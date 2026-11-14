@@ -260,15 +260,16 @@ def test_watch_embedded_rar_tail_before_head_is_retried(package, tmp_path):
     assert tail.read_bytes() == wrapped[-1].read_bytes()
     assert not marker_present(watch.output, case.marker_name)
     watch.start()
-    # Publish the head last, after the other two files are complete. A missing
-    # result for the head can no longer be attributed to a partial download.
-    middle = download(watch, wrapped[1])
-    head = download(watch, wrapped[0])
+    # The completed carriers are staged outside Watch. Move them in with the
+    # head last so Watch cannot consume a temporary name before publication.
+    middle = wrapped[1].replace(watch.root / wrapped[1].name)
+    head = wrapped[0].replace(watch.root / wrapped[0].name)
     watch.await_archive(case)
+    wait_for(lambda: not any(path.exists() for path in (head, middle, tail)),
+             "cleanup of the three delivered carriers")
     watch.stop()
     watch.assert_no_terminal_failures()
     assert_once(watch, case)
-    assert not any(path.exists() for path in (head, middle, tail))
 
 
 @pytest.mark.requires_watch_broker

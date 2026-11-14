@@ -750,7 +750,7 @@ impl Server {
             }
             let started = Instant::now();
             let foreground = header.argv.first().is_none_or(|command| command != "--cancel-watch-batch");
-            if foreground { super::diagnostics::event("foreground_request_started", serde_json::json!({"origin":"foreground","command":header.argv.first(),"queue_ms":connected.elapsed().as_secs_f64()*1000.0})); }
+            if foreground { super::diagnostics::event("foreground_request_started", || serde_json::json!({"origin":"foreground","command":header.argv.first(),"queue_ms":connected.elapsed().as_secs_f64()*1000.0})); }
             let session: Arc<dyn Session> = connection.clone();
             let code = match cli::run(&self.host, &header.cwd, header.argv, session, cancel).await {
                 Ok(code) => code,
@@ -762,7 +762,7 @@ impl Server {
                     1
                 }
             };
-            if foreground { super::diagnostics::event("foreground_request_finished", serde_json::json!({"origin":"foreground","exit_code":code,"duration_ms":started.elapsed().as_secs_f64()*1000.0})); }
+            if foreground { super::diagnostics::event("foreground_request_finished", || serde_json::json!({"origin":"foreground","exit_code":code,"duration_ms":started.elapsed().as_secs_f64()*1000.0})); }
             // The launcher closes as soon as it reads the status frame. Its
             // control EOF can arrive before the completed write is observed.
             connection.finishing.store(true, Ordering::Release);
@@ -886,7 +886,7 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
     } else {
         "idle_timeout"
     };
-    super::diagnostics::event("host_stopping", serde_json::json!({"foreground_requests":server.activity.lock().unwrap().active,"exit_reason":exit_reason}));
+    super::diagnostics::event("host_stopping", || serde_json::json!({"foreground_requests":server.activity.lock().unwrap().active,"exit_reason":exit_reason}));
     server.shutdown.cancel();
     if server.host.watch.is_running() {
         let _ = server.host.watch.stop();

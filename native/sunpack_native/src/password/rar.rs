@@ -20,7 +20,6 @@ use hmac::{Hmac, Mac};
 use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
-use std::borrow::Cow;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
@@ -615,49 +614,18 @@ fn parse_rar4_block(data: &[u8], offset: usize) -> Option<Rar4Block> {
 /// MHD_PASSWORD; the salt is immediately after that header and all following
 /// block headers are AES-CBC encrypted.
 fn decrypt_rar4_header(encrypted: &[u8], password: &str, salt_source: &[u8]) -> Option<Rar4Block> {
-    decrypt_rar4_header_with_read(encrypted, password, salt_source, |_, _| None)
-}
-
-pub(crate) fn rar4_decrypt_header_flags_with_read(
-    data: &[u8],
-    password: &str,
-    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
-) -> Option<u16> {
-    let main = parse_rar4_block(data, RAR4_SIGNATURE.len()).filter(|b| b.header_type == 0x73)?;
-    if main.flags & RAR4_MAIN_HEADER_PASSWORD == 0 {
-        return None;
-    }
-    let offset = main.next_offset.checked_add(8)?;
-    let salt = header_range(data, main.next_offset, 8, &mut read)?;
-    let first = decrypt_rar4_header_with_read(
-        data.get(offset..).unwrap_or_default(),
-        password,
-        &salt,
-        |pos, size| read((offset as u64).checked_add(pos)?, size),
-    )?;
-    (0x72..=0x7b)
-        .contains(&first.header_type)
-        .then_some(main.flags)
-}
-
-fn decrypt_rar4_header_with_read(
-    encrypted: &[u8],
-    password: &str,
-    salt_source: &[u8],
-    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
-) -> Option<Rar4Block> {
     let salt: &[u8; 8] = salt_source.get(..8)?.try_into().ok()?;
     let (key, iv) = derive_rar3_key_iv(password, Some(salt))?;
     let cipher = Aes128::new_from_slice(&key).ok()?;
-    let first = header_range(encrypted, 0, 16, &mut read)?;
-    let plain = decrypt_cbc_block(&cipher, &mut iv.clone(), &first);
+    let first = encrypted.get(..16)?;
+    let plain = decrypt_cbc_block(&cipher, &mut iv.clone(), first);
     let size = u16::from_le_bytes([plain[5], plain[6]]) as usize;
     if size < RAR4_MIN_HEADER_SIZE {
         return None;
     }
     let aligned = size.checked_add(15)? & !15;
-    let encrypted = header_range(encrypted, 0, aligned, &mut read)?;
-    let full = decrypt_cbc_bytes(&cipher, &iv, &encrypted);
+    let encrypted = encrypted.get(..aligned)?;
+    let full = decrypt_cbc_bytes(&cipher, &iv, encrypted);
     parse_rar4_block(&full[..size], 0)
 }
 
@@ -1003,7 +971,6 @@ struct Rar5EncryptionHeader {
     salt: [u8; 16],
     has_password_check: bool,
     password_check: [u8; 8],
-    header_end: usize,
 }
 
 fn find_rar5_encryption_header(data: &[u8]) -> Option<Rar5EncryptionHeader> {
@@ -1145,7 +1112,6 @@ fn parse_rar5_encryption_body(
         salt,
         has_password_check,
         password_check,
-        header_end: if include_iv { 0 } else { end },
     })
 }
 
@@ -1205,63 +1171,6 @@ fn rar5_aes_key(password: &str, header: &Rar5EncryptionHeader) -> Option<[u8; 32
         derived_check[index % 8] ^= *byte;
     }
     (derived_check == header.password_check).then_some(key)
-}
-
-/// Decrypt the RAR5 archive main header of a header-encrypted (-hp) archive.
-///
-/// The input must start at the RAR5 signature.  The unencrypted type-4
-/// encryption header is followed by a 16-byte AES-256-CBC IV and then the
-/// encrypted main header block (CRC + header fields), aligned to a 16-byte
-/// boundary.  The AES key is the standard PBKDF2-HMAC-SHA256 of the password
-/// with the stored 16-byte salt and 2^lg2_count iterations.
-///
-/// Returns `(archive_flags, volume_number)` parsed from the decrypted main
-/// header, or `None` when no type-4 header exists, the password does not pass
-/// the embedded password check, or the decrypted block fails CRC validation.
-#[cfg(test)]
-pub(crate) fn rar5_decrypt_main_header(data: &[u8], password: &str) -> Option<(u64, Option<u32>)> {
-    rar5_decrypt_main_header_with_read(data, password, |_, _| None)
-}
-
-fn header_range<'a>(
-    data: &'a [u8],
-    offset: usize,
-    len: usize,
-    read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
-) -> Option<Cow<'a, [u8]>> {
-    let end = offset.checked_add(len)?;
-    if let Some(bytes) = data.get(offset..end) {
-        return Some(Cow::Borrowed(bytes));
-    }
-    let prefix = data.get(offset..).unwrap_or_default();
-    let bytes = read(offset.checked_add(prefix.len())? as u64, len - prefix.len())?;
-    if bytes.len() != len - prefix.len() {
-        return None;
-    }
-    let mut full = Vec::with_capacity(len);
-    full.extend_from_slice(prefix);
-    full.extend(bytes);
-    Some(Cow::Owned(full))
-}
-
-pub(crate) fn rar5_decrypt_main_header_with_read(
-    data: &[u8],
-    password: &str,
-    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
-) -> Option<(u64, Option<u32>)> {
-    let header = find_rar5_encryption_header(data)?;
-    let key = rar5_aes_key(password, &header)?;
-    let cipher = Aes256::new_from_slice(&key).ok()?;
-    let iv = header_range(data, header.header_end, 16, &mut read)?;
-    let iv: [u8; 16] = iv.as_ref().try_into().ok()?;
-    let offset = header.header_end.checked_add(16)?;
-    let first = header_range(data, offset, 16, &mut read)?;
-    let plain = decrypt_cbc_block(&cipher, &mut iv.clone(), &first);
-    let size = rar5_header_len(&plain)?;
-    let aligned = size.checked_add(15)? & !15;
-    let encrypted = header_range(data, offset, aligned, &mut read)?;
-    let full = decrypt_cbc_bytes(&cipher, &iv, &encrypted);
-    rar5_main_volume(&full[..size], 0)
 }
 
 /// Share decrypted main-header and ENDARC facts between Relations and Embedded.
@@ -1776,7 +1685,6 @@ mod kdf_regression_tests {
                     salt: [0x73; 16],
                     has_password_check: true,
                     password_check: [0; 8],
-                    header_end: 0,
                 };
                 let mut key = [0u8; 32];
                 let mut check = [0u8; 32];
@@ -1812,26 +1720,14 @@ pub(crate) mod rar5_header_decryption_tests {
     // Real RAR 5.60 -hp encrypted fixtures (password "secret") generated by
     // the bundled Rar.exe.  Single volume plus first/second split volumes.
     pub(crate) const SINGLE_HP_HEX: &str = "526172211a07010074de7b1c21040000010f7b64253244702e2a32eb93579555a37d38b616cb97898c463d3682920551724ed0c1c974029cc2b8ef8491fc816311daa1b0410f6115608170466e4948a8c6d4f17e28b08c727b4acfc116d3d075ce011963dc0c72e50a803d9036619810e92352e809830c9463ab4a0abdaab61e008218673e9c51409f76b2064bf7982e56d8173f1e387329bd5aca3bac49063545fcbfc19547d2be214b4fe1dae172b250e168f2a258548930b1763fb500c7869d70f2539d86fd19214dcc3bca1363154b0a0f2b0bba7dcc224ec1893cbc31cfa95158ccf5e96d74921de6f268ea4429e2ddf63d49220005742fef059f868372345f071322a7e690d56d5ac17b563fa9e923076fa2c58aa8e88e9843df17b7e79a30ca936d8215c92f6832f86887c3c3160ecfddfcdf7712382f84f39eb8";
-    const PART1_HP_HEX: &str = "526172211a070100ba274f7921040000010fb5b78bc874c2401abc24a83cef823460c50737df44187dc3fa3a8316028f5a16a7ec9cd527eff412f0bd4f8e579a17b4f089c86869ed79e1eda2749f3ec19c16fa0a126c255e5a0ade47c823d3c82ddc00c1c6caebf6506ef16dd177984ee975d3669ff26194eee05db61c51b12d618f31b63f8edfe5828ad2c512093459f242c0b23a51614fe315c307cbdac485";
-    const PART2_HP_HEX: &str = "526172211a070100ba274f7921040000010fb5b78bc874c2401abc24a83cef823460c50737df44187dc3fa3a831619b05ee4bf8e2194083d002591665679b4863aed78506ef5d174ab922c0c6c14e872055e0c440d2288a78fca53664503b46b93be4dc1f58098453bfc79bc498cb0cff26cdfadb5a13581c4bc1ae85166bbf4b013ccbd11873b02c45cbc42b8d64ca2effb581d24eddb503087a1cfb8599789";
+    pub(crate) const PART1_HP_HEX: &str = "526172211a070100ba274f7921040000010fb5b78bc874c2401abc24a83cef823460c50737df44187dc3fa3a8316028f5a16a7ec9cd527eff412f0bd4f8e579a17b4f089c86869ed79e1eda2749f3ec19c16fa0a126c255e5a0ade47c823d3c82ddc00c1c6caebf6506ef16dd177984ee975d3669ff26194eee05db61c51b12d618f31b63f8edfe5828ad2c512093459f242c0b23a51614fe315c307cbdac485";
+    pub(crate) const PART2_HP_HEX: &str = "526172211a070100ba274f7921040000010fb5b78bc874c2401abc24a83cef823460c50737df44187dc3fa3a831619b05ee4bf8e2194083d002591665679b4863aed78506ef5d174ab922c0c6c14e872055e0c440d2288a78fca53664503b46b93be4dc1f58098453bfc79bc498cb0cff26cdfadb5a13581c4bc1ae85166bbf4b013ccbd11873b02c45cbc42b8d64ca2effb581d24eddb503087a1cfb8599789";
 
     pub(crate) fn hex_bytes(hex: &str) -> Vec<u8> {
         (0..hex.len())
             .step_by(2)
             .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
             .collect()
-    }
-
-    #[test]
-    fn decrypts_real_hp_single_volume_main_header() {
-        let data = hex_bytes(SINGLE_HP_HEX);
-        let (archive_flags, number) = rar5_decrypt_main_header(&data, "secret").unwrap();
-        assert_eq!(
-            archive_flags & 0x0001,
-            0,
-            "single volume must not be multivolume"
-        );
-        assert_eq!(number, None);
     }
 
     #[test]
@@ -1855,27 +1751,6 @@ pub(crate) mod rar5_header_decryption_tests {
             assert!(matches!(result, Err(error) if is_cancellation(&error)));
         }
         std::fs::remove_file(valid).unwrap();
-    }
-
-    #[test]
-    fn decrypts_real_hp_split_volume_main_headers() {
-        let first = hex_bytes(PART1_HP_HEX);
-        let second = hex_bytes(PART2_HP_HEX);
-        let (first_flags, first_number) = rar5_decrypt_main_header(&first, "secret").unwrap();
-        let (second_flags, second_number) = rar5_decrypt_main_header(&second, "secret").unwrap();
-        assert_eq!(first_flags & 0x0001, 0x0001);
-        assert_eq!(
-            first_number, None,
-            "first volume has no volume number field"
-        );
-        assert_eq!(second_flags & 0x0003, 0x0003);
-        assert_eq!(second_number, Some(1));
-    }
-
-    #[test]
-    fn rejects_wrong_password_before_decrypting() {
-        let data = hex_bytes(SINGLE_HP_HEX);
-        assert!(rar5_decrypt_main_header(&data, "not-the-password").is_none());
     }
 
     #[test]
@@ -1924,7 +1799,7 @@ pub(crate) mod rar5_header_decryption_tests {
 mod relation_header_tests {
     use super::*;
     use crate::analysis_native::volume_anchor::{
-        probe_volume_anchor_at_offset, upgrade_relation_rar_end,
+        probe_volume_anchor_reader_at_offset, resolve_encrypted_relation_anchor,
     };
     use aes::cipher::BlockModeEncrypt;
 
@@ -1971,14 +1846,13 @@ mod relation_header_tests {
         data.extend(rar4_block(0x73, 0x91, &[0; 6]));
         data.extend(salt);
         data.extend(ciphertext);
-        let path = crate::test_support::temp_file("encrypted_rar4_identity", &data);
-        let anchor =
-            probe_volume_anchor_at_offset(&path.to_string_lossy(), 37, "rar", Some("secret"));
-        assert!(!anchor.needs_password, "{}", anchor.error);
-        let anchor = upgrade_relation_rar_end(&anchor, Some("secret"));
+        let passwords = [Arc::from("secret")];
+        let reader = ManagedReader::from_bytes(data, Default::default());
+        let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 37, "rar").unwrap();
+        let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true).unwrap();
+        assert_eq!(matched, Some(0));
         assert_eq!(anchor.internal_volume_number, Some(3));
         assert_eq!(anchor.relation_has_next, Some(false));
-        std::fs::remove_file(path).unwrap();
 
         let mut extra_body = vec![2, 1];
         extra_body.extend(vint(600));
@@ -2005,19 +1879,18 @@ mod relation_header_tests {
         data.extend(rar5_block(&encryption));
         data.extend(iv);
         data.extend(ciphertext);
-        let path = crate::test_support::temp_file("encrypted_rar5_long_main", &data);
-        let anchor =
-            probe_volume_anchor_at_offset(&path.to_string_lossy(), 0, "rar", Some("secret"));
+        let reader = ManagedReader::from_bytes(data.clone(), Default::default());
+        let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 0, "rar").unwrap();
+        let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true).unwrap();
+        assert_eq!(matched, Some(0));
         assert_eq!(anchor.internal_volume_number, Some(3), "{}", anchor.error);
-        assert!(!anchor.needs_password);
-        std::fs::remove_file(path).unwrap();
+
         data.truncate(300);
-        let path = crate::test_support::temp_file("encrypted_rar5_short_main", &data);
-        let anchor =
-            probe_volume_anchor_at_offset(&path.to_string_lossy(), 0, "rar", Some("secret"));
-        assert!(anchor.needs_password);
+        let reader = ManagedReader::from_bytes(data, Default::default());
+        let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 0, "rar").unwrap();
+        let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true).unwrap();
+        assert!(matched.is_none() && anchor.needs_password);
         assert!(!anchor.wrong_password);
-        std::fs::remove_file(path).unwrap();
     }
 }
 

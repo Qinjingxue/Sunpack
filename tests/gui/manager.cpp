@@ -269,7 +269,6 @@ void editing(Fixture& f) {
         auto module=config_fields(parse_json(R"({"analysis":{"modules":[{"name":"gzip","enabled":true}]}})"),"",language);
         assert(module.size()==1 && module[0]["known"].get<bool>() && module[0]["module"]=="gzip" && module[0]["blockLabel"]=="GZIP");
     }
-    assert(log_directory(f.dir)==f.dir/".sunpack_watch");
 }
 // Existing file/edit tests only check rejection. This coarse scenario catches
 // leaked message keys, frozen locales and lost Windows codes across the same

@@ -1,5 +1,9 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_reader_at_offset, CheapAnchorCell, VolumeAnchor,
+    probe_volume_anchor_reader_at_offset, CheapAnchorCell, VolumeAnchor, EMBEDDED_VOLUME, FIRST,
+    MEMBER, RAR_END_CHECKED, RAR_OLD_NUMBERING, RAR_PART_NUMBERING, SEVEN_ZIP_NEXT_HEADER_CRC,
+    SEVEN_ZIP_STUB, SFX_CHECKED, TERMINAL, UNRESOLVED_VOLUME, WINRAR_STUB, ZIP_CARRIER_CHECKED,
+    ZIP_DIRECTORY_MEMBER, ZIP_EOCD_HEAD, ZIP_LOCAL_HEADER, ZIP_SINGLE_DISK, ZIP_SPLIT_END,
+    ZIP_SPLIT_START, ZIP_TAIL_CHECKED, ZIP_TAIL_WITHOUT_HEAD,
 };
 use crate::io::archive_state::{
     AnalysisOrigin, ArchiveInput, InputExtent, InputPart, InputRole, OpenMode, VolumeCompleteness,
@@ -272,7 +276,7 @@ impl NativeRelationGroup {
                 } else if !data.relation_confirmed
                     && ((data.multivolume && (data.is_split || data.structural_non_head))
                         || anchor
-                            .is_some_and(|a| a.evidence.contains(&"embedded:volume_candidate")))
+                            .is_some_and(|a| a.has_any(EMBEDDED_VOLUME)))
                 {
                     Some("missing_volume")
                 } else {
@@ -363,7 +367,7 @@ impl NativeRelationGroup {
                     is_split: parsed.is_some(),
                     parsed,
                     entry_path: &row.path,
-                    format_hint: anchor.map(|a| a.format.as_str()).unwrap_or(""),
+                    format_hint: anchor.map(|a| a.format).unwrap_or(""),
                     companions: &[],
                     carrier_path: &row.path,
                     needs_password: anchor.is_some_and(|a| a.needs_password),
@@ -372,7 +376,7 @@ impl NativeRelationGroup {
                     structural_non_head: anchor.is_some_and(|a| {
                         a.continuation_from_previous
                             || a.internal_volume_number.is_some_and(|number| number > 1)
-                            || a.anchor_roles.contains(&"member")
+                            || a.has_any(MEMBER)
                     }),
                 }
             }
@@ -643,17 +647,17 @@ fn resolve_shared_carrier_volumes(
             continue;
         };
         let needs_password = anchor.needs_password || anchor.wrong_password;
-        anchor.evidence.push("embedded:unresolved_volume");
+        anchor.flags |= UNRESOLVED_VOLUME;
         // Only an entry can retain an unresolved logical input. Orphan slices
         // remain available in the source snapshot for a later entry.
         let path = anchor.path.clone();
-        let format = anchor.format.clone();
+        let format = anchor.format;
         let name = Path::new(&path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         let logical_name = get_logical_name(name, true);
-        let style = match format.as_str() {
+        let style = match format {
             "rar" => "rar_part",
             "zip" => "zip_spanned",
             _ => "numeric_suffix",
@@ -666,7 +670,7 @@ fn resolve_shared_carrier_volumes(
                 ProposalStatus::Inconclusive
             },
             proposal: RelationProposal {
-                format,
+                format: format.into(),
                 logical_name,
                 style: style.into(),
                 width: 3,
@@ -831,8 +835,8 @@ fn build_candidate_groups_from_source(
 fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
     let offset = anchor.structure_offset.unwrap_or(0);
     let proven_sfx = offset > 0 && anchor.sfx && anchor.pe_state == PeState::Confirmed;
-    if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
-        || anchor.confidence != "strong"
+    if !matches!(anchor.format, "rar" | "7z" | "zip")
+        || !anchor.strong
         || !(anchor.standalone || anchor.needs_password || proven_sfx)
     {
         return false;
@@ -871,16 +875,16 @@ fn promote_sfx_archive_anchor(
     // validate the archive at the overlay offset below.
     let sfx_profile = executable_sfx_stub_profile(reader, image_end).ok()?;
     let Some(overlay) = overlay else {
-        let evidence = match sfx_profile {
-            "seven_zip_sfx" => "sfx:seven_zip_stub",
-            "winrar_sfx" => "sfx:winrar_stub",
+        let stub = match sfx_profile {
+            "seven_zip_sfx" => SEVEN_ZIP_STUB,
+            "winrar_sfx" => WINRAR_STUB,
             _ => return None,
         };
         let mut anchor = row.anchor.clone().unwrap_or_default();
         anchor.pe_state = PeState::Confirmed;
         anchor.pe_image_end = Some(image_end);
         anchor.sfx = true;
-        anchor.evidence.push(evidence);
+        anchor.flags |= stub;
         return Some(anchor);
     };
     let format = overlay.format;
@@ -896,15 +900,14 @@ fn promote_sfx_archive_anchor(
     let archive_offset = overlay.offset;
 
     let mut anchor =
-        probe_volume_anchor_reader_at_offset(reader, &row.path, archive_offset, format, None)
+        probe_volume_anchor_reader_at_offset(reader, &row.path, archive_offset, format)
             .ok()?;
-    if anchor.format != format || anchor.confidence != "strong" {
+    if anchor.format != format || !anchor.strong {
         return None;
     }
     anchor.pe_state = PeState::Confirmed;
     anchor.pe_image_end = Some(image_end);
     anchor.sfx = true;
-    anchor.evidence.push("sfx:pe_overlay");
     Some(anchor)
 }
 
@@ -995,7 +998,7 @@ fn project_proposal(
         .map(|(path, number)| {
             let anchor = anchors.get(&path_key(path));
             let terminal = proposal.style == "zip_spanned"
-                && anchor.is_some_and(|anchor| anchor.anchor_roles.contains(&"terminal"));
+                && anchor.is_some_and(|anchor| anchor.has_any(TERMINAL));
             InputPart {
                 role: if *number == 0 { InputRole::Main } else if terminal { InputRole::Terminal } else if *number == 1 { InputRole::First } else { InputRole::Member },
                 extent: InputExtent {
@@ -1040,7 +1043,7 @@ fn project_proposal(
     let incomplete = validation.status == ProposalStatus::Inconclusive
         || anchors
             .values()
-            .any(|anchor| anchor.evidence.contains(&"embedded:unresolved_volume"));
+            .any(|anchor| anchor.has_any(UNRESOLVED_VOLUME));
     input.analysis.volume_completeness = Some(
         if input.volume_attempts.is_some() || validation.status == ProposalStatus::NeedsPassword {
             VolumeCompleteness::Unknown
@@ -1114,16 +1117,13 @@ fn proposal_split_family(
 ) -> String {
     let style = proposal.style.as_str();
     if proposal.format == "rar" && style != "rar_sfx_part" {
-        let head_evidence = proposal
+        let head = proposal
             .volumes
             .iter()
             .find(|(_, number)| *number == 1)
-            .and_then(|(path, _)| anchors.get(&path_key(path)))
-            .map(|anchor| anchor.evidence.as_slice())
-            .unwrap_or(&[]);
-        let old_naming = head_evidence.contains(&"rar4:old_volume_naming");
-        let new_naming = head_evidence.contains(&"rar4:new_volume_naming")
-            || head_evidence.contains(&"rar5:volume_header");
+            .and_then(|(path, _)| anchors.get(&path_key(path)));
+        let old_naming = head.is_some_and(|anchor| anchor.has_any(RAR_OLD_NUMBERING));
+        let new_naming = head.is_some_and(|anchor| anchor.has_any(RAR_PART_NUMBERING));
         if old_naming && style != "rar_oldstyle" {
             return "rar_oldstyle".to_string();
         }
@@ -1739,7 +1739,7 @@ impl RelationRegexes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis_native::volume_anchor::probe_volume_anchor_paths_cheap;
+    use crate::analysis_native::volume_anchor::probe_volume_anchor_path_cheap;
 
     #[test]
     fn retired_regex_generation_lives_only_until_concurrent_parse_finishes() {
@@ -1955,8 +1955,8 @@ mod tests {
         bytes.extend([0; 128]);
         let path = crate::test_support::temp_file("scan_native_head", &bytes);
         let path_string = path.to_string_lossy().into_owned();
-        let anchor = probe_volume_anchor_paths_cheap(&[path_string.clone()], None).remove(0);
-        let anchor = upgrade_relation_rar_end(&anchor, None);
+        let anchor = probe_volume_anchor_path_cheap(&path_string);
+        let anchor = upgrade_relation_rar_end(&anchor);
         assert_eq!(anchor.proven_extent_end(), Some(end));
         let mut validation = validation_with_owned_paths(ProposalStatus::Valid, &[&path_string]);
         Arc::make_mut(&mut validation.facts).anchors.insert(path_key(&path_string), anchor);
@@ -1981,7 +1981,7 @@ mod tests {
             Arc::make_mut(&mut validation.facts).anchors.insert(
                 path.into(),
                 VolumeAnchor {
-                    format: "rar".into(),
+                    format: "rar",
                     needs_password: true,
                     ..Default::default()
                 },

@@ -383,7 +383,7 @@ impl Watch {
             let once = {
                 let mut slot = self.running.lock().unwrap();
                 if slot.as_ref().is_some_and(Running::continuous) {
-                    super::diagnostics::event("watch_start_reused", json!({}));
+                    super::diagnostics::event("watch_start_reused", || json!({}));
                     return Ok(json!({"running":true,"started":false,"generation":self.generation.load(Ordering::Relaxed)}));
                 }
                 match slot.as_ref() {
@@ -403,7 +403,7 @@ impl Watch {
         let hub = Arc::clone(&running.hub);
         *self.running.lock().unwrap() = Some(running);
         let generation = self.generation.load(Ordering::Relaxed);
-        super::diagnostics::event("watch_starting", json!({"tray_enabled":tray}));
+        super::diagnostics::event("watch_starting", || json!({"tray_enabled":tray}));
         // Like main, publish the host-owned service before readiness and allow
         // stop to interrupt startup without cancelling the caller's future.
         drop(lifecycle);
@@ -417,7 +417,7 @@ impl Watch {
             if let Some(failed) = failed { let _ = Self::join_run(failed).await; }
             return Err(error);
         }
-        super::diagnostics::event("watch_started", json!({}));
+        super::diagnostics::event("watch_started", || json!({}));
         Ok(json!({"running":true,"started":true,"generation":generation}))
     }
 
@@ -462,7 +462,7 @@ impl Watch {
                 if !once && !cancel.cancelled() { *last_error.lock().unwrap() = Some(error.to_string()); }
             }
             if let Err(error) = &result {
-                super::diagnostics::event("watch_failed", json!({"error":error.to_string()}));
+                super::diagnostics::event("watch_failed", || json!({"error":error.to_string()}));
             }
             finished.0.complete(&result);
             wake();
@@ -490,10 +490,10 @@ impl Watch {
             .filter(|run| include_once || run.continuous())
             .map(|run| (Arc::clone(&run.hub), Arc::clone(&run.completion), !run.thread.is_finished()));
         let Some((hub, completion, stopped)) = current else {
-            super::diagnostics::event("watch_stop_ignored", json!({}));
+            super::diagnostics::event("watch_stop_ignored", || json!({}));
             return Ok(json!({"running":false,"stopped":false,"generation":generation}));
         };
-        super::diagnostics::event("watch_stopping", json!({}));
+        super::diagnostics::event("watch_stopping", || json!({}));
         hub.stop();
         // Keep the old service published while it drains, as main does.
         // Concurrent start sees that service; concurrent stop joins the same
@@ -511,7 +511,7 @@ impl Watch {
             result?;
             joined?;
         }
-        super::diagnostics::event("watch_stopped", json!({}));
+        super::diagnostics::event("watch_stopped", || json!({}));
         Ok(json!({"running":false,"stopped":stopped,"generation":self.generation.load(Ordering::Relaxed)}))
     }
 
@@ -566,7 +566,7 @@ impl Watch {
     pub(super) async fn reload_async(&self) -> io::Result<Value> {
         let result = self.reload_result().await?;
         let running = result.is_some();
-        if !running { super::diagnostics::event("watch_reload_ignored", json!({})); }
+        if !running { super::diagnostics::event("watch_reload_ignored", || json!({})); }
         let reloaded = result.is_some_and(|result| result.unwrap_or(false));
         Ok(json!({"running":running,"reloaded":reloaded,"generation":self.generation.load(Ordering::Relaxed)}))
     }
@@ -661,7 +661,7 @@ impl Watch {
             })
         });
         if let Some(apply) = &apply {
-            super::diagnostics::event("watch_roots_added", json!({"added":added,"updated":updated,"applied":apply["applied"]}));
+            super::diagnostics::event("watch_roots_added", || json!({"added":added,"updated":updated,"applied":apply["applied"]}));
         }
         Ok(json!({
             "roots_path":path,"added":added,"updated":updated,"rejected":rejected,
@@ -698,7 +698,7 @@ impl Watch {
                 })
             });
         if let Some(apply) = &apply {
-            super::diagnostics::event("watch_roots_removed", json!({"removed":removed,"applied":apply["applied"]}));
+            super::diagnostics::event("watch_roots_removed", || json!({"removed":removed,"applied":apply["applied"]}));
         }
         Ok(json!({"roots_path":path,"removed":removed,"apply":apply}))
     }
@@ -994,7 +994,7 @@ struct Hub {
     signals: Mutex<Signals>,
     wake: std::sync::Condvar,
     claims: Mutex<HashMap<String, Arc<str>>>,
-    completed_families: Mutex<CompletedFamilies>,
+    completed_families: CompletedFamilies,
     activities: Arc<quiet::Activities>,
     pending_count: AtomicUsize,
 }
@@ -1018,6 +1018,7 @@ impl CompletedMember {
 }
 
 type CompletedFamilyKey = (Arc<[CompletedMember]>, bool);
+#[derive(Clone)]
 struct CompletedGenerations {
     ordered: Vec<(Arc<str>, PhysicalFileGeneration)>,
     by_path: HashSet<Arc<str>>,
@@ -1033,31 +1034,35 @@ impl CompletedGenerations {
 }
 
 #[derive(Default)]
-struct CompletedFamilies {
+struct CompletedFamilies(Mutex<CompletedFamilyCache>);
+
+#[derive(Default)]
+struct CompletedFamilyCache {
     sequence: u64,
     by_family: HashMap<CompletedFamilyKey, u64>,
-    ordered: BTreeMap<u64, (CompletedFamilyKey, CompletedGenerations, PathBuf)>,
+    ordered: BTreeMap<u64, (CompletedFamilyKey, Arc<CompletedGenerations>, Arc<Path>)>,
 }
 
 impl CompletedFamilies {
-    fn remember(&mut self, generations: SourceGenerations, deep: bool, output: &Path) {
+    fn remember(&self, generations: SourceGenerations, deep: bool, output: &Path) {
         if generations.is_empty() { return; }
         let mut ordered: Vec<_> = generations.into_iter().map(|(path, generation)|
             (CompletedMember::new(&path, &generation), (path, generation))).collect();
         ordered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let (members, generations): (Vec<_>, Vec<_>) = ordered.into_iter().unzip();
         let family = (Arc::from(members), deep);
-        if let Some(previous) = self.by_family.remove(&family) { self.ordered.remove(&previous); }
-        self.sequence += 1;
-        self.by_family.insert(family.clone(), self.sequence);
-        self.ordered.insert(self.sequence, (family, CompletedGenerations::new(generations), output.to_owned()));
-        while self.ordered.len() > COMPLETED_FAMILY_LIMIT {
-            let (_, (family, _, _)) = self.ordered.pop_first().unwrap();
-            self.by_family.remove(&family);
+        let generations = Arc::new(CompletedGenerations::new(generations));
+        let output = Arc::from(output);
+        let mut cache = self.0.lock().unwrap();
+        if let Some(previous) = cache.by_family.get(&family).copied() { cache.ordered.remove(&previous); }
+        cache.insert(family, generations, output);
+        if cache.ordered.len() > COMPLETED_FAMILY_LIMIT {
+            let (_, (family, _, _)) = cache.ordered.pop_first().unwrap();
+            cache.by_family.remove(&family);
         }
     }
 
-    fn output(&mut self, generations: &SourceGenerations, deep: bool) -> Option<PathBuf> {
+    fn output(&self, generations: &SourceGenerations, deep: bool) -> Option<PathBuf> {
         // Rename changes a spelling, not an already extracted physical member.
         // Keep the full family and content-generation checks, without another
         // metadata pass or a search through all cached families.
@@ -1065,49 +1070,78 @@ impl CompletedFamilies {
             (CompletedMember::new(path, generation), (path, generation))).collect();
         current.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let (members, current): (Vec<_>, Vec<_>) = current.into_iter().unzip();
-        let sequence = *self.by_family.get(&(Arc::from(members), deep))?;
-        let (_, previous, _) = self.ordered.get_mut(&sequence)?;
-        if !current.iter().zip(&previous.ordered).all(|((_, current), (_, previous))|
-            current.matches_input(&previous.persisted())) {
-            return None;
-        }
+        let family = (Arc::from(members), deep);
+        let output = {
+            let cache = self.0.lock().unwrap();
+            let (_, previous, output) = &cache.ordered[cache.by_family.get(&family)?];
+            if !current.iter().zip(&previous.ordered).all(|((_, current), (_, previous))|
+                current.matches_input(&previous.persisted())) {
+                return None;
+            }
+            Arc::clone(output)
+        };
+        let live = output.is_dir();
+        let mut cache = self.0.lock().unwrap();
+        let sequence = cache.validated_sequence(&family, &output, live)?;
         // Late completion/failure checks must use the validated live names too.
         // Share each name with the membership index and retain unchanged names,
         // without filesystem observations beyond admission's snapshot.
-        let mut renamed = false;
-        for ((path, _), (stored, _)) in current.iter().zip(&mut previous.ordered) {
-            if stored.as_ref() != path.as_str() {
-                *stored = Arc::from(path.as_str());
-                renamed = true;
+        let (_, previous, _) = cache.ordered.get_mut(&sequence).unwrap();
+        if current.iter().zip(&previous.ordered).any(|((path, _), (stored, _))| stored.as_ref() != path.as_str()) {
+            let previous = Arc::make_mut(previous);
+            for ((path, _), (stored, _)) in current.iter().zip(&mut previous.ordered) {
+                if stored.as_ref() != path.as_str() { *stored = Arc::from(path.as_str()); }
             }
-        }
-        if renamed {
             previous.by_path.clear();
             previous.by_path.extend(previous.ordered.iter().map(|(path, _)| Arc::clone(path)));
         }
-        self.refresh_output(sequence).map(Path::to_path_buf)
+        cache.refresh(sequence);
+        Some(output.to_path_buf())
     }
 
-    fn covers(&mut self, path: &Path, deep: bool) -> bool {
+    fn covers(&self, path: &Path, deep: bool) -> bool {
         let path = key(path);
-        let matched = self.ordered.iter().find_map(|(sequence, (family, generations, _))| {
-            if family.1 != deep || !generations.by_path.contains(path.as_str()) { return None; }
+        let candidates: Vec<_> = self.0.lock().unwrap().ordered.values()
+            .filter(|(family, generations, _)| family.1 == deep && generations.by_path.contains(path.as_str()))
+            .cloned().collect();
+        for (family, generations, output) in candidates {
             // Require the entire current family, not only the old request's head.
-            generations.ordered.iter().all(|(member, previous)| {
+            if !generations.ordered.iter().all(|(member, previous)| {
                 crate::io::reader::capture_file_generation(Path::new(member.as_ref()))
                     .is_ok_and(|current| current.matches_input(&previous.persisted()))
-            }).then_some(*sequence)
-        });
-        matched.is_some_and(|sequence| self.refresh_output(sequence).is_some())
+            }) { continue; }
+            let live = output.is_dir();
+            let mut cache = self.0.lock().unwrap();
+            let Some(sequence) = cache.validated_sequence(&family, &output, live) else { continue; };
+            if Arc::ptr_eq(&cache.ordered[&sequence].1, &generations) {
+                cache.refresh(sequence);
+                return true;
+            }
+        }
+        false
     }
+}
 
-    fn refresh_output(&mut self, sequence: u64) -> Option<&Path> {
-        let (family, generations, output) = self.ordered.remove(&sequence)?;
-        if !output.is_dir() { self.by_family.remove(&family); return None; }
+impl CompletedFamilyCache {
+    fn insert(&mut self, family: CompletedFamilyKey, generations: Arc<CompletedGenerations>, output: Arc<Path>) {
         self.sequence += 1;
         self.by_family.insert(family.clone(), self.sequence);
         self.ordered.insert(self.sequence, (family, generations, output));
-        Some(self.ordered[&self.sequence].2.as_path())
+    }
+
+    fn validated_sequence(&mut self, family: &CompletedFamilyKey, output: &Arc<Path>, live: bool) -> Option<u64> {
+        let sequence = *self.by_family.get(family)?;
+        // An old probe cannot refresh or remove a replacement receipt.
+        if !Arc::ptr_eq(output, &self.ordered[&sequence].2) { return None; }
+        if live { return Some(sequence); }
+        self.by_family.remove(family);
+        self.ordered.remove(&sequence);
+        None
+    }
+
+    fn refresh(&mut self, sequence: u64) {
+        let (family, generations, output) = self.ordered.remove(&sequence).unwrap();
+        self.insert(family, generations, output);
     }
 }
 
@@ -1119,7 +1153,7 @@ impl Hub {
             signals: Mutex::default(),
             wake: std::sync::Condvar::new(),
             claims: Mutex::default(),
-            completed_families: Mutex::default(),
+            completed_families: CompletedFamilies::default(),
             activities: Arc::default(),
             pending_count: AtomicUsize::new(0),
         }
@@ -1152,7 +1186,7 @@ impl Hub {
     fn clear_idle_completed_families(&self) {
         // Drop both entries and their allocated tables at the existing idle
         // maintenance boundary, as main clears completed Watch generations.
-        *self.completed_families.lock().unwrap() = CompletedFamilies::default();
+        *self.completed_families.0.lock().unwrap() = CompletedFamilyCache::default();
     }
 
     fn root_completed(&self, root: RootCompleted) {
@@ -2544,7 +2578,7 @@ impl Scheduler {
         // The rootless shell releases that temporary state on every exit path.
         let suspended = self.suspend_empty_scheduler();
         result.and_then(|changed| suspended.map(|()| {
-            super::diagnostics::event(if changed { "watch_reloaded" } else { "watch_reload_skipped" }, json!({}));
+            super::diagnostics::event(if changed { "watch_reloaded" } else { "watch_reload_skipped" }, || json!({}));
             changed
         }))
     }
@@ -2781,7 +2815,7 @@ impl Scheduler {
                         .map_err(|error: &io::Error| io::Error::new(error.kind(), error.to_string())));
                 }
                 match reload {
-                    Ok(changed) => super::diagnostics::event(if changed { "watch_reloaded" } else { "watch_reload_skipped" }, json!({})),
+                    Ok(changed) => super::diagnostics::event(if changed { "watch_reloaded" } else { "watch_reload_skipped" }, || json!({})),
                     Err(error) => { *last_error.lock().unwrap() = Some(error.to_string()); }
                 }
                 if repaired.is_some() { break; }
@@ -2953,23 +2987,21 @@ impl Scheduler {
                 self.cache_deadline = None;
                 if self.active.is_empty() && self.pending.is_empty() {
                     let engine = Arc::clone(&self.engine);
-                    let mut maintenance = Ok(());
                     windows::maintain_when_foreground_idle(&engine, || {
-                        maintenance = engine.run_stage("catalog_maintenance", Origin::Watch, || {
-                        self.checkpoint(&HashMap::new(), true, false)?;
-                        self.catalog.commit(true);
                         let _ = crate::io::reader::clear_reader_resources();
-                        self.engine.clear_idle_passwords();
-                        self.hub.clear_idle_completed_families();
-                        self.journal.state().trim_idle_storage();
-                        self.pending.shrink_to_fit();
-                        self.unpublished.shrink_to_fit();
-                        self.active.shrink_to_fit();
-                        self.active_paths.shrink_to_fit();
-                        Ok(())
-                    }).and_then(|result| result);
-                    });
-                    maintenance?;
+                        engine.clear_idle_passwords();
+                    }, || {
+                        self.checkpoint(&HashMap::new(), true, false)?;
+                        engine.run_stage("catalog_maintenance", Origin::Watch, || {
+                            self.catalog.commit(true);
+                            self.hub.clear_idle_completed_families();
+                            self.journal.state().trim_idle_storage();
+                            self.pending.shrink_to_fit();
+                            self.unpublished.shrink_to_fit();
+                            self.active.shrink_to_fit();
+                            self.active_paths.shrink_to_fit();
+                        })
+                    })?;
                 }
             }
         }
@@ -5153,9 +5185,10 @@ impl Scheduler {
             }
             Err(error) => {
                 let mut absent = crate::watch_store::NativeWatchOperations::empty();
+                let error = error.to_string();
                 for candidate in &active.inputs {
                     self.retry_pipeline_error(batch, &active.root, active.recovery.as_ref(),
-                        &candidate.path, &error.to_string(), quiet, &mut absent)?;
+                        &candidate.path, &error, quiet, &mut absent)?;
                 }
                 self.journal.commit(true, |_| Ok(absent))?;
                 self.persist_candidates(BTreeMap::new(), true)?;
@@ -5203,6 +5236,14 @@ impl Scheduler {
         let error_paths = completion_input_errors(&outcome.errors, &completed.outputs, &groups, &active.inputs);
         let mut operations = crate::watch_store::NativeWatchOperations::empty();
         let current_passwords = self.passwords.snapshot();
+        let current_password_signature = std::cell::OnceCell::new();
+        let password_updated = |record: &crate::watch_store::EntryRecord, user_signature: &str| {
+            record.failure_payload.get("password_signature").and_then(Value::as_str)
+                .is_some_and(|before| {
+                    before != current_password_signature.get_or_init(||
+                        password_source_signature(user_signature, &current_passwords.scope_signature(&active.password_scope)))
+                })
+        };
         let mut retry = Vec::new();
         let mut published = HashSet::new();
         for archive in outcome
@@ -5219,7 +5260,7 @@ impl Scheduler {
             if self.active_paths.contains_key(&id) {
                 continue;
             }
-            if self.hub.completed_families.lock().unwrap().covers(&archive.path, active.deep) {
+            if self.hub.completed_families.covers(&archive.path, active.deep) {
                 operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&candidate.path, None));
                 continue;
             }
@@ -5284,11 +5325,7 @@ impl Scheduler {
                     }
                 }
             }
-            let payload = &entry.failure_payload;
-            let password_updated = payload
-                .get("password_signature")
-                .and_then(Value::as_str)
-                .is_some_and(|previous| previous != password_source_signature(&self.user_password_signature, &current_passwords.scope_signature(&recovery.password_scope)));
+            let password_updated = password_updated(&entry, &self.user_password_signature);
             let pending = regroup.then(|| self.pending.get_mut(&id)).flatten();
             let handed_off = pending.is_some();
             handoff_promoted_blocker(&mut entry, route_root, root,
@@ -5309,11 +5346,10 @@ impl Scheduler {
             }
         }
         let output_containers = completion_output_containers(&outcome);
-        let canonical_inputs: HashMap<_, _> = active.inputs.iter()
-            .map(|candidate| (watch_path_key(&candidate.path), candidate.clone())).collect();
+        let canonical_inputs = std::cell::OnceCell::new();
         let mut projected_groups = HashSet::new();
         let mut reported_discovery = HashSet::new();
-        for candidate in active.inputs {
+        for candidate in &active.inputs {
             let id = watch_path_key(&candidate.path);
             if self.pending.contains_key(&id)
 
@@ -5348,7 +5384,7 @@ impl Scheduler {
             // A multipart request has one logical result and one blocker.
             // Physical sibling generations only need their pending WAL retired.
             let candidate = if completed.cancelled {
-                candidate
+                std::borrow::Cow::Borrowed(candidate)
             } else {
                 if id != canonical_id {
                     operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
@@ -5361,20 +5397,23 @@ impl Scheduler {
                     continue;
                 }
                 if id == canonical_id {
-                    candidate
-                } else if let Some(head) = canonical_inputs.get(&canonical_id) {
-                    head.clone()
+                    std::borrow::Cow::Borrowed(candidate)
+                } else if let Some(&head) = canonical_inputs.get_or_init(|| {
+                    active.inputs.iter().map(|candidate| (watch_path_key(&candidate.path), candidate))
+                        .collect::<HashMap<_, _>>()
+                }).get(&canonical_id) {
+                    std::borrow::Cow::Borrowed(head)
                 } else if error.is_none() {
                     // Successful source cleanup may already have removed the
                     // head. No blocker observation is needed for a success.
-                    let mut head = candidate;
+                    let mut head = candidate.clone();
                     head.path = canonical.clone();
-                    head
+                    std::borrow::Cow::Owned(head)
                 } else {
                     let Ok(Some(head)) = watch_candidate_for_path(Path::new(&canonical), None) else {
                         continue;
                     };
-                    head
+                    std::borrow::Cow::Owned(head)
                 }
             };
             let stale = error.is_some()
@@ -5407,7 +5446,7 @@ impl Scheduler {
                 continue;
             }
             if (retryable || discovery_failure.is_some_and(|failure| failure.kind == FailureKind::MissingVolume || failure.is_password_retry()))
-                && self.hub.completed_families.lock().unwrap().covers(Path::new(&canonical), active.deep) {
+                && self.hub.completed_families.covers(Path::new(&canonical), active.deep) {
                 operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&candidate.path, None));
                 continue;
             }
@@ -5451,13 +5490,7 @@ impl Scheduler {
                 })
             };
             if let Some(record) = &record {
-                let directory = &active.password_scope;
-                if record
-                    .failure_payload
-                    .get("password_signature")
-                    .and_then(Value::as_str)
-                    .is_some_and(|before| before != password_source_signature(&self.user_password_signature, &current_passwords.scope_signature(directory)))
-                {
+                if password_updated(record, &self.user_password_signature) {
                     retry.push((candidate.path.clone(), CandidateAdmission::PasswordRetry));
                 }
             }
@@ -5472,14 +5505,15 @@ impl Scheduler {
             } else {
                 "no_tasks_found"
             };
-            if published.insert(watch_path_key(&canonical)) {
+            let counts = success_counts.get(&canonical_id).copied().unwrap_or_default();
+            if published.insert(canonical_id) {
                 let outputs = completion_output_dirs(archives.into_iter().flatten()
                     .filter_map(|item| item.output.as_deref()), &output_containers);
                 let mut event = json!({"event":event,"path":canonical,"owner":batch,
                     "error":error,"error_kind":failure.map(|failure| failure.kind),
                     "output_dirs":outputs,"retire_group":true});
                 if event["event"] == "done" {
-                    success_counts.get(&canonical_id).copied().unwrap_or_default().write(&mut event);
+                    counts.write(&mut event);
                 }
                 if let (Some(input_error), Some(failure)) = (input_error, discovery_failure) {
                     reported_discovery.insert(input_error.path.as_path());
@@ -6049,7 +6083,7 @@ impl Observer for WatchObserver {
     }
 
     fn completed_sources(&self, generations: &SourceGenerations) -> io::Result<Option<PathBuf>> {
-        Ok(self.hub.completed_families.lock().unwrap().output(generations, self.deep))
+        Ok(self.hub.completed_families.output(generations, self.deep))
     }
 
     fn sources_processed(
@@ -6058,7 +6092,7 @@ impl Observer for WatchObserver {
         output: Option<&Path>,
     ) -> io::Result<()> {
         if let Some(output) = output {
-            self.hub.completed_families.lock().unwrap().remember(generations, self.deep, output);
+            self.hub.completed_families.remember(generations, self.deep, output);
         }
         Ok(())
     }
@@ -6528,7 +6562,7 @@ mod tests {
         fs::create_dir(&output).unwrap();
         let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
             (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect();
-        let mut cache = CompletedFamilies::default();
+        let cache = CompletedFamilies::default();
         cache.remember(generations.clone(), false, &output);
         assert_eq!(cache.output(&generations, false), Some(output.clone()));
         assert_eq!(cache.output(&generations, true), None);
@@ -6551,8 +6585,7 @@ mod tests {
         fs::remove_dir(&output).unwrap();
         assert_eq!(cache.output(&refreshed, false), None);
         assert!(!cache.covers(&head, false));
-        assert!(cache.by_family.is_empty());
-        assert!(cache.ordered.is_empty());
+        assert!(cache.0.lock().unwrap().by_family.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -6569,7 +6602,7 @@ mod tests {
             [&*head, tail].into_iter().map(|path|
                 (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect()
         };
-        let mut cache = CompletedFamilies::default();
+        let cache = CompletedFamilies::default();
         cache.remember(capture(&tail), false, &output);
         fs::rename(&tail, &arrived).unwrap();
         let renamed = capture(&arrived);
@@ -6599,14 +6632,12 @@ mod tests {
         let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
             (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect();
         let hub = Hub::new();
-        hub.completed_families.lock().unwrap().remember(generations.clone(), false, &output);
-        assert_eq!(hub.completed_families.lock().unwrap().output(&generations, false), Some(output.clone()));
+        hub.completed_families.remember(generations.clone(), false, &output);
+        assert_eq!(hub.completed_families.output(&generations, false), Some(output.clone()));
         hub.clear_idle_completed_families();
-        let mut cache = hub.completed_families.lock().unwrap();
+        let cache = &hub.completed_families;
         assert_eq!(cache.output(&generations, false), None);
-        assert!(cache.by_family.is_empty());
-        assert!(cache.ordered.is_empty());
-        drop(cache);
+        assert!(cache.0.lock().unwrap().by_family.is_empty());
         fs::remove_dir(output).unwrap();
         fs::remove_file(head).unwrap();
         fs::remove_file(tail).unwrap();
@@ -6620,21 +6651,21 @@ mod tests {
         let head = directory.join("head");
         fs::write(&head, b"head").unwrap();
         let generation = crate::io::reader::capture_file_generation(&head).unwrap();
-        let mut cache = CompletedFamilies::default();
+        let cache = CompletedFamilies::default();
         cache.remember(HashMap::from([(key(&head), generation.clone())]), false, &directory);
         // Synthetic unrelated families exercise the LRU without thousands of
         // filesystem objects; spellings of the same object now intentionally coalesce.
         for n in 1..COMPLETED_FAMILY_LIMIT {
             let family: CompletedFamilyKey = (Arc::from([CompletedMember::Path(format!("other-{n}"))]), false);
-            cache.sequence += 1;
-            cache.by_family.insert(family.clone(), cache.sequence);
-            cache.ordered.insert(cache.sequence, (family, CompletedGenerations::new(vec![(format!("other-{n}"), generation.clone())]), directory.clone()));
+            let generations = Arc::new(CompletedGenerations::new(vec![(format!("other-{n}"), generation.clone())]));
+            cache.0.lock().unwrap().insert(family, generations, Arc::from(directory.as_path()));
         }
         assert!(cache.covers(&head, false));
         cache.remember(HashMap::from([(key(&head), generation)]), true, &directory);
+        assert!(cache.covers(&head, false));
+        let cache = cache.0.lock().unwrap();
         assert_eq!(cache.ordered.len(), COMPLETED_FAMILY_LIMIT);
         assert_eq!(cache.by_family.len(), COMPLETED_FAMILY_LIMIT);
-        assert!(cache.covers(&head, false));
         assert!(!cache.by_family.keys().any(|(members, _)| members.iter().any(|member| matches!(member, CompletedMember::Path(path) if path == "other-1"))));
         fs::remove_dir_all(directory).unwrap();
     }

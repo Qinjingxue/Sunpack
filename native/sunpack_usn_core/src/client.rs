@@ -232,15 +232,6 @@ fn transact_request(
     payload: &mut Vec<u8>,
 ) -> io::Result<Response> {
     let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
-    let mut state = state
-        .lock()
-        .map_err(|_| io::Error::other("broker client state poisoned"))?;
-    if state.leases == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "SunPack Watch Broker has not been acquired",
-        ));
-    }
     // Only these read-only requests are safe to replay after the pipe dies:
     // a request may have reached the broker before the connection was lost.
     let replay_safe = matches!(
@@ -248,6 +239,15 @@ fn transact_request(
         Opcode::ProbeVolume | Opcode::ReadChangeReasons
     );
     loop {
+        let mut state = state
+            .lock()
+            .map_err(|_| io::Error::other("broker client state poisoned"))?;
+        if state.leases == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "SunPack Watch Broker has not been acquired",
+            ));
+        }
         if state.connection.is_none() {
             state.connection = Some(connect_and_hello()?);
         }
@@ -264,6 +264,9 @@ fn transact_request(
                 if !replay_safe || !is_transient_broker_io(&error) {
                     return Err(error);
                 }
+                // Give other callers the chance to release or reconnect while
+                // this request backs off after the broken exchange.
+                drop(state);
                 thread::sleep(Duration::from_millis(50));
             }
         }

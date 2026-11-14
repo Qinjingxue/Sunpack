@@ -5,6 +5,7 @@ use crate::io::archive_state::{
     AnalysisOrigin, ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
 };
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
+use crate::io::reader::NativeArchiveSession;
 use crate::password::rar::resolve_embedded_rar_boundaries;
 use crate::path_keys::{path_ancestors, path_key};
 use crate::scan::directory::{
@@ -678,7 +679,10 @@ fn probe_relations(
     let pending = table.encrypted_rar_anchors();
     if pending.is_empty() { return Ok(()); }
     let resolved = pending.into_par_iter().map(|anchor| request.cancel.run(|| {
-        match candidates.resolve_relation(&anchor, &request.cancel) {
+        // Open even without password candidates, so a departed member refreshes the family.
+        let resolved = NativeArchiveSession::new(anchor.path.clone())
+            .and_then(|session| candidates.resolve_relation(&anchor, &session, &request.cancel));
+        match resolved {
             Ok((anchor, password)) => Ok((anchor, password, false)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((anchor, None, true)),
             Err(error) => Err(error),

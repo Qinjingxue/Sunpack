@@ -655,7 +655,4 @@ Json directory_rows(const WatchRoots& roots) {
     }
     return rows;
 }
-fs::path log_directory(const fs::path& dir) {
-    return dir/".sunpack_watch";
-}
 }

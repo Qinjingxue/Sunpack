@@ -40,15 +40,15 @@ impl StructuralFacts {
     pub fn from_row(row: &RelationInput, format: &str) -> Self {
         let anchor = row.anchor.as_ref().filter(|a| a.format == format);
         let first = anchor.is_some_and(|a| match format {
-            "zip" => a.evidence.contains(&"zip:split_marker"),
-            _ => a.internal_volume_number == Some(1) || a.anchor_roles.contains(&"first"),
+            "zip" => a.has_any(ZIP_SPLIT_START),
+            _ => a.internal_volume_number == Some(1) || a.has_any(FIRST),
         });
-        let terminal = anchor.is_some_and(|a| a.anchor_roles.contains(&"terminal"));
+        let terminal = anchor.is_some_and(|a| a.has_any(TERMINAL));
         let exact_slot = anchor.and_then(|a| {
             if format == "zip"
-                && !a.evidence.contains(&"zip:split_marker")
-                && !a.evidence.contains(&"zip:eocd_split_terminal")
-                && !a.evidence.contains(&"zip:directory_member")
+                && !a.has_any(ZIP_SPLIT_START)
+                && !a.has_any(ZIP_SPLIT_END)
+                && !a.has_any(ZIP_DIRECTORY_MEMBER)
             {
                 None
             } else {
@@ -79,11 +79,9 @@ impl StructuralFacts {
             _ => VolumeRole::Unknown,
         };
         let numbering_style = anchor.and_then(|a| {
-            if a.evidence.contains(&"rar4:old_volume_naming") {
+            if a.has_any(RAR_OLD_NUMBERING) {
                 Some(NumberingStyle::RarOldStyle)
-            } else if a.evidence.contains(&"rar4:new_volume_naming")
-                || a.evidence.contains(&"rar5:volume_header")
-            {
+            } else if a.has_any(RAR_PART_NUMBERING) {
                 Some(NumberingStyle::RarPart)
             } else {
                 None
@@ -117,8 +115,8 @@ impl StructuralFacts {
                 !a.standalone
                     && (a.multivolume
                         || a.needs_password
-                        || a.anchor_roles.contains(&"terminal")
-                        || a.evidence.contains(&"zip:local_header"))
+                        || a.has_any(TERMINAL)
+                        || a.has_any(ZIP_LOCAL_HEADER))
             }),
         }
     }
@@ -139,7 +137,7 @@ pub(super) fn collect(
             rows[*i].anchor.as_ref().is_some_and(|a| {
                 a.pe_state != PeState::None
                     && !a.sfx
-                    && !a.evidence.contains(&"relation:sfx_checked")
+                    && !a.has_any(SFX_CHECKED)
             })
         })
         .collect();
@@ -169,7 +167,7 @@ pub(super) fn collect(
             rows[i].anchor = Some(anchor);
         }
         if let Some(anchor) = rows[i].anchor.as_mut() {
-            anchor.evidence.push("relation:sfx_checked");
+            anchor.flags |= SFX_CHECKED;
         }
         remember_tail_facts(&rows[i], rows[i].anchor.as_ref().unwrap());
     }
@@ -192,16 +190,16 @@ pub(super) fn collect(
             if a.format == "rar"
                 && !a.needs_password
                 && a.relation_has_next.is_none()
-                && !a.evidence.contains(&"relation:rar_end_checked")
+                && !a.has_any(RAR_END_CHECKED)
             {
                 rar.push(i);
             }
             if zip_bucket
                 && (a.format == "zip" || a.format.is_empty())
                 && !a.sfx
-                && !a.anchor_roles.contains(&"terminal")
+                && !a.has_any(TERMINAL)
                 && a.carrier_limit.is_none()
-                && !a.evidence.contains(&"relation:zip_tail_checked")
+                && !a.has_any(ZIP_TAIL_CHECKED)
             {
                 zip.push(i);
             }
@@ -212,10 +210,7 @@ pub(super) fn collect(
         .map(|&i| {
             (
                 i,
-                upgrade_relation_rar_end(
-                    rows[i].anchor.as_ref().unwrap(),
-                    None,
-                ),
+                upgrade_relation_rar_end(rows[i].anchor.as_ref().unwrap()),
             )
         })
         .chain(zip.par_iter().map(|&i| {
@@ -240,7 +235,7 @@ pub(super) fn collect(
             rows[i]
                 .anchor
                 .as_ref()
-                .is_some_and(|a| a.format == "zip" && a.anchor_roles.contains(&"terminal"))
+                .is_some_and(|a| a.format == "zip" && a.has_any(TERMINAL))
         });
         if zip_bucket && !terminal {
             let candidates: Vec<_> = indexes
@@ -280,19 +275,18 @@ pub(super) fn collect(
             rows[*i]
                 .anchor
                 .as_ref()
-                .is_some_and(|a| !a.standalone && a.evidence.contains(&"zip:local_header"))
+                .is_some_and(|a| !a.standalone && a.has_any(ZIP_LOCAL_HEADER))
         });
         if !raw_head {
             for &i in indexes {
                 if let Some(a) = rows[i].anchor.as_mut().filter(|a| {
-                    a.evidence.contains(&"zip:eocd_head")
-                        && a.evidence.contains(&"zip:eocd_single_disk")
+                    a.has_any(ZIP_EOCD_HEAD)
+                        && a.has_any(ZIP_SINGLE_DISK)
                         && a.expected_logical_size == Some(a.size)
                 }) {
                     a.standalone = true;
                     a.multivolume = false;
                     a.structure_offset = Some(0);
-                    a.anchor_roles.push("standalone");
                 }
             }
         }
@@ -303,20 +297,13 @@ pub(super) fn collect(
 /// inference. Embedded offsets and decrypted headers must not replace a cheap
 /// head, and concurrent requests must never downgrade a more complete tail.
 fn remember_tail_facts(row: &RelationInput, anchor: &VolumeAnchor) {
-    let markers = [
-        "relation:sfx_checked",
-        "relation:rar_end_checked",
-        "relation:zip_tail_checked",
-        "relation:zip_carrier_checked",
-    ];
+    let checks = SFX_CHECKED | RAR_END_CHECKED | ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED;
     if !anchor.error.is_empty()
         || anchor.encrypted
         || anchor.needs_password
         || anchor.carrier_limit.is_some()
-        || anchor.evidence.contains(&"zip:directory_member")
-        || !markers
-            .iter()
-            .any(|marker| anchor.evidence.contains(marker))
+        || anchor.has_any(ZIP_DIRECTORY_MEMBER)
+        || !anchor.has_any(checks)
     {
         return;
     }
@@ -345,12 +332,8 @@ fn remember_tail_facts(row: &RelationInput, anchor: &VolumeAnchor) {
         || old.needs_password
         || (old.standalone && !anchor.standalone)
         || (old.zip_eocd_offset.is_some() && anchor.zip_eocd_offset.is_none())
-        || markers.iter().any(|marker| {
-            old.evidence.contains(marker) && !anchor.evidence.contains(marker)
-        })
-        || markers.iter().all(|marker| {
-            !anchor.evidence.contains(marker) || old.evidence.contains(marker)
-        })
+        || old.flags & checks & !anchor.flags != 0
+        || anchor.flags & checks & !old.flags == 0
     {
         return;
     }
@@ -383,7 +366,7 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
             a.format == "zip"
                 && a.error.is_empty()
                 && !a.standalone
-                && a.evidence.contains(&"zip:local_header")
+                && a.has_any(ZIP_LOCAL_HEADER)
         }) else {
             continue;
         };
@@ -404,7 +387,7 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
     let mut carriers = indexes.iter().copied().filter(|i| {
         rows[*i].anchor.as_ref().is_some_and(|a| {
             a.carrier_limit.is_some()
-                || (a.structure_offset.unwrap_or(0) > 0 && !a.anchor_roles.contains(&"terminal"))
+                || (a.structure_offset.unwrap_or(0) > 0 && !a.has_any(TERMINAL))
         })
     });
     let carrier = match (carriers.next(), carriers.next()) {
@@ -547,10 +530,10 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                 let a = rows[i].anchor.as_mut().unwrap();
                 a.internal_volume_number = Some(slot);
                 a.structure_offset = Some(base);
-                a.confidence = "strong".into();
+                a.strong = true;
                 a.multivolume = true;
                 a.continuation_from_previous = slot > 1;
-                a.evidence.push("zip:directory_member");
+                a.flags |= ZIP_DIRECTORY_MEMBER;
             }
         }
     }
@@ -594,11 +577,11 @@ fn refine_seven_zip_terminal(rows: &mut [RelationInput], indexes: &[usize]) {
     }
     if let Some(i) = terminal {
         let a = rows[i].anchor.as_mut().unwrap();
-        a.format = "7z".into();
-        a.confidence = "strong".into();
+        a.format = "7z";
+        a.strong = true;
         a.multivolume = true;
-        a.anchor_roles.push("terminal");
+        a.flags |= TERMINAL;
         a.relation_has_next = Some(false);
-        a.evidence.push("7z:next_header_crc");
+        a.flags |= SEVEN_ZIP_NEXT_HEADER_CRC;
     }
 }

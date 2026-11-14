@@ -1,6 +1,8 @@
 use super::filename::{NameFeatures, NameProfile, NumberChannel};
 use super::structural::{NumberingStyle, SfxRole, StructuralFacts, VolumeRole};
 use super::*;
+#[cfg(test)]
+use crate::analysis_native::volume_anchor::RAR_VERSION_5;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +113,8 @@ impl BucketView<'_> {
         self.format == "zip"
             && self.indexes.iter().any(|i| {
                 self.rows[*i].anchor.as_ref().is_some_and(|a| {
-                    a.evidence.contains(&"zip:split_marker")
-                        || a.evidence.contains(&"zip:eocd_split_terminal")
+                    a.has_any(ZIP_SPLIT_START)
+                        || a.has_any(ZIP_SPLIT_END)
                 })
             })
     }
@@ -258,7 +260,7 @@ impl BucketView<'_> {
                 .slots
                 .get(&1)
                 .and_then(|i| self.rows[*i].anchor.as_ref())
-                .filter(|head| head.confidence == "strong")
+                .filter(|head| head.strong)
                 .and_then(|head| {
                     head.expected_logical_size?
                         .checked_sub(head.structure_offset.unwrap_or(0))
@@ -552,8 +554,8 @@ pub(super) fn resolve_buckets(
         let formats: HashSet<_> = bucket
             .iter()
             .filter_map(|i| rows[*i].anchor.as_ref())
-            .filter(|a| !a.standalone && matches!(a.format.as_str(), "rar" | "zip" | "7z"))
-            .map(|a| a.format.as_str())
+            .filter(|a| !a.standalone && matches!(a.format, "rar" | "zip" | "7z"))
+            .map(|a| a.format)
             .collect();
         let mut features = HashMap::new();
         for format in ["rar", "zip", "7z"] {
@@ -651,8 +653,7 @@ pub(super) fn resolve_buckets(
                 if format == "zip"
                     && members.iter().any(|i| {
                         rows[*i].anchor.as_ref().is_some_and(|a| {
-                            a.evidence
-                                .contains(&"zip:eocd_single_disk_without_local_header")
+                            a.has_any(ZIP_TAIL_WITHOUT_HEAD)
                         })
                     })
                 {
@@ -663,7 +664,7 @@ pub(super) fn resolve_buckets(
                             rows[*i]
                                 .anchor
                                 .as_ref()
-                                .is_some_and(|a| a.evidence.contains(&"zip:local_header"))
+                                .is_some_and(|a| a.has_any(ZIP_LOCAL_HEADER))
                         })
                         .collect();
                     if heads.len() == 1 {
@@ -679,7 +680,7 @@ pub(super) fn resolve_buckets(
                                 && rows[**i]
                                     .anchor
                                     .as_ref()
-                                    .is_some_and(|a| a.evidence.contains(&"zip:local_header")))
+                                    .is_some_and(|a| a.has_any(ZIP_LOCAL_HEADER)))
                     })
                     .count();
                 // RAR volumes have their own headers. Opaque unrelated files are
@@ -745,7 +746,7 @@ pub(super) fn resolve_buckets(
                                 && rows[*i]
                                     .anchor
                                     .as_ref()
-                                    .is_some_and(|a| a.evidence.contains(&"zip:local_header")))
+                                    .is_some_and(|a| a.has_any(ZIP_LOCAL_HEADER)))
                     })
                     .collect();
                 let mut competing_families = false;
@@ -836,10 +837,10 @@ pub(super) fn resolve_buckets(
                 for &i in &companions {
                     let a = rows[i].anchor.as_ref().unwrap();
                     let profile_matches = match format {
-                        "7z" => a.evidence.contains(&"sfx:seven_zip_stub"),
+                        "7z" => a.has_any(SEVEN_ZIP_STUB),
                         "zip" => {
-                            a.evidence.contains(&"sfx:seven_zip_stub")
-                                || a.evidence.contains(&"sfx:winrar_stub")
+                            a.has_any(SEVEN_ZIP_STUB)
+                                || a.has_any(WINRAR_STUB)
                         }
                         _ => false,
                     };
@@ -1051,7 +1052,7 @@ pub(super) fn proposal_facts(view: &BucketView<'_>, companions: &[usize]) -> Arc
 mod tests {
     use super::*;
 
-    fn row(name: &str, format: &str, slot: Option<u32>, terminal: bool) -> RelationInput {
+    fn row(name: &str, format: &'static str, slot: Option<u32>, terminal: bool) -> RelationInput {
         RelationInput {
             path: name.into(),
             path_key: name.to_ascii_lowercase(),
@@ -1062,24 +1063,18 @@ mod tests {
             anchor: Some(VolumeAnchor {
                 path: name.into(),
                 size: 100,
-                format: format.into(),
-                confidence: if format.is_empty() { "none" } else { "strong" }.into(),
+                format,
+                strong: !format.is_empty(),
                 multivolume: !format.is_empty(),
                 internal_volume_number: slot,
                 relation_has_next: (!format.is_empty()).then_some(!terminal),
-                anchor_roles: if terminal {
-                    vec!["terminal"]
-                } else if slot == Some(1) {
-                    vec!["first"]
-                } else {
-                    vec!["member"]
-                },
-                evidence: match format {
-                    "rar" => vec!["rar5:volume_header"],
-                    "zip" if terminal => vec!["zip:eocd_split_terminal"],
-                    "zip" => vec!["zip:split_marker"],
-                    _ => vec![],
-                },
+                flags: (if terminal { TERMINAL } else if slot == Some(1) { FIRST } else { MEMBER })
+                    | match format {
+                        "rar" => RAR_VERSION_5 | RAR_PART_NUMBERING,
+                        "zip" if terminal => ZIP_SPLIT_END,
+                        "zip" => ZIP_SPLIT_START,
+                        _ => 0,
+                    },
                 ..Default::default()
             }),
         }
@@ -1391,9 +1386,8 @@ mod tests {
         for row in &mut rows {
             let anchor = row.anchor.as_mut().unwrap();
             anchor.needs_password = true;
-            anchor.anchor_roles.clear();
             anchor.relation_has_next = None;
-            anchor.evidence = vec!["rar5:encryption_header"];
+            anchor.flags = RAR_VERSION_5;
         }
         let head = rows[0].anchor.as_mut().unwrap();
         head.sfx = true;
@@ -1455,7 +1449,7 @@ mod tests {
             row("same.z0.a4.b7", "zip", Some(4), true),
             row("same.unassigned", "zip", None, false),
         ];
-        rows[4].anchor.as_mut().unwrap().evidence.clear();
+        rows[4].anchor.as_mut().unwrap().flags &= !ZIP_SPLIT_START;
         let groups = resolve(&rows);
         assert!(groups[0].attempts.is_some());
         assert!(validation_owned_paths(&groups[0]).contains(&rows[4].path));
@@ -1605,7 +1599,7 @@ mod tests {
         anchor.multivolume = false;
         anchor.needs_password = true;
         anchor.relation_has_next = None;
-        anchor.anchor_roles.clear();
+        anchor.flags &= !(FIRST | MEMBER | TERMINAL);
         assert!(resolve(&rows).is_empty());
         rows[0].anchor.as_mut().unwrap().multivolume = true;
         assert!(resolve(&rows).is_empty());
@@ -1664,7 +1658,7 @@ mod tests {
             let anchor = launcher.anchor.as_mut().unwrap();
             anchor.sfx = true;
             anchor.pe_state = PeState::Confirmed;
-            anchor.evidence = vec!["sfx:seven_zip_stub"];
+            anchor.flags = SEVEN_ZIP_STUB;
             let rows = vec![
                 row("same.7z.001", "7z", Some(1), false),
                 row("same.7z.002", "", None, false),

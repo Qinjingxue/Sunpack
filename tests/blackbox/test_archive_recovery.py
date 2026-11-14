@@ -238,10 +238,13 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
     settings.write_text(json.dumps(config), encoding="utf-8")
 
     carrier = tmp_path / "damaged.zip"
+    intact_files = 55
     with zipfile.ZipFile(carrier, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.writestr("nested.zip", _zip_bytes({"recovered.txt": b"verified payload"}))
         archive.writestr("damaged.txt", b"will fail verification")
         bad = archive.getinfo("damaged.txt")
+        for index in range(intact_files - 1):
+            archive.writestr(f"verified-{index}.txt", b"verified payload")
     content = bytearray(carrier.read_bytes())
     content[bad.header_offset + 30 + len(bad.filename)] ^= 1
     carrier.write_bytes(content)
@@ -250,6 +253,7 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
     report = package.json("extract", "--direct-file", "-r", "*", "-c", "d", "-o", output, carrier)
     assert report["summary"]["success_count"] == 1
     assert report["summary"]["partial_success_count"] == 1
+    assert report["summary"]["recovered_outputs"][0]["complete_files"] == intact_files
     _only_output(output, "recovered.txt", b"verified payload")
     assert carrier.is_file()
     assert not list(output.rglob("nested.zip"))

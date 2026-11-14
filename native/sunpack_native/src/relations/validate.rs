@@ -75,14 +75,7 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
     // NextHeader extent agrees with the CRC stored in the already-read head.
     if proposal.format == "7z" && validation.status == ProposalStatus::Valid {
         match verify_seven_zip_mapping(validation) {
-            Ok(Some(true)) => {
-                if let Some(head) = Arc::make_mut(&mut validation.facts)
-                    .anchors
-                    .get_mut(&path_key(&proposal.volumes[0].0))
-                {
-                    head.evidence.push("7z:mapped_next_header_crc");
-                }
-            }
+            Ok(Some(true)) => {}
             Ok(Some(false)) => {
                 if unresolved_head {
                     // Total size cannot locate carrier padding while a tail is
@@ -140,7 +133,7 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
         .last()
         .and_then(|p| validation.facts.anchors.get(&path_key(&p.0)));
     // The structure-only pass has already checked this exact terminal range.
-    if last.is_some_and(|a| a.evidence.contains(&"7z:next_header_crc") && a.size >= next.size) {
+    if last.is_some_and(|a| a.has_any(SEVEN_ZIP_NEXT_HEADER_CRC) && a.size >= next.size) {
         return Ok(Some(true));
     }
     let mut crc = crc32fast::Hasher::new();
@@ -224,7 +217,7 @@ fn mapped_carrier_end<'a>(
         // extraction still validates the member CRCs using these extents.
         let lengths = parts
             .clone()
-            .filter(|(n, a)| *n > 1 && a.is_some_and(|a| !a.anchor_roles.contains(&"terminal")))
+            .filter(|(n, a)| *n > 1 && a.is_some_and(|a| !a.has_any(TERMINAL)))
             .filter_map(|(_, a)| a.map(VolumeAnchor::payload_size));
         return spanned_carrier_end(head, lengths).map(|end| (head, end));
     } else {
@@ -267,7 +260,7 @@ pub(super) fn assignment_status<'a>(
             });
             if conflict {
                 ProposalStatus::Reject
-            } else if head.is_some_and(|a| a.anchor_roles.contains(&"first"))
+            } else if head.is_some_and(|a| a.has_any(FIRST))
                 && last.is_some_and(|a| a.relation_has_next == Some(false))
             {
                 ProposalStatus::Valid
@@ -276,7 +269,7 @@ pub(super) fn assignment_status<'a>(
             }
         }
         "7z" => {
-            if let Some(first) = head.filter(|a| a.format == "7z" && a.confidence == "strong") {
+            if let Some(first) = head.filter(|a| a.format == "7z" && a.strong) {
                 let mapped = mapped_carrier_end(format, spanned, parts.clone());
                 let actual = parts.clone().try_fold(0u64, |size, (_, a)| {
                     a.and_then(|a| {
@@ -302,26 +295,25 @@ pub(super) fn assignment_status<'a>(
         "zip" => {
             let terminal_count = parts
                 .clone()
-                .filter(|(_, a)| a.is_some_and(|a| a.anchor_roles.contains(&"terminal")))
+                .filter(|(_, a)| a.is_some_and(|a| a.has_any(TERMINAL)))
                 .count();
             if terminal_count != 1 {
                 ProposalStatus::Inconclusive
             } else if spanned {
                 if head.is_some_and(|a| {
-                    a.evidence.contains(&"zip:split_marker")
-                        || a.evidence.contains(&"zip:local_header")
+                    a.has_any(ZIP_SPLIT_START)
+                        || a.has_any(ZIP_LOCAL_HEADER)
                 }) && last.is_some_and(|a| {
-                    a.evidence.contains(&"zip:eocd_split_terminal")
+                    a.has_any(ZIP_SPLIT_END)
                         && a.internal_volume_number == last_part.map(|(n, _)| n)
                 }) {
                     ProposalStatus::Valid
                 } else {
                     ProposalStatus::Inconclusive
                 }
-            } else if head.is_some_and(|a| a.evidence.contains(&"zip:local_header"))
+            } else if head.is_some_and(|a| a.has_any(ZIP_LOCAL_HEADER))
                 && last.is_some_and(|a| {
-                    a.evidence
-                        .contains(&"zip:eocd_single_disk_without_local_header")
+                    a.has_any(ZIP_TAIL_WITHOUT_HEAD)
                 })
             {
                 ProposalStatus::Valid

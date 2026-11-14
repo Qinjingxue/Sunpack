@@ -90,7 +90,7 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     times.defined |= ArchiveItemMetadata::Attributes;
     times.attributes = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
     const auto file = writer.make_file(
-        job, (directory / L"parallel.bin").wstring(), L"parallel.bin", 0, 0, times);
+        job, (directory / L"parallel.bin").wstring(), 0, 0, times);
     // Start with a partial buffer and then grow it before submission. The
     // content check below also verifies the staged prefix survives growth.
     constexpr std::uint32_t prefix = 113;
@@ -106,7 +106,7 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
         return false;
     }
 
-    const auto snapshot = writer.snapshot_file(file);
+    const auto snapshot = writer.take_file_snapshot(file);
     const auto metrics = writer.snapshot_meters();
     const DWORD attributes = GetFileAttributesW((directory / L"parallel.bin").c_str());
     SetFileAttributesW((directory / L"parallel.bin").c_str(), FILE_ATTRIBUTE_NORMAL);
@@ -140,7 +140,7 @@ bool write_zero_length_file(const std::filesystem::path& directory) {
     // 1965 is representable on disk but not by the unsigned Unix-ns inventory.
     times.modification = FILETIME{0x4EF30000, 0x019816FE};
     const auto file = writer.make_file(
-        job, (directory / L"empty.bin").wstring(), L"empty.bin", 1, 1, times);
+        job, (directory / L"empty.bin").wstring(), 1, 1, times);
     // Force close to finish before the decoder result, without a timing race
     // or sleep. Other tests record the result before close and miss this case.
     writer.close_file(file, {});
@@ -148,7 +148,7 @@ bool write_zero_length_file(const std::filesystem::path& directory) {
         return false;
     }
     writer.record_operation_result(file, 0);
-    const auto snapshot = writer.snapshot_file(file);
+    const auto snapshot = writer.take_file_snapshot(file);
     std::error_code error;
     return !snapshot.failed && snapshot.closed && snapshot.written_bytes == 0 &&
         !snapshot.metadata_errors.first_error() && !snapshot.has_mtime_ns &&
@@ -174,23 +174,23 @@ bool blocked_open_does_not_block_other_jobs(const std::filesystem::path& directo
         }
     });
     const auto blocked_job = writer.make_job();
-    const auto blocked = writer.make_file(blocked_job, blocked_path.wstring(), L"blocked", 0, 0);
+    const auto blocked = writer.make_file(blocked_job, blocked_path.wstring(), 0, 0);
     writer.close_file(blocked, {});
     const bool began = entered_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     auto sibling = std::async(std::launch::async, [&] {
         writer.cancel_job(blocked_job);
         const auto job = writer.make_job();
-        const auto file = writer.make_file(job, (directory / L"independent-open.bin").wstring(), L"independent", 0, 0);
+        const auto file = writer.make_file(job, (directory / L"independent-open.bin").wstring(), 0, 0);
         const unsigned char payload = 0x73;
         UInt32 processed = 0;
         writer.write(file, &payload, 1, &processed);
         writer.close_file(file, {});
-        return writer.finish_job(job) == S_OK && processed == 1 && writer.snapshot_file(file).closed;
+        return writer.finish_job(job) == S_OK && processed == 1 && writer.take_file_snapshot(file).closed;
     });
     const bool independent = began && sibling.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     release.set_value();
     const bool sibling_ok = sibling.get();
-    return independent && sibling_ok && writer.finish_job(blocked_job) == E_ABORT && writer.snapshot_file(blocked).closed;
+    return independent && sibling_ok && writer.finish_job(blocked_job) == E_ABORT && writer.take_file_snapshot(blocked).closed;
 }
 
 // Only this test reuses the same writer after an actual SetFileTime failure;
@@ -201,7 +201,7 @@ bool timestamp_failure_does_not_fail_content(const std::filesystem::path& direct
     times.modification = FILETIME{0, 0x80000000}; // outside Windows' valid time range
     const auto job = writer.make_job();
     const auto path = directory / L"invalid-time.bin";
-    const auto file = writer.make_file(job, path.wstring(), L"invalid-time.bin", 0, 0, times);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0, times);
     const unsigned char payload[] = {1, 2, 3};
     std::uint32_t processed = 0;
     if (writer.write(file, payload, sizeof(payload), &processed) != S_OK || processed != sizeof(payload))
@@ -209,18 +209,18 @@ bool timestamp_failure_does_not_fail_content(const std::filesystem::path& direct
     writer.record_operation_result(file, 0);
     writer.close_file(file, {});
     if (writer.finish_job(job) != S_OK) return false;
-    const auto snapshot = writer.snapshot_file(file);
+    const auto snapshot = writer.take_file_snapshot(file);
     if (snapshot.failed || !snapshot.closed || !snapshot.metadata_errors.first_error() ||
         snapshot.written_bytes != sizeof(payload) || std::filesystem::file_size(path) != sizeof(payload))
         return false;
 
     const auto next_job = writer.make_job();
     const auto next_path = directory / L"valid-time.bin";
-    const auto next = writer.make_file(next_job, next_path.wstring(), L"valid-time.bin", 1, 1, historical_times());
+    const auto next = writer.make_file(next_job, next_path.wstring(), 1, 1, historical_times());
     writer.record_operation_result(next, 0);
     writer.close_file(next, {});
     return writer.finish_job(next_job) == S_OK &&
-        !writer.snapshot_file(next).metadata_errors.first_error() && file_times_match(next_path, historical_times());
+        !writer.take_file_snapshot(next).metadata_errors.first_error() && file_times_match(next_path, historical_times());
 }
 
 bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
@@ -232,7 +232,7 @@ bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
 
     AsyncFileWriter writer;
     const auto job = writer.make_job();
-    const auto file = writer.make_file(job, path.wstring(), L"existing.bin", 2, 2);
+    const auto file = writer.make_file(job, path.wstring(), 2, 2);
     const unsigned char byte = 0xA5;
     std::uint32_t processed = 0;
     if (writer.write(file, &byte, 1, &processed) != S_OK || processed != 1) {
@@ -243,7 +243,7 @@ bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
     if (writer.finish_job(job) == S_OK) {
         return false;
     }
-    const auto snapshot = writer.snapshot_file(file);
+    const auto snapshot = writer.take_file_snapshot(file);
     const auto metrics = writer.snapshot_meters();
     // A permanently failed buffer is accounted as discarded, not left as a
     // permanent accepted/written gap.
@@ -270,7 +270,7 @@ bool cancelled_job_returns_pending_to_zero(const std::filesystem::path& director
     std::vector<unsigned char> payload(payload_size, 0x5A);
     const auto job = writer.make_job(job_budget);
     const auto file = writer.make_file(
-        job, (directory / L"cancelled.bin").wstring(), L"cancelled.bin", 3, 3);
+        job, (directory / L"cancelled.bin").wstring(), 3, 3);
 
     std::uint32_t processed = 0;
     std::promise<void> accepted;
@@ -328,7 +328,7 @@ bool successful_job_leaves_pending_at_zero(const std::filesystem::path& director
     AsyncFileWriter writer;
     const auto job = writer.make_job();
     const auto file = writer.make_file(
-        job, (directory / L"accounted.bin").wstring(), L"accounted.bin", 4, 4);
+        job, (directory / L"accounted.bin").wstring(), 4, 4);
     std::uint32_t processed = 0;
     if (writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed) != S_OK) {
         return false;
@@ -361,7 +361,7 @@ bool cleanup_survives_allocation_failure(const std::filesystem::path& directory)
     for (std::size_t index = 0; index < files.size(); ++index) {
         const auto name = L"oom-" + std::to_wstring(index);
         files[index] = writer.make_file(index % 2 ? sibling : first,
-            (directory / name).wstring(), name, static_cast<UInt32>(index), index);
+            (directory / name).wstring(), static_cast<UInt32>(index), index);
         const unsigned char byte = 1;
         UInt32 processed = 0;
         if (writer.write(files[index], &byte, 1, &processed) != S_OK || processed != 1) return false;
@@ -377,13 +377,13 @@ bool cleanup_survives_allocation_failure(const std::filesystem::path& directory)
         return false;
     }
     for (std::size_t index = 0; index < files.size(); ++index) {
-        if (writer.snapshot_file(files[index]).closed != (index % 2 == 0)) return false;
+        if (writer.take_file_snapshot(files[index]).closed != (index % 2 == 0)) return false;
     }
     reject_cleanup_allocations = true;
     writer.finish();
     reject_cleanup_allocations = false;
     const auto finished = writer.snapshot_meters();
-    for (const auto& file : files) if (!writer.snapshot_file(file).closed) return false;
+    for (const auto& file : files) if (!writer.take_file_snapshot(file).closed) return false;
     const std::weak_ptr released = files.front();
     for (auto& file : files) file.reset();
     return finished.pending_bytes == 0 && finished.discarded_bytes == files.size() && released.expired();
@@ -403,7 +403,7 @@ bool quiescence_tracks_jobs_and_files(const std::filesystem::path& directory) {
         return false;
     }
     const auto file = writer.make_file(
-        job, (directory / L"quiescent.bin").wstring(), L"quiescent.bin", 6, 6);
+        job, (directory / L"quiescent.bin").wstring(), 6, 6);
     if (writer.is_quiescent()) {
         std::cerr << "writer with a live file reported quiescent\n";
         return false;
@@ -440,7 +440,7 @@ bool configuration_is_snapshotted_not_reread(const std::filesystem::path& direct
     const std::vector<unsigned char> payload(1U << 20, 0x55);
     const auto job = writer.make_job();
     const auto file = writer.make_file(
-        job, (directory / L"configured.bin").wstring(), L"configured.bin", 7, 7);
+        job, (directory / L"configured.bin").wstring(), 7, 7);
     std::uint32_t processed = 0;
     if (writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed) != S_OK) {
         return false;
@@ -515,7 +515,7 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
         const std::vector<unsigned char> payload(1U << 20, 0x77);
         const auto job = lease.writer().make_job();
         const auto file = lease.writer().make_file(
-            job, (directory / L"registry.bin").wstring(), L"registry.bin", 8, 8);
+            job, (directory / L"registry.bin").wstring(), 8, 8);
         std::uint32_t processed = 0;
         if (lease.writer().write(
                 file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed) != S_OK) {
@@ -599,7 +599,7 @@ bool registry_reclaims_aggregate_small_pools(const std::filesystem::path& direct
             const auto name = L"pool-" + std::to_wstring(i) + L"-" + std::to_wstring(phase) + L".bin";
             const auto path = directory / name;
             auto job = writer.make_job();
-            auto file = writer.make_file(job, path.wstring(), name, 0, 0);
+            auto file = writer.make_file(job, path.wstring(), 0, 0);
             UInt32 processed = 0;
             if (writer.write(file, payload.data(), static_cast<UInt32>(payload.size()), &processed) != S_OK ||
                 processed != payload.size()) return false;

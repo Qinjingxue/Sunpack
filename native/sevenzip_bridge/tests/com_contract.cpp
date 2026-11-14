@@ -93,7 +93,7 @@ void check_extract_to_disk_callback()
     ExtractOutputTrace trace;
     auto *raw = new ExtractToDiskCallback(
         nullptr, L"", L"",
-        ExtractProgressCallback{}, true, &trace, 0);
+        ExtractProgressCallback{}, true, trace, 0);
     CMyComPtr<IArchiveExtractCallback> callback(raw);
     auto *probe = raw;
 
@@ -172,7 +172,7 @@ void check_archive_root_directory_entries()
             ExtractOutputTrace trace;
             auto *raw = new ExtractToDiskCallback(
                 archive.Interface(), L"", output.wstring(),
-                [&events](const ExtractProgressEvent &event) { events.emplace_back(event.event); }, dry_run, &trace, 1);
+                [&events](const ExtractProgressEvent &event) { events.emplace_back(event.event); }, dry_run, trace, 1);
             CMyComPtr<IArchiveExtractCallback> callback(raw);
             CMyComPtr<ISequentialOutStream> stream;
             const HRESULT hr = callback->GetStream(0, &stream, kExtractMode);
@@ -181,7 +181,7 @@ void check_archive_root_directory_entries()
             {
                 check(hr == S_OK && callback->SetOperationResult(kOpOk) == S_OK,
                       "root directory entry succeeds as a no-op");
-                check(raw->dirs_written() == 1 && raw->files_written() == 0 && raw->bytes_written() == 0 &&
+                check(raw->dirs_written() == 1 && raw->files_written() == 0 && trace.total_bytes_written == 0 &&
                       !raw->output_error() && raw->failed_item().empty(),
                       "root directory entry only increments the directory count");
                 check(!std::filesystem::exists(output) || std::filesystem::is_empty(output),
@@ -201,7 +201,7 @@ void check_archive_root_directory_entries()
                       raw->dirs_written() == 0 && raw->files_written() == 0,
                       "unsafe output path is rejected");
                 check(trace.items.size() == 1 && trace.items.front().failed &&
-                      trace.items.front().hresult == E_INVALIDARG,
+                      trace.last_hresult == E_INVALIDARG,
                       "unsafe output path retains its failure trace");
             }
         }

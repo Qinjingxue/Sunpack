@@ -268,8 +268,6 @@ pub struct FailureEvidence {
     pub missing_volume_evidence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read: Option<FailureRead>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recovery: Option<RecoveryPreview>,
 }
 
 /// Field-level Rust preflight diagnostics, distinct from worker physical reads.
@@ -315,37 +313,6 @@ pub struct FailureRead {
     pub returned: u64,
     pub win32_error: i64,
     pub read_error: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RecoveryPreview {
-    pub complete_files: usize,
-    pub partial_files: usize,
-    pub failed_files: usize,
-    pub incomplete_files: usize,
-    pub omitted_files: usize,
-    pub files: Vec<RecoveryFile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecoveryFile {
-    pub index: u32,
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_path: Option<String>,
-    pub status: RecoveryStatus,
-    pub bytes_written: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_size: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecoveryStatus {
-    Complete,
-    Partial,
-    Failed,
-    Incomplete,
 }
 
 #[derive(Debug, Serialize)]

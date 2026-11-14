@@ -156,9 +156,7 @@ namespace sunpack::sevenzip
                     !item.is_dir &&
                     item.done &&
                     item.bytes_written != 0 &&
-                    item.has_source_crc32 &&
-                    item.has_output_crc32 &&
-                    item.source_crc32 == item.output_crc32)
+                    item.has_source_crc32)
                 {
                     ++count;
                 }
@@ -310,7 +308,6 @@ namespace sunpack::sevenzip
 
                 // Forward the raw std::error_code through the existing trace channel so the
                 // caller can tell "no space" apart from "path unusable".
-                result.output_trace.last_win32_error = prepare_error.value();
                 result.output_trace.last_hresult =
                     static_cast<int>(HRESULT_FROM_WIN32(static_cast<DWORD>(prepare_error.value())));
 
@@ -529,7 +526,7 @@ namespace sunpack::sevenzip
                 output_dir,
                 progress,
                 dry_run,
-                &result.output_trace,
+                result.output_trace,
                 num_items,
                 shared_writer,
                 cancel_token
@@ -543,7 +540,7 @@ namespace sunpack::sevenzip
                 output_dir,
                 progress,
                 dry_run,
-                &result.output_trace,
+                result.output_trace,
                 num_items,
                 shared_writer,
                 cancel_token);
@@ -588,9 +585,6 @@ namespace sunpack::sevenzip
 #else
             raw_extract_callback->finalize_output();
 #endif
-            if (format.Data4[5] == kLz4FormatId)
-                for (auto &item : result.output_trace.items) item.crc_verified = false;
-
             last_hr = hr;
 
             last_op_res = raw_extract_callback->operation_result();
@@ -606,8 +600,6 @@ namespace sunpack::sevenzip
             result.bytes_written = result.output_trace.total_bytes_written;
 
             result.failed_item = raw_extract_callback->failed_item();
-
-            result.failed_item_index = raw_extract_callback->failed_item_index();
 
             result.failed_item_bytes_written = raw_extract_callback->failed_item_bytes_written();
 

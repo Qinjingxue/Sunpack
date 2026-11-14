@@ -12,7 +12,7 @@ impl BucketIndex {
         anchor.is_volume_entry()
             || (!anchor.standalone && anchor.needs_password
                 && !anchor.continuation_from_previous
-                && !anchor.anchor_roles.contains(&"member"))
+                && !anchor.has_any(MEMBER))
             || (anchor.pe_state != PeState::None && !anchor.standalone)
     }
 

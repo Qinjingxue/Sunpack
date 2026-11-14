@@ -82,9 +82,9 @@ std::wstring path_key(const fs::path& p) {
     return s;
 }
 bool is_under(const std::wstring& p, const std::wstring& root) {
-    auto r = root;
-    while (!r.empty() && (r.back() == L'\\' || r.back() == L'/')) r.pop_back();
-    return p == root || (p.size() > r.size() && p.compare(0, r.size(), r) == 0 && p[r.size()] == L'\\');
+    const auto end = root.find_last_not_of(L"\\/");
+    const auto length = end == std::wstring::npos ? 0 : end + 1;
+    return p == root || (p.size() > length && p.compare(0, length, root, 0, length) == 0 && p[length] == L'\\');
 }
 std::wstring mutex_name(const fs::path& p, const std::wstring& prefix) {
     auto bytes = utf8(path_key(p));

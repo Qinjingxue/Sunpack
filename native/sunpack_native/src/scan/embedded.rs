@@ -1,5 +1,7 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_reader_at_offset, upgrade_relation_rar_end_reader, VolumeAnchor,
+    probe_volume_anchor_reader_at_offset, upgrade_relation_rar_end_reader, VolumeAnchor, FIRST, RAR_VERSION_5,
+    SEVEN_ZIP_CARRIER_INTERRUPTED, ZIP_CARRIER_CHECKED, ZIP_LOCAL_HEADER, ZIP_SPLIT_START,
+    ZIP_TAIL_CHECKED,
 };
 #[cfg(windows)]
 use crate::io::iocp;
@@ -250,18 +252,13 @@ impl NativeScanResult {
                         .cloned()
                         .unwrap_or_else(|| VolumeAnchor {
                             size: self.file_size,
-                            format: "zip".into(),
-                            confidence: if split { "strong" } else { "weak" }.into(),
+                            format: "zip",
+                            strong: split,
                             multivolume: split,
                             continuation_to_next: split,
                             internal_volume_number: split.then_some(1),
                             structure_offset: Some(first.offset),
-                            anchor_roles: if split { vec!["first"] } else { vec![] },
-                            evidence: if split {
-                                vec!["zip:split_marker", "zip:local_header"]
-                            } else {
-                                vec!["zip:local_header"]
-                            },
+                            flags: ZIP_LOCAL_HEADER | if split { FIRST | ZIP_SPLIT_START } else { 0 },
                             ..VolumeAnchor::default()
                         });
                 while boundaries.peek().is_some_and(|c| c.offset <= first.offset) {
@@ -271,8 +268,7 @@ impl NativeScanResult {
                 // The full physical signature pass includes split EOCDs too.
                 // Keep only this negative byte fact, not a second hit index.
                 if anchor.format == "zip" && self.zip_eocd_absent {
-                    anchor.evidence.push("relation:zip_tail_checked");
-                    anchor.evidence.push("relation:zip_carrier_checked");
+                    anchor.flags |= ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED;
                 }
                 Some(anchor)
             })
@@ -1688,23 +1684,15 @@ fn validate_seven_zip(
         let next = crate::formats::seven_zip::RelationNextHeader::parse(&header).unwrap();
         item.volume_anchor = Some(Box::new(VolumeAnchor {
             size,
-            format: "7z".into(),
-            confidence: "strong".into(),
+            format: "7z",
+            strong: true,
             multivolume: true,
-            anchor_roles: vec!["first"],
             internal_volume_number: Some(1),
             structure_offset: Some(offset),
             expected_logical_size: Some(end),
             seven_zip_next_header: Some(std::sync::Arc::new(next)),
             continuation_to_next: true,
-            evidence: vec![
-                "7z:start_header_crc",
-                if end > size {
-                    "7z:logical_size_exceeds_part"
-                } else {
-                    "7z:carrier_interrupted"
-                },
-            ],
+            flags: FIRST | if end <= size { SEVEN_ZIP_CARRIER_INTERRUPTED } else { 0 },
             ..VolumeAnchor::default()
         }));
         return Ok(Some(item));
@@ -1762,21 +1750,21 @@ fn validate_rar(
     _size: u64,
     offset: u64,
 ) -> io::Result<Option<EmbeddedCandidate>> {
-    let anchor = probe_volume_anchor_reader_at_offset(file, "", offset, "rar", None)?;
+    let anchor = probe_volume_anchor_reader_at_offset(file, "", offset, "rar")?;
     if anchor.format != "rar" || !anchor.error.is_empty() {
         return Ok(None);
     }
-    let anchor = upgrade_relation_rar_end_reader(&anchor, None, file)?;
+    let anchor = upgrade_relation_rar_end_reader(&anchor, file)?;
     if !anchor.error.is_empty() {
         return Ok(None);
     }
     let validation = if anchor.needs_password {
-        if anchor.evidence.contains(&"rar5:encryption_header") {
+        if anchor.has_any(RAR_VERSION_5) {
             "rar5_encryption_header_crc"
         } else {
             "rar4_header_encrypted_main_header_crc"
         }
-    } else if anchor.evidence.iter().any(|e| e.starts_with("rar5:")) {
+    } else if anchor.has_any(RAR_VERSION_5) {
         "rar5_complete_block_walk"
     } else {
         "rar4_complete_block_walk"
@@ -2231,7 +2219,7 @@ mod tests {
             assert_eq!(scan.zip_eocd_absent, !terminal);
             assert!(anchors
                 .iter()
-                .all(|a| a.evidence.contains(&"relation:zip_carrier_checked") == !terminal));
+                .all(|a| a.has_any(ZIP_CARRIER_CHECKED) == !terminal));
             let _ = fs::remove_file(path);
         }
     }

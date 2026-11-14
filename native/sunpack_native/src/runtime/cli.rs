@@ -2731,9 +2731,14 @@ mod option_tests {
 
     #[test]
     fn alternating_request_sources_reuse_their_config_subscriptions() {
-        let path_a = crate::test_support::temp_file("cli_config_a", br#"{"cli":{"language":"en"}}"#);
-        let path_b = crate::test_support::temp_file("cli_config_b", br#"{"cli":{"language":"zh"}}"#);
-        let cwd = path_a.parent().unwrap();
+        let marker = crate::test_support::temp_file("cli_config_subscriptions", b"");
+        let directory = marker.with_extension("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let cwd = directory.as_path();
+        let path_a = cwd.join("english.json");
+        let path_b = cwd.join("chinese.json");
+        std::fs::write(&path_a, br#"{"cli":{"language":"en"}}"#).unwrap();
+        std::fs::write(&path_b, br#"{"cli":{"language":"zh"}}"#).unwrap();
         let mut source_a = config::ConfigSources::default();
         source_a.simple = Some(path_a.clone());
         let mut source_b = config::ConfigSources::default();
@@ -2751,6 +2756,8 @@ mod option_tests {
         drop(host);
         std::fs::remove_file(path_a).unwrap();
         std::fs::remove_file(path_b).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_file(marker).unwrap();
     }
 
     #[test]

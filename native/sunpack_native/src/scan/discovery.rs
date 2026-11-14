@@ -1,4 +1,6 @@
-use crate::analysis_native::volume_anchor::CheapAnchor;
+use crate::analysis_native::volume_anchor::{
+    CheapAnchor, EMBEDDED_VOLUME, RAR_PASSWORD_MATCHED_INCOMPLETE, SEVEN_ZIP_CARRIER_INTERRUPTED,
+};
 use crate::io::archive_state::AnalysisFacts;
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
@@ -740,7 +742,7 @@ impl NativeEmbeddedBatch {
                 if let Some(scan) = item.scan {
                     let failure_reason = anchor.expected_logical_size.is_none().then(|| {
                         if matched.contains_key(&match_key)
-                            || anchor.evidence.contains(&"rar:password_matched_incomplete")
+                            || anchor.has_any(RAR_PASSWORD_MATCHED_INCOMPLETE)
                         {
                             "embedded_truncated"
                         } else if anchor.wrong_password {
@@ -768,7 +770,7 @@ impl NativeEmbeddedBatch {
             if !anchor.multivolume
                 || !batch.claims_offset(&key, anchor.structure_offset.unwrap_or(0))
             {
-                anchor.evidence.push("embedded:volume_candidate");
+                anchor.flags |= EMBEDDED_VOLUME;
                 anchors.push(anchor);
             }
             // Project once after Relations; the planner combines logical inputs
@@ -822,7 +824,7 @@ impl NativeEmbeddedBatch {
             !group.candidate_data().relation_confirmed
                 && group
                     .entry_anchor()
-                    .is_some_and(|a| a.evidence.contains(&"7z:carrier_interrupted"))
+                    .is_some_and(|a| a.has_any(SEVEN_ZIP_CARRIER_INTERRUPTED))
         };
         let mut peers: HashMap<String, HashSet<String>> = groups
             .iter()
@@ -1165,7 +1167,7 @@ impl NativeCandidateTable {
                     path,
                     format_hint: fact
                         .and_then(CheapAnchor::anchor)
-                        .map_or("", |anchor| anchor.format.as_str()),
+                        .map_or("", |anchor| anchor.format),
                     logical_name: filesystem_logical_name(path),
                 }
             }
@@ -1186,8 +1188,8 @@ impl NativeCandidateTable {
                 table.relation_anchors[*index]
                     .as_ref()
                     .and_then(CheapAnchor::anchor)
-                    .map(|anchor| anchor.format.clone())
-                    .unwrap_or_default(),
+                    .map_or("", |anchor| anchor.format)
+                    .to_owned(),
             ),
             Candidate::Relation(group) => {
                 let data = group.candidate_data();
@@ -1297,7 +1299,7 @@ impl NativeCandidateTable {
                             let anchor = table.relation_anchors[*file_index]
                                 .as_ref()
                                 .and_then(CheapAnchor::anchor);
-                            let format = anchor.map(|anchor| anchor.format.as_str()).unwrap_or("");
+                            let format = anchor.map(|anchor| anchor.format).unwrap_or("");
                             let accepted = matches!(
                                 format,
                                 "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"

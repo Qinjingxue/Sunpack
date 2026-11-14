@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 use super::catalog::{catalog_stem, CatalogRow, NativeWatchObservation, ScopeCatalog};
 use super::path_filter::{FilterPath, NativePathRule, PathRule, PathRuleScratch};
 use crate::analysis_native::volume_anchor::{
-    cheap_fast_probe_pool, probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
+    cheap_fast_probe_pool, probe_volume_anchor_from_head, probe_volume_anchor_path_cheap,
     probe_volume_anchor_record_cheap, CheapAnchor, CheapAnchorCell,
 };
 use crate::io::resource_lifecycle::NativeReadScope;
@@ -168,12 +168,12 @@ fn filesystem_file_route(is_dir: bool, fact: Option<&CheapAnchor>) -> u8 {
     };
     // PE facts authorize Relations refinement; they never terminate discovery.
     if anchor.pe_state != crate::scan::pe_overlay::PeState::None
-        || matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
+        || matches!(anchor.format, "rar" | "7z" | "zip")
     {
         return FILE_ROUTE_RELATIONS;
     }
     if matches!(
-        anchor.format.as_str(),
+        anchor.format,
         "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
     ) {
         return FILE_ROUTE_DETECTION;
@@ -961,46 +961,30 @@ fn populate_relation_anchors_cached(
     let needs_anchor = |record: &DirectoryEntryRecord| {
         !record.is_dir && record.relation_member_eligible && record.relation_anchor.is_none()
     };
-    if records
-        .iter()
-        .any(|record| record.size.is_some() && needs_anchor(record))
-    {
-        // A conflicting promotion retains the original per-file error/retry path.
-        let scope = root.and_then(|root| NativeReadScope::new(Path::new(root)).ok());
-        cheap_fast_probe_pool().install(|| {
-            records
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(index, record)| {
-                    if let Some(size) = record.size.filter(|_| needs_anchor(record)) {
-                        record.relation_anchor = Some(probe_volume_anchor_record_cheap(
-                            &record.path,
-                            size,
-                            cells.get(index).and_then(Option::as_ref),
-                            scope.as_ref(),
-                        ));
-                    }
-                });
-        });
+    if !records.iter().any(needs_anchor) {
+        return;
     }
-
-    let needs_size = |record: &DirectoryEntryRecord| record.size.is_none() && needs_anchor(record);
-    let unknown_size_paths: Vec<_> = records
-        .iter()
-        .filter(|record| needs_size(record))
-        .map(|record| record.path.clone())
-        .collect();
-    if !unknown_size_paths.is_empty() {
-        let anchors = probe_volume_anchor_paths_cheap(&unknown_size_paths, None);
-        for (record, anchor) in records
-            .iter_mut()
-            .filter(|record| needs_size(record))
-            .zip(anchors)
-        {
-            // Without a size column the full anchor owns the probed size.
-            record.relation_anchor = Some(CheapAnchor::Full(Arc::new(anchor)));
-        }
-    }
+    // A conflicting promotion retains the original per-file error/retry path.
+    let scope = root.and_then(|root| NativeReadScope::new(Path::new(root)).ok());
+    cheap_fast_probe_pool().install(|| {
+        records
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(_, record)| needs_anchor(record))
+            .for_each(|(index, record)| {
+                let anchor = match record.size {
+                    Some(size) => probe_volume_anchor_record_cheap(
+                        &record.path,
+                        size,
+                        cells.get(index).and_then(Option::as_ref),
+                        scope.as_ref(),
+                    ),
+                    // Without a size column the full anchor owns the probed size.
+                    None => CheapAnchor::Full(Arc::new(probe_volume_anchor_path_cheap(&record.path))),
+                };
+                record.relation_anchor = Some(anchor);
+            });
+    });
 }
 
 fn scan_directory_views(

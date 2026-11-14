@@ -2321,18 +2321,14 @@ mod tests {
                 let anchor = VolumeAnchor {
                     path: path.to_string_lossy().into_owned(),
                     size: bytes.len() as u64,
-                    format: "rar".into(),
+                    format: "rar",
                     structure_offset: Some(37),
                     rar_next_header_offset: Some(37),
-                    evidence: vec![if rar5 {
-                        "rar5:volume_header"
-                    } else {
-                        "rar4:volume_header"
-                    }],
+                    flags: if rar5 { crate::analysis_native::volume_anchor::RAR_VERSION_5 } else { 0 },
                     ..Default::default()
                 };
                 let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
-                let resolved = upgrade_relation_rar_end_reader(&anchor, None, &reader).unwrap();
+                let resolved = upgrade_relation_rar_end_reader(&anchor, &reader).unwrap();
                 let reads = THREAD_PHYSICAL_READS.with(std::cell::Cell::get) - before;
                 assert_eq!(resolved.expected_logical_size, Some(end));
                 assert_eq!(resolved.relation_has_next, Some(false));

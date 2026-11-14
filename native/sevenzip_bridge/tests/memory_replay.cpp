@@ -228,7 +228,7 @@ void sparse_replay(const std::filesystem::path &directory) {
     auto writer = std::make_shared<AsyncFileWriter>();
     writer->set_max_write_chunk_for_test(4093);
     auto job = writer->make_job();
-    auto file = writer->make_file(job, receipt.path, L"holes.bin", 0, 0, {}, &receipt);
+    auto file = writer->make_file(job, receipt.path, 0, 0, {}, &receipt);
     {
         CMyComPtr<ISequentialOutStream> stream(new AsyncFileOutStream(writer, file));
         for (std::size_t offset = 0; offset < expected.size();) {
@@ -275,7 +275,7 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
         NativeCpuJobContext credits(cpu);
         credits.acquire_extra(1);
         const auto job = writer->make_job(2 * MiB, memory.cancel);
-        auto file = writer->make_file(job, receipt.path, L"combined.bin", 0, 0, {}, &receipt);
+        auto file = writer->make_file(job, receipt.path, 0, 0, {}, &receipt);
         std::vector<unsigned char> payload(MiB, 0x5A);
         for (int i = 0; i < 16; ++i) {
             UInt32 done = 0;
@@ -313,7 +313,7 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
     state->space_gate->poll(64 * MiB);
     {
         auto job = writer->make_job(0, memory.cancel);
-        auto file = writer->make_file(job, receipt.path, L"combined.bin", 0, 0, {}, &receipt);
+        auto file = writer->make_file(job, receipt.path, 0, 0, {}, &receipt);
         CMyComPtr<ISequentialOutStream> stream(new AsyncFileOutStream(writer, file));
         std::vector<unsigned char> bytes(4 * MiB, 0x5A);
         UInt32 done = 0;

@@ -496,54 +496,6 @@ private:
     std::size_t count_ = 0;
 };
 
-void append_output_item_trace(std::string& row, const sunpack::sevenzip::ExtractOutputItemTrace& item) {
-    row.clear();
-    row += wire::array();
-    wire::append_number(row, item.index);
-    wire::append_text(row, wide_to_utf8(item.path));
-    wire::append_text(row, wide_to_utf8(item.output_path));
-    row.push_back(item.is_dir ? wire::kTrue : wire::kFalse);
-    row.push_back(item.encrypted ? wire::kTrue : wire::kFalse);
-    wire::append_number(row, item.bytes_written);
-    wire::append_number(row, item.expected_size);
-    row.push_back(item.has_expected_size ? wire::kTrue : wire::kFalse);
-    wire::append_number(row, item.source_crc32);
-    row.push_back(item.has_source_crc32 ? wire::kTrue : wire::kFalse);
-    wire::append_number(row, item.output_crc32);
-    row.push_back(item.has_output_crc32 ? wire::kTrue : wire::kFalse);
-    row.push_back(item.crc_verified ? wire::kTrue : wire::kFalse);
-    wire::append_number(row, item.operation_result);
-    wire::append_text(row, sunpack::sevenzip::operation_result_name(item.operation_result));
-    wire::append_number(row, item.hresult);
-    wire::append_number(row, item.win32_error);
-    row.push_back(item.done ? wire::kTrue : wire::kFalse);
-    row.push_back(item.failed ? wire::kTrue : wire::kFalse);
-    row += wire::end();
-}
-
-std::size_t emit_output_trace_chunks(const std::string& job_id, const sunpack::sevenzip::ExtractOutputTrace& trace) {
-    WorkerChunks chunks(job_id, "trace_chunk", "items");
-    std::string row;
-    row.reserve(256);
-    for (const auto& item : trace.items) {
-        append_output_item_trace(row, item);
-        chunks.append(row);
-    }
-    return chunks.finish();
-}
-
-std::string output_trace_wire(const sunpack::sevenzip::ExtractOutputTrace& trace, std::size_t chunk_count) {
-    return wire::object() +
-        wire::key("total_bytes_written") + wire::number(trace.total_bytes_written) +
-        wire::key("current_item_bytes_written") + wire::number(trace.current_item_bytes_written) +
-        wire::key("last_write_size") + wire::number(trace.last_write_size) +
-        wire::key("last_hresult") + wire::number(trace.last_hresult) +
-        wire::key("last_win32_error") + wire::number(trace.last_win32_error) +
-        wire::key("item_count") + wire::number(trace.items.size()) +
-        wire::key("chunk_count") + wire::number(chunk_count) +
-        wire::end();
-}
-
 #ifdef SUP7Z_DEBUG
 std::string pipeline_timing_wire(const sunpack::sevenzip::ExtractPipelineTiming& timing) {
     return wire::object() +
@@ -599,38 +551,6 @@ std::string verified_manifest_wire(const std::string& job_id, const sunpack::sev
         wire::key("file_count") + wire::number(file_count) +
         wire::key("total_size") + wire::number(total_size) +
         wire::key("chunk_count") + wire::number(chunk_count) + wire::end();
-}
-
-std::string failed_item_wire(const sunpack::sevenzip::ExtractArchiveResult& result) {
-    return wire::object() +
-        wire::key("index") + wire::number(result.failed_item_index) +
-        wire::key("path") + wire::text(wide_to_utf8(result.failed_item)) +
-        wire::key("bytes_written") + wire::number(result.failed_item_bytes_written) +
-        wire::key("operation_result") + wire::number(result.operation_result) +
-        wire::key("operation_result_name") + wire::text(sunpack::sevenzip::operation_result_name(result.operation_result)) +
-        wire::end();
-}
-
-std::string diagnostics_wire(const sunpack::sevenzip::ExtractArchiveResult& result, std::size_t trace_chunks) {
-    return wire::object() +
-        wire::key("failure_stage") + wire::text(result.failure_stage) +
-        wire::key("failure_kind") + wire::text(result.failure_kind) +
-        wire::key("hresult") + wire::number(result.hresult) +
-        wire::key("operation_result") + wire::number(result.operation_result) +
-        wire::key("operation_result_name") + wire::text(sunpack::sevenzip::operation_result_name(result.operation_result)) +
-        wire::key("missing_volume_suspected") + wire::boolean(result.missing_volume_suspected) +
-        wire::key("missing_volume_evidence") + wire::text(result.missing_volume_evidence) +
-        wire::key("missing_volume_name") + wire::text(wide_to_utf8(result.missing_volume_name)) +
-        wire::key("password_candidate_batch") + wire::boolean(result.password_candidate_batch) +
-        wire::key("password_candidate_direct") + wire::boolean(result.password_candidate_direct) +
-        wire::key("password_candidates_all_rejected") + wire::boolean(result.password_candidates_all_rejected) +
-        wire::key("password_candidate_count") + wire::number(result.password_candidate_count) +
-        wire::key("password_attempts") + wire::number(result.password_attempts) +
-        wire::key("matched_index") + wire::number(result.matched_index) +
-        wire::key("input_trace") + input_trace_wire(result.input_trace) +
-        wire::key("output_trace") + output_trace_wire(result.output_trace, trace_chunks) +
-        wire::key("failed_item") + failed_item_wire(result) +
-        wire::end();
 }
 
 }  // namespace
@@ -1157,14 +1077,16 @@ int run_request(
     }
     const std::string manifest_field = (ok && !dry_run)
         ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result) : "";
-    const auto trace_chunks = (!ok || dry_run) ? emit_output_trace_chunks(job_id, result.output_trace) : 0;
+    const auto complete_files = !ok && !dry_run ? std::count_if(
+        result.output_trace.items.begin(), result.output_trace.items.end(),
+        [](const ExtractOutputItemTrace& item) {
+            return !item.is_dir && item.done && !item.failed && item.operation_result == 0;
+        }) : 0;
     const std::string failure_fields = ok ? "" :
         wire::key("failure_stage") + wire::text(result.failure_stage) +
         wire::key("failure_kind") + wire::text(result.failure_kind) +
         wire::key("hresult") + wire::number(result.hresult);
-    const std::string diagnostic_fields = (!ok || dry_run) ?
-        wire::key("diagnostics") + diagnostics_wire(result, trace_chunks) : "";
-    const std::string input_trace_field = sunpack::sevenzip::read_file_timing_enabled() ?
+    const std::string input_trace_field = (!ok || dry_run || read_file_timing_enabled()) ?
         wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
     const auto &output_trace = result.output_trace;
     const std::string metadata_warning_field = (output_trace.metadata_failed_files || output_trace.metadata_failed_directories) ?
@@ -1206,6 +1128,7 @@ int run_request(
         wire::key("unsupported_method") + wire::boolean(result.unsupported_method) +
         wire::key("item_count") + wire::number(result.item_count) +
         wire::key("files_written") + wire::number(result.files_written) +
+        wire::key("recovered_complete_files") + wire::number(complete_files) +
         wire::key("dirs_written") + wire::number(result.dirs_written) +
         wire::key("bytes_written") + wire::number(result.bytes_written) +
         volume_attempt_fields +
@@ -1219,7 +1142,7 @@ int run_request(
 #ifdef SUP7Z_DEBUG
         + pipeline_timing_field
 #endif
-        + diagnostic_fields + wire::end());
+        + wire::end());
     return ok ? 0 : 1;
 }
 

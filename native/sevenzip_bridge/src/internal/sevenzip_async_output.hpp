@@ -162,7 +162,6 @@ namespace sunpack::sevenzip
             UInt64 written_bytes = 0;
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
-            int win32_error = 0;
             ArchiveMetadataErrors metadata_errors;
             bool operation_result_set = false;
             bool has_mtime_ns = false;
@@ -171,6 +170,7 @@ namespace sunpack::sevenzip
             bool failed = false;
             bool closed = false;
 #ifdef SUP7Z_TEST_IO_FAULTS
+            int win32_error = 0;
             UInt64 accepted_bytes = 0;
             std::size_t peak_active_data_writes = 0;
 #endif
@@ -244,18 +244,15 @@ namespace sunpack::sevenzip
             FileState(
                 JobStatePtr state,
                 std::wstring file_path,
-                std::wstring archive_path,
                 UInt32 archive_index,
                 std::size_t trace,
                 const ArchiveItemMetadata &file_metadata)
-                : item_path(std::move(archive_path)),
-                  item_index(archive_index),
+                : item_index(archive_index),
                   trace_index(trace),
                   job(std::move(state)),
                   path(std::move(file_path)),
                   metadata(file_metadata) {}
 
-            const std::wstring item_path;
             const UInt32 item_index = 0;
             const std::size_t trace_index = 0;
 
@@ -275,7 +272,7 @@ namespace sunpack::sevenzip
             const ArchiveItemMetadata metadata;
             std::shared_ptr<VolumeSpaceGate> space_gate;
             std::atomic<UInt64> accepted_bytes{0};
-            std::atomic<UInt64> next_write_offset{0};
+            UInt64 next_write_offset = 0;
             std::mutex producer_mutex;
             Buffer *staging_buffer = nullptr;
             std::size_t inflight_bytes = 0;
@@ -287,7 +284,9 @@ namespace sunpack::sevenzip
             UInt64 written_bytes = 0;
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
+#ifdef SUP7Z_TEST_IO_FAULTS
             int win32_error = 0;
+#endif
             ArchiveMetadataErrors metadata_errors;
             bool operation_result_set = false;
             bool has_mtime_ns = false;
@@ -402,7 +401,6 @@ namespace sunpack::sevenzip
         FileStatePtr make_file(
             const JobStatePtr &job,
             std::wstring path,
-            std::wstring item_path,
             UInt32 item_index,
             std::size_t trace_index,
             const ArchiveItemMetadata &metadata = {}
@@ -411,7 +409,7 @@ namespace sunpack::sevenzip
         {
             auto file = std::make_shared<FileState>(
                 job ? job : make_job(),
-                std::move(path), std::move(item_path), item_index, trace_index, metadata);
+                std::move(path), item_index, trace_index, metadata);
             file->replay = replay;
             file->track_replay = replay || current_extraction_replay;
             if (replay) {
@@ -437,7 +435,7 @@ namespace sunpack::sevenzip
             if (error != S_OK) return error;
             if (file->staging_buffer && file->staging_buffer->size && !enqueue_staging_locked(file, true))
                 return terminal_result_locked(file->job);
-            file->next_write_offset.fetch_add(size, std::memory_order_relaxed);
+            file->next_write_offset += size;
             file->accepted_bytes.fetch_add(size, std::memory_order_relaxed);
             return S_OK;
         }
@@ -860,7 +858,7 @@ namespace sunpack::sevenzip
             file->operation_result_set = true;
         }
 
-        FileSnapshot snapshot_file(const FileStatePtr &file) const
+        FileSnapshot take_file_snapshot(const FileStatePtr &file) const noexcept
         {
             FileSnapshot snapshot;
             if (!file)
@@ -871,15 +869,15 @@ namespace sunpack::sevenzip
             snapshot.written_bytes = file->written_bytes;
             snapshot.operation_result = file->operation_result;
             snapshot.hresult = file->hresult;
-            snapshot.win32_error = file->win32_error;
             snapshot.metadata_errors = file->metadata_errors;
             snapshot.operation_result_set = file->operation_result_set;
             snapshot.has_mtime_ns = file->has_mtime_ns;
             snapshot.mtime_ns = file->mtime_ns;
-            snapshot.magic = file->magic;
+            snapshot.magic = std::move(file->magic);
             snapshot.failed = file->failed;
             snapshot.closed = file->closed;
 #ifdef SUP7Z_TEST_IO_FAULTS
+            snapshot.win32_error = file->win32_error;
             snapshot.accepted_bytes = file->accepted_bytes.load(std::memory_order_relaxed);
             snapshot.peak_active_data_writes = file->peak_active_data_writes;
 #endif
@@ -1166,7 +1164,7 @@ namespace sunpack::sevenzip
             }
 
             Buffer *buffer = file->staging_buffer;
-            const UInt64 output_offset = file->next_write_offset.load(std::memory_order_relaxed);
+            const UInt64 output_offset = file->next_write_offset;
             if (output_offset > (std::numeric_limits<UInt64>::max)() - buffer->size)
             {
                 discard_staging_locked(file);
@@ -1195,8 +1193,7 @@ namespace sunpack::sevenzip
                 return false;
             }
             file->staging_buffer = nullptr;
-            file->next_write_offset.store(
-                output_offset + buffer->size, std::memory_order_relaxed);
+            file->next_write_offset += buffer->size;
             ++queued_jobs_;
             return true;
         }
@@ -1839,7 +1836,7 @@ namespace sunpack::sevenzip
             producer_cv_.notify_all();
         }
 
-        static void mark_file_failure_locked(const FileStatePtr &file, HRESULT hr, int win32_error) noexcept
+        static void mark_file_failure_locked(const FileStatePtr &file, HRESULT hr, [[maybe_unused]] int win32_error) noexcept
         {
             if (!file || file->failed)
             {
@@ -1847,7 +1844,9 @@ namespace sunpack::sevenzip
             }
             file->failed = true;
             file->hresult = hr;
+#ifdef SUP7Z_TEST_IO_FAULTS
             file->win32_error = win32_error;
+#endif
         }
 
         std::vector<std::unique_ptr<Buffer>> buffers_;

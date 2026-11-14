@@ -196,7 +196,7 @@ impl AttemptSource {
                 .carrier_limit
                 .map_or(anchor.extent_end(), |limit| limit.min(anchor.extent_end())),
             proven_end: anchor.proven_extent_end(),
-            terminal: anchor.anchor_roles.contains(&"terminal"),
+            terminal: anchor.has_any(TERMINAL),
             head_size: anchor.zip_head_size,
         }
     }

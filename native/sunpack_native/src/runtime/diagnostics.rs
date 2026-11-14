@@ -13,28 +13,33 @@ impl Log {
     pub(super) fn open(path: PathBuf, days: u64, watch: &Arc<super::watch::Watch>) -> io::Result<Arc<Self>> {
         let log = Arc::new(Self { events: NativeEventLog::new(path, days.min(u32::MAX as u64) as u32, false)?, watch: Arc::downgrade(watch) });
         *CURRENT.lock().unwrap() = Arc::downgrade(&log);
-        event("host_started", json!({}));
+        log.write("host_started", json!({}));
         Ok(log)
     }
     pub(super) fn finish(&self, reason: &str) {
-        event("host_stopped", json!({"exit_reason": reason}));
+        self.write("host_stopped", json!({"exit_reason": reason}));
         let _ = self.events.flush();
+    }
+
+    fn write(&self, name: &str, mut fields: Value) {
+        fields["event"] = json!(name);
+        fields["host_pid"] = json!(std::process::id());
+        fields["watch_generation"] = json!(self.watch.upgrade().map_or(0, |watch| watch.generation()));
+        fields["ts"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64());
+        let _ = self.events.write(fields);
     }
 }
 pub(super) fn retention(days: u64) {
-    if let Some(log) = CURRENT.lock().unwrap().upgrade() { let _ = log.events.configure_retention(days.min(u32::MAX as u64) as u32); }
+    let log = CURRENT.lock().unwrap().upgrade();
+    if let Some(log) = log { let _ = log.events.configure_retention(days.min(u32::MAX as u64) as u32); }
 }
-pub(super) fn event(name: &str, mut fields: Value) {
+pub(super) fn event(name: &str, fields: impl FnOnce() -> Value) {
     let Some(log) = CURRENT.lock().unwrap().upgrade() else { return; };
-    fields["event"] = json!(name);
-    fields["host_pid"] = json!(std::process::id());
-    fields["watch_generation"] = json!(log.watch.upgrade().map_or(0, |watch| watch.generation()));
-    fields["ts"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64());
-    let _ = log.events.write(fields);
+    log.write(name, fields());
 }
-pub(super) fn qos(mode: ProcessMode, worker_pid: u32, host: &io::Result<()>, worker: &io::Result<bool>) {
+pub(super) fn qos(mode: ProcessMode, worker_pid: impl FnOnce() -> u32, host: &io::Result<()>, worker: &io::Result<bool>) {
     let mode = match mode { ProcessMode::Background => "background", ProcessMode::Normal => "normal", ProcessMode::High => "high" };
-    event("qos_changed", json!({"mode":mode, "worker_pid":worker_pid, "host_applied":host.is_ok(), "worker_applied":matches!(worker, Ok(true)),
+    event("qos_changed", || json!({"mode":mode, "worker_pid":worker_pid(), "host_applied":host.is_ok(), "worker_applied":matches!(worker, Ok(true)),
         "host_error":host.as_ref().err().map(ToString::to_string), "worker_error":worker.as_ref().err().map(ToString::to_string)}));
 }
 
@@ -66,8 +71,8 @@ mod tests {
         let path = folder.join("runtime-test.state.events.json");
         let watch = Arc::new(super::super::watch::Watch::new(Arc::new(|| {})));
         let log = Log::open(path.clone(), 7, &watch).unwrap();
-        qos(ProcessMode::High, 0, &Ok(()), &Ok(false));
-        event("watch_control", json!({"action":"status","result":{"running":false}}));
+        qos(ProcessMode::High, || 0, &Ok(()), &Ok(false));
+        event("watch_control", || json!({"action":"status","result":{"running":false}}));
         // Owner calls, not CLI dispatch: these transitions also cover non-CLI
         // callers and must each produce their own ignored lifecycle event.
         assert_eq!(watch.stop().unwrap()["stopped"], false);

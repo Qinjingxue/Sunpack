@@ -161,15 +161,18 @@ pub(super) fn foreground_active() -> bool {
     process::foreground_active()
 }
 
-pub(super) fn maintain_when_foreground_idle(engine: &Engine, maintain: impl FnOnce()) {
+pub(super) fn maintain_when_foreground_idle(
+    engine: &Engine, release: impl FnOnce(), maintain: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     let _transition = crate::pipeline::block_on(PRIORITY_TRANSITION.lock());
-    if !foreground_active() {
-        let host = process::expire_foreground_override();
-        let mode = process::effective_mode();
-        let worker = engine.set_process_mode(mode);
-        super::diagnostics::qos(mode, engine.worker_pid(), &host, &worker);
-        maintain();
-    }
+    if foreground_active() { return Ok(()); }
+    let host = process::expire_foreground_override();
+    let mode = process::effective_mode();
+    let worker = engine.set_process_mode(mode);
+    super::diagnostics::qos(mode, || engine.worker_pid(), &host, &worker);
+    release();
+    drop(_transition);
+    maintain()
 }
 
 pub(super) fn monotonic_seconds() -> f64 {
@@ -198,7 +201,7 @@ pub(super) async fn configure_priority_async(engine: &Engine, mode: ProcessMode)
     let host = process::configure_mode(mode);
     let mode = process::effective_mode();
     let worker = engine.set_process_mode_async(mode).await;
-    super::diagnostics::qos(mode, engine.worker_pid(), &host, &worker);
+    super::diagnostics::qos(mode, || engine.worker_pid(), &host, &worker);
 }
 
 pub(super) struct Foreground<'a> {
@@ -215,7 +218,7 @@ impl<'a> Foreground<'a> {
         let (host, applied) = process::ForegroundPriority::enter((!watch.is_running()).then_some(configured_mode));
         let mode = process::effective_mode();
         let worker = engine.set_process_mode_async(mode).await;
-        super::diagnostics::qos(mode, engine.worker_pid(), &applied, &worker);
+        super::diagnostics::qos(mode, || engine.worker_pid(), &applied, &worker);
         Self { engine, watch, host: Some(host) }
     }
 
@@ -237,7 +240,7 @@ impl<'a> Foreground<'a> {
                     let host = process::expire_foreground_override();
                     let mode = process::effective_mode();
                     let worker = self.engine.set_process_mode_async(mode).await;
-                    super::diagnostics::qos(mode, self.engine.worker_pid(), &host, &worker);
+                    super::diagnostics::qos(mode, || self.engine.worker_pid(), &host, &worker);
                 }
             }
         }

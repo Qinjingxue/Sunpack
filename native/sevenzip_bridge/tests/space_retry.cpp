@@ -208,7 +208,7 @@ void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 1, 2);
 
     const auto job = writer.make_job(8 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r1-resume.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
 
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
@@ -224,7 +224,7 @@ void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
           "R-1: space_blocked 必须在暂停后送达");
 
     // R-1 空间错误不置位 failed
-    const auto paused_file = writer.snapshot_file(file);
+    const auto paused_file = writer.take_file_snapshot(file);
     check(!paused_file.failed, "R-1: 暂停期间 file->failed 必须仍是 false");
     check(paused_file.hresult == S_OK, "R-1: 暂停期间 file->hresult 必须仍是 S_OK");
     // R-2 空间错误不置位 job error
@@ -292,7 +292,7 @@ void r4_producer_backpressure(const std::filesystem::path &directory) {
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 64);
 
     const auto job = writer.make_job(kBudget);
-    const auto file = writer.make_file(job, path.wstring(), L"r4-backpressure.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
 
     std::atomic<bool> producer_returned{false};
     std::atomic<std::uint32_t> produced{0};
@@ -340,7 +340,7 @@ void r7_cancel_pierces_pause(const std::filesystem::path &directory) {
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
 
     const auto job = writer.make_job(4 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r7-cancel.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
 
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
@@ -372,7 +372,7 @@ void r8_finish_while_paused(const std::filesystem::path &directory) {
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
 
     const auto job = writer.make_job(4 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r8-finish.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
     check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-8: 必须进入暂停");
@@ -406,17 +406,17 @@ void r11a_no_volume_gate_data_failure(const std::filesystem::path &directory) {
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
 
     const auto job = writer.make_job(4 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r11a-legacy.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                        &processed) == S_OK,
           "R-11a: 写入必须被接受");
 
-    check(wait_until([&] { return writer.snapshot_file(file).failed; }, 5s),
+    check(wait_until([&] { return writer.take_file_snapshot(file).failed; }, 5s),
           "R-11a: 无卷 gate 时空间错误必须走旧的永久失败路径");
 
     // 四条旧副作用逐条断言（只断言"job 最终失败"是不够的）。
-    const auto snapshot = writer.snapshot_file(file);
+    const auto snapshot = writer.take_file_snapshot(file);
     check(snapshot.failed, "R-11a: 副作用 1 —— file->failed 必须置位");
     check(snapshot.win32_error == ERROR_DISK_FULL,
           "R-11a: file 必须记录原始 Win32 错误码");
@@ -465,7 +465,7 @@ void r13_abort_then_finish(const std::filesystem::path &directory) {
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
 
     const auto job = writer.make_job(4 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r13-abort.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
     check(wait_until([&] { return gate->blocked(); }, 5s), "R-13: 必须进入暂停");
@@ -499,7 +499,7 @@ void r14_terminal_records_discarded(const std::filesystem::path &directory) {
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 1, 1);
 
     const auto job = writer.make_job(4 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r14-terminal.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                        &processed) == S_OK,
@@ -578,7 +578,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
         const auto path = directory / L"r16-first.bin";
         writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r16-first.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
@@ -613,7 +613,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
         const auto path = directory / L"r16-second.bin";
         writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r16-second.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
@@ -651,7 +651,7 @@ void r17_concurrent_open_is_serialized(const std::filesystem::path &directory) {
     const auto path = directory / L"r17-parallel.bin";
 
     const auto job = writer.make_job(16 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r17-parallel.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                        &processed) == S_OK,
@@ -660,7 +660,7 @@ void r17_concurrent_open_is_serialized(const std::filesystem::path &directory) {
     writer.close_file(file, {});
     check(writer.finish_job(job) == S_OK, "R-17: 并发写同一文件必须成功");
 
-    const auto snapshot = writer.snapshot_file(file);
+    const auto snapshot = writer.take_file_snapshot(file);
     check(snapshot.peak_active_data_writes >= 2,
           "R-17: 测试前提 —— 同一 file 的多个 Data WorkItem 必须被多个 writer 线程并发处理");
     check(open_calls.load() == 1,
@@ -681,7 +681,7 @@ void r18_permanent_failure_records_discarded(const std::filesystem::path &direct
     writer.set_write_fault_for_test(ERROR_WRITE_FAULT, 1, 1);
 
     const auto job = writer.make_job(4 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r18-permanent.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                        &processed) == S_OK,
@@ -695,7 +695,7 @@ void r18_permanent_failure_records_discarded(const std::filesystem::path &direct
     check(metrics.pending_bytes == 0, "R-18: pending 必须归零");
     check(metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
           "R-18: 必须保持记账不变量");
-    const auto snapshot = writer.snapshot_file(file);
+    const auto snapshot = writer.take_file_snapshot(file);
     check(snapshot.failed && snapshot.win32_error == ERROR_WRITE_FAULT,
           "R-18: file 必须记录永久错误");
     // 永久错误走 probe inconclusive：绝不产生 space_resumed。
@@ -712,7 +712,7 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
         const auto payload = make_payload(1 * kMib);
         const auto job = writer.make_job(2 * kMib);
         const auto file = writer.make_file(
-            job, (directory / L"r19-ok.bin").wstring(), L"r19-ok.bin", 0, 0);
+            job, (directory / L"r19-ok.bin").wstring(), 0, 0);
         std::uint32_t processed = 0;
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
@@ -727,7 +727,7 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
         const auto path = directory / L"r19-permanent.bin";
         writer.set_write_fault_for_test(ERROR_WRITE_FAULT, 1);
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r19-permanent.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
@@ -743,7 +743,7 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
         const auto path = directory / L"r19-terminal.bin";
         writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r19-terminal.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
@@ -761,7 +761,7 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
         const auto path = directory / L"r19-space.bin";
         writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r19-space.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
@@ -791,7 +791,7 @@ void r9_flush_space_error(const std::filesystem::path &directory) {
     writer.set_flush_fault_for_test(ERROR_DISK_FULL, 1);
 
     const auto job = writer.make_job(4 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r9-flush.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                        &processed) == S_OK,
@@ -802,11 +802,11 @@ void r9_flush_space_error(const std::filesystem::path &directory) {
     check(wait_until([&] { return harness.gate->blocked(); }, 5s),
           "R-9: flush 的空间错误必须让卷进入暂停");
     // 暂停期间 handle 必须仍然有效（同 handle 续写语义的一部分）。
-    check(!writer.snapshot_file(file).closed, "R-9: 暂停期间文件不得被关闭");
+    check(!writer.take_file_snapshot(file).closed, "R-9: 暂停期间文件不得被关闭");
 
     check(harness.release_probe_and_wait_ready(), "R-9: 恢复后必须回到 Ready");
     check(writer.finish_job(job) == S_OK, "R-9: 恢复后 job 必须完成");
-    const auto snapshot = writer.snapshot_file(file);
+    const auto snapshot = writer.take_file_snapshot(file);
     check(snapshot.closed, "R-9: 恢复后文件必须已关闭");
     check(!snapshot.failed, "R-9: 恢复后文件不得是失败状态");
     check(open_calls.load() == 1, "R-9: flush 重试不得重新打开文件（同 handle）");
@@ -877,7 +877,7 @@ void r10_directory_retry_and_memo(const std::filesystem::path &directory) {
 
         auto *callback_raw = new ExtractToDiskCallback(
             nullptr, L"", directory.wstring(),
-        ExtractProgressCallback{}, true, &trace, 4);
+        ExtractProgressCallback{}, true, trace, 4);
         CMyComPtr<IArchiveExtractCallback> callback_owner(callback_raw);
         auto *callback = callback_raw;
         check(callback != nullptr, "R-10: callback 必须构造成功");
@@ -931,7 +931,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
             existing << "existing";
         }
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r11b-open.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         const unsigned char byte = 0xA5;
         std::uint32_t processed = 0;
         writer.write(file, &byte, 1, &processed);
@@ -939,7 +939,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         writer.close_file(file, {});
         check(writer.finish_job(job) != S_OK, "R-11b: open 失败必须让 job 失败");
 
-        const auto snapshot = writer.snapshot_file(file);
+        const auto snapshot = writer.take_file_snapshot(file);
         check(snapshot.failed, "R-11b: ① open 失败必须置 file->failed");
         check(writer.current_error(job) != S_OK, "R-11b: ① open 失败必须置 job->first_error");
         check(open_calls.load() == 1,
@@ -968,7 +968,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         writer.set_flush_fault_for_test(ERROR_DISK_FULL, 1);
 
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r11b-flush.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
@@ -976,7 +976,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         writer.close_file(file, {});
         check(writer.finish_job(job) != S_OK, "R-11b: ② flush 空间错误必须让 job 失败");
 
-        const auto snapshot = writer.snapshot_file(file);
+        const auto snapshot = writer.take_file_snapshot(file);
         check(snapshot.failed && snapshot.win32_error == ERROR_DISK_FULL,
               "R-11b: ② flush 失败必须置 file->failed 并记录原始码");
         check(writer.current_error(job) != S_OK, "R-11b: ② 必须置 job->first_error");
@@ -1054,7 +1054,7 @@ void r21_open_space_error_is_retryable(const std::filesystem::path &directory) {
     }
 
     const auto job = writer.make_job(2 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r21-open.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                        &processed) == S_OK,
@@ -1062,7 +1062,7 @@ void r21_open_space_error_is_retryable(const std::filesystem::path &directory) {
 
     check(wait_until([&] { return harness.gate->blocked(); }, 5s),
           "R-21: open 的空间类失败必须让卷进入暂停（而不是永久失败）");
-    const auto paused = writer.snapshot_file(file);
+    const auto paused = writer.take_file_snapshot(file);
     check(!paused.failed, "R-21: 暂停期间 file 不得被标记失败");
     check(writer.current_error(job) == S_OK, "R-21: 暂停期间 job 不得被标记失败");
     check(harness.log->count(VolumeSpaceTransition::Kind::Blocked) >= 1,
@@ -1099,7 +1099,7 @@ void r22_partial_write_then_space_failure(const std::filesystem::path &directory
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 1, 1);
 
     const auto job = writer.make_job(2 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), L"r22-partial.bin", 0, 0);
+    const auto file = writer.make_file(job, path.wstring(), 0, 0);
     std::uint32_t processed = 0;
     check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                        &processed) == S_OK,
@@ -1145,8 +1145,8 @@ void r24_cancel_queued_retry(const std::filesystem::path &directory) {
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 64);
     const auto a = writer.make_job(2 * kMib);
     const auto b = writer.make_job(2 * kMib);
-    const auto fa = writer.make_file(a, (directory / L"r24-a.bin").wstring(), L"a", 0, 0);
-    const auto fb = writer.make_file(b, (directory / L"r24-b.bin").wstring(), L"b", 1, 1);
+    const auto fa = writer.make_file(a, (directory / L"r24-a.bin").wstring(), 0, 0);
+    const auto fb = writer.make_file(b, (directory / L"r24-b.bin").wstring(), 1, 1);
     std::uint32_t processed = 0;
     writer.write(fa, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
     check(wait_until([&] { return harness.gate->wait_call_count() > 0; }, 5s),
@@ -1177,7 +1177,7 @@ void r25_cancel_blocked_producer(const std::filesystem::path &directory) {
         const auto payload = make_payload(16 * kMib);
         const auto job = writer.make_job(2 * kMib);
         const auto name = shutdown ? L"r25-shutdown.bin" : L"r25-cancel.bin";
-        const auto file = writer.make_file(job, (directory / name).wstring(), name, 0, 0);
+        const auto file = writer.make_file(job, (directory / name).wstring(), 0, 0);
         std::thread producer([&] {
             std::uint32_t processed = 0;
             writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
@@ -1207,7 +1207,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
 
         const auto path = directory / L"r23-hot-path.bin";
         const auto job = writer.make_job(8 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r23-hot-path.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                            &processed) == S_OK &&
@@ -1237,7 +1237,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
         writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
 
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r23-cold-path.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                            &processed) == S_OK,
@@ -1265,7 +1265,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
         writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
 
         const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), L"r23-after-recovery.bin", 0, 0);
+        const auto file = writer.make_file(job, path.wstring(), 0, 0);
         std::uint32_t processed = 0;
         check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                            &processed) == S_OK,
@@ -1280,7 +1280,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
         const auto second_path = directory / L"r23-after-recovery-2.bin";
         const auto second_job = writer.make_job(2 * kMib);
         const auto second_file =
-            writer.make_file(second_job, second_path.wstring(), L"r23-after-recovery-2.bin", 0, 0);
+            writer.make_file(second_job, second_path.wstring(), 0, 0);
         std::uint32_t second_processed = 0;
         check(writer.write(second_file, payload.data(),
                            static_cast<std::uint32_t>(payload.size()),

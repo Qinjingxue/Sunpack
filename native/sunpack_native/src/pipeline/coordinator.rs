@@ -33,6 +33,7 @@ use crate::scan::directory::{
     scan_output_inventory_impl, NativeDirectoryScanOptions, NativeOutputInventory,
 };
 use crate::scan::worker_event::WorkerFrame;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -1184,6 +1185,12 @@ struct Executed {
     input: Arc<ArchiveInput>,
 }
 
+enum BatchTaskResult {
+    Completed(Outcome),
+    Cancelled(TaskId, ArchiveResult),
+    Failed(io::Error),
+}
+
 impl<'run, O: Observer> Run<'run, O> {
     async fn execute_request(self: &Arc<Self>, spawner: Spawner<'run>) -> io::Result<PublicOutcome> {
         let decisions = Arc::clone(&self.recursion.decisions);
@@ -1386,29 +1393,23 @@ impl<'run, O: Observer> Run<'run, O> {
             let root_errors = has_root_errors
                 .then(|| root_errors.lock().unwrap().remove(&task.entry().entry_path))
                 .flatten();
-            let owner = Arc::clone(&owner);
             let this = Arc::clone(&owner);
             let children = children.clone();
             let scope = inherited_scope.clone();
             Box::pin(async move {
                 let entry = task.entry();
                 let extent = entry.physical_extents().next();
-                // Preserve the cancellation report coordinates without
-                // gathering every physical member for every live task.
-                let cancelled = ArchiveResult {
-                    path: PathBuf::from(&entry.entry_path),
-                    format: entry.format_hint.clone(),
-                    encrypted: entry.analysis.password_required.then_some(true),
-                    depth,
-                    offset: extent.map_or(0, |extent| extent.start),
-                    end_offset: extent.and_then(|extent| extent.end),
-                    discovery_source: task.source,
-                    ..ArchiveResult::default()
-                };
+                let path = PathBuf::from(&entry.entry_path);
+                // Keep only the coordinates needed to report a cancelled task.
+                let format = entry.format_hint.clone();
+                let encrypted = entry.analysis.password_required.then_some(true);
+                let offset = extent.map_or(0, |extent| extent.start);
+                let end_offset = extent.and_then(|extent| extent.end);
+                let discovery_source = task.source;
                 let ready = stage("report", &Cancellation::default()).await;
-                let id = owner.queue_task(task.entry(), depth, parent_id, || None);
+                let id = this.queue_task(task.entry(), depth, parent_id, || None);
                 let mut result = match ready {
-                    Ok(()) => owner.execute_task((task, sources, keys, requested), id, depth, scope, children).await,
+                    Ok(()) => this.execute_task((task, sources, keys, requested), id, depth, scope, children).await,
                     Err(error) => Err(error),
                 };
                 let unowned_errors = match (&mut result, root_errors) {
@@ -1418,21 +1419,31 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     (_, errors) => errors,
                 };
-                let result = if depth == 1 { this.finish_root(id, &cancelled.path, result).await } else { result };
-                (id, cancelled, result, unowned_errors)
+                let result = if depth == 1 { this.finish_root(id, &path, result).await } else { result };
+                let result = match result {
+                    Ok(outcome) => BatchTaskResult::Completed(outcome),
+                    Err(error) if is_cancellation(&error) => BatchTaskResult::Cancelled(
+                        id, ArchiveResult {
+                            path, format, encrypted, depth, offset, end_offset, discovery_source,
+                            failure: Some(Failure::new(FailureKind::Cancelled, "Operation interrupted")),
+                            ..ArchiveResult::default()
+                        },
+                    ),
+                    Err(error) => BatchTaskResult::Failed(error),
+                };
+                (result, unowned_errors)
             })
         }).await;
         stage("report", &Cancellation::default()).await?;
         outcome.uncommitted |= executed.len() != task_count;
         let mut first_error = None;
-        for (id, mut cancelled, branch, unowned_errors) in executed {
+        for (branch, unowned_errors) in executed {
             if let Some(errors) = unowned_errors {
                 outcome.errors.extend(errors);
             }
             let mut branch = match branch {
-                Ok(branch) => branch,
-                Err(error) if is_cancellation(&error) => {
-                    cancelled.failure = Some(Failure::new(FailureKind::Cancelled, "Operation interrupted"));
+                BatchTaskResult::Completed(branch) => branch,
+                BatchTaskResult::Cancelled(id, cancelled) => {
                     self.notify(|| Event::Finished {
                         id, path: cancelled.path.clone(), depth,
                         result: super::TaskCompletion::from_result(&cancelled),
@@ -1440,7 +1451,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     outcome.archives.push(cancelled);
                     continue;
                 }
-                Err(error) => {
+                BatchTaskResult::Failed(error) => {
                     first_error.get_or_insert(error);
                     continue;
                 }
@@ -1606,7 +1617,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut shell = this.engine.shell.branch();
             let (mut generations, missing) = this.capture_generations(&task);
             let discovered = task.source != DiscoverySource::Direct;
-            let discovery_scope = task.scope.clone();
+            let discovery_scope = task.scope.take();
             let admission = this.task_admission(&task, &generations, &missing, discovered, watch_root,
                 |path| requested.as_ref().and_then(|members| members.get(path))
                     .or_else(|| captured.as_ref().and_then(|members| members.get(path))))?;
@@ -1821,7 +1832,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut report_states = Vec::with_capacity(count);
             let mut replacement_retained = None;
             let mut replacement_rows = None;
-            let retry = task.retry.filter(|_| task.inputs.len() == 1);
+            let mut retry = task.retry.filter(|_| !multi);
             let mut replacement_entry = None;
             let mut promotion_sources = task.owned_paths;
             let mut superseded_candidates = HashSet::new();
@@ -1897,7 +1908,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     .await?
                 };
                 let mut replacement_checkpoint = None;
-                if let Some(context) = retry.as_deref().filter(|_| {
+                if let Some(context) = retry.take().filter(|_| {
                     !cancel.cancelled()
                         && !multi
                         && (before_worker || this.request.mode == Mode::Extract)
@@ -1909,14 +1920,16 @@ impl<'run, O: Observer> Run<'run, O> {
                 }) {
                     this.notify(|| Event::ResolvingVolumes { id });
                     stage("missing_volume", cancel).await?;
-                    if let Some(mut replacement) = discovery::retry_volume(
+                    let replacement = discovery::retry_volume(
                         &executed.result,
                         &missing,
-                        context,
+                        &context,
                         this.options_at(depth)?,
                         &candidates,
                         &this.request,
-                    )? {
+                    )?;
+                    drop(context);
+                    if let Some(mut replacement) = replacement {
                         // Main replaces the whole single-input extraction only
                         // after resolving a usable physical family. Until then,
                         // its damaged payload remains available for recovery.
@@ -2064,15 +2077,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 parent_outputs.push((result, inventory, input, id));
             }
-            // Preserve checkpoint insertion order without moving later child
-            // receipts: the first attempt precedes its replacement in main.
-            let replacement_retained = replacement_retained.map(|previous| {
-                let index = outcome.checkpoints.len();
-                outcome.checkpoints.push(previous);
-                index
-            });
             this.apply_complete_content_policy(&mut parent_outputs, &mut report_states,
-                replacement_retained, &mut outcome)?;
+                replacement_retained.as_mut(), &mut outcome)?;
             // Settle physical ownership before any successful sibling descends.
             // Promoted retryable sources remain failures, but no longer block
             // flattening the independent retained output subtree.
@@ -2088,8 +2094,10 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     checkpoint
                 }).collect();
-            let mut replacement_result = replacement_retained.map(|index| {
-                let mut retained = outcome.checkpoints[index].result(depth);
+            let mut replacement_result = replacement_retained.map(|checkpoint| {
+                let mut retained = checkpoint.result(depth);
+                // First-attempt history precedes the replacement and its children.
+                outcome.checkpoints.push(checkpoint);
                 // These are two logical input IDs of the same replanned carrier,
                 // not two independent top-level paths in the result tree.
                 if let Some((current, ..)) = parent_outputs.first() { retained.path = current.path.clone(); }
@@ -2405,7 +2413,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 })
                 .collect();
             let mut root_cleanup = None;
-            if sources_complete && this.request.mode == Mode::Extract {
+            if this.request.mode == Mode::Extract && sources_complete {
                 if let Some(family) = completed_family {
                     stage("output_state", &Cancellation::default()).await?;
                     this.observer.sources_processed(family,
@@ -2414,7 +2422,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 let cleanup_paths = sources.release(true);
                 let mode = if depth > 1 { CleanupMode::Delete }
                     else { this.request.config.post_extract.archive_cleanup_mode };
-                let generated: HashSet<_> = admitted_promoted.iter().map(|(path, _)| (*path).clone()).collect();
+                let generated: HashSet<_> = admitted_promoted.into_iter().map(|(path, _)| path).collect();
                 let mut deletes = Vec::new();
                 let mut recycles = Vec::new();
                 for path in &promotion_sources {
@@ -3052,13 +3060,11 @@ impl<'run, O: Observer> Run<'run, O> {
             result.failure = Some(Failure::new(FailureKind::Cancelled, "Operation interrupted"));
             return Ok(Executed { planned_output: None, result, inventory: None, input: Arc::new(input) });
         }
-        stage("preflight", &self.request.cancel).await?;
+        if !super::scheduling::in_stage() {
+            stage("preflight", &self.request.cancel).await?;
+        }
         self.notify(|| Event::Extracting { id });
         let output = if self.request.mode == Mode::Extract {
-            let preferred = carrier.map_or_else(
-                || self.preferred_output(&input, depth),
-                |root| root.join(archive_name(&input)),
-            );
             let reserved = match retry_output {
                 Some(RetryOutput::Recreate(path)) => self.recreate_reserved_output(path, &result)?,
                 Some(RetryOutput::Existing(path)) => {
@@ -3076,7 +3082,13 @@ impl<'run, O: Observer> Run<'run, O> {
                         Err(error) => return Err(error),
                     }
                 }
-                None => self.reserve_output(preferred, &result, carrier)?,
+                None => {
+                    let preferred = carrier.map_or_else(
+                        || self.preferred_output(&input, depth),
+                        |root| root.join(archive_name(&input)),
+                    );
+                    self.reserve_output(preferred, &result, carrier)?
+                }
             };
             match reserved {
                 Ok(path) => {
@@ -3181,7 +3193,11 @@ impl<'run, O: Observer> Run<'run, O> {
         self.notify(|| Event::Waiting { id });
         let native = match self.engine.worker(&self.request.config.performance.worker, &self.request.cancel).await {
             Ok(worker) => {
-                stage("extract_prepare", &self.request.cancel).await?;
+                if super::scheduling::in_stage() {
+                    self.request.cancel.check_io()?;
+                } else {
+                    stage("extract_prepare", &self.request.cancel).await?;
+                }
                 worker
                     .submit(
                         &job_id,
@@ -3214,7 +3230,7 @@ impl<'run, O: Observer> Run<'run, O> {
         self.notify(|| Event::Finalizing { id });
         let mut inventory = None;
         match native {
-            Ok(mut frame) => {
+            Ok(frame) => {
                 let value = &frame.summary;
                 let format = worker::string(value, "archive_type");
                 if !format.is_empty()
@@ -3242,8 +3258,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             )
                         })
                         .and_then(|raw| {
-                            serde_json::from_value::<VolumeSelection>(raw.clone())
-                                .map_err(io::Error::from)
+                            VolumeSelection::deserialize(raw).map_err(io::Error::from)
                         });
                     match selected.and_then(|selected| input.select_volumes(&selected)) {
                         Ok(()) => {
@@ -3271,7 +3286,9 @@ impl<'run, O: Observer> Run<'run, O> {
                         result.files = stats.file_count() as u64;
                         result.bytes = stats.total_size();
                         result.output = Some(output.clone());
-                        inventory = Some(stats);
+                        if depth <= self.request.max_depth {
+                            inventory = Some(stats);
+                        }
                     }
                 } else if result.failure.is_none() {
                     let split = input.mode.structured() || input.physical_paths().nth(1).is_some()
@@ -3300,7 +3317,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         // main keeps nonempty failed output for manual recovery,
                         // but only verified files authorize recursive processing.
                         if verified_files > 0 || stats.file_count() > 0 {
-                            result.recovered_complete_files = recovery_complete_files(&failure, verified_files as u64);
+                            result.recovered_complete_files = recovery_complete_files(&failure, verified_files);
                             result.partial = accepts_partial_content(
                                 self.request.config.extraction.content_requirement,
                                 failure.kind, result.recovered_complete_files,
@@ -3308,12 +3325,12 @@ impl<'run, O: Observer> Run<'run, O> {
                             result.files = stats.file_count() as u64;
                             result.bytes = stats.total_size();
                             result.output = Some(output.clone());
-                            if result.partial {
+                            if result.partial && depth <= self.request.max_depth {
                                 inventory = Some(stats);
                             }
                         }
                     }
-                    failure.evidence = worker_evidence(value, frame.recovery.take(), plan.evidence);
+                    failure.evidence = worker_evidence(value, plan.evidence);
                     let context = if failure.kind == FailureKind::Unknown {
                         super::FailureContext::WorkerWarning
                     } else {
@@ -3339,7 +3356,7 @@ impl<'run, O: Observer> Run<'run, O> {
 
     fn apply_complete_content_policy(
         &self, parent_outputs: &mut [ParentOutput], report_states: &mut [Option<ReportState>],
-        replacement_retained: Option<usize>, outcome: &mut Outcome,
+        replacement_retained: Option<&mut InputCheckpoint>, outcome: &mut Outcome,
     ) -> io::Result<()> {
         // Main retains best-effort bytes per input before applying the
         // physical carrier's content policy. A complete sibling keeps
@@ -3352,7 +3369,7 @@ impl<'run, O: Observer> Run<'run, O> {
             // members as partial output. Do not let its deleted slot survive
             // a Complete-policy rejection in the recovery report.
             let rejected_output = parent_outputs.iter().any(|(result, ..)| result.output.is_some())
-                || replacement_retained.is_some_and(|index| outcome.checkpoints[index].has_recovered_members());
+                || replacement_retained.as_deref().is_some_and(InputCheckpoint::has_recovered_members);
             for (index, (result, inventory, ..)) in parent_outputs.iter_mut().enumerate() {
                 if let Some(output) = result.output.clone() {
                     if self.discard_failed_output(result, &output, outcome)? {
@@ -3367,7 +3384,7 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             if rejected_output && parent_outputs.iter().all(|(result, ..)| result.output.is_none()) {
                 for state in report_states.iter_mut() { InputCheckpoint::clear_report_output(state); }
-                if let Some(index) = replacement_retained { outcome.checkpoints[index].clear_recovery_output(); }
+                if let Some(checkpoint) = replacement_retained { checkpoint.clear_recovery_output(); }
             }
         }
         Ok(())
@@ -3818,17 +3835,13 @@ fn flag(result: &Value, name: &str) -> bool {
 
 fn worker_evidence(
     result: &Value,
-    recovery: Option<super::RecoveryPreview>,
     password_evidence: Option<&str>,
 ) -> Option<Box<FailureEvidence>> {
-    let diagnostics = &result["diagnostics"];
     let field = |name: &str| {
-        [result, diagnostics].into_iter().find_map(|value| {
-            let text = worker::string(value, name);
-            (!text.is_empty()).then(|| text.to_owned())
-        })
+        let text = worker::string(result, name);
+        (!text.is_empty()).then(|| text.to_owned())
     };
-    let hresult = result.get("hresult").or_else(|| diagnostics.get("hresult")).and_then(Value::as_i64);
+    let hresult = result["hresult"].as_i64();
     // Keep the scalar proof behind the classification, not passwords or the
     // complete worker payload. Main exposes these in its failure details.
     // Explicit rejection takes precedence over fallback evidence in main.
@@ -3847,13 +3860,10 @@ fn worker_evidence(
     let stderr_tail = field("stderr_tail");
     let stage = field("failure_stage");
     let native_kind = field("failure_kind");
-    let missing_volume_suspected = flag(result, "missing_volume_suspected")
-        || flag(diagnostics, "missing_volume_suspected");
+    let missing_volume_suspected = flag(result, "missing_volume_suspected");
     let missing_volume_name = field("missing_volume_name");
     let missing_volume_evidence = field("missing_volume_evidence");
-    let input = diagnostics
-        .get("input_trace")
-        .unwrap_or(&result["input_trace"]);
+    let input = &result["input_trace"];
     let last = &input["last_read"];
     let path = worker::string(last, "source_path");
     let read_error = flag(input, "read_error");
@@ -3866,14 +3876,12 @@ fn worker_evidence(
         win32_error: input["last_win32_error"].as_i64().unwrap_or_default(),
         read_error,
     });
-    let recovery = recovery.filter(|preview| !preview.files.is_empty());
     (hresult.is_some() || classification_evidence.is_some() || missing_volume_suspected || stderr_tail.is_some()
         || stage.is_some()
         || native_kind.is_some()
         || missing_volume_name.is_some()
         || missing_volume_evidence.is_some()
-        || read.is_some()
-        || recovery.is_some())
+        || read.is_some())
     .then(|| {
         Box::new(FailureEvidence {
             hresult, classification_evidence, password_crc_proven_items, backend_operation_result,
@@ -3884,7 +3892,6 @@ fn worker_evidence(
             missing_volume_name,
             missing_volume_evidence,
             read,
-            recovery,
             ..Default::default()
         })
     })
@@ -3915,24 +3922,13 @@ fn classify_worker_failure(
     let native = worker::string(result, "native_status");
     let failure = worker::string(result, "failure_kind");
     let operation = worker::string(result, "operation_result_name");
-    let diagnostics = result.get("diagnostics").unwrap_or(&Value::Null);
-    let diagnostic_failure = worker::string(diagnostics, "failure_kind");
-    let hresult = result
-        .get("hresult")
-        .or_else(|| diagnostics.get("hresult"))
-        .and_then(Value::as_i64)
+    let hresult = result["hresult"]
+        .as_i64()
         .map(|value| value as u32);
-    let damaged_kind = |kind| {
-        matches!(
-            kind,
-            "corrupted_data" | "data_error" | "checksum_error" | "crc_error"
-        )
-    };
     let payload_damage = flag(result, "checksum_error")
         || flag(result, "damaged")
         || native == "damaged"
-        || damaged_kind(failure)
-        || damaged_kind(diagnostic_failure);
+        || matches!(failure, "corrupted_data" | "data_error" | "checksum_error" | "crc_error");
     let kind = if failure == "resource_unavailable"
         || matches!(hresult, Some(0x80070008 | 0x8007000e | 0x800705af))
     {
@@ -3959,10 +3955,6 @@ fn classify_worker_failure(
         || native == "wrong_password"
         || operation == "wrong_password"
         || matches!(failure, "wrong_password" | "encrypted_or_wrong_password")
-        || matches!(
-            diagnostic_failure,
-            "wrong_password" | "encrypted_or_wrong_password"
-        )
     {
         return Failure::password();
     } else if payload_damage || flag(result, "missing_volume_suspected") {
@@ -4026,7 +4018,7 @@ fn accepts_partial_content(requirement: ContentRequirement, failure: FailureKind
         && complete_files > 0
 }
 
-fn recoverable_file_count(frame: &WorkerFrame) -> Option<usize> {
+fn recoverable_file_count(frame: &WorkerFrame) -> Option<u64> {
     let kind = frame.summary["failure_kind"].as_str().unwrap_or_default();
     let stage = frame.summary["failure_stage"].as_str().unwrap_or_default();
     if matches!(
@@ -4049,7 +4041,7 @@ fn recoverable_file_count(frame: &WorkerFrame) -> Option<usize> {
     {
         return None;
     }
-    Some(frame.recovery.as_ref().map_or(0, |preview| preview.complete_files))
+    Some(worker::number(&frame.summary, "recovered_complete_files"))
 }
 
 fn inventory_for(frame: &WorkerFrame, path: &str) -> NativeOutputInventory {
@@ -5066,7 +5058,7 @@ mod tests {
     #[test]
     fn worker_failure_proof_survives_json_and_streamed_report() {
         let cases = [
-            (json!({"failure_kind":"resource_unavailable", "diagnostics":{"hresult":-2147024882i64}}), None,
+            (json!({"failure_kind":"resource_unavailable", "hresult":-2147024882i64}), None,
                 json!({"hresult":-2147024882i64})),
             (json!({"failure_kind":"checksum_error", "operation_result_name":"crc_error",
                 "password_crc_proven":true, "password_crc_proven_items":2}), Some("zipcrypto_header_byte"),
@@ -5078,7 +5070,7 @@ mod tests {
         ];
         for (worker, proof, expected) in cases {
             let mut failure = classify_worker_failure(&worker, proof, false);
-            failure.evidence = worker_evidence(&worker, None, proof);
+            failure.evidence = worker_evidence(&worker, proof);
             let mut report = Vec::new();
             crate::failure_report::stream_json(&mut report, &failure, false, &Cancellation::new()).unwrap();
             let value: Value = serde_json::from_slice(&report).unwrap();
@@ -5093,7 +5085,7 @@ mod tests {
 
     #[test]
     fn worker_stderr_survives_failure_evidence_serialization() {
-        let evidence = worker_evidence(&json!({"stderr_tail":"native detail\n"}), None, None).unwrap();
+        let evidence = worker_evidence(&json!({"stderr_tail":"native detail\n"}), None).unwrap();
         let encoded = serde_json::to_value(&evidence).unwrap();
         assert_eq!(encoded["stderr_tail"], "native detail\n");
         let decoded: FailureEvidence = serde_json::from_value(encoded).unwrap();
@@ -5107,9 +5099,6 @@ mod tests {
         // the shared physical-input projection used by Watch and notifications.
         let cases = [
             (serde_json::json!({"failure_kind": "checksum_error", "operation_result_name": "crc_error"}),
-                Some("zipcrypto_header_byte"), FailureKind::PasswordInconclusive, false),
-            (serde_json::json!({"operation_result_name": "crc_error",
-                "diagnostics": {"failure_kind": "password_or_volume_inconclusive"}}),
                 Some("zipcrypto_header_byte"), FailureKind::PasswordInconclusive, false),
             (serde_json::json!({"failure_kind": "password_or_volume_inconclusive"}),
                 Some("zipcrypto_header_byte"), FailureKind::PasswordInconclusive, true),
@@ -5125,7 +5114,7 @@ mod tests {
         ];
         for (worker, evidence, kind, retry) in cases {
             let mut failure = classify_worker_failure(&worker, evidence, true);
-            failure.evidence = worker_evidence(&worker, None, evidence);
+            failure.evidence = worker_evidence(&worker, evidence);
             assert_eq!(failure.kind, kind, "{worker}");
             let failure: Failure = serde_json::from_value(serde_json::to_value(&failure).unwrap()).unwrap();
             assert_eq!(failure.is_password_retry(), retry, "{worker}");
@@ -7919,7 +7908,7 @@ mod tests {
             let mut result = receipt(&input, DiscoverySource::Direct, 1);
             result.partial = partial;
             let mut failure = Failure::new(kind, "native cause");
-            failure.evidence = worker_evidence(&json!({"missing_volume_suspected": suspected}), None, None);
+            failure.evidence = worker_evidence(&json!({"missing_volume_suspected": suspected}), None);
             result.failure = Some(failure);
             project_possible_missing_volume(std::slice::from_mut(&mut result), split);
             let failure = result.failure.unwrap();
@@ -7980,10 +7969,10 @@ mod tests {
         let mut states = vec![InputCheckpoint::report_state(&replacement, &second,
             Some(&output), None, 1, 1)];
         let mut parent_outputs = vec![(second, None, Arc::new(replacement), 1)];
+        run.apply_complete_content_policy(&mut parent_outputs, &mut states, Some(&mut checkpoint), &mut outcome).unwrap();
+        assert!(!checkpoint.has_recovered_members());
+        assert!(!checkpoint.has_output());
         outcome.checkpoints.push(checkpoint);
-        run.apply_complete_content_policy(&mut parent_outputs, &mut states, Some(0), &mut outcome).unwrap();
-        assert!(!outcome.checkpoints[0].has_recovered_members());
-        assert!(!outcome.checkpoints[0].has_output());
         let (second, _, input, ..) = &parent_outputs[0];
         let mut checkpoint = InputCheckpoint::create(&source, Arc::clone(input), second, &generations, None).unwrap();
         checkpoint.install_report(states[0].take());
@@ -8087,12 +8076,9 @@ mod tests {
             ("output_filesystem", "item_extract", false),
             ("process_exit", "archive_extract", false),
         ] {
-            let mut frame: WorkerFrame = serde_json::from_str(&serde_json::json!({
-                "failure_kind":kind, "failure_stage":stage,
+            let frame: WorkerFrame = serde_json::from_str(&serde_json::json!({
+                "failure_kind":kind, "failure_stage":stage, "recovered_complete_files":2,
             }).to_string()).unwrap();
-            frame.recovery = Some(super::super::RecoveryPreview {
-                complete_files: 2, ..Default::default()
-            });
             assert_eq!(recoverable_file_count(&frame), expected.then_some(2));
         }
         for kind in [FailureKind::Damaged, FailureKind::MissingVolume,
@@ -8739,7 +8725,7 @@ mod tests {
                     archive.partial = partial;
                     archive.failure = failure_kind.map(|kind| {
                         let mut failure = Failure::new(kind, "worker diagnostic");
-                        failure.evidence = worker_evidence(&json!({"failure_stage": "item_extract"}), None, None);
+                        failure.evidence = worker_evidence(&json!({"failure_stage": "item_extract"}), None);
                         failure
                     });
                 }

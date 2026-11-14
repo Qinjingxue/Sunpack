@@ -57,13 +57,8 @@ impl Key {
             }
             _ => (input.entry_path.as_str(), 0, None),
         };
-        let generation = sessions.iter().find_map(|session| {
-            let (source, generation) = session.generation().ok()?;
-            (source == path).then_some(generation)
-        })?;
-        let compound: Option<Arc<[u8]>> = if input.volume_attempts.is_some()
-            || !matches!(input.mode, OpenMode::File | OpenMode::FileRange)
-        {
+        let (generation, compound): (_, Option<Arc<[u8]>>) = if input.volume_attempts.is_some()
+            || !matches!(input.mode, OpenMode::File | OpenMode::FileRange) {
             // Iteration follows the descriptor, not HashMap order. Binding all
             // candidate sources prevents stale proof reuse after a volume edit.
             let generations = sessions.iter().map(NativeArchiveSession::generation)
@@ -75,8 +70,14 @@ impl Key {
                 input.mode, &members, &input.parts, &input.ranges,
                 &input.volume_attempts,
             )).ok()?;
-            Some(Arc::from(bytes))
-        } else { None };
+            (*generations.get(path)?, Some(Arc::from(bytes)))
+        } else {
+            let generation = sessions.iter().find_map(|session| {
+                let (source, generation) = session.generation().ok()?;
+                (source == path).then_some(generation)
+            })?;
+            (generation, None)
+        };
         let compound_hash = compound.as_deref().map_or(0, |bytes| crate::fast_hash_core::xxh64(bytes, 0));
         Some(Self { generation, format, start, end,
             eocd: input.analysis.zip_eocd_offset, zip_spanned: input.analysis.zip_spanned,
@@ -278,11 +279,10 @@ impl CandidateSet {
     pub(super) fn resolve_relation(
         &self,
         anchor: &crate::analysis_native::volume_anchor::VolumeAnchor,
+        session: &NativeArchiveSession,
         cancellation: &Cancellation,
     ) -> io::Result<(crate::analysis_native::volume_anchor::VolumeAnchor, Option<Arc<str>>)> {
         use crate::io::archive_state::{InputExtent, InputPart};
-        // Preserve departed-source refresh even with no password candidates.
-        let reader = crate::io::reader::ManagedReader::open(&anchor.path)?;
         let mut input = ArchiveInput::file(anchor.path.clone(), "rar".into(), String::new());
         let offset = anchor.structure_offset.unwrap_or(0);
         if offset != 0 || anchor.carrier_limit.is_some() {
@@ -292,7 +292,7 @@ impl CandidateSet {
             })].into();
         }
         input.analysis.password_required = true;
-        let plan = match self.plan(&input, None, cancellation)? {
+        let plan = match self.plan_inner(&input, None, cancellation, Some(std::slice::from_ref(session)))? {
             Ok(plan) => plan,
             Err(failure) => {
                 let mut out = anchor.clone();
@@ -302,6 +302,7 @@ impl CandidateSet {
         };
         let passwords = plan.verified_password.as_ref().map(std::slice::from_ref)
             .unwrap_or(&plan.candidates);
+        let (_, reader) = session.borrowed_reader();
         let (out, matched) = crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor(
             anchor, &reader, passwords, offset != 0 || anchor.carrier_limit.is_some(),
         )?;
@@ -313,6 +314,16 @@ impl CandidateSet {
         input: &ArchiveInput,
         known: Option<Arc<str>>,
         cancellation: &Cancellation,
+    ) -> io::Result<Result<PasswordPlan, Failure>> {
+        self.plan_inner(input, known, cancellation, None)
+    }
+
+    fn plan_inner(
+        &self,
+        input: &ArchiveInput,
+        known: Option<Arc<str>>,
+        cancellation: &Cancellation,
+        sessions: Option<&[NativeArchiveSession]>,
     ) -> io::Result<Result<PasswordPlan, Failure>> {
         let cache = &self.sources.cache;
         if let Some(password) = known {
@@ -337,12 +348,16 @@ impl CandidateSet {
                 Ok(PasswordPlan::empty_fallback())
             });
         }
-        let sessions = if matches!(input.format_hint.as_str(), "zip" | "rar" | "7z" | "enc") {
-            open_sessions(input)?
-        } else {
-            Vec::new()
+        let opened;
+        let sessions = match sessions {
+            Some(sessions) => sessions,
+            None if matches!(input.format_hint.as_str(), "zip" | "rar" | "7z" | "enc") => {
+                opened = open_sessions(input)?;
+                &opened
+            }
+            None => &[],
         };
-        let key = Key::for_input(input, &sessions);
+        let key = Key::for_input(input, sessions);
         if let Some(proof) = key.as_ref().and_then(|key| cache.proof(key)) {
             match proof {
                 None => return Ok(Ok(PasswordPlan::clear())),
@@ -399,7 +414,7 @@ impl CandidateSet {
             PLANNED_BATCHES.with(|capture| {
                 if let Some(batches) = capture.borrow_mut().as_mut() { batches.push(batch.clone()); }
             });
-            let result = password::verify(input, &batch, &sessions, None)?;
+            let result = password::verify(input, &batch, sessions, None)?;
             match result.status {
                 "not_required" => {
                     if let Some(key) = key.as_ref() {
@@ -628,21 +643,25 @@ mod tests {
         let wrong: Vec<Arc<str>> = (0..256).map(|n| Arc::from(format!("wrong-{n}"))).collect();
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         pool.install(|| {
-            let anchor = probe_volume_anchor_at_offset(&path, 0, "rar", None);
+            let anchor = probe_volume_anchor_at_offset(&path, 0, "rar");
+            // A hot proof is scoped to the same reader generation. Unrelated
+            // tests can evict the pooled handle between calls, so pin it here.
+            let session = NativeArchiveSession::new(path.clone()).unwrap();
+            let cancel = Cancellation::new();
             let threads = Arc::new(Mutex::new(Vec::new()));
             RAR5_CANDIDATE_THREADS.with(|value| *value.borrow_mut() = Some(threads.clone()));
             PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
             let candidates = CandidateSet::new(wrong.clone().into(), None, &cache, None);
-            let (blocked, password) = candidates.resolve_relation(&anchor, &Cancellation::new()).unwrap();
+            let (blocked, password) = candidates.resolve_relation(&anchor, &session, &cancel).unwrap();
             assert!(blocked.wrong_password && password.is_none());
             assert_eq!(threads.lock().unwrap().len(), 256);
             assert!(threads.lock().unwrap().iter().collect::<HashSet<_>>().len() > 1);
-            let (blocked, _) = candidates.resolve_relation(&anchor, &Cancellation::new()).unwrap();
+            let (blocked, _) = candidates.resolve_relation(&anchor, &session, &cancel).unwrap();
             assert!(blocked.wrong_password);
             assert_eq!(threads.lock().unwrap().len(), 256, "hot retry must skip old KDFs");
             let mut extended = wrong.clone(); extended.push(Arc::from("secret"));
             let candidates = CandidateSet::new(extended.into(), None, &cache, None);
-            let (resolved, password) = candidates.resolve_relation(&anchor, &Cancellation::new()).unwrap();
+            let (resolved, password) = candidates.resolve_relation(&anchor, &session, &cancel).unwrap();
             assert_eq!(password.as_deref(), Some("secret"));
             assert!(resolved.standalone && !resolved.needs_password);
             assert!(resolved.relation_has_next.is_none(), "standalone must stop after the main header");
@@ -653,8 +672,9 @@ mod tests {
             });
             // Replacing the source invalidates old rejection/proof generations.
             std::fs::write(&source, [&bytes[..], b"tail"].concat()).unwrap();
+            let changed = NativeArchiveSession::new(path.clone()).unwrap();
             let candidates = CandidateSet::new(wrong.into(), None, &cache, None);
-            assert!(candidates.resolve_relation(&anchor, &Cancellation::new()).unwrap().0.wrong_password);
+            assert!(candidates.resolve_relation(&anchor, &changed, &cancel).unwrap().0.wrong_password);
             assert_eq!(threads.lock().unwrap().len(), 513);
             RAR5_CANDIDATE_THREADS.with(|value| *value.borrow_mut() = None);
             PLANNED_BATCHES.with(|value| *value.borrow_mut() = None);

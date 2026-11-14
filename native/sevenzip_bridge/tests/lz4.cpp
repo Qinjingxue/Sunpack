@@ -319,7 +319,7 @@ int wmain(int argc,wchar_t **argv) {
         auto extracted=sunpack::sevenzip::extract_archive((root/L"frame_7_15.lz4").wstring(),{},{},L"lz4",L"",(root/L"worker_output").wstring(),L"",nullptr,false);
         if (!extracted.command_ok) std::cerr<<"worker: "<<extracted.message<<" kind="<<extracted.failure_kind<<" hr="<<extracted.hresult<<" op="<<extracted.operation_result<<"\n";
         check(extracted.command_ok,"worker extraction");
-        check(extracted.output_trace.items.size()==1&&!extracted.output_trace.items[0].crc_verified,"no fake CRC32");
+        check(extracted.output_trace.items.size()==1&&!extracted.output_trace.items[0].has_source_crc32,"no fake CRC32");
         const auto &output_item=extracted.output_trace.items[0];
         std::ifstream actual(root/L"worker_output"/output_item.output_path,std::ios::binary);
         Bytes extracted_bytes((std::istreambuf_iterator<char>(actual)),std::istreambuf_iterator<char>());

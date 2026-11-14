@@ -469,7 +469,6 @@ void Application::apply_pending() {
             // Frequent task publications must not rematch the retained directory
             // pane or a configuration/password page with unchanged sources.
             if(!task_snapshot.is_null()) find_->Refresh("task");
-            if(patch.contains("rootRows")) find_->Refresh("root");
             if(!password_snapshot.is_null() || !password_delta_patch.is_null()) find_->Refresh("password");
             if(patch.contains("startupEnabled") || patch.contains("themeChoice") || patch.contains("contextMenuEnabled")) find_->Refresh("config");
         }
@@ -1026,16 +1025,22 @@ void Application::work() {
         WatchRoots roots; EventLog log; View view;
         Json errors=Json::object();
         auto dir=options_.data_dir;
-        const auto log_dir=log_directory(dir);
-        auto dir_key=path_key(dir);
-        auto on_data=[this,dir_key](const fs::path& path){
-            auto name=path.filename().wstring(); CharLowerBuffW(name.data(),DWORD(name.size()));
-            if(path.empty() || is_under(dir_key,path_key(path))) {
+        const auto log_dir=dir/".sunpack_watch";
+        const auto dir_key=path_key(dir);
+        const auto log_key=path_key(log_dir);
+        auto on_data=[this,dir_key,config_key=path_key(dir/"sunpack_config.json"),
+            passwords_key=path_key(dir/"builtin_passwords.json"),roots_key=path_key(dir/"sunpack_watch_roots.txt")](const fs::path& path){
+            if(path.empty()) {
                 changed(Config|Passwords|Roots); return;
             }
-            if(name.empty() || name==L"sunpack_config.json") changed(Config);
-            if(name.empty() || name==L"builtin_passwords.json") changed(Passwords);
-            if(name.empty() || name==L"sunpack_watch_roots.txt") changed(Roots);
+            const auto key=path_key(path);
+            // An ancestor notification can make the whole data directory appear.
+            if(is_under(dir_key,key)) {
+                changed(Config|Passwords|Roots); return;
+            }
+            if(key==config_key) changed(Config);
+            else if(key==passwords_key) changed(Passwords);
+            else if(key==roots_key) changed(Roots);
         };
         std::unique_ptr<DirectoryWatcher> data_watcher;
         std::unique_ptr<DirectoryWatcher> log_watcher;
@@ -1231,10 +1236,10 @@ void Application::work() {
             if(!log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
                 log_watcher.reset();
                 try {
-                    log_watcher=std::make_unique<DirectoryWatcher>(log_dir,[this](const fs::path& path){
-                        auto name=path.filename().wstring(); CharLowerBuffW(name.data(),DWORD(name.size()));
-                        std::error_code ec;
-                        if(path.empty() || name==L"events.json" || fs::is_directory(path,ec)) changed(Log);
+                    log_watcher=std::make_unique<DirectoryWatcher>(log_dir,[this,log_key,manifest_key=path_key(log_dir/"events.json")](const fs::path& path){
+                        if(path.empty()) { changed(Log); return; }
+                        const auto key=path_key(path);
+                        if(key==manifest_key || is_under(log_key,key)) changed(Log);
                     }); errors.erase("logObserver");
                 } catch(const std::exception& e) { errors["logObserver"]=e.what(); }
                 log.set_path(log_dir/"events.json"); flags|=Log; tasks_changed=true;

@@ -3,7 +3,8 @@
 use super::{ArchiveResult, CleanupResult, CleanupStatus, FailureKind, InputError,
     InputErrorKind, InputCheckpoint, Outcome, PromotedSource, ScanTaskFailure};
 use std::collections::LinkedList;
-use std::ops::{Index, IndexMut};
+#[cfg(test)]
+use std::ops::Index;
 
 pub(super) trait ResultFacts {
     fn incomplete(&self) -> bool { false }
@@ -48,9 +49,6 @@ impl<T: ResultFacts> Results<T> {
     #[cfg(test)]
     pub fn last(&self) -> Option<&T> { self.iter().last() }
     pub fn iter(&self) -> impl Iterator<Item = &T> { self.blocks.iter().flatten().chain(&self.tail) }
-    // Mutations here relocate paths/receipts, not outcome classification. The
-    // cancellation rollback is the exception and explicitly refreshes facts.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> { self.blocks.iter_mut().flatten().chain(&mut self.tail) }
     pub fn refresh(&mut self) {
         let (incomplete, cancelled) = self.iter().fold((0, 0), |(incomplete, cancelled), item| {
             (incomplete + usize::from(item.incomplete()), cancelled + usize::from(item.cancelled()))
@@ -115,12 +113,10 @@ impl<T: ResultFacts> Extend<T> for Results<T> {
         self.append(&mut Self::from(block));
     }
 }
+#[cfg(test)]
 impl<T: ResultFacts> Index<usize> for Results<T> {
     type Output = T;
     fn index(&self, index: usize) -> &T { self.iter().nth(index).expect("result index") }
-}
-impl<T: ResultFacts> IndexMut<usize> for Results<T> {
-    fn index_mut(&mut self, index: usize) -> &mut T { self.iter_mut().nth(index).expect("result index") }
 }
 impl<'a, T> IntoIterator for &'a Results<T> {
     type Item = &'a T;
@@ -128,6 +124,7 @@ impl<'a, T> IntoIterator for &'a Results<T> {
     fn into_iter(self) -> Self::IntoIter { self.blocks.iter().flatten().chain(&self.tail) }
 }
 impl<'a, T> IntoIterator for &'a mut Results<T> {
+    // Path relocation preserves classification. Rollback refreshes the facts.
     type Item = &'a mut T;
     type IntoIter = std::iter::Chain<std::iter::Flatten<std::collections::linked_list::IterMut<'a, Vec<T>>>, std::slice::IterMut<'a, T>>;
     fn into_iter(self) -> Self::IntoIter { self.blocks.iter_mut().flatten().chain(&mut self.tail) }
