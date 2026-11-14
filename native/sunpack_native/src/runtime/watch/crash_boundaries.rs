@@ -159,9 +159,17 @@ fn hard_death_recovers_partially_promoted_family_without_duplicate_admission() {
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+                external: Arc::new(Mutex::new(None)), _lease: None,
             };
             scheduler.recover_pending(None).unwrap();
+            if phase == "promoted-only" {
+                let destination = watched.join(names[0]);
+                assert_eq!(scheduler.pending.len(), 2);
+                assert!(scheduler.pending.contains_key(&key(&owner)));
+                assert!(scheduler.pending.contains_key(&key(&destination)));
+                assert_eq!(scheduler.journal.state().pending_items().len(), 2);
+                return;
+            }
             let expected = names.iter().enumerate().map(|(index, name)| {
                 if index < moved { watched.join(name) } else { output.join(name) }
             }).collect::<Vec<_>>();
@@ -204,13 +212,16 @@ fn hard_death_recovers_partially_promoted_family_without_duplicate_admission() {
             [(PendingObservation(owner_text.into(), 7, 1.0, String::new(), 0),
                 watched.to_string_lossy().into_owned(), None)], false, "", false, true, None,
         )?.0)).unwrap();
-        journal.commit(true, |state| Ok(state.output_operation(owner_text, owner_text.into(),
-            output.to_string_lossy().into_owned(), None, None)?.unwrap())).unwrap();
-        journal.commit(true, |state| Ok(state.output_operation(owner_text, owner_text.into(),
-            output.to_string_lossy().into_owned(), Some(true), None)?.unwrap())).unwrap();
+        if phase != "promoted-only" {
+            journal.commit(true, |state| Ok(state.output_operation(owner_text, owner_text.into(),
+                output.to_string_lossy().into_owned(), None, None)?.unwrap())).unwrap();
+            journal.commit(true, |state| Ok(state.output_operation(owner_text, owner_text.into(),
+                output.to_string_lossy().into_owned(), Some(true), None)?.unwrap())).unwrap();
+        }
         journal.commit(true, |state| Ok(state.promotion_operation(owner_text,
             destinations.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
             sources.iter().map(|path| path.to_string_lossy().into_owned()).collect()).unwrap())).unwrap();
+        let moved = if phase == "promoted-only" { 1 } else { moved };
         for (source, destination) in sources.iter().zip(&destinations).take(moved) {
             crate::io::atomic_file::rename_no_replace(source, destination).unwrap();
         }
@@ -231,7 +242,7 @@ fn hard_death_recovers_partially_promoted_family_without_duplicate_admission() {
         io::stdin().read_exact(&mut byte).unwrap();
         panic!("parent must kill promotion owner without unwinding");
     }
-    for phase in ["prepared", "partial", "moved", "receipts"] {
+    for phase in ["prepared", "partial", "moved", "receipts", "promoted-only"] {
         let marker = crate::test_support::temp_file("promotion_hard_death", b"");
         let base = marker.with_extension("case");
         fs::create_dir(&base).unwrap();
@@ -311,7 +322,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+                external: Arc::new(Mutex::new(None)), _lease: None,
             };
 
         let mut interrupted = NativeWatchOperations::empty();
@@ -350,10 +361,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
             let old = super::tests::completion_archive(head.to_str().unwrap(), 1, Some(kind));
             fs::write(&tail, b"new complete tail").unwrap();
             fs::create_dir(&output).unwrap();
-            let mut success = super::tests::completion_archive(head.to_str().unwrap(), 1, None);
-            success.source_paths.push(tail.clone());
-            success.output = Some(output.clone());
-            let generations = [&head, &tail].into_iter().map(|path|
+            let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
                 (key(path), capture_file_generation(path).unwrap())).collect();
             let observer = WatchObserver {
                 deep: false, journal: Arc::clone(&scheduler.journal),
@@ -362,13 +370,8 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 batch: Arc::from("new-success"), toast: None, hub: Arc::clone(&scheduler.hub),
                 groups: Arc::default(), claimed: Arc::default(), promoted: Mutex::default(),
             };
-            // A single-source success must not acquire a completed-family fact.
-            let single = super::tests::completion_archive(head.to_str().unwrap(), 1, None);
-            observer.sources_processed(&[single], &generations, Some(&output)).unwrap();
-            let subset = HashMap::from([(key(&head), generations[&key(&head)].clone())]);
-            assert_eq!(observer.completed_sources(&subset).unwrap(), None);
             // Main remembers complete source output even if a child failed.
-            observer.sources_processed(&[success], &generations, Some(&output)).unwrap();
+            observer.sources_processed(generations.clone(), Some(&output)).unwrap();
             assert_eq!(observer.completed_sources(&generations).unwrap(), Some(output.clone()));
             let mut outcome = Outcome::default();
             outcome.archives.push(old);

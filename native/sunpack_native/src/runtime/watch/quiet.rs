@@ -12,6 +12,13 @@ pub(super) struct Activities(std::sync::Mutex<std::collections::HashMap<String, 
 #[derive(Clone)]
 pub(super) struct Activity(std::sync::Arc<ActivityInner>);
 
+pub(super) struct Observation {
+    pub(super) candidate: WatchCandidateRow,
+    pub(super) now: Instant,
+    pub(super) at: f64,
+    pub(super) since_usn: Option<i64>,
+}
+
 struct ActivityInner {
     state: std::sync::Mutex<ActivityState>,
     registration: std::sync::OnceLock<(String, std::sync::Weak<Activities>)>,
@@ -74,18 +81,18 @@ impl Activity {
     // Probe and timestamp on the collection thread, before WAL/catalog work.
     // Serializing this small per-path operation also prevents an older probe
     // from replacing a newer sample collected by the scheduler.
-    pub(super) fn capture(&self, path: &std::path::Path, claims: &std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<str>>>, key: &str) -> std::io::Result<bool> {
+    pub(super) fn capture(&self, path: &std::path::Path, claims: &std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<str>>>, key: &str) -> std::io::Result<Option<Observation>> {
         let mut state = self.0.state.lock().unwrap();
-        let baseline = state.baseline.as_ref().map(|value| value.3);
-        if let Some(candidate) = crate::postprocess::watch_candidate_for_path(path, baseline)? {
+        let since_usn = state.baseline.as_ref().map(|value| value.3);
+        if let Some(candidate) = crate::postprocess::watch_candidate_for_path(path, since_usn)? {
             let now = Instant::now();
             let at = super::windows::monotonic_seconds();
             let claims = claims.lock().unwrap();
-            if claims.contains_key(key) { return Ok(false); }
+            if claims.contains_key(key) { return Ok(None); }
             state.record(&candidate, now, at, false, None);
-            return Ok(true);
+            return Ok(Some(Observation { candidate, now, at, since_usn }));
         }
-        Ok(false)
+        Ok(None)
     }
 
     pub(super) fn probe(&self, path: &std::path::Path, baseline: Option<i64>)
@@ -347,6 +354,12 @@ pub(super) fn changed(previous: &WatchCandidateRow, current: &WatchCandidateRow)
         previous.observation.change_usn,
         current,
     )
+}
+
+pub(super) fn observation_changed(previous: &WatchCandidateRow, current: &WatchCandidateRow) -> bool {
+    previous.size != current.size || previous.mtime != current.mtime
+        || previous.observation.file_id != current.observation.file_id
+        || previous.observation.change_usn != current.observation.change_usn
 }
 
 pub(super) fn duration(seconds: f64) -> std::time::Duration {

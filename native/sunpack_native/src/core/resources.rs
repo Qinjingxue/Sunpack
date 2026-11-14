@@ -10,7 +10,7 @@ pub fn program_data_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "PROGRAMDATA is not defined"))
 }
 
-pub(crate) fn package_root() -> Option<PathBuf> {
+pub(crate) fn package_root() -> Option<&'static Path> {
     static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
         let exe = env::current_exe().ok()?;
@@ -19,31 +19,33 @@ pub(crate) fn package_root() -> Option<PathBuf> {
             && dir.join("sunpack-runtime.exe").is_file())
         .then(|| dir.to_path_buf())
     })
-    .clone()
+    .as_deref()
 }
 
 fn development_root(cwd: &Path) -> Option<PathBuf> {
-    development_root_for(env::current_exe().ok().as_deref(), cwd)
+    static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| env::current_exe().ok().as_deref().and_then(checkout_root))
+        .clone()
+        .or_else(|| checkout_root(cwd))
 }
 
-fn development_root_for(exe: Option<&Path>, cwd: &Path) -> Option<PathBuf> {
-    let checkout = |root: &Path| root.join("native/Cargo.toml").is_file();
+fn checkout_root(path: &Path) -> Option<PathBuf> {
     // Match main's module-root-first policy: the invoking directory may itself
     // be a different checkout, but must not replace the running application's root.
-    exe.and_then(|exe| exe.ancestors().find(|root| checkout(root)))
-        .or_else(|| cwd.ancestors().find(|root| checkout(root)))
+    path.ancestors()
+        .find(|root| root.join("native/Cargo.toml").is_file())
         .map(Path::to_path_buf)
 }
 
 /// Resolve the native CLI entry point without mistaking a source build for a package.
 pub(crate) fn launcher_path(cwd: &Path) -> io::Result<PathBuf> {
     let exe = env::current_exe()?;
-    let root = package_root().or_else(|| development_root(cwd))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SunPack application root was not found"))?;
-    let path = if package_root().is_some() {
+    let path = if let Some(root) = package_root() {
         let installed = root.join("bin/sunpack.exe");
         if installed.is_file() { installed } else { root.join("sunpack.exe") }
     } else {
+        let root = development_root(cwd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SunPack application root was not found"))?;
         development_launcher(&root, &exe)?
     };
     if !path.is_file() {
@@ -67,7 +69,7 @@ fn development_launcher(root: &Path, exe: &Path) -> io::Result<PathBuf> {
 
 pub(crate) fn resource_roots(cwd: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::with_capacity(2);
-    if let Some(root) = package_root().or_else(|| development_root(cwd)) {
+    if let Some(root) = package_root().map(Path::to_path_buf).or_else(|| development_root(cwd)) {
         roots.push(root);
     }
     if roots.first().is_none_or(|root| root != cwd) {
@@ -189,17 +191,13 @@ mod entrypoint_tests {
     use super::*;
 
     #[test]
-    fn running_checkout_precedes_another_checkout_used_as_cwd() {
+    fn source_layout_finds_its_own_checkout_from_the_runtime_executable() {
         let temp = env::temp_dir().join(format!("sunpack-resource-roots-{}", std::process::id()));
         let application = temp.join("application");
-        let caller = temp.join("caller");
-        for root in [&application, &caller] {
-            std::fs::create_dir_all(root.join("native")).unwrap();
-            std::fs::write(root.join("native/Cargo.toml"), "[workspace]").unwrap();
-        }
+        std::fs::create_dir_all(application.join("native")).unwrap();
+        std::fs::write(application.join("native/Cargo.toml"), "[workspace]").unwrap();
         let exe = application.join(".cache/rust-target/x64/target/ci/sunpack-runtime.exe");
-        assert_eq!(development_root_for(Some(&exe), &caller), Some(application));
-        assert_eq!(development_root_for(None, &caller), Some(caller));
+        assert_eq!(checkout_root(&exe), Some(application));
         std::fs::remove_dir_all(temp).unwrap();
     }
 

@@ -35,7 +35,7 @@ const ZIP_LOCAL_RECOVERY_ERRORS: &[&str] = &[
     "archive_offset_underflow",
     "central_directory_size_out_of_range",
 ];
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ModuleKind {
     Zip,
     Rar,
@@ -71,30 +71,20 @@ impl ModuleKind {
     }
 }
 
-#[derive(Clone)]
-struct ModuleConfig {
-    name: String,
-    kind: ModuleKind,
-}
-
 /// Parsed analysis configuration, built once per engine and shared by calls.
 pub(crate) struct NativeAnalysisConfig {
-    modules: Vec<ModuleConfig>,
+    modules: Vec<ModuleKind>,
 }
 
 impl NativeAnalysisConfig {
     pub(crate) fn new<T: AsRef<str>>(modules: impl IntoIterator<Item = (T, bool)>) -> Self {
-        let mut ordered: Vec<ModuleConfig> = Vec::new();
+        let mut ordered = Vec::new();
         for (name, enabled) in modules {
-            let name = name.as_ref().trim();
-            let Some(kind) = enabled.then(|| ModuleKind::from_name(name)).flatten() else {
+            let Some(kind) = enabled.then(|| ModuleKind::from_name(name.as_ref().trim())).flatten() else {
                 continue;
             };
-            if !ordered.iter().any(|module| module.name == name) {
-                ordered.push(ModuleConfig {
-                    name: name.to_owned(),
-                    kind,
-                });
+            if !ordered.contains(&kind) {
+                ordered.push(kind);
             }
         }
         Self { modules: ordered }
@@ -116,7 +106,7 @@ impl Default for NativeAnalysisConfig {
                 "lz4",
             ]
             .into_iter()
-            .map(|name| (name.to_owned(), true)),
+            .map(|name| (name, true)),
         )
     }
 }
@@ -169,16 +159,16 @@ impl EvidenceDetails {
 
 }
 
-pub(crate) struct Evidence {
-    pub(crate) format: String,
-    pub(crate) status: &'static str,
+struct Evidence {
+    format: &'static str,
+    status: &'static str,
     segments: Vec<Segment>,
     details: EvidenceDetails,
 }
 
 impl Evidence {
     fn new(
-        format: &str,
+        format: &'static str,
         status: &'static str,
         mut segments: Vec<Segment>,
         details: impl Into<EvidenceDetails>,
@@ -187,7 +177,7 @@ impl Evidence {
             segment.extractable |= status == "extractable";
         }
         Self {
-            format: format.to_string(),
+            format,
             status,
             segments,
             details: details.into(),
@@ -209,7 +199,7 @@ impl Evidence {
             .unwrap_or((u64::MAX, std::cmp::Reverse(0)))
     }
 
-    fn not_found(format: &str) -> Self {
+    fn not_found(format: &'static str) -> Self {
         Self::new(format, "not_found", Vec::new(), EvidenceDetails::Empty)
     }
 }
@@ -279,12 +269,12 @@ impl AnalysisBinaryView {
             signatures: LeadingSignatures::read(&self.reader).map_err(reader_error)?,
             stream_structure: None,
         };
-        let mut evidences = Vec::new();
-        for module in &config.modules {
+        let mut evidences = Vec::with_capacity(config.modules.len());
+        for &module in &config.modules {
             cancellation.check()?;
             evidences.push(match context.run_module(module) {
                 Ok(evidence) => evidence,
-                Err(_) => Evidence::new(module.kind.format(), "error", Vec::new(), EvidenceDetails::Empty),
+                Err(_) => Evidence::new(module.format(), "error", Vec::new(), EvidenceDetails::Empty),
             });
         }
         cancellation.check()?;
@@ -308,7 +298,7 @@ impl AnalysisBinaryView {
             let segment = &evidence.segments[index];
             AnalysisSegment {
                 status: AnalysisStatus::from_evidence(evidence.status),
-                format_hint: evidence.format.clone(),
+                format_hint: evidence.format.to_owned(),
                 start: segment.start,
                 end: segment.end,
                 zip_eocd_offset: segment.zip_eocd_offset,
@@ -334,7 +324,7 @@ impl AnalysisBinaryView {
             facts.missing_volume_evidence = Some(plan.missing_volume_evidence.to_owned());
         }
         Ok(AnalysisReport {
-            format_hint: primary.map_or_else(String::new, |e| e.format.clone()),
+            format_hint: primary.map_or_else(String::new, |e| e.format.to_owned()),
             facts,
             extractable_segments,
             password_segment,
@@ -343,8 +333,8 @@ impl AnalysisBinaryView {
 }
 
 impl<'a> ReportContext<'a> {
-    fn run_module(&mut self, module: &ModuleConfig) -> std::io::Result<Evidence> {
-        match module.kind {
+    fn run_module(&mut self, module: ModuleKind) -> std::io::Result<Evidence> {
+        match module {
             ModuleKind::Zip => self.zip_module(),
             ModuleKind::Rar => self.rar_module(),
             ModuleKind::SevenZip => self.seven_zip_module(),
@@ -501,18 +491,15 @@ impl<'a> ReportContext<'a> {
             return Ok(structure.clone());
         }
         let reader = &self.view.reader;
-        let header = (reader.read_cached_at(0, 32)).ok();
-        let structure =
-            if let Some(header) = header.filter(|head| has_compression_stream_header(head)) {
-                Some(match reader.file_identity().ok() {
-                    Some(identity) => stream_structure_cached(identity, reader, &header)?,
-                    None => Arc::new(inspect_compression_stream_reader(reader, &header)?),
-                })
-            } else {
-                // No compression family can match; the requested-format mismatch
-                // projection never reads the structure result.
-                None
-            };
+        let header = self.signatures.head.as_slice();
+        let structure = if has_compression_stream_header(header) {
+            Some(match reader.file_identity().ok() {
+                Some(identity) => stream_structure_cached(identity, reader, header)?,
+                None => Arc::new(inspect_compression_stream_reader(reader, header)?),
+            })
+        } else {
+            None
+        };
         self.stream_structure = Some(structure.clone());
         Ok(structure)
     }
@@ -590,13 +577,8 @@ fn rar_from_native(mut raw: RarObservation, start: u64) -> Evidence {
     };
     let mut segment_flags = damage_flags;
     append_native_field_flag(&mut segment_flags, raw.read_fault.as_ref());
-    if !error.is_empty() {
-        segment_flags.push(error.into());
-    }
-    if !taxonomy.is_empty() {
-        segment_flags.push(taxonomy.into());
-    }
     if taxonomy == "valid_encrypted_but_unwalkable" {
+        segment_flags.push(taxonomy.into());
         raw.password_required = Some(true);
     }
     Evidence::new(
@@ -612,9 +594,6 @@ fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> Evidence {
     if let Some((fault, legacy)) = &raw.read_fault {
         raw.error = legacy;
         damage_flags.extend(native_read_fault_flags(fault));
-    }
-    if raw.read_fault.is_none() && !raw.error.is_empty() {
-        damage_flags.push(raw.error.into());
     }
     append_native_field_flag(&mut damage_flags, raw.read_fault.as_ref());
     if !raw.error.is_empty() {
@@ -750,9 +729,6 @@ impl SegmentPlan {
         // analyzed logical bytes proves a missing later volume.
         let mut missing_volume_evidence = "";
         for evidence in evidences {
-            if !evidence.format.eq_ignore_ascii_case("7z") {
-                continue;
-            }
             let expected_end = match &evidence.details {
                 EvidenceDetails::SevenZip(details) if details.start_header_crc_ok => {
                     let raw = details;
@@ -958,7 +934,7 @@ mod report_tests {
     use super::*;
 
     fn evidence(
-        format: &str,
+        format: &'static str,
         status: &'static str,
         segments: &[(u64, Option<u64>)],
         password_required: bool,
@@ -975,12 +951,12 @@ mod report_tests {
         )
     }
 
-    fn planned(evidences: &[Evidence], plan: &SegmentPlan) -> Vec<(String, u64)> {
+    fn planned(evidences: &[Evidence], plan: &SegmentPlan) -> Vec<(&'static str, u64)> {
         plan.extractable
             .iter()
             .map(|(evidence, segment)| {
                 (
-                    evidences[*evidence].format.clone(),
+                    evidences[*evidence].format,
                     evidences[*evidence].segments[*segment].start,
                 )
             })
@@ -1019,7 +995,7 @@ mod report_tests {
         let plan = SegmentPlan::build(&evidences, &[0, 1, 2], 100);
         assert_eq!(
             planned(&evidences, &plan),
-            vec![("7z".into(), 0), ("rar".into(), 40)]
+            vec![("7z", 0), ("rar", 40)]
         );
     }
 

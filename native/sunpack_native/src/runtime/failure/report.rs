@@ -315,22 +315,24 @@ pub(in crate::runtime) fn archive_groups<'a>(archives: impl IntoIterator<Item = 
 }
 
 pub(in crate::runtime) fn archive_report<'a>(entries: &[&'a ArchiveResult], language: Language) -> Option<Report<'a>> {
-    archive_projection(entries, language, false)
+    archive_projection(entries, language, has_recovery_warning(entries))
 }
 
 pub(in crate::runtime) fn recovery_warning<'a>(entries: &[&'a ArchiveResult], language: Language) -> Option<Report<'a>> {
+    if !has_recovery_warning(entries) { return None; }
     archive_projection(entries, language, true)
 }
 
-fn archive_projection<'a>(entries: &[&'a ArchiveResult], language: Language, warning_only: bool) -> Option<Report<'a>> {
+pub(in crate::runtime) fn has_recovery_warning(entries: &[&ArchiveResult]) -> bool {
+    let failures = || entries.iter().filter_map(|entry| entry.failure.as_ref());
+    !failures().any(|failure| failure.contains(FailureKind::MissingVolume)
+        || matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })))
+        && failures().any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume))
+}
+
+fn archive_projection<'a>(entries: &[&'a ArchiveResult], language: Language, warning: bool) -> Option<Report<'a>> {
     let postprocess = entries.iter().filter_map(|entry| entry.failure.as_ref())
         .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })));
-    let warning = postprocess.is_none()
-        && !entries.iter().filter_map(|entry| entry.failure.as_ref())
-            .any(|failure| failure.contains(FailureKind::MissingVolume))
-        && entries.iter().filter_map(|entry| entry.failure.as_ref())
-            .any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume));
-    if warning_only && !warning { return None; }
     let mut causes: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
         .map(|failure| Report::from_failure(failure, language)).collect();
     if causes.is_empty() { return None; }

@@ -412,7 +412,7 @@ type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
 type WatchGenerations = BTreeMap<String, PhysicalFileGeneration>;
 
 enum TaskAdmission {
-    Execute,
+    Execute(Option<SourceGenerations>),
     Departed,
     Completed(PathBuf),
 }
@@ -1594,8 +1594,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 |path| requested.as_ref().and_then(|members| members.get(path))
                     .or_else(|| captured.as_ref().and_then(|members| members.get(path))))?;
             drop((requested, captured));
-            match admission {
-                TaskAdmission::Execute => {},
+            let mut completed_family = match admission {
+                TaskAdmission::Execute(family) => family,
                 TaskAdmission::Departed => {
                     this.observer.notify(Event::Skipped { id: task_id });
                     return Ok(outcome);
@@ -1604,7 +1604,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     this.reuse_completed_task(&task, task_id, depth, output, &mut outcome);
                     return Ok(outcome);
                 }
-            }
+            };
             this.observer.notify(Event::Started {
                 id: task_id,
                 path: PathBuf::from(&task.entry().entry_path),
@@ -1688,7 +1688,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         cancel,
                     ).await?;
                     this.promote_blocked(&task.owned_paths, &destination,
-                        &mut completed, &mut outcome, &mut shell).await?;
+                        completed.iter_mut(), &mut outcome, &mut shell).await?;
                 }
                 outcome.promoted_sources.extend(task.owned_paths.iter().filter_map(|path|
                     this.admitted_promotion(path, &generations, watch_root)));
@@ -1715,21 +1715,23 @@ impl<'run, O: Observer> Run<'run, O> {
                 return Ok(outcome);
             }
             let candidates = this.candidates.with_scope(source_scope);
-            let preferred_carrier = this.preferred_output(task.entry(), depth);
+            let multi = task.inputs.len() > 1;
+            let preferred_carrier = (this.request.mode == Mode::Extract && (multi || !this.checkpoints.is_empty()))
+                .then(|| this.preferred_output(task.entry(), depth));
             let report_previous = this.select_checkpoints(&owner_path, &task.inputs);
             let mut retained: Vec<_> = task
                 .inputs
                 .iter().zip(&report_previous)
                 .map(|(logical, previous)| {
-                    if logical.failure.as_ref().is_some_and(|failure|
+                    if this.request.mode != Mode::Extract || logical.failure.as_ref().is_some_and(|failure|
                         matches!(failure.context.as_deref(), Some(super::FailureContext::InputAdmission { .. })))
                     { None } else {
-                        this.checkpoint_for(&logical.input, *previous, &generations, &preferred_carrier, depth, &candidates)
+                        previous.and_then(|previous| this.checkpoint_for(&logical.input, Some(previous), &generations,
+                            preferred_carrier.as_deref().expect("extract recovery has a preferred output"), depth, &candidates))
                     }
                 })
                 .collect();
             let mut split_input = task.entry().mode.structured() || task.entry().physical_paths().nth(1).is_some();
-            let multi = task.inputs.len() > 1;
             let count = task.inputs.len();
             let mut had_checkpoints = report_previous.iter().any(Option::is_some);
             let continued_output = retained.iter().flatten().any(|checkpoint| checkpoint.continuable_output());
@@ -1749,7 +1751,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     None if task.inputs.iter().zip(&retained)
                         .any(|(input, checkpoint)| checkpoint.is_none() && input.failure.is_none()) => {
                         let receipt = receipt(task.entry(), task.source, depth);
-                        match this.reserve_output(preferred_carrier, &receipt, None)? {
+                        match this.reserve_output(preferred_carrier.expect("carrier has a preferred output"), &receipt, None)? {
                             Ok(path) => {
                                 shell.output(&path);
                                 Some(path)
@@ -1801,10 +1803,6 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 }
             }
-            let mut completed = Vec::with_capacity(task.inputs.len());
-            let mut outputs_committed = true;
-            let mut carrier_children_complete = true;
-            let mut children = Outcome::default();
             let mut parent_outputs = Vec::with_capacity(count);
             let report_enabled = this.request.mode == Mode::Extract && task.owned_paths.iter()
                 .all(|path| generations.contains_key(&path_key(path)));
@@ -1901,6 +1899,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     stage("missing_volume", cancel).await?;
                     if let Some(mut replacement) = discovery::retry_volume(
                         &executed.result,
+                        &missing,
                         context,
                         this.options_at(depth)?,
                         &candidates,
@@ -1942,8 +1941,8 @@ impl<'run, O: Observer> Run<'run, O> {
                             let admission = this.task_admission(&replacement, &generations, &missing, discovered, watch_root,
                                 |path| requested.as_ref().and_then(|members| members.get(path)))?;
                             drop(requested);
-                            match admission {
-                                TaskAdmission::Execute => {},
+                            completed_family = match admission {
+                                TaskAdmission::Execute(family) => family,
                                 TaskAdmission::Departed => {
                                     this.observer.notify(Event::Skipped { id: task_id });
                                     return Ok(outcome);
@@ -1952,7 +1951,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                     this.reuse_completed_task(&replacement, task_id, depth, output, &mut outcome);
                                     return Ok(outcome);
                                 }
-                            }
+                            };
                             this.admit_missing_inputs(&mut replacement, &missing, discovered);
                             this.observer.claim_sources(
                                 Path::new(&replacement.entry().entry_path),
@@ -2018,24 +2017,27 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 let replacement_matches = replacement_checkpoint.as_ref()
                     .is_some_and(|previous| previous.same_report_input(&input));
-                let report_previous = if replacement_checkpoint.is_some() {
+                let state_previous = if replacement_checkpoint.is_some() {
                     replacement_checkpoint.as_ref().filter(|_| replacement_matches)
                 } else { report_previous[index].or(checkpoint).or(retry_slot) };
-                report_states.push(if report_enabled {
-                    // Capture before content cleanup and recursion, using the
-                    // exact input and counters returned by this execution.
-                    InputCheckpoint::report_state(&input, &result,
+                let keeps_replaced = replacement_checkpoint.is_some() && !replacement_matches;
+                if report_enabled && (multi || result.failure.is_some() || keeps_replaced) {
+                    // An ordinary successful input cannot be retried from its
+                    // own receipt. Nested blockers keep their own checkpoints.
+                    let mut state = InputCheckpoint::report_state(&input, &result,
                         planned_output.as_deref().or(planned_slots[index].as_deref()),
-                        report_previous, index + 1, report_count)
-                } else { None });
-                if let Some(previous) = replacement_checkpoint.filter(|_| !replacement_matches) {
-                    // adopt_detection_plan does not erase old checkpoints. A
-                    // different logical ID leaves that failed sibling in the
-                    // carrier result even if the replacement itself succeeds.
-                    replacement_retained = Some(previous);
+                        state_previous, index + 1, report_count);
+                    if result.retained && result.output.is_none() && checkpoint.is_some_and(|checkpoint| checkpoint.has_output()) {
+                        InputCheckpoint::clear_report_output(&mut state);
+                    }
+                    report_states.push(state);
+                } else {
+                    report_states.push(None);
                 }
-                if result.retained && result.output.is_none() && checkpoint.is_some_and(|checkpoint| checkpoint.has_output()) {
-                    InputCheckpoint::clear_report_output(&mut report_states[index]);
+                if keeps_replaced {
+                    // A different logical ID leaves the failed first attempt
+                    // in the carrier result even when its replacement succeeds.
+                    replacement_retained = replacement_checkpoint;
                 }
                 // Segment progress ends with its own extraction, as main's
                 // input_finished does. Physical root completion still waits
@@ -2062,12 +2064,11 @@ impl<'run, O: Observer> Run<'run, O> {
             // Settle physical ownership before any successful sibling descends.
             // Promoted retryable sources remain failures, but no longer block
             // flattening the independent retained output subtree.
-            let (mut settled, parents): (Vec<_>, Vec<_>) = parent_outputs.into_iter()
-                .map(|(result, inventory, input, id)| (result, (inventory, input, id))).unzip();
-            let mut parent_checkpoints: Vec<_> = settled.iter().zip(&parents).enumerate()
-                .map(|(index, (result, (_, input, _)))| {
-                    let mut checkpoint = (this.request.mode == Mode::Extract).then(||
-                        InputCheckpoint::create(&owner_path, Arc::clone(input), result, &generations, carrier.as_deref())).flatten();
+            let mut parent_checkpoints: Vec<_> = parent_outputs.iter().enumerate()
+                .map(|(index, (result, _, input, _))| {
+                    let mut checkpoint = (this.request.mode == Mode::Extract
+                        && (multi || result.failure.is_some() || replacement_retained.is_some())).then(||
+                            InputCheckpoint::create(&owner_path, Arc::clone(input), result, &generations, carrier.as_deref())).flatten();
                     if let Some(checkpoint) = &mut checkpoint {
                         checkpoint.install_report(report_states[index].take());
                         checkpoint.set_planned_output(planned_slots[index].as_deref());
@@ -2075,19 +2076,20 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     checkpoint
                 }).collect();
-            if let Some(index) = replacement_retained {
+            let mut replacement_result = replacement_retained.map(|index| {
                 let mut retained = outcome.checkpoints[index].result(depth);
                 // These are two logical input IDs of the same replanned carrier,
                 // not two independent top-level paths in the result tree.
-                if let Some(current) = settled.first() { retained.path = current.path.clone(); }
+                if let Some((current, ..)) = parent_outputs.first() { retained.path = current.path.clone(); }
                 retained.partial = retained.failure.as_ref().is_some_and(|failure|
                     accepts_partial_content(this.request.config.extraction.content_requirement,
                         failure.kind, retained.recovered_complete_files));
-                settled.push(retained);
-            }
+                retained
+            });
+            let settled = || parent_outputs.iter().map(|(result, ..)| result)
+                .chain(replacement_result.iter());
             if !superseded_candidates.is_empty() {
-                let retained: HashSet<_> = settled
-                    .iter()
+                let retained: HashSet<_> = settled()
                     .flat_map(|result| {
                         result
                             .source_paths
@@ -2106,8 +2108,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 // Accepted partial segments do not make a carrier successful
                 // when a sibling failed. Only an entirely accepted carrier
                 // stays in place; promotion retains its sibling outputs.
-                && settled.iter().any(|result| result.failure.is_some() && !result.partial)
-                && settled.iter().any(|result| {
+                && settled().any(|result| result.failure.is_some() && !result.partial)
+                && settled().any(|result| {
                     result.failure.as_ref().is_some_and(|failure| {
                         failure.is_password_retry() || failure.contains(FailureKind::MissingVolume)
                     })
@@ -2124,7 +2126,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 let promoted_paths = this.promote_blocked(
                     &promotion_sources,
                     &destination,
-                    &mut settled,
+                    parent_outputs.iter_mut().map(|(result, ..)| result)
+                        .chain(replacement_result.iter_mut()),
                     &mut outcome,
                     &mut shell,
                 )
@@ -2133,10 +2136,10 @@ impl<'run, O: Observer> Run<'run, O> {
                     for checkpoint in parent_checkpoints.iter_mut().flatten() { checkpoint.promoted(&paths)?; }
                 }
             }
-            let promoted = settled.iter().all(|result| result.promoted);
-            let replacement_result = replacement_retained.and_then(|_| settled.pop());
-            let parent_outputs = settled.into_iter().zip(parents)
-                .map(|(result, (inventory, _input, id))| (result, inventory, id));
+            let promoted = parent_outputs.iter().map(|(result, ..)| result)
+                .chain(replacement_result.iter()).all(|result| result.promoted);
+            let parent_outputs = parent_outputs.into_iter()
+                .map(|(result, inventory, _input, id)| (result, inventory, id));
             // Finish every logical parent before prompting or descending into
             // any segment. Independent output trees share the existing request
             // consumer budget rather than serializing behind the first subtree.
@@ -2194,11 +2197,13 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             // Cancellation may leave recursive outputs undispatched. Their
             // existing carrier receipts must stay owned for request rollback.
-            outputs_committed &= descendants.len() == parent_output_count;
-            carrier_children_complete &= descendants.len() == parent_output_count;
             // Join every writer before committing or cleaning up, then restore
             // logical segment order, including segments with no recursive work.
             descendants.sort_unstable_by_key(|(index, _)| *index);
+            let mut completed = Vec::with_capacity(count);
+            let mut outputs_committed = descendants.len() == parent_output_count;
+            let mut carrier_children_complete = outputs_committed;
+            let mut children = Outcome::default();
             for (index, descendant) in descendants {
                 let (mut result, mut descendants, ran_recursive_children) = descendant?;
                 stage("output_state", &Cancellation::new()).await?;
@@ -2380,9 +2385,9 @@ impl<'run, O: Observer> Run<'run, O> {
                 .collect();
             let mut root_cleanup = None;
             if sources_complete && this.request.mode == Mode::Extract {
-                if watch_root {
+                if let Some(family) = completed_family {
                     stage("output_state", &Cancellation::new()).await?;
-                    this.observer.sources_processed(&completed, &generations,
+                    this.observer.sources_processed(family,
                         carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
                 }
                 let cleanup_paths = sources.release(true);
@@ -2531,14 +2536,15 @@ impl<'run, O: Observer> Run<'run, O> {
         }
     }
 
-    async fn promote_blocked(
+    async fn promote_blocked<'output>(
         &self,
         sources: &[String],
         destination: &Path,
-        results: &mut [ArchiveResult],
+        results: impl Iterator<Item = &'output mut ArchiveResult> + Send,
         outcome: &mut Outcome,
         shell: &mut ShellUpdates<'_>,
     ) -> io::Result<Option<PromotionPaths>> {
+        let mut results: Vec<_> = results.collect();
         let representative = results
             .iter()
             .position(|result| result.failure.is_some() && !result.partial)
@@ -2819,6 +2825,12 @@ impl<'run, O: Observer> Run<'run, O> {
                 Err(_) => {}
             }
         }
+        // Standalone SFX launchers can belong to cleanup without being read.
+        // As in main, only members of the execution plan can block admission.
+        if !missing.is_empty() {
+            let members: HashSet<_> = task.input_paths().map(path_key).collect();
+            missing.retain(|path| members.contains(&path_key(&path.to_string_lossy())));
+        }
         (generations, missing)
     }
 
@@ -2839,8 +2851,13 @@ impl<'run, O: Observer> Run<'run, O> {
 
     fn requested_generation(&self, task: &Task, watch_root: bool) -> Option<SourceGenerations> {
         if !watch_root || task.owned_paths.len() < 2 { return None; }
-        let (generations, _) = self.capture_generations(task);
-        (generations.len() == task.owned_paths.len()).then_some(generations)
+        let mut generations = HashMap::new();
+        for path in task.input_paths() {
+            if let std::collections::hash_map::Entry::Vacant(entry) = generations.entry(path_key(path)) {
+                entry.insert(capture_file_generation(Path::new(path)).ok()?);
+            }
+        }
+        (generations.len() > 1).then_some(generations)
     }
 
     fn task_admission<'a>(
@@ -2854,33 +2871,41 @@ impl<'run, O: Observer> Run<'run, O> {
     ) -> io::Result<TaskAdmission> {
         // Check the resolved physical family only after its lease is acquired.
         // Departed discovery proposals are not successful output reuse.
-        if discovered && !missing.is_empty() && missing.len() == task.owned_paths.len() {
-            return Ok(TaskAdmission::Departed);
-        }
-        if watch_root && task.owned_paths.len() > 1 {
-            // main retains the complete pre-wait generation when a prior owner
-            // consumed members, but only while every surviving member is unchanged.
-            let before_wait;
-            let version = if generations.len() == task.owned_paths.len() {
-                Some(generations)
-            } else if generations.iter().all(|(path, current)| requested(path)
-                .is_some_and(|previous| current.matches_input(&previous.persisted())))
-            {
-                // The whole request can share its pre-wait snapshot. The
-                // completed-output cache still addresses one task's family.
-                before_wait = task.owned_paths.iter().filter_map(|path| {
-                    let key = path_key(path);
-                    requested(&key).map(|generation| (key, generation.clone()))
-                }).collect::<SourceGenerations>();
-                (before_wait.len() == task.owned_paths.len()).then_some(&before_wait)
-            } else {
-                None
-            };
-            if let Some(output) = version.map(|version| self.observer.completed_sources(version)).transpose()?.flatten() {
-                return Ok(TaskAdmission::Completed(output));
+        if discovered && !missing.is_empty() {
+            let departed: HashSet<_> = missing.iter().map(|path| path_key(&path.to_string_lossy())).collect();
+            if task.input_paths().all(|path| departed.contains(&path_key(path))) {
+                return Ok(TaskAdmission::Departed);
             }
         }
-        Ok(TaskAdmission::Execute)
+        if watch_root && task.owned_paths.len() > 1 {
+            // Cache the execution candidates before the worker narrows them to
+            // a winning composition. Cleanup-only companions stay outside this key.
+            let members: HashSet<_> = task.input_paths().map(path_key).collect();
+            if members.len() < 2 { return Ok(TaskAdmission::Execute(None)); }
+            // main retains the complete pre-wait generation when a prior owner
+            // consumed members, but only while every surviving member is unchanged.
+            let version = if generations.len() == members.len()
+                && members.iter().all(|path| generations.contains_key(path)) {
+                Some(generations.clone())
+            } else {
+                let complete = members.iter().all(|path| generations.contains_key(path));
+                members.into_iter().map(|path| {
+                    let current = generations.get(&path);
+                    if complete {
+                        Some((path, current.unwrap().clone()))
+                    } else {
+                        let previous = requested(&path)?;
+                        current.is_none_or(|current| current.matches_input(&previous.persisted()))
+                            .then(|| (path, previous.clone()))
+                    }
+                }).collect::<Option<SourceGenerations>>()
+            };
+            if let Some(output) = version.as_ref().map(|version| self.observer.completed_sources(version)).transpose()?.flatten() {
+                return Ok(TaskAdmission::Completed(output));
+            }
+            return Ok(TaskAdmission::Execute(version));
+        }
+        Ok(TaskAdmission::Execute(None))
     }
 
     fn reuse_completed_task(&self, task: &Task, id: TaskId, depth: usize,
@@ -2889,6 +2914,8 @@ impl<'run, O: Observer> Run<'run, O> {
         // not re-extract/recurse, schedule source cleanup, or publish that
         // existing directory as a newly owned output operation.
         let mut result = receipt(task.entry(), task.source, depth);
+        // Watch uses these aliases to settle durable ownership, including
+        // cleanup-only companions that are outside the cache key.
         result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect();
         result.output = Some(output);
         self.observer.notify(Event::Finished { id, path: result.path.clone(), depth,
@@ -5742,6 +5769,7 @@ mod tests {
         impl Observer for Reuse {
             fn notify(&self, event: Event) { self.events.lock().unwrap().push(event); }
             fn completed_sources(&self, generations: &HashMap<String, PhysicalFileGeneration>) -> io::Result<Option<PathBuf>> {
+                if !self.output.is_dir() { return Ok(None); }
                 assert_eq!(generations.len(), 2);
                 self.queries.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(self.output.clone()))
@@ -5758,6 +5786,7 @@ mod tests {
         }
         let head = crate::test_support::temp_file("completed_family_head", b"head");
         let tail = crate::test_support::temp_file("completed_family_tail", b"tail");
+        let launcher = crate::test_support::temp_file("completed_family_launcher", b"standalone executable");
         let output = head.with_extension("existing-output");
         fs::create_dir(&output).unwrap();
         fs::write(output.join("damaged-inner.zip"), b"retained terminal inner failure").unwrap();
@@ -5766,34 +5795,71 @@ mod tests {
         request.origin = Origin::Watch;
         let observer = Reuse { output: output.clone(), events: Mutex::default(), queries: 0.into() };
         let run = test_run(&engine, &request, &observer);
+        let mut input = ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+        input.mode = OpenMode::NativeVolumes;
+        input.parts = [&head, &tail].map(|path| crate::io::archive_state::InputPart::range(
+            crate::io::archive_state::InputExtent { path: path.to_string_lossy().into_owned(), start: 0, end: None },
+        )).into();
         let task = Task {
-            primary: None, owned_paths: vec![head.to_string_lossy().into_owned(), tail.to_string_lossy().into_owned()],
+            primary: None, owned_paths: [&head, &tail, &launcher].map(|path| path.to_string_lossy().into_owned()).into(),
             inputs: vec![LogicalInput { password_probe: None,
-                input: ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
+                input,
                 password: None, failure: None }],
             source: DiscoverySource::Relations, retry: None, scope: None,
         };
         let (generations, missing) = run.capture_generations(&task);
+        assert_eq!(generations.len(), 3, "launcher remains owned for cleanup");
+        assert_eq!(run.requested_generation(&task, true).unwrap().len(), 2);
         // Foreground/nested tasks and incomplete observations do not consume
         // the Watch-only completed family fact.
-        assert!(matches!(run.task_admission(&task, &generations, &[], true, false, |_| None).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&task, &generations, &[], true, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
         let mut partial = generations.clone();
         partial.remove(&path_key(&tail.to_string_lossy()));
-        assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, |_| None).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, |_| None).unwrap(), TaskAdmission::Execute(None)));
         assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true, |_| None).unwrap(), TaskAdmission::Departed));
         let single = Task { primary: None, owned_paths: vec![head.to_string_lossy().into_owned()],
-            inputs: vec![LogicalInput { password_probe: None, input: task.entry().clone(), password: None, failure: None }],
+            inputs: vec![LogicalInput { password_probe: None,
+                input: ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
+                password: None, failure: None }],
             source: DiscoverySource::Relations, retry: None, scope: None };
-        assert!(matches!(run.task_admission(&single, &partial, &[], true, true, |_| None).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&single, &partial, &[], true, true, |_| None).unwrap(), TaskAdmission::Execute(None)));
         assert_eq!(observer.queries.load(Ordering::SeqCst), 0);
         assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, |path| generations.get(path)).unwrap(),
             TaskAdmission::Completed(ref path) if path == &output));
         assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true,
             |path| generations.get(path)).unwrap(), TaskAdmission::Departed));
         let changed = HashMap::from([(path_key(&head.to_string_lossy()), generations[&path_key(&tail.to_string_lossy())].clone())]);
-        assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, true, |path| generations.get(path)).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, true, |path| generations.get(path)).unwrap(), TaskAdmission::Execute(None)));
         assert_eq!(observer.queries.swap(0, Ordering::SeqCst), 1);
         assert!(missing.is_empty());
+        // A successful worker can select only two of three candidate sources.
+        // The cache must store the complete admitted set and omit the unrelated
+        // executable. Do not derive its key from the successful worker output.
+        let alternative = crate::test_support::temp_file("completed_family_alternative", b"candidate");
+        let mut alternative_input = task.entry().clone();
+        alternative_input.volume_attempts = Some(Box::new(crate::io::archive_state::VolumeAttemptPlan {
+            sources: [&head, &tail, &alternative].map(|path| crate::io::archive_state::InputExtent {
+                path: path.to_string_lossy().into_owned(), start: 0, end: None,
+            }).into(),
+            layouts: Box::new([]), domains: Box::new([]), head_size_from_total: None,
+            minimum_size: None, tail_totals: Box::new([]),
+        }));
+        let alternative_task = Task {
+            primary: None,
+            owned_paths: [&head, &tail, &alternative, &launcher].map(|path| path.to_string_lossy().into_owned()).into(),
+            inputs: vec![LogicalInput { password_probe: None, input: alternative_input, password: None, failure: None }],
+            source: DiscoverySource::Relations, retry: None, scope: None,
+        };
+        let uncached = Reuse { output: output.join("absent"), events: Mutex::default(), queries: 0.into() };
+        let uncached = test_run(&engine, &request, &uncached);
+        let (physical, missing) = uncached.capture_generations(&alternative_task);
+        let TaskAdmission::Execute(Some(cache_key)) = uncached.task_admission(
+            &alternative_task, &physical, &missing, true, true, |_| None,
+        ).unwrap() else { panic!("uncached speculative family should execute"); };
+        let candidate_paths = [&head, &tail, &alternative].map(|path| path_key(&path.to_string_lossy()));
+        assert_eq!(cache_key.len(), candidate_paths.len());
+        assert!(candidate_paths.iter().all(|path| cache_key.contains_key(path)));
+        fs::remove_file(alternative).unwrap();
         let outcome = Scheduler::new().run(1, Origin::Watch, &request.cancel, |spawner| {
             run.execute_task(run.register_task(task), 1, 1, None, spawner)
         }).unwrap();
@@ -5802,7 +5868,7 @@ mod tests {
         let reused = &outcome.archives[0];
         assert_eq!(reused.path, head);
         assert_eq!(reused.output.as_ref(), Some(&output));
-        assert_eq!(reused.source_paths, [head.clone(), tail.clone()]);
+        assert_eq!(reused.source_paths, [head.clone(), tail.clone(), launcher.clone()]);
         assert!(reused.failure.is_none() && !reused.partial);
         assert_eq!(reused.files, 0); // No invented member inventory/count.
         assert!(outcome.cleanup_results.is_empty());
@@ -5812,9 +5878,11 @@ mod tests {
         assert!(matches!(observer.events.lock().unwrap().as_slice(),
             [Event::Finished { id: 1, result, .. }] if result.output.as_ref() == Some(&output)));
         assert_eq!(fs::read(output.join("damaged-inner.zip")).unwrap(), b"retained terminal inner failure");
+        assert!(launcher.is_file());
         fs::remove_dir_all(output).unwrap();
         fs::remove_file(head).unwrap();
         fs::remove_file(tail).unwrap();
+        fs::remove_file(launcher).unwrap();
     }
 
     #[test]
@@ -5914,11 +5982,17 @@ mod tests {
             let events = Mutex::new(Vec::new());
             let observer = |event: Event| { events.lock().unwrap().push(event); };
             let run = test_run(&engine, &request, &observer);
+            let mut input = ArchiveInput::file(path.to_string_lossy().into_owned(), "rar".into(), "archive".into());
+            input.mode = OpenMode::NativeVolumes;
+            input.parts = [&path, &missing].map(|path| crate::io::archive_state::InputPart::range(
+                crate::io::archive_state::InputExtent { path: path.to_string_lossy().into_owned(), start: 0, end: None },
+            )).into();
+            let companion = missing.with_extension("exe");
             let mut task = Task {
                 primary: None,
-                owned_paths: vec![path.to_string_lossy().into_owned(), missing.to_string_lossy().into_owned()],
+                owned_paths: [&path, &missing, &companion].map(|path| path.to_string_lossy().into_owned()).into(),
                 inputs: vec![LogicalInput { password_probe: None,
-                    input: ArchiveInput::file(path.to_string_lossy().into_owned(), "rar".into(), "archive".into()),
+                    input,
                     password: None, failure: None,
                 }],
                 source: DiscoverySource::Relations, retry: None,
@@ -5929,7 +6003,7 @@ mod tests {
             assert_eq!(absent, vec![missing.clone()]);
             assert_eq!(generations.len(), 1);
             assert_eq!(generations[&path_key(&path.to_string_lossy())], capture_file_generation(&path).unwrap());
-            assert!(matches!(run.task_admission(&task, &generations, &absent, true, false, |_| None).unwrap(), TaskAdmission::Execute));
+            assert!(matches!(run.task_admission(&task, &generations, &absent, true, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
             run.admit_missing_inputs(&mut task, &absent, false);
             assert!(task.inputs[0].failure.is_none());
             task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
@@ -6168,12 +6242,12 @@ mod tests {
                         retry: None,
                         scope: None,
                     };
-                    assert!(matches!(run.task_admission(&direct, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute));
+                    assert!(matches!(run.task_admission(&direct, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
                     // A replacement can be classified Relations while retaining
                     // the original Direct task's no-silent-skip boundary.
                     let mut replacement = direct;
                     replacement.source = DiscoverySource::Relations;
-                    assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute));
+                    assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
                     assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], true, false, |_| None).unwrap(), TaskAdmission::Departed));
                 }
             }
@@ -7157,11 +7231,19 @@ mod tests {
         let mut writer = fs::File::create(&last).unwrap();
         writer.write_all(&[0; 13]).unwrap();
         writer.write_all(&next_header).unwrap();
-        assert!(discovery::retry_volume(&original, context, &options, &candidates, &request)
+        assert!(discovery::retry_volume(&original, &[], context, &options, &candidates, &request)
             .unwrap().is_none());
         assert!(output.join("damaged.bin").is_file());
         drop(writer);
-        assert!(discovery::retry_volume(&original, context, &options, &candidates, &request)
+        assert!(discovery::retry_volume(&original, &[], context, &options, &candidates, &request)
+            .unwrap().is_some());
+        // A live retry cannot replace a member that was still present at
+        // admission. Only names admitted as departed may be left behind.
+        let departed = root.join("split.7z.002.downloading");
+        original.source_paths.push(departed.clone());
+        assert!(discovery::retry_volume(&original, &[], context, &options, &candidates, &request)
+            .unwrap().is_none());
+        assert!(discovery::retry_volume(&original, &[departed], context, &options, &candidates, &request)
             .unwrap().is_some());
         run.discard_failed_output(&original, &output, &mut Outcome::default()).unwrap();
         assert!(!output.exists());

@@ -40,7 +40,7 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
         fs::create_dir_all(base.join("native")).unwrap();
         fs::write(base.join("native/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
-        for case in ["stable", "content", "claim", "owned", "error", "stop"] {
+        for case in ["stable", "resnapshot", "content", "claim", "owned", "error", "stop"] {
             let directory = base.join(case);
             let watched = directory.join("watched");
             fs::create_dir_all(&watched).unwrap();
@@ -69,7 +69,7 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+                external: Arc::new(Mutex::new(None)), _lease: None,
             };
             let source_text = source.to_str().unwrap();
             if case == "stable" {
@@ -100,7 +100,16 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
                     assert!(!scheduler.pending[&check_id].admission_ready);
                 }
                 if case == "claim" {
-                    scheduler.hub.claims.lock().unwrap().insert(check_id, Arc::from("foreground"));
+                    scheduler.hub.claims.lock().unwrap().insert(check_id.clone(), Arc::from("foreground"));
+                }
+                if case == "resnapshot" {
+                    let file = fs::OpenOptions::new().write(true).open(&check_source).unwrap();
+                    file.set_modified(std::time::SystemTime::now()
+                        - std::time::Duration::from_secs(20)).unwrap();
+                    drop(file);
+                    let pending = scheduler.pending.get_mut(&check_id).unwrap();
+                    pending.admission_ready = false;
+                    return Ok(());
                 }
                 if case == "owned" {
                     let output = check_source.parent().unwrap().to_string_lossy().into_owned();
@@ -131,12 +140,18 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
             let result = scheduler.dispatch_ready();
             assert_eq!(result.is_err(), case == "error", "{case}: {result:?}");
             assert!(scheduler.admission_checkpoint.is_none(), "checkpoint barrier not reached: {case}");
-            if matches!(case, "stable" | "owned") {
+            if matches!(case, "stable" | "owned" | "resnapshot") {
                 assert!(scheduler.pending.is_empty(), "{case} candidate was requeued");
                 assert!(scheduler.due.is_empty());
                 if case == "owned" {
                     assert!(scheduler.active.is_empty(), "owned output reached the worker");
                     assert!(scheduler.journal.state().pending(source_text).is_none());
+                }
+                if case == "resnapshot" {
+                    let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
+                    assert!(scheduler.journal.state().pending(source_text).unwrap().matches_observation(&candidate));
+                    scheduler.hub.stop();
+                    scheduler.drain_active(&mut Ok(0)).unwrap();
                 }
             } else {
                 assert!(!scheduler.pending[&id].admission_ready, "readiness leaked past {case}");
@@ -239,7 +254,7 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
-        external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+        external: Arc::new(Mutex::new(None)), _lease: None,
     };
     scheduler.options = Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap());
     for path in [&good, &bad] {
@@ -307,7 +322,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+                external: Arc::new(Mutex::new(None)), _lease: None,
             };
             let owner = source.to_str().unwrap();
             let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -400,7 +415,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: lease,
+                external: Arc::new(Mutex::new(None)), _lease: Some(lease),
             };
             let owner = source.to_str().unwrap();
             let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -523,7 +538,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
             active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
-            external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+            external: Arc::new(Mutex::new(None)), _lease: None,
         };
         let path = source.to_str().unwrap();
         let failed = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -591,6 +606,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             &HashMap::from([(root_id.clone(), HashSet::from([tail.clone()]))]),
             &HashMap::from([(tail, CandidateEvent::Created)]),
             &HashSet::new(),
+            &mut HashMap::new(),
         ).unwrap();
         assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9),
             "quiet summary after volume arrival: {:?}", scheduler.pending[&id].quiet.summary());
@@ -650,7 +666,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
             active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
-            external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+            external: Arc::new(Mutex::new(None)), _lease: None,
         };
 
         let mut expected = Vec::new();
@@ -659,11 +675,19 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             fs::write(&path, b"archive").unwrap();
             let kind = event.kind();
             let mut signals = Signals::default();
-            signals.root_changed(&root_id, Some(vec![path.clone()]));
-            if kind == "modified" { signals.modified_paths.insert(path.clone()); }
-            signals.candidate_events.insert(path.clone(), event);
-            scheduler.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
-                &signals.modified_paths, &signals.candidate_events).unwrap();
+            signals.changes.root_changed(&root_id, Some(vec![path.clone()]));
+            if kind == "modified" { signals.changes.modified_paths.insert(path.clone()); }
+            signals.changes.candidate_events.insert(path.clone(), event);
+            let id = key(&path);
+            let activity = scheduler.hub.activities.bind(id.clone(), quiet::Activity::default);
+            let observation = activity.capture(&path, &scheduler.hub.claims, &id).unwrap().unwrap();
+            signals.changes.observations.insert(path.clone(), (activity, observation));
+            // A second identity lookup would fail. The event already has the
+            // matching observation, and readiness still rechecks on admission.
+            *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(path.clone());
+            let result = scheduler.observe_root_changes(&mut signals.changes);
+            *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = None;
+            result.unwrap();
             assert!(scheduler.pending.contains_key(&key(&path)));
             expected.push((path, "candidate_active", kind, String::new()));
         }
@@ -675,11 +699,10 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             // Native rename supplies both old (now missing) and new paths,
             // selecting the actual checkpoint branch rather than ordinary enqueue.
             let mut signals = Signals::default();
-            signals.root_changed(&root_id, Some(vec![old.clone(), new.clone()]));
-            signals.candidate_events.insert(new.clone(), CandidateEvent::Moved(old.clone()));
+            signals.changes.root_changed(&root_id, Some(vec![old.clone(), new.clone()]));
+            signals.changes.candidate_events.insert(new.clone(), CandidateEvent::Moved(old.clone()));
             if fail { *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(new.clone()); }
-            scheduler.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
-                &signals.modified_paths, &signals.candidate_events).unwrap();
+            scheduler.observe_root_changes(&mut signals.changes).unwrap();
             *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = None;
             assert_eq!(scheduler.pending.contains_key(&key(&new)), !fail);
             expected.push((new, if fail { "candidate_ignored" } else { "candidate_active" },
@@ -694,8 +717,9 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         assert!(scheduler.catalog.path_is_directory(
             &scheduler.roots[&root_id].1, departed.to_str().unwrap()) == Some(false));
         fs::remove_file(departed).unwrap();
-        let mut changes = HashMap::from([(root_id.clone(), HashSet::from([departed.clone()]))]);
-        scheduler.observe_root_changes(&mut changes, &HashSet::new(), &HashSet::new(), &HashMap::new()).unwrap();
+        let mut signals = Signals::default();
+        signals.changes.root_changed(&root_id, Some(vec![departed.clone()]));
+        scheduler.observe_root_changes(&mut signals.changes).unwrap();
         assert!(!scheduler.pending.contains_key(&key(departed)));
         assert!(!scheduler.pending.contains_key(&key(&recovery)));
         scheduler.checkpoint(&HashMap::new(), true, false).unwrap();
@@ -752,6 +776,7 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
         // native filesystem notification against the corresponding waiter.
         scheduler.config_observers.clear();
         let original = Arc::downgrade(&scheduler.journal);
+        let broker_lease = Arc::downgrade(scheduler._lease.as_ref().unwrap());
         scheduler.journal.fail_for_test();
         let last_error = Arc::new(Mutex::new(None));
         let error = Arc::clone(&last_error);
@@ -761,6 +786,7 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
         assert!(block_on(once_wait.wait()).is_err());
         assert!(!hub.stopped.load(Ordering::Acquire));
         assert!(original.upgrade().is_none(), "faulted Journal must be released before reload");
+        assert!(broker_lease.upgrade().is_some(), "the repair shell keeps the original Broker lease");
         assert!(last_error.lock().unwrap().is_some());
         let (rebuild, rebuild_wait) = command_reply();
         hub.update(|signals| signals.rebuild.push(rebuild));
@@ -776,8 +802,10 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
         let (reload, reload_wait) = command_reply();
         hub.queue_reload(Some(reload));
         assert!(block_on(reload_wait.wait()).unwrap());
+        assert!(broker_lease.upgrade().is_some(), "reopening reuses the service's Broker lease");
         hub.stop();
         assert_eq!(thread.join().unwrap().unwrap(), 0);
+        assert!(broker_lease.upgrade().is_none(), "service shutdown releases the Broker lease");
         return;
     }
     run_isolated("scheduler_fault_keeps_reload_control_and_reopens_the_store", CHILD);

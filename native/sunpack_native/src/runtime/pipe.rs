@@ -561,13 +561,16 @@ impl Connection {
                 }
                 CANCEL => {
                     if !self.cancel.cancelled() {
-                        self.cancel.cancel();
-                        self.prompt.lock().unwrap().take();
                         let language = config::load_language(cwd);
                         let message = format!("{}\n", language.text("interrupt.stopping"));
                         // Like main, reserve the one cancellation notice even
                         // while ordinary producers are waiting on output space.
-                        self.output.try_enqueue(output_frame(Stream::Err as u8, message.as_bytes()), true)?;
+                        // Publish it before cancellation wakes request tasks
+                        // that can immediately print the final interrupt result.
+                        let notice = self.output.try_enqueue(output_frame(Stream::Err as u8, message.as_bytes()), true);
+                        self.cancel.cancel();
+                        self.prompt.lock().unwrap().take();
+                        notice?;
                     }
                 }
                 length => {
@@ -745,12 +748,14 @@ impl Server {
             let foreground = header.argv.first().is_none_or(|command| command != "--cancel-watch-batch");
             if foreground { super::diagnostics::event("foreground_request_started", serde_json::json!({"origin":"foreground","command":header.argv.first(),"queue_ms":connected.elapsed().as_secs_f64()*1000.0})); }
             let session: Arc<dyn Session> = connection.clone();
-            let result = cli::run(&self.host, &header.cwd, header.argv, session, cancel).await;
-            let code = match result {
+            let code = match cli::run(&self.host, &header.cwd, header.argv, session, cancel).await {
                 Ok(code) => code,
                 Err(error) => {
-                    let _ = connection.awrite(Stream::Err, format!("{error}\n").as_bytes()).await;
-                    3
+                    crate::pipeline::stage("cli", &Cancellation::new()).await?;
+                    let message = config::load_language(&header.cwd)
+                        .translate("cli.persistent_request_failed", &[("error", &error.to_string())]);
+                    connection.awrite(Stream::Err, format!("{message}\n").as_bytes()).await?;
+                    1
                 }
             };
             if foreground { super::diagnostics::event("foreground_request_finished", serde_json::json!({"origin":"foreground","exit_code":code,"duration_ms":started.elapsed().as_secs_f64()*1000.0})); }

@@ -916,6 +916,13 @@ pub(super) fn resolve(cwd: &Path, value: &str) -> io::Result<PathBuf> {
     std::path::absolute(cwd.join(relative))
 }
 
+fn watch_targets(cwd: &Path, options: &Options) -> Vec<PathBuf> {
+    options.paths.iter().map(|value| {
+        let path = Path::new(value);
+        if path.is_absolute() { path.to_owned() } else { cwd.join(path) }
+    }).collect()
+}
+
 fn targets(cwd: &Path, options: &Options) -> io::Result<Vec<PathBuf>> {
     options
         .paths
@@ -1075,8 +1082,19 @@ struct ArchiveSummary {
     processed: usize,
     nested: usize,
     depth: usize,
-    recovered: Vec<Value>,
+    recovered: Vec<RecoveredOutput>,
     errors: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RecoveredOutput {
+    archive: PathBuf,
+    out_dir: PathBuf,
+    complete_files: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<Value>,
+    #[serde(skip)]
+    has_warning: bool,
 }
 
 impl ArchiveSummary {
@@ -1123,11 +1141,10 @@ impl ArchiveSummary {
                 });
             } else if entries.iter().any(|entry| entry.partial) {
                 summary.partial += 1;
-                let outputs = entries
-                    .iter()
-                    .filter_map(|entry| entry.output.clone())
-                    .collect::<Vec<_>>();
-                let output = crate::pipeline::common_ancestor(&outputs).unwrap_or_default();
+                let output = if json {
+                    crate::pipeline::common_ancestor(entries.iter().filter_map(|entry| entry.output.as_deref()))
+                        .unwrap_or_default()
+                } else { PathBuf::new() };
                 let complete = entries
                     .iter()
                     .filter(|entry| entry.failure.is_none() || entry.partial)
@@ -1139,11 +1156,17 @@ impl ArchiveSummary {
                         }
                     })
                     .sum::<u64>();
-                let mut recovery = json!({"archive": entries[0].path, "out_dir": output, "complete_files": complete});
-                if let Some(warning) = failures::recovery_warning(entries, language) {
-                    recovery["warning"] = serde_json::to_value(warning).expect("failure report is serializable");
-                }
-                summary.recovered.push(recovery);
+                let (warning, has_warning) = if json {
+                    let report = failures::recovery_warning(entries, language);
+                    let value = report.map(|warning| serde_json::to_value(warning).expect("failure report is serializable"));
+                    (value, false)
+                } else {
+                    (None, failures::has_recovery_warning(entries))
+                };
+                summary.recovered.push(RecoveredOutput {
+                    archive: entries[0].path.clone(), out_dir: output,
+                    complete_files: complete, warning, has_warning,
+                });
             } else {
                 summary.success += 1;
             }
@@ -1216,7 +1239,7 @@ impl Drop for ReportClose<'_> {
 struct Display {
     panel: Option<live::Panel>,
     prompting: bool,
-    deferred: Vec<u8>,
+    deferred_scopes: Vec<(TaskId, bool)>,
     outputs: Vec<PathBuf>,
 }
 
@@ -1278,35 +1301,50 @@ impl Progress {
         }
         // Do not render the completion events only to immediately clear them.
         self.apply_events(&mut display, false);
-        // Completion events already carry authoritative policy and relocation
-        // results. Keep the same task tree for live and final output.
-        if !archives.is_empty() {
-            let Display { panel, deferred, outputs, prompting } = &mut *display;
-            if let Some(panel) = panel {
-                if *prompting {
-                    panel.write_scope(id, self.session.unicode(), self.language, deferred)?;
-                } else {
-                    panel.clear(self.session.as_ref())?;
-                    let mut writer = BufWriter::new(SessionWriter(self.session.as_ref()));
-                    panel.write_scope(id, self.session.unicode(), self.language, &mut writer)?;
-                    writer.flush()?;
-                }
-                // A directory kept for manual recovery is still a failed input.
-                // Only accepted root inputs authorize the summary output, as in
-                // main's success/has_retained_outputs check; verbose rows above
-                // continue to show the actual output even on failure.
-                if archives.iter().take_while(|archive| archive.depth == 1)
-                    .any(|archive| archive.failure.is_none() || archive.partial)
-                {
-                    if let Some(output) = panel.take_scope_output(id) { outputs.push(output); }
-                }
+        let prompting = display.prompting;
+        let Some(panel) = &mut display.panel else { return Ok(()); };
+        if archives.is_empty() {
+            panel.remove(id);
+        } else {
+            // A directory kept for manual recovery is still a failed input.
+            // Only accepted root inputs authorize the summary output.
+            let accepted = archives.iter().take_while(|archive| archive.depth == 1)
+                .any(|archive| archive.failure.is_none() || archive.partial);
+            if prompting {
+                display.deferred_scopes.push((id, accepted));
+                return Ok(());
             }
+            panel.clear(self.session.as_ref())?;
+            self.write_scope(&mut display, id, accepted)?;
         }
-        if let Some(panel) = &mut display.panel { panel.remove(id); }
-        if !display.prompting {
+        if !prompting {
             if let Some(panel) = &mut display.panel { panel.redraw(self.session.as_ref(), self.language, true); }
         }
         Ok(())
+    }
+
+    fn write_scope(&self, display: &mut Display, id: TaskId, accepted: bool) -> io::Result<()> {
+        let Display { panel, outputs, .. } = display;
+        let Some(panel) = panel else { return Ok(()); };
+        let mut writer = BufWriter::new(SessionWriter(self.session.as_ref()));
+        panel.write_scope(id, self.session.unicode(), self.language, &mut writer)?;
+        writer.flush()?;
+        if accepted {
+            if let Some(output) = panel.take_scope_output(id) { outputs.push(output); }
+        }
+        panel.remove(id);
+        Ok(())
+    }
+
+    fn resume_panel(&self, display: &mut Display) {
+        display.prompting = false;
+        let deferred = std::mem::take(&mut display.deferred_scopes);
+        for (id, accepted) in deferred {
+            let _ = self.write_scope(display, id, accepted);
+        }
+        if let Some(panel) = display.panel.as_mut().filter(|_| !self.cancel.cancelled()) {
+            panel.redraw(self.session.as_ref(), self.language, true);
+        }
     }
 }
 
@@ -1360,17 +1398,7 @@ impl Observer for Progress {
         let confirmed = confirm_on(self.session.as_ref(), self.language, &prompt,
             if self.visible { Stream::Out } else { Stream::Err }).await.unwrap_or(false);
         let _ = crate::pipeline::stage("report", &Cancellation::new()).await;
-        let mut display = self.display.lock().unwrap();
-        display.prompting = false;
-        if !display.deferred.is_empty() {
-            let deferred = std::mem::take(&mut display.deferred);
-            let _ = self.session.write(Stream::Out, &deferred);
-        }
-        if !self.cancel.cancelled() {
-            if let Some(panel) = &mut display.panel {
-                panel.redraw(self.session.as_ref(), self.language, true);
-            }
-        }
+        self.resume_panel(&mut self.display.lock().unwrap());
         confirmed
     }
 
@@ -1840,15 +1868,11 @@ fn report_extract_round(
         )?;
     }
     for recovery in &counts.recovered {
-        let archive = recovery["archive"].as_str().unwrap_or_default();
-        let name = Path::new(archive)
+        let name = recovery.archive
             .file_name()
-            .unwrap_or(std::ffi::OsStr::new(archive))
+            .unwrap_or(recovery.archive.as_os_str())
             .to_string_lossy();
-        let complete = recovery["complete_files"]
-            .as_u64()
-            .unwrap_or_default()
-            .to_string();
+        let complete = recovery.complete_files.to_string();
         line(
             session,
             Stream::Out,
@@ -1857,7 +1881,8 @@ fn report_extract_round(
                 &[("archive", &name), ("complete_files", &complete)],
             ),
         )?;
-        if let Some(warning) = recovery["warning"]["message"].as_str() {
+        if recovery.has_warning {
+            let warning = language.text("failure.possible_missing_volume");
             line(
                 session,
                 Stream::Out,
@@ -2551,16 +2576,17 @@ async fn watch_command(
         "stop" => result.summary = host.watch.stop_async().await?,
         "reload" => result.summary = host.watch.reload_async().await?,
         "add" => {
-            let paths = targets(cwd, options)?;
+            let requested = watch_targets(cwd, options);
             let output = options.output.as_deref();
-            result.inputs = json!({"action": "add", "paths": paths, "output_dir": output});
-            if output.is_some() && paths.len() != 1 {
+            result.inputs = json!({"action": "add", "paths": requested, "output_dir": output});
+            if output.is_some() && requested.len() != 1 {
                 result
                     .errors
                     .push(language.text("cli.watch.output_dir_single_path").into());
                 return Ok((2, result));
             }
             result.inputs["deep_detect"] = json!(options.deep.then_some(true));
+            let paths = targets(cwd, options)?;
             result.summary =
                 host.watch
                     .add_async(cwd, &paths, output, options.deep, options.recursive).await?;
@@ -2617,7 +2643,7 @@ async fn watch_command(
         }
         "remove" => {
             let paths = targets(cwd, options)?;
-            result.inputs["paths"] = json!(paths);
+            result.inputs["paths"] = json!(watch_targets(cwd, options));
             result.summary = host.watch.remove_async(cwd, &paths).await?;
             result.items = result.summary["removed"]
                 .as_array()
@@ -3395,7 +3421,7 @@ mod recursive_prompt_tests {
         })).unwrap()));
         archive.failure = Some(failure);
         let summary = ArchiveSummary::collect([&archive], Language::En, true);
-        let warning = &summary.recovered[0]["warning"];
+        let warning = summary.recovered[0].warning.as_ref().unwrap();
         assert_eq!(warning.as_object().unwrap().len(), 8);
         assert_eq!(warning, &serde_json::to_value(failures::archive_report(&[&archive], Language::En).unwrap()).unwrap());
         assert_eq!(warning["stage"], "extraction_report");
@@ -3411,7 +3437,7 @@ mod recursive_prompt_tests {
         for confirmed in [false, true] {
             if confirmed { outcome.archives[0].failure.as_mut().unwrap().kind = FailureKind::MissingVolume; }
             let summary = ArchiveSummary::collect(&outcome.archives, Language::En, true);
-            assert_eq!(summary.recovered[0].get("warning").is_some(), !confirmed);
+            assert_eq!(summary.recovered[0].warning.is_some(), !confirmed);
             let input = Input::default();
             report_extract_round(&outcome, &[], 0, &input, Language::En).unwrap();
             let text = String::from_utf8(input.combined.lock().unwrap().clone()).unwrap();
@@ -3576,7 +3602,7 @@ mod recursive_prompt_tests {
         for prompting in [false, true] {
             let session = Arc::new(Input::default());
             let progress = Progress {
-                session, watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
+                session: session.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
                 cancel: Cancellation::new(), language: Language::En,
                 display: Mutex::default(), reporting: reporting::Reports::default(),
                 prompt: false, visible: true, verbose: false,
@@ -3593,7 +3619,16 @@ mod recursive_prompt_tests {
                 result: crate::pipeline::TaskCompletion { discovery: None, status: TaskStatus::Skipped,
                     failure: None, output: None } });
             progress.finish_scope(1, &[parent, child]).unwrap();
-            let display = progress.display.lock().unwrap();
+            let mut display = progress.display.lock().unwrap();
+            if prompting {
+                assert!(session.stdout.lock().unwrap().is_empty());
+                progress.resume_panel(&mut display);
+            }
+            let stdout = session.stdout.lock().unwrap();
+            let text = std::str::from_utf8(&stdout).unwrap();
+            assert_eq!(text.matches("parent.zip").count(), 1, "{text}");
+            assert_eq!(text.matches("child.zip").count(), 1, "{text}");
+            assert!(!text.contains("other.zip"), "{text}");
             let mut bytes = Vec::new();
             display.panel.as_ref().unwrap().write_scope(1, true, Language::En, &mut bytes).unwrap();
             assert!(bytes.is_empty());

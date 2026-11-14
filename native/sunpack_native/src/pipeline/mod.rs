@@ -842,8 +842,7 @@ pub(crate) trait Observer: Send + Sync {
 
     fn sources_processed(
         &self,
-        _archives: &[ArchiveResult],
-        _generations: &HashMap<String, PhysicalFileGeneration>,
+        _generations: HashMap<String, PhysicalFileGeneration>,
         _output: Option<&Path>,
     ) -> io::Result<()> {
         Ok(())

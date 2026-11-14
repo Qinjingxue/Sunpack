@@ -65,6 +65,10 @@ impl Task {
     pub(super) fn entry(&self) -> &ArchiveInput {
         self.primary.as_deref().unwrap_or(&self.inputs[0].input)
     }
+
+    pub(super) fn input_paths(&self) -> impl Iterator<Item = &str> {
+        self.inputs.iter().flat_map(|logical| logical.input.physical_paths())
+    }
 }
 
 pub(super) struct Discovered {
@@ -604,26 +608,26 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
 
 pub(super) fn retry_volume(
     original: &super::ArchiveResult,
+    missing: &[PathBuf],
     context: &RetryScope,
     options: &NativeDirectoryScanOptions,
     candidates: &CandidateSet,
     request: &Request,
 ) -> io::Result<Option<Task>> {
     request.cancel.check_io()?;
-    let mut surviving = original.source_paths.iter().filter(|path| {
-        !std::fs::metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    // Only admission can release a previously required name. Use the live
+    // snapshot below to find replacements, without redefining the input group
+    // from a second set of file existence checks.
+    let missing: HashSet<_> = missing.iter().map(|path| path_key(&path.to_string_lossy())).collect();
+    let mut surviving = original.source_paths.iter().filter_map(|path| {
+        let key = path_key(&path.to_string_lossy());
+        (!missing.contains(&key)).then_some((path, key))
     });
-    let Some(seed) = surviving.next() else {
+    let Some((seed, first)) = surviving.next() else {
         return Ok(None);
     };
-    let required: HashSet<_> = std::iter::once(seed)
-        .chain(surviving)
-        .map(|path| path_key(&path.to_string_lossy()))
-        .collect();
+    let required: HashSet<_> = std::iter::once(first).chain(surviving.map(|(_, key)| key)).collect();
     let seed = seed.to_string_lossy();
-    if required.is_empty() {
-        return Ok(None);
-    }
     let (filtered, raw) = options.refresh_relation_bucket(
         &context.scope,
         &seed,

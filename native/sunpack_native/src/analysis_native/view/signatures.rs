@@ -1,4 +1,5 @@
 struct LeadingSignatures {
+    head: crate::io::reader::CachedBytes,
     rar: bool,
     seven_zip: bool,
     zip_local: Option<u64>,
@@ -7,8 +8,8 @@ struct LeadingSignatures {
 
 impl LeadingSignatures {
     fn read(reader: &ManagedReader) -> io::Result<Self> {
-        let head = reader.read_cached_at(0, 22)?;
-        let head = head.as_slice();
+        let prefix = reader.read_cached_at(0, 32)?;
+        let head = prefix.as_slice();
         let split_zip = head.starts_with(b"PK\x07\x08") || head.starts_with(b"PK00");
         let zip_local = if head.starts_with(ZIP_LOCAL) {
             Some(0)
@@ -41,6 +42,7 @@ impl LeadingSignatures {
             seven_zip: head.starts_with(SEVEN_ZIP),
             zip_local,
             zip_eocd,
+            head: prefix,
         })
     }
 }

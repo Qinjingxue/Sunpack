@@ -674,22 +674,21 @@ fn bool_field(value: &Value, path: &[&str]) -> io::Result<bool> {
         .ok_or_else(|| invalid(format!("{} must be boolean", path.join("."))))
 }
 
-fn string_field(value: &Value, path: &[&str]) -> String {
+fn string_field<'a>(value: &'a Value, path: &[&str]) -> &'a str {
     field(value, path)
         .as_str()
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase()
 }
 
-fn selection_field(value: &Value, path: &[&str], default: &str) -> String {
+fn selection_field<'a>(value: &'a Value, path: &[&str], default: &'a str) -> &'a str {
     let value = field(value, path);
     if !json_truthy(value) {
-        return default.into();
+        return default;
     }
     // Python stringifies truthy non-strings before checking the enum. None
     // can match these string choices; let the enum emit its normal diagnostic.
-    value.as_str().unwrap_or_default().trim().to_ascii_lowercase()
+    value.as_str().unwrap_or_default().trim()
 }
 
 fn number_field(value: &Value, path: &[&str]) -> io::Result<f64> {
@@ -828,7 +827,7 @@ impl Config {
                 1,
             )?,
         };
-        let process_mode = ProcessMode::parse(&selection_field(
+        let process_mode = ProcessMode::parse(selection_field(
             value,
             &["runtime", "process_mode"],
             "normal",
@@ -881,7 +880,10 @@ impl Config {
             .enumerate()
             .map(|(index, filter)| ScanFilter::parse(index, filter))
             .collect::<io::Result<Arc<[_]>>>()?;
-        let modules = field(value, &["analysis", "modules"])
+        // A supplied module list replaces the defaults, including a null
+        // value that the analysis engine treats as no configured modules.
+        let modules = at(value, &["analysis", "modules"])
+            .unwrap_or(&defaults()["analysis"]["modules"])
             .as_array()
             .into_iter()
             .flatten()
@@ -925,14 +927,14 @@ impl Config {
                 recursive_candidate_ratio,
             },
             extraction: ExtractionConfig {
-                content_requirement: ContentRequirement::parse(&selection_field(
+                content_requirement: ContentRequirement::parse(selection_field(
                     value,
                     &["extraction", "content_requirement"],
                     "complete",
                 ))?,
             },
             post_extract: PostExtractConfig {
-                archive_cleanup_mode: CleanupMode::parse(&string_field(
+                archive_cleanup_mode: CleanupMode::parse(string_field(
                     value,
                     &["post_extract", "archive_cleanup_mode"],
                 ))?,
@@ -1044,9 +1046,9 @@ pub(crate) fn decimal_digit(character: char) -> Option<u32> {
 impl ProcessMode {
     pub fn parse(value: &str) -> io::Result<Self> {
         match value {
-            "background" => Ok(Self::Background),
-            "normal" => Ok(Self::Normal),
-            "high" => Ok(Self::High),
+            value if value.eq_ignore_ascii_case("background") => Ok(Self::Background),
+            value if value.eq_ignore_ascii_case("normal") => Ok(Self::Normal),
+            value if value.eq_ignore_ascii_case("high") => Ok(Self::High),
             _ => Err(invalid(
                 "runtime.process_mode must be background, normal, or high",
             )),
@@ -1057,9 +1059,9 @@ impl ProcessMode {
 impl CleanupMode {
     pub fn parse(value: &str) -> io::Result<Self> {
         match value {
-            "d" => Ok(Self::Delete),
-            "r" => Ok(Self::Recycle),
-            "k" => Ok(Self::Keep),
+            "d" | "D" => Ok(Self::Delete),
+            "r" | "R" => Ok(Self::Recycle),
+            "k" | "K" => Ok(Self::Keep),
             _ => Err(invalid("archive_cleanup_mode must be one of: d, r, k")),
         }
     }
@@ -1076,8 +1078,8 @@ impl CleanupMode {
 impl ContentRequirement {
     pub fn parse(value: &str) -> io::Result<Self> {
         match value {
-            "complete" => Ok(Self::Complete),
-            "allow_partial" => Ok(Self::AllowPartial),
+            value if value.eq_ignore_ascii_case("complete") => Ok(Self::Complete),
+            value if value.eq_ignore_ascii_case("allow_partial") => Ok(Self::AllowPartial),
             _ => Err(invalid(
                 "extraction.content_requirement must be 'complete' or 'allow_partial'",
             )),
@@ -1307,6 +1309,14 @@ fn utc_minute(value: &str) -> Option<i128> {
 #[cfg(test)]
 mod layer_merge_tests {
     use super::*;
+
+    #[test]
+    fn explicit_null_analysis_modules_does_not_enable_builtins() {
+        let default = Config::parse(&serde_json::json!({"analysis": null})).unwrap();
+        let disabled = Config::parse(&serde_json::json!({"analysis": {"modules": null}})).unwrap();
+        assert!(!default.analysis.modules.is_empty());
+        assert!(disabled.analysis.modules.is_empty());
+    }
 
     #[test]
     fn observed_invalid_edit_is_consumed_while_inspection_stays_strict() {

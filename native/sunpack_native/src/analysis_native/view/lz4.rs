@@ -1,12 +1,9 @@
 impl<'a> ReportContext<'a> {
     fn lz4_module(&mut self) -> io::Result<Evidence> {
-        if self.stream_structure.is_none() {
-            let Ok(prefix) = self.view.reader.read_cached_at(0, 4) else {
-                return Ok(Evidence::not_found("lz4"));
-            };
-            if !crate::formats::lz4::leading(prefix.as_slice()) {
-                return Ok(Evidence::not_found("lz4"));
-            }
+        if self.stream_structure.is_none()
+            && !crate::formats::lz4::leading(self.signatures.head.as_slice())
+        {
+            return Ok(Evidence::not_found("lz4"));
         }
         let Some(facts) = self.full_stream_structure()? else {
             return Ok(Evidence::not_found("lz4"));
