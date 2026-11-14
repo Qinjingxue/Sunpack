@@ -72,7 +72,7 @@ fn read_error(fault: &crate::pipeline::ArchiveReadFault) -> Value {
 }
 
 pub(in crate::runtime) fn recovery(failure: &Failure) -> Option<&crate::pipeline::InputRecovery> {
-    failure.recovery.as_deref().or_else(|| failure.causes.iter().find_map(recovery))
+    failure.recovery.as_deref()
 }
 
 fn kind_name(kind: FailureKind) -> &'static str {
@@ -96,14 +96,6 @@ fn kind_name(kind: FailureKind) -> &'static str {
 impl<'a> Report<'a> {
     fn attach_recovery(&mut self, recovery: &'a crate::pipeline::InputRecovery, language: Language) {
         self.recovery = Some((recovery, language));
-    }
-
-    fn from_cause(failure: &'a Failure, language: Language) -> Self {
-        let mut report = Self::from_failure(failure, language);
-        if let Some(scope) = failure.discovery_scope.as_deref() {
-            report.details["discovery_scope"] = json!(scope);
-        }
-        report
     }
 
     pub(in crate::runtime) fn from_failure(failure: &'a Failure, language: Language) -> Self {
@@ -197,13 +189,6 @@ impl<'a> Report<'a> {
             Some(FailureContext::OutputCreate { .. }) => {
                 stage = "preflight";
             }
-            Some(FailureContext::Postprocess { destination }) => {
-                stage = "postprocess";
-                spec = super::Message::key("");
-                raw_message = Some(failure.message.clone());
-                details["destination"] = json!(destination);
-                user_action = "";
-            }
             None => {
                 // Older persisted failures lack the creation boundary. Preserve
                 // their original facts rather than inventing a stage or key.
@@ -216,7 +201,7 @@ impl<'a> Report<'a> {
             kind: kind_name(failure.kind), stage,
             message: raw_message.unwrap_or_else(|| spec.render(message_language).into_owned()),
             message_key: spec.key.into(), message_params: params, user_action,
-            causes: failure.causes.iter().map(|cause| Self::from_cause(cause, language)).collect(),
+            causes: Vec::new(),
             details, recovery: None,
         }
     }
@@ -263,9 +248,6 @@ fn aggregate_key(all_password: bool) -> &'static str {
 /// Summary text uses the same carrier decision without allocating JSON reports.
 pub(in crate::runtime) fn carrier_message<'a>(entries: &[&'a ArchiveResult], language: Language) -> std::borrow::Cow<'a, str> {
     let failures = || entries.iter().filter_map(|entry| entry.failure.as_ref());
-    if let Some(failure) = failures().find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. }))) {
-        return super::message(failure, language);
-    }
     if failures().any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume)) {
         return language.text("failure.possible_missing_volume").into();
     }
@@ -324,14 +306,11 @@ pub(in crate::runtime) fn recovery_warning<'a>(entries: &[&'a ArchiveResult], la
 
 pub(in crate::runtime) fn has_recovery_warning(entries: &[&ArchiveResult]) -> bool {
     let failures = || entries.iter().filter_map(|entry| entry.failure.as_ref());
-    !failures().any(|failure| failure.contains(FailureKind::MissingVolume)
-        || matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })))
+    !failures().any(|failure| failure.kind == FailureKind::MissingVolume)
         && failures().any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume))
 }
 
 fn archive_projection<'a>(entries: &[&'a ArchiveResult], language: Language, warning: bool) -> Option<Report<'a>> {
-    let postprocess = entries.iter().filter_map(|entry| entry.failure.as_ref())
-        .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })));
     let mut causes: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
         .map(|failure| Report::from_failure(failure, language)).collect();
     if causes.is_empty() { return None; }
@@ -342,34 +321,10 @@ fn archive_projection<'a>(entries: &[&'a ArchiveResult], language: Language, war
     // Its repeated receipts are one task failure, not failed segments.
     let admission = entries.iter().all(|entry| entry.failure.as_ref().is_some_and(|failure|
         matches!(failure.context.as_deref(), Some(FailureContext::InputAdmission { .. }))));
-    let mut report = if admission { causes.remove(0) } else if let Some(failure) = postprocess {
-        let mut outer = Report::from_failure(failure, language);
-        let original: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
-            .flat_map(|failure| {
-                let wrapped = matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. }));
-                failure.causes.iter().filter(move |_| wrapped)
-                    .chain(std::iter::once(failure).filter(move |_| !wrapped))
-            }).collect();
-        if !original.is_empty() {
-            let admission = original.iter().all(|failure|
-                matches!(failure.context.as_deref(), Some(FailureContext::InputAdmission { .. })));
-            let mut reports: Vec<_> = original.iter().map(|failure| Report::from_failure(failure, language)).collect();
-            let mut original_report = if !admission && aggregated {
-                aggregate(reports, report_count, language)
-            } else { reports.remove(0) };
-            if let Some(scope) = original.iter().find_map(|failure| failure.discovery_scope.as_deref()) {
-                original_report.details["discovery_scope"] = json!(scope);
-            }
-            if let Some(recovery) = recovery { original_report.attach_recovery(recovery, language); }
-            outer.causes = vec![original_report];
-        }
-        outer
-    } else if aggregated {
+    let mut report = if admission { causes.remove(0) } else if aggregated {
         aggregate(causes, report_count, language)
     } else { causes.remove(0) };
-    if postprocess.is_none() {
-        if let Some(recovery) = recovery { report.attach_recovery(recovery, language); }
-    }
+    if let Some(recovery) = recovery { report.attach_recovery(recovery, language); }
     if warning {
         let partial = entries.iter().any(|entry| entry.partial)
             && entries.iter().all(|entry| entry.failure.is_none() || entry.partial);
@@ -382,16 +337,14 @@ fn archive_projection<'a>(entries: &[&'a ArchiveResult], language: Language, war
             message: language.text(key).to_owned(), message_key: key.into(),
             message_params: json!({}), user_action: "", causes: vec![report], details, recovery: shared_recovery };
     }
-    if postprocess.is_none() {
-        if let Some(scope) = entries.iter().filter_map(|entry| entry.failure.as_ref())
-            .find_map(|failure| failure.discovery_scope.as_deref())
-        {
-            report.details["discovery_scope"] = json!(scope);
-        }
+    if let Some(scope) = entries.iter().filter_map(|entry| entry.failure.as_ref())
+        .find_map(|failure| failure.discovery_scope.as_deref())
+    {
+        report.details["discovery_scope"] = json!(scope);
     }
-    if entries.iter().any(|entry| entry.promoted) {
+    if entries.iter().any(|entry| entry.depth > 1) {
         report.details["path"] = json!(entries[0].path);
-        report.details["promoted_nested_input"] = json!(true);
+        report.details["nested_input"] = json!(true);
     }
     Some(report)
 }
@@ -425,7 +378,7 @@ mod tests {
             volume_attempts: None, source_paths: vec![], password: None,
             discovery_source: DiscoverySource::Embedded, damage_flags: None,
             partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+              scan_layout: Default::default(),
         }];
         let report = archive_report(&[&archives[0]], Language::En).unwrap();
         let original = &report.causes[0];
@@ -500,42 +453,7 @@ mod tests {
         assert_eq!(super::super::message(&warning, Language::Zh), Language::Zh.text("failure.warning_busy_or_partial"));
         assert_eq!(warning.message, "raw worker warning");
 
-        let promoted = Failure::new(FailureKind::FilesystemError, "Unable to promote blocked nested input: denied")
-            .with_context(FailureContext::Postprocess { destination: "out".into() })
-            .with_cause(Some(failure));
-        let report = serde_json::to_value(Report::from_failure(&promoted, Language::En)).unwrap();
-        assert_eq!(report["stage"], "postprocess");
-        assert_eq!(report["details"]["destination"], "out");
-        assert_eq!(report["causes"][0]["stage"], "extraction");
-        assert_eq!(report["message_key"], "");
-    }
 
-    #[test]
-    fn promotion_plan_failure_keeps_unwrapped_sibling_failures() {
-        let first = Failure::new(FailureKind::FilesystemError, "promotion denied")
-            .with_context(FailureContext::Postprocess { destination: "out".into() })
-            .with_cause(Some(Failure::new(FailureKind::WrongPassword, "password blocked")
-                .with_context(FailureContext::Extraction)));
-        let sibling = Failure::new(FailureKind::Damaged, "damaged sibling")
-            .with_context(FailureContext::Extraction);
-        let archives: Vec<_> = [first, sibling].into_iter().enumerate().map(|(index, failure)| ArchiveResult {
-            path: "carrier.bin".into(), format: "zip".into(), output: None,
-            failure: Some(failure), files: 0, bytes: 0, encrypted: None, depth: 2,
-            offset: index as u64, end_offset: None, volume_completeness: None,
-            volume_attempts: None, source_paths: vec![], password: None,
-            discovery_source: DiscoverySource::Embedded, damage_flags: None,
-            partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
-        }).collect();
-        let reports = serde_json::to_value(collect(&archives, Language::En)).unwrap();
-        assert_eq!(reports.as_array().unwrap().len(), 1);
-        let report = &reports[0];
-        assert_eq!(report["kind"], "filesystem_error");
-        assert_eq!(report["causes"][0]["kind"], "inputs_failed");
-        let causes = report["causes"][0]["causes"].as_array().unwrap();
-        assert_eq!(causes.len(), 2);
-        assert_eq!(causes[0]["kind"], "wrong_password");
-        assert_eq!(causes[1]["kind"], "damaged");
     }
 
     #[test]
@@ -569,7 +487,7 @@ mod tests {
             volume_attempts: None, source_paths: vec![], password: None,
             discovery_source: DiscoverySource::Embedded, damage_flags: None,
             partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+              scan_layout: Default::default(),
         }];
         let reports = serde_json::to_value(collect(&archives, Language::En)).unwrap();
         assert_eq!(reports[0]["kind"], "missing_volume");

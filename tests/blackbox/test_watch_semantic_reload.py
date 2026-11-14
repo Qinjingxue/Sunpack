@@ -73,13 +73,13 @@ def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_p
     assert not list(output.rglob("payload.txt"))
 
 
-def test_watch_restart_keeps_flattened_carrier_and_retries_promoted_child(package, tmp_path):
+def test_watch_restart_keeps_carrier_outputs_and_retries_retained_child(package, tmp_path):
     import io
     import zipfile
 
     watched = tmp_path / "watched"
     watched.mkdir()
-    (tmp_path / "secret.txt").write_bytes(b"promoted child")
+    (tmp_path / "secret.txt").write_bytes(b"retained child")
     locked = tmp_path / "locked.zip"
     subprocess.run(
         [str(package.tools / "7z.exe"), "a", "-tzip", "-mem=AES256", "-precovered-key",
@@ -99,28 +99,28 @@ def test_watch_restart_keeps_flattened_carrier_and_retries_promoted_child(packag
     package.json("watch", "add", watched, "--deep-detect", "-o", output)
     package.json("watch", "start", "--no-tray")
     events = package.data / ".sunpack_watch" / "events.json"
-    ordinary = output / "carrier" / "ordinary.txt"
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         try:
             display = native_fixture("display_events", path=str(events))
             blocked = any(row.get("event") == "failed_password"
                           for row in (*display["history"], *display["live"]))
-            if blocked and ordinary.is_file():
+            ordinary_files = list(output.rglob("ordinary.txt"))
+            if blocked and len(ordinary_files) == 1:
+                ordinary, = ordinary_files
                 break
         except subprocess.CalledProcessError:
             pass
         time.sleep(0.05)
     else:
-        pytest.fail("Carrier did not finish flattening beside its promoted password blocker")
+        pytest.fail("Carrier did not finish flattening beside its retained password blocker")
     assert package.json("watch", "stop")["summary"]["stopped"]
     identity = (ordinary.stat().st_ino, ordinary.stat().st_mtime_ns)
     assert ordinary.read_bytes() == b"retained ordinary"
     assert package.run("--persistent-shutdown").returncode == 0
     package.configure(user_passwords=["recovered-key"])
     package.json("watch", "start", "--once", "--no-tray")
-    assert [path.read_bytes() for path in output.rglob("secret.txt")] == [b"promoted child"]
+    assert [path.read_bytes() for path in output.rglob("secret.txt")] == [b"retained child"]
     assert list(output.rglob("ordinary.txt")) == [ordinary]
     assert (ordinary.stat().st_ino, ordinary.stat().st_mtime_ns) == identity
-    assert not list((output / "carrier").rglob("wrapper"))
     assert source.is_file()

@@ -64,11 +64,11 @@ def test_one_carrier_supplies_two_independent_split_heads(package, tmp_path, ent
     else:
         watch = watch_setup(package, tmp_path, passwords=passwords, cleanup="d", recursive=True)
         sources = batch.rename(watch.root / batch.name)
-        wait_for(lambda: not any(sources.iterdir()), "cleanup after both split inputs commit")
+        wait_for(lambda: (not sources.exists() or not any(sources.iterdir())), "cleanup after both split inputs commit")
         watch.stop()
         watch.assert_no_terminal_failures()
     assert _payload_directory(output, seven) != _payload_directory(output, zip_case)
-    assert not any(sources.iterdir())
+    assert (not sources.exists() or not any(sources.iterdir()))
 
 
 @pytest.mark.requires_watch_broker
@@ -95,7 +95,7 @@ def test_watch_password_retry_preserves_completed_split_input_with_shared_head(p
     watch.passwords(["wrong", zip_case.password])
     watch.start()
     watch.await_archive(zip_case)
-    wait_for(lambda: not any(sources.iterdir()), "cleanup of the shared carrier and both sets of volumes")
+    wait_for(lambda: (not sources.exists() or not any(sources.iterdir())), "cleanup of the shared carrier and both sets of volumes")
     watch.stop()
 
     assert _payload_directory(watch.output, seven) == first.parent
@@ -104,7 +104,7 @@ def test_watch_password_retry_preserves_completed_split_input_with_shared_head(p
     watch.assert_no_terminal_failures()
 
 
-def test_compressed_tar_promotes_pkzip_disks_and_an_enc_inside_lz4(package, tmp_path, entry_mode):
+def test_compressed_tar_recovers_pkzip_disks_and_an_enc_inside_lz4(package, tmp_path, entry_mode):
     # One outer extraction introduces both a set of disk-relative ZIP inputs
     # and a separately encrypted stream that needs another discovery pass.
     fixtures = tmp_path / "fixtures"

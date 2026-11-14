@@ -51,7 +51,9 @@ def test_concurrent_nested_groups_isolate_password_failure_and_cleanup(package, 
     assert report["summary"]["success_count"] == 9, report
     assert len(report["errors"]) == 1 and blocked.blocked_name in report["errors"][0], report
     assert report["tasks"][0]["wrong_password_failure"]
-    assert (blocked.outer.archive_dir / blocked.blocked_name).is_file()
+    retained, = (path for path in output.rglob(blocked.blocked_name) if path.is_file())
+    assert retained.is_file()
+    assert not (blocked.outer.archive_dir / blocked.blocked_name).exists()
     assert_nested_outputs(output, healthy, leaf_success=True)
     assert_nested_outputs(output, blocked, leaf_success=False)
     assert not any(path.exists() for path in healthy.parts)

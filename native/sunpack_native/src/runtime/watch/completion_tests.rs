@@ -43,11 +43,12 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
         deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
         passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
         root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-        parent_observers: HashMap::new(), config_observers: Vec::new(),
+        parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+        volume_checks: HashMap::new(),
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
-        external: Arc::new(Mutex::new(None)), _lease: None,
+        external: Arc::default(), _lease: None,
     };
     let head_path = base.join("outer.001");
     let tail_path = base.join("outer.002");
@@ -73,6 +74,7 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
         completion_archive(base.join("outer/inner.zip").to_str().unwrap(), 2, None),
         completion_archive(other.to_str().unwrap(), 1, None)];
     let context = CompletionContext {
+            max_depth: usize::MAX,
         deep: true, root: key(&base), recovery: None, password_scope: base.clone(),
         passwords: scheduler.passwords.snapshot(),
         inputs: [head, tail, other].into_iter().map(|path|
@@ -81,7 +83,7 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
         groups, toast: None, task: None,
     };
     scheduler.apply_completion("one-batch", context, Completed {
-        cancelled: false, result: Ok(outcome), promoted: HashMap::new(), outputs,
+        cancelled: false, result: Ok(outcome),  outputs,
     }).unwrap();
     scheduler.journal.flush().unwrap();
     // Read the actual compressed disk records, not the in-memory submitted JSON.

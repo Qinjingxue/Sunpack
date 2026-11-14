@@ -47,7 +47,7 @@ def test_plan7_nested_failure_is_attributed_to_the_inner_input_in_cli(package, t
     failure, = report["tasks"][0]["failures"]
     retry_input = Path(failure["details"]["path"])
     assert retry_input.name == expected and retry_input.is_file()
-    assert failure["details"]["promoted_nested_input"] is True
+    assert failure["details"]["nested_input"] is True
     assert not list(output.rglob(inner.marker_name))
     assert next(output.rglob("outer-note.txt")).read_bytes() == b"healthy outer payload"
 
@@ -61,7 +61,8 @@ def test_plan7_nested_watch_failure_is_a_retryable_inner_input(package, tmp_path
     status = "failed_password" if kind == "password" else "suspended_missing_volume"
     event = watch.await_event(status, path=expected)
     retry = Path(event["path"])
-    assert retry.parent == watch.root and retry.is_file() and retry != source
+    assert retry.is_relative_to(watch.output) and retry.is_file() and retry != source
+    assert not (watch.root / retry.name).exists()
     assert not list(watch.output.rglob(inner.marker_name))
     watch.stop()
     assert source.is_file()

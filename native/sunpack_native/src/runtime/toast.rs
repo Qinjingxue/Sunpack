@@ -820,7 +820,7 @@ fn archive_owner(
     archive: &crate::pipeline::ArchiveResult,
     owner: &impl Fn(&Path) -> Option<String>,
 ) -> String {
-    result_owner(archive.promotion_original_path.as_deref().unwrap_or(&archive.path), owner)
+    result_owner(&archive.path, owner)
 }
 
 fn completion_roots(
@@ -1314,7 +1314,7 @@ impl RootFailureReport<'_> {
     fn errors(&self) -> Vec<String> {
         let mut messages: Vec<_> = self.archives.iter().filter_map(|entries| {
             let path = &entries.first()?.path;
-            let name = if entries.iter().any(|entry| entry.promoted) {
+            let name = if entries.iter().any(|entry| entry.depth > 1) {
                 path.as_os_str()
             } else {
                 path.file_name().unwrap_or(path.as_os_str())
@@ -2029,7 +2029,7 @@ mod tests {
             volume_attempts: None, source_paths: Vec::new(), password: None,
             discovery_source: crate::pipeline::DiscoverySource::Direct, damage_flags: None,
             partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+              scan_layout: Default::default(),
         }
     }
 
@@ -2181,7 +2181,7 @@ mod tests {
     #[test]
     fn batched_top_level_tasks_keep_independent_completion_and_reports() {
         // Covers batched scheduling, nested/carrier ownership, invisible
-        // failures, promotion and report admission in one production flow.
+        // failures, recovery and report admission in one production flow.
         let directory = TestDirectory::new();
         let publisher = publisher(directory.0.clone());
         let activity = publisher.register(Arc::from("30"), Language::En);
@@ -2209,9 +2209,8 @@ mod tests {
         outcome.archives.push(archive("a.zip", None));
         outcome.archives.push(archive("a/nested.zip", None));
         outcome.archives.push(archive("b.zip", None));
-        let mut promoted = archive("promoted.zip", Some(FailureKind::WrongPassword));
-        promoted.promotion_original_path = Some("b/nested.zip".into());
-        outcome.archives.push(promoted);
+        let retained = archive("b/nested.zip", Some(FailureKind::WrongPassword));
+        outcome.archives.push(retained);
         outcome.archives.push(archive("c.zip", None));
         outcome.archives.push(archive("c/nested.zip", Some(FailureKind::Damaged)));
         let mut segment = archive("c/nested.zip", Some(FailureKind::Damaged));
@@ -2237,7 +2236,6 @@ mod tests {
         assert_eq!(details[0]["kind"], "inputs_failed");
         assert_eq!(details[0]["causes"].as_array().unwrap().len(), 2);
         assert_eq!(details[1]["kind"], "damaged");
-        assert!(!text.contains("promoted.zip"));
         assert!(!text.lines().any(|line| line.ends_with("] d.zip")));
 
         // No owner metadata: independent paths stay independent, while

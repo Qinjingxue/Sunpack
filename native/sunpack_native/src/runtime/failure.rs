@@ -153,14 +153,6 @@ mod tests {
     }
 
     #[test]
-    fn promotion_error_keeps_filesystem_diagnostic_and_password_cause() {
-        let failure = Failure::new(FailureKind::FilesystemError, "Unable to promote: access denied")
-            .with_cause(Some(Failure::new(FailureKind::PasswordRequired, "password required")));
-        assert!(failure.is_password_retry());
-        assert_eq!(message(&failure, Language::En), "Unable to promote: access denied");
-    }
-
-    #[test]
     fn split_recovery_warning_preserves_failure_kind_and_diagnostics() {
         let mut failure = Failure::new(FailureKind::Damaged, "raw backend damage");
         failure.evidence = Some(Box::new(FailureEvidence {

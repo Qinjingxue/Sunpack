@@ -750,10 +750,10 @@ pub(super) fn run_console(
 }
 
 fn trim_password_retry_recovery(paths: &[PathBuf], checkpoints: &mut Vec<crate::pipeline::InputCheckpoint>,
-    promoted: &mut Vec<crate::pipeline::PromotedSource>) {
+    generated: &mut Vec<crate::pipeline::GeneratedSource>) {
     let candidates: HashSet<_> = paths.iter().map(|path| path_key(path)).collect();
     // Preserve all logical siblings of the failed physical carrier and its
-    // relocation anchors, not unrelated successful ancestors or descendants.
+    // source receipts, not unrelated successful ancestors or descendants.
     let carriers: HashSet<_> = checkpoints.iter().filter(|checkpoint|
         candidates.contains(&path_key(checkpoint.carrier()))
         || checkpoint.source_paths().any(|path| candidates.contains(&path_key(path))))
@@ -761,11 +761,11 @@ fn trim_password_retry_recovery(paths: &[PathBuf], checkpoints: &mut Vec<crate::
     checkpoints.retain(|checkpoint| carriers.contains(&path_key(checkpoint.carrier())));
     let mut sources = candidates;
     sources.extend(checkpoints.iter().flat_map(|checkpoint| checkpoint.source_paths()).map(path_key));
-    promoted.retain(|source| sources.contains(&path_key(source.path())));
+    generated.retain(|source| sources.contains(&path_key(source.path())));
     // The prompt can remain open indefinitely: release discarded inline slots,
     // not only the layouts formerly owned by those slots.
     if checkpoints.capacity() > checkpoints.len().saturating_mul(4) { checkpoints.shrink_to_fit(); }
-    if promoted.capacity() > promoted.len().saturating_mul(4) { promoted.shrink_to_fit(); }
+    if generated.capacity() > generated.len().saturating_mul(4) { generated.shrink_to_fit(); }
 }
 
 pub(super) async fn run(
@@ -1075,7 +1075,7 @@ fn password_retry_paths(archives: &[ArchiveResult]) -> Vec<PathBuf> {
     for archive in archives {
         let Some(failure) = archive.failure.as_ref() else { continue; };
         let blocked = failures::recovery(failure).map_or_else(
-            || failure.is_password_retry() && !failure.contains(FailureKind::MissingVolume),
+            || failure.is_password_retry() && failure.kind != FailureKind::MissingVolume,
             crate::pipeline::InputRecovery::has_password_blocker,
         );
         if blocked {
@@ -1139,7 +1139,7 @@ impl ArchiveSummary {
                 summary.failed += usize::from(!invalid);
                 let message = failures::carrier_message(entries, language);
                 let path = &entries[0].path;
-                let task = if invalid || entries.iter().any(|entry| entry.promoted) {
+                let task = if invalid || entries.iter().any(|entry| entry.depth > 1) {
                     path.as_os_str()
                 } else { path.file_name().unwrap_or(path.as_os_str()) };
                 let text = format!("{} [{message}]", task.to_string_lossy());
@@ -1421,6 +1421,10 @@ impl Observer for Progress {
         self.watch.register_external_output(output)
     }
 
+    fn reuse_output(&self, _archive: &ArchiveResult, output: &Path) -> io::Result<()> {
+        self.watch.reuse_external_output(output)
+    }
+
     fn before_flatten(&self, output: &Path, work: &Path, leaf: &Path) -> io::Result<()> {
         self.watch.prepare_external_flatten(output, work, leaf)
     }
@@ -1435,6 +1439,10 @@ impl Observer for Progress {
             });
         }
         Ok(())
+    }
+
+    fn outputs_finished(&self, paths: &[String]) -> io::Result<()> {
+        self.watch.finish_external_outputs(paths)
     }
 
     fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
@@ -1645,7 +1653,7 @@ async fn archives(
     let mut archive_status = HashMap::new();
     let mut had_input_error = false;
     let mut checkpoints = Vec::new();
-    let mut promoted_sources = Vec::new();
+    let mut generated_sources = Vec::new();
     loop {
         let began = Instant::now();
         let mut request = Request::new(
@@ -1663,7 +1671,7 @@ async fn archives(
         request.config = Arc::clone(&settings);
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
-        request.promoted_sources = std::mem::take(&mut promoted_sources);
+        request.generated_sources = std::mem::take(&mut generated_sources);
         progress.reporting.reopen();
         let _report_close = ReportClose(&progress.reporting);
         let reporting = if progress.visible {
@@ -1755,7 +1763,7 @@ async fn archives(
         let outputs = std::mem::take(&mut progress.display.lock().unwrap().outputs);
         report_extract_round(&current, &outputs, began.elapsed().as_secs(), session, language)?;
         checkpoints = current.checkpoints;
-        promoted_sources = current.promoted_sources;
+        generated_sources = current.generated_sources;
         // Retry inputs are physical paths. Replace every segment for a path
         // together even when a formerly nested carrier is now a root.
         candidate_paths = password_retry_paths(&current.archives);
@@ -1768,7 +1776,7 @@ async fn archives(
         if candidate_paths.is_empty() {
             break;
         }
-        trim_password_retry_recovery(&candidate_paths, &mut checkpoints, &mut promoted_sources);
+        trim_password_retry_recovery(&candidate_paths, &mut checkpoints, &mut generated_sources);
         let retry = confirm(
             session,
             language,
@@ -2925,7 +2933,7 @@ mod option_tests {
 #[cfg(test)]
 mod recursive_prompt_tests {
     #[test]
-    fn password_retry_keeps_only_failed_carrier_siblings_and_promoted_anchors() {
+    fn password_retry_keeps_only_failed_carrier_siblings_and_generated_anchors() {
         let marker = crate::test_support::temp_file("cli_retry_scope", b"source");
         let generation = crate::io::reader::capture_file_generation(&marker).unwrap().persisted();
         let checkpoint = |carrier: &str, source: &str, failed: bool| {
@@ -2938,27 +2946,27 @@ mod recursive_prompt_tests {
                 "encrypted":false,"discovery_source":"direct","failure":failure
             })).unwrap()
         };
-        let promoted = |source: &str| serde_json::from_value::<crate::pipeline::PromotedSource>(
+        let generated = |source: &str| serde_json::from_value::<crate::pipeline::GeneratedSource>(
             json!({"path":source,"generation":generation})).unwrap();
         let mut checkpoints = vec![checkpoint("outer.zip", "outer.zip", false)];
         for index in 0..1000 { let path = format!("outer/success-{index}.zip");
             checkpoints.push(checkpoint(&path, &path, false)); }
-        // The selected promoted source can identify an old carrier through its
+        // The selected generated source can identify an carrier through its
         // physical anchor; keep its successful logical sibling as well.
-        checkpoints.push(checkpoint("old-carrier.bin", "promoted-failed.zip", true));
+        checkpoints.push(checkpoint("old-carrier.bin", "generated-failed.zip", true));
         checkpoints.push(checkpoint("old-carrier.bin", "same-carrier-good.zip", false));
-        let mut promotions = vec![promoted("promoted-failed.zip"), promoted("same-carrier-good.zip"),
-            promoted("outer/success-1.zip")];
-        trim_password_retry_recovery(&[PathBuf::from("promoted-failed.zip")], &mut checkpoints, &mut promotions);
+        let mut generated_sources = vec![generated("generated-failed.zip"), generated("same-carrier-good.zip"),
+            generated("outer/success-1.zip")];
+        trim_password_retry_recovery(&[PathBuf::from("generated-failed.zip")], &mut checkpoints, &mut generated_sources);
         assert_eq!(checkpoints.len(), 2);
         assert!(checkpoints.capacity() <= 8);
         assert!(checkpoints.iter().all(|entry| entry.carrier() == Path::new("old-carrier.bin")));
-        assert_eq!(promotions.iter().map(|source| source.path()).collect::<Vec<_>>(),
-            [Path::new("promoted-failed.zip"), Path::new("same-carrier-good.zip")]);
-        trim_password_retry_recovery(&[], &mut checkpoints, &mut promotions);
-        assert!(checkpoints.is_empty() && promotions.is_empty());
+        assert_eq!(generated_sources.iter().map(|source| source.path()).collect::<Vec<_>>(),
+            [Path::new("generated-failed.zip"), Path::new("same-carrier-good.zip")]);
+        trim_password_retry_recovery(&[], &mut checkpoints, &mut generated_sources);
+        assert!(checkpoints.is_empty() && generated_sources.is_empty());
         assert_eq!(checkpoints.capacity(), 0);
-        assert_eq!(promotions.capacity(), 0);
+        assert_eq!(generated_sources.capacity(), 0);
         std::fs::remove_file(marker).unwrap();
     }
 
@@ -3193,7 +3201,7 @@ mod recursive_prompt_tests {
                 volume_completeness: None, volume_attempts: None, source_paths: vec![],
                 password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
                 damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
-                promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+                  scan_layout: Default::default(),
             }
         }
         let mut all = HashMap::new();
@@ -3234,7 +3242,7 @@ mod recursive_prompt_tests {
                 end_offset: None, volume_completeness: None, volume_attempts: None,
                 source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
                 damage_flags: None, partial, retained: false, recovered_complete_files: 0,
-                promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+                  scan_layout: Default::default(),
             };
             // Production publishes the terminal task fact before scope reporting.
             progress.notify(Event::Finished { id: 7, path: archive.path.clone(), depth: 1,
@@ -3259,7 +3267,7 @@ mod recursive_prompt_tests {
             end_offset: None, volume_completeness: None, volume_attempts: None,
             source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
             damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None, scan_layout: crate::pipeline::ScanLayout { range: offset != 0, volumes: false },
+              scan_layout: crate::pipeline::ScanLayout { range: offset != 0, volumes: false },
         }
     }
 
@@ -3473,10 +3481,10 @@ mod recursive_prompt_tests {
         archive.failure = Some(crate::pipeline::Failure::new(FailureKind::Damaged, "native detail"));
         let summary = ArchiveSummary::collect([&archive], Language::En, true);
         assert_eq!(summary.errors, [format!("blocked.zip [{}]", Language::En.text("failure.damaged"))]);
-        archive.promoted = true;
+        archive.depth = 2;
         let summary = ArchiveSummary::collect([&archive], Language::En, true);
         assert_eq!(summary.errors, [format!("C:/inputs/blocked.zip [{}]", Language::En.text("failure.damaged"))]);
-        archive.promoted = false;
+        archive.depth = 1;
         let mut sibling = report_archive("C:/inputs/blocked.zip", 10);
         sibling.failure = Some(crate::pipeline::Failure::new(FailureKind::WrongPassword, "native password"));
         let summary = ArchiveSummary::collect([&archive, &sibling], Language::En, false);

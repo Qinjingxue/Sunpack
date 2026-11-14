@@ -262,15 +262,10 @@ def test_watch_observes_edits_to_config_symlink_target(package, tmp_path):
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
 @pytest.mark.parametrize("layout", ["outside-alias", "inside-alias", "direct"])
-def test_owned_outputs_are_excluded_after_restart_but_admit_replacement(
+def test_settled_outputs_ignore_old_writes_but_admit_changes_after_restart(
     package, tmp_path, origin, layout,
 ):
-    """Real extraction covers both registration routes and physical admission.
-
-    Lexical lifecycle tests miss outputs created outside a scope through a
-    junction. One nested archive also catches re-entry after WAL reopen, while
-    replacing the directory proves exclusion is identity-based, not permanent.
-    """
+    """Output baselines survive restart; additions and edits remain ordinary inputs."""
     watched = tmp_path / "watched"
     real = watched / "physical"
     real.mkdir(parents=True)
@@ -302,16 +297,20 @@ def test_owned_outputs_are_excluded_after_restart_but_admit_replacement(
         assert package.run("--persistent-shutdown").returncode == 0
         package.json("watch", "start", "--once", "--no-tray")
         assert not list(real.rglob("generated.txt"))
+        history = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))["history"]
+        assert not [row for row in history if row["event"] in {"candidate_active", "pipeline_request_started"}
+                    and Path(row.get("path", "")).name == inner.name], history
         nested, = real.rglob(inner.name)
         output = nested.parent
-        # Keep the old directory alive so an ID cannot be immediately reused.
-        output.rename(tmp_path / "previous-output")
-        output.mkdir()
         package.json("watch", "start", "--no-tray")
         incoming = tmp_path / "external.zip"
         _zip(incoming, "external.txt", b"new input at the old output path")
         incoming.replace(output / incoming.name)
         _wait_for_output(real, "external.txt", b"new input at the old output path")
+        replacement = tmp_path / "replacement.zip"
+        _zip(replacement, "changed.txt", b"changed nested archive is now an input")
+        replacement.replace(nested)
+        _wait_for_output(real, "changed.txt", b"changed nested archive is now an input")
         package.json("watch", "start", "--once", "--no-tray")
         assert package.json("watch", "stop")["summary"]["stopped"]
         assert not list(real.rglob("generated.txt"))

@@ -36,7 +36,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         }).unwrap();
         journal.commit(true, |state| {
             Ok(state.output_operation(owner_text, owner_text.into(),
-                root.to_string_lossy().into_owned(), None, None)?.unwrap())
+                root.to_string_lossy().into_owned(), None, false)?.unwrap())
         }).unwrap();
         prepare_flatten(&journal, owner_text, &root, &work, &leaf).unwrap();
         let phase = std::env::var(PHASE).unwrap();
@@ -109,7 +109,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
             assert!(!work.exists(), "{phase}/{reopen}");
             assert!(journal.state().runtime_keys("flatten|").is_empty());
             let pending = journal.state().pending(owner.to_str().unwrap()).unwrap();
-            assert!(recovery_output_matches(journal.state(), &pending, root.to_str().unwrap()));
+            assert!(recovery_output_matches(&pending, root.to_str().unwrap()));
             assert!(journal.state().owned_root(work.to_str().unwrap()).is_none());
         }
         fs::remove_dir_all(&base).unwrap();
@@ -118,171 +118,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
 }
 
 
-// Promotion recovery has to retain both sides of a partially moved multipart
-// family. A whole-process death must bypass the move routine's error rollback.
-#[test]
-fn hard_death_recovers_partially_promoted_family_without_duplicate_admission() {
-    const CHILD: &str = "SUNPACK_PROMOTION_CRASH_CHILD";
-    const PHASE: &str = "SUNPACK_PROMOTION_CRASH_PHASE";
-    const MODE: &str = "SUNPACK_PROMOTION_CRASH_MODE";
-    const READY: &str = "sunpack-promotion-crash-ready";
-    if let Some(base) = std::env::var_os(CHILD) {
-        let base = PathBuf::from(base);
-        let watched = base.join("watched");
-        let output = watched.join("output");
-        let owner = watched.join("carrier.bin");
-        let names = ["series.7z.001", "series.7z.002"];
-        let phase = std::env::var(PHASE).unwrap();
-        let moved = match phase.as_str() { "prepared" => 0, "partial" => 1, _ => 2 };
-        if std::env::var(MODE).as_deref() == Ok("recover") {
-            // Only the recovery method is under test: no worker, observers or
-            // broker connection is started. This isolated process has no
-            // acquired broker lease, so its empty lease Drop is a no-op.
-            let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
-            let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
-            let settings = Arc::new(Config::parse(&json!({})).unwrap());
-            let mut scheduler = Scheduler {
-                candidate_diagnostics: CandidateDiagnostics::default(),
-                admission_checkpoint: None,
-                cwd: base.clone(), root_file: base.join(ROOTS_FILE),
-                roots: BTreeMap::from([(key(&watched), (Root { path: watched.clone(), output: None,
-                    recursive: true, deep: true, scanned: true }, scope))]),
-                available_roots: HashSet::from([key(&watched)]),
-                user_password_signature: user_password_signature(&settings.user_passwords),
-                settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
-                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
-                options: None,
-                deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
-                passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
-                root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-                parent_observers: HashMap::new(), config_observers: Vec::new(),
-                pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-                active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
-                tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: None,
-            };
-            scheduler.recover_pending(None).unwrap();
-            if phase == "promoted-only" {
-                let destination = watched.join(names[0]);
-                assert_eq!(scheduler.pending.len(), 2);
-                assert!(scheduler.pending.contains_key(&key(&owner)));
-                assert!(scheduler.pending.contains_key(&key(&destination)));
-                assert_eq!(scheduler.journal.state().pending_items().len(), 2);
-                return;
-            }
-            let expected = names.iter().enumerate().map(|(index, name)| {
-                if index < moved { watched.join(name) } else { output.join(name) }
-            }).collect::<Vec<_>>();
-            assert_eq!(scheduler.pending.len(), 2, "{phase}");
-            assert_eq!(scheduler.journal.state().pending_items().len(), 2, "{phase}");
-            assert!(scheduler.journal.state().pending(owner.to_str().unwrap()).is_none());
-            for (index, path) in expected.iter().enumerate() {
-                assert!(scheduler.pending.contains_key(&key(path)), "{}", path.display());
-                assert_eq!(fs::read(path).unwrap(), format!("volume-{index}").as_bytes());
-                let identity = capture_file_generation(path).unwrap().persisted();
-                let saved: Value = serde_json::from_slice(&fs::read(base.join(format!("generation-{index}.json"))).unwrap()).unwrap();
-                // A rename may change USN/change-time; the physical file ID
-                // and payload must remain the original, not regenerated data.
-                let current = serde_json::to_value(identity).unwrap();
-                assert!(!saved["windows"]["file_id"].is_null());
-                assert_eq!(current["windows"]["file_id"], saved["windows"]["file_id"]);
-                assert_eq!(current["windows"]["volume"], saved["windows"]["volume"]);
-                assert_eq!(usize::from(watched.join(names[index]).is_file())
-                    + usize::from(output.join(names[index]).is_file()), 1);
-            }
-            return;
-        }
-        fs::create_dir_all(&output).unwrap();
-        // BuiltinStore resolves this explicit test development root, not the
-        // actual checkout's editable password file.
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
-        fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
-        fs::write(&owner, b"carrier").unwrap();
-        let sources = names.iter().map(|name| output.join(name)).collect::<Vec<_>>();
-        let destinations = names.iter().map(|name| watched.join(name)).collect::<Vec<_>>();
-        for (index, source) in sources.iter().enumerate() {
-            fs::write(source, format!("volume-{index}")).unwrap();
-            fs::write(base.join(format!("generation-{index}.json")),
-                serde_json::to_vec(&capture_file_generation(source).unwrap().persisted()).unwrap()).unwrap();
-        }
-        let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
-        let owner_text = owner.to_str().unwrap();
-        journal.commit(true, |state| Ok(state.pending_operations(
-            [(PendingObservation(owner_text.into(), 7, 1.0, String::new(), 0),
-                watched.to_string_lossy().into_owned(), None)], false, "", false, true, None,
-        )?.0)).unwrap();
-        if phase != "promoted-only" {
-            journal.commit(true, |state| Ok(state.output_operation(owner_text, owner_text.into(),
-                output.to_string_lossy().into_owned(), None, None)?.unwrap())).unwrap();
-            journal.commit(true, |state| Ok(state.output_operation(owner_text, owner_text.into(),
-                output.to_string_lossy().into_owned(), Some(true), None)?.unwrap())).unwrap();
-        }
-        journal.commit(true, |state| Ok(state.promotion_operation(owner_text,
-            destinations.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
-            sources.iter().map(|path| path.to_string_lossy().into_owned()).collect()).unwrap())).unwrap();
-        let moved = if phase == "promoted-only" { 1 } else { moved };
-        for (source, destination) in sources.iter().zip(&destinations).take(moved) {
-            crate::io::atomic_file::rename_no_replace(source, destination).unwrap();
-        }
-        if phase == "receipts" {
-            journal.commit(true, |_| {
-                let mut operations = NativeWatchOperations::empty();
-                for path in &destinations {
-                    operations.put_promoted(serde_json::from_value(json!({
-                        "path": path, "generation": capture_file_generation(path)?.persisted(),
-                    }))?);
-                }
-                Ok(operations)
-            }).unwrap();
-        }
-        println!("{READY}");
-        io::stdout().flush().unwrap();
-        let mut byte = [0];
-        io::stdin().read_exact(&mut byte).unwrap();
-        panic!("parent must kill promotion owner without unwinding");
-    }
-    for phase in ["prepared", "partial", "moved", "receipts", "promoted-only"] {
-        let marker = crate::test_support::temp_file("promotion_hard_death", b"");
-        let base = marker.with_extension("case");
-        fs::create_dir(&base).unwrap();
-        let test_name = format!("{}::hard_death_recovers_partially_promoted_family_without_duplicate_admission",
-            module_path!().split_once("::").unwrap().1);
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test_name, "--nocapture"])
-            .env(CHILD, &base).env(PHASE, phase)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
-            .spawn().unwrap();
-        let (send, ready) = mpsc::sync_channel(1);
-        let stdout = child.stdout.take().unwrap();
-        let reader = thread::spawn(move || {
-            for line in io::BufReader::new(stdout).lines() {
-                if line.unwrap().contains(READY) { let _ = send.send(()); return; }
-            }
-        });
-        let reached = ready.recv_timeout(Duration::from_secs(30));
-        let killed = child.kill();
-        let status = child.wait().unwrap();
-        reader.join().unwrap();
-        reached.expect("promotion owner did not reach the durable boundary");
-        killed.unwrap();
-        assert!(!status.success());
-        for _ in 0..2 {
-            let recovered = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &test_name, "--nocapture"])
-                .env(CHILD, &base).env(PHASE, phase).env(MODE, "recover")
-                .output().unwrap();
-            assert!(recovered.status.success(), "{phase}: {}\n{}",
-                String::from_utf8_lossy(&recovered.stdout), String::from_utf8_lossy(&recovered.stderr));
-        }
-        fs::remove_dir_all(&base).unwrap();
-        fs::remove_file(marker).unwrap();
-    }
-}
 
-
-// Exercise the real release/observation path in an isolated process, so the
-// existing empty BrokerLease does not affect another test's acquired lease.
 #[test]
 fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling() {
     const CHILD: &str = "SUNPACK_CLAIM_RELEASE_CHILD";
@@ -318,11 +154,12 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
                 root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-                parent_observers: HashMap::new(), config_observers: Vec::new(),
+                parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+                volume_checks: HashMap::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: None,
+                external: Arc::default(), _lease: None,
             };
 
         let mut interrupted = NativeWatchOperations::empty();
@@ -335,11 +172,12 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         scheduler.hub.claims.lock().unwrap().extend(groups.keys().map(|path| (path.clone(), Arc::<str>::from("owner"))));
         let dirty = HashSet::from([key(&source), key(&sibling)]);
         scheduler.apply_completion("owner", CompletionContext {
+            max_depth: usize::MAX,
             deep: false,
             root: key(&watched), recovery: None, password_scope: watched.clone(), passwords: Arc::default(),
             inputs: vec![old, same], quiet: HashMap::new(), dirty, claimed: captured, groups, toast: None, task: None,
         }, Completed { cancelled: true, result: Err(io::Error::other("cancelled owner")),
-            promoted: HashMap::new(), outputs: BTreeMap::new() }).unwrap();
+             outputs: BTreeMap::new() }).unwrap();
         assert_eq!(scheduler.pending.len(), 1);
         assert_eq!(scheduler.pending[&key(&source)].candidate.size, fs::metadata(&source).unwrap().len());
         assert!(!scheduler.pending.contains_key(&key(&sibling)));
@@ -364,11 +202,12 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
             let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
                 (key(path), capture_file_generation(path).unwrap())).collect();
             let observer = WatchObserver {
+                catalog: Arc::clone(&scheduler.catalog),
                 deep: false, journal: Arc::clone(&scheduler.journal),
-                owners: HashMap::new(), output_scopes: Arc::from([]),
+                owners: HashMap::new(),
                 outputs: Mutex::new(ObservedOutputs::from(BTreeMap::new())),
                 batch: Arc::from("new-success"), toast: None, hub: Arc::clone(&scheduler.hub),
-                groups: Arc::default(), claimed: Arc::default(), promoted: Mutex::default(),
+                groups: Arc::default(), claimed: Arc::default(),
             };
             // Main remembers complete source output even if a child failed.
             observer.sources_processed(generations.clone(), Some(&output)).unwrap();
@@ -376,11 +215,12 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
             let mut outcome = Outcome::default();
             outcome.archives.push(old);
             scheduler.apply_completion("late-old-failure", CompletionContext {
+            max_depth: usize::MAX,
                 deep: false, root: key(&watched), recovery: None, password_scope: watched.clone(), passwords: Arc::default(),
                 inputs: vec![candidate.clone()], quiet: HashMap::new(), dirty: HashSet::new(),
                 claimed: Arc::default(), groups: HashMap::new(), toast: None, task: None,
             }, Completed { cancelled: false, result: Ok(outcome),
-                promoted: HashMap::new(), outputs: BTreeMap::new() }).unwrap();
+                 outputs: BTreeMap::new() }).unwrap();
             assert!(scheduler.journal.state().entry(&candidate.path).is_none());
             assert!(scheduler.journal.state().pending(&candidate.path).is_none());
             assert!(!scheduler.pending.contains_key(&key(&head)));

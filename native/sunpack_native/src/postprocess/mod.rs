@@ -1,154 +1,8 @@
 use crate::io::atomic_file::rename_no_replace;
-use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
-
-pub(crate) type PromotionResult = (
-    Vec<(String, String)>,
-    String,
-    bool,
-);
-
-pub(crate) struct NativeBlockedInputPromotion {
-    moves: Vec<(PathBuf, PathBuf)>,
-}
-
-impl NativeBlockedInputPromotion {
-    pub(crate) fn new(paths: Vec<String>, destination: PathBuf) -> io::Result<Self> {
-        let moves = plan_promotion_moves(paths, &destination)?;
-        Ok(Self { moves })
-    }
-
-    pub(crate) fn moves(&self) -> &[(PathBuf, PathBuf)] {
-        &self.moves
-    }
-
-    pub(crate) fn execute(&self, before_move: impl FnOnce() -> io::Result<()>) -> PromotionResult {
-        promote_input_files_with_move(&self.moves, before_move, move_input_no_replace)
-    }
-}
-
-fn plan_promotion_moves(
-    paths: Vec<String>,
-    destination: &Path,
-) -> io::Result<Vec<(PathBuf, PathBuf)>> {
-    static NEXT_ALIAS: AtomicU64 = AtomicU64::new(0);
-    let mut destinations = HashSet::new();
-    let mut sources = HashSet::new();
-    let mut moves = Vec::new();
-    for raw in paths {
-        let source = PathBuf::from(raw);
-        if !sources.insert(crate::path_keys::path_key(&normalize_path(&source))) {
-            continue;
-        }
-        let Some(name) = source.file_name() else {
-            return Err(io::Error::other("input has no basename"));
-        };
-        if !source.metadata()?.is_file() {
-            return Err(io::Error::other(format!(
-                "not an input file: {}",
-                source.display()
-            )));
-        }
-        let mut target = destination.join(name);
-        while target.try_exists()?
-            || destinations.contains(&crate::path_keys::path_key(&normalize_path(&target)))
-        {
-            // Keep the first-dot bucket and every original numeric channel.
-            // Alphabetic aliases introduce neither volume numbers nor format hints.
-            let mut value = NEXT_ALIAS.fetch_add(1, Ordering::Relaxed);
-            let mut suffix = String::from(".__sunpack_");
-            loop {
-                suffix.push((b'a' + (value & 15) as u8) as char);
-                value >>= 4;
-                if value == 0 {
-                    break;
-                }
-            }
-            let mut alias = name.to_os_string();
-            alias.push(suffix);
-            target = destination.join(alias);
-        }
-        destinations.insert(crate::path_keys::path_key(&normalize_path(&target)));
-        moves.push((source, target));
-    }
-    Ok(moves)
-}
-
-fn promote_input_files_with_move(
-    moves: &[(PathBuf, PathBuf)],
-    before_move: impl FnOnce() -> io::Result<()>,
-    mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
-) -> PromotionResult {
-    let mut residual = Vec::new();
-    let mut parents = HashSet::new();
-    // Recheck after acquiring publication leases, before the durable intent.
-    for (source, target) in moves {
-        match target.try_exists() {
-            Ok(false) => {}
-            Ok(true) => {
-                return (
-                    residual,
-                    "promotion destination exists".into(),
-                    true,
-                )
-            }
-            Err(error) => return (residual, error.to_string(), false),
-        }
-        if let Some(parent) = source.parent() {
-            parents.insert(parent.to_path_buf());
-        }
-    }
-    if let Err(error) = before_move() {
-        return (residual, error.to_string(), false);
-    }
-    for (index, (source, target)) in moves.iter().enumerate() {
-        if let Err(error) = move_file(source, target) {
-            let mut message = error.to_string();
-            // Only this prefix moved. Build a residual map only on failed rollback;
-            // successful execution reuses the already published move plan.
-            for (old, new) in moves[..index].iter().rev() {
-                if let Err(rollback) = move_file(new, old) {
-                    residual.push((normalize_path(old), normalize_path(new)));
-                    message.push_str(&format!("; rollback {}: {}", new.display(), rollback));
-                }
-            }
-            let collision = is_name_collision(&error) && residual.is_empty();
-            return (residual, message, collision);
-        }
-    }
-    for parent in &parents {
-        // remove_dir itself atomically checks emptiness; never walk upwards.
-        let _ = fs::remove_dir(parent);
-    }
-    (residual, String::new(), false)
-}
-
-fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    match rename_no_replace(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(17) => {
-            // A create-new handle prevents a concurrent arrival from being overwritten.
-            let mut input = fs::File::open(source)?;
-            let mut output = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(destination)?;
-            let copied = io::copy(&mut input, &mut output);
-            drop(output);
-            drop(input);
-            if let Err(error) = copied.and_then(|_| fs::remove_file(source)) {
-                let _ = fs::remove_file(destination);
-                return Err(error);
-            }
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
 
 use crate::filesystem::{watch_file_observation_known_kind, WatchFileObservation};
 
@@ -384,9 +238,6 @@ fn only_child_directory(dir: &Path) -> Option<PathBuf> {
     first.metadata().ok()?.is_dir().then(|| first.path())
 }
 
-fn is_name_collision(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::AlreadyExists || matches!(error.raw_os_error(), Some(80 | 183))
-}
 
 fn remove_empty_flatten_wrappers(work: &Path, leaf_relative: &Path) -> Result<usize, String> {
     let leaf = work.join(leaf_relative);
@@ -444,105 +295,6 @@ mod tests {
         assert!(watch_candidate_for_path(path, None).unwrap().is_none());
     }
 
-    #[test]
-    fn promotion_rolls_back_preceding_members_on_move_failure() {
-        let root = TestDirectory::new("promotion-rollback");
-        let source = root.path().join("source");
-        let destination = root.path().join("destination");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&destination).unwrap();
-        let first = source.join("game.001");
-        let second = source.join("game.002");
-        fs::write(&first, b"first").unwrap();
-        fs::write(&second, b"second").unwrap();
-        let moves = plan_promotion_moves(
-            vec![normalize_path(&first), normalize_path(&second)],
-            &destination,
-        )
-        .unwrap();
-        // Both a permanent failure and a concurrent collision must roll back
-        // earlier members. Only a fully restored collision may replan.
-        for kind in [
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::AlreadyExists,
-        ] {
-            let result = promote_input_files_with_move(
-                &moves,
-                || Ok(()),
-                |old, new| {
-                    if old == second {
-                        return Err(io::Error::new(kind, "injected"));
-                    }
-                    rename_no_replace(old, new)
-                },
-            );
-            assert!(result.0.is_empty());
-            assert!(result.1.contains("injected"));
-            assert_eq!(result.2, kind == io::ErrorKind::AlreadyExists);
-            assert!(first.is_file() && second.is_file());
-            assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
-        }
-    }
-
-    #[test]
-    fn promotion_reports_only_members_left_after_partial_rollback() {
-        // Complete rollback never exercises residual path reporting. Four tiny
-        // files cover restored, retained, failed and not-yet-attempted members.
-        let root = TestDirectory::new("promotion-partial-rollback");
-        let source = root.path().join("source");
-        let destination = root.path().join("destination");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&destination).unwrap();
-        let paths: Vec<_> = (1..=4)
-            .map(|number| source.join(format!("inner.blob.{number:03}")))
-            .collect();
-        for path in &paths {
-            fs::write(path, b"payload").unwrap();
-        }
-        let moves = plan_promotion_moves(
-            paths.iter().map(|path| normalize_path(path)).collect(),
-            &destination,
-        )
-        .unwrap();
-        let mut attempted = Vec::new();
-        let result = promote_input_files_with_move(
-            &moves,
-            || Ok(()),
-            |old, new| {
-                attempted.push(old.to_path_buf());
-                if old == paths[2] {
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "collision"));
-                }
-                if old == moves[1].1 {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "retained"));
-                }
-                rename_no_replace(old, new)
-            },
-        );
-        assert_eq!(
-            result.0,
-            vec![(normalize_path(&paths[1]), normalize_path(&moves[1].1))]
-        );
-        assert!(result.1.contains("collision") && result.1.contains("retained"));
-        assert!(
-            !result.2,
-            "partial rollback must not allow collision replanning"
-        );
-        assert_eq!(
-            attempted,
-            vec![
-                paths[0].clone(),
-                paths[1].clone(),
-                paths[2].clone(),
-                moves[1].1.clone(),
-                moves[0].1.clone(),
-            ]
-        );
-        assert!(paths[0].is_file() && paths[2].is_file() && paths[3].is_file());
-        assert!(!paths[1].exists());
-        assert_eq!(fs::read(&moves[1].1).unwrap(), b"payload");
-        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
-    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDirectory(PathBuf);
@@ -692,4 +444,30 @@ mod tests {
         assert_eq!(stats.removed_dirs, 0);
         assert_eq!(stats.errors.len(), 1);
     }
+}
+
+pub(crate) fn watch_content_changed(
+    size: u64,
+    mtime: f64,
+    id: &str,
+    usn: i64,
+    current: &WatchCandidateRow,
+) -> bool {
+    if id != current.observation.file_id || size != current.size {
+        return true;
+    }
+    if usn == current.observation.change_usn {
+        return false;
+    }
+    if let Some(reasons) = current.observation.change_reasons {
+        return reasons.without_close & 7 != 0;
+    }
+    current.mtime >= mtime - 2.0
+}
+
+/// Recovery permissions belong to the original location as well as its bytes.
+pub(crate) fn watch_source_changed(size: u64, mtime: f64, id: &str, usn: i64, current: &WatchCandidateRow) -> bool {
+    watch_content_changed(size, mtime, id, usn, current)
+        || (usn != current.observation.change_usn && current.observation.change_reasons
+            .is_some_and(|reasons| reasons.without_close & 0x3000 != 0))
 }

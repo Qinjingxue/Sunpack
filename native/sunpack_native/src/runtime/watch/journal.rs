@@ -75,6 +75,11 @@ pub(super) struct Journal {
 
 impl Journal {
     pub(super) fn open(dir: &Path, retention_days: u64) -> io::Result<Self> {
+        Self::open_with_outputs(dir, retention_days, Arc::default())
+    }
+
+    pub(super) fn open_with_outputs(dir: &Path, retention_days: u64,
+        outputs: crate::watch_store::active_outputs::OutputReservations) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -84,7 +89,8 @@ impl Journal {
             .share_mode(0)
             .open(dir.join("state.runtime.lock"))?;
         let snapshot = dir.join("state.snapshot");
-        let state = NativeWatchState::new();
+        let mut state = NativeWatchState::new();
+        state.outputs = outputs;
         let frontier = Self::restore_state(&state, dir)?;
         let stream_id = key(&snapshot);
         let stream = watch_journal_open(stream_id.clone())?;
@@ -319,11 +325,11 @@ impl Journal {
     }
 
     /// Use the existing publication gate without emitting a WAL record or
-    /// advancing a cursor. An output's mkdir and durable registration cannot
+    /// advancing a cursor. An output's mkdir and temporary registration cannot
     /// be observed halfway through by a directory-notification callback.
     pub(super) fn owned_event_filter<'a>(
         &self, paths: impl Iterator<Item = &'a Path>, boundary: &Path,
-    ) -> Option<crate::watch_store::owned_outputs::OwnedEventFilter> {
+    ) -> Option<crate::watch_store::active_outputs::OwnedEventFilter> {
         let records = {
             let frontier = self.frontier.lock().unwrap();
             if frontier.fault.is_some() { return None; }
@@ -687,16 +693,10 @@ mod tests {
             let owned = marker.with_extension("owned");
             fs::create_dir(&owned).unwrap();
             let journal = Journal::open(&dir, 7).unwrap();
-            journal.commit(true, |_| {
-                let mut operations = NativeWatchOperations::password_generation(1, "one".into());
+            journal.commit(true, |state| {
+                let operations = NativeWatchOperations::password_generation(1, "one".into());
                 let (volume, id, _) = crate::filesystem::watch_path_identity(owned.to_str().unwrap())?;
-                operations.extend(NativeWatchOperations::owned_outputs(
-                    &[owned.to_string_lossy().into_owned()], &[&format!("{volume}|{id}")],
-                ));
-                operations.put_promoted(serde_json::from_value(serde_json::json!({
-                    "path": marker,
-                    "generation": crate::io::reader::capture_file_generation(&marker)?.persisted(),
-                }))?);
+                state.register_output_paths(&[owned.to_string_lossy().into_owned()], &[&format!("{volume}|{id}")]);
                 Ok(operations)
             }).unwrap();
             journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
@@ -732,11 +732,10 @@ mod tests {
             for _ in 0..2 {
                 let journal = Journal::open(&dir, 7).unwrap();
                 assert_eq!(journal.state().password_generation(), 3, "{phase}");
-                assert!(!journal.state().promoted_source(marker.to_str().unwrap()).unwrap().is_replaced());
-                assert_eq!(journal.state().runtime_keys("owned|").len(), 1);
+                assert!(journal.state().active_output_keys().is_empty());
                 let mut events = vec![owned.join("nested.zip")];
                 journal.filter_owned_events(&mut events, &owned);
-                assert!(events.is_empty(), "replayed ownership must still filter output events");
+                assert_eq!(events.len(), 1, "temporary reservations must not survive their writer");
                 if phase != "before_snapshot" {
                     assert!(!segment_path(&dir, 1).exists());
                 }
@@ -1043,20 +1042,18 @@ mod tests {
             assert_eq!(filtered.recv_timeout(Duration::from_millis(100)),
                 Err(mpsc::RecvTimeoutError::Timeout));
             let (volume, id, _) = crate::filesystem::watch_path_identity(output.to_str().unwrap())?;
-            Ok(NativeWatchOperations::owned_outputs(
-                &crate::path_keys::output_path_aliases(&output)?, &[&format!("{volume}|{id}")],
-            ))
+            journal.state().register_output_paths(&crate::path_keys::output_path_aliases(&output)?, &[&format!("{volume}|{id}")]);
+            Ok(NativeWatchOperations::empty())
         }).unwrap();
         assert_eq!(filtered.recv_timeout(Duration::from_secs(5)).unwrap(), vec![directory.clone()]);
         worker.join().unwrap();
-        assert_eq!(journal.frontier.lock().unwrap().seq, 1);
         assert!(journal.state().watch_cursors().is_empty());
         drop(journal);
         let journal = Journal::open(&state_directory, 7).unwrap();
         let mut paths = vec![output.join("nested.blob"), physical.join("nested.blob")];
         journal.filter_owned_events(&mut paths, &directory);
-        assert!(paths.is_empty());
-        assert_eq!(journal.state().runtime_keys("owned|").len(), 2);
+        assert_eq!(paths.len(), 2);
+        assert!(journal.state().active_output_keys().is_empty());
         assert!(journal.state().watch_cursors().is_empty());
         drop(journal);
         fs::remove_dir(alias).unwrap();
@@ -1077,16 +1074,10 @@ mod tests {
             for generation in 1..=3 {
                 journal
                     .commit(true, |_| {
-                        let mut operations = NativeWatchOperations::password_generation(
+                        let operations = NativeWatchOperations::password_generation(
                             generation,
                             generation.to_string(),
                         );
-                        if generation == 1 {
-                            operations.put_promoted(serde_json::from_value(serde_json::json!({
-                                "path": marker,
-                                "generation": crate::io::reader::capture_file_generation(&marker)?.persisted(),
-                            }))?);
-                        }
                         Ok(operations)
                     })
                     .unwrap();
@@ -1099,14 +1090,6 @@ mod tests {
         {
             let journal = Journal::open(&dir, 7).unwrap();
             assert_eq!(journal.state().password_generation(), 3);
-            let receipt = journal
-                .state()
-                .promoted_source(marker.to_str().unwrap())
-                .unwrap();
-            assert_eq!(receipt.path(), marker);
-            assert!(!receipt.is_replaced());
-            fs::write(&marker, b"replacement data").unwrap();
-            assert!(receipt.is_replaced());
         }
         fs::remove_dir_all(dir).unwrap();
         fs::remove_file(marker).unwrap();

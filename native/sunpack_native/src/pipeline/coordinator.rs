@@ -1,5 +1,5 @@
 use super::results::RunOutcome as Outcome;
-use super::checkpoint::{CheckpointKey, InputCheckpoint, InputRecovery, PromotedSource, ReportState};
+use super::checkpoint::{CheckpointKey, InputCheckpoint, InputRecovery, GeneratedSource, ReportState};
 use super::discovery::{self, Discovered, LogicalInput, Task};
 use super::passwords::{AttemptCache, CandidateSet};
 use super::scheduling::{stage, Scheduler, Spawner};
@@ -24,10 +24,9 @@ use crate::io::reader::{
 #[cfg(test)]
 use crate::io::reader::release_reader_resources_under_roots;
 use crate::io::resource_lifecycle::Promotion;
-use crate::path_keys::{normalize_windows_extended_prefix, path_ancestors, path_key, resolved_path_key};
+use crate::path_keys::{normalize_windows_extended_prefix, path_key};
 use crate::postprocess::{
     discover_flatten_leaf, flatten_single_branch_directories, remove_owned_file, remove_owned_tree, FlattenLeaf,
-    NativeBlockedInputPromotion,
 };
 use crate::scan::directory::{
     scan_output_inventory_impl, NativeDirectoryScanOptions, NativeOutputInventory,
@@ -236,16 +235,13 @@ impl Engine {
         for (index, checkpoint) in request.checkpoints.iter().enumerate() {
             checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
         }
-        let promoted_sources = request
-            .promoted_sources
+        let generated_sources = request
+            .generated_sources
             .iter().enumerate()
             .map(|(index, source)| (path_key(&source.path().to_string_lossy()), index))
             .collect();
-        let target_directories = if request.mode == Mode::Extract && request.max_depth > 0 {
-            TargetDirectories::new(&request.inputs)
-        } else {
-            TargetDirectories::default()
-        };
+        let cleanup_boundaries = request.cleanup_boundaries.iter().chain(request.inputs.iter().filter(|p| p.is_dir()))
+            .map(|path| resolved_key(path)).collect();
         let request = Arc::new(request);
         Ok(Arc::new(Run {
             engine: self.clone(),
@@ -261,14 +257,20 @@ impl Engine {
             output_names: OutputReservationGuard { registry: Arc::clone(&self.output_names), owner: request_id },
             created_outputs: Mutex::default(),
             output_base,
-            target_directories,
             checkpoints,
             checkpoint_anchors: OnceLock::new(),
-            promoted_sources,
+            generated_sources,
+            cleanup_boundaries,
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
             cleanup_refs: Arc::default(),
         }))
+    }
+
+    pub(crate) fn find_watch_volume(&self, request: &Request, options: &NativeDirectoryScanOptions, retry_incomplete: bool) -> io::Result<Option<Arc<super::PreparedVolume>>> {
+        let candidates = CandidateSet::new(Arc::clone(&request.passwords), request.password_snapshot.clone(),
+            &self.password_attempts, request.password_scope.as_deref());
+        discovery::find_watch_volume(request, options, &candidates, retry_incomplete)
     }
 
     pub(crate) async fn worker_ready(&self, config: &WorkerConfig, cancel: &Cancellation) -> io::Result<()> {
@@ -391,10 +393,10 @@ struct Run<'a, O> {
     output_names: OutputReservationGuard,
     created_outputs: Mutex<CreatedOutputs>,
     output_base: Option<PathBuf>,
-    target_directories: TargetDirectories,
     checkpoints: RecoveryCheckpointIndex,
     checkpoint_anchors: OnceLock<RecoveryAnchorIndex>,
-    promoted_sources: HashMap<String, usize>,
+    generated_sources: HashMap<String, usize>,
+    cleanup_boundaries: HashSet<String>,
     scan_errors: Mutex<DirectoryReadErrors>,
     cleanup_tasks: Mutex<CleanupTasks>,
     cleanup_refs: Arc<Mutex<CleanupRefs>>,
@@ -456,60 +458,8 @@ impl Drop for CleanupOwner {
     }
 }
 
-#[derive(Default)]
-struct TargetDirectories {
-    first: Option<Arc<Path>>,
-    exact: HashMap<String, Arc<Path>>,
-    ancestors: HashMap<String, Arc<Path>>,
-}
-
-impl TargetDirectories {
-    fn new(inputs: &[PathBuf]) -> Self {
-        let mut targets = Self::default();
-        for input in inputs {
-            let Ok(path) = std::path::absolute(input) else { continue };
-            let is_dir = path.is_dir();
-            let directory: Arc<Path> = if is_dir {
-                Arc::from(path.as_path())
-            } else {
-                Arc::from(path.parent().unwrap_or(Path::new(".")))
-            };
-            targets.first.get_or_insert_with(|| Arc::clone(&directory));
-            if inputs.len() == 1 { break; }
-            if is_dir {
-                let key = resolved_path_key(&path);
-                let stored = targets.ancestors.entry(key.trim_end_matches('\\').to_owned())
-                    .or_insert_with(|| Arc::clone(&directory));
-                if directory.as_os_str().len() > stored.as_os_str().len() {
-                    *stored = Arc::clone(&directory);
-                }
-            }
-            targets.exact.entry(path_key(&path.to_string_lossy())).or_insert(directory);
-        }
-        targets
-    }
-
-    fn directory_for(&self, entry: &Path) -> Arc<Path> {
-        if self.exact.is_empty() {
-            return self.first.clone()
-                .unwrap_or_else(|| Arc::from(entry.parent().unwrap_or(Path::new("."))));
-        }
-        self.exact.get(&path_key(&entry.to_string_lossy()))
-            .or_else(|| {
-                if self.ancestors.is_empty() { return None; }
-                let key = resolved_path_key(entry);
-                let target = path_ancestors(&key).find_map(|ancestor| self.ancestors.get(ancestor));
-                target
-            })
-            .or(self.first.as_ref())
-            .cloned()
-            .unwrap_or_else(|| Arc::from(entry.parent().unwrap_or(Path::new("."))))
-    }
-}
-
 struct RecursiveScope {
     password: Option<Arc<Path>>,
-    promotion: Arc<Path>,
 }
 
 enum RetryOutput<'a> {
@@ -1225,7 +1175,7 @@ impl<'run, O: Observer> Run<'run, O> {
 
     fn watch_generations(&self, discovered: &Discovered) -> Option<Arc<WatchGenerations>> {
         if self.request.origin != Origin::Watch || self.request.mode != Mode::Extract
-            || !self.request.checkpoints.is_empty() || !self.request.promoted_sources.is_empty()
+            || !self.request.checkpoints.is_empty() || !self.request.generated_sources.is_empty()
             || !discovered.errors.is_empty() || !discovered.scan_errors.is_empty()
             || !discovered.tasks.iter().any(|task| task.owned_paths.len() > 1)
         {
@@ -1253,13 +1203,21 @@ impl<'run, O: Observer> Run<'run, O> {
         }
         // Scheduler completion joins every writer, even on cancellation. Never
         // roll back a tree while a native job or recursive branch can write it.
-        if self.request.cancel.cancelled() {
-            stage("cancel_cleanup", &Cancellation::default()).await?;
-            let mut discarded = Outcome::default();
-            self.created_outputs.lock().unwrap().rollback(
-                &*self.observer, executed.as_mut().unwrap_or(&mut discarded),
-            )?;
-        }
+        let rollback = async {
+            if self.request.cancel.cancelled() {
+                stage("cancel_cleanup", &Cancellation::default()).await?;
+                let mut discarded = Outcome::default();
+                self.created_outputs.lock().unwrap().rollback(
+                    &*self.observer, executed.as_mut().unwrap_or(&mut discarded),
+                )?;
+            }
+            Ok::<_, io::Error>(())
+        }.await;
+        let outputs = self.output_names.registry.lock().unwrap().owners
+            .get(&self.output_names.owner).cloned().unwrap_or_default();
+        let publication = self.observer.outputs_finished(&outputs);
+        rollback?;
+        publication?;
         let mut outcome = executed?;
         outcome.errors.extend(
             std::mem::replace(&mut *self.scan_errors.lock().unwrap(), DirectoryReadErrors::report())
@@ -1468,8 +1426,8 @@ impl<'run, O: Observer> Run<'run, O> {
             outcome.checkpoints.append(&mut branch.checkpoints);
             outcome.cleanup_results.append(&mut branch.cleanup_results);
             outcome
-                .promoted_sources
-                .append(&mut branch.promoted_sources);
+                .generated_sources
+                .append(&mut branch.generated_sources);
         }
         first_error.map_or(Ok(outcome), Err)
     }
@@ -1659,7 +1617,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let discovery_blocked = task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
                 matches!(failure.context.as_deref(), Some(super::FailureContext::Discovery { .. }))));
             let single_volume_retry = task.inputs.len() == 1 && task.inputs[0].failure.as_ref()
-                .is_some_and(|failure| failure.contains(FailureKind::MissingVolume));
+                .is_some_and(|failure| failure.kind == FailureKind::MissingVolume);
             if !single_volume_retry && (admission || discovery_blocked) {
                 let failure = task.inputs[0].failure.as_ref().expect("task preflight failure");
                 // task_started in main registers segment rows even when task
@@ -1703,21 +1661,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                     }
                 }
-                if this.request.mode == Mode::Extract && depth > 1 && !cancel.cancelled()
-                    && completed.iter().any(|result| result.failure.as_ref().is_some_and(|failure|
-                        failure.is_password_retry() || failure.contains(FailureKind::MissingVolume)))
-                {
-                    let destination = this.promotion_directory(&owner_path, inherited_scope.as_deref());
-                    drop(lease);
-                    lease = this.engine.leases.acquire(
-                        task.owned_paths.iter().map(|path| resolved_key(Path::new(path))).collect(),
-                        cancel,
-                    ).await?;
-                    this.promote_blocked(&task.owned_paths, &destination,
-                        completed.iter_mut(), &mut outcome, &mut shell).await?;
-                }
-                outcome.promoted_sources.extend(task.owned_paths.iter().filter_map(|path|
-                    this.admitted_promotion(path, &generations, watch_root)));
+                outcome.generated_sources.extend(task.owned_paths.iter().filter_map(|path|
+                    this.generated_source(path, &generations, watch_root, depth)));
                 drop(lease);
                 this.notify(|| {
                     let mut completion = if discovery_blocked {
@@ -1833,8 +1778,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut replacement_retained = None;
             let mut replacement_rows = None;
             let mut retry = task.retry.filter(|_| !multi);
-            let mut replacement_entry = None;
-            let mut promotion_sources = task.owned_paths;
+            let mut physical_sources = task.owned_paths;
             let mut superseded_candidates = HashSet::new();
             for (index, (((logical, checkpoint), retry_slot), &original_id)) in
                 task.inputs.into_iter().zip(retained.drain(..)).zip(retry_slots).zip(&ids).enumerate()
@@ -1992,8 +1936,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             });
                             split_input = replacement.entry().mode.structured()
                                 || replacement.entry().physical_paths().nth(1).is_some();
-                            promotion_sources = std::mem::take(&mut replacement.owned_paths);
-                            replacement_entry = Some(PathBuf::from(&replacement.entry().entry_path));
+                            physical_sources = std::mem::take(&mut replacement.owned_paths);
                             let (active, retained) = this.replan_input(task_id, depth,
                                 replacement.entry(), replacement_checkpoint.as_ref());
                             id = active;
@@ -2094,7 +2037,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     checkpoint
                 }).collect();
-            let mut replacement_result = replacement_retained.map(|checkpoint| {
+            let replacement_result = replacement_retained.map(|checkpoint| {
                 let mut retained = checkpoint.result(depth);
                 // First-attempt history precedes the replacement and its children.
                 outcome.checkpoints.push(checkpoint);
@@ -2117,51 +2060,16 @@ impl<'run, O: Observer> Run<'run, O> {
                             .map(|path| path_key(&path.to_string_lossy()))
                     })
                     .collect();
-                promotion_sources.retain(|path| {
+                physical_sources.retain(|path| {
                     !superseded_candidates.contains(&path_key(path))
                         || retained.contains(&path_key(path))
                 });
-                if this.request.mode == Mode::Extract { sources.refresh(&promotion_sources); }
-            }
-            if depth > 1
-                && !cancel.cancelled()
-                // Accepted partial segments do not make a carrier successful
-                // when a sibling failed. Only an entirely accepted carrier
-                // stays in place; promotion retains its sibling outputs.
-                && settled().any(|result| result.failure.is_some() && !result.partial)
-                && settled().any(|result| {
-                    result.failure.as_ref().is_some_and(|failure| {
-                        failure.is_password_retry() || failure.contains(FailureKind::MissingVolume)
-                    })
-                })
-            {
-                let destination = this.promotion_directory(&owner_path, inherited_scope.as_deref());
-                // Release this task's read pin before upgrading. Sibling readers
-                // may finish concurrently; publishing a moved source is exclusive.
-                drop(lease);
-                lease = this.engine.leases.acquire(
-                    promotion_sources.iter().map(|path| resolved_key(Path::new(path))).collect(),
-                    cancel,
-                ).await?;
-                let promoted_paths = this.promote_blocked(
-                    &promotion_sources,
-                    &destination,
-                    parent_outputs.iter_mut().map(|(result, ..)| result)
-                        .chain(replacement_result.iter_mut()),
-                    &mut outcome,
-                    &mut shell,
-                )
-                .await?;
-                if let Some(paths) = promoted_paths {
-                    for checkpoint in parent_checkpoints.iter_mut().flatten() { checkpoint.promoted(&paths)?; }
-                }
+                if this.request.mode == Mode::Extract { sources.refresh(&physical_sources); }
             }
             // A replaced attempt is report history after successful cleanup,
             // not a failed input of the replacement's physical execution.
             let physical_complete = parent_outputs.iter()
                 .all(|(result, ..)| result.failure.is_none() && !result.partial);
-            let promoted = parent_outputs.iter().map(|(result, ..)| result)
-                .chain(replacement_result.iter()).all(|result| result.promoted);
             let parent_outputs = parent_outputs.into_iter()
                 .map(|(result, inventory, _input, id)| (result, inventory, id));
             // Finish every logical parent before prompting or descending into
@@ -2183,9 +2091,6 @@ impl<'run, O: Observer> Run<'run, O> {
             } else {
                 inherited_scope.clone().or_else(|| Some(Arc::new(RecursiveScope {
                     password: source_scope.map(Arc::from),
-                    promotion: this.promotion_directory(
-                        replacement_entry.as_deref().unwrap_or(&owner_path), None,
-                    ),
                 })))
             };
             if !recursive.is_empty() {
@@ -2286,8 +2191,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 children.checkpoints.append(&mut descendants.checkpoints);
                 outcome
-                    .promoted_sources
-                    .append(&mut descendants.promoted_sources);
+                    .generated_sources
+                    .append(&mut descendants.generated_sources);
                 children.archives.append(&mut descendants.archives);
                 children.errors.append(&mut descendants.errors);
                 children.scan_incomplete |= descendants.scan_incomplete;
@@ -2301,7 +2206,7 @@ impl<'run, O: Observer> Run<'run, O> {
             // Only the final carrier namespace is flattened. Individual segment
             // layouts remain intact while any input or recursive subtree may resume.
             if multi && outputs_committed && carrier_children_complete
-                && (promoted || completed.iter().all(|result| result.failure.is_none()))
+                && completed.iter().all(|result| result.failure.is_none())
                 && !continued_output
                 && this.request.config.post_extract.flatten_single_directory
                 && !cancel.cancelled()
@@ -2379,7 +2284,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
             }
             if this.request.mode == Mode::Extract && completed.iter().any(|result| result.failure.is_some()) {
-                // Receipts have already followed promotion/flatten. Preserve the
+                // Receipts have already followed flattening. Preserve the
                 // pre-cleanup facts, but do not reconstruct them from final IO.
                 let retry_output = continued_output || ((multi || had_checkpoints) && completed.iter().any(|result|
                     result.output.is_some() && (result.failure.is_none() || result.partial)));
@@ -2388,11 +2293,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     carrier.as_deref(), report_count, had_checkpoints, retry_output)
                 {
                     for failure in completed.iter_mut().filter_map(|result| result.failure.as_mut()) {
-                        if matches!(failure.context.as_deref(), Some(super::FailureContext::Postprocess { .. })) && !failure.causes.is_empty() {
-                            failure.causes[0].recovery = Some(Arc::clone(&recovery));
-                        } else {
-                            failure.recovery = Some(Arc::clone(&recovery));
-                        }
+                        failure.recovery = Some(Arc::clone(&recovery));
                     }
                 }
             }
@@ -2405,10 +2306,10 @@ impl<'run, O: Observer> Run<'run, O> {
                 && !cancel.cancelled();
             // A Watch request may have been admitted before another batch moved
             // these members. The source leases now cover the actual resolved family.
-            let admitted_promoted: Vec<_> = promotion_sources
+            let admitted_generated: Vec<_> = physical_sources
                 .iter()
                 .filter_map(|path| {
-                    this.admitted_promotion(path, &generations, watch_root)
+                    this.generated_source(path, &generations, watch_root, depth)
                         .map(|source| (path, source))
                 })
                 .collect();
@@ -2422,10 +2323,10 @@ impl<'run, O: Observer> Run<'run, O> {
                 let cleanup_paths = sources.release(true);
                 let mode = if depth > 1 { CleanupMode::Delete }
                     else { this.request.config.post_extract.archive_cleanup_mode };
-                let generated: HashSet<_> = admitted_promoted.into_iter().map(|(path, _)| path).collect();
+                let generated: HashSet<_> = admitted_generated.into_iter().map(|(path, _)| path).collect();
                 let mut deletes = Vec::new();
                 let mut recycles = Vec::new();
-                for path in &promotion_sources {
+                for path in &physical_sources {
                     if !cleanup_paths.contains(&namespace_key(Path::new(path))) { continue; }
                     if mode == CleanupMode::Delete || generated.contains(path) {
                         deletes.push(PathBuf::from(path));
@@ -2469,13 +2370,13 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 }
             } else {
-                outcome.promoted_sources.extend(admitted_promoted.into_iter().map(|(_, source)| source));
+                outcome.generated_sources.extend(admitted_generated.into_iter().map(|(_, source)| source));
                 drop(lease);
             }
             if this.request.mode == Mode::Extract {
                 project_possible_missing_volume(&mut completed, split_input);
             }
-            // Refresh segment rows after carrier policy, promotion and flattening,
+            // Refresh segment rows after carrier policy and flattening,
             // just as main's task_finished refreshes its input_results.
             if multi {
                 for (&id, result) in ids.iter().zip(&completed) {
@@ -2554,159 +2455,27 @@ impl<'run, O: Observer> Run<'run, O> {
         })
     }
 
-    fn promotion_directory(&self, entry: &Path, inherited: Option<&RecursiveScope>) -> Arc<Path> {
-        if let Some(scope) = inherited {
-            Arc::clone(&scope.promotion)
-        } else {
-            self.target_directories.directory_for(entry)
-        }
-    }
-
-    async fn promote_blocked<'output>(
-        &self,
-        sources: &[String],
-        destination: &Path,
-        results: impl Iterator<Item = &'output mut ArchiveResult> + Send,
-        outcome: &mut Outcome,
-        shell: &mut ShellUpdates<'_>,
-    ) -> io::Result<Option<PromotionPaths>> {
-        let mut results: Vec<_> = results.collect();
-        let representative = results
-            .iter()
-            .position(|result| result.failure.is_some() && !result.partial)
-            .expect("blocked task has an unaccepted failure");
-        let promoted: io::Result<(
-            Vec<(PathBuf, PathBuf)>,
-            Vec<PromotedSource>,
-            bool,
-            Option<String>,
-        )> = async {
-            stage("promotion_plan", &self.request.cancel).await?;
-            loop {
-                self.request.cancel.check_io()?;
-                let plan =
-                    NativeBlockedInputPromotion::new(sources.to_vec(), destination.to_path_buf())?;
-                let keys = plan
-                    .moves()
-                    .iter()
-                    .map(|(_, target)| resolved_key(target))
-                    .collect();
-                let _destinations = match self.engine.leases
-                    .acquire_absent(keys, plan.moves(), &self.request.cancel).await {
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                    result => result?,
-                };
-                stage("promotion", &self.request.cancel).await?;
-                let _promotion = Promotion::begin(sources.iter().map(PathBuf::from))?;
-                let (residual, error, collision) = plan.execute(|| {
-                    self.observer
-                        .before_promotion(&results[representative], plan.moves())
-                });
-                if collision && residual.is_empty() {
-                    continue;
-                }
-                let success = error.is_empty();
-                let moves = if success {
-                    plan.moves().to_vec()
-                } else {
-                    residual
-                        .into_iter()
-                        .map(|(source, target)| (PathBuf::from(source), PathBuf::from(target)))
-                        .collect()
-                };
-                for (source, target) in &moves {
-                    shell.parent(source);
-                    shell.parent(target);
-                }
-                let receipts: Vec<_> = moves
-                    .iter()
-                    .filter_map(|(_, target)| PromotedSource::capture(target).ok())
-                    .collect();
-                self.observer.after_promotion(
-                    &results[representative],
-                    &moves,
-                    success,
-                    &receipts,
-                )?;
-                return Ok((
-                    moves,
-                    receipts,
-                    success,
-                    (!error.is_empty()).then_some(error),
-                ));
-            }
-        }
-        .await;
-        let mut promoted_paths = None;
-        match promoted {
-            Ok((moves, receipts, success, error)) => {
-                outcome.promoted_sources.append(&mut receipts.into());
-                let paths = PromotionPaths::new(&moves);
-                for result in results.iter_mut() {
-                    if success {
-                        result.promotion_original_path = Some(result.path.clone());
-                    }
-                    paths.remap(&mut result.path);
-                    if let Some(failure) = &mut result.failure { paths.remap_failure(failure); }
-                    for source in &mut result.source_paths {
-                        paths.remap(source);
-                    }
-                    result.promoted = success;
-                    if success {
-                        if let Some(failure) = &mut result.failure {
-                            failure.discovery_scope = Some(Box::new(super::FailureScope {
-                                root: destination.to_string_lossy().into_owned(),
-                                max_depth: Some(0), excluded_subtrees: Vec::new(),
-                            }));
-                        }
-                    }
-                    if !success {
-                        result.failure = Some(Failure::new(
-                            FailureKind::FilesystemError,
-                            format!(
-                                "Unable to promote blocked nested input: {}",
-                                error.as_deref().unwrap_or("unknown move failure")
-                            ),
-                        ).with_context(super::FailureContext::Postprocess { destination: destination.to_owned() })
-                            .with_cause(result.failure.take()));
-                    }
-                }
-                for checkpoint in &mut outcome.checkpoints {
-                    checkpoint.promoted(&paths)?;
-                }
-                promoted_paths = Some(paths);
-            }
-            Err(error) if self.request.cancel.cancelled() => return Err(error),
-            Err(error) => {
-                results[representative].failure = Some(Failure::new(
-                    FailureKind::FilesystemError,
-                    format!("Unable to promote blocked nested input: {error}"),
-                ).with_context(super::FailureContext::Postprocess { destination: destination.to_owned() })
-                    .with_cause(results[representative].failure.take()));
-            }
-        }
-        Ok(promoted_paths)
-    }
-
-    fn admitted_promotion(
+    fn generated_source(
         &self,
         path: &str,
         generations: &HashMap<String, PhysicalFileGeneration>,
         watch_root: bool,
-    ) -> Option<PromotedSource> {
-        if !watch_root && self.promoted_sources.is_empty() {
+        depth: usize,
+    ) -> Option<GeneratedSource> {
+        if depth == 1 && !watch_root && self.generated_sources.is_empty() {
             return None;
         }
         let key = path_key(path);
         let generation = generations.get(&key)?;
-        self.promoted_sources
+        if depth > 1 { return Some(GeneratedSource::from_generation(Path::new(path), generation)); }
+        self.generated_sources
             .get(&key)
-            .map(|&index| &self.request.promoted_sources[index])
+            .map(|&index| &self.request.generated_sources[index])
             .filter(|source| source.matches(generation))
             .cloned()
             .or_else(|| {
                 watch_root
-                    .then(|| self.observer.promoted_source(path))
+                    .then(|| self.observer.generated_source(path))
                     .flatten()
                     .filter(|source| source.matches(generation))
             })
@@ -2735,10 +2504,10 @@ impl<'run, O: Observer> Run<'run, O> {
                 output_candidate(preferred_carrier, container)
                     || (depth == 1
                         && self
-                            .admitted_promotion(
+                            .generated_source(
                                 &input.entry_path,
                                 generations,
-                                self.request.origin == Origin::Watch,
+                                self.request.origin == Origin::Watch, 1,
                             )
                             .is_some())
             }
@@ -3587,6 +3356,12 @@ impl<'run, O: Observer> Run<'run, O> {
             };
             if removed.is_ok() {
                 shell.parent(path);
+                if let Some(parent) = path.parent().filter(|parent| parent.parent().is_some()) {
+                    let protected = self.cleanup_boundaries.contains(&resolved_key(parent));
+                    // RemoveDirectory checks emptiness atomically. Never recurse:
+                    // a concurrent arrival, retained sibling or output protects itself.
+                    if !protected && fs::remove_dir(parent).is_ok() { shell.parent(parent); }
+                }
             }
             failures.extend(cleanup_failure(path, mode, removed));
         }
@@ -3660,8 +3435,7 @@ fn flatten_result(
         }
         let mut relocated_recoveries = HashMap::new();
         for child in &mut children.archives {
-            let mut failures: Vec<_> = child.failure.iter_mut().collect();
-            while let Some(failure) = failures.pop() {
+            if let Some(failure) = &mut child.failure {
                 if let Some(recovery) = &mut failure.recovery {
                     let key = Arc::as_ptr(recovery);
                     let relocated = relocated_recoveries.entry(key).or_insert_with(|| {
@@ -3671,7 +3445,6 @@ fn flatten_result(
                     });
                     *recovery = Arc::clone(relocated);
                 }
-                failures.extend(&mut failure.causes);
             }
             if let Some(path) = child.output.as_mut() {
                 super::relocate_flatten_output(path, &old, &new);
@@ -3692,39 +3465,6 @@ fn flatten_result(
         result.output = Some(new);
     }
     Ok(())
-}
-
-/// Promotion moves physical files, never directory prefixes. Normalize each
-/// source once, then visit each result/checkpoint field once.
-pub(super) struct PromotionPaths(HashMap<String, PathBuf>);
-
-impl PromotionPaths {
-    pub(super) fn new(moves: &[(PathBuf, PathBuf)]) -> Self {
-        Self(moves.iter().map(|(source, target)| (resolved_key(source), target.clone())).collect())
-    }
-
-    pub(super) fn target(&self, path: &Path) -> Option<&PathBuf> {
-        self.0.get(&resolved_key(path))
-    }
-
-    pub(super) fn remap_failure(&self, failure: &mut Failure) {
-        let mut pending = vec![failure];
-        while let Some(failure) = pending.pop() {
-            if let Some(super::FailureContext::Discovery { path, .. }) = failure.context.as_deref_mut() {
-                self.remap(path);
-            }
-            pending.extend(&mut failure.causes);
-        }
-    }
-
-    pub(super) fn remap(&self, path: &mut PathBuf) -> bool {
-        if let Some(target) = self.target(path) {
-            *path = target.clone();
-            true
-        } else {
-            false
-        }
-    }
 }
 
 fn record_cleanup(outcome: &mut Outcome, path: &Path, mode: &'static str, removed: io::Result<()>) {
@@ -3789,8 +3529,8 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
         partial: false,
         retained: false,
         recovered_complete_files: 0,
-        promoted: false,
-        promotion_original_path: None, scan_layout: super::ScanLayout::from_input(input),
+
+         scan_layout: super::ScanLayout::from_input(input),
     }
 }
 
@@ -4008,7 +3748,6 @@ fn project_possible_missing_volume(results: &mut [ArchiveResult], split: bool) {
 // recoverable failure classes grant a checkpoint permission to reuse that root.
 fn recovery_complete_files(failure: &Failure, verified_files: u64) -> u64 {
     if matches!(failure.kind, FailureKind::Damaged | FailureKind::MissingVolume)
-        && failure.causes.is_empty()
     { verified_files } else { 0 }
 }
 
@@ -4715,31 +4454,23 @@ impl Leases {
         }).await
     }
 
+    #[cfg(test)]
     async fn acquire(
         self: &Arc<Self>,
         keys: HashSet<String>,
         cancel: &Cancellation,
     ) -> io::Result<Lease> {
-        self.acquire_paths(keys, &[], None, cancel).await
+        self.acquire_paths(keys, None, cancel).await
     }
 
     async fn acquire_shared(
         self: &Arc<Self>, keys: HashSet<String>, request: u64, cancel: &Cancellation,
     ) -> io::Result<Lease> {
-        self.acquire_paths(keys, &[], Some(request), cancel).await
-    }
-
-    async fn acquire_absent(
-        self: &Arc<Self>,
-        keys: HashSet<String>,
-        absent: &[(PathBuf, PathBuf)],
-        cancel: &Cancellation,
-    ) -> io::Result<Lease> {
-        self.acquire_paths(keys, absent, None, cancel).await
+        self.acquire_paths(keys, Some(request), cancel).await
     }
 
     async fn acquire_paths(
-        self: &Arc<Self>, keys: HashSet<String>, absent: &[(PathBuf, PathBuf)],
+        self: &Arc<Self>, keys: HashSet<String>,
         request: Option<u64>, cancel: &Cancellation,
     ) -> io::Result<Lease> {
         let mut waiting = LeaseWait {
@@ -4748,18 +4479,6 @@ impl Leases {
         };
         let mut subscription = None;
         poll_fn(|cx| {
-            if !absent.is_empty() {
-                if let Err(error) = cancel.check_io() {
-                    return Poll::Ready(Err(error));
-                }
-            }
-            for (_, path) in absent {
-                match path.try_exists() {
-                    Ok(false) => {},
-                    Ok(true) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::AlreadyExists, "promotion destination exists"))),
-                    Err(error) => return Poll::Ready(Err(error)),
-                }
-            }
             let mut state = self.state.lock().unwrap();
             if let Err(error) = cancel.check_io() {
                 return Poll::Ready(Err(error));
@@ -4963,44 +4682,6 @@ mod tests {
     }
 
     #[test]
-    fn promotion_collision_does_not_wait_for_destination_lease() {
-        use std::future::Future;
-        use std::task::{Context, Wake};
-        struct Noop;
-        impl Wake for Noop { fn wake(self: Arc<Self>) {} }
-        let leases = Arc::new(Leases::default());
-        let cancel = Cancellation::new();
-        let target = std::env::temp_dir().join(format!("sunpack-lease-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let keys = [resolved_key(&target)].into_iter().collect();
-        let held = super::super::scheduling::block_on(leases.acquire(keys, &cancel)).unwrap();
-        std::fs::write(&target, b"occupied").unwrap();
-        let moves = [(PathBuf::new(), target.clone())];
-        let keys = [resolved_key(&target)].into_iter().collect();
-        let mut pending = Box::pin(leases.acquire_absent(keys, &moves, &cancel));
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
-        assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(Err(error))
-            if error.kind() == io::ErrorKind::AlreadyExists));
-        drop(pending);
-        std::fs::remove_file(&target).unwrap();
-
-        // A destination created while waiting must be rechecked after wake.
-        let keys = [resolved_key(&target)].into_iter().collect();
-        let mut pending = Box::pin(leases.acquire_absent(keys, &moves, &cancel));
-        assert!(pending.as_mut().poll(&mut cx).is_pending());
-        std::fs::write(&target, b"occupied").unwrap();
-        drop(held);
-        assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(Err(error))
-            if error.kind() == io::ErrorKind::AlreadyExists));
-        drop(pending);
-        let state = leases.state.lock().unwrap();
-        assert!(state.waiters.is_empty() && state.blocked_by.is_empty());
-        drop(state);
-        std::fs::remove_file(target).unwrap();
-    }
-
-    #[test]
     fn request_notifications_are_separate_from_physical_family_leases() {
         use std::future::Future;
         use std::sync::atomic::AtomicUsize;
@@ -5126,7 +4807,7 @@ mod tests {
                     volume_attempts: None, source_paths: vec!["carrier.bin".into()],
                     password: None, discovery_source: DiscoverySource::Direct,
                     damage_flags: None, partial: false, retained: false,
-                    recovered_complete_files: 0, promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+                    recovered_complete_files: 0,   scan_layout: Default::default(),
                 }],
                 ..PublicOutcome::default()
             };
@@ -5668,10 +5349,11 @@ mod tests {
             output_names: OutputReservationGuard { registry: Arc::clone(&engine.output_names), owner: 1 },
             created_outputs: Mutex::default(),
             output_base: None,
-            target_directories: TargetDirectories::new(&request.inputs),
             checkpoints: HashMap::new(),
             checkpoint_anchors: OnceLock::new(),
-            promoted_sources: HashMap::new(),
+            generated_sources: HashMap::new(),
+            cleanup_boundaries: request.cleanup_boundaries.iter().chain(request.inputs.iter().filter(|p| p.is_dir()))
+                .map(|path| resolved_key(path)).collect(),
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
             cleanup_refs: Arc::default(),
@@ -6091,7 +5773,7 @@ mod tests {
     }
 
     #[test]
-    fn carrier_completion_keeps_postprocess_but_suppresses_segment_aggregate_detail() {
+    fn carrier_completion_keeps_split_warning_but_suppresses_segment_aggregate_detail() {
         let input = ArchiveInput::file("carrier.bin".into(), "zip".into(), "archive".into());
         let mut results = vec![receipt(&input, DiscoverySource::Embedded, 1), receipt(&input, DiscoverySource::Embedded, 1)];
         results[0].failure = Some(Failure::new(FailureKind::Damaged, "segment damaged"));
@@ -6104,11 +5786,7 @@ mod tests {
         }));
         let completion = super::super::TaskCompletion::from_group(&results);
         assert!(completion.failure.as_ref().unwrap().evidence.as_ref().unwrap().possible_missing_volume);
-        results[0].failure = Some(Failure::new(FailureKind::FilesystemError, "promotion denied")
-            .with_context(super::super::FailureContext::Postprocess { destination: "out".into() }));
-        let completion = super::super::TaskCompletion::from_group(&results);
-        assert_eq!(completion.failure.as_ref().unwrap().kind, FailureKind::FilesystemError);
-        assert_eq!(completion.failure.as_ref().unwrap().message, "promotion denied");
+
     }
 
     #[test]
@@ -6592,254 +6270,6 @@ mod tests {
         });
         assert_eq!(value.unwrap().unwrap(), 42);
         assert!(!crate::pipeline::scheduling::in_stage());
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn denied_nested_promotion_keeps_archive_cause_and_retry_path() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let marker = crate::test_support::temp_file("promotion_denied", b"marker");
-        let root = marker.with_extension("output");
-        let nested = root.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        for kind in [FailureKind::PasswordRequired, FailureKind::MissingVolume] {
-            let source = nested.join("blocked.zip");
-            fs::write(&source, b"archive").unwrap();
-            let engine = Engine::new(PathBuf::from("unused-worker"));
-            let request = Request::new(vec![root.clone()], Mode::Extract);
-            let change_metadata = std::sync::atomic::AtomicBool::new(false);
-            let observer = |event: Event| {
-                if matches!(event, Event::Started { .. })
-                    && change_metadata.load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    // Admission already captured the generation. A timestamp
-                    // change must not add a promotion veto absent from main.
-                    fs::OpenOptions::new().write(true).open(&source).unwrap()
-                        .set_times(fs::FileTimes::new().set_modified(
-                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456))).unwrap();
-                }
-            };
-            let run = test_run(&engine, &request, &observer);
-            let execute = || {
-                let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "blocked".into());
-                let task = Task {
-                    primary: None,
-                    inputs: vec![LogicalInput { password_probe: None, input, password: None,
-                        failure: Some(Failure::new(kind, "archive blocked")) }],
-                    owned_paths: vec![source.to_string_lossy().into_owned()],
-                    source: DiscoverySource::Embedded, retry: None,
-                    scope: None,
-                };
-                Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
-                    run.execute_task(run.register_task(task), 1, 2, None, spawner)
-                }).unwrap()
-            };
-            // Permit generation reads but deny rename/removal without production hooks.
-            let lock = fs::OpenOptions::new().read(true).share_mode(1).open(&source).unwrap();
-            let outcome = PublicOutcome::from(execute());
-            let failed = outcome.archives.iter().find(|result| result.failure.is_some()).unwrap();
-            let failure = failed.failure.as_ref().unwrap();
-            assert_eq!(failure.kind, FailureKind::FilesystemError);
-            assert_eq!(failure.causes[0].kind, kind);
-            assert!(failed.path.is_file());
-            assert!(!failed.promoted);
-            let failures = outcome.input_failures();
-            let input = failures.values().next().unwrap();
-            assert!(input.retryable());
-            assert!(input.terminal.is_none());
-            assert_eq!(failure.is_password_retry(), kind == FailureKind::PasswordRequired);
-            let restored: Failure = serde_json::from_value(serde_json::to_value(failure).unwrap()).unwrap();
-            assert!(restored.contains(kind));
-            drop(lock);
-            // The same source can be retried once the external obstruction is removed.
-            change_metadata.store(true, std::sync::atomic::Ordering::Relaxed);
-            let retry = execute();
-            assert!(retry.archives.iter().any(|result| result.promoted));
-            fs::remove_file(root.join("blocked.zip")).unwrap();
-            fs::create_dir_all(&nested).unwrap();
-        }
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_file(marker).unwrap();
-    }
-
-    #[test]
-    fn bulk_promotion_mapping_is_exact_and_not_cascading() {
-        let moves: Vec<_> = (0..2048).map(|index| (
-            PathBuf::from(format!("missing-promotion-source/part-{index}")),
-            PathBuf::from(format!("missing-promotion-target/part-{index}")),
-        )).collect();
-        let paths = PromotionPaths::new(&moves);
-        assert_eq!(paths.0.len(), moves.len());
-        for (source, target) in &moves {
-            let mut path = source.clone();
-            assert!(paths.remap(&mut path));
-            assert_eq!(&path, target);
-            let mut child = source.join("not-a-moved-file");
-            assert!(!paths.remap(&mut child));
-        }
-        let a = PathBuf::from("missing-promotion-a");
-        let b = PathBuf::from("missing-promotion-b");
-        let c = PathBuf::from("missing-promotion-c");
-        let paths = PromotionPaths::new(&[(a.clone(), b.clone()), (b.clone(), c)]);
-        let mut path = a;
-        paths.remap(&mut path);
-        assert_eq!(path, b);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn nested_carrier_promotion_preserves_accepted_siblings_for_retry() {
-        // Exercise the real task boundary and physical move, not just its
-        // predicate: accepted siblings must keep their output and receipts
-        // when another segment blocks the carrier, then survive a root retry.
-        fn execute(
-            engine: &Engine, request: &Request, inputs: &[ArchiveInput],
-            blocked: FailureKind, depth: usize,
-        ) -> Outcome {
-            let observer = |_: Event| {};
-            let mut run = test_run(engine, request, &observer);
-            for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-                Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
-            }
-            Arc::get_mut(&mut run).unwrap().promoted_sources = request.promoted_sources.iter().enumerate().map(|(index, source)| {
-                (path_key(&source.path().to_string_lossy()), index)
-            }).collect();
-            let task = Task {
-                primary: None,
-                inputs: inputs.iter().enumerate().map(|(index, input)| LogicalInput { password_probe: None,
-                    input: input.clone(),
-                    password: None,
-                    failure: (index == 2).then(|| Failure::new(blocked, "blocked segment")),
-                }).collect(),
-                owned_paths: vec![inputs[0].entry_path.clone()],
-                source: DiscoverySource::Embedded,
-                retry: None,
-                scope: None,
-            };
-            Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
-                run.execute_task(run.register_task(task), 1, depth, None, spawner)
-            }).unwrap()
-        }
-
-        let marker = crate::test_support::temp_file("carrier_partial_promotion", b"marker");
-        let root = marker.with_extension("output");
-        for origin in [Origin::Foreground, Origin::Watch] {
-          for (depth, partial_kind, blocked, accepted, promoted) in [
-            (2, FailureKind::Damaged, FailureKind::PasswordRequired, false, true),
-            (2, FailureKind::Damaged, FailureKind::MissingVolume, false, true),
-            // Main inspects all aggregate causes, including accepted partials.
-            (2, FailureKind::MissingVolume, FailureKind::Damaged, false, true),
-            // All accepted partials must use main's recoverable categories.
-            (2, FailureKind::MissingVolume, FailureKind::Damaged, true, false),
-            (2, FailureKind::Damaged, FailureKind::Damaged, false, false),
-            (1, FailureKind::Damaged, FailureKind::PasswordRequired, false, false),
-          ] {
-            let parent = root.join("outer");
-            let source = parent.join("carrier.bin");
-            let container = parent.join("carrier");
-            fs::create_dir_all(&container).unwrap();
-            fs::write(&source, [0; 16]).unwrap();
-            let input = ArchiveInput::file(
-                source.to_string_lossy().into_owned(), "zip".into(), "carrier".into(),
-            );
-            let (segments, _) = archive_input_slices(&input, &[
-                ("zip", 0, Some(4)), ("zip", 4, Some(8)), ("zip", 8, Some(12)),
-            ]).unwrap();
-            let mut inputs: Vec<_> = segments.into_iter().map(Option::unwrap).collect();
-            let generations = HashMap::from([
-                (path_key(&input.entry_path), capture_file_generation(&source).unwrap()),
-            ]);
-            let mut request = Request::new(vec![root.clone()], Mode::Extract);
-            request.origin = origin;
-            request.max_depth = 0;
-            Arc::make_mut(&mut request.config).extraction.content_requirement =
-                ContentRequirement::AllowPartial;
-            for (index, input) in inputs.iter().enumerate().take(if accepted { 3 } else { 2 }) {
-                let output = container.join(format!("segment-{index}"));
-                fs::create_dir(&output).unwrap();
-                fs::write(output.join("payload"), b"keep").unwrap();
-                let mut result = receipt(input, DiscoverySource::Embedded, depth);
-                result.output = Some(output);
-                result.files = 1;
-                result.bytes = 4;
-                if index != 0 {
-                    result.partial = true;
-                    result.recovered_complete_files = 1;
-                    result.failure = Some(Failure::new(
-                        if index == 1 { partial_kind } else { blocked }, "accepted partial",
-                    ));
-                }
-                let mut checkpoint = InputCheckpoint::create(&source, Arc::new((input).clone()), &result, &generations, Some(&container)).unwrap();
-                checkpoint.install_report(InputCheckpoint::report_state(
-                    input, &result, result.output.as_deref(), None, index + 1, 3));
-                checkpoint.set_password_signature(|| CandidateSet::new(
-                    Arc::from([]), None, &AttemptCache::default(), None,
-                ).signature(&input.entry_path));
-                request.checkpoints.push(checkpoint);
-            }
-            let engine = Engine::new(PathBuf::from("unused-worker"));
-            let outcome = execute(&engine, &request, &inputs, blocked, depth);
-            assert_eq!(outcome.archives.len(), 3);
-            assert!(outcome.errors.is_empty());
-            assert_eq!(outcome.failed(), usize::from(!accepted));
-            assert_eq!(outcome.subtree_complete(), promoted);
-            let current = if promoted { root.join("carrier.bin") } else { source.clone() };
-            assert!(current.is_file());
-            assert_eq!(source.is_file(), !promoted);
-            assert_eq!(outcome.promoted_sources.len(), usize::from(promoted));
-            for result in &outcome.archives {
-                assert_eq!(result.path, current);
-                assert_eq!(result.source_paths, [current.clone()]);
-                assert_eq!(result.promoted, promoted);
-                assert_eq!(result.promotion_original_path.as_ref(), promoted.then_some(&source));
-            }
-            let recovery = outcome.archives.iter().filter_map(|result| result.failure.as_ref())
-                .find_map(|failure| failure.recovery.as_deref()).expect("executed failure retains recovery report");
-            let report = recovery.report(|failure| json!({"kind": format!("{:?}", failure.kind)}));
-            assert_eq!(report["input_count"], 3);
-            assert_eq!(report["inputs"].as_array().unwrap().len(), 3);
-            for (index, row) in report["inputs"].as_array().unwrap().iter().enumerate() {
-                assert_eq!(row["position"], index + 1);
-                assert_eq!(row["archive_input"]["entry_path"], json!(current));
-            }
-            let rediscovered = ArchiveInput::file(
-                current.to_string_lossy().into_owned(), "zip".into(),
-                crate::scan::directory::filesystem_logical_name(&current.to_string_lossy()),
-            );
-            inputs = archive_input_slices(&rediscovered, &[
-                ("zip", 0, Some(4)), ("zip", 4, Some(8)), ("zip", 8, Some(12)),
-            ]).unwrap().0.into_iter().map(Option::unwrap).collect();
-            let generations = HashMap::from([
-                (path_key(&inputs[0].entry_path), capture_file_generation(&current).unwrap()),
-            ]);
-            assert_eq!(outcome.checkpoints.iter().filter(|checkpoint| checkpoint.has_output()).count(),
-                request.checkpoints.len());
-            for (index, checkpoint) in outcome.checkpoints.iter().filter(|checkpoint| checkpoint.has_output()).enumerate() {
-                assert_eq!(checkpoint.entry(), current);
-                assert_eq!(checkpoint.carrier(), current);
-                assert_eq!(checkpoint.container(), Some(container.as_path()));
-                assert!(checkpoint.valid_for(&inputs[index], &generations));
-                assert_eq!(fs::read(checkpoint.output().join("payload")).unwrap(), b"keep");
-            }
-            if promoted {
-                request.checkpoints = outcome.checkpoints.into_vec();
-                request.promoted_sources = outcome.promoted_sources.into_vec();
-                let retry = execute(&engine, &request, &inputs, blocked, 1);
-                assert_eq!(retry.checkpoints.iter().filter(|checkpoint| checkpoint.has_output()).count(), 2);
-                assert!(retry.archives.iter().take(2).all(|result| result.retained));
-                assert_eq!(retry.archives[1].failure.as_ref().unwrap().kind, partial_kind);
-                assert!(retry.archives[1].partial);
-                assert_eq!(retry.archives[1].recovered_complete_files, 1);
-                assert_eq!(retry.archives[2].failure.as_ref().unwrap().kind, blocked);
-                assert_eq!(retry.archives[0].output.as_ref(), Some(&container.join("segment-0")));
-                assert_eq!(retry.archives[1].output.as_ref(), Some(&container.join("segment-1")));
-                assert!(current.is_file());
-            }
-            release_reader_resources_under_roots(vec![root.to_string_lossy().into_owned()]).unwrap();
-            fs::remove_dir_all(&root).unwrap();
-          }
-        }
-        fs::remove_file(marker).unwrap();
     }
 
     fn encrypted_rar_fixture() -> Vec<u8> {
@@ -8083,11 +7513,9 @@ mod tests {
         }
         for kind in [FailureKind::Damaged, FailureKind::MissingVolume,
             FailureKind::WrongPassword, FailureKind::Unsupported, FailureKind::PasswordInconclusive] {
-            let mut failure = Failure::new(kind, "worker failure");
+            let failure = Failure::new(kind, "worker failure");
             assert_eq!(recovery_complete_files(&failure, 2),
                 if matches!(kind, FailureKind::Damaged | FailureKind::MissingVolume) { 2 } else { 0 });
-            failure.causes.push(Failure::new(FailureKind::Unsupported, "compound cause"));
-            assert_eq!(recovery_complete_files(&failure, 2), 0);
             assert_eq!(accepts_partial_content(ContentRequirement::AllowPartial, kind, 2),
                 matches!(kind, FailureKind::Damaged | FailureKind::MissingVolume));
             assert!(!accepts_partial_content(ContentRequirement::Complete, kind, 2));

@@ -65,7 +65,7 @@ def test_carrier_keeps_each_segments_directory_tree(package, tmp_path):
     assert first.parent.parent.parent == second.parent.parent.parent == output / "carrier"
 
 
-@pytest.mark.parametrize("nested", [False, True], ids=["root-carrier", "promoted-carrier"])
+@pytest.mark.parametrize("nested", [False, True], ids=["root-carrier", "retained-carrier"])
 def test_extract_password_retry_resumes_one_logical_input_in_a_carrier(package, tmp_path, nested):
     carrier = tmp_path / "wrapped.data"
     output = tmp_path / "out"
@@ -90,7 +90,7 @@ def test_extract_password_retry_resumes_one_logical_input_in_a_carrier(package, 
 
 
 @pytest.mark.requires_watch_broker
-@pytest.mark.parametrize("nested", [False, True], ids=["root-carrier", "promoted-carrier"])
+@pytest.mark.parametrize("nested", [False, True], ids=["root-carrier", "retained-carrier"])
 def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(package, tmp_path, nested):
     if "SUNPACK_WATCH_BROKER_PIPE_NAME" not in package.env:
         pytest.skip("The isolated Watch Broker service is required")
@@ -101,8 +101,8 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
     fixture = tmp_path / carrier.name if nested else carrier
     first, second = _two_payload_carrier(package, tmp_path, fixture)
     if nested:
-        # The successful receipt is under an outer output. Promotion changes
-        # both the source owner and the preferred output of the retry.
+        # Both logical inputs retain their original physical carrier and
+        # committed outputs while the failed sibling awaits its password.
         (watched / "outer.zip").write_bytes(_zip_bytes({
             carrier.name: fixture.read_bytes(),
             "note.txt": b"outer archive",
@@ -119,6 +119,9 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
     assert blocked.returncode in (0, 1), (blocked.stdout, blocked.stderr)
     first_path = _only_output(output, "first.txt", first)
     assert not list(output.rglob("second.txt"))
+    if nested:
+        assert not carrier.exists()
+        carrier, = output.rglob(carrier.name)
     assert carrier.is_file()
 
     # Unlike graceful shutdown, TerminateProcess cannot flush or retire state.
@@ -179,7 +182,7 @@ def test_deep_discovery_restores_nested_filters_and_consumes_only_generated_arch
     assert empty.is_file()
 
 
-def test_password_retry_deletes_promoted_nested_archive_under_keep_mode(package, tmp_path):
+def test_password_retry_deletes_retained_nested_archive_under_keep_mode(package, tmp_path):
     fixtures = tmp_path / "fixtures"
     fixtures.mkdir()
     payload = fixtures / "secret.txt"
@@ -224,7 +227,8 @@ def test_password_retry_deletes_promoted_nested_archive_under_keep_mode(package,
             if process.poll() is None:
                 process.kill()
 
-    assert _only_output(output, "secret.txt", b"nested secret").parent == output / "nested" / "locked"
+    _only_output(output, "secret.txt", b"nested secret")
+    assert not list(output.rglob(inner.name))
     _only_output(output, "plain.txt", b"plain payload")
     assert outer.is_file()
     assert not (nested_dir / inner.name).exists()

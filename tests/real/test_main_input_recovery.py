@@ -1,4 +1,4 @@
-"""Main's source replacement and nested promotion through real entry points."""
+"""Source replacement and nested in-place recovery through real entry points."""
 
 import os
 from pathlib import Path
@@ -74,8 +74,8 @@ def test_replaced_carrier_with_same_length_and_mtime_gets_rediscovered(package, 
 
 @pytest.mark.parametrize("entry_mode", ["cli", WATCH])
 @pytest.mark.parametrize("layout", ["carrier", "split", "wrapped-split-head"])
-def test_promoted_carrier_uses_free_name_and_retries_without_touching_user_file(package, tmp_path, entry_mode, layout):
-    secret = "promotion-key"
+def test_retained_carrier_retries_without_touching_user_file(package, tmp_path, entry_mode, layout):
+    secret = "recovery-key"
     split = layout != "carrier"
     locked = FACTORY.create(
         tmp_path / "fixtures", "inner", "7z", password=secret, split=split,
@@ -106,7 +106,7 @@ def test_promoted_carrier_uses_free_name_and_retries_without_touching_user_file(
         expected = {"missing_volume"} if split else {"wrong_password"}
         assert failure_kinds(report) == expected, report
         failure, = report["tasks"][0]["failures"]
-        promoted = Path(failure["details"]["path"])
+        retained = Path(failure["details"]["path"])
     else:
         watch = watch_setup(package, tmp_path, passwords=["wrong"])
         collision = watch.root / inner.name
@@ -114,16 +114,16 @@ def test_promoted_carrier_uses_free_name_and_retries_without_touching_user_file(
         outer = download(watch, outer)
         status = "suspended_missing_volume" if split else "failed_password"
         blocker = watch.await_event(status)
-        promoted = Path(blocker["path"])
-    assert promoted.parent == collision.parent and promoted != collision
-    assert promoted.read_bytes() == inner.read_bytes()
+        retained = Path(blocker["path"])
+    assert retained.is_relative_to(output) and retained != collision
+    assert retained.read_bytes() == inner.read_bytes()
     assert collision.read_bytes() == original
     assert not list(output.rglob(locked.marker_name))
 
     if split:
         tail = tail.rename(tail.with_name(f"{tail.name}.opaque"))
         if entry_mode == "cli":
-            tail = tail.rename(inputs / tail.name)
+            tail = tail.rename(retained.parent / tail.name)
         else:
             if layout == "wrapped-split-head":
                 # Drain the retry at a real Watch boundary so a persistent
@@ -131,7 +131,7 @@ def test_promoted_carrier_uses_free_name_and_retries_without_touching_user_file(
                 watch.stop()
             delivered_tail = download(watch, tail, mode="direct")
     if entry_mode == "cli":
-        report = extract_report(package, promoted, output, passwords=[secret], cleanup="d", code=(0, 1))
+        report = extract_report(package, retained, output, passwords=[secret], cleanup="d", code=(0, 1))
         assert report["summary"]["success_count"] == 1, (
             failure_kinds(report), [str(path) for path in output.rglob("inner.7z.002.opaque")],
         )
@@ -147,13 +147,13 @@ def test_promoted_carrier_uses_free_name_and_retries_without_touching_user_file(
     else:
         watch.passwords([secret])
         watch.await_archive(locked)
-        wait_for(lambda: not promoted.exists(), "cleanup of the promoted archive")
+        wait_for(lambda: not retained.exists(), "cleanup of the retained archive")
         watch.stop()
         watch.assert_no_terminal_failures()
     assert [path.read_bytes() for path in output.rglob("outer.txt")] == [b"successful outer archive"]
     marker, = output.rglob(locked.marker_name)
     assert_exact_tree(marker.parent, locked.metadata["expected_files"])
-    assert not promoted.exists()
+    assert not retained.exists()
     assert collision.read_bytes() == original
     assert outer.is_file()
     if split:
@@ -165,7 +165,7 @@ def test_promoted_carrier_uses_free_name_and_retries_without_touching_user_file(
 
 
 @pytest.mark.requires_watch_broker
-def test_watch_recovers_promoted_password_and_missing_volume_blockers_in_separate_steps(package, tmp_path):
+def test_watch_recovers_retained_password_and_missing_volume_blockers_in_separate_steps(package, tmp_path):
     # Main's discovery-failure recovery mixes a password blocker found in a
     # carrier, a directly detected encrypted input, and a missing-volume set.
     secret = "nested-recovery-key"
@@ -190,18 +190,18 @@ def test_watch_recovers_promoted_password_and_missing_volume_blockers_in_separat
     )
     watch = watch_setup(package, tmp_path, passwords=["wrong"], flatten=True)
     outer = download(watch, outer)
-    promoted = [Path(watch.await_event("failed_password", path=name)["path"])
+    retained = [Path(watch.await_event("failed_password", path=name)["path"])
                 for name in (carrier.name, "direct.图片")]
     split_head = f"{head.name}.图片"
     blocked = Path(watch.await_event("suspended_missing_volume", path=split_head)["path"])
-    assert all(path.parent == watch.root and path.is_file() for path in [*promoted, blocked])
+    assert all(path.is_relative_to(watch.output) and path.is_file() for path in [*retained, blocked])
     assert all(not list(watch.output.rglob(case.marker_name)) for case in (wrapped, direct, split))
     watch.restart()
 
     watch.passwords([secret])
     for case in (wrapped, direct):
         watch.await_archive(case)
-    wait_for(lambda: not any(path.exists() for path in promoted), "cleanup of password retries")
+    wait_for(lambda: not any(path.exists() for path in retained), "cleanup of password retries")
     assert blocked.is_file() and not list(watch.output.rglob(split.marker_name))
     renamed_tail = tail.rename(tail.with_name(f"{tail.name}.图片"))
     delivered_tail = download(watch, renamed_tail, mode="direct")

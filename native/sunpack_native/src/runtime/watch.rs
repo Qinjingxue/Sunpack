@@ -11,13 +11,12 @@ use crate::io::config_changes::{DirectoryChange, NativeConfigChanges};
 use crate::io::reader::PhysicalFileGeneration;
 use crate::pipeline::{
     ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
-    PromotedSource, Request, InputFailure,
+    GeneratedSource, Request, InputFailure,
 };
 use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
 use crate::scan::directory::{NativeDirectoryScanOptions, NativeWatchCatalog};
 use crate::scan::scope::NativeDiscoveryScope;
 use crate::watch_store::{is_path_under, watch_path_key};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -316,14 +315,31 @@ pub(super) struct Watch {
     lifecycle: AsyncGate,
     running: Mutex<Option<Running>>,
     wake_host: Arc<dyn Fn() + Send + Sync>,
-    external: Arc<Mutex<Option<ExternalOutputs>>>,
+    external: Arc<OutputPublications>,
     generation: AtomicU64,
     last_error: Arc<Mutex<Option<String>>>,
 }
 
+// Reservations follow writer lifetime, including a Watch stop/start while a
+// foreground request is still extracting. The current catalog is replaceable.
+#[derive(Default)]
+struct OutputPublications {
+    current: Mutex<Option<ExternalOutputs>>,
+    reservations: crate::watch_store::active_outputs::OutputReservations,
+}
+impl OutputPublications {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<ExternalOutputs>>> {
+        self.current.lock()
+    }
+}
+
+#[derive(Clone)]
 struct ExternalOutputs {
     journal: Weak<journal::Journal>,
     scopes: Arc<[NativeDiscoveryScope]>,
+    catalog: Arc<NativeWatchCatalog>,
+    options: Arc<NativeDirectoryScanOptions>,
+    hub: Weak<Hub>,
 }
 
 impl Watch {
@@ -749,55 +765,88 @@ impl Watch {
 }
 
 impl Watch {
-    fn external_journal(&self) -> Option<(Arc<journal::Journal>, Arc<[NativeDiscoveryScope]>)> {
+    fn external_journal(&self) -> Option<Arc<journal::Journal>> {
         let external = self.external.lock().unwrap();
         let external = external.as_ref()?;
-        Some((external.journal.upgrade()?, Arc::clone(&external.scopes)))
+        external.journal.upgrade()
     }
 
     pub(super) fn register_external_output(&self, path: &Path) -> io::Result<()> {
-        let create = || crate::scan::scope::create_output_root_exclusive(path)
-            .map_err(crate::pipeline::OutputCreateError::wrap);
-        if let Some((journal, scopes)) = self.external_journal() {
-            // Notification classification takes this same publication gate.
-            // Never expose a created output before its owned identity exists.
-            let mut created = false;
-            journal.commit(true, |state| {
-                create()?;
-                created = true;
-                let paths = crate::path_keys::output_path_aliases(path)?;
-                if !paths.iter().any(|path| scopes.iter().any(|scope| scope.intersects_output(path)))
-                    || paths.iter().any(|path| state.owned_root(path).is_some())
-                {
-                    return Ok(crate::watch_store::NativeWatchOperations::empty());
-                }
-                let identity = output_identity(&path.to_string_lossy())?;
-                Ok(crate::watch_store::NativeWatchOperations::owned_outputs(&paths, &[&identity]))
-            })?;
-            if created { return Ok(()); }
+        self.external_output(path, true)
+    }
+
+    pub(super) fn reuse_external_output(&self, path: &Path) -> io::Result<()> {
+        self.external_output(path, false)
+    }
+
+    fn external_output(&self, path: &Path, exclusive: bool) -> io::Result<()> {
+        let create = || (if exclusive { crate::scan::scope::create_output_root_exclusive(path) }
+            else { fs::create_dir_all(path) }).map_err(crate::pipeline::OutputCreateError::wrap);
+        loop {
+            let external = self.external.lock().unwrap();
+            let journal = external.as_ref().and_then(|external| external.journal.upgrade())
+                .filter(|journal| !journal.suspended());
+            if let Some(journal) = journal {
+                drop(external);
+                // mkdir and reservation share the observer publication gate.
+                let mut created = false;
+                journal.commit(true, |state| {
+                    create()?;
+                    created = true;
+                    let paths = crate::path_keys::output_path_aliases(path)?;
+                    if !paths.iter().any(|path| state.owned_root(path).is_some()) {
+                        state.register_output_paths(&paths, &[&output_identity(&path.to_string_lossy())?]);
+                    }
+                    Ok(crate::watch_store::NativeWatchOperations::empty())
+                })?;
+                if created { return Ok(()); }
+                // Root removal suspended this journal before the callback.
+                // Re-read the publication target without creating twice.
+                continue;
+            }
+            // Startup takes the same lock before arming observers. Keep the
+            // reservation visible even if Watch attaches during this request.
+            create()?;
+            let paths = crate::path_keys::output_path_aliases(path)?;
+            let outputs = &self.external.reservations;
+            if !paths.iter().any(|path| crate::watch_store::active_outputs::find_owned_root(outputs, path).is_some()) {
+                crate::watch_store::active_outputs::register(outputs, &paths, &[&output_identity(&path.to_string_lossy())?]);
+            }
+            return Ok(());
         }
-        // The final root may have been removed after the journal was captured.
-        // A suspended journal skips its callback, but CLI still owns the mkdir.
-        create()
+    }
+
+    pub(super) fn finish_external_outputs(&self, paths: &[String]) -> io::Result<()> {
+        let external = self.external.lock().unwrap();
+        if let Some(external) = external.as_ref() {
+            let published = external.catalog.publish_outputs(paths, &external.scopes, &external.options, None)?;
+            if let Some(hub) = external.hub.upgrade().filter(|_| !published.is_empty()) {
+                hub.update(|signals| signals.published_outputs.extend(published));
+            }
+        } else {
+            let records = crate::watch_store::active_outputs::records(&self.external.reservations, paths);
+            crate::watch_store::active_outputs::release(&self.external.reservations, &records);
+        }
+        Ok(())
     }
 
     pub(super) fn prepare_external_flatten(
-        &self,
-        output: &Path,
-        work: &Path,
-        leaf: &Path,
+        &self, output: &Path, work: &Path, leaf: &Path,
     ) -> io::Result<()> {
-        if let Some((journal, scopes)) = self.external_journal() {
-            let paths = crate::path_keys::output_path_aliases(output)?;
-            if paths.iter().any(|path| scopes.iter().any(|scope| scope.intersects_output(path))) {
-                prepare_flatten(&journal, "", output, work, leaf)?;
-            }
+        let external = self.external.lock().unwrap();
+        if let Some(journal) = external.as_ref().and_then(|external| external.journal.upgrade()) {
+            prepare_flatten(&journal, "", output, work, leaf)?;
+        } else {
+            let mut paths = crate::path_keys::output_path_aliases(output)?;
+            paths.extend(crate::path_keys::output_path_aliases(work)?);
+            crate::watch_store::active_outputs::register(&self.external.reservations, &paths,
+                &[&output_identity(&output.to_string_lossy())?, &output_identity(&leaf.to_string_lossy())?]);
         }
         Ok(())
     }
 
     pub(super) fn finish_external_flatten(&self, output: &Path) -> io::Result<()> {
-        if let Some((journal, _)) = self.external_journal() {
+        if let Some(journal) = self.external_journal() {
             finish_flatten(&journal, &output.to_string_lossy())?;
         }
         Ok(())
@@ -918,6 +967,7 @@ struct Signals {
     once: Vec<CommandReply<()>>,
     password_changed: bool,
     foreground_finished: bool,
+    published_outputs: Vec<(String, String)>,
     maintenance: bool,
     volumes: VolumeChanges,
     rebuild: Vec<CommandReply<bool>>,
@@ -1246,6 +1296,7 @@ impl Hub {
                 && !value.password_changed
                 && !value.maintenance
                 && !value.foreground_finished
+                && value.published_outputs.is_empty()
                 && value.volumes.is_empty()
                 && value.rebuild.is_empty()
                 && value.cancel.is_empty()
@@ -1466,12 +1517,12 @@ impl RootObserver {
         passwords: &Path,
         hub: &Arc<Hub>,
         journal: &Arc<journal::Journal>,
-        catalog: &Arc<NativeWatchCatalog>,
+        catalog: &Arc<NativeWatchCatalog>, dependency_only: bool,
     ) -> io::Result<Self> {
         let identity = output_identity(&directory.to_string_lossy())?;
         let id = key(&root.path);
         let watched_dir = directory.to_owned();
-        let recursive = root.recursive;
+        let recursive = root.recursive || dependency_only;
         let password_name = passwords.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let password_path = key(passwords);
         let hub = Arc::clone(hub);
@@ -1496,7 +1547,10 @@ impl RootObserver {
                         password_changed = true;
                         continue;
                     }
-                    if !scope.contains(&path.to_string_lossy()) { continue; }
+                    let ordinary = scope.contains(&path.to_string_lossy());
+                    if dependency_only && ordinary { continue; }
+                    if !ordinary && !catalog.generated_under(&scope, &path.to_string_lossy())
+                        && journal.state().entry(&path.to_string_lossy()).is_none() { continue; }
                     let modified = change.action == 3;
                     match changes.entry(path) {
                         std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -1513,6 +1567,7 @@ impl RootObserver {
                     changes.retain(|path, _| !filter.contains(path));
                 }
                 for (path, change) in &mut changes {
+                    if !scope.contains(&path.to_string_lossy()) { continue; }
                     let key = key(path);
                     if hub.claims.lock().unwrap().contains_key(&key) { continue; }
                     let activity = hub.activities.bind(key.clone(), || {
@@ -1532,6 +1587,8 @@ impl RootObserver {
                     if !root_changed { return; }
                     if let Some(paths) = paths {
                         signals.changes.root_changed(&id, paths);
+                    } else if dependency_only {
+                        signals.changes.root_changed(&id, [(watched_dir.clone(), PathChange { modified_only: false, event: None, observation: None })]);
                     } else {
                         signals.changes.topology_changed(id.clone());
                     }
@@ -1653,7 +1710,7 @@ impl RootObservers {
             self.root.take();
         }
         if self.root.is_none() && root.path.is_dir() {
-            match RootObserver::start(&root.path, root, scope.clone(), passwords, hub, journal, catalog) {
+            match RootObserver::start(&root.path, root, scope.clone(), passwords, hub, journal, catalog, false) {
                 Ok(observer) => self.root = Some(observer),
                 Err(error) => errors.push(error),
             }
@@ -1838,8 +1895,8 @@ fn consume_claimed_pending(
 }
 
 // Keep the durable blocker and a generation already queued for regroup under
-// the admitting root, retaining the promoted subtree's recovery scope.
-fn handoff_promoted_blocker(
+// the admitting root, preserving the nested input's original recovery scope.
+fn handoff_nested_blocker(
     entry: &mut Arc<crate::watch_store::EntryRecord>,
     root_id: &str,
     root: &Root,
@@ -1855,6 +1912,7 @@ fn handoff_promoted_blocker(
 
 #[derive(Debug)]
 struct Recovery {
+    max_depth: Option<usize>,
     scope: NativeDiscoveryScope,
     password_scope: PathBuf,
 }
@@ -1875,9 +1933,16 @@ impl Recovery {
             .map(str::to_owned)
             .collect();
         Some(Self {
+            max_depth: scope.get("extract_depth").and_then(Value::as_u64).map(|n| n as usize),
             scope: NativeDiscoveryScope::new(root, depth, excluded),
             password_scope: PathBuf::from(password_scope),
         })
+    }
+
+    fn record(&self) -> serde_json::Map<String, Value> {
+        let mut record = scope_record(&self.scope);
+        record.insert("extract_depth".into(), json!(self.max_depth));
+        record
     }
 
     fn password_dir<'a>(&'a self, path: &'a Path) -> &'a Path {
@@ -1936,6 +2001,7 @@ fn completion_claims<'a>(
 }
 
 struct Active {
+    max_depth: usize,
     deep: bool,
     root: String,
     recovery: Option<Arc<Recovery>>,
@@ -1983,6 +2049,7 @@ struct RootCompleted {
 }
 
 struct CompletionContext {
+    max_depth: usize,
     deep: bool,
     root: String,
     recovery: Option<Arc<Recovery>>,
@@ -2000,7 +2067,6 @@ struct CompletionContext {
 struct Completed {
     cancelled: bool,
     result: io::Result<Outcome>,
-    promoted: HashMap<String, Option<WatchCandidateRow>>,
     outputs: BTreeMap<String, String>,
 }
 
@@ -2118,9 +2184,11 @@ struct Scheduler {
     root_observers: HashMap<String, RootObservers>,
     root_progress: RootPolicyProgress,
     parent_observers: HashMap<String, ParentObserver>,
+    dependency_observers: HashMap<(String, String), RootObserver>,
     config_observers: Vec<ConfigSubscription>,
     pending: HashMap<String, Pending>,
     unpublished: HashSet<String>,
+    volume_checks: HashMap<String, (u64, Option<Arc<crate::pipeline::PreparedVolume>>)>,
     due: BTreeMap<(Instant, String), ()>,
     active: HashMap<String, Active>,
     active_paths: HashMap<String, Arc<str>>,
@@ -2130,21 +2198,21 @@ struct Scheduler {
     monitor: Option<(crate::core::clipboard_monitor::Monitor, bool, usize)>,
     toast: Option<super::toast::Toast>,
     cache_deadline: Option<Instant>,
-    external: Arc<Mutex<Option<ExternalOutputs>>>,
+    external: Arc<OutputPublications>,
     _lease: Option<Arc<BrokerLease>>,
 }
 
 impl Scheduler {
     fn open(
         cwd: PathBuf, engine: Arc<Engine>, hub: Arc<Hub>, continuous: bool,
-        tray_enabled: bool, external: Arc<Mutex<Option<ExternalOutputs>>>, snapshot: Snapshot,
+        tray_enabled: bool, external: Arc<OutputPublications>, snapshot: Snapshot,
     ) -> io::Result<Self> {
         Self::open_with_lease(cwd, engine, hub, continuous, tray_enabled, external, snapshot, None)
     }
 
     fn open_with_lease(
         cwd: PathBuf, engine: Arc<Engine>, hub: Arc<Hub>, continuous: bool,
-        tray_enabled: bool, external: Arc<Mutex<Option<ExternalOutputs>>>, snapshot: Snapshot,
+        tray_enabled: bool, external: Arc<OutputPublications>, snapshot: Snapshot,
         lease: Option<Arc<BrokerLease>>,
     ) -> io::Result<Self> {
         let executor = Arc::clone(&engine);
@@ -2159,7 +2227,7 @@ impl Scheduler {
         hub: Arc<Hub>,
         continuous: bool,
         tray_enabled: bool,
-        external: Arc<Mutex<Option<ExternalOutputs>>>,
+        external: Arc<OutputPublications>,
         snapshot: Snapshot,
         lease: Option<Arc<BrokerLease>>,
     ) -> io::Result<Self> {
@@ -2169,7 +2237,7 @@ impl Scheduler {
         };
         let root_file = roots_path(&cwd)?;
         let dir = state_dir(&cwd)?;
-        let journal = Arc::new(journal::Journal::open(&dir, snapshot.config.watch.event_log_retention_days)?);
+        let journal = Arc::new(journal::Journal::open_with_outputs(&dir, snapshot.config.watch.event_log_retention_days, Arc::clone(&external.reservations))?);
         let maintenance_hub = Arc::downgrade(&hub);
         journal.set_maintenance(Arc::new(move || {
             if let Some(hub) = maintenance_hub.upgrade() {
@@ -2210,9 +2278,11 @@ impl Scheduler {
             root_observers: HashMap::new(),
             root_progress: RootPolicyProgress::default(),
             parent_observers: HashMap::new(),
+            dependency_observers: HashMap::new(),
             config_observers,
             pending: HashMap::new(),
             unpublished: HashSet::new(),
+            volume_checks: HashMap::new(),
             due: BTreeMap::new(),
             active: HashMap::new(),
             active_paths: HashMap::new(),
@@ -2229,7 +2299,6 @@ impl Scheduler {
         scheduler.reconcile_roots(false)?;
         scheduler.activate_scan_options()?;
         scheduler.retire_missing_entries(None, true)?;
-        scheduler.retire_stale_promoted(None, true)?;
         scheduler.reconcile_shell();
         scheduler.recover_pending(None)?;
         if !scheduler.continuous && !scheduler.roots.is_empty()
@@ -2239,7 +2308,7 @@ impl Scheduler {
         scheduler.password_update(true)?;
         scheduler.checkpoint(&HashMap::new(), true, true)?;
         scheduler.root_progress.checkpoint = false;
-        scheduler.retry_missing_volumes_with_event(None, "startup_missing_volume_reconcile")?;
+        scheduler.retry_missing_volumes(None)?;
         scheduler.root_progress.recovery = false;
         scheduler
             .hub
@@ -2258,6 +2327,7 @@ impl Scheduler {
         // Keep only the configuration/tray/log shell; durable recovery belongs to
         // the next scheduler, not to an idle service with no roots.
         self.root_observers.clear();
+        self.dependency_observers.clear();
         self.parent_observers.clear();
         self.monitor.take();
         self.toast.take();
@@ -2268,6 +2338,7 @@ impl Scheduler {
         self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(), None));
         self.pending = HashMap::new();
         self.unpublished = HashSet::new();
+        self.volume_checks = HashMap::new();
         self.due.clear();
         self.active = HashMap::new();
         self.active_paths = HashMap::new();
@@ -2485,7 +2556,7 @@ impl Scheduler {
             self.drain_active(&mut Ok(0))?;
             // Main builds its new scheduler from the durable work. In-memory
             // candidates produced by the stop checkpoint must not mask pending
-            // output cleanup or promoted recovery under the new policy.
+            // output cleanup or retained recovery under the new policy.
             self.persist_candidates(BTreeMap::new(), true)?;
             self.pending.clear();
             self.due.clear();
@@ -2509,17 +2580,22 @@ impl Scheduler {
                 self.catalog.retain_roots(entries.iter()
                     .map(|entry| entry.path.to_string_lossy().into_owned()).collect());
                 self.root_observers.clear();
+                self.dependency_observers.clear();
                 let scopes = self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>();
                 *self.external.lock().unwrap() = Some(ExternalOutputs {
                     journal: Arc::downgrade(&self.journal),
                     scopes: scopes.clone().into(),
+                    catalog: Arc::clone(&self.catalog),
+                    options: Arc::new(self.deep_options.clone()),
+                    hub: Arc::downgrade(&self.hub),
                 });
                 self.journal.commit(true, |state| Ok(state.scope_retirement_operations(&scopes)))?;
             }
-            self.retire_owned_outputs(None)
+            Ok(())
         })();
         self.rearm_root_observers_blocking(None);
         retirement?;
+        self.reconcile_generated_sources()?;
         self.root_progress.retirement = false;
         Ok((self.root_progress.checkpoint, self.root_progress.recovery))
         })?
@@ -2527,7 +2603,10 @@ impl Scheduler {
 
     fn rearm_root_observers(&mut self, changed: Option<&HashSet<String>>) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_rearm", Origin::Watch, || self.rearm_root_observers_blocking(changed))
+        engine.run_stage("watch_rearm", Origin::Watch, || {
+            self.rearm_root_observers_blocking(changed);
+            self.reconcile_generated_sources()
+        })?
     }
 
     fn rearm_root_observers_blocking(&mut self, changed: Option<&HashSet<String>>) {
@@ -2616,6 +2695,7 @@ impl Scheduler {
         });
 
         let apply = (|| {
+            if scheduler_changed || roots_changed || config_changed { self.volume_checks.clear(); }
             if scheduler_changed || roots_changed {
                 self.activate_scan_options()?;
             }
@@ -2707,6 +2787,7 @@ impl Scheduler {
                 if let Err(error) = self.checkpoint(&HashMap::new(), true, false) { *result = Err(error); }
             }
             self.root_observers.clear();
+            self.dependency_observers.clear();
             self.parent_observers.clear();
             self.monitor.take();
         }
@@ -2908,6 +2989,16 @@ impl Scheduler {
             if let Some(error) = completion_error {
                 return Err(error);
             }
+            for (root, output) in signals.published_outputs {
+                if let Some((_, scope)) = self.roots.get(&watch_path_key(&root)) {
+                    let scope = scope.clone();
+                    let mut retried = HashSet::new();
+                    let mut buckets = HashSet::new();
+                    if buckets.insert(crate::scan::catalog::catalog_stem(&output)) {
+                        self.retry_volume_peers(&scope, &output, &mut retried)?;
+                    }
+                }
+            }
             for waiter in signals.rebuild {
                 let result = self.engine.run_stage("catalog_maintenance", Origin::Watch, || self.journal.rebuild_log()).and_then(|result| result);
                 let _ = waiter.send(result);
@@ -3016,6 +3107,7 @@ impl Scheduler {
             Ok(options) => { self.options = options; Ok(()) }
             Err(error) => {
                 self.root_observers.clear();
+                self.dependency_observers.clear();
                 self.parent_observers.clear();
                 self.monitor.take();
                 Err(error)
@@ -3029,10 +3121,82 @@ impl Scheduler {
         Ok(if deep { &self.deep_options } else { options })
     }
 
-    fn retire_owned_outputs(&self, paths: Option<&[String]>) -> io::Result<()> {
-        let scopes = self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>();
-        let retirement = self.journal.state().prepare_owned_retirement(&scopes, paths);
-        self.journal.commit(true, |state| Ok(retirement.operations(state)))
+    fn reconcile_generated_sources(&mut self) -> io::Result<()> {
+        let scopes: Vec<_> = self.roots.values().map(|(_, scope)| scope.clone()).collect();
+        for scope in scopes {
+            let paths = self.catalog.generated_paths(&scope);
+            self.ensure_dependency_observers(scope.key(), paths.iter().filter_map(|p| Path::new(p).parent().map(Path::to_owned)))?;
+            let invalid = self.catalog.validate_generated(&scope, None)?;
+            self.retire_recovery(invalid.into_iter())?;
+        }
+        self.retire_dependency_observers();
+        Ok(())
+    }
+
+    fn ensure_dependency_observers(&mut self, root_id: &str, directories: impl Iterator<Item = PathBuf>) -> io::Result<()> {
+        let Some((root, scope)) = self.roots.get(root_id) else { return Ok(()); };
+        let mut directories_seen = HashSet::new();
+        let mut bases_seen = HashSet::new();
+        for directory in directories {
+            let directory_key = key(&directory);
+            if !directories_seen.insert(directory_key.clone()) { continue; }
+            if root.recursive && scope.contains(&directory.to_string_lossy())
+                && crate::scan::directory::walk_can_reach(scope.key(), &directory.to_string_lossy()) { continue; }
+            let contains = |parent: &Path| directory_key == key(parent) || is_path_under(&directory_key, &key(parent));
+            let base = root.output.as_deref().filter(|p| contains(p))
+                .or_else(|| contains(&root.path).then_some(root.path.as_path())).unwrap_or(&directory);
+            if !bases_seen.insert(key(base)) { continue; }
+            let base = match fs::canonicalize(base) {
+                Ok(base) => PathBuf::from(crate::path_keys::normalize_windows_extended_prefix(base.to_string_lossy().into_owned())),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let id = (root_id.to_owned(), key(&base));
+            if self.dependency_observers.get(&id).is_some_and(|observer| observer.matches(&base)) { continue; }
+            let observer = RootObserver::start(&base, root, scope.clone(), self.passwords.path(),
+                &self.hub, &self.journal, &self.catalog, true)?;
+            self.dependency_observers.insert(id, observer);
+        }
+        Ok(())
+    }
+
+    fn retire_dependency_observers(&mut self) {
+        self.dependency_observers.retain(|(root, _), observer| self.roots.get(root).is_some_and(|(_, scope)|
+            self.catalog.generated_under(scope, &observer.observer.path.to_string_lossy())));
+    }
+
+    fn invalidate_recovery(&mut self, paths: impl Iterator<Item = String>) -> io::Result<()> {
+        let mut retired = Vec::new();
+        for path in paths {
+            let Some(entry) = self.journal.state().entry(&path) else { continue; };
+            let changed = match watch_candidate_for_path(Path::new(&path), Some(entry.change_usn)) {
+                Ok(Some(current)) => crate::postprocess::watch_source_changed(entry.size.max(0) as u64,
+                    entry.mtime, &entry.file_id, entry.change_usn, &current),
+                Ok(None) => true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Err(_) => continue,
+            };
+            if changed { retired.push(path); }
+        }
+        self.retire_recovery(retired.into_iter())
+    }
+
+    fn retire_recovery(&mut self, paths: impl Iterator<Item = String>) -> io::Result<()> {
+        let mut operations = crate::watch_store::NativeWatchOperations::empty();
+        let mut retired = Vec::new();
+        for path in paths {
+            let id = watch_path_key(&path);
+            if !self.pending.contains_key(&id) && self.journal.state().entry_by_key(&id).is_none()
+                && self.journal.state().pending(&path).is_none() { continue; }
+            if let Some(pending) = self.pending.remove(&id) { self.due.remove(&(pending.due, id.clone())); }
+            self.unpublished.remove(&id);
+            self.volume_checks.remove(&id);
+            operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&path, None));
+            retired.push(path);
+        }
+        self.journal.commit(false, |_| Ok(operations))?;
+        for path in retired { self.journal.log(json!({"event":"task_retired", "path":path, "reason":"source_changed"})); }
+        Ok(())
     }
 
     fn observe_file_changes_blocking(
@@ -3077,6 +3241,22 @@ impl Scheduler {
     fn observe_root_changes(&mut self, changes: &mut RootChanges) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_directory", Origin::Watch, || {
+            for (id, paths) in &changes.changed_roots {
+                if let Some((_, scope)) = self.roots.get(id) {
+                    let invalid = self.catalog.validate_generated_paths(scope, paths)?;
+                    self.retire_recovery(invalid.into_iter())?;
+                    self.invalidate_recovery(paths.iter().map(|p| p.to_string_lossy().into_owned()))?;
+                }
+            }
+            self.retire_dependency_observers();
+            // Dependency-only changes never request ordinary root enumeration.
+            changes.changed_roots.retain(|id, paths| {
+                // An empty set is an existing topology/full-root invalidation,
+                // not an empty dependency notification.
+                if paths.is_empty() { return true; }
+                paths.retain(|path| self.roots.get(id).is_some_and(|(_, scope)| scope.contains(&path.to_string_lossy())));
+                !paths.is_empty()
+            });
             let departed = changes.prepare(|id, path| {
                 self.roots.get(id).is_some_and(|(_, scope)| {
                     self.catalog.path_is_directory(scope, &path.to_string_lossy()) == Some(false)
@@ -3156,7 +3336,6 @@ impl Scheduler {
             // Old snapshots can have only an outside literal name while its
             // physical watched volume is offline. Resolve those legacy names
             // once when a root returns, before catalog recovery or admission.
-            self.retire_owned_outputs(None)?;
             // A returning root can have durable work with the same inventory
             // and no USN delta. Resume only the affected ownership scopes.
             self.recover_pending(Some(&reopened))?;
@@ -3183,7 +3362,7 @@ impl Scheduler {
         let mut retried = HashSet::new();
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
-        for (id, root, scope, identity, current, cached, arrived) in probes {
+        for (id, root, scope, identity, current, cached, _arrived) in probes {
             let range = match (&current, &cached) {
                 (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end)))
                     if volume == old_volume
@@ -3197,14 +3376,6 @@ impl Scheduler {
             let mut paths = Vec::new();
             let mut errors = Vec::new();
             let rebuild = !root.scanned || range.is_none_or(|(_, entries)| entries.is_err());
-            // An admission checkpoint still covers every root's USN interval,
-            // but valid intervals reconcile only paths that actually changed.
-            // Root enumeration/topology recovery alone needs the whole subtree.
-            let affected = owned_checkpoint_paths(
-                &scope, changed.get(&id), range.and_then(|(_, paths)| paths.as_deref().ok()),
-                startup || rebuild || arrived,
-            );
-            if !affected.is_empty() { self.retire_owned_outputs(Some(&affected))?; }
             if rebuild {
                 // Only startup without a trusted persisted cursor establishes
                 // a conservative baseline. During a running session the in-memory
@@ -3328,7 +3499,9 @@ impl Scheduler {
                     }) {
                         continue;
                     }
-                    CandidateAdmission::ExplicitRetry
+                    if self.catalog.observation(&path).is_some() {
+                        CandidateAdmission::Observe
+                    } else { CandidateAdmission::ExplicitRetry }
                 } else {
                     CandidateAdmission::Observe
                 };
@@ -3472,33 +3645,9 @@ impl Scheduler {
         })
     }
 
-    fn retire_stale_promoted(&self, path: Option<&str>, recursive: bool) -> io::Result<()> {
-        let candidates = self.journal.state().promoted_sources(path, recursive);
-        if candidates.is_empty() {
-            return Ok(());
-        }
-        self.journal.commit(false, |state| {
-            let mut operations = crate::watch_store::NativeWatchOperations::empty();
-            for (key, receipt) in candidates {
-                let path = receipt.path().to_string_lossy();
-                if self
-                    .roots
-                    .values()
-                    .any(|(root, scope)| scope.contains(&path) && root.path.is_dir())
-                    && (NativePresence::at(&path).is_absent() || receipt.is_replaced())
-                    && state
-                        .promoted_source(&path)
-                        .is_some_and(|current| Arc::ptr_eq(&receipt, &current))
-                {
-                    operations.retire_promoted(key);
-                }
-            }
-            Ok(operations)
-        })
-    }
-
     fn departed(&mut self, path: &str, recursive: bool) -> io::Result<()> {
         let path_key = watch_path_key(path);
+        self.volume_checks.retain(|id, _| id != &path_key && !(recursive && is_path_under(id, &path_key)));
         let is_missing = |pending: &Pending| {
             NativePresence::at(&pending.candidate.path).is_absent()
                 && self
@@ -3531,7 +3680,6 @@ impl Scheduler {
         }
         self.journal.log(json!({"event":"candidate_departed","path":path,"recursive":recursive}));
         self.catalog.forget_observation(path, recursive, true);
-        self.retire_stale_promoted(Some(path), recursive)?;
         self.retire_missing_entries(Some(path), recursive)
     }
 
@@ -3610,7 +3758,7 @@ impl Scheduler {
         let id = watch_path_key(&path);
         if self.defer_claimed_path(&id) { return Ok(()); }
         let previous = self.catalog.observation(&path);
-        let (blocked, promoted) = self.journal.state().observation_state(&id);
+        let blocked = self.journal.state().entry_by_key(&id);
         let interrupted = blocked
             .as_ref()
             .filter(|entry| entry.status == "interrupted");
@@ -3651,21 +3799,13 @@ impl Scheduler {
         };
         // Workers can acquire a sibling while the filesystem probe runs.
         if self.defer_claimed_path(&id) { return Ok(()); }
-        if let Some(receipt) = promoted.filter(|receipt| receipt.is_replaced()) {
-            self.journal.commit(false, |state| {
-                let mut operations = crate::watch_store::NativeWatchOperations::empty();
-                if state
-                    .promoted_source(&path)
-                    .is_some_and(|current| Arc::ptr_eq(&receipt, &current))
-                {
-                    operations.retire_promoted(id.clone());
-                }
-                Ok(operations)
-            })?;
+        if recovery.is_some() && blocked.as_ref().is_some_and(|before|
+            crate::postprocess::watch_source_changed(before.size.max(0) as u64, before.mtime,
+                &before.file_id, before.change_usn, &candidate)) {
+            self.retire_recovery(std::iter::once(path))?;
+            return Ok(());
         }
-        let blocked_unchanged = blocked
-            .as_ref()
-            .is_some_and(|before| !entry_changed(before, &candidate));
+        let blocked_unchanged = blocked.as_ref().is_some_and(|before| !entry_changed(before, &candidate));
         let unchanged = if let Some(before) = self.pending.get(&id).map(|entry| &entry.candidate) {
             !quiet::changed(before, &candidate)
         } else if let Some(before) = captured {
@@ -3746,6 +3886,7 @@ impl Scheduler {
             }
             return Ok(());
         }
+        if !unchanged { self.catalog.content_changed(&path); }
         if let Some(interrupted) = interrupted {
             self.journal.commit(false, |state| {
                 Ok(if state.entry(&candidate.path).is_some_and(|current| Arc::ptr_eq(interrupted, &current)) {
@@ -3869,7 +4010,7 @@ impl Scheduler {
                     let update = (
                         observation,
                         root.path.to_string_lossy().into_owned(),
-                        Some(scope_record(&recovery.scope)),
+                        Some(recovery.record()),
                     );
                     recoveries.push((update, pending.force, &recovery.password_scope));
                 } else {
@@ -3946,6 +4087,7 @@ impl Scheduler {
         let signature = password_source_signature(&self.user_password_signature, snapshot.signature());
         let state = self.journal.state();
         let changed = state.password_source_signature() != signature;
+        if changed { self.volume_checks.clear(); }
         if changed || startup {
             // A prior runtime can publish the password generation before
             // scheduling every affected blocker. Reconcile entries once when
@@ -3983,6 +4125,8 @@ impl Scheduler {
         roots: Option<&HashSet<String>>, event: &'static str,
     ) -> io::Result<()> {
         for entry in self.journal.state().entry_items(Some("password")) {
+            self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
+            if self.journal.state().entry(&entry.path).is_none() { continue; }
             let Some((root, recovery)) = self.blocker_route(&entry) else {
                 continue;
             };
@@ -4006,37 +4150,64 @@ impl Scheduler {
         Ok(())
     }
 
-    fn retry_missing_volumes(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
-        self.retry_missing_volumes_with_event(roots, "volume_changed")
-    }
-
     fn retry_volume_peers(&mut self, scope: &NativeDiscoveryScope, seed: &str, retried: &mut HashSet<String>) -> io::Result<()> {
-        let seed_key = crate::path_keys::path_key(seed);
         for peer in self.catalog.bucket_paths(scope, seed) {
-            let id = crate::path_keys::path_key(&peer);
-            if id == seed_key || retried.contains(&id) { continue; }
-            let Some(entry) = self.journal.state().entry_by_key(&id)
-                .filter(|entry| entry.status == "suspended_missing_volume") else { continue };
-            if let Some((root, recovery)) = self.blocker_route(&entry) {
+            let id = watch_path_key(&peer);
+            if retried.contains(&id) { continue; }
+            if let Some(entry) = self.journal.state().entry_by_key(&id)
+                .filter(|entry| entry.status == "suspended_missing_volume") {
                 retried.insert(id);
-                self.enqueue_with_recovery(&root, peer, recovery)?;
+                self.check_missing_volume(&entry, false)?;
             }
         }
         Ok(())
     }
 
-    fn retry_missing_volumes_with_event(&mut self, roots: Option<&HashSet<String>>, event: &'static str) -> io::Result<()> {
-        for entry in self.journal.state().entry_items(Some("missing_volume")) {
-            let Some((root, recovery)) = self.blocker_route(&entry) else {
-                continue;
-            };
-            if roots.is_some_and(|roots| !roots.contains(&root)) {
-                continue;
+    fn check_missing_volume(&mut self, entry: &crate::watch_store::EntryRecord, retry_incomplete: bool) -> io::Result<()> {
+        self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
+        if self.journal.state().entry(&entry.path).is_none() { return Ok(()); }
+        let Some((root, recovery)) = self.blocker_route(entry) else { return Ok(()); };
+        let id = watch_path_key(&entry.path);
+        if self.defer_claimed_path(&id) { return Ok(()); }
+        let (policy, watched) = &self.roots[&root];
+        let catalog_visible = self.catalog.dependency_contains(watched, &entry.path) && !self.catalog.is_owned(&entry.path);
+        let scope = if catalog_visible { watched.clone() }
+            else if let Some(recovery) = &recovery { recovery.scope.clone() }
+            else { return Ok(()); };
+        let revision = if catalog_visible { self.catalog.bucket_revision(&scope, &entry.path) } else { 0 };
+        if !retry_incomplete && self.volume_checks.get(&id).is_some_and(|(before, _)| *before == revision) { return Ok(()); }
+        let mut request = Request::with_config(vec![PathBuf::from(&entry.path)], Mode::Extract, Arc::clone(&self.settings));
+        request.origin = Origin::Watch;
+        request.deep = policy.deep;
+        request.passwords = Arc::clone(&self.settings.user_passwords);
+        request.password_snapshot = Some(self.passwords.snapshot());
+        request.password_scope = Some(candidate_password_scope(self.journal.state(), &entry.path, recovery.as_deref()));
+        request.discovery_scope = Some(scope);
+        if catalog_visible { request.watch_catalog = Some(Arc::clone(&self.catalog)); }
+        let engine = Arc::clone(&self.engine);
+        let options = if policy.deep { &self.deep_options } else { self.options.as_ref().unwrap_or(&self.deep_options) };
+        let lookup = engine.run_stage("volume_lookup", Origin::Watch, || engine.find_watch_volume(&request, options, retry_incomplete))?;
+        self.retire_dependency_observers();
+        let prepared = match lookup {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.journal.log(json!({"event":"volume_lookup_failed","path":entry.path,"error":error.to_string()}));
+                return Ok(());
             }
-            let id = watch_path_key(&entry.path);
-            if !self.pending.contains_key(&id) {
-                self.observe_candidate_with_event(&root, entry.path.clone(), CandidateAdmission::Retry,
-                    recovery, None, None, Some(&CandidateEvent::Business(event)), None)?;
+        };
+        let found = prepared.is_some();
+        self.volume_checks.insert(id, (revision, prepared));
+        if found { self.enqueue_with_recovery(&root, entry.path.clone(), recovery)?; }
+        Ok(())
+    }
+
+    fn retry_missing_volumes(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
+        for entry in self.journal.state().entry_items(Some("missing_volume")) {
+            let Some((root, _)) = self.blocker_route(&entry) else { continue; };
+            if roots.is_none_or(|roots| roots.contains(&root)) {
+                // Startup/policy reconciliation deliberately retries incomplete
+                // inputs too: a changed content policy may accept retained work.
+                self.check_missing_volume(&entry, true)?;
             }
         }
         self.persist_candidates(BTreeMap::new(), true)
@@ -4050,7 +4221,7 @@ impl Scheduler {
     }
 
     fn recover_pending(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
-        recover_flattens(&self.journal, |owner| {
+        let settled = recover_flattens(&self.journal, |owner| {
             roots.is_none_or(|roots| {
                 self.journal.state().pending(owner).is_some_and(|record| {
                     roots.contains(&watch_path_key(&record.source_input_root))
@@ -4063,6 +4234,9 @@ impl Scheduler {
                         .contains_key(&watch_path_key(owner))
             })
         })?;
+        let scopes = self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>();
+        let published = self.catalog.publish_outputs(&settled, &scopes, &self.deep_options, None)?;
+        if !published.is_empty() { self.hub.update(|signals| signals.published_outputs.extend(published)); }
         let journal = Arc::clone(&self.journal);
         let state = journal.state();
         let flatten_owners: HashSet<_> = state
@@ -4116,6 +4290,19 @@ impl Scheduler {
             {
                 continue;
             }
+            if pending.internal_recovery {
+                let changed = match watch_candidate_for_path(Path::new(&pending.path), Some(pending.change_usn)) {
+                    Ok(Some(current)) => crate::postprocess::watch_source_changed(pending.size.max(0) as u64,
+                        pending.mtime, &pending.file_id, pending.change_usn, &current),
+                    Ok(None) => true,
+                    Err(error) if missing_path(&error) => true,
+                    Err(_) => continue,
+                };
+                if changed {
+                    self.retire_recovery(std::iter::once(pending.path.clone()))?;
+                    continue;
+                }
+            }
             let source = Path::new(&pending.path);
             let entry = state.entry(&pending.path);
             let borrowed = entry.as_ref().and_then(|entry| {
@@ -4148,7 +4335,7 @@ impl Scheduler {
                     continue;
                 }
                 if inspected_outputs.insert(watch_path_key(output)) {
-                    if recovery_output_matches(state, &pending, output) {
+                    if recovery_output_matches(&pending, output) {
                         if let Err(error) = crate::postprocess::remove_owned_tree(Path::new(output)) {
                             cleanup_failed = true;
                             self.journal.log(json!({"event":"crash_output_cleanup","path":output,"error":error.to_string()}));
@@ -4187,25 +4374,6 @@ impl Scheduler {
                 })?;
                 continue;
             }
-            let mut destinations_unavailable = false;
-            for promoted in pending.promoted_destinations.iter() {
-                match crate::watch_store::NativeWatchState::file_presence(promoted) {
-                    Some(true) => {
-                        revisit.insert(watch_path_key(promoted), promoted.clone());
-                    }
-                    Some(false) => {}
-                    None => destinations_unavailable = true,
-                }
-            }
-            if destinations_unavailable {
-                continue;
-            }
-            let promoted_present = pending
-                .promoted_destinations
-                .iter()
-                .any(|path| revisit.contains_key(&watch_path_key(path)));
-            // An intent can contain promotion destinations without output
-            // roots. The original file is also a recovery candidate then.
             if pending.committed_roots.iter().next().is_none()
                 && !has_active_output
                 && source.is_file()
@@ -4216,13 +4384,13 @@ impl Scheduler {
             let mut missing_output = false;
             let mut unavailable = false;
             for output in pending.committed_roots.iter() {
-                if recovery_output_matches(state, &pending, output) {
+                if recovery_output_matches(&pending, output) {
                     verified.push(output);
                 } else {
                     missing_output = true;
                 }
             }
-            if missing_output && !promoted_present {
+            if missing_output {
                 if !source.is_file() {
                     self.journal.log(
                         json!({"event":"crash_committed_output_missing","owner_path":pending.path}),
@@ -4297,6 +4465,7 @@ impl Scheduler {
                         .max_by_key(|output| output.len());
                     let recovery = if let Some(output) = nested {
                         Recovery {
+            max_depth: None,
                             scope: NativeDiscoveryScope::new((**output).clone(), None, Vec::new()),
                             password_scope: PathBuf::from(&pending.password_scope_dir),
                         }
@@ -4304,6 +4473,7 @@ impl Scheduler {
                         Recovery::from_record(&pending.discovery_scope, &pending.password_scope_dir)
                             .filter(|recovery| recovery.scope.contains(&path))
                             .unwrap_or_else(|| Recovery {
+            max_depth: None,
                                 scope: if scope.contains(&path) {
                                     scope.clone()
                                 } else {
@@ -4358,18 +4528,6 @@ fn missing_path(error: &io::Error) -> bool {
     )
 }
 
-fn owned_checkpoint_paths(
-    scope: &NativeDiscoveryScope,
-    named: Option<&HashSet<PathBuf>>,
-    recovered: Option<&[(String, String)]>,
-    reconcile_root: bool,
-) -> Vec<String> {
-    if reconcile_root { return vec![scope.root.clone()]; }
-    recovered.into_iter().flatten().filter(|(_, id)| scope.contains_key(id)).map(|(path, _)| path.clone())
-        .chain(named.into_iter().flatten().map(|path| path.to_string_lossy().into_owned()))
-        .collect()
-}
-
 fn output_identity(path: &str) -> io::Result<String> {
     let (volume, identity, _) = filesystem::watch_path_identity(path)?;
     Ok(format!("{volume}|{identity}"))
@@ -4389,21 +4547,12 @@ fn password_source_signature(user: &str, builtin: &str) -> String {
 }
 
 fn recovery_output_matches(
-    state: &crate::watch_store::NativeWatchState,
     pending: &crate::watch_store::PendingRecord,
     path: &str,
 ) -> bool {
     let Ok(Some(actual)) = identity_if_present(path) else {
         return false;
     };
-    if let Some(record) = state.runtime_record(&format!("owned|{}", watch_path_key(path))) {
-        if let Some(ids) = record["identities"]
-            .as_array()
-            .filter(|ids| !ids.is_empty())
-        {
-            return ids.iter().any(|id| id.as_str() == Some(&actual));
-        }
-    }
     pending.output_identities.get(path) == Some(&actual)
 }
 
@@ -4481,6 +4630,12 @@ impl Scheduler {
             // A callback can arrive while the filesystem readiness probe runs.
             // Read its generation and deadline atomically, not as independent
             // matches/deadline checks that could accept a just-written file.
+            if pending.recovery.is_some() && crate::postprocess::watch_source_changed(
+                pending.candidate.size, pending.candidate.mtime, &pending.candidate.observation.file_id,
+                previous_usn, &current) {
+                self.retire_recovery(std::iter::once(pending.candidate.path.clone()))?;
+                continue;
+            }
             let (captured, deadline) = pending.quiet.observation(&current);
             if let Some(deadline) = deadline.filter(|deadline| *deadline > now && *deadline > pending.due) {
                 pending.due = deadline;
@@ -4489,6 +4644,7 @@ impl Scheduler {
                 continue;
             }
             if quiet::changed(&pending.candidate, &current) && !captured {
+                self.catalog.content_changed(&current.path);
                 let boundary = quiet::is_boundary(&current);
                 pending.quiet.boundary_observation(&current, observed_now, observed_at,
                     self.settings.watch.boundary_confirmation_seconds);
@@ -4702,29 +4858,20 @@ impl Scheduler {
         );
         request.origin = Origin::Watch;
         request.cancel = cancel.clone();
-        // A missing-volume promotion visible to ordinary Watch discovery can
-        // join peers anywhere in the current watched scope. Its saved local
-        // scope still bounds recovery if the destination is outside it.
+        request.cleanup_boundaries = self.roots.values().map(|(root, _)| root.path.clone()).collect();
+        // Catalog-backed recovery can join ordinary and generated peers.
+        // The local scope remains the fallback when no catalog row is visible.
         let catalog_recovery = recovery.is_some()
-            && candidates.iter().all(|candidate| {
-                if !scope.contains(&candidate.path) || self.catalog.is_owned(&candidate.path) {
-                    return false;
-                }
-                let (entry, promoted) = self
-                    .journal
-                    .state()
-                    .observation_state(&watch_path_key(&candidate.path));
-                promoted.is_some()
-                    && entry.is_some_and(|entry| entry.status == "suspended_missing_volume")
-            });
+            && candidates.iter().all(|candidate| self.catalog.dependency_contains(&scope, &candidate.path)
+                && !self.catalog.is_owned(&candidate.path));
         let local_recovery = recovery.as_ref().filter(|_| !catalog_recovery);
-        let nested_recovery = local_recovery.is_some_and(|recovery| {
+        let nested_recovery = recovery.as_ref().is_some_and(|recovery| {
             watch_path_key(&recovery.scope.root) != watch_path_key(&scope.root)
         });
         if !nested_recovery {
             request.output_root = root.output.clone();
         }
-        request.max_depth = cli::depth(self.settings.recursive_extract);
+        request.max_depth = cli::depth(self.settings.recursive_extract).min(recovery.as_ref().and_then(|r| r.max_depth).unwrap_or(usize::MAX));
         request.deep = root.deep;
         let passwords = self.passwords.snapshot();
         request.passwords = Arc::clone(&self.settings.user_passwords);
@@ -4741,11 +4888,10 @@ impl Scheduler {
             request.checkpoints.extend(restore_checkpoints(
                 self.journal.state(), &candidate.path, &mut outputs,
             )?);
-            if let Some(entry) = self.journal.state().entry(&candidate.path) {
-                if let Some(receipts) = entry.failure_payload.get("promoted_sources") {
-                    let sources = Vec::<PromotedSource>::deserialize(receipts)?;
-                    request.promoted_sources.extend(sources);
-                }
+        }
+        for candidate in &candidates {
+            if let Some((_, plan)) = self.volume_checks.get_mut(&watch_path_key(&candidate.path)) {
+                request.prepared_volumes.extend(plan.take());
             }
         }
         let engine = Arc::clone(&self.engine);
@@ -4758,9 +4904,7 @@ impl Scheduler {
             .iter()
             .map(|input| (watch_path_key(&input.path), input.path.clone()))
             .collect();
-        let output_scopes = self.external.lock().unwrap().as_ref()
-            .map(|external| Arc::clone(&external.scopes))
-            .unwrap_or_else(|| Arc::from([scope.clone()]));
+
         let toast = self
             .toast
             .as_ref()
@@ -4780,17 +4924,17 @@ impl Scheduler {
             "path":candidates.first().map(|entry| &entry.path),"count":candidates.len()}));
         let observer = Arc::new(WatchObserver {
             deep: root.deep,
+            catalog: Arc::clone(&self.catalog),
             journal,
             owners,
-            output_scopes,
             outputs: Mutex::new(ObservedOutputs::from(outputs)),
             batch: worker_batch,
             toast: worker_toast,
             hub: Arc::clone(&hub),
             groups: worker_groups,
             claimed: worker_claimed,
-            promoted: Mutex::default(),
         });
+        let max_depth = request.max_depth;
         let request_handle = engine.submit(request, Arc::clone(&observer), move |result| {
             let cancelled = worker_cancel.cancelled();
             let report_path = report_path.filter(|_| !result.as_ref().is_ok_and(|outcome| {
@@ -4820,12 +4964,10 @@ impl Scheduler {
                     );
                 }
             }
-            let promoted = std::mem::take(&mut *observer.promoted.lock().unwrap());
             let outputs = std::mem::take(&mut *observer.outputs.lock().unwrap()).paths;
             Completed {
                 cancelled,
                 result,
-                promoted,
                 outputs,
             }
         });
@@ -4843,6 +4985,7 @@ impl Scheduler {
         self.active.insert(
             batch,
             Active {
+                max_depth,
                 deep: root.deep,
                 root: id,
                 recovery,
@@ -5004,6 +5147,7 @@ impl Scheduler {
         }
         let quiet = members.iter().filter_map(|path| active.quiet.remove(path).map(|tracker| (path.clone(), tracker))).collect();
         let context = CompletionContext {
+            max_depth: active.max_depth,
             deep: active.deep,
             root: active.root.clone(), recovery: active.recovery.clone(), password_scope: active.password_scope.clone(), passwords: Arc::clone(&active.passwords),
             inputs, quiet, dirty, claimed: Arc::clone(&active.claimed), groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
@@ -5054,6 +5198,7 @@ impl Scheduler {
         completed.cancelled |= active.cancel.cancelled();
         let groups = std::mem::take(&mut *active.groups.lock().unwrap()).into_aliases();
         self.apply_completion(batch, CompletionContext {
+            max_depth: active.max_depth,
             deep: active.deep,
             root: active.root, recovery: active.recovery, password_scope: active.password_scope, passwords: active.passwords,
             inputs: active.inputs.into_values().collect(), quiet: active.quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
@@ -5079,12 +5224,12 @@ impl Scheduler {
                 if !self.pending.contains_key(&path) {
                     let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
                     let tracker = quiet.remove(&path);
-                    let admission = if self.journal.state().entry(&path)
-                        .is_some_and(|entry| entry.status == "suspended_missing_volume") {
-                        CandidateAdmission::Retry
-                    } else {
-                        CandidateAdmission::Observe
-                    };
+                    if let Some(entry) = self.journal.state().entry(&path)
+                        .filter(|entry| entry.status == "suspended_missing_volume") {
+                        self.check_missing_volume(&entry, false)?;
+                        continue;
+                    }
+                    let admission = CandidateAdmission::Observe;
                     self.observe_candidate_with_event(&root, path, admission, recovery.clone(), captured.as_ref(), tracker,
                         Some(&CandidateEvent::Business("pipeline_claim_released")), None)?;
                 }
@@ -5093,7 +5238,11 @@ impl Scheduler {
         })?
     }
 
-    fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, mut completed: Completed, quiet: &mut HashMap<String, quiet::Activity>) -> io::Result<(Outcome, Option<super::toast::Finish>)> {
+    fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, completed: Completed, quiet: &mut HashMap<String, quiet::Activity>) -> io::Result<(Outcome, Option<super::toast::Finish>)> {
+        let scopes: Vec<_> = self.roots.values().map(|(_, scope)| scope.clone()).collect();
+        let paths: Vec<_> = completed.outputs.keys().cloned().collect();
+        self.ensure_dependency_observers(&active.root, paths.iter().map(PathBuf::from))?;
+        let published_outputs = self.catalog.publish_outputs(&paths, &scopes, &self.deep_options, Some(&active.root))?;
         let coalesced_from = completed.result.as_ref().ok().and_then(|outcome| outcome.coalesced_from);
         let mut unfinished = HashSet::new();
         if completed.cancelled && coalesced_from.is_none() {
@@ -5132,7 +5281,7 @@ impl Scheduler {
                     claims.remove(path);
                 }
             };
-            for path in completion_claims(active.task, &groups, &claimed).chain(completed.promoted.keys()) { release(path); }
+            for path in completion_claims(active.task, &groups, &claimed) { release(path); }
             for input in &active.inputs { release(&watch_path_key(&input.path)); }
             crate::collections::trim_map(&mut claims);
         }
@@ -5140,7 +5289,7 @@ impl Scheduler {
         // members of the completed request. Restore only their admission keys.
         {
             let claimed = active.claimed.lock().unwrap();
-            for path in completion_claims(active.task, &groups, &claimed).chain(completed.promoted.keys()).cloned()
+            for path in completion_claims(active.task, &groups, &claimed).cloned()
                 .chain(active.inputs.iter().map(|candidate| watch_path_key(&candidate.path)))
             {
                 if let Some(pending) = self.pending.get(&path) {
@@ -5197,6 +5346,8 @@ impl Scheduler {
                 return Ok((Outcome::default(), finish));
             }
         };
+        self.catalog.retire_consumed(outcome.archives.iter().flat_map(|archive| archive.source_paths.iter().cloned())
+            .collect::<HashSet<_>>().into_iter());
         let input_failures = outcome.input_failures();
         let (by_path, success_counts) = completion_archives(&outcome, &completed.outputs, &groups, &input_failures);
         for archive in &outcome.archives {
@@ -5245,18 +5396,27 @@ impl Scheduler {
                 })
         };
         let mut retry = Vec::new();
+        let mut regrouped_recoveries = Vec::new();
         let mut published = HashSet::new();
+        let generated = std::cell::OnceCell::new();
         for archive in outcome
             .archives
             .iter()
-            .filter(|archive| promoted_retry(archive, &input_failures))
+            .filter(|archive| nested_retry(archive, &input_failures))
         {
             let input_failure = &input_failures[&crate::path_keys::path_key(&archive.path.to_string_lossy())];
-            let failure = input_failure.failure().expect("promoted input has a retry cause");
+            let failure = input_failure.failure().expect("retained input has a retry cause");
             let id = key(&archive.path);
-            let Some(candidate) = completed.promoted.remove(&id).flatten() else {
+            if !published.insert(id.clone()) { continue; }
+            let Some(candidate) = watch_candidate_for_path(&archive.path, None)? else {
                 continue;
             };
+            // The completion must not grant recovery to a replacement made
+            // after this nested input was examined by the pipeline.
+            let source = generated.get_or_init(|| outcome.generated_sources.iter()
+                .map(|source| (key(source.path()), source)).collect::<HashMap<_, _>>()).get(&id);
+            if !source.is_some_and(|source| crate::io::reader::capture_file_generation(&archive.path)
+                .is_ok_and(|current| source.matches(&current))) { continue; }
             if self.active_paths.contains_key(&id) {
                 continue;
             }
@@ -5291,10 +5451,10 @@ impl Scheduler {
                 multipart: archive.source_paths.len() > 1,
             };
             let directory = archive.path.parent().unwrap_or(Path::new(""));
-            // A promoted family now lives beside the admitted source. Seal
-            // its new discovery boundary while retaining the password scope
-            // inherited from that source.
+            // Keep the failed input in place with its remaining recursion
+            // depth and inherited password scope; this grants no directory permission.
             let recovery = Recovery {
+                max_depth: Some(active.max_depth.saturating_sub(archive.depth.saturating_sub(1))),
                 scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), Some(0), Vec::new()),
                 password_scope: active.password_scope.clone(),
             };
@@ -5310,9 +5470,8 @@ impl Scheduler {
                 &active.password_scope,
             );
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
-            payload.insert("details".into(), json!({"promoted_nested_input":true}));
             payload.insert("input_checkpoints".into(), serde_json::to_value(
-                promoted_checkpoints(&outcome.checkpoints, &archive.source_paths))?);
+                recovery_checkpoints(&outcome.checkpoints, &archive.source_paths))?);
             let route_root = &active.root;
             let (root, scope) = &self.roots[route_root];
             payload.insert("source_input_root".into(), json!(scope.root));
@@ -5328,7 +5487,7 @@ impl Scheduler {
             let password_updated = password_updated(&entry, &self.user_password_signature);
             let pending = regroup.then(|| self.pending.get_mut(&id)).flatten();
             let handed_off = pending.is_some();
-            handoff_promoted_blocker(&mut entry, route_root, root,
+            handoff_nested_blocker(&mut entry, route_root, root,
                 recovery, pending);
             if handed_off {
                 self.unpublished.insert(id.clone());
@@ -5417,7 +5576,7 @@ impl Scheduler {
                 }
             };
             let stale = error.is_some()
-                // A promoted terminal child may outlive its successfully
+                // A retained terminal child may outlive its successfully
                 // consumed outer source. That is still this owner's failure.
                 && !failed_archive.is_some_and(|archive| archive.depth > 1)
                 && (discovery_failure.is_none() || retryable)
@@ -5450,6 +5609,17 @@ impl Scheduler {
                 operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&candidate.path, None));
                 continue;
             }
+            // An ordinary arrival can resolve to a generated head. That is a
+            // new top-level attempt; any subsequent blocker stays at that head
+            // with this attempt's depth/password context, not the old decision.
+            let regrouped_recovery = (retryable && active.recovery.is_none()
+                && self.catalog.generated_observation(&candidate.path).is_some()).then(|| Recovery {
+                    max_depth: Some(active.max_depth),
+                    scope: NativeDiscoveryScope::new(Path::new(&candidate.path).parent().unwrap_or(Path::new(""))
+                        .to_string_lossy().into_owned(), Some(0), Vec::new()),
+                    password_scope: active.password_scope.clone(),
+                });
+            let recovery = active.recovery.as_deref().or(regrouped_recovery.as_ref());
             let record = if completed.cancelled {
                 // Only the cancelled generation is retired. A generation
                 // queued while the batch was in flight is left in the WAL.
@@ -5473,19 +5643,20 @@ impl Scheduler {
                         &active.passwords,
                         &self.user_password_signature,
                         group.map(Arc::as_ref),
-                        active.recovery.as_deref(),
+                        recovery,
                         &active.password_scope,
                     );
                     Arc::make_mut(&mut entry).failure_payload.insert("input_checkpoints".into(),
-                        serde_json::to_value(promoted_checkpoints(&outcome.checkpoints,
+                        serde_json::to_value(recovery_checkpoints(&outcome.checkpoints,
                             &[PathBuf::from(&canonical)])).expect("serializable input checkpoints"));
-                    if active.recovery.is_some() {
+                    if recovery.is_some() {
                         if let Some((root, _)) = self.roots.get(&active.root) {
                             Arc::make_mut(&mut entry)
                                 .failure_payload
                                 .insert("source_input_root".into(), json!(root.path));
                         }
                     }
+                    if regrouped_recovery.is_some() { regrouped_recoveries.push(candidate.path.clone()); }
                     entry
                 })
             };
@@ -5543,25 +5714,29 @@ impl Scheduler {
                 }
             }
         }
-        self.journal.commit(true, |state| {
-            for archive in outcome
-                .archives
-                .iter()
-                .filter(|archive| archive.failure.is_none())
-            {
-                for path in &archive.source_paths {
-                    let path = path.to_string_lossy();
-                    if state.promoted_source(&path).is_some()
-                        && NativePresence::at(&path).is_absent()
-                    {
-                        operations.retire_promoted(watch_path_key(&path));
-                    }
-                }
-            }
-            Ok(operations)
-        })?;
+        self.journal.commit(true, |_| Ok(operations))?;
+        // A change observed during an active retry must not be overwritten
+        // by that retry's late completion of the original generation.
+        if active.recovery.is_some() || !regrouped_recoveries.is_empty() {
+            self.invalidate_recovery(regrouped_recoveries.into_iter().chain(active.inputs.iter()
+                .filter(|_| active.recovery.is_some()).map(|candidate| candidate.path.clone())))?;
+        }
+        self.retire_dependency_observers();
         self.release_display_claims(batch, &groups);
+        if !published_outputs.is_empty() {
+            self.hub.update(|signals| signals.published_outputs.extend(published_outputs));
+        }
+        for candidate in &active.inputs {
+            if let Some(entry) = self.journal.state().entry(&candidate.path)
+                .filter(|entry| entry.status == "suspended_missing_volume") {
+                self.check_missing_volume(&entry, false)?;
+            }
+        }
         for (path, admission) in retry {
+            if admission == CandidateAdmission::Retry {
+                if let Some(entry) = self.journal.state().entry(&path) { self.check_missing_volume(&entry, false)?; }
+                continue;
+            }
             if let Some((root, recovery)) = self.journal.state().entry(&path)
                 .and_then(|entry| self.blocker_route(&entry))
             {
@@ -5575,6 +5750,8 @@ impl Scheduler {
         let discovery_retry = outcome.errors.iter()
             .any(|error| error.kind == crate::pipeline::InputErrorKind::WatchDiscoveryIo);
         self.persist_candidates(BTreeMap::new(), discovery_retry)?;
+        self.volume_checks.retain(|path, _| self.journal.state().entry_by_key(path)
+            .is_some_and(|entry| entry.status == "suspended_missing_volume"));
         self.arm_idle_cleanup();
         Ok((outcome, finish))
     }
@@ -5622,7 +5799,7 @@ impl Scheduler {
 }
 
 // Reuse the output ownership captured by the observer. Descendants can finish
-// after their source was promoted or removed, so filesystem discovery cannot
+// after their source was retained or removed, so filesystem discovery cannot
 // recover their request association at completion time.
 fn output_owner<'a>(outputs: &'a BTreeMap<String, String>, path: &str) -> Option<&'a str> {
     let mut boundary = path.len();
@@ -5634,7 +5811,7 @@ fn output_owner<'a>(outputs: &'a BTreeMap<String, String>, path: &str) -> Option
     }
 }
 
-fn promoted_checkpoints<'a>(
+fn recovery_checkpoints<'a>(
     checkpoints: &'a [crate::pipeline::InputCheckpoint], sources: &[PathBuf],
 ) -> Vec<&'a crate::pipeline::InputCheckpoint> {
     let sources = sources.iter().map(|source| key(source)).collect::<HashSet<_>>();
@@ -5654,8 +5831,8 @@ fn promoted_checkpoints<'a>(
         .collect()
 }
 
-fn promoted_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailure<'_>>) -> bool {
-    archive.promoted && !archive.partial && failures
+fn nested_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailure<'_>>) -> bool {
+    archive.depth > 1 && !archive.partial && failures
         .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))
         .is_some_and(InputFailure::retryable)
 }
@@ -5682,7 +5859,7 @@ fn route_blocker(
                     || !watched_scope.contains(&entry.path)
                     || is_owned(&entry.path)
                     || payload.get("details").is_some_and(|details| {
-                        details["promoted_nested_input"].as_bool() == Some(true)
+                        details["nested_input"].as_bool() == Some(true)
                     }))
             {
                 return Some((root, Some(Arc::new(recovery))));
@@ -5809,9 +5986,9 @@ fn completion_archives<'a>(
         for path in archive.source_paths.iter().chain(std::iter::once(&archive.path)) {
             by_path.entry(key(path)).or_default().push(archive);
         }
-        if archive.depth > 1 && !archive.partial && archive.failure.is_some() && !promoted_retry(archive, failures)
+        if archive.depth > 1 && !archive.partial && archive.failure.is_some() && !nested_retry(archive, failures)
         {
-            // Promoted retry blockers get their own durable entry below. All
+            // Nested retry blockers get their own durable entry below. All
             // other nested failures belong to the original top-level card.
             if let Some(owner) = output_owner(outputs, &key(&archive.path)) {
                 let owner = watch_path_key(owner);
@@ -5878,7 +6055,8 @@ fn make_entry(
         payload["source_group"] = json!(group);
     }
     if let Some(recovery) = recovery {
-        payload["discovery_scope"] = Value::Object(scope_record(&recovery.scope));
+        payload["discovery_scope"] = Value::Object(recovery.record());
+        payload["details"] = json!({"nested_input":true});
     }
     payload["password_scope_dir"] = json!(password_scope);
     if password {
@@ -5969,16 +6147,15 @@ impl ObservedOutputs {
 
 struct WatchObserver {
     deep: bool,
+    catalog: Arc<NativeWatchCatalog>,
     journal: Arc<journal::Journal>,
     owners: HashMap<String, String>,
-    output_scopes: Arc<[NativeDiscoveryScope]>,
     outputs: Mutex<ObservedOutputs>,
     batch: Arc<str>,
     toast: Option<super::toast::Activity>,
     hub: Arc<Hub>,
     groups: Arc<Mutex<SourceGroups>>,
     claimed: Arc<Mutex<ClaimedSources>>,
-    promoted: Mutex<HashMap<String, Option<WatchCandidateRow>>>,
 }
 
 impl WatchObserver {
@@ -6020,7 +6197,7 @@ impl Observer for WatchObserver {
         let root = key(path);
         // Move only this logical owner's state. A shared member stays claimed
         // until its final consumer settles; another admitted root never moves.
-        let (groups, outputs, promoted) = {
+        let (groups, outputs) = {
         let mut claimed = self.claimed.lock().unwrap();
         let mut groups = self.groups.lock().unwrap();
         // A tail can own the WAL and outputs of several independent heads.
@@ -6036,22 +6213,13 @@ impl Observer for WatchObserver {
         let mut shared_outputs = self.outputs.lock().unwrap();
         let outputs = shared_outputs.take_owners(&members);
         drop(shared_outputs);
-        let mut shared_promoted = self.promoted.lock().unwrap();
-        let mut promoted = HashMap::new();
-        for archive in outcome.archives.iter().filter(|archive| archive.promoted) {
-            for path in archive.source_paths.iter().chain(std::iter::once(&archive.path)) {
-                let key = key(path);
-                if let Some(candidate) = shared_promoted.remove(&key) { promoted.insert(key, candidate); }
-            }
-        }
-        drop(shared_promoted);
-        (aliases, outputs, promoted)
+        (aliases, outputs)
         };
         let reply = Arc::new(super::cli::reporting::Reply::default());
         self.hub.root_completed(RootCompleted {
             request,
             reply: Arc::clone(&reply), batch: self.batch.to_string(), id, path: path.to_owned(), groups,
-            completed: Completed { cancelled: false, result: Ok(outcome), promoted, outputs },
+            completed: Completed { cancelled: false, result: Ok(outcome), outputs },
         });
         let outcome = reply.wait().await?;
         if let Some(toast) = &self.toast {
@@ -6075,11 +6243,14 @@ impl Observer for WatchObserver {
         }
     }
 
-    fn promoted_source(&self, path: &str) -> Option<PromotedSource> {
-        self.journal
-            .state()
-            .promoted_source(path)
-            .map(|receipt| (*receipt).clone())
+    fn generated_source(&self, path: &str) -> Option<GeneratedSource> {
+        let before = self.catalog.generated_observation(path)?;
+        // Capture before probing the accepted baseline. A later replacement
+        // cannot inherit this receipt; pipeline admission validates its generation.
+        let receipt = GeneratedSource::capture(Path::new(path)).ok()?;
+        let current = watch_candidate_for_path(Path::new(path), Some(before.change_usn)).ok()??;
+        (!crate::postprocess::watch_source_changed(before.size, before.mtime, &before.file_id(), before.change_usn, &current))
+            .then_some(receipt)
     }
 
     fn completed_sources(&self, generations: &SourceGenerations) -> io::Result<Option<PathBuf>> {
@@ -6093,71 +6264,6 @@ impl Observer for WatchObserver {
     ) -> io::Result<()> {
         if let Some(output) = output {
             self.hub.completed_families.remember(generations, self.deep, output);
-        }
-        Ok(())
-    }
-
-    fn before_promotion(
-        &self,
-        archive: &ArchiveResult,
-        moves: &[(PathBuf, PathBuf)],
-    ) -> io::Result<()> {
-        let Some(owner) = self.owner(archive) else {
-            return Err(io::Error::other("Promoted input has no Watch owner"));
-        };
-        let sources = moves
-            .iter()
-            .map(|(source, _)| source.to_string_lossy().into_owned())
-            .collect();
-        let destinations = moves
-            .iter()
-            .map(|(_, target)| target.to_string_lossy().into_owned())
-            .collect();
-        self.journal.commit(true, |state| {
-            state
-                .promotion_operation(&owner, destinations, sources)
-                .ok_or_else(|| io::Error::other("Promoted input owner was retired"))
-        })?;
-        let mut promoted = self.promoted.lock().unwrap();
-        let mut claims = self.hub.claims.lock().unwrap();
-        for (_, target) in moves {
-            let id = key(target);
-            promoted.entry(id.clone()).or_insert(None);
-            claims.insert(id, Arc::clone(&self.batch));
-        }
-        Ok(())
-    }
-
-    fn after_promotion(
-        &self,
-        archive: &ArchiveResult,
-        moves: &[(PathBuf, PathBuf)],
-        success: bool,
-        receipts: &[PromotedSource],
-    ) -> io::Result<()> {
-        let Some(owner) = self.owner(archive) else {
-            return Ok(());
-        };
-        if !receipts.is_empty() {
-            // Publish before releasing destination leases. Another request
-            // can adopt the newly visible family before this batch completes.
-            let mut operations = crate::watch_store::NativeWatchOperations::empty();
-            for receipt in receipts {
-                operations.put_promoted(receipt.clone());
-            }
-            self.journal.commit(true, |_| Ok(operations))?;
-        }
-        for (_, target) in moves {
-            let id = key(target);
-            self.outputs
-                .lock()
-                .unwrap()
-                .insert(id.clone(), owner.clone());
-            if success {
-                if let Ok(Some(candidate)) = watch_candidate_for_path(target, None) {
-                    self.promoted.lock().unwrap().insert(id, Some(candidate));
-                }
-            }
         }
         Ok(())
     }
@@ -6217,7 +6323,7 @@ impl Observer for WatchObserver {
         let task = archive.path.to_string_lossy().into_owned();
         self.journal.commit(true, |state| {
             state
-                .output_operation(&owner, task, output, None, Some(&self.output_scopes))?
+                .output_operation(&owner, task, output, None, true)?
                 .ok_or_else(|| io::Error::other("Watch input owner was retired before output"))
         })?;
         self.outputs.lock().unwrap().insert(key(path), owner);
@@ -6234,7 +6340,7 @@ impl Observer for WatchObserver {
         // start operation republishes its identity without exclusive mkdir.
         self.journal.commit(true, |state| {
             state.output_operation(&owner, archive.path.to_string_lossy().into_owned(),
-                path.to_string_lossy().into_owned(), None, None)?
+                path.to_string_lossy().into_owned(), None, false)?
                 .ok_or_else(|| io::Error::other("Watch input owner was retired before output"))
         })?;
         self.outputs.lock().unwrap().insert(key(path), owner);
@@ -6270,9 +6376,7 @@ impl Observer for WatchObserver {
                     &owner,
                     task,
                     output,
-                    Some(archive.failure.is_none() || archive.partial),
-                    None,
-                )?
+                    Some(archive.failure.is_none() || archive.partial), false)?
                 .unwrap_or_else(crate::watch_store::NativeWatchOperations::empty))
         })
     }
@@ -6284,7 +6388,7 @@ impl Observer for WatchObserver {
         let task = archive.to_string_lossy().into_owned();
         let output = output.to_string_lossy().into_owned();
         self.journal.commit(true, |state| {
-            Ok(state.output_operation(&owner, task, output, Some(false), None)?
+            Ok(state.output_operation(&owner, task, output, Some(false), false)?
                 .unwrap_or_else(crate::watch_store::NativeWatchOperations::empty))
         })
     }
@@ -6309,18 +6413,15 @@ fn prepare_flatten(
             "new_identity":new,"root_paths":root_paths,"work_paths":work_paths,
         })));
         if !owner.is_empty() {
-            if let Some(checkpoint) = state.promotion_operation(
-                owner, Vec::new(), vec![root.to_string_lossy().into_owned()],
+            if let Some(checkpoint) = state.protect_output_operation(
+                owner, vec![root.to_string_lossy().into_owned()],
             ) {
                 operations.extend(checkpoint);
             }
         }
-        operations.extend(NativeWatchOperations::owned_outputs(
-            &root_paths, &[&old, &new],
-        ));
-        operations.extend(NativeWatchOperations::owned_outputs(
-            &work_paths, &[&old],
-        ));
+        let mut paths = root_paths;
+        paths.extend(work_paths);
+        state.register_output_paths(&paths, &[&old, &new]);
         Ok(operations)
     })
 }
@@ -6382,13 +6483,13 @@ fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root:
             operations.relocate_output(owner, source.to_owned(), root.to_owned(), current.clone());
         }
     }
-    operations.extend(NativeWatchOperations::owned_outputs(
-        &root_paths, &[&current],
-    ));
+    let mut paths = root_paths;
+    if work_exists { paths.extend(work_paths.clone().map(str::to_owned)); }
+    state.register_output_paths(&paths, &[&current, record["old_identity"].as_str().unwrap_or_default()]);
     if !work_exists {
         if let Some(old) = record["old_identity"].as_str() {
             let work_paths = work_paths.map(str::to_owned).collect::<Vec<_>>();
-            operations.extend(state.remove_owned_output(&work_paths, old));
+            state.remove_active_output(&work_paths, old);
         }
     }
     Ok(operations)
@@ -6434,7 +6535,8 @@ fn input_checkpoints(
     values.into_iter().map(|record| serde_json::from_value(record).map_err(io::Error::other))
 }
 
-fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool) -> io::Result<()> {
+fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool) -> io::Result<Vec<String>> {
+    let mut settled = Vec::new();
     for id in journal.state().runtime_keys("flatten|") {
         let Some(record) = journal.state().runtime_record(&id) else {
             continue;
@@ -6465,6 +6567,7 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
         }
         if root_id.as_deref() == Some(old) && work_id.is_none() {
             recover_finish_flatten(journal, root)?;
+            if journal.state().runtime_record(&id).is_none() { settled.push(root.to_owned()); }
             continue;
         }
         if root_id.as_deref().is_some_and(|id| id != new)
@@ -6489,9 +6592,10 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
         );
         if identity_if_present(root).is_ok_and(|identity| identity.as_deref() == Some(new)) {
             recover_finish_flatten(journal, root)?;
+            if journal.state().runtime_record(&id).is_none() { settled.push(root.to_owned()); }
         }
     }
-    Ok(())
+    Ok(settled)
 }
 
 // Directory enumeration can return readable files alongside local errors.
@@ -6549,6 +6653,52 @@ fn spawn_error_dialog(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::io::reader::capture_file_generation;
+    use crate::watch_store::{NativeWatchOperations, PendingObservation};
+    #[test]
+    fn foreground_output_reservation_survives_scheduler_replacement_and_is_published_once() {
+        let marker = crate::test_support::temp_file("output_publication_handoff", b"");
+        let root = marker.with_extension("watch");
+        let output = root.join("output");
+        let state_dir = marker.with_extension("state");
+        let watch = Watch::new(Arc::new(|| {}));
+        watch.register_external_output(&output).unwrap();
+        let member = output.join("nested.zip");
+        fs::write(&member, b"generated content").unwrap();
+        let leaf = output.join("leaf");
+        fs::create_dir(&leaf).unwrap();
+        let work = root.join("flatten-work");
+        watch.prepare_external_flatten(&output, &work, &leaf).unwrap();
+        let scope = NativeDiscoveryScope::new(root.to_string_lossy().into_owned(), None, Vec::new());
+        let options = Arc::new(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap());
+        for generation in 0..2 {
+            let journal = Arc::new(journal::Journal::open_with_outputs(&state_dir, 7,
+                Arc::clone(&watch.external.reservations)).unwrap());
+            let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
+            options.catalog_update(&catalog, &scope, None).unwrap();
+            assert!(catalog.is_owned(member.to_str().unwrap()));
+            assert!(catalog.candidate_paths(&scope, None).is_empty());
+            *watch.external.lock().unwrap() = Some(ExternalOutputs {
+                journal: Arc::downgrade(&journal), scopes: Arc::from([scope.clone()]),
+                catalog: Arc::clone(&catalog), options: Arc::clone(&options), hub: Weak::new(),
+            });
+            if generation == 1 {
+                watch.finish_external_outputs(&[output.to_string_lossy().into_owned()]).unwrap();
+                assert!(!catalog.is_owned(member.to_str().unwrap()));
+                let before = catalog.observation(member.to_str().unwrap()).unwrap();
+                let current = watch_candidate_for_path(&member, Some(before.change_usn)).unwrap().unwrap();
+                assert!(catalog.generated_observation(member.to_str().unwrap()).is_some());
+                assert!(!quiet::content_changed(before.size, before.mtime, &before.file_id(), before.change_usn, &current));
+                assert!(watch.external.reservations.lock().unwrap().is_empty());
+            }
+            *watch.external.lock().unwrap() = None;
+        }
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(state_dir).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
     #[test]
     fn completed_family_requires_full_generation_mode_and_live_output() {
         let directory = std::env::temp_dir().join(format!("sunpack-completed-family-{}-{}", std::process::id(),
@@ -7016,7 +7166,7 @@ mod tests {
         let source = watched.join("growing.zip");
         let activity = hub.activities.bind(key(&source), quiet::Activity::default);
         let observer = RootObserver::start(&watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]),
-            &watched.join("builtin_passwords.json"), &hub, &journal, &catalog).unwrap();
+            &watched.join("builtin_passwords.json"), &hub, &journal, &catalog, false).unwrap();
         let mut file = fs::File::create(&source).unwrap();
         // Wait for each size to reach the shared activity without draining the
         // scheduler's signals. Cadence confirmation is tested with a controlled clock.
@@ -7061,7 +7211,7 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let passwords = watched.join("builtin_passwords.json");
         let observer = RootObserver::start(
-            &watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]), &passwords, &hub, &journal, &Arc::new(NativeWatchCatalog::new(journal.state(), None)),
+            &watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]), &passwords, &hub, &journal, &Arc::new(NativeWatchCatalog::new(journal.state(), None)), false,
         ).unwrap();
         fs::write(&passwords, b"{}").unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -7085,22 +7235,6 @@ mod tests {
         assert_eq!(roots[0].output.as_ref().unwrap(), &input.join("child-output"));
         fs::remove_file(marker).unwrap();
     }
-
-    #[test]
-    fn admission_owned_reconciliation_uses_only_changed_paths() {
-        let scope = super::NativeDiscoveryScope::new(r"C:\watched".into(), None, Vec::new());
-        let changed = [r"C:\watched\new.zip", r"C:\outside\file.zip"]
-            .map(|path| (path.to_owned(), crate::path_keys::path_key(path)));
-        assert!(super::owned_checkpoint_paths(&scope, None, Some(&[]), false).is_empty());
-        assert_eq!(super::owned_checkpoint_paths(&scope, None, Some(&changed), false),
-            [r"C:\watched\new.zip"]);
-        assert_eq!(super::owned_checkpoint_paths(&scope, None, Some(&changed), true),
-            [r"C:\watched"]);
-    }
-
-    use super::*;
-    use crate::io::reader::capture_file_generation;
-    use crate::watch_store::{NativeWatchOperations, PendingObservation};
 
     #[test]
     fn open_error_dialog_does_not_retain_watch_state_across_restart() {
@@ -7241,8 +7375,8 @@ mod tests {
     }
 
     #[test]
-    fn promoted_regroup_handoff_persists_the_new_current_root() {
-        let marker = crate::test_support::temp_file("watch_rerouted_promotion", b"");
+    fn retained_regroup_handoff_persists_the_new_current_root() {
+        let marker = crate::test_support::temp_file("watch_rerouted_recovery", b"");
         let directory = marker.with_extension("state");
         let root = Root { path: r"C:\watch".into(), output: None,
             recursive: true, deep: false, scanned: false };
@@ -7252,27 +7386,28 @@ mod tests {
         let candidate = WatchCandidateRow {
             path: r"C:\watch\old\inner.part1.rar".into(), size: 42, mtime: 1.0,
             observation: crate::filesystem::WatchFileObservation {
-                file_id: "promoted-generation".into(), change_usn: 9, change_reasons: None,
+                file_id: "retained-generation".into(), change_usn: 9, change_reasons: None,
             },
         };
         let recovery = Recovery {
+            max_depth: None,
             scope: NativeDiscoveryScope::new(r"C:\watch\old".into(), Some(0), Vec::new()),
             password_scope: r"C:\passwords".into(),
         };
         let mut entry = Arc::new(observed_entry(&candidate, "suspended_missing_volume", None));
         let payload = &mut Arc::make_mut(&mut entry).failure_payload;
-        payload.insert("discovery_scope".into(), Value::Object(scope_record(&recovery.scope)));
+        payload.insert("discovery_scope".into(), Value::Object(recovery.record()));
         payload.insert("password_scope_dir".into(), json!(recovery.password_scope));
-        payload.insert("details".into(), json!({"promoted_nested_input":true}));
+        payload.insert("details".into(), json!({"nested_input":true}));
         let mut pending = Pending {
             root: watch_path_key(r"C:\watch\old"), candidate,
             quiet: quiet::Activity::default(), due: Instant::now(), force: true, recovery: None,
         };
         let due = pending.due;
-        // Old A was removed; current B covers the promoted file. This is the
+        // Old A was removed; current B covers the retained file. This is the
         // exact fallback route that completion must hand to an existing queue.
         let (route, _) = route_blocker(&entry, &roots, |_| false).unwrap();
-        handoff_promoted_blocker(&mut entry, &route, &roots[&route].0,
+        handoff_nested_blocker(&mut entry, &route, &roots[&route].0,
             recovery, Some(&mut pending));
         assert_eq!(pending.root, root_id);
         assert_eq!(pending.due, due);
@@ -7287,7 +7422,7 @@ mod tests {
                     PendingObservation(candidate.path.clone(), candidate.size as i64,
                         candidate.mtime, candidate.observation.file_id.clone(),
                         candidate.observation.change_usn),
-                    current.path.to_string_lossy().into_owned(), Some(scope_record(&recovery.scope)),
+                    current.path.to_string_lossy().into_owned(), Some(recovery.record()),
                 )], pending.force, &recovery.password_scope.to_string_lossy(), true, true, None)?;
                 operations.put_entry(Arc::clone(&entry));
                 Ok(operations)
@@ -7352,7 +7487,7 @@ mod tests {
             volume_completeness: None, volume_attempts: None, source_paths: vec![path.into()],
             password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
             damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+              scan_layout: Default::default(),
         }
     }
 
@@ -7386,7 +7521,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_password_scope_survives_family_head_retry_and_promoted_recovery() {
+    fn admitted_password_scope_survives_family_head_retry_and_retained_recovery() {
         use crate::watch_store::{NativeWatchState, NativeWatchOperations, PendingObservation};
         let state = NativeWatchState::new();
         let a = Path::new(r"C:\watch\A");
@@ -7427,11 +7562,12 @@ mod tests {
             // the subsequent retry must retain B even though its path is A.
             assert_eq!(candidate_password_scope(&state, path, None), b);
         }
-        let promoted = Recovery {
+        let retained = Recovery {
+            max_depth: None,
             scope: NativeDiscoveryScope::new(r"C:\output\nested".into(), Some(0), Vec::new()),
             password_scope: b.to_owned(),
         };
-        assert_eq!(candidate_password_scope(&state, r"C:\output\nested\inner.zip", Some(&promoted)), b);
+        assert_eq!(candidate_password_scope(&state, r"C:\output\nested\inner.zip", Some(&retained)), b);
         let pending_path = r"C:\watch\A\pending.zip";
         let (operations, _) = state.pending_operations([(
             PendingObservation(pending_path.into(), 42, 1.0, String::new(), 0),
@@ -7450,41 +7586,38 @@ mod tests {
     }
 
     #[test]
-    fn promoted_carrier_segments_share_blockers_without_hiding_independent_terminal_children() {
+    fn retained_carrier_segments_share_blockers_without_hiding_independent_terminal_children() {
         let owner = Path::new(r"C:\Watch\outer.zip");
-        let promoted_path = r"C:\Watch\carrier.bin";
-        let mut partial = completion_archive(promoted_path, 2, Some(FailureKind::MissingVolume));
+        let retained_path = r"C:\Watch\carrier.bin";
+        let mut partial = completion_archive(retained_path, 2, Some(FailureKind::MissingVolume));
         partial.partial = true;
-        partial.promoted = true;
-        let mut terminal = completion_archive(promoted_path, 2, Some(FailureKind::Damaged));
-        terminal.promoted = true;
-        let mut blocked = completion_archive(promoted_path, 2, Some(FailureKind::PasswordRequired));
-        blocked.promoted = true;
+        let terminal = completion_archive(retained_path, 2, Some(FailureKind::Damaged));
+        let blocked = completion_archive(retained_path, 2, Some(FailureKind::PasswordRequired));
         let mut outcome = Outcome::default();
         outcome.archives = vec![completion_archive(owner.to_str().unwrap(), 1, None), partial, terminal, blocked];
         let outputs = BTreeMap::from([
-            (key(Path::new(promoted_path)), owner.to_string_lossy().into_owned()),
+            (key(Path::new(retained_path)), owner.to_string_lossy().into_owned()),
             (key(Path::new(r"C:\Watch\outer")), owner.to_string_lossy().into_owned()),
         ]);
         let failures = outcome.input_failures();
-        let carrier = &failures[&crate::path_keys::path_key(promoted_path)];
+        let carrier = &failures[&crate::path_keys::path_key(retained_path)];
         assert!(carrier.retryable());
         assert!(carrier.password.is_some() && carrier.missing.is_some());
         assert_eq!(carrier.failure().unwrap().kind, FailureKind::MissingVolume);
         let candidate = WatchCandidateRow {
-            path: promoted_path.into(), size: 42, mtime: 1.0,
+            path: retained_path.into(), size: 42, mtime: 1.0,
             observation: crate::filesystem::WatchFileObservation {
                 file_id: String::new(), change_usn: 0, change_reasons: None,
             },
         };
         let passwords = crate::core::passwords::PasswordSnapshot::default();
         let entry = make_entry(&candidate, "carrier blocked", Some(carrier), None,
-            &passwords, &user_password_signature(&[]), None, None, Path::new(promoted_path).parent().unwrap());
+            &passwords, &user_password_signature(&[]), None, None, Path::new(retained_path).parent().unwrap());
         assert_eq!(entry.status, "suspended_missing_volume");
         assert_eq!(entry.failure_payload["blockers"], json!(["missing_volume", "password"]));
         assert_eq!(entry.failure_payload["password_signature"],
-            json!(password_source_signature(&user_password_signature(&[]), &passwords.scope_signature(Path::new(promoted_path).parent().unwrap()))));
-        let retry_paths = outcome.archives.iter().filter(|archive| promoted_retry(archive, &failures))
+            json!(password_source_signature(&user_password_signature(&[]), &passwords.scope_signature(Path::new(retained_path).parent().unwrap()))));
+        let retry_paths = outcome.archives.iter().filter(|archive| nested_retry(archive, &failures))
             .map(|archive| key(&archive.path)).collect::<HashSet<_>>();
         assert_eq!(retry_paths.len(), 1, "one physical retry retains all logical receipts");
         let (projected, _) = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
@@ -7495,26 +7628,20 @@ mod tests {
         let (projected, _) = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
         assert_eq!(completion_failed_archive(&projected[&key(owner)], &failures).unwrap().failure.as_ref().unwrap().kind, FailureKind::Unsupported);
         outcome.archives.pop();
-        // Without a successful promotion, retain the owner's retry checkpoint.
-        for archive in outcome.archives.iter_mut().skip(1) { archive.promoted = false; }
-        let failures = outcome.input_failures();
-        let (projected, _) = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
-        let failed = completion_failed_archive(&projected[&key(owner)], &failures).unwrap();
-        assert_eq!(failures[&crate::path_keys::path_key(&failed.path.to_string_lossy())].failure().unwrap().kind, FailureKind::MissingVolume);
         // All-accepted partial evidence is successful, not a new blocker.
         outcome.archives.truncate(2);
         let failures = outcome.input_failures();
         let (projected, _) = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
         assert!(completion_failed_archive(&projected[&key(owner)], &failures).is_none());
-        assert!(!failures[&crate::path_keys::path_key(promoted_path)].retryable());
+        assert!(!failures[&crate::path_keys::path_key(retained_path)].retryable());
     }
 
     #[test]
-    fn promoted_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
+    fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
         // The carrier receipt alone cannot prevent a nested accepted partial
         // from being extracted again. Exercise durable handoff and reopen,
         // while ensuring an unrelated output is not kept under this blocker.
-        let owner = crate::test_support::temp_file("watch_promotion_handoff", b"outer archive");
+        let owner = crate::test_support::temp_file("watch_recovery_handoff", b"outer archive");
         let root = owner.with_extension("state");
         let segment = root.join("retained");
         let child_output = segment.join("nested");
@@ -7563,7 +7690,7 @@ mod tests {
                 last_attempt_at: 1.0,
             };
             blocker.failure_payload.insert("input_checkpoints".into(), serde_json::to_value(
-                promoted_checkpoints(&checkpoints, &[carrier.clone()])).unwrap());
+                recovery_checkpoints(&checkpoints, &[carrier.clone()])).unwrap());
             journal.commit(true, |_| {
                 let mut operations = NativeWatchOperations::empty();
                 operations.put_entry(Arc::new(blocker));
@@ -7967,11 +8094,13 @@ mod tests {
             deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
             passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
             root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-            parent_observers: HashMap::new(), config_observers: Vec::new(),
+            parent_observers: HashMap::new(),
+            dependency_observers: HashMap::new(), config_observers: Vec::new(),
+            volume_checks: HashMap::new(),
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
             active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
-            external: Arc::new(Mutex::new(None)), _lease: None,
+            external: Arc::default(), _lease: None,
         };
         let limit = scheduler.admission_available();
         let driver = crate::pipeline::Scheduler::new();
@@ -7980,9 +8109,10 @@ mod tests {
             let request = driver.submit(id, Origin::Watch, &cancel, move |_| Box::pin(async move {
                 Completed { cancelled: !failed,
                     result: Err(io::Error::other("test request settled")),
-                    promoted: HashMap::new(), outputs: BTreeMap::new() }
+                     outputs: BTreeMap::new() }
             }));
             Active {
+                max_depth: usize::MAX,
                 deep: false, root: String::new(), recovery: None, password_scope: base.clone(),
                 passwords: Arc::default(),
                 inputs: names.into_iter().map(|path| (watch_path_key(&path), WatchCandidateRow {
@@ -8022,7 +8152,7 @@ mod tests {
             reply: Arc::default(), batch: "first".into(), id: 1, path: head.into(),
             groups: group.members.iter().map(|member| (watch_path_key(member), Arc::clone(&group))).collect(),
             completed: Completed { cancelled: false, result: Ok(Outcome::default()),
-                promoted: HashMap::new(), outputs: BTreeMap::new() },
+                 outputs: BTreeMap::new() },
         };
         scheduler.complete_root(root()).unwrap();
         assert_eq!(scheduler.admission_available(), 2);
@@ -8065,7 +8195,7 @@ mod tests {
         fn root() -> RootCompleted {
             RootCompleted { request: 1, reply: Arc::default(), batch: "batch".into(), id: 1, path: "a.zip".into(), groups: HashMap::new(),
                 completed: Completed { cancelled: false, result: Ok(Outcome::default()),
-                    promoted: HashMap::new(), outputs: BTreeMap::new() } }
+                     outputs: BTreeMap::new() } }
         }
         let hub = Arc::new(Hub::new());
         let waiting = Arc::clone(&hub);
@@ -8144,28 +8274,27 @@ mod tests {
         let other = Path::new(r"C:\watch\b.zip");
         let output = Path::new(r"C:\watch\a");
         let other_output = Path::new(r"C:\watch\b");
-        let promoted = Path::new(r"C:\watch\nested.zip");
+        let retained = Path::new(r"C:\watch\nested.zip");
         let group = Arc::new(SourceGroup { path: head.into(), name: "a".into(), multipart: true,
             members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
         let hub = Arc::new(Hub::new());
         let mut observer = WatchObserver {
             deep: false,
+            catalog: Arc::new(NativeWatchCatalog::new(&crate::watch_store::NativeWatchState::new(), None)),
             journal: Arc::new(journal::Journal::open(&directory, 7).unwrap()),
             owners: HashMap::from([(key(alias), alias.to_string_lossy().into_owned())]),
-            output_scopes: Arc::from([]),
             outputs: Mutex::new(ObservedOutputs::from(BTreeMap::from([(key(output), alias.to_string_lossy().into_owned()),
                 (key(other_output), other.to_string_lossy().into_owned())]))),
             batch: Arc::from("batch"), toast: None, hub: Arc::clone(&hub),
             groups: Arc::new(Mutex::new({ let mut groups = SourceGroups::default(); groups.insert(Arc::clone(&group)); groups })),
-            claimed: Arc::default(), promoted: Mutex::new(HashMap::from([(key(promoted), None)])),
+            claimed: Arc::default(),
         };
         // Cancellation winning the mutex first must not turn an already
         // durable root into an interrupted root when its report comes back.
         observer.claimed.lock().unwrap().cancelled = true;
         let mut outcome = Outcome::default();
         outcome.archives.push(completion_archive(head.to_str().unwrap(), 1, None));
-        let mut child = completion_archive(promoted.to_str().unwrap(), 2, Some(FailureKind::WrongPassword));
-        child.promoted = true;
+        let child = completion_archive(retained.to_str().unwrap(), 2, Some(FailureKind::WrongPassword));
         outcome.archives.push(child);
         let allocation = outcome.archives.as_ptr();
         let waker = Waker::from(Arc::new(NoWake));
@@ -8209,7 +8338,6 @@ mod tests {
         assert!(matches!(early.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(Ok(_))));
         drop(early);
         observer.claimed.lock().unwrap().finished.clear();
-        observer.promoted.lock().unwrap().insert(key(promoted), None);
         observer.groups.lock().unwrap().insert(group);
 
         // Directly admitted roots still settle independently of their peers.
@@ -8232,7 +8360,6 @@ mod tests {
         assert_eq!(root.groups.len(), 1);
         assert_eq!(root.groups[&key(head)].path, head);
         assert_eq!(root.completed.outputs.len(), 1);
-        assert_eq!(root.completed.promoted.len(), 1);
         assert_eq!(observer.groups.lock().unwrap().roots[&key(other)].path, other);
         assert_eq!(observer.outputs.lock().unwrap().paths.len(), 1);
         assert!(!observer.claimed.lock().unwrap().finished.contains(&key(alias)));
@@ -8323,11 +8450,11 @@ mod tests {
             }).unwrap();
             journal.commit(true, |state| {
                 Ok(state.output_operation(owner, owner.to_owned(),
-                    container.to_str().unwrap().to_owned(), None, None)?.unwrap())
+                    container.to_str().unwrap().to_owned(), None, false)?.unwrap())
             }).unwrap();
             journal.commit(true, |state| {
                 let mut operations = state.output_operation(owner, owner.to_owned(),
-                    container.to_str().unwrap().to_owned(), Some(true), None)?.unwrap();
+                    container.to_str().unwrap().to_owned(), Some(true), false)?.unwrap();
                 let candidate = watch_candidate_for_path(&source, None)?.unwrap();
                 let mut blocker = observed_entry(&candidate, "failed_password", None);
                 blocker.failure_payload.insert("input_checkpoints".into(), json!([{
@@ -8352,17 +8479,16 @@ mod tests {
             assert_eq!(checkpoints.len(), 1);
             let observer = WatchObserver {
                 deep: false,
+                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)),
                 journal: Arc::clone(&journal),
                 owners: HashMap::from([(key(&source), owner.to_owned())]),
-                output_scopes: Arc::from([NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new())]),
                 outputs: Mutex::new(outputs.into()),
                 batch: Arc::from("restored"),
                 toast: None,
                 hub: Arc::new(Hub::new()),
                 groups: Arc::default(),
                 claimed: Arc::default(),
-                promoted: Mutex::default(),
-            };
+                };
             assert_eq!(observer.owner_for_path(&output.join("nested.zip")).as_deref(), Some(owner));
             // A carrier's enclosing output need not be a logical receipt's
             // output. Restoring it must not attempt an exclusive re-create.
@@ -8376,7 +8502,7 @@ mod tests {
                 source_paths: vec![nested.clone()], password: None,
                 discovery_source: crate::pipeline::DiscoverySource::Direct, damage_flags: None,
                 partial: false, retained: false, recovered_complete_files: 0,
-                promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+                  scan_layout: Default::default(),
             };
             observer.register_output(&archive, &nested_output).unwrap();
             assert!(nested_output.is_dir());
@@ -8455,14 +8581,12 @@ mod tests {
                             owner,
                             owner.to_owned(),
                             root_text.to_owned(),
-                            None,
-                            None,
-                        )?
+                            None, false)?
                         .unwrap())
                 })
                 .unwrap();
             prepare_flatten(&journal, owner, &root, &work, &leaf).unwrap();
-            assert_eq!(journal.state().runtime_keys("owned|").len(), 4);
+            assert_eq!(journal.state().active_output_keys().len(), 4);
             fs::rename(&root, &work).unwrap();
             journal.flush().unwrap();
         }
@@ -8473,7 +8597,7 @@ mod tests {
             assert_eq!(fs::read(root.join("nested/payload")).unwrap(), b"extracted");
             assert!(!work.exists());
             assert!(journal.state().runtime_keys("flatten|").is_empty());
-            assert_eq!(journal.state().runtime_keys("owned|").len(), 2);
+            assert_eq!(journal.state().active_output_keys().len(), 2);
             let catalog = NativeWatchCatalog::new(journal.state(), None);
             for output in [&root, &real.join("output")] {
                 assert!(catalog.is_owned(output.join("nested.zip").to_str().unwrap()));
@@ -8490,7 +8614,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [root_text]
             );
-            assert!(recovery_output_matches(journal.state(), &pending, root_text));
+            assert!(recovery_output_matches(&pending, root_text));
         }
         fs::remove_dir(alias).unwrap();
         fs::remove_dir_all(directory).unwrap();
@@ -8519,13 +8643,10 @@ mod tests {
         finish_flatten(&journal, root.to_str().unwrap()).unwrap();
         assert_eq!(journal.state().runtime_keys("flatten|").len(), 1);
         assert!(journal.state().owned_root(physical_work.to_str().unwrap()).is_some());
-        journal.commit(true, |state| Ok(state.owned_retirement_operations(
-            &[NativeDiscoveryScope::new(real.to_string_lossy().into_owned(), None, Vec::new())], None,
-        ))).unwrap();
         fs::remove_dir(&physical_work).unwrap();
         finish_flatten(&journal, root.to_str().unwrap()).unwrap();
         assert!(journal.state().runtime_keys("flatten|").is_empty());
-        assert_eq!(journal.state().runtime_keys("owned|").len(), 1);
+        assert_eq!(journal.state().active_output_keys().len(), 1);
         drop(journal);
         fs::remove_dir_all(base).unwrap();
         fs::remove_file(marker).unwrap();

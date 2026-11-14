@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 pub(crate) use crate::io::cancellation::Cancellation;
 pub use checkpoint::InputCheckpoint;
-pub(crate) use checkpoint::{InputRecovery, PromotedSource};
+pub(crate) use checkpoint::{InputRecovery, GeneratedSource};
 pub use coordinator::Engine;
 pub(crate) use coordinator::{common_ancestor, common_output_base};
 pub(crate) use discovery::scan_options;
@@ -92,10 +92,20 @@ pub struct Request {
     pub(crate) password_scope: Option<PathBuf>,
     pub config: Arc<Config>,
     pub checkpoints: Vec<InputCheckpoint>,
-    pub(crate) promoted_sources: Vec<PromotedSource>,
+    pub(crate) generated_sources: Vec<GeneratedSource>,
+    pub(crate) cleanup_boundaries: Vec<PathBuf>,
     pub(crate) cancel: Cancellation,
     pub(crate) discovery_scope: Option<crate::scan::scope::NativeDiscoveryScope>,
     pub(crate) watch_catalog: Option<Arc<crate::scan::directory::NativeWatchCatalog>>,
+    pub(crate) prepared_volumes: Vec<Arc<PreparedVolume>>,
+}
+
+/// A one-shot handoff of the existing relation plan, not a second discovery.
+/// Its directory snapshot is released with the submitted request.
+pub(crate) struct PreparedVolume {
+    path: String,
+    generations: Vec<(String, crate::io::reader::PhysicalFileGeneration)>,
+    tasks: std::sync::Mutex<Option<Vec<discovery::Task>>>,
 }
 
 impl Request {
@@ -119,10 +129,12 @@ impl Request {
             password_scope: None,
             config,
             checkpoints: Vec::new(),
-            promoted_sources: Vec::new(),
+            generated_sources: Vec::new(),
+            cleanup_boundaries: Vec::new(),
             cancel: Cancellation::new(),
             discovery_scope: None,
             watch_catalog: None,
+            prepared_volumes: Vec::new(),
         }
     }
 }
@@ -166,7 +178,6 @@ pub enum FailureContext {
     Extraction,
     WorkerWarning,
     OutputCreate { error: String, #[serde(default)] path: Option<PathBuf> },
-    Postprocess { destination: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,8 +205,6 @@ pub struct Failure {
     pub discovery_scope: Option<Box<FailureScope>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recovery: Option<Arc<checkpoint::InputRecovery>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causes: Vec<Failure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Box<FailureEvidence>>,
     /// Explicit classification decision, independent of fallback diagnostics.
@@ -209,20 +218,10 @@ impl Failure {
     pub(crate) fn is_password_retry(&self) -> bool {
         matches!(self.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword)
             || (self.kind == FailureKind::PasswordInconclusive && self.password_retry)
-            || self.causes.iter().any(Self::is_password_retry)
-    }
-
-    pub(crate) fn contains(&self, kind: FailureKind) -> bool {
-        self.kind == kind || self.causes.iter().any(|cause| cause.contains(kind))
     }
 
     pub(crate) fn with_context(mut self, context: FailureContext) -> Self {
         self.context = Some(Box::new(context));
-        self
-    }
-
-    pub(crate) fn with_cause(mut self, cause: Option<Self>) -> Self {
-        self.causes.extend(cause);
         self
     }
 
@@ -233,7 +232,6 @@ impl Failure {
             context: None,
             discovery_scope: None,
             recovery: None,
-            causes: Vec::new(),
             evidence: None,
             password_retry: false,
         }
@@ -411,9 +409,7 @@ pub struct ArchiveResult {
     pub partial: bool,
     pub retained: bool,
     pub recovered_complete_files: u64,
-    pub promoted: bool,
-    pub promotion_original_path: Option<PathBuf>,
-}
+        }
 
 /// Sparse presentation facts retained while the canonical input is available.
 /// Extraction diagnostics keep their original completeness independently.
@@ -482,7 +478,7 @@ pub struct Outcome {
     pub checkpoints: Vec<InputCheckpoint>,
     pub cleanup_results: Vec<CleanupResult>,
     #[serde(skip)]
-    pub(crate) promoted_sources: Vec<PromotedSource>,
+    pub(crate) generated_sources: Vec<GeneratedSource>,
     #[serde(skip)]
     pub(crate) coalesced_from: Option<u64>,
     #[serde(skip)]
@@ -508,7 +504,7 @@ impl Outcome {
             && self.archives.iter().all(|archive| archive.failure.is_none())
         {
             self.checkpoints = Vec::new();
-            self.promoted_sources = Vec::new();
+            self.generated_sources = Vec::new();
         }
         if self.archives.len() <= 1 {
             if let Some(entry) = self.archives.first_mut() {
@@ -555,7 +551,7 @@ impl Outcome {
                 .or_default();
             input.failed |= !archive.partial;
             match failure.kind {
-                _ if failure.contains(FailureKind::MissingVolume) => { input.missing.get_or_insert(failure); }
+                _ if failure.kind == FailureKind::MissingVolume => { input.missing.get_or_insert(failure); }
                 _ if failure.is_password_retry() => { input.password.get_or_insert(failure); }
                 _ if !archive.partial => { input.terminal.get_or_insert(failure); }
                 _ => {}
@@ -584,12 +580,11 @@ impl Outcome {
 
 impl ArchiveResult {
     fn release_extract_provenance(&mut self) {
-        // Cleanup, promotion and recovery already consumed these fields.
+        // Cleanup and recovery already consumed these fields.
         self.source_paths = Vec::new();
         self.password = None;
         self.damage_flags = None;
         self.volume_attempts = None;
-        self.promotion_original_path = None;
     }
 }
 
@@ -669,7 +664,6 @@ impl TaskCompletion {
                 .map(|context| Box::new(context.clone())),
             discovery_scope: None,
             recovery: None,
-            causes: failure.causes.clone(),
             password_retry: failure.password_retry,
             // Only the fields used by the common human-facing projection.
             evidence: failure.evidence.as_deref().map(|e| Box::new(FailureEvidence {
@@ -694,15 +688,10 @@ impl TaskCompletion {
             TaskStatus::Failed
         } else if results.iter().any(|r| r.partial) { TaskStatus::Partial }
         else { TaskStatus::Complete };
-        // main suppresses the ordinary INPUTS_FAILED parent detail because
-        // each segment has its own row. A task-level postprocess error is not
-        // that aggregate: retain its real failure for the carrier's detail.
-        // Likewise a split-recovery warning wraps (rather than duplicates)
-        // INPUTS_FAILED in main, and keeps its own carrier message.
+        // Segment rows carry individual failures. Only a split-recovery
+        // warning adds a separate message for the physical carrier.
         let failure = results.iter().filter_map(|result| result.failure.as_ref())
-            .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })))
-            .or_else(|| results.iter().filter_map(|result| result.failure.as_ref())
-                .find(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume)))
+            .find(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume))
             .map(Self::display_failure);
         Self { discovery: None, status, failure, output: common_ancestor(results.iter().filter_map(|r| r.output.as_deref())) }
     }
@@ -825,7 +814,7 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
-    fn promoted_source(&self, _path: &str) -> Option<PromotedSource> {
+    fn generated_source(&self, _path: &str) -> Option<GeneratedSource> {
         None
     }
 
@@ -843,25 +832,11 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
+    /// All request writers and rollback have joined. Paths are existing output
+    /// reservations; observers may publish their final inventory before release.
+    fn outputs_finished(&self, _paths: &[String]) -> io::Result<()> { Ok(()) }
+
     fn discard_output(&self, _archive: &Path, _sources: &[PathBuf], _output: &Path) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn before_promotion(
-        &self,
-        _archive: &ArchiveResult,
-        _moves: &[(PathBuf, PathBuf)],
-    ) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn after_promotion(
-        &self,
-        _archive: &ArchiveResult,
-        _moves: &[(PathBuf, PathBuf)],
-        _success: bool,
-        _receipts: &[PromotedSource],
-    ) -> io::Result<()> {
         Ok(())
     }
 

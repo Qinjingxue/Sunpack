@@ -22,8 +22,27 @@ pub(super) struct Stamp {
 struct Delta {
     pub scope: String,
     pub removed: Vec<String>,
-    pub rows: Vec<DirectoryEntryRecord>,
+    pub rows: Vec<StoredRow>,
     pub stamp: Option<Stamp>,
+}
+#[derive(Deserialize)]
+struct StoredRow {
+    #[serde(flatten)]
+    record: DirectoryEntryRecord,
+    #[serde(default)]
+    observed: Option<(u64, f64, String, i64)>,
+    generated: Option<Box<super::catalog::GeneratedBaseline>>,
+}
+impl StoredRow {
+    fn insert(self, catalog: &mut ScopeCatalog) {
+        let key = crate::path_keys::path_key(&self.record.path);
+        catalog.insert(self.record);
+        catalog.rows.get_mut(key.as_str()).unwrap().generated = self.generated;
+        if let Some((size, mtime, id, usn)) = self.observed {
+            let row = catalog.rows.get_mut(key.as_str()).unwrap();
+            row.remember_observation(size, mtime, &id, usn, true);
+        }
+    }
 }
 #[derive(Serialize)]
 pub(super) struct DeltaView<'a> {
@@ -56,8 +75,8 @@ impl<'de> Deserialize<'de> for ScopeInput {
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut catalog = ScopeCatalog::default();
-                while let Some(row) = seq.next_element::<DirectoryEntryRecord>()? {
-                    catalog.insert(row);
+                while let Some(row) = seq.next_element::<StoredRow>()? {
+                    row.insert(&mut catalog);
                 }
                 Ok(ScopeInput(catalog))
             }
@@ -146,7 +165,7 @@ impl CatalogStore {
                         let catalog = catalogs.entry(delta.scope.clone()).or_default();
                         catalog.remove_many(delta.removed.iter().map(String::as_str));
                         for row in delta.rows {
-                            catalog.insert(row);
+                            row.insert(catalog);
                         }
                         if let Some(stamp) = delta.stamp {
                             store.stamps.insert(delta.scope, stamp);

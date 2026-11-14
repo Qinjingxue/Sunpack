@@ -339,24 +339,7 @@ fn quantile(samples: &VecDeque<(f64, f64)>, now: f64) -> f64 {
     weighted[samples.len() - 1].0
 }
 
-pub(super) fn content_changed(
-    size: u64,
-    mtime: f64,
-    id: &str,
-    usn: i64,
-    current: &WatchCandidateRow,
-) -> bool {
-    if id != current.observation.file_id || size != current.size {
-        return true;
-    }
-    if usn == current.observation.change_usn {
-        return false;
-    }
-    if let Some(reasons) = current.observation.change_reasons {
-        return reasons.without_close & 7 != 0;
-    }
-    current.mtime >= mtime - 2.0
-}
+pub(super) use crate::postprocess::watch_content_changed as content_changed;
 
 pub(super) fn changed(previous: &WatchCandidateRow, current: &WatchCandidateRow) -> bool {
     content_changed(

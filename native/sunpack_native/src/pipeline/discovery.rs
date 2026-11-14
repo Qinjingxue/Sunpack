@@ -9,7 +9,7 @@ use crate::io::reader::NativeArchiveSession;
 use crate::password::rar::resolve_embedded_rar_boundaries;
 use crate::path_keys::{path_ancestors, path_key};
 use crate::scan::directory::{
-    classify_scan_targets, filesystem_logical_name, is_reparse_point, NativeDirectoryScanOptions,
+    classify_scan_targets, filesystem_logical_name, walk_can_reach, NativeDirectoryScanOptions,
     NativeDirectorySnapshot, NativeOutputInventory,
 };
 use crate::scan::discovery::{
@@ -142,17 +142,7 @@ fn scan_discovery_scope(
     Ok((scope_view(filtered, scope), scope_view(raw, scope)))
 }
 
-fn walk_can_reach(root: &str, target: &str) -> bool {
-    for path in Path::new(target).ancestors() {
-        if path_key(&path.to_string_lossy()).trim_end_matches('\\') == root {
-            return true;
-        }
-        if std::fs::symlink_metadata(path).map_or(true, |meta| is_reparse_point(&meta)) {
-            return false;
-        }
-    }
-    false
-}
+
 
 pub(crate) fn scan_options(config: &Config) -> io::Result<NativeDirectoryScanOptions> {
     let mut blacklist = Vec::new();
@@ -190,6 +180,15 @@ pub(super) fn discover(
     candidates: &CandidateSet,
 ) -> io::Result<Discovered> {
     let mut result = Discovered::default();
+    let mut prepared = HashSet::new();
+    let mut prepared_tasks = Vec::new();
+    for plan in &request.prepared_volumes {
+        if let Some(tasks) = plan.tasks.lock().unwrap().take().filter(|_| plan.generations.iter().all(|(path, before)|
+            crate::io::reader::capture_file_generation(Path::new(path)).is_ok_and(|now| now == *before))) {
+            prepared.insert(path_key(&plan.path));
+            prepared_tasks.extend(tasks);
+        }
+    }
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
     for input in &request.inputs {
@@ -197,7 +196,8 @@ pub(super) fn discover(
         if request
             .discovery_scope
             .as_ref()
-            .is_none_or(|scope| scope.contains(&path))
+            .is_none_or(|scope| scope.contains(&path) || (request.watch_catalog.as_ref().is_some_and(|catalog| catalog.dependency_contains(scope, &path))))
+            && !prepared.contains(&path_key(&path))
             && seen.insert(path_key(&path))
         {
             paths.push(path);
@@ -438,6 +438,13 @@ pub(super) fn discover(
     }
     retain_logical_retry_scopes(logical_scopes.into_values(), &mut retry_scopes);
     assign_retry_scopes(&mut result.tasks, &retry_scopes);
+    if !prepared_tasks.is_empty() {
+        // Preserve the prepared retry scopes, and coalesce a peer admitted in
+        // the same batch through the existing shared-input projection.
+        prepared_tasks.append(&mut result.tasks);
+        result.tasks = prepared_tasks;
+        if result.tasks.len() > 1 { merge_shared_inputs(&mut result.tasks, &mut result.blocked_paths); }
+    }
     Ok(result)
 }
 
@@ -546,13 +553,13 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
     if scopes.is_empty() {
         return;
     }
-    let by_root = (scopes.len() > 1).then(|| {
-        scopes
-            .iter()
-            .map(|scope| ((scope.scope.key(), scope.bucket.as_str()), scope))
-            .collect::<HashMap<_, _>>()
-    });
     let has_buckets = scopes.iter().any(|scope| !scope.bucket.is_empty());
+    let by_root = (!has_buckets && scopes.len() > 1).then(|| scopes.iter()
+        .map(|scope| (scope.scope.key(), scope)).collect::<HashMap<_, _>>());
+    // Catalog buckets already define membership, including generated files
+    // outside the ordinary root. Physical ancestry only defines CLI scopes.
+    let by_bucket = has_buckets.then(|| scopes.iter().map(|scope|
+        (scope.bucket.as_str(), scope)).collect::<HashMap<_, _>>());
     for task in tasks.iter_mut() {
         let input = task.entry();
         let may_split = input.mode.structured()
@@ -563,20 +570,17 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
                 .is_some_and(|failure| failure.kind == FailureKind::MissingVolume);
         let key = path_key(&input.entry_path);
         let bucket = has_buckets.then(|| crate::scan::catalog::catalog_stem(&input.entry_path));
-        let selected = if let Some(by_root) = &by_root {
+        let selected = if let Some(by_bucket) = &by_bucket {
+            bucket.as_deref().and_then(|bucket| by_bucket.get(bucket)).map(|scope| Arc::clone(scope))
+        } else if let Some(by_root) = &by_root {
             path_ancestors(&key).find_map(|root| {
-                bucket
-                    .as_deref()
-                    .and_then(|bucket| by_root.get(&(root, bucket)))
-                    .or_else(|| by_root.get(&(root, "")))
+                by_root.get(root)
                     .filter(|scope| scope.scope.contains_key(&key))
                     .map(|scope| Arc::clone(scope))
             })
         } else {
             let scope = &scopes[0];
-            (scope.scope.contains_key(&key)
-                && (scope.bucket.is_empty() || bucket.as_ref() == Some(&scope.bucket)))
-            .then(|| Arc::clone(scope))
+            scope.scope.contains_key(&key).then(|| Arc::clone(scope))
         };
         if task.source != DiscoverySource::Direct {
             task.scope = selected.as_ref().map(|scope| Arc::clone(&scope.scope));
@@ -618,32 +622,68 @@ pub(super) fn retry_volume(
                 .is_some_and(|scope| path_key(&scope.root) == path_key(&context.scope.root))
         }),
     )?;
+    resolve_volume(Path::new(seed.as_ref()), &filesystem_logical_name(&original.path.to_string_lossy()), &original.format, &required, &filtered, &raw, candidates, request)
+}
+
+fn resolve_volume(
+    original: &Path, logical_name: &str, format: &str, required: &HashSet<String>,
+    filtered: &NativeDirectorySnapshot, raw: &NativeDirectorySnapshot,
+    candidates: &CandidateSet, request: &Request,
+) -> io::Result<Option<Task>> {
     let mut verified = HashMap::new();
-    let targets = vec![(
-        seed.into_owned(),
-        filesystem_logical_name(&original.path.to_string_lossy()),
-    )];
-    let table = directory_table(
-        &filtered,
-        &raw,
-        Some(FileTargets::new(targets)),
-        candidates,
-        &mut verified,
-        request,
-    )?;
+    let targets = vec![(original.to_string_lossy().into_owned(), logical_name.to_owned())];
+    let table = directory_table(filtered, raw, Some(FileTargets::new(targets)), candidates, &mut verified, request)?;
     for index in table.resolve()?.resolved_relations() {
         let task = project_task(table.project(index)?, DiscoverySource::Relations, &verified);
         let input = task.entry();
-        if task.inputs[0].failure.is_none()
-            && input.mode.structured()
-            && (original.format.is_empty() || input.format_hint == original.format)
-            && required.is_subset(&input.physical_paths().map(path_key).collect())
-
-        {
+        if task.inputs[0].failure.is_none() && input.mode.structured()
+            && (format.is_empty() || input.format_hint == format)
+            && required.is_subset(&input.physical_paths().map(path_key).collect()) {
             return Ok(Some(task));
         }
     }
     Ok(None)
+}
+
+pub(super) fn find_watch_volume(
+    request: &Request, options: &NativeDirectoryScanOptions, candidates: &CandidateSet, retry_incomplete: bool,
+) -> io::Result<Option<Arc<super::PreparedVolume>>> {
+    let (Some(scope), Some(path)) = (&request.discovery_scope, request.inputs.first()) else {
+        return Ok(None);
+    };
+    let path = path.to_string_lossy();
+    let (filtered, raw) = if let Some(catalog) = &request.watch_catalog {
+        options.catalog_snapshot(catalog, scope, &path)?
+    } else { scan_discovery_scope(options, scope, &HashMap::new(), &mut HashMap::new())? };
+    let mut verified = HashMap::new();
+    let targets = FileTargets::new(vec![(path.to_string(), filesystem_logical_name(&path))]);
+    let mut table = directory_table(&filtered, &raw, Some(targets), candidates, &mut verified, request)?;
+    let mut discovered = Discovered::default();
+    // Reuse the complete projection, including embedded members and carriers.
+    // This is a dependency lookup for an already admitted source; it neither
+    // discovers unrelated arrivals nor traverses any output recursively.
+    discovered.project(std::slice::from_mut(&mut table), candidates, &verified, request, false)?;
+    if let Some(error) = discovered.errors.first() { return Err(io::Error::other(error.message.clone())); }
+    if discovered.tasks.is_empty() || (!retry_incomplete && !discovered.tasks.iter().flat_map(|task| &task.inputs).any(|logical|
+        logical.failure.is_none() && (logical.input.mode.structured()
+            || logical.input.parts.len() > 1 || logical.input.volume_attempts.is_some()))) {
+        return Ok(None);
+    }
+    let context = Arc::new(RetryScope { scope: Arc::new(scope.clone()), snapshot: raw,
+        bucket: crate::scan::catalog::catalog_stem(&path) });
+    let mut seen = HashSet::new();
+    let mut generations = Vec::new();
+    for task in &mut discovered.tasks {
+        task.scope = Some(Arc::clone(&context.scope));
+        task.retry = Some(Arc::clone(&context));
+        for path in &task.owned_paths {
+            if seen.insert(path_key(path)) {
+                generations.push((path.clone(), crate::io::reader::capture_file_generation(Path::new(path))?));
+            }
+        }
+    }
+    Ok(Some(Arc::new(super::PreparedVolume { path: path.into_owned(), generations,
+        tasks: std::sync::Mutex::new(Some(discovered.tasks)) })))
 }
 
 fn watch_discovery_error(path: PathBuf, error: io::Error) -> InputError {

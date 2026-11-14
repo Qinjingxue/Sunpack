@@ -1,7 +1,7 @@
 //! Request-local result blocks. Recursive returns splice ownership rather than
 //! copying every descendant through every ancestor. Public results remain Vecs.
 use super::{ArchiveResult, CleanupResult, CleanupStatus, FailureKind, InputError,
-    InputErrorKind, InputCheckpoint, Outcome, PromotedSource, ScanTaskFailure};
+    InputErrorKind, InputCheckpoint, Outcome, GeneratedSource, ScanTaskFailure};
 use std::collections::LinkedList;
 #[cfg(test)]
 use std::ops::Index;
@@ -11,7 +11,7 @@ pub(super) trait ResultFacts {
     fn cancelled(&self) -> bool { false }
 }
 impl ResultFacts for ArchiveResult {
-    fn incomplete(&self) -> bool { !self.promoted && (self.failure.is_some() || self.partial) }
+    fn incomplete(&self) -> bool { self.failure.is_some() || self.partial }
     fn cancelled(&self) -> bool {
         self.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::Cancelled)
     }
@@ -25,7 +25,7 @@ impl ResultFacts for CleanupResult {
     fn incomplete(&self) -> bool { self.mode == "flatten" && self.status == CleanupStatus::Failed }
 }
 impl ResultFacts for InputCheckpoint {}
-impl ResultFacts for PromotedSource {}
+impl ResultFacts for GeneratedSource {}
 #[cfg(test)]
 impl ResultFacts for String {}
 
@@ -137,7 +137,7 @@ pub(super) struct RunOutcome {
     pub scan_failures: Vec<ScanTaskFailure>,
     pub checkpoints: Results<InputCheckpoint>,
     pub cleanup_results: Results<CleanupResult>,
-    pub promoted_sources: Results<PromotedSource>,
+    pub generated_sources: Results<GeneratedSource>,
     pub scan_incomplete: bool,
     pub uncommitted: bool,
 }
@@ -153,7 +153,7 @@ impl From<Outcome> for RunOutcome {
         Self { archives: value.archives.into(), errors: value.errors.into(),
             scan_failures: value.scan_failures,
             checkpoints: value.checkpoints.into(), cleanup_results: value.cleanup_results.into(),
-            promoted_sources: value.promoted_sources.into(),
+            generated_sources: value.generated_sources.into(),
             scan_incomplete: value.scan_incomplete, uncommitted: value.uncommitted }
     }
 }
@@ -162,7 +162,7 @@ impl From<RunOutcome> for Outcome {
         Self { archives: value.archives.into_vec(), errors: value.errors.into_vec(),
             scan_failures: value.scan_failures,
             checkpoints: value.checkpoints.into_vec(), cleanup_results: value.cleanup_results.into_vec(),
-            promoted_sources: value.promoted_sources.into_vec(), coalesced_from: None,
+            generated_sources: value.generated_sources.into_vec(), coalesced_from: None,
             scan_incomplete: value.scan_incomplete, uncommitted: value.uncommitted }
     }
 }

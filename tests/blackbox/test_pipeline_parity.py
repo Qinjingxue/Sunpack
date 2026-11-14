@@ -68,7 +68,7 @@ def test_output_file_parent_does_not_block_other_archives(package, tmp_path):
     assert bad.exists() and not good.exists()
 
 
-def test_explicit_outer_archive_keeps_nested_failure_beside_it(package, tmp_path):
+def test_explicit_outer_archive_keeps_nested_failure_in_its_output(package, tmp_path):
     fixtures = tmp_path / "fixtures"
     fixtures.mkdir()
     (fixtures / "secret.txt").write_text("encrypted payload")
@@ -90,10 +90,11 @@ def test_explicit_outer_archive_keeps_nested_failure_beside_it(package, tmp_path
 
     report = package.json("extract", "-R", "-r", "*", "--no-builtin-pw", root, outer, code=1)
 
-    promoted = outer.with_name(inner.name)
-    assert promoted.read_bytes() == inner.read_bytes()
+    retained, = (path for path in (outer.parent / outer.stem).rglob(inner.name) if path.is_file())
+    assert retained.read_bytes() == inner.read_bytes()
+    assert not outer.with_name(inner.name).exists()
     assert not (root / inner.name).exists()
-    assert str(promoted) in report["errors"][0]
+    assert str(retained) in report["errors"][0]
 
 
 @pytest.mark.parametrize(("command", "select_directory"), [

@@ -5,7 +5,6 @@
 
 use crate::collections::trim_map;
 use crate::io::resource_lifecycle::TrackedFile;
-use crate::pipeline::PromotedSource;
 use crate::wal::{self, Kind};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
@@ -14,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub(crate) mod owned_outputs;
+pub(crate) mod active_outputs;
 
 fn recorded_file_presence(path: &str) -> Option<bool> {
     match std::fs::metadata(path) {
@@ -161,8 +160,7 @@ enum OutputChange {
         destination: String,
         identity: String,
     },
-    Promote {
-        destinations: Vec<String>,
+    Protect {
         sources: Vec<String>,
     },
 }
@@ -254,9 +252,6 @@ impl PendingRecord {
                 for path in self.completed_sources.remove_under(source) {
                     self.completed_sources.insert(relocate(&path));
                 }
-                for path in self.promoted_destinations.remove_under(source) {
-                    self.promoted_destinations.insert(relocate(&path));
-                }
                 let prefix = format!("{}\\", source.trim_end_matches('\\'));
                 let mut moved: Vec<_> = self
                     .output_identities
@@ -279,14 +274,10 @@ impl PendingRecord {
                         .insert(destination.clone(), identity.clone());
                 }
             }
-            OutputChange::Promote {
-                destinations,
+            OutputChange::Protect {
                 sources,
             } => {
                 self.durable_owner = true;
-                for path in destinations {
-                    self.promoted_destinations.insert(path.clone());
-                }
                 let source_keys: Vec<_> = sources.iter().map(|p| path_key(p)).collect();
                 for output in self.active_outputs.values() {
                     let root = path_key(output);
@@ -324,7 +315,6 @@ pub(crate) struct PendingRecord {
     pub(crate) committed_roots: PathSet,
     pub(crate) completed_sources: PathSet,
     pub(crate) output_identities: BTreeMap<String, String>,
-    pub(crate) promoted_destinations: PathSet,
 }
 
 impl PendingRecord {
@@ -338,7 +328,6 @@ impl PendingRecord {
     pub(crate) fn has_output_work(&self) -> bool {
         !self.active_outputs.is_empty()
             || self.committed_roots.iter().next().is_some()
-            || self.promoted_destinations.iter().next().is_some()
     }
 }
 
@@ -394,7 +383,6 @@ enum Operation {
     SetMetadata(i64, String),
     SetCursors(BTreeMap<String, Cursor>),
     Runtime(String, Option<Arc<Value>>),
-    Promoted(String, Option<Arc<PromotedSource>>),
 }
 
 // Fixed numeric opcodes and tuple fields; put records persist their path once.
@@ -411,7 +399,6 @@ impl Serialize for Operation {
             }
             Self::SetCursors(cursors) => (5u8, cursors).serialize(serializer),
             Self::Runtime(key, value) => (6u8, key, value).serialize(serializer),
-            Self::Promoted(key, value) => (8u8, key, value).serialize(serializer),
         }
     }
 }
@@ -468,15 +455,13 @@ impl<'de> Deserialize<'de> for Operation {
                     5 => Operation::SetCursors(field(&mut seq)?),
                     6 => {
                         let key: String = field(&mut seq)?;
-                        if !key.starts_with("owned|")
-                            && !key.starts_with("flatten|")
+                        if !key.starts_with("flatten|")
                         {
                             return Err(A::Error::custom("unknown runtime record"));
                         }
                         Operation::Runtime(key, field(&mut seq)?)
                     }
                     7 => Operation::Output(field(&mut seq)?, field(&mut seq)?),
-                    8 => Operation::Promoted(field(&mut seq)?, field(&mut seq)?),
                     _ => return Err(A::Error::custom("unknown operation opcode")),
                 };
                 if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
@@ -497,7 +482,6 @@ pub(crate) struct StateData {
     password_source_signature: String,
     cursors: BTreeMap<String, Cursor>,
     runtime: BTreeMap<String, Arc<Value>>,
-    promoted: BTreeMap<String, Arc<PromotedSource>>,
 }
 
 impl StateData {
@@ -540,13 +524,6 @@ impl StateData {
                     self.runtime.insert(key.clone(), value.clone());
                 } else {
                     self.runtime.remove(key);
-                }
-            }
-            Operation::Promoted(key, value) => {
-                if let Some(receipt) = value {
-                    self.promoted.insert(key.clone(), Arc::clone(receipt));
-                } else {
-                    self.promoted.remove(key);
                 }
             }
             Operation::PutPending(key, record) => {
@@ -611,19 +588,6 @@ impl NativeWatchOperations {
         Arc::make_mut(&mut self.operations)
             .0
             .push(Operation::PutEntry(path_key(&entry.path), entry));
-    }
-
-    pub(crate) fn put_promoted(&mut self, receipt: PromotedSource) {
-        let key = path_key(&receipt.path().to_string_lossy());
-        Arc::make_mut(&mut self.operations)
-            .0
-            .push(Operation::Promoted(key, Some(Arc::new(receipt))));
-    }
-
-    pub(crate) fn retire_promoted(&mut self, key: String) {
-        Arc::make_mut(&mut self.operations)
-            .0
-            .push(Operation::Promoted(key, None));
     }
 
     pub(crate) fn finish_pending(path: &str, entry: Option<Arc<EntryRecord>>) -> Self {
@@ -748,8 +712,6 @@ struct SnapshotDocument<'a> {
     pending_work: Records<'a, PendingRecord>,
     entries: Records<'a, EntryRecord>,
     runtime: &'a BTreeMap<String, Arc<Value>>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    promoted: &'a BTreeMap<String, Arc<PromotedSource>>,
 }
 
 #[derive(Deserialize)]
@@ -762,8 +724,6 @@ struct SnapshotInput {
     #[serde(deserialize_with = "read_records")]
     entries: HashMap<String, Arc<EntryRecord>>,
     runtime: BTreeMap<String, Arc<Value>>,
-    #[serde(default)]
-    promoted: BTreeMap<String, Arc<PromotedSource>>,
 }
 
 impl NativeWatchSnapshot {
@@ -778,7 +738,6 @@ impl NativeWatchSnapshot {
                 pending_work: Records(&self.data.pending),
                 entries: Records(&self.data.entries),
                 runtime: &self.data.runtime,
-                promoted: &self.data.promoted,
             };
             let mut file = TrackedFile::open_with(&path, |options| {
                 options.write(true).truncate(true);
@@ -817,6 +776,7 @@ fn entry_event(record: &EntryRecord) -> Value {
 
 pub(crate) struct NativeWatchState {
     pub(crate) data: Arc<Mutex<StateData>>,
+    pub(crate) outputs: active_outputs::OutputReservations,
     events: Mutex<Option<std::sync::Weak<crate::event_log::Shared>>>,
 }
 
@@ -1013,10 +973,9 @@ impl NativeWatchState {
         ))
     }
 
-    pub(crate) fn promotion_operation(
+    pub(crate) fn protect_output_operation(
         &self,
         owner: &str,
-        destinations: Vec<String>,
         sources: Vec<String>,
     ) -> Option<NativeWatchOperations> {
         let key = path_key(owner);
@@ -1026,9 +985,8 @@ impl NativeWatchState {
             .then(|| NativeWatchOperations {
                 operations: Arc::new(Operations(vec![Operation::Output(
                     key,
-                    OutputChange::Promote {
-                        destinations,
-                        sources,
+                    OutputChange::Protect {
+                                sources,
                     },
                 )])),
             })
@@ -1041,9 +999,9 @@ impl NativeWatchState {
         task: String,
         output: String,
         keep: Option<bool>,
-        new_output_scopes: Option<&[crate::scan::scope::NativeDiscoveryScope]>,
+        exclusive: bool,
     ) -> std::io::Result<Option<NativeWatchOperations>> {
-        if new_output_scopes.is_some() && keep.is_some() {
+        if exclusive && keep.is_some() {
             return Err(invalid("output registration requires a start"));
         }
         let key = path_key(owner);
@@ -1057,7 +1015,7 @@ impl NativeWatchState {
                 if !active {
                     if !keep {
                         // Rollback can remove a previously committed output.
-                        // Finish must revoke its recovery and owned exclusions
+                        // Finish must revoke its retained recovery output
                         // even after the active reservation has been cleared.
                         if !record.committed_roots.covers(&output) {
                             return Ok(None);
@@ -1078,7 +1036,7 @@ impl NativeWatchState {
         let mut owned_paths = Vec::new();
         let identity = (|| -> std::io::Result<Option<String>> {
             let path = Path::new(&output);
-            if let Some(scopes) = new_output_scopes {
+            if exclusive {
                 crate::scan::scope::create_output_root_exclusive(path)
                     .map_err(|error| {
                         // A name collision retries the existing reservation.
@@ -1088,17 +1046,18 @@ impl NativeWatchState {
                             crate::pipeline::OutputCreateError::wrap(error)
                         } else { error }
                     })?;
-                // Relevance is sampled after mkdir, under the publication
+                // Aliases are sampled after mkdir, under the publication
                 // gate. An alias retargeted since reservation cannot create an
                 // unregistered tree in another watched namespace.
                 let paths = crate::path_keys::output_path_aliases(path)?;
-                if paths.iter().any(|path| scopes.iter().any(|scope| scope.intersects_output(path)))
-                    && !paths.iter().any(|path| self.owned_root(path).is_some())
+                if !paths.iter().any(|path| self.owned_root(path).is_some())
                 {
                     owned_paths = paths;
                 }
             } else if keep.is_none() {
                 std::fs::create_dir_all(path)?;
+                let paths = crate::path_keys::output_path_aliases(path)?;
+                if !paths.iter().any(|path| self.owned_root(path).is_some()) { owned_paths = paths; }
             }
             if refresh && path.is_dir() {
                 let (volume, identity, _) = crate::filesystem::watch_path_identity(&output)?;
@@ -1108,11 +1067,7 @@ impl NativeWatchState {
             }
         })()?;
         let register = !owned_paths.is_empty();
-        let mut operations = if keep == Some(false) {
-            self.discarded_owned_operations(&output)
-        } else {
-            Vec::with_capacity(1 + owned_paths.len())
-        };
+        let mut operations = Vec::with_capacity(1);
         let change = if let Some(keep) = keep {
             OutputChange::Finish {
                 task,
@@ -1135,7 +1090,7 @@ impl NativeWatchState {
                 }));
             }
             if register {
-                operations.extend(owned_outputs::owned_operations(&owned_paths, &[&identity]));
+                self.register_output_paths(&owned_paths, &[&identity]);
             }
             OutputChange::Start {
                 task,
@@ -1163,12 +1118,13 @@ impl NativeWatchState {
     }
 
     pub(crate) fn owned_root(&self, path: &str) -> Option<String> {
-        owned_outputs::find_owned_root(&self.data, path)
+        active_outputs::find_owned_root(&self.outputs, path)
     }
 
     pub(crate) fn new() -> Self {
         Self {
             data: Arc::new(Mutex::new(StateData::default())),
+            outputs: Arc::default(),
             events: Mutex::new(None),
         }
     }
@@ -1212,51 +1168,6 @@ impl NativeWatchState {
         self.lock().entries.get(key).cloned()
     }
 
-    pub(crate) fn observation_state(
-        &self,
-        key: &str,
-    ) -> (Option<Arc<EntryRecord>>, Option<Arc<PromotedSource>>) {
-        let data = self.lock();
-        (
-            data.entries.get(key).cloned(),
-            data.promoted.get(key).cloned(),
-        )
-    }
-
-    pub(crate) fn promoted_source(&self, path: &str) -> Option<Arc<PromotedSource>> {
-        self.lock().promoted.get(&path_key(path)).cloned()
-    }
-
-    pub(crate) fn promoted_sources(
-        &self,
-        path: Option<&str>,
-        recursive: bool,
-    ) -> Vec<(String, Arc<PromotedSource>)> {
-        let data = self.lock();
-        if let Some(path) = path {
-            let key = path_key(path);
-            if !recursive {
-                return data
-                    .promoted
-                    .get(&key)
-                    .map(|receipt| (key, Arc::clone(receipt)))
-                    .into_iter()
-                    .collect();
-            }
-            return data
-                .promoted
-                .range(key.clone()..)
-                .take_while(|(path, _)| path.starts_with(&key))
-                .filter(|(path, _)| **path == key || is_path_under(path, &key))
-                .map(|(path, receipt)| (path.clone(), Arc::clone(receipt)))
-                .collect();
-        }
-        data.promoted
-            .iter()
-            .map(|(path, receipt)| (path.clone(), Arc::clone(receipt)))
-            .collect()
-    }
-
     pub(crate) fn pending_items(&self) -> Vec<Arc<PendingRecord>> {
         self.lock().pending.values().cloned().collect()
     }
@@ -1287,7 +1198,6 @@ impl NativeWatchState {
                         .keys()
                         .chain(record.active_outputs.values())
                         .chain(record.committed_roots.iter())
-                        .chain(record.promoted_destinations.iter())
                         .map(|path| path_key(path))
                 })
                 .collect();
@@ -1472,7 +1382,6 @@ fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
     let password_generation = snapshot.password_generation;
     let data = StateData {
         runtime: snapshot.runtime,
-        promoted: snapshot.promoted,
         pending: snapshot.pending_work,
         entries: snapshot.entries,
         password_generation,
@@ -1614,7 +1523,7 @@ mod tests {
             .filter(|output| !pending.committed_roots.contains(output)).collect::<Vec<_>>(), vec![&second]);
         // Rollback may still discard the committed child after its active
         // reservation is retired. It must preserve the enclosing carrier.
-        let rollback = resumed.output_operation(&owner, task.clone(), first.clone(), Some(false), None)
+        let rollback = resumed.output_operation(&owner, task.clone(), first.clone(), Some(false), false)
             .unwrap().unwrap();
         resumed.apply(&rollback);
         assert!(resumed.pending(&owner).unwrap().committed_roots.contains(&container));

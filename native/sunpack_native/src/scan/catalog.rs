@@ -1,4 +1,4 @@
-//! Compact resident rows. Scan anchors and runtime observations never enter the WAL.
+//! Compact resident rows. Accepted file baselines are durable; scan anchors are disposable.
 use super::directory::DirectoryEntryRecord;
 use crate::analysis_native::volume_anchor::CheapAnchorCell;
 use crate::path_keys::path_key;
@@ -102,6 +102,14 @@ impl NativeWatchObservation {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct GeneratedBaseline {
+    size: u64,
+    mtime: f64,
+    file_id: String,
+    usn: i64,
+}
+
 pub(super) struct CatalogRow {
     parent: Arc<str>,
     name: Box<str>,
@@ -110,9 +118,17 @@ pub(super) struct CatalogRow {
     flags: u8,
     pub cheap_anchor: Option<CheapAnchorCell>,
     pub observation: Option<Box<NativeWatchObservation>>,
+    pub generated: Option<Box<GeneratedBaseline>>,
 }
 
 impl CatalogRow {
+    pub fn remember_generated(&mut self, size: u64, mtime: f64, id: &str, usn: i64) {
+        self.generated = Some(Box::new(GeneratedBaseline { size, mtime, file_id: id.to_owned(), usn }));
+    }
+    pub fn generated_observation(&self) -> Option<NativeWatchObservation> {
+        self.generated.as_ref().map(|g| NativeWatchObservation::new(g.size, g.mtime, FileId::new(&g.file_id), g.usn))
+    }
+
     pub fn remember_observation(
         &mut self,
         size: u64,
@@ -185,16 +201,25 @@ impl CatalogRow {
 
 impl Serialize for CatalogRow {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Preserve the existing four-field WAL/snapshot representation.
-        self.record().serialize(serializer)
+        #[derive(Serialize)]
+        struct Row<'a> {
+            #[serde(flatten)]
+            record: DirectoryEntryRecord,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            observed: Option<(u64, f64, String, i64)>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            generated: Option<&'a GeneratedBaseline>,
+        }
+        Row { record: self.record(), observed: self.observation.as_ref().map(|o|
+            (o.size, o.mtime, o.file_id(), o.change_usn)), generated: self.generated.as_deref() }.serialize(serializer)
     }
 }
 
-pub(super) enum CatalogBucket {
+enum BucketRows {
     One(Arc<str>),
     Many(Vec<Arc<str>>),
 }
-impl CatalogBucket {
+impl BucketRows {
     pub fn iter(&self) -> std::slice::Iter<'_, Arc<str>> {
         match self {
             Self::One(key) => std::slice::from_ref(key).iter(),
@@ -229,6 +254,23 @@ impl CatalogBucket {
     }
 }
 
+pub(super) struct CatalogBucket {
+    rows: BucketRows,
+    pub revision: u64,
+}
+fn next_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+impl CatalogBucket {
+    fn new(key: Arc<str>) -> Self { Self { rows: BucketRows::One(key), revision: next_revision() } }
+    pub fn iter(&self) -> std::slice::Iter<'_, Arc<str>> { self.rows.iter() }
+    fn touch(&mut self) { self.revision = next_revision(); }
+    fn push(&mut self, key: Arc<str>) { self.rows.push(key); self.touch(); }
+    fn remove(&mut self, key: &str) -> bool { self.touch(); self.rows.remove(key) }
+    fn retain(&mut self, keep: impl FnMut(&Arc<str>) -> bool) -> bool { self.touch(); self.rows.retain(keep) }
+}
+
 #[derive(Default)]
 pub(super) struct ScopeCatalog {
     pub rows: BTreeMap<Arc<str>, CatalogRow>,
@@ -247,10 +289,14 @@ pub(crate) fn catalog_stem(path: &str) -> String {
 }
 
 impl ScopeCatalog {
+    pub fn touch(&mut self, path: &str) {
+        if let Some(bucket) = self.buckets.get_mut(catalog_stem(path).as_str()) { bucket.touch(); }
+    }
     pub fn insert(&mut self, row: DirectoryEntryRecord) {
         self.insert_key(Arc::from(path_key(&row.path)), row);
     }
     pub fn insert_key(&mut self, key: Arc<str>, record: DirectoryEntryRecord) {
+        self.touch(&record.path);
         self.insert_row(key, record, false);
     }
     pub fn insert_transient(&mut self, key: Arc<str>, record: DirectoryEntryRecord) {
@@ -294,12 +340,14 @@ impl ScopeCatalog {
                 | u8::from(record.mtime_ns.is_some()) * HAS_MTIME
                 | u8::from(transient) * TRANSIENT,
             observation: None,
+            generated: None,
             cheap_anchor: None,
         };
         let mut reuse_indexes = false;
         if let Some((old_key, mut old)) = self.rows.remove_entry(key.as_ref()) {
             key = old_key;
             row.observation = old.observation.take();
+            row.generated = old.generated.take();
             reuse_indexes = old.persistent() && row.persistent() && old.is_dir() == row.is_dir();
             if reuse_indexes {
                 self.release_parent(&old);
@@ -315,7 +363,7 @@ impl ScopeCatalog {
                     Some(bucket) => bucket.push(Arc::clone(&key)),
                     None => {
                         self.buckets
-                            .insert(stem.into_boxed_str(), CatalogBucket::One(Arc::clone(&key)));
+                            .insert(stem.into_boxed_str(), CatalogBucket::new(Arc::clone(&key)));
                     }
                 }
             }
@@ -329,8 +377,8 @@ impl ScopeCatalog {
                 let stem = catalog_stem(&row.name);
                 if let Some(dirty) = dirty.filter(|_| {
                     matches!(
-                        self.buckets.get(stem.as_str()),
-                        Some(CatalogBucket::Many(_))
+                        self.buckets.get(stem.as_str()).map(|bucket| &bucket.rows),
+                        Some(BucketRows::Many(_))
                     )
                 }) {
                     dirty.insert(stem);
@@ -399,7 +447,7 @@ mod tests {
         let mut row = CatalogRow {
             parent: Arc::from("C:\\watch"), name: "input.zip".into(),
             size: 42, mtime_ns: 0, flags: HAS_SIZE | HAS_MTIME,
-            cheap_anchor: None, observation: Some(Box::new(observation)),
+            cheap_anchor: None, generated: None, observation: Some(Box::new(observation)),
         };
         // Main skips activity learning for unchanged forced retries, but its
         // ordinary observation publication still honors an explicit CLOSE.

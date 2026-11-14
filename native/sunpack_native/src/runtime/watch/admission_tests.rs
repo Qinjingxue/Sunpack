@@ -36,11 +36,12 @@ fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
         deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
         passwords: BuiltinStore::shared(base).unwrap(), hub: Arc::new(Hub::new()),
         root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-        parent_observers: HashMap::new(), config_observers: Vec::new(),
+        parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+        volume_checks: HashMap::new(),
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
-        external: Arc::new(Mutex::new(None)), _lease: None,
+        external: Arc::default(), _lease: None,
     }
 }
 
@@ -202,11 +203,12 @@ fn checkpoint_submits_the_first_ready_generation() {
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
                 root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-                parent_observers: HashMap::new(), config_observers: Vec::new(),
+                parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+                volume_checks: HashMap::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: None,
+                external: Arc::default(), _lease: None,
             };
             let source_text = source.to_str().unwrap();
             if case == "stable" {
@@ -246,9 +248,7 @@ fn checkpoint_submits_the_first_ready_generation() {
                 if matches!(case, "owned" | "owned_content") {
                     let output = check_source.parent().unwrap().to_string_lossy().into_owned();
                     let identity = output_identity(&output).unwrap();
-                    scheduler.journal.commit(true, |_| Ok(crate::watch_store::NativeWatchOperations::owned_outputs(
-                        &[output], &[&identity],
-                    ))).unwrap();
+                    scheduler.journal.state().register_output_paths(&[output], &[&identity]);
                 }
                 if case == "stop" { scheduler.hub.stopped.store(true, Ordering::Release); }
                 // Every case now conflicts with a second readiness probe. main
@@ -358,11 +358,12 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
         options: None, deep_options: options,
         passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
         root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-        parent_observers: HashMap::new(), config_observers: Vec::new(),
+        parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+        volume_checks: HashMap::new(),
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
-        external: Arc::new(Mutex::new(None)), _lease: None,
+        external: Arc::default(), _lease: None,
     };
     scheduler.options = Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap());
     for path in [&good, &bad] {
@@ -427,11 +428,12 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
                 root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-                parent_observers: HashMap::new(), config_observers: Vec::new(),
+                parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+                volume_checks: HashMap::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: None,
+                external: Arc::default(), _lease: None,
             };
             let owner = source.to_str().unwrap();
             let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -450,7 +452,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 let task = watched.join("missing-nested.zip");
                 scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
                     task.to_string_lossy().into_owned(), output.to_string_lossy().into_owned(),
-                    None, None)?.unwrap())).unwrap();
+                    None, false)?.unwrap())).unwrap();
                 scheduler.recover_pending(None).unwrap();
                 assert!(!output.exists());
                 assert!(scheduler.journal.state().pending(owner).is_some());
@@ -463,7 +465,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 for keep in [None, Some(true)] {
                     scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
                         output.to_string_lossy().into_owned(), output.to_string_lossy().into_owned(),
-                        keep, None)?.unwrap())).unwrap();
+                        keep, false)?.unwrap())).unwrap();
                 }
             }
             let nested = surviving.join("unfinished.zip");
@@ -520,11 +522,12 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
                 root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-                parent_observers: HashMap::new(), config_observers: Vec::new(),
+                parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+                volume_checks: HashMap::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: Some(lease),
+                external: Arc::default(), _lease: Some(lease),
             };
             let owner = source.to_str().unwrap();
             let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -541,7 +544,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         let output = watched.join("interrupted-output");
         scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
             owner.to_owned(), output.to_string_lossy().into_owned(),
-            None, None)?.unwrap())).unwrap();
+            None, false)?.unwrap())).unwrap();
         let member = output.join("locked.txt");
         fs::write(&member, b"unfinished extraction").unwrap();
         let lock = fs::OpenOptions::new().read(true).share_mode(0).open(&member).unwrap();
@@ -575,7 +578,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         write_roots(&scheduler.root_file, std::slice::from_ref(&root)).unwrap();
         let held_output = watched.join("held-output");
         scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
-            owner.to_owned(), held_output.to_string_lossy().into_owned(), None, None)?.unwrap())).unwrap();
+            owner.to_owned(), held_output.to_string_lossy().into_owned(), None, false)?.unwrap())).unwrap();
         let held_member = held_output.join("locked.txt");
         fs::write(&held_member, b"unfinished output").unwrap();
         let held = fs::OpenOptions::new().read(true).share_mode(0).open(&held_member).unwrap();
@@ -591,6 +594,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         let watch = Watch::new(Arc::new(|| {}));
         *watch.external.lock().unwrap() = Some(ExternalOutputs {
             journal: Arc::downgrade(&old_journal), scopes: old_scopes,
+            catalog: Arc::clone(&scheduler.catalog), options: Arc::new(scheduler.deep_options.clone()), hub: Arc::downgrade(&scheduler.hub),
         });
         let foreground_output = watched.join("foreground-output");
         watch.register_external_output(&foreground_output).unwrap();
@@ -643,11 +647,12 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
             passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
             root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-            parent_observers: HashMap::new(), config_observers: Vec::new(),
+            parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+            volume_checks: HashMap::new(),
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
             active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
-            external: Arc::new(Mutex::new(None)), _lease: None,
+            external: Arc::default(), _lease: None,
         };
         let path = source.to_str().unwrap();
         let failed = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -716,6 +721,8 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             &mut HashMap::from([(tail, PathChange { event: Some(CandidateEvent::Created), ..PathChange::default() })]),
             &HashSet::new(),
         ).unwrap();
+        assert!(!scheduler.pending.contains_key(&id), "an unrelated invalid tail must not execute the blocker");
+        scheduler.enqueue_with_recovery(&root_id, path.into(), None).unwrap();
         assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9),
             "quiet summary after volume arrival: {:?}", scheduler.pending[&id].quiet.summary());
         assert_eq!(scheduler.pending[&id].quiet.summary(), (10.0, Some(2.0), 1.0, 0.0));
@@ -770,11 +777,12 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
             passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
             root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-            parent_observers: HashMap::new(), config_observers: Vec::new(),
+            parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
+            volume_checks: HashMap::new(),
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
             active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
-            external: Arc::new(Mutex::new(None)), _lease: None,
+            external: Arc::default(), _lease: None,
         };
 
         let mut expected = Vec::new();
@@ -881,7 +889,7 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
             output: None, recursive: true, deep: false, scanned: true }]).unwrap();
         let hub = Arc::new(Hub::new());
         let mut scheduler = Scheduler::open(base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
-            Arc::clone(&hub), true, false, Arc::new(Mutex::new(None)), config::load_snapshot(&base).unwrap()).unwrap();
+            Arc::clone(&hub), true, false, Arc::default(), config::load_snapshot(&base).unwrap()).unwrap();
         // This test drives explicit reloads deterministically; do not race the
         // native filesystem notification against the corresponding waiter.
         scheduler.config_observers.clear();
@@ -941,7 +949,7 @@ fn a_retired_toast_activation_is_successful_and_leaves_current_request_running()
         fs::write(base.join("native/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let mut scheduler = Scheduler::open(base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
-            Arc::new(Hub::new()), false, false, Arc::new(Mutex::new(None)), config::load_snapshot(&base).unwrap()).unwrap();
+            Arc::new(Hub::new()), false, false, Arc::default(), config::load_snapshot(&base).unwrap()).unwrap();
         let retired = "80000000000000000000000000000000";
         assert!(!scheduler.cancel_display_batch(retired).unwrap());
         let toast = super::super::toast::Toast::start(
@@ -970,7 +978,7 @@ fn coalesced_watch_completion_keeps_the_leaders_blocker() {
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let mut scheduler = Scheduler::open(
             base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
-            Arc::new(Hub::new()), false, false, Arc::new(Mutex::new(None)),
+            Arc::new(Hub::new()), false, false, Arc::default(),
             config::load_snapshot(&base).unwrap(),
         ).unwrap();
         scheduler.journal.resume().unwrap();
@@ -1000,11 +1008,12 @@ fn coalesced_watch_completion_keeps_the_leaders_blocker() {
             Completed {
                 cancelled: false,
                 result: Ok(outcome),
-                promoted: HashMap::new(), outputs: BTreeMap::new(),
+                 outputs: BTreeMap::new(),
             }
         }).unwrap();
         let claimed = Arc::new(Mutex::new(ClaimedSources { coalesced: true, ..Default::default() }));
         scheduler.active.insert("follower".into(), Active {
+            max_depth: usize::MAX,
             deep: false, root: key(&watched), recovery: None, password_scope: watched.clone(),
             passwords: scheduler.passwords.snapshot(), inputs: HashMap::from([(id.clone(), candidate.clone())]),
             quiet: HashMap::new(), dirty: HashSet::new(), claimed,

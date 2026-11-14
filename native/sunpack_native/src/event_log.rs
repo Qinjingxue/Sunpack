@@ -3,7 +3,7 @@ use crate::io::display_store::{utc_us, Store, DAY_US};
 use crate::io::display_wake::Wake;
 use crate::watch_store::NativeWatchState;
 use serde_json::{json, Value};
-use serde::ser::{SerializeSeq, SerializeStruct};
+use serde::ser::SerializeStruct;
 use std::collections::{HashMap, HashSet};
 
 use std::path::PathBuf;
@@ -19,26 +19,16 @@ struct DiagnosticFailure<'a>(pub &'a crate::pipeline::Failure);
 impl serde::Serialize for DiagnosticFailure<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let failure = self.0;
-        let mut object = serializer.serialize_struct("FailureDiagnostic", 7)?;
+        let mut object = serializer.serialize_struct("FailureDiagnostic", 6)?;
         object.serialize_field("kind", &failure.kind)?;
         object.serialize_field("message", &failure.message)?;
         if let Some(context) = &failure.context { object.serialize_field("context", context)?; }
         if let Some(scope) = &failure.discovery_scope { object.serialize_field("discovery_scope", scope)?; }
-        if !failure.causes.is_empty() { object.serialize_field("causes", &Causes(&failure.causes))?; }
         if let Some(evidence) = &failure.evidence { object.serialize_field("evidence", evidence)?; }
         if failure.password_retry { object.serialize_field("password_retry", &true)?; }
         object.end()
     }
 }
-struct Causes<'a>(&'a [crate::pipeline::Failure]);
-impl serde::Serialize for Causes<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut list = serializer.serialize_seq(Some(self.0.len()))?;
-        for failure in self.0 { list.serialize_element(&DiagnosticFailure(failure))?; }
-        list.end()
-    }
-}
-
 const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 type Record = Arc<Vec<u8>>;
 fn encode(value: &Value) -> Record {

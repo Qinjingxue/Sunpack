@@ -78,37 +78,33 @@ struct SourceGeneration {
     generation: PersistedFileGeneration,
 }
 
-/// A generated input moved out of a recursive output tree for a later retry.
+/// A generated source generation, retained at its original path for a later retry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct PromotedSource(SourceGeneration);
+pub(crate) struct GeneratedSource(SourceGeneration);
 
-impl PromotedSource {
-    pub(super) fn capture(path: &Path) -> io::Result<Self> {
-        Ok(Self(SourceGeneration {
+impl GeneratedSource {
+    pub(crate) fn capture(path: &Path) -> io::Result<Self> {
+        Ok(Self::from_generation(path, &capture_file_generation(path)?))
+    }
+
+    pub(super) fn from_generation(path: &Path, generation: &PhysicalFileGeneration) -> Self {
+        Self(SourceGeneration {
             path: path.to_path_buf(),
-            generation: capture_file_generation(path)?.persisted(),
-        }))
+            generation: generation.persisted(),
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.0.path
     }
 
-    pub(super) fn matches(&self, generation: &PhysicalFileGeneration) -> bool {
+    pub(crate) fn matches(&self, generation: &PhysicalFileGeneration) -> bool {
         generation.persisted() == self.0.generation
     }
 
-    pub(crate) fn is_replaced(&self) -> bool {
-        capture_file_generation(self.path()).is_ok_and(|generation| !self.matches(&generation))
-    }
 }
 
 impl InputCheckpoint {
-    /// Lightweight projection of this module's serialized recovery contract.
-    pub(crate) fn serialized_output_roots(record: &serde_json::Value) -> impl Iterator<Item = &str> {
-        ["output", "container"].into_iter().filter_map(move |field| record[field].as_str())
-            .filter(|path| !path.is_empty())
-    }
 
     pub fn entry(&self) -> &Path {
         Path::new(&self.input.entry_path)
@@ -399,45 +395,6 @@ impl InputCheckpoint {
             || receipt.password_signature.as_ref().is_some_and(|saved| *saved == signature()))
     }
 
-    pub(super) fn promoted(&mut self, paths: &super::coordinator::PromotionPaths) -> io::Result<bool> {
-        // Only physical sources are moved. Keep directory-prefix relocation in
-        // relocate, where it is actually required.
-        if !self.sources.iter().any(|source| paths.target(&source.path).is_some()) {
-            return Ok(false);
-        }
-        let has_output = self.has_output();
-        let input = Arc::make_mut(&mut self.input);
-        if let Some(destination) = paths.target(Path::new(&input.entry_path)) {
-            let logical_name = crate::scan::directory::filesystem_logical_name;
-            if input.logical_name == logical_name(&input.entry_path) {
-                input.logical_name = logical_name(&destination.to_string_lossy());
-            }
-            input.entry_path = destination.to_string_lossy().into_owned();
-        }
-        paths.remap(&mut self.carrier);
-        if let Some(planned) = &mut self.planned_output { paths.remap(planned); }
-        if has_output { paths.remap(&mut self.output); }
-        if let Some(report) = &mut self.report { paths.remap(&mut report.output); }
-        if let Some(container) = &mut self.container { paths.remap(container); }
-        for source in Arc::make_mut(&mut self.sources) {
-            paths.remap(&mut source.path);
-            source.generation = capture_file_generation(&source.path)?.persisted();
-        }
-        for extent in input.parts.iter_mut().map(|part| &mut part.extent).chain(&mut input.ranges) {
-            if let Some(target) = paths.target(Path::new(&extent.path)) {
-                extent.path = target.to_string_lossy().into_owned();
-            }
-        }
-        if let Some(plan) = &mut input.volume_attempts {
-            for extent in &mut plan.sources {
-                if let Some(target) = paths.target(Path::new(&extent.path)) {
-                    extent.path = target.to_string_lossy().into_owned();
-                }
-            }
-        }
-        Ok(true)
-    }
-
     pub(super) fn result(&self, depth: usize) -> ArchiveResult {
         let failure = self.failure.as_ref().map(|receipt| receipt.failure.clone());
         let extent = self
@@ -482,8 +439,8 @@ impl InputCheckpoint {
                 .failure
                 .as_ref()
                 .map_or(0, |receipt| receipt.complete_files),
-            promoted: false,
-            promotion_original_path: None, scan_layout: super::ScanLayout::from_input(&self.input),
+
+             scan_layout: super::ScanLayout::from_input(&self.input),
         }
     }
 }
@@ -597,7 +554,7 @@ where F: Fn(&'a Failure) -> T, T: Serialize {
         let mut blockers = [""; 2];
         let mut count = 0;
         if let Some(error) = error {
-            if error.contains(FailureKind::MissingVolume)
+            if error.kind == FailureKind::MissingVolume
                 || checkpoint.input.execution_evidence().is_some()
                 || checkpoint.input.analysis.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing)
                 || error.evidence.as_deref().is_some_and(|e| e.classification_evidence.as_deref() == Some("password_or_volume_inconclusive"))
@@ -636,8 +593,8 @@ mod tests {
             files: 0, bytes: 0, encrypted: None, depth: 1, offset: 0, end_offset: None,
             volume_completeness: None, volume_attempts: None, source_paths: vec![source.clone()],
             password: None, discovery_source: DiscoverySource::Direct, damage_flags: None,
-            partial: false, retained: false, recovered_complete_files: 0, promoted: false,
-            promotion_original_path: None, scan_layout: Default::default(),
+            partial: false, retained: false, recovered_complete_files: 0,
+             scan_layout: Default::default(),
         };
         result.failure = Some(Failure::new(FailureKind::Damaged, "damaged").with_context(super::super::FailureContext::Extraction));
         result.output = Some(output.clone()); result.files = 3; result.bytes = 17;
@@ -743,141 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn bulk_promotion_remaps_all_layout_fields_once() {
-        let marker = crate::test_support::temp_file("checkpoint_bulk_promotion", b"marker");
-        let root = marker.with_extension("output");
-        fs::create_dir_all(&root).unwrap();
-        let moves: Vec<_> = (0..256).map(|index| (
-            root.join(format!("old-{index}")), root.join(format!("new-{index}")),
-        )).collect();
-        let mut sources = Vec::new();
-        let mut parts = Vec::new();
-        for (index, (source, target)) in moves.iter().enumerate() {
-            fs::write(source, b"part").unwrap();
-            sources.push(SourceGeneration {
-                path: source.clone(), generation: capture_file_generation(source).unwrap().persisted(),
-            });
-            parts.push(InputPart {
-                role: if index == 0 { crate::io::archive_state::InputRole::First } else { crate::io::archive_state::InputRole::Member },
-                extent: InputExtent { path: source.to_string_lossy().into_owned(), start: 0, end: Some(4) },
-                volume_number: Some(index as u32 + 1), canonical_name: format!("archive.7z.{:03}", index + 1),
-            });
-            fs::rename(source, target).unwrap();
-        }
-        let retained = root.join("retained-output");
-        let mut checkpoint = InputCheckpoint {
-            schema_version: SCHEMA_VERSION, carrier: moves[0].0.clone(),
-            input: Arc::new(ArchiveInput {
-                mode: OpenMode::NativeVolumes,
-                ranges: parts.iter().map(|part| part.extent.clone()).collect::<Vec<_>>().into_boxed_slice(),
-                parts: parts.into_boxed_slice(),
-                ..ArchiveInput::file(moves[0].0.to_string_lossy().into_owned(), "7z".into(), String::new())
-            }), report: None,
-            sources: sources.into(), output: retained.clone(),
-            planned_output: Some(retained.clone()), container: Some(root.clone()),
-            files: 1, bytes: 4, encrypted: None, discovery_source: DiscoverySource::Embedded,
-            failure: None,
-        };
-        let paths = super::super::coordinator::PromotionPaths::new(&moves);
-        assert!(checkpoint.promoted(&paths).unwrap());
-        assert_eq!(checkpoint.carrier, moves[0].1);
-        assert_eq!(Path::new(&checkpoint.input.entry_path), moves[0].1);
-        assert_eq!(checkpoint.output, retained);
-        assert_eq!(checkpoint.planned_output.as_ref(), Some(&retained));
-        assert_eq!(checkpoint.container.as_ref(), Some(&root));
-        for (index, (_, target)) in moves.iter().enumerate() {
-            assert_eq!(&checkpoint.sources[index].path, target);
-            assert_eq!(Path::new(&checkpoint.input.parts[index].extent.path), target);
-            assert_eq!(Path::new(&checkpoint.input.ranges[index].path), target);
-            assert_eq!(checkpoint.sources[index].generation, capture_file_generation(target).unwrap().persisted());
-        }
-        assert!(!checkpoint.promoted(&paths).unwrap());
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_file(marker).unwrap();
-    }
-
-    #[test]
-    fn promoted_partial_collision_reuses_receipt_after_fresh_discovery_naming() {
-        use crate::io::archive_state::archive_input_slices;
-        use crate::postprocess::NativeBlockedInputPromotion;
-        use crate::scan::directory::filesystem_logical_name;
-
-        let marker = crate::test_support::temp_file("checkpoint_promotion_collision", b"marker");
-        let root = marker.with_extension("output");
-        for (filename, promoted_name) in [("carrier.bin", "carrier.bin"), ("carrier.zip", "carrier")] {
-            let nested = root.join("nested");
-            let container = nested.join("retained");
-            let output = container.join("segment");
-            fs::create_dir_all(&output).unwrap();
-            fs::write(output.join("payload"), b"keep").unwrap();
-            let source = nested.join(filename);
-            fs::write(&source, b"archive!").unwrap();
-            fs::write(root.join(filename), b"existing").unwrap();
-            let discover = |path: &Path| {
-                let path = path.to_string_lossy();
-                let carrier = ArchiveInput::file(
-                    path.to_string(), "zip".into(), filesystem_logical_name(&path),
-                );
-                archive_input_slices(&carrier, &[("zip", 0, Some(4))])
-                    .unwrap().0.remove(0).unwrap()
-            };
-            let input = discover(&source);
-            let failure = Failure::new(FailureKind::Damaged, "accepted partial")
-                .with_context(super::super::FailureContext::Discovery {
-                    discovery: DiscoverySource::Embedded, path: source.clone(),
-                    reason: "damaged".into(), error: "original diagnostic".into(),
-                });
-            let mut checkpoint = InputCheckpoint {
-                schema_version: SCHEMA_VERSION,
-                carrier: source.clone(),
-                input: Arc::new(input.clone()), report: None,
-                sources: vec![SourceGeneration {
-                    path: source.clone(), generation: capture_file_generation(&source).unwrap().persisted(),
-                }].into(),
-                output: output.clone(),
-                planned_output: None,
-                container: Some(container.clone()),
-                files: 1, bytes: 4, encrypted: None,
-                discovery_source: DiscoverySource::Embedded, failure: Some(Arc::new(FailureReceipt {
-                    partial: true, password_signature: None,
-                    failure, complete_files: 1,
-                })),
-            };
-            let plan = NativeBlockedInputPromotion::new(
-                vec![source.to_string_lossy().into_owned()], root.clone(),
-            ).unwrap();
-            let destination = plan.moves()[0].1.clone();
-            assert_ne!(destination, root.join(filename));
-            let (_, error, _) = plan.execute(|| Ok(()));
-            assert!(error.is_empty(), "{error}");
-            let diagnostic = Arc::clone(checkpoint.failure.as_ref().unwrap());
-            checkpoint.promoted(&super::super::coordinator::PromotionPaths::new(plan.moves())).unwrap();
-            assert!(Arc::ptr_eq(&diagnostic, checkpoint.failure.as_ref().unwrap()));
-            assert!(matches!(checkpoint.failure.as_ref().unwrap().failure.context.as_deref(),
-                Some(super::super::FailureContext::Discovery { path, .. }) if path == &source));
-            let checkpoint: InputCheckpoint = serde_json::from_value(
-                serde_json::to_value(checkpoint).unwrap(),
-            ).unwrap();
-            let rediscovered = discover(&destination);
-            assert_eq!(rediscovered.logical_name, promoted_name);
-            let generations = HashMap::from([(
-                path_key(&rediscovered.entry_path), capture_file_generation(&destination).unwrap(),
-            )]);
-            assert!(checkpoint.valid_for(&rediscovered, &generations));
-            let result = checkpoint.result(1);
-            assert!(result.retained && result.partial);
-            assert_eq!(result.failure.unwrap().kind, FailureKind::Damaged);
-            assert_eq!(result.recovered_complete_files, 1);
-            assert_eq!(fs::read(output.join("payload")).unwrap(), b"keep");
-            let mut changed = rediscovered;
-            changed.analysis.password_required = true;
-            assert!(!checkpoint.valid_for(&changed, &generations));
-            fs::remove_dir_all(&root).unwrap();
-        }
-        fs::remove_file(marker).unwrap();
-    }
-
-    #[test]
     fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternatives() {
         let source = crate::test_support::temp_file("checkpoint_retry", b"archive");
         let output = source.with_extension("output");
@@ -973,15 +795,7 @@ mod tests {
         generations.insert(key, capture_file_generation(&source).unwrap());
         assert!(!partial.valid_for(&input, &generations));
         assert!(!complete.valid_for(&alternatives, &generations));
-        // Promotion moves the source file itself, not only a containing
-        // directory. Its rebased generation must reopen the new file path.
-        let promoted = source.with_extension("promoted");
-        fs::rename(&source, &promoted).unwrap();
-        let mut complete = complete;
-        complete.promoted(&super::super::coordinator::PromotionPaths::new(&[(source, promoted.clone())])).unwrap();
-        assert_eq!(complete.entry(), promoted);
-        assert_eq!(Path::new(&complete.input.parts[0].extent.path), promoted);
         fs::remove_dir(output).unwrap();
-        fs::remove_file(promoted).unwrap();
+        fs::remove_file(source).unwrap();
     }
 }

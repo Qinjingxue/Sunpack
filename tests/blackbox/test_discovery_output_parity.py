@@ -97,8 +97,7 @@ def test_flat_output_with_long_name_does_not_need_flatten_work_path(package, tmp
     assert (output / source.stem / "item.txt").read_bytes() == b"payload"
 
 
-@pytest.mark.parametrize("keep_first_segment", [False, True])
-def test_carrier_flattens_only_final_remaining_branch(package, tmp_path, keep_first_segment):
+def test_carrier_retains_both_branches_while_nested_password_is_missing(package, tmp_path):
     (tmp_path / "secret.txt").write_text("secret", encoding="utf-8")
     locked = tmp_path / "locked.zip"
     subprocess.run([str(package.tools / "7z.exe"), "a", "-tzip", "-mem=AES256", "-punknown",
@@ -106,8 +105,6 @@ def test_carrier_flattens_only_final_remaining_branch(package, tmp_path, keep_fi
     first = io.BytesIO()
     with zipfile.ZipFile(first, "w") as archive:
         archive.writestr("locked.zip", locked.read_bytes())
-        if keep_first_segment:
-            archive.writestr("first.txt", b"first survives")
     second = io.BytesIO()
     with zipfile.ZipFile(second, "w") as archive:
         archive.writestr("ordinary.txt", b"ordinary")
@@ -118,12 +115,10 @@ def test_carrier_flattens_only_final_remaining_branch(package, tmp_path, keep_fi
     report = package.json("extract", "-d", "-r", "*", "-c", "k", "--no-builtin-pw", "-o", output, source, code=1)
     ordinary, = output.rglob("ordinary.txt")
     assert ordinary.read_bytes() == b"ordinary"
-    if keep_first_segment:
-        first_file, = output.rglob("first.txt")
-        assert first_file.parent != ordinary.parent
-        assert ordinary.parent.parent == output / "carrier"
-    else:
-        assert ordinary == output / "carrier" / "ordinary.txt", report
+    retained, = output.rglob("locked.zip")
+    assert retained.read_bytes() == locked.read_bytes()
+    assert retained.parent != ordinary.parent
+    assert ordinary.parent.parent == retained.parent.parent == output / "carrier"
     assert source.is_file()
 
 
@@ -202,7 +197,7 @@ def test_recursive_file_targets_share_embedded_relation_candidates(
 
 def _nested_mixed_carrier(package, tmp_path, *, recursive_child=False):
     # Unlike a successful segment containing a blocked child, this carrier's
-    # own sibling segment fails. Promotion must settle the carrier itself.
+    # own sibling segment fails. Recovery retains the carrier itself.
     (tmp_path / "secret.txt").write_bytes(b"secret")
     locked = tmp_path / "locked.7z"
     # Encrypted headers block this segment before the worker writes any files.
@@ -226,15 +221,17 @@ def _nested_mixed_carrier(package, tmp_path, *, recursive_child=False):
     return outer, carrier
 
 
-def test_nested_mixed_carrier_promotes_before_flattening_successful_segment(package, tmp_path):
+def test_nested_mixed_carrier_retains_failed_input_beside_successful_segment(package, tmp_path):
     outer, carrier = _nested_mixed_carrier(package, tmp_path)
     output = tmp_path / "out"
     package.configure(post_extract={"flatten_single_directory": True}, recursive_authorization={"enabled": False},
                       filesystem={"scan_filters_enabled": False})
     report = package.json("extract", "-d", "-r", "*", "-c", "k", "--no-builtin-pw", "-o", output, outer, code=1)
-    assert (output / "outer" / "carrier" / "hello.txt").read_bytes() == b"independent success", report
+    payload, = output.rglob("hello.txt")
+    assert payload.read_bytes() == b"independent success", report
     assert (output / "outer" / "keep.txt").is_file()
-    assert (tmp_path / "carrier.bin").read_bytes() == carrier
+    assert (output / "outer" / "carrier.bin").read_bytes() == carrier
+    assert not (tmp_path / "carrier.bin").exists()
     assert outer.is_file()
 
 
@@ -286,7 +283,7 @@ def test_nested_mixed_carrier_survives_cancel_during_successful_sibling_recursio
         time.sleep(0.05)
     assert not (output / "outer").exists(), "cancelled request did not roll back its uncommitted output"
     assert outer.is_file()
-    assert (tmp_path / "carrier.bin").read_bytes() == carrier
+    assert not (tmp_path / "carrier.bin").exists()
     # A successful second connection proves this was request cancellation, not
     # runtime process death (which would test a different recovery boundary).
     assert owner.is_running()

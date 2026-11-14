@@ -379,7 +379,7 @@ def _await_watch(predicate, description):
 
 
 @pytest.mark.requires_watch_broker
-def test_continuous_watch_retries_promoted_nested_input_after_password_edit(package, tmp_path):
+def test_continuous_watch_retries_retained_nested_input_after_password_edit(package, tmp_path):
     if "SUNPACK_WATCH_BROKER_PIPE_NAME" not in package.env:
         pytest.skip("The isolated Watch Broker service is required")
 
@@ -412,12 +412,13 @@ def test_continuous_watch_retries_promoted_nested_input_after_password_edit(pack
     assert same_root["apply"]["generation"] == started["generation"]
 
     source = watched / incoming.name
-    promoted = watched / inner.name
     incoming.replace(source)
     _await_watch(
-        lambda: not source.exists() and promoted.is_file(),
+        lambda: not source.exists() and any(path.is_file() for path in output.rglob(inner.name)),
         "Watch did not retain the blocked nested input before removing its parent",
     )
+    retained, = (path for path in output.rglob(inner.name) if path.is_file())
+    assert not (watched / inner.name).exists()
     assert not list(output.rglob(marker.name))
 
     passwords = package.data / "builtin_passwords.json"
@@ -425,8 +426,8 @@ def test_continuous_watch_retries_promoted_nested_input_after_password_edit(pack
     updated.write_text(json.dumps({"passwords": [{"value": "nested-key"}]}), encoding="utf-8")
     updated.replace(passwords)
     _await_watch(
-        lambda: not promoted.exists() and any(output.rglob(marker.name)),
-        "Editing the password table did not resume the promoted nested archive",
+        lambda: not retained.exists() and any(output.rglob(marker.name)),
+        "Editing the password table did not resume the retained nested archive",
     )
     assert package.json("watch", "start", "--once")["summary"]["exit_code"] == 0
     status = package.json("watch", "status")["summary"]
