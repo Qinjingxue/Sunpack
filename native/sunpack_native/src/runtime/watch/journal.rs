@@ -30,6 +30,7 @@ impl Drop for DeferredScope {
 const CHECKPOINT_RECORDS: u64 = 8192;
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 const JOURNAL_HARD_BYTES: u64 = 256 * 1024 * 1024;
+const SNAPSHOT_TEMP_NAME: &str = "state.snapshot.tmp";
 
 struct Frontier {
     seq: u64,
@@ -62,7 +63,7 @@ struct Checkpoint {
 pub(super) struct Journal {
     state: NativeWatchState,
     suspended: AtomicBool,
-    log: NativeEventLog,
+    log: Arc<NativeEventLog>,
     frontier: Mutex<Frontier>,
     checkpoint: Mutex<Option<Checkpoint>>,
     maintenance: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -88,7 +89,7 @@ impl Journal {
         let stream_id = key(&snapshot);
         let stream = watch_journal_open(stream_id.clone())?;
         watch_journal_seed(&stream_id, frontier.seq)?;
-        let log = NativeEventLog::new(dir.join("events.json"), retention_days.min(u32::MAX.into()) as u32, true)?;
+        let log = Arc::new(NativeEventLog::new(dir.join("events.json"), retention_days.min(u32::MAX.into()) as u32, true)?);
         state.attach_events(&log)?;
         log.recover(Some(&state))?;
         Ok(Self {
@@ -194,6 +195,10 @@ impl Journal {
 
     pub(super) fn state(&self) -> &NativeWatchState {
         &self.state
+    }
+
+    pub(super) fn event_log(&self) -> &Arc<NativeEventLog> {
+        &self.log
     }
 
     pub(super) fn log(&self, value: Value) {
@@ -392,7 +397,7 @@ impl Journal {
                 // retry: never hide it behind the recoverable publication path.
                 seal.wait()?;
                 let dir = snapshot.parent().unwrap();
-                let temp = dir.join("state.snapshot.tmp");
+                let temp = dir.join(SNAPSHOT_TEMP_NAME);
                 let publication = (|| {
                     drop(File::create(&temp)?);
                     checkpoint.write(temp.to_string_lossy().into_owned())?;
@@ -488,8 +493,11 @@ fn ensure_healthy(frontier: &Frontier) -> io::Result<()> {
 // A published snapshot covers this prefix. Failure only leaves redundant WAL;
 // retry on an existing idle maintenance or the next open, never on a timer.
 fn retire_segments(dir: &Path, boundary: u64) -> bool {
+    // A hard stop can leave a large unpublished checkpoint. The journal's
+    // exclusive service lock and single active checkpoint own this path.
+    let mut pending = fs::remove_file(dir.join(SNAPSHOT_TEMP_NAME))
+        .is_err_and(|error| error.kind() != io::ErrorKind::NotFound);
     let Ok(paths) = segments(dir) else { return true; };
-    let mut pending = false;
     for (_, path) in paths.into_iter().take_while(|(start, _)| *start <= boundary) {
         if let Err(error) = fs::remove_file(path) {
             pending |= error.kind() != io::ErrorKind::NotFound;
@@ -812,9 +820,12 @@ mod tests {
         journal.wait_for_checkpoint().unwrap();
         drop(journal);
         drop(reader);
+        let stale_snapshot = dir.join(SNAPSHOT_TEMP_NAME);
+        fs::write(&stale_snapshot, b"incomplete snapshot").unwrap();
         let journal = Journal::open(&dir, 7).unwrap();
         assert_eq!(journal.state().password_generation(), 2);
         assert!(!wal.exists());
+        assert!(!stale_snapshot.exists());
         drop(journal);
         fs::remove_dir_all(dir).unwrap();
         fs::remove_file(marker).unwrap();

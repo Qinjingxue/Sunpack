@@ -242,3 +242,20 @@ def test_direct_truncated_single_7z_tail_is_not_confirmed_missing_volume(package
                 check_blockers(child)
 
     check_blockers(report)
+
+
+def test_unreplaced_missing_volume_preflight_has_no_extraction_receipt(package, tmp_path):
+    package.configure(filesystem={"scan_filters_enabled": False})
+    source = tmp_path / "truncated.bin"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("payload.txt", b"payload")
+    source.write_bytes(source.read_bytes()[:-12])
+
+    report = package.json("extract", "-r", "1", "--no-bpw", source, code=1)
+
+    failure, = report["tasks"][0]["failures"]
+    assert (failure["kind"], failure["stage"]) == ("missing_volume", "relations")
+    assert failure["message_key"] == "failure.possible_missing_volume"
+    assert failure["message"] == "Archive is incomplete and may be missing volumes"
+    assert "input_recovery" not in failure["details"]
+    assert source.is_file()

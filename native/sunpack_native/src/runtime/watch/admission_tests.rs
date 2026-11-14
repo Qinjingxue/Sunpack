@@ -286,6 +286,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
             let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
             let settings = Arc::new(config::load_snapshot(&base).unwrap().config);
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
+            let lease = BrokerLease::acquire().unwrap();
             let mut scheduler = Scheduler {
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
@@ -304,7 +305,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+                external: Arc::new(Mutex::new(None)), _lease: lease,
             };
             let owner = source.to_str().unwrap();
             let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -350,6 +351,8 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         // Removing the last root must release the data scheduler, not discard
         // unfinished output ownership. Re-adding it loads the same durable work.
         let root = scheduler.roots[&root_id].0.clone();
+        let old_journal = Arc::clone(&scheduler.journal);
+        let old_scopes = Arc::from([scheduler.roots[&root_id].1.clone()]);
         write_roots(&scheduler.root_file, std::slice::from_ref(&root)).unwrap();
         let held_output = watched.join("held-output");
         scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
@@ -364,6 +367,16 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         assert!(scheduler.pending.is_empty() && scheduler.journal.state().pending_items().is_empty());
         assert!(receipt.upgrade().is_none(), "idle shell retained recovery receipts");
         assert!(scheduler.external.lock().unwrap().is_none());
+        // A CLI create that captured the prior publication must still create
+        // its output if the final root is removed before it reaches the gate.
+        let watch = Watch::new(Arc::new(|| {}));
+        *watch.external.lock().unwrap() = Some(ExternalOutputs {
+            journal: Arc::downgrade(&old_journal), scopes: old_scopes,
+        });
+        let foreground_output = watched.join("foreground-output");
+        watch.register_external_output(&foreground_output).unwrap();
+        assert!(foreground_output.is_dir());
+        fs::remove_dir(&foreground_output).unwrap();
         scheduler.password_update(false).unwrap();
         scheduler.journal.rebuild_log().unwrap();
         scheduler.journal.flush().unwrap();
@@ -640,6 +653,9 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
         assert!(!hub.stopped.load(Ordering::Acquire));
         assert!(original.upgrade().is_none(), "faulted Journal must be released before reload");
         assert!(last_error.lock().unwrap().is_some());
+        let (rebuild, rebuild_wait) = command_reply();
+        hub.update(|signals| signals.rebuild.push(rebuild));
+        assert!(block_on(rebuild_wait.wait()).unwrap(), "the service log outlives its faulted WAL");
         // Service-only configuration still applies while the data scheduler is
         // unavailable, without attempting to reopen its failed state stream.
         fs::write(base.join("sunpack_advanced_config.json"), br#"{"runtime":{"process_mode":"background"},"watch":{"clipboard_monitor_enabled":false,"toast_enabled":false,"tray_enabled":false}}"#).unwrap();

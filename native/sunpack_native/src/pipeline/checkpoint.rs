@@ -180,8 +180,13 @@ impl InputCheckpoint {
         input: &ArchiveInput, result: &ArchiveResult, planned: Option<&Path>,
         previous: Option<&Self>, position: usize, input_count: usize,
     ) -> Option<ReportState> {
-        if result.failure.as_ref().is_some_and(|failure| matches!(failure.context.as_deref(),
-            Some(super::FailureContext::InputAdmission { .. }))) {
+        if result.failure.as_ref().is_some_and(|failure| match failure.context.as_deref() {
+            Some(super::FailureContext::InputAdmission { .. }) => true,
+            // A single blocked discovery only tries to replace its volume plan.
+            // If it remains blocked, the extraction state machine never ran.
+            Some(super::FailureContext::Discovery { .. }) => input_count == 1,
+            _ => false,
+        }) {
             return None;
         }
         let old = previous.and_then(|checkpoint| checkpoint.report.as_ref());

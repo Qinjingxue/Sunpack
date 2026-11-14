@@ -1975,8 +1975,11 @@ mod tests {
         let finish = later.prepare_finish(&Ok(outcome), false, false, one_root).unwrap();
         // Watch may prepare a whole completion batch before any WAL wait.
         // Preparation cannot make its terminal notification visible.
-        finish_debounce(&publisher);
-        assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
+        {
+            let state = publisher.shared.state.lock().unwrap();
+            assert!(state.group.as_ref().unwrap().finalize_at.is_none());
+            assert!(state.completed.is_empty());
+        }
         finish.publish();
         finish_debounce(&publisher);
         let completed = Snapshot::completed(&take_completed(&publisher), None);

@@ -151,7 +151,11 @@ def test_launcher_preserves_flag_like_operands_and_validates_pause_flags(package
     invalid_pause = package.run("version", "--pause")
     assert invalid_pause.returncode == 2 and "unrecognized arguments: --no-pause" in invalid_pause.stderr
 
-    rejected_prompt = package.run("scan", "--json", "--pause", "--ask-pw", "--", archive.name, cwd=tmp_path)
+    rejected_prompt = subprocess.run(
+        [str(package.launcher), "scan", "--json", "--pause", "--ask-pw", "--", archive.name],
+        cwd=tmp_path, env=package.env, stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
     assert rejected_prompt.returncode == 2, rejected_prompt.stderr
     assert json.loads(rejected_prompt.stdout)["inputs"]["argv"] == [
         "scan", "--json", "--ask-pw", "--no-pause", "--", archive.name,

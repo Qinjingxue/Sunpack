@@ -41,20 +41,18 @@ function Assert-PrivateDirectory([string]$Directory) {
     }
 }
 
-# This script owns config migration and the managed-data reset.
+# This script owns config migration and the pre-1.4 runtime-data reset.
 $dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
 Assert-PlainPath $dataDirectory
 Assert-PrivateDirectory $dataDirectory
 $version = $null
-$versionText = $PreviousVersion.Trim() -replace '^v', ''
-if ($versionText -match '^(\d+\.\d+\.\d+(?:\.\d+)?)(?:-[0-9A-Za-z.-]+)?$') {
+$versionText = $PreviousVersion.Trim()
+if ($versionText -match '^v?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)(?=$|[-+_~\s]|\.?(?:dev|a(?:lpha)?|b(?:eta)?|rc|pre(?:view)?|post)[0-9])') {
     [void][Version]::TryParse($Matches[1], [ref]$version)
 }
 if ($null -eq $version) {
-    if (Test-Path -LiteralPath $dataDirectory) {
-        Assert-PlainTree $dataDirectory
-        Remove-Item -LiteralPath $dataDirectory -Recurse -Force
-    }
+    # Untagged builds can have a commit hash, timestamp or custom label.
+    # Only a known version can select a data migration.
     exit 0
 }
 if ($version -ge [Version]'1.4.0') {

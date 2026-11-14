@@ -91,7 +91,8 @@ def test_version_gate_and_failed_preflight_leave_all_data_untouched(tmp_path, re
     # Exercise current repairs and failed JSON/reparse preflight on disk.
     for index, (version, broken, success) in enumerate([
         ("1.4.0", False, True), ("v1.4.0-2-gabcdef0", True, False),
-        ("1.10.0", False, True),
+        ("1.10.0", False, True), ("1.4.0rc1", True, False), ("1.4.0.dev1", True, False),
+        ("20261114-020000", True, True), ("dev", True, True),
         ("1.3.5", True, False),
     ]):
         data = tmp_path / str(index)
@@ -195,7 +196,7 @@ def test_current_upgrade_retires_verification_and_preserves_state(tmp_path, repo
     advanced.write_text(json.dumps({"verification": {"methods": []}, "custom": "retained"}), encoding="utf-8")
     state = tmp_path / "state.snapshot"
     state.write_bytes(b"retained runtime state")
-    result = _upgrade(repo_root, user, "1.4.0", advanced)
+    result = _upgrade(repo_root, user, "V1.4.0-rc.1+build.2", advanced)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(user.read_text(encoding="utf-8")) == {"extraction": payload["extraction"]}
     assert json.loads(advanced.read_text(encoding="utf-8")) == {"custom": "retained"}

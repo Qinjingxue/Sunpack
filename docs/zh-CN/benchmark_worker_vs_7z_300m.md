@@ -119,11 +119,13 @@ BZip2/TBZ2 worker 峰值约 43–44 MiB，`7z.exe` 约 12.6 MiB；solid 7z/XZ wo
 
 ## 复现
 
-复现下列历史结果时，使用记录的源码提交及该提交构建的原生扩展和 worker。
+复现历史结果请使用 `b9fdfa6d` 源码及该提交构建的原生扩展和 worker。
+[当前基准入口](../../benchmarks/README.md)测量完整的 SunPack CLI 与 7-Zip。
 
 ```powershell
-uv sync --locked --extra dev
-cmake --build native/sevenzip_bridge/build-x64 --config Release --target sunpack_sevenzip_worker --parallel
+git worktree add --detach ..\sunpack-benchmark-b9fdfa6d b9fdfa6d
+Set-Location ..\sunpack-benchmark-b9fdfa6d
+.\scripts\setup_windows_dev.ps1
 uv run python -m benchmarks extraction worker-vs-7z-300m `
   --sunpack-version v0.7.9 `
   --worker-source-commit b9fdfa6d `
@@ -133,7 +135,7 @@ uv run python -m benchmarks extraction worker-vs-7z-300m `
   --json-out benchmarks/results/worker-vs-7z-300m-v0.7.9-b9fdfa6-rss-20261003.json
 ```
 
-独立脚本入口：
+该检出目录也支持直接运行脚本：
 
 ```powershell
 uv run python benchmarks/scenarios/worker_vs_7z_300m.py `

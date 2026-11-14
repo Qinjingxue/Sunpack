@@ -73,7 +73,7 @@ english.TaskContextMenuFailed=Failed to register the sunpack folder context menu
 english.TaskContextMenuRemoveFailed=Failed to remove the existing sunpack context menu.
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
 english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service could not be removed. Restart Windows and run the installer again.
-english.PrepareDataUpgradeFailed=Could not safely prepare the SunPack data upgrade. Back up your data and check the installed version, configuration and folder access before retrying.
+english.PrepareDataUpgradeFailed=Could not prepare the SunPack data upgrade. Check the configuration and folder access before retrying.
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
 english.UninstallStopFailed=sunpack runtime processes or the Watch Broker service could not be stopped. Please restart Windows and run the uninstaller again.
 english.DataDirectoryPermissionsFailed=Failed to secure the SunPack data directory: %s
@@ -103,7 +103,7 @@ chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜�
 chinesesimplified.TaskContextMenuRemoveFailed=无法清理现有 sunpack 右键菜单。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
 chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Broker 服务。请重启 Windows，然后重新运行安装程序。
-chinesesimplified.PrepareDataUpgradeFailed=无法安全准备 SunPack 数据升级。请先备份数据，再检查已安装版本号、配置和目录权限后重试。
+chinesesimplified.PrepareDataUpgradeFailed=无法准备 SunPack 数据升级。请检查配置和目录权限后重试。
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
 chinesesimplified.UninstallStopFailed=无法停止 sunpack 运行时进程或 Watch Broker 服务。请重启 Windows，然后重新运行卸载程序。
 chinesesimplified.DataDirectoryPermissionsFailed=无法设置 SunPack 数据目录权限：%s
@@ -786,8 +786,6 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  UserConfigPath: string;
 begin
   ApplyStartupTaskDefault;
   { PrepareToInstall can be retried after Watch has already been stopped. }
@@ -808,14 +806,12 @@ begin
   end;
   if not UpgradePrepared then
   begin
-    UserConfigPath := ExpandConstant('{commonappdata}\SunPack\sunpack_config.json');
-    InitializeLanguageOnInstall := not FileExists(UserConfigPath);
+    InitializeLanguageOnInstall := not FileExists(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
     if not UpgradeConfigurationFields then
     begin
       Result := CustomMessage('PrepareDataUpgradeFailed');
       Exit;
     end;
-    InitializeLanguageOnInstall := InitializeLanguageOnInstall or not FileExists(UserConfigPath);
     UpgradePrepared := True;
   end;
   if not RemoveMachinePath(ExistingApplicationDirectory) then

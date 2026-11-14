@@ -27,10 +27,7 @@ fn development_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn development_root_for(exe: Option<&Path>, cwd: &Path) -> Option<PathBuf> {
-    let checkout = |root: &Path| {
-        root.join("native/Cargo.toml").is_file()
-            && root.join("sunpack_advanced_config.json").is_file()
-    };
+    let checkout = |root: &Path| root.join("native/Cargo.toml").is_file();
     // Match main's module-root-first policy: the invoking directory may itself
     // be a different checkout, but must not replace the running application's root.
     exe.and_then(|exe| exe.ancestors().find(|root| checkout(root)))
@@ -199,7 +196,6 @@ mod entrypoint_tests {
         for root in [&application, &caller] {
             std::fs::create_dir_all(root.join("native")).unwrap();
             std::fs::write(root.join("native/Cargo.toml"), "[workspace]").unwrap();
-            std::fs::write(root.join("sunpack_advanced_config.json"), "{}").unwrap();
         }
         let exe = application.join(".cache/rust-target/x64/target/ci/sunpack-runtime.exe");
         assert_eq!(development_root_for(Some(&exe), &caller), Some(application));

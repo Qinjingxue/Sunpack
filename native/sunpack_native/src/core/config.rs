@@ -14,7 +14,7 @@ const SIMPLE: &str = "sunpack_config.json";
 const ADVANCED: &str = "sunpack_advanced_config.json";
 const OVERRIDES: &str = "SUNPACK_CONFIG_OVERRIDES";
 const DEFAULTS: &str = include_str!("../../../../sunpack_advanced_config.json");
-const CONFIG_CACHE_LIMIT: usize = 64;
+pub(crate) const CONFIG_CACHE_LIMIT: usize = 64;
 
 #[derive(Clone, PartialEq)]
 pub struct Config {
@@ -142,9 +142,20 @@ pub enum ScanFilterKind {
     Unknown(Box<str>),
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct PathRule {
+    inner: Arc<PathRuleInner>,
+}
+
+struct PathRuleInner {
     entries: [Vec<RuleEntry>; 4],
+    compiled: OnceLock<io::Result<NativePathRule>>,
+}
+
+impl PartialEq for PathRule {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) || self.inner.entries == other.inner.entries
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -822,12 +833,13 @@ impl Config {
             &["runtime", "process_mode"],
             "normal",
         ))?;
-        let recursive_extract = Recursion::parse(
-            &field(value, &["recursive_extract"])
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| field(value, &["recursive_extract"]).to_string()),
-        )?;
+        let recursive_extract = match field(value, &["recursive_extract"]) {
+            Value::String(value) => Recursion::parse(value)?,
+            Value::Number(value) => value.as_u64().filter(|&count| count > 0)
+                .map(|count| Recursion::Fixed(count as usize))
+                .ok_or_else(invalid_recursion)?,
+            _ => return Err(invalid_recursion()),
+        };
         let authorization_number = |name| {
             number_field(value, &["recursive_authorization", name])
                 .map_err(|_| invalid("recursive_authorization thresholds must be numeric"))
@@ -883,7 +895,7 @@ impl Config {
             .collect();
         let mut user_passwords: Vec<Arc<str>> = match value.get("user_passwords") {
             None | Some(Value::Null) => Vec::new(),
-            Some(value) => serde_json::from_value(value.clone())
+            Some(value) => serde::Deserialize::deserialize(value)
                 .map_err(|_| invalid("user_passwords must be an array of strings"))?,
         };
         let mut seen = std::collections::HashSet::new();
@@ -986,13 +998,13 @@ impl Recursion {
         match value.trim() {
             "*" => Ok(Self::Infinite),
             "?" => Ok(Self::Prompt),
-            count => positive_decimal(count)
-                .map(Self::Fixed)
-                .ok_or_else(|| {
-                    invalid("recursive_extract must be \"*\", \"?\", or a positive integer")
-                }),
+            count => positive_decimal(count).map(Self::Fixed).ok_or_else(invalid_recursion),
         }
     }
+}
+
+fn invalid_recursion() -> io::Error {
+    invalid("recursive_extract must be \"*\", \"?\", or a positive integer")
 }
 
 // Python int accepts Unicode decimal digits and single underscores between
@@ -1123,12 +1135,19 @@ impl PathRule {
             }).collect::<io::Result<Vec<_>>>()?;
             Ok(entries)
         };
-        Ok(Self { entries: [parse("paths")?, parse("files")?, parse("extensions")?, parse("full_names")?] })
+        Ok(Self {
+            inner: Arc::new(PathRuleInner {
+                entries: [parse("paths")?, parse("files")?, parse("extensions")?, parse("full_names")?],
+                compiled: OnceLock::new(),
+            }),
+        })
     }
 
     pub(crate) fn compile(&self) -> io::Result<NativePathRule> {
-        let [paths, files, extensions, full_names] = self.entries.clone();
-        NativePathRule::compile(paths, files, extensions, full_names)
+        self.inner.compiled.get_or_init(|| {
+            let [paths, files, extensions, full_names] = self.inner.entries.clone();
+            NativePathRule::compile(paths, files, extensions, full_names)
+        }).as_ref().cloned().map_err(|error| io::Error::new(error.kind(), error.to_string()))
     }
 }
 
@@ -1427,6 +1446,11 @@ mod filter_runtime_tests {
         assert!(before != changed);
         let omitted_rules = PathRule::parse(&serde_json::json!({"name":"blacklist","enabled":true})).unwrap();
         let empty_rules = PathRule::parse(&serde_json::json!({"paths":[],"files":[],"extensions":[],"full_names":[]})).unwrap();
+        // The compiled matcher is shared, and does not affect settings equality.
+        omitted_rules.compile().unwrap();
+        let copied = omitted_rules.clone();
+        assert!(Arc::ptr_eq(&omitted_rules.inner, &copied.inner));
+        assert!(copied.inner.compiled.get().is_some());
         assert!(omitted_rules == empty_rules);
     }
 

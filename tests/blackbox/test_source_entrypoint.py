@@ -18,11 +18,11 @@ def test_source_runtime_watch_and_native_launcher_share_checkout_root(package, r
     for source, destination in (
         (repo_root / ".cache" / "rust-target" / arch / target / profile / runtime.name, runtime),
         (repo_root / "native" / "sevenzip_bridge" / f"build-{arch}{suffix}" / "Release" / launcher.name, launcher),
-        (repo_root / "sunpack_advanced_config.json", checkout / "sunpack_advanced_config.json"),
     ):
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
     (checkout / "native" / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+    # The ordinary config alone is sufficient, even in a development build.
     (checkout / "sunpack_config.json").write_text('{"cli":{"language":"en"},"performance":{"persistent_server_idle_seconds":60}}', encoding="utf-8")
     (checkout / "builtin_passwords.json").write_text('{"passwords":[]}', encoding="utf-8")
     observed = checkout / "input"
@@ -33,7 +33,7 @@ def test_source_runtime_watch_and_native_launcher_share_checkout_root(package, r
     caller = tmp_path / "other checkout"
     (caller / "native").mkdir(parents=True)
     (caller / "native" / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
-    shutil.copyfile(repo_root / "sunpack_advanced_config.json", caller / "sunpack_advanced_config.json")
+    (caller / "sunpack_config.json").write_text('{"cli":{"language":"zh"}}', encoding="utf-8")
     (caller / "sunpack_watch_roots.txt").write_text("", encoding="utf-8")
     owner = None
     try:

@@ -452,6 +452,7 @@ impl CleanupOwner {
     }
 
     fn refresh(&mut self, paths: &[String]) {
+        if paths.is_empty() && self.paths.is_empty() { return; }
         let paths: HashSet<_> = paths.iter().map(|path| namespace_key(Path::new(path))).collect();
         let mut refs = self.registry.lock().unwrap();
         for key in self.paths.difference(&paths) {
@@ -1187,10 +1188,7 @@ impl<'run, O: Observer> Run<'run, O> {
             for decision in decisions { decision.complete(false); }
         });
         stage("discovery", &self.request.cancel).await?;
-        let mut discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates)?;
-        if self.resolve_aliases && discovered.tasks.len() > 1 {
-            dedup_resolved_plans(&mut discovered.tasks);
-        }
+        let discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates)?;
         // Request admission covers only the user's original selections, as in
         // main. Discovery may resolve different selections to one volume family;
         // claim_task shares reads within a request and serializes other requests.
@@ -1288,6 +1286,15 @@ impl<'run, O: Observer> Run<'run, O> {
         parent: Option<(TaskId, &ArchiveResult)>,
         spawner: Spawner<'run>,
     ) -> io::Result<Outcome> {
+        // Scan has no request claim to reveal aliases. Reuse the resolved
+        // paths from deduplication for read leases in both modes.
+        let resolved_paths = if depth == 1 && batch.tasks.len() > 1
+            && (self.resolve_aliases || (self.request.mode == Mode::Scan && self.request.inputs.len() > 1))
+        {
+            dedup_resolved_plans(&mut batch.tasks)
+        } else {
+            HashMap::new()
+        };
         let mut root_errors = HashMap::new();
         if depth == 1 && self.request.watch_catalog.is_some()
             && batch.errors.iter().any(|error| error.kind == InputErrorKind::EmbeddedDiscovery)
@@ -1322,16 +1329,6 @@ impl<'run, O: Observer> Run<'run, O> {
         let owner = Arc::clone(self);
         let has_root_errors = !root_errors.is_empty();
         let root_errors = Mutex::new(root_errors);
-        // Scan has no request claim to reveal aliases. For multiple targets,
-        // claim each distinct plan and reuse its resolved paths in the read
-        // lease. The resolution cache lives only through this planning step.
-        let resolved_paths = if depth == 1 && self.request.mode == Mode::Scan && self.request.inputs.len() > 1
-            && batch.tasks.len() > 1
-        {
-            dedup_resolved_plans(&mut batch.tasks)
-        } else {
-            HashMap::new()
-        };
         let task_count = batch.tasks.len();
         if depth == 1 {
             self.observer.roots_planned(batch.tasks.iter().map(|task| task.entry().entry_path.as_str()));
@@ -1519,7 +1516,8 @@ impl<'run, O: Observer> Run<'run, O> {
     }
 
     fn register_task(&self, task: Task) -> (Task, CleanupOwner, Option<HashSet<String>>) {
-        let sources = CleanupOwner::new(Arc::clone(&self.cleanup_refs), &task.owned_paths);
+        let paths = if self.request.mode == Mode::Extract { task.owned_paths.as_slice() } else { &[] };
+        let sources = CleanupOwner::new(Arc::clone(&self.cleanup_refs), paths);
         (task, sources, None)
     }
 
@@ -1888,7 +1886,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             had_checkpoints |= replacement_checkpoint.is_some();
                             executed.result.output = None;
                             this.observer.after_output(&executed.result)?;
-                            sources.refresh(&replacement.owned_paths);
+                            if this.request.mode == Mode::Extract { sources.refresh(&replacement.owned_paths); }
                             drop(lease);
                             let requested = this.requested_generation(&replacement, watch_root);
                             lease = this.claim_task(&replacement, None).await?;
@@ -2054,7 +2052,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     !superseded_candidates.contains(&path_key(path))
                         || retained.contains(&path_key(path))
                 });
-                sources.refresh(&promotion_sources);
+                if this.request.mode == Mode::Extract { sources.refresh(&promotion_sources); }
             }
             if depth > 1
                 && !cancel.cancelled()
@@ -2637,7 +2635,6 @@ impl<'run, O: Observer> Run<'run, O> {
         if self.request.mode != Mode::Extract {
             return None;
         }
-        let preferred = self.preferred_output(input, depth);
         let checkpoint = previous?;
         if !checkpoint.valid_for(input, generations)
             || !checkpoint.password_unchanged(|| candidates.signature(&input.entry_path)) {
@@ -2656,7 +2653,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             )
                             .is_some())
             }
-            None => output_candidate(&preferred, checkpoint.output()),
+            None => output_candidate(&self.preferred_output(input, depth), checkpoint.output()),
         };
         if !destination_matches {
             return None;

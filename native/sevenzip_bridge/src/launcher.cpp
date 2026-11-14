@@ -118,8 +118,7 @@ InstallContext install_context(const std::wstring& executable) {
         const bool ci = name.size() >= 3 && name.compare(name.size() - 3, 3, L"-ci") == 0;
         const auto arch = ci ? name.substr(0, name.size() - 3) : name;
         if ((arch == L"build-x64" || arch == L"build-arm64") &&
-            file_exists((root / L"native" / L"Cargo.toml").wstring()) &&
-            file_exists((root / L"sunpack_advanced_config.json").wstring())) {
+            file_exists((root / L"native" / L"Cargo.toml").wstring())) {
             const auto target = arch == L"build-arm64"
                 ? L"aarch64-pc-windows-msvc" : L"x86_64-pc-windows-msvc";
             const auto platform = arch == L"build-arm64" ? L"arm64" : L"x64";
@@ -778,12 +777,15 @@ bool consume_pause(std::vector<std::wstring>& arguments) {
 }
 
 void pause_on_exit(bool pause, const std::string& language) {
-    if (pause && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR) {
-        write_stream(STD_OUTPUT_HANDLE, localized(language, kPressEnterEn, kPressEnterZh));
-        wchar_t buffer[2]{};
-        DWORD read = 0;
-        ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 1, &read, nullptr);
-    }
+    if (!pause) return;
+    const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (!GetConsoleMode(input, &mode)) return;
+    const DWORD stream = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode) ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE;
+    write_stream(stream, localized(language, kPressEnterEn, kPressEnterZh));
+    wchar_t buffer[2]{};
+    DWORD read = 0;
+    ReadConsoleW(input, buffer, 1, &read, nullptr);
 }
 
 }  // namespace

@@ -123,7 +123,11 @@ impl<'a> Report<'a> {
                     DiscoverySource::Direct => "direct",
                 };
                 details = json!({"path": path, "reason": reason});
-                raw_message = Some(error.clone());
+                // Preflight uses the localized discovery reason when it has a
+                // message key. Native I/O diagnostics have no translation key.
+                if spec.key.is_empty() {
+                    raw_message = Some(error.clone());
+                }
             }
             Some(FailureContext::InputAdmission { missing_paths }) => {
                 stage = "input_admission";
@@ -556,7 +560,7 @@ mod tests {
         }));
         let leaf = Report::from_failure(&failure, Language::En);
         assert_eq!(leaf.stage, "embedded_boundary");
-        assert!(leaf.message.is_empty());
+        assert_eq!(leaf.message, Language::En.text("failure.possible_missing_volume"));
         let archives = [ArchiveResult {
             path: "carrier.bin".into(), format: "zip".into(), output: None,
             failure: Some(failure), files: 0, bytes: 0, encrypted: None, depth: 0,
@@ -569,7 +573,7 @@ mod tests {
         let reports = serde_json::to_value(collect(&archives, Language::En)).unwrap();
         assert_eq!(reports[0]["kind"], "missing_volume");
         assert_eq!(reports[0]["stage"], "embedded_boundary");
-        assert_eq!(reports[0]["message"], "");
+        assert_eq!(reports[0]["message"], Language::En.text("failure.possible_missing_volume"));
         assert_eq!(reports[0]["causes"], json!([]));
         assert_eq!(reports[0]["details"]["reason"], "missing_volume");
     }

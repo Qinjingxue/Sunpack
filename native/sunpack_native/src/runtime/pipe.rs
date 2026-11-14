@@ -22,7 +22,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    LockFileEx, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
+    LockFileEx, UnlockFileEx, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
     FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
@@ -73,7 +73,7 @@ fn token_bytes(hex: &str) -> Option<[u8; 32]> {
 
 struct StateFile {
     path: PathBuf,
-    _lock: File,
+    lock: File,
 }
 
 impl StateFile {
@@ -88,14 +88,28 @@ impl StateFile {
             .write(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(lock_path)?;
-        // Launchers serialize startup, not the lifetime of an existing server.
-        // A competing server must exit when the owner is still alive, including
-        // when its endpoint state cannot be read by the launcher.
-        let mut range = OVERLAPPED::default();
-        if unsafe { LockFileEx(lock.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &mut range) } == 0 {
+        let lock_range = |offset, flags| {
+            let mut range = OVERLAPPED::default();
+            range.Anonymous.Anonymous.Offset = offset;
+            if unsafe { LockFileEx(lock.as_raw_handle(), flags, 0, 1, 0, &mut range) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        // An unreadable endpoint must not make a second launcher wait for a
+        // live listener. After it closes, wait for the old owner's log and
+        // state file to finish before opening a replacement.
+        lock_range(0, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)?;
+        lock_range(1, LOCKFILE_EXCLUSIVE_LOCK)?;
+        Ok(Self { path, lock })
+    }
+
+    fn stop_accepting(&self) -> io::Result<()> {
+        let mut listener = OVERLAPPED::default();
+        if unsafe { UnlockFileEx(self.lock.as_raw_handle(), 0, 1, 0, &mut listener) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { path, _lock: lock })
+        Ok(())
     }
 
     fn publish(
@@ -824,7 +838,7 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
                 (timeout, state.shutting_down)
             };
             if shutting_down {
-                return Ok(());
+                break;
             }
             let handles = [accept.event.raw(), server.wake.raw()];
             match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, wait) } {
@@ -839,13 +853,17 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
                         Err(error) => return Err(error),
                     }
                 }
-                WAIT_TIMEOUT if wait == 0 => return Ok(()),
+                WAIT_TIMEOUT if wait == 0 => break,
                 WAIT_TIMEOUT => {}
                 value if value == WAIT_OBJECT_0 + 1 => {}
                 _ => return Err(io::Error::last_os_error()),
             }
         }
+        state.stop_accepting()
     })();
+    if result.is_err() {
+        let _ = state.stop_accepting();
+    }
     let exit_reason = if result.is_err() {
         "error"
     } else if server.activity.lock().unwrap().shutting_down {

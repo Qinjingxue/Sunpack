@@ -14,6 +14,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, BufWriter, Write};
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -24,18 +25,38 @@ pub(super) mod reporting;
 pub(super) struct Host {
     pub(super) scheduler: Arc<crate::pipeline::Scheduler>,
     engine: OnceLock<Arc<Engine>>,
-    passwords: Mutex<Option<Arc<passwords::BuiltinStore>>>,
+    passwords: Arc<Mutex<Option<Arc<passwords::BuiltinStore>>>>,
     idle: Mutex<Duration>,
     pub(super) watch: Arc<watch::Watch>,
-    sources: Mutex<SourceObservers>,
+    sources: Mutex<VecDeque<Arc<SourceObservers>>>,
 }
 
-#[derive(Default)]
 struct SourceObservers {
     paths: Vec<PathBuf>,
+    password_path: PathBuf,
     observers: Vec<watch::ConfigSubscription>,
-    passwords: Arc<Mutex<Option<std::sync::Weak<passwords::BuiltinStore>>>>,
-    changed: Arc<std::sync::atomic::AtomicBool>,
+    changed: Arc<AtomicU64>,
+    checked: AtomicU64,
+}
+
+impl SourceObservers {
+    fn alive(&self) -> bool {
+        !self.observers.is_empty() && self.observers.iter().all(watch::ConfigSubscription::alive)
+    }
+
+    fn current(&self) -> bool {
+        if !self.alive() {
+            return false;
+        }
+        let generation = self.changed.load(Ordering::Acquire);
+        if generation > self.checked.load(Ordering::Acquire) {
+            if !watch::observes_files(&self.paths, &self.password_path, &self.observers) {
+                return false;
+            }
+            self.checked.fetch_max(generation, Ordering::Release);
+        }
+        true
+    }
 }
 
 impl Host {
@@ -47,7 +68,7 @@ impl Host {
         Self {
             scheduler: crate::pipeline::Scheduler::new(),
             engine: OnceLock::new(),
-            passwords: Mutex::default(),
+            passwords: Arc::default(),
             idle: Mutex::new(Duration::from_secs_f64(config::default_idle_seconds())),
             watch: Arc::new(watch::Watch::new(Arc::new(wake))),
             sources: Mutex::default(),
@@ -79,85 +100,87 @@ impl Host {
         ))
     }
 
-    fn passwords(&self, cwd: &Path) -> io::Result<Arc<passwords::BuiltinStore>> {
-        let source = passwords::BuiltinStore::shared(cwd)?;
-        let mut held = self.passwords.lock().unwrap();
-        if held
-            .as_ref()
-            .is_none_or(|previous| previous.path() != source.path())
-        {
-            *held = Some(Arc::clone(&source));
-        }
-        let sources = self.sources.lock().unwrap();
-        let mut observed = sources.passwords.lock().unwrap();
-        if observed.as_ref().and_then(std::sync::Weak::upgrade)
-            .is_none_or(|previous| !Arc::ptr_eq(&previous, &source)) {
-            *observed = Some(Arc::downgrade(&source));
-            source.invalidate();
-        }
-        Ok(source)
-    }
-
     fn password_snapshot(&self, cwd: &Path) -> io::Result<Arc<passwords::PasswordSnapshot>> {
-        let store = self.passwords(cwd)?;
-        let sources = self.sources.lock().unwrap();
-        let observed = sources.paths.contains(&store.path().to_path_buf())
-            && !sources.observers.is_empty() && sources.observers.iter().all(watch::ConfigSubscription::alive);
-        drop(sources);
-        Ok(if observed { store.observed_snapshot() } else { store.snapshot_for_request() })
-    }
-
-    fn generation(&self, cwd: &Path, inspect: bool) -> config::ConfigRead {
-        let config_sources = config::resolve_sources(cwd);
-        let mode = if inspect { ReadMode::Inspect } else { ReadMode::CheckStamp };
-        let mut paths = config::watch_paths(cwd, &config_sources);
-        let password_path = resources::writable_data_dir(cwd).map(|dir| dir.join(passwords::FILENAME));
-        let Ok(password_path) = password_path else {
-            return config::read_generation(cwd, config_sources, mode);
-        };
-        paths.push(password_path.clone());
-        let mut retired = Vec::new();
-        let mut sources = self.sources.lock().unwrap();
-        let unobserved = sources.observers.is_empty() || sources.observers.iter().any(|observer| !observer.alive());
-        let new_sources = sources.paths != paths;
-        let changed = sources.changed.swap(false, std::sync::atomic::Ordering::AcqRel);
-        if unobserved || new_sources
-            || (changed && !watch::observes_files(&paths, &password_path, &sources.observers)) {
-            let passwords = Arc::clone(&sources.passwords);
-            let changed = Arc::clone(&sources.changed);
-            match watch::observe_files(&paths, &password_path, move |config, changed_passwords| {
-                if config {
-                    config::invalidate_sources();
-                    changed.store(true, std::sync::atomic::Ordering::Release);
-                }
-                if changed_passwords {
-                    if let Some(store) = passwords.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
-                        store.invalidate();
-                    }
-                }
-            }) {
-                Ok(observers) => {
-                    retired = std::mem::replace(&mut sources.observers, observers);
-                    sources.paths = paths;
-                    if unobserved || new_sources {
-                        config::invalidate_sources();
-                        if let Some(store) = sources.passwords.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
-                            store.invalidate();
-                        }
-                    }
-                }
-                Err(_) => {
-                    sources.changed.store(true, std::sync::atomic::Ordering::Release);
-                    drop(sources);
-                    return config::read_generation(cwd, config_sources, mode);
-                },
+        let store = passwords::BuiltinStore::shared(cwd)?;
+        {
+            let mut held = self.passwords.lock().unwrap();
+            if held.as_ref().is_none_or(|previous| !Arc::ptr_eq(previous, &store)) {
+                // A notification may have arrived before this source was held.
+                store.invalidate();
+                *held = Some(Arc::clone(&store));
             }
         }
-        drop(sources);
-        // The last reader of a removed directory joins its native observer.
-        // Never do that while holding the request source registry lock.
+        let source = self.sources.lock().unwrap().iter()
+            .find(|source| source.password_path == store.path()).cloned();
+        Ok(if source.as_ref().is_some_and(|source| source.current()) {
+            store.observed_snapshot()
+        } else {
+            store.snapshot_for_request()
+        })
+    }
+
+    fn generation(&self, cwd: &Path, config_sources: config::ConfigSources, inspect: bool) -> config::ConfigRead {
+        let mode = if inspect { ReadMode::Inspect } else { ReadMode::CheckStamp };
+        let Ok(data) = resources::writable_data_dir(cwd) else {
+            return config::read_generation(cwd, config_sources, mode);
+        };
+        let paths = config::watch_paths(cwd, &config_sources);
+        let password_path = data.join(passwords::FILENAME);
+        let matches = |source: &Arc<SourceObservers>| source.paths == paths && source.password_path == password_path;
+        let previous = {
+            let mut sources = self.sources.lock().unwrap();
+            sources.iter().position(&matches).and_then(|index| sources.remove(index)).inspect(|source| {
+                sources.push_front(Arc::clone(source));
+            })
+        };
+        if previous.as_ref().is_some_and(|source| source.current()) {
+            // Keep the subscription alive through the read, even if another
+            // request evicts or replaces the cache entry concurrently.
+            return config::read_generation(cwd, config_sources, if inspect { mode } else { ReadMode::Observe });
+        }
+        let passwords = Arc::clone(&self.passwords);
+        let changed = Arc::new(AtomicU64::new(0));
+        let notified = Arc::clone(&changed);
+        let notify_path = password_path.clone();
+        let observers = watch::observe_files(&paths, &password_path, move |config, changed_passwords| {
+            if config {
+                config::invalidate_sources();
+                notified.fetch_add(1, Ordering::Release);
+            }
+            if changed_passwords {
+                if let Some(store) = passwords.lock().unwrap().as_ref().filter(|store| store.path() == notify_path) {
+                    store.invalidate();
+                }
+            }
+        });
+        let Ok(observers) = observers else {
+            return config::read_generation(cwd, config_sources, mode);
+        };
+        if let Some(store) = self.passwords.lock().unwrap().as_ref().filter(|store| store.path() == password_path) {
+            store.invalidate();
+        }
+        // A cold or re-armed observer cannot account for edits before it
+        // started. Read once through it before allowing notification-only hits.
+        let read = config::read_generation(cwd, config_sources, mode);
+        let source = Arc::new(SourceObservers {
+            paths, password_path, observers, changed, checked: AtomicU64::new(0),
+        });
+        let retired = {
+            let mut sources = self.sources.lock().unwrap();
+            let current = sources.iter().position(|entry| entry.paths == source.paths && entry.password_path == source.password_path);
+            if current.is_some_and(|index| previous.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &sources[index]))) {
+                None // Another reader already published a live group.
+            } else {
+                let retired = current.and_then(|index| sources.remove(index));
+                let evicted = if sources.len() == config::CONFIG_CACHE_LIMIT { sources.pop_back() } else { None };
+                sources.push_front(source);
+                retired.or(evicted)
+            }
+        };
+        // Dropping the last subscription joins the native observer, so let it
+        // retire after releasing the registry lock.
         drop(retired);
-        config::read_generation(cwd, config_sources, if inspect { mode } else { ReadMode::Observe })
+        read
     }
 }
 
@@ -775,7 +798,7 @@ pub(super) async fn run(
     let error_argv = (options.json && matches!(options.command, "scan" | "extract")).then_some(args);
     let inspection = options.command == "doctor" || (options.command == "config" && !options.rule_stdin);
     let generation = (!options.rule_stdin && options.command != "version")
-        .then(|| host.generation(cwd, inspection));
+        .then(|| host.generation(cwd, config::resolve_sources(cwd), inspection));
     let language = generation.as_ref().map_or_else(|| config::load_language(cwd), config::ConfigRead::language);
     let execution = match options.command {
         "scan" | "extract" => match generation.unwrap().normalized(true) {
@@ -2656,6 +2679,30 @@ async fn watch_command(
 #[cfg(test)]
 mod option_tests {
     use super::*;
+
+    #[test]
+    fn alternating_request_sources_reuse_their_config_subscriptions() {
+        let path_a = crate::test_support::temp_file("cli_config_a", br#"{"cli":{"language":"en"}}"#);
+        let path_b = crate::test_support::temp_file("cli_config_b", br#"{"cli":{"language":"zh"}}"#);
+        let cwd = path_a.parent().unwrap();
+        let mut source_a = config::ConfigSources::default();
+        source_a.simple = Some(path_a.clone());
+        let mut source_b = config::ConfigSources::default();
+        source_b.simple = Some(path_b.clone());
+        let host = Host::new();
+        assert_eq!(host.generation(cwd, source_a.clone(), false).language(), Language::En);
+        let first = Arc::clone(host.sources.lock().unwrap().front().unwrap());
+        assert_eq!(host.generation(cwd, source_b, false).language(), Language::Zh);
+        assert_eq!(host.generation(cwd, source_a, false).language(), Language::En);
+        let sources = host.sources.lock().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(Arc::ptr_eq(sources.front().unwrap(), &first));
+        drop(sources);
+        drop(first);
+        drop(host);
+        std::fs::remove_file(path_a).unwrap();
+        std::fs::remove_file(path_b).unwrap();
+    }
 
     #[test]
     fn password_display_escapes_controls_without_changing_candidates() {

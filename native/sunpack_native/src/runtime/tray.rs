@@ -216,13 +216,14 @@ fn load_icon() -> (HICON, bool) {
     unsafe {
         let tray = windows::wide(OsStr::new("Shell_TrayWnd"));
         let taskbar = FindWindowW(tray.as_ptr(), null());
-        let dpi = if taskbar.is_null() {
-            96
-        } else {
-            GetDpiForWindow(taskbar).max(96)
+        let dpi = if taskbar.is_null() { 0 } else { GetDpiForWindow(taskbar) };
+        let dpi = if dpi == 0 { 96 } else { dpi };
+        let icon_size = |metric| {
+            let size = GetSystemMetricsForDpi(metric, dpi);
+            if size == 0 { 16 } else { size }
         };
-        let width = GetSystemMetricsForDpi(SM_CXSMICON, dpi).max(16);
-        let height = GetSystemMetricsForDpi(SM_CYSMICON, dpi).max(16);
+        let width = icon_size(SM_CXSMICON);
+        let height = icon_size(SM_CYSMICON);
         let icon = LoadImageW(
             GetModuleHandleW(null()),
             1usize as *const u16,

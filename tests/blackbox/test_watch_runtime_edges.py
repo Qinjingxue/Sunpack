@@ -6,11 +6,24 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import psutil
 
 from tests.helpers.native_fixture import native_fixture
 
 
 pytestmark = pytest.mark.requires_watch_broker
+
+
+def test_rootless_watch_restores_foreground_process_priority(package, tmp_path):
+    package.configure(runtime={"process_mode": "normal"})
+    package.json("watch", "start", "--no-tray")
+    source = tmp_path / "archive.zip"
+    _zip(source, "payload.txt", b"payload")
+    assert package.json("scan", source)["summary"]["archive_count"] == 1
+
+    state = next(package.data.glob("runtime-*.state"))
+    owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
+    assert owner.nice() == psutil.NORMAL_PRIORITY_CLASS
 
 
 def _zip(path, name, content):

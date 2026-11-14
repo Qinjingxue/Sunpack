@@ -134,12 +134,14 @@ peaks and are not summed across formats.
 
 ## Reproduction
 
-Use the recorded source revision and its matching native extension and worker
-binary when reproducing the historical run below.
+Run the historical worker benchmark in a checkout of `b9fdfa6d` with its matching
+native extension and worker binary. The [current benchmark runner](../benchmarks/README.md)
+measures the full SunPack CLI against 7-Zip.
 
 ```powershell
-uv sync --locked --extra dev
-cmake --build native/sevenzip_bridge/build-x64 --config Release --target sunpack_sevenzip_worker --parallel
+git worktree add --detach ..\sunpack-benchmark-b9fdfa6d b9fdfa6d
+Set-Location ..\sunpack-benchmark-b9fdfa6d
+.\scripts\setup_windows_dev.ps1
 uv run python -m benchmarks extraction worker-vs-7z-300m `
   --sunpack-version v0.7.9 `
   --worker-source-commit b9fdfa6d `
@@ -149,7 +151,7 @@ uv run python -m benchmarks extraction worker-vs-7z-300m `
   --json-out benchmarks/results/worker-vs-7z-300m-v0.7.9-b9fdfa6-rss-20261003.json
 ```
 
-The direct script entry point is:
+The direct script entry point in that checkout is:
 
 ```powershell
 uv run python benchmarks/scenarios/worker_vs_7z_300m.py `

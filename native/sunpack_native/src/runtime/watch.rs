@@ -350,9 +350,14 @@ impl Watch {
 
     pub(super) fn foreground_finished(&self, when_unwatched: impl FnOnce()) {
         let running = self.running.lock().unwrap();
-        if let Some(run) = running.as_ref().filter(|run| run.continuous()) {
-            run.hub.update(|signals| signals.foreground_finished = true);
-        } else {
+        let external = self.external.lock().unwrap();
+        let delivered = running.as_ref().filter(|run| run.continuous()).is_some_and(|run| {
+            run.hub.update(|signals| signals.foreground_finished = true)
+        });
+        let defer_priority = delivered && external.as_ref().is_some_and(|external| !external.scopes.is_empty());
+        drop(external);
+        drop(running);
+        if !defer_priority {
             when_unwatched();
         }
     }
@@ -749,12 +754,15 @@ impl Watch {
     }
 
     pub(super) fn register_external_output(&self, path: &Path) -> io::Result<()> {
+        let create = || crate::scan::scope::create_output_root_exclusive(path)
+            .map_err(crate::pipeline::OutputCreateError::wrap);
         if let Some((journal, scopes)) = self.external_journal() {
             // Notification classification takes this same publication gate.
             // Never expose a created output before its owned identity exists.
+            let mut created = false;
             journal.commit(true, |state| {
-                crate::scan::scope::create_output_root_exclusive(path)
-                    .map_err(crate::pipeline::OutputCreateError::wrap)?;
+                create()?;
+                created = true;
                 let paths = crate::path_keys::output_path_aliases(path)?;
                 if !paths.iter().any(|path| scopes.iter().any(|scope| scope.intersects_output(path)))
                     || paths.iter().any(|path| state.owned_root(path).is_some())
@@ -764,11 +772,11 @@ impl Watch {
                 let identity = output_identity(&path.to_string_lossy())?;
                 Ok(crate::watch_store::NativeWatchOperations::owned_outputs(&paths, &[&identity]))
             })?;
-        } else {
-            crate::scan::scope::create_output_root_exclusive(path)
-                .map_err(crate::pipeline::OutputCreateError::wrap)?;
+            if created { return Ok(()); }
         }
-        Ok(())
+        // The final root may have been removed after the journal was captured.
+        // A suspended journal skips its callback, but CLI still owns the mkdir.
+        create()
     }
 
     pub(super) fn prepare_external_flatten(
@@ -1093,14 +1101,15 @@ impl Hub {
         }
     }
 
-    fn update(&self, update: impl FnOnce(&mut Signals)) {
+    fn update(&self, update: impl FnOnce(&mut Signals)) -> bool {
         let mut signals = self.signals.lock().unwrap();
         if self.stopped.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         update(&mut signals);
         drop(signals);
         self.wake.notify_one();
+        true
     }
 
     fn queue_reload(&self, wait: Option<CommandReply<bool>>) {
@@ -2123,26 +2132,24 @@ impl Scheduler {
     }
 
     fn reconcile_tray(cwd: &Path, settings: &Config, enabled: bool, hub: &Arc<Hub>,
-        journal: Weak<journal::Journal>, tray: &mut Option<super::tray::Tray>) {
+        log: &Arc<crate::event_log::NativeEventLog>, tray: &mut Option<super::tray::Tray>) {
         let show_tray = enabled && settings.watch.tray_enabled;
         if show_tray && tray.is_none() {
             let hub = Arc::clone(hub);
-            let diagnostic = journal.clone();
+            let diagnostic = Arc::downgrade(log);
             match super::tray::Tray::start(cwd, settings.cli.language, move |action| {
                 match action {
                     super::tray::Action::Reload => hub.queue_reload(None),
                     super::tray::Action::Stop => hub.stop(),
                 }
             }, move |message, error| {
-                if let Some(journal) = diagnostic.upgrade() {
-                    journal.log(json!({"event":"tray_callback_error", "error":error.to_string(),
+                if let Some(log) = diagnostic.upgrade() {
+                    let _ = log.write(json!({"event":"tray_callback_error", "error":error.to_string(),
                         "error_type":format!("{:?}", error.kind()), "message":message}));
                 }
             }) {
                 Ok(value) => *tray = Some(value),
-                Err(error) => if let Some(journal) = journal.upgrade() {
-                    journal.log(json!({"event":"tray_start_failed", "error":error.to_string()}));
-                },
+                Err(error) => { let _ = log.write(json!({"event":"tray_start_error", "error":error.to_string()})); }
             }
         } else if !show_tray {
             tray.take();
@@ -2156,10 +2163,10 @@ impl Scheduler {
             return;
         }
         Self::reconcile_tray(&self.cwd, &self.settings, self.tray_enabled,
-            &self.hub, Arc::downgrade(&self.journal), &mut self.tray);
+            &self.hub, self.journal.event_log(), &mut self.tray);
         if self.options.is_some() && !self.roots.is_empty() && self.settings.watch.toast_enabled {
             if self.toast.is_none() {
-                let diagnostic = state_dir(&self.cwd).map(|dir| dir.join("toast-diagnostic.log"));
+                let diagnostic = state_dir(&self.cwd).map(|dir| dir.join("toast_host_events.jsonl"));
                 let journal = Arc::downgrade(&self.journal);
                 match diagnostic.and_then(|path| {
                     super::toast::Toast::start(
@@ -2207,7 +2214,7 @@ impl Scheduler {
                             // The window thread owns clipboard persistence, as in main.
                             // Only publish an invalidation to the scheduler after saving.
                             match passwords.merge_clipboard(&values, clipboard_limit) {
-                                Ok(true) => hub.update(|signals| signals.password_changed = true),
+                                Ok(true) => { hub.update(|signals| signals.password_changed = true); }
                                 Ok(false) => {},
                                 Err(error) => journal.log(json!({
                                     "event":"watch_clipboard_password_save_failed", "error":error.to_string(),
@@ -2302,6 +2309,7 @@ impl Scheduler {
             });
             Ok((entries, next, policy_changed))
         })??;
+        if next.is_empty() && self.journal.suspended() { return Ok((false, false)); }
         if self.journal.resume()? {
             self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(),
                 Some(state_dir(&self.cwd)?.to_string_lossy().into_owned())));
@@ -2586,7 +2594,7 @@ impl Scheduler {
             let external = Arc::clone(&self.external);
             let mut settings = Arc::clone(&self.settings);
             let password_path = self.passwords.path().to_owned();
-            let journal = Arc::downgrade(&self.journal);
+            let log = Arc::clone(self.journal.event_log());
             let roots: Vec<_> = self.roots.values().map(|(root, _)| root.clone()).collect();
             let tray_enabled = self.tray_enabled;
             let mut observers = std::mem::take(&mut self.config_observers);
@@ -2600,7 +2608,10 @@ impl Scheduler {
                 let signals = hub.wait(None);
                 for ( _, waiter) in signals.cancel { let _ = waiter.send(Ok(false)); }
                 for waiter in signals.once { let _ = waiter.send(Err(io::Error::other(error.to_string()))); }
-                for waiter in signals.rebuild { let _ = waiter.send(Err(io::Error::other(error.to_string()))); }
+                if !signals.rebuild.is_empty() {
+                    let rebuilt = log.rebuild().and_then(|()| log.flush()).is_ok();
+                    for waiter in signals.rebuild { let _ = waiter.send(Ok(rebuilt)); }
+                }
                 for root in signals.roots { root.reply.complete(Err(io::Error::other(error.to_string()))); }
                 if !signals.reload { continue; }
                 let reload = (|| {
@@ -2617,9 +2628,10 @@ impl Scheduler {
                             &roots_path(&cwd)?, &password_path, &hub)?;
                         settings = Arc::new(snapshot.config);
                         super::diagnostics::retention(settings.watch.event_log_retention_days);
+                        log.configure_retention(settings.watch.event_log_retention_days.min(u64::from(u32::MAX)) as u32)?;
                         windows::configure_priority(&engine, settings.runtime.process_mode);
                         Self::reconcile_tray(&cwd, &settings, tray_enabled, &hub,
-                            journal.clone(), &mut tray);
+                            &log, &mut tray);
                         observers = next_observers;
                         return Ok(shell_changed);
                     }
@@ -2732,7 +2744,7 @@ impl Scheduler {
             if signals.password_changed || !signals.reload_waiters.is_empty() {
                 self.password_update(false)?;
             }
-            if signals.foreground_finished && !self.roots.is_empty() {
+            if signals.foreground_finished {
                 self.arm_idle_cleanup();
             } else if signals.password_changed && self.cache_deadline.is_none() {
                 let path = self.passwords.path().to_string_lossy();
