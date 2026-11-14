@@ -5611,7 +5611,10 @@ fn promoted_checkpoints<'a>(
 ) -> Vec<&'a crate::pipeline::InputCheckpoint> {
     let sources = sources.iter().map(|source| key(source)).collect::<HashSet<_>>();
     let direct = |checkpoint: &crate::pipeline::InputCheckpoint| {
-        checkpoint.source_paths().any(|source| sources.contains(&key(source)))
+        // A provisional volume representative can own completed siblings in
+        // another physical file. Keep that task's receipts across head changes.
+        sources.contains(&key(checkpoint.carrier()))
+            || checkpoint.source_paths().any(|source| sources.contains(&key(source)))
     };
     let roots = checkpoints.iter().filter(|checkpoint| checkpoint.has_output() && direct(checkpoint))
         .map(|checkpoint| (key(checkpoint.output()), String::new())).collect::<BTreeMap<_, _>>();
@@ -6179,7 +6182,7 @@ impl Observer for WatchObserver {
     }
 
     fn register_output(&self, archive: &ArchiveResult, path: &Path) -> io::Result<()> {
-        let Some(owner) = self.owner(archive) else {
+        let Some(owner) = self.owner(archive).or_else(|| self.owner_for_path(path)) else {
             return Err(io::Error::other("Watch output has no durable input owner"));
         };
         let output = path.to_string_lossy().into_owned();
@@ -6194,7 +6197,9 @@ impl Observer for WatchObserver {
     }
 
     fn reuse_output(&self, archive: &ArchiveResult, path: &Path) -> io::Result<()> {
-        let Some(owner) = self.owner(archive) else {
+        // Decryption can replace a provisional tail representative with the
+        // actual carrier. Its retained output already routes to the WAL owner.
+        let Some(owner) = self.owner(archive).or_else(|| self.owner_for_path(path)) else {
             return Err(io::Error::other("Watch output has no durable input owner"));
         };
         // The retained carrier already owns this child namespace. The existing

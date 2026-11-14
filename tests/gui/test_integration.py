@@ -23,6 +23,36 @@ def test_gui_template_texts_exist_in_both_languages():
             assert all(catalog[key].get(language) for language in ("zh", "en")), (template.name, key)
 
 
+@pytest.mark.requires_watch_broker
+def test_encrypted_rar5_recovery_keeps_one_gui_card(package, tmp_path, repo_root):
+    # Reuse the real archive lifecycle. Runtime-only assertions cannot catch
+    # stale cards, lost member chips, or C++ status projection after head changes.
+    from tests.blackbox.test_format_volume_matrix import _watch_encrypted_rar5_recovery
+
+    arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
+    binary = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"))
+    assert binary.is_file(), "Build the native GUI with scripts/build_gui.ps1"
+
+    def project(phase, parts, head):
+        result = subprocess.run(
+            [str(binary), "--project", str(package.data / ".sunpack_watch" / "events.json")],
+            capture_output=True, text=True, encoding="utf-8", check=True, timeout=30,
+        )
+        rows = json.loads(result.stdout)["tasks"]["rows"]
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row["status"] == ("taskSucceeded" if phase == "done" else "taskWaiting"), row
+        assert row["statusText"] == {"password": "等待密码", "volumes": "等待分卷", "done": "成功"}[phase], row
+        assert set(row["parts"]) == {part.name for part in parts}, row
+        if head:
+            assert Path(row["path"]) == head and row["name"] == head.name, row
+        assert not row["error"] and not row["errorType"], row
+        if phase == "done":
+            assert row["outputs"] and all(Path(path).is_dir() for path in row["outputs"]), row
+
+    _watch_encrypted_rar5_recovery(package, tmp_path, project)
+
+
 def _ps_string(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 

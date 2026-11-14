@@ -751,7 +751,6 @@ impl OutputHistory {
 struct OutputClaim {
     owner: u64,
     source: String,
-    path: PathBuf,
 }
 
 struct OutputReservationGuard {
@@ -766,12 +765,12 @@ impl Drop for OutputReservationGuard {
 }
 
 impl OutputNames {
-    fn claim(&mut self, path: &Path, key: String, owner: u64, source: String) {
+    fn claim(&mut self, key: String, owner: u64, source: String) {
         if !self.claimed.contains_key(&key) {
             self.owners.entry(owner).or_default().push(key.clone());
         }
         self.claimed.insert(key, OutputClaim {
-            owner, source, path: path.to_owned(),
+            owner, source,
         });
     }
 
@@ -842,38 +841,39 @@ impl OutputNames {
             .is_some_and(|(path, _)| path.starts_with(&prefix))
     }
 
-    fn conflicting_ancestor(&self, parent: &str, owner: u64, input: Option<&str>) -> Option<PathBuf> {
-        // Check root-first, so rerouting leaves every unrelated owning tree.
-        let ancestors: Vec<_> = crate::path_keys::path_ancestors(parent).collect();
-        for ancestor in ancestors.into_iter().rev() {
+    fn conflicting_ancestor<'a>(&self, parent: &'a str, owner: u64, input: Option<&str>) -> Option<&'a str> {
+        // Keep the root-most conflict so rerouting leaves every owning tree.
+        let mut conflict = None;
+        for ancestor in crate::path_keys::path_ancestors(parent) {
             if let Some(claim) = self.claimed.get(ancestor) {
                 if claim.owner == owner && input.is_some_and(|input| {
                     input == ancestor || input.strip_prefix(ancestor).is_some_and(|tail| tail.starts_with('\\'))
                 }) {
                     continue;
                 }
-                return Some(claim.path.clone());
+                conflict = Some(ancestor);
             }
         }
-        None
+        conflict
     }
 
-    fn retain(&mut self, path: &Path, owner: u64, source: &Path, input: Option<&Path>) -> bool {
+    fn retain(registry: &Mutex<Self>, path: &Path, owner: u64, source: &Path, input: Option<&Path>) -> bool {
         let key = output_key(path);
         let source = resolved_key(source);
         let input = input.map(output_key);
+        let parent = output_key(path.parent().unwrap_or(Path::new(".")));
+        let mut names = registry.lock().unwrap();
         // Several continued carrier segments share one container. Only the
         // same physical source in this request may reuse that exact claim.
-        if self.claimed.get(&key).is_some_and(|claim| {
+        if names.claimed.get(&key).is_some_and(|claim| {
             claim.owner == owner && claim.source == source
         }) {
             return true;
         }
-        let parent = output_key(path.parent().unwrap_or(Path::new(".")));
-        if self.conflicting_ancestor(&parent, owner, input.as_deref()).is_some() || self.has_under(&key) {
+        if names.conflicting_ancestor(&parent, owner, input.as_deref()).is_some() || names.has_under(&key) {
             return false;
         }
-        self.claim(path, key, owner, source);
+        names.claim(key, owner, source);
         true
     }
 
@@ -881,12 +881,9 @@ impl OutputNames {
         registry: &Mutex<Self>, preferred: PathBuf, result: &ArchiveResult,
         observer: &impl Observer, owner: u64, input: Option<&Path>,
     ) -> io::Result<Result<PathBuf, Failure>> {
-        let parent = output_key(preferred.parent().unwrap_or(Path::new(".")));
-        let source = resolved_key(&result.path);
-        let input = input.map(output_key);
         loop {
-            let (path, claim_key) = match registry.lock().unwrap().plan_keys(
-                preferred.clone(), parent.clone(), owner, &source, input.as_deref(),
+            let (path, claim_key) = match Self::plan_checked(
+                registry, preferred.clone(), &result.path, owner, input, Path::try_exists,
             )? {
                 Ok(plan) => plan,
                 Err(failure) => return Ok(Err(failure)),
@@ -914,77 +911,118 @@ impl OutputNames {
     }
 
     fn plan(
-        &mut self, preferred: PathBuf, source: &Path,
+        registry: &Mutex<Self>, preferred: PathBuf, source: &Path,
         owner: u64, input: Option<&Path>,
     ) -> io::Result<Result<PathBuf, Failure>> {
-        let parent = output_key(preferred.parent().unwrap_or(Path::new(".")));
-        self.plan_keys(preferred, parent, owner, &resolved_key(source),
-            input.map(output_key).as_deref()).map(|result| result.map(|(path, _)| path))
+        Self::plan_checked(registry, preferred, source, owner, input, Path::try_exists)
+            .map(|result| result.map(|(path, _)| path))
     }
 
-    fn plan_keys(
-        &mut self, mut preferred: PathBuf, mut parent: String,
-        owner: u64, source: &str, input: Option<&str>,
+    fn plan_checked(
+        registry: &Mutex<Self>, preferred: PathBuf, source: &Path,
+        owner: u64, input: Option<&Path>, mut exists: impl FnMut(&Path) -> io::Result<bool>,
     ) -> io::Result<Result<(PathBuf, String), Failure>> {
-        // A different request may own an ancestor even though this leaf does
-        // not exist. Number that ancestor, preserving the mirrored suffix.
-        while let Some(ancestor) = self.conflicting_ancestor(&parent, owner, input) {
-            let (base, relative) = conflicting_output_base(
-                &preferred, &output_key(&preferred), &output_key(&ancestor),
-            )?;
-            let base_parent = output_key(base.parent().unwrap_or(Path::new(".")));
-            let replacement = match self.next_available(base, &base_parent)? {
-                Ok((path, _)) => path,
-                Err(failure) => return Ok(Err(failure)),
+        // Resolve aliases before taking the naming lock. All keys below are
+        // derived from this namespace; the lock protects only memory claims.
+        let mut parent = output_key(preferred.parent().unwrap_or(Path::new(".")));
+        let mut preferred_key = Self::candidate_key(&preferred, &parent);
+        let source = resolved_key(source);
+        let input = input.map(output_key);
+        let mut occupied_preferred = None;
+        let mut rebased_parent: Option<(PathBuf, String)> = None;
+        loop {
+            let (path, key, slot, suffix, base_key) = {
+                let mut names = registry.lock().unwrap();
+                let (base, base_parent, suffix) = match names.conflicting_ancestor(&parent, owner, input.as_deref()) {
+                    Some(ancestor) => {
+                        let (base, suffix) = conflicting_output_base(&preferred, &preferred_key, ancestor)?;
+                        // Number the caller's spelling, which may be a junction
+                        // at a different depth from its physical destination.
+                        // Resolve that sibling namespace outside the lock, then
+                        // recheck the ancestor before choosing a candidate.
+                        if rebased_parent.as_ref().is_none_or(|(path, _)| path != base) {
+                            drop(names);
+                            rebased_parent = Some((base.to_owned(), output_key(base.parent().unwrap_or(Path::new(".")))));
+                            continue;
+                        }
+                        let base_parent = rebased_parent.as_ref().unwrap().1.as_str();
+                        if names.conflicting_ancestor(base_parent, owner, input.as_deref()).is_some() {
+                            // The alias's containing tree can itself belong to
+                            // another request. Rebase that tree before claiming.
+                            preferred_key = format!("{}\\{}", Self::candidate_key(base, base_parent), path_key(&suffix.to_string_lossy()));
+                            parent = preferred_key.rsplit_once('\\').unwrap().0.to_owned();
+                            continue;
+                        }
+                        (base, base_parent, Some(suffix))
+                    }
+                    None => (preferred.as_path(), parent.as_str(), None),
+                };
+                let (path, key, slot) = names.next_available(base, base_parent, occupied_preferred.as_deref());
+                (path, key, slot, suffix, Self::candidate_key(base, base_parent))
             };
-            preferred = replacement.join(relative);
-            parent = output_key(preferred.parent().unwrap_or(Path::new(".")));
-        }
-        let (path, key) = match self.next_available(&preferred, &parent)? {
-            Ok(candidate) => candidate,
-            Err(failure) => return Ok(Err(failure)),
-        };
-        self.claim(&path, key.clone(), owner, source.to_owned());
-        Ok(Ok((path, key)))
-    }
-
-    // Both a leaf and a rebased ancestor use the same reservation-aware history.
-    // Ancestor slots are released by release_key's existing ancestor walk.
-    fn next_available(&mut self, preferred: &Path, parent: &str)
-        -> io::Result<Result<(PathBuf, String), Failure>>
-    {
-        let candidate_key = |path: &Path| format!("{}\\{}", parent.trim_end_matches('\\'),
-            crate::path_keys::case_key(&path.file_name().unwrap().to_string_lossy()));
-        let preferred_key = candidate_key(preferred);
-        if !self.has_under(&preferred_key) {
-            match preferred.try_exists() {
-                Ok(false) => return Ok(Ok((preferred.to_owned(), preferred_key))),
-                Ok(true) => {}
+            // A query must not reserve a tree that may already exist on disk:
+            // peers may legitimately create children there. Only the numbered
+            // index is taken while IO is in flight; publish after revalidation.
+            let checked = exists(&path);
+            let mut names = registry.lock().unwrap();
+            let occupied = names.has_under(&key);
+            let candidate_parent = key.rsplit_once('\\').unwrap().0;
+            let conflicting = names.conflicting_ancestor(candidate_parent, owner, input.as_deref()).is_some();
+            if let Some((family, index)) = slot {
+                // Another request may have evicted this bounded history while
+                // we were on the network. Claims, not history, prove exclusivity.
+                if names.indices.peek_mut(&family).is_some() {
+                    if occupied || matches!(checked, Ok(false)) && !conflicting {
+                        names.observe_slot(&key, &family, index);
+                    } else if !matches!(checked, Ok(true)) {
+                        names.indices.peek_mut(&family).unwrap().release(index);
+                    }
+                }
+            }
+            match checked {
+                Ok(false) => {
+                    if occupied || conflicting {
+                        continue;
+                    }
+                    let (path, key) = if let Some(suffix) = suffix {
+                        // A nonexistent ancestor makes its mirrored leaf free.
+                        // The leaf's release also returns the ancestor's slot.
+                        (path.join(&suffix), format!("{}\\{}", key, path_key(&suffix.to_string_lossy())))
+                    } else {
+                        (path, key)
+                    };
+                    names.claim(key.clone(), owner, source);
+                    return Ok(Ok((path, key)));
+                }
+                Ok(true) => occupied_preferred = Some(base_key),
                 Err(error) => return Ok(Err(file_failure(error))),
             }
         }
+    }
+
+    fn candidate_key(path: &Path, parent: &str) -> String {
+        format!("{}\\{}", parent.trim_end_matches('\\'),
+            crate::path_keys::case_key(&path.file_name().unwrap().to_string_lossy()))
+    }
+
+    // Both a leaf and a rebased ancestor use the same reservation-aware history.
+    // Selection takes only an index; plan_checked probes and revalidates the tree.
+    fn next_available(&mut self, preferred: &Path, parent: &str, occupied: Option<&str>)
+        -> (PathBuf, String, Option<(Arc<str>, usize)>)
+    {
+        let preferred_key = Self::candidate_key(preferred, parent);
+        if occupied != Some(preferred_key.as_str()) && !self.has_under(&preferred_key) {
+            return (preferred.to_owned(), preferred_key, None);
+        }
         let preferred_key: Arc<str> = Arc::from(preferred_key);
-        // Always recheck the preferred unnumbered name, as main does. The
-        // history only accelerates numbered alternatives across requests.
         loop {
             let index = self.next_index(&preferred_key);
             let path = numbered(preferred, index);
-            let candidate_key = candidate_key(&path);
-            if self.has_under(&candidate_key) {
-                self.observe_slot(&candidate_key, &preferred_key, index);
-                continue;
+            let key = Self::candidate_key(&path, parent);
+            if !self.has_under(&key) {
+                return (path, key, Some((preferred_key, index)));
             }
-            let exists = match path.try_exists() {
-                Ok(exists) => exists,
-                Err(error) => {
-                    self.indices.peek_mut(&preferred_key).unwrap().release(index);
-                    return Ok(Err(file_failure(error)));
-                }
-            };
-            if !exists {
-                self.observe_slot(&candidate_key, &preferred_key, index);
-                return Ok(Ok((path, candidate_key)));
-            }
+            self.observe_slot(&key, &preferred_key, index);
         }
     }
 }
@@ -1763,14 +1801,13 @@ impl<'run, O: Observer> Run<'run, O> {
                     let previous = retained[index].or(retry_slots[index])
                         .filter(|checkpoint| checkpoint.container() == Some(root))
                         .and_then(InputCheckpoint::output_slot);
-                    let mut names = this.output_names.registry.lock().unwrap();
-                    let slot = previous.filter(|path| names.retain(
+                    let slot = previous.filter(|path| OutputNames::retain(&this.output_names.registry,
                         path, this.output_names.owner, Path::new(&logical.input.entry_path), Some(root),
                     ));
                     if let Some(slot) = slot {
                         planned_slots[index] = Some(slot.to_owned());
                     } else {
-                        match names.plan(root.join(archive_name(&logical.input)), Path::new(&logical.input.entry_path),
+                        match OutputNames::plan(&this.output_names.registry, root.join(archive_name(&logical.input)), Path::new(&logical.input.entry_path),
                             this.output_names.owner, Some(root))?
                         {
                             Ok(slot) => planned_slots[index] = Some(slot),
@@ -2706,17 +2743,16 @@ impl<'run, O: Observer> Run<'run, O> {
         if !destination_matches {
             return None;
         }
-        let mut names = self.output_names.registry.lock().unwrap();
         let source = Path::new(&input.entry_path);
         let nested = (depth > 1).then_some(source);
         if let Some(container) = checkpoint.container() {
             // The physical task owns the container even when its logical
             // segments start in different files of the volume family.
-            if !names.retain(container, self.output_names.owner, checkpoint.carrier(), nested) {
+            if !OutputNames::retain(&self.output_names.registry, container, self.output_names.owner, checkpoint.carrier(), nested) {
                 return None;
             }
         }
-        names.retain(checkpoint.output(), self.output_names.owner, source,
+        OutputNames::retain(&self.output_names.registry, checkpoint.output(), self.output_names.owner, source,
             checkpoint.container().or(nested)).then_some(checkpoint)
     }
 
@@ -2786,7 +2822,7 @@ impl<'run, O: Observer> Run<'run, O> {
         let checkpoint = previous?;
         if !checkpoint.output_slot_for(input, carrier) { return None; }
         // The root was retained through an unchanged sibling above.
-        self.output_names.registry.lock().unwrap().retain(
+        OutputNames::retain(&self.output_names.registry,
             checkpoint.output_slot().expect("matching output slot"), self.output_names.owner,
             Path::new(&input.entry_path), Some(carrier),
         ).then_some(checkpoint)
@@ -3561,7 +3597,7 @@ fn flatten_result(
         let mut work = output.as_os_str().to_os_string();
         work.push(".__sunpack_flatten_work__");
         let work = PathBuf::from(work);
-        let available = names.registry.lock().unwrap().plan(
+        let available = OutputNames::plan(&names.registry,
             work, &result.path, names.owner, Some(output),
         )?.map_err(|failure| io::Error::other(failure.message))?;
         let attempt = (|| {
@@ -3573,7 +3609,8 @@ fn flatten_result(
                 |root, work, leaf| observer.before_flatten(root, work, leaf),
             ))
         })();
-        names.registry.lock().unwrap().release_path(&output_key(&available), names.owner);
+        let available_key = output_key(&available);
+        names.registry.lock().unwrap().release_path(&available_key, names.owner);
         attempt
     };
     let stats = match attempt() {
@@ -7349,21 +7386,23 @@ mod tests {
         let base = source.with_extension("output");
         let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
         let result = receipt(&input, DiscoverySource::Direct, 1);
-        let mut names = OutputNames::default();
-        assert_eq!(names.plan(base.clone(), &result.path, 1, None).unwrap().unwrap(), base);
+        let names = Mutex::new(OutputNames::default());
+        assert_eq!(OutputNames::plan(&names, base.clone(), &result.path, 1, None).unwrap().unwrap(), base);
         for index in 1..=32 {
             let wanted = base.join(format!("child-{index}"));
-            assert_eq!(names.plan(wanted, &result.path, index as u64 + 1, None).unwrap().unwrap(),
+            assert_eq!(OutputNames::plan(&names, wanted, &result.path, index as u64 + 1, None).unwrap().unwrap(),
                 numbered(&base, index).join(format!("child-{index}")));
         }
         let family = output_key(&base);
-        let history = names.indices.peek(family.as_str()).unwrap();
+        let guard = names.lock().unwrap();
+        let history = guard.indices.peek(family.as_str()).unwrap();
         assert_eq!(history.next, 33);
         assert_eq!(history.observed.len(), 32);
-        names.release(2);
-        assert_eq!(names.plan(base.join("replacement"), &result.path, 99, None).unwrap().unwrap(),
+        drop(guard);
+        names.lock().unwrap().release(2);
+        assert_eq!(OutputNames::plan(&names, base.join("replacement"), &result.path, 99, None).unwrap().unwrap(),
             numbered(&base, 1).join("replacement"));
-        assert_eq!(names.indices.peek(family.as_str()).unwrap().next, 33);
+        assert_eq!(names.lock().unwrap().indices.peek(family.as_str()).unwrap().next, 33);
         fs::remove_file(source).unwrap();
     }
 
@@ -7380,15 +7419,93 @@ mod tests {
         }
     }
 
+    // Registration-only tests miss filesystem probes under the naming lock.
+    // Inject peers at that exact boundary, including an alias of the same tree;
+    // no sleeps or timing assumptions are needed to expose lost reservations.
+    #[test]
+    fn output_path_queries_release_the_gate_and_keep_alias_ancestor_slots() {
+        let source = crate::test_support::temp_file("output_query_gate", b"input");
+        let root = source.with_extension("output").join("physical").join("deep");
+        let alias = source.with_extension("aliases").join("shortcut");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(alias.parent().unwrap()).unwrap();
+        let junction = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"]).arg(&alias).arg(&root).output().unwrap();
+        assert!(junction.status.success(), "{}{}", String::from_utf8_lossy(&junction.stdout), String::from_utf8_lossy(&junction.stderr));
+        let names = Mutex::new(OutputNames::default());
+        let base = root.join("archive");
+        let aliased = alias.join("archive");
+        assert_eq!(OutputNames::plan(&names, base.clone(), &source, 1, None).unwrap().unwrap(), base);
+        fs::create_dir(numbered(&base, 1)).unwrap();
+        let mut probes = 0;
+        let (output, key) = OutputNames::plan_checked(
+            &names, aliased.join("child"), &source, 2, None, |path| {
+                drop(names.try_lock().expect("path query held the global naming gate"));
+                probes += 1;
+                assert_eq!(path, numbered(&aliased, [1, 2, 4][probes - 1]));
+                if probes == 1 {
+                    let inside = numbered(&base, 1).join("inside");
+                    assert_eq!(OutputNames::plan(&names, inside.clone(), &source, 10, None)?.unwrap(), inside,
+                        "an unverified candidate must not displace children of an existing directory");
+                }
+                if probes == 2 {
+                    let peer = OutputNames::plan(&names, base.join("peer"), &source, 3, None)?.unwrap();
+                    assert_eq!(peer, numbered(&base, 3).join("peer"));
+                    let independent = root.join("independent");
+                    assert_eq!(OutputNames::plan(&names, independent.clone(), &source, 4, None)?.unwrap(), independent);
+                    let child = OutputNames::plan(&names, path.join("nested"), &source, 2, Some(path))?.unwrap();
+                    assert_eq!(child, path.join("nested"));
+                }
+                path.try_exists()
+            },
+        ).unwrap().unwrap();
+        assert_eq!(probes, 3);
+        assert_eq!(output, numbered(&aliased, 4).join("child"));
+        assert_eq!(key, output_key(&numbered(&base, 4).join("child")));
+        names.lock().unwrap().release(2);
+        // A failed query must return its numbered ancestor slot, even though
+        // the previous probe transferred that slot to a descendant claim.
+        let failure = OutputNames::plan_checked(&names, base.join("failed"), &source, 5, None, |path| {
+            assert_eq!(path, numbered(&base, 2));
+            Err(io::ErrorKind::PermissionDenied.into())
+        }).unwrap().unwrap_err();
+        assert_eq!(failure.kind, FailureKind::FilesystemError);
+        assert!(!names.lock().unwrap().owners.contains_key(&5));
+        assert_eq!(OutputNames::plan(&names, base.join("retry"), &source, 5, None).unwrap().unwrap(),
+            numbered(&base, 2).join("retry"));
+        let mut names = names.lock().unwrap();
+        for owner in [1, 3, 4, 5, 10] { names.release(owner); }
+        assert!(names.claimed.is_empty() && names.owners.is_empty() && names.slots.is_empty());
+        drop(names);
+        // When the claimed ancestor is the junction itself, numbering must
+        // stay beside the alias, not beside its deeper physical destination.
+        let names = Mutex::new(OutputNames::default());
+        assert!(OutputNames::retain(&names, &root, 6, &source, None));
+        let (moved, key) = OutputNames::plan_checked(&names, alias.join("branch/leaf"),
+            &source, 7, None, Path::try_exists).unwrap().unwrap();
+        assert_eq!(moved, numbered(&alias, 1).join("branch/leaf"));
+        assert_eq!(key, output_key(&moved));
+        names.lock().unwrap().release(7);
+        assert!(OutputNames::retain(&names, alias.parent().unwrap(), 8, &source, None));
+        let (moved, key) = OutputNames::plan_checked(&names, alias.join("branch/leaf"),
+            &source, 9, None, Path::try_exists).unwrap().unwrap();
+        assert_eq!(moved, numbered(alias.parent().unwrap(), 1).join("shortcut/branch/leaf"));
+        assert_eq!(key, output_key(&moved));
+        fs::remove_dir(&alias).unwrap();
+        fs::remove_dir(alias.parent().unwrap()).unwrap();
+        fs::remove_dir_all(source.with_extension("output")).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
     #[test]
     fn output_registration_does_not_hold_naming_gate_and_failure_releases_only_its_claim() {
         struct Register<'a>(&'a Mutex<OutputNames>);
         impl Observer for Register<'_> {
             fn notify(&self, _: Event) {}
             fn register_output(&self, result: &ArchiveResult, path: &Path) -> io::Result<()> {
-                let mut names = self.0.try_lock().expect("registration held the global naming gate");
+                drop(self.0.try_lock().expect("registration held the global naming gate"));
                 // Simulate a peer selecting the same tree during publication.
-                let peer = names.plan(path.to_owned(), &result.path, 2, None)?.unwrap();
+                let peer = OutputNames::plan(self.0, path.to_owned(), &result.path, 2, None)?.unwrap();
                 assert_ne!(peer, path);
                 Err(super::super::OutputCreateError::wrap(io::ErrorKind::PermissionDenied.into()))
             }
@@ -7402,13 +7519,12 @@ mod tests {
             .unwrap().unwrap_err();
         assert!(matches!(failure.context.as_deref(),
             Some(super::super::FailureContext::OutputCreate { path: Some(path), .. }) if path == &preferred));
-        let mut names = names.lock().unwrap();
-        assert!(!names.owners.contains_key(&1));
-        assert_eq!(names.claimed.len(), 1);
-        assert_eq!(names.plan(preferred.clone(), &result.path, 3, None).unwrap().unwrap(), preferred);
-        names.release(2);
-        names.release(3);
-        assert!(names.claimed.is_empty());
+        assert!(!names.lock().unwrap().owners.contains_key(&1));
+        assert_eq!(names.lock().unwrap().claimed.len(), 1);
+        assert_eq!(OutputNames::plan(&names, preferred.clone(), &result.path, 3, None).unwrap().unwrap(), preferred);
+        names.lock().unwrap().release(2);
+        names.lock().unwrap().release(3);
+        assert!(names.lock().unwrap().claimed.is_empty());
         fs::remove_file(source).unwrap();
     }
 
@@ -7502,7 +7618,7 @@ mod tests {
             let foreign = OutputNames::reserve(&registry, successful.join("foreign"), &result, &ObserverWithFailure, 3, Some(&generated))
                 .unwrap().unwrap();
             assert!(!foreign.starts_with(&successful));
-            assert!(!registry.lock().unwrap().retain(&successful.join("continued"), 3, &result.path, None));
+            assert!(!OutputNames::retain(&registry, &successful.join("continued"), 3, &result.path, None));
             cleanup_owned_output(&failed).unwrap();
             assert_eq!(fs::read(successful.join("payload")).unwrap(), b"keep");
             assert_eq!(OutputNames::reserve(&registry, root.join("denied"), &result, &ObserverWithFailure, owner, None)
@@ -7540,16 +7656,16 @@ mod tests {
         let preferred = root.join("segment");
         let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "segment".into());
         let result = receipt(&input, DiscoverySource::Embedded, 1);
-        let mut names = OutputNames::default();
-        let failed = names.plan(preferred.clone(), &result.path, 1, None).unwrap().unwrap();
-        let sibling = names.plan(preferred.clone(), &result.path, 1, None).unwrap().unwrap();
+        let names = Mutex::new(OutputNames::default());
+        let failed = OutputNames::plan(&names, preferred.clone(), &result.path, 1, None).unwrap().unwrap();
+        let sibling = OutputNames::plan(&names, preferred.clone(), &result.path, 1, None).unwrap().unwrap();
         assert_eq!(failed, preferred);
         assert_eq!(sibling, numbered(&preferred, 1));
         assert!(!failed.exists() && !sibling.exists());
-        names.release(1);
-        assert!(names.retain(&failed, 2, &source, Some(&root)));
-        assert!(names.retain(&sibling, 2, &source, Some(&root)));
-        assert_eq!(names.plan(preferred.clone(), &result.path, 2, None).unwrap().unwrap(), numbered(&preferred, 2));
+        names.lock().unwrap().release(1);
+        assert!(OutputNames::retain(&names, &failed, 2, &source, Some(&root)));
+        assert!(OutputNames::retain(&names, &sibling, 2, &source, Some(&root)));
+        assert_eq!(OutputNames::plan(&names, preferred.clone(), &result.path, 2, None).unwrap().unwrap(), numbered(&preferred, 2));
         fs::remove_dir(root).unwrap();
         fs::remove_file(source).unwrap();
     }
@@ -8502,7 +8618,7 @@ mod tests {
         work.push(".__sunpack_flatten_work__");
         let preferred = PathBuf::from(work);
         let names = OutputReservationGuard { registry: Arc::default(), owner: 1 };
-        let reserved = names.registry.lock().unwrap().plan(preferred.clone(), &archive.path, 2, None).unwrap().unwrap();
+        let reserved = OutputNames::plan(&names.registry, preferred.clone(), &archive.path, 2, None).unwrap().unwrap();
         assert_eq!(reserved, preferred);
         assert!(!reserved.exists()); // Peer has claimed but not created its output.
         let observer = Work(Mutex::default());

@@ -69,6 +69,9 @@ impl Candidate {
 pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
     targets: Option<FileTargets>,
+    // Decrypted continuations may outlive their headless proposal. Transfer
+    // their existing facts to the same embedded peer frontier, without I/O.
+    volume_seeds: Vec<(Arc<DirectorySnapshotTable>, usize, crate::analysis_native::volume_anchor::VolumeAnchor)>,
     // Shared physical facts; row indices survive only for this discovery scan.
     relation_sources: Vec<NativeDirectorySnapshot>,
 }
@@ -726,6 +729,11 @@ impl NativeEmbeddedBatch {
             let mut anchor = item.anchor;
             let match_key = (key.clone(), anchor.structure_offset.unwrap_or(0));
             if anchor.standalone || (!anchor.multivolume && anchor.needs_password) {
+                if !anchor.standalone && anchor.rar5_encryption.is_some() {
+                    // Relations decides whether these public header facts have
+                    // peers. Keep the ordinary fallback until that decision.
+                    anchors.push(anchor.clone());
+                }
                 if path_counts[&key] == 1 {
                     batch.excluded.insert(key);
                 }
@@ -794,6 +802,11 @@ impl NativeEmbeddedBatch {
         batch.excluded.retain(|key| !anchor_paths.contains(key));
         let excluded = &batch.excluded;
         let mut groups = resolve_embedded_volumes(sources, anchors, excluded, cache);
+        // A lone encrypted file keeps its existing embedded boundary result.
+        // Only a real candidate proposal replaces those individual failures.
+        groups.retain(|group| group.unresolved_password_group()
+            || !group.entry_anchor().is_some_and(|a|
+                a.needs_password && !a.multivolume && a.rar5_encryption.is_some()));
         // A failed NextHeader inside a carrier can also be damaged standalone
         // data. Require actual peers for this speculative split identity.
         // Index only nominated stems once, rather than rescan scopes per head.
@@ -884,6 +897,19 @@ impl NativeEmbeddedBatch {
             fallback.retain(|row| !batch.supplemental.contains(&row.index)
                 || owned.contains(&path_key(table.rows[row.index].embedded_source().0)));
         }
+        let mut grouped_ranges = HashMap::new();
+        let mut seen_facts = HashSet::new();
+        for group in groups.iter().filter(|group| group.unresolved_password_group()) {
+            group.collect_source_ranges(&anchor_paths, &mut grouped_ranges, &mut seen_facts);
+        }
+        for row in &mut fallback {
+            if let Some(scan) = &mut row.scan {
+                let key = path_key(table.rows[row.index].embedded_source().0);
+                if let Some(ranges) = grouped_ranges.get(&key) {
+                    scan.resolutions.retain(|offset, _| !ranges.iter().any(|(start, _)| start == offset));
+                }
+            }
+        }
         for group in groups {
             // Keep the decrypted head's password request-local. Execution uses
             // LogicalArchiveInput's existing proof instead of deriving it again.
@@ -914,6 +940,7 @@ impl NativeCandidateTable {
     pub(crate) fn extend(&mut self, other: &mut Self) {
         self.rows.append(&mut other.rows);
         self.relation_sources.append(&mut other.relation_sources);
+        self.volume_seeds.append(&mut other.volume_seeds);
     }
 
     pub(crate) fn append_directory(
@@ -1003,6 +1030,9 @@ impl NativeCandidateTable {
     ) -> std::io::Result<()> {
         (|| {
             let mut cached = self.relation_cache();
+            let mut previous: HashSet<_> = cached.anchors.iter()
+                .filter(|(_, a)| a.needs_password && a.rar5_encryption.is_some())
+                .map(|(path, _)| path.clone()).collect();
             cached.anchors.extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
             // A short password probe may start after another request consumed its
             // inputs. Drop only proven departures from that proposal, sharing the
@@ -1040,6 +1070,22 @@ impl NativeCandidateTable {
                 selected.as_ref(),
                 Some(&cached),
             );
+            for group in &groups {
+                let data = group.candidate_data();
+                for path in data.parts().chain([data.entry_path]) {
+                    previous.remove(&path_key(path));
+                }
+            }
+            // A recovered continuation is not a standalone task, but still
+            // nominates same-stem opaque carriers when the head is embedded.
+            for &row in raw.rows.iter() {
+                if previous.is_empty() { break; }
+                let key = path_key(&raw.table.paths[row]);
+                if previous.remove(&key) && cached.anchors.get(&key).is_some_and(|a|
+                    a.multivolume && !a.needs_password && !a.is_volume_entry()) {
+                    self.volume_seeds.push((Arc::clone(&raw.table), row, cached.anchors.remove(&key).unwrap()));
+                }
+            }
             self.rows.retain(|row| matches!(row, Candidate::File(..)));
             let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());
             replacement.extend(
@@ -1063,7 +1109,11 @@ impl NativeCandidateTable {
                 Candidate::File(table, index) => path_key(&table.paths[*index]),
                 Candidate::Relation(group) => {
                     let data = group.candidate_data();
-                    if data.is_split {
+                    // Encryption-header partitions already have a stable
+                    // representative. A filename-family key would erase an
+                    // independent encrypted set sharing the same display name.
+                    if data.is_split && group.entry_anchor()
+                        .is_none_or(|a| a.rar5_encryption.is_none()) {
                         let parent = Path::new(data.entry_path)
                             .parent()
                             .unwrap_or_else(|| Path::new(""));
@@ -1388,7 +1438,7 @@ impl NativeCandidateTable {
                     || matches!(routes.scans.get(index), Some(Err(_)))
             });
         }
-        if ids.is_empty() {
+        if ids.is_empty() && self.volume_seeds.is_empty() {
             // This root has no remaining I/O or cached errors. Its primary
             // decisions are already owned by the caller; no recovery can use it.
             *self = Self::default();
@@ -1450,9 +1500,15 @@ impl NativeCandidateTable {
             self.rows = rows;
             scans
         };
-        NativeEmbeddedBatch {
+        let mut pending_volumes = Vec::with_capacity(self.volume_seeds.len());
+        for (facts, row, anchor) in std::mem::take(&mut self.volume_seeds) {
+            let index = self.rows.len();
+            self.rows.push(Candidate::File(facts, row));
+            pending_volumes.push(PendingEmbeddedVolume { index, anchor, scan: None });
+        }
+        let mut batch = NativeEmbeddedBatch {
             relation_cache,
-            pending_volumes: Vec::new(),
+            pending_volumes,
             excluded,
             claimed_ranges,
             supplemental: HashSet::new(),
@@ -1463,7 +1519,11 @@ impl NativeCandidateTable {
             peer_rows: None,
             seen_paths: HashSet::new(),
             force_scan,
+        };
+        if enabled && (select_all || ratio > 0.0) {
+            batch.enqueue_volume_peers(self);
         }
+        batch
     }
 }
 

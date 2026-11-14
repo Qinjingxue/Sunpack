@@ -884,25 +884,27 @@ impl NativeWatchState {
         let mut notifications = Vec::new();
         {
             let mut data = self.lock();
+            let mut removed = Vec::new();
             for operation in operations.0.iter() {
-                let removed = if let (Some(_), Operation::Delete(Collection::Entries, path)) =
-                    (&events, operation)
-                {
-                    data.entries.get(path).cloned()
-                } else {
-                    None
-                };
-                data.apply(operation);
-                if events.is_none() {
-                    continue;
+                if let (Some(_), Operation::Delete(Collection::Entries, path)) = (&events, operation) {
+                    if let Some(record) = data.entries.get(path) {
+                        removed.push(Arc::clone(record));
+                    }
                 }
-                if let Some(record) = removed {
+                data.apply(operation);
+            }
+            // One WAL batch can replace a provisional member with its real
+            // head. Publish the committed state, never the temporary gap
+            // between Delete(old) and PutEntry(head), which clears GUI groups.
+            if events.is_some() {
+                for record in removed {
                     let group = record.failure_payload.get("source_group");
                     let remaining = group
                         .and_then(|g| g["members"].as_array())
                         .into_iter()
                         .flatten()
                         .filter_map(Value::as_str)
+                        .chain(std::iter::once(record.path.as_str()))
                         .filter_map(|member| data.entries.get(&path_key(member)))
                         .max_by(|a, b| a.last_attempt_at.total_cmp(&b.last_attempt_at));
                     if let Some(record) = remaining {
@@ -912,12 +914,12 @@ impl NativeWatchState {
                         "task_path":group.and_then(|g| g["path"].as_str()).unwrap_or(&record.path)}));
                     }
                 }
-                if let Operation::PutEntry(_, record) = operation {
-                    if matches!(
-                        record.status.as_str(),
-                        "failed_password" | "suspended_missing_volume"
-                    ) {
-                        notifications.push(entry_event(record));
+                for operation in operations.0.iter() {
+                    if let Operation::PutEntry(path, record) = operation {
+                        if data.entries.get(path).is_some_and(|current| Arc::ptr_eq(current, record))
+                            && matches!(record.status.as_str(), "failed_password" | "suspended_missing_volume") {
+                            notifications.push(entry_event(record));
+                        }
                     }
                 }
             }

@@ -671,6 +671,31 @@ void task_history(Application& app,const fs::path& dir) {
         return visible.size()==1 && visible[0]["name"]=="task-0.001" &&
                active_find_widget(list)!=nullptr;
     },"Find and highlight a task outside the loaded window");
+
+    // Follow one grouped card through actual file notifications and page
+    // updates. Static projection cannot catch stale virtualized member chips.
+    search("");
+    const auto head=dir/"shared.jpg", tail=dir/"shared.chunk3.opaque";
+    const std::array<std::pair<const char*,const char*>,4> phases={{{"failed_password","taskWaiting"},
+        {"suspended_missing_volume","taskWaiting"},{"processing_started","taskProcessing"},{"done","taskSucceeded"}}};
+    for(size_t phase=0;phase<phases.size();++phase) {
+        const auto path=phase?head:tail;
+        Json members={utf8(head.wstring()),utf8(tail.wstring())};
+        if(phase>=2) members.push_back(utf8((dir/"shared.chunk2.opaque").wstring()));
+        Json value={{"event",phases[phase].first},{"task_id","encrypted-group"},{"path",utf8(path.wstring())},
+            {"ts",1792403000+phase},{"group",{{"path",utf8(path.wstring())},{"members",members},{"multipart",true}}}};
+        publish_events(history_path,value.dump()+"\n");
+        pump([&]{
+            const auto visible=rows();
+            return visible.size()==1 && visible[0]["id"]=="encrypted-group" &&
+                visible[0]["status"]==phases[phase].second && visible[0]["path"]==utf8(path.wstring()) &&
+                visible[0]["parts"].size()==members.size();
+        },"Refresh encrypted volume status");
+        ui_window_relayout(app.window());
+        auto* chip=dynamic_cast<ui::LabelWidget*>(window(app).Root()->FindById(
+            "taskPart-encrypted-group-"+std::to_string(members.size()-1)));
+        assert(chip && chip->Text()==(phase>=2?L"shared.chunk2.opaque":L"shared.chunk3.opaque"));
+    }
 }
 
 

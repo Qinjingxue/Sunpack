@@ -597,296 +597,334 @@ pub(super) fn resolve_buckets(
                 members.push(i);
                 facts.insert(i, f);
             }
-            // Encryption hides the Main Header. A lone encrypted file has no
-            // split identity until the password reveals volume structure.
-            if members.len() == 1
-                && rows[members[0]].anchor.as_ref().is_some_and(|a| {
-                    a.needs_password
-                        && !a.multivolume
-                        && !a.continuation_from_previous
-                        && !a.continuation_to_next
-                })
+            // Keep the same candidate partition before and after decryption.
+            // RAR volumes carry their own headers; different encryption salts
+            // must not compete for the same numbered slots after password retry.
+            let mut partitions = HashMap::new();
+            if format == "rar" && members.iter().any(|i|
+                rows[*i].anchor.as_ref().is_some_and(|a| a.rar5_encryption.is_some()))
             {
-                continue;
-            }
-            // A raw ZIP first chunk is proven only by an independent terminal
-            // single-disk EOCD in this view, not by a local header alone.
-            if format == "zip"
-                && members.iter().any(|i| {
-                    rows[*i].anchor.as_ref().is_some_and(|a| {
-                        a.evidence
-                            .contains(&"zip:eocd_single_disk_without_local_header")
-                    })
-                })
-            {
-                let heads: Vec<_> = members
-                    .iter()
-                    .copied()
-                    .filter(|i| {
-                        rows[*i]
-                            .anchor
-                            .as_ref()
-                            .is_some_and(|a| a.evidence.contains(&"zip:local_header"))
-                    })
-                    .collect();
-                if heads.len() == 1 {
-                    facts.get_mut(&heads[0]).unwrap().exact_slot = Some(1);
+                for i in std::mem::take(&mut members) {
+                    let identity = rows[i].anchor.as_ref().and_then(|a| a.rar5_encryption.as_deref());
+                    partitions.entry(identity).or_insert_with(Vec::new).push(i);
                 }
             }
-            let heads = members
-                .iter()
-                .filter(|i| {
-                    facts[i].exact_slot == Some(1)
-                        || (format == "zip"
-                            && facts[i].exact_slot.is_none()
-                            && rows[**i]
-                                .anchor
-                                .as_ref()
-                                .is_some_and(|a| a.evidence.contains(&"zip:local_header")))
-                })
-                .count();
-            // RAR volumes have their own headers. Opaque unrelated files are
-            // not required to complete an otherwise exact RAR assignment.
-            if format == "rar"
-                && members
-                    .iter()
-                    .filter(|i| facts[i].owned)
-                    .all(|i| facts[i].exact_slot.is_some())
-            {
-                members.retain(|i| facts[i].owned);
-            }
-            // Several analyzed slices can occupy one physical carrier. The
-            // unique-file assignment solver intentionally cannot express that;
-            // feed the same full structural facts to the existing slot-domain
-            // builder instead, before filename families can collapse a slice.
-            let mut physical = HashSet::new();
-            if members.iter().any(|i| !physical.insert(rows[*i].path_key.as_str())) {
-                for &i in &members {
-                    features.entry(i).or_insert_with(|| cached
-                        .and_then(|cache| cache.names.get(&rows[i].path_key)).cloned()
-                        .unwrap_or_else(|| NameFeatures::parse(&rows[i].name)));
-                }
-                let view = BucketView { rows, indexes: &members, facts: &facts,
-                    features: &features, format, loose_numeric_allowed: true };
-                let candidates = attempts::build(&view, None);
-                if !candidates.is_empty() {
-                    output.extend(candidates);
-                    continue;
-                }
-            }
-            let structural_only = BucketView {
-                rows,
-                indexes: &members,
-                facts: &facts,
-                features: &features,
-                format,
-                loose_numeric_allowed: false,
-            };
-            let need_names = heads > 1
-                || structural_only
-                    .fixed()
-                    .map_or(true, |a| !a.unresolved.is_empty());
-            if need_names {
-                for &i in &members {
-                    features.entry(i).or_insert_with(|| {
-                        cached
-                            .and_then(|c| c.names.get(&rows[i].path_key))
-                            .cloned()
-                            .unwrap_or_else(|| NameFeatures::parse(&rows[i].name))
-                    });
-                }
-            }
-            // Multiple heads require a strong format-associated family name.
-            // Unknown rows cannot be shared by competing archive families.
-            let head_indexes: HashSet<_> = members
-                .iter()
-                .copied()
-                .filter(|i| {
-                    facts[i].exact_slot == Some(1)
-                        || (format == "zip"
-                            && facts[i].exact_slot.is_none()
-                            && rows[*i]
-                                .anchor
-                                .as_ref()
-                                .is_some_and(|a| a.evidence.contains(&"zip:local_header")))
-                })
-                .collect();
-            let mut competing_families = false;
-            let mut families: Vec<(String, Vec<usize>)> = if head_indexes.len() > 1 {
-                let head_families: HashSet<_> = head_indexes
-                    .iter()
-                    .filter_map(|i| features.get(i).and_then(|f| f.family(format)))
-                    .collect();
-                if head_families.len() == head_indexes.len() {
-                    let mut grouped: HashMap<String, Vec<usize>> =
-                        head_families.into_iter().map(|f| (f, Vec::new())).collect();
-                    let mut orphan_owned = false;
-                    for &i in &members {
-                        if let Some(group) = features
-                            .get(&i)
-                            .and_then(|f| f.family(format))
-                            .and_then(|family| grouped.get_mut(&family))
-                        {
-                            group.push(i);
-                        } else if facts[&i].owned {
-                            orphan_owned = true;
-                        }
-                    }
-                    if orphan_owned {
-                        competing_families = true;
-                        vec![(stem.clone(), members.clone())]
-                    } else {
-                        grouped.into_iter().collect()
-                    }
-                } else {
-                    competing_families = true;
-                    vec![(stem.clone(), members.clone())]
-                }
-            } else {
-                vec![(stem.clone(), members.clone())]
-            };
-            // A complete local set is independent even when another directory
-            // has a gap. Only the remaining members may pair across directories.
-            let mut local_assignments = HashMap::new();
-            if competing_families {
-                let mut local: HashMap<String, Vec<usize>> = HashMap::new();
-                for &i in &members {
-                    let parent = Path::new(&rows[i].path).parent().unwrap_or(Path::new(""));
-                    local
-                        .entry(path_key(&parent.to_string_lossy()))
-                        .or_default()
-                        .push(i);
-                }
-                if local.len() > 1 {
-                    let mut complete = HashSet::new();
-                    let mut local_families = Vec::new();
-                    for indexes in local.into_values() {
-                        let view = BucketView {
-                            rows,
-                            indexes: &indexes,
-                            facts: &facts,
-                            features: &features,
-                            format,
-                            loose_numeric_allowed: true,
-                        };
-                        let (assignment, reason) = view.solve();
-                        if reason.is_none() && view.complete(&assignment) {
-                            complete.extend(indexes.iter().copied());
-                            local_assignments.insert(indexes[0], assignment);
-                            local_families.push((stem.clone(), indexes));
-                        }
-                    }
-                    if !complete.is_empty() {
-                        let remaining: Vec<_> = members
-                            .iter()
-                            .copied()
-                            .filter(|i| !complete.contains(i))
-                            .collect();
-                        competing_families = remaining
-                            .iter()
-                            .filter(|i| head_indexes.contains(i))
-                            .count()
-                            > 1;
-                        if !remaining.is_empty() {
-                            local_families.push((stem.clone(), remaining));
-                        }
-                        families = local_families;
-                    }
-                }
-            }
-            let local_sets = !local_assignments.is_empty();
-            let mut launchers: HashMap<String, Vec<usize>> = HashMap::new();
-            for i in companions {
-                let a = rows[i].anchor.as_ref().unwrap();
-                let profile_matches = match format {
-                    "7z" => a.evidence.contains(&"sfx:seven_zip_stub"),
-                    "zip" => {
-                        a.evidence.contains(&"sfx:seven_zip_stub")
-                            || a.evidence.contains(&"sfx:winrar_stub")
-                    }
-                    _ => false,
-                };
-                if profile_matches {
-                    launchers
-                        .entry(case_key(&get_logical_name(&rows[i].name, false)))
-                        .or_default()
-                        .push(i);
-                }
-            }
-            for (family, indexes) in families {
-                // The display name may use canonical spelling even when every
-                // slot was structural. This never participates in assignment.
-                if let Some(i) = indexes.iter().find(|i| facts[i].exact_slot == Some(1)) {
-                    features.entry(*i).or_insert_with(|| {
-                        cached
-                            .and_then(|c| c.names.get(&rows[*i].path_key))
-                            .cloned()
-                            .unwrap_or_else(|| NameFeatures::parse(&rows[*i].name))
-                    });
-                }
-                if indexes.is_empty() {
-                    continue;
-                }
-                let view = BucketView {
-                    rows,
-                    loose_numeric_allowed: !competing_families
-                        && indexes.iter().filter(|i| head_indexes.contains(i)).count() == 1,
-                    indexes: &indexes,
-                    facts: &facts,
-                    features: &features,
-                    format,
-                };
-                let (mut assignment, reason) =
-                    if let Some(assignment) = local_assignments.remove(&view.indexes[0]) {
-                        (assignment, None)
-                    } else if competing_families {
-                        (
-                            VolumeAssignment {
-                                unresolved: view.indexes.to_vec(),
-                                ..Default::default()
+            for mut members in (!members.is_empty()).then_some(members).into_iter().chain(partitions.into_values()) {
+                if members.len() > 1 && members.iter().all(|i| rows[*i].anchor.as_ref()
+                    .is_some_and(|a| a.needs_password && !a.multivolume && a.rar5_encryption.is_some()))
+                {
+                    let mut paths = HashSet::new();
+                    if members.iter().all(|i| paths.insert(rows[*i].path_key.as_str())) {
+                        // A representative is not a proven first volume. Keep
+                        // every role unknown and block execution until retry.
+                        members.sort_unstable_by(|a, b| rows[*a].path_key.cmp(&rows[*b].path_key));
+                        let view = BucketView { rows, indexes: &members, facts: &facts,
+                            features: &features, format, loose_numeric_allowed: false };
+                        output.push(ProposalValidation {
+                            status: ProposalStatus::NeedsPassword,
+                            proposal: RelationProposal {
+                                format: format.into(), logical_name: stem.clone(), style: "rar_part".into(),
+                                width: 3, volumes: members.iter().map(|i| (rows[*i].path.clone(), 0)).collect(),
+                                companions: Vec::new(),
                             },
-                            Some(RelationFailureReason::AmbiguousVolumeMapping),
-                        )
-                    } else {
-                        view.solve()
-                    };
-                let logical = if family == *stem {
-                    assignment
-                        .slots
-                        .get(&1)
-                        .and_then(|i| {
-                            features
-                                .get(i)
-                                .map(|f| filename::logical_name(&rows[*i].name, f, format))
+                            facts: proposal_facts(&view, &[]),
+                            reason: Some(RelationFailureReason::NeedsPassword),
+                            unresolved: Vec::new(), attempts: None,
+                        });
+                        continue;
+                    }
+                }
+                // Encryption hides the Main Header. A lone encrypted file has no
+                // split identity until the password reveals volume structure.
+                if members.len() == 1
+                    && rows[members[0]].anchor.as_ref().is_some_and(|a| {
+                        a.needs_password
+                            && !a.multivolume
+                            && !a.continuation_from_previous
+                            && !a.continuation_to_next
+                    })
+                {
+                    continue;
+                }
+                // A raw ZIP first chunk is proven only by an independent terminal
+                // single-disk EOCD in this view, not by a local header alone.
+                if format == "zip"
+                    && members.iter().any(|i| {
+                        rows[*i].anchor.as_ref().is_some_and(|a| {
+                            a.evidence
+                                .contains(&"zip:eocd_single_disk_without_local_header")
                         })
-                        .unwrap_or_else(|| family.clone())
-                } else {
-                    family.clone()
-                };
-                if reason.is_some() {
-                    let candidates = attempts::build(&view, Some(&logical));
+                    })
+                {
+                    let heads: Vec<_> = members
+                        .iter()
+                        .copied()
+                        .filter(|i| {
+                            rows[*i]
+                                .anchor
+                                .as_ref()
+                                .is_some_and(|a| a.evidence.contains(&"zip:local_header"))
+                        })
+                        .collect();
+                    if heads.len() == 1 {
+                        facts.get_mut(&heads[0]).unwrap().exact_slot = Some(1);
+                    }
+                }
+                let heads = members
+                    .iter()
+                    .filter(|i| {
+                        facts[i].exact_slot == Some(1)
+                            || (format == "zip"
+                                && facts[i].exact_slot.is_none()
+                                && rows[**i]
+                                    .anchor
+                                    .as_ref()
+                                    .is_some_and(|a| a.evidence.contains(&"zip:local_header")))
+                    })
+                    .count();
+                // RAR volumes have their own headers. Opaque unrelated files are
+                // not required to complete an otherwise exact RAR assignment.
+                if format == "rar"
+                    && members
+                        .iter()
+                        .filter(|i| facts[i].owned)
+                        .all(|i| facts[i].exact_slot.is_some())
+                {
+                    members.retain(|i| facts[i].owned);
+                }
+                // Several analyzed slices can occupy one physical carrier. The
+                // unique-file assignment solver intentionally cannot express that;
+                // feed the same full structural facts to the existing slot-domain
+                // builder instead, before filename families can collapse a slice.
+                let mut physical = HashSet::new();
+                if members.iter().any(|i| !physical.insert(rows[*i].path_key.as_str())) {
+                    for &i in &members {
+                        features.entry(i).or_insert_with(|| cached
+                            .and_then(|cache| cache.names.get(&rows[i].path_key)).cloned()
+                            .unwrap_or_else(|| NameFeatures::parse(&rows[i].name)));
+                    }
+                    let view = BucketView { rows, indexes: &members, facts: &facts,
+                        features: &features, format, loose_numeric_allowed: true };
+                    let candidates = attempts::build(&view, None);
                     if !candidates.is_empty() {
                         output.extend(candidates);
                         continue;
                     }
                 }
-                if reason.is_none() {
-                    if let Some(matching) = launchers.get(&case_key(&logical)) {
-                        let matching: Vec<_> = matching
-                            .iter()
-                            .copied()
-                            .filter(|i| {
-                                !local_sets
-                                    || Path::new(&rows[*i].path).parent()
-                                        == Path::new(&rows[view.indexes[0]].path).parent()
-                            })
-                            .collect();
-                        if matching.len() == 1 {
-                            assignment.companions = matching;
+                let structural_only = BucketView {
+                    rows,
+                    indexes: &members,
+                    facts: &facts,
+                    features: &features,
+                    format,
+                    loose_numeric_allowed: false,
+                };
+                let need_names = heads > 1
+                    || structural_only
+                        .fixed()
+                        .map_or(true, |a| !a.unresolved.is_empty());
+                if need_names {
+                    for &i in &members {
+                        features.entry(i).or_insert_with(|| {
+                            cached
+                                .and_then(|c| c.names.get(&rows[i].path_key))
+                                .cloned()
+                                .unwrap_or_else(|| NameFeatures::parse(&rows[i].name))
+                        });
+                    }
+                }
+                // Multiple heads require a strong format-associated family name.
+                // Unknown rows cannot be shared by competing archive families.
+                let head_indexes: HashSet<_> = members
+                    .iter()
+                    .copied()
+                    .filter(|i| {
+                        facts[i].exact_slot == Some(1)
+                            || (format == "zip"
+                                && facts[i].exact_slot.is_none()
+                                && rows[*i]
+                                    .anchor
+                                    .as_ref()
+                                    .is_some_and(|a| a.evidence.contains(&"zip:local_header")))
+                    })
+                    .collect();
+                let mut competing_families = false;
+                let mut families: Vec<(String, Vec<usize>)> = if head_indexes.len() > 1 {
+                    let head_families: HashSet<_> = head_indexes
+                        .iter()
+                        .filter_map(|i| features.get(i).and_then(|f| f.family(format)))
+                        .collect();
+                    if head_families.len() == head_indexes.len() {
+                        let mut grouped: HashMap<String, Vec<usize>> =
+                            head_families.into_iter().map(|f| (f, Vec::new())).collect();
+                        let mut orphan_owned = false;
+                        for &i in &members {
+                            if let Some(group) = features
+                                .get(&i)
+                                .and_then(|f| f.family(format))
+                                .and_then(|family| grouped.get_mut(&family))
+                            {
+                                group.push(i);
+                            } else if facts[&i].owned {
+                                orphan_owned = true;
+                            }
+                        }
+                        if orphan_owned {
+                            competing_families = true;
+                            vec![(stem.clone(), members.clone())]
+                        } else {
+                            grouped.into_iter().collect()
+                        }
+                    } else {
+                        competing_families = true;
+                        vec![(stem.clone(), members.clone())]
+                    }
+                } else {
+                    vec![(stem.clone(), members.clone())]
+                };
+                // A complete local set is independent even when another directory
+                // has a gap. Only the remaining members may pair across directories.
+                let mut local_assignments = HashMap::new();
+                if competing_families {
+                    let mut local: HashMap<String, Vec<usize>> = HashMap::new();
+                    for &i in &members {
+                        let parent = Path::new(&rows[i].path).parent().unwrap_or(Path::new(""));
+                        local
+                            .entry(path_key(&parent.to_string_lossy()))
+                            .or_default()
+                            .push(i);
+                    }
+                    if local.len() > 1 {
+                        let mut complete = HashSet::new();
+                        let mut local_families = Vec::new();
+                        for indexes in local.into_values() {
+                            let view = BucketView {
+                                rows,
+                                indexes: &indexes,
+                                facts: &facts,
+                                features: &features,
+                                format,
+                                loose_numeric_allowed: true,
+                            };
+                            let (assignment, reason) = view.solve();
+                            if reason.is_none() && view.complete(&assignment) {
+                                complete.extend(indexes.iter().copied());
+                                local_assignments.insert(indexes[0], assignment);
+                                local_families.push((stem.clone(), indexes));
+                            }
+                        }
+                        if !complete.is_empty() {
+                            let remaining: Vec<_> = members
+                                .iter()
+                                .copied()
+                                .filter(|i| !complete.contains(i))
+                                .collect();
+                            competing_families = remaining
+                                .iter()
+                                .filter(|i| head_indexes.contains(i))
+                                .count()
+                                > 1;
+                            if !remaining.is_empty() {
+                                local_families.push((stem.clone(), remaining));
+                            }
+                            families = local_families;
                         }
                     }
                 }
-                output.extend(materialize(&view, assignment, &logical, reason, None));
+                let local_sets = !local_assignments.is_empty();
+                let mut launchers: HashMap<String, Vec<usize>> = HashMap::new();
+                for &i in &companions {
+                    let a = rows[i].anchor.as_ref().unwrap();
+                    let profile_matches = match format {
+                        "7z" => a.evidence.contains(&"sfx:seven_zip_stub"),
+                        "zip" => {
+                            a.evidence.contains(&"sfx:seven_zip_stub")
+                                || a.evidence.contains(&"sfx:winrar_stub")
+                        }
+                        _ => false,
+                    };
+                    if profile_matches {
+                        launchers
+                            .entry(case_key(&get_logical_name(&rows[i].name, false)))
+                            .or_default()
+                            .push(i);
+                    }
+                }
+                for (family, indexes) in families {
+                    // The display name may use canonical spelling even when every
+                    // slot was structural. This never participates in assignment.
+                    if let Some(i) = indexes.iter().find(|i| facts[i].exact_slot == Some(1)) {
+                        features.entry(*i).or_insert_with(|| {
+                            cached
+                                .and_then(|c| c.names.get(&rows[*i].path_key))
+                                .cloned()
+                                .unwrap_or_else(|| NameFeatures::parse(&rows[*i].name))
+                        });
+                    }
+                    if indexes.is_empty() {
+                        continue;
+                    }
+                    let view = BucketView {
+                        rows,
+                        loose_numeric_allowed: !competing_families
+                            && indexes.iter().filter(|i| head_indexes.contains(i)).count() == 1,
+                        indexes: &indexes,
+                        facts: &facts,
+                        features: &features,
+                        format,
+                    };
+                    let (mut assignment, reason) =
+                        if let Some(assignment) = local_assignments.remove(&view.indexes[0]) {
+                            (assignment, None)
+                        } else if competing_families {
+                            (
+                                VolumeAssignment {
+                                    unresolved: view.indexes.to_vec(),
+                                    ..Default::default()
+                                },
+                                Some(RelationFailureReason::AmbiguousVolumeMapping),
+                            )
+                        } else {
+                            view.solve()
+                        };
+                    let logical = if family == *stem {
+                        assignment
+                            .slots
+                            .get(&1)
+                            .and_then(|i| {
+                                features
+                                    .get(i)
+                                    .map(|f| filename::logical_name(&rows[*i].name, f, format))
+                            })
+                            .unwrap_or_else(|| family.clone())
+                    } else {
+                        family.clone()
+                    };
+                    if reason.is_some() {
+                        let candidates = attempts::build(&view, Some(&logical));
+                        if !candidates.is_empty() {
+                            output.extend(candidates);
+                            continue;
+                        }
+                    }
+                    if reason.is_none() {
+                        if let Some(matching) = launchers.get(&case_key(&logical)) {
+                            let matching: Vec<_> = matching
+                                .iter()
+                                .copied()
+                                .filter(|i| {
+                                    !local_sets
+                                        || Path::new(&rows[*i].path).parent()
+                                            == Path::new(&rows[view.indexes[0]].path).parent()
+                                })
+                                .collect();
+                            if matching.len() == 1 {
+                                assignment.companions = matching;
+                            }
+                        }
+                    }
+                    output.extend(materialize(&view, assignment, &logical, reason, None));
+                }
             }
         }
     }
@@ -895,6 +933,7 @@ pub(super) fn resolve_buckets(
             .logical_name
             .cmp(&b.proposal.logical_name)
             .then(a.proposal.format.cmp(&b.proposal.format))
+            .then(a.proposal.entry_path().cmp(b.proposal.entry_path()))
     });
     output
 }

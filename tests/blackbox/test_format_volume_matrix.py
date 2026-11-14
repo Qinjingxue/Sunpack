@@ -5,6 +5,7 @@ checks), not hand-built descriptor mocks. Missing generators are setup failures,
 not a reason to silently skip format coverage in a configured Windows run.
 """
 import io
+import json
 import shutil
 import zipfile
 from pathlib import Path
@@ -82,7 +83,8 @@ def test_carrier_native_volume_and_password_matrix(package, tmp_path, kind, pass
     assert all(path.is_file() for path in parts)
 
 
-def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package, tmp_path):
+@pytest.mark.parametrize("carrier", [False, True], ids=["plain-file", "embedded"])
+def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package, tmp_path, carrier):
     case = create_encrypted_rar_archive(
         tmp_path, "numbered", password=PASSWORD, header_encrypt=True, split=True,
         payload_size=160 * 1024, split_volume_size=48 * 1024,
@@ -90,17 +92,35 @@ def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package
     parts = sorted(case.archive_dir.iterdir())
     assert len(parts) > 2 and parts[0] == case.entry_path
 
-    # Before decryption, renamed candidate members must still appear in scan
-    # even when their headers cannot establish the physical volume numbers.
+    # The public encryption header groups candidates, but only decryption
+    # reveals the first volume. The misleading .001 file is really volume 2.
     disguised = []
     for index, part in enumerate(parts):
         target = part.with_name("renamed.xyz" if index == 0 else f"renamed.{index:03d}.jpg")
         part.rename(target)
         disguised.append(target)
+    if carrier:
+        sibling = io.BytesIO()
+        with zipfile.ZipFile(sibling, "w") as archive:
+            archive.writestr("sibling.txt", SIBLING)
+        disguised[0].write_bytes(b"prefix" * 211 + disguised[0].read_bytes()
+                                 + b"gap" * 37 + sibling.getvalue() + b"suffix" * 11)
     report = package.json("scan", "-d", "--no-builtin-pw", case.archive_dir, code=1)
-    item, = report["items"]
-    assert item["error_kind"] == "password_required"
+    blocked, = [item for item in report["items"] if item.get("error_kind") == "password_required"]
+    assert len(report["items"]) == 1 + carrier, report
+    assert {Path(path) for path in blocked["all_parts"]} == set(disguised)
+
+    # Password-blocked candidates must survive destructive cleanup requests.
+    package.json("extract", "-d", "-r", "1", "-c", "d", "-o", tmp_path / "blocked",
+                 "--no-builtin-pw", case.archive_dir, code=1)
+    assert all(path.is_file() for path in disguised)
+
+    # Retry uses the same relation solver with real roles, including changing
+    # the representative from the alphabetically first continuation to the head.
+    report = package.json("scan", "-d", "--no-builtin-pw", "-p", PASSWORD, case.archive_dir)
+    item, = [item for item in report["items"] if item.get("all_parts")]
     assert {Path(path) for path in item["all_parts"]} == set(disguised)
+    assert Path(item["main_path"]) == disguised[0]
 
     renamed = []
     for index, part in enumerate(disguised, 1):
@@ -109,11 +129,101 @@ def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package
         renamed.append(target)
 
     output = tmp_path / "out"
-    report = package.json("extract", "-r", "1", "-c", "k", "-o", output,
+    report = package.json("extract", "-d", "-r", "1", "-c", "k", "-o", output,
                           "--no-builtin-pw", "-p", PASSWORD, renamed[0])
 
     assert report["summary"]["success_count"] == 1
-    assert (output / "renamed" / case.marker_name).read_text(encoding="utf-8") == case.marker_text
+    if carrier:
+        _one_marker(output, case)
+    else:
+        assert (output / "renamed" / case.marker_name).read_text(encoding="utf-8") == case.marker_text
+
+
+def test_encrypted_rar5_same_stem_keeps_independent_sets_and_singleton(package, tmp_path):
+    # Same password and stem cannot distinguish independent sets. The single
+    # set test cannot catch cross-set merging during cached password retry.
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    cases, groups = [], []
+    for number in range(3):
+        case = create_encrypted_rar_archive(
+            tmp_path / f"fixture{number}", f"set{number}", password=PASSWORD,
+            header_encrypt=True, split=number < 2, payload_size=100 * 1024,
+            split_volume_size=48 * 1024,
+        )
+        cases.append(case)
+        paths = []
+        for index, part in enumerate(sorted(case.archive_dir.iterdir())):
+            target = inputs / f"same.{index * 3 + number:03d}.jpg"
+            shutil.copyfile(part, target)
+            paths.append(target)
+        groups.append(set(paths))
+    report = package.json("scan", "-d", "--no-builtin-pw", inputs, code=1)
+    assert len(report["items"]) == 3, [(Path(i["main_path"]).name, [Path(p).name for p in i.get("all_parts", [])]) for i in report["items"]]
+    actual = [{Path(path) for path in item.get("all_parts", [item["main_path"]])}
+              for item in report["items"]]
+    assert all(group in actual for group in groups), report
+    assert all(item["error_kind"] == "password_required" for item in report["items"])
+    report = package.json("scan", "-d", "--no-builtin-pw", "-p", PASSWORD, inputs)
+    assert len(report["items"]) == 3, [(Path(i["main_path"]).name, [Path(p).name for p in i.get("all_parts", [])]) for i in report["items"]]
+    outer = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer, "w") as archive:
+        for part in inputs.iterdir():
+            archive.write(part, part.name)
+    output = tmp_path / "out"
+    report = package.json("extract", "-d", "-r", "*", "-c", "k", "-o", output,
+                          "--no-builtin-pw", "-p", PASSWORD, outer)
+    assert report["summary"]["failed_count"] == 0, report
+    for case in cases:
+        markers = list(output.rglob(case.marker_name))
+        assert len(markers) == 1, markers
+        assert markers[0].read_text(encoding="utf-8") == case.marker_text
+
+
+@pytest.mark.requires_watch_broker
+def test_watch_encrypted_rar5_group_recovers_password_and_missing_volume(package, tmp_path):
+    _watch_encrypted_rar5_recovery(package, tmp_path)
+
+
+def _watch_encrypted_rar5_recovery(package, tmp_path, project=None):
+    # One lifecycle covers a password-blocked candidate, decrypted missing slot,
+    # persisted sibling ownership, and eventual cleanup after volume arrival.
+    from tests.helpers.native_fixture import native_fixture
+
+    case, parts = _carrier(tmp_path, "rar5", PASSWORD)
+    missing = parts[1].read_bytes()
+    parts[1].unlink()
+    output = tmp_path / "out"
+    package.configure(post_extract={"archive_cleanup_mode": "d", "flatten_single_directory": False})
+    package.json("watch", "add", "-d", "-o", output, case.archive_dir)
+    package.json("watch", "start", "--once", "--no-tray")
+    events = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))
+    blocked = [row for row in (*events["history"], *events["live"])
+               if row.get("event") == "failed_password"]
+    assert len(blocked) == 1, blocked
+    if project:
+        project("password", [path for path in parts if path != parts[1]], None)
+    sibling, = output.rglob("sibling.txt")
+    before = (sibling, sibling.stat().st_ino, sibling.stat().st_mtime_ns)
+    assert all(path.is_file() for path in parts if path != parts[1])
+    assert package.run("--persistent-shutdown").returncode == 0
+    package.configure(user_passwords=[PASSWORD])
+    result = package.run("watch", "start", "--once", "--no-tray", "--json")
+    assert result.returncode in (0, 1), (result.stdout, result.stderr)
+    assert all(path.is_file() for path in parts if path != parts[1])
+    assert not list(output.rglob(case.marker_name))
+    events = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))
+    assert any(row.get("event") == "suspended_missing_volume" for row in events["live"]), json.dumps(events, ensure_ascii=False)
+    assert len(list(output.rglob("sibling.txt"))) == 1, "password retry repeated an intact sibling"
+    if project:
+        project("volumes", [path for path in parts if path != parts[1]], parts[0])
+    parts[1].write_bytes(missing)
+    package.json("watch", "start", "--once", "--no-tray")
+    sibling = _one_marker(output, case)
+    assert (sibling, sibling.stat().st_ino, sibling.stat().st_mtime_ns) == before
+    assert all(not path.exists() for path in parts)
+    if project:
+        project("done", parts, parts[0])
 
 
 @pytest.mark.requires_watch_broker

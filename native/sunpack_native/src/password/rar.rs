@@ -953,6 +953,41 @@ fn find_rar5_password_match(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Rar5EncryptionIdentity {
+    lg2_count: u8,
+    salt: [u8; 16],
+    password_check: Option<[u8; 8]>,
+}
+
+// The header remains recognizable even when its encryption parameters are
+// unsupported. Both discovery and password parsing use these same bounds.
+pub(crate) fn rar5_archive_encryption_header(data: &[u8]) -> Option<(usize, usize)> {
+    let offset = RAR5_SIGNATURE.len();
+    let end = offset.checked_add(rar5_header_len(data.get(offset..)?)?)?;
+    let header = data.get(..end)?;
+    if crc32(&header[offset + 4..]) != le_u32(header, offset)? { return None; }
+    let (_, start) = read_vint(header, offset + 4)?;
+    let (kind, cursor) = read_vint(header, start)?;
+    if kind != 4 { return None; }
+    let (flags, mut cursor) = read_vint(header, cursor)?;
+    let extra = if flags & 1 != 0 {
+        let (size, next) = read_vint(header, cursor)?;
+        cursor = next;
+        usize::try_from(size).ok()?
+    } else { 0 };
+    if flags & 2 != 0 { cursor = read_vint(header, cursor)?.1; }
+    (cursor <= end.checked_sub(extra)?).then_some((cursor, end))
+}
+
+pub(crate) fn rar5_encryption_identity(data: &[u8], body: usize, end: usize) -> Option<Rar5EncryptionIdentity> {
+    let header = parse_rar5_encryption_body(data, body, end, false, false)?;
+    Some(Rar5EncryptionIdentity {
+        lg2_count: header.lg2_count, salt: header.salt,
+        password_check: header.has_password_check.then_some(header.password_check),
+    })
+}
+
 struct Rar5EncryptionHeader {
     lg2_count: u8,
     salt: [u8; 16],
@@ -962,6 +997,9 @@ struct Rar5EncryptionHeader {
 }
 
 fn find_rar5_encryption_header(data: &[u8]) -> Option<Rar5EncryptionHeader> {
+    if let Some((body, end)) = rar5_archive_encryption_header(data) {
+        return parse_rar5_encryption_body(data, body, end, false, false);
+    }
     let mut offset = RAR5_SIGNATURE.len();
     while offset + 6 <= data.len() {
         let stored_crc = le_u32(data, offset)?;

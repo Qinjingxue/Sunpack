@@ -43,6 +43,8 @@ struct RelationProposal {
     logical_name: String,
     style: String,
     width: usize,
+    // Zero retains an encrypted candidate whose physical role is still hidden.
+    // Such proposals are password-blocked and never reach worker execution.
     volumes: Vec<(String, u32)>,
     companions: Vec<String>,
 }
@@ -204,6 +206,11 @@ impl<'a> RelationCandidateData<'a> {
 }
 
 impl NativeRelationGroup {
+    pub(crate) fn unresolved_password_group(&self) -> bool {
+        matches!(self, Self::Proposal(validation) if validation.status == ProposalStatus::NeedsPassword
+            && validation.proposal.volumes.iter().all(|(_, number)| *number == 0))
+    }
+
     pub(crate) fn is_incomplete(&self) -> bool {
         matches!(self, Self::Proposal(validation) if matches!(validation.status,
             ProposalStatus::Inconclusive | ProposalStatus::NeedsPassword))
@@ -581,12 +588,17 @@ fn resolve_shared_carrier_volumes(
             // Proven logical slices may share a physical lease. Ordinary path
             // arbitration would erase a blocked sibling when another succeeds.
             for validation in resolve_candidate_validations(&mut rows, &name_index, Some(&cache)) {
-                let Some((head_path, _)) = validation.proposal.volumes.iter().find(|(_, slot)| *slot == 1) else { continue; };
-                let head_key = path_key(head_path);
-                let Some(head) = validation.facts.anchors.get(&head_key) else { continue; };
-                if !by_path.get(&head_key).is_some_and(|anchors| anchors.iter().any(|anchor|
-                    anchor.format == validation.proposal.format
-                        && anchor.structure_offset == head.structure_offset)) {
+                let has_head = validation.proposal.volumes.iter().any(|(_, slot)| *slot == 1);
+                let selected = validation.proposal.volumes.iter()
+                    .filter(|(_, slot)| *slot == 1 || !has_head && *slot == 0)
+                    .any(|(path, _)| {
+                        let key = path_key(path);
+                        validation.facts.anchors.get(&key).is_some_and(|head|
+                            by_path.get(&key).is_some_and(|anchors| anchors.iter().any(|anchor|
+                                anchor.format == validation.proposal.format
+                                    && anchor.structure_offset == head.structure_offset)))
+                    });
+                if !selected {
                     continue;
                 }
                 let group = NativeRelationGroup::Proposal(validation);
@@ -980,13 +992,12 @@ fn project_proposal(
     input.parts = proposal
         .volumes
         .iter()
-        .filter(|(_, number)| *number > 0)
         .map(|(path, number)| {
             let anchor = anchors.get(&path_key(path));
             let terminal = proposal.style == "zip_spanned"
                 && anchor.is_some_and(|anchor| anchor.anchor_roles.contains(&"terminal"));
             InputPart {
-                role: if terminal { InputRole::Terminal } else if *number == 1 { InputRole::First } else { InputRole::Member },
+                role: if *number == 0 { InputRole::Main } else if terminal { InputRole::Terminal } else if *number == 1 { InputRole::First } else { InputRole::Member },
                 extent: InputExtent {
                     path: path.clone(),
                     start: anchor.and_then(|a| a.structure_offset).unwrap_or(0),
@@ -995,14 +1006,14 @@ fn project_proposal(
                         (end < a.size).then_some(end)
                     }),
                 },
-                volume_number: Some(*number),
-                canonical_name: canonical_volume_name(
+                volume_number: (*number > 0).then_some(*number),
+                canonical_name: if *number == 0 { String::new() } else { canonical_volume_name(
                     &proposal.logical_name,
                     *number,
                     &style,
                     proposal.width,
                     terminal,
-                ),
+                ) },
             }
         })
         .collect::<Vec<_>>()

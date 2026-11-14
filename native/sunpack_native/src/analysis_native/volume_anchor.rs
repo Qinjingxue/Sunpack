@@ -12,6 +12,7 @@ use crate::io::reader::ManagedReader;
 use crate::io::resource_lifecycle::{NativeReadScope, TrackedFile};
 use crate::password::rar::{
     rar4_decrypt_header_flags_with_read, rar5_decrypt_main_header_with_read,
+    rar5_archive_encryption_header, rar5_encryption_identity, Rar5EncryptionIdentity,
 };
 use crate::scan::compression_stream::validate_bzip2_identity;
 use crate::scan::pe_overlay::{probe_pe_prefix, PeState};
@@ -43,6 +44,7 @@ pub(crate) struct VolumeAnchor {
     pub(crate) standalone: bool,
     pub(crate) multivolume: bool,
     pub(crate) encrypted: bool,
+    pub(crate) rar5_encryption: Option<Arc<Rar5EncryptionIdentity>>,
     pub(crate) needs_password: bool,
     pub(crate) wrong_password: bool,
     pub(crate) anchor_roles: Vec<&'static str>,
@@ -538,11 +540,11 @@ fn probe_rar_at_reader(
     {
         let header_offset = offset + RAR5.len();
         let Some((archive_flags, number)) = rar5_main_volume(prefix, header_offset) else {
-            if !rar5_encryption_header(prefix, header_offset) {
-                return false;
-            }
+            let data = &prefix[offset..];
+            let Some((body, end)) = rar5_archive_encryption_header(data) else { return false; };
             initialize_rar_anchor(out, offset);
             out.encrypted = true;
+            out.rar5_encryption = rar5_encryption_identity(data, body, end).map(Arc::new);
             if let Some(password) = password {
                 // Header-encrypted RAR5 keeps the main-volume flags and number
                 // behind encryption.  Decrypt the main header with the
@@ -651,32 +653,6 @@ fn probe_rar_at_reader(
         return false;
     }
     true
-}
-
-fn rar5_encryption_header(data: &[u8], offset: usize) -> bool {
-    let Some(stored_crc) = u32_le(data, offset) else {
-        return false;
-    };
-    let Some((header_size, after_size)) = read_vint(data, offset + 4) else {
-        return false;
-    };
-    let Some(total) = after_size
-        .checked_sub(offset + 4)
-        .and_then(|size_len| 4usize.checked_add(size_len))
-        .and_then(|prefix| prefix.checked_add(header_size as usize))
-    else {
-        return false;
-    };
-    let Some(end) = offset.checked_add(total) else {
-        return false;
-    };
-    let Some(header) = data.get(offset + 4..end) else {
-        return false;
-    };
-    if crc32(header) != stored_crc {
-        return false;
-    }
-    read_vint(data, after_size).is_some_and(|(header_type, _)| header_type == 4)
 }
 
 fn initialize_rar_anchor(out: &mut VolumeAnchor, offset: usize) {
