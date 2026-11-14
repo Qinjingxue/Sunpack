@@ -21,7 +21,6 @@ namespace sunpack::sevenzip
     {
         VolumeWriterRegistry *registry = registry_;
         registry_ = nullptr;
-        created_facility_ = false;
         if (registry != nullptr && writer_)
         {
             registry->release(writer_->volume_key());
@@ -29,11 +28,9 @@ namespace sunpack::sevenzip
         writer_.reset();
     }
 
-    VolumeWriterRegistry::VolumeWriterRegistry(WriterMetersPtr meters,
-                                               AsyncWriterConfig config,
+    VolumeWriterRegistry::VolumeWriterRegistry(AsyncWriterConfig config,
                                                VolumeSpaceChangeSink sink)
-        : meters_(meters ? std::move(meters) : std::make_shared<WriterMeters>()),
-          config_(config),
+        : config_(config),
           sink_(std::move(sink)) {}
 
     VolumeWriterRegistry::~VolumeWriterRegistry() { shutdown(); }
@@ -41,7 +38,6 @@ namespace sunpack::sevenzip
     VolumeWriterRegistry::Lease VolumeWriterRegistry::acquire(const std::string &key)
     {
         std::shared_ptr<AsyncFileWriter> writer;
-        bool created = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto found = entries_.find(key);
@@ -57,31 +53,14 @@ namespace sunpack::sevenzip
 
             if (!entry.state->space_gate && !key.empty())
             {
-                std::weak_ptr<VolumeState> weak_state = entry.state;
-                const VolumeSpaceChangeSink inner = sink_;
                 entry.state->space_gate = std::make_shared<VolumeSpaceGate>(
-                    key,
-                    std::string{},
-                    [weak_state, inner](const VolumeSpaceTransition &transition)
-                    {
-                        if (!inner)
-                        {
-                            return;
-                        }
-                        VolumeSpaceTransition enriched = transition;
-                        if (const auto state = weak_state.lock())
-                        {
-                            enriched.pending_bytes = pending_bytes_of(state->counters);
-                        }
-                        inner(enriched);
-                    });
+                    key, std::string{}, sink_);
             }
 
             if (!entry.writer)
             {
                 entry.writer = std::make_shared<AsyncFileWriter>(
-                    meters_, entry.state, config_);
-                created = true;
+                    entry.state, config_);
             }
             ++entry.leases;
             entry.reap_deadline = std::chrono::steady_clock::time_point{};
@@ -91,9 +70,7 @@ namespace sunpack::sevenzip
                 entries_.emplace(key, std::move(pending));
             }
         }
-        Lease lease(this, std::move(writer));
-        lease.created_facility_ = created;
-        return lease;
+        return Lease(this, std::move(writer));
     }
 
     void VolumeWriterRegistry::release(const std::string &key) noexcept
@@ -112,9 +89,8 @@ namespace sunpack::sevenzip
         }
     }
 
-    std::vector<std::string> VolumeWriterRegistry::reap_idle()
+    void VolumeWriterRegistry::reap_idle()
     {
-        std::vector<std::string> reclaimed;
         std::vector<std::shared_ptr<AsyncFileWriter>> retired;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -139,7 +115,6 @@ namespace sunpack::sevenzip
                     ++it;
                     continue;
                 }
-                reclaimed.push_back(it->first);
                 retired.push_back(std::move(entry.writer));
                 if (entry.state && entry.state->persistent)
                 {
@@ -176,8 +151,6 @@ namespace sunpack::sevenzip
             }
         }
 
-        retired.clear();
-        return reclaimed;
     }
 
     std::optional<std::chrono::steady_clock::time_point> VolumeWriterRegistry::next_reap_deadline() const

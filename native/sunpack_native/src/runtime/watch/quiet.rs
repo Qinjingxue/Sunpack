@@ -214,7 +214,7 @@ const WINDOW: usize = 12;
 const CLOSE: u32 = 0x8000_0000;
 
 pub(super) fn is_boundary(candidate: &WatchCandidateRow) -> bool {
-    candidate.observation.change_reasons_known && candidate.observation.change_reasons & CLOSE != 0
+    candidate.observation.change_reasons.is_some_and(|reasons| reasons.all & CLOSE != 0)
 }
 
 #[derive(Default)]
@@ -352,8 +352,8 @@ pub(super) fn content_changed(
     if usn == current.observation.change_usn {
         return false;
     }
-    if current.observation.change_reasons_known {
-        return current.observation.change_reasons_without_close & 7 != 0;
+    if let Some(reasons) = current.observation.change_reasons {
+        return reasons.without_close & 7 != 0;
     }
     current.mtime >= mtime - 2.0
 }
@@ -396,9 +396,8 @@ mod tests {
         let mut candidate = WatchCandidateRow {
             path: "path".into(), size: 100, mtime: 0.0,
             observation: crate::filesystem::WatchFileObservation {
-                file_id: "one".into(), change_usn: 1, change_reasons: 1,
-                change_reasons_without_close: 1, change_reasons_known: true,
-                change_reason_error: String::new(),
+                file_id: "one".into(), change_usn: 1,
+                change_reasons: Some(sunpack_usn_core::ChangeReasons { all: 1, without_close: 1 }),
             },
         };
         for index in 0..20 {
@@ -420,7 +419,7 @@ mod tests {
         candidate.observation.change_usn -= 1;
         owner.content_deadline(&candidate, now, 0.0, false, false, None);
         assert_eq!(owner.summary(), before);
-        candidate.observation.change_reasons = CLOSE;
+        candidate.observation.change_reasons.as_mut().unwrap().all = CLOSE;
         owner.metadata(&candidate, now);
         owner.boundary_observation(&candidate, now, 0.0, 0.5);
         assert_eq!(owner.summary(), before); // delayed CLOSE/probe cannot reset newer samples
@@ -431,7 +430,7 @@ mod tests {
         assert_eq!(owner.deadline(), Some(after(now, 101.0)));
         candidate.size += 2;
         candidate.observation.change_usn += 2;
-        candidate.observation.change_reasons = 1;
+        candidate.observation.change_reasons.as_mut().unwrap().all = 1;
         owner.content_deadline(&candidate, after(now, 102.0), 102.0, false, false, None);
         let latest = owner.deadline();
         owner.accelerate(after(now, 101.0), after(now, 101.0));

@@ -1,6 +1,7 @@
 use super::PasswordVerification;
 use crate::formats::seven_zip::{
-    seven_zip_encryption_facts_from_next_header, SevenZipPasswordProbe,
+    seven_zip_encryption_facts_from_next_header, RelationNextHeader, SevenZipPasswordProbe,
+    SEVEN_Z_HEADER_SIZE, SEVEN_Z_MAGIC,
 };
 use crate::io::archive_state::InputExtent;
 use crate::io::cancellation::Cancellation;
@@ -10,13 +11,11 @@ use crate::io::reader::NativeArchiveSession;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use crate::password::input::{parse_ranges, ranges_key, ranges_total_len, VirtualRangeReader};
 use rayon::prelude::*;
-use sevenz_rust2::{Archive, Error as SevenZipError, Password};
+use sevenz_rust2::{Archive, EncoderMethod, Error as SevenZipError, Password};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-const SEVEN_Z_SIGNATURE: &[u8] = b"7z\xbc\xaf\x27\x1c";
-const SEVEN_Z_AES256_SHA256_METHOD: &[u8] = &[0x06, 0xf1, 0x07, 0x01];
 const PARALLEL_PASSWORD_THRESHOLD: usize = 4;
 const MAX_PASSWORD_WORKERS: usize = 64;
 
@@ -88,7 +87,7 @@ fn prepare_seven_zip<R: Read + Seek>(
     mut reader: R,
     total_len: u64,
 ) -> Result<SevenZipPasswordContext, PreparedStatus> {
-    let mut signature = [0u8; 6];
+    let mut signature = [0u8; SEVEN_Z_MAGIC.len()];
     read_exact_field(
         &mut reader,
         &mut signature,
@@ -96,23 +95,34 @@ fn prepare_seven_zip<R: Read + Seek>(
         "7z.signature",
         FieldLocation::Head,
     )?;
-    if signature != SEVEN_Z_SIGNATURE {
+    if signature != SEVEN_Z_MAGIC {
         return Err(PreparedStatus::new(
             "unsupported_method",
             "7z signature not found",
         ));
     }
-    let start_header = seven_zip_tail_requirement(&mut reader)?;
+    let mut start_header = [0u8; SEVEN_Z_HEADER_SIZE];
+    start_header[..SEVEN_Z_MAGIC.len()].copy_from_slice(&signature);
+    read_exact_field(
+        &mut reader,
+        &mut start_header[SEVEN_Z_MAGIC.len()..],
+        total_len,
+        "7z.start_header",
+        FieldLocation::Head,
+    )?;
+    let next = seven_zip_tail_requirement(&start_header, total_len)?;
     // Reuse the start header for the existing bounded descriptor. Encrypted headers
     // need no preliminary Archive::read (which reparses the same coder graph).
     // Keep the original parser only for plaintext and unsupported graphs.
-    let probe_error = if std::env::var_os("SUNPACK_DISABLE_7Z_PASSWORD_PROBE").is_none() {
-        match SevenZipPasswordProbe::from_header(&mut reader, total_len, &start_header) {
+    let probe_error = if std::env::var_os("SUNPACK_DISABLE_7Z_PASSWORD_PROBE").is_some() {
+        "7z password probe is disabled".into()
+    } else if start_header[6] == 0 {
+        match SevenZipPasswordProbe::from_header(&mut reader, total_len, &start_header, next) {
             Ok(probe) => return Ok(SevenZipPasswordContext { probe }),
             Err(message) => message,
         }
     } else {
-        "7z password probe is disabled".to_string()
+        "7z password probe signature or version is unsupported".into()
     };
     if probe_error.starts_with("resource_unavailable:") {
         return Err(PreparedStatus::new(
@@ -160,45 +170,27 @@ enum HeaderRead {
     Damaged(String),
 }
 
-fn seven_zip_tail_requirement<R: Read + Seek>(mut reader: R) -> Result<[u8; 32], ReadFault> {
-    let length = reader.seek(SeekFrom::End(0)).map_err(|error| {
-        ReadFault::from_io(error, "seek_end", 0, 0, 0, 0)
-            .with_field("7z.archive_length", FieldLocation::Body)
+fn seven_zip_tail_requirement(
+    header: &[u8; SEVEN_Z_HEADER_SIZE],
+    length: u64,
+) -> Result<RelationNextHeader, ReadFault> {
+    let next = RelationNextHeader::checked_fields(header).ok_or_else(|| {
+        ReadFault::short_read("range", SEVEN_Z_HEADER_SIZE as u64, usize::MAX, 0, length)
+            .with_field("7z.next_header.offset_size", FieldLocation::Tail)
     })?;
-    reader.seek(SeekFrom::Start(0)).map_err(|error| {
-        ReadFault::from_io(error, "seek", 0, 0, 0, length)
-            .with_field("7z.start_header", FieldLocation::Head)
-    })?;
-    let mut header = [0u8; 32];
-    read_exact_field(
-        &mut reader,
-        &mut header,
-        length,
-        "7z.start_header",
-        FieldLocation::Head,
-    )?;
-    if &header[..6] != SEVEN_Z_SIGNATURE {
-        return Ok(header);
+    if next.end() > length {
+        let requested = usize::try_from(next.size).unwrap_or(usize::MAX);
+        let actual = length.saturating_sub(next.offset).min(next.size) as usize;
+        return Err(ReadFault::short_read(
+            "read_declared_range",
+            next.offset,
+            requested,
+            actual,
+            length,
+        )
+        .with_field("7z.next_header", FieldLocation::Tail));
     }
-    let next_offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
-    let next_size = u64::from_le_bytes(header[20..28].try_into().unwrap());
-    let required_length = 32u64
-        .checked_add(next_offset)
-        .and_then(|start| start.checked_add(next_size))
-        .ok_or_else(|| {
-            ReadFault::short_read("range", 32, usize::MAX, 0, length)
-                .with_field("7z.next_header.offset_size", FieldLocation::Tail)
-        })?;
-    if required_length > length {
-        let start = 32u64.saturating_add(next_offset);
-        let requested = usize::try_from(next_size).unwrap_or(usize::MAX);
-        let actual = length.saturating_sub(start).min(next_size) as usize;
-        return Err(
-            ReadFault::short_read("read_declared_range", start, requested, actual, length)
-                .with_field("7z.next_header", FieldLocation::Tail),
-        );
-    }
-    Ok(header)
+    Ok(next)
 }
 
 fn find_first_conclusive_header_with_probe(
@@ -281,7 +273,7 @@ fn read_archive_header_from_reader<R: Read + Seek>(mut reader: R, password: &str
                 block
                     .coders
                     .iter()
-                    .any(|coder| coder.encoder_method_id() == SEVEN_Z_AES256_SHA256_METHOD)
+                    .any(|coder| coder.encoder_method_id() == EncoderMethod::ID_AES256_SHA256)
             }),
         },
         Err(SevenZipError::PasswordRequired) | Err(SevenZipError::MaybeBadPassword(_)) => {
@@ -349,14 +341,12 @@ mod tests {
 
     #[test]
     fn declared_next_header_beyond_input_requires_a_volume_or_has_damaged_offsets() {
-        let mut bytes = vec![0u8; 64];
-        bytes[..6].copy_from_slice(SEVEN_Z_SIGNATURE);
+        let mut bytes = [0u8; SEVEN_Z_HEADER_SIZE];
+        bytes[..6].copy_from_slice(SEVEN_Z_MAGIC);
         bytes[12..20].copy_from_slice(&64u64.to_le_bytes());
         bytes[20..28].copy_from_slice(&16u64.to_le_bytes());
         assert_eq!(
-            seven_zip_tail_requirement(std::io::Cursor::new(bytes))
-                .unwrap_err()
-                .field,
+            seven_zip_tail_requirement(&bytes, 64).unwrap_err().field,
             "7z.next_header"
         );
     }

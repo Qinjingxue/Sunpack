@@ -45,8 +45,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-    // Callback streams have independent trace storage; only the first failure
-    // is published atomically. Decoder/prefetch threads never share trace fields.
+    // Only the first callback I/O failure is published to the open callback.
     class VolumeInStream final : public CMyUnknownImp, public IInStream {
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
     public:
@@ -54,15 +53,16 @@ namespace sunpack::sevenzip
                        InputPrefetchConfig prefetch, std::shared_ptr<std::atomic<HRESULT>> error)
             : error_(std::move(error)) {
             if (range) {
-                auto* stream = new MultiRangeInStream({*range}, &trace_, prefetch, true);
+                auto* stream = new MultiRangeInStream({*range}, nullptr, prefetch, true);
                 stream_ = stream;
                 opened_ = stream->is_open();
+                if (!opened_) record(stream->open_hresult());
             } else {
-                auto* stream = new FileInStream(path, &trace_, L"file", prefetch);
+                auto* stream = new FileInStream(path, nullptr, L"file", prefetch);
                 stream_ = stream;
                 opened_ = stream->is_open();
+                if (!opened_) record(stream->open_hresult());
             }
-            if (!opened_) record(trace_.last_hresult ? static_cast<HRESULT>(trace_.last_hresult) : E_FAIL);
         }
         bool is_open() const { return opened_; }
         HRESULT STDMETHODCALLTYPE Read(void* data, UInt32 size, UInt32* processed) SUP7Z_NOEXCEPT override {
@@ -79,7 +79,6 @@ namespace sunpack::sevenzip
             }
             return hr;
         }
-        ExtractInputTrace trace_;
         std::shared_ptr<std::atomic<HRESULT>> error_;
         CMyComPtr<IInStream> stream_;
         bool opened_ = false;

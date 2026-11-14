@@ -127,12 +127,13 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoverySource {
     Relations,
     Detection,
     Embedded,
+    #[default]
     Direct,
 }
 
@@ -418,7 +419,7 @@ pub enum CleanupStatus {
     Failed,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct ArchiveResult {
     #[serde(skip)]
     pub(crate) scan_layout: ScanLayout,
@@ -542,6 +543,15 @@ impl Outcome {
             self.checkpoints = Vec::new();
             self.promoted_sources = Vec::new();
         }
+        if self.archives.len() <= 1 {
+            if let Some(entry) = self.archives.first_mut() {
+                if entry.failure.is_none() && !entry.partial {
+                    entry.output = entry.output.as_deref().and_then(|path| std::path::absolute(path).ok());
+                }
+                entry.release_extract_provenance();
+            }
+            return;
+        }
         let mut groups: HashMap<(String, usize), Vec<ArchiveResult>> = HashMap::new();
         let mut order = Vec::new();
         for archive in std::mem::take(&mut self.archives) {
@@ -553,27 +563,20 @@ impl Outcome {
             let mut entries = groups.remove(&key).expect("completed physical input");
             if entries.iter().all(|entry| entry.failure.is_none() && !entry.partial) {
                 let output = common_ancestor(entries.iter().filter_map(|entry| entry.output.as_deref()));
-                let files = entries.iter().map(|entry| entry.files).sum();
-                let bytes = entries.iter().map(|entry| entry.bytes).sum();
                 let mut summary = entries.remove(0);
                 summary.output = output;
-                summary.files = files;
-                summary.bytes = bytes;
-                entries = vec![summary];
+                for entry in entries {
+                    summary.files += entry.files;
+                    summary.bytes += entry.bytes;
+                }
+                summary.release_extract_provenance();
+                self.archives.push(summary);
+            } else {
+                for entry in &mut entries {
+                    entry.release_extract_provenance();
+                }
+                self.archives.extend(entries);
             }
-            for entry in &mut entries {
-                // Extraction-only provenance has already been consumed by
-                // cleanup, promotion and recovery receipts. Failure evidence
-                // stays on the sparse result for CLI diagnostics.
-                entry.source_paths = Vec::new();
-                // Confirmed passwords already live in the engine's recent
-                // password cache; extract reports never read this scan field.
-                entry.password = None;
-                entry.damage_flags = None;
-                entry.volume_attempts = None;
-                entry.promotion_original_path = None;
-            }
-            self.archives.extend(entries);
         }
     }
 
@@ -609,6 +612,17 @@ impl Outcome {
                 .filter(|error| error.kind != InputErrorKind::Cleanup)
                 .map(InputError::count)
                 .sum::<usize>()
+    }
+}
+
+impl ArchiveResult {
+    fn release_extract_provenance(&mut self) {
+        // Cleanup, promotion and recovery already consumed these fields.
+        self.source_paths = Vec::new();
+        self.password = None;
+        self.damage_flags = None;
+        self.volume_attempts = None;
+        self.promotion_original_path = None;
     }
 }
 
@@ -817,8 +831,6 @@ pub(crate) trait Observer: Send + Sync {
         async { Ok(outcome) }
     }
 
-    fn archive_branch(&self, _parent: &ArchiveResult, _child: &ArchiveResult) {}
-
     // Reporting can wait for client capacity. Transfer the existing outcome
     // vector so implementations can park the poll without copying its results.
     fn scope_finished(
@@ -852,19 +864,13 @@ pub(crate) trait Observer: Send + Sync {
         None
     }
 
-    fn before_output(&self, _archive: &ArchiveResult, _output: &Path) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn register_output(&self, archive: &ArchiveResult, output: &Path) -> io::Result<()> {
-        self.before_output(archive, output)?;
+    fn register_output(&self, _archive: &ArchiveResult, output: &Path) -> io::Result<()> {
         crate::scan::scope::create_output_root_exclusive(output).map_err(OutputCreateError::wrap)
     }
 
     /// Restart an already claimed retained output after best-effort cleanup.
     /// New output names still use exclusive registration above.
-    fn reuse_output(&self, archive: &ArchiveResult, output: &Path) -> io::Result<()> {
-        self.before_output(archive, output)?;
+    fn reuse_output(&self, _archive: &ArchiveResult, output: &Path) -> io::Result<()> {
         std::fs::create_dir_all(output).map_err(OutputCreateError::wrap)
     }
 
@@ -872,7 +878,7 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
-    fn discard_output(&self, _archive: &ArchiveResult, _output: &Path) -> io::Result<()> {
+    fn discard_output(&self, _archive: &Path, _sources: &[PathBuf], _output: &Path) -> io::Result<()> {
         Ok(())
     }
 
@@ -902,11 +908,12 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
-    fn allow_recursive_async(&self, depth: usize, pending: usize)
+    fn allow_recursive_async(&self, _depth: usize, _pending: usize)
         -> impl std::future::Future<Output = bool> + Send {
-        async move { self.allow_recursive(depth, pending) }
+        async { true }
     }
 
+    #[cfg(test)]
     fn allow_recursive(&self, _depth: usize, _pending: usize) -> bool {
         true
     }

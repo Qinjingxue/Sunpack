@@ -1,5 +1,5 @@
-const SEVEN_Z_MAGIC: &[u8] = b"7z\xbc\xaf\x27\x1c";
-const SEVEN_Z_HEADER_SIZE: usize = 32;
+pub(crate) const SEVEN_Z_MAGIC: &[u8] = b"7z\xbc\xaf\x27\x1c";
+pub(crate) const SEVEN_Z_HEADER_SIZE: usize = 32;
 const SZ_END: u8 = 0x00;
 const SZ_HEADER: u8 = 0x01;
 const SZ_MAIN_STREAMS_INFO: u8 = 0x04;

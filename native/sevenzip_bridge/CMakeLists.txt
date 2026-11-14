@@ -362,7 +362,6 @@ set(SUP7Z_WRITER_SOURCES
 set(SUP7Z_COMMON_SOURCES
     src/internal/native_cpu_budget.cpp
     src/internal/native_memory.cpp
-    src/internal/sevenzip_engine.cpp
     src/internal/sevenzip_formats.cpp
     src/internal/sevenzip_guid_defs.cpp
     src/internal/sevenzip_paths.cpp
@@ -451,7 +450,7 @@ apply_release_optimizations(sunpack_sevenzip_space_gate)
 apply_source_charset(sunpack_sevenzip_space_gate)
 
 target_link_libraries(sunpack_sevenzip_space_gate
-    PRIVATE sunpack_sevenzip_core
+    PRIVATE sunpack_sevenzip_io_test_core
 )
 
 sup7z_attach_bundled_7z(sunpack_sevenzip_space_gate)

@@ -129,12 +129,10 @@ struct SinkLog {
 };
 
 std::shared_ptr<VolumeSpaceGate> make_gate(const std::string &key,
-                                           const std::shared_ptr<SinkLog> &log,
-                                           std::chrono::milliseconds wait_tick = 20ms) {
+                                           const std::shared_ptr<SinkLog> &log) {
     return std::make_shared<VolumeSpaceGate>(
         key, std::string{},
-        [log](const VolumeSpaceTransition &transition) { log->record(transition); },
-        wait_tick);
+        [log](const VolumeSpaceTransition &transition) { log->record(transition); });
 }
 
 bool wait_until(const std::function<bool()> &predicate, std::chrono::milliseconds timeout) {
@@ -146,13 +144,6 @@ bool wait_until(const std::function<bool()> &predicate, std::chrono::millisecond
         std::this_thread::sleep_for(2ms);
     }
     return predicate();
-}
-
-// 测试自身写错时应当失败而不是挂死：只用在期待 Probe 的场合（期待 Ready 时必须传空谓词）。
-VolumeSpaceGate::WaitResult wait_bounded(const std::shared_ptr<VolumeSpaceGate> &gate,
-                                         std::chrono::milliseconds timeout = 3s) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    return gate->wait([deadline] { return std::chrono::steady_clock::now() >= deadline; });
 }
 
 // 让 lease 能在测试线程之间安全传递：lease 本身归 mutex，观察量用 atomic。
@@ -236,7 +227,7 @@ void g3_zero_space_blocks_probe() {
           "G-3: zero space leaves requests parked");
     check(gate->poll(200 * kMib), "G-3: positive space permits a probe");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-3: probe lease");
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
@@ -254,7 +245,7 @@ void g4_positive_space_issues_single_probe() {
     gate->report_space_failure(ERROR_DISK_FULL, unresolvable);
     check(gate->poll(200 * kMib), "G-4: 首次正数空间采样授权");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-4: 需先占住第一次许可");
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolvable);
     }
@@ -297,14 +288,14 @@ void g5_probe_success_resumes_everyone() {
     auto slot = std::make_shared<LeaseSlot>();
     ProbeLease owner;
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-5: 主线程必须拿到许可");
         owner = std::move(result.lease);
     }
 
     std::atomic<int> ready_count{0};
     std::thread waiter([&] {
-        auto result = wait_bounded(gate);
+        auto result = gate->wait({});
         if (result.kind == VolumeSpaceGate::WaitResult::Kind::Ready) {
             ready_count.fetch_add(1);
         }
@@ -333,14 +324,14 @@ void g6_failed_probe_retries_same_positive_space() {
     const auto blocked_count = log->count(VolumeSpaceTransition::Kind::Blocked);
     check(gate->poll(500 * kMib), "G-6: initial positive-space probe");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         result.lease.report_space_failure(ERROR_DISK_FULL, path);
     }
     check(gate->phase() == VolumeSpacePhase::Blocked, "G-6: failure returns Blocked");
     check(gate->poll(500 * kMib), "G-6: same positive space can retry");
     check(!gate->poll(500 * kMib), "G-6: no second lease while Probing");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         result.lease.report_space_failure(ERROR_DISK_FULL, path);
     }
     check(gate->poll(1), "G-6: smaller positive space can retry");
@@ -361,7 +352,7 @@ void g7_no_second_permit_while_probing() {
     check(gate->phase() == VolumeSpacePhase::Probing, "G-7: 仍必须是 Probing");
 
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-7: 拿到许可");
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
@@ -392,7 +383,7 @@ void g8_concurrent_failures_open_one_episode() {
 // wake_waiters()
 void g9_wake_waiters_does_not_change_state() {
     auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g9", log, 20ms);
+    auto gate = make_gate("job:g9", log);
 
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
 
@@ -426,7 +417,7 @@ void g9_wake_waiters_does_not_change_state() {
 // terminal predicate
 void g10_terminal_predicate_is_honoured() {
     auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g10", log, 20ms);
+    auto gate = make_gate("job:g10", log);
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
 
     auto flag = std::make_shared<std::atomic<bool>>(false);
@@ -438,24 +429,23 @@ void g10_terminal_predicate_is_honoured() {
     });
     check(wait_until([&] { return gate->waiter_count() >= 1; }, 2s),
           "G-10: 等待者必须先阻塞");
-    std::this_thread::sleep_for(60ms);
     flag->store(true, std::memory_order_release);
     gate->wake_waiters();
     waiter.join();
     const auto elapsed = std::chrono::steady_clock::now() - started;
     check(saw_terminal.load(), "G-10: 谓词为真时必须返回 Terminal");
-    check(elapsed < 1s, "G-10: 必须在 poll_interval 量级内返回");
+    check(elapsed < 1s, "G-10: notification must wake the cancelled waiter promptly");
 }
 
 // lease 析构兜底
 void g11_lease_destructor_is_inconclusive() {
     auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g11", log, 20ms);
+    auto gate = make_gate("job:g11", log);
 
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     gate->poll(100 * kMib);
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-11: 必须拿到许可");
         // 什么都不做，直接析构。
     }
@@ -470,7 +460,7 @@ void g11_lease_destructor_is_inconclusive() {
 // waiter 全部离开 ≠ Ready
 void g12_all_waiters_leaving_is_not_ready() {
     auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g12", log, 20ms);
+    auto gate = make_gate("job:g12", log);
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
 
     auto stop = std::make_shared<std::atomic<bool>>(false);
@@ -508,7 +498,7 @@ void g13_event_fanout_uses_affected_jobs() {
     // ② job 抢到 probe 并成功 → 它仍必须收到 space_resumed（它已被移出 waiters_）。
     gate->poll(500 * kMib);
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-13: 必须拿到许可");
         result.lease.report_success();
     }
@@ -547,7 +537,7 @@ void g15_ready_and_terminal_are_distinguishable() {
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     gate->poll(500 * kMib);
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-15: B 拿到许可");
         result.lease.report_success();
     }
@@ -573,7 +563,7 @@ void g16_inconclusive_probe_never_resumes() {
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     gate->poll(500 * kMib);
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-16: 必须拿到许可");
         result.lease.report_inconclusive();
     }
@@ -592,7 +582,7 @@ void g17_new_episode_probes_lower_space() {
     gate->report_space_failure(ERROR_DISK_FULL, path);
     check(gate->poll(500 * kMib), "G-17: first episode probes");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         result.lease.report_success();
     }
     check(gate->phase() == VolumeSpacePhase::Ready, "G-17: first episode recovered");
@@ -616,7 +606,7 @@ void g18_sampling_controls_probe() {
     check(resolved->poll((std::max)(free_now, std::uint64_t{1})),
           "G-18: positive sample permits probe");
     {
-        auto result = wait_bounded(resolved);
+        auto result = resolved->try_wait({});
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
     check(resolved->poll((std::max)(free_now, std::uint64_t{1})),
@@ -700,7 +690,7 @@ void g19_query_root_resolution() {
 // 只有真实成功才 Ready
 void g20_only_real_success_resumes() {
     auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate(to_ascii(current_volume_key()), log, 20ms);
+    auto gate = make_gate(to_ascii(current_volume_key()), log);
     gate->register_job("A");
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     std::uint64_t free_now = 0, total_now = 0;
@@ -708,7 +698,7 @@ void g20_only_real_success_resumes() {
     check(gate->poll((std::max)(free_now, std::uint64_t{1})),
           "G-20: positive space authorizes a probe");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
     for (int i = 0; i < 3; ++i)
@@ -716,7 +706,7 @@ void g20_only_real_success_resumes() {
     check(gate->phase() == VolumeSpacePhase::Blocked, "G-20: remains Blocked");
     check(gate->poll(1), "G-20: a new positive sample permits a probe");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         result.lease.report_inconclusive();
     }
     check(gate->phase() == VolumeSpacePhase::Probing, "G-20: inconclusive does not resume");
@@ -746,7 +736,7 @@ void g21_lease_token_ownership() {
     gate->poll(500 * kMib);
     ProbeLease owner;
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-21: 必须拿到许可");
         owner = std::move(result.lease);
     }
@@ -769,7 +759,7 @@ void g21_lease_token_ownership() {
     gate->poll(600 * kMib);
     ProbeLease first_owner;
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-21: 第二个许可");
         first_owner = std::move(result.lease);
     }
@@ -788,7 +778,7 @@ void g21_lease_token_ownership() {
     gate2->poll(500 * kMib);
     ProbeLease late_owner;
     {
-        auto result = wait_bounded(gate2);
+        auto result = gate2->try_wait({});
         late_owner = std::move(result.lease);
     }
     const std::size_t blocked_before = log2->count(VolumeSpaceTransition::Kind::Blocked);
@@ -845,7 +835,7 @@ void g23_poll_serializes_positive_space_probes() {
     check(!gate->poll(100 * kMib), "G-23: second permit denied while Probing");
     check(!gate->poll(0), "G-23: zero sample cannot authorize a second probe");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         result.lease.report_success();
     }
     check(!gate->poll(100 * kMib), "G-23: Ready does not authorize probes");
@@ -889,7 +879,7 @@ void g24_sticky_hint_survives_recovery() {
     // A 卷恢复 → 这次拉取返回空 → 采样必须停下。
     gate->poll(500 * kMib);
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         result.lease.report_success();
     }
     check(gate->phase() == VolumeSpacePhase::Ready, "G-24: 卷已恢复");
@@ -925,7 +915,7 @@ void g25_two_volumes_recover_independently() {
     VolumeSpaceMonitor monitor(
         VolumeSpaceMonitor::Options{5ms, 5ms},
         [blocked] { return *blocked; },
-        [status_seen_b, status_calls](const VolumeStatePtr &state, std::uint64_t, std::uint64_t,
+        [status_seen_b, status_calls](const VolumeStatePtr &state, std::uint64_t,
                                       bool, unsigned long) {
             status_calls->fetch_add(1);
             if (state && state->key == "job:g25-b") {
@@ -944,7 +934,7 @@ void g25_two_volumes_recover_independently() {
     check(gate_b->poll(100 * kMib), "G-25: B 必须能发放许可");
 
     {
-        auto result = wait_bounded(gate_a);
+        auto result = gate_a->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-25: A 必须先拿到许可");
         result.lease.report_success(); // A 先恢复
     }
@@ -973,7 +963,7 @@ void g25_two_volumes_recover_independently() {
 
     check(gate_b->poll(999 * kMib), "G-25: B 新采样后必须能重新发放许可");
     {
-        auto result = wait_bounded(gate_b);
+        auto result = gate_b->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-25: B 必须拿到新许可");
         result.lease.report_success();
     }
@@ -996,7 +986,7 @@ void g26_registration_covers_root_directory_creation() {
     log->clear();
     check(gate->poll(500 * kMib), "G-26: 正数空间必须发放许可");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-26: 拿到许可");
         result.lease.report_success();
     }
@@ -1009,7 +999,7 @@ void g26_registration_covers_root_directory_creation() {
     config.threads_per_volume = 1;
     config.buffer_count = 4;
     auto registry = std::make_shared<VolumeWriterRegistry>(
-        std::make_shared<sunpack::sevenzip::WriterMeters>(), config,
+        config,
         VolumeSpaceGate::ChangeSink{});
     {
         auto lease = registry->acquire("job:g26-lease");
@@ -1060,7 +1050,7 @@ void g27_only_real_transitions_advance_the_discontinuity_generation() {
     log->clear();
     check(gate->poll(500 * kMib), "G-27: 必须能发放许可");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-27: 拿到许可");
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
@@ -1071,7 +1061,7 @@ void g27_only_real_transitions_advance_the_discontinuity_generation() {
     check(gate->poll(600 * kMib), "G-27: 必须能再次发放许可");
     log->clear();
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-27: 拿到许可");
         result.lease.report_success();
     }
@@ -1107,7 +1097,7 @@ void g28_one_blocked_per_job_per_episode() {
     // 进入下一个 episode 后才会再收到一条（新 episode 是新事件）。
     gate->poll(500 * kMib);
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-28: 拿到许可");
         result.lease.report_success();
     }
@@ -1135,7 +1125,7 @@ void g29_no_late_blocked_after_recovery() {
 
     check(gate->poll(500 * kMib), "G-29: 必须能发放许可");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-29: 拿到许可");
         result.lease.report_success();
     }
@@ -1171,7 +1161,7 @@ void g30_positive_samples_retry_after_failure() {
     for (std::uint64_t level : {100ULL, 100ULL, 1ULL, 200ULL}) {
         check(gate->poll(level), "G-30: every failed probe permits the next positive-space probe");
         check(!gate->poll(level), "G-30: in-flight probe remains exclusive");
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: owner acquired");
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
         check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: failed probe remains Blocked");
@@ -1179,7 +1169,7 @@ void g30_positive_samples_retry_after_failure() {
     check(!gate->poll(0), "G-30: zero space remains blocked");
     check(gate->poll(1), "G-30: positive space resumes probing");
     {
-        auto result = wait_bounded(gate);
+        auto result = gate->try_wait({});
         result.lease.report_success();
     }
     check(gate->phase() == VolumeSpacePhase::Ready, "G-30: true success resumes");
@@ -1203,7 +1193,7 @@ void g31_monitor_drops_episode_history_after_recovery() {
     VolumeSpaceMonitor monitor(
         VolumeSpaceMonitor::Options{5ms, 10s},
         [blocked] { return *blocked; },
-        [status_calls](const VolumeStatePtr &, std::uint64_t, std::uint64_t, bool, unsigned long) {
+        [status_calls](const VolumeStatePtr &, std::uint64_t, bool, unsigned long) {
             status_calls->fetch_add(1);
         });
 
@@ -1285,13 +1275,13 @@ void g31_monitor_drops_episode_history_after_recovery() {
 
 void g32_query_failure_invalidates_inflight_probe() {
     auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g32", log, 20ms);
+    auto gate = make_gate("job:g32", log);
 
     gate->register_job("A");
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     check(gate->poll(100), "G-32: first successful sample must authorise a probe");
 
-    auto result = wait_bounded(gate);
+    auto result = gate->try_wait({});
     check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe,
           "G-32: must acquire the in-flight probe lease");
 
@@ -1312,7 +1302,7 @@ void g32_query_failure_invalidates_inflight_probe() {
 
     check(gate->poll(100),
           "G-32: first successful sample after the query failure must re-arm probing");
-    auto retry = wait_bounded(gate);
+    auto retry = gate->try_wait({});
     check(retry.kind == VolumeSpaceGate::WaitResult::Kind::Probe,
           "G-32: recovery must issue a fresh probe lease");
     retry.lease.report_success();
@@ -1327,13 +1317,13 @@ void g32_query_failure_invalidates_inflight_probe() {
 // probe success -> later query failure，避免端到端测试把此前合法的 resumed 当成 stale resume。
 void g33_late_query_failure_does_not_rewrite_completed_resume() {
     auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g33", log, 20ms);
+    auto gate = make_gate("job:g33", log);
 
     gate->register_job("A");
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     check(gate->poll(100), "G-33: first successful sample must authorise a probe");
 
-    auto result = wait_bounded(gate);
+    auto result = gate->try_wait({});
     check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe,
           "G-33: must acquire the probe lease");
     result.lease.report_success();

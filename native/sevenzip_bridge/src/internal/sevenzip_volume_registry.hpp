@@ -34,8 +34,7 @@ namespace sunpack::sevenzip
 
             Lease(Lease &&other) noexcept
                 : registry_(std::exchange(other.registry_, nullptr)),
-                  writer_(std::move(other.writer_)),
-                  created_facility_(std::exchange(other.created_facility_, false)) {}
+                  writer_(std::move(other.writer_)) {}
 
             Lease &operator=(Lease &&other) noexcept
             {
@@ -44,7 +43,6 @@ namespace sunpack::sevenzip
                     reset();
                     registry_ = std::exchange(other.registry_, nullptr);
                     writer_ = std::move(other.writer_);
-                    created_facility_ = std::exchange(other.created_facility_, false);
                 }
                 return *this;
             }
@@ -54,7 +52,6 @@ namespace sunpack::sevenzip
             bool valid() const noexcept { return writer_ != nullptr; }
             AsyncFileWriter &writer() const noexcept { return *writer_; }
             std::shared_ptr<AsyncFileWriter> writer_pointer() const noexcept { return writer_; }
-            bool created_facility() const noexcept { return created_facility_; }
             const VolumeStatePtr &volume() const noexcept
             {
                 return writer_ ? writer_->volume_state() : empty_state();
@@ -67,14 +64,10 @@ namespace sunpack::sevenzip
 
             VolumeWriterRegistry *registry_ = nullptr;
             std::shared_ptr<AsyncFileWriter> writer_;
-            bool created_facility_ = false;
-
-            friend class VolumeWriterRegistry;
         };
 
-        VolumeWriterRegistry(WriterMetersPtr meters,
-                             AsyncWriterConfig config,
-                             VolumeSpaceChangeSink sink = {});
+        explicit VolumeWriterRegistry(AsyncWriterConfig config,
+                                      VolumeSpaceChangeSink sink = {});
         ~VolumeWriterRegistry();
 
         VolumeWriterRegistry(const VolumeWriterRegistry &) = delete;
@@ -86,7 +79,7 @@ namespace sunpack::sevenzip
         std::size_t volume_count() const noexcept;
 #endif
 
-        std::vector<std::string> reap_idle();
+        void reap_idle();
 
         std::optional<std::chrono::steady_clock::time_point> next_reap_deadline() const;
 
@@ -113,7 +106,6 @@ namespace sunpack::sevenzip
 
         void release(const std::string &key) noexcept;
 
-        const WriterMetersPtr meters_;
         const AsyncWriterConfig config_;
         // gate 只在新建 entry 时创建并注入 sink；已有 entry 的 gate 不得重设。
         const VolumeSpaceChangeSink sink_;

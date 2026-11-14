@@ -1,5 +1,4 @@
 use crate::io::scratch::{Blob, Spool};
-use std::borrow::Cow;
 use std::io::Write;
 
 enum CoderInput<'a> {
@@ -12,11 +11,6 @@ impl AsRef<[u8]> for CoderInput<'_> {
             Self::Borrowed(bytes) => bytes,
             Self::Owned(blob) => blob,
         }
-    }
-}
-impl From<Cow<'_, [u8]>> for CoderInput<'_> {
-    fn from(value: Cow<'_, [u8]>) -> Self {
-        CoderInput::Owned(value.into_owned().into())
     }
 }
 
@@ -34,26 +28,18 @@ impl SevenZipPasswordProbe {
         reader: &mut R,
         reader_len: u64,
         start: &[u8; SEVEN_Z_HEADER_SIZE],
-    ) -> Result<Self, String> {
-        if !start.starts_with(SEVEN_Z_MAGIC) || start[6] != 0 {
-            return Err("7z password probe signature or version is unsupported".to_string());
-        }
+        next: RelationNextHeader,
+    ) -> Result<Self, std::borrow::Cow<'static, str>> {
         let stored_start_crc = u32_le(start, 8);
         if crc32(&start[12..32]) != stored_start_crc {
-            return Err("7z password probe start header crc is invalid".to_string());
+            return Err("7z password probe start header crc is invalid".into());
         }
-        let next = RelationNextHeader::parse(start)
-            .ok_or_else(|| "7z password probe next header range is invalid".to_string())?;
-        let next_header_size = usize::try_from(next.size)
-            .map_err(|_| "7z password probe next header is too large".to_string())?;
+        let next_header_size =
+            usize::try_from(next.size).map_err(|_| "7z password probe next header is too large")?;
         if next_header_size == 0 {
-            return Err("7z password probe next header size is unsupported".to_string());
+            return Err("7z password probe next header size is unsupported".into());
         }
         let next_header_start = next.offset;
-        let next_header_end = next.end();
-        if next_header_end > reader_len {
-            return Err("7z password probe next header is truncated".to_string());
-        }
         let raw = read_seven_zip_probe_range(
             reader,
             reader_len,
@@ -62,31 +48,31 @@ impl SevenZipPasswordProbe {
             "7z.next_header",
             FieldLocation::Tail,
         )
-        .map_err(|err| resource_error(err))?;
-        if crc32(&raw) != u32_le(start, 28) {
-            return Err("7z password probe next header crc is invalid".to_string());
+        .map_err(resource_error)?;
+        if crc32(&raw) != next.crc {
+            return Err("7z password probe next header crc is invalid".into());
         }
         let (pack, folder) = parse_seven_zip_encoded_header_descriptor(&raw)?;
         drop(raw);
         if folder.expected_crc.is_none() || !seven_zip_probe_folder_supported(&folder) {
-            return Err("7z password probe coder graph has no safe fast path".to_string());
+            return Err("7z password probe coder graph has no safe fast path".into());
         }
         if pack.num_streams != pack.sizes.len() || pack.sizes.len() != folder.packed_streams.len() {
-            return Err("7z password probe pack stream count mismatch".to_string());
+            return Err("7z password probe pack stream count mismatch".into());
         }
         let mut stream_start = (SEVEN_Z_HEADER_SIZE as u64)
-            .checked_add(pack.pack_pos.value)
-            .ok_or_else(|| "7z password probe stream offset overflow".to_string())?;
+            .checked_add(pack.pack_pos)
+            .ok_or("7z password probe stream offset overflow")?;
         let mut packed_data = Vec::with_capacity(pack.sizes.len());
-        for size in &pack.sizes {
+        for size in pack.sizes {
             let stream_end = stream_start
-                .checked_add(size.value)
-                .ok_or_else(|| "7z password probe stream end overflow".to_string())?;
+                .checked_add(size)
+                .ok_or("7z password probe stream end overflow")?;
             if stream_end > next_header_start {
-                return Err("7z password probe stream range is invalid".to_string());
+                return Err("7z password probe stream range is invalid".into());
             }
-            let stream_size = usize::try_from(size.value)
-                .map_err(|_| "7z password probe stream is too large".to_string())?;
+            let stream_size =
+                usize::try_from(size).map_err(|_| "7z password probe stream is too large")?;
             packed_data.push(
                 read_seven_zip_probe_range(
                     reader,
@@ -96,7 +82,7 @@ impl SevenZipPasswordProbe {
                     "7z.encoded_header.packed_stream",
                     FieldLocation::Body,
                 )
-                .map_err(|err| resource_error(err))?,
+                .map_err(resource_error)?,
             );
             stream_start = stream_end;
         }
@@ -124,7 +110,7 @@ impl SevenZipPasswordProbe {
             && self
                 .folder
                 .expected_crc
-                .is_some_and(|expected| crc32(&decoded) == expected.value))
+                .is_some_and(|expected| crc32(&decoded) == expected))
         .then_some(decoded))
     }
 }
@@ -139,7 +125,14 @@ fn read_seven_zip_probe_range<R: Read + Seek>(
 ) -> std::io::Result<Blob> {
     seek_field(reader, offset, source_len, field, location)
         .map_err(|fault| fault.into_io_error())?;
+    if len <= crate::io::scratch::MEMORY_BYTES {
+        let mut bytes = crate::io::resource_error::zeroed_bytes(len)?;
+        read_exact_field(reader, &mut bytes, source_len, field, location)
+            .map_err(|fault| fault.into_io_error())?;
+        return Ok(bytes.into());
+    }
     let mut output = Spool::default();
+    output.spill()?;
     let mut remaining = len;
     let mut bytes = vec![0; 64 * 1024];
     while remaining > 0 {
@@ -154,49 +147,19 @@ fn read_seven_zip_probe_range<R: Read + Seek>(
 
 fn parse_seven_zip_encoded_header_descriptor(
     raw: &[u8],
-) -> Result<(SevenZipPackInfoAst, SevenZipFolderAst), String> {
-    let mut pos = 0usize;
-    if raw.get(pos).copied() != Some(SZ_ENCODED_HEADER) {
-        return Err("encoded_header_nid_missing".to_string());
+) -> Result<(SevenZipPackInfoAst, SevenZipFolderAst), &'static str> {
+    if raw.first() != Some(&SZ_ENCODED_HEADER) {
+        return Err("encoded_header_nid_missing");
     }
-    pos += 1;
-    let mut pack_info = None;
-    let mut unpack_info = None;
-    loop {
-        let Some(nid) = raw.get(pos).copied() else {
-            return Err("encoded_header_tree_truncated".to_string());
-        };
-        pos += 1;
-        match nid {
-            SZ_END => break,
-            SZ_PACK_INFO => pack_info = Some(parse_seven_zip_pack_info(raw, &mut pos, true)?),
-            SZ_UNPACK_INFO => {
-                let parsed = parse_seven_zip_unpack_info(raw, &mut pos)?;
-                if parsed.folders.len() != 1 {
-                    return Err("encoded_header_folder_not_unique".to_string());
-                }
-                unpack_info = Some(parsed);
-            }
-            SZ_SUB_STREAMS_INFO => {
-                let unpack = unpack_info
-                    .as_ref()
-                    .ok_or_else(|| "encoded_header_substreams_require_unpack_info".to_string())?;
-                parse_seven_zip_substreams_info(raw, &mut pos, unpack)?;
-            }
-            _ => {
-                return Err(format!(
-                    "encoded_header_unsupported_streams_nid_0x{nid:02x}"
-                ))
-            }
-        }
-    }
+    let mut pos = 1;
+    let mut streams = SevenZipStreams::default();
+    parse_seven_zip_streams_info(raw, &mut pos, &mut streams, true)?;
     Ok((
-        pack_info.ok_or_else(|| "encoded_header_pack_info_missing".to_string())?,
-        unpack_info
-            .ok_or_else(|| "encoded_header_unpack_info_missing".to_string())?
+        streams.pack.ok_or("encoded_header_pack_info_missing")?,
+        streams
             .folders
             .pop()
-            .ok_or_else(|| "encoded_header_folder_missing".to_string())?,
+            .ok_or("encoded_header_unpack_info_missing")?,
     ))
 }
 
@@ -219,7 +182,7 @@ fn decode_seven_zip_encoded_folder(
     if folder.coders.is_empty() {
         return Err("encoded_header_decoder_unsupported_method".to_string());
     }
-    let mut visiting = vec![false; folder.coders.len()];
+    let mut visiting = [false; SEVEN_Z_MAX_FOLDER_CODERS];
     decode_seven_zip_output(
         folder.main_output_stream,
         packed_data,
@@ -261,53 +224,44 @@ fn decode_seven_zip_output(
         return Err("encoded_header_bind_pair_cycle".to_string());
     }
     visiting[coder_index] = true;
-    let mut inputs = Vec::with_capacity(usize::try_from(coder.num_in_streams).unwrap_or(0));
-    for relative in 0..coder.num_in_streams {
+    let mut read_input = |relative| {
         let input_stream = coder_input_base + relative;
         if let Some((_, upstream_output)) = folder
             .bind_pairs
             .iter()
             .find(|(input, _)| *input == input_stream)
         {
-            inputs.push(CoderInput::Owned(decode_seven_zip_output(
-                *upstream_output,
-                packed_data,
-                folder,
-                password,
-                visiting,
-            )?));
+            decode_seven_zip_output(*upstream_output, packed_data, folder, password, visiting)
+                .map(CoderInput::Owned)
         } else {
             let packed_index = folder
                 .packed_streams
                 .iter()
                 .position(|stream| *stream == input_stream)
                 .ok_or_else(|| "encoded_header_input_stream_unbound".to_string())?;
-            inputs.push(
-                packed_data
-                    .get(packed_index)
-                    .map(|data| CoderInput::Borrowed(data))
-                    .ok_or_else(|| "encoded_header_pack_stream_missing".to_string())?,
-            );
+            packed_data
+                .get(packed_index)
+                .map(|data| CoderInput::Borrowed(data))
+                .ok_or_else(|| "encoded_header_pack_stream_missing".to_string())
         }
-    }
-    visiting[coder_index] = false;
-    let unpack_size = folder
-        .unpack_sizes
-        .get(usize::try_from(output_stream).unwrap_or(usize::MAX))
-        .map(|span| span.value)
-        .unwrap_or(folder.unpack_size);
+    };
+    let unpack_size = folder.unpack_size(output_stream);
     if coder.method_id.as_slice() == EncoderMethod::ID_BCJ2 {
-        if inputs.len() != 4 {
+        if coder.num_in_streams != 4 {
             return Err("encoded_header_bcj2_input_count_invalid".to_string());
         }
-        let cursors = inputs.into_iter().map(Cursor::new).collect::<Vec<_>>();
-        let reader = Bcj2Reader::new(cursors, unpack_size);
-        return collect_decoded(reader, unpack_size);
+        let cursors = (0..4)
+            .map(|index| read_input(index).map(Cursor::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        visiting[coder_index] = false;
+        return collect_decoded(Bcj2Reader::new(cursors, unpack_size), unpack_size);
     }
-    if inputs.len() != 1 {
+    if coder.num_in_streams != 1 {
         return Err("encoded_header_decoder_unsupported_multi_input_coder".to_string());
     }
-    decode_seven_zip_encoded_coder(inputs.pop().unwrap(), coder, password, unpack_size)
+    let input = read_input(0)?;
+    visiting[coder_index] = false;
+    decode_seven_zip_encoded_coder(input, coder, password, unpack_size)
 }
 
 fn seven_zip_bcj_start_pos(coder: &SevenZipCoderAst) -> Result<usize, String> {
@@ -342,13 +296,12 @@ fn seven_zip_bcj_start_pos(coder: &SevenZipCoderAst) -> Result<usize, String> {
     Ok(start as usize)
 }
 
-fn decode_seven_zip_encoded_coder<'a>(
-    data: impl Into<CoderInput<'a>>,
+fn decode_seven_zip_encoded_coder(
+    data: CoderInput<'_>,
     coder: &SevenZipCoderAst,
     password: Option<&str>,
     unpack_size: u64,
 ) -> Result<Blob, String> {
-    let data = data.into();
     if coder.method_id.as_slice() == EncoderMethod::ID_COPY {
         return collect_decoded(Cursor::new(data), unpack_size);
     }
@@ -508,7 +461,7 @@ fn decrypt_seven_zip_aes256_sha256(
     let Some(password) = password.filter(|value| !value.is_empty()) else {
         return Err("encoded_header_decode_password_required".into());
     };
-    let password_bytes = seven_zip_password(Some(password));
+    let password_bytes = Password::from(password);
     let (key, mut iv) = seven_zip_aes_key_iv(properties, password_bytes.as_slice())?;
     if data.len() % 16 != 0 || unpack_size > data.len() as u64 {
         return Err("encoded_header_payload_crc_bad:aes_block_size".into());
@@ -633,7 +586,7 @@ fn seven_zip_kdf_cache(
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
-pub(crate) fn clear_seven_zip_kdf_cache() -> usize {
+pub(crate) fn clear_seven_zip_kdf_cache() {
     // Idle cleanup owns the same boundary as reader/password-context cleanup.
     // Drop entries and their backing allocation outside the cache lock.
     let entries = std::mem::take(
@@ -641,7 +594,7 @@ pub(crate) fn clear_seven_zip_kdf_cache() -> usize {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     );
-    entries.len()
+    drop(entries);
 }
 
 fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
@@ -796,7 +749,7 @@ mod encoded_folder_graph_tests {
             num_out_streams: 1,
         };
         let decode = |data: &[u8], size| {
-            decode_seven_zip_encoded_coder(Cow::Borrowed(data), &coder, None, size)
+            decode_seven_zip_encoded_coder(CoderInput::Borrowed(data), &coder, None, size)
         };
         assert_eq!(decode(&packed, 512).unwrap(), b"test".repeat(128));
         for wrong_size in [0, 1, 511, 513] {
@@ -809,7 +762,7 @@ mod encoded_folder_graph_tests {
         large_dictionary.properties[0] = 40;
         assert_eq!(
             decode_seven_zip_encoded_coder(
-                Cow::Borrowed(packed.as_slice()),
+                CoderInput::Borrowed(packed.as_slice()),
                 &large_dictionary,
                 None,
                 512
@@ -834,13 +787,13 @@ mod encoded_folder_graph_tests {
             num_out_streams: 1,
         };
         assert_eq!(
-            decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4)
+            decode_seven_zip_encoded_coder(CoderInput::Borrowed(bytes.as_slice()), &coder, None, 4)
                 .unwrap(),
             b"test"
         );
         for wrong_size in [0, 3, 5, 64 * 1024 * 1024 + 1] {
             assert!(decode_seven_zip_encoded_coder(
-                Cow::Borrowed(bytes.as_slice()),
+                CoderInput::Borrowed(bytes.as_slice()),
                 &coder,
                 None,
                 wrong_size
@@ -848,15 +801,21 @@ mod encoded_folder_graph_tests {
             .is_err());
         }
         *bytes.last_mut().unwrap() ^= 1;
-        assert!(
-            decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4)
-                .is_err()
-        );
+        assert!(decode_seven_zip_encoded_coder(
+            CoderInput::Borrowed(bytes.as_slice()),
+            &coder,
+            None,
+            4
+        )
+        .is_err());
         coder.properties.clear();
-        assert!(
-            decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4)
-                .is_err()
-        );
+        assert!(decode_seven_zip_encoded_coder(
+            CoderInput::Borrowed(bytes.as_slice()),
+            &coder,
+            None,
+            4
+        )
+        .is_err());
     }
 
     fn reference_aes_key(properties: &[u8], password: &[u8]) -> [u8; 32] {
@@ -944,8 +903,7 @@ mod encoded_folder_graph_tests {
             bind_pairs: vec![(2, 1), (0, 2)],
             packed_streams: vec![1],
             main_output_stream: 0,
-            unpack_size: 4,
-            unpack_sizes: vec![SevenZipVintSpan { value: 4 }; 3],
+            unpack_sizes: SevenZipUnpackSizes::All(vec![4; 3]),
             expected_crc: None,
         };
         let decoded =
@@ -992,8 +950,7 @@ mod encoded_folder_graph_tests {
             bind_pairs: vec![(0, 0)],
             packed_streams: Vec::new(),
             main_output_stream: 0,
-            unpack_size: 1,
-            unpack_sizes: vec![SevenZipVintSpan { value: 1 }],
+            unpack_sizes: SevenZipUnpackSizes::Main(1),
             expected_crc: None,
         };
         let error = decode_seven_zip_encoded_folder(&[], &folder, None).unwrap_err();

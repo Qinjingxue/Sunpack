@@ -136,29 +136,21 @@ pub(super) fn watch_file_observation_known_kind(
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         is_directory,
     )?;
-    let mut observation = read_file_usn(handle.raw())?;
-    if let Some(previous_usn) = since_usn.filter(|value| *value > 0) {
-        if observation.change_usn > previous_usn {
-            match read_change_reasons(
-                path,
-                &observation.file_id,
-                previous_usn,
-                observation.change_usn,
-            ) {
-                Ok(reasons) => {
-                    observation.change_reasons = reasons.all;
-                    observation.change_reasons_without_close = reasons.without_close;
-                    observation.change_reasons_known = true;
-                }
-                Err(error) => {
-                    observation.change_reason_error = error.to_string();
-                }
-            }
-        } else if observation.change_usn == previous_usn {
-            observation.change_reasons_known = true;
+    let file = read_file_usn(handle.raw())?;
+    let change_reasons = since_usn.filter(|value| *value > 0).and_then(|previous| {
+        if file.usn == previous {
+            Some(sunpack_usn_core::ChangeReasons::default())
+        } else if file.usn > previous {
+            volume_device(path).and_then(|volume| {
+                sunpack_usn_core::broker_read_change_reasons(
+                    &volume, file.id, file.id_len, previous, file.usn,
+                )
+            }).ok()
+        } else {
+            None
         }
-    }
-    Ok(observation)
+    });
+    Ok(WatchFileObservation { file_id: file.id_text(), change_usn: file.usn, change_reasons })
 }
 
 pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i64)> {
@@ -185,8 +177,8 @@ pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i6
     };
     Ok((
         volume_device(path)?,
-        observation.file_id,
-        observation.change_usn,
+        observation.id_text(),
+        observation.usn,
     ))
 }
 
@@ -242,12 +234,24 @@ fn open_path(
     })
 }
 
-fn read_file_usn(handle: Handle) -> io::Result<WatchFileObservation> {
+struct FileUsn {
+    id: [u8; sunpack_usn_core::protocol::FILE_ID_BYTES],
+    id_len: u8,
+    usn: i64,
+}
+
+impl FileUsn {
+    fn id_text(&self) -> String {
+        sunpack_usn_core::protocol::format_file_id(&self.id[..usize::from(self.id_len)])
+    }
+}
+
+fn read_file_usn(handle: Handle) -> io::Result<FileUsn> {
     let request = ReadFileUsnData {
         min_major_version: 2,
         max_major_version: 4,
     };
-    let mut output = vec![0u8; 4096];
+    let mut output = [0u8; 4096];
     let mut bytes_returned = 0u32;
     if unsafe {
         DeviceIoControl(
@@ -267,7 +271,7 @@ fn read_file_usn(handle: Handle) -> io::Result<WatchFileObservation> {
     parse_file_usn_record(&output[..bytes_returned as usize])
 }
 
-fn parse_file_usn_record(bytes: &[u8]) -> io::Result<WatchFileObservation> {
+fn parse_file_usn_record(bytes: &[u8]) -> io::Result<FileUsn> {
     if bytes.len() < 32 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -307,33 +311,10 @@ fn parse_file_usn_record(bytes: &[u8]) -> io::Result<WatchFileObservation> {
             "NTFS returned a negative file USN",
         ));
     }
-    let file_id = bytes[8..file_id_end]
-        .iter()
-        .rev()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(WatchFileObservation {
-        file_id,
-        change_usn,
-        change_reasons: 0,
-        change_reasons_without_close: 0,
-        change_reasons_known: false,
-        change_reason_error: String::new(),
-    })
-}
-
-fn read_change_reasons(
-    path: &Path,
-    expected_file_id: &str,
-    previous_usn: i64,
-    current_usn: i64,
-) -> io::Result<sunpack_usn_core::ChangeReasons> {
-    sunpack_usn_core::broker_read_change_reasons(
-        &volume_device(path)?,
-        expected_file_id,
-        previous_usn,
-        current_usn,
-    )
+    let file_id = &bytes[8..file_id_end];
+    let mut id = [0; sunpack_usn_core::protocol::FILE_ID_BYTES];
+    id[..file_id.len()].copy_from_slice(file_id);
+    Ok(FileUsn { id, id_len: file_id.len() as u8, usn: change_usn })
 }
 
 pub(super) fn validate_volume_journal(path: &Path) -> io::Result<()> {
@@ -466,9 +447,8 @@ mod tests {
                 record[usn_offset..usn_offset + 8].copy_from_slice(&usn.to_le_bytes());
                 let observation = parse_file_usn_record(&record)
                     .expect("zero USN is valid for an unchanged pre-existing file or directory");
-                assert_eq!(observation.file_id, expected_file_id);
-                assert_eq!(observation.change_usn, usn);
-                assert!(!observation.change_reasons_known);
+                assert_eq!(observation.id_text(), expected_file_id);
+                assert_eq!(observation.usn, usn);
             }
             record[usn_offset..usn_offset + 8].copy_from_slice(&(-1i64).to_le_bytes());
             assert!(parse_file_usn_record(&record).is_err());

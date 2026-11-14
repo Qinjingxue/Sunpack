@@ -55,8 +55,11 @@ impl StderrHistory {
         let text = String::from_utf8_lossy(&bytes);
         let start = text.char_indices().rev().nth(STDERR_TAIL_CHARS - 1)
             .map_or(0, |(offset, _)| offset);
-        let lines: Vec<_> = text[start..].split_inclusive('\n').collect();
-        lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].concat()
+        let tail = &text[start..];
+        let lines = tail.strip_suffix('\n').unwrap_or(tail);
+        let start = lines.rmatch_indices('\n').nth(STDERR_TAIL_LINES - 1)
+            .map_or(0, |(offset, _)| offset + 1);
+        tail[start..].to_owned()
     }
 }
 
@@ -286,7 +289,6 @@ impl Episode {
 #[derive(Default)]
 struct Mailbox {
     updates: Mutex<Updates>,
-    stderr: Mutex<StderrHistory>,
     interest: WorkerUpdates,
 }
 
@@ -875,10 +877,10 @@ impl Shared {
             }
             return;
         }
-        let job_id = string(&frame.summary, "job_id").to_owned();
+        let job_id = string(&frame.summary, "job_id");
         if kind == "native_event" && string(&frame.summary, "event") == "job_finished" {
-            if let Some(mut job) = state.jobs.remove(&job_id) {
-                let mut result = job.result.take().unwrap_or_else(|| {
+            if let Some((job_id, mut job)) = state.jobs.remove_entry(job_id) {
+                let result = job.result.take().unwrap_or_else(|| {
                     Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "native job finished without a result",
@@ -898,10 +900,6 @@ impl Shared {
                         state.grant_retry();
                     }
                 } else {
-                    if let Ok(frame) = &mut result {
-                        let stderr = job.mailbox.stderr.lock().unwrap().take();
-                        if !stderr.is_empty() { frame.summary["stderr_tail"] = Value::String(stderr); }
-                    }
                     state.completion_epoch += 1;
                     if state.grant_retry() {
                         state.claimed_epoch = state.completion_epoch;
@@ -914,15 +912,15 @@ impl Shared {
             }
             return;
         }
-        let Some(job) = state.jobs.get_mut(&job_id) else {
+        let Some(job) = state.jobs.get_mut(job_id) else {
             return;
         };
         if job.result.is_some() {
             return;
         }
         let event = string(&frame.summary, "event");
-        if matches!(kind, "progress" | "native_memory") && job.resource_event(event, &frame.summary)
-        {
+        if matches!(kind, "progress" | "native_memory")
+            && (job.mailbox.interest == WorkerUpdates::None || job.resource_event(event, &frame.summary)) {
             return;
         }
         match kind {
@@ -947,10 +945,15 @@ impl Shared {
             }
             "progress" | "native_memory" => {}
             _ => match job.accumulator.as_mut().expect("active job accumulator").accept(frame) {
-                Ok(Some(frame)) if string(&frame.summary, "type") == "result" => {
-                    let stderr = self.stderr.lock().unwrap().take();
-                    job.mailbox.stderr.lock().unwrap().append(stderr.as_bytes());
-                    job.result = Some(Ok(frame))
+                Ok(Some(mut frame)) if string(&frame.summary, "type") == "result" => {
+                    let mut stderr = self.stderr.lock().unwrap();
+                    if string(&frame.summary, "status") == "ok" || rejected(&frame) {
+                        stderr.bytes.clear();
+                    } else {
+                        let tail = stderr.take();
+                        if !tail.is_empty() { frame.summary["stderr_tail"] = Value::String(tail); }
+                    }
+                    job.result = Some(Ok(frame));
                 }
                 Ok(_) => {}
                 Err(error) => job.protocol_error(error),
@@ -1800,6 +1803,11 @@ mod tests {
         let text = frame.summary["stderr_tail"].as_str().unwrap();
         assert_eq!(text.lines().count(), STDERR_TAIL_LINES);
         assert!(text.starts_with("line20\n") && text.ends_with("line59\n"));
+        let success = register(&shared, "success");
+        pump_stderr(io::Cursor::new(b"irrelevant successful-job detail\n"), &shared);
+        dispatch(&shared, json!({"type": "result", "job_id": "success", "status": "ok"}));
+        dispatch(&shared, json!({"type": "native_event", "event": "job_finished", "job_id": "success"}));
+        assert!(success.updates.lock().unwrap().result.take().unwrap().unwrap().summary.get("stderr_tail").is_none());
         let third = register(&shared, "third");
         finish(&shared, "third", false);
         assert!(third.updates.lock().unwrap().result.take().unwrap().unwrap().summary.get("stderr_tail").is_none());

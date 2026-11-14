@@ -13,13 +13,6 @@ use std::io::{Cursor, Read, Seek};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
-fn seven_zip_password(password: Option<&str>) -> Password {
-    match password {
-        Some(value) if !value.is_empty() => Password::from(value),
-        _ => Password::empty(),
-    }
-}
-
 fn u32_le(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
         bytes[offset],
@@ -44,9 +37,14 @@ pub(crate) struct RelationNextHeader {
 
 impl RelationNextHeader {
     pub(crate) fn parse(header: &[u8]) -> Option<Self> {
-        if header.len() < 32 || header.get(..6)? != b"7z\xbc\xaf'\x1c" || header[6] != 0 {
+        let header = header.first_chunk::<SEVEN_Z_HEADER_SIZE>()?;
+        if !header.starts_with(SEVEN_Z_MAGIC) || header[6] != 0 {
             return None;
         }
+        Self::checked_fields(header)
+    }
+
+    pub(crate) fn checked_fields(header: &[u8; SEVEN_Z_HEADER_SIZE]) -> Option<Self> {
         let offset = 32u64.checked_add(u64::from_le_bytes(header[12..20].try_into().ok()?))?;
         let size = u64::from_le_bytes(header[20..28].try_into().ok()?);
         offset.checked_add(size)?;

@@ -32,7 +32,7 @@ namespace sunpack::sevenzip
 
         using BlockedProvider = std::function<std::vector<VolumeStatePtr>()>;
         using StatusSink = std::function<void(const VolumeStatePtr &, std::uint64_t free_bytes,
-                                              std::uint64_t pending_bytes, bool query_ok,
+                                              bool query_ok,
                                               unsigned long query_error)>;
 
         VolumeSpaceMonitor(Options options, BlockedProvider provider, StatusSink status)
@@ -153,11 +153,9 @@ namespace sunpack::sevenzip
             {
                 return;
             }
-            const std::uint64_t pending_bytes =
-                state->counters.pending_bytes.load(std::memory_order_relaxed);
             try
             {
-                status_(state, free_bytes, pending_bytes, query_ok, query_error);
+                status_(state, free_bytes, query_ok, query_error);
             }
             catch (...)
             {

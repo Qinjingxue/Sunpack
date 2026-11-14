@@ -131,7 +131,6 @@ impl StageQueue {
 }
 
 fn stage_priority(stage: &str) -> usize {
-    let stage = stage.to_ascii_lowercase();
     if stage.contains("background") { 0 }
     else if ["cancel", "close", "cleanup"].iter().any(|word| stage.contains(word)) { 5 }
     else if ["commit", "postprocess", "promotion"].iter().any(|word| stage.contains(word)) { 4 }
@@ -275,8 +274,14 @@ impl Scheduler {
     /// main's worker handshake can change admission only within the original
     /// finite executor ceiling; already executing work is never preempted.
     pub(super) fn configure_capacity(self: &Arc<Self>, value: usize) {
-        self.state.lock().unwrap().limit = Some(value.max(1).min(self.capacity));
-        self.dispatch();
+        let value = value.max(1).min(self.capacity);
+        let grew = {
+            let mut state = self.state.lock().unwrap();
+            let previous = state.limit.unwrap_or(self.capacity);
+            state.limit = Some(value);
+            value > previous
+        };
+        if grew { self.dispatch(); }
     }
 
     fn dispatch(self: &Arc<Self>) {

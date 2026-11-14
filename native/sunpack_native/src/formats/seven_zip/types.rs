@@ -1,21 +1,7 @@
-struct SevenZipHeader {
-    archive_end: usize,
-    next_header_start: usize,
-    next_header_nid: u8,
-}
-#[derive(Clone, Copy)]
-struct SevenZipVintSpan {
-    value: u64,
-}
-#[derive(Clone, Copy)]
-struct SevenZipCrcSpan {
-    value: u32,
-}
-
 struct SevenZipPackInfoAst {
-    pack_pos: SevenZipVintSpan,
+    pack_pos: u64,
     num_streams: usize,
-    sizes: Vec<SevenZipVintSpan>,
+    sizes: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -26,22 +12,31 @@ struct SevenZipCoderAst {
     num_out_streams: u64,
 }
 
-#[derive(Clone)]
 struct SevenZipFolderAst {
     coders: Vec<SevenZipCoderAst>,
     bind_pairs: Vec<(u64, u64)>,
     packed_streams: Vec<u64>,
     main_output_stream: u64,
-    unpack_size: u64,
-    unpack_sizes: Vec<SevenZipVintSpan>,
-    expected_crc: Option<SevenZipCrcSpan>,
+    unpack_sizes: SevenZipUnpackSizes,
+    expected_crc: Option<u32>,
 }
 
-struct SevenZipUnpackInfoAst {
+enum SevenZipUnpackSizes {
+    Main(u64),
+    All(Vec<u64>),
+}
+
+impl SevenZipFolderAst {
+    fn unpack_size(&self, output: u64) -> u64 {
+        match &self.unpack_sizes {
+            SevenZipUnpackSizes::Main(size) => *size,
+            SevenZipUnpackSizes::All(sizes) => sizes[output as usize],
+        }
+    }
+}
+
+#[derive(Default)]
+struct SevenZipStreams {
+    pack: Option<SevenZipPackInfoAst>,
     folders: Vec<SevenZipFolderAst>,
-}
-
-struct SevenZipHeaderAst {
-    unpack_info: Option<SevenZipUnpackInfoAst>,
-    diagnostics: Vec<String>,
 }

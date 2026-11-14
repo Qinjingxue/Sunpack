@@ -301,7 +301,7 @@ fn serve_client(
 
 fn request_shape_is_valid(request: &Request) -> bool {
     match request.opcode {
-        Opcode::Hello | Opcode::Ping => {
+        Opcode::Hello => {
             request.volume_guid.is_empty()
                 && request.file_id_len == 0
                 && request.previous_usn == 0
@@ -423,7 +423,7 @@ fn handle_request(
     let mut response = Response::ok(request.request_id);
     let mut payload = Vec::new();
     let result: io::Result<(u64, i64, sunpack_usn_core::ChangeReasons)> = match request.opcode {
-        Opcode::Hello | Opcode::Ping => Ok((0, 0, Default::default())),
+        Opcode::Hello => Ok((0, 0, Default::default())),
         Opcode::ProbeVolume => journals
             .with_reader(request.volume_guid, JournalReader::probe_volume)
             .map(|(journal_id, next_usn)| (journal_id, next_usn, Default::default())),
@@ -881,9 +881,12 @@ mod tests {
             owner = next;
         }
         let mut unleased = connect(&name);
-        // An invalid pre-Hello ping confirms this connection is accepted.
+        // A valid probe before Hello confirms the connection is accepted and
+        // cannot run journal commands without a lease.
+        let mut probe = Request::simple(Opcode::ProbeVolume, 2);
+        probe.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned();
         unleased
-            .write_all(&Request::simple(Opcode::Ping, 2).encode().unwrap())
+            .write_all(&probe.encode().unwrap())
             .unwrap();
         let mut response = [0; RESPONSE_BYTES];
         unleased.read_exact(&mut response).unwrap();
@@ -1002,7 +1005,7 @@ mod tests {
     #[test]
     fn only_minimal_shapes_are_accepted_for_non_journal_operations() {
         assert!(request_shape_is_valid(&Request::simple(Opcode::Hello, 1)));
-        let mut invalid = Request::simple(Opcode::Ping, 2);
+        let mut invalid = Request::simple(Opcode::Hello, 2);
         invalid.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned();
         assert!(!request_shape_is_valid(&invalid));
     }

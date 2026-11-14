@@ -1638,25 +1638,14 @@ impl RelationRegexCache {
         Arc::clone(current.get_or_insert_with(|| Arc::new(RelationRegexes::default())))
     }
 
-    fn clear(&self) -> usize {
+    fn clear(&self) {
         let retired = self
             .0
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .take();
         // Destruction of the potentially large search pools stays outside the lock.
-        retired
-            .as_ref()
-            .map_or(0, |regexes| regexes.initialized_count())
-    }
-
-    #[cfg(test)]
-    fn initialized_count(&self) -> usize {
-        self.0
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map_or(0, |regexes| regexes.initialized_count())
+        drop(retired);
     }
 }
 
@@ -1665,7 +1654,7 @@ fn regex_cache() -> &'static RelationRegexCache {
     CACHE.get_or_init(RelationRegexCache::default)
 }
 
-pub(crate) fn clear_regex_caches() -> usize {
+pub(crate) fn clear_regex_caches() {
     regex_cache().clear()
 }
 
@@ -1684,24 +1673,6 @@ struct RelationRegexes {
 }
 
 impl RelationRegexes {
-    fn initialized_count(&self) -> usize {
-        [
-            &self.archive_numbered_suffix_re,
-            &self.zip_zero_numbered_suffix_re,
-            &self.plain_numeric_suffix_re,
-            &self.parse_archive_numbered_re,
-            &self.parse_zip_zero_numbered_re,
-            &self.parse_zip_split_re,
-            &self.parse_rar_part_re,
-            &self.parse_old_rar_re,
-            &self.parse_plain_numbered_re,
-            &self.parse_marker_numbered_re,
-        ]
-        .iter()
-        .filter(|value| value.get().is_some())
-        .count()
-    }
-
     fn archive_numbered_suffix_re(&self) -> &Regex {
         self.archive_numbered_suffix_re
             .get_or_init(|| re(r"\.(7z|zip|rar)\.\d{3}(?:\.[^.]+)?$"))
@@ -1782,8 +1753,8 @@ mod tests {
             );
         });
         ready_rx.recv().unwrap();
-        assert!(cache.clear() > 0);
-        assert_eq!(cache.initialized_count(), 0);
+        cache.clear();
+        assert!(cache.0.read().unwrap().is_none());
         let second = cache.acquire();
         assert!(!Arc::ptr_eq(&weak.upgrade().unwrap(), &second));
         assert_eq!(
@@ -1795,9 +1766,8 @@ mod tests {
         assert!(weak.upgrade().is_none());
         let second_weak = Arc::downgrade(&second);
         drop(second);
-        assert!(cache.clear() > 0);
+        cache.clear();
         assert!(second_weak.upgrade().is_none());
-        assert_eq!(cache.clear(), 0);
     }
 
     #[test]

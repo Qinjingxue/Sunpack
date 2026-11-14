@@ -4,10 +4,8 @@ use std::path::Path;
 pub(crate) struct WatchFileObservation {
     pub(crate) file_id: String,
     pub(crate) change_usn: i64,
-    pub(crate) change_reasons: u32,
-    pub(crate) change_reasons_without_close: u32,
-    pub(crate) change_reasons_known: bool,
-    pub(crate) change_reason_error: String,
+    #[cfg(windows)]
+    pub(crate) change_reasons: Option<sunpack_usn_core::ChangeReasons>,
 }
 
 #[cfg(windows)]

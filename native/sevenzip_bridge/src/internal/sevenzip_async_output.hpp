@@ -176,17 +176,29 @@ namespace sunpack::sevenzip
 #endif
         };
 
-        WriterMeterSnapshot snapshot_global_meters() const noexcept
+#ifdef SUP7Z_TEST_IO_FAULTS
+        struct WriterMeterSnapshot
         {
-            return snapshot_counters(meters_->counters);
-        }
+            std::uint64_t accepted_bytes;
+            std::uint64_t written_bytes;
+            std::uint64_t discarded_bytes;
+            std::uint64_t pending_bytes;
+            std::uint64_t completed_files;
+            std::uint64_t completed_jobs;
+        };
 
-        WriterMeterSnapshot snapshot_volume_meters() const noexcept
+        WriterMeterSnapshot snapshot_meters() const noexcept
         {
-            return state_ ? snapshot_counters(state_->counters) : WriterMeterSnapshot{};
+            return {test_accepted_bytes_.load(std::memory_order_relaxed),
+                    test_written_bytes_.load(std::memory_order_relaxed),
+                    test_discarded_bytes_.load(std::memory_order_relaxed),
+                    test_pending_bytes_.load(std::memory_order_relaxed),
+                    test_completed_files_.load(std::memory_order_relaxed),
+                    test_completed_jobs_.load(std::memory_order_relaxed)};
         }
 
         const AsyncWriterConfig &config() const noexcept { return config_; }
+#endif
 
         const VolumeStatePtr &volume_state() const noexcept { return state_; }
 
@@ -341,11 +353,9 @@ namespace sunpack::sevenzip
         static constexpr std::size_t kDefaultFileInFlightBytes = 8U << 20;
 
         AsyncFileWriter(
-            std::shared_ptr<WriterMeters> meters,
             VolumeStatePtr state,
             AsyncWriterConfig config = {})
-            : meters_(meters ? std::move(meters) : std::make_shared<WriterMeters>()),
-              state_(state ? std::move(state) : make_volume_state(std::string{}, false)),
+            : state_(state ? std::move(state) : make_volume_state(std::string{}, false)),
               config_(config),
               writer_count_((std::max)(std::size_t{1}, config.threads_per_volume)),
               buffer_count_((std::max)(std::size_t{4}, config.buffer_count)),
@@ -356,7 +366,6 @@ namespace sunpack::sevenzip
 
         AsyncFileWriter()
             : AsyncFileWriter(
-                  std::make_shared<WriterMeters>(),
                   make_volume_state(std::string{}, false),
                   configured_async_writer_config()) {}
 
@@ -623,7 +632,10 @@ namespace sunpack::sevenzip
                         }
                         file->accepted_bytes.fetch_add(chunk, std::memory_order_relaxed);
                         file->new_writes = true;
-                        account_accepted(chunk);
+#ifdef SUP7Z_TEST_IO_FAULTS
+                        test_accepted_bytes_.fetch_add(chunk, std::memory_order_relaxed);
+                        test_pending_bytes_.fetch_add(chunk, std::memory_order_relaxed);
+#endif
                         consumed += chunk;
                         if (buffer->size == kBufferSize)
                         {
@@ -725,11 +737,12 @@ namespace sunpack::sevenzip
 
             const HRESULT result = terminal_result_locked(job);
             unregister_job_locked(job);
+#ifdef SUP7Z_TEST_IO_FAULTS
             if (result == S_OK)
             {
-                meters_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
-                state_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
+                test_completed_jobs_.fetch_add(1, std::memory_order_relaxed);
             }
+#endif
             return result;
         }
 
@@ -965,67 +978,13 @@ namespace sunpack::sevenzip
 
         bool write_through() const noexcept { return config_.write_through; }
 
-        void account_accepted(std::size_t bytes) noexcept
-        {
-            const std::uint64_t value = static_cast<std::uint64_t>(bytes);
-            meters_->counters.accepted_bytes.fetch_add(value, std::memory_order_relaxed);
-            meters_->counters.pending_bytes.fetch_add(value, std::memory_order_relaxed);
-            state_->counters.accepted_bytes.fetch_add(value, std::memory_order_relaxed);
-            state_->counters.pending_bytes.fetch_add(value, std::memory_order_relaxed);
-        }
-
-        void account_written(std::size_t bytes) noexcept
-        {
-            const std::uint64_t value = static_cast<std::uint64_t>(bytes);
-            meters_->counters.written_bytes.fetch_add(value, std::memory_order_relaxed);
-            state_->counters.written_bytes.fetch_add(value, std::memory_order_relaxed);
-            account_pending_release(bytes);
-        }
-
+#ifdef SUP7Z_TEST_IO_FAULTS
         void account_discarded(std::size_t bytes) noexcept
         {
-            if (bytes == 0)
-            {
-                return;
-            }
-            const std::uint64_t value = static_cast<std::uint64_t>(bytes);
-            meters_->counters.discarded_bytes.fetch_add(value, std::memory_order_relaxed);
-            state_->counters.discarded_bytes.fetch_add(value, std::memory_order_relaxed);
-            account_pending_release(bytes);
+            test_discarded_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+            test_pending_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
         }
-
-        void account_pending_release(std::size_t bytes) noexcept
-        {
-            release_pending(meters_->counters.pending_bytes, *state_, bytes);
-            release_pending(state_->counters.pending_bytes, *state_, bytes);
-        }
-
-        static void release_pending(
-            std::atomic<std::uint64_t> &pending,
-            VolumeState &volume,
-            std::size_t bytes) noexcept
-        {
-            const std::uint64_t value = static_cast<std::uint64_t>(bytes);
-#ifndef NDEBUG
-            const std::uint64_t previous = pending.fetch_sub(value, std::memory_order_relaxed);
-            assert(previous >= value && "pending gauge over-released: a byte was accounted twice");
-#else
-            std::uint64_t current = pending.load(std::memory_order_relaxed);
-            for (;;)
-            {
-                if (current < value)
-                {
-                    volume.accounting_violations.fetch_add(1, std::memory_order_relaxed);
-                }
-                const std::uint64_t next = current > value ? current - value : 0;
-                if (pending.compare_exchange_weak(
-                        current, next, std::memory_order_relaxed, std::memory_order_relaxed))
-                {
-                    return;
-                }
-            }
 #endif
-        }
 
         void set_job_error_locked(const JobStatePtr &job, HRESULT hr, int win32_error) noexcept
         {
@@ -1157,7 +1116,9 @@ namespace sunpack::sevenzip
             file->staging_buffer = nullptr;
             if (buffer->size != 0)
             {
+#ifdef SUP7Z_TEST_IO_FAULTS
                 account_discarded(buffer->size);
+#endif
                 if (file->inflight_bytes >= buffer->size)
                 {
                     file->inflight_bytes -= buffer->size;
@@ -1379,8 +1340,10 @@ namespace sunpack::sevenzip
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure)
                 record_failure(file, HRESULT_FROM_WIN32(result.win32_error), result.win32_error);
+#ifdef SUP7Z_TEST_IO_FAULTS
             if (result.kind != AttemptResult::Kind::Succeeded && buffer->size > buffer->transferred)
                 account_discarded(buffer->size - buffer->transferred);
+#endif
             release_buffer(buffer);
         }
 
@@ -1401,7 +1364,7 @@ namespace sunpack::sevenzip
                     result = classify_data_failure(file, error);
                 else if (bytes == 0 || bytes > buffer->size - buffer->transferred)
                 {
-                    record_failure(file, HRESULT_FROM_WIN32(ERROR_WRITE_FAULT), ERROR_WRITE_FAULT, 0);
+                    record_failure(file, HRESULT_FROM_WIN32(ERROR_WRITE_FAULT), ERROR_WRITE_FAULT);
                     result = {AttemptResult::Kind::PermanentFailure, ERROR_WRITE_FAULT};
                 }
                 else
@@ -1607,7 +1570,10 @@ namespace sunpack::sevenzip
 
         void add_written_bytes(const FileStatePtr &file, DWORD written, UInt64 offset = 0) noexcept
         {
-            account_written(written);
+#ifdef SUP7Z_TEST_IO_FAULTS
+            test_written_bytes_.fetch_add(written, std::memory_order_relaxed);
+            test_pending_bytes_.fetch_sub(written, std::memory_order_relaxed);
+#endif
             std::lock_guard<std::mutex> lock(mutex_);
             if (file)
             {
@@ -1690,7 +1656,7 @@ namespace sunpack::sevenzip
             {
                 return {AttemptResult::Kind::SpaceFailure, static_cast<unsigned long>(error)};
             }
-            record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error), 0);
+            record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
             return {AttemptResult::Kind::PermanentFailure, static_cast<unsigned long>(error)};
         }
 
@@ -1793,22 +1759,21 @@ namespace sunpack::sevenzip
                     record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
                 }
             }
-            bool completed_successfully = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 file->metadata_errors = metadata_errors;
                 file->closed = true;
-                completed_successfully = !file->failed;
+#ifdef SUP7Z_TEST_IO_FAULTS
+                if (!file->failed)
+                {
+                    test_completed_files_.fetch_add(1, std::memory_order_relaxed);
+                }
+#endif
                 if (job && job->pending_jobs != 0)
                 {
                     --job->pending_jobs;
                 }
                 unregister_file_locked(file);
-            }
-            if (completed_successfully)
-            {
-                meters_->counters.completed_files.fetch_add(1, std::memory_order_relaxed);
-                state_->counters.completed_files.fetch_add(1, std::memory_order_relaxed);
             }
             producer_cv_.notify_all();
         }
@@ -1860,13 +1825,8 @@ namespace sunpack::sevenzip
         void record_failure(
             const FileStatePtr &file,
             HRESULT hr,
-            int win32_error,
-            std::size_t discarded_bytes = 0) noexcept
+            int win32_error) noexcept
         {
-            // discarded_bytes 是调用方持有的剩余字节；空间/终态路径一律传 0 ——
-            // 已 dequeue 的 buffer 剩余字节只由 writer_loop 收尾负责，
-            // staging 中的 buffer 由 discard_staging_locked() 负责，两者不重叠。
-            account_discarded(discarded_bytes);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 mark_file_failure_locked(file, hr, win32_error);
@@ -1903,7 +1863,6 @@ namespace sunpack::sevenzip
         std::mutex finish_mutex_;
         std::deque<WorkItem> retry_queue_;
         std::shared_ptr<CompletionWake> space_wake_;
-        const std::shared_ptr<WriterMeters> meters_;
         const VolumeStatePtr state_;
         const AsyncWriterConfig config_;
         const std::size_t writer_count_;
@@ -1914,6 +1873,13 @@ namespace sunpack::sevenzip
         std::atomic<bool> stopping_{false};
 
 #ifdef SUP7Z_TEST_IO_FAULTS
+        std::atomic<std::uint64_t> test_accepted_bytes_{0};
+        std::atomic<std::uint64_t> test_written_bytes_{0};
+        std::atomic<std::uint64_t> test_discarded_bytes_{0};
+        std::atomic<std::uint64_t> test_pending_bytes_{0};
+        std::atomic<std::uint64_t> test_completed_files_{0};
+        std::atomic<std::uint64_t> test_completed_jobs_{0};
+
     public:
         // 测试专用：
         //   A：failure_classifier 可注入，用真实的其他错误码驱动空间失败路径。

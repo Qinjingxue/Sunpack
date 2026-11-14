@@ -48,42 +48,52 @@ impl StateData {
         roots
     }
 
-    fn owned_records(&self, paths: Option<&[String]>, descendants: bool) -> BTreeMap<String, Value> {
+    fn owned_records(&self, paths: Option<&[String]>) -> BTreeMap<String, Value> {
         let Some(paths) = paths else {
             return self.runtime.range("owned|".to_owned()..)
                 .take_while(|(key, _)| key.starts_with("owned|"))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
         };
+        let keys: Vec<_> = paths.iter().map(|path| path_key(path)).collect();
+        let mut records = self.owned_ancestors(&keys);
+        for path in &keys {
+            let prefix = format!("owned|{}\\", path.trim_end_matches('\\'));
+            records.extend(self.runtime.range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .map(|(key, value)| (key.clone(), value.clone())));
+        }
+        // An event in either namespace reconciles the original pair, even
+        // after the junction disappeared or was redirected. A reused key
+        // belonging to a newer registration is never part of this pair.
+        let aliases = records.values().flat_map(|record| {
+            record_paths(record).filter_map(move |path| {
+                let key = format!("owned|{}", path_key(path));
+                self.runtime.get(&key)
+                    .filter(|other| same_registration(record, other))
+                    .map(|other| (key, other.clone()))
+            })
+        }).collect::<Vec<_>>();
+        records.extend(aliases);
+        records
+    }
+
+    fn owned_ancestors(&self, keys: impl IntoIterator<Item = impl AsRef<str>>) -> BTreeMap<String, Value> {
         let mut records = BTreeMap::new();
-        for path in paths {
-            let path = path_key(path);
-            for ancestor in crate::path_keys::path_ancestors(&path) {
-                let key = format!("owned|{ancestor}");
+        if self.runtime.range::<str, _>((std::ops::Bound::Included("owned|"), std::ops::Bound::Unbounded)).next()
+            .is_none_or(|(key, _)| !key.starts_with("owned|"))
+        {
+            return records;
+        }
+        let mut key = String::from("owned|");
+        for path in keys {
+            for ancestor in crate::path_keys::path_ancestors(path.as_ref()) {
+                key.truncate("owned|".len());
+                key.push_str(ancestor);
                 if let Some(value) = self.runtime.get(&key) {
-                    records.entry(key).or_insert_with(|| value.clone());
+                    records.entry(key.clone()).or_insert_with(|| value.clone());
                 }
             }
-            if descendants {
-                let prefix = format!("owned|{}\\", path.trim_end_matches('\\'));
-                records.extend(self.runtime.range(prefix.clone()..)
-                    .take_while(|(key, _)| key.starts_with(&prefix))
-                    .map(|(key, value)| (key.clone(), value.clone())));
-            }
-        }
-        if descendants {
-            // An event in either namespace reconciles the original pair, even
-            // after the junction disappeared or was redirected. A reused key
-            // belonging to a newer registration is never part of this pair.
-            let aliases = records.values().flat_map(|record| {
-                record_paths(record).filter_map(move |path| {
-                    let key = format!("owned|{}", path_key(path));
-                    self.runtime.get(&key)
-                        .filter(|other| same_registration(record, other))
-                        .map(|other| (key, other.clone()))
-                })
-            }).collect::<Vec<_>>();
-            records.extend(aliases);
         }
         records
     }
@@ -147,7 +157,7 @@ impl NativeWatchState {
         scopes: &[NativeDiscoveryScope],
         paths: Option<&[String]>,
     ) -> OwnedRetirement {
-        let mut records = self.lock().owned_records(paths, true);
+        let mut records = self.lock().owned_records(paths);
         let mut observed = records.iter().map(|(key, record)| (key.clone(), Some(record.clone())))
             .collect::<BTreeMap<_, _>>();
         if records.is_empty() {
@@ -272,7 +282,7 @@ impl NativeWatchState {
     /// the existing finish delta instead of waiting for another filesystem event.
     pub(super) fn discarded_owned_operations(&self, output: &str) -> Vec<Operation> {
         let root = format!("owned|{}", path_key(output).trim_end_matches('\\'));
-        let records = self.lock().owned_records(Some(&[output.to_owned()]), true);
+        let records = self.lock().owned_records(Some(&[output.to_owned()]));
         let mut identities = HashMap::new();
         records.into_iter().filter_map(|(key, record)| {
             if !record_paths(&record).any(|path| {
@@ -329,8 +339,7 @@ impl NativeWatchState {
     /// Capture registrations at the mkdir/publication boundary. Identity I/O
     /// must happen after releasing the journal's global publication gate.
     pub(crate) fn owned_event_records(&self, paths: &[PathBuf]) -> BTreeMap<String, Value> {
-        let keys: Vec<_> = paths.iter().map(|path| path_key(&path.to_string_lossy())).collect();
-        self.lock().owned_records(Some(&keys), false)
+        self.lock().owned_ancestors(paths.iter().map(|path| path_key(&path.to_string_lossy())))
     }
 
     #[cfg(test)]
@@ -342,7 +351,7 @@ impl NativeWatchState {
     pub(crate) fn filter_owned_event_records(
         &self, paths: &mut Vec<PathBuf>, boundary: &Path, records: BTreeMap<String, Value>,
     ) {
-        let boundary = path_key(&boundary.to_string_lossy());
+        if records.is_empty() { return; }
         let mut identities = HashMap::new();
         let verified: Vec<_> = records.into_iter().filter(|(_, record)| {
             let Some(path) = record["path"].as_str() else { return false; };
@@ -357,6 +366,8 @@ impl NativeWatchState {
             data.runtime.get(&key).filter(|current| same_registration(&record, current))
                 .map(|_| key["owned|".len()..].to_owned())
         }).collect();
+        if owned.is_empty() { return; }
+        let boundary = path_key(&boundary.to_string_lossy());
         paths.retain(|path| {
             let key = path_key(&path.to_string_lossy());
             key == boundary || !crate::path_keys::path_ancestors(&key)

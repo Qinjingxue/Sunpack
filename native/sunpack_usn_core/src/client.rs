@@ -1,5 +1,5 @@
 use crate::protocol::{
-    parse_file_id, Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES,
+    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES,
     MAX_DIRECTORY_RESPONSE_BYTES, RESPONSE_BYTES,
 };
 use crate::{
@@ -12,10 +12,11 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY,
-    ERROR_SERVICE_ALREADY_RUNNING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_SEM_TIMEOUT, ERROR_SERVICE_ALREADY_RUNNING, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
@@ -130,27 +131,6 @@ pub fn broker_release() -> io::Result<()> {
     Ok(())
 }
 
-pub fn broker_is_connected() -> bool {
-    STATE
-        .get()
-        .and_then(|state| {
-            state
-                .lock()
-                .ok()
-                .map(|state| state.leases > 0 && state.connection.is_some())
-        })
-        .unwrap_or(false)
-}
-
-pub fn broker_ping() -> io::Result<Duration> {
-    let started = Instant::now();
-    ensure_ok(transact_request(Request::simple(
-        Opcode::Ping,
-        next_request_id(),
-    ))?)?;
-    Ok(started.elapsed())
-}
-
 pub fn broker_probe_volume(volume_guid: &str) -> io::Result<()> {
     broker_volume_cursor(volume_guid).map(|_| ())
 }
@@ -164,11 +144,11 @@ pub fn broker_volume_cursor(volume_guid: &str) -> io::Result<(u64, i64)> {
 
 pub fn broker_read_change_reasons(
     volume_guid: &str,
-    file_id: &str,
+    file_id: [u8; FILE_ID_BYTES],
+    file_id_len: u8,
     previous_usn: i64,
     current_usn: i64,
 ) -> io::Result<ChangeReasons> {
-    let (file_id, file_id_len) = parse_file_id(file_id)?;
     let mut request = Request::simple(Opcode::ReadChangeReasons, next_request_id());
     request.volume_guid = volume_guid.to_owned();
     request.file_id = file_id;
@@ -180,29 +160,6 @@ pub fn broker_read_change_reasons(
         all: response.reasons_all,
         without_close: response.reasons_without_close,
     })
-}
-
-pub fn broker_read_root_changes(
-    volume_guid: &str,
-    root_file_id: &str,
-    start_usn: i64,
-    end_usn: i64,
-) -> io::Result<Vec<String>> {
-    let (file_id, _) = parse_file_id(root_file_id)?;
-    let (journal, _) = broker_volume_cursor(volume_guid)?;
-    let mut changes = std::collections::BTreeSet::new();
-    broker_for_each_directory_change(
-        volume_guid,
-        journal,
-        &[file_id],
-        start_usn,
-        end_usn,
-        |_, name| {
-            changes.insert(name.to_owned());
-            Ok(())
-        },
-    )?;
-    Ok(changes.into_iter().collect())
 }
 
 pub fn broker_for_each_directory_change(
@@ -314,7 +271,7 @@ fn transact_request(request: Request) -> io::Result<Response> {
     // a request may have reached the broker before the connection was lost.
     let replay_safe = matches!(
         request.opcode,
-        Opcode::Ping | Opcode::ProbeVolume | Opcode::ReadChangeReasons
+        Opcode::ProbeVolume | Opcode::ReadChangeReasons
     );
     loop {
         if state.connection.is_none() {
@@ -584,10 +541,16 @@ fn connect_pipe() -> io::Result<BrokerConnection> {
             // Reuse SCM startup instead of waiting forever for an exited broker.
             start_service()?;
         }
-        unsafe {
-            WaitNamedPipeW(pipe_name.as_ptr(), 50);
+        if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), 50) } != 0 {
+            continue;
         }
-        thread::sleep(Duration::from_millis(10));
+        match unsafe { GetLastError() } {
+            ERROR_SEM_TIMEOUT => {}
+            // The SCM can report RUNNING before the first pipe is created.
+            // WaitNamedPipeW returns immediately when the pipe doesn't exist.
+            ERROR_FILE_NOT_FOUND => thread::sleep(Duration::from_millis(10)),
+            error => return Err(io::Error::from_raw_os_error(error as i32)),
+        }
     }
 }
 
@@ -737,11 +700,6 @@ mod tests {
             io::ErrorKind::InvalidData,
             "invalid reply",
         )));
-    }
-
-    #[test]
-    fn disconnected_client_is_not_reported_as_connected() {
-        assert!(!broker_is_connected());
     }
 
     #[test]

@@ -986,7 +986,7 @@ impl Drop for FileSource {
             let index = shards.trailing_zeros() as usize;
             shards &= shards - 1;
             if let Ok(mut shard) = manager().cache_shards[index].lock() {
-                if shard.remove_source(self.identity.source_id).0 != 0 {
+                if shard.remove_source(self.identity.source_id) {
                     shard.compact_stale_orders();
                 }
             }
@@ -1471,9 +1471,9 @@ impl CacheShard {
         path: &Arc<Path>,
         data: Arc<[u8]>,
         tier: CacheTier,
-    ) -> (Arc<[u8]>, u64) {
+    ) -> Arc<[u8]> {
         if let Some(existing) = self.entries.get(&key) {
-            return (Arc::clone(&existing.data), 0);
+            return Arc::clone(&existing.data);
         }
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -1497,7 +1497,6 @@ impl CacheShard {
         queue.bytes += data.len();
         queue.order.push_back((key, generation));
 
-        let mut evictions = 0;
         while self.queue(tier).over_budget() {
             let (key, generation) = self.queue(tier).order.pop_front().unwrap();
             if self.entries.get(&key).map(|entry| entry.generation) != Some(generation) {
@@ -1505,13 +1504,12 @@ impl CacheShard {
                 continue;
             }
             self.remove_entry(&key, false);
-            evictions += 1;
         }
-        (data, evictions)
+        data
     }
 
-    fn remove_entry(&mut self, key: &BlockKey, leave_order_entry: bool) -> Option<CacheEntry> {
-        let entry = self.entries.remove(key)?;
+    fn remove_entry(&mut self, key: &BlockKey, leave_order_entry: bool) {
+        let entry = self.entries.remove(key).expect("tracked cache entry");
         let queue = self.queue(entry.tier);
         queue.bytes -= entry.data.len();
         queue.stale += usize::from(leave_order_entry);
@@ -1522,20 +1520,17 @@ impl CacheShard {
                 self.by_source.remove(&key.source_id);
             }
         }
-        Some(entry)
     }
 
-    fn remove_source(&mut self, source_id: u64) -> (usize, usize) {
+    fn remove_source(&mut self, source_id: u64) -> bool {
         let Some(source) = self.by_source.remove(&source_id) else {
-            return (0, 0);
+            return false;
         };
-        let mut removed_bytes = 0;
-        let count = source.indices.len();
         for index in source.indices {
             let key = BlockKey { source_id, index };
-            removed_bytes += self.remove_entry(&key, true).unwrap().data.len();
+            self.remove_entry(&key, true);
         }
-        (count, removed_bytes)
+        true
     }
 
     fn compact_stale_orders(&mut self) {
@@ -1565,7 +1560,7 @@ impl CacheShard {
 }
 
 impl ReaderManager {
-    fn clear_resources(&self) -> io::Result<(usize, usize, usize)> {
+    fn clear_resources(&self) -> io::Result<()> {
         let mut handles = self
             .handles
             .lock()
@@ -1578,29 +1573,25 @@ impl ReaderManager {
             entry.source.close()?;
         }
         // A retired handle cannot publish a block after its close. Keep the
-        // Arc until the cache sweep accounts for the source's released bytes.
-        let mut removed_entries = 0usize;
-        let mut removed_bytes = 0usize;
+        // sources alive until their cache shards have been cleared.
         for shard in &self.cache_shards {
             let mut shard = shard
                 .lock()
                 .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-            removed_entries += shard.entries.len();
-            removed_bytes += shard.hot.bytes + shard.general.bytes;
             let empty = CacheShard::new(shard.hot.capacity, shard.general.capacity);
             let retired = std::mem::replace(&mut *shard, empty);
             drop(shard);
             drop(retired);
         }
-        Ok((entries.len(), removed_entries, removed_bytes))
+        Ok(())
     }
 
     fn release_resources_under_roots(
         &self,
         roots: &[PathBuf],
-    ) -> io::Result<(usize, usize, usize)> {
+    ) -> io::Result<()> {
         if roots.is_empty() {
-            return Ok((0, 0, 0));
+            return Ok(());
         }
         let mut handles = self
             .handles
@@ -1618,8 +1609,6 @@ impl ReaderManager {
         for source in &sources {
             source.close()?;
         }
-        let mut removed_entries = 0usize;
-        let mut removed_bytes = 0usize;
         for shard in &self.cache_shards {
             let mut shard = shard
                 .lock()
@@ -1630,13 +1619,11 @@ impl ReaderManager {
                 .filter_map(|(&id, source)| path_is_under_roots(&source.path, roots).then_some(id))
                 .collect::<Vec<_>>();
             for source_id in source_ids {
-                let (entries, bytes) = shard.remove_source(source_id);
-                removed_entries += entries;
-                removed_bytes += bytes;
+                shard.remove_source(source_id);
             }
             shard.compact_stale_orders();
         }
-        Ok((sources.len(), removed_entries, removed_bytes))
+        Ok(())
     }
 
     fn open_file(&self, path: &Path) -> io::Result<Arc<FileSource>> {
@@ -1785,8 +1772,7 @@ impl ReaderManager {
         source
             .cached_shards
             .fetch_or(1 << shard_index, Ordering::Relaxed);
-        let (block, _) = shard.insert(key, &source.identity.path, data, tier);
-        Ok(block)
+        Ok(shard.insert(key, &source.identity.path, data, tier))
     }
 
 }
@@ -1881,19 +1867,15 @@ fn cache_tier(source: &FileSource, index: u64) -> CacheTier {
     }
 }
 
-pub(crate) fn clear_reader_resources() -> io::Result<HashMap<&'static str, u64>> {
-    let relation_regexes = crate::relations::clear_regex_caches();
+pub(crate) fn clear_reader_resources() -> io::Result<()> {
+    crate::relations::clear_regex_caches();
     crate::password::context::clear();
     crate::analysis_native::clear_stream_structure_cache();
-    let seven_zip_kdf_entries = crate::formats::seven_zip::clear_seven_zip_kdf_cache();
-    let (handles, cache_entries, cache_bytes) = manager().clear_resources()?;
-    let mut metrics = HashMap::new();
-    metrics.insert("handles", (handles) as u64);
-    metrics.insert("cache_entries", (cache_entries) as u64);
-    metrics.insert("cache_bytes", (cache_bytes) as u64);
-    metrics.insert("relation_regexes", (relation_regexes) as u64);
-    metrics.insert("seven_zip_kdf_entries", (seven_zip_kdf_entries) as u64);
-    Ok(metrics)
+    crate::formats::seven_zip::clear_seven_zip_kdf_cache();
+    if let Some(manager) = MANAGER.get() {
+        manager.clear_resources()?;
+    }
+    Ok(())
 }
 
 pub(crate) fn release_reader_resources_under_resolved_roots(roots: &[PathBuf]) -> io::Result<()> {
@@ -2252,6 +2234,12 @@ mod tests {
         }
     }
 
+    fn cached_source_has_blocks(source_id: u64) -> bool {
+        manager().cache_shards.iter().any(|shard| {
+            shard.lock().unwrap().by_source.contains_key(&source_id)
+        })
+    }
+
     #[test]
     fn directory_walk_releases_its_windows_without_populating_shared_blocks() {
         // Small relation fixtures cannot expose retaining a whole directory
@@ -2281,10 +2269,11 @@ mod tests {
         let reads = THREAD_PHYSICAL_READS.with(std::cell::Cell::get) - before;
         assert_eq!(count, 4096);
         assert!(reads < 32, "directory walk issued {reads} physical reads");
-        let (_, blocks, retained) = manager()
-            .release_resources_under_roots(&[std::fs::canonicalize(&path).unwrap()])
+        let source = manager().open_file(&path).unwrap();
+        assert!(!cached_source_has_blocks(source.identity.source_id));
+        manager()
+            .release_resources_under_roots(&[source.identity.path.to_path_buf()])
             .unwrap();
-        assert_eq!((blocks, retained), (0, 0));
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2348,11 +2337,12 @@ mod tests {
                 assert_eq!(resolved.expected_logical_size, Some(end));
                 assert_eq!(resolved.relation_has_next, Some(false));
                 assert!(resolved.error.is_empty());
-                let (_, blocks, retained) = manager()
-                    .release_resources_under_roots(&[std::fs::canonicalize(&path).unwrap()])
+                let identity = reader.file_identity().unwrap();
+                assert!(!cached_source_has_blocks(identity.source_id), "rar5={rar5}, direct={direct}");
+                manager()
+                    .release_resources_under_roots(&[identity.path.to_path_buf()])
                     .unwrap();
                 std::fs::remove_file(path).unwrap();
-                assert_eq!((blocks, retained), (0, 0), "rar5={rar5}, direct={direct}");
                 assert!(reads < 32, "RAR header walk issued {reads} physical reads");
             }
         }
@@ -2390,10 +2380,11 @@ mod tests {
         let mut bytes = [0; 4];
         cursor.read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, [0x5a; 4]);
-        let (_, blocks, retained) = manager()
-            .release_resources_under_roots(&[reader.file_identity().unwrap().path.to_path_buf()])
+        let identity = reader.file_identity().unwrap();
+        assert!(!cached_source_has_blocks(identity.source_id));
+        manager()
+            .release_resources_under_roots(&[identity.path.to_path_buf()])
             .unwrap();
-        assert_eq!((blocks, retained), (0, 0));
         let fault = probe
             .read_exact_field_at(2, 4, "zip.eocd", FieldLocation::Tail)
             .unwrap_err();
@@ -2541,10 +2532,11 @@ mod tests {
         assert_eq!(&*probe.read_cached_at(0, 4).unwrap(), b"abcd");
         assert_eq!(reader.stats().unwrap().read_bytes, 4);
         assert_eq!(reader.stats().unwrap().cache_hits, 1);
-        let (_, blocks, retained) = manager()
-            .release_resources_under_roots(&[reader.file_identity().unwrap().path.to_path_buf()])
+        let identity = reader.file_identity().unwrap();
+        assert!(!cached_source_has_blocks(identity.source_id));
+        manager()
+            .release_resources_under_roots(&[identity.path.to_path_buf()])
             .unwrap();
-        assert_eq!((blocks, retained), (0, 0));
         assert_eq!(&*first, b"abcd");
         let _ = std::fs::remove_file(path);
     }
@@ -2658,12 +2650,12 @@ mod tests {
         .unwrap();
 
         let data = reader.read_cached_at(0, 7).unwrap();
-        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let (handles, entries, _) = manager()
-            .release_resources_under_roots(&[canonical])
+        let identity = reader.file_identity().unwrap();
+        assert!(cached_source_has_blocks(identity.source_id));
+        manager()
+            .release_resources_under_roots(&[identity.path.to_path_buf()])
             .unwrap();
-        assert!(handles >= 1);
-        assert!(entries >= 1);
+        assert!(!cached_source_has_blocks(identity.source_id));
         assert_eq!(&*data, b"payload");
 
         drop(reader);
@@ -2683,12 +2675,11 @@ mod tests {
             let first = BlockKey::new(&source, start);
             let second = BlockKey::new(&source, start + 1);
             let third = BlockKey::new(&source, start + 2);
-            assert_eq!(shard.insert(first, source_path, Arc::from([]), tier).1, 0);
-            assert_eq!(
-                shard.insert(second, source_path, Arc::from([b'x']), tier).1,
-                0
-            );
-            assert_eq!(shard.insert(third, source_path, Arc::from([]), tier).1, 1);
+            shard.insert(first, source_path, Arc::from([]), tier);
+            shard.insert(second, source_path, Arc::from([b'x']), tier);
+            assert!(shard.entries.contains_key(&first));
+            assert!(shard.entries.contains_key(&second));
+            shard.insert(third, source_path, Arc::from([]), tier);
             assert!(!shard.entries.contains_key(&first));
             assert!(shard.entries.contains_key(&second));
             assert!(shard.entries.contains_key(&third));
@@ -2722,14 +2713,14 @@ mod tests {
         }
         let live = keys.pop().unwrap();
         for key in keys {
-            shard.remove_entry(&key, true).unwrap();
+            shard.remove_entry(&key, true);
         }
         shard.compact_stale_orders();
         assert_eq!(shard.entries.len(), 1);
         assert!(shard.entries.capacity() <= 256 && shard.by_source.capacity() <= 256);
         assert!(shard.hot.order.capacity() <= 256 && shard.general.order.capacity() <= 256);
         assert!(Arc::ptr_eq(&shard.entries[&live].data, &payload));
-        shard.remove_entry(&live, true).unwrap();
+        shard.remove_entry(&live, true);
         shard.compact_stale_orders();
         assert_eq!(shard.hot.bytes + shard.general.bytes, 0);
         assert_eq!(
@@ -2770,11 +2761,8 @@ mod tests {
             std::fs::canonicalize(&first_path).unwrap_or_else(|_| first_path.clone()),
             std::fs::canonicalize(&second_path).unwrap_or_else(|_| second_path.clone()),
         ];
-        let (handles, entries, bytes) = manager().release_resources_under_roots(&roots).unwrap();
+        manager().release_resources_under_roots(&roots).unwrap();
 
-        assert_eq!(handles, 2);
-        assert_eq!(entries, 2);
-        assert_eq!(bytes, 16);
         assert!(first.closed.load(Ordering::Acquire));
         assert!(second.closed.load(Ordering::Acquire));
         assert!(!manager().contains_block(&first_key).unwrap());

@@ -16,7 +16,6 @@ pub enum Opcode {
     Hello = 1,
     ProbeVolume = 2,
     ReadChangeReasons = 3,
-    Ping = 4,
     ReadDirectoriesChanges = 7,
 }
 
@@ -28,7 +27,6 @@ impl TryFrom<u16> for Opcode {
             1 => Ok(Self::Hello),
             2 => Ok(Self::ProbeVolume),
             3 => Ok(Self::ReadChangeReasons),
-            4 => Ok(Self::Ping),
             7 => Ok(Self::ReadDirectoriesChanges),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -244,11 +242,13 @@ pub fn parse_file_id(value: &str) -> io::Result<([u8; FILE_ID_BYTES], u8)> {
 }
 
 pub fn format_file_id(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .rev()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes.iter().rev() {
+        text.push(HEX[usize::from(byte >> 4)] as char);
+        text.push(HEX[usize::from(byte & 15)] as char);
+    }
+    text
 }
 
 #[cfg(test)]

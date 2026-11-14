@@ -1,12 +1,9 @@
 #pragma once
 
 #include "sevenzip_space_gate.hpp"
-#include "sevenzip_writer_meters.hpp"
 
 #ifdef _WIN32
 
-#include <atomic>
-#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -21,10 +18,6 @@ namespace sunpack::sevenzip
 
         const VolumeKey key;
         const bool persistent = true;
-
-        WriterCounters counters;
-
-        std::atomic<std::uint64_t> accounting_violations{0};
 
         // 懒创建：dry-run job 与 shared_writer == nullptr 的兜底 writer 没有真实卷身份
         // （key 为空），此时 gate 保持 nullptr，让这些路径语义完全不变。

@@ -38,6 +38,7 @@
 #include "internal/native_memory.hpp"
 #include "internal/extraction_replay.hpp"
 #include "internal/native_cpu_budget.hpp"
+#include "internal/sevenzip_streams.hpp"
 #ifdef SUP7Z_DEBUG
 #include "internal/worker_pipeline_timing.hpp"
 #endif
@@ -48,14 +49,6 @@
 #endif
 
 namespace {
-
-bool read_file_timing_enabled() noexcept {
-    static const bool enabled = [] {
-        const char* value = std::getenv("SUNPACK_SEVENZIP_PROFILE_READS");
-        return value && value[0] == '1';
-    }();
-    return enabled;
-}
 
 std::wstring utf8_to_wide(std::string_view value) {
 #ifdef _WIN32
@@ -1253,7 +1246,7 @@ int run_request(
         wire::key("hresult") + wire::number(result.hresult);
     const std::string diagnostic_fields = (!ok || dry_run) ?
         wire::key("diagnostics") + diagnostics_wire(result, trace_chunks) : "";
-    const std::string input_trace_field = read_file_timing_enabled() ?
+    const std::string input_trace_field = sunpack::sevenzip::read_file_timing_enabled() ?
         wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
     const auto &output_trace = result.output_trace;
     const std::string metadata_warning_field = (output_trace.metadata_failed_files || output_trace.metadata_failed_directories) ?
@@ -1360,7 +1353,6 @@ public:
     )
         : writer_config_(sunpack::sevenzip::configured_async_writer_config()),
           writer_registry_(std::make_shared<sunpack::sevenzip::VolumeWriterRegistry>(
-              nullptr,
               writer_config_,
               [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
                   on_space_transition(transition);
@@ -1380,10 +1372,9 @@ public:
             [this] { return writer_registry_->blocked_volumes(); },
             [this](const sunpack::sevenzip::VolumeStatePtr &state,
                    std::uint64_t free_bytes,
-                   std::uint64_t pending_bytes,
                    bool query_ok,
                    unsigned long query_error) {
-                print_volume_space_status(state, free_bytes, pending_bytes, query_ok, query_error);
+                print_volume_space_status(state, free_bytes, query_ok, query_error);
             });
         workers_.reserve(worker_count_);
         try {
@@ -1744,16 +1735,6 @@ private:
             active_jobs);
     }
 
-    // Facility lifecycle, so an empty `live_facilities` count can be told apart from a volume key that never reached the writer.
-    static void print_writer_facility_event(
-        const char* event,
-        const std::string& volume_key
-    ) noexcept {
-        print_frame(
-            (wire::object() + wire::key("type") + wire::text("native_writer") + wire::key("event")) + wire::text(event) +
-            wire::key("volume_key") + wire::text(volume_key) + wire::end());
-    }
-
     // Space events go out on the `progress` channel, one per affected job, with a real job_id: both dispatchers drop events whose job_id is empty or unknown.
     static const char* space_event_name(
         sunpack::sevenzip::VolumeSpaceTransition::Kind kind
@@ -1776,7 +1757,6 @@ private:
         std::uint64_t episode_id,
         unsigned long win32_error,
         std::uint64_t free_bytes,
-        std::uint64_t pending_bytes,
         double blocked_seconds,
         bool query_ok,
         unsigned long query_error
@@ -1788,7 +1768,6 @@ private:
             wire::key("episode_id") + wire::number(episode_id) +
             wire::key("win32_error") + wire::number(win32_error) +
             wire::key("free_bytes") + wire::number(free_bytes) +
-            wire::key("pending_bytes") + wire::number(pending_bytes) +
             wire::key("blocked_seconds") + wire::number(blocked_seconds) +
             wire::key("volume_query_ok") + wire::boolean(query_ok) +
             wire::key("volume_query_error") + wire::number(query_error) + wire::end();
@@ -1807,7 +1786,6 @@ private:
                 transition.episode_id,
                 transition.win32_error,
                 transition.free_bytes,
-                transition.pending_bytes,
                 transition.blocked_seconds,
                 transition.query_ok,
                 transition.query_error));
@@ -1817,14 +1795,12 @@ private:
     void print_volume_space_status(
         const sunpack::sevenzip::VolumeStatePtr& state,
         std::uint64_t free_bytes,
-        std::uint64_t pending_bytes,
         bool query_ok,
         unsigned long query_error
     ) noexcept {
         if (!state || !state->space_gate) {
             return;
         }
-        // Low-frequency diagnostic (default 15s); Python's space_waiting is driven only by space_blocked/space_resumed, not by this.
         const auto& gate = *state->space_gate;
         const auto job_ids = gate.affected_job_ids();
         if (job_ids.empty()) {
@@ -1835,21 +1811,14 @@ private:
             print_frame(space_event_payload(
                 "space_status",
                 job_id,
-                transition_volume_key(state),
+                state->key,
                 episode_id,
                 query_ok ? 0UL : query_error,
                 free_bytes,
-                pending_bytes,
                 0.0,
                 query_ok,
                 query_error));
         }
-    }
-
-    static std::string transition_volume_key(
-        const sunpack::sevenzip::VolumeStatePtr& state
-    ) {
-        return state ? state->key : std::string{};
     }
 
     // ChangeSink landing: keeps the volume-space monitor active and fans the event out to affected jobs.
@@ -1893,8 +1862,7 @@ private:
             if (monitor_stopping_) return;
             monitor_recheck_ = false;
             lock.unlock();
-            for (const auto &volume : writer_registry_->reap_idle())
-                print_writer_facility_event("writer_facility_reaped", volume);
+            writer_registry_->reap_idle();
             space_monitor_->tick(std::chrono::steady_clock::now());
         }
     }
@@ -1985,7 +1953,6 @@ private:
                     } else if (!job.request.dry_run && !job.request.scan_only) {
                         const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
                         auto lease = writer_registry_->acquire(key);
-                        if (lease.created_facility()) print_writer_facility_event("writer_facility_created", key);
                         register_cancel_writer(job_id, lease.writer_pointer());
                         const auto weak = std::weak_ptr<sunpack::sevenzip::AsyncFileWriter>(lease.writer_pointer());
                         memory_.set_wake(memory_job, [weak] { if (auto writer = weak.lock()) writer->wake_waiters(); });

@@ -45,7 +45,6 @@ impl<T: ResultFacts> Results<T> {
     pub fn is_empty(&self) -> bool { self.len == 0 }
     #[cfg(test)]
     pub fn capacity(&self) -> usize { self.blocks.iter().map(Vec::capacity).sum::<usize>() + self.tail.capacity() }
-    pub fn first(&self) -> Option<&T> { self.iter().next() }
     #[cfg(test)]
     pub fn last(&self) -> Option<&T> { self.iter().last() }
     pub fn iter(&self) -> impl Iterator<Item = &T> { self.blocks.iter().flatten().chain(&self.tail) }
@@ -191,7 +190,7 @@ mod tests {
         let mut addresses = Vec::new();
         for id in (0..64).rev() {
             let mut parent = Results::from(vec![Item { id, visits: Arc::clone(&visits) }]);
-            addresses.push(parent.first().unwrap() as *const Item);
+            addresses.push(parent.iter().next().unwrap() as *const Item);
             parent.append(&mut child);
             assert_eq!(child.len(), 0);
             child = parent;

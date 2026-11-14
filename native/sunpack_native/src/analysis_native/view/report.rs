@@ -902,24 +902,22 @@ fn stream_structure_cached(
     result
 }
 
-pub(crate) fn clear_stream_structure_cache() -> usize {
+pub(crate) fn clear_stream_structure_cache() {
     // Retire the whole allocation and drop results outside the cache lock.
     let retired = std::mem::take(
         &mut *stream_structure_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner()),
     );
-    retired.len()
+    drop(retired);
 }
 
-pub(crate) fn release_stream_structure_cache_under_roots(roots: &[PathBuf]) -> usize {
+pub(crate) fn release_stream_structure_cache_under_roots(roots: &[PathBuf]) {
     let mut entries = stream_structure_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let before = entries.len();
     entries.retain(|(key, _)| !roots.iter().any(|root| key.path.starts_with(root)));
     crate::collections::trim_deque(&mut entries);
-    before - entries.len()
 }
 
 fn sorted_unique(mut values: Vec<String>) -> Vec<String> {

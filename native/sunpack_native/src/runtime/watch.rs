@@ -931,20 +931,39 @@ struct Signals {
 struct RootChanges {
     changed_roots: HashMap<String, HashSet<PathBuf>>,
     topology_roots: HashSet<String>,
-    modified_paths: HashSet<PathBuf>,
-    candidate_events: HashMap<PathBuf, CandidateEvent>,
-    observations: HashMap<PathBuf, (quiet::Activity, quiet::Observation)>,
+    paths: HashMap<PathBuf, PathChange>,
+    observations: HashMap<PathBuf, CapturedPath>,
+}
+
+type CapturedPath = (quiet::Activity, quiet::Observation);
+
+#[derive(Default)]
+struct PathChange {
+    modified_only: bool,
+    event: Option<CandidateEvent>,
 }
 
 impl RootChanges {
-    fn root_changed(&mut self, id: &str, paths: Option<Vec<PathBuf>>) {
-        // Overflow/failure has no path list and invalidates the subscription;
-        // named content events need catalog work, not parent identity probes.
-        if paths.is_none() {
-            self.topology_roots.insert(id.to_owned());
+    fn root_changed(&mut self, id: &str, paths: impl IntoIterator<Item = (PathBuf, PathChange, Option<CapturedPath>)>) {
+        let changed = self.changed_roots.entry(id.to_owned()).or_default();
+        for (path, change, observation) in paths {
+            // A later notification invalidates the earlier snapshot even
+            // when its probe returned no file.
+            if let Some(observation) = observation {
+                self.observations.insert(path.clone(), observation);
+            } else {
+                self.observations.remove(&path);
+            }
+            let first_for_root = changed.insert(path.clone());
+            let current = self.paths.entry(path).or_default();
+            current.modified_only = change.modified_only && (first_for_root || current.modified_only);
+            if current.event.is_none() { current.event = change.event; }
         }
-        self.changed_roots.entry(id.to_owned()).or_default()
-            .extend(paths.into_iter().flatten());
+    }
+
+    fn topology_changed(&mut self, id: String) {
+        self.topology_roots.insert(id.clone());
+        self.changed_roots.entry(id).or_default();
     }
     fn prepare(&mut self, is_known_file: impl Fn(&str, &Path) -> bool) -> Option<HashSet<PathBuf>> {
         let mut checkpoint = !self.topology_roots.is_empty();
@@ -954,7 +973,7 @@ impl RootChanges {
         for (root, paths) in &mut self.changed_roots {
             paths.retain(|path| {
                 if self.observations.contains_key(path) { return true; }
-                let modified = self.modified_paths.contains(path);
+                let modified = self.paths.get(path).is_some_and(|change| change.modified_only);
                 match fs::metadata(path) {
                     Ok(metadata) if metadata.is_dir() && modified => return false,
                     Ok(metadata) if metadata.is_file() => {}
@@ -1433,9 +1452,8 @@ impl RootObserver {
         // configuration/ancestor subscriptions keep their 4 KiB allocation.
         let observer = FileObserver::start_with_filter(
             directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, 64_000, move |names| {
-            let mut modified_only = HashMap::new();
+            let mut changes = HashMap::<_, PathChange>::new();
             let mut password_changed = false;
-            let mut events = HashMap::new();
             let mut rename_source = None;
             let mut paths = names.map(|names| {
                 let mut paths = Vec::new();
@@ -1450,13 +1468,14 @@ impl RootObserver {
                     }
                     if !scope.contains(&path.to_string_lossy()) { continue; }
                     let modified = change.action == 3;
-                    if let Some(event) = event { events.entry(path.clone()).or_insert(event); }
-                    match modified_only.entry(path.clone()) {
+                    match changes.entry(path.clone()) {
                         std::collections::hash_map::Entry::Occupied(mut entry) => {
-                            *entry.get_mut() &= modified;
+                            let change = entry.get_mut();
+                            change.modified_only &= modified;
+                            if change.event.is_none() { change.event = event; }
                         }
                         std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(modified);
+                            entry.insert(PathChange { modified_only: modified, event });
                             // The buffer contains names, not separate filesystem
                             // observations. Probe each once while retaining event order.
                             paths.push(path);
@@ -1483,26 +1502,14 @@ impl RootObserver {
                 hub.update(|signals| {
                     signals.password_changed |= password_changed;
                     if !root_changed { return; }
-                    if let Some(paths) = &paths {
-                        for (path, observation) in paths.iter().zip(observations) {
-                            // A later notification invalidates the earlier
-                            // snapshot even if the new probe returned no file.
-                            if let Some(observation) = observation {
-                                signals.changes.observations.insert(path.clone(), observation);
-                            } else {
-                                signals.changes.observations.remove(path);
-                            }
-                            if let Some(event) = events.remove(path) {
-                                signals.changes.candidate_events.entry(path.clone()).or_insert(event);
-                            }
-                            if !modified_only[path] {
-                                signals.changes.modified_paths.remove(path);
-                            } else if !signals.changes.changed_roots.get(&id).is_some_and(|old| old.contains(path)) {
-                                signals.changes.modified_paths.insert(path.clone());
-                            }
-                        }
+                    if let Some(paths) = paths {
+                        signals.changes.root_changed(&id, paths.into_iter().zip(observations).map(|(path, observation)| {
+                            let change = changes.remove(&path).unwrap();
+                            (path, change, observation)
+                        }));
+                    } else {
+                        signals.changes.topology_changed(id.clone());
                     }
-                    signals.changes.root_changed(&id, paths);
                 });
             }
         })?;
@@ -1590,8 +1597,7 @@ impl ParentObserver {
             let affected = affected_parent_roots(&watched_members.lock().unwrap(), changed.as_deref());
             if !affected.is_empty() {
                 hub.update(|signals| for root in affected {
-                    signals.changes.topology_roots.insert(root.clone());
-                    signals.changes.changed_roots.entry(root).or_default();
+                    signals.changes.topology_changed(root);
                 });
             }
         })?;
@@ -2910,8 +2916,7 @@ impl Scheduler {
                 for (id, (root, _)) in &self.roots {
                     let observed = self.root_observers.get(id).is_some_and(|observers| observers.root.is_some());
                     if signals.volumes.affects(&root.path, observed) {
-                        signals.changes.topology_roots.insert(id.clone());
-                        signals.changes.changed_roots.entry(id.clone()).or_default();
+                        signals.changes.topology_changed(id.clone());
                         if signals.volumes.arrives(&root.path, observed) {
                             self.available_roots.remove(id);
                         }
@@ -3007,9 +3012,9 @@ impl Scheduler {
     fn observe_file_changes_blocking(
         &mut self,
         changed: &HashMap<String, HashSet<PathBuf>>,
-        events: &HashMap<PathBuf, CandidateEvent>,
+        path_changes: &HashMap<PathBuf, PathChange>,
         departed: &HashSet<PathBuf>,
-        observations: &mut HashMap<PathBuf, (quiet::Activity, quiet::Observation)>,
+        observations: &mut HashMap<PathBuf, CapturedPath>,
     ) -> io::Result<()> {
         if self.options.is_none() { return Ok(()); }
         // Match main's ordinary file-event path: enqueue in memory without
@@ -3021,7 +3026,7 @@ impl Scheduler {
             let deep = root.deep;
             let scope = scope.clone();
             for path in paths {
-                let event = events.get(path);
+                let event = path_changes.get(path).and_then(|change| change.event.as_ref());
                 let source = path.to_string_lossy();
                 if !scope.contains(&source) || self.catalog.is_owned(&source) { continue; }
                 if departed.contains(path) && Path::new(&scope.root).is_dir() {
@@ -3053,20 +3058,17 @@ impl Scheduler {
             });
             match departed {
                 Some(departed) => self.observe_file_changes_blocking(&changes.changed_roots,
-                    &changes.candidate_events, &departed, &mut changes.observations),
-                None => self.checkpoint_blocking(&changes.changed_roots, false, false, &changes.candidate_events),
+                    &changes.paths, &departed, &mut changes.observations),
+                None => self.checkpoint_blocking(&changes.changed_roots, false, false, &changes.paths),
             }
         })?
     }
 
     fn checkpoint(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, all_roots: bool, startup: bool) -> io::Result<()> {
-        self.checkpoint_with_events(changed, all_roots, startup, &HashMap::new())
-    }
-
-    fn checkpoint_with_events(&mut self, changed: &HashMap<String, HashSet<PathBuf>>,
-        all_roots: bool, startup: bool, events: &HashMap<PathBuf, CandidateEvent>) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_usn_checkpoint", Origin::Watch, || self.checkpoint_blocking(changed, all_roots, startup, events))?
+        engine.run_stage("watch_usn_checkpoint", Origin::Watch, || {
+            self.checkpoint_blocking(changed, all_roots, startup, &HashMap::new())
+        })?
     }
 
     fn checkpoint_blocking(
@@ -3074,7 +3076,7 @@ impl Scheduler {
         changed: &HashMap<String, HashSet<PathBuf>>,
         all_roots: bool,
         startup: bool,
-        events: &HashMap<PathBuf, CandidateEvent>,
+        path_changes: &HashMap<PathBuf, PathChange>,
     ) -> io::Result<()> {
         if self.options.is_none() { return Ok(()); }
         let selected = self
@@ -3307,7 +3309,7 @@ impl Scheduler {
                 let path_id = watch_path_key(&path);
                 if admitted.insert(path_id) {
                     self.observe_candidate_with_event(&id, path.clone(), admission,
-                        None, None, None, Some(events.get(Path::new(&path)).unwrap_or(&CandidateEvent::Business(
+                        None, None, None, Some(path_changes.get(Path::new(&path)).and_then(|change| change.event.as_ref()).unwrap_or(&CandidateEvent::Business(
                             if index >= recovered_paths { "initial_scan" }
                             else if startup { "startup_usn_recovery" } else { "usn_recovery" }))), None)?;
                     self.retry_volume_peers(&scope, &path, &mut retried)?;
@@ -5950,10 +5952,14 @@ struct WatchObserver {
 
 impl WatchObserver {
     fn owner<'a>(&'a self, archive: &'a ArchiveResult) -> Option<String> {
-        std::iter::once(&archive.path)
-            .chain(archive.source_paths.iter())
+        self.owner_for_sources(&archive.path, &archive.source_paths)
+    }
+
+    fn owner_for_sources(&self, path: &Path, sources: &[PathBuf]) -> Option<String> {
+        std::iter::once(path)
+            .chain(sources.iter().map(PathBuf::as_path))
             .find_map(|path| self.owners.get(&key(path)).cloned())
-            .or_else(|| self.owner_for_path(&archive.path))
+            .or_else(|| self.owner_for_path(path))
     }
 
     fn owner_for_path(&self, path: &Path) -> Option<String> {
@@ -6238,11 +6244,11 @@ impl Observer for WatchObserver {
         })
     }
 
-    fn discard_output(&self, archive: &ArchiveResult, output: &Path) -> io::Result<()> {
-        let Some(owner) = self.owner(archive) else {
+    fn discard_output(&self, archive: &Path, sources: &[PathBuf], output: &Path) -> io::Result<()> {
+        let Some(owner) = self.owner_for_sources(archive, sources) else {
             return Ok(());
         };
-        let task = archive.path.to_string_lossy().into_owned();
+        let task = archive.to_string_lossy().into_owned();
         let output = output.to_string_lossy().into_owned();
         self.journal.commit(true, |state| {
             Ok(state.output_operation(&owner, task, output, Some(false), None)?
@@ -6718,12 +6724,17 @@ mod tests {
         // Coalescing retains the first actual ordinary event, as main's
         // diagnostic throttle would, until this Signals burst is consumed.
         let mut signals = Signals::default();
-        signals.changes.candidate_events.entry(path.to_owned()).or_insert(moved);
-        signals.changes.candidate_events.entry(path.to_owned()).or_insert(CandidateEvent::Modified);
-        assert_eq!(signals.changes.candidate_events[path].kind(), "moved");
+        signals.changes.root_changed("root", [(path.to_owned(), PathChange {
+            modified_only: false, event: Some(moved),
+        }, None)]);
+        signals.changes.root_changed("root", [(path.to_owned(), PathChange {
+            modified_only: true, event: Some(CandidateEvent::Modified),
+        }, None)]);
+        assert_eq!(signals.changes.paths[path].event.as_ref().unwrap().kind(), "moved");
+        assert!(!signals.changes.paths[path].modified_only);
         let captured = std::mem::take(&mut signals);
-        assert!(signals.changes.candidate_events.is_empty());
-        assert_eq!(captured.changes.candidate_events[path].source(), "source.zip");
+        assert!(signals.changes.paths.is_empty());
+        assert_eq!(captured.changes.paths[path].event.as_ref().unwrap().source(), "source.zip");
     }
 
     #[test]
@@ -6875,18 +6886,18 @@ mod tests {
         std::fs::write(&file, b"archive").unwrap();
         let missing = directory.join("departed.zip");
         let mut signals = Signals::default();
-        signals.changes.root_changed("root", Some(vec![directory.clone(), file.clone(), missing.clone()]));
-        signals.changes.modified_paths.extend([directory.clone(), file.clone(), missing.clone()]);
+        signals.changes.root_changed("root", [directory.clone(), file.clone(), missing.clone()]
+            .map(|path| (path, PathChange { modified_only: true, event: None }, None)));
         assert!(signals.changes.prepare(|_, _| false).is_some());
         assert!(!signals.changes.changed_roots["root"].contains(&directory));
         assert!(signals.changes.changed_roots["root"].contains(&file));
         for path in [directory.clone(), missing] {
             let mut signals = Signals::default();
-            signals.changes.root_changed("root", Some(vec![path]));
+            signals.changes.root_changed("root", [(path, PathChange::default(), None)]);
             assert!(signals.changes.prepare(|_, _| false).is_none());
         }
         let mut signals = Signals::default();
-        signals.changes.root_changed("root", None);
+        signals.changes.topology_changed("root".into());
         assert!(signals.changes.prepare(|_, _| false).is_none());
         std::fs::remove_file(file).unwrap();
         std::fs::remove_dir(directory).unwrap();
@@ -7115,13 +7126,13 @@ mod tests {
     fn content_batches_do_not_invalidate_topology_but_overflow_does() {
         let mut signals = Signals::default();
         for _ in 0..100 {
-            signals.changes.root_changed("root-a", Some(vec![PathBuf::from("root-a/archive.zip")]));
+            signals.changes.root_changed("root-a", [(PathBuf::from("root-a/archive.zip"), PathChange::default(), None)]);
         }
         assert!(signals.changes.topology_roots.is_empty());
         assert_eq!(signals.changes.changed_roots.len(), 1);
         // A content event batched after an overflow must not erase the rearm.
-        signals.changes.root_changed("root-a", None);
-        signals.changes.root_changed("root-a", Some(vec![PathBuf::from("root-a/archive.zip")]));
+        signals.changes.topology_changed("root-a".into());
+        signals.changes.root_changed("root-a", [(PathBuf::from("root-a/archive.zip"), PathChange::default(), None)]);
         assert_eq!(signals.changes.topology_roots, HashSet::from(["root-a".to_owned()]));
         assert_eq!(signals.changes.changed_roots["root-a"].len(), 1);
     }
@@ -7155,9 +7166,7 @@ mod tests {
         let candidate = WatchCandidateRow {
             path: r"C:\watch\sub\archive.part1.rar".into(), size: 42, mtime: 1.0,
             observation: crate::filesystem::WatchFileObservation {
-                file_id: String::new(), change_usn: 0, change_reasons: 0,
-                change_reasons_without_close: 0, change_reasons_known: false,
-                change_reason_error: String::new(),
+                file_id: String::new(), change_usn: 0, change_reasons: None,
             },
         };
         // Both kinds can return from a request admitted before root reload.
@@ -7199,9 +7208,7 @@ mod tests {
         let candidate = WatchCandidateRow {
             path: r"C:\watch\old\inner.part1.rar".into(), size: 42, mtime: 1.0,
             observation: crate::filesystem::WatchFileObservation {
-                file_id: "promoted-generation".into(), change_usn: 9, change_reasons: 0,
-                change_reasons_without_close: 0, change_reasons_known: false,
-                change_reason_error: String::new(),
+                file_id: "promoted-generation".into(), change_usn: 9, change_reasons: None,
             },
         };
         let recovery = Recovery {
@@ -7352,9 +7359,7 @@ mod tests {
         let candidate = WatchCandidateRow {
             path: path.into(), size: 42, mtime: 1.0,
             observation: crate::filesystem::WatchFileObservation {
-                file_id: String::new(), change_usn: 0, change_reasons: 0,
-                change_reasons_without_close: 0, change_reasons_known: false,
-                change_reason_error: String::new(),
+                file_id: String::new(), change_usn: 0, change_reasons: None,
             },
         };
         let passwords = crate::core::passwords::PasswordSnapshot::default();
@@ -7425,9 +7430,7 @@ mod tests {
         let candidate = WatchCandidateRow {
             path: promoted_path.into(), size: 42, mtime: 1.0,
             observation: crate::filesystem::WatchFileObservation {
-                file_id: String::new(), change_usn: 0, change_reasons: 0,
-                change_reasons_without_close: 0, change_reasons_known: false,
-                change_reason_error: String::new(),
+                file_id: String::new(), change_usn: 0, change_reasons: None,
             },
         };
         let passwords = crate::core::passwords::PasswordSnapshot::default();
@@ -7654,7 +7657,7 @@ mod tests {
         hub.queue_reload(Some(CommandReply::Sync(reload)));
         assert!(hub.queue_once(CommandReply::Sync(once)));
         hub.update(|signals| {
-            signals.changes.root_changed("old-root", Some(vec![PathBuf::from("archive.zip")]));
+            signals.changes.root_changed("old-root", [(PathBuf::from("archive.zip"), PathChange::default(), None)]);
             signals.password_changed = true;
         });
         hub.batch_completed("old-request".into());
@@ -7850,9 +7853,7 @@ mod tests {
             pending.insert(id.clone(), Pending { root: "root".into(),
                 candidate: WatchCandidateRow { path: path.clone(), size: 42, mtime: 1.0,
                     observation: crate::filesystem::WatchFileObservation {
-                        file_id: String::new(), change_usn: index as i64, change_reasons: 0,
-                        change_reasons_without_close: 0, change_reasons_known: false,
-                        change_reason_error: String::new(),
+                        file_id: String::new(), change_usn: index as i64, change_reasons: None,
                     } },
                 quiet: quiet::Activity::default(), due: deadline, force: false, recovery: None,
             });
@@ -7943,9 +7944,7 @@ mod tests {
                 inputs: names.into_iter().map(|path| (watch_path_key(&path), WatchCandidateRow {
                     path, size: 1, mtime: 1.0,
                     observation: crate::filesystem::WatchFileObservation {
-                        file_id: String::new(), change_usn: 0, change_reasons: 0,
-                        change_reasons_without_close: 0, change_reasons_known: false,
-                        change_reason_error: String::new(),
+                        file_id: String::new(), change_usn: 0, change_reasons: None,
                     },
                 })).collect(),
                 quiet: HashMap::new(), dirty: HashSet::new(), cancel,
