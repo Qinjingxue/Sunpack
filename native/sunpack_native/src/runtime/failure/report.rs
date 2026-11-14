@@ -194,9 +194,8 @@ impl<'a> Report<'a> {
                     if let Some(value) = &evidence.backend_operation_result { details["backend_operation_result"] = json!(value); }
                 }
             }
-            Some(FailureContext::OutputCreate { error, .. }) => {
+            Some(FailureContext::OutputCreate { .. }) => {
                 stage = "preflight";
-                spec = super::Message::error("extract.dir_create_failed", error);
             }
             Some(FailureContext::Postprocess { destination }) => {
                 stage = "postprocess";

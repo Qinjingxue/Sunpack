@@ -3390,10 +3390,12 @@ impl<'run, O: Observer> Run<'run, O> {
                 let mut failure = Failure::new(FailureKind::ProcessError, error.to_string())
                     .with_context(super::FailureContext::Extraction);
                 let evidence = failure.evidence.get_or_insert_with(Default::default);
-                evidence.native_kind = Some(error.get_ref()
+                let kind = error.get_ref()
                     .and_then(|error| error.downcast_ref::<super::worker::CommunicationError>())
-                    .map_or("process_io", |error| error.kind).into());
-                evidence.stage = Some("worker_communication".into());
+                    .map_or("process_io", |error| error.kind);
+                evidence.native_kind = Some(kind.into());
+                evidence.stage = Some(if kind == "process_start" { "worker_start" }
+                    else { "worker_communication" }.into());
                 failure
             }
         } else {
@@ -5691,6 +5693,42 @@ mod tests {
             cleanup_tasks: Mutex::default(),
             cleanup_refs: Arc::default(),
         })
+    }
+
+    #[test]
+    fn replacement_worker_spawn_failure_preserves_start_classification() {
+        let source = crate::test_support::temp_file("replacement_worker", b"archive");
+        let engine = Engine::new(source.with_extension("missing-worker.exe"));
+        let initial = Process::with_test_input(Vec::new());
+        engine.worker.lock().unwrap().process = Some(Arc::clone(&initial));
+        let request = Request::new(vec![source.clone()], Mode::Scan);
+        let observer = |event: Event| {
+            if matches!(event, Event::Waiting { .. }) { initial.test_exit(); }
+        };
+        let run = test_run(&engine, &request, &observer);
+        let logical = LogicalInput {
+            input: ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
+            password_probe: None, password: None, failure: None,
+        };
+        let mut shell = engine.shell.branch();
+        let mut outcome = Outcome::default();
+        let result = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |_| {
+            Box::pin(async {
+                // The first borrow and handshake succeed inside this request.
+                let started = engine.worker(&request.config.performance.worker, &request.cancel).await.unwrap();
+                assert!(Arc::ptr_eq(&started, &initial));
+                run.execute_input(logical, 1, DiscoverySource::Direct, 1, None, None,
+                    &run.candidates, &mut shell, &mut outcome).await
+            })
+        }).unwrap().result;
+        let failure = result.failure.unwrap();
+        assert_eq!(failure.kind, FailureKind::ProcessError);
+        let evidence = failure.evidence.unwrap();
+        assert_eq!(evidence.native_kind.as_deref(), Some("process_start"));
+        assert_eq!(evidence.stage.as_deref(), Some("worker_start"));
+        assert!(!failure.message.is_empty());
+        assert!(!Arc::ptr_eq(engine.worker.lock().unwrap().process.as_ref().unwrap(), &initial));
+        fs::remove_file(source).unwrap();
     }
 
     #[test]

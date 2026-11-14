@@ -4,6 +4,143 @@ use crate::watch_store::PendingObservation;
 use std::os::windows::fs::OpenOptionsExt;
 use std::process::Command;
 
+type ReadinessHook = (String, Box<dyn FnOnce() + Send>);
+static READINESS_HOOK: Mutex<Option<ReadinessHook>> = Mutex::new(None);
+
+pub(super) fn before_readiness(path: &str) {
+    let hook = {
+        let mut slot = READINESS_HOOK.lock().unwrap();
+        if slot.as_ref().is_some_and(|(target, _)| target == path) { slot.take() } else { None }
+    };
+    if let Some((_, hook)) = hook { hook(); }
+}
+
+fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
+    let watched = base.join("input");
+    fs::create_dir_all(&watched).unwrap();
+    let root = key(&watched);
+    let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
+    let mut settings = Config::default();
+    settings.post_extract.archive_cleanup_mode = crate::core::config::CleanupMode::Keep;
+    let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
+    Scheduler {
+        candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
+        cwd: base.into(), root_file: base.join(ROOTS_FILE),
+        roots: BTreeMap::from([(root.clone(), (Root { path: watched, output: Some(base.join("output")),
+            recursive: true, deep: false, scanned: true }, scope))]),
+        available_roots: HashSet::from([root]),
+        user_password_signature: user_password_signature(&settings.user_passwords),
+        settings: Arc::new(settings), engine: Arc::new(Engine::new(worker)),
+        catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+        options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
+        deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
+        passwords: BuiltinStore::shared(base).unwrap(), hub: Arc::new(Hub::new()),
+        root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
+        parent_observers: HashMap::new(), config_observers: Vec::new(),
+        pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
+        active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+        tray: None, monitor: None, toast: None, cache_deadline: None,
+        external: Arc::new(Mutex::new(None)), _lease: None,
+    }
+}
+
+#[test]
+fn admission_rejects_capture_during_readiness_without_losing_deadline() {
+    const CHILD: &str = "SUNPACK_READINESS_GENERATION_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("admission_rejects_capture_during_readiness_without_losing_deadline", CHILD);
+        return;
+    };
+    let base = PathBuf::from(base);
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    let source = base.join("input/disguised.part");
+    fs::write(&source, b"first generation").unwrap();
+    let id = key(&source);
+    let root = key(&base.join("input"));
+    scheduler.enqueue(&root, source.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
+    let tracker = scheduler.pending[&id].quiet.clone();
+    tracker.set_seconds(30.0);
+    let captured_tracker = tracker.clone();
+    let hub = Arc::clone(&scheduler.hub);
+    let changed_path = source.clone();
+    *READINESS_HOOK.lock().unwrap() = Some((scheduler.pending[&id].candidate.path.clone(), Box::new(move || {
+        // Publish on the native callback side after the quiet snapshot, before
+        // readability returns. No timer or race-probability assertion.
+        std::thread::spawn(move || {
+            fs::write(&changed_path, b"second generation with more data").unwrap();
+            captured_tracker.capture(&changed_path, &hub.claims, &key(&changed_path)).unwrap().unwrap();
+        }).join().unwrap();
+    })));
+    let prepared = scheduler.prepare_ready_blocking(Instant::now(), 1).unwrap();
+    assert!(READINESS_HOOK.lock().unwrap().is_none());
+    assert!(prepared.is_empty(), "stale candidate bypassed the new quiet generation");
+    let deadline = tracker.deadline().unwrap();
+    assert!(deadline > Instant::now());
+    assert_eq!(scheduler.pending[&id].due, deadline);
+    assert!(scheduler.due.contains_key(&(deadline, id.clone())));
+    // Expire the logical quiet deadline without a sleep. The current candidate
+    // is admitted once, proving rejection did not strand the next generation.
+    let ready = scheduler.prepare_ready_blocking(deadline, 1).unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].1.candidate.size, fs::metadata(&source).unwrap().len());
+    assert!(scheduler.pending.is_empty());
+}
+
+#[test]
+fn output_create_failure_recovers_durable_input_after_restart() {
+    const CHILD: &str = "SUNPACK_OUTPUT_RECOVERY_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("output_create_failure_recovers_durable_input_after_restart", CHILD);
+        return;
+    };
+    let base = PathBuf::from(base);
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let worker = resources::worker_path(&checkout).expect("staged native worker required");
+    let mut scheduler = audit_scheduler(&base, worker.clone());
+    let source = base.join("input").join("archive.7z");
+    let payload = base.join("payload.txt");
+    fs::write(&payload, b"restored output permission").unwrap();
+    let mut archive = sevenz_rust2::ArchiveWriter::create(&source).unwrap();
+    archive.push_archive_entry(sevenz_rust2::ArchiveEntry::from_path(
+        &payload, "payload.txt".into()), Some(fs::File::open(&payload).unwrap())).unwrap();
+    archive.finish().unwrap();
+    let original = fs::metadata(&source).unwrap().modified().unwrap();
+    let output = base.join("output");
+    fs::create_dir(&output).unwrap();
+    struct DenyCreate(PathBuf);
+    impl Drop for DenyCreate {
+        fn drop(&mut self) {
+            assert!(Command::new("icacls").arg(&self.0).args(["/remove:d", "*S-1-1-0"])
+                .output().unwrap().status.success());
+        }
+    }
+    assert!(Command::new("icacls").arg(&output).args(["/deny", "*S-1-1-0:(AD)"])
+        .output().unwrap().status.success());
+    let denied = DenyCreate(output.clone());
+    assert_eq!(fs::create_dir(output.join("probe")).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    let root = key(&base.join("input"));
+    scheduler.enqueue(&root, source.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
+    scheduler.dispatch_ready().unwrap();
+    scheduler.drain_active(&mut Ok(0)).unwrap();
+    scheduler.journal.flush().unwrap();
+    assert!(scheduler.journal.state().pending(source.to_str().unwrap()).is_some(),
+        "mkdir failure deleted durable work: {}",
+        display_events::read(&base.join("state/events.json")).unwrap());
+    drop(scheduler);
+    drop(denied);
+    let mut restarted = audit_scheduler(&base, worker);
+    assert!(restarted.roots[&root].0.scanned);
+    // Invoke startup recovery directly, so no full scan or broker fallback can
+    // rescue a lost pending record and make this test falsely pass.
+    restarted.recover_pending(None).unwrap();
+    assert!(restarted.pending.contains_key(&key(&source)));
+    restarted.dispatch_ready().unwrap();
+    restarted.drain_active(&mut Ok(0)).unwrap();
+    assert_eq!(fs::read(output.join("archive/payload.txt")).unwrap(), b"restored output permission");
+    assert!(restarted.journal.state().pending(source.to_str().unwrap()).is_none());
+    assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), original);
+}
+
 #[test]
 fn stopped_watch_saves_conflicting_outputs_for_runtime_validation() {
     const CHILD: &str = "SUNPACK_WATCH_OUTPUT_CONFIG_TEST";

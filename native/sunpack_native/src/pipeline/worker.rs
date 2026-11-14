@@ -367,7 +367,10 @@ impl Process {
         // not to a request poll. All borrowers await the same retained result.
         let owner = thread::Builder::new()
             .name("sunpack-worker-stdout".into())
-            .spawn(move || run_process(spawn, &owner_child, &owner))?;
+            .spawn(move || run_process(spawn, &owner_child, &owner))
+            .map_err(|error| io::Error::new(error.kind(), CommunicationError {
+                kind: "process_start", message: error.to_string(),
+            }))?;
         Ok(Self { owner: Some(owner), child, shared })
     }
 
@@ -671,7 +674,7 @@ fn run_process(
     let mut spawned = match spawn() {
         Ok(child) => child,
         Err(error) => {
-            shared.fail(error.to_string(), error.kind());
+            shared.fail_classified(error.to_string(), error.kind(), "process_start");
             return;
         }
     };

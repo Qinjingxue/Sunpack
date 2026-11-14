@@ -4497,6 +4497,8 @@ impl Scheduler {
                 self.unpublished.insert(id.clone());
             }
             pending.candidate = current;
+            #[cfg(test)]
+            admission_tests::before_readiness(&pending.candidate.path);
             match filesystem::watch_file_is_ready(&pending.candidate.path) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -4513,6 +4515,12 @@ impl Scheduler {
                     self.delay(id, pending, Instant::now());
                     continue;
                 }
+            }
+            if let Err(deadline) = pending.quiet.admit(observed_now, Instant::now()) {
+                pending.due = deadline;
+                self.due.insert((deadline, id.clone()), ());
+                self.pending.insert(id, pending);
+                continue;
             }
             prepared.push((id, pending));
         }

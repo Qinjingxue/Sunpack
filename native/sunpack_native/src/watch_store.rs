@@ -1078,7 +1078,14 @@ impl NativeWatchState {
             let path = Path::new(&output);
             if let Some(scopes) = new_output_scopes {
                 crate::scan::scope::create_output_root_exclusive(path)
-                    .map_err(crate::pipeline::OutputCreateError::wrap)?;
+                    .map_err(|error| {
+                        // A name collision retries the existing reservation.
+                        // Other mkdir errors are infrastructure failures: keep
+                        // the durable owner on Watch's request recovery path.
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            crate::pipeline::OutputCreateError::wrap(error)
+                        } else { error }
+                    })?;
                 // Relevance is sampled after mkdir, under the publication
                 // gate. An alias retargeted since reservation cannot create an
                 // unregistered tree in another watched namespace.
@@ -1089,7 +1096,7 @@ impl NativeWatchState {
                     owned_paths = paths;
                 }
             } else if keep.is_none() {
-                std::fs::create_dir_all(path).map_err(crate::pipeline::OutputCreateError::wrap)?;
+                std::fs::create_dir_all(path)?;
             }
             if refresh && path.is_dir() {
                 let (volume, identity, _) = crate::filesystem::watch_path_identity(&output)?;

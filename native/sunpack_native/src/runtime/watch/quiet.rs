@@ -123,6 +123,18 @@ impl Activity {
             *size == candidate.size && *mtime == candidate.mtime && *id == candidate.observation.file_id
                 && *usn == candidate.observation.change_usn), state.due)
     }
+
+    // Linearize admission with native captures, after the readability check.
+    // Reuse the probe timestamp: even a replacement with identical metadata
+    // must not admit observations published after that probe.
+    pub(super) fn admit(&self, probed: Instant, now: Instant) -> Result<(), Instant> {
+        let state = self.0.state.lock().unwrap();
+        if state.observed.is_some_and(|observed| observed > probed) {
+            Err(state.due.unwrap_or(now).max(now))
+        } else {
+            Ok(())
+        }
+    }
     #[cfg(test)]
     pub(super) fn sample_count(&self) -> usize {
         self.0.state.lock().unwrap().quiet.samples.as_ref().map_or(0, |samples| samples.len())

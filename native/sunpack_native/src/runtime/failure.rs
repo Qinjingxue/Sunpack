@@ -77,6 +77,9 @@ pub(super) fn original_message_spec(failure: &Failure, language: Language) -> Me
 }
 
 fn describe(failure: &Failure, language: Language, warning: bool) -> Message<'_> {
+    if let Some(FailureContext::OutputCreate { error, .. }) = failure.context.as_deref() {
+        return Message::error("extract.dir_create_failed", error);
+    }
     if warning && failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume) {
         return Message::key("failure.possible_missing_volume");
     }
@@ -133,6 +136,21 @@ fn describe(failure: &Failure, language: Language, warning: bool) -> Message<'_>
 mod tests {
     use super::*;
     use crate::pipeline::{ArchiveReadFault, FailureEvidence};
+
+    #[test]
+    fn output_create_text_and_report_share_operation_context() {
+        let failure = Failure::new(FailureKind::FilesystemError, "Access denied")
+            .with_context(FailureContext::OutputCreate { error: "Access denied".into(), path: None });
+        for language in [Language::En, Language::Zh] {
+            let expected = language.translate("extract.dir_create_failed", &[("error", "Access denied")]);
+            assert_eq!(message(&failure, language), expected);
+            assert_eq!(original_message_spec(&failure, language).render(language), expected);
+            let report = serde_json::to_value(report::Report::from_failure(&failure, language)).unwrap();
+            assert_eq!(report["message"], expected);
+            assert_eq!(report["message_key"], "extract.dir_create_failed");
+            assert_eq!(report["stage"], "preflight");
+        }
+    }
 
     #[test]
     fn promotion_error_keeps_filesystem_diagnostic_and_password_cause() {
