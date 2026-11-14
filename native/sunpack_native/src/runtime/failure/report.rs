@@ -6,16 +6,59 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-#[derive(Serialize)]
-pub(in crate::runtime) struct Report {
+pub(in crate::runtime) struct Report<'a> {
     kind: &'static str,
     stage: &'static str,
     message: String,
     message_key: std::borrow::Cow<'static, str>,
     message_params: Value,
     user_action: &'static str,
-    causes: Vec<Report>,
+    causes: Vec<Report<'a>>,
     details: Value,
+    recovery: Option<(&'a crate::pipeline::InputRecovery, Language)>,
+}
+
+impl Serialize for Report<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut report = serializer.serialize_struct("Report", 8)?;
+        report.serialize_field("kind", &self.kind)?;
+        report.serialize_field("stage", &self.stage)?;
+        report.serialize_field("message", &self.message)?;
+        report.serialize_field("message_key", &self.message_key)?;
+        report.serialize_field("message_params", &self.message_params)?;
+        report.serialize_field("user_action", &self.user_action)?;
+        report.serialize_field("causes", &self.causes)?;
+        report.serialize_field("details", &ReportDetails(self))?;
+        report.end()
+    }
+}
+
+struct ReportDetails<'r, 'a>(&'r Report<'a>);
+impl Serialize for ReportDetails<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let details = self.0.details.as_object().expect("report details object");
+        let recovery = self.0.recovery;
+        let retry_output = recovery.and_then(|(recovery, _)| recovery.retry_output());
+        let mut map = serializer.serialize_map(Some(details.len() + usize::from(recovery.is_some()) + usize::from(retry_output.is_some())))?;
+        let mut fields = details.iter().peekable();
+        for special in ["input_recovery", "retry_output_dir"] {
+            while fields.peek().is_some_and(|(key, _)| key.as_str() < special) {
+                let (key, value) = fields.next().unwrap();
+                map.serialize_entry(key, value)?;
+            }
+            if special == "input_recovery" {
+                if let Some((recovery, language)) = recovery {
+                    map.serialize_entry(special, &recovery.report_view(|failure| Report::from_failure(failure, language)))?;
+                }
+            } else if let Some(output) = retry_output {
+                map.serialize_entry(special, output)?;
+            }
+        }
+        for (key, value) in fields { map.serialize_entry(key, value)?; }
+        map.end()
+    }
 }
 
 fn read_error(fault: &crate::pipeline::ArchiveReadFault) -> Value {
@@ -50,16 +93,12 @@ fn kind_name(kind: FailureKind) -> &'static str {
     }
 }
 
-impl Report {
-    fn attach_recovery(&mut self, recovery: &crate::pipeline::InputRecovery, language: Language) {
-        self.details["input_recovery"] = recovery.report(|failure|
-            serde_json::to_value(Self::from_failure(failure, language)).expect("failure report is serializable"));
-        if let Some(output) = recovery.retry_output() {
-            self.details["retry_output_dir"] = json!(output);
-        }
+impl<'a> Report<'a> {
+    fn attach_recovery(&mut self, recovery: &'a crate::pipeline::InputRecovery, language: Language) {
+        self.recovery = Some((recovery, language));
     }
 
-    fn from_cause(failure: &Failure, language: Language) -> Self {
+    fn from_cause(failure: &'a Failure, language: Language) -> Self {
         let mut report = Self::from_failure(failure, language);
         if let Some(scope) = failure.discovery_scope.as_deref() {
             report.details["discovery_scope"] = json!(scope);
@@ -67,7 +106,7 @@ impl Report {
         report
     }
 
-    pub(in crate::runtime) fn from_failure(failure: &Failure, language: Language) -> Self {
+    pub(in crate::runtime) fn from_failure(failure: &'a Failure, language: Language) -> Self {
         let context = failure.context.as_deref();
         let mut spec = super::original_message_spec(failure, language);
         let mut stage = "";
@@ -175,11 +214,11 @@ impl Report {
             message: raw_message.unwrap_or_else(|| spec.render(message_language).into_owned()),
             message_key: spec.key.into(), message_params: params, user_action,
             causes: failure.causes.iter().map(|cause| Self::from_cause(cause, language)).collect(),
-            details,
+            details, recovery: None,
         }
     }
 
-    pub(in crate::runtime) fn input_error(error: &InputError, language: Language) -> Self {
+    pub(in crate::runtime) fn input_error(error: &'a InputError, language: Language) -> Self {
         if let Some(failure) = error.failure.as_deref() {
             Self::from_failure(failure, language)
         } else {
@@ -195,7 +234,7 @@ impl Report {
             kind: "filesystem_error", stage: "filesystem_scan", message,
             message_key: key.into(), message_params: json!({"path": error.path, "error": error.message}),
             user_action: "", causes: vec![],
-            details: json!({"path": error.path, "operation": operation, "count": error.count()}),
+            details: json!({"path": error.path, "operation": operation, "count": error.count()}), recovery: None,
         }
     }
 
@@ -205,7 +244,7 @@ impl Report {
         Self {
             kind: "invalid_input", stage: "input", message,
             message_key: key.into(), message_params: json!({"path": error.path}), user_action: "", causes: vec![],
-            details: json!({"path": error.path}),
+            details: json!({"path": error.path}), recovery: None,
         }
     }
 }
@@ -240,7 +279,7 @@ pub(in crate::runtime) fn scan_message<'a>(entries: impl Iterator<Item = &'a Arc
     failures.next().map_or_else(|| "".into(), |failure| super::original_message_spec(failure, language).render(language))
 }
 
-fn aggregate(causes: Vec<Report>, count: usize, language: Language) -> Report {
+fn aggregate<'a>(causes: Vec<Report<'a>>, count: usize, language: Language) -> Report<'a> {
     let (key, params, message, action) = if count == 1 && causes.len() == 1 {
         let child = &causes[0];
         let params: Vec<_> = child.message_params.as_object().into_iter().flatten()
@@ -257,7 +296,7 @@ fn aggregate(causes: Vec<Report>, count: usize, language: Language) -> Report {
     };
     Report { kind: "inputs_failed", stage: "inputs", message, message_key: key.into(),
         message_params: params, user_action: action,
-        details: json!({"segment_count": count, "failed_segment_count": causes.len()}), causes }
+        details: json!({"segment_count": count, "failed_segment_count": causes.len()}), causes, recovery: None }
 }
 
 pub(in crate::runtime) fn archive_groups<'a>(archives: impl IntoIterator<Item = &'a ArchiveResult>) -> Vec<Vec<&'a ArchiveResult>> {
@@ -271,15 +310,15 @@ pub(in crate::runtime) fn archive_groups<'a>(archives: impl IntoIterator<Item = 
     groups
 }
 
-pub(in crate::runtime) fn archive_report(entries: &[&ArchiveResult], language: Language) -> Option<Report> {
+pub(in crate::runtime) fn archive_report<'a>(entries: &[&'a ArchiveResult], language: Language) -> Option<Report<'a>> {
     archive_projection(entries, language, false)
 }
 
-pub(in crate::runtime) fn recovery_warning(entries: &[&ArchiveResult], language: Language) -> Option<Report> {
+pub(in crate::runtime) fn recovery_warning<'a>(entries: &[&'a ArchiveResult], language: Language) -> Option<Report<'a>> {
     archive_projection(entries, language, true)
 }
 
-fn archive_projection(entries: &[&ArchiveResult], language: Language, warning_only: bool) -> Option<Report> {
+fn archive_projection<'a>(entries: &[&'a ArchiveResult], language: Language, warning_only: bool) -> Option<Report<'a>> {
     let postprocess = entries.iter().filter_map(|entry| entry.failure.as_ref())
         .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })));
     let warning = postprocess.is_none()
@@ -330,15 +369,13 @@ fn archive_projection(entries: &[&ArchiveResult], language: Language, warning_on
         let partial = entries.iter().any(|entry| entry.partial)
             && entries.iter().all(|entry| entry.failure.is_none() || entry.partial);
         let key = "failure.possible_missing_volume";
-        let mut details = json!({"missing_volume_confirmed": false,
+        let details = json!({"missing_volume_confirmed": false,
             "evidence": if partial { "partial_recovery_on_split_input" } else { "backend_possible_missing_volume" },
             "partial_recovery": partial, "original_failure_kind": report.kind});
-        for key in ["input_recovery", "retry_output_dir"] {
-            if let Some(value) = report.details.get(key) { details[key] = value.clone(); }
-        }
+        let shared_recovery = report.recovery;
         report = Report { kind: "damaged", stage: "extraction_report",
             message: language.text(key).to_owned(), message_key: key.into(),
-            message_params: json!({}), user_action: "", causes: vec![report], details };
+            message_params: json!({}), user_action: "", causes: vec![report], details, recovery: shared_recovery };
     }
     if postprocess.is_none() {
         if let Some(scope) = entries.iter().filter_map(|entry| entry.failure.as_ref())
@@ -359,9 +396,46 @@ mod tests {
     use super::*;
     use crate::pipeline::FailureEvidence;
 
-    fn collect(archives: &[ArchiveResult], language: Language) -> Vec<Report> {
+    fn collect(archives: &[ArchiveResult], language: Language) -> Vec<Report<'_>> {
         archive_groups(archives).into_iter()
             .filter_map(|entries| archive_report(&entries, language)).collect()
+    }
+
+    #[test]
+    fn missing_volume_wrapper_borrows_recovery_and_streams_both_receipts() {
+        let recovery: crate::pipeline::InputRecovery = serde_json::from_value(json!({
+            "inputs": [], "output": "restored", "input_count": 1,
+            "had_checkpoints": false, "retry_output": true,
+        })).unwrap();
+        let mut failure = Failure::new(FailureKind::Damaged, "damaged")
+            .with_context(FailureContext::Extraction);
+        failure.evidence = Some(Box::new(FailureEvidence {
+            possible_missing_volume: true, ..Default::default()
+        }));
+        failure.recovery = Some(std::sync::Arc::new(recovery));
+        let archives = [ArchiveResult {
+            path: "carrier.bin".into(), format: "zip".into(), output: None,
+            failure: Some(failure), files: 0, bytes: 0, encrypted: None, depth: 0,
+            offset: 0, end_offset: None, volume_completeness: None,
+            volume_attempts: None, source_paths: vec![], password: None,
+            discovery_source: DiscoverySource::Embedded, damage_flags: None,
+            partial: false, retained: false, recovered_complete_files: 0,
+            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
+        }];
+        let report = archive_report(&[&archives[0]], Language::En).unwrap();
+        let original = &report.causes[0];
+        assert!(std::ptr::eq(report.recovery.unwrap().0, original.recovery.unwrap().0));
+        assert!(report.details.get("input_recovery").is_none());
+        assert!(original.details.get("input_recovery").is_none());
+        let mut bytes = Vec::new();
+        serde_json::to_writer(&mut bytes, &report).unwrap();
+        let streamed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(streamed, serde_json::to_value(&report).unwrap());
+        let expected = json!({"inputs": [], "output_dir": "restored", "input_count": 1});
+        assert_eq!(streamed["details"]["input_recovery"], expected);
+        assert_eq!(streamed["causes"][0]["details"]["input_recovery"], expected);
+        assert_eq!(streamed["details"]["retry_output_dir"], "restored");
+        assert_eq!(streamed["causes"][0]["details"]["retry_output_dir"], "restored");
     }
 
     #[test]

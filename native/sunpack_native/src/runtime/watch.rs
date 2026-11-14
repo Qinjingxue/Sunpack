@@ -376,6 +376,7 @@ impl Watch {
             let once = {
                 let mut slot = self.running.lock().unwrap();
                 if slot.as_ref().is_some_and(Running::continuous) {
+                    super::diagnostics::event("watch_start_reused", json!({}));
                     return Ok(json!({"running":true,"started":false,"generation":self.generation.load(Ordering::Relaxed)}));
                 }
                 match slot.as_ref() {
@@ -395,6 +396,7 @@ impl Watch {
         let hub = Arc::clone(&running.hub);
         *self.running.lock().unwrap() = Some(running);
         let generation = self.generation.load(Ordering::Relaxed);
+        super::diagnostics::event("watch_starting", json!({"tray_enabled":tray}));
         // Like main, publish the host-owned service before readiness and allow
         // stop to interrupt startup without cancelling the caller's future.
         drop(lifecycle);
@@ -408,6 +410,7 @@ impl Watch {
             if let Some(failed) = failed { let _ = Self::join_run(failed).await; }
             return Err(error);
         }
+        super::diagnostics::event("watch_started", json!({}));
         Ok(json!({"running":true,"started":true,"generation":generation}))
     }
 
@@ -439,9 +442,9 @@ impl Watch {
                 cancel.check()?;
                 Scheduler::open(cwd, engine, worker_hub, !once, tray, external, snapshot)
             }) {
-                Ok(mut scheduler) => {
+                Ok(scheduler) => {
                     let _ = ready.send(Ok(()));
-                    scheduler.run(once)
+                    scheduler.run_service(once, &last_error)
                 }
                 Err(error) => {
                     let _ = ready.send(Err(io::Error::new(error.kind(), error.to_string())));
@@ -480,8 +483,10 @@ impl Watch {
             .filter(|run| include_once || run.continuous())
             .map(|run| (Arc::clone(&run.hub), Arc::clone(&run.completion), !run.thread.is_finished()));
         let Some((hub, completion, stopped)) = current else {
+            super::diagnostics::event("watch_stop_ignored", json!({}));
             return Ok(json!({"running":false,"stopped":false,"generation":generation}));
         };
+        super::diagnostics::event("watch_stopping", json!({}));
         hub.stop();
         // Keep the old service published while it drains, as main does.
         // Concurrent start sees that service; concurrent stop joins the same
@@ -499,6 +504,7 @@ impl Watch {
             result?;
             joined?;
         }
+        super::diagnostics::event("watch_stopped", json!({}));
         Ok(json!({"running":false,"stopped":stopped,"generation":self.generation.load(Ordering::Relaxed)}))
     }
 
@@ -553,6 +559,7 @@ impl Watch {
     pub(super) async fn reload_async(&self) -> io::Result<Value> {
         let result = self.reload_result().await?;
         let running = result.is_some();
+        if !running { super::diagnostics::event("watch_reload_ignored", json!({})); }
         let reloaded = result.is_some_and(|result| result.unwrap_or(false));
         Ok(json!({"running":running,"reloaded":reloaded,"generation":self.generation.load(Ordering::Relaxed)}))
     }
@@ -646,6 +653,9 @@ impl Watch {
                 "running":true,"generation":generation,
             })
         });
+        if let Some(apply) = &apply {
+            super::diagnostics::event("watch_roots_added", json!({"added":added,"updated":updated,"applied":apply["applied"]}));
+        }
         Ok(json!({
             "roots_path":path,"added":added,"updated":updated,"rejected":rejected,
             "apply":apply,"start":null,
@@ -680,6 +690,9 @@ impl Watch {
                     "running":true,"generation":generation,
                 })
             });
+        if let Some(apply) = &apply {
+            super::diagnostics::event("watch_roots_removed", json!({"removed":removed,"applied":apply["applied"]}));
+        }
         Ok(json!({"roots_path":path,"removed":removed,"apply":apply}))
     }
 
@@ -1967,7 +1980,7 @@ impl Scheduler {
         let executor = Arc::clone(&engine);
         executor.run_stage("watch_start", Origin::Watch, || {
             Self::open_blocking(cwd, engine, hub, continuous, tray_enabled, external, snapshot)
-        })
+        })?
     }
 
     fn open_blocking(
@@ -2109,37 +2122,41 @@ impl Scheduler {
         })
     }
 
+    fn reconcile_tray(cwd: &Path, settings: &Config, enabled: bool, hub: &Arc<Hub>,
+        journal: Weak<journal::Journal>, tray: &mut Option<super::tray::Tray>) {
+        let show_tray = enabled && settings.watch.tray_enabled;
+        if show_tray && tray.is_none() {
+            let hub = Arc::clone(hub);
+            let diagnostic = journal.clone();
+            match super::tray::Tray::start(cwd, settings.cli.language, move |action| {
+                match action {
+                    super::tray::Action::Reload => hub.queue_reload(None),
+                    super::tray::Action::Stop => hub.stop(),
+                }
+            }, move |message, error| {
+                if let Some(journal) = diagnostic.upgrade() {
+                    journal.log(json!({"event":"tray_callback_error", "error":error.to_string(),
+                        "error_type":format!("{:?}", error.kind()), "message":message}));
+                }
+            }) {
+                Ok(value) => *tray = Some(value),
+                Err(error) => if let Some(journal) = journal.upgrade() {
+                    journal.log(json!({"event":"tray_start_failed", "error":error.to_string()}));
+                },
+            }
+        } else if !show_tray {
+            tray.take();
+        } else if let Some(tray) = tray {
+            tray.set_language(settings.cli.language);
+        }
+    }
+
     fn reconcile_shell(&mut self) {
         if !self.continuous {
             return;
         }
-        let show_tray = self.tray_enabled && self.settings.watch.tray_enabled;
-        if show_tray && self.tray.is_none() {
-            let hub = Arc::clone(&self.hub);
-            let journal = Arc::downgrade(&self.journal);
-            let tray =
-                super::tray::Tray::start(&self.cwd, self.settings.cli.language, move |action| {
-                    match action {
-                        super::tray::Action::Reload => hub.queue_reload(None),
-                        super::tray::Action::Stop => hub.stop(),
-                    }
-                }, move |message, error| {
-                    if let Some(journal) = journal.upgrade() {
-                        journal.log(json!({"event":"tray_callback_error", "error":error.to_string(),
-                            "error_type":format!("{:?}", error.kind()), "message":message}));
-                    }
-                });
-            match tray {
-                Ok(tray) => self.tray = Some(tray),
-                Err(error) => self
-                    .journal
-                    .log(json!({"event":"tray_start_failed","error":error.to_string()})),
-            }
-        } else if !show_tray {
-            self.tray.take();
-        } else if let Some(tray) = &self.tray {
-            tray.set_language(self.settings.cli.language);
-        }
+        Self::reconcile_tray(&self.cwd, &self.settings, self.tray_enabled,
+            &self.hub, Arc::downgrade(&self.journal), &mut self.tray);
         if self.options.is_some() && !self.roots.is_empty() && self.settings.watch.toast_enabled {
             if self.toast.is_none() {
                 let diagnostic = state_dir(&self.cwd).map(|dir| dir.join("toast-diagnostic.log"));
@@ -2284,7 +2301,7 @@ impl Scheduler {
                 })
             });
             Ok((entries, next, policy_changed))
-        })?;
+        })??;
         if self.journal.resume()? {
             self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(),
                 Some(state_dir(&self.cwd)?.to_string_lossy().into_owned())));
@@ -2332,10 +2349,10 @@ impl Scheduler {
         retirement?;
         self.root_progress.retirement = false;
         Ok((self.root_progress.checkpoint, self.root_progress.recovery))
-        })
+        })?
     }
 
-    fn rearm_root_observers(&mut self, changed: Option<&HashSet<String>>) -> () {
+    fn rearm_root_observers(&mut self, changed: Option<&HashSet<String>>) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_rearm", Origin::Watch, || self.rearm_root_observers_blocking(changed))
     }
@@ -2387,11 +2404,14 @@ impl Scheduler {
         // Invalid config/root policy or rollback failures may follow a resume.
         // The rootless shell releases that temporary state on every exit path.
         let suspended = self.suspend_empty_scheduler();
-        result.and_then(|changed| suspended.map(|()| changed))
+        result.and_then(|changed| suspended.map(|()| {
+            super::diagnostics::event(if changed { "watch_reloaded" } else { "watch_reload_skipped" }, json!({}));
+            changed
+        }))
     }
 
     fn reload_loaded(&mut self) -> io::Result<bool> {
-        let snapshot = self.engine.run_stage("watch_config_reload", Origin::Watch, || config::reload_snapshot(&self.cwd))?;
+        let snapshot = self.engine.run_stage("watch_config_reload", Origin::Watch, || config::reload_snapshot(&self.cwd))??;
         let config_changed = *self.settings != snapshot.config;
         let scheduler_changed = scheduler_configuration_changed(&self.settings, &snapshot.config);
         let tray_changed = self.settings.watch.tray_enabled != snapshot.config.watch.tray_enabled
@@ -2405,7 +2425,7 @@ impl Scheduler {
         // apply must not publish sources or lose the old recovery notifications.
         let observers = observers_changed.then(|| self.engine.run_stage("watch_rearm", Origin::Watch, || Self::observe_config(
             &self.cwd, &snapshot, &self.root_file, self.passwords.path(), &self.hub,
-        ))).transpose()?;
+        )).and_then(|result| result)).transpose()?;
         let (roots_changed, root_policy_changed) = match self.reconcile_roots(scheduler_changed) {
             Ok(changed) => changed,
             Err(error) => {
@@ -2534,31 +2554,106 @@ impl Scheduler {
             }
             let signals = self.hub.wait_drain(cancellation_observed);
             for (batch, waiter) in signals.cancel {
-                let _ = waiter.send(Ok(self.cancel_display_batch(&batch)));
+                let _ = waiter.send(self.cancel_display_batch(&batch));
             }
-            for root in signals.roots {
-                if let Err(error) = self.complete_root(root) { *result = Err(error); }
-            }
-            for completed in signals.completed {
-                if result.is_err() {
-                    self.abandon_completed(&completed);
-                } else if let Err(error) = self.complete(&completed) {
-                    *result = Err(error);
-                }
-            }
+            let failed_before_harvest = result.is_err();
+            if let Err(error) = self.complete_roots(signals.roots) { *result = Err(error); }
+            if failed_before_harvest {
+                // Closing an already failed scheduler only releases requests;
+                // its untrusted projection must not create new state changes.
+                for batch in signals.completed { self.abandon_completed(&batch); }
+            } else if let Err(error) = self.complete_requests(signals.completed) { *result = Err(error); }
         }
         // A failed completion may leave durable recovery intent. Do not resume
         // admission with the partially retired in-memory request indexes.
-        if result.is_err() { self.hub.stop(); }
+        if result.is_err() { self.options = None; }
         result.as_ref().map(|_| ()).map_err(|error|
             io::Error::new(error.kind(), error.to_string()))
     }
 
+    // The persistent service owns configuration observation and the tray;
+    // a failed data scheduler must not take those repair controls down with it.
+    fn run_service(mut self, once: bool, last_error: &Mutex<Option<String>>) -> io::Result<i32> {
+        loop {
+            let result = self.run(once);
+            if once || result.is_ok() || self.hub.stopped.load(Ordering::Acquire) { return result; }
+            let error = result.unwrap_err();
+            *last_error.lock().unwrap() = Some(error.to_string());
+            self.journal.log(json!({"event":"scheduler_error","error":error.to_string()}));
+            let cwd = self.cwd.clone();
+            let engine = Arc::clone(&self.engine);
+            let hub = Arc::clone(&self.hub);
+            let external = Arc::clone(&self.external);
+            let mut settings = Arc::clone(&self.settings);
+            let password_path = self.passwords.path().to_owned();
+            let journal = Arc::downgrade(&self.journal);
+            let roots: Vec<_> = self.roots.values().map(|(root, _)| root.clone()).collect();
+            let tray_enabled = self.tray_enabled;
+            let mut observers = std::mem::take(&mut self.config_observers);
+            let mut tray = self.tray.take();
+            // Drop the faulted stream and its lock before reopening; never
+            // clear a WAL error in place or write the failed memory projection.
+            drop(self);
+            hub.pending_count.store(0, Ordering::Relaxed);
+            let mut repaired = None;
+            while !hub.stopped.load(Ordering::Acquire) {
+                let signals = hub.wait(None);
+                for ( _, waiter) in signals.cancel { let _ = waiter.send(Ok(false)); }
+                for waiter in signals.once { let _ = waiter.send(Err(io::Error::other(error.to_string()))); }
+                for waiter in signals.rebuild { let _ = waiter.send(Err(io::Error::other(error.to_string()))); }
+                for root in signals.roots { root.reply.complete(Err(io::Error::other(error.to_string()))); }
+                if !signals.reload { continue; }
+                let reload = (|| {
+                    let snapshot = config::reload_snapshot(&cwd)?;
+                    let next_roots = read_roots(&roots_path(&cwd)?)?;
+                    let changed = scheduler_configuration_changed(&settings, &snapshot.config)
+                        || roots.len() != next_roots.len()
+                        || roots.iter().any(|root| !next_roots.iter().any(|next| key(&root.path) == key(&next.path) && root.same_policy(next)));
+                    let shell_changed = *settings != snapshot.config;
+                    if !changed && (signals.reload_waiters.is_empty() || shell_changed) {
+                        // A failed scheduler does not disable service-only policy
+                        // changes. Keep the existing tray/configuration shell alive.
+                        let next_observers = Self::observe_config(&cwd, &snapshot,
+                            &roots_path(&cwd)?, &password_path, &hub)?;
+                        settings = Arc::new(snapshot.config);
+                        super::diagnostics::retention(settings.watch.event_log_retention_days);
+                        windows::configure_priority(&engine, settings.runtime.process_mode);
+                        Self::reconcile_tray(&cwd, &settings, tray_enabled, &hub,
+                            journal.clone(), &mut tray);
+                        observers = next_observers;
+                        return Ok(shell_changed);
+                    }
+                    repaired = Some(Self::open(cwd.clone(), Arc::clone(&engine), Arc::clone(&hub),
+                        true, false, Arc::clone(&external), snapshot)?);
+                    Ok(true)
+                })();
+                for waiter in signals.reload_waiters {
+                    let _ = waiter.send(reload.as_ref().copied()
+                        .map_err(|error: &io::Error| io::Error::new(error.kind(), error.to_string())));
+                }
+                match reload {
+                    Ok(changed) => super::diagnostics::event(if changed { "watch_reloaded" } else { "watch_reload_skipped" }, json!({})),
+                    Err(error) => { *last_error.lock().unwrap() = Some(error.to_string()); }
+                }
+                if repaired.is_some() { break; }
+            }
+            drop(observers);
+            drop(tray);
+            let Some(mut scheduler) = repaired else { return Ok(0); };
+            scheduler.tray_enabled = tray_enabled;
+            scheduler.reconcile_shell();
+            *last_error.lock().unwrap() = None;
+            self = scheduler;
+        }
+    }
+
     fn run(&mut self, once: bool) -> io::Result<i32> {
         let mut result = self.run_inner(once);
-        self.hub.stop();
+        if once || result.is_ok() { self.hub.stop(); }
         let _ = self.drain_active(&mut result);
-        let signals = self.hub.wait(None);
+        let signals = if self.hub.stopped.load(Ordering::Acquire) {
+            self.hub.wait(None)
+        } else { Signals::default() };
         drop(signals.cancel);
         for waiter in signals.reload_waiters {
             let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
@@ -2576,7 +2671,7 @@ impl Scheduler {
             self.catalog.close();
             self.journal.log(json!({"event":"watch_stopped"}));
             self.journal.flush()
-        })?;
+        })??;
         if self.hub.cancelled.load(Ordering::Acquire) {
             return Err(crate::io::cancellation::cancelled_io());
         }
@@ -2600,7 +2695,7 @@ impl Scheduler {
                     // A gap between bursts is not the idle-cache deadline.
                     self.catalog.commit(false);
                     self.journal.compact()
-                })?;
+                })??;
             }
             let due = self.next_admission();
             let deadline = match (due, self.cache_deadline) {
@@ -2611,7 +2706,7 @@ impl Scheduler {
             let mut signals = self.hub.wait(deadline);
             self.candidate_diagnostics.clear_expired(Instant::now());
             for (batch, waiter) in signals.cancel {
-                let _ = waiter.send(Ok(self.cancel_display_batch(&batch)));
+                let _ = waiter.send(self.cancel_display_batch(&batch));
             }
             // Claims arrive from pipeline workers. Remove each queued deadline
             // once; keep its observation for generation-safe completion.
@@ -2620,15 +2715,9 @@ impl Scheduler {
                 park_claimed_deadlines(&self.pending, &mut self.due, &claims, signals.claimed);
             }
             let mut completion_error = None;
-            for root in signals.roots {
-                if let Err(error) = self.complete_root(root) { completion_error = Some(error); }
-            }
-            for completed in signals.completed {
-                if completion_error.is_some() {
-                    self.abandon_completed(&completed);
-                } else if let Err(error) = self.complete(&completed) {
-                    completion_error = Some(error);
-                }
+            if let Err(error) = self.complete_roots(signals.roots) { completion_error = Some(error); }
+            if let Err(error) = self.complete_requests(signals.completed) {
+                completion_error = Some(error);
             }
             // Every notification in this taken batch must be harvested, even
             // when an earlier completion failed. Drain cannot wait for a wake
@@ -2637,7 +2726,7 @@ impl Scheduler {
                 return Err(error);
             }
             for waiter in signals.rebuild {
-                let result = self.engine.run_stage("catalog_maintenance", Origin::Watch, || self.journal.rebuild_log());
+                let result = self.engine.run_stage("catalog_maintenance", Origin::Watch, || self.journal.rebuild_log()).and_then(|result| result);
                 let _ = waiter.send(result);
             }
             if signals.password_changed || !signals.reload_waiters.is_empty() {
@@ -2685,7 +2774,7 @@ impl Scheduler {
                 // turn. Only a native topology event or an admission needs a
                 // checkpoint; the control request is not a rescan.
                 if self.options.is_some() && !signals.topology_roots.is_empty() {
-                    self.rearm_root_observers(Some(&signals.topology_roots));
+                    self.rearm_root_observers(Some(&signals.topology_roots))?;
                 }
                 let result = (if signals.changed_roots.is_empty() { Ok(()) } else {
                     self.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
@@ -2718,9 +2807,9 @@ impl Scheduler {
                 if self.active.is_empty() && self.pending.is_empty() {
                     let engine = Arc::clone(&self.engine);
                     let mut maintenance = Ok(());
-                    windows::maintain_when_foreground_idle(&engine, || engine.run_stage("catalog_maintenance", Origin::Watch, || {
-                        maintenance = self.checkpoint(&HashMap::new(), true, false);
-                        if maintenance.is_err() { return; }
+                    windows::maintain_when_foreground_idle(&engine, || {
+                        maintenance = engine.run_stage("catalog_maintenance", Origin::Watch, || {
+                        self.checkpoint(&HashMap::new(), true, false)?;
                         self.catalog.commit(true);
                         let _ = crate::io::reader::clear_reader_resources();
                         self.engine.clear_idle_passwords();
@@ -2730,7 +2819,9 @@ impl Scheduler {
                         self.unpublished.shrink_to_fit();
                         self.active.shrink_to_fit();
                         self.active_paths.shrink_to_fit();
-                    }));
+                        Ok(())
+                    }).and_then(|result| result);
+                    });
                     maintenance?;
                 }
             }
@@ -2796,7 +2887,7 @@ impl Scheduler {
             } else {
                 self.observe_file_changes_blocking(changed, events)
             }
-        })
+        })?
     }
 
     fn checkpoint(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, all_roots: bool, startup: bool) -> io::Result<()> {
@@ -2806,7 +2897,7 @@ impl Scheduler {
     fn checkpoint_with_events(&mut self, changed: &HashMap<String, HashSet<PathBuf>>,
         all_roots: bool, startup: bool, events: &HashMap<PathBuf, CandidateEvent>) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_usn_checkpoint", Origin::Watch, || self.checkpoint_blocking(changed, all_roots, startup, events))
+        engine.run_stage("watch_usn_checkpoint", Origin::Watch, || self.checkpoint_blocking(changed, all_roots, startup, events))?
     }
 
     fn checkpoint_blocking(
@@ -3628,7 +3719,7 @@ impl Scheduler {
 
     fn password_update(&mut self, startup: bool) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("password_reload", Origin::Watch, || self.password_update_blocking(startup))
+        engine.run_stage("password_reload", Origin::Watch, || self.password_update_blocking(startup))?
     }
 
     fn password_update_blocking(&mut self, startup: bool) -> io::Result<()> {
@@ -4123,7 +4214,7 @@ impl Scheduler {
 
     fn prepare_ready(&mut self, now: Instant, available: usize) -> io::Result<Vec<(String, Pending)>> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_admission", Origin::Watch, || self.prepare_ready_blocking(now, available))
+        engine.run_stage("watch_admission", Origin::Watch, || self.prepare_ready_blocking(now, available))?
     }
 
     fn prepare_ready_blocking(&mut self, now: Instant, available: usize) -> io::Result<Vec<(String, Pending)>> {
@@ -4346,7 +4437,7 @@ impl Scheduler {
 
     fn start_batch(&mut self, root_id: String, candidates: Vec<(WatchCandidateRow, quiet::Activity)>, recovery: Option<Arc<Recovery>>, password_scope: PathBuf) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_admission", Origin::Watch, || self.start_batch_blocking(root_id, candidates, recovery, password_scope))
+        engine.run_stage("watch_admission", Origin::Watch, || self.start_batch_blocking(root_id, candidates, recovery, password_scope))?
     }
 
     fn start_batch_blocking(
@@ -4538,7 +4629,7 @@ impl Scheduler {
         Ok(())
     }
 
-    fn cancel_display_batch(&mut self, id: &str) -> bool {
+    fn cancel_display_batch(&mut self, id: &str) -> io::Result<bool> {
         if matches!(id.as_bytes().first(), Some(b'8'..=b'9' | b'a'..=b'f')) {
             let requests = self
                 .toast
@@ -4547,22 +4638,40 @@ impl Scheduler {
                 .unwrap_or_default();
             // Keep each request's existing durable boundary. An arbitrarily
             // large display group must not become a single WAL record.
-            let mut stopped = false;
-            for request in requests {
-                stopped |= self.cancel_batch(&request);
+            let engine = Arc::clone(&self.engine);
+            let journal = Arc::clone(&self.journal);
+            let result = engine.run_stage("watch_cancel", Origin::Watch, || {
+                let (cancellations, durable) = journal.defer_waits(|| requests.iter()
+                    .filter_map(|request| self.prepare_cancel_batch(request)).collect::<Vec<_>>());
+                if let Err(error) = durable {
+                    journal.log(json!({"event":"watch_cancel_persistence_failed","error":error.to_string()}));
+                }
+                let stopped = !cancellations.is_empty();
+                for cancel in cancellations { cancel.cancel(); }
+                stopped
+            });
+            if let Err(error) = &result {
+                journal.log(json!({"event":"watch_cancel_persistence_failed","error":error.to_string()}));
+                for request in requests { if let Some(active) = self.active.get(request.as_ref()) { active.cancel.cancel(); } }
             }
-            stopped
+            result
         } else {
-            self.cancel_batch(id)
+            Ok(self.cancel_batch(id))
         }
     }
 
     fn cancel_batch(&mut self, batch: &str) -> bool {
+        let Some(cancel) = self.prepare_cancel_batch(batch) else { return false; };
+        cancel.cancel();
+        true
+    }
+
+    fn prepare_cancel_batch(&mut self, batch: &str) -> Option<Cancellation> {
         let Some(active) = self.active.get(batch) else {
-            return false;
+            return None;
         };
         if active.request.is_finished() || active.cancel.cancelled() {
-            return false;
+            return None;
         }
         let mut claimed = active.claimed.lock().unwrap();
         claimed.cancelled = true;
@@ -4597,8 +4706,7 @@ impl Scheduler {
             self.journal.log(json!({"event":"watch_cancel_persistence_failed","owner":batch,"error":error.to_string()}));
         }
         // Stop the workers even when the state volume failed the durable write.
-        active.cancel.cancel();
-        true
+        Some(active.cancel.clone())
     }
 
     fn abandon_completed(&mut self, batch: &str) {
@@ -4609,11 +4717,49 @@ impl Scheduler {
         }
     }
 
+    fn complete_roots(&mut self, roots: Vec<RootCompleted>) -> io::Result<()> {
+        if roots.is_empty() { return Ok(()); }
+        let engine = Arc::clone(&self.engine);
+        let journal = Arc::clone(&self.journal);
+        let waiting: Vec<_> = roots.iter().map(|root| Arc::clone(&root.reply)).collect();
+        let result = engine.run_stage("watch_complete_state", Origin::Watch, || {
+            let replies = roots.into_iter().filter_map(|root| {
+                if !self.active.contains_key(&root.batch) {
+                    root.reply.complete(Err(io::Error::other("Watch request already retired")));
+                    return None;
+                }
+                let reply = super::cli::reporting::FailedReply(Arc::clone(&root.reply));
+                let toast = self.active.get(&root.batch).and_then(|active| active.toast.clone());
+                let id = root.id;
+                let (result, tickets) = journal.prepare_waits(|| self.prepare_root(root));
+                Some((reply, toast, id, result, tickets))
+            }).collect::<Vec<_>>();
+            let mut failure = None;
+            for (reply, toast, id, result, tickets) in replies {
+                let durable = journal.wait_prepared(tickets);
+                let result = result.and_then(|outcome| durable.map(|()| outcome));
+                match &result {
+                    Ok(outcome) => { if let Some(toast) = toast { toast.root_finished(id, outcome); } }
+                    Err(error) => { failure = Some(io::Error::new(error.kind(), error.to_string())); }
+                }
+                reply.0.complete(result);
+            }
+            failure.map_or(Ok(()), Err)
+        });
+        if let Err(error) = &result {
+            for reply in waiting { reply.complete(Err(io::Error::new(error.kind(), error.to_string()))); }
+        }
+        result?
+    }
+
+    #[cfg(test)]
     fn complete_root(&mut self, root: RootCompleted) -> io::Result<()> {
-        let _reply = super::cli::reporting::FailedReply(Arc::clone(&root.reply));
+        self.complete_roots(vec![root])
+    }
+
+    fn prepare_root(&mut self, root: RootCompleted) -> io::Result<Outcome> {
         let Some(active) = self.active.get_mut(&root.batch) else {
-            root.reply.complete(Err(io::Error::other("Watch request already retired")));
-            return Ok(());
+            return Err(io::Error::other("Watch request already retired"));
         };
         let members: HashSet<_> = root.groups.keys().cloned()
             .chain(std::iter::once(key(&root.path))).collect();
@@ -4631,14 +4777,41 @@ impl Scheduler {
             root: active.root.clone(), recovery: active.recovery.clone(), password_scope: active.password_scope.clone(), passwords: Arc::clone(&active.passwords),
             inputs, quiet, dirty, claimed: Arc::clone(&active.claimed), groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
         };
-        let result = self.apply_completion(&root.batch, context, root.completed);
-        let error = result.as_ref().err().map(|error| io::Error::new(error.kind(), error.to_string()));
-        root.reply.complete(result);
-        error.map_or(Ok(()), Err)
+        self.apply_completion(&root.batch, context, root.completed).map(|(outcome, _)| outcome)
     }
 
-    fn complete(&mut self, batch: &str) -> io::Result<()> {
-        let Some(active) = self.active.remove(batch) else { return Ok(()); };
+    fn complete_requests(&mut self, batches: Vec<String>) -> io::Result<()> {
+        if batches.is_empty() { return Ok(()); }
+        let engine = Arc::clone(&self.engine);
+        let journal = Arc::clone(&self.journal);
+        // Hub publishes these only after request completion. Their join cannot
+        // wait for a root reply, unlike arbitrary still-active requests.
+        let result = engine.run_stage("watch_complete_state", Origin::Watch, || {
+            let mut prepared = Vec::new();
+            for batch in &batches {
+                // main gathers every finished request independently. A failed
+                // sibling must not suppress another request's projection.
+                prepared.push(journal.prepare_waits(|| self.complete(batch)));
+            }
+            let mut result = Ok(());
+            for (completion, tickets) in prepared {
+                let durable = journal.wait_prepared(tickets);
+                match completion.and_then(|finish| durable.map(|()| finish)) {
+                    Ok(Some(finish)) => finish.publish(),
+                    Ok(None) => {},
+                    Err(error) => result = Err(error),
+                }
+            }
+            result
+        }).and_then(|result| result);
+        if result.is_err() {
+            for batch in &batches { self.abandon_completed(batch); }
+        }
+        result
+    }
+
+    fn complete(&mut self, batch: &str) -> io::Result<Option<super::toast::Finish>> {
+        let Some(active) = self.active.remove(batch) else { return Ok(None); };
         let mut completed = active.request.join()
             .map_err(|_| io::Error::other("Watch extraction request failed"))?;
         completed.cancelled |= active.cancel.cancelled();
@@ -4647,10 +4820,10 @@ impl Scheduler {
             deep: active.deep,
             root: active.root, recovery: active.recovery, password_scope: active.password_scope, passwords: active.passwords,
             inputs: active.inputs.into_values().collect(), quiet: active.quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
-        }, completed).map(|_| ())
+        }, completed).map(|(_, finish)| finish)
     }
 
-    fn apply_completion(&mut self, batch: &str, mut active: CompletionContext, completed: Completed) -> io::Result<Outcome> {
+    fn apply_completion(&mut self, batch: &str, mut active: CompletionContext, completed: Completed) -> io::Result<(Outcome, Option<super::toast::Finish>)> {
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_complete_state", Origin::Watch, || {
             consume_claimed_pending(
@@ -4680,10 +4853,10 @@ impl Scheduler {
                 }
             }
             Ok(result)
-        })
+        })?
     }
 
-    fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, mut completed: Completed, quiet: &mut HashMap<String, quiet::Activity>) -> io::Result<Outcome> {
+    fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, mut completed: Completed, quiet: &mut HashMap<String, quiet::Activity>) -> io::Result<(Outcome, Option<super::toast::Finish>)> {
         let mut unfinished = HashSet::new();
         if completed.cancelled {
             let state = self.journal.state();
@@ -4703,14 +4876,14 @@ impl Scheduler {
             }
         }
         let groups = active.groups;
-        if let Some(toast) = active.toast.as_ref().filter(|_| active.task.is_none()) {
-            toast.finish(
+        let finish = active.toast.as_ref().filter(|_| active.task.is_none()).and_then(|toast| {
+            toast.prepare_finish(
                 &completed.result,
                 completed.cancelled,
                 !unfinished.is_empty(),
                 |path| completion_owner(path, &completed.outputs, &groups),
-            );
-        }
+            )
+        });
         {
             let claimed = active.claimed.lock().unwrap();
             let remaining = self.active.get(batch).map(|active| active.groups.lock().unwrap());
@@ -4747,7 +4920,7 @@ impl Scheduler {
                 self.journal.log(json!({"event":"pipeline_request_interrupted","owner":batch,"error":error.to_string()}));
                 self.release_display_claims(batch, &groups);
                 self.arm_idle_cleanup();
-                return Ok(Outcome::default());
+                return Ok((Outcome::default(), finish));
             }
             Err(error) => {
                 let mut absent = crate::watch_store::NativeWatchOperations::empty();
@@ -4777,7 +4950,7 @@ impl Scheduler {
                 self.persist_candidates(BTreeMap::new(), true)?;
                 self.release_display_claims(batch, &groups);
                 self.arm_idle_cleanup();
-                return Ok(Outcome::default());
+                return Ok((Outcome::default(), finish));
             }
         };
         let input_failures = outcome.input_failures();
@@ -5146,10 +5319,7 @@ impl Scheduler {
         }
         self.persist_candidates(BTreeMap::new(), false)?;
         self.arm_idle_cleanup();
-        if let (Some(toast), Some(task)) = (&active.toast, active.task) {
-            toast.root_finished(task, &outcome);
-        }
-        Ok(outcome)
+        Ok((outcome, finish))
     }
 
     fn arm_idle_cleanup(&mut self) {
@@ -7230,12 +7400,12 @@ mod tests {
         *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, continuous: true, completion });
         let engine = Engine::new(PathBuf::from("unused-worker"));
         let caller = Arc::clone(&watch);
-        let reload = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { caller.reload_async().await });
+        let reload = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { caller.reload_async().await }).unwrap();
         entering.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         let caller = Arc::clone(&watch);
-        let stop = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { caller.stop_async().await });
+        let stop = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { caller.stop_async().await }).unwrap();
         let (progress, progressed) = mpsc::channel();
-        let independent = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { progress.send(()).unwrap(); });
+        let independent = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { progress.send(()).unwrap(); }).unwrap();
         let responsive = progressed.recv_timeout(std::time::Duration::from_secs(5));
         release.send(()).unwrap();
         independent.join().unwrap();
@@ -7479,12 +7649,21 @@ mod tests {
         scheduler.active_paths.extend(names[..2].iter().map(|path| (watch_path_key(path), Arc::from("second"))));
         scheduler.active.insert("second".into(), batch(2, vec![names[0].clone(), names[1].clone()], true));
         assert_eq!(scheduler.admission_available(), 0, "second batch consumes only the freed candidate slots");
-        scheduler.complete("first").unwrap();
+        scheduler.complete_requests(vec!["first".into()]).unwrap();
         assert_eq!(scheduler.admission_available(), limit - 2, "cancellation returns only unfinished siblings");
-        scheduler.complete("second").unwrap();
+        scheduler.complete_requests(vec!["second".into()]).unwrap();
         assert_eq!(scheduler.admission_available(), limit, "failed batch returns all remaining owners");
-        scheduler.complete("second").unwrap();
+        scheduler.complete_requests(vec!["second".into()]).unwrap();
         assert_eq!(scheduler.admission_available(), limit);
+        // A persistence error in the first completion must not abandon the
+        // following cancellation projection (which releases its physical claims).
+        scheduler.active_paths.insert(watch_path_key(&names[0]), Arc::from("faulted"));
+        scheduler.active_paths.insert(watch_path_key(&names[1]), Arc::from("cancelled"));
+        scheduler.active.insert("faulted".into(), batch(3, vec![names[0].clone()], true));
+        scheduler.active.insert("cancelled".into(), batch(4, vec![names[1].clone()], false));
+        scheduler.journal.fail_for_test();
+        assert!(scheduler.complete_requests(vec!["faulted".into(), "cancelled".into()]).is_err());
+        assert!(scheduler.active_paths.is_empty(), "failed sibling suppressed cancellation projection");
         scheduler.options = None;
         assert_eq!(scheduler.admission_available(), 0);
         drop(scheduler);

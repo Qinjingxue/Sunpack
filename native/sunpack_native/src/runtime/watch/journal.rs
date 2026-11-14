@@ -2,7 +2,7 @@ use super::key;
 use crate::event_log::NativeEventLog;
 use crate::watch_journal::{
     watch_journal_open, watch_journal_request_flush, watch_journal_seed,
-    watch_journal_submit_append, watch_journal_submit_seal, NativeJournalStream,
+    watch_journal_submit_append, watch_journal_submit_seal, NativeJournalStream, NativeJournalTicket,
 };
 use crate::watch_store::{NativeWatchOperations, NativeWatchState};
 use serde_json::Value;
@@ -13,6 +13,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
+
+// Scoped to the admitted scheduler stage: worker publications on other
+// threads retain their own durable boundary.
+thread_local! {
+    static DEFERRED: std::cell::RefCell<Option<(usize, Vec<(NativeJournalTicket, bool)>)>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) struct PendingCommits(Vec<(NativeJournalTicket, bool)>);
+
+struct DeferredScope;
+impl Drop for DeferredScope {
+    fn drop(&mut self) { DEFERRED.with(|slot| { slot.borrow_mut().take(); }); }
+}
 
 const CHECKPOINT_RECORDS: u64 = 8192;
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -139,6 +152,11 @@ impl Journal {
         Ok(frontier)
     }
 
+    #[cfg(test)]
+    pub(super) fn fail_for_test(&self) {
+        self.frontier.lock().unwrap().fault = Some("injected unavailable WAL".into());
+    }
+
     pub(super) fn suspended(&self) -> bool {
         self.suspended.load(Ordering::Acquire)
     }
@@ -237,8 +255,42 @@ impl Journal {
             frontier.records += 1;
             ticket
         };
-        // Other batches can enqueue their mutations during this disk wait.
-        // The existing writer combines ready durability barriers.
+        let ticket = DEFERRED.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some((_, tickets)) = slot.as_mut().filter(|(owner, _)| *owner == self as *const Self as usize) {
+                tickets.push((ticket, durable));
+                None
+            } else { Some(ticket) }
+        });
+        match ticket { Some(ticket) => self.wait_commit(ticket, durable), None => Ok(()) }
+    }
+
+    pub(super) fn prepare_waits<T>(&self, prepare: impl FnOnce() -> T) -> (T, PendingCommits) {
+        DEFERRED.with(|slot| {
+            assert!(slot.borrow().is_none(), "nested Watch journal deferral");
+            *slot.borrow_mut() = Some((self as *const Self as usize, Vec::new()));
+        });
+        let scope = DeferredScope;
+        let result = prepare();
+        let tickets = DEFERRED.with(|slot| slot.borrow_mut().take().unwrap().1);
+        drop(scope);
+        (result, PendingCommits(tickets))
+    }
+
+    pub(super) fn wait_prepared(&self, tickets: PendingCommits) -> io::Result<()> {
+        let mut durable = Ok(());
+        for (ticket, required) in tickets.0 {
+            if let Err(error) = self.wait_commit(ticket, required) { durable = Err(error); }
+        }
+        durable
+    }
+
+    pub(super) fn defer_waits<T>(&self, prepare: impl FnOnce() -> T) -> (T, io::Result<()>) {
+        let (result, tickets) = self.prepare_waits(prepare);
+        (result, self.wait_prepared(tickets))
+    }
+
+    fn wait_commit(&self, ticket: NativeJournalTicket, durable: bool) -> io::Result<()> {
         let result = if durable {
             ticket.wait()
         } else {
@@ -473,6 +525,31 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_completion_submits_every_projection_before_waiting() {
+        let marker = crate::test_support::temp_file("deferred_journal", b"");
+        let dir = marker.with_extension("state");
+        let journal = Journal::open(&dir, 7).unwrap();
+        let (prepared, durable) = journal.defer_waits(|| {
+            for generation in 1..=32 {
+                journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(
+                    generation, generation.to_string()))).unwrap();
+                DEFERRED.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().1.len(), generation as usize));
+            }
+            assert_eq!(journal.state().password_generation(), 32);
+            journal.frontier.lock().unwrap().seq
+        });
+        durable.unwrap();
+        assert_eq!(prepared, 32);
+        assert!(DEFERRED.with(|slot| slot.borrow().is_none()));
+        drop(journal);
+        let journal = Journal::open(&dir, 7).unwrap();
+        assert_eq!(journal.state().password_generation(), 32);
+        drop(journal);
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_file(marker);
+    }
 
     #[test]
     fn rootless_shell_releases_receipts_and_replays_snapshot_and_wal() {

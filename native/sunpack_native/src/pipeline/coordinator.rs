@@ -99,9 +99,14 @@ impl Engine {
     pub(crate) fn spawn_control<T: Send + 'static>(
         &self, origin: Origin, cancel: &Cancellation,
         future: impl std::future::Future<Output = T> + Send + 'static,
-    ) -> super::scheduling::Join<T> {
+    ) -> io::Result<super::scheduling::Join<T>> {
+        let (id, prepared) = self.prepare_control()?;
+        Ok(prepared.submit(id, origin, cancel, |_| Box::pin(future)))
+    }
+
+    pub(crate) fn prepare_control(&self) -> io::Result<(u64, super::scheduling::PreparedSubmit<'_>)> {
         let id = self.next_id();
-        self.scheduler.get_or_init(Scheduler::new).submit(id, origin, cancel, |_| Box::pin(future))
+        Ok((id, self.scheduler.get_or_init(Scheduler::new).prepare_submit()?))
     }
 
     pub(crate) async fn reserve_foreground_async(
@@ -122,13 +127,13 @@ impl Engine {
     /// archive stages. Nested blocking helpers reuse the admitted stage.
     pub(crate) fn run_stage<T: Send>(
         &self, name: &'static str, origin: Origin, work: impl FnOnce() -> T + Send,
-    ) -> T {
-        if super::scheduling::in_stage() { return work(); }
+    ) -> io::Result<T> {
+        if super::scheduling::in_stage() { return Ok(work()); }
         let cancel = Cancellation::new();
         let id = self.next_id();
         self.scheduler.get_or_init(Scheduler::new).run(id, origin, &cancel, |_| Box::pin(async {
-            stage(name, &cancel).await.expect("uncancelled service stage");
-            work()
+            stage(name, &cancel).await?;
+            Ok(work())
         }))
     }
 
@@ -192,7 +197,12 @@ impl Engine {
         let request_id = reservation.as_ref().map_or_else(
             || self.next_id(), |claim| claim.id);
         let engine = self.clone();
-        self.scheduler.get_or_init(Scheduler::new).submit(
+        let scheduler = self.scheduler.get_or_init(Scheduler::new);
+        let prepared = match scheduler.prepare_submit() {
+            Ok(prepared) => prepared,
+            Err(error) => return super::scheduling::Join::ready(complete(Err(error))),
+        };
+        prepared.submit(
             request_id, request.origin, &request.cancel.clone(), move |spawner| {
                 Box::pin(async move {
                     let result = async {
@@ -209,8 +219,12 @@ impl Engine {
                     let run = engine.prepare(request, ObserverRef::Owned(observer), request_id)?;
                     run.execute_request(spawner).await
                     }.await;
-                    stage("report", &Cancellation::new()).await.expect("completion is not cancellable");
-                    complete(result)
+                    // Failure to create the executor is an error completion,
+                    // not permission to run normal reporting on the driver.
+                    match stage("report", &Cancellation::new()).await {
+                        Ok(()) => complete(result),
+                        Err(error) => complete(Err(error)),
+                    }
                 })
             })
     }
@@ -1629,7 +1643,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         task.owned_paths.iter().map(|path| resolved_key(Path::new(path))).collect(),
                         cancel,
                     ).await?;
-                    this.promote_blocked(&task.owned_paths, &destination, &generations,
+                    this.promote_blocked(&task.owned_paths, &destination,
                         &mut completed, &mut outcome, &mut shell).await?;
                 }
                 outcome.promoted_sources.extend(task.owned_paths.iter().filter_map(|path|
@@ -2065,7 +2079,6 @@ impl<'run, O: Observer> Run<'run, O> {
                 let promoted_paths = this.promote_blocked(
                     &promotion_sources,
                     &destination,
-                    &generations,
                     &mut settled,
                     &mut outcome,
                     &mut shell,
@@ -2197,7 +2210,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 if let Some(checkpoint) = checkpoint {
                     outcome.checkpoints.push(checkpoint);
                 }
-                outcome.checkpoints.append(&mut descendants.checkpoints);
+                children.checkpoints.append(&mut descendants.checkpoints);
                 outcome
                     .promoted_sources
                     .append(&mut descendants.promoted_sources);
@@ -2226,13 +2239,16 @@ impl<'run, O: Observer> Run<'run, O> {
                     this.drain_cleanup(Some(&root), &mut children).await;
                     stage("postprocess", cancel).await?;
                     children.archives.append(&mut std::mem::take(&mut completed).into());
+                    let has_local_checkpoints = outcome.checkpoints.len() != 0;
                     children.checkpoints.append(&mut outcome.checkpoints);
                     let input = ArchiveInput::file(owner_path.to_string_lossy().into_owned(), String::new(), String::new());
                     let mut container = receipt(&input, task.source, depth);
                     container.output = Some(root.clone());
                     let flattened = flatten_result(&*this.observer, task_id, &mut container, &mut children, Some(&this.created_outputs), &this.output_names);
                     completed = children.archives.take_tail();
-                    outcome.checkpoints.append(&mut children.checkpoints);
+                    if has_local_checkpoints {
+                        outcome.checkpoints = children.checkpoints.take_tail().into();
+                    }
                     carrier = container.output;
                     flattened?;
                 }
@@ -2419,6 +2435,18 @@ impl<'run, O: Observer> Run<'run, O> {
                     },
                 });
             }
+            // Recovery is local to a physical carrier. Successful, committed
+            // subtrees need no input plans retained by their ancestors; blocked
+            // descendants and same-carrier success siblings still keep theirs.
+            if outputs_committed && !cancel.cancelled()
+                && completed.iter().all(|result| result.failure.is_none() && !result.partial)
+                && children.subtree_complete() && children.checkpoints.len() == 0
+            {
+                outcome.checkpoints = Default::default();
+            }
+            // Capture above visits only this carrier's receipts, never its
+            // descendant tree. Splice outstanding descendant ownership last.
+            outcome.checkpoints.append(&mut children.checkpoints);
             outcome.archives.append(&mut completed.into());
             outcome.archives.append(&mut children.archives);
             outcome.errors.append(&mut children.errors);
@@ -2449,7 +2477,6 @@ impl<'run, O: Observer> Run<'run, O> {
         &self,
         sources: &[String],
         destination: &Path,
-        generations: &HashMap<String, PhysicalFileGeneration>,
         results: &mut [ArchiveResult],
         outcome: &mut Outcome,
         shell: &mut ShellUpdates<'_>,
@@ -2465,14 +2492,6 @@ impl<'run, O: Observer> Run<'run, O> {
             Option<String>,
         )> = async {
             stage("promotion_plan", &self.request.cancel).await?;
-            for source in sources {
-                let before = generations.get(&path_key(source)).ok_or_else(|| {
-                    io::Error::other("promotion source has no admitted generation")
-                })?;
-                if capture_file_generation(Path::new(source))? != *before {
-                    return Err(io::Error::other("promotion source generation changed"));
-                }
-            }
             loop {
                 self.request.cancel.check_io()?;
                 let plan =
@@ -6108,6 +6127,42 @@ mod tests {
     }
 
     #[test]
+    fn control_driver_start_failure_drops_future_and_allows_retry() {
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let scheduler = engine.scheduler.get_or_init(Scheduler::new);
+        scheduler.fail_driver.store(true, Ordering::Relaxed);
+        let held = Arc::new(());
+        let pending = Arc::clone(&held);
+        let failed = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move {
+            drop(pending);
+        });
+        assert!(failed.is_err());
+        assert_eq!(Arc::strong_count(&held), 1);
+        let next = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async { 42 }).unwrap();
+        assert_eq!(next.join().unwrap(), 42);
+    }
+
+    #[test]
+    fn owned_request_reports_executor_startup_failure_once_and_retries() {
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let scheduler = engine.scheduler.get_or_init(Scheduler::new);
+        scheduler.fail_pool.store(2, Ordering::Relaxed);
+        let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&called);
+        let request = Request::new(Vec::new(), Mode::Extract);
+        let completion = engine.submit(request, Arc::new(|_: Event| {}), move |result| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            result
+        });
+        assert!(completion.join().unwrap().is_err());
+        assert_eq!(called.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.fail_pool.load(Ordering::Relaxed), 0);
+        // A service call after the fault must use the newly available executor.
+        scheduler.fail_pool.store(0, Ordering::Relaxed);
+        assert_eq!(engine.run_stage("report", Origin::Foreground, || 42).unwrap(), 42);
+    }
+
+    #[test]
     fn synchronous_service_work_reuses_shared_stage_and_nested_admission() {
         let engine = Engine::new(PathBuf::from("unused-worker"));
         let scheduler = engine.scheduler.get_or_init(Scheduler::new);
@@ -6119,7 +6174,7 @@ mod tests {
                 42
             })
         });
-        assert_eq!(value, 42);
+        assert_eq!(value.unwrap().unwrap(), 42);
         assert!(!crate::pipeline::scheduling::in_stage());
     }
 
@@ -6136,7 +6191,18 @@ mod tests {
             fs::write(&source, b"archive").unwrap();
             let engine = Engine::new(PathBuf::from("unused-worker"));
             let request = Request::new(vec![root.clone()], Mode::Extract);
-            let observer = |_: Event| {};
+            let change_metadata = std::sync::atomic::AtomicBool::new(false);
+            let observer = |event: Event| {
+                if matches!(event, Event::Started { .. })
+                    && change_metadata.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    // Admission already captured the generation. A timestamp
+                    // change must not add a promotion veto absent from main.
+                    fs::OpenOptions::new().write(true).open(&source).unwrap()
+                        .set_times(fs::FileTimes::new().set_modified(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456))).unwrap();
+                }
+            };
             let run = test_run(&engine, &request, &observer);
             let execute = || {
                 let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "blocked".into());
@@ -6170,6 +6236,7 @@ mod tests {
             assert!(restored.contains(kind));
             drop(lock);
             // The same source can be retried once the external obstruction is removed.
+            change_metadata.store(true, std::sync::atomic::Ordering::Relaxed);
             let retry = execute();
             assert!(retry.archives.iter().any(|result| result.promoted));
             fs::remove_file(root.join("blocked.zip")).unwrap();
@@ -7158,7 +7225,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn complete_carrier_keeps_salvage_only_with_a_complete_sibling() {
-        for complete_sibling in [false, true] {
+        for (complete_sibling, damaged) in [(false, true), (true, true), (true, false)] {
             let source = crate::test_support::temp_file("carrier_salvage", &[0; 16]);
             let container = source.with_extension("output");
             fs::create_dir(&container).unwrap();
@@ -7183,7 +7250,7 @@ mod tests {
                 result.output = Some(output);
                 result.files = 1;
                 result.bytes = 4;
-                if index != 0 || !complete_sibling {
+                if (index != 0 && damaged) || !complete_sibling {
                     result.partial = true;
                     result.recovered_complete_files = 1;
                     result.failure = Some(Failure::new(FailureKind::Damaged, "CRC error"));
@@ -7207,7 +7274,9 @@ mod tests {
                 run.execute_task(run.register_task(task), 1, 1, None, spawner)
             }).unwrap();
             assert_eq!(outcome.archives.len(), 2);
-            assert_eq!(outcome.failed(), if complete_sibling { 1 } else { 2 });
+            assert_eq!(outcome.failed(), if !damaged { 0 } else if complete_sibling { 1 } else { 2 });
+            assert_eq!(outcome.checkpoints.len(), if damaged { 2 } else { 0 },
+                "successful carrier plans must not survive in ancestor recovery");
             assert!(outcome.archives.iter().all(|result| !result.partial));
             assert!(source.is_file());
             for index in 0..2 {

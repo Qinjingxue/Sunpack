@@ -561,7 +561,7 @@ public:
 };
 
 RequestOutcome request(const InstallContext& context, const std::vector<std::wstring>& arguments, bool shutdown,
-                       int& exit_code, const std::wstring& request_cwd, std::string& exit_prompt,
+                       int& exit_code, const std::wstring& request_cwd,
                        RuntimeStartup* startup = nullptr) {
     std::wstring pipe_name;
     std::array<unsigned char, 32> token{};
@@ -644,8 +644,6 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
             append_u32(response, static_cast<std::uint32_t>(input.size()));
             response.append(input);
             if (!controls.send(response.data(), response.size())) break;
-        } else if (kind == 4) {
-            exit_prompt = std::move(payload);
         }
     }
     return RequestOutcome::DeliveryUncertain;
@@ -726,6 +724,8 @@ void write_stream(DWORD handle_id, const std::string& text) {
     }
 }
 
+constexpr wchar_t kPressEnterEn[] = L"Press Enter to continue...";
+constexpr wchar_t kPressEnterZh[] = L"按回车键继续...";
 constexpr wchar_t kPersistentUnavailableEn[] = L"SunPack persistent process is unavailable";
 constexpr wchar_t kPersistentUnavailableZh[] = L"SunPack 持久进程不可用";
 constexpr wchar_t kRuntimeLaunchFailedEn[] = L"sunpack runtime failed to launch (Win32 error {error})";
@@ -752,6 +752,40 @@ std::string localized_value(
     return text;
 }
 
+// The installed launcher owns pause, as in main. Only consume actual flags:
+// attached password values and operands following -- remain untouched.
+bool consume_pause(std::vector<std::wstring>& arguments) {
+    bool pause = false;
+    bool no_pause = false;
+    bool options = true;
+    auto output = arguments.begin();
+    for (auto input = arguments.begin(); input != arguments.end(); ++input) {
+        if (options && *input == L"--pause") {
+            pause = true;
+            continue;
+        }
+        if (options && *input == L"--no-pause") no_pause = true;
+        if (*input == L"--") options = false;
+        if (output != input) *output = std::move(*input);
+        ++output;
+    }
+    arguments.erase(output, arguments.end());
+    if (pause && !no_pause) {
+        const auto end_options = std::find(arguments.begin(), arguments.end(), L"--");
+        arguments.insert(end_options, L"--no-pause");
+    }
+    return pause;
+}
+
+void pause_on_exit(bool pause, const std::string& language) {
+    if (pause && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR) {
+        write_stream(STD_OUTPUT_HANDLE, localized(language, kPressEnterEn, kPressEnterZh));
+        wchar_t buffer[2]{};
+        DWORD read = 0;
+        ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 1, &read, nullptr);
+    }
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -769,15 +803,15 @@ int wmain(int argc, wchar_t** argv) {
     const bool shutdown_request = argc >= 2 && wcscmp(argv[1], L"--persistent-shutdown") == 0;
     const bool shutdown = shutdown_request;
     const int first_request_argument = shutdown ? 2 : 1;
-    const std::vector<std::wstring> request_arguments(argv + first_request_argument, argv + argc);
+    std::vector<std::wstring> request_arguments(argv + first_request_argument, argv + argc);
     int code = 1;
-    std::string exit_prompt;
-    RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd, exit_prompt);
+    const bool pause = consume_pause(request_arguments);
+    RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd);
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
         RuntimeStartup startup(context);
         if (startup.held) {
             // Another launcher may have completed startup while we waited.
-            outcome = request(context, request_arguments, false, code, invocation_cwd, exit_prompt, &startup);
+            outcome = request(context, request_arguments, false, code, invocation_cwd, &startup);
         }
         DWORD spawn_error = ERROR_SUCCESS;
         HANDLE runtime_process = nullptr;
@@ -788,7 +822,7 @@ int wmain(int argc, wchar_t** argv) {
             if (spawn_runtime(context, {L"--persistent-server"}, true, nullptr, &spawn_error, &runtime_process)) {
                 const HANDLE handles[] = {startup.ready, runtime_process};
                 const DWORD ready = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-                outcome = request(context, request_arguments, false, code, invocation_cwd, exit_prompt, &startup);
+                outcome = request(context, request_arguments, false, code, invocation_cwd, &startup);
                 if (outcome == RequestOutcome::NotDelivered && ready == WAIT_OBJECT_0 + 1) {
                     GetExitCodeProcess(runtime_process, &runtime_exit_code);
                     runtime_failed = true;
@@ -822,7 +856,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool ok = outcome == RequestOutcome::Completed;
     if (!ok) code = shutdown ? 0 : 1;
     std::string language;
-    if (!ok && !shutdown) {
+    if (pause || (!ok && !shutdown)) {
         language = cli_language_from_config(context);
     }
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
@@ -830,13 +864,7 @@ int wmain(int argc, wchar_t** argv) {
     } else if (outcome == RequestOutcome::DeliveryUncertain && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kDeliveryUncertainEn, kDeliveryUncertainZh) + "\n");
     }
-    if (ok && !exit_prompt.empty()) {
-        DWORD output_mode = 0;
-        const DWORD prompt_stream = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &output_mode)
-            ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE;
-        write_stream(prompt_stream, exit_prompt);
-        read_input_line();
-    }
+    pause_on_exit(pause, language);
     return code;
 }
 

@@ -72,6 +72,33 @@ void expect_resize(HANDLE pipe, SHORT columns, SHORT rows) {
 int main() {
     try {
         development_entrypoint_contract();
+        for (auto arguments : std::vector<std::vector<std::wstring>>{
+                {L"extract", L"archive.zip", L"--pause"},
+                {L"extract", L"--json", L"--pause"},
+                {L"watch", L"list", L"--pause"}}) {
+            require(consume_pause(arguments), "client owns pause regardless of command result");
+        }
+        for (auto arguments : std::vector<std::vector<std::wstring>>{
+                {L"extract", L"--", L"--pause"},
+                {L"extract", L"--password=--pause"},
+                {L"extract", L"-p--pause"},
+                {L"extract", L"-p=--pause"},
+                {L"extract", L"--no-pause"}}) {
+            require(!consume_pause(arguments), "do not reinterpret operands or option values");
+        }
+
+        for (auto arguments : std::vector<std::vector<std::wstring>>{
+                {L"scan", L"archive.zip", L"--pause", L"--no-pause"},
+                {L"scan", L"archive.zip", L"--no-pause", L"--pause"},
+                {L"scan", L"archive.zip", L"--pause"}}) {
+            require(consume_pause(arguments), "explicit pause belongs to launcher");
+            require(arguments == std::vector<std::wstring>{L"scan", L"archive.zip", L"--no-pause"},
+                    "both pause flag orders run without runtime conflict");
+        }
+        std::vector<std::wstring> operands{L"scan", L"--pause", L"--", L"--pause", L"--no-pause"};
+        require(consume_pause(operands) && operands == std::vector<std::wstring>{
+                L"scan", L"--no-pause", L"--", L"--pause", L"--no-pause"},
+                "insert runtime suppression before delimiter without consuming operands");
         require(supports_cancellation({L"scan"}) && supports_cancellation({L"s"}) &&
                 supports_cancellation({L"extract"}) && supports_cancellation({L"e"}) &&
                 !supports_cancellation({L"watch", L"status"}) && !supports_cancellation({}),
@@ -125,6 +152,12 @@ int main() {
             controls.pause();
             expect_empty(server); // Cancellation remains idempotent.
         }
+        // This is the same final client boundary for success, cancellation and
+        // startup/transport failure: no runtime response is needed to pause.
+        key(input, L'\r');
+        pause_on_exit(true, "en");
+        key(input, L'\r');
+        pause_on_exit(true, "zh");
         DWORD restored = 0;
         require(GetConsoleMode(input, &restored) && restored == mode, "restore input mode");
         CloseHandle(client);

@@ -331,7 +331,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         drop(lock);
         // Exercise the real shutdown checkpoint with an observer installed.
         // Its fallback scan can admit this source before WAL recovery runs.
-        scheduler.rearm_root_observers(None);
+        scheduler.rearm_root_observers(None).unwrap();
         fs::write(&configuration, br#"{"cli":{"language":"zh"}}"#).unwrap();
         assert!(scheduler.reload().unwrap());
         assert!(!output.exists(), "semantic restart must retry interrupted cleanup");
@@ -609,4 +609,62 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         return;
     }
     run_isolated("native_event_provenance_survives_ordinary_and_checkpoint_admission", CHILD);
+}
+
+#[test]
+fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
+    const CHILD: &str = "SUNPACK_SCHEDULER_FAULT_SERVICE_TEST";
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        fs::create_dir_all(base.join("native")).unwrap();
+        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::write(base.join("sunpack_advanced_config.json"), br#"{"watch":{"clipboard_monitor_enabled":false,"toast_enabled":false}}"#).unwrap();
+        let watched = base.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        write_roots(&roots_path(&base).unwrap(), &[Root { path: watched,
+            output: None, recursive: true, deep: false, scanned: true }]).unwrap();
+        let hub = Arc::new(Hub::new());
+        let mut scheduler = Scheduler::open(base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
+            Arc::clone(&hub), true, false, Arc::new(Mutex::new(None)), config::load_snapshot(&base).unwrap()).unwrap();
+        // This test drives explicit reloads deterministically; do not race the
+        // native filesystem notification against the corresponding waiter.
+        scheduler.config_observers.clear();
+        let original = Arc::downgrade(&scheduler.journal);
+        scheduler.journal.fail_for_test();
+        let last_error = Arc::new(Mutex::new(None));
+        let error = Arc::clone(&last_error);
+        let (once, once_wait) = command_reply();
+        assert!(hub.queue_once(once));
+        let thread = std::thread::spawn(move || scheduler.run_service(false, &error));
+        assert!(block_on(once_wait.wait()).is_err());
+        assert!(!hub.stopped.load(Ordering::Acquire));
+        assert!(original.upgrade().is_none(), "faulted Journal must be released before reload");
+        assert!(last_error.lock().unwrap().is_some());
+        // Service-only configuration still applies while the data scheduler is
+        // unavailable, without attempting to reopen its failed state stream.
+        fs::write(base.join("sunpack_advanced_config.json"), br#"{"runtime":{"process_mode":"background"},"watch":{"clipboard_monitor_enabled":false,"toast_enabled":false,"tray_enabled":false}}"#).unwrap();
+        let (shell_reload, shell_wait) = command_reply();
+        hub.queue_reload(Some(shell_reload));
+        assert!(block_on(shell_wait.wait()).unwrap());
+        assert!(last_error.lock().unwrap().is_some(), "shell-only reload must not rebuild scheduler");
+        assert_eq!(crate::core::process::effective_mode(), crate::core::config::ProcessMode::Background);
+        let (reload, reload_wait) = command_reply();
+        hub.queue_reload(Some(reload));
+        assert!(block_on(reload_wait.wait()).unwrap());
+        hub.stop();
+        assert_eq!(thread.join().unwrap().unwrap(), 0);
+        return;
+    }
+    run_isolated("scheduler_fault_keeps_reload_control_and_reopens_the_store", CHILD);
+}
+
+#[test]
+fn process_mode_only_change_is_shell_policy_not_scheduler_policy() {
+    let previous = Config::default();
+    let mut next = previous.clone();
+    next.runtime.process_mode = if previous.runtime.process_mode == crate::core::config::ProcessMode::Normal {
+        crate::core::config::ProcessMode::Background
+    } else { crate::core::config::ProcessMode::Normal };
+    assert!(!scheduler_configuration_changed(&previous, &next));
+    assert!(previous != next, "shell changes must not be reported as no-op");
 }

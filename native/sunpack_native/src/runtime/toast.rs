@@ -909,14 +909,49 @@ pub(super) struct Activity {
     request: Arc<str>,
 }
 
+// A bounded presentation projection, prepared while the outcome is borrowed.
+// The scheduler publishes it only after its state tickets are durable.
+pub(super) struct Finish {
+    activity: Activity,
+    summary: Summary,
+}
+
+impl Finish {
+    pub(super) fn publish(self) {
+        let mut state = self.activity.publisher.shared.state.lock().unwrap();
+        if state.stopping { return; }
+        let Some(group) = state.group.iter_mut()
+            .find(|group| group.requests.contains_key(&self.activity.request))
+        else { return; };
+        group.finish(&self.activity.request, self.summary);
+        state.settle(Instant::now());
+        state.dirty = true;
+        self.activity.publisher.shared.changed.notify_one();
+    }
+}
+
 impl Publisher {
     // Report copies and retention enumeration use the existing shared I/O
     // admission, never the sole native presenter thread.
     fn publish(&self, engine: &crate::pipeline::Engine, completed: Completed) -> crate::pipeline::RequestHandle<()> {
+        let (id, prepared) = match engine.prepare_control() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if !completed.cancellation.cancelled() {
+                    eprintln!("SunPack toast failure report: {error}");
+                }
+                let mut state = self.shared.state.lock().unwrap();
+                if !state.stopping && state.group.iter().any(|group| group.id == completed.id) {
+                    state.published.push_back((completed, None));
+                    self.shared.changed.notify_one();
+                }
+                return crate::pipeline::scheduling::Join::ready(());
+            }
+        };
         let reports = Arc::clone(&self.reports);
         let shared = Arc::clone(&self.shared);
         let cancel = completed.cancellation.clone();
-        engine.spawn_control(crate::pipeline::Origin::Watch, &cancel.clone(), async move {
+        prepared.submit(id, crate::pipeline::Origin::Watch, &cancel.clone(), move |_| Box::pin(async move {
             let result = async {
                 crate::pipeline::stage("watch_failure_report", &cancel).await?;
                 reports.publish(&completed, &shared)
@@ -938,7 +973,7 @@ impl Publisher {
                 state.published.push_back((completed, report));
                 shared.changed.notify_one();
             }
-        })
+        }))
     }
 
     fn register(&self, request: Arc<str>, language: Language) -> Activity {
@@ -1092,22 +1127,22 @@ impl Activity {
         self.publisher.shared.changed.notify_one();
     }
 
-    pub(super) fn finish(
+    pub(super) fn prepare_finish(
         &self,
         result: &io::Result<Outcome>,
         cancelled: bool,
         output_cleanup_failed: bool,
         owner: impl Fn(&Path) -> Option<String>,
-    ) {
+    ) -> Option<Finish> {
         let (language, visible, started, settled) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping {
-                return;
+                return None;
             }
             let Some(group) = state.group.iter()
                 .find(|group| group.requests.contains_key(&self.request))
             else {
-                return;
+                return None;
             };
             let request = &group.requests[&self.request];
             (group.language, request.visible, if cancelled { request.roots.values().cloned().collect::<HashSet<_>>() }
@@ -1119,19 +1154,13 @@ impl Activity {
             .filter(|root| !settled.contains(root)).collect();
         let summary = Summary::for_result(language, result, cancelled, output_cleanup_failed, visible,
             &owner, Some(&started));
-        let mut state = self.publisher.shared.state.lock().unwrap();
-        if state.stopping {
-            return;
-        }
-        let Some(group) = state.group.iter_mut()
-            .find(|group| group.requests.contains_key(&self.request))
-        else {
-            return;
-        };
-        group.finish(&self.request, summary);
-        state.settle(Instant::now());
-        state.dirty = true;
-        self.publisher.shared.changed.notify_one();
+        Some(Finish { activity: self.clone(), summary })
+    }
+
+    #[cfg(test)]
+    fn finish(&self, result: &io::Result<Outcome>, cancelled: bool,
+        output_cleanup_failed: bool, owner: impl Fn(&Path) -> Option<String>) {
+        if let Some(finish) = self.prepare_finish(result, cancelled, output_cleanup_failed, owner) { finish.publish(); }
     }
 
     pub(super) fn record(
@@ -1943,7 +1972,12 @@ mod tests {
             error_code: 5,
             message: "Access denied".to_owned(),
         });
-        later.finish(&Ok(outcome), false, false, one_root);
+        let finish = later.prepare_finish(&Ok(outcome), false, false, one_root).unwrap();
+        // Watch may prepare a whole completion batch before any WAL wait.
+        // Preparation cannot make its terminal notification visible.
+        finish_debounce(&publisher);
+        assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
+        finish.publish();
         finish_debounce(&publisher);
         let completed = Snapshot::completed(&take_completed(&publisher), None);
         let state = publisher.shared.state.lock().unwrap();

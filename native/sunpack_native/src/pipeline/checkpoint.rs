@@ -508,31 +508,16 @@ impl InputRecovery {
         self.inputs.iter().filter_map(InputCheckpoint::failure).any(Failure::is_password_retry)
     }
 
+    /// Borrow receipts until the final writer consumes them.
+    pub(crate) fn report_view<'a, T: Serialize + 'a>(
+        &'a self, failure: impl Fn(&'a Failure) -> T + 'a,
+    ) -> impl Serialize + 'a {
+        RecoveryReport { recovery: self, failure }
+    }
+
+    #[cfg(test)]
     pub(crate) fn report(&self, failure: impl Fn(&Failure) -> serde_json::Value) -> serde_json::Value {
-        use serde_json::{json, Value};
-        let inputs: Vec<_> = self.inputs.iter().map(|checkpoint| {
-            let state = checkpoint.report.as_ref().expect("captured report state");
-            let error = checkpoint.failure.as_ref().map(|receipt| &receipt.failure);
-            let mut blockers = Vec::new();
-            if let Some(error) = error {
-                if error.contains(FailureKind::MissingVolume)
-                    || checkpoint.input.execution_evidence().is_some()
-                    || checkpoint.input.analysis.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing)
-                    || error.evidence.as_deref().is_some_and(|e| e.classification_evidence.as_deref() == Some("password_or_volume_inconclusive"))
-                { blockers.push("missing_volume"); }
-                if error.is_password_retry() { blockers.push("password"); }
-            }
-            // Preserve the native, lossless generation representation. No stat
-            // or legacy identity conversion is performed for diagnostics.
-            let generation = &checkpoint.sources;
-            json!({"input_id": state.input_id, "position": state.position,
-                "archive_input": checkpoint.input.report_with_name(&state.logical_name), "generation": generation,
-                "output_dir": state.output, "complete": error.is_none(), "blockers": blockers,
-                "failure": error.map(&failure).unwrap_or(Value::Null),
-                "files_written": state.files, "bytes_written": state.bytes,
-                "recovered_complete_files": state.recovered_complete_files})
-        }).collect();
-        json!({"inputs": inputs, "output_dir": self.output, "input_count": self.input_count})
+        serde_json::to_value(self.report_view(failure)).expect("recovery report serializes")
     }
 
     pub(super) fn relocate_flatten(&mut self, leaf: &Path, root: &Path) {
@@ -570,6 +555,65 @@ fn layout_matches(saved: &ArchiveInput, input: &ArchiveInput) -> bool {
             None => saved.parts == input.parts,
         }
     }
+
+struct RecoveryReport<'a, F> { recovery: &'a InputRecovery, failure: F }
+struct RecoveryInputs<'a, F> { recovery: &'a InputRecovery, failure: F }
+struct RecoveryInput<'a, F> { checkpoint: &'a InputCheckpoint, failure: F }
+
+impl<'a, F, T> Serialize for RecoveryReport<'a, F>
+where F: Fn(&'a Failure) -> T, T: Serialize {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("input_count", &self.recovery.input_count)?;
+        map.serialize_entry("inputs", &RecoveryInputs { recovery: self.recovery, failure: &self.failure })?;
+        map.serialize_entry("output_dir", &self.recovery.output)?;
+        map.end()
+    }
+}
+impl<'a, F, T> Serialize for RecoveryInputs<'a, F>
+where F: Fn(&'a Failure) -> T, T: Serialize {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.recovery.inputs.len()))?;
+        for checkpoint in &self.recovery.inputs {
+            seq.serialize_element(&RecoveryInput { checkpoint, failure: &self.failure })?;
+        }
+        seq.end()
+    }
+}
+impl<'a, F, T> Serialize for RecoveryInput<'a, F>
+where F: Fn(&'a Failure) -> T, T: Serialize {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let checkpoint = self.checkpoint;
+        let state = checkpoint.report.as_ref().expect("captured report state");
+        let error = checkpoint.failure.as_ref().map(|receipt| &receipt.failure);
+        let mut blockers = [""; 2];
+        let mut count = 0;
+        if let Some(error) = error {
+            if error.contains(FailureKind::MissingVolume)
+                || checkpoint.input.execution_evidence().is_some()
+                || checkpoint.input.analysis.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing)
+                || error.evidence.as_deref().is_some_and(|e| e.classification_evidence.as_deref() == Some("password_or_volume_inconclusive"))
+            { blockers[count] = "missing_volume"; count += 1; }
+            if error.is_password_retry() { blockers[count] = "password"; count += 1; }
+        }
+        let mut map = serializer.serialize_map(Some(11))?;
+        map.serialize_entry("archive_input", &checkpoint.input.report_with_name(&state.logical_name))?;
+        map.serialize_entry("blockers", &blockers[..count])?;
+        map.serialize_entry("bytes_written", &state.bytes)?;
+        map.serialize_entry("complete", &error.is_none())?;
+        map.serialize_entry("failure", &error.map(&self.failure))?;
+        map.serialize_entry("files_written", &state.files)?;
+        map.serialize_entry("generation", &checkpoint.sources)?;
+        map.serialize_entry("input_id", &state.input_id)?;
+        map.serialize_entry("output_dir", &state.output)?;
+        map.serialize_entry("position", &state.position)?;
+        map.serialize_entry("recovered_complete_files", &state.recovered_complete_files)?;
+        map.end()
+    }
+}
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -612,7 +656,20 @@ mod tests {
         assert!(Arc::ptr_eq(&checkpoint.input, &output_only.input));
         assert!(Arc::ptr_eq(&checkpoint.sources, &output_only.sources));
         let render = |failure: &Failure| serde_json::json!({"kind": format!("{:?}", failure.kind)});
+        // Construction must not visit the potentially large recovery tree.
+        // The existing output assertions below cover its full public schema.
+        let visits = std::cell::Cell::new(0);
+        let view = recovery.report_view(|failure| {
+            visits.set(visits.get() + 1);
+            render(failure)
+        });
+        assert_eq!(visits.get(), 0);
+        let mut bytes = Vec::new();
+        serde_json::to_writer(&mut bytes, &view).unwrap();
+        assert_eq!(visits.get(), 1);
+        let streamed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let report = recovery.report(render);
+        assert_eq!(streamed, report);
         assert_eq!(report["inputs"][0]["position"], 4);
         assert_eq!(report["inputs"][0]["files_written"], 3);
         assert_eq!(report["inputs"][0]["bytes_written"], 17);

@@ -61,6 +61,11 @@ pub(crate) struct Scheduler {
     pool: OnceLock<rayon::ThreadPool>,
     state: Mutex<Admission>,
     driver: OnceLock<mpsc::Sender<DriverEvent>>,
+    initialize: Mutex<()>,
+    #[cfg(test)]
+    pub(super) fail_pool: AtomicUsize,
+    #[cfg(test)]
+    pub(super) fail_driver: AtomicBool,
 }
 
 #[derive(Default)]
@@ -210,13 +215,48 @@ impl Scheduler {
             pool: OnceLock::new(),
             state: Mutex::default(),
             driver: OnceLock::new(),
+            initialize: Mutex::new(()),
+            #[cfg(test)]
+            fail_pool: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_driver: AtomicBool::new(false),
         })
     }
 
-    fn pool(&self) -> &rayon::ThreadPool {
-        self.pool.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(self.capacity)
+    fn pool(&self) -> io::Result<&rayon::ThreadPool> {
+        if let Some(pool) = self.pool.get() { return Ok(pool); }
+        let _initialize = self.initialize.lock().unwrap();
+        if let Some(pool) = self.pool.get() { return Ok(pool); }
+        #[cfg(test)]
+        {
+            let mut left = self.fail_pool.load(Ordering::Relaxed);
+            while left != 0 {
+                match self.fail_pool.compare_exchange_weak(left, left - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => return Err(io::Error::other("injected stage thread creation failure")),
+                    Err(current) => left = current,
+                }
+            }
+        }
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(self.capacity)
             .thread_name(|id| format!("sunpack-stage-{id}"))
-            .build().expect("start shared stage executor"))
+            .build().map_err(io::Error::other)?;
+        let _ = self.pool.set(pool);
+        Ok(self.pool.get().unwrap())
+    }
+
+    pub(crate) fn prepare_submit(self: &Arc<Self>) -> io::Result<PreparedSubmit<'_>> {
+        if self.driver.get().is_none() {
+            let _initialize = self.initialize.lock().unwrap();
+            if self.driver.get().is_none() {
+                #[cfg(test)]
+                if self.fail_driver.swap(false, Ordering::Relaxed) { return Err(io::Error::other("injected driver thread creation failure")); }
+                let (tx, rx) = mpsc::channel();
+                std::thread::Builder::new().name("sunpack-request-driver".into())
+                    .spawn(move || drive_owned(rx))?;
+                let _ = self.driver.set(tx);
+            }
+        }
+        Ok(PreparedSubmit(self))
     }
 
     pub(crate) fn next_id(&self) -> u64 { self.next_id.fetch_add(1, Ordering::Relaxed) }
@@ -294,12 +334,16 @@ impl Scheduler {
         let first = loop {
             let Ok(signal) = state.ready.recv() else { break None; };
             if let Some(job) = state.handle(signal) {
-                if job.slot.is_some() { break Some(job); }
-                job.poll();
+                if job.slot.is_some() {
+                    match self.pool() {
+                        Ok(pool) => break Some((job, pool)),
+                        Err(error) => job.fail_stage(error),
+                    }
+                } else { job.poll(); }
             }
             if state.finished() { break None; }
         };
-        if let Some(first) = first { self.pool().in_place_scope(|scope| {
+        if let Some((first, pool)) = first { pool.in_place_scope(|scope| {
             scope.spawn(move |_| first.poll());
             while let Ok(signal) = state.ready.recv() {
                 if let Some(job) = state.handle(signal) {
@@ -315,19 +359,14 @@ impl Scheduler {
 
     /// Suspended owned requests share one wake-driven driver. Blocking stages
     /// share admission with scoped callers; no request owns an OS thread.
-    pub(crate) fn submit<T: Send + 'static>(
+    fn submit_ready<T: Send + 'static>(
         self: &Arc<Self>,
         request: u64,
         origin: Origin,
         cancel: &Cancellation,
         run: impl FnOnce(Spawner<'static>) -> Task<'static, T>,
     ) -> Join<T> {
-        let driver = self.driver.get_or_init(|| {
-            let (tx, rx) = mpsc::channel();
-            std::thread::Builder::new().name("sunpack-request-driver".into())
-                .spawn(move || drive_owned(rx)).expect("start request driver");
-            tx
-        }).clone();
+        let driver = self.driver.get().expect("prepared driver").clone();
         let (spawner, state) = RequestState::new(self, request, origin, cancel.clone(), Some(driver.clone()));
         let result = spawner.spawn(run(spawner.clone()));
         let completed = Arc::new(Completion::default());
@@ -407,8 +446,27 @@ fn drive_owned(rx: mpsc::Receiver<DriverEvent>) {
 
 fn dispatch_owned(state: &mut RequestState<'static>, signal: Signal) {
     if let Some(job) = state.handle(signal) {
-        if job.slot.is_some() { state.scheduler.pool().spawn(move || job.poll()); }
-        else { job.poll(); }
+        if job.slot.is_some() {
+            match state.scheduler.pool() {
+                Ok(pool) => pool.spawn(move || job.poll()),
+                Err(error) => job.fail_stage(error),
+            }
+        } else { job.poll(); }
+    }
+}
+
+pub(crate) struct PreparedSubmit<'a>(&'a Arc<Scheduler>);
+impl PreparedSubmit<'_> {
+    pub(crate) fn submit<T: Send + 'static>(self, request: u64, origin: Origin,
+        cancel: &Cancellation, run: impl FnOnce(Spawner<'static>) -> Task<'static, T>) -> Join<T> {
+        self.0.submit_ready(request, origin, cancel, run)
+    }
+}
+#[cfg(test)]
+impl Scheduler {
+    pub(crate) fn submit<T: Send + 'static>(self: &Arc<Self>, request: u64, origin: Origin,
+        cancel: &Cancellation, run: impl FnOnce(Spawner<'static>) -> Task<'static, T>) -> Join<T> {
+        self.prepare_submit().unwrap().submit(request, origin, cancel, run)
     }
 }
 
@@ -512,6 +570,14 @@ struct PollJob<'a> {
 }
 
 impl PollJob<'_> {
+    fn fail_stage(mut self, error: io::Error) {
+        if let Some(stage) = self.wake.stage.lock().unwrap().as_ref() {
+            let _ = stage.failure.set(error);
+        }
+        drop(self.slot.take());
+        self.poll();
+    }
+
     fn poll(self) {
         let mut future = self.parked.lock().unwrap().take().unwrap();
         // A stage grant applies to this continuation only. External async wakes
@@ -588,6 +654,7 @@ struct StageIntent {
     name: &'static str,
     cancel: Cancellation,
     granted: AtomicBool,
+    failure: OnceLock<io::Error>,
 }
 
 /// The future owns its stack across this boundary. Only the synchronous stage
@@ -597,6 +664,9 @@ pub(crate) async fn stage(name: &'static str, cancel: &Cancellation) -> io::Resu
     let mut subscription = None;
     poll_fn(|cx| {
         cancel.check_io()?;
+        if let Some(error) = intent.as_ref().and_then(|stage| stage.failure.get()) {
+            return Poll::Ready(Err(io::Error::new(error.kind(), error.to_string())));
+        }
         if intent.as_ref().is_some_and(|stage| stage.granted.load(Ordering::Acquire)) {
             return Poll::Ready(Ok(()));
         }
@@ -605,7 +675,7 @@ pub(crate) async fn stage(name: &'static str, cancel: &Cancellation) -> io::Resu
             return Poll::Ready(Ok(()));
         };
         if intent.is_none() {
-            let stage = Arc::new(StageIntent { name, cancel: cancel.clone(), granted: AtomicBool::new(false) });
+            let stage = Arc::new(StageIntent { name, cancel: cancel.clone(), granted: AtomicBool::new(false), failure: OnceLock::new() });
             *task.stage.lock().unwrap() = Some(Arc::clone(&stage));
             intent = Some(stage);
             let wake = cx.waker().clone();
@@ -673,6 +743,11 @@ fn completed<T>(value: Result<T, Panic>) -> T {
     value.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 impl<T> Join<T> {
+    pub(crate) fn ready(value: T) -> Self {
+        let result = Arc::new(Completion::default());
+        result.complete(Ok(value));
+        Self(result)
+    }
     fn take(&mut self) -> Option<T> {
         self.0.state.lock().unwrap().0.take().map(completed)
     }
@@ -803,17 +878,73 @@ mod tests {
     }
 
     #[test]
+    fn failed_pool_retry_keeps_parallel_stage_progress() {
+        let scheduler = Scheduler::with_capacity(2);
+        scheduler.fail_pool.store(1, Ordering::Relaxed);
+        let cancel = Cancellation::new();
+        scheduler.run(1, Origin::Foreground, &cancel, |spawner| {
+            let cancel = cancel.clone();
+            Box::pin(async move {
+                assert!(stage("first", &cancel).await.is_err());
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let jobs: Vec<_> = (0..2).map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let cancel = cancel.clone();
+                    spawner.spawn(Box::pin(async move {
+                        stage("extract", &cancel).await.unwrap();
+                        barrier.wait();
+                    }))
+                }).collect();
+                for job in jobs { job.wait().await; }
+            })
+        });
+        assert_eq!(scheduler.state.lock().unwrap().pending, 0);
+    }
+
+    #[test]
+    fn initialization_failure_settles_requests_and_allows_later_retry() {
+        let scheduler = Scheduler::with_capacity(1);
+        let cancel = Cancellation::new();
+        scheduler.fail_driver.store(true, Ordering::Relaxed);
+        assert!(scheduler.prepare_submit().is_err());
+        assert!(scheduler.driver.get().is_none());
+        assert_eq!(scheduler.state.lock().unwrap().pending, 0);
+        scheduler.fail_pool.store(1, Ordering::Relaxed);
+        let child_cancel = cancel.clone();
+        let failed = scheduler.prepare_submit().unwrap().submit(1, Origin::Watch, &cancel,
+            move |_| Box::pin(async move { stage("extract", &child_cancel).await }));
+        assert!(failed.join().unwrap().is_err());
+        assert!(scheduler.pool.get().is_none());
+        assert_eq!(scheduler.state.lock().unwrap().active, 0);
+        assert_eq!(scheduler.state.lock().unwrap().pending, 0);
+        let result = scheduler.run(2, Origin::Foreground, &cancel, |_| Box::pin(async {
+            stage("extract", &cancel).await
+        }));
+        assert!(result.is_ok());
+        assert_eq!(scheduler.state.lock().unwrap().active, 0);
+        assert_eq!(scheduler.state.lock().unwrap().pending, 0);
+        let fresh = Scheduler::with_capacity(1);
+        fresh.fail_pool.store(1, Ordering::Relaxed);
+        let result = fresh.run(3, Origin::Foreground, &cancel, |_| Box::pin(async {
+            stage("extract", &cancel).await
+        }));
+        assert!(result.is_err());
+        assert_eq!(fresh.state.lock().unwrap().pending, 0);
+        assert_eq!(fresh.state.lock().unwrap().active, 0);
+    }
+
+    #[test]
     fn concurrent_first_stage_initializes_one_shared_pool() {
         let scheduler = Scheduler::new();
         let addresses = std::thread::scope(|scope| {
             let jobs: Vec<_> = (0..8).map(|_| {
                 let scheduler = &scheduler;
-                scope.spawn(move || scheduler.pool() as *const rayon::ThreadPool as usize)
+                scope.spawn(move || scheduler.pool().unwrap() as *const rayon::ThreadPool as usize)
             }).collect();
             jobs.into_iter().map(|job| job.join().unwrap()).collect::<Vec<_>>()
         });
         assert!(addresses.iter().all(|address| *address == addresses[0]));
-        assert_eq!(scheduler.pool().current_num_threads(), scheduler.capacity);
+        assert_eq!(scheduler.pool().unwrap().current_num_threads(), scheduler.capacity);
     }
 
     #[test]
@@ -1142,7 +1273,7 @@ mod tests {
     fn stage_pool_keeps_main_minimum_capacity_and_nested_rayon_progress() {
         let small_host = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let scheduler = small_host.install(|| Scheduler::with_capacity(4));
-        assert_eq!(scheduler.pool().current_num_threads(), 4);
+        assert_eq!(scheduler.pool().unwrap().current_num_threads(), 4);
         let (entered, entered_rx) = mpsc::channel();
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let held = Arc::clone(&gate);

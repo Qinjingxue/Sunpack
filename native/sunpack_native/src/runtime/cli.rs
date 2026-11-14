@@ -1598,7 +1598,7 @@ async fn archives(
             let progress = Arc::clone(&progress);
             Some(engine.spawn_control(crate::pipeline::Origin::Foreground, &Cancellation::new(), async move {
                 progress.reporting.serve_async(|| progress.flush_events()).await;
-            }))
+            })?)
         } else { None };
         let current = settle_unwind(engine.run_reserved_async(request, Arc::clone(&progress), Arc::clone(&reservation))).await;
         progress.reporting.close();
@@ -2649,22 +2649,6 @@ async fn watch_command(
             }
         }
         _ => unreachable!(),
-    }
-    let event = match options.action.as_str() {
-        "start" if options.once => None,
-        "start" => Some(if result.summary["started"] == true { "watch_started" } else { "watch_start_reused" }),
-        "stop" => Some(if result.summary["stopped"] == true { "watch_stopped" } else { "watch_stop_ignored" }),
-        "reload" => Some(if result.summary["running"] != true { "watch_reload_ignored" } else if result.summary["reloaded"] == true { "watch_reloaded" } else { "watch_reload_skipped" }),
-        "add" => Some(if result.summary["apply"].is_null() { "watch_roots_add_ignored" } else { "watch_roots_added" }),
-        "remove" => Some(if result.summary["apply"].is_null() { "watch_roots_remove_ignored" } else { "watch_roots_removed" }),
-        _ => None,
-    };
-    if let Some(event) = event {
-        let payload = if matches!(options.action.as_str(), "add" | "remove") {
-            if result.summary["apply"].is_null() { json!({"paths":result.inputs["paths"]}) }
-            else { result.summary["apply"].clone() }
-        } else { result.summary.clone() };
-        super::diagnostics::event(event, payload);
     }
     Ok((code, result))
 }

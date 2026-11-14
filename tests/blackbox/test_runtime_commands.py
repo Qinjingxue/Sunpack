@@ -149,17 +149,17 @@ def test_launcher_preserves_flag_like_operands_and_validates_pause_flags(package
     assert str(json_name) in human.stdout and not human.stdout.startswith("{")
 
     invalid_pause = package.run("version", "--pause")
-    assert invalid_pause.returncode == 2 and "unrecognized arguments: --pause" in invalid_pause.stderr
+    assert invalid_pause.returncode == 2 and "unrecognized arguments: --no-pause" in invalid_pause.stderr
 
     rejected_prompt = package.run("scan", "--json", "--pause", "--ask-pw", "--", archive.name, cwd=tmp_path)
     assert rejected_prompt.returncode == 2, rejected_prompt.stderr
     assert json.loads(rejected_prompt.stdout)["inputs"]["argv"] == [
-        "scan", "--json", "--pause", "--ask-pw", "--", archive.name,
+        "scan", "--json", "--ask-pw", "--no-pause", "--", archive.name,
     ]
 
-    conflict = package.run("scan", archive, "--pause", "--no-pause")
-    assert conflict.returncode == 2
-    assert "argument --no-pause: not allowed with argument --pause" in conflict.stderr
+    for flags in [("--pause", "--no-pause"), ("--no-pause", "--pause")]:
+        result = package.run("scan", archive, *flags)
+        assert result.returncode == 0, (result.stdout, result.stderr)
 
 
 def test_version_uses_package_metadata_only(package, tmp_path):

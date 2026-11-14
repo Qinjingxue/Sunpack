@@ -148,7 +148,7 @@ pub(super) struct RunOutcome {
 impl RunOutcome {
     pub fn settled(&self) -> bool { !self.uncommitted && self.archives.cancelled == 0 }
     pub fn subtree_complete(&self) -> bool {
-        !self.uncommitted && !self.scan_incomplete && self.archives.incomplete == 0
+        !self.uncommitted && self.archives.incomplete == 0
             && self.errors.incomplete == 0 && self.cleanup_results.incomplete == 0
     }
 }
@@ -221,6 +221,8 @@ mod tests {
     fn undispatched_cancelled_subtree_remains_incomplete_through_result_conversion() {
         let mut root = RunOutcome::default();
         assert!(root.subtree_complete());
+        root.scan_incomplete = true;
+        assert!(root.subtree_complete(), "reported scan errors do not veto postprocessing");
         root.uncommitted = true;
         assert!(!root.subtree_complete());
         assert!(!root.settled());

@@ -23,7 +23,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     LockFileEx, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, PIPE_ACCESS_DUPLEX,
+    FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
@@ -88,11 +88,11 @@ impl StateFile {
             .write(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(lock_path)?;
-        // Launchers serialize startup. A child spawned after its predecessor
-        // closes the listener waits for that owner to finish removing the state
-        // and draining the log before publishing the next endpoint.
+        // Launchers serialize startup, not the lifetime of an existing server.
+        // A competing server must exit when the owner is still alive, including
+        // when its endpoint state cannot be read by the launcher.
         let mut range = OVERLAPPED::default();
-        if unsafe { LockFileEx(lock.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &mut range) } == 0 {
+        if unsafe { LockFileEx(lock.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &mut range) } == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(Self { path, _lock: lock })
@@ -608,11 +608,10 @@ impl Session for Connection {
     }
     fn interactive(&self) -> bool { self.flags & 2 != 0 }
     fn input_is_terminal(&self) -> bool { self.flags & 4 != 0 }
-    fn pause_on_exit<'a>(&'a self, prompt: &'a str) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            if self.input_is_terminal() { self.frame(4, prompt.as_bytes()).await?; }
-            Ok(())
-        })
+    fn pause_on_exit<'a>(&'a self, _prompt: &'a str) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+        // The launcher owns exit interaction even when startup/delivery fails.
+        // Console sessions retain the direct-runtime CLI pause policy.
+        Box::pin(async { Ok(()) })
     }
     fn unicode(&self) -> bool { self.flags & 16 != 0 }
     fn terminal_size(&self) -> (usize, usize) {
@@ -673,7 +672,11 @@ impl Server {
         let activity = ActiveRequest::new(Arc::clone(self));
         let handler = Arc::clone(self);
         let cancel = Cancellation::new();
-        let request = self.host.scheduler.submit(self.host.scheduler.next_id(), Origin::Foreground, &cancel.clone(),
+        let prepared = match self.host.scheduler.prepare_submit() {
+            Ok(prepared) => prepared,
+            Err(error) => return crate::pipeline::scheduling::Join::ready(Err(error)),
+        };
+        let request = prepared.submit(self.host.scheduler.next_id(), Origin::Foreground, &cancel.clone(),
             move |spawner| Box::pin(async move { handler.request(pipe, spawner, cancel, connected).await }));
         // Connection lifetime includes output/control and CLI cleanup, like the
         // protocol's on_closed callback after its owned work finishes.
@@ -852,13 +855,8 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
     };
     super::diagnostics::event("host_stopping", serde_json::json!({"foreground_requests":server.activity.lock().unwrap().active,"exit_reason":exit_reason}));
     server.shutdown.cancel();
-    let stopping_watch = server.host.watch.is_running();
-    if stopping_watch { super::diagnostics::event("watch_stopping", serde_json::json!({})); }
-    let stopped_watch = server.host.watch.stop();
-    if stopping_watch {
-        if let Ok(summary) = stopped_watch {
-            super::diagnostics::event(if summary["stopped"] == true { "watch_stopped" } else { "watch_stop_ignored" }, summary);
-        }
+    if server.host.watch.is_running() {
+        let _ = server.host.watch.stop();
     }
     let _drained = server
         .drained
@@ -977,6 +975,31 @@ mod async_connection_tests {
     use std::sync::mpsc;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
+    #[test]
+    fn competing_runtime_does_not_wait_for_a_live_owner_with_missing_endpoint() {
+        let path = crate::test_support::temp_file("runtime_lock", b"invalid endpoint");
+        let owner = StateFile::acquire(path.clone()).unwrap();
+        fs::remove_file(&path).unwrap();
+        let other_path = path.clone();
+        let (send, receive) = mpsc::channel();
+        let competitor = std::thread::spawn(move || {
+            let result = StateFile::acquire(other_path);
+            send.send(result.as_ref().err().and_then(io::Error::raw_os_error)).unwrap();
+            result.is_err()
+        });
+        let result = receive.recv_timeout(Duration::from_secs(5));
+        // Release before joining even on regression, so a blocking acquisition
+        // cannot strand the test process.
+        drop(owner);
+        let rejected = competitor.join().unwrap();
+        assert_eq!(result.unwrap(), Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32));
+        assert!(rejected);
+        drop(StateFile::acquire(path.clone()).unwrap());
+        let mut lock_path = path.into_os_string();
+        lock_path.push(".lock");
+        fs::remove_file(lock_path).unwrap();
+    }
+
     fn server() -> Arc<Server> {
         Arc::new(Server {
             host: Host::new(), activity: Mutex::new(Activity { last_completed: None, active: 0, shutting_down: false }),
@@ -1012,22 +1035,21 @@ mod async_connection_tests {
     }
 
     #[test]
-    fn exit_pause_uses_client_side_frame_after_text_commands() {
+    fn launcher_sessions_never_pause_inside_runtime() {
         let server = server();
-        let cases: &[(&[&str], bool, u32, i32)] = &[
-            (&["watch", "list", "--pause"], true, 4, 0),
-            (&["watch", "list", "--pause"], false, 0, 0),
-            (&["watch", "list", "--pause", "--json"], false, 4, 0),
-            (&["watch", "list", "--pause", "--help"], false, 4, 0),
-            (&["version", "--pause"], false, 4, 2),
+        let cases: &[(&[&str], u32, i32)] = &[
+            (&["watch", "list", "--pause"], 4, 0),
+            (&["watch", "list", "--pause"], 0, 0),
+            (&["watch", "list", "--pause", "--json"], 4, 0),
+            (&["watch", "list", "--pause", "--help"], 4, 0),
+            (&["version", "--pause"], 4, 2),
         ];
-        for &(args, pause, flags, expected) in cases {
+        for &(args, flags, expected) in cases {
             let (mut client, request) = connect(&server);
             client.write_all(&command_request(&server, flags, args)).unwrap();
             let mut handshake = [0; 20];
             client.read_exact(&mut handshake).unwrap();
             assert_eq!(&handshake[..4], b"SPS2");
-            let mut exit_prompt = None;
             loop {
                 let mut kind = [0];
                 client.read_exact(&mut kind).unwrap();
@@ -1039,12 +1061,9 @@ mod async_connection_tests {
                         break;
                     }
                     1 | 2 => {}
-                    4 => { assert!(exit_prompt.replace(bytes).is_none()); }
                     _ => panic!("unexpected interactive input frame for {args:?}"),
                 }
             }
-            assert_eq!(exit_prompt.is_some(), pause, "{args:?}");
-            assert!(exit_prompt.is_none_or(|prompt| !prompt.is_empty()));
             request.join().unwrap().unwrap();
         }
     }
