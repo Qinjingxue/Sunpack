@@ -1,5 +1,5 @@
 //! Best-effort display history. Business state remains in the existing task store.
-use crate::io::display_store::{utc_us, HistoryRecord, Store, DAY_US};
+use crate::io::display_store::{utc_us, EventField, HistoryRecord, LiveEvent, Store, DAY_US};
 use crate::io::display_wake::Wake;
 use crate::watch_store::NativeWatchState;
 use serde_json::{json, Value};
@@ -59,22 +59,6 @@ fn state_event(event: &str) -> bool {
             | "pipeline_request_coalesced"
             | "pipeline_sources_released"
     )
-}
-
-struct HistoryEvent<'a> {
-    fields: &'a serde_json::Map<String, Value>,
-    failure: &'a crate::pipeline::Failure,
-}
-
-impl serde::Serialize for HistoryEvent<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut event = serializer.serialize_map(Some(self.fields.len() + 1))?;
-        for (key, value) in self.fields {
-            event.serialize_entry(key, value)?;
-        }
-        event.serialize_entry("failure", &DiagnosticFailure(self.failure))?;
-        event.end()
-    }
 }
 
 #[derive(Default)]
@@ -251,7 +235,7 @@ impl Projection {
     /// Update the live projection and report whether to persist this event in history.
     fn apply(&mut self, value: &mut Value) -> bool {
         self.order += 1;
-        let event = field(value, "event").to_owned();
+        let event = field(value, "event");
         if event == "pipeline_sources_claimed" {
             let owner = field(value, "owner").to_owned();
             let processing = value["processing"].as_bool().unwrap_or(false);
@@ -345,9 +329,7 @@ impl Projection {
             }
             return false;
         }
-        let path = field(value, "path").to_owned();
-        let physical = key(&path);
-        let mut id = self.resolve(value, &physical);
+        let path = field(value, "path");
         if event == "pipeline_sources_released" {
             self.release_owner(field(value, "owner"));
             let ids: HashSet<_> = value["paths"]
@@ -355,7 +337,7 @@ impl Projection {
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
-                .chain((!path.is_empty()).then_some(path.as_str()))
+                .chain((!path.is_empty()).then_some(path))
                 .map(key)
                 .map(|p| self.aliases.get(&p).unwrap_or(&p).clone())
                 .collect();
@@ -370,22 +352,22 @@ impl Projection {
             }
             return false;
         }
-        if event == "task_retired" && field(value, "scope") == "task" {
-            value["task_id"] = json!(id);
-            self.remove(&id);
-            return false;
-        }
         if event == "blocker_cleared" {
             let path = if field(value, "task_path").is_empty() {
-                path.as_str()
+                path
             } else {
                 field(value, "task_path")
             };
             let id = self.resolve(value, &key(path));
-            value["task_id"] = json!(id);
             if self.tasks.get(&id).is_some_and(|t| t.blocked) {
                 self.remove(&id);
             }
+            return false;
+        }
+        let physical = key(path);
+        let mut id = self.resolve(value, &physical);
+        if event == "task_retired" && field(value, "scope") == "task" {
+            self.remove(&id);
             return false;
         }
         if event == "candidate_departed" || event == "task_retired" {
@@ -432,7 +414,6 @@ impl Projection {
             return false;
         }
         if event == "no_tasks_found" || event == "pipeline_request_coalesced" {
-            value["task_id"] = json!(id);
             if self.tasks.get(&id).is_some_and(|t| {
                 (field(value, "owner").is_empty() || t.owner == field(value, "owner"))
                     && (t.group.is_none()
@@ -446,7 +427,7 @@ impl Projection {
         }
         if !path.is_empty()
             && matches!(
-                event.as_str(),
+                event,
                 "processing_started"
                     | "failed_password"
                     | "suspended_missing_volume"
@@ -456,7 +437,7 @@ impl Projection {
             )
         {
             let terminal = matches!(
-                event.as_str(),
+                event,
                 "done" | "failed_terminal" | "partial_rejected"
             );
             let owner = field(value, "owner");
@@ -488,10 +469,9 @@ impl Projection {
                     .get(&id)
                     .is_some_and(|t| !t.owner.is_empty() && t.owner != owner)
             {
-                value["task_id"] = json!(self.instance_id(owner, &physical));
-                value["event"] = json!("stale_task_completion");
                 return false;
             }
+            let blocked = matches!(event, "failed_password" | "suspended_missing_volume");
             value["task_id"] = json!(id);
             let mut task = self.remove(&id).unwrap_or_default();
             if task.group.is_none() {
@@ -505,10 +485,7 @@ impl Projection {
             }
             task.stamp = timestamp(value);
             task.expired = false;
-            task.blocked = matches!(
-                event.as_str(),
-                "failed_password" | "suspended_missing_volume"
-            );
+            task.blocked = blocked;
             if !field(value, "owner").is_empty() {
                 task.owners.insert(field(value, "owner").to_owned());
                 task.owner = field(value, "owner").to_owned();
@@ -644,9 +621,10 @@ impl Shared {
         let result = if history {
             let ts = timestamp(&value);
             let row = match failure {
-                Some(failure) => HistoryRecord::new(&value, ts, &HistoryEvent {
+                Some(failure) => HistoryRecord::new(&value, ts, &EventField {
                     fields: value.as_object().unwrap(),
-                    failure,
+                    name: "failure",
+                    value: DiagnosticFailure(failure),
                 }),
                 None => HistoryRecord::new(&value, ts, &value),
             };
@@ -766,11 +744,8 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             if let Some((live, reset)) = live {
                 let values = live.into_iter().map(|(id, row)| {
                     let value = if let Some((status, group)) = row {
-                        let mut value: Value = serde_json::from_slice(&status)?;
-                        if let Some(group) = group {
-                            value["group"] = Arc::unwrap_or_clone(group);
-                        }
-                        Some((timestamp(&value), value))
+                        let value = serde_json::from_slice(&status)?;
+                        Some(LiveEvent { ts: timestamp(&value), value, group })
                     } else {
                         None
                     };

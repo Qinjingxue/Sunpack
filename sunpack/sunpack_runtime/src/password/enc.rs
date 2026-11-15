@@ -45,7 +45,7 @@ pub(crate) fn enc_fast_verify_passwords_from_ranges(
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let parsed = parse_ranges(ranges, sessions)?;
+    let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
     verify_prepared(ranges_key("enc", &parsed)?, candidates, || {
         let reader = VirtualRangeReader::new(&parsed);
         let length = reader.len();

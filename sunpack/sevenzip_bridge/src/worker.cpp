@@ -243,7 +243,6 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
             std::any_of(plan.sources.begin(), plan.sources.end(), [](const auto& source) {
                 return source.path.empty() || (source.has_end && source.end < source.start);
             })) { input.validation_error = "invalid volume attempt sources"; return input; }
-        plan.prepare();
         // A composition plan supplies every range and canonical name used
         // during execution. The descriptor's fixed composition is redundant.
         return input;
@@ -712,7 +711,7 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
 }
 
 int run_request(
-    const WorkerRequest& request,
+    WorkerRequest& request,
     // The registry lease in worker_loop covers the output-volume writer.
     const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
     const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr
@@ -770,7 +769,6 @@ int run_request(
     if (volume_trials) {
         auto& cursor = volume_replay->volumes;
         if (!cursor.started) {
-            cursor.reserve(request.archive_input.volume_attempts);
             const auto root = std::filesystem::path(win32_extended_path(output_dir));
             const bool output_owned = directory_is_empty_or_missing(root);
             if (!output_owned) {
@@ -778,6 +776,14 @@ int run_request(
                     (wire::key("status") + wire::text("failed") + wire::key("failure_stage") + wire::text("output_prepare") + wire::key("failure_kind") + wire::text("output_filesystem") + wire::key("message") + wire::text("volume composition trials require an empty output directory") + wire::end()));
                 return 2;
             }
+            auto& plan = request.archive_input.volume_attempts;
+            {
+                // The derived tables have the same lifetime as the queued request.
+                // Keep them on the request allocator even though only extraction needs them.
+                NativeMemoryScope request_memory(nullptr);
+                plan.prepare();
+            }
+            cursor.reserve(plan);
             cursor.started = true;
         }
     }

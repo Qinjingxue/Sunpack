@@ -24,7 +24,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 #[cfg(test)]
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -318,22 +318,22 @@ pub(super) struct Watch {
 // foreground request is still extracting. The current catalog is replaceable.
 #[derive(Default)]
 struct OutputPublications {
-    current: Mutex<Option<ExternalOutputs>>,
+    current: RwLock<Option<ExternalOutputs>>,
     reservations: crate::watch_store::active_outputs::OutputReservations,
 }
-impl OutputPublications {
-    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<ExternalOutputs>>> {
-        self.current.lock()
-    }
-}
 
-#[derive(Clone)]
 struct ExternalOutputs {
     journal: Weak<journal::Journal>,
     scopes: Arc<[NativeDiscoveryScope]>,
     catalog: Arc<NativeWatchCatalog>,
-    options: Arc<NativeDirectoryScanOptions>,
+    options: NativeDirectoryScanOptions,
     hub: Weak<Hub>,
+}
+
+impl ExternalOutputs {
+    fn active_journal(&self) -> Option<Arc<journal::Journal>> {
+        self.journal.upgrade().filter(|journal| !journal.suspended())
+    }
 }
 
 impl Watch {
@@ -358,7 +358,7 @@ impl Watch {
 
     pub(super) fn foreground_finished(&self, when_unwatched: impl FnOnce()) {
         let running = self.running.lock().unwrap();
-        let external = self.external.lock().unwrap();
+        let external = self.external.current.read().unwrap();
         let delivered = running.as_ref().filter(|run| !run.thread.is_finished()).is_some_and(|run| {
             run.hub.update(|signals| signals.foreground_finished = true)
         });
@@ -684,12 +684,6 @@ impl Watch {
 }
 
 impl Watch {
-    fn external_journal(&self) -> Option<Arc<journal::Journal>> {
-        let external = self.external.lock().unwrap();
-        let external = external.as_ref()?;
-        external.journal.upgrade()
-    }
-
     pub(super) fn register_external_output(&self, path: &Path) -> io::Result<()> {
         self.external_output(path, true)
     }
@@ -702,11 +696,9 @@ impl Watch {
         let create = || crate::scan::scope::OutputRootCreation::create(path, exclusive)
             .map_err(crate::pipeline::OutputCreateError::wrap);
         loop {
-            let external = self.external.lock().unwrap();
-            let journal = external.as_ref().and_then(|external| external.journal.upgrade())
-                .filter(|journal| !journal.suspended());
+            let journal = self.external.current.read().unwrap().as_ref()
+                .and_then(ExternalOutputs::active_journal);
             if let Some(journal) = journal {
-                drop(external);
                 // mkdir and reservation share the observer publication gate.
                 let mut created = false;
                 journal.commit(true, |state| {
@@ -724,8 +716,12 @@ impl Watch {
                 // Re-read the publication target without creating twice.
                 continue;
             }
-            // Startup takes the same lock before arming observers. Keep the
-            // reservation visible even if Watch attaches during this request.
+            let external = self.external.current.write().unwrap();
+            if external.as_ref().and_then(ExternalOutputs::active_journal).is_some() {
+                continue;
+            }
+            // Serialize the rootless check and reservation with attachment and
+            // with other rootless output registrations.
             let creation = create()?;
             let paths = crate::path_keys::output_path_aliases(path)?;
             let outputs = &self.external.reservations;
@@ -738,7 +734,9 @@ impl Watch {
     }
 
     pub(super) fn finish_external_outputs(&self, paths: &[String]) -> io::Result<()> {
-        let external = self.external.lock().unwrap();
+        // Keep the catalog attached until its inventory replaces the
+        // reservations. Other lookups can still reach the journal.
+        let external = self.external.current.read().unwrap();
         if let Some(external) = external.as_ref() {
             let published = external.catalog.publish_outputs(paths, &external.scopes, &external.options, None)?;
             if let Some(hub) = external.hub.upgrade().filter(|_| !published.is_empty()) {
@@ -754,7 +752,7 @@ impl Watch {
     pub(super) fn prepare_external_flatten(
         &self, output: &Path, work: &Path, leaf: &Path,
     ) -> io::Result<()> {
-        let external = self.external.lock().unwrap();
+        let external = self.external.current.write().unwrap();
         if let Some(journal) = external.as_ref().and_then(|external| external.journal.upgrade()) {
             prepare_flatten(&journal, "", output, work, leaf)?;
         } else {
@@ -767,7 +765,9 @@ impl Watch {
     }
 
     pub(super) fn finish_external_flatten(&self, output: &Path) -> io::Result<()> {
-        if let Some(journal) = self.external_journal() {
+        let journal = self.external.current.read().unwrap().as_ref()
+            .and_then(|external| external.journal.upgrade());
+        if let Some(journal) = journal {
             finish_flatten(&journal, &output.to_string_lossy())?;
         }
         Ok(())
@@ -2238,7 +2238,7 @@ impl Scheduler {
         self.parent_observers = HashMap::new();
         self.monitor.take();
         self.toast.take();
-        *self.external.lock().unwrap() = None;
+        *self.external.current.write().unwrap() = None;
         self.broker_lease.take();
         self.catalog.commit(true);
         self.journal.suspend()?;
@@ -2492,18 +2492,21 @@ impl Scheduler {
         // retirement, and always restore subscriptions even if retirement fails.
         let retirement: io::Result<()> = (|| {
             if refresh_catalog {
-                self.catalog.retain_roots(entries.iter()
-                    .map(|entry| entry.path.to_string_lossy().into_owned()).collect());
                 self.root_observers.clear();
                 self.dependency_observers.clear();
-                let scopes = self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>();
-                *self.external.lock().unwrap() = Some(ExternalOutputs {
+                let scopes: Arc<[_]> = self.roots.values()
+                    .map(|(_, scope)| scope.clone()).collect::<Vec<_>>().into();
+                let mut external = self.external.current.write().unwrap();
+                self.catalog.retain_roots(entries.iter()
+                    .map(|entry| entry.path.to_string_lossy().into_owned()).collect());
+                *external = Some(ExternalOutputs {
                     journal: Arc::downgrade(&self.journal),
-                    scopes: scopes.clone().into(),
+                    scopes: Arc::clone(&scopes),
                     catalog: Arc::clone(&self.catalog),
-                    options: Arc::new(self.deep_options.clone()),
+                    options: self.deep_options.clone(),
                     hub: Arc::downgrade(&self.hub),
                 });
+                drop(external);
                 self.journal.commit(true, |state| Ok(state.scope_retirement_operations(&scopes)))?;
             }
             Ok(())
@@ -2832,7 +2835,7 @@ impl Scheduler {
         for waiter in signals.rebuild {
             waiter.send(Err(io::ErrorKind::Interrupted.into()));
         }
-        *self.external.lock().unwrap() = None;
+        *self.external.current.write().unwrap() = None;
         *self.hub.claims.lock().unwrap() = HashMap::new();
         self.engine.run_stage("watch_close", Origin::Watch, || {
             self.catalog.commit(true);

@@ -51,17 +51,6 @@ namespace sunpack::sevenzip
             return result;
         }
 
-        bool encrypted_header_range_probe_candidate(const std::wstring &format_hint)
-        {
-            std::wstring hint = lower_text(format_hint);
-            if (!hint.empty() && hint.front() == L'.')
-            {
-                hint.erase(hint.begin());
-            }
-            return hint == L"7z" || hint == L"sevenzip" || hint == L"seven_zip" ||
-                   hint == L"rar" || hint == L"rar4" || hint == L"rar5";
-        }
-
         struct BoundedPasswordProbeSelection
         {
             std::optional<UInt32> index;
@@ -187,7 +176,7 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> &part_paths,
 
-        const std::vector<GUID> &formats,
+        const ExtractionFormats &selection_formats,
 
         const std::vector<ExtractInputRange> &input_ranges,
 
@@ -245,6 +234,7 @@ namespace sunpack::sevenzip
         Int32 last_op_res = kOpOk;
         bool last_encryption_evidence = false;
 
+        const auto &formats = selection_formats.handlers;
         const UInt64 start_only = 0;
         for (std::size_t attempt_index = 0; attempt_index < formats.size() * 2; ++attempt_index)
         {
@@ -422,7 +412,7 @@ namespace sunpack::sevenzip
         }
         else if (!any_opened &&
                  (looks_wrong_password(last_hr, last_op_res, last_encryption_evidence) ||
-                  (!input_ranges.empty() && encrypted_header_range_probe_candidate(format_hint))))
+                  (!input_ranges.empty() && selection_formats.encrypted_headers)))
         {
 
             result.status = PasswordTestStatus::WrongPassword;

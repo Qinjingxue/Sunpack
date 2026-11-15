@@ -416,9 +416,9 @@ impl InputCheckpoint {
                     .as_ref()
                     .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
                 {
-                    "missing".to_owned()
+                    super::VolumeCompleteness::Missing
                 } else {
-                    "complete".to_owned()
+                    super::VolumeCompleteness::Complete
                 }
             }),
             failure,
@@ -443,7 +443,7 @@ impl InputCheckpoint {
                 .as_ref()
                 .map_or(0, |receipt| receipt.complete_files),
 
-             scan_layout: super::ScanLayout::from_input(&self.input),
+            scan_layout: super::ScanLayout::default(),
         }
     }
 }

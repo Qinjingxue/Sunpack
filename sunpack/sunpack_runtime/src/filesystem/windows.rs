@@ -119,13 +119,15 @@ pub(super) fn watch_file_observation_known_kind(
     since_usn: Option<i64>,
     is_directory: bool,
 ) -> io::Result<WatchFileObservation> {
-    let handle = open_path(
-        path,
-        FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        is_directory,
-    )?;
-    let file = read_file_usn(handle.raw())?;
+    let file = {
+        let handle = open_path(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            is_directory,
+        )?;
+        read_file_usn(handle.raw())?
+    };
     let change_reasons = since_usn.filter(|value| *value > 0).and_then(|previous| {
         if file.usn == previous {
             Some(sunpack_usn_core::ChangeReasons::default())

@@ -9,14 +9,12 @@ fn virtual_ranges_read_and_seek_across_files() {
         RangeSpec {
             reader: ManagedReader::open(&first).unwrap(),
             start: 2,
-            end: Some(5),
             len: 3,
             virtual_start: 0,
         },
         RangeSpec {
             reader: ManagedReader::open(&second).unwrap(),
             start: 1,
-            end: Some(5),
             len: 4,
             virtual_start: 3,
         },

@@ -41,7 +41,7 @@ pub(crate) fn zip_fast_verify_passwords_from_ranges(
     eocd_offset: Option<u64>,
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let parsed = parse_ranges(ranges, sessions)?;
+    let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
     let key = ranges_key("zip", &parsed)?;
     verify_prepared(key, candidates, || {
         let mut reader = VirtualRangeReader::new(&parsed);

@@ -42,19 +42,35 @@ void FindController::Refresh(const char* scope) {
         }
         if(!s.matches.empty()) clear_matches(s);
         if(s.targets.capacity()) {
-            if(!s.hits.empty()) s.saved=selection(s);
+            if(!s.targets.empty()) s.saved=selection(s);
             release_results(s);
         }
     }
 }
 FindController::Selection FindController::selection(const Search& s) {
-    const auto& hit=s.hits[s.current];
+    const auto& hit=s.current;
     const auto& target=s.targets[hit.target];
     return {target.id,target.tag,target.ranges[hit.range].start};
 }
+bool FindController::at_edge(const Search& s,int direction) {
+    const auto [target,range]=s.current;
+    return direction>0 ? target+1==s.targets.size() && range+1==s.targets.back().ranges.size() : target==0 && range==0;
+}
+void FindController::advance(Search& s,int direction) {
+    auto& [target,range]=s.current;
+    if(direction>0) {
+        if(++range==s.targets[target].ranges.size()) {
+            target=(target+1)%s.targets.size();
+            range=0;
+        }
+    } else if(range) --range;
+    else {
+        target=target?target-1:s.targets.size()-1;
+        range=s.targets[target].ranges.size()-1;
+    }
+}
 void FindController::release_results(Search& s) {
     decltype(s.targets)().swap(s.targets);
-    decltype(s.hits)().swap(s.hits);
     decltype(s.ticks)().swap(s.ticks);
     decltype(s.byId)().swap(s.byId);
 }
@@ -92,32 +108,36 @@ void FindController::refresh(Search& s) {
     auto snapshot=page_value(page_,"searchSnapshot",true);
     ui_page_set_json(page_,"searchSnapshot","null"); // Never retain a duplicate of the reactive rows.
     auto query=fold_search(snapshot.at("query").get_ref<const std::string&>());
-    bool changed=s.query!=query;
-    auto old=s.hits.empty()?std::move(s.saved):selection(s);
+    const bool changed=s.query!=query;
+    auto old=changed?Selection{}:s.targets.empty()?std::move(s.saved):selection(s);
     s.saved={};
     if(changed || query.empty()) clear_matches(s);
     if(changed) s.pending=0;
     s.before=snapshot.value("before",false); s.after=snapshot.value("after",false);
-    s.query=std::move(query); s.targets.clear(); s.hits.clear(); s.byId.clear(); s.ticks.clear();
-    s.current=0; s.geometry=~uint64_t(0); s.extent=-1; s.revision=++revision_;
+    s.query=std::move(query); s.targets.clear(); s.byId.clear(); s.ticks.clear();
+    s.current={}; s.geometry=~uint64_t(0); s.extent=-1; s.revision=++revision_;
     if(s.query.empty()) release_results(s);
     if(!s.query.empty()) for(auto& source:snapshot.at("targets")) {
         Target target{source.at("id").get<std::string>(),source.at("row").get<int>(),source.at("tag").get<int>()};
         target.ranges=match(s,source.at("text").get_ref<const std::string&>());
-        for(size_t i=0;i<target.ranges.size();++i) {
-            if(!changed && target.id==old.id && target.tag==old.tag && target.ranges[i].start==old.start) s.current=s.hits.size();
-            s.hits.push_back({s.targets.size(),i});
+        if(target.ranges.empty()) continue;
+        if(!changed && target.id==old.id && target.tag==old.tag) {
+            const auto found=std::lower_bound(target.ranges.begin(),target.ranges.end(),old.start,
+                [](const ui::TextHighlight& range,uint32_t start){return range.start<start;});
+            if(found!=target.ranges.end() && found->start==old.start)
+                s.current={s.targets.size(),size_t(found-target.ranges.begin())};
         }
-        if(!target.ranges.empty()) { s.byId[target.id].targets.push_back(s.targets.size()); s.targets.push_back(std::move(target)); }
+        s.byId[target.id].targets.push_back(s.targets.size());
+        s.targets.push_back(std::move(target));
     }
-    if(!s.hits.empty()) {
-        if(s.pending) s.current=s.pending>0?std::min(s.current+1,s.hits.size()-1):(s.current?s.current-1:0);
-        auto h=s.hits[s.current]; s.targets[h.target].ranges[h.range].active=true;
+    if(!s.targets.empty()) {
+        if(s.pending && !at_edge(s,s.pending)) advance(s,s.pending);
+        s.targets[s.current.target].ranges[s.current.range].active=true;
     }
     const bool locate=changed || s.pending!=0;
     s.pending=0;
     decorate(s);
-    if(locate && !s.hits.empty()) reveal(s);
+    if(locate && !s.targets.empty()) reveal(s);
 }
 void FindController::Decorate() { for(auto& s:searches_) if(visible(s)) decorate(s); }
 void FindController::decorate(Search& s) {
@@ -165,7 +185,7 @@ void FindController::decorate(Search& s) {
 void FindController::reveal(Search& s) {
     auto* owner=ui::GetContext().GetWindow(window_);
     if(ui::LayoutDirtyFlag()) owner->LayoutRoot();
-    const auto& hit=s.hits[s.current]; const auto& target=s.targets[hit.target];
+    const auto& target=s.targets[s.current.target];
     auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll));
     auto* list=dynamic_cast<ui::VirtualListWidget*>(root()->FindById(s.list));
     if(scroll && list && target.row>=0 && size_t(target.row)<list->RowCount()) {
@@ -192,16 +212,15 @@ void FindController::reveal(Search& s) {
 }
 void FindController::Move(const std::string& scope,int direction) {
     auto found=std::find_if(searches_.begin(),searches_.end(),[&](auto& s){return scope==s.scope;});
-    if(found==searches_.end() || !visible(*found) || found->hits.empty()) return;
+    if(found==searches_.end() || !visible(*found) || found->targets.empty()) return;
     auto& s=*found;
     if(auto* input=root()->FindById(scope+"Search")) ui::GetContext().GetWindow(window_)->FocusWidget(input,false);
-    if(scope=="task" && ((direction>0 && s.current+1==s.hits.size() && s.after) ||
-                         (direction<0 && s.current==0 && s.before))) {
+    if(scope=="task" && (direction>0?s.after:s.before) && at_edge(s,direction)) {
         s.pending=direction; auto encoded=Json(direction).dump(); ui_page_call_json(page_,"searchTaskPage",encoded.c_str()); return;
     }
-    activate(s,s.hits[s.current],false);
-    s.current=direction>0?(s.current+1)%s.hits.size():(s.current+s.hits.size()-1)%s.hits.size();
-    activate(s,s.hits[s.current],true);
+    activate(s,s.current,false);
+    advance(s,direction);
+    activate(s,s.current,true);
     reveal(s);
 }
 void FindController::activate(Search& s,const Hit& h,bool active) {
@@ -221,7 +240,7 @@ bool FindController::Key(int vk) {
     return false;
 }
 void FindController::markers(Search& s,ui::Renderer& r) {
-    if(s.hits.empty()) return;
+    if(s.targets.empty()) return;
     auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll));
     auto* list=dynamic_cast<ui::VirtualListWidget*>(root()->FindById(s.list));
     if(!scroll || !list) return;
@@ -246,7 +265,7 @@ void FindController::markers(Search& s,ui::Renderer& r) {
         }
     }
     for(float tick:s.ticks) r.FillRoundedRect({b.left,b.top+tick,b.right,b.top+tick+2},1,1,D2D1::ColorF(0xd2ad22));
-    float at=b.top+position(s.byId.at(s.targets[s.hits[s.current].target].id));
+    float at=b.top+position(s.byId.at(s.targets[s.current.target].id));
     r.FillRoundedRect({b.left,at,b.right,at+3},1,1,D2D1::ColorF(0xef8c22));
 }
 }

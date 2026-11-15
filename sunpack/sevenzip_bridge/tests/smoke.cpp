@@ -73,9 +73,9 @@ bool check_extraction_handler_selection_is_read_free() {
     // The selector accepts only the already-analyzed hint, so no input path
     // can be opened. Generic RAR maps to the fixed order (RAR5, then RAR4).
     const auto formats = extraction_formats_for_hint(L"rar");
-    return formats.size() == 2 &&
-        formats[0].Data4[5] == 0xCC &&
-        formats[1].Data4[5] == 0x03;
+    return formats.encrypted_headers && formats.handlers.size() == 2 &&
+        formats.handlers[0].Data4[5] == 0xCC &&
+        formats.handlers[1].Data4[5] == 0x03;
 }
 
 bool check_wrong_password_evidence() {

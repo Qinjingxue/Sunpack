@@ -11,17 +11,16 @@ namespace spg {
 class FindController {
     struct Target { std::string id; int row=-1, tag=-1; std::vector<ui::TextHighlight> ranges; };
     struct Source { std::vector<size_t> targets; float offset=0; };
-    struct Hit { size_t target, range; };
+    struct Hit { size_t target=0, range=0; };
     struct Selection { std::string id; int tag=-1; uint32_t start=0; };
     struct Match { std::string text; std::vector<ui::TextHighlight> ranges; size_t bytes; };
     struct Search {
         const char *scope, *list, *scroll;
         std::wstring query;
         std::vector<Target> targets;
-        std::vector<Hit> hits;
         std::unordered_map<std::string,Source> byId;
         std::vector<float> ticks;
-        size_t current=0;
+        Hit current;
         Selection saved;
         uint64_t revision=0, geometry=~uint64_t(0);
         float extent=-1, offset=-1, height=-1;
@@ -43,6 +42,8 @@ class FindController {
     bool visible(const Search& search) const;
     void refresh(Search& search);
     static Selection selection(const Search& search);
+    static bool at_edge(const Search& search,int direction);
+    static void advance(Search& search,int direction);
     static void release_results(Search& search);
     void clear_matches(Search& search);
     std::vector<ui::TextHighlight> match(Search& search,const std::string& text);

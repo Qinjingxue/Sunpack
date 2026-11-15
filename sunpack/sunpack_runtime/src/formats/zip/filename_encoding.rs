@@ -1,8 +1,8 @@
-use crate::io::archive_state::{build_segments, ArchiveInput, Segment};
-use crate::io::reader::ManagedReader;
+use crate::io::archive_state::{ArchiveInput, InputExtent};
 use crate::io::scratch::SpillSet;
+use crate::password::input::{parse_ranges, VirtualRangeReader};
 use encoding_rs::{BIG5, GBK, SHIFT_JIS};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::sync::OnceLock;
 
@@ -55,121 +55,28 @@ struct EncodingScore {
     decoded_count: usize,
 }
 
-#[derive(Clone)]
-struct LogicalSegment {
-    reader: ManagedReader,
-    physical_start: u64,
-    len: u64,
-    logical_start: u64,
-}
-
-struct ZipLogicalReader {
-    segments: Vec<LogicalSegment>,
-    len: u64,
-    disk_starts: Option<Vec<u64>>,
-}
-
-impl ZipLogicalReader {
-    fn open(segments: Vec<Segment>, disk_aware: bool) -> io::Result<Self> {
-        let mut readers = HashMap::<String, ManagedReader>::new();
-        let mut logical_segments = Vec::with_capacity(segments.len());
-        let mut starts = Vec::with_capacity(segments.len());
-        let mut logical_start = 0u64;
-
-        for segment in segments {
-            let Segment::Range { path, start, len } = segment;
-            if len == 0 {
-                continue;
-            }
-            let reader = if let Some(reader) = readers.get(&path) {
-                reader.clone()
-            } else {
-                let reader = ManagedReader::open(&path)?;
-                readers.insert(path.clone(), reader.clone());
-                reader
-            };
-            starts.push(logical_start);
-            logical_segments.push(LogicalSegment {
-                reader,
-                physical_start: start,
-                len,
-                logical_start,
-            });
-            logical_start = logical_start.checked_add(len).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "ZIP logical input size overflow",
-                )
-            })?;
-        }
-
-        Ok(Self {
-            segments: logical_segments,
-            len: logical_start,
-            disk_starts: disk_aware.then_some(starts),
-        })
-    }
-
-    fn len(&self) -> u64 {
-        self.len
-    }
-
-    fn central_logical_offset(&self, disk: usize, offset: u64) -> Option<u64> {
-        match &self.disk_starts {
-            Some(starts) => starts.get(disk)?.checked_add(offset),
-            None if disk == 0 => Some(offset),
-            None => None,
-        }
-    }
-
-    fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        if offset >= self.len || len == 0 {
-            return Ok(Vec::new());
-        }
-        let requested = len.min((self.len - offset) as usize);
-        let mut output = vec![0u8; requested];
-        let mut cursor = offset;
-        let mut written = 0usize;
-
-        while written < requested {
-            let index = self
-                .segments
-                .partition_point(|segment| segment.logical_start + segment.len <= cursor);
-            let Some(segment) = self.segments.get(index) else {
-                break;
-            };
-            if cursor < segment.logical_start {
-                break;
-            }
-            let local_offset = cursor - segment.logical_start;
-            let available = (segment.len - local_offset) as usize;
-            let take = available.min(requested - written);
-            let read = segment.reader.read_into_at(
-                segment.physical_start + local_offset,
-                &mut output[written..written + take],
-            )?;
-            if read == 0 {
-                break;
-            }
-            written += read;
-            cursor += read as u64;
-        }
-        output.truncate(written);
-        Ok(output)
-    }
-}
-
 pub(crate) fn analyze_zip_filename_encoding(
     archive_input: &ArchiveInput,
 ) -> io::Result<Option<&'static str>> {
-    let reader = ZipLogicalReader::open(
-        build_segments(archive_input)?,
-        archive_input.analysis.zip_spanned,
-    )?;
-    scan_zip_names(&reader)
+    let mut extents = archive_input.physical_extents().peekable();
+    let fallback = extents.peek().is_none().then(|| InputExtent {
+        path: archive_input.entry_path.clone(),
+        start: 0,
+        end: None,
+    });
+    let ranges = parse_ranges(extents.chain(fallback.as_ref()), &[])?;
+    let mut reader = VirtualRangeReader::new(&ranges);
+    let disk_starts = archive_input
+        .analysis
+        .zip_spanned
+        .then(|| reader.disk_starts());
+    scan_zip_names(&mut reader, disk_starts.as_deref())
 }
 
-fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<Option<&'static str>> {
+fn scan_zip_names(
+    reader: &mut VirtualRangeReader<'_>,
+    disk_starts: Option<&[u64]>,
+) -> io::Result<Option<&'static str>> {
     let file_size = reader.len();
     if file_size < ZIP_EOCD_LENGTH as u64 {
         return Ok(None);
@@ -188,11 +95,9 @@ fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<Option<&'static str>>
     let mut central_offset = eocd.cd_offset as u64;
     let eocd_logical_offset = tail_start + eocd.offset as u64;
     let mut directory_end = eocd_logical_offset;
-    match super::zip64::locate_end_record(
-        eocd_logical_offset,
-        reader.disk_starts.as_deref(),
-        |at, size| reader.read_at(at, size),
-    ) {
+    match super::zip64::locate_end_record(eocd_logical_offset, disk_starts, |at, size| {
+        reader.read_at(at, size)
+    }) {
         Ok(Some(found)) => {
             central_disk = found.record.cd_disk as usize;
             total_entries = found.record.total_entries;
@@ -211,7 +116,13 @@ fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<Option<&'static str>>
         return Ok(None);
     }
     let physical_candidate = directory_end.checked_sub(central_size_u64);
-    let declared_candidate = reader.central_logical_offset(central_disk, central_offset);
+    let declared_candidate = match disk_starts {
+        Some(starts) => starts
+            .get(central_disk)
+            .and_then(|start| start.checked_add(central_offset)),
+        None if central_disk == 0 => Some(central_offset),
+        None => None,
+    };
     let mut central_logical_offset = None;
     for candidate in [physical_candidate, declared_candidate]
         .into_iter()
@@ -252,7 +163,7 @@ fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<Option<&'static str>>
     while checked < total_entries {
         if cursor < window_start || cursor + 46 > window_start + window.len() as u64 {
             window_start = cursor;
-            window = reader.read_at(cursor, (end - cursor).min(64 * 1024) as usize)?;
+            reader.read_at_into(cursor, (end - cursor).min(64 * 1024) as usize, &mut window)?;
         }
         let offset = (cursor - window_start) as usize;
         let Some(fixed) = window.get(offset..offset + 46) else {
@@ -270,9 +181,10 @@ fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<Option<&'static str>>
         }
         if offset + length > window.len() {
             window_start = cursor;
-            window = reader.read_at(
+            reader.read_at_into(
                 cursor,
                 (end - cursor).min((64 * 1024).max(length) as u64) as usize,
+                &mut window,
             )?;
         }
         let offset = (cursor - window_start) as usize;

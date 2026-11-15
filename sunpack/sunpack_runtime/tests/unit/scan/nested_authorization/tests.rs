@@ -5,11 +5,11 @@ fn semantic_scope_uses_first_directory_below_root() {
     let root = Path::new("C:\\out");
     assert_eq!(
         semantic_scope(Path::new("C:\\out\\wrapper\\inner.zip"), root),
-        Some((PathBuf::from("C:\\out\\wrapper"), false))
+        Some(PathBuf::from("C:\\out\\wrapper"))
     );
     assert_eq!(
         semantic_scope(Path::new("C:\\out\\root.rar"), root),
-        Some((PathBuf::from("C:\\out"), true))
+        Some(PathBuf::from("C:\\out"))
     );
 }
 
@@ -31,18 +31,11 @@ fn odds_fusion_accelerates_at_extreme_ratios() {
 }
 
 #[test]
-fn immediate_branch_ignores_direct_files_but_tracks_directories() {
+fn immediate_branch_finds_first_directory_for_nested_files() {
     let root = Path::new("C:\\out");
+    assert_eq!(immediate_branch(Path::new("C:\\out\\a.zip"), root), None);
     assert_eq!(
-        immediate_branch(Path::new("C:\\out\\a.zip"), root, false),
-        None
-    );
-    assert_eq!(
-        immediate_branch(Path::new("C:\\out\\wrapper"), root, true),
-        Some(PathBuf::from("C:\\out\\wrapper"))
-    );
-    assert_eq!(
-        immediate_branch(Path::new("C:\\out\\wrapper\\a.zip"), root, false),
+        immediate_branch(Path::new("C:\\out\\wrapper\\a.zip"), root),
         Some(PathBuf::from("C:\\out\\wrapper"))
     );
 }

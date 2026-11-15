@@ -699,9 +699,12 @@ void task_history(Application& app,const fs::path& dir) {
     constexpr int total=201;
     auto history_path=dir/".sunpack_watch"/"events.json";
     std::string events;
-    for(int i=0;i<total;++i)
-        events+=Json{{"event","done"},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},
-            {"ts",1792401342+i}}.dump()+"\n";
+    for(int i=0;i<total;++i) {
+        auto path=utf8((dir/"history"/(i?"task-"+std::to_string(i)+".001":"task-0-task-0.001")).wstring());
+        Json event={{"event","done"},{"path",path},{"ts",1792401342+i}};
+        if(!i) event["group"]={{"multipart",true},{"members",{utf8((dir/"history"/"task-0-volume.002").wstring())}}};
+        events+=event.dump()+"\n";
+    }
     publish_events(history_path,events);
 
     auto rows=[&]{return state(app.page(),"tasks")["rows"];};
@@ -737,9 +740,27 @@ void task_history(Application& app,const fs::path& dir) {
     search("task-0");
     pump([&]{
         auto visible=rows();
-        return visible.size()==1 && visible[0]["name"]=="task-0.001" &&
+        return visible.size()==1 && visible[0]["name"]=="task-0-task-0.001" &&
                active_find_widget(list)!=nullptr;
     },"Find and highlight a task outside the loaded window");
+    const auto id=rows()[0]["id"].get<std::string>();
+    auto check_hit=[&](const std::string& target,uint32_t start) {
+        auto* active=active_find_widget(list);
+        assert(active && active->id==target);
+        const auto match=std::find_if(active->textHighlights.begin(),active->textHighlights.end(),
+            [](const auto& range){return range.active;});
+        assert(match!=active->textHighlights.end() && match->start==start);
+    };
+    click(app,"taskSearch");
+    check_hit("taskName-"+id,0);
+    SendMessageW(native.Handle(),WM_KEYDOWN,VK_DOWN,0);
+    check_hit("taskName-"+id,7);
+    SendMessageW(native.Handle(),WM_KEYDOWN,VK_DOWN,0);
+    check_hit("taskPart-"+id+"-0",0);
+    SendMessageW(native.Handle(),WM_KEYDOWN,VK_DOWN,0);
+    check_hit("taskName-"+id,0);
+    SendMessageW(native.Handle(),WM_KEYDOWN,VK_UP,0);
+    check_hit("taskPart-"+id+"-0",0);
 
     // Follow one grouped card through actual file notifications and page
     // updates. Static projection cannot catch stale virtualized member chips.

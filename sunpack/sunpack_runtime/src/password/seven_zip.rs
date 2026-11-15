@@ -51,7 +51,7 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_ranges(
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let parsed = parse_ranges(ranges, sessions)?;
+    let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
     verify_prepared(ranges_key("7z", &parsed)?, candidates, || {
         let reader = VirtualRangeReader::new(&parsed);
         let total_len = reader.len();

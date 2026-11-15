@@ -253,13 +253,6 @@ namespace sunpack::sevenzip
         return volumes;
     }
 
-    std::wstring lower_extension(const std::wstring &path)
-    {
-
-        return lower_text(std::filesystem::path(path).extension().wstring());
-    }
-
-
 #endif
 
 } // namespace sunpack::sevenzip

@@ -105,13 +105,14 @@ struct VolumeAttemptPlan {
                 domains[reference.domain].front() != domains[slots[i].domain].front();
             merged.variable_length |= info.variable_length || different_slot || merged.length != info.length;
         }
-        for (std::size_t i = shortest->size(); i < variation.size(); ++i) {
+        auto variable_from = shortest->size();
+        for (std::size_t l = 0; l < layouts.size(); ++l) {
+            const auto minimum = minimum_slots_for(l);
+            if (minimum < layouts[l].size()) variable_from = (std::min)(variable_from, minimum - 1);
+        }
+        for (std::size_t i = variable_from; i < variation.size(); ++i) {
             variation[i].variable = variation[i].variable_length = true;
         }
-        for (std::size_t l = 0; l < layouts.size(); ++l)
-            if (minimum_slots_for(l) < layouts[l].size())
-                for (std::size_t i = minimum_slots_for(l) - 1; i < variation.size(); ++i)
-                    variation[i].variable = variation[i].variable_length = true;
         if (!variation.empty() && (head_size_from_total || !tail_totals.empty()))
             variation.front().variable = variation.front().variable_length = true;
     }

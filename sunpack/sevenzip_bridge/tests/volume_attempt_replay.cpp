@@ -72,7 +72,6 @@ void request_recovery(const std::filesystem::path& archive, const std::filesyste
     plan.domains = {{2}, {0, 1}};
     if (after_failure) plan.layouts.push_back({{1, L"v1", 0}});
     plan.layouts.push_back({{1, L"v1", 1}, {2, L"v2", 1}});
-    plan.prepare();
     injected = false;
     withdrawing_cursor = &replay.volumes;
     withdrawing_domain = 1;

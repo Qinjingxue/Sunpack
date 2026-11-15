@@ -2,6 +2,7 @@
 //! Runs are ordered by UTC; clock rollback starts another run. No WAL or replay.
 use super::resource_lifecycle::{NativeResourceGuard, TrackedFile};
 use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -51,12 +52,20 @@ struct Live {
     run: Run,
     data: TrackedFile,
     index: TrackedFile,
-    rows: HashMap<Arc<str>, (u64, [u8; ENTRY_BYTES])>,
+    rows: HashMap<Arc<str>, LiveRow>,
     time: BTreeMap<(i64, u64), Arc<str>>,
     free: Vec<u64>,
     bytes: u64,
     revision: u64,
 }
+
+struct LiveRow {
+    slot: u64,
+    stamp: i64,
+    offset: u64,
+    size: u64,
+}
+
 impl Live {
     fn set_revision(&mut self, revision: u64) -> io::Result<()> {
         if self.revision != revision {
@@ -67,23 +76,23 @@ impl Live {
         Ok(())
     }
     fn remove(&mut self, id: &str) -> io::Result<()> {
-        if let Some((slot, bytes)) = self.rows.remove(id) {
+        if let Some(row) = self.rows.remove(id) {
+            let slot = row.slot;
             zero(
                 &mut self.index,
                 slot * ENTRY_BYTES as u64,
                 (slot + 1) * ENTRY_BYTES as u64,
             )?;
-            self.release_data(slot, &bytes)?;
+            self.release_data(row)?;
             self.free.push(slot);
         }
         Ok(())
     }
 
-    fn release_data(&mut self, slot: u64, bytes: &[u8; ENTRY_BYTES]) -> io::Result<()> {
-        let size = record_size(&mut self.data, bytes)?;
-        zero(&mut self.data, offset(bytes), offset(bytes) + size)?;
-        self.bytes -= size;
-        self.time.remove(&(stamp(bytes), slot));
+    fn release_data(&mut self, row: LiveRow) -> io::Result<()> {
+        zero(&mut self.data, row.offset, row.offset + row.size)?;
+        self.bytes -= row.size;
+        self.time.remove(&(row.stamp, row.slot));
         Ok(())
     }
 }
@@ -255,7 +264,7 @@ fn add_text(bits: &mut [u64; 4], text: &str) {
         previous = Some(ch);
     }
 }
-fn filter(value: &Value) -> [u64; 4] {
+fn filter(value: &Value, group: Option<&Value>) -> [u64; 4] {
     let mut bits = [0; 4];
     let mut path = |s: &str| {
         add_text(&mut bits, s);
@@ -263,17 +272,19 @@ fn filter(value: &Value) -> [u64; 4] {
             add_text(&mut bits, &s.replace('/', "\\"));
         }
     };
-    if let Some(s) = value["path"].as_str() {
+    let event_path = value["path"].as_str();
+    if let Some(s) = event_path {
         path(s);
     }
-    if let Some(group) = value.get("group") {
-        if let Some(s) = group["path"].as_str() {
+    if let Some(group) = group.or_else(|| value.get("group")) {
+        let group_path = group["path"].as_str();
+        if let Some(s) = group_path.filter(|s| Some(*s) != event_path) {
             path(s);
         }
         if let Some(members) = group["members"].as_array() {
-            for member in members {
-                if let Some(s) = member.as_str() {
-                    path(s);
+            for name in members.iter().filter_map(Value::as_str) {
+                if Some(name) != event_path && Some(name) != group_path {
+                    path(name);
                 }
             }
         }
@@ -302,12 +313,38 @@ struct RecordIndex {
 }
 
 impl RecordIndex {
-    fn new(value: &Value, ts: i64) -> Self {
+    fn new(value: &Value, ts: i64, group: Option<&Value>) -> Self {
         let kind = kind(value);
         // The GUI discards non-task records before looking at the search bits.
-        let filter = if kind == 0 { [0; 4] } else { filter(value) };
+        let filter = if kind == 0 { [0; 4] } else { filter(value, group) };
         Self { ts, kind, filter }
     }
+}
+
+pub(crate) struct EventField<'a, T> {
+    pub fields: &'a serde_json::Map<String, Value>,
+    pub name: &'static str,
+    pub value: T,
+}
+
+impl<T: Serialize> Serialize for EventField<'_, T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let count = self.fields.len() + usize::from(!self.fields.contains_key(self.name));
+        let mut event = serializer.serialize_map(Some(count))?;
+        for (key, value) in self.fields {
+            if key != self.name {
+                event.serialize_entry(key, value)?;
+            }
+        }
+        event.serialize_entry(self.name, &self.value)?;
+        event.end()
+    }
+}
+
+pub(crate) struct LiveEvent {
+    pub ts: i64,
+    pub value: Value,
+    pub group: Option<Arc<Value>>,
 }
 
 pub(crate) struct HistoryRecord {
@@ -320,7 +357,7 @@ impl HistoryRecord {
         let mut raw = super::scratch::Spool::default();
         rmp_serde::encode::write_named(&mut raw, payload).map_err(io::Error::other)?;
         Ok(Self {
-            index: RecordIndex::new(value, ts),
+            index: RecordIndex::new(value, ts, None),
             raw: raw.finish()?,
         })
     }
@@ -435,7 +472,7 @@ impl Store {
         slot: u64,
         raw: &[u8],
         record: &RecordIndex,
-    ) -> io::Result<([u8; ENTRY_BYTES], u64)> {
+    ) -> io::Result<LiveRow> {
         let position = data.seek(SeekFrom::End(0))?;
         let (packed_length, raw_length, size) = if raw.len() <= super::scratch::MEMORY_BYTES {
             let len = compress_block(raw, compressed)?;
@@ -473,7 +510,12 @@ impl Store {
         }
         index.seek(SeekFrom::Start(slot * ENTRY_BYTES as u64))?;
         index.write_all(&bytes)?;
-        Ok((bytes, size))
+        Ok(LiveRow {
+            slot,
+            stamp: record.ts,
+            offset: position,
+            size,
+        })
     }
     pub(crate) fn append(&mut self, record: &HistoryRecord) -> io::Result<()> {
         let ts = record.timestamp();
@@ -532,7 +574,7 @@ impl Store {
     }
     pub(crate) fn update_live(
         &mut self,
-        rows: impl ExactSizeIterator<Item = io::Result<(String, Option<(i64, Value)>)>>,
+        rows: impl ExactSizeIterator<Item = io::Result<(String, Option<LiveEvent>)>>,
         reset: bool,
         cutoff: i64,
     ) -> io::Result<()> {
@@ -550,8 +592,8 @@ impl Store {
         }
         for row in rows {
             let (id, value) = row?;
-            let expired = value.as_ref().is_some_and(|(ts, _)| *ts <= cutoff);
-            let Some((ts, value)) = value.filter(|_| !expired) else {
+            let expired = value.as_ref().is_some_and(|event| event.ts <= cutoff);
+            let Some(LiveEvent { ts, value, group }) = value.filter(|_| !expired) else {
                 if let Some(live) = &mut self.live {
                     live.remove(&id)?;
                 }
@@ -564,28 +606,38 @@ impl Store {
                 self.live = Some(self.new_live()?);
             }
             let live = self.live.as_mut().unwrap();
-            let (id, slot) = if let Some((id, (slot, bytes))) = live.rows.remove_entry(id.as_str()) {
+            let (id, slot) = if let Some((id, row)) = live.rows.remove_entry(id.as_str()) {
                 // Readers already reject this revision. Overwrite the index slot
                 // directly and reclaim only the old record's data.
-                live.release_data(slot, &bytes)?;
+                let slot = row.slot;
+                live.release_data(row)?;
                 (id, slot)
             } else {
                 (Arc::from(id), live.free.pop().unwrap_or(live.run.count))
             };
             let mut raw = super::scratch::Spool::default();
-            rmp_serde::encode::write(&mut raw, &value).map_err(|e| invalid(&e.to_string()))?;
-            let (bytes, size) = Self::write_record(
+            let group = group.as_deref();
+            match group {
+                Some(group) => rmp_serde::encode::write(&mut raw, &EventField {
+                    fields: value.as_object().ok_or_else(|| invalid("live event must be an object"))?,
+                    name: "group",
+                    value: group,
+                }),
+                None => rmp_serde::encode::write(&mut raw, &value),
+            }
+            .map_err(io::Error::other)?;
+            let row = Self::write_record(
                 &mut self.compressed,
                 &mut live.data,
                 &mut live.index,
                 slot,
                 &raw.finish()?,
-                &RecordIndex::new(&value, ts),
+                &RecordIndex::new(&value, ts, group),
             )?;
             live.run.count = live.run.count.max(slot + 1);
-            live.bytes += size;
+            live.bytes += row.size;
             live.time.insert((ts, slot), Arc::clone(&id));
-            live.rows.insert(id, (slot, bytes));
+            live.rows.insert(id, row);
         }
         self.manifest.task_revision += 1;
         self.finish_live()
@@ -616,11 +668,11 @@ impl Store {
         let old = self.live.as_mut().unwrap();
         let mut buffer = [0u8; 65536];
         for ((ts, _), id) in &old.time {
-            let (_, mut bytes) = old.rows[id];
-            let size = record_size(&mut old.data, &bytes)?;
+            let row = &old.rows[id];
+            let mut bytes = entry(&mut old.index, row.slot)?;
             let position = new.data.stream_position()?;
-            old.data.seek(SeekFrom::Start(offset(&bytes)))?;
-            let mut remaining = size;
+            old.data.seek(SeekFrom::Start(row.offset))?;
+            let mut remaining = row.size;
             while remaining != 0 {
                 let count = remaining.min(buffer.len() as u64) as usize;
                 old.data.read_exact(&mut buffer[..count])?;
@@ -631,9 +683,14 @@ impl Store {
             bytes[28..32].copy_from_slice(&(new.run.count as u32).to_le_bytes());
             new.index.write_all(&bytes)?;
             new.time.insert((*ts, new.run.count), id.clone());
-            new.rows.insert(id.clone(), (new.run.count, bytes));
+            new.rows.insert(id.clone(), LiveRow {
+                slot: new.run.count,
+                stamp: *ts,
+                offset: position,
+                size: row.size,
+            });
             new.run.count += 1;
-            new.bytes += size;
+            new.bytes += row.size;
         }
         new.run.first = old.run.first;
         new.run.last = old.run.last;

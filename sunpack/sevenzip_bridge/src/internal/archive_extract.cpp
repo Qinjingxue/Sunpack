@@ -309,10 +309,10 @@ namespace sunpack::sevenzip
         const auto formats = [&]()
         {
             PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::FormatCandidates);
-            return extraction_formats_for_hint(format_hint);
+            return extraction_formats_for_hint(format_hint).handlers;
         }();
 #else
-        const auto formats = extraction_formats_for_hint(format_hint);
+        const auto formats = extraction_formats_for_hint(format_hint).handlers;
 #endif
         const auto prefetch_config = input_prefetch_config_for_archive(format_hint, native_volume_input);
 

@@ -16,7 +16,7 @@ fn foreground_output_reservation_survives_scheduler_replacement_and_is_published
     let work = root.join("flatten-work");
     watch.prepare_external_flatten(&output, &work, &leaf).unwrap();
     let scope = NativeDiscoveryScope::new(root.to_string_lossy().into_owned(), None, Vec::new());
-    let options = Arc::new(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap());
+    let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
     for generation in 0..2 {
         let journal = Arc::new(journal::Journal::open_with_outputs(&state_dir, 7,
             Arc::clone(&watch.external.reservations)).unwrap());
@@ -24,12 +24,29 @@ fn foreground_output_reservation_survives_scheduler_replacement_and_is_published
         options.catalog_update(&catalog, &scope, None).unwrap();
         assert!(catalog.is_owned(member.to_str().unwrap()));
         assert!(catalog.candidate_paths(&scope, None).is_empty());
-        *watch.external.lock().unwrap() = Some(ExternalOutputs {
+        *watch.external.current.write().unwrap() = Some(ExternalOutputs {
             journal: Arc::downgrade(&journal), scopes: Arc::from([scope.clone()]),
-            catalog: Arc::clone(&catalog), options: Arc::clone(&options), hub: Weak::new(),
+            catalog: Arc::clone(&catalog), options: options.clone(), hub: Weak::new(),
         });
         if generation == 1 {
-            watch.finish_external_outputs(&[output.to_string_lossy().into_owned()]).unwrap();
+            // An inventory publication pins the current target. Another
+            // foreground worker can still register an independent output.
+            let concurrent = root.join("other-output");
+            std::thread::scope(|threads| {
+                let publication = watch.external.current.read().unwrap();
+                let (registered, receive) = mpsc::channel();
+                let (watch, concurrent) = (&watch, &concurrent);
+                threads.spawn(move || {
+                    let _ = registered.send(watch.register_external_output(concurrent));
+                });
+                let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+                drop(publication);
+                result.expect("output registration waited on publication").unwrap();
+            });
+            watch.finish_external_outputs(&[
+                output.to_string_lossy().into_owned(),
+                concurrent.to_string_lossy().into_owned(),
+            ]).unwrap();
             assert!(!catalog.is_owned(member.to_str().unwrap()));
             let before = catalog.observation(member.to_str().unwrap()).unwrap();
             let current = watch_candidate_for_path(&member, Some(before.change_usn)).unwrap().unwrap();
@@ -37,7 +54,7 @@ fn foreground_output_reservation_survives_scheduler_replacement_and_is_published
             assert!(!quiet::content_changed(before.size, before.mtime, &before.file_id(), before.change_usn, &current));
             assert!(watch.external.reservations.lock().unwrap().is_empty());
         }
-        *watch.external.lock().unwrap() = None;
+        *watch.external.current.write().unwrap() = None;
     }
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(state_dir).unwrap();

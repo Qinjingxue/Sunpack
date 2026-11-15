@@ -711,13 +711,13 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         assert!(broker.upgrade().is_none(), "rootless shell retained the Broker lease");
         assert!(scheduler.pending.is_empty() && scheduler.journal.state().pending_items().is_empty());
         assert!(receipt.upgrade().is_none(), "idle shell retained recovery receipts");
-        assert!(scheduler.external.lock().unwrap().is_none());
+        assert!(scheduler.external.current.read().unwrap().is_none());
         // A CLI create that captured the prior publication must still create
         // its output if the final root is removed before it reaches the gate.
         let watch = Watch::new(Arc::new(|| {}));
-        *watch.external.lock().unwrap() = Some(ExternalOutputs {
+        *watch.external.current.write().unwrap() = Some(ExternalOutputs {
             journal: Arc::downgrade(&old_journal), scopes: old_scopes,
-            catalog: Arc::clone(&scheduler.catalog), options: Arc::new(scheduler.deep_options.clone()), hub: Arc::downgrade(&scheduler.hub),
+            catalog: Arc::clone(&scheduler.catalog), options: scheduler.deep_options.clone(), hub: Arc::downgrade(&scheduler.hub),
         });
         let foreground_output = watched.join("foreground-output");
         watch.register_external_output(&foreground_output).unwrap();

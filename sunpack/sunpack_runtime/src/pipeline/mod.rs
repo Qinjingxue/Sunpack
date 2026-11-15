@@ -13,6 +13,7 @@ mod worker;
 pub(crate) use worker::coalesced_wait_batches;
 
 use crate::core::{config::Config, passwords::PasswordSnapshot};
+use crate::io::archive_state::VolumeCompleteness;
 use crate::io::reader::PhysicalFileGeneration;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -389,7 +390,8 @@ pub struct ArchiveResult {
     pub depth: usize,
     pub offset: u64,
     pub end_offset: Option<u64>,
-    pub volume_completeness: Option<String>,
+    #[serde(serialize_with = "serialize_volume_completeness")]
+    pub(crate) volume_completeness: Option<VolumeCompleteness>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) volume_attempts: Option<Box<crate::io::archive_state::VolumeAttemptPlan>>,
     pub source_paths: Vec<PathBuf>,
@@ -398,7 +400,13 @@ pub struct ArchiveResult {
     pub partial: bool,
     pub retained: bool,
     pub recovered_complete_files: u64,
-        }
+}
+
+fn serialize_volume_completeness<S: serde::Serializer>(
+    value: &Option<VolumeCompleteness>, serializer: S,
+) -> Result<S::Ok, S::Error> {
+    value.map(VolumeCompleteness::as_str).serialize(serializer)
+}
 
 /// Sparse presentation facts retained while the canonical input is available.
 /// Extraction diagnostics keep their original completeness independently.
@@ -420,13 +428,15 @@ impl ScanLayout {
         }
     }
 
-    pub(crate) fn volumes<'a>(self, result: &'a ArchiveResult) -> (bool, Option<&'a str>) {
-        let completeness = result.volume_completeness.as_deref();
+    pub(crate) fn volumes(self, result: &ArchiveResult) -> (bool, Option<&'static str>) {
+        let completeness = result.volume_completeness;
+        let missing = completeness == Some(VolumeCompleteness::Missing);
         if result.volume_attempts.is_some() {
-            return (false, Some(if completeness == Some("missing") { "missing" } else { "pending" }));
+            return (false, Some(if missing { VolumeCompleteness::Missing.as_str() } else { "pending" }));
         }
-        let show = self.volumes || result.source_paths.len() > 1 || completeness == Some("missing");
-        (show, completeness.filter(|value| show && matches!(*value, "complete" | "missing")))
+        let show = self.volumes || result.source_paths.len() > 1 || missing;
+        (show, completeness.filter(|value| show && *value != VolumeCompleteness::Unknown)
+            .map(VolumeCompleteness::as_str))
     }
 }
 
@@ -831,7 +841,7 @@ pub(crate) trait Observer: Send + Sync {
 
     /// All request writers and rollback have joined. Paths are existing output
     /// reservations; observers may publish their final inventory before release.
-    fn outputs_finished(&self, _paths: &[String]) -> io::Result<()> { Ok(()) }
+    fn outputs_finished(&self, _paths: impl FnOnce() -> Vec<String>) -> io::Result<()> { Ok(()) }
 
     fn discard_output(&self, _archive: &Path, _sources: &[PathBuf], _output: &Path) -> io::Result<()> {
         Ok(())

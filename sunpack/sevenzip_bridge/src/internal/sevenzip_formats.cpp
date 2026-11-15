@@ -4,84 +4,29 @@
 #include "sevenzip_bridge/enc.h"
 #include "sevenzip_paths.hpp"
 
-#ifdef _WIN32
-#include <vector>
-#endif
-
 namespace sunpack::sevenzip
 {
 
 #ifdef _WIN32
 
-    namespace
+    ExtractionFormats extraction_formats_for_hint(const std::wstring &format_hint)
     {
-        std::wstring normalized_format_hint(const std::wstring &format_hint)
-        {
-            std::wstring hint = lower_text(format_hint);
-            if (!hint.empty() && hint.front() == L'.')
-            {
-                hint.erase(hint.begin());
-            }
-            return hint;
-        }
+        auto hint = lower_text(format_hint);
+        if (!hint.empty() && hint.front() == L'.') hint.erase(hint.begin());
 
-        std::vector<unsigned char> known_format_ids_for_hint(const std::wstring &hint)
-        {
-            if (hint == L"enc") return {kEncFormatId};
-            if (hint == L"zip" || hint == L"zipx")
-                return {0x01};
-            if (hint == L"7z" || hint == L"sevenzip" || hint == L"seven_zip")
-                return {0x07};
-            if (hint == L"rar4")
-                return {0x03, 0xCC};
-            if (hint == L"rar5")
-                return {0xCC, 0x03};
-            if (hint == L"tar")
-                return {0xEE};
-            if (hint == L"gz" || hint == L"gzip" || hint == L"tgz")
-                return {0xEF};
-            if (hint == L"bz2" || hint == L"bzip2" || hint == L"tbz2" || hint == L"tbz")
-                return {0x02};
-            if (hint == L"xz" || hint == L"txz")
-                return {0x0C};
-            if (hint == L"lz4")
-                return {0xFA};
-            if (hint == L"zst" || hint == L"zstd" || hint == L"tzst")
-                return {0x0E};
-            return {};
-        }
-
-        const std::vector<unsigned char> &generic_format_ids()
-        {
-            static const std::vector<unsigned char> ids{
-                0x07, 0x01, 0xCC, 0x03, 0xEE, 0xEF, 0x02, 0x0C, 0x0E, 0xFA};
-            return ids;
-        }
-
-        std::vector<GUID> format_guids(const std::vector<unsigned char> &ids)
-        {
-            std::vector<GUID> formats;
-            formats.reserve(ids.size());
-            for (const unsigned char id : ids)
-            {
-                formats.push_back(format_guid(id));
-            }
-            return formats;
-        }
-    } // namespace
-
-    std::vector<GUID> extraction_formats_for_hint(const std::wstring &format_hint)
-    {
-        const std::wstring hint = normalized_format_hint(format_hint);
-        std::vector<unsigned char> ids =
-            hint == L"rar"
-                ? std::vector<unsigned char>{0xCC, 0x03}
-                : known_format_ids_for_hint(hint);
-        if (ids.empty())
-        {
-            return format_guids(generic_format_ids());
-        }
-        return format_guids(ids);
+        if (hint == L"enc") return {{format_guid(kEncFormatId)}};
+        if (hint == L"zip" || hint == L"zipx") return {{format_guid(0x01)}};
+        if (hint == L"7z" || hint == L"sevenzip" || hint == L"seven_zip") return {{format_guid(0x07)}, true};
+        if (hint == L"rar4") return {{format_guid(0x03), format_guid(0xCC)}, true};
+        if (hint == L"rar" || hint == L"rar5") return {{format_guid(0xCC), format_guid(0x03)}, true};
+        if (hint == L"tar") return {{format_guid(0xEE)}};
+        if (hint == L"gz" || hint == L"gzip" || hint == L"tgz") return {{format_guid(0xEF)}};
+        if (hint == L"bz2" || hint == L"bzip2" || hint == L"tbz2" || hint == L"tbz") return {{format_guid(0x02)}};
+        if (hint == L"xz" || hint == L"txz") return {{format_guid(0x0C)}};
+        if (hint == L"lz4") return {{format_guid(kLz4FormatId)}};
+        if (hint == L"zst" || hint == L"zstd" || hint == L"tzst") return {{format_guid(0x0E)}};
+        return {{format_guid(0x07), format_guid(0x01), format_guid(0xCC), format_guid(0x03), format_guid(0xEE),
+                 format_guid(0xEF), format_guid(0x02), format_guid(0x0C), format_guid(0x0E), format_guid(kLz4FormatId)}};
     }
 
     std::wstring canonical_archive_type_for_guid(const GUID &format)

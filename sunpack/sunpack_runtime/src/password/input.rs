@@ -8,49 +8,49 @@ use std::io::{Read, Seek, SeekFrom};
 pub(crate) struct RangeSpec {
     reader: ManagedReader,
     start: u64,
-    end: Option<u64>,
     len: u64,
     virtual_start: u64,
 }
 
 // The caller already holds lifecycle borrows. Reuse their validated readers
 // instead of reopening every physical member for every password batch.
-struct InputReaders(HashMap<String, ManagedReader>);
+struct InputReaders<'a>(HashMap<&'a str, ManagedReader>);
 
-impl InputReaders {
-    fn new(sessions: &[NativeArchiveSession]) -> std::io::Result<Self> {
-        let mut readers = HashMap::new();
-        for session in sessions {
-            let (path, reader) = session.borrowed_reader();
-            readers.insert(Self::key(path)?, reader);
-        }
-        Ok(Self(readers))
+impl<'a> InputReaders<'a> {
+    fn new(sessions: &'a [NativeArchiveSession]) -> Self {
+        Self(
+            sessions
+                .iter()
+                .map(NativeArchiveSession::borrowed_reader)
+                .collect(),
+        )
     }
 
-    fn key(path: &str) -> std::io::Result<String> {
-        Ok(crate::path_keys::path_key(
-            &std::path::absolute(path)?.to_string_lossy(),
-        ))
-    }
-
-    fn open(&self, path: &str) -> std::io::Result<ManagedReader> {
-        if let Some(reader) = self.0.get(&Self::key(path)?) {
+    fn open(&mut self, path: &'a str, reuse: bool) -> std::io::Result<ManagedReader> {
+        // A case-sensitive Windows directory can contain both spellings.
+        // Sessions are opened from the same physical extent paths.
+        if let Some(reader) = self.0.get(path) {
             return Ok(reader.clone());
         }
-        ManagedReader::open(path)
+        let reader = ManagedReader::open(path)?;
+        if reuse {
+            self.0.insert(path, reader.clone());
+        }
+        Ok(reader)
     }
 }
 
-pub(crate) fn parse_ranges(
-    ranges: &[&InputExtent],
-    sessions: &[NativeArchiveSession],
+pub(crate) fn parse_ranges<'a>(
+    ranges: impl Iterator<Item = &'a InputExtent>,
+    sessions: &'a [NativeArchiveSession],
 ) -> std::io::Result<Vec<RangeSpec>> {
-    let readers = InputReaders::new(sessions)?;
-    let mut parsed = Vec::with_capacity(ranges.len());
+    let mut readers = InputReaders::new(sessions);
+    let (minimum, maximum) = ranges.size_hint();
+    let mut parsed = Vec::with_capacity(minimum);
     let mut cursor = 0u64;
     for range in ranges {
         let (path, start, end) = (&range.path, range.start, range.end);
-        let reader = readers.open(path)?;
+        let reader = readers.open(path, maximum.is_none_or(|count| count > 1))?;
         let file_len = reader.len();
         if start > file_len {
             return Err(std::io::Error::other("range start is beyond file length"));
@@ -63,11 +63,15 @@ pub(crate) fn parse_ranges(
         parsed.push(RangeSpec {
             reader,
             start,
-            end,
             len,
             virtual_start: cursor,
         });
-        cursor = cursor.saturating_add(len);
+        cursor = cursor.checked_add(len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "logical input size overflow",
+            )
+        })?;
     }
     Ok(parsed)
 }
@@ -78,7 +82,9 @@ pub(crate) fn ranges_key(format: &'static str, ranges: &[RangeSpec]) -> std::io:
         "ranges",
         ranges
             .iter()
-            .map(|range| InputMember::new(&range.reader, range.start, range.end, 0))
+            .map(|range| {
+                InputMember::new(&range.reader, range.start, Some(range.start + range.len), 0)
+            })
             .collect::<std::io::Result<_>>()?,
     ))
 }
@@ -93,20 +99,11 @@ pub(crate) fn read_ranges_at_field(
 ) -> Result<Vec<u8>, ReadFault> {
     let mut reader = VirtualRangeReader::new(ranges);
     let total_len = reader.len();
-    let requested = max_len.min(total_len.saturating_sub(offset) as usize);
-    let mut data = vec![0u8; requested];
-    if requested == 0 {
-        return Ok(data);
-    }
-    let len = reader
-        .seek(SeekFrom::Start(offset))
-        .and_then(|_| reader.read(&mut data))
-        .map_err(|error| {
-            ReadFault::from_io(error, "read_ranges", offset, requested, 0, total_len)
-                .with_field(field, FieldLocation::Head)
-        })?;
-    data.truncate(len);
-    Ok(data)
+    reader.read_at(offset, max_len).map_err(|error| {
+        let requested = (max_len as u64).min(total_len.saturating_sub(offset)) as usize;
+        ReadFault::from_io(error, "read_ranges", offset, requested, 0, total_len)
+            .with_field(field, FieldLocation::Head)
+    })
 }
 
 pub(crate) struct VirtualRangeReader<'a> {
@@ -129,6 +126,34 @@ impl<'a> VirtualRangeReader<'a> {
 
     pub(crate) fn len(&self) -> u64 {
         self.total_len
+    }
+
+    pub(crate) fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        self.read_at_into(offset, len, &mut data)?;
+        Ok(data)
+    }
+
+    pub(crate) fn read_at_into(
+        &mut self,
+        offset: u64,
+        len: usize,
+        output: &mut Vec<u8>,
+    ) -> std::io::Result<()> {
+        self.position = offset;
+        let requested = (len as u64).min(self.total_len.saturating_sub(offset)) as usize;
+        output.resize(requested, 0);
+        let read = self.read(output)?;
+        output.truncate(read);
+        Ok(())
+    }
+
+    pub(crate) fn disk_starts(&self) -> Vec<u64> {
+        self.ranges
+            .iter()
+            .filter(|range| range.len != 0)
+            .map(|range| range.virtual_start)
+            .collect()
     }
 }
 
@@ -192,11 +217,11 @@ pub(crate) struct VolumeSpec {
     pub(crate) end: Option<u64>,
 }
 
-pub(crate) fn parse_volumes(
-    parts: &[InputPart],
-    sessions: &[NativeArchiveSession],
+pub(crate) fn parse_volumes<'a>(
+    parts: &'a [InputPart],
+    sessions: &'a [NativeArchiveSession],
 ) -> std::io::Result<Vec<VolumeSpec>> {
-    let readers = InputReaders::new(sessions)?;
+    let mut readers = InputReaders::new(sessions);
     let mut parsed = Vec::with_capacity(parts.len());
     for item in parts {
         let number = item
@@ -204,7 +229,7 @@ pub(crate) fn parse_volumes(
             .ok_or_else(|| std::io::Error::other("volume_number is required"))?;
         let InputExtent { path, start, end } = &item.extent;
         let (start, end) = (*start, *end);
-        let reader = readers.open(path)?;
+        let reader = readers.open(path, parts.len() > 1)?;
         if start > end.unwrap_or(reader.len()).min(reader.len()) {
             return Err(std::io::Error::other("volume range is outside file length"));
         }

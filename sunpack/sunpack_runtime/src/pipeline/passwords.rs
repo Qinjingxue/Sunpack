@@ -99,9 +99,11 @@ struct AttemptCacheState {
 
 impl AttemptCache {
     pub(super) fn clear(&self) {
-        let mut state = self.0.lock().unwrap();
-        state.successes = CacheOrder::default();
-        state.negative = CacheOrder::default();
+        let caches = {
+            let mut state = self.0.lock().unwrap();
+            (std::mem::take(&mut state.successes), std::mem::take(&mut state.negative))
+        };
+        drop(caches);
     }
 
     pub(super) fn recent(&self) -> Vec<Arc<str>> {
@@ -124,11 +126,15 @@ impl AttemptCache {
         self.0.lock().unwrap().successes.get(key).cloned()
     }
 
+    #[cfg(test)]
     fn remove_rejected(&self, key: &Key, candidates: &mut Vec<Arc<str>>) -> bool {
-        let mut state = self.0.lock().unwrap();
         let before = candidates.len();
-        candidates.retain(|password| state.negative.get(&(key.clone(), password.clone())).is_none());
+        candidates.retain(|password| !self.rejected(key, password));
         candidates.len() != before
+    }
+
+    fn rejected(&self, key: &Key, password: &Arc<str>) -> bool {
+        self.0.lock().unwrap().negative.get(&(key.clone(), Arc::clone(password))).is_some()
     }
 
     fn fill_available<'p>(
@@ -161,9 +167,12 @@ impl AttemptCache {
     }
 
     fn reject(&self, key: Key, candidates: &[Arc<str>]) {
-        let mut state = self.0.lock().unwrap();
-        for password in candidates {
-            state.negative.insert((key.clone(), password.clone()), (), MAX_REJECTIONS);
+        // Fallback can return more than one Rust verification batch at once.
+        for batch in candidates.chunks(BATCH_SIZE) {
+            let mut state = self.0.lock().unwrap();
+            for password in batch {
+                state.negative.insert((key.clone(), Arc::clone(password)), (), MAX_REJECTIONS);
+            }
         }
     }
 }
@@ -386,10 +395,9 @@ impl CandidateSet {
         // Empty has first-candidate priority, not a separate verification phase.
         // Fill the same batch so the native verifier retains its parallel threshold.
         if !needs_password {
-            batch.push(Arc::from(""));
-            if let Some(key) = key.as_ref() {
-                password_rejected |= cache.remove_rejected(key, &mut batch);
-            }
+            let empty = Arc::from("");
+            password_rejected = key.as_ref().is_some_and(|key| cache.rejected(key, &empty));
+            if !password_rejected { batch.push(empty); }
         }
         loop {
             cancellation.check_io()?;

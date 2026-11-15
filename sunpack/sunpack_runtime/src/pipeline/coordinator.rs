@@ -285,9 +285,9 @@ impl Engine {
                 }
             };
             match process.ready(cancel).await {
-                Ok(()) => {
+                Ok(thread_capacity) => {
                     self.scheduler.get_or_init(Scheduler::new)
-                        .configure_capacity(process.thread_capacity());
+                        .configure_capacity(thread_capacity);
                     return Ok(process);
                 }
                 // A new borrower may arrive while an abandoned generation is
@@ -579,8 +579,7 @@ impl RecursivePrompts {
         };
         if first {
             if let Some(prompt) = inline {
-                let allowed = stage("report", cancel).await.is_ok() && prompt(depth, pending).await;
-                decision.complete(allowed);
+                decision.complete(prompt(depth, pending).await);
             } else {
                 #[cfg(test)]
                 {
@@ -1127,11 +1126,13 @@ enum BatchTaskResult {
 
 impl<'run, O: Observer> Run<'run, O> {
     async fn execute_request(self: &Arc<Self>, spawner: Spawner<'run>) -> io::Result<PublicOutcome> {
-        let decisions = Arc::clone(&self.recursion.decisions);
-        let _cancellation = self.request.cancel.subscribe(move || {
-            let decisions: Vec<_> = decisions.lock().unwrap().values().cloned().collect();
-            for decision in decisions { decision.complete(false); }
-        });
+        let _cancellation = if self.request.config.recursive_extract == Recursion::Prompt {
+            let decisions = Arc::clone(&self.recursion.decisions);
+            self.request.cancel.subscribe(move || {
+                let decisions: Vec<_> = decisions.lock().unwrap().values().cloned().collect();
+                for decision in decisions { decision.complete(false); }
+            })
+        } else { None };
         self.request.cancel.check_io()?;
         let discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates)?;
         let requested = self.watch_generations(&discovered);
@@ -1197,9 +1198,10 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             Ok::<_, io::Error>(())
         }.await;
-        let outputs: Vec<_> = self.output_names.registry.lock().unwrap().owners
-            .get(&self.output_names.owner).into_iter().flatten().cloned().collect();
-        let publication = self.observer.outputs_finished(&outputs);
+        let publication = self.observer.outputs_finished(|| {
+            self.output_names.registry.lock().unwrap().owners
+                .get(&self.output_names.owner).into_iter().flatten().cloned().collect()
+        });
         rollback?;
         publication?;
         let mut outcome = executed?;
@@ -1630,6 +1632,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     // main scan_items still projects every original descriptor.
                     task.inputs.iter().enumerate().map(|(index, logical)| {
                         let mut result = receipt(&logical.input, task.source, depth);
+                        if this.request.mode == Mode::Scan {
+                            result.scan_layout = super::ScanLayout::from_input(&logical.input);
+                        }
                         result.password = logical.password.as_deref().map(str::to_owned);
                         result.volume_attempts = logical.input.volume_attempts.clone();
                         // scan_items gives the original node failure precedence
@@ -1681,7 +1686,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let preferred_carrier = (this.request.mode == Mode::Extract && (multi || !this.checkpoints.is_empty()))
                 .then(|| this.preferred_output(task.entry(), depth));
             let report_previous = this.select_checkpoints(&owner_path, &task.inputs);
-            let mut retained: Vec<_> = task
+            let retained: Vec<_> = task
                 .inputs
                 .iter().zip(&report_previous)
                 .map(|(logical, previous)| {
@@ -1710,8 +1715,8 @@ impl<'run, O: Observer> Run<'run, O> {
                     .map(Path::to_path_buf);
                 match existing {
                     Some(path) => Some(path),
-                    None if task.inputs.iter().zip(&retained)
-                        .any(|(input, checkpoint)| checkpoint.is_none() && input.failure.is_none()) => {
+                    None if task.inputs.iter().enumerate()
+                        .any(|(index, input)| retained.get(index).is_none_or(Option::is_none) && input.failure.is_none()) => {
                         let receipt = receipt(task.entry(), task.source, depth);
                         match this.reserve_output(preferred_carrier.expect("carrier has a preferred output"), &receipt, None)? {
                             Ok(path) => {
@@ -1742,25 +1747,31 @@ impl<'run, O: Observer> Run<'run, O> {
                 .collect();
             // Reserve logical names in input order before discovery/password
             // failures can return. A planned slot is not a physical output.
-            let mut planned_slots = vec![None; count];
+            let mut planned_slots = Vec::new();
             if let Some(root) = carrier.as_deref() {
+                planned_slots.reserve_exact(count);
                 for (index, logical) in task.inputs.iter_mut().enumerate() {
-                    let previous = retained[index].or(retry_slots[index])
+                    let previous = retained.get(index).copied().flatten()
+                        .or_else(|| retry_slots.get(index).copied().flatten())
                         .filter(|checkpoint| checkpoint.container() == Some(root))
                         .and_then(InputCheckpoint::output_slot);
                     let slot = previous.filter(|path| OutputNames::retain(&this.output_names.registry,
                         path, this.output_names.owner, Path::new(&logical.input.entry_path), Some(root),
                     ));
-                    if let Some(slot) = slot {
-                        planned_slots[index] = Some(slot.to_owned());
+                    let slot = if let Some(slot) = slot {
+                        Some(slot.to_owned())
                     } else {
                         match OutputNames::plan(&this.output_names.registry, root.join(archive_name(&logical.input)), Path::new(&logical.input.entry_path),
                             this.output_names.owner, Some(root))?
                         {
-                            Ok(slot) => planned_slots[index] = Some(slot),
-                            Err(failure) => { logical.failure.get_or_insert(failure); }
+                            Ok(slot) => Some(slot),
+                            Err(failure) => {
+                                logical.failure.get_or_insert(failure);
+                                None
+                            }
                         }
-                    }
+                    };
+                    planned_slots.push(slot);
                 }
             }
             let mut parent_outputs = Vec::with_capacity(count);
@@ -1772,9 +1783,11 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut retry = retry.filter(|_| !multi);
             let mut physical_sources = task.owned_paths;
             let mut superseded_candidates = HashSet::new();
-            for (index, (((logical, checkpoint), retry_slot), &original_id)) in
-                task.inputs.into_iter().zip(retained.drain(..)).zip(retry_slots).zip(&ids).enumerate()
-            {
+            for (index, (logical, &original_id)) in task.inputs.into_iter().zip(&ids).enumerate() {
+                let checkpoint = retained.get(index).copied().flatten();
+                let retry_slot = retry_slots.get(index).copied().flatten();
+                let previous = report_previous.get(index).copied().flatten();
+                let planned_slot = planned_slots.get(index).and_then(Option::as_deref);
                 let mut id = original_id;
                 if multi {
                     this.notify(|| Event::Started {
@@ -1829,7 +1842,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         // result into a receipt for the changed dependencies.
                         Some(if cleared { RetryOutput::Recreate(slot) }
                              else { RetryOutput::Existing(slot) })
-                    } else { planned_slots[index].as_deref().map(RetryOutput::Recreate) };
+                    } else { planned_slot.map(RetryOutput::Recreate) };
                     this.execute_input(
                         logical,
                         id,
@@ -1878,7 +1891,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                 .and_then(|mut checkpoint| {
                                     let state = InputCheckpoint::report_state(&executed.input,
                                         &executed.result, retry_output.as_deref(),
-                                        report_previous[index], index + 1, report_count)?;
+                                        previous, index + 1, report_count)?;
                                     checkpoint.install_report(Some(state));
                                     Some(checkpoint)
                                 })
@@ -1968,8 +1981,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         .as_ref()
                         .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
                     {
-                        result.volume_completeness =
-                            Some(VolumeCompleteness::Missing.as_str().to_owned());
+                        result.volume_completeness = Some(VolumeCompleteness::Missing);
                     }
                 }
                 if result.failure.is_none() {
@@ -1979,13 +1991,13 @@ impl<'run, O: Observer> Run<'run, O> {
                     .is_some_and(|previous| previous.same_report_input(&input));
                 let state_previous = if replacement_checkpoint.is_some() {
                     replacement_checkpoint.as_ref().filter(|_| replacement_matches)
-                } else { report_previous[index].or(checkpoint).or(retry_slot) };
+                } else { previous.or(checkpoint).or(retry_slot) };
                 let keeps_replaced = replacement_checkpoint.is_some() && !replacement_matches;
                 if report_enabled && (multi || result.failure.is_some() || keeps_replaced) {
                     // An ordinary successful input cannot be retried from its
                     // own receipt. Nested blockers keep their own checkpoints.
                     let mut state = InputCheckpoint::report_state(&input, &result,
-                        planned_output.as_deref().or(planned_slots[index].as_deref()),
+                        planned_output.as_deref().or(planned_slot),
                         state_previous, index + 1, report_count);
                     if result.retained && result.output.is_none() && checkpoint.is_some_and(|checkpoint| checkpoint.has_output()) {
                         InputCheckpoint::clear_report_output(&mut state);
@@ -2023,7 +2035,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     let mut checkpoint = InputCheckpoint::create(&owner_path, Arc::clone(input),
                         result, &generations, carrier.as_deref())?;
                     checkpoint.install_report(report_states.get_mut(index).and_then(Option::take));
-                    checkpoint.set_planned_output(planned_slots[index].as_deref());
+                    checkpoint.set_planned_output(planned_slots.get(index).and_then(Option::as_deref));
                     checkpoint.set_password_signature(|| candidates.signature(&input.entry_path));
                     Some(checkpoint)
                 }).collect()
@@ -2547,7 +2559,7 @@ impl<'run, O: Observer> Run<'run, O> {
     /// arrived first volume can change its carrier; only a unique old carrier
     /// reached by its physical sources supplies that task's recovery scope.
     fn select_checkpoints(&self, carrier: &Path, inputs: &[LogicalInput]) -> Vec<Option<&InputCheckpoint>> {
-        if self.checkpoints.is_empty() { return vec![None; inputs.len()]; }
+        if self.checkpoints.is_empty() { return Vec::new(); }
         let carrier = path_key(&carrier.to_string_lossy());
         let group = self.checkpoints.get_key_value(carrier.as_str()).or_else(|| {
             let index = self.checkpoint_anchor_index();
@@ -2948,7 +2960,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         Ok(()) => {
                             result.source_paths =
                                 input.physical_paths().map(PathBuf::from).collect();
-                            result.volume_completeness = Some("complete".to_owned());
+                            result.volume_completeness = Some(VolumeCompleteness::Complete);
                         }
                         Err(error) => {
                             result.failure =
@@ -3434,11 +3446,7 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
         offset: extent.map_or(0, |extent| extent.start),
         end_offset: extent.and_then(|extent| extent.end),
         volume_attempts: None,
-        volume_completeness: input
-            .analysis
-            .volume_completeness
-            .map(VolumeCompleteness::as_str)
-            .map(str::to_owned),
+        volume_completeness: input.analysis.volume_completeness,
         source_paths,
         password: None,
         discovery_source: source,
@@ -3446,7 +3454,7 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
         retained: false,
         recovered_complete_files: 0,
 
-         scan_layout: super::ScanLayout::from_input(input),
+        scan_layout: super::ScanLayout::default(),
     }
 }
 
@@ -4113,7 +4121,12 @@ impl RequestClaim {
     }
 
     fn overlaps(&self, other: &Self) -> bool {
-        if self.objects.keys().any(|id| other.objects.contains_key(id)) {
+        let (few_objects, many_objects) = if self.objects.len() <= other.objects.len() {
+            (&self.objects, &other.objects)
+        } else {
+            (&other.objects, &self.objects)
+        };
+        if few_objects.keys().any(|id| many_objects.contains_key(id)) {
             return true;
         }
         let (small, large) = if self.paths.len() <= other.paths.len() {
@@ -4226,7 +4239,13 @@ impl Engine {
             }
         }
         if !changed { return; }
-        if claim.paths.is_empty() { state.requests.remove(&request); }
+        if claim.paths.is_empty() {
+            state.requests.remove(&request);
+            crate::collections::trim_map(&mut state.requests);
+        } else {
+            crate::collections::trim_map(&mut claim.paths);
+            crate::collections::trim_map(&mut claim.objects);
+        }
         let waiters = state.released(&LeaseBlocker::Request(request));
         drop(state);
         for waiter in waiters { waiter.wake(); }
@@ -4334,17 +4353,11 @@ impl Leases {
     async fn reserve_request_async(
         self: &Arc<Self>, id: u64, origin: Origin, paths: &[PathBuf], cancel: &Cancellation,
     ) -> io::Result<RequestClaimGuard> {
-        let inputs = paths.iter().map(|path| ClaimedInput::new(path))
-            .collect::<io::Result<Vec<_>>>()?;
-        self.admit_request(id, origin, inputs, cancel).await?;
-        Ok(RequestClaimGuard { registry: Arc::clone(self), id })
-    }
-
-    async fn admit_request(
-        self: &Arc<Self>, id: u64, origin: Origin, inputs: Vec<ClaimedInput>, cancel: &Cancellation,
-    ) -> io::Result<()> {
         let mut claim = RequestClaim::new(origin);
-        for input in inputs { claim.add(input); }
+        for path in paths {
+            cancel.check_io()?;
+            claim.add(ClaimedInput::new(path)?);
+        }
         let mut claim = Some(claim);
         let mut waiting = LeaseWait { owner: self, id: None };
         let mut subscription = None;
@@ -4362,7 +4375,7 @@ impl Leases {
             }
             if blockers.is_empty() {
                 state.requests.insert(id, claim.take().unwrap());
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(Ok(RequestClaimGuard { registry: Arc::clone(self), id }));
             }
             let waiter = *waiting.id.get_or_insert_with(|| {
                 state.next_waiter += 1;

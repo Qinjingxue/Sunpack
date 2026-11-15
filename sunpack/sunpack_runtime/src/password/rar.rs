@@ -20,6 +20,7 @@ use hmac::{Hmac, Mac};
 use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
+use std::borrow::Cow;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
@@ -107,7 +108,7 @@ pub(crate) fn rar_fast_verify_passwords_from_ranges(
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let parsed = parse_ranges(ranges, sessions)?;
+    let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
     verify_prepared(ranges_key("rar", &parsed)?, candidates, || {
         prepare_rar(|offset, len, field| read_ranges_at_field(&parsed, offset, len, field))
             .map(PasswordContext::Rar)
@@ -136,28 +137,62 @@ fn prepare_rar(
     if data.starts_with(RAR5_SIGNATURE) {
         return prepare_rar5_stream(&mut read_at);
     }
-    if data.starts_with(RAR4_SIGNATURE) {
-        if let Some(header) = read_rar4_header_at(&data, RAR4_SIGNATURE.len() as u64, &mut read_at)?
-        {
-            if header.len() + RAR4_SIGNATURE.len() > data.len() {
-                data = read_at(0, header.len() + RAR4_SIGNATURE.len(), "rar4.main_header")?;
-            }
-            if let Some(main) = rar4_plain_main_header(&data) {
-                return prepare_rar4_file_data(&data, main, &mut read_at)
-                    .map(|material| RarPasswordContext { material });
-            }
-            // RAR4's encrypted header length is a u16; read one maximum-width
-            // header plus salt, independent of archive or payload size.
-            if let Some(main) = parse_rar4_block(&data, RAR4_SIGNATURE.len()) {
-                data = read_at(
-                    0,
-                    main.next_offset.saturating_add(8 + 65536),
-                    "rar4.encrypted_header",
-                )?;
-            }
+    if !data.starts_with(RAR4_SIGNATURE) {
+        if data.starts_with(b"Rar!") {
+            return Err(ReadFault::short_read(
+                "read_record",
+                0,
+                RAR5_SIGNATURE.len(),
+                data.len(),
+                data.len() as u64,
+            )
+            .with_field("rar.signature", FieldLocation::Head)
+            .into());
         }
+        return Err(PreparedStatus::new(
+            "unsupported_method",
+            "rar signature not found",
+        ));
     }
-    prepare_rar_data(&data)
+    let main_offset = RAR4_SIGNATURE.len() as u64;
+    let main = read_rar4_header_at(&data, main_offset, &mut read_at)?
+        .and_then(|header| parse_rar4_block(&header, 0))
+        .filter(|block| block.header_type == 0x73)
+        .ok_or_else(|| {
+            PreparedStatus::new(
+                "unknown_needs_final_verifier",
+                "rar4 encrypted headers require a CRC-valid plaintext main header",
+            )
+        })?;
+    let next = main_offset + main.next_offset as u64;
+    let material = if main.flags & RAR4_MAIN_HEADER_PASSWORD == 0 {
+        prepare_rar4_file_data(&data, next, &mut read_at)?
+    } else {
+        // One header plus salt covers the first verification block.
+        let (mut encrypted, available_end) = if data.len() < RAR_INITIAL_PREFIX_SCAN {
+            let available_end = data.len() as u64;
+            data.drain(..next.min(available_end) as usize);
+            (data, available_end)
+        } else {
+            let encrypted = read_at(next, 8 + 65536, "rar4.encrypted_header")?;
+            let available_end = next + encrypted.len() as u64;
+            (encrypted, available_end)
+        };
+        if encrypted.len() < 24 {
+            return Err(ReadFault::short_read(
+                "read_record",
+                next,
+                24,
+                encrypted.len(),
+                available_end,
+            )
+            .with_field("rar4.encrypted_header.salt_block", FieldLocation::Head)
+            .into());
+        }
+        encrypted.truncate(8 + ((encrypted.len() - 8) & !0x0f));
+        RarPasswordMaterial::Header(encrypted)
+    };
+    Ok(RarPasswordContext { material })
 }
 
 fn prepare_rar5_stream(
@@ -191,20 +226,19 @@ fn prepare_rar5_stream(
         if crc32(&header[4..]) != le_u32(&header, 0).ok_or_else(unknown)? {
             return Err(PreparedStatus::new("damaged", "RAR5 header CRC mismatch"));
         }
-        let (kind, after_type) = read_vint(&header, after_size).ok_or_else(unknown)?;
-        let (flags, mut position) = read_vint(&header, after_type).ok_or_else(unknown)?;
-        if flags & 1 != 0 {
-            position = read_vint(&header, position).ok_or_else(unknown)?.1;
-        }
-        let data_size = if flags & 2 != 0 {
-            read_vint(&header, position).ok_or_else(unknown)?.0
-        } else {
-            0
+        let fields = rar5_common_fields(&header, after_size).ok_or_else(unknown)?;
+        let encryption = match fields.kind {
+            4 => parse_rar5_encryption_body(&header, fields.body, length, false, false),
+            2 | 3 if fields.extra_size != 0 => parse_rar5_file_encryption_extra(
+                &header,
+                fields.body,
+                length,
+                fields.extra_size,
+                fields.kind == 3,
+            ),
+            _ => None,
         };
-        let mut prefixed = Vec::with_capacity(8 + header.len());
-        prefixed.extend_from_slice(RAR5_SIGNATURE);
-        prefixed.extend_from_slice(&header);
-        if let Some(encryption) = find_rar5_encryption_header(&prefixed) {
+        if let Some(encryption) = encryption {
             if !encryption.has_password_check {
                 return Err(unknown());
             }
@@ -212,7 +246,7 @@ fn prepare_rar5_stream(
                 material: RarPasswordMaterial::Rar5(encryption),
             });
         }
-        if kind == 5 {
+        if fields.kind == 5 {
             return Err(PreparedStatus::new(
                 "not_required",
                 "RAR5 headers contain no encrypted entries",
@@ -220,24 +254,14 @@ fn prepare_rar5_stream(
         }
         offset = offset
             .checked_add(length as u64)
-            .and_then(|value| value.checked_add(data_size))
+            .and_then(|value| value.checked_add(fields.data_size))
             .ok_or_else(unknown)?;
     }
 }
 
-/// A plaintext RAR4 main header without MHD_PASSWORD: file headers are
-/// readable and only per-file `-p` encryption is possible.
-fn rar4_plain_main_header(data: &[u8]) -> Option<Rar4Block> {
-    if !data.starts_with(RAR4_SIGNATURE) {
-        return None;
-    }
-    parse_rar4_block(data, RAR4_SIGNATURE.len())
-        .filter(|block| block.header_type == 0x73 && block.flags & RAR4_MAIN_HEADER_PASSWORD == 0)
-}
-
 enum Rar4EncryptionScan {
     /// First encrypted file whose stored payload can prove a password.
-    Encrypted { offset: u64, header: Vec<u8> },
+    Encrypted { data_offset: u64, probe: Option<Rar4DataProbe> },
     /// The final ENDARC was reached and no file header is encrypted.
     NotEncrypted,
     /// Encryption cannot be decided from bounded header reads.
@@ -249,10 +273,9 @@ enum Rar4EncryptionScan {
 /// already-read prefix cost no I/O at all.
 fn scan_rar4_file_encryption(
     prefix: &[u8],
-    main: Rar4Block,
+    mut offset: u64,
     read_at: &mut impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, ReadFault>,
 ) -> Result<Rar4EncryptionScan, ReadFault> {
-    let mut offset = main.next_offset as u64;
     let mut saw_unprovable_encrypted = false;
     loop {
         let Some(header) = read_rar4_header_at(prefix, offset, read_at)? else {
@@ -261,21 +284,21 @@ fn scan_rar4_file_encryption(
         let Some(block) = parse_rar4_block(&header, 0) else {
             return Ok(Rar4EncryptionScan::Unknown);
         };
-        let mut data_size = (block.next_offset - block.header_end) as u64;
+        let data_size = (block.next_offset - block.header_end) as u64;
+        let Some(data_offset) = offset.checked_add(block.header_end as u64) else {
+            return Ok(Rar4EncryptionScan::Unknown);
+        };
         match block.header_type {
             0x74 => {
-                if block.flags & RAR4_FILE_LARGE != 0 {
-                    let Some(high) = header.get(32..36) else {
-                        return Ok(Rar4EncryptionScan::Unknown);
-                    };
-                    data_size |= (u32::from_le_bytes(high.try_into().unwrap()) as u64) << 32;
-                }
                 if block.flags & RAR4_FILE_PASSWORD != 0 {
                     // Directories and empty files carry no payload to verify.
                     if data_size > 0
                         && block.flags & RAR4_FILE_DIRECTORY_MASK != RAR4_FILE_DIRECTORY_MASK
                     {
-                        return Ok(Rar4EncryptionScan::Encrypted { offset, header });
+                        return Ok(Rar4EncryptionScan::Encrypted {
+                            data_offset,
+                            probe: parse_rar4_file_probe(&header, 0, block),
+                        });
                     }
                     saw_unprovable_encrypted = true;
                 }
@@ -291,10 +314,7 @@ fn scan_rar4_file_encryption(
             }
             _ => {}
         }
-        let Some(next) = offset
-            .checked_add(header.len() as u64)
-            .and_then(|value| value.checked_add(data_size))
-        else {
+        let Some(next) = data_offset.checked_add(data_size) else {
             return Ok(Rar4EncryptionScan::Unknown);
         };
         offset = next;
@@ -302,11 +322,11 @@ fn scan_rar4_file_encryption(
 }
 
 /// Return exactly one declared RAR4 block header, or `None` at end of input.
-fn read_rar4_header_at(
-    prefix: &[u8],
+fn read_rar4_header_at<'a>(
+    prefix: &'a [u8],
     offset: u64,
     read_at: &mut impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, ReadFault>,
-) -> Result<Option<Vec<u8>>, ReadFault> {
+) -> Result<Option<Cow<'a, [u8]>>, ReadFault> {
     // Serve the header from the prefix whenever it is fully inside it.
     let in_prefix = usize::try_from(offset).ok().and_then(|start| {
         Some((
@@ -320,7 +340,7 @@ fn read_rar4_header_at(
             return Ok(None);
         }
         if let Some(header) = prefix.get(start..start + header_size) {
-            return Ok(Some(header.to_vec()));
+            return Ok(Some(Cow::Borrowed(header)));
         }
     }
     let mut buffer = read_at(offset, RAR4_HEADER_READ_HINT, "rar4.block_header")?;
@@ -338,16 +358,16 @@ fn read_rar4_header_at(
         }
     }
     buffer.truncate(header_size);
-    Ok(Some(buffer))
+    Ok(Some(Cow::Owned(buffer)))
 }
 
 fn prepare_rar4_file_data(
     prefix: &[u8],
-    main: Rar4Block,
+    first_block: u64,
     read_at: &mut impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, ReadFault>,
 ) -> Result<RarPasswordMaterial, PreparedStatus> {
-    let (offset, header) = match scan_rar4_file_encryption(prefix, main, read_at)? {
-        Rar4EncryptionScan::Encrypted { offset, header } => (offset, header),
+    let (data_offset, probe) = match scan_rar4_file_encryption(prefix, first_block, read_at)? {
+        Rar4EncryptionScan::Encrypted { data_offset, probe } => (data_offset, probe),
         Rar4EncryptionScan::NotEncrypted => {
             return Err(PreparedStatus::new(
                 "not_required",
@@ -361,14 +381,12 @@ fn prepare_rar4_file_data(
             ))
         }
     };
-    let probe = parse_rar4_block(&header, 0)
-        .and_then(|block| parse_rar4_file_probe(&header, 0, block))
-        .ok_or_else(|| {
+    let probe = probe.ok_or_else(|| {
             PreparedStatus::new(
                 "unknown_needs_final_verifier",
                 "rar3/rar4 encrypted file header is not supported by the fast verifier",
             )
-        })?;
+    })?;
     if probe.method != 0 {
         return Err(PreparedStatus::new(
             "unknown_needs_final_verifier",
@@ -387,9 +405,6 @@ fn prepare_rar4_file_data(
             "rar3/rar4 -p stored data is not AES block aligned",
         ));
     }
-    let data_offset = offset
-        .checked_add(probe.data_offset as u64)
-        .ok_or_else(|| PreparedStatus::new("damaged", "RAR4 data range overflow"))?;
     let mut encrypted = Spool::default();
     let mut consumed = 0usize;
     while consumed < probe.pack_size {
@@ -433,10 +448,7 @@ enum RarPasswordMaterial {
         encrypted: Blob,
         probe: Rar4DataProbe,
     },
-    Header {
-        salt: [u8; 8],
-        encrypted: Vec<u8>,
-    },
+    Header(Vec<u8>),
 }
 
 impl RarPasswordContext {
@@ -444,7 +456,7 @@ impl RarPasswordContext {
         match &self.material {
             RarPasswordMaterial::Rar5(_) => std::mem::size_of::<Rar5EncryptionHeader>(),
             RarPasswordMaterial::Stored { encrypted, .. } => encrypted.len(),
-            RarPasswordMaterial::Header { encrypted, .. } => encrypted.len(),
+            RarPasswordMaterial::Header(encrypted) => encrypted.capacity(),
         }
     }
 
@@ -454,7 +466,8 @@ impl RarPasswordContext {
             RarPasswordMaterial::Stored { encrypted, probe } => {
                 verify_rar4_stored_data(encrypted, candidates, probe)
             }
-            RarPasswordMaterial::Header { salt, encrypted } => {
+            RarPasswordMaterial::Header(encrypted) => {
+                let (salt, encrypted) = encrypted.split_at(8);
                 let cancellation = Cancellation::current();
                 let matched = (|| {
                     let matches = |password: &Arc<str>| {
@@ -490,74 +503,6 @@ impl RarPasswordContext {
     }
 }
 
-fn prepare_rar_data(data: &[u8]) -> Result<RarPasswordContext, PreparedStatus> {
-    let material = if data.starts_with(RAR5_SIGNATURE) {
-        let header = find_rar5_encryption_header(data).ok_or_else(|| {
-            PreparedStatus::new(
-                "unknown_needs_final_verifier",
-                "rar5 password check header not found",
-            )
-        })?;
-        if !header.has_password_check {
-            return Err(PreparedStatus::new(
-                "unknown_needs_final_verifier",
-                "rar5 encryption header has no password check",
-            ));
-        }
-        RarPasswordMaterial::Rar5(header)
-    } else if data.starts_with(RAR4_SIGNATURE) {
-        prepare_rar4(data)?
-    } else if data.starts_with(b"Rar!") {
-        return Err(ReadFault::short_read(
-            "read_record",
-            0,
-            RAR5_SIGNATURE.len(),
-            data.len(),
-            data.len() as u64,
-        )
-        .with_field("rar.signature", FieldLocation::Head)
-        .into());
-    } else {
-        return Err(PreparedStatus::new(
-            "unsupported_method",
-            "rar signature not found",
-        ));
-    };
-    Ok(RarPasswordContext { material })
-}
-
-/// RAR4 `-hp` material.  Plaintext main headers are routed to
-/// `prepare_rar4_file_data` before this point.
-fn prepare_rar4(data: &[u8]) -> Result<RarPasswordMaterial, PreparedStatus> {
-    let main = parse_rar4_block(data, RAR4_SIGNATURE.len())
-        .filter(|block| block.header_type == 0x73)
-        .filter(|block| block.flags & RAR4_MAIN_HEADER_PASSWORD != 0)
-        .ok_or_else(|| {
-            PreparedStatus::new(
-                "unknown_needs_final_verifier",
-                "rar4 encrypted headers require a CRC-valid plaintext main header",
-            )
-        })?;
-    let offset = main.next_offset;
-    let salt_block = data.get(offset..offset.saturating_add(24)).ok_or_else(|| {
-        ReadFault::short_read(
-            "read_record",
-            offset as u64,
-            24,
-            data.len().saturating_sub(offset),
-            data.len() as u64,
-        )
-        .with_field("rar4.encrypted_header.salt_block", FieldLocation::Head)
-    })?;
-    let salt = salt_block[..8].try_into().unwrap();
-    let encrypted = &data[offset + 8..];
-    let len = encrypted.len() & !0x0f;
-    Ok(RarPasswordMaterial::Header {
-        salt,
-        encrypted: encrypted[..len].to_vec(),
-    })
-}
-
 #[derive(Clone, Copy)]
 struct Rar4Block {
     header_type: u8,
@@ -571,7 +516,6 @@ struct Rar4DataProbe {
     pack_size: usize,
     unpacked_size: usize,
     file_crc: u32,
-    data_offset: usize,
     salt: Option<[u8; 8]>,
 }
 
@@ -672,12 +616,8 @@ fn parse_rar4_file_probe(data: &[u8], offset: usize, block: Rar4Block) -> Option
     if block.flags & RAR4_FILE_LARGE == 0 && unpacked_low == u32::MAX as u64 {
         return None;
     }
-    let pack_size = usize::try_from(crate::formats::rar::rar4_data_size(
-        &data[offset..block.header_end],
-    )?)
-    .ok()?;
+    let pack_size = block.next_offset - block.header_end;
     let unpacked_size = usize::try_from((unpacked_high << 32) | unpacked_low).ok()?;
-    let data_offset = block.header_end;
     let salt = if block.flags & RAR4_FILE_SALT != 0 {
         let salt_end = name_end.checked_add(8)?;
         if salt_end > block.header_end {
@@ -692,7 +632,6 @@ fn parse_rar4_file_probe(data: &[u8], offset: usize, block: Rar4Block) -> Option
         pack_size,
         unpacked_size,
         file_crc,
-        data_offset,
         salt,
     })
 }
@@ -946,16 +885,9 @@ pub(crate) fn rar5_archive_encryption_header(data: &[u8]) -> Option<(usize, usiz
     let header = data.get(..end)?;
     if crc32(&header[offset + 4..]) != le_u32(header, offset)? { return None; }
     let (_, start) = read_vint(header, offset + 4)?;
-    let (kind, cursor) = read_vint(header, start)?;
-    if kind != 4 { return None; }
-    let (flags, mut cursor) = read_vint(header, cursor)?;
-    let extra = if flags & 1 != 0 {
-        let (size, next) = read_vint(header, cursor)?;
-        cursor = next;
-        usize::try_from(size).ok()?
-    } else { 0 };
-    if flags & 2 != 0 { cursor = read_vint(header, cursor)?.1; }
-    (cursor <= end.checked_sub(extra)?).then_some((cursor, end))
+    let fields = rar5_common_fields(header, start)?;
+    let extra = usize::try_from(fields.extra_size).ok()?;
+    (fields.kind == 4 && fields.body <= end.checked_sub(extra)?).then_some((fields.body, end))
 }
 
 pub(crate) fn rar5_encryption_identity(data: &[u8], body: usize, end: usize) -> Option<Rar5EncryptionIdentity> {
@@ -973,57 +905,32 @@ struct Rar5EncryptionHeader {
     password_check: [u8; 8],
 }
 
-fn find_rar5_encryption_header(data: &[u8]) -> Option<Rar5EncryptionHeader> {
-    if let Some((body, end)) = rar5_archive_encryption_header(data) {
-        return parse_rar5_encryption_body(data, body, end, false, false);
-    }
-    let mut offset = RAR5_SIGNATURE.len();
-    while offset + 6 <= data.len() {
-        let stored_crc = le_u32(data, offset)?;
-        let crc_start = offset + 4;
-        let (header_size, after_size) = read_vint(data, crc_start)?;
-        let header_size_vint_len = after_size.checked_sub(crc_start)?;
-        let total_crc_bytes = header_size_vint_len.checked_add(header_size as usize)?;
-        let crc_end = crc_start.checked_add(total_crc_bytes)?;
-        if crc_end > data.len() {
-            return None;
-        }
-        if crc32(&data[crc_start..crc_end]) != stored_crc {
-            return None;
-        }
-        let (header_type, after_type) = read_vint(data, after_size)?;
-        let (header_flags, mut cursor) = read_vint(data, after_type)?;
-        let extra_area_size = if header_flags & 0x0001 != 0 {
-            let (value, next) = read_vint(data, cursor)?;
-            cursor = next;
-            value
-        } else {
-            0
-        };
-        let data_area_size = if header_flags & 0x0002 != 0 {
-            let (value, next) = read_vint(data, cursor)?;
-            cursor = next;
-            value
-        } else {
-            0
-        };
-        if header_type == 4 {
-            return parse_rar5_encryption_body(data, cursor, crc_end, false, false);
-        }
-        if matches!(header_type, 2 | 3) && extra_area_size != 0 {
-            if let Some(header) = parse_rar5_file_encryption_extra(
-                data,
-                cursor,
-                crc_end,
-                extra_area_size,
-                header_type == 3,
-            ) {
-                return Some(header);
-            }
-        }
-        offset = crc_end.checked_add(usize::try_from(data_area_size).ok()?)?;
-    }
-    None
+struct Rar5CommonFields {
+    kind: u64,
+    flags: u64,
+    extra_size: u64,
+    data_size: u64,
+    body: usize,
+}
+
+fn rar5_common_fields(header: &[u8], start: usize) -> Option<Rar5CommonFields> {
+    let (kind, cursor) = read_vint(header, start)?;
+    let (flags, mut body) = read_vint(header, cursor)?;
+    let extra_size = if flags & 1 != 0 {
+        let (size, next) = read_vint(header, body)?;
+        body = next;
+        size
+    } else {
+        0
+    };
+    let data_size = if flags & 2 != 0 {
+        let (size, next) = read_vint(header, body)?;
+        body = next;
+        size
+    } else {
+        0
+    };
+    Some(Rar5CommonFields { kind, flags, extra_size, data_size, body })
 }
 
 fn parse_rar5_file_encryption_extra(
@@ -1356,13 +1263,10 @@ fn walk_rar5_encrypted_headers(
         if crc32(&full[4..]) != stored_crc {
             return Ok(proof);
         }
-        let Some((header_type, after_type)) = read_vint(&full, after_size) else {
+        let Some(fields) = rar5_common_fields(&full, after_size) else {
             return Ok(proof);
         };
-        let Some((header_flags, mut field_cursor)) = read_vint(&full, after_type) else {
-            return Ok(proof);
-        };
-        if !matches!(header_type, 1..=5) && header_flags & 0x0004 == 0 {
+        if !matches!(fields.kind, 1..=5) && fields.flags & 0x0004 == 0 {
             return Ok(proof);
         }
         if proof.main_volume.is_none() {
@@ -1377,26 +1281,11 @@ fn walk_rar5_encrypted_headers(
                 return Ok(proof);
             }
         }
-        if header_flags & 0x0001 != 0 {
-            let Some((_, after_extra)) = read_vint(&full, field_cursor) else {
-                return Ok(proof);
-            };
-            field_cursor = after_extra;
-        }
-        let data_size = if header_flags & 0x0002 != 0 {
-            let Some((value, after_data)) = read_vint(&full, field_cursor) else {
-                return Ok(proof);
-            };
-            field_cursor = after_data;
-            value
-        } else {
-            0
-        };
-        let next = next_header_offset.checked_add(data_size).ok_or_else(|| {
+        let next = next_header_offset.checked_add(fields.data_size).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "RAR5 data offset overflow")
         })?;
-        if header_type == 5 {
-            let end_flags = read_vint(&full, field_cursor)
+        if fields.kind == 5 {
+            let end_flags = read_vint(&full, fields.body)
                 .map(|(value, _)| value)
                 .unwrap_or(0);
             return Ok(RarTerminalProof {

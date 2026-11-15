@@ -1306,9 +1306,14 @@ impl DirectoryEvidence {
                 self.suffixes.push(suffix);
             }
             // A walk appends nodes in reverse physical order. Existing nodes
-            // are disjoint from the newly visited path.
+            // are disjoint from the newly visited path. Consecutive ZIPs in a
+            // carrier usually append after the preceding directories.
             self.suffixes[first_new..].reverse();
-            if first_new != 0 {
+            if first_new != 0
+                && self.suffixes.get(first_new).is_some_and(|first| {
+                    first.start < self.suffixes[first_new - 1].start
+                })
+            {
                 self.suffixes.sort_unstable_by_key(|item| item.start);
             }
             suffix

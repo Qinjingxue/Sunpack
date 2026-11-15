@@ -24,17 +24,12 @@ fn zip_scan_honors_utf8_filename_flag() {
     .concat();
     let contents = [local, central, eocd].concat();
     let path = temp_file("zip_names", &contents);
-    let reader = ZipLogicalReader::open(
-        vec![Segment::Range {
-            path: path.to_string_lossy().to_string(),
-            start: 0,
-            len: contents.len() as u64,
-        }],
-        false,
-    )
-    .unwrap();
-
-    assert_eq!(scan_zip_names(&reader).unwrap(), None);
+    let archive = ArchiveInput::file(
+        path.to_string_lossy().into_owned(),
+        "zip".into(),
+        "zip_names".into(),
+    );
+    assert_eq!(analyze_zip_filename_encoding(&archive).unwrap(), None);
     let _ = fs::remove_file(path);
 }
 

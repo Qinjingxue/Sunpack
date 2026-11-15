@@ -174,6 +174,8 @@ def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package
 def test_encrypted_rar5_same_stem_keeps_independent_sets_and_singleton(package, tmp_path):
     # Same password and stem cannot distinguish independent sets. The single
     # set test cannot catch cross-set merging during cached password retry.
+    # Admit the smaller split members to the nested scan as well as the singleton.
+    package.configure(embedded_scan={"recursive_candidate_ratio": 0.01})
     inputs = tmp_path / "inputs"
     inputs.mkdir()
     cases, groups = [], []

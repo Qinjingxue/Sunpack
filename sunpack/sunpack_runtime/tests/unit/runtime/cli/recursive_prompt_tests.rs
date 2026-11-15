@@ -608,13 +608,14 @@ fn scan_json_keeps_main_sparse_fields_without_internal_failure_evidence() {
 #[test]
 fn scan_sparse_layout_is_shared_by_text_and_json() {
     use crate::io::archive_state::{AnalysisOrigin, ArchiveInput, InputExtent, InputPart, InputRole, OpenMode};
+    use crate::io::archive_state::VolumeCompleteness::{Complete, Missing, Unknown};
     for (mode, origin, start, complete, show_range, show_parts, public_complete) in [
-        (OpenMode::FileRange, AnalysisOrigin::Embedded, 64, "complete", true, false, None),
-        (OpenMode::FileRange, AnalysisOrigin::Embedded, 0, "complete", true, false, None),
-        (OpenMode::ConcatRanges, AnalysisOrigin::Embedded, 0, "complete", true, false, None),
-        (OpenMode::NativeVolumes, AnalysisOrigin::Relations, 0, "complete", false, true, Some("complete")),
-        (OpenMode::NativeVolumes, AnalysisOrigin::Relations, 0, "unknown", false, true, None),
-        (OpenMode::File, AnalysisOrigin::Plain, 0, "missing", false, true, Some("missing")),
+        (OpenMode::FileRange, AnalysisOrigin::Embedded, 64, Complete, true, false, None),
+        (OpenMode::FileRange, AnalysisOrigin::Embedded, 0, Complete, true, false, None),
+        (OpenMode::ConcatRanges, AnalysisOrigin::Embedded, 0, Complete, true, false, None),
+        (OpenMode::NativeVolumes, AnalysisOrigin::Relations, 0, Complete, false, true, Some("complete")),
+        (OpenMode::NativeVolumes, AnalysisOrigin::Relations, 0, Unknown, false, true, None),
+        (OpenMode::File, AnalysisOrigin::Plain, 0, Missing, false, true, Some("missing")),
     ] {
         let mut descriptor = ArchiveInput::file("carrier.bin".into(), "zip".into(), "carrier".into());
         descriptor.mode = mode;
@@ -627,7 +628,7 @@ fn scan_sparse_layout_is_shared_by_text_and_json() {
             let mut archive = report_archive("carrier.bin", start);
             archive.end_offset = Some(100);
             archive.source_paths.push("carrier.bin".into());
-            archive.volume_completeness = Some(complete.into());
+            archive.volume_completeness = Some(complete);
             archive.scan_layout = crate::pipeline::ScanLayout::from_input(&descriptor);
             let mut outcome = Outcome::default();
             outcome.archives.push(archive);

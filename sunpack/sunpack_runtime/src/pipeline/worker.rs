@@ -5,7 +5,7 @@ use super::{ResourceWait, WorkerUpdates};
 #[cfg(test)]
 pub(crate) use tests::coalesced_wait_batches;
 use crate::core::config::{ProcessMode, WorkerConfig};
-use crate::io::cancellation::Cancellation;
+use crate::io::cancellation::{cancelled_io, Cancellation};
 use crate::scan::worker_event::{NativeWorkerResultAccumulator, WorkerFrame};
 use crate::scan::worker_wire::{encode_worker_frame, NativeWorkerFrameDecoder};
 use serde_json::{json, Value};
@@ -371,11 +371,7 @@ impl Process {
 
     pub(super) fn pid(&self) -> u32 { self.shared.state.lock().unwrap().pid }
 
-    pub(super) fn thread_capacity(&self) -> usize {
-        self.shared.state.lock().unwrap().thread_capacity.max(1)
-    }
-
-    pub(super) async fn ready(&self, cancellation: &Cancellation) -> io::Result<()> {
+    pub(super) async fn ready(&self, cancellation: &Cancellation) -> io::Result<usize> {
         {
             let state = self.shared.state.lock().unwrap();
             if let Some(reason) = &state.closed {
@@ -383,7 +379,8 @@ impl Process {
                 return Err(reason.error());
             }
             if state.ready {
-                return cancellation.check_io();
+                cancellation.check_io()?;
+                return Ok(state.thread_capacity.max(1));
             }
         }
         // Register before checking cancellation: even a cancellation between
@@ -408,7 +405,7 @@ impl Process {
                     // concurrent cancellations must not both count each other
                     // as a surviving borrower and skip the final cleanup wait.
                     state.ready_waiters.remove(&waiter.id);
-                    return Poll::Ready(cancellation.check_io());
+                    return Poll::Ready(Err(cancelled_io()));
                 }
                 // The last borrower owns cancellation cleanup, but not a host
                 // slot. Keep its future until spawn/child reaping completes so
@@ -421,7 +418,7 @@ impl Process {
                     return Poll::Ready(Err(reason.error()));
                 }
                 if state.ready {
-                    return Poll::Ready(Ok(()));
+                    return Poll::Ready(Ok(state.thread_capacity.max(1)));
                 }
             }
             *state.ready_waiters.get_mut(&waiter.id).unwrap() = Some(cx.waker().clone());

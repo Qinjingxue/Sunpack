@@ -1435,8 +1435,8 @@ impl Observer for Progress {
         Ok(())
     }
 
-    fn outputs_finished(&self, paths: &[String]) -> io::Result<()> {
-        self.watch.finish_external_outputs(paths)
+    fn outputs_finished(&self, paths: impl FnOnce() -> Vec<String>) -> io::Result<()> {
+        self.watch.finish_external_outputs(&paths())
     }
 
     fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
@@ -2096,7 +2096,7 @@ fn report_scan(
                 if let Some(failure) = &entry.failure {
                     if !(matches!(failure.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword) && entry.password.is_none())
                         && !(failure.kind == FailureKind::MissingVolume
-                            && entry.volume_completeness.as_deref() == Some("missing"))
+                            && entry.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing))
                     {
                         let error = language.translate("cli.scan.error", &[
                             ("error", &failure_message(failure, language)),

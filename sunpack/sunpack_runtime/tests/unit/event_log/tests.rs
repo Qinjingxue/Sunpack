@@ -40,7 +40,11 @@ fn archive_diagnostics_do_not_expand_or_change_shared_recovery_receipts() {
                 "input_count":count,"had_checkpoints":true,"retry_output":true}
         })).unwrap();
         let event = json!({"event":"archive_failure_evidence","path":"C:/input.zip"});
-        let payload = HistoryEvent { fields: event.as_object().unwrap(), failure: &failure };
+        let payload = EventField {
+            fields: event.as_object().unwrap(),
+            name: "failure",
+            value: DiagnosticFailure(&failure),
+        };
         let output: Value = rmp_serde::from_slice(&rmp_serde::to_vec_named(&payload).unwrap()).unwrap();
         assert_eq!(output["failure"]["kind"], "damaged");
         assert_eq!(output["failure"]["evidence"]["stage"], "item_extract");

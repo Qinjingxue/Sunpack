@@ -48,7 +48,7 @@ fn readiness(
     process: &Arc<Process>,
     cancel: &Cancellation,
     id: u64,
-) -> (JoinHandle<io::Result<()>>, mpsc::Receiver<()>) {
+) -> (JoinHandle<io::Result<usize>>, mpsc::Receiver<()>) {
     let scheduler = Arc::clone(scheduler);
     let process = Arc::clone(process);
     let cancel = cancel.clone();
@@ -132,9 +132,8 @@ fn slow_ready_shares_waiters_cancellation_and_startup_mode_without_host_slots() 
     let mode_responsive = mode_finished.recv_timeout(timeout);
     release.send(()).unwrap();
     process.test_event(json!({"type":"process_mode_ack", "mode":"high", "applied":false}));
-    second.join().unwrap().unwrap();
-    third.join().unwrap().unwrap();
-    assert_eq!(process.thread_capacity(), 7);
+    assert_eq!(second.join().unwrap().unwrap(), 7);
+    assert_eq!(third.join().unwrap().unwrap(), 7);
     assert!(!control.join().unwrap().unwrap());
     assert!(process.shared.state.lock().unwrap().ready_waiters.is_empty());
     assert!(process.shared.state.lock().unwrap().startup_command.is_none());

@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 use serde::ser::{SerializeMap, SerializeSeq};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io;
 use std::sync::Arc;
 
@@ -573,44 +572,6 @@ pub(crate) struct TailTotal {
 pub(crate) struct VolumeSelection {
     pub layout: usize,
     pub sources: Vec<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum Segment {
-    Range { path: String, start: u64, len: u64 },
-}
-
-impl Segment {
-    pub(crate) fn len(&self) -> u64 {
-        match self {
-            Self::Range { len, .. } => *len,
-        }
-    }
-}
-
-pub(crate) fn build_segments(source: &ArchiveInput) -> io::Result<Vec<Segment>> {
-    let mut segments = source
-        .physical_extents()
-        .map(|extent| range_segment(&extent.path, extent.start, extent.end))
-        .collect::<io::Result<Vec<_>>>()?;
-    if segments.is_empty() {
-        segments.push(range_segment(&source.entry_path, 0, None)?);
-    }
-    segments.retain(|segment| segment.len() > 0);
-    Ok(segments)
-}
-
-fn range_segment(path: &str, start: u64, end: Option<u64>) -> io::Result<Segment> {
-    let size = fs::metadata(path)?.len();
-    let effective_end = end.unwrap_or(size).min(size);
-    let len = effective_end
-        .checked_sub(start)
-        .ok_or_else(|| invalid("range start is beyond input end"))?;
-    Ok(Segment::Range {
-        path: path.to_owned(),
-        start,
-        len,
-    })
 }
 
 #[cfg(test)]
