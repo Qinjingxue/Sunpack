@@ -16,6 +16,7 @@ struct ActivePromotion {
     roots: Vec<PathBuf>,
     // The gate rejects overlapping registrations, so this count only falls.
     remaining: usize,
+    after_release: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Default)]
@@ -267,14 +268,11 @@ impl NativeResourceGuard {
             .registry
             .lock()
             .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-        if registry
-            .promotions
-            .values()
-            .any(|promotion| paths_overlap(&paths, &promotion.roots))
-        {
+        if let Some((&id, _)) = registry.promotions.iter()
+            .find(|(_, promotion)| paths_overlap(&paths, &promotion.roots)) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!("native resource registration blocked by promotion: {paths:?}"),
+                PromotionConflict { completion: PromotionCompletion(id), paths },
             ));
         }
         registry.resources.insert(id, paths);
@@ -358,6 +356,42 @@ fn paths_overlap(paths: &[PathBuf], roots: &[PathBuf]) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PromotionCompletion(u64);
+
+#[derive(Debug)]
+struct PromotionConflict {
+    completion: PromotionCompletion,
+    paths: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for PromotionConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "native resource registration blocked by promotion: {:?}", self.paths)
+    }
+}
+
+impl std::error::Error for PromotionConflict {}
+
+impl PromotionCompletion {
+    pub(crate) fn from_error(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<PromotionConflict>().map(|conflict| conflict.completion)
+    }
+
+    pub(crate) fn notify(self, resume: impl FnOnce() + Send + 'static) -> io::Result<()> {
+        let mut registry = registry().registry.lock()
+            .map_err(|_| io::Error::other("native resource registry poisoned"))?;
+        if let Some(promotion) = registry.promotions.get_mut(&self.0) {
+            promotion.after_release.push(Box::new(resume));
+        } else {
+            // The mutation can finish between the failed probe and subscription.
+            drop(registry);
+            resume();
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct Promotion(u64);
 
 impl Promotion {
@@ -380,7 +414,7 @@ impl Promotion {
                 .values()
                 .filter(|paths| paths_overlap(paths, &keys))
                 .count();
-            registry.promotions.insert(id, ActivePromotion { roots: keys, remaining });
+            registry.promotions.insert(id, ActivePromotion { roots: keys, remaining, after_release: Vec::new() });
         }
         let guard = Self(id);
         // Evict cached handles before joining live readers. The published gate
@@ -397,11 +431,18 @@ impl Promotion {
 
 impl Drop for Promotion {
     fn drop(&mut self) {
-        if let Ok(mut registry) = registry().registry.lock() {
-            registry.promotions.remove(&self.0);
+        let promotion = {
+            let Ok(mut registry) = registry().registry.lock() else { return; };
+            let promotion = registry.promotions.remove(&self.0);
             if registry.promotions.capacity() > 256 {
                 crate::collections::trim_map(&mut registry.promotions);
             }
+            promotion
+        };
+        // Re-entering Watch can take scheduler locks. The namespace gate is
+        // already open and the resource registry unlocked when notifying it.
+        if let Some(promotion) = promotion {
+            for resume in promotion.after_release { resume(); }
         }
     }
 }

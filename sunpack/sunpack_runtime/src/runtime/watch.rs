@@ -2990,11 +2990,34 @@ impl Scheduler {
         for scope in scopes {
             let paths = self.catalog.generated_paths(&scope);
             self.ensure_dependency_observers(scope.key(), paths.iter().filter_map(|p| Path::new(p).parent().map(Path::to_owned)))?;
-            let invalid = self.catalog.validate_generated(&scope, None)?;
+            let invalid = self.validate_generated_sources(&scope, None)?;
             self.retire_recovery(invalid.into_iter())?;
         }
         self.retire_dependency_observers();
         Ok(())
+    }
+
+    fn validate_generated_sources(
+        &self, scope: &NativeDiscoveryScope, paths: Option<&HashSet<PathBuf>>,
+    ) -> io::Result<Vec<String>> {
+        let mut deferred = None;
+        let invalid = self.catalog.validate_generated_paths(scope, paths, |promotion, path| {
+            deferred.get_or_insert_with(HashMap::new).entry(promotion)
+                .or_insert_with(Vec::new).push(PathBuf::from(path));
+        })?;
+        // Subscribe once per conflicting mutation for this batch. Its release
+        // resubmits only the affected paths through normal Watch notifications.
+        for (promotion, paths) in deferred.into_iter().flatten() {
+            let hub = Arc::downgrade(&self.hub);
+            let root = scope.key().to_owned();
+            promotion.notify(move || {
+                if let Some(hub) = hub.upgrade() {
+                    hub.update(|signals| signals.changes.root_changed(&root,
+                        paths.into_iter().map(|path| (path, PathChange::default()))));
+                }
+            })?;
+        }
+        Ok(invalid)
     }
 
     fn ensure_dependency_observers(&mut self, root_id: &str, directories: impl Iterator<Item = PathBuf>) -> io::Result<()> {
@@ -3113,7 +3136,7 @@ impl Scheduler {
         engine.run_stage("watch_directory", Origin::Watch, || {
             for (id, paths) in &changes.changed_roots {
                 if let Some((_, scope)) = self.roots.get(id) {
-                    let invalid = self.catalog.validate_generated_paths(scope, paths)?;
+                    let invalid = self.validate_generated_sources(scope, Some(paths))?;
                     self.retire_recovery(invalid.into_iter())?;
                     self.invalidate_recovery(paths.iter().map(|p| p.to_string_lossy().into_owned()))?;
                 }

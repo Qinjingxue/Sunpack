@@ -12,7 +12,7 @@ use crate::analysis_native::volume_anchor::{
     cheap_fast_probe_pool, probe_volume_anchor_from_head, probe_volume_anchor_path_cheap,
     probe_volume_anchor_record_cheap, CheapAnchor, CheapAnchorCell,
 };
-use crate::io::resource_lifecycle::NativeReadScope;
+use crate::io::resource_lifecycle::{NativeReadScope, PromotionCompletion};
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryEntryRecord {
@@ -462,7 +462,9 @@ impl NativeDirectoryScanOptions {
         seed: &str,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let stem = catalog_stem(seed);
-        state.validate_generated(scope, Some(&stem))?;
+        state.validate_generated_keys(scope, |table| {
+            table.buckets.get(stem.as_str()).into_iter().flat_map(|bucket| bucket.iter()).cloned().collect()
+        }, None)?;
         let (filtered, raw) = (|| {
             let root = Path::new(&scope.root);
             let mut filter_scratch = PathFilterScratch::new(&self.options);
@@ -1507,20 +1509,17 @@ impl NativeWatchCatalog {
             .filter(|row| row.generated.is_some()).map(|row| row.path()).collect()
     }
 
-    /// Exact-path receipts never follow a rename. Notifications, startup and
-    /// dependency lookup all use this validator, including USN content reasons.
-    pub(crate) fn validate_generated(&self, scope: &crate::scan::scope::NativeDiscoveryScope, stem: Option<&str>) -> std::io::Result<Vec<String>> {
+    pub(crate) fn validate_generated_paths(
+        &self,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        paths: Option<&HashSet<PathBuf>>,
+        mut defer: impl FnMut(PromotionCompletion, String),
+    ) -> std::io::Result<Vec<String>> {
         self.validate_generated_keys(scope, |table| {
-            if let Some(stem) = stem {
-                table.buckets.get(stem).into_iter().flat_map(|bucket| bucket.iter()).cloned().collect()
-            } else {
-                table.rows.iter().filter(|(_, row)| row.generated.is_some()).map(|(key, _)| Arc::clone(key)).collect()
-            }
-        })
-    }
-
-    pub(crate) fn validate_generated_paths(&self, scope: &crate::scan::scope::NativeDiscoveryScope, paths: &HashSet<PathBuf>) -> std::io::Result<Vec<String>> {
-        self.validate_generated_keys(scope, |table| {
+            let Some(paths) = paths else {
+                return table.rows.iter().filter(|(_, row)| row.generated.is_some())
+                    .map(|(key, _)| Arc::clone(key)).collect();
+            };
             let mut keys = HashSet::new();
             for path in paths {
                 let key = crate::path_keys::path_key(&path.to_string_lossy());
@@ -1530,13 +1529,16 @@ impl NativeWatchCatalog {
                     .filter(|(_, row)| row.generated.is_some()).map(|(key, _)| Arc::clone(key)));
             }
             keys.into_iter().collect()
-        })
+        }, Some(&mut defer))
     }
 
+    /// Exact-path receipts never follow a rename. Notifications, startup and
+    /// dependency lookup all use this validator, including USN content reasons.
     fn validate_generated_keys(
         &self,
         scope: &crate::scan::scope::NativeDiscoveryScope,
         select_keys: impl FnOnce(&ScopeCatalog) -> Vec<Arc<str>>,
+        mut defer: Option<&mut dyn FnMut(PromotionCompletion, String)>,
     ) -> std::io::Result<Vec<String>> {
         let baselines: Vec<_> = {
             let tables = self.catalogs.lock().unwrap();
@@ -1552,8 +1554,14 @@ impl NativeWatchCatalog {
             let invalid = match crate::postprocess::watch_candidate_for_path(Path::new(&path), Some(before.usn)) {
                 Ok(Some(current)) => before.source_changed(&current),
                 Ok(None) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                Err(error) => return Err(error),
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => true,
+                Err(error) => {
+                    let Some((promotion, defer)) = PromotionCompletion::from_error(&error).zip(defer.as_deref_mut()) else {
+                        return Err(error);
+                    };
+                    defer(promotion, path);
+                    continue;
+                }
             };
             if invalid {
                 stale.push((key, path, before));

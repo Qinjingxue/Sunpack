@@ -46,6 +46,48 @@ fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
 }
 
 #[test]
+fn watch_replays_a_generated_file_change_after_output_promotion() {
+    const CHILD: &str = "SUNPACK_GENERATED_PROMOTION_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("watch_replays_a_generated_file_change_after_output_promotion", CHILD);
+        return;
+    };
+    let base = PathBuf::from(base);
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    let scope = scheduler.roots.values().next().unwrap().1.clone();
+    let slot = base.join("output/retained");
+    let sibling = base.join("output/sibling");
+    let member = slot.join("member.txt");
+    let other = sibling.join("other.txt");
+    for path in [&member, &other] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"generated output").unwrap();
+    }
+    let outputs = [&slot, &sibling].map(|path| path.to_string_lossy().into_owned());
+    scheduler.journal.state().register_output_paths(&outputs, &[]);
+    scheduler.catalog.publish_outputs(&outputs, std::slice::from_ref(&scope),
+        &scheduler.deep_options, Some(scope.key())).unwrap();
+
+    // Hold the real cleanup gate during the notification pass. Keep the old
+    // member on disk so validating its identity necessarily hits the gate.
+    let promotion = crate::io::resource_lifecycle::Promotion::begin([slot.clone()]).unwrap();
+    fs::remove_file(&other).unwrap();
+    let mut changes = RootChanges::default();
+    changes.root_changed(scope.key(), [&member, &other].map(|path| (path.clone(), PathChange::default())));
+    scheduler.observe_root_changes(&mut changes).unwrap();
+    assert!(scheduler.catalog.generated_observation(member.to_str().unwrap()).is_some());
+    assert!(scheduler.catalog.generated_observation(other.to_str().unwrap()).is_none());
+    assert!(scheduler.hub.signals.lock().unwrap().changes.changed_roots.is_empty());
+
+    crate::postprocess::remove_owned_tree(&slot).unwrap();
+    drop(promotion);
+    let mut resumed = std::mem::take(&mut scheduler.hub.signals.lock().unwrap().changes);
+    assert_eq!(resumed.changed_roots.get(scope.key()), Some(&HashSet::from([member.clone()])));
+    scheduler.observe_root_changes(&mut resumed).unwrap();
+    assert!(scheduler.catalog.generated_observation(member.to_str().unwrap()).is_none());
+}
+
+#[test]
 fn admission_rejects_capture_during_readiness_without_losing_deadline() {
     const CHILD: &str = "SUNPACK_READINESS_GENERATION_TEST";
     let Some(base) = std::env::var_os(CHILD) else {
