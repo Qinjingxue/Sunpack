@@ -471,7 +471,7 @@ impl NativeDirectoryScanOptions {
                 let mut data = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
                 let mut records = Vec::new();
                 let mut cells = Vec::new();
-                if let Some(catalog) = data.get_mut(&crate::path_keys::path_key(&scope.root)) {
+                if let Some(catalog) = data.scopes.get_mut(&crate::path_keys::path_key(&scope.root)) {
                     if let Some(bucket) = catalog.buckets.get(stem.as_str()) {
                         for key in bucket.iter() {
                             let Some(row) = catalog.rows.get_mut(key) else {
@@ -986,7 +986,7 @@ fn scan_directory_views(
     max_depth: Option<usize>,
     options: &DirectoryScanOptions,
 ) -> std::io::Result<DirectoryScanRecords> {
-    scan_directory_impl(root_path, max_depth, options, None)
+    scan_directory_impl(root_path, max_depth, options, None, true)
 }
 
 fn scan_directory_impl(
@@ -994,6 +994,7 @@ fn scan_directory_impl(
     max_depth: Option<usize>,
     options: &DirectoryScanOptions,
     known_metadata: Option<fs::Metadata>,
+    collect_filtered: bool,
 ) -> std::io::Result<DirectoryScanRecords> {
     let root = PathBuf::from(root_path);
     let filter_root = options
@@ -1033,8 +1034,8 @@ fn scan_directory_impl(
     let mut filter_scratch = PathFilterScratch::new(options);
     let mut directory_cache = HashMap::new();
     if root != filter_root
-        && (dir_rejected(&root, filter_root, options, &mut filter_scratch)
-            && metadata.as_ref().is_some_and(|metadata| metadata.is_dir())
+        && (metadata.as_ref().is_some_and(|metadata| metadata.is_dir())
+            && dir_rejected(&root, filter_root, options, &mut filter_scratch)
             || file_under_rejected_directory(
                 &root,
                 filter_root,
@@ -1058,7 +1059,8 @@ fn scan_directory_impl(
         };
         let size = metadata.len();
         let mtime_ns = metadata_mtime_ns(metadata);
-        let eligible = !file_rejected_by_path(&root, match_root, options, &mut filter_scratch)
+        let eligible = collect_filtered
+            && !file_rejected_by_path(&root, match_root, options, &mut filter_scratch)
             && numeric_ranges_allow(&options.mtime_ranges, mtime_ns);
         // Raw and filtered views describe the same observation. File events
         // already supplied metadata; repeated queries can also split the views
@@ -1156,7 +1158,9 @@ fn scan_directory_impl(
                     relation_anchor: None,
                 });
                 if !rejected {
-                    records.push(raw_records.len() - 1);
+                    if collect_filtered {
+                        records.push(raw_records.len() - 1);
+                    }
                     child_dirs.push(path);
                 }
                 continue;
@@ -1167,7 +1171,7 @@ fn scan_directory_impl(
 
             let size = metadata.len();
             let mtime_ns = metadata_mtime_ns(&metadata);
-            let hard_rejected = !metadata.is_file()
+            let hard_rejected = !collect_filtered || !metadata.is_file()
                 || file_rejected_by_path(&path, filter_root, options, &mut filter_scratch)
                 || !numeric_ranges_allow(&options.mtime_ranges, mtime_ns);
             let raw_file_index = raw_records.len();
@@ -1345,11 +1349,25 @@ pub(crate) fn scope_file_paths(
 
 /// One native path table with derived filename buckets and a disposable cache WAL.
 pub(crate) struct NativeWatchCatalog {
-    catalogs: Mutex<HashMap<String, ScopeCatalog>>,
+    catalogs: Mutex<CatalogTables>,
     outputs: crate::watch_store::active_outputs::OutputReservations,
     store: Mutex<Option<super::catalog_store::CatalogStore>>,
     error: Mutex<Option<String>>,
     recovery_ids: Mutex<HashMap<String, crate::filesystem::DirectoryRecoveryCache>>,
+}
+
+struct CatalogTables {
+    scopes: HashMap<String, ScopeCatalog>,
+    revision: u64,
+}
+
+impl CatalogTables {
+    // Inventory changes can invalidate an in-flight enumeration. Cache fills
+    // and capacity changes don't change the inventory observed by the scan.
+    fn edit(&mut self) -> &mut HashMap<String, ScopeCatalog> {
+        self.revision = self.revision.wrapping_add(1);
+        &mut self.scopes
+    }
 }
 
 impl NativeWatchCatalog {
@@ -1370,7 +1388,7 @@ impl NativeWatchCatalog {
             }
         });
         Self {
-            catalogs: Mutex::new(catalogs),
+            catalogs: Mutex::new(CatalogTables { scopes: catalogs, revision: 0 }),
             outputs: Arc::clone(&outputs.outputs),
             store: Mutex::new(store),
             error: Mutex::new(error),
@@ -1387,7 +1405,8 @@ impl NativeWatchCatalog {
     ) -> std::io::Result<Vec<(String, String)>> {
         let records = crate::watch_store::active_outputs::records(&self.outputs, paths);
         if records.is_empty() { return Ok(Vec::new()); }
-        let mut catalogs = self.catalogs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tables = self.catalogs.lock().unwrap_or_else(|e| e.into_inner());
+        let catalogs = tables.edit();
         let mut published = Vec::new();
         for scope in scopes {
             let mut covered = Vec::<String>::new();
@@ -1401,7 +1420,8 @@ impl NativeWatchCatalog {
                     if dependency_root != Some(scope.key()) || key != &crate::path_keys::resolved_path_key(Path::new(path)) { continue; }
                 }
                 if covered.iter().any(|root| crate::watch_store::is_path_under(target, root) || target == root) { continue; }
-                let (errors, _) = update_catalog_locked(options, self, scope, Some(target), false, true, &mut catalogs)?;
+                let prepared = scan_catalog(options, self, scope, target, true)?;
+                let (errors, _) = apply_catalog_scan(self, scope, Some(target), false, true, prepared, catalogs)?;
                 if !errors.is_empty() { return Err(std::io::Error::other(format!("output inventory publication failed: {errors:?}"))); }
                 covered.push(target.to_owned());
                 let mut buckets = HashSet::new();
@@ -1437,6 +1457,7 @@ impl NativeWatchCatalog {
                 .catalogs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .scopes
                 .get(&crate::path_keys::path_key(&scope.root))
                 .into_iter()
                 .flat_map(|catalog| {
@@ -1463,17 +1484,17 @@ impl NativeWatchCatalog {
 
     pub(crate) fn generated_observation(&self, path: &str) -> Option<NativeWatchObservation> {
         let key = crate::path_keys::path_key(path);
-        self.catalogs.lock().unwrap().values().find_map(|table| table.rows.get(key.as_str())?.generated_observation())
+        self.catalogs.lock().unwrap().scopes.values().find_map(|table| table.rows.get(key.as_str())?.generated_observation())
     }
     pub(crate) fn dependency_contains(&self, scope: &crate::scan::scope::NativeDiscoveryScope, path: &str) -> bool {
         let key = crate::path_keys::path_key(path);
-        self.catalogs.lock().unwrap().get(scope.key()).and_then(|table| table.rows.get(key.as_str()))
+        self.catalogs.lock().unwrap().scopes.get(scope.key()).and_then(|table| table.rows.get(key.as_str()))
             .is_some_and(|row| scope.contains(path) || row.generated.is_some())
     }
 
     pub(crate) fn generated_under(&self, scope: &crate::scan::scope::NativeDiscoveryScope, path: &str) -> bool {
         let key = crate::path_keys::path_key(path);
-        self.catalogs.lock().unwrap().get(scope.key()).is_some_and(|table| {
+        self.catalogs.lock().unwrap().scopes.get(scope.key()).is_some_and(|table| {
             table.rows.range::<str, _>((std::ops::Bound::Included(key.as_str()), std::ops::Bound::Unbounded))
                 .take_while(|(k, _)| k.starts_with(&key))
                 .filter(|(k, _)| k.as_ref() == key || crate::watch_store::is_path_under(k, &key))
@@ -1482,7 +1503,7 @@ impl NativeWatchCatalog {
     }
 
     pub(crate) fn generated_paths(&self, scope: &crate::scan::scope::NativeDiscoveryScope) -> Vec<String> {
-        self.catalogs.lock().unwrap().get(scope.key()).into_iter().flat_map(|table| table.rows.values())
+        self.catalogs.lock().unwrap().scopes.get(scope.key()).into_iter().flat_map(|table| table.rows.values())
             .filter(|row| row.generated.is_some()).map(|row| row.path()).collect()
     }
 
@@ -1519,7 +1540,7 @@ impl NativeWatchCatalog {
     ) -> std::io::Result<Vec<String>> {
         let baselines: Vec<_> = {
             let tables = self.catalogs.lock().unwrap();
-            let Some(table) = tables.get(scope.key()) else { return Ok(Vec::new()); };
+            let Some(table) = tables.scopes.get(scope.key()) else { return Ok(Vec::new()); };
             select_keys(table).into_iter().filter_map(|key| {
                 let row = table.rows.get(key.as_ref())?;
                 let baseline = row.generated.as_deref()?;
@@ -1541,7 +1562,8 @@ impl NativeWatchCatalog {
         if stale.is_empty() {
             return Ok(Vec::new());
         }
-        let mut tables = self.catalogs.lock().unwrap();
+        let mut guard = self.catalogs.lock().unwrap();
+        let tables = guard.edit();
         let Some(table) = tables.get_mut(scope.key()) else { return Ok(Vec::new()); };
         let mut invalidated = Vec::new();
         let mut removed = Vec::new();
@@ -1565,7 +1587,7 @@ impl NativeWatchCatalog {
         table.remove_many(removed.iter().map(String::as_str));
         if !removed.is_empty() || !changed.is_empty() {
             let rows = changed.iter().filter_map(|key| tables[scope.key()].rows.get(key.as_ref())).collect();
-            self.persist(&tables, super::catalog_store::DeltaView { scope: scope.key(), removed: &removed,
+            self.persist(tables, super::catalog_store::DeltaView { scope: scope.key(), removed: &removed,
                 rows, stamp: None }, false);
         }
         Ok(invalidated)
@@ -1575,7 +1597,8 @@ impl NativeWatchCatalog {
         let missing: Vec<_> = paths.filter(|path| matches!(path.try_exists(), Ok(false)))
             .map(|path| crate::path_keys::path_key(&path.to_string_lossy())).collect();
         if missing.is_empty() { return; }
-        let mut tables = self.catalogs.lock().unwrap();
+        let mut guard = self.catalogs.lock().unwrap();
+        let tables = guard.edit();
         let mut changes = Vec::new();
         for (scope, table) in tables.iter_mut() {
             let removed: Vec<_> = missing.iter().filter(|key| table.rows.contains_key(key.as_str())).cloned().collect();
@@ -1583,13 +1606,13 @@ impl NativeWatchCatalog {
             if !removed.is_empty() { changes.push((scope.clone(), removed)); }
         }
         for (scope, removed) in changes {
-            self.persist(&tables, super::catalog_store::DeltaView { scope: &scope, removed: &removed, rows: Vec::new(), stamp: None }, false);
+            self.persist(tables, super::catalog_store::DeltaView { scope: &scope, removed: &removed, rows: Vec::new(), stamp: None }, false);
         }
     }
     pub(crate) fn observation(&self, path: &str) -> Option<NativeWatchObservation> {
         (|| {
             let key = crate::path_keys::path_key(path);
-            self.catalogs.lock().unwrap().values().find_map(|table| {
+            self.catalogs.lock().unwrap().scopes.values().find_map(|table| {
                 table
                     .rows
                     .get(key.as_str())?
@@ -1612,7 +1635,8 @@ impl NativeWatchCatalog {
     ) {
         (|| {
             let key = crate::path_keys::path_key(path);
-            let mut tables = self.catalogs.lock().unwrap();
+            let mut guard = self.catalogs.lock().unwrap();
+            let tables = guard.edit();
             let scope = tables
                 .keys()
                 .filter(|scope| {
@@ -1651,7 +1675,7 @@ impl NativeWatchCatalog {
 
     pub(crate) fn content_changed(&self, path: &str) {
         let key = crate::path_keys::path_key(path);
-        for table in self.catalogs.lock().unwrap().values_mut() {
+        for table in self.catalogs.lock().unwrap().edit().values_mut() {
             if let Some(row) = table.rows.get_mut(key.as_str()) {
                 row.generated = None;
             }
@@ -1671,7 +1695,7 @@ impl NativeWatchCatalog {
         (|| {
             let key = crate::path_keys::path_key(path);
             let mut tables = self.catalogs.lock().unwrap();
-            for table in tables.values_mut() {
+            for table in tables.edit().values_mut() {
                 if let Some(row) = table.rows.get_mut(key.as_str()) {
                     if !row.persistent() {
                         table.remove(&key);
@@ -1695,7 +1719,7 @@ impl NativeWatchCatalog {
         key.truncate(key.trim_end_matches('\\').len());
         (|| {
             let mut tables = self.catalogs.lock().unwrap();
-            for table in tables.values_mut() {
+            for table in tables.edit().values_mut() {
                 let keys: Vec<_> = table
                     .rows
                     .range::<str, _>((
@@ -1746,7 +1770,7 @@ impl NativeWatchCatalog {
         })()
     }
     pub(crate) fn bucket_revision(&self, scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str) -> u64 {
-        self.catalogs.lock().unwrap().get(scope.key())
+        self.catalogs.lock().unwrap().scopes.get(scope.key())
             .and_then(|table| table.buckets.get(catalog_stem(seed).as_str())).map_or(0, |bucket| bucket.revision)
     }
 
@@ -1756,7 +1780,7 @@ impl NativeWatchCatalog {
         seed: &str,
     ) -> Vec<String> {
         let tables = self.catalogs.lock().unwrap();
-        tables
+        tables.scopes
             .get(&crate::path_keys::path_key(&scope.root))
             .into_iter()
             .flat_map(|table| {
@@ -1779,6 +1803,7 @@ impl NativeWatchCatalog {
         self.catalogs
             .lock()
             .unwrap()
+            .scopes
             .get(&crate::path_keys::path_key(&scope.root))?
             .rows
             .get(crate::path_keys::path_key(path).as_str())
@@ -1790,7 +1815,8 @@ impl NativeWatchCatalog {
             .iter()
             .map(|root| crate::path_keys::path_key(root))
             .collect();
-        let mut tables = self.catalogs.lock().unwrap();
+        let mut guard = self.catalogs.lock().unwrap();
+        let tables = guard.edit();
         let previous = tables.len();
         tables.retain(|key, _| keys.contains(key));
         let removed_roots = previous != tables.len();
@@ -1862,9 +1888,9 @@ impl NativeWatchCatalog {
                 excluded: Self::catalog_exclusions(scope),
                 cursor: Some((volume, journal, next_usn)),
             };
-            let tables = self.catalogs.lock().unwrap();
+            let mut tables = self.catalogs.lock().unwrap();
             self.persist(
-                &tables,
+                tables.edit(),
                 super::catalog_store::DeltaView {
                     scope: &crate::path_keys::path_key(&scope.root),
                     removed: &[],
@@ -1887,14 +1913,14 @@ impl NativeWatchCatalog {
             let mut tables = self.catalogs.lock().unwrap();
             // Commit is already event-driven. Reclaim deletion high water even
             // when no pipeline completion has armed Watch's idle-maintenance timer.
-            for table in tables.values_mut() {
+            for table in tables.scopes.values_mut() {
                 table.trim_capacity();
             }
             let mut slot = self.store.lock().unwrap();
             if let Some(store) = slot.as_mut() {
                 if let Err(error) = store.commit().and_then(|_| {
                     if store.checkpoint_due(idle) {
-                        store.checkpoint(&tables)
+                        store.checkpoint(&tables.scopes)
                     } else {
                         Ok(())
                     }
@@ -1911,7 +1937,7 @@ impl NativeWatchCatalog {
             let tables = self.catalogs.lock().unwrap();
             let mut slot = self.store.lock().unwrap();
             if let Some(mut store) = slot.take() {
-                if let Err(error) = store.checkpoint(&tables) {
+                if let Err(error) = store.checkpoint(&tables.scopes) {
                     *self.error.lock().unwrap() = Some(error.to_string());
                 }
             }
@@ -1930,7 +1956,7 @@ impl NativeWatchCatalog {
         let mut directories: Vec<_> = {
             let tables = self.catalogs.lock().unwrap();
             std::iter::once(scope.root.clone())
-                .chain(tables.get(&crate::path_keys::path_key(&scope.root))
+                .chain(tables.scopes.get(&crate::path_keys::path_key(&scope.root))
                     .into_iter()
                     .flat_map(|table| table.rows.values())
                     .filter(|row| row.persistent() && row.is_dir())
@@ -1995,194 +2021,260 @@ fn update_catalog(
     changed: Option<&str>,
     report_changes: bool,
 ) -> std::io::Result<(Vec<DirectoryReadError>, Vec<String>)> {
-    let mut catalogs = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
-    update_catalog_locked(options, state, scope, changed, report_changes, false, &mut catalogs)
+    let target = changed.unwrap_or(&scope.root);
+    let scan = || scan_catalog(options, state, scope, target, false);
+    let revision = state.catalogs.lock().unwrap_or_else(|e| e.into_inner()).revision;
+    let prepared = scan();
+    #[cfg(test)]
+    AFTER_CATALOG_SCAN.with(|hook| {
+        if let Some(hook) = hook.take() { hook(); }
+    });
+    let mut tables = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
+    let prepared = if tables.revision == revision {
+        prepared?
+    } else {
+        // A concurrent edit may have published a previously excluded output
+        // or removed a row. Retry with the original writer ordering, once.
+        drop(prepared);
+        scan()?
+    };
+    apply_catalog_scan(state, scope, changed, report_changes, false, prepared, tables.edit())
 }
 
-fn update_catalog_locked(
+struct CatalogScan {
+    effective: crate::scan::scope::NativeDiscoveryScope,
+    raw: Vec<DirectoryEntryRecord>,
+    errors: Vec<DirectoryReadError>,
+}
+
+fn scan_catalog(
     options: &NativeDirectoryScanOptions,
+    state: &NativeWatchCatalog,
+    scope: &crate::scan::scope::NativeDiscoveryScope,
+    target: &str,
+    baseline: bool,
+) -> std::io::Result<Option<CatalogScan>> {
+    let mut effective = if baseline {
+        crate::scan::scope::NativeDiscoveryScope::new(target.to_owned(), None, Vec::new())
+    } else { scope.clone() };
+    let metadata = fs::metadata(target);
+    let target_owned = !baseline && state.is_owned(target);
+    if metadata.as_ref().is_ok_and(|m| m.is_dir())
+        && effective.contains(target)
+        && !target_owned && !baseline
+    {
+        effective.exclude_roots(state.output_roots(target).into_iter());
+    }
+    let mut options = options.options.clone();
+    options.scope = Some(effective.clone());
+    let mut records = if !effective.contains(target) || target_owned {
+        DirectoryScanRecords {
+            filtered: Vec::new(),
+            raw: Vec::new(),
+            errors: DirectoryReadErrors::report(),
+        }
+    } else {
+        match &metadata {
+            Ok(metadata) => {
+                // Catalog rows use raw metadata. Discovery applies file rules
+                // later when it builds the filtered view for a relation bucket.
+                scan_directory_impl(target, effective.max_depth, &options, Some(metadata.clone()), false)?
+            }
+            Err(error) => {
+                let mut errors = DirectoryReadErrors::new(Path::new(target));
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    errors.push(
+                        Path::new(target),
+                        "metadata",
+                        std::io::Error::new(error.kind(), error.to_string()),
+                    );
+                }
+                DirectoryScanRecords {
+                    filtered: Vec::new(),
+                    raw: Vec::new(),
+                    errors,
+                }
+            }
+        }
+    };
+    if let Ok(meta) = &metadata {
+        if meta.is_dir()
+            && crate::path_keys::path_key(target) != crate::path_keys::path_key(&scope.root)
+            && effective.contains(target)
+            && (baseline || !state.is_owned(target))
+        {
+            records.raw.push(DirectoryEntryRecord {
+                path: target.to_owned(),
+                is_dir: true,
+                size: None,
+                mtime_ns: metadata_mtime_ns(meta),
+                relation_member_eligible: false,
+                relation_anchor: None,
+            });
+        }
+    }
+    // Validate directory/deletion observations before touching resident rows.
+    // Existing file updates already prove their root was accessible.
+    if (!metadata.as_ref().is_ok_and(|m| m.is_file()) || records.raw.is_empty())
+        && !Path::new(&scope.root).is_dir()
+    {
+        return Ok(None);
+    }
+    Ok(Some(CatalogScan {
+        effective,
+        raw: records.raw,
+        errors: records.errors.into_messages(),
+    }))
+}
+
+fn apply_catalog_scan(
     state: &NativeWatchCatalog,
     scope: &crate::scan::scope::NativeDiscoveryScope,
     changed: Option<&str>,
     report_changes: bool,
     baseline: bool,
+    prepared: Option<CatalogScan>,
     catalogs: &mut HashMap<String, ScopeCatalog>,
 ) -> std::io::Result<(Vec<DirectoryReadError>, Vec<String>)> {
-    (|| {
-        let target = changed.unwrap_or(&scope.root);
-        let mut effective = if baseline {
-            crate::scan::scope::NativeDiscoveryScope::new(target.to_owned(), None, Vec::new())
-        } else { scope.clone() };
-        let metadata = fs::metadata(target);
-        if metadata.is_err() && !Path::new(&scope.root).is_dir() {
-            return Ok((
-                vec![(
-                    scope.root.clone(),
-                    "metadata".into(),
-                    "watch root unavailable".into(),
-                )],
-                Vec::new(),
-            ));
+    let Some(CatalogScan { effective, raw, errors }) = prepared else {
+        return Ok((
+            vec![(scope.root.clone(), "metadata".into(), "watch root unavailable".into())],
+            Vec::new(),
+        ));
+    };
+    let target = changed.unwrap_or(&scope.root);
+    let scope_key = crate::path_keys::path_key(&scope.root);
+    let mut target_key = crate::path_keys::path_key(target);
+    target_key.truncate(target_key.trim_end_matches('\\').len());
+    let catalog = catalogs.entry(scope_key.clone()).or_default();
+    let needs_removal = !catalog.rows.is_empty();
+    let mut present = HashSet::new();
+    let mut changed_paths = Vec::new();
+    let mut mutated = false;
+    let mut changed_keys = Vec::new();
+    for record in raw.into_iter()
+        .filter(|r| effective.contains(&r.path) && (!baseline || !r.is_dir || scope.contains(&r.path)))
+    {
+        let key: Arc<str> = Arc::from(crate::path_keys::path_key(&record.path));
+        if needs_removal {
+            present.insert(Arc::clone(&key));
         }
-        let target_owned = !baseline && state.is_owned(target);
-        if metadata.as_ref().is_ok_and(|m| m.is_dir())
-            && effective.contains(target)
-            && !target_owned && !baseline
-        {
-            effective.exclude_roots(state.output_roots(target).into_iter());
-        }
-        let mut options = options.options.clone();
-        options.scope = Some(effective.clone());
-        let mut records = if !effective.contains(target) || target_owned {
-            DirectoryScanRecords {
-                filtered: Vec::new(),
-                raw: Vec::new(),
-                errors: DirectoryReadErrors::report(),
+        let unchanged = catalog
+            .rows
+            .get(&key)
+            .is_some_and(|old| old.matches(&record));
+        let observation = if baseline && !record.is_dir && record.size.is_some_and(|size| size > 0) {
+            // Enumeration already supplies size and mtime. Only read the
+            // identity/USN once; do not stat every settled output again.
+            match crate::filesystem::watch_file_observation_known_kind(Path::new(&record.path), None, false) {
+                Ok(observation) => Some((record.size.unwrap(), record.mtime_ns.unwrap_or(0) as f64 / 1e9, observation)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
             }
-        } else {
-            match &metadata {
-                Ok(metadata) => {
-                    scan_directory_impl(target, effective.max_depth, &options, Some(metadata.clone()))?
-                }
-                Err(error) => {
-                    let mut errors = DirectoryReadErrors::new(Path::new(target));
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        errors.push(
-                            Path::new(target),
-                            "metadata",
-                            std::io::Error::new(error.kind(), error.to_string()),
-                        );
-                    }
-                    DirectoryScanRecords {
-                        filtered: Vec::new(),
-                        raw: Vec::new(),
-                        errors,
-                    }
-                }
+        } else { None };
+        if !unchanged || observation.is_some() {
+            mutated = true;
+            if report_changes && !record.is_dir {
+                changed_paths.push(record.path.clone());
             }
-        };
-        if let Ok(meta) = &metadata {
-            if meta.is_dir()
-                && crate::path_keys::path_key(target) != crate::path_keys::path_key(&scope.root)
-                && effective.contains(target)
-                && (baseline || !state.is_owned(target))
-            {
-                records.raw.push(DirectoryEntryRecord {
-                    path: target.to_owned(),
-                    is_dir: true,
-                    size: None,
-                    mtime_ns: metadata_mtime_ns(meta),
-                    relation_member_eligible: false,
-                    relation_anchor: None,
-                });
+            if changed.is_some() {
+                changed_keys.push(Arc::clone(&key));
             }
-        }
-        // Validate directory/deletion observations before touching resident rows.
-        // Existing file updates already prove their root was accessible.
-        if (!metadata.as_ref().is_ok_and(|m| m.is_file()) || records.raw.is_empty())
-            && !Path::new(&scope.root).is_dir()
-        {
-            return Ok((
-                vec![(
-                    scope.root.clone(),
-                    "metadata".into(),
-                    "watch root unavailable".into(),
-                )],
-                Vec::new(),
-            ));
-        }
-        drop(records.filtered);
-        let errors = records.errors.into_messages();
-        let scope_key = crate::path_keys::path_key(&scope.root);
-        let mut target_key = crate::path_keys::path_key(target);
-        target_key.truncate(target_key.trim_end_matches('\\').len());
-        let catalog = catalogs.entry(scope_key.clone()).or_default();
-        let needs_removal = !catalog.rows.is_empty();
-        let mut present = HashSet::new();
-        let mut changed_paths = Vec::new();
-        let mut mutated = false;
-        let mut changed_keys = Vec::new();
-        for record in records
-            .raw
-            .into_iter()
-            .filter(|r| effective.contains(&r.path) && (!baseline || !r.is_dir || scope.contains(&r.path)))
-        {
-            let key: Arc<str> = Arc::from(crate::path_keys::path_key(&record.path));
-            if needs_removal {
-                present.insert(Arc::clone(&key));
-            }
-            let unchanged = catalog
-                .rows
-                .get(&key)
-                .is_some_and(|old| old.matches(&record));
-            let observation = if baseline && !record.is_dir && record.size.is_some_and(|size| size > 0) {
-                // Enumeration already supplies size and mtime. Only read the
-                // identity/USN once; do not stat every settled output again.
-                match crate::filesystem::watch_file_observation_known_kind(Path::new(&record.path), None, false) {
-                    Ok(observation) => Some((record.size.unwrap(), record.mtime_ns.unwrap_or(0) as f64 / 1e9, observation)),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                }
-            } else { None };
-            if !unchanged || observation.is_some() {
-                mutated = true;
-                if report_changes && !record.is_dir {
-                    changed_paths.push(record.path.clone());
-                }
-                if changed.is_some() {
-                    changed_keys.push(Arc::clone(&key));
-                }
-                catalog.insert_key(Arc::clone(&key), record);
-                if let Some((size, mtime, observed)) = observation {
-                    let row = catalog.rows.get_mut(key.as_ref()).unwrap();
-                    row.remember_generated(size, mtime, &observed.file_id, observed.change_usn);
-                    if scope.contains(&row.path()) {
-                        row.remember_observation(size, mtime, &observed.file_id, observed.change_usn, true);
-                    }
+            catalog.insert_key(Arc::clone(&key), record);
+            if let Some((size, mtime, observed)) = observation {
+                let row = catalog.rows.get_mut(key.as_ref()).unwrap();
+                row.remember_generated(size, mtime, &observed.file_id, observed.change_usn);
+                if scope.contains(&row.path()) {
+                    row.remember_observation(size, mtime, &observed.file_id, observed.change_usn, true);
                 }
             }
         }
-        let mut removed_keys = Vec::new();
-        if needs_removal && errors.is_empty() {
-            let removed: Vec<_> = catalog
-                .rows
-                .range::<str, _>((
-                    std::ops::Bound::Included(target_key.as_str()),
-                    std::ops::Bound::Unbounded,
-                ))
-                .take_while(|(key, _)| key.starts_with(&target_key))
-                .filter(|(key, row)| {
-                    row.persistent()
-                        && (baseline || row.generated.is_none() || effective.contains(&row.path()))
-                        && (key.as_ref() == target_key || key[target_key.len()..].starts_with('\\'))
-                        && !present.contains(*key)
-                })
-                .map(|(key, _)| Arc::clone(key))
-                .collect();
-            catalog.remove_many(removed.iter().map(|key| key.as_ref()));
-            removed_keys.extend(removed.iter().map(|key| key.to_string()));
-        }
-        if mutated || !removed_keys.is_empty() {
-            state.persist(
-                &catalogs,
-                super::catalog_store::DeltaView {
-                    scope: &scope_key,
-                    removed: &removed_keys,
-                    rows: changed_keys
-                        .iter()
-                        .filter_map(|key| catalogs[&scope_key].rows.get(key))
-                        .collect(),
-                    stamp: None,
-                },
-                changed.is_none(),
-            );
-        }
-        Ok((errors, changed_paths))
-    })()
+    }
+    let mut removed_keys = Vec::new();
+    if needs_removal && errors.is_empty() {
+        let removed: Vec<_> = catalog
+            .rows
+            .range::<str, _>((
+                std::ops::Bound::Included(target_key.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(key, _)| key.starts_with(&target_key))
+            .filter(|(key, row)| {
+                row.persistent()
+                    && (baseline || row.generated.is_none() || effective.contains(&row.path()))
+                    && (key.as_ref() == target_key || key[target_key.len()..].starts_with('\\'))
+                    && !present.contains(*key)
+            })
+            .map(|(key, _)| Arc::clone(key))
+            .collect();
+        catalog.remove_many(removed.iter().map(|key| key.as_ref()));
+        removed_keys.extend(removed.iter().map(|key| key.to_string()));
+    }
+    if mutated || !removed_keys.is_empty() {
+        state.persist(
+            catalogs,
+            super::catalog_store::DeltaView {
+                scope: &scope_key,
+                removed: &removed_keys,
+                rows: changed_keys
+                    .iter()
+                    .filter_map(|key| catalogs[&scope_key].rows.get(key))
+                    .collect(),
+                stamp: None,
+            },
+            changed.is_none(),
+        );
+    }
+    Ok((errors, changed_paths))
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_CATALOG_SCAN: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
 mod watch_cache_lifetime_tests {
+    #[test]
+    fn refresh_rescans_when_output_is_published_after_enumeration() {
+        use super::*;
+        use crate::scan::scope::NativeDiscoveryScope;
+
+        let root = crate::test_support::temp_file("catalog_publish_during_scan", b"");
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        let scope = NativeDiscoveryScope::new(root.to_str().unwrap().to_owned(), None, Vec::new());
+        let output = root.join("output");
+        fs::create_dir(&output).unwrap();
+        let file = output.join("result.zip");
+        fs::write(&file, b"settled output").unwrap();
+        let path = output.to_str().unwrap();
+
+        let state = crate::watch_store::NativeWatchState::new();
+        state.register_output_paths(&[path.to_owned()], &[]);
+        let catalog = Arc::new(NativeWatchCatalog::new(&state, None));
+        let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let during = Arc::clone(&catalog);
+        let publish_scope = scope.clone();
+        let publish_options = options.clone();
+        let publish_path = path.to_owned();
+        AFTER_CATALOG_SCAN.with(|hook| hook.set(Some(Box::new(move || {
+            assert!(during.catalogs.try_lock().is_ok());
+            assert!(during.candidate_paths(&publish_scope, None).is_empty());
+            let published = during.publish_outputs(&[publish_path], &[publish_scope], &publish_options, None).unwrap();
+            assert_eq!(published.len(), 1);
+        }))));
+
+        let (errors, arrivals) = options.catalog_refresh(&catalog, &scope, None).unwrap();
+        assert!(errors.is_empty() && arrivals.is_empty());
+        assert_eq!(catalog.path_is_directory(&scope, path), Some(true));
+        assert!(catalog.generated_observation(file.to_str().unwrap()).is_some());
+        assert!(!catalog.is_owned(path));
+        fs::remove_file(&file).unwrap();
+        fs::remove_dir(&output).unwrap();
+        fs::remove_dir(&root).unwrap();
+    }
+
     #[test]
     fn ordinary_commit_keeps_usn_identity_cache_until_idle_commit() {
         let state = crate::watch_store::NativeWatchState::new();

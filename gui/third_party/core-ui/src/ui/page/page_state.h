@@ -27,7 +27,7 @@ public:
     // Install a compiled page. Spins up a fresh ScriptRuntime + reactive
     // proxy + binding effects + v-if/v-for runtimes. Existing variable
     // values set via Set* are preserved across Attach (hot reload).
-    void Attach(CompiledPage page);
+    bool Attach(CompiledPage page, std::string& error);
 
     // Process-wide override for the QuickJS path. The flag is now mostly
     // historical (every page goes through QuickJS); kept for env-var
@@ -58,7 +58,7 @@ public:
     void SetValue(const std::string& name, ui::expr::Value v);
     // Parse text straight into QuickJS; avoid an intermediate expr::Value round trip.
     bool SetJsonText(const std::string& name, const char* json, size_t length, std::string& error);
-    bool CallJsonMethod(const std::string& name, const std::string& json);
+    bool CallJsonMethod(const std::string& name, const std::string& json, std::string& error);
 
     bool GetValue(const std::string& name, ui::expr::Value& out) const;
 
@@ -109,8 +109,9 @@ private:
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> i18nTables_;
 
     // ---- QuickJS path state ----
-    void AttachQuickJS(CompiledPage page);
-    void DetachQuickJS();
+    bool AttachQuickJS(std::string& error);
+    void DetachQuickJS(bool dispatchUnmount = true);
+    void SetJsValue(const std::string& name, JSValue value);
     void WireQuickJSConditionals();
     // Helper extracted from WireQuickJSConditionals so nested v-if (a v-if
     // declared inside another v-if's subtree, surfaced as sub.conditionals)

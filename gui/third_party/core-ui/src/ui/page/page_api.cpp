@@ -381,7 +381,7 @@ bool CompileAndAttachPage(PageEntry& e, const std::string& rawText) {
         OutputDebugStringA(warnings.c_str());
         OutputDebugStringA("\n");
     }
-    e.state->Attach(std::move(compiled));
+    if (!e.state->Attach(std::move(compiled), e.lastError)) return false;
     e.lastError = std::move(warnings);
     return true;
 }
@@ -542,7 +542,7 @@ static UiWindow page_open_or_prepare_(UiPage p,
                                          const UiWindowConfig* override_defaults,
                                          bool show) {
     auto* e = ui::page::Registry().Get(p);
-    if (!e || !e->state) return 0;
+    if (!e || !e->state || !e->state->PageData().root) return 0;
     const auto& hints = e->state->PageData().windowHints;
 
     UiWindowConfig cfg = {0};
@@ -654,8 +654,9 @@ UI_API int ui_page_set_json(UiPage p, const char* name, const char* utf8_json) {
 UI_API int ui_page_call_json(UiPage p, const char* method, const char* utf8_json) {
     auto* e = ui::page::Registry().Get(p);
     if(!e || !e->state || !method || !utf8_json) return -1;
-    if(!e->state->CallJsonMethod(method,utf8_json)) {
-        e->lastError="ui_page_call_json failed: "+std::string(method);
+    std::string error;
+    if(!e->state->CallJsonMethod(method,utf8_json,error)) {
+        e->lastError="ui_page_call_json failed: "+std::string(method)+": "+error;
         return -1;
     }
     return 0;

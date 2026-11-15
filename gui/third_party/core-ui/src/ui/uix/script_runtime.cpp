@@ -1,6 +1,7 @@
 #include "script_runtime.h"
 
 #include <cstring>
+#include <new>
 #include <utility>
 
 namespace ui::uix {
@@ -24,22 +25,22 @@ JSValue ProxyGetTrap(JSContext* ctx, JSValueConst /*this_val*/,
     // outer effect is tracked there — bypass plain JS_GetProperty so we
     // never read whatever (probably undefined) sits on the data object
     // for this name.
-    if (self) {
+    if (self && !JS_IsSymbol(key)) {
         const char* keyStr = JS_ToCString(ctx, key);
-        if (keyStr) {
-            void* tp = JS_VALUE_GET_PTR(target);
-            if (self->IsComputed(tp, keyStr)) {
-                JSValue r = self->GetComputed(tp, keyStr);
-                JS_FreeCString(ctx, keyStr);
-                return r;
-            }
-            self->TrackRead(tp, keyStr);
+        if (!keyStr) return JS_EXCEPTION;
+        void* tp = JS_VALUE_GET_PTR(target);
+        if (self->IsComputed(tp, keyStr)) {
+            JSValue r = self->GetComputed(tp, keyStr);
             JS_FreeCString(ctx, keyStr);
+            return r;
         }
+        self->TrackRead(tp, keyStr);
+        JS_FreeCString(ctx, keyStr);
     }
 
     // Pass-through: return target[key].
     JSAtom atom = JS_ValueToAtom(ctx, key);
+    if (atom == JS_ATOM_NULL) return JS_EXCEPTION;
     JSValue result = JS_GetProperty(ctx, target, atom);
     JS_FreeAtom(ctx, atom);
     return result;
@@ -62,10 +63,15 @@ JSValue ProxySetTrap(JSContext* ctx, JSValueConst /*this_val*/,
     // repeatedly rebinds controls, invalidates layout and schedules paints.
     // Object/array writes must retain reference/identity update semantics.
     JSAtom atom = JS_ValueToAtom(ctx, key);
+    if (atom == JS_ATOM_NULL) return JS_EXCEPTION;
     if (JS_IsString(value) || JS_IsNumber(value) || JS_IsBool(value) ||
         JS_IsNull(value) || JS_IsUndefined(value)) {
         JSValue previous = JS_GetProperty(ctx, target, atom);
-        bool same = !JS_IsException(previous) && JS_IsStrictEqual(ctx, previous, value);
+        if (JS_IsException(previous)) {
+            JS_FreeAtom(ctx, atom);
+            return JS_EXCEPTION;
+        }
+        bool same = JS_IsStrictEqual(ctx, previous, value);
         JS_FreeValue(ctx, previous);
         if (same) {
             JS_FreeAtom(ctx, atom);
@@ -78,12 +84,11 @@ JSValue ProxySetTrap(JSContext* ctx, JSValueConst /*this_val*/,
     if (rc < 0) return JS_EXCEPTION;
 
     // Trigger dependent effects after the write lands.
-    if (self) {
+    if (self && !JS_IsSymbol(key)) {
         const char* keyStr = JS_ToCString(ctx, key);
-        if (keyStr) {
-            self->TriggerWrite(JS_VALUE_GET_PTR(target), keyStr);
-            JS_FreeCString(ctx, keyStr);
-        }
+        if (!keyStr) return JS_EXCEPTION;
+        self->TriggerWrite(JS_VALUE_GET_PTR(target), keyStr);
+        JS_FreeCString(ctx, keyStr);
     }
 
     return JS_TRUE;
@@ -95,12 +100,24 @@ JSValue ProxySetTrap(JSContext* ctx, JSValueConst /*this_val*/,
 
 ScriptRuntime::ScriptRuntime() {
     rt_  = JS_NewRuntime();
+    if (!rt_) throw std::bad_alloc();
     ctx_ = JS_NewContext(rt_);
+    if (!ctx_) {
+        JS_FreeRuntime(rt_);
+        throw std::bad_alloc();
+    }
     JS_SetContextOpaque(ctx_, this);
 
     // Pre-build the trap functions so MakeReactive can reuse them.
     trapGet_ = JS_NewCFunction(ctx_, &ProxyGetTrap, "get", 3);
-    trapSet_ = JS_NewCFunction(ctx_, &ProxySetTrap, "set", 4);
+    if (!JS_IsException(trapGet_)) {
+        trapSet_ = JS_NewCFunction(ctx_, &ProxySetTrap, "set", 4);
+        if (!JS_IsException(trapSet_)) return;
+        JS_FreeValue(ctx_, trapGet_);
+    }
+    JS_FreeContext(ctx_);
+    JS_FreeRuntime(rt_);
+    throw std::bad_alloc();
 }
 
 ScriptRuntime::~ScriptRuntime() {
@@ -127,33 +144,40 @@ ScriptRuntime::~ScriptRuntime() {
 }
 
 namespace {
-// Pull the pending exception off the context, format into `out`, free the
-// exception. Appends `.stack` if available for richer diagnostics.
-void CaptureException(JSContext* ctx, std::string& out) {
-    JSValue exc = JS_GetException(ctx);
-    const char* msg = JS_ToCString(ctx, exc);
-    out = msg ? msg : "(no message)";
-    if (msg) JS_FreeCString(ctx, msg);
-
-    JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
-    if (!JS_IsUndefined(stack) && !JS_IsException(stack)) {
-        const char* s = JS_ToCString(ctx, stack);
-        if (s) {
-            out += "\n";
-            out += s;
-            JS_FreeCString(ctx, s);
+std::string FormatException(JSContext* ctx, JSValue exc, bool includeStack) {
+    auto freeString = [ctx](const char* s) { JS_FreeCString(ctx, s); };
+    std::unique_ptr<const char, decltype(freeString)> message(
+        JS_ToCString(ctx, exc), freeString);
+    std::unique_ptr<const char, decltype(freeString)> trace(nullptr, freeString);
+    if (message && includeStack && JS_IsObject(exc)) {
+        JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+        if (!JS_IsUndefined(stack) && !JS_IsException(stack)) {
+            trace.reset(JS_ToCString(ctx, stack));
         }
+        JS_FreeValue(ctx, stack);
     }
-    JS_FreeValue(ctx, stack);
     JS_FreeValue(ctx, exc);
+    // Error coercion and stack getters can execute JS, and allocation can fail.
+    if (JS_HasException(ctx)) JS_FreeValue(ctx, JS_GetException(ctx));
+    std::string out = message ? message.get() : "(no message)";
+    if (trace) {
+        out += '\n';
+        out += trace.get();
+    }
+    return out;
 }
 }  // namespace
+
+std::string TakeExceptionMessage(JSContext* ctx, bool includeStack) {
+    if (!JS_HasException(ctx)) return "(no message)";
+    return FormatException(ctx, JS_GetException(ctx), includeStack);
+}
 
 bool ScriptRuntime::Eval(const std::string& source, const std::string& filename) {
     JSValue v = JS_Eval(ctx_, source.c_str(), source.size(),
                         filename.c_str(), JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(v)) {
-        CaptureException(ctx_, lastError_);
+        lastError_ = TakeExceptionMessage(ctx_, true);
         JS_FreeValue(ctx_, v);
         return false;
     }
@@ -171,7 +195,7 @@ ScriptRuntime::EvalModule(const std::string& source, const std::string& filename
                                filename.c_str(),
                                JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     if (JS_IsException(compiled)) {
-        CaptureException(ctx_, lastError_);
+        lastError_ = TakeExceptionMessage(ctx_, true);
         return r;
     }
 
@@ -181,8 +205,16 @@ ScriptRuntime::EvalModule(const std::string& source, const std::string& filename
     // 2) Evaluate the module's top-level body. JS_EvalFunction takes
     //    ownership of `compiled` (don't free it ourselves).
     JSValue evalRet = JS_EvalFunction(ctx_, compiled);
-    if (JS_IsException(evalRet)) {
-        CaptureException(ctx_, lastError_);
+    if (JS_IsException(evalRet) || JS_HasException(ctx_)) {
+        JS_FreeValue(ctx_, evalRet);
+        lastError_ = TakeExceptionMessage(ctx_, true);
+        return r;
+    }
+    // Module execution can reject its promise even without any async work.
+    if (JS_PromiseState(ctx_, evalRet) == JS_PROMISE_REJECTED) {
+        JSValue reason = JS_PromiseResult(ctx_, evalRet);
+        JS_FreeValue(ctx_, evalRet);
+        lastError_ = FormatException(ctx_, reason, true);
         return r;
     }
     JS_FreeValue(ctx_, evalRet);
@@ -190,7 +222,7 @@ ScriptRuntime::EvalModule(const std::string& source, const std::string& filename
     // 3) Extract the `default` export from the module's namespace.
     JSValue ns = JS_GetModuleNamespace(ctx_, mod);
     if (JS_IsException(ns)) {
-        CaptureException(ctx_, lastError_);
+        lastError_ = TakeExceptionMessage(ctx_, true);
         return r;
     }
 
@@ -198,7 +230,7 @@ ScriptRuntime::EvalModule(const std::string& source, const std::string& filename
     JS_FreeValue(ctx_, ns);
 
     if (JS_IsException(def)) {
-        CaptureException(ctx_, lastError_);
+        lastError_ = TakeExceptionMessage(ctx_, true);
         return r;
     }
     if (JS_IsUndefined(def)) {
@@ -224,7 +256,7 @@ JSValue ScriptRuntime::CompileBindingClosure(const std::string& jsExpr,
     JSValue v = JS_Eval(ctx_, src.c_str(), src.size(),
                         filename.c_str(), JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(v)) {
-        CaptureException(ctx_, lastError_);
+        lastError_ = TakeExceptionMessage(ctx_, true);
     } else {
         lastError_.clear();
     }
@@ -253,7 +285,7 @@ JSValue ScriptRuntime::CompileHandlerClosure(const std::string& jsExpr,
     JSValue v = JS_Eval(ctx_, src.c_str(), src.size(),
                         filename.c_str(), JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(v)) {
-        CaptureException(ctx_, lastError_);
+        lastError_ = TakeExceptionMessage(ctx_, true);
     } else {
         lastError_.clear();
     }
@@ -274,7 +306,10 @@ JSValue ScriptRuntime::CompileTemplateClosure(const std::string& source, const s
         return JS_DupValue(ctx_, found->second);
     }
     JSValue value = JS_Eval(ctx_, source.c_str(), source.size(), filename.c_str(), JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(value)) { CaptureException(ctx_, lastError_); return value; }
+    if (JS_IsException(value)) {
+        lastError_ = TakeExceptionMessage(ctx_, true);
+        return value;
+    }
     lastError_.clear();
     if (key.size() <= 8192) {
         if (templateClosures_.size() >= 512 || templateSourceBytes_ + key.size() > 131072) ClearTemplateClosures();
@@ -361,21 +396,24 @@ JSValue ScriptRuntime::CompileLoopHandlerClosure(const std::string& jsExpr,
 }
 
 JSValue ScriptRuntime::MakeReactive(JSValueConst target) {
-    // Build handler = { get: trapGet_, set: trapSet_ } — but Proxy() consumes
-    // its handler arg, so we DupValue the per-runtime trap closures.
+    // The handler owns a reference to each trap.
     JSValue handler = JS_NewObject(ctx_);
-    JS_SetPropertyStr(ctx_, handler, "get", JS_DupValue(ctx_, trapGet_));
-    JS_SetPropertyStr(ctx_, handler, "set", JS_DupValue(ctx_, trapSet_));
+    if (JS_IsException(handler)) return handler;
+    if (JS_SetPropertyStr(ctx_, handler, "get", JS_DupValue(ctx_, trapGet_)) < 0 ||
+        JS_SetPropertyStr(ctx_, handler, "set", JS_DupValue(ctx_, trapSet_)) < 0) {
+        JS_FreeValue(ctx_, handler);
+        return JS_EXCEPTION;
+    }
 
     // new Proxy(target, handler)
     JSValue global    = JS_GetGlobalObject(ctx_);
     JSValue proxyCtor = JS_GetPropertyStr(ctx_, global, "Proxy");
 
-    JSValue args[2] = { JS_DupValue(ctx_, target), handler };
-    JSValue proxy   = JS_CallConstructor(ctx_, proxyCtor, 2, args);
+    JSValueConst args[2] = { target, handler };
+    JSValue proxy = JS_IsException(proxyCtor)
+        ? JS_EXCEPTION : JS_CallConstructor(ctx_, proxyCtor, 2, args);
 
-    JS_FreeValue(ctx_, args[0]);  // ctor took its own ref
-    JS_FreeValue(ctx_, args[1]);  // ctor took its own ref
+    JS_FreeValue(ctx_, handler);
     JS_FreeValue(ctx_, proxyCtor);
     JS_FreeValue(ctx_, global);
 
@@ -436,8 +474,8 @@ bool ScriptRuntime::IsComputed(void* target_ptr, const std::string& key) const {
     return computeds_.find(DepKey{target_ptr, key}) != computeds_.end();
 }
 
-uint64_t ScriptRuntime::DefineComputed(void* target_ptr, const std::string& key,
-                                        JSValueConst userFn, JSValueConst thisObj) {
+bool ScriptRuntime::DefineComputed(void* target_ptr, const std::string& key,
+                                   JSValueConst userFn, JSValueConst thisObj) {
     auto ref = std::make_unique<ComputedRef>();
     ref->userFn  = JS_DupValue(ctx_, userFn);
     ref->thisObj = JS_DupValue(ctx_, thisObj);
@@ -469,27 +507,31 @@ uint64_t ScriptRuntime::DefineComputed(void* target_ptr, const std::string& key,
     JSValue v = JS_Call(ctx_, ref->userFn, ref->thisObj, 0, nullptr);
     activeEffectId_ = prev;
 
+    bool ok = true;
     if (JS_IsException(v)) {
-        // Capture the message so callers see it via lastError_; cache stays
-        // undefined and dirty so the next read re-attempts (in case the
-        // failure was transient — e.g. depended on a key not yet defined).
-        CaptureException(ctx_, lastError_);
-        ref->cachedValue = JS_UNDEFINED;
-        ref->dirty       = true;
+        JSValue error = JS_GetException(ctx_);
+        if (JS_IsUncatchableError(error)) {
+            JS_Throw(ctx_, error);
+            ok = false;
+        } else {
+            // A later read can retry after another computed is registered.
+            lastError_ = FormatException(ctx_, error, true);
+        }
     } else {
         ref->cachedValue = v;
         ref->dirty       = false;
     }
 
-    uint64_t wid = ref->watcherId;
     computeds_.emplace(DepKey{target_ptr, key}, std::move(ref));
-    return wid;
+    return ok;
 }
 
 JSValue ScriptRuntime::GetComputed(void* target_ptr, const std::string& key) {
     auto it = computeds_.find(DepKey{target_ptr, key});
     if (it == computeds_.end()) return JS_UNDEFINED;
     auto& ref = *it->second;
+    // Keep the outer dependency even if evaluation fails this time.
+    TrackRead(target_ptr, key);
 
     if (ref.dirty) {
         // Recompute under the watcher's effect id so reads register
@@ -504,8 +546,9 @@ JSValue ScriptRuntime::GetComputed(void* target_ptr, const std::string& key) {
         activeEffectId_ = prev;
 
         if (JS_IsException(v)) {
-            CaptureException(ctx_, lastError_);
-            JS_FreeValue(ctx_, v);
+            JSValue error = JS_GetException(ctx_);
+            if (JS_IsUncatchableError(error)) return JS_Throw(ctx_, error);
+            lastError_ = FormatException(ctx_, error, true);
             // Leave dirty=true so next read retries; keep prior cached value.
         } else {
             ref.cachedValue = v;
@@ -513,10 +556,6 @@ JSValue ScriptRuntime::GetComputed(void* target_ptr, const std::string& key) {
             ref.dirty = false;
         }
     }
-
-    // Outer effect (if any) tracks this computed key so it re-runs when
-    // the watcher fires TriggerWrite on (target_ptr, key).
-    TrackRead(target_ptr, key);
 
     return JS_DupValue(ctx_, ref.cachedValue);
 }

@@ -12,6 +12,7 @@
 #include <ui/ui_window.h>
 #include <ui/controls.h>
 #include <ui/ui_debug.h>
+#include <ui/uix/script_runtime.h>
 
 using namespace spg;
 
@@ -77,6 +78,74 @@ Json state(UiPage page,const char* key) {
     if(!text) throw std::runtime_error(std::string("UI state unavailable: ")+key);
     return parse_json(text.get());
 }
+
+void script_error_contracts() {
+    for(const auto* source:{
+        R"(<script>
+          export default {data() {return {ready: true};}};
+          try {throw new InternalError("module failed");} catch (error) {}
+        </script><template><div/></template>)",
+        R"(<script>
+          export default {get data() {throw new InternalError("data failed");}};
+        </script><template><div/></template>)",
+        R"(<script>
+          export default {
+            methods: {ok() {}, get broken() {throw new InternalError("methods failed");}}
+          };
+        </script><template><div/></template>)",
+        R"(<script>
+          export default {
+            computed: {ok() {return {};}, broken() {throw new InternalError("eager computed failed");}}
+          };
+        </script><template><div/></template>)"
+    }) {
+        UiPage page=ui_page_load_string(source);
+        assert(page);
+        const std::string error=ui_page_last_error(page);
+        assert(error.find("InternalError: ")!=std::string::npos);
+        assert(ui_page_root(page)==0 && ui_page_prepare_window(page,nullptr)==0);
+        assert(ui_page_reload(page)==0);
+        ui_page_destroy(page);
+    }
+
+    UiPage page=ui_page_load_string(R"(<script>
+      export default {
+        data() {return {broken: false, continued: false, caught: false};},
+        computed: {
+          derived() {
+            if(this.broken) throw new InternalError("computed failed");
+            return 7;
+          }
+        },
+        methods: {
+          fail() {
+            this.broken=true;
+            try {void this.derived;} catch (error) {this.caught=true;}
+            this.continued=true;
+          },
+          recover() {this.broken=false;}
+        }
+      };
+    </script><template><div/></template>)");
+    assert(page && state(page,"derived")==7);
+    assert(ui_page_call_json(page,"fail","null")==-1);
+    assert(std::string(ui_page_last_error(page)).find("computed failed")!=std::string::npos);
+    assert(state(page,"continued")==false && state(page,"caught")==false);
+    assert(ui_page_call_json(page,"recover","null")==0 && state(page,"derived")==7);
+    ui_page_destroy(page);
+
+    ui::uix::ScriptRuntime runtime;
+    JSMemoryUsage usage{};
+    JS_ComputeMemoryUsage(runtime.rt(),&usage);
+    JS_SetMemoryLimit(runtime.rt(),static_cast<size_t>(usage.malloc_size)+64*1024);
+    assert(!runtime.Eval("try { new ArrayBuffer(1024 * 1024); } catch (error) {}"));
+    assert(runtime.lastError().find("out of memory")!=std::string::npos);
+    assert(!JS_HasException(runtime.ctx()));
+    JS_SetMemoryLimit(runtime.rt(),static_cast<size_t>(-1));
+    assert(!runtime.Eval("throw { toString() { throw new InternalError('secondary'); } }"));
+    assert(!JS_HasException(runtime.ctx()) && runtime.Eval("1 + 1;"));
+}
+
 UiRect rect(Application& app,const std::string& id) {
     auto* widget=ui::GetContext().GetWindow(app.window())->Root()->FindById(id);
     if(!widget) throw std::runtime_error("Widget missing: "+id);
@@ -749,6 +818,7 @@ int wmain(int argc,wchar_t** argv) {
     _set_error_mode(_OUT_TO_STDERR);
     _set_abort_behavior(0,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
     const std::wstring mode=argc>1?argv[1]:L"--acceptance";
+    if(mode==L"--script-errors") { script_error_contracts(); return 0; }
     if(mode==L"--startup-failure") return startup_failure_contract();
     if(mode==L"--theme" || mode==L"--theme-session") return theme_contracts(argc,argv);
     if(mode==L"--fake-cli") return fake_cli(argc,argv);

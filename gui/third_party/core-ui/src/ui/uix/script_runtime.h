@@ -38,6 +38,9 @@
 
 namespace ui::uix {
 
+// Consume the pending exception and any exception raised while formatting it.
+std::string TakeExceptionMessage(JSContext* ctx, bool includeStack = false);
+
 class ScriptRuntime {
 public:
     ScriptRuntime();
@@ -160,9 +163,9 @@ public:
     // cache dirty, and triggers every effect that depends on
     // (target_ptr, key) — typical case: bindings reading the computed.
     //
-    // Returns the watcher effect id (informational).
-    uint64_t DefineComputed(void* target_ptr, const std::string& key,
-                             JSValueConst userFn, JSValueConst thisObj);
+    // Returns false with a pending exception if initial evaluation is fatal.
+    bool DefineComputed(void* target_ptr, const std::string& key,
+                        JSValueConst userFn, JSValueConst thisObj);
 
     // Internal: called from the proxy get-trap when key is a registered
     // computed. Recomputes if dirty + tracks the outer effect against

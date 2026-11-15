@@ -811,7 +811,7 @@ export default {
         </div>
         <label class="h2">{{ $t('settings_about') }}</label>
         <div class="panel">
-          <label class="lbl">Core UI 1.5.x · QuickJS-NG v0.14.0</label>
+          <label class="lbl">Core UI 1.5.x · QuickJS-NG v0.18.0</label>
           <label class="lbl">Direct2D · DirectWrite · Win32</label>
           <label class="lbl">{{ $t('settings_about_desc') }}</label>
         </div>

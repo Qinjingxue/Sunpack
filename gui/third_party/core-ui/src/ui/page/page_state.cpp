@@ -191,10 +191,11 @@ JSValue JsTranslateTrampoline(JSContext* ctx, JSValueConst this_val,
     if (!page || argc < 1) return JS_UNDEFINED;
 
     JSValue localeV = JS_GetPropertyStr(ctx, this_val, "$locale");
+    if (JS_IsException(localeV)) return localeV;
     JS_FreeValue(ctx, localeV);
 
     const char* key = JS_ToCString(ctx, argv[0]);
-    if (!key) return JS_NewString(ctx, "");
+    if (!key) return JS_EXCEPTION;
     std::string out = page->Translate(key);
     JS_FreeCString(ctx, key);
     return JS_NewStringLen(ctx, out.data(), out.size());
@@ -232,8 +233,9 @@ JSValue JsRectTrampoline(JSContext* ctx, JSValueConst /*this_val*/,
     if (!page || argc < 1) return JS_NULL;
 
     const char* id = JS_ToCString(ctx, argv[0]);
-    if (!id || !*id) {
-        if (id) JS_FreeCString(ctx, id);
+    if (!id) return JS_EXCEPTION;
+    if (!*id) {
+        JS_FreeCString(ctx, id);
         return JS_NULL;
     }
 
@@ -386,29 +388,27 @@ PageState::~PageState() {
 
 // ---- Reactive state writes ------------------------------------------------
 //
-// All writes route through the JS proxy's set-trap when the runtime is
-// attached. Without a runtime (pre-attach Set* calls — typical for callers
-// that prime state via ui_page_set_int before ui_page_open_window), we
-// stash the value and replay it inside AttachQuickJS… that path isn't
-// implemented here; callers should attach first. The C API guards against
-// nullptr state already.
+// Callers with a runtime and state write through the JS proxy's set-trap.
+void PageState::SetJsValue(const std::string& name, JSValue value) {
+    JSContext* ctx = jsRt_->ctx();
+    if (JS_IsException(value) || JS_SetPropertyStr(ctx, jsState_, name.c_str(), value) < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+}
 
 void PageState::SetBool(const std::string& name, bool v) {
     if (!jsRt_ || JS_IsUndefined(jsState_)) return;
-    JS_SetPropertyStr(jsRt_->ctx(), jsState_, name.c_str(),
-                      JS_NewBool(jsRt_->ctx(), v));
+    SetJsValue(name, JS_NewBool(jsRt_->ctx(), v));
 }
 
 void PageState::SetNumber(const std::string& name, double v) {
     if (!jsRt_ || JS_IsUndefined(jsState_)) return;
-    JS_SetPropertyStr(jsRt_->ctx(), jsState_, name.c_str(),
-                      JS_NewFloat64(jsRt_->ctx(), v));
+    SetJsValue(name, JS_NewFloat64(jsRt_->ctx(), v));
 }
 
 void PageState::SetString(const std::string& name, const std::string& v) {
     if (!jsRt_ || JS_IsUndefined(jsState_)) return;
-    JS_SetPropertyStr(jsRt_->ctx(), jsState_, name.c_str(),
-                      JS_NewStringLen(jsRt_->ctx(), v.data(), v.size()));
+    SetJsValue(name, JS_NewStringLen(jsRt_->ctx(), v.data(), v.size()));
 }
 
 void PageState::SetValue(const std::string& name, ui::expr::Value v) {
@@ -422,16 +422,12 @@ void PageState::SetValue(const std::string& name, ui::expr::Value v) {
     if (v.IsNumber()) { SetNumber(name, v.Number()); return; }
     if (v.IsString()) { SetString(name, v.ToString()); return; }
     if (v.IsNull()) {
-        JS_SetPropertyStr(ctx, jsState_, name.c_str(), JS_NULL);
+        SetJsValue(name, JS_NULL);
         return;
     }
     std::string json = ui::expr::EmitJson(v);
     JSValue parsed = JS_ParseJSON(ctx, json.c_str(), json.size(), "<set_value>");
-    if (JS_IsException(parsed)) {
-        JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
-        return;
-    }
-    JS_SetPropertyStr(ctx, jsState_, name.c_str(), parsed);
+    SetJsValue(name, parsed);
 }
 
 bool PageState::SetJsonText(const std::string& name, const char* json, size_t length, std::string& error) {
@@ -441,34 +437,38 @@ bool PageState::SetJsonText(const std::string& name, const char* json, size_t le
     }
     JSContext* ctx = jsRt_->ctx();
     JSValue value = JS_ParseJSON(ctx, json, length, "<set_json>");
-    auto failed = [&]() {
-        JSValue exception = JS_GetException(ctx);
-        const char* message = JS_ToCString(ctx, exception);
-        error = message ? message : "QuickJS JSON error";
-        if (message) JS_FreeCString(ctx, message);
-        JS_FreeValue(ctx, exception);
-        return false;
-    };
-    if (JS_IsException(value)) return failed();
     // The proxy setter takes ownership and triggers normal reactive bindings.
-    if (JS_SetPropertyStr(ctx, jsState_, name.c_str(), value) < 0) return failed();
+    if (JS_IsException(value) || JS_SetPropertyStr(ctx, jsState_, name.c_str(), value) < 0) {
+        error = ui::uix::TakeExceptionMessage(ctx);
+        return false;
+    }
     return true;
 }
 
-bool PageState::CallJsonMethod(const std::string& name,const std::string& json) {
-    if(!jsRt_ || JS_IsUndefined(jsState_)) return false;
-    JSContext* ctx=jsRt_->ctx();
-    JSValue method=JS_GetPropertyStr(ctx,jsState_,name.c_str());
-    if(!JS_IsFunction(ctx,method)) { JS_FreeValue(ctx,method); return false; }
-    JSValue argument=JS_ParseJSON(ctx,json.data(),json.size(),"<call_json>");
-    if(JS_IsException(argument)) {
-        JSValue error=JS_GetException(ctx); JS_FreeValue(ctx,error);
-        JS_FreeValue(ctx,method); return false;
+bool PageState::CallJsonMethod(const std::string& name, const std::string& json, std::string& error) {
+    if (!jsRt_ || JS_IsUndefined(jsState_)) {
+        error = "QuickJS state unavailable";
+        return false;
     }
-    JSValue result=JS_Call(ctx,method,jsState_,1,&argument);
-    bool ok=!JS_IsException(result);
-    if(!ok) { JSValue error=JS_GetException(ctx); JS_FreeValue(ctx,error); }
-    JS_FreeValue(ctx,result); JS_FreeValue(ctx,argument); JS_FreeValue(ctx,method);
+    JSContext* ctx = jsRt_->ctx();
+    JSValue method = JS_GetPropertyStr(ctx, jsState_, name.c_str());
+    if (JS_IsException(method)) {
+        error = ui::uix::TakeExceptionMessage(ctx);
+        return false;
+    }
+    if (!JS_IsFunction(ctx, method)) {
+        JS_FreeValue(ctx, method);
+        error = "property is not a method";
+        return false;
+    }
+    JSValue argument = JS_ParseJSON(ctx, json.data(), json.size(), "<call_json>");
+    JSValue result = JS_IsException(argument)
+        ? JS_EXCEPTION : JS_Call(ctx, method, jsState_, 1, &argument);
+    bool ok = !JS_IsException(result);
+    JS_FreeValue(ctx, result);
+    JS_FreeValue(ctx, argument);
+    JS_FreeValue(ctx, method);
+    if (!ok) error = ui::uix::TakeExceptionMessage(ctx);
     return ok;
 }
 
@@ -476,10 +476,11 @@ bool PageState::GetValue(const std::string& name, ui::expr::Value& out) const {
     if (!jsRt_ || JS_IsUndefined(jsState_)) return false;
     JSContext* ctx = jsRt_->ctx();
     JSValue v = JS_GetPropertyStr(ctx, jsState_, name.c_str());
-    if (JS_IsUndefined(v) || JS_IsException(v)) {
-        JS_FreeValue(ctx, v);
+    if (JS_IsException(v)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
         return false;
     }
+    if (JS_IsUndefined(v)) return false;
     out = ui::uix::JSValueToExprValue(ctx, v);
     JS_FreeValue(ctx, v);
     return true;
@@ -1507,9 +1508,13 @@ void PageState::DispatchQuickJSResize(int width, int height) {
 
     JSContext* ctx = jsRt_->ctx();
     JSValue fn = JS_GetPropertyStr(ctx, jsOptions_, "onResize");
-    if (!JS_IsFunction(ctx, fn)) {
+    if (!JS_IsException(fn) && !JS_IsFunction(ctx, fn)) {
         JS_FreeValue(ctx, fn);
         fn = JS_GetPropertyStr(ctx, jsState_, "onResize");
+    }
+    if (JS_IsException(fn)) {
+        errors_.push_back("onResize lookup threw: " + ui::uix::TakeExceptionMessage(ctx));
+        return;
     }
     if (!JS_IsFunction(ctx, fn)) {
         JS_FreeValue(ctx, fn);
@@ -1526,15 +1531,11 @@ void PageState::DispatchQuickJSResize(int width, int height) {
     JSValue r = JS_Call(ctx, fn, jsState_, 2, args);
     JS_FreeValue(ctx, args[0]);
     JS_FreeValue(ctx, args[1]);
-    if (JS_IsException(r)) {
-        JSValue exc = JS_GetException(ctx);
-        const char* msg = JS_ToCString(ctx, exc);
-        errors_.push_back(std::string("onResize threw: ") + (msg ? msg : "(no message)"));
-        if (msg) JS_FreeCString(ctx, msg);
-        JS_FreeValue(ctx, exc);
-    }
     JS_FreeValue(ctx, r);
     JS_FreeValue(ctx, fn);
+    if (JS_IsException(r)) {
+        errors_.push_back("onResize threw: " + ui::uix::TakeExceptionMessage(ctx));
+    }
 }
 
 ContextMenu* PageState::FindMenuById(const std::string& id) const {
@@ -1587,12 +1588,16 @@ bool PageState::GetGlobalUseQuickJS() {
     return g_quickJsFlag == FlagState::On;
 }
 
-void PageState::Attach(CompiledPage page) {
+bool PageState::Attach(CompiledPage page, std::string& error) {
     EnsureFlagInit();
-    // The flag exists for env-var diff-bisecting; setting UI_PAGE_QUICKJS=0
-    // would historically force the legacy AST path. That path no longer
-    // exists, so we just route everything through QuickJS.
-    AttachQuickJS(std::move(page));
+    DetachQuickJS();
+    InvalidateMenuHandles();
+    page_ = std::move(page);
+    errors_.clear();
+    if (AttachQuickJS(error)) return true;
+    DetachQuickJS(false);
+    page_ = {};
+    return false;
 }
 
 // ---- QuickJS path ---------------------------------------------------------
@@ -1694,13 +1699,13 @@ struct PageState::JsLoopRuntime {
     bool                     outerHasIdx = false;
 };
 
-void PageState::DetachQuickJS() {
+void PageState::DetachQuickJS(bool dispatchUnmount) {
     if (!jsRt_) return;
     // Fire unmount hooks before tearing anything down — registered onUnmount
     // callbacks (ui_page_on_widget_unmount) need a chance to release
     // external resources tied to the live widget instances. Without this
     // window-close / page-swap leaks any user-attached cleanup.
-    if (page_.root) DispatchUnmountHooks(page_.root.get());
+    if (dispatchUnmount && page_.root) DispatchUnmountHooks(page_.root.get());
 
     for (uint64_t id : jsEffectIds_) jsRt_->DisposeEffect(id);
     jsEffectIds_.clear();
@@ -1730,14 +1735,19 @@ void PageState::DetachQuickJS() {
     jsRt_.reset();
 }
 
-void PageState::AttachQuickJS(CompiledPage page) {
-    DetachQuickJS();
-    InvalidateMenuHandles();
-    page_ = std::move(page);
-
-    jsRt_ = std::make_unique<ui::uix::ScriptRuntime>();
+bool PageState::AttachQuickJS(std::string& error) {
+    try {
+        jsRt_ = std::make_unique<ui::uix::ScriptRuntime>();
+    } catch (const std::bad_alloc&) {
+        error = "QuickJS initialization failed: out of memory";
+        return false;
+    }
     jsRt_->SetUserData(this);
     JSContext* ctx = jsRt_->ctx();
+    auto failed = [&](const char* stage) {
+        error = stage + ui::uix::TakeExceptionMessage(ctx, true);
+        return false;
+    };
 
     bool hasScript = false;
     for (char c : page_.scriptSource) {
@@ -1748,12 +1758,13 @@ void PageState::AttachQuickJS(CompiledPage page) {
     if (hasScript) {
         auto evalRes = jsRt_->EvalModule(page_.scriptSource, "<script>");
         if (!evalRes.ok) {
-            errors_.push_back("<script> JS error: " + jsRt_->lastError());
-            return;
+            error = "<script> JS error: " + jsRt_->lastError();
+            return false;
         }
         jsOptions_ = evalRes.defaultExport;
 
         JSValue dataFn = JS_GetPropertyStr(ctx, jsOptions_, "data");
+        if (JS_IsException(dataFn)) return failed("data: ");
         if (JS_IsFunction(ctx, dataFn)) {
             dataObj = JS_Call(ctx, dataFn, JS_UNDEFINED, 0, nullptr);
         } else if (JS_IsObject(dataFn)) {
@@ -1762,84 +1773,88 @@ void PageState::AttachQuickJS(CompiledPage page) {
             dataObj = JS_NewObject(ctx);
         }
         JS_FreeValue(ctx, dataFn);
-
-        if (JS_IsException(dataObj)) {
-            errors_.push_back("data() threw");
-            JSValue exc = JS_GetException(ctx);
-            JS_FreeValue(ctx, exc);
-            JS_FreeValue(ctx, dataObj);
-            return;
-        }
     } else {
-        jsOptions_ = JS_UNDEFINED;
-        dataObj    = JS_NewObject(ctx);
+        dataObj = JS_NewObject(ctx);
     }
+    if (JS_IsException(dataObj)) return failed("data(): ");
+    auto dataFailed = [&](const char* stage) {
+        JS_FreeValue(ctx, dataObj);
+        return failed(stage);
+    };
 
     // 3a. Merge methods{} onto data BEFORE Proxy wrap.
     if (!JS_IsUndefined(jsOptions_)) {
         JSValue methods = JS_GetPropertyStr(ctx, jsOptions_, "methods");
+        if (JS_IsException(methods)) return dataFailed("methods: ");
+        bool ok = true;
         if (JS_IsObject(methods)) {
             JSPropertyEnum* tab = nullptr;
             uint32_t        len = 0;
-            if (JS_GetOwnPropertyNames(ctx, &tab, &len, methods,
-                                        JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0) {
-                for (uint32_t i = 0; i < len; ++i) {
-                    JSValue m = JS_GetProperty(ctx, methods, tab[i].atom);
-                    JS_SetProperty(ctx, dataObj, tab[i].atom, m);
-                    JS_FreeAtom(ctx, tab[i].atom);
-                }
-                js_free(ctx, tab);
+            ok = JS_GetOwnPropertyNames(ctx, &tab, &len, methods,
+                                        JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0;
+            for (uint32_t i = 0; ok && i < len; ++i) {
+                JSValue m = JS_GetProperty(ctx, methods, tab[i].atom);
+                ok = !JS_IsException(m) && JS_SetProperty(ctx, dataObj, tab[i].atom, m) >= 0;
             }
+            if (tab) JS_FreePropertyEnum(ctx, tab, len);
         }
         JS_FreeValue(ctx, methods);
+        if (!ok) return dataFailed("methods: ");
     }
 
     // 3a.bis. i18n: $locale + $t on dataObj.
-    JS_SetPropertyStr(ctx, dataObj, "$locale",
-                       JS_NewStringLen(ctx, currentLocale_.data(),
-                                       currentLocale_.size()));
-    JS_SetPropertyStr(ctx, dataObj, "$t",
-                       JS_NewCFunction(ctx, &JsTranslateTrampoline, "$t", 1));
-    JS_SetPropertyStr(ctx, dataObj, "$rect",
-                       JS_NewCFunction(ctx, &JsRectTrampoline, "$rect", 1));
-    JS_SetPropertyStr(ctx, dataObj, "$windowSize",
-                       JS_NewCFunction(ctx, &JsWindowSizeTrampoline, "$windowSize", 0));
-    JS_SetPropertyStr(ctx, dataObj, "$nextTick",
-                       JS_NewCFunction(ctx, &JsNextTickTrampoline, "$nextTick", 1));
+    auto setData = [&](const char* name, JSValue value) {
+        return !JS_IsException(value) && JS_SetPropertyStr(ctx, dataObj, name, value) >= 0;
+    };
+    if (!setData("$locale", JS_NewStringLen(ctx, currentLocale_.data(), currentLocale_.size())) ||
+        !setData("$t", JS_NewCFunction(ctx, &JsTranslateTrampoline, "$t", 1)) ||
+        !setData("$rect", JS_NewCFunction(ctx, &JsRectTrampoline, "$rect", 1)) ||
+        !setData("$windowSize", JS_NewCFunction(ctx, &JsWindowSizeTrampoline, "$windowSize", 0)) ||
+        !setData("$nextTick", JS_NewCFunction(ctx, &JsNextTickTrampoline, "$nextTick", 1))) {
+        return dataFailed("page state: ");
+    }
 
     // 3b. MakeReactive — capture dataObj's pointer first; the Proxy keeps a
     // ref so the underlying object stays alive, and the get-trap uses the
     // same pointer as the dep-map key.
     void* dataPtr = JS_VALUE_GET_PTR(dataObj);
-    jsState_ = jsRt_->MakeReactive(dataObj);
+    JSValue proxy = jsRt_->MakeReactive(dataObj);
     JS_FreeValue(ctx, dataObj);
+    if (JS_IsException(proxy)) return failed("reactive state: ");
+    jsState_ = proxy;
     JSValue global = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global, "state", JS_DupValue(ctx, jsState_));
+    int setState = JS_SetPropertyStr(ctx, global, "state", JS_DupValue(ctx, jsState_));
     JS_FreeValue(ctx, global);
+    if (setState < 0) return failed("reactive state: ");
 
     // 3c. computed{} — lazy memoized derived values.
     JSValue computed = JS_IsUndefined(jsOptions_)
                         ? JS_UNDEFINED
                         : JS_GetPropertyStr(ctx, jsOptions_, "computed");
+    if (JS_IsException(computed)) return failed("computed: ");
+    bool computedOk = true;
     if (JS_IsObject(computed)) {
         JSPropertyEnum* tab = nullptr;
         uint32_t        len = 0;
-        if (JS_GetOwnPropertyNames(ctx, &tab, &len, computed,
-                                    JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0) {
-            for (uint32_t i = 0; i < len; ++i) {
-                JSValue fn = JS_GetProperty(ctx, computed, tab[i].atom);
+        computedOk = JS_GetOwnPropertyNames(ctx, &tab, &len, computed,
+                                            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0;
+        for (uint32_t i = 0; computedOk && i < len; ++i) {
+            JSValue fn = JS_GetProperty(ctx, computed, tab[i].atom);
+            if (JS_IsException(fn)) {
+                computedOk = false;
+            } else if (JS_IsFunction(ctx, fn)) {
                 const char* name = JS_AtomToCString(ctx, tab[i].atom);
-                if (name && JS_IsFunction(ctx, fn)) {
-                    jsRt_->DefineComputed(dataPtr, name, fn, jsState_);
+                computedOk = name && jsRt_->DefineComputed(dataPtr, name, fn, jsState_);
+                if (name) {
+                    JS_FreeCString(ctx, name);
                 }
-                if (name) JS_FreeCString(ctx, name);
-                JS_FreeValue(ctx, fn);
-                JS_FreeAtom(ctx, tab[i].atom);
             }
-            js_free(ctx, tab);
+            JS_FreeValue(ctx, fn);
         }
+        if (tab) JS_FreePropertyEnum(ctx, tab, len);
     }
     JS_FreeValue(ctx, computed);
+    if (!computedOk) return failed("computed: ");
 
     // 4. Wire each CompiledBinding as a WatchEffect.
     for (auto& b : page_.bindings) {
@@ -1895,6 +1910,7 @@ void PageState::AttachQuickJS(CompiledPage page) {
     // root tree (anything outside v-if/v-for is mounted at this point).
     // v-if and v-for paths fire their own hooks at mount time.
     if (page_.root) DispatchMountHooks(page_.root.get());
+    return true;
 }
 
 void PageState::WireQuickJSConditionals() {
@@ -2882,17 +2898,12 @@ void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
 
     auto callHandler = [this, ctx, fn](JSValue arg) {
         JSValue argv[1] = { arg };
-        JSValue r = JS_Call(ctx, fn, jsState_, 1, argv);
-        if (JS_IsException(r)) {
-            JSValue exc = JS_GetException(ctx);
-            const char* msg = JS_ToCString(ctx, exc);
-            std::string s = msg ? msg : "(no message)";
-            if (msg) JS_FreeCString(ctx, msg);
-            JS_FreeValue(ctx, exc);
-            errors_.push_back("event handler threw: " + s);
-        }
+        JSValue r = JS_IsException(arg) ? JS_EXCEPTION : JS_Call(ctx, fn, jsState_, 1, argv);
         JS_FreeValue(ctx, r);
         JS_FreeValue(ctx, arg);
+        if (JS_IsException(r)) {
+            errors_.push_back("event handler threw: " + ui::uix::TakeExceptionMessage(ctx));
+        }
     };
 
     // MouseEvent → JS object mirroring DOM MouseEvent/WheelEvent. Legacy
@@ -3050,15 +3061,13 @@ void PageState::WireQuickJSModelWrite(Widget* target, const std::string& propNam
         dynamic_cast<ChipsInputWidget*>(target)) {
         target->onTextChanged = [this, ctx, propName](const std::wstring& v) {
             std::string utf8 = ToUtf8(v);
-            JS_SetPropertyStr(ctx, jsState_, propName.c_str(),
-                              JS_NewStringLen(ctx, utf8.data(), utf8.size()));
+            SetJsValue(propName, JS_NewStringLen(ctx, utf8.data(), utf8.size()));
         };
     } else if (dynamic_cast<CheckBoxWidget*>(target) ||
                dynamic_cast<ToggleWidget*>(target) ||
                dynamic_cast<RadioButtonWidget*>(target)) {
         target->onValueChanged = [this, ctx, propName](bool v) {
-            JS_SetPropertyStr(ctx, jsState_, propName.c_str(),
-                              JS_NewBool(ctx, v));
+            SetJsValue(propName, JS_NewBool(ctx, v));
         };
     } else if (dynamic_cast<SliderWidget*>(target) ||
                dynamic_cast<NumberBoxWidget*>(target) ||
@@ -3066,21 +3075,23 @@ void PageState::WireQuickJSModelWrite(Widget* target, const std::string& propNam
         target->onFloatChanged = [this, ctx, propName](float v) {
             double dv = static_cast<double>(v);
             JSValue cur = JS_GetPropertyStr(ctx, jsState_, propName.c_str());
+            if (JS_IsException(cur)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                return;
+            }
             if (JS_IsNumber(cur)) {
                 double n; JS_ToFloat64(ctx, &n, cur);
                 if (std::floor(n) == n) dv = std::round(dv);
             }
             JS_FreeValue(ctx, cur);
-            JS_SetPropertyStr(ctx, jsState_, propName.c_str(),
-                              JS_NewFloat64(ctx, dv));
+            SetJsValue(propName, JS_NewFloat64(ctx, dv));
         };
     } else if (auto* combo = dynamic_cast<ComboBoxWidget*>(target)) {
         // ComboBox emits onSelectionChanged (int idx), NOT onFloatChanged —
         // wiring onFloatChanged was a dead branch and v-model on <select>
         // never updated state.
         combo->onSelectionChanged = [this, ctx, propName](int idx) {
-            JS_SetPropertyStr(ctx, jsState_, propName.c_str(),
-                              JS_NewInt32(ctx, idx));
+            SetJsValue(propName, JS_NewInt32(ctx, idx));
         };
     }
 }

@@ -69,11 +69,12 @@ add_test(NAME gui_interface COMMAND sunpack_gui_ui_tests --acceptance)
 add_test(NAME gui_history_window COMMAND sunpack_gui_ui_tests --history)
 add_test(NAME gui_theme_preferences COMMAND sunpack_gui_ui_tests --theme)
 add_test(NAME gui_startup_failure COMMAND sunpack_gui_ui_tests --startup-failure)
+add_test(NAME gui_script_errors COMMAND sunpack_gui_ui_tests --script-errors)
 if(SUNPACK_GUI_ASAN)
   target_sources(sunpack_gui_tests PRIVATE ../tests/gui/asan_options.cpp)
   target_sources(sunpack_gui_ui_tests PRIVATE ../tests/gui/asan_options.cpp)
 endif()
-set_tests_properties(gui_file_contracts gui_interface gui_history_window gui_theme_preferences gui_startup_failure PROPERTIES TIMEOUT 60)
+set_tests_properties(gui_file_contracts gui_interface gui_history_window gui_theme_preferences gui_startup_failure gui_script_errors PROPERTIES TIMEOUT 60)
 
 # One MSBuild invocation can schedule all independent targets in parallel.
 add_custom_target(sunpack_gui_checks DEPENDS SunPackGUI sunpack_gui_tests sunpack_gui_ui_tests)

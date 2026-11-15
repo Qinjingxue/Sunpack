@@ -41,7 +41,7 @@ include(FetchContent)
 FetchContent_Declare(
     quickjs
     GIT_REPOSITORY https://github.com/quickjs-ng/quickjs.git
-    GIT_TAG        v0.14.0
+    GIT_TAG        v0.18.0
     GIT_SHALLOW    TRUE
 )
 set(BUILD_SHARED_LIBS    OFF CACHE BOOL "" FORCE)
