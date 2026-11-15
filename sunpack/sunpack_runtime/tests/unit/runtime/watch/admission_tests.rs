@@ -15,7 +15,7 @@ pub(super) fn before_readiness(path: &str) {
     if let Some((_, hook)) = hook { hook(); }
 }
 
-fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
+pub(super) fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
     let watched = base.join("input");
     fs::create_dir_all(&watched).unwrap();
     let root = key(&watched);

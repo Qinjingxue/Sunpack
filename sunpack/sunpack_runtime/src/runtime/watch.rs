@@ -39,12 +39,29 @@ mod crash_boundaries;
 #[path = "../../tests/unit/runtime/watch/admission_tests.rs"]
 mod admission_tests;
 #[cfg(test)]
+#[path = "../../tests/unit/runtime/watch/quiet_replay.rs"]
+mod quiet_replay;
+#[cfg(test)]
 #[path = "../../tests/unit/runtime/watch/completion_tests.rs"]
 mod completion_tests;
 
 const ROOTS_FILE: &str = "sunpack_watch_roots.txt";
 const WATCH_METADATA: &str = ".sunpack_watch";
 const ROOTS_LOCK: &str = "SunPackWatchRoots";
+
+#[inline]
+fn admission_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = quiet_replay::now() { return now; }
+    Instant::now()
+}
+
+#[inline]
+fn admission_readable(path: &str) -> io::Result<bool> {
+    #[cfg(test)]
+    if let Some(readable) = quiet_replay::readable(path) { return Ok(readable); }
+    filesystem::watch_file_is_ready(path)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Root {
@@ -3726,13 +3743,13 @@ impl Scheduler {
             Ok((Some(candidate), now, at)) => (candidate, now, at),
             Ok((None, _, _)) => {
                 self.candidate_diagnostics.log_unobservable(
-                    &self.journal, Instant::now(), &id, &path);
+                    &self.journal, admission_now(), &id, &path);
                 return Ok(());
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 self.candidate_diagnostics.log_observation(
-                    &self.journal, Instant::now(), &id, &path, &error, event);
+                    &self.journal, admission_now(), &id, &path, &error, event);
                 return Ok(());
             }
         };
@@ -3800,13 +3817,13 @@ impl Scheduler {
                 );
             }
             if let Some(pending) = self.pending.get_mut(&id) {
-                let now = Instant::now();
+                let now = admission_now();
                 if boundary && baseline != Some(candidate.observation.change_usn) {
                     pending.quiet.metadata(&candidate, observed_now);
                     // CLOSE is a useful hint only if a writer hasn't reopened
                     // the file. Keep short existing waits on their cadence.
                     if pending.due.saturating_duration_since(now).as_millis() >= 100
-                        && filesystem::watch_file_is_ready(&candidate.path).unwrap_or(false)
+                        && admission_readable(&candidate.path).unwrap_or(false)
                     {
                         self.due.remove(&(pending.due, id.clone()));
                         pending.quiet.accelerate(observed_now, now);
@@ -4527,8 +4544,8 @@ impl Scheduler {
                     continue;
                 }
                 Err(error) => {
-                    self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, Instant::now());
+                    self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, Some(&error));
+                    self.delay(id, pending, admission_now());
                     continue;
                 }
             };
@@ -4588,11 +4605,11 @@ impl Scheduler {
             pending.candidate = current;
             #[cfg(test)]
             admission_tests::before_readiness(&pending.candidate.path);
-            match filesystem::watch_file_is_ready(&pending.candidate.path) {
+            match admission_readable(&pending.candidate.path) {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, None);
-                    self.delay(id, pending, Instant::now());
+                    self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, None);
+                    self.delay(id, pending, admission_now());
                     continue;
                 }
                 Err(error) if missing_path(&error) => {
@@ -4600,12 +4617,12 @@ impl Scheduler {
                     continue;
                 }
                 Err(error) => {
-                    self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, Instant::now());
+                    self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, Some(&error));
+                    self.delay(id, pending, admission_now());
                     continue;
                 }
             }
-            if let Err(deadline) = pending.quiet.admit(observed_now, Instant::now()) {
+            if let Err(deadline) = pending.quiet.admit(observed_now, admission_now()) {
                 pending.due = deadline;
                 self.due.insert((deadline, id.clone()), ());
                 self.pending.insert(id, pending);
@@ -4651,20 +4668,7 @@ impl Scheduler {
                 self.due.insert((pending.due, id), ());
                 continue;
             }
-            let (seconds, last, cadence, tentative) = pending.quiet.summary();
-            self.journal.log(json!({
-                "event":"candidate_quiet", "path":pending.candidate.path,
-                "quiet_seconds":seconds,
-            }));
-            if pending.recovery.is_none() {
-                self.catalog.retire_observation(
-                    &pending.candidate.path,
-                    Some(seconds),
-                    last,
-                    cadence,
-                    tentative,
-                );
-            }
+            self.retire_admitted_observation(&pending);
             let password_scope = candidate_password_scope(self.journal.state(),
                 &pending.candidate.path, pending.recovery.as_deref());
             let source = (pending.candidate, pending.quiet);
@@ -4691,6 +4695,24 @@ impl Scheduler {
             }
             Ok(())
         })?
+    }
+
+    #[inline]
+    fn retire_admitted_observation(&self, pending: &Pending) {
+        let (seconds, last, cadence, tentative) = pending.quiet.summary();
+        self.journal.log(json!({
+            "event":"candidate_quiet", "path":pending.candidate.path,
+            "quiet_seconds":seconds,
+        }));
+        if pending.recovery.is_none() {
+            self.catalog.retire_observation(
+                &pending.candidate.path,
+                Some(seconds),
+                last,
+                cadence,
+                tentative,
+            );
+        }
     }
 
     fn retire_owned_admission(&mut self, id: &str, pending: &Pending) -> io::Result<bool> {

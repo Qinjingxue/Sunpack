@@ -4,6 +4,7 @@ import bisect
 import heapq
 import math
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Protocol
 
@@ -135,6 +136,40 @@ def record_proposal(result: FileResult, file, at: float, group_ready: dict, hori
         usable_at = file.readable_from(max(file.complete_at, file.visible_at))
         if at >= usable_at and result.first_usable_latency is None:
             result.first_usable_latency = at - usable_at
+
+
+def input_results(trace, files):
+    """One complete input per archive family, not a second proposal per volume."""
+    groups = defaultdict(list)
+    truth = {file.key: file for file in trace.files}
+    for file in files:
+        source = truth[file["key"]]
+        key = source.group if source.shape == "split_complete" else source.key
+        groups[key].append(file)
+    inputs = []
+    for key, members in groups.items():
+        sources = [truth[file["key"]] for file in members]
+        complete = all(file.complete_at is not None for file in sources)
+        arrived = max(max(file.complete_at, file.visible_at) for file in sources) if complete else None
+        ready = readable_group_from(sources, arrived) if complete else None
+        proposals = sorted(at for file in members for at in file["proposal_times"])
+        first = next((at for at in proposals if ready is not None and at >= ready), None)
+        first_detection = next((at for at in proposals if arrived is not None and at >= arrived), None)
+        invalid = sum(ready is None or at < ready for at in proposals)
+        inputs.append(dict(
+            key=key, shape=sources[0].shape, members=[file["key"] for file in members], completed=complete,
+            proposals=len(proposals), proposal_times=proposals,
+            premature=sum(arrived is None or at < arrived for at in proposals),
+            invalid_proposals=invalid,
+            busy_proposals=sum(file["busy_proposals"] for file in members),
+            early_group_proposals=sum(file["early_group_proposals"] for file in members),
+            premature_exposure_seconds=sum(file["premature_exposure_seconds"] for file in members),
+            first_detection_latency=None if first_detection is None else first_detection - arrived,
+            first_usable_latency=None if first is None else first - ready,
+            complete_arrival_at=arrived, processing_ready_at=ready, first_valid_proposal_at=first,
+            ready_to_valid_proposal_seconds=None if first is None else first - ready,
+        ))
+    return inputs
 
 
 def replay(trace: Trace, factory: Callable[[], Estimator], *, tie_order: str = "observation_first") -> dict:

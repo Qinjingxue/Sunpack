@@ -35,6 +35,7 @@ uv run --locked --extra test python -m benchmarks worker format-matrix
 uv run --locked --extra test python -m benchmarks scan game-tree --game-tree D:\game
 uv run --locked --extra test python -m benchmarks watch quiet-trace --intervals 0.1,0.1,0.1,1,1,1
 uv run --locked --extra test python -m benchmarks watch quiet-corpus --seeds 2 --splits development --channels immediate --widths 1,4
+uv run --locked --extra test python -m benchmarks watch quiet-scheduler --seeds 2 --splits development --channels immediate --widths 1,4
 ```
 
 `password probe-matrix` puts the matching password after the requested number
@@ -72,12 +73,34 @@ replays the original estimator-only lifecycle, alongside fixed and EWMA controls
 The report retains per-seed, family/channel/width/tie strata, confidence
 intervals, valid-proposal latency, censored outcomes and invalid-proposal burst
 metrics. Traces, proposal timelines and executed generator/scoring source are
-saved beside the report. This does **not** reproduce the old production-scheduler
-replay: the retired Python scheduler cannot drive the new Rust scheduler. The
-estimator retains trackers until the end of each trace and emits at most one
-proposal per observed content generation, so its results must not be labelled
-as actual Watch admission, and cannot be directly compared with the old
-scheduler benchmark. The CPU figure includes Python replay and FFI overhead.
+saved beside the report. The estimator retains trackers until the end of each
+trace and emits at most one proposal per observed content generation. Its CPU
+figure includes Python replay and FFI overhead.
+
+`watch quiet-scheduler` drives the current Rust Watch capture, queue, deadline,
+readiness and tracker retirement paths with the same corpus. Cargo builds and
+runs an ignored unit-test entry point. The virtual clock, file snapshots and
+replay output are compiled only with `cfg(test)`. The replay substitutes
+virtual metadata and handle readability for file probes and assumes instant
+processing at admission. It scores one logical input per split set, including
+completion-to-proposal latency, censored inputs and invalid proposal bursts.
+Replay elapsed time and scheduler-thread CPU time exclude corpus generation,
+process startup and report writing. Busy retry loops under an unchanged snapshot are coalesced, so probe
+counts describe the simulator. Actual Broker, pipeline and OS timings belong
+to the Watch end-to-end benchmarks.
+
+Both commands save the exact corpus and evaluator source. Use `--corpus` to
+reuse the saved traces and `--compare` to report paired deltas by seed. Comparison
+requires the same replay mode, evaluator, algorithm selection, tie orders and
+corpus. The scheduler uses the Rust code in the current checkout, and the
+estimator accepts `--policy-source PATH` for an alternate Rust `quiet.rs`.
+
+```powershell
+# Freeze one report before changing the Rust policy.
+uv run --locked --extra test python -m benchmarks watch quiet-scheduler --pin-report .cache/quiet-before.json
+# Replay the saved traces with the changed implementation and the same evaluator.
+uv run --locked --extra test python -m benchmarks watch quiet-scheduler --corpus PATH/TO/traces.jsonl.gz --compare .cache/quiet-before.json
+```
 
 Generated fixtures reuse the deterministic many-small-file and few-large-file
 corpora. ZIP, 7z, RAR, TAR, gzip, bzip2, XZ, Zstandard and available split variants

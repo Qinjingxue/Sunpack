@@ -205,6 +205,8 @@ impl Journal {
     }
 
     pub(super) fn log(&self, value: Value) {
+        #[cfg(test)]
+        if super::quiet_replay::now().is_some() { return; }
         if self.log.write(value).is_err() {
             let _ = self.rebuild_log();
         }

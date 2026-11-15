@@ -86,9 +86,18 @@ impl Activity {
     pub(super) fn capture(&self, path: &std::path::Path, claims: &std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<str>>>, key: &str) -> std::io::Result<Option<Observation>> {
         let mut state = self.0.state.lock().unwrap();
         let since_usn = state.baseline.as_ref().map(|value| value.3);
-        if let Some(candidate) = crate::postprocess::watch_candidate_for_path(path, since_usn)? {
-            let now = Instant::now();
-            let at = super::windows::monotonic_seconds();
+        let real_probe = || -> std::io::Result<_> {
+            Ok(crate::postprocess::watch_candidate_for_path(path, since_usn)?
+                .map(|candidate| (candidate, Instant::now(), super::windows::monotonic_seconds())))
+        };
+        #[cfg(not(test))]
+        let snapshot = real_probe()?;
+        #[cfg(test)]
+        let snapshot = match super::quiet_replay::probe(path, since_usn) {
+            Some((candidate, now, at)) => candidate.map(|candidate| (candidate, now, at)),
+            None => real_probe()?,
+        };
+        if let Some((candidate, now, at)) = snapshot {
             let claims = claims.lock().unwrap();
             if claims.contains_key(key) { return Ok(None); }
             state.record(&candidate, now, at, false, None);
@@ -100,8 +109,7 @@ impl Activity {
     pub(super) fn probe(&self, path: &std::path::Path, baseline: Option<i64>)
         -> std::io::Result<(Option<WatchCandidateRow>, Instant, f64)> {
         let _state = self.0.state.lock().unwrap();
-        let candidate = crate::postprocess::watch_candidate_for_path(path, baseline)?;
-        Ok((candidate, Instant::now(), super::windows::monotonic_seconds()))
+        probe_candidate(path, baseline)
     }
 
     pub(super) fn content_deadline(&self, candidate: &WatchCandidateRow, now: Instant,
@@ -210,6 +218,15 @@ impl ActivityState {
         self.baseline = Some((candidate.size, candidate.mtime,
             candidate.observation.file_id.clone(), candidate.observation.change_usn));
     }
+}
+
+#[inline]
+fn probe_candidate(path: &std::path::Path, since_usn: Option<i64>)
+    -> std::io::Result<(Option<WatchCandidateRow>, Instant, f64)> {
+    #[cfg(test)]
+    if let Some(result) = super::quiet_replay::probe(path, since_usn) { return Ok(result); }
+    let candidate = crate::postprocess::watch_candidate_for_path(path, since_usn)?;
+    Ok((candidate, Instant::now(), super::windows::monotonic_seconds()))
 }
 
 const WINDOW: usize = 12;

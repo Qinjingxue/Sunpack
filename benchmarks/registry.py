@@ -31,5 +31,6 @@ for scenario in (
     Scenario("scan", "game-tree", "Recursive authorization on a game tree archive.", (), "benchmarks.scenarios.game_tree"),
     Scenario("watch", "quiet-trace", "Native quiet policy simulated timing trajectories.", (), "benchmarks.scenarios.quiet_trace"),
     Scenario("watch", "quiet-corpus", "Historical complex writer corpus and quiet-policy assessment.", (), "benchmarks.scenarios.quiet_corpus"),
+    Scenario("watch", "quiet-scheduler", "Historical writer corpus through native Watch admission.", ("--scheduler",), "benchmarks.scenarios.quiet_corpus"),
 ):
     SCENARIOS[(scenario.group, scenario.name)] = scenario
