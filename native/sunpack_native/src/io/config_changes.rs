@@ -7,6 +7,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED};
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -56,13 +57,19 @@ pub(crate) struct DirectoryChange {
     pub(crate) action: u32,
 }
 
+#[derive(PartialEq, Eq)]
+enum Issuer {
+    Subscriber,
+    Reader,
+}
+
 struct Request {
     file: File,
     _event: OwnedHandle,
     // Both addresses must remain fixed until cancellation has completed.
     overlapped: Box<Overlapped>,
     buffer: Box<[u32]>,
-    pending: bool,
+    pending: Option<Issuer>,
     recursive: bool,
     filter: u32,
 }
@@ -72,7 +79,7 @@ struct Request {
 unsafe impl Send for Request {}
 
 impl Request {
-    fn arm(&mut self) -> io::Result<()> {
+    fn arm(&mut self, issuer: Issuer) -> io::Result<()> {
         let result = unsafe {
             ReadDirectoryChangesW(
                 self.file.as_raw_handle(),
@@ -87,11 +94,11 @@ impl Request {
         };
         if result == 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(997) {
+            if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
                 return Err(error);
             }
         }
-        self.pending = true;
+        self.pending = Some(issuer);
         Ok(())
     }
 
@@ -130,7 +137,7 @@ impl Request {
 
 impl Drop for Request {
     fn drop(&mut self) {
-        if self.pending {
+        if self.pending.is_some() {
             // Cancellation is asynchronous: drain it before freeing the buffers.
             unsafe {
                 CancelIoEx(self.file.as_raw_handle(), &mut *self.overlapped);
@@ -170,18 +177,18 @@ impl NativeConfigChanges {
             }),
             _event: event,
             buffer: vec![0u32; buffer_bytes / 4].into_boxed_slice(),
-            pending: false,
+            pending: None,
             recursive,
             filter,
         };
-        request.arm()?;
+        request.arm(Issuer::Subscriber)?;
         Ok(Self {
             request: Mutex::new(Some(request)),
             stopped,
         })
     }
 
-    // None denotes overflow: invalidate all subscribed files in this directory.
+    // None denotes a gap: invalidate all subscribed files in this directory.
     pub(crate) fn read(&self) -> io::Result<Option<Vec<DirectoryChange>>> {
         let mut guard = self.request.lock().unwrap();
         let Some(request) = guard.as_mut() else {
@@ -197,30 +204,34 @@ impl NativeConfigChanges {
             _ => return Err(io::Error::last_os_error()),
         }
         let mut size = 0;
-        if unsafe {
+        let completed = unsafe {
             GetOverlappedResult(
                 request.file.as_raw_handle(),
                 &mut *request.overlapped,
                 &mut size,
                 0,
             )
-        } == 0
-        {
+        };
+        let issuer = request.pending.take();
+        if completed == 0 {
             let error = io::Error::last_os_error();
-            request.pending = false;
-            if error.raw_os_error() == Some(1022) {
-                request.arm()?;
-                return Ok(None);
+            match error.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_NOTIFY_ENUM_DIR) => {}
+                // The first read is armed before publication. Its issuing
+                // thread can exit while other subscribers still use the
+                // observer. Rearm on the reader and invalidate the gap.
+                Some(ERROR_OPERATION_ABORTED) if issuer == Some(Issuer::Subscriber) => {}
+                _ => return Err(error),
             }
-            return Err(error);
+            request.arm(Issuer::Reader)?;
+            return Ok(None);
         }
-        request.pending = false;
         let names = if size == 0 {
             None
         } else {
             Some(request.names(size as usize)?)
         };
-        request.arm()?;
+        request.arm(Issuer::Reader)?;
         Ok(names)
     }
 

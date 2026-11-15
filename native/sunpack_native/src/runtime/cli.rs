@@ -2751,17 +2751,46 @@ mod option_tests {
         source_a.simple = Some(path_a.clone());
         let mut source_b = config::ConfigSources::default();
         source_b.simple = Some(path_b.clone());
+        // Seed the shared directory observer from a different thread. Keep
+        // its first OS read pending until both requests have subscribed.
+        let (ready, armed) = std::sync::mpsc::channel();
+        let (leave, exit) = std::sync::mpsc::channel::<()>();
+        let (notify, changed) = std::sync::mpsc::channel();
+        let path = path_a.clone();
+        let issuer = std::thread::spawn(move || {
+            let subscriptions = watch::observe_files(
+                std::slice::from_ref(&path),
+                &path.with_file_name(passwords::FILENAME),
+                move |reload, _| {
+                    if reload {
+                        let _ = notify.send(());
+                    }
+                },
+            ).unwrap();
+            ready.send(subscriptions).ok().unwrap();
+            let _ = exit.recv();
+        });
+        let seed = armed.recv().unwrap();
         let host = Host::new();
         assert_eq!(host.generation(cwd, source_a.clone(), false).language(), Language::En);
         let first = Arc::clone(host.sources.lock().unwrap().front().unwrap());
         assert_eq!(host.generation(cwd, source_b, false).language(), Language::Zh);
+        drop(leave);
+        issuer.join().unwrap();
+        // Joining the issuer cancels its outstanding read. Wait for the
+        // shared observer to process that completion before the next request.
+        changed.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(host.generation(cwd, source_a, false).language(), Language::En);
         let sources = host.sources.lock().unwrap();
         assert_eq!(sources.len(), 2);
         assert!(Arc::ptr_eq(sources.front().unwrap(), &first));
         drop(sources);
+        // The same observer must also deliver subsequent file changes.
+        std::fs::write(&path_a, br#"{"cli":{"language":"en"}}"#).unwrap();
+        changed.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(first);
         drop(host);
+        drop(seed);
         std::fs::remove_file(path_a).unwrap();
         std::fs::remove_file(path_b).unwrap();
         std::fs::remove_dir(directory).unwrap();
