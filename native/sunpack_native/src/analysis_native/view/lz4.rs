@@ -1,45 +1,29 @@
 impl<'a> ReportContext<'a> {
-    fn lz4_module(&mut self) -> io::Result<Evidence> {
+    fn lz4_module(&mut self) -> io::Result<Option<Evidence>> {
         if self.stream_structure.is_none()
             && !crate::formats::lz4::leading(self.signatures.head.as_slice())
         {
-            return Ok(Evidence::not_found("lz4"));
+            return Ok(None);
         }
         let Some(facts) = self.full_stream_structure()? else {
-            return Ok(Evidence::not_found("lz4"));
+            return Ok(None);
         };
         if facts.format != "lz4"
+            || !facts.structure_complete
             || (facts.stream_count == 0
-                && matches!(
-                    facts.error.as_str(),
-                    "" | "lz4_magic_not_found"
-                ))
+                && matches!(facts.error.as_str(), "" | "lz4_magic_not_found"))
         {
-            return Ok(Evidence::not_found("lz4"));
+            return Ok(None);
         }
-        let complete = facts.structure_complete;
-        let segment = lz4_segment(
-            0,
-            facts.segment_end,
-            complete,
-            &facts.error,
-        );
-        Ok(Evidence::new(
-            "lz4",
-            if complete { "extractable" } else { "damaged" },
-            vec![segment],
-            EvidenceDetails::Stream(facts),
-        ))
+        let flags = if !facts.error.is_empty()
+            && strict_subrange(0, facts.segment_end, self.view.reader.len())
+        {
+            vec![facts.error.clone()]
+        } else {
+            Vec::new()
+        };
+        let mut evidence = Evidence::new("lz4", Extractable, 0, facts.segment_end, flags);
+        evidence.structure_complete = true;
+        Ok(Some(evidence))
     }
-}
-
-fn lz4_segment(offset: u64, end: Option<u64>, complete: bool, error: &str) -> Segment {
-    let flags = if error.is_empty() {
-        Vec::new()
-    } else {
-        vec![error.to_owned()]
-    };
-    let mut segment = Segment::new(offset, end, flags);
-    segment.extractable = complete;
-    segment
 }

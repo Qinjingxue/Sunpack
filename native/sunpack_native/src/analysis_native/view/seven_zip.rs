@@ -1,146 +1,57 @@
-// Native 7z observations are shared by public probes and report scoring.
 #[derive(Default)]
 struct SevenZipObservation {
-    plausible: bool,
-    magic_matched: bool,
-    strong_accept: bool,
-    error: &'static str,
-    archive_offset: u64,
-    segment_end: u64,
-    next_header_offset: u64,
-    next_header_size: u64,
-    start_header_crc_ok: bool,
-    next_header_crc_checked: bool,
-    next_header_crc_ok: bool,
-    next_header_nid_valid: bool,
-    password_required: bool,
-    read_fault: Option<(ReadFault, &'static str)>,
+    declared_end: Option<u64>,
+    // Only a validated next header can tell planning about a password.
+    password_required: Option<bool>,
 }
 
 impl AnalysisBinaryView {
-    fn probe_seven_zip_native(&self, start_offset: u64) -> std::io::Result<SevenZipObservation> {
-        let mut result = SevenZipObservation {
-            archive_offset: start_offset,
-            ..Default::default()
-        };
-        let header = match self.read_field_at_bytes(
-            start_offset,
-            32,
-            "7z.start_header",
-            FieldLocation::Head,
-        ) {
-            Ok(data) => data,
-            Err(fault) => {
-                result.read_fault = Some((fault, "7z_header_too_small"));
-                return Ok(result);
-            }
-        };
-        if &header[0..6] != SEVEN_ZIP {
-            result.error = "7z_signature_not_found";
+    fn probe_seven_zip_native(&self, header: &[u8]) -> io::Result<SevenZipObservation> {
+        let mut result = SevenZipObservation::default();
+        if header.len() < 32 || header[6] != 0 || u32_le(header, 8) != crc32(&header[12..32]) {
             return Ok(result);
         }
-        result.magic_matched = true;
-
-        if header[6] != 0 {
-            result.error = "unsupported_version";
-            return Ok(result);
-        }
-        let stored_start_crc = u32_le(&header, 8);
-        let start_header = &header[12..32];
-        let computed_start_crc = crc32(start_header);
-        result.start_header_crc_ok = stored_start_crc == computed_start_crc;
-        if stored_start_crc != computed_start_crc {
-            result.error = "start_header_crc_mismatch";
-            return Ok(result);
-        }
-        let next_header_offset = u64_le(start_header, 0);
-        let next_header_size = u64_le(start_header, 8);
-        let next_header_crc = u32_le(start_header, 16);
-        let Some(next_header_start) = start_offset
-            .checked_add(32)
-            .and_then(|value| value.checked_add(next_header_offset))
-        else {
-            result.error = "next_header_out_of_range";
+        let next_header_offset = u64_le(header, 12);
+        let next_header_size = u64_le(header, 20);
+        let next_header_crc = u32_le(header, 28);
+        let Some(next_header_start) = 32u64.checked_add(next_header_offset) else {
             return Ok(result);
         };
         let Some(segment_end) = next_header_start.checked_add(next_header_size) else {
-            result.error = "next_header_out_of_range";
             return Ok(result);
         };
-        result.next_header_offset = next_header_offset;
-        result.next_header_size = next_header_size;
-        result.segment_end = segment_end;
-        if next_header_size == 0 && next_header_offset != 0 {
-            result.error = "invalid_next_header_range";
+        result.declared_end = Some(segment_end);
+        if (next_header_size == 0 && next_header_offset != 0) || segment_end > self.reader.len() {
             return Ok(result);
         }
-        let size = self.reader.len();
-        if segment_end > size {
-            let fault = ReadFault::short_read(
-                "read_declared_range",
-                next_header_start,
-                usize::try_from(next_header_size).unwrap_or(usize::MAX),
-                size.saturating_sub(next_header_start) as usize,
-                size,
-            )
-            .with_field("7z.next_header", FieldLocation::Tail);
-            result.read_fault = Some((fault, "next_header_out_of_range"));
-            return Ok(result);
-        }
-        result.plausible = true;
 
+        // Spill large headers for shared encryption-fact parsing without
+        // allocating the whole declared range on the heap.
+        use std::io::Write;
+        let mut next_header = crate::io::scratch::Spool::default();
+        let mut hash = crc32fast::Hasher::new();
+        let mut offset = next_header_start;
+        while offset < segment_end {
+            let length = (segment_end - offset).min(64 * 1024) as usize;
+            let bytes = self.reader.read_cached_at(offset, length)?;
+            if bytes.len() != length {
+                return Ok(result);
+            }
+            hash.update(&bytes);
+            next_header.write_all(&bytes)?;
+            offset += length as u64;
+        }
+        let next_header = next_header.finish()?;
+        if hash.finalize() == next_header_crc
+            && next_header
+                .first()
+                .is_none_or(|nid| matches!(nid, 0x01 | 0x17))
         {
-            // CRC covers the complete declared range with a fixed working buffer.
-            // Spill large headers for shared encryption-fact parsing without
-            // allocating the whole declared range on the heap.
-            let mut next_header = crate::io::scratch::Spool::default();
-            use std::io::Write;
-            let mut hash = crc32fast::Hasher::new();
-            let mut offset = next_header_start;
-            while offset < segment_end {
-                let length = (segment_end - offset).min(64 * 1024) as usize;
-                let bytes = match self.read_field_at_bytes(
-                    offset,
-                    length,
-                    "7z.next_header",
-                    FieldLocation::Tail,
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(fault) => {
-                        result.read_fault = Some((fault, "next_header_read_failed"));
-                        return Ok(result);
-                    }
-                };
-                hash.update(&bytes);
-                next_header.write_all(&bytes)?;
-                offset += length as u64;
-            }
-            let next_header = next_header.finish()?;
-            let crc_ok = hash.finalize() == next_header_crc;
-            let nid = next_header.first().copied().unwrap_or(0);
-            let nid_valid = next_header.is_empty() || nid == 0x01 || nid == 0x17;
-            result.next_header_crc_checked = true;
-            result.next_header_crc_ok = crc_ok;
-
-            result.next_header_nid_valid = nid_valid;
-            if crc_ok {
-                if nid_valid {
-                    let encryption = {
-                        crate::formats::seven_zip::seven_zip_encryption_facts_from_next_header(
-                            &next_header,
-                        )
-                    };
-                    result.password_required = encryption.password_required;
-                    result.strong_accept = true;
-
-                } else {
-                    result.error = "next_header_nid_unrecognized";
-                }
-            } else {
-                result.error = "next_header_crc_mismatch";
-            }
+            let facts = crate::formats::seven_zip::seven_zip_encryption_facts_from_next_header(
+                &next_header,
+            );
+            result.password_required = Some(facts.password_required);
         }
-
         Ok(result)
     }
 }

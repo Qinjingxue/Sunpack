@@ -1,5 +1,4 @@
 use crate::formats::rar::read_vint;
-use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, ReaderConfig};
 use crc32fast::hash as crc32;
 use std::io::{self, Read};

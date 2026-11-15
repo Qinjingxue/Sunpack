@@ -57,7 +57,7 @@ impl Drop for BrokerConnection {
 impl BrokerConnection {
     fn transact(
         &mut self,
-        request: &Request,
+        request: &Request<'_>,
         query: &[u8],
         payload: &mut Vec<u8>,
     ) -> io::Result<Response> {
@@ -127,13 +127,9 @@ pub fn broker_release() -> io::Result<()> {
     Ok(())
 }
 
-pub fn broker_probe_volume(volume_guid: &str) -> io::Result<()> {
-    broker_volume_cursor(volume_guid).map(|_| ())
-}
-
 pub fn broker_volume_cursor(volume_guid: &str) -> io::Result<(u64, i64)> {
     let mut request = Request::simple(Opcode::ProbeVolume, next_request_id());
-    request.volume_guid = volume_guid.to_owned();
+    request.volume_guid = volume_guid;
     let response = transact_request(&request, &[], &mut Vec::new())?;
     Ok((response.journal_id, response.next_usn))
 }
@@ -146,7 +142,7 @@ pub fn broker_read_change_reasons(
     current_usn: i64,
 ) -> io::Result<ChangeReasons> {
     let mut request = Request::simple(Opcode::ReadChangeReasons, next_request_id());
-    request.volume_guid = volume_guid.to_owned();
+    request.volume_guid = volume_guid;
     request.file_id = file_id;
     request.file_id_len = file_id_len;
     request.previous_usn = previous_usn;
@@ -175,7 +171,7 @@ pub fn broker_for_each_directory_change(
     let batch_ids = (MAX_DIRECTORY_QUERY_BYTES - 8) / FILE_ID_BYTES;
     // Only the ID and cursor change between pages of this logical query.
     let mut request = Request::simple(Opcode::ReadDirectoriesChanges, 0);
-    request.volume_guid = volume.to_owned();
+    request.volume_guid = volume;
     request.current_usn = end;
     let mut query = Vec::with_capacity(8 + directories.len().min(batch_ids) * FILE_ID_BYTES);
     let mut payload = Vec::new();
@@ -227,7 +223,7 @@ pub fn broker_for_each_directory_change(
 }
 
 fn transact_request(
-    request: &Request,
+    request: &Request<'_>,
     query: &[u8],
     payload: &mut Vec<u8>,
 ) -> io::Result<Response> {

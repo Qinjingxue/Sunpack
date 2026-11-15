@@ -299,7 +299,7 @@ fn serve_client(
     Ok(())
 }
 
-fn request_shape_is_valid(request: &Request) -> bool {
+fn request_shape_is_valid(request: &Request<'_>) -> bool {
     match request.opcode {
         Opcode::Hello => {
             request.volume_guid.is_empty()
@@ -362,15 +362,21 @@ impl JournalDispatcher {
 
     fn reader_for(
         &self,
-        mut volume_guid: String,
+        volume_guid: &str,
         deadline: Instant,
     ) -> io::Result<SharedJournalReader> {
-        volume_guid.make_ascii_lowercase();
+        let normalized;
+        let volume_guid = if volume_guid.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            normalized = volume_guid.to_ascii_lowercase();
+            &normalized
+        } else {
+            volume_guid
+        };
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| io::Error::other("volume table poisoned"))?;
-        if let Some((reader, previous_deadline)) = entries.get_mut(volume_guid.as_str()) {
+        if let Some((reader, previous_deadline)) = entries.get_mut(volume_guid) {
             *previous_deadline = (*previous_deadline).max(deadline);
             return Ok(Arc::clone(reader));
         }
@@ -396,7 +402,7 @@ impl JournalDispatcher {
 
     fn with_reader<T>(
         &self,
-        volume_guid: String,
+        volume_guid: &str,
         operation: impl FnOnce(&mut JournalReader) -> io::Result<T>,
     ) -> io::Result<T> {
         let deadline = Instant::now() + VOLUME_CONTEXT_IDLE_TTL;
@@ -417,7 +423,7 @@ impl JournalDispatcher {
 
 fn handle_request(
     journals: &JournalDispatcher,
-    request: Request,
+    request: Request<'_>,
     query: &[u8],
 ) -> (Response, Vec<u8>) {
     let mut response = Response::ok(request.request_id);
@@ -884,7 +890,7 @@ mod tests {
         // A valid probe before Hello confirms the connection is accepted and
         // cannot run journal commands without a lease.
         let mut probe = Request::simple(Opcode::ProbeVolume, 2);
-        probe.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned();
+        probe.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}";
         unleased
             .write_all(&probe.encode().unwrap())
             .unwrap();
@@ -1006,14 +1012,14 @@ mod tests {
     fn only_minimal_shapes_are_accepted_for_non_journal_operations() {
         assert!(request_shape_is_valid(&Request::simple(Opcode::Hello, 1)));
         let mut invalid = Request::simple(Opcode::Hello, 2);
-        invalid.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned();
+        invalid.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}";
         assert!(!request_shape_is_valid(&invalid));
     }
 
     #[test]
     fn journal_read_requires_a_bounded_usn_interval_and_file_identity() {
         let mut request = Request::simple(Opcode::ReadChangeReasons, 1);
-        request.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned();
+        request.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}";
         request.file_id_len = 8;
         request.previous_usn = 100;
         request.current_usn = 101;
@@ -1028,19 +1034,19 @@ mod tests {
         let deadline = Instant::now() + VOLUME_CONTEXT_IDLE_TTL;
         let first = dispatcher
             .reader_for(
-                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned(),
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}",
                 deadline,
             )
             .unwrap();
         let same = dispatcher
             .reader_for(
-                r"\\?\VOLUME{01234567-89AB-CDEF-0123-456789ABCDEF}".to_owned(),
+                r"\\?\VOLUME{01234567-89AB-CDEF-0123-456789ABCDEF}",
                 deadline,
             )
             .unwrap();
         let other = dispatcher
             .reader_for(
-                r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}".to_owned(),
+                r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}",
                 deadline,
             )
             .unwrap();
@@ -1055,7 +1061,7 @@ mod tests {
         let deadline = now + VOLUME_CONTEXT_IDLE_TTL;
         let reader = dispatcher
             .reader_for(
-                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned(),
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}",
                 deadline,
             )
             .unwrap();

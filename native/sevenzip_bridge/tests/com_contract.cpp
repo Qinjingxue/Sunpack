@@ -181,9 +181,9 @@ void check_archive_root_directory_entries()
             {
                 check(hr == S_OK && callback->SetOperationResult(kOpOk) == S_OK,
                       "root directory entry succeeds as a no-op");
-                check(raw->dirs_written() == 1 && raw->files_written() == 0 && trace.total_bytes_written == 0 &&
+                check(raw->files_written() == 0 &&
                       !raw->output_error() && raw->failed_item().empty(),
-                      "root directory entry only increments the directory count");
+                      "root directory entry writes no files");
                 check(!std::filesystem::exists(output) || std::filesystem::is_empty(output),
                       "root directory entry creates no child output");
                 check(events == std::vector<std::string>{"item_start", "item_done"},
@@ -198,7 +198,7 @@ void check_archive_root_directory_entries()
             else
             {
                 check(hr == E_INVALIDARG && raw->output_error() && raw->failed_item() == entry.name &&
-                      raw->dirs_written() == 0 && raw->files_written() == 0,
+                      raw->files_written() == 0,
                       "unsafe output path is rejected");
                 check(trace.items.size() == 1 && trace.items.front().failed &&
                       trace.last_hresult == E_INVALIDARG,
@@ -355,13 +355,13 @@ void check_archive_open_start_and_carrier_fallback()
         check(result.status == PasswordTestStatus::Ok && result.archive_type == L"rar4",
               "RAR4 opens with a generic family hint, including carrier prefix fallback");
         if (!prefix) {
-            check(result.input_trace.total_bytes_returned < (512u << 10),
+            check(result.input_trace.total_bytes_returned > 0 && result.input_trace.total_bytes_returned < (512u << 10),
                   "wrong RAR handler does not consume the large carrier tail");
         } else {
             const std::vector<ExtractInputRange> ranges = {{path.wstring(), prefix, prefix + rar.size(), true}};
             const auto carved = extract_archive(path.wstring(), {}, ranges, L"rar", L"", root.wstring(), L"", {}, true);
             check(carved.status == PasswordTestStatus::Ok && carved.archive_type == L"rar4" &&
-                  carved.input_trace.total_bytes_returned < (512u << 10),
+                  carved.input_trace.total_bytes_returned > 0 && carved.input_trace.total_bytes_returned < (512u << 10),
                   "canonical carrier range opens without consuming the underlying prefix and tail");
         }
     }
@@ -508,8 +508,8 @@ void check_prefetch_virtual_inputs()
         UInt64 position = 0;
         stream->Seek(-33, FILE_END, &position);
         correct = position == 480 && stream->Read(bytes, 33, &read) == S_OK && read == 33;
-        check(correct && !std::memcmp(bytes, payload + 480, 33) && trace.last_range_index == 2,
-              "volume seek discards prefetched windows and retains physical indices across an empty part");
+        check(correct && !std::memcmp(bytes, payload + 480, 33) && trace.last_source_path == second.wstring(),
+              "volume seek discards prefetched windows and reports the physical path across an empty part");
     }
     {
         // Same physical inputs represent an embedded payload whose prefix and
@@ -564,6 +564,7 @@ void check_output_path_reservations()
 
 int main()
 {
+    _putenv_s("SUNPACK_SEVENZIP_PROFILE_READS", "1");
     check_extract_callback();
     check_extract_to_disk_callback();
     check_archive_root_directory_entries();

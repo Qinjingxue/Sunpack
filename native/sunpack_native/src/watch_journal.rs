@@ -120,6 +120,55 @@ pub(crate) struct NativeJournalStream {
     stream: Option<String>,
 }
 
+impl NativeJournalStream {
+    pub(crate) fn open_seeded(stream: String, seq: u64) -> Result<Self, String> {
+        let handle = runtime().open(stream)?;
+        handle.runtime.seed(handle.key(), seq)?;
+        Ok(handle)
+    }
+
+    fn key(&self) -> &str {
+        self.stream.as_deref().expect("open Watch journal stream")
+    }
+
+    pub(crate) fn submit_task_append(
+        &self,
+        path: PathBuf,
+        segment_start: u64,
+        seq: u64,
+        operations: &NativeWatchOperations,
+        durable: bool,
+    ) -> io::Result<NativeJournalTicket> {
+        self.runtime
+            .submit_append(
+                self.key().to_owned(),
+                path,
+                segment_start,
+                seq,
+                JournalPayload::Task(Arc::clone(&operations.operations)),
+                durable,
+            )
+            .map_err(io::Error::other)
+    }
+
+    pub(crate) fn submit_seal(
+        &self,
+        path: PathBuf,
+        segment_start: u64,
+        boundary: u64,
+    ) -> io::Result<NativeJournalTicket> {
+        self.runtime
+            .submit_seal(self.key().to_owned(), path, segment_start, boundary)
+            .map_err(io::Error::other)
+    }
+
+    pub(crate) fn request_flush(&self, seq: u64) -> io::Result<NativeJournalTicket> {
+        self.runtime
+            .request_flush(self.key().to_owned(), seq)
+            .map_err(io::Error::other)
+    }
+}
+
 impl Drop for NativeJournalStream {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
@@ -136,8 +185,19 @@ impl NativeJournalTicket {
         (self.wait_for(self.goal)).map_err(std::io::Error::other)
     }
 
-    pub(crate) fn wait_written(&self) -> std::io::Result<()> {
-        (self.wait_for(TicketGoal::Written)).map_err(std::io::Error::other)
+    pub(crate) fn wait_appends(tickets: &[Self]) -> io::Result<u64> {
+        let Some((last, previous)) = tickets.split_last() else {
+            return Ok(0);
+        };
+        // A task's deferred appends share one stream and are sequenced at
+        // submission. Only the latest written and durable targets matter.
+        if matches!(last.goal, TicketGoal::Written) {
+            if let Some(durable) = previous.iter().rfind(|ticket| matches!(ticket.goal, TicketGoal::Durable)) {
+                durable.wait()?;
+            }
+        }
+        last.wait()?;
+        Ok(tickets.iter().map(Self::bytes_written).fold(0u64, u64::saturating_add))
     }
 
     pub(crate) fn bytes_written(&self) -> u64 {
@@ -951,55 +1011,6 @@ fn flusher_loop(shared: Arc<Shared>) {
     }
 }
 
-pub(crate) fn watch_journal_open(stream: String) -> std::io::Result<NativeJournalStream> {
-    (runtime().open(stream)).map_err(std::io::Error::other)
-}
-
-pub(crate) fn watch_journal_submit_append(
-    stream: String,
-    path: String,
-    segment_start: u64,
-    seq: u64,
-    operations: &NativeWatchOperations,
-    durable: bool,
-) -> std::io::Result<NativeJournalTicket> {
-    let operations = JournalPayload::Task(Arc::clone(&operations.operations));
-    runtime()
-        .submit_append(
-            stream,
-            PathBuf::from(path),
-            segment_start,
-            seq,
-            operations,
-            durable,
-        )
-        .map_err(std::io::Error::other)
-}
-
-pub(crate) fn watch_journal_submit_seal(
-    stream: String,
-    old_path: String,
-    old_start: u64,
-    boundary: u64,
-) -> std::io::Result<NativeJournalTicket> {
-    runtime()
-        .submit_seal(stream, PathBuf::from(old_path), old_start, boundary)
-        .map_err(std::io::Error::other)
-}
-
-pub(crate) fn watch_journal_request_flush(
-    stream: String,
-    target_seq: u64,
-) -> std::io::Result<NativeJournalTicket> {
-    runtime()
-        .request_flush(stream, target_seq)
-        .map_err(std::io::Error::other)
-}
-
-pub(crate) fn watch_journal_seed(stream: &str, seq: u64) -> std::io::Result<()> {
-    runtime().seed(stream, seq).map_err(std::io::Error::other)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,9 +1245,7 @@ mod tests {
 
 // Catalog cache uses the same ordered writer, on its own stream and files.
 pub(crate) fn open_cache(stream: String, seq: u64) -> Result<NativeJournalStream, String> {
-    let handle = runtime().open(stream.clone())?;
-    runtime().seed(&stream, seq)?;
-    Ok(handle)
+    NativeJournalStream::open_seeded(stream, seq)
 }
 pub(crate) fn append_cache(
     stream: &str,

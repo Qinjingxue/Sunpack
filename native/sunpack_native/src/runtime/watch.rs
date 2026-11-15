@@ -16,7 +16,7 @@ use crate::pipeline::{
 use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
 use crate::scan::directory::{NativeDirectoryScanOptions, NativeWatchCatalog};
 use crate::scan::scope::NativeDiscoveryScope;
-use crate::watch_store::{is_path_under, watch_path_key};
+use crate::watch_store::{is_path_under, recorded_file_is_absent, watch_path_key};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -1387,6 +1387,8 @@ struct ConfigDirectory {
     observer: FileObserver,
     listeners: Arc<Mutex<HashMap<u64, ConfigListener>>>,
 }
+static CONFIG_DIRECTORIES: OnceLock<Mutex<HashMap<String, Weak<ConfigDirectory>>>> = OnceLock::new();
+
 pub(super) struct ConfigSubscription {
     directory: Arc<ConfigDirectory>,
     id: u64,
@@ -1395,10 +1397,8 @@ impl ConfigSubscription {
     pub(super) fn alive(&self) -> bool { self.directory.observer.alive() }
 
     fn start(path: &Path, files: HashMap<String, (bool, bool)>, notify: ConfigNotify) -> io::Result<Self> {
-        static DIRECTORIES: OnceLock<Mutex<HashMap<String, Weak<ConfigDirectory>>>> = OnceLock::new();
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let mut directories = DIRECTORIES.get_or_init(Mutex::default).lock().unwrap();
-        directories.retain(|_, entry| entry.strong_count() != 0);
+        let mut directories = CONFIG_DIRECTORIES.get_or_init(Mutex::default).lock().unwrap();
         let path_key = key(path);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let listener = ConfigListener { files, notify };
@@ -1427,7 +1427,21 @@ impl ConfigSubscription {
 }
 impl Drop for ConfigSubscription {
     fn drop(&mut self) {
-        self.directory.listeners.lock().unwrap().remove(&self.id);
+        let mut listeners = self.directory.listeners.lock().unwrap();
+        listeners.remove(&self.id);
+        if !listeners.is_empty() { return; }
+        drop(listeners);
+
+        let key = key(&self.directory.observer.path);
+        let mut directories = CONFIG_DIRECTORIES.get().unwrap().lock().unwrap();
+        // Another subscription may have reused this observer or replaced it
+        // between locks. Check both its current registration and listeners.
+        if directories.get(&key).is_some_and(|entry| std::ptr::eq(entry.as_ptr(), Arc::as_ptr(&self.directory)))
+            && self.directory.listeners.lock().unwrap().is_empty()
+        {
+            directories.remove(&key);
+            crate::collections::trim_map(&mut directories);
+        }
     }
 }
 
@@ -2702,7 +2716,7 @@ impl Scheduler {
                 self.activate_scan_options()?;
             }
             if config_changed {
-                self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
+                self.journal.set_retention(self.settings.watch.event_log_retention_days);
             }
             if scheduler_changed { self.recover_pending(None)?; }
             self.checkpoint_reload(scheduler_changed || roots_changed)?;
@@ -2723,7 +2737,7 @@ impl Scheduler {
             // Root edits are durable and are never rolled back. Recover
             // ordinary settings against the latest root file, like main.
             let rollback: io::Result<()> = (|| {
-                self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
+                self.journal.set_retention(self.settings.watch.event_log_retention_days);
                 let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots(false)?;
                 self.activate_scan_options()?;
                 let restart = scheduler_changed || latest_policy_changed;
@@ -2862,7 +2876,8 @@ impl Scheduler {
                 for ( _, waiter) in signals.cancel { let _ = waiter.send(Ok(false)); }
                 for waiter in signals.once { let _ = waiter.send(Err(io::Error::other(error.to_string()))); }
                 if !signals.rebuild.is_empty() {
-                    let rebuilt = log.rebuild().and_then(|()| log.flush()).is_ok();
+                    log.rebuild();
+                    let rebuilt = log.flush().is_ok();
                     for waiter in signals.rebuild { let _ = waiter.send(Ok(rebuilt)); }
                 }
                 for root in signals.roots { root.reply.complete(Err(io::Error::other(error.to_string()))); }
@@ -2881,7 +2896,7 @@ impl Scheduler {
                             &roots_path(&cwd)?, &password_path, &hub)?;
                         settings = Arc::new(snapshot.config);
                         super::diagnostics::retention(settings.watch.event_log_retention_days);
-                        log.configure_retention(settings.watch.event_log_retention_days.min(u64::from(u32::MAX)) as u32)?;
+                        log.configure_retention(settings.watch.event_log_retention_days.min(u64::from(u32::MAX)) as u32);
                         windows::configure_priority(&engine, settings.runtime.process_mode);
                         Self::reconcile_tray(&cwd, &settings, tray_enabled, &hub,
                             &log, &mut tray);
@@ -3091,6 +3106,7 @@ impl Scheduler {
                             self.journal.state().trim_idle_storage();
                             self.pending.shrink_to_fit();
                             self.unpublished.shrink_to_fit();
+                            crate::collections::trim_map(&mut self.volume_checks);
                             self.active.shrink_to_fit();
                             self.active_paths.shrink_to_fit();
                         })
@@ -3309,8 +3325,6 @@ impl Scheduler {
             // cursor. A rename may replace its path while recovery is running.
             let identity = output_identity(&scope.root).ok();
             let current = filesystem::watch_volume_cursor(&scope.root);
-            let arrived = !startup && (reopened.contains(&id) || identity.as_deref()
-                .is_some_and(|identity| self.catalog.root_replaced(&scope, identity)));
             let cached = identity.as_deref().and_then(|identity| self.catalog.cursor(&scope, identity));
             if let (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end))) =
                 (&current, &cached)
@@ -3332,7 +3346,7 @@ impl Scheduler {
                     entry.2.push(scope.clone());
                 }
             }
-            probes.push((id, root, scope, identity, current, cached, arrived));
+            probes.push((id, root, scope, identity, current, cached));
         }
         if !reopened.is_empty() {
             // Old snapshots can have only an outside literal name while its
@@ -3364,7 +3378,7 @@ impl Scheduler {
         let mut retried = HashSet::new();
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
-        for (id, root, scope, identity, current, cached, _arrived) in probes {
+        for (id, root, scope, identity, current, cached) in probes {
             let range = match (&current, &cached) {
                 (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end)))
                     if volume == old_volume
@@ -3605,42 +3619,41 @@ impl Scheduler {
         Ok(())
     }
 
-    fn retire_missing_entries(&self, path: Option<&str>, recursive: bool) -> io::Result<()> {
+    fn retire_missing_entries(&self, path_key: Option<&str>, recursive: bool) -> io::Result<()> {
         let mut available = HashMap::new();
-        let missing = self
+        let mut missing = self
             .journal
             .state()
-            .entry_paths(path, recursive)
+            .entries_in_scope(path_key, recursive)
             .into_iter()
-            .filter_map(|(id, recorded_path)| {
+            .filter_map(|entry| {
                 let root = self
                     .roots
                     .values()
-                    .find_map(|(root, scope)| scope.contains(&recorded_path).then_some(&root.path))
+                    .find_map(|(root, scope)| scope.contains(&entry.path).then_some(&root.path))
                     .or_else(|| {
-                        let entry = self.journal.state().entry(&recorded_path)?;
                         let source = entry.failure_payload.get("source_input_root")?.as_str()?;
                         self.roots
                             .get(&watch_path_key(source))
                             .map(|(root, _)| &root.path)
                     })?;
                 (*available.entry(root).or_insert_with(|| root.is_dir())
-                    && NativePresence::at(&recorded_path).is_absent())
-                .then_some((id, root))
+                    && recorded_file_is_absent(&entry.path))
+                .then(|| (watch_path_key(&entry.path), entry, root))
             })
             .collect::<Vec<_>>();
         if missing.is_empty() {
             return Ok(());
         }
+        missing.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         // A volume can disappear during the probe. Keep its durable blockers.
         available.clear();
-        let keys = missing.into_iter().filter_map(|(id, root)| {
-            available
-                .entry(root)
-                .or_insert_with(|| root.is_dir())
+        self.journal.commit(false, |state| {
+            let keys = missing.into_iter().filter_map(|(id, entry, root)| {
+                (*available.entry(root).or_insert_with(|| root.is_dir())
+                    && state.entry_by_key(&id).is_some_and(|current| Arc::ptr_eq(&entry, &current)))
                 .then_some(id)
-        });
-        self.journal.commit(false, |_| {
+            });
             Ok(crate::watch_store::NativeWatchOperations::retire_entries(
                 keys,
             ))
@@ -3649,9 +3662,12 @@ impl Scheduler {
 
     fn departed(&mut self, path: &str, recursive: bool) -> io::Result<()> {
         let path_key = watch_path_key(path);
-        self.volume_checks.retain(|id, _| id != &path_key && !(recursive && is_path_under(id, &path_key)));
+        self.volume_checks.remove(&path_key);
+        if recursive {
+            self.volume_checks.retain(|id, _| !is_path_under(id, &path_key));
+        }
         let is_missing = |pending: &Pending| {
-            NativePresence::at(&pending.candidate.path).is_absent()
+            recorded_file_is_absent(&pending.candidate.path)
                 && self
                     .roots
                     .get(&pending.root)
@@ -3682,7 +3698,7 @@ impl Scheduler {
         }
         self.journal.log(json!({"event":"candidate_departed","path":path,"recursive":recursive}));
         self.catalog.forget_observation(path, recursive, true);
-        self.retire_missing_entries(Some(path), recursive)
+        self.retire_missing_entries(Some(&path_key), recursive)
     }
 
     fn retire_departed_owner(&self, id: &str, path: &str) -> io::Result<()> {
@@ -4436,7 +4452,7 @@ impl Scheduler {
                 }
                 if source.is_file() {
                     revisit.insert(watch_path_key(&pending.path), pending.path.clone());
-                } else if !NativePresence::at(&pending.path).is_absent() {
+                } else if !recorded_file_is_absent(&pending.path) {
                     continue;
                 }
             }
@@ -4496,7 +4512,7 @@ impl Scheduler {
                     Some(&CandidateEvent::Business(if pending.has_output_work() {
                         "crash_recovery"
                     } else { "recovery" })), None)?;
-                if !self.pending.contains_key(&id) && !NativePresence::at(&path).is_absent() {
+                if !self.pending.contains_key(&id) && !recorded_file_is_absent(&path) {
                     rebase = false;
                 }
             }
@@ -4509,17 +4525,6 @@ impl Scheduler {
         }
         self.persist_candidates(BTreeMap::new(), true)?;
         Ok(())
-    }
-}
-
-struct NativePresence(Option<bool>);
-impl NativePresence {
-    fn at(path: &str) -> Self {
-        Self(crate::watch_store::NativeWatchState::file_presence(path))
-    }
-
-    fn is_absent(&self) -> bool {
-        self.0 == Some(false)
     }
 }
 
@@ -4742,12 +4747,12 @@ impl Scheduler {
                 self.due.insert((pending.due, id), ());
                 continue;
             }
+            let (seconds, last, cadence, tentative) = pending.quiet.summary();
             self.journal.log(json!({
                 "event":"candidate_quiet", "path":pending.candidate.path,
-                "quiet_seconds":pending.quiet.summary().0,
+                "quiet_seconds":seconds,
             }));
             if pending.recovery.is_none() {
-                let (seconds, last, cadence, tentative) = pending.quiet.summary();
                 self.catalog.retire_observation(
                     &pending.candidate.path,
                     Some(seconds),
@@ -4811,7 +4816,7 @@ impl Scheduler {
                 .recovery
                 .as_ref()
                 .is_none_or(|recovery| Path::new(&recovery.scope.root).is_dir())
-            && NativePresence::at(path).is_absent()
+            && recorded_file_is_absent(path)
         {
             self.departed(path, false)?;
             self.retire_departed_owner(id, path)?;
@@ -5059,7 +5064,7 @@ impl Scheduler {
             if claimed.finished.contains(&id)
                 || self.hub.claims.lock().unwrap().get(&id).is_some_and(|owner| owner.as_ref() != batch)
                 || self.pending.get(&id).is_some_and(|pending| quiet::changed(input, &pending.candidate))
-                || NativePresence::at(&input.path).is_absent()
+                || recorded_file_is_absent(&input.path)
             {
                 continue;
             }
@@ -5254,7 +5259,7 @@ impl Scheduler {
                 };
                 if let Some(output) = record.active_outputs.values().find(|output| {
                     !record.committed_roots.contains(output)
-                        && !NativePresence::at(output).is_absent()
+                        && !recorded_file_is_absent(output)
                 }) {
                     unfinished.insert(watch_path_key(&input.path));
                     self.journal
@@ -5581,7 +5586,7 @@ impl Scheduler {
                 // consumed outer source. That is still this owner's failure.
                 && !failed_archive.is_some_and(|archive| archive.depth > 1)
                 && (discovery_failure.is_none() || retryable)
-                && (NativePresence::at(&canonical).is_absent()
+                && (recorded_file_is_absent(&canonical)
                     || (!retryable
                         && group.is_some_and(|group| {
                             group.multipart
@@ -5773,7 +5778,7 @@ impl Scheduler {
     ) -> io::Result<()> {
         let id = watch_path_key(path);
         if self.pending.contains_key(&id) { return Ok(()); }
-        if NativePresence::at(path).is_absent() {
+        if recorded_file_is_absent(path) {
             operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(path, None));
             return Ok(());
         }
@@ -6858,6 +6863,7 @@ mod tests {
         assert!(observes_files(&[config.clone()], &passwords, &first));
         assert!(!observes_files(&[config.clone()], &passwords, &second));
         let weak = Arc::downgrade(&first[0].directory);
+        let directory_key = key(&first[0].directory.observer.path);
         assert_eq!(first[0].directory.listeners.lock().unwrap().len(), 2);
         drop(first);
         assert!(second[0].alive());
@@ -6868,6 +6874,7 @@ mod tests {
         drop(second);
         drop(third);
         assert!(weak.upgrade().is_none());
+        assert!(!CONFIG_DIRECTORIES.get().unwrap().lock().unwrap().contains_key(&directory_key));
 
         let child = directory.join("new");
         let paths = [child.join("config.json")];

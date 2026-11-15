@@ -252,7 +252,6 @@ impl Engine {
             deep_options,
             analysis,
             observer: ObserverRef::Owned(observer, std::marker::PhantomData),
-            worker_request_id: request_id.to_string(),
             recursion: RecursivePrompts::default(),
             output_names: OutputReservationGuard { registry: Arc::clone(&self.output_names), owner: request_id },
             created_outputs: Mutex::default(),
@@ -388,7 +387,6 @@ struct Run<'a, O> {
     deep_options: Option<NativeDirectoryScanOptions>,
     analysis: NativeAnalysisConfig,
     observer: ObserverRef<'a, O>,
-    worker_request_id: String,
     recursion: RecursivePrompts,
     output_names: OutputReservationGuard,
     created_outputs: Mutex<CreatedOutputs>,
@@ -2737,7 +2735,7 @@ impl<'run, O: Observer> Run<'run, O> {
             Err(error) => return Err(error),
         };
         if !report.format_hint.is_empty() {
-            original.input.format_hint = report.format_hint.to_string();
+            original.input.format_hint = report.format_hint.to_owned();
         }
         let previous = &original.input.analysis;
         let mut facts = report.facts;
@@ -2752,16 +2750,13 @@ impl<'run, O: Observer> Run<'run, O> {
         facts.status = previous.status;
         facts.damage_flags = previous.damage_flags.clone();
         original.input.analysis = facts;
-        let mut selected = report.extractable_segments;
-        if selected.is_empty() {
-            selected.extend(report.password_segment);
-        }
+        let selected = report.segments;
         if selected.is_empty() {
             return Ok(());
         }
         let slices: Vec<_> = selected
             .iter()
-            .map(|item| (item.format_hint.as_str(), item.start, item.end))
+            .map(|item| (item.format_hint, item.start, item.end))
             .collect();
         let (projected, probe) = archive_input_slices(&original.input, &slices)?;
         let probe_zip_eocd = selected[0].zip_eocd_offset;
@@ -2771,10 +2766,11 @@ impl<'run, O: Observer> Run<'run, O> {
             .filter_map(|(input, segment)| {
                 let mut input = input?;
                 input.analysis.origin = crate::io::archive_state::AnalysisOrigin::Planned;
-                input.analysis.status = segment.status;
+                input.analysis.status = Some(segment.status);
                 input.analysis.zip_eocd_offset = segment.zip_eocd_offset;
                 input.analysis.password_required = segment.password_required;
-                input.analysis.damage_flags = segment.damage_flags;
+                input.analysis.damage_flags = (!segment.damage_flags.is_empty())
+                    .then(|| Arc::new(segment.damage_flags));
                 input.analysis.structure_complete = input.format_hint == "lz4";
                 Some(LogicalInput {
                     input,
@@ -2944,7 +2940,6 @@ impl<'run, O: Observer> Run<'run, O> {
         };
         let mut request = json!({
             "job_id": job_id, "operation": if self.request.mode == Mode::Scan { "scan" } else { "extract" },
-            "request_id": self.worker_request_id,
             "origin": if self.request.origin == Origin::Watch { "watch" } else { "foreground" },
             "output_dir": output_string, "output_volume_key": volume_key,
             "archive_input": input.worker_input(), "password_candidates": plan.candidates,
@@ -5182,7 +5177,6 @@ mod tests {
             }).unwrap().result;
             let submitted = responder.join().unwrap();
             assert_eq!(submitted["password_verified"], true);
-            assert_eq!(submitted["request_id"], run.worker_request_id);
             assert_eq!(submitted["password"], "secret");
             assert_eq!(result.failure.unwrap().kind, kind);
             assert_eq!(result.password.as_deref(), expected);
@@ -5344,7 +5338,6 @@ mod tests {
             deep_options: None,
             analysis: NativeAnalysisConfig::new(Vec::<(String, bool)>::new()),
             observer: ObserverRef::Borrowed(observer),
-            worker_request_id: "1".to_owned(),
             recursion: RecursivePrompts::default(),
             output_names: OutputReservationGuard { registry: Arc::clone(&engine.output_names), owner: 1 },
             created_outputs: Mutex::default(),

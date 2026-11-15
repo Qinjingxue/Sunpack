@@ -95,16 +95,6 @@ pub(crate) enum AnalysisOrigin {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AnalysisStatus { Error, Weak, Damaged, Extractable }
 
-impl AnalysisStatus {
-    pub(crate) fn from_evidence(status: &str) -> Option<Self> {
-        match status {
-            "error" => Some(Self::Error), "weak" => Some(Self::Weak),
-            "damaged" => Some(Self::Damaged), "extractable" => Some(Self::Extractable),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AnalysisFacts {
     #[serde(default)]

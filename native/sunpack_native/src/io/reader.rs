@@ -1,5 +1,5 @@
 use crate::io::cancellation::Cancellation;
-use crate::io::read_fault::{FieldLocation, ReadFault};
+use crate::io::read_fault::ReadFault;
 use crate::io::resource_lifecycle::TrackedFile;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -462,34 +462,6 @@ impl ManagedReader {
             .uncached_read_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(data)
-    }
-
-    pub(crate) fn read_exact_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let data = self.read_at(offset, len)?;
-        if data.len() != len {
-            return Err(ReadFault::short_read(
-                "read_exact_at",
-                offset,
-                len,
-                data.len(),
-                self.len(),
-            )
-            .into_io_error());
-        }
-        Ok(data)
-    }
-
-    pub(crate) fn read_exact_field_at(
-        &self,
-        offset: u64,
-        len: usize,
-        field: &'static str,
-        location: FieldLocation,
-    ) -> Result<Vec<u8>, ReadFault> {
-        self.read_exact_at(offset, len).map_err(|error| {
-            ReadFault::from_io(error, "read_exact_at", offset, len, 0, self.len())
-                .with_field(field, location)
-        })
     }
 
     /// Reads through the shared cache directly into a caller-owned buffer.
@@ -2132,28 +2104,13 @@ mod tests {
         let path = temp_file("managed_reader_eof", b"abcdef");
         let reader = ManagedReader::open(&path).unwrap();
         assert_eq!(reader.read_at(4, 8).unwrap(), b"ef");
+        let mut cursor = reader.cursor();
+        cursor.seek(SeekFrom::Start(4)).unwrap();
         assert_eq!(
-            reader.read_exact_at(4, 8).unwrap_err().kind(),
+            cursor.read_exact(&mut [0; 8]).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
         assert_eq!(reader.stats().unwrap().read_bytes, 4);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn field_read_preserves_exact_short_read_diagnostics() {
-        let path = temp_file("managed_reader_field_eof", b"abcdef");
-        let reader = ManagedReader::open(&path).unwrap();
-        let fault = reader
-            .read_exact_field_at(4, 8, "zip.eocd", FieldLocation::Tail)
-            .unwrap_err();
-        assert_eq!(fault.code, "unexpected_eof");
-        assert_eq!(fault.field, "zip.eocd");
-        assert_eq!(fault.offset, 4);
-        assert_eq!(fault.requested, 8);
-        assert_eq!(fault.actual, 2);
-        assert_eq!(fault.source_len, 6);
-        assert!(fault.possible_missing_volume());
         let _ = std::fs::remove_file(path);
     }
 
@@ -2362,15 +2319,6 @@ mod tests {
             &[0x5a; 4]
         );
         assert_eq!(probe.read_at(data.len() as u64 - 2, 8).unwrap(), [0x5a; 2]);
-        let fault = probe
-            .read_exact_field_at(data.len() as u64 - 2, 8, "zip.eocd", FieldLocation::Tail)
-            .unwrap_err();
-        assert_eq!(fault.code, "unexpected_eof");
-        assert_eq!(fault.field, "zip.eocd");
-        assert_eq!(fault.requested, 8);
-        assert_eq!(fault.actual, 2);
-        assert_eq!(fault.source_len, data.len() as u64);
-        assert!(fault.possible_missing_volume());
         let mut cursor = probe.cursor();
         cursor.seek(SeekFrom::Start(3)).unwrap();
         let mut bytes = [0; 4];
@@ -2381,15 +2329,13 @@ mod tests {
         manager()
             .release_resources_under_roots(&[identity.path.to_path_buf()])
             .unwrap();
-        let fault = probe
-            .read_exact_field_at(2, 4, "zip.eocd", FieldLocation::Tail)
-            .unwrap_err();
+        let error = probe.read_at(2, 4).unwrap_err();
+        let fault = error.get_ref().unwrap().downcast_ref::<ReadFault>().unwrap();
         assert_eq!(fault.code, "io_error");
         assert_eq!(fault.operation, "read_at");
         assert_eq!(fault.offset, 2);
         assert_eq!(fault.requested, 4);
         assert_eq!(fault.actual, 0);
-        assert_eq!(fault.field, "zip.eocd");
         let _ = std::fs::remove_file(path);
     }
 
@@ -2460,11 +2406,10 @@ mod tests {
             .read_cached_at(BLOCK_SIZE as u64 * 2 + 200, 4096)
             .unwrap();
         assert_eq!(&*bulk, &bytes[BLOCK_SIZE + 150..BLOCK_SIZE + 150 + 4096]);
+        let mut cursor = probe.cursor();
+        cursor.seek(SeekFrom::End(-3)).unwrap();
         assert_eq!(
-            probe
-                .read_exact_at(bytes.len() as u64 - 3, 8)
-                .unwrap_err()
-                .kind(),
+            cursor.read_exact(&mut [0; 8]).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
         let root = reader.file_identity().unwrap().path.to_path_buf();
@@ -2499,8 +2444,10 @@ mod tests {
         assert_eq!(reader.read_at(4, 2).unwrap(), b"ef");
         reader.hint_probe_window(6);
         assert_eq!(reader.read_at(6, 4).unwrap(), b"gh");
+        let mut cursor = reader.cursor();
+        cursor.seek(SeekFrom::Start(1)).unwrap();
         assert_eq!(
-            reader.read_exact_at(1, 6).unwrap_err().kind(),
+            cursor.read_exact(&mut [0; 6]).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
         // Distinct fields of sparse hits must remain exact reads, rather than

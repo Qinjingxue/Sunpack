@@ -88,7 +88,7 @@ struct WorkerArchiveInput {
     sunpack::sevenzip::VolumeAttemptPlan volume_attempts;
     std::wstring archive_path;
     std::wstring format_hint;
-    std::string open_mode;
+    bool native_volume_input = false;
     std::vector<std::wstring> part_paths;
     std::vector<std::wstring> canonical_names;
     std::string analyzed_missing_volume_evidence;
@@ -99,17 +99,12 @@ struct WorkerArchiveInput {
 };
 
 sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
-    const sunpack::sevenzip::PasswordTestResult& probe,
-    std::size_t candidate_count
+    const sunpack::sevenzip::PasswordTestResult& probe
 ) {
     using namespace sunpack::sevenzip;
     ExtractArchiveResult result;
     result.status = probe.status;
-    result.backend_available = probe.backend_available;
     result.archive_type = probe.archive_type;
-    result.password_candidate_batch = true;
-    result.password_candidate_count = static_cast<unsigned int>(candidate_count);
-    result.password_attempts = probe.attempts;
     result.matched_index = probe.matched_index;
     result.password_candidates_all_rejected = probe.status == PasswordTestStatus::WrongPassword;
     result.encrypted = probe.status == PasswordTestStatus::WrongPassword;
@@ -184,7 +179,7 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
     const std::string_view entry_path = descriptor.string_field("entry_path", "");
     input.archive_path = utf8_to_wide(entry_path);
     const std::string_view mode = descriptor.string_field("open_mode", "file");
-    input.open_mode = mode;
+    input.native_volume_input = mode == "native_volumes";
     input.format_hint = utf8_to_wide(descriptor.string_field("format_hint", ""));
 
     const auto attempts = descriptor.object_field("volume_attempts");
@@ -342,14 +337,14 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
 struct WorkerRequest {
     std::string worker_command;
     std::string job_id;
-    std::string request_id;
-    std::string origin = "foreground";
+    bool from_watch = false;
     std::string output_volume_key;
     std::string process_mode = "normal";
     std::wstring output_dir;
     std::wstring password;
     std::wstring codepage;
     bool dry_run = false;
+    bool report_progress = false;
     bool password_verified = false;
     bool scan_only = false;
     int encrypted = -1;
@@ -362,8 +357,7 @@ WorkerRequest parse_worker_request(const std::string& request_frame) {
     WorkerRequest request;
     request.worker_command = fields.string_field("worker_command", "");
     request.job_id = fields.string_field("job_id", "");
-    request.request_id = fields.string_field("request_id", "");
-    request.origin = fields.string_field("origin", "foreground");
+    request.from_watch = fields.string_field("origin") == "watch";
     request.output_volume_key = fields.string_field("output_volume_key", "");
     request.process_mode = fields.string_field("mode", "normal");
 
@@ -379,6 +373,7 @@ WorkerRequest parse_worker_request(const std::string& request_frame) {
     request.password = utf8_to_wide(fields.string_field("password", ""));
     request.codepage = utf8_to_wide(fields.string_field("codepage", ""));
     request.dry_run = fields.bool_field("dry_run", false);
+    request.report_progress = fields.bool_field("report_progress");
     request.password_verified = fields.bool_field("password_verified", false);
     request.scan_only = fields.string_field("operation", "extract") == "scan";
     request.encrypted = fields.bool_field("encrypted", false) ? 1 :
@@ -401,53 +396,46 @@ void print_frame(const std::string& payload) {
     std::cout.flush();
 }
 
-void print_frames(const std::string& first, const std::string& second) {
-    std::lock_guard<std::mutex> lock(g_output_mutex);
-    wire::write(std::cout, first);
-    wire::write(std::cout, second);
-    std::cout.flush();
+void print_job_event(const std::string& job_id, const char* event) {
+    if (job_id.empty()) return;
+    print_frame(wire::object() + wire::key("type") + wire::text("native_event") +
+        wire::key("job_id") + wire::text(job_id) + wire::key("event") + wire::text(event) + wire::end());
 }
 
-std::string status_to_string(sunpack::sevenzip::PasswordTestStatus status) {
-    return sunpack::sevenzip::status_name(status);
-}
-
-std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace) {
-    return wire::object() +
-        wire::key("mode") + wire::text(wide_to_utf8(trace.mode)) +
-        wire::key("virtual_size") + wire::number(trace.virtual_size) +
-        wire::key("position") + wire::number(trace.position) +
-        wire::key("max_position_seen") + wire::number(trace.max_position_seen) +
-        wire::key("total_bytes_returned") + wire::number(trace.total_bytes_returned) +
-        wire::key("read_file_call_count") + wire::number(trace.read_file_call_count) +
-        wire::key("read_file_wall_ns") + wire::number(trace.read_file_wall_ns) +
-        wire::key("read_file_max_wall_ns") + wire::number(trace.read_file_max_wall_ns) +
-        wire::key("logical_read_call_count") + wire::number(trace.logical_read_call_count) +
-        wire::key("sequential_read_bytes") + wire::number(trace.sequential_read_bytes) +
-        wire::key("nonsequential_read_bytes") + wire::number(trace.nonsequential_read_bytes) +
-        wire::key("sequential_run_count") + wire::number(trace.sequential_run_count) +
-        wire::key("max_sequential_run_bytes") + wire::number(trace.max_sequential_run_bytes) +
-        wire::key("seek_count") + wire::number(trace.seek_count) +
-        wire::key("seek_forward_bytes") + wire::number(trace.seek_forward_bytes) +
-        wire::key("seek_backward_bytes") + wire::number(trace.seek_backward_bytes) +
-        wire::key("prefetch_enabled") + wire::boolean(trace.prefetch_enabled) +
-        wire::key("prefetch_hit_count") + wire::number(trace.prefetch_hit_count) +
-        wire::key("prefetch_miss_count") + wire::number(trace.prefetch_miss_count) +
-        wire::key("prefetch_invalidation_count") + wire::number(trace.prefetch_invalidation_count) +
-        wire::key("prefetch_consumer_wait_ns") + wire::number(trace.prefetch_consumer_wait_ns) +
+std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace, bool profiling) {
+    auto payload = wire::object() +
         wire::key("read_error") + wire::boolean(trace.read_error) +
-        wire::key("last_hresult") + wire::number(trace.last_hresult) +
         wire::key("last_win32_error") + wire::number(trace.last_win32_error) +
         (wire::key("last_read") + wire::object() + wire::key("virtual_offset")) + wire::number(trace.last_read_virtual_offset) +
         wire::key("source_path") + wire::text(wide_to_utf8(trace.last_source_path)) +
         wire::key("source_offset") + wire::number(trace.last_read_source_offset) +
-        wire::key("range_index") + wire::number(trace.last_range_index) +
         wire::key("requested") + wire::number(trace.last_read_requested) +
         wire::key("returned") + wire::number(trace.last_read_returned) +
-        (wire::end() + wire::key("last_seek") + wire::object() + wire::key("origin")) + wire::number(trace.last_seek_origin) +
-        wire::key("offset") + wire::number(trace.last_seek_offset) +
-        wire::key("new_position") + wire::number(trace.last_seek_new_position) +
-        (wire::end() + wire::end());
+        wire::end();
+    if (profiling) {
+        payload +=
+            wire::key("mode") + wire::text(wide_to_utf8(trace.mode)) +
+            wire::key("virtual_size") + wire::number(trace.virtual_size) +
+            wire::key("total_bytes_returned") + wire::number(trace.total_bytes_returned) +
+            wire::key("read_file_call_count") + wire::number(trace.read_file_call_count) +
+            wire::key("read_file_wall_ns") + wire::number(trace.read_file_wall_ns) +
+            wire::key("read_file_max_wall_ns") + wire::number(trace.read_file_max_wall_ns) +
+            wire::key("logical_read_call_count") + wire::number(trace.logical_read_call_count) +
+            wire::key("sequential_read_bytes") + wire::number(trace.sequential_read_bytes) +
+            wire::key("nonsequential_read_bytes") + wire::number(trace.nonsequential_read_bytes) +
+            wire::key("sequential_run_count") + wire::number(trace.sequential_run_count) +
+            wire::key("max_sequential_run_bytes") + wire::number(trace.max_sequential_run_bytes) +
+            wire::key("seek_count") + wire::number(trace.seek_count) +
+            wire::key("seek_forward_bytes") + wire::number(trace.seek_forward_bytes) +
+            wire::key("seek_backward_bytes") + wire::number(trace.seek_backward_bytes) +
+            wire::key("prefetch_enabled") + wire::boolean(trace.prefetch_enabled) +
+            wire::key("prefetch_hit_count") + wire::number(trace.prefetch_hit_count) +
+            wire::key("prefetch_miss_count") + wire::number(trace.prefetch_miss_count) +
+            wire::key("prefetch_invalidation_count") + wire::number(trace.prefetch_invalidation_count) +
+            wire::key("prefetch_consumer_wait_ns") + wire::number(trace.prefetch_consumer_wait_ns);
+    }
+    payload += wire::end();
+    return payload;
 }
 
 // Bound each serialized event by bytes, including its routing envelope. The
@@ -633,7 +621,7 @@ int scan_request(const WorkerRequest& request) {
             // the availability of candidates for later volumes.
             ok = probe.status == PasswordTestStatus::Ok || ambiguous;
             if (!ok) {
-                fields += wire::key("native_status") + wire::text(status_to_string(probe.status)) +
+                fields += wire::key("native_status") + wire::text(status_name(probe.status)) +
                     wire::key("message") + wire::text(probe.message) +
                     wire::key("password_candidates_all_rejected") + wire::boolean(probe.status == PasswordTestStatus::WrongPassword);
                 if (probe.missing_volume)
@@ -766,7 +754,6 @@ int run_request(
     const std::wstring& output_dir = request.output_dir;
     const std::wstring& password = request.password;
     const std::wstring& format_hint = request.archive_input.format_hint;
-    const std::string& open_mode = request.archive_input.open_mode;
     const std::wstring& codepage = request.codepage;
     const bool dry_run = request.dry_run;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
@@ -777,10 +764,9 @@ int run_request(
         return 2;
     }
 
-    auto last_progress_emit = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-    bool reported_bytes = false;
     const bool volume_trials = !request.archive_input.volume_attempts.layouts.empty();
-    auto progress = [&job_id, last_progress_emit, reported_bytes, volume_trials](const ExtractProgressEvent& event) mutable {
+    auto progress = [&job_id, last_progress_emit = std::chrono::steady_clock::time_point{},
+                     reported_bytes = false, volume_trials](const ExtractProgressEvent& event) mutable {
             if (volume_trials && event.event == "item_failed") return;
             const auto now = std::chrono::steady_clock::now();
             const bool first_bytes = !reported_bytes && event.completed_bytes > 0;
@@ -828,8 +814,9 @@ int run_request(
         // password/composition keeps its own progress counters on this stack.
         auto attempt_progress = progress;
         return extract_archive(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
-            format_hint, selected_password, output_dir, codepage, std::ref(attempt_progress), dry_run,
-            archive_input.canonical_names, open_mode == "native_volumes", shared_writer, cancel_token);
+            format_hint, selected_password, output_dir, codepage,
+            request.report_progress ? ExtractProgressCallback{std::ref(attempt_progress)} : ExtractProgressCallback{},
+            dry_run, archive_input.canonical_names, request.archive_input.native_volume_input, shared_writer, cancel_token);
     };
 
     ExtractArchiveResult result;
@@ -921,12 +908,9 @@ int run_request(
                     format_hint, password_candidates.data(), password_candidates.size(), archive_input.canonical_names);
                 if (probe.status != PasswordTestStatus::Ok || probe.matched_index < 0 ||
                     static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
-                    result = password_candidate_failure(probe, password_candidates.size());
+                    result = password_candidate_failure(probe);
                 } else {
                     result = extract_with_password(password_candidates[probe.matched_index]);
-                    result.password_candidate_batch = true;
-                    result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
-                    result.password_attempts = probe.attempts;
                     result.matched_index = probe.matched_index;
                 }
             } else {
@@ -936,7 +920,6 @@ int run_request(
                         const auto error = discard_candidate_output(output_dir);
                         if (error) {
                             result = ExtractArchiveResult{};
-                            result.backend_available = true;
                             result.status = PasswordTestStatus::Error;
                             result.failure_stage = "candidate_cleanup";
                             result.failure_kind = "output_filesystem";
@@ -977,9 +960,6 @@ int run_request(
                             result.message = "wrong password";
                         }
                     }
-                    result.password_candidate_direct = true;
-                    result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
-                    result.password_attempts = password_candidates.size() == 1 && direct_ok ? 0 : static_cast<int>(index + 1);
                     result.matched_index = direct_ok || result.password_crc_proven ? static_cast<int>(index) : -1;
                     result.password_candidates_all_rejected =
                         result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
@@ -991,10 +971,8 @@ int run_request(
                 if (index == password_candidates.size()) {
                     PasswordTestResult rejected;
                     rejected.status = PasswordTestStatus::WrongPassword;
-                    rejected.backend_available = true;
-                    rejected.attempts = static_cast<int>(password_candidates.size());
                     rejected.message = "wrong password";
-                    result = password_candidate_failure(rejected, password_candidates.size());
+                    result = password_candidate_failure(rejected);
                 }
             }
         }
@@ -1063,17 +1041,13 @@ int run_request(
     }
 
     const bool ok = result.status == PasswordTestStatus::Ok && result.command_ok;
-    std::string volume_attempt_fields;
-    if (volume_trials) {
+    std::string volume_selection;
+    if (volume_trials && ok) {
         const auto& cursor = volume_replay->volumes;
-        volume_attempt_fields = wire::key("volume_attempts") + wire::number(cursor.attempts);
-        if (ok) {
-            volume_attempt_fields += (wire::key("volume_selection") + wire::object() + wire::key("layout")) + wire::number(cursor.layout) + (wire::key("sources") + wire::array());
-            for (std::size_t i = 0; i < cursor.selected.size(); ++i) {
-                volume_attempt_fields += wire::number(cursor.selected[i]);
-            }
-            volume_attempt_fields += (wire::end() + wire::end());
-        }
+        volume_selection = wire::key("volume_selection") + wire::object() +
+            wire::key("layout") + wire::number(cursor.layout) + wire::key("sources") + wire::array();
+        for (const auto source : cursor.selected) wire::append_number(volume_selection, source);
+        volume_selection += wire::end() + wire::end();
     }
     const std::string manifest_field = (ok && !dry_run)
         ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result) : "";
@@ -1085,9 +1059,11 @@ int run_request(
     const std::string failure_fields = ok ? "" :
         wire::key("failure_stage") + wire::text(result.failure_stage) +
         wire::key("failure_kind") + wire::text(result.failure_kind) +
-        wire::key("hresult") + wire::number(result.hresult);
-    const std::string input_trace_field = (!ok || dry_run || read_file_timing_enabled()) ?
-        wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
+        wire::key("hresult") + wire::number(result.hresult) +
+        wire::key("operation_result_name") + wire::text(operation_result_name(result.operation_result));
+    const bool profile_reads = read_file_timing_enabled();
+    const std::string input_trace_field = (!ok || profile_reads) ?
+        wire::key("input_trace") + input_trace_wire(result.input_trace, profile_reads) : "";
     const auto &output_trace = result.output_trace;
     const std::string metadata_warning_field = (output_trace.metadata_failed_files || output_trace.metadata_failed_directories) ?
         (wire::key("metadata_warning") + wire::object() + wire::key("file_count")) + wire::number(output_trace.metadata_failed_files) +
@@ -1105,9 +1081,7 @@ int run_request(
     print_frame(
         (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
         wire::key("status") + wire::text(ok ? "ok" : "failed") +
-        wire::key("native_status") + wire::text(status_to_string(result.status)) +
-        wire::key("operation_result") + wire::number(result.operation_result) +
-        wire::key("operation_result_name") + wire::text(operation_result_name(result.operation_result)) +
+        wire::key("native_status") + wire::text(status_name(result.status)) +
         wire::key("encrypted") + wire::boolean(result.encrypted) +
         wire::key("damaged") + wire::boolean(result.damaged) +
         wire::key("checksum_error") + wire::boolean(result.checksum_error) +
@@ -1119,21 +1093,11 @@ int run_request(
         wire::key("password_rejected") + wire::boolean(result.password_rejected) +
         wire::key("password_crc_proven") + wire::boolean(result.password_crc_proven) +
         wire::key("password_crc_proven_items") + wire::number(result.password_crc_proven_items) +
-        wire::key("password_candidate_batch") + wire::boolean(result.password_candidate_batch) +
-        wire::key("password_candidate_direct") + wire::boolean(result.password_candidate_direct) +
         wire::key("password_candidates_all_rejected") + wire::boolean(result.password_candidates_all_rejected) +
-        wire::key("password_candidate_count") + wire::number(result.password_candidate_count) +
-        wire::key("password_attempts") + wire::number(result.password_attempts) +
         wire::key("matched_index") + wire::number(result.matched_index) +
         wire::key("unsupported_method") + wire::boolean(result.unsupported_method) +
-        wire::key("item_count") + wire::number(result.item_count) +
-        wire::key("files_written") + wire::number(result.files_written) +
         wire::key("recovered_complete_files") + wire::number(complete_files) +
-        wire::key("dirs_written") + wire::number(result.dirs_written) +
-        wire::key("bytes_written") + wire::number(result.bytes_written) +
-        volume_attempt_fields +
-        wire::key("dry_run") + wire::boolean(dry_run) +
-        wire::key("open_mode") + wire::text(open_mode) +
+        volume_selection +
         wire::key("archive_type") + wire::text(wide_to_utf8(result.archive_type)) +
         manifest_field +
         wire::key("failed_item") + wire::text(wide_to_utf8(result.failed_item)) +
@@ -1235,12 +1199,7 @@ public:
 
     void submit(WorkerRequest request) {
         auto cancel_token = std::make_shared<std::atomic<bool>>(false);
-        JobMetadata metadata = metadata_from_request(request);
-        const std::string queued_event =
-            request.job_id.empty()
-                ? std::string{}
-                : worker_event_wire("job_queued", metadata, 0);
-        const std::string job_id = request.job_id;
+        const std::string& job_id = request.job_id;
         bool rejected_for_capacity = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1260,9 +1219,8 @@ public:
                 Job job{
                     std::move(request),
                     std::move(cancel_token),
-                    std::move(metadata),
                 };
-                if (job.request.origin != "watch") {
+                if (!job.request.from_watch) {
                     foreground_queue_.push_back(std::move(job));
                 } else {
                     background_queue_.push_back(std::move(job));
@@ -1274,13 +1232,10 @@ public:
             print_frame(
                 (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                 (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("backpressure") + wire::key("retryable") + wire::boolean(true) + wire::key("failure_stage") + wire::text("native_admission") + wire::key("failure_kind") + wire::text("queue_capacity") + wire::key("message") + wire::text("native job queue is full") + wire::end()));
-            print_worker_event(job_id, "job_finished", metadata);
+            print_job_event(job_id, "job_finished");
             return;
         }
 
-        if (!queued_event.empty()) {
-            print_frame(queued_event);
-        }
         condition_.notify_one();
     }
 
@@ -1325,7 +1280,7 @@ public:
             }
             print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                 (wire::key("status") + wire::text("cancelled") + wire::key("native_status") + wire::text("cancelled") + wire::key("hresult") + wire::number(-2147467260) + wire::end()));
-            print_worker_event(job_id, "job_finished", withdrawn->metadata);
+            print_job_event(job_id, "job_finished");
             if (drained) drain_condition_.notify_all();
             return true;
         }
@@ -1335,9 +1290,6 @@ public:
             writer_to_wake->wake_waiters();
         }
 #endif
-        // One canceled queued job needs at most one execution lane. Baton
-        // passing handles any additional ready work without a wake-all storm.
-        condition_.notify_all(); // cancellation must also wake a parked retry
         return true;
     }
 
@@ -1407,15 +1359,6 @@ public:
     }
 
 private:
-    struct JobMetadata {
-        // WorkerRequest owns identity and routing; retain only encoded events.
-        // Lifecycle events reuse these fields four times per job. Encoding them
-        // once at submission avoids repeated allocations on the
-        // admission and completion hot paths.
-        std::string encoded_job_id;
-        std::string lifecycle_context_wire;
-    };
-
     struct JobExecution {
         struct InputStamp {
             std::wstring path;
@@ -1456,7 +1399,6 @@ private:
     struct Job {
         WorkerRequest request;
         std::shared_ptr<std::atomic<bool>> cancel_token;
-        JobMetadata metadata;
         std::unique_ptr<JobExecution> execution;
     };
 
@@ -1469,18 +1411,6 @@ private:
         std::weak_ptr<std::atomic<bool>> attempt_cancel;
         std::weak_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
     };
-
-    static JobMetadata metadata_from_request(const WorkerRequest& request) noexcept {
-        JobMetadata metadata;
-        const auto &request_id = request.request_id.empty() ? request.job_id : request.request_id;
-        metadata.encoded_job_id = wire::text(request.job_id);
-        metadata.lifecycle_context_wire =
-            wire::key("request_id") + wire::text(request_id) +
-            wire::key("origin") + wire::text(request.origin != "watch" ? "foreground" : "watch") +
-            wire::key("output_volume_key") + wire::text(request.output_volume_key) +
-            wire::key("requires_writer") + wire::boolean(!request.dry_run && !request.scan_only);
-        return metadata;
-    }
 
     bool queues_empty_locked() const noexcept {
         return foreground_queue_.empty() && background_queue_.empty();
@@ -1515,62 +1445,6 @@ private:
             monitor_recheck_ = true;
         }
         monitor_condition_.notify_one();
-    }
-
-    std::string worker_event_wire(
-        const char* event,
-        const JobMetadata& metadata,
-        std::size_t active_jobs = 0
-    ) const {
-        return
-            (wire::object() + wire::key("type") + wire::text("native_event") + wire::key("job_id")) + metadata.encoded_job_id +
-            wire::key("event") + wire::text(event) +
-            metadata.lifecycle_context_wire +
-            wire::key("active_jobs") + wire::number(active_jobs) +
-            wire::end();
-    }
-
-    void print_worker_event(
-        const std::string& job_id,
-        const char* event,
-        const JobMetadata& metadata,
-        std::size_t active_jobs = 0
-    ) const noexcept {
-        if (job_id.empty()) {
-            return;
-        }
-        print_frame(worker_event_wire(
-            event, metadata, active_jobs));
-    }
-
-    void print_job_start_events(
-        const Job& job,
-        std::size_t active_jobs
-    ) const noexcept {
-        if (job.request.job_id.empty()) {
-            return;
-        }
-        print_frames(
-            worker_event_wire(
-                "job_admitted",
-                job.metadata,
-                active_jobs),
-            worker_event_wire(
-                "job_started",
-                job.metadata,
-                active_jobs));
-    }
-
-    void print_active_event(
-        const Job& job,
-        const char* event,
-        std::size_t active_jobs
-    ) const noexcept {
-        print_worker_event(
-            job.request.job_id,
-            event,
-            job.metadata,
-            active_jobs);
     }
 
     // Space events go out on the `progress` channel, one per affected job, with a real job_id: both dispatchers drop events whose job_id is empty or unknown.
@@ -1728,7 +1602,6 @@ private:
     void worker_loop() noexcept {
         for (;;) {
             Job job;
-            std::size_t admitted_jobs = 0;
             bool wake_next_job = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
@@ -1746,7 +1619,6 @@ private:
 
                 job = pop_next_job_locked();
                 active_jobs_ += 1;
-                admitted_jobs = active_jobs_;
                 if (queues_empty_locked()) {
                     // On canceling shutdown the first broadcast can reach
                     // idle workers before a parked job is requeued. Removing
@@ -1765,7 +1637,7 @@ private:
 
             const bool replaying = job.execution != nullptr;
             if (!job.execution) {
-                print_job_start_events(job, admitted_jobs);
+                if (job.request.report_progress) print_job_event(job.request.job_id, "job_started");
                 job.execution = std::make_unique<JobExecution>(memory_, job.request);
             }
             int code = -100;
@@ -1830,7 +1702,7 @@ private:
                 const auto notice = [parked](bool blocked, std::int64_t headroom, std::uint64_t needed) {
                     auto &episode = parked->execution->memory_episode;
                     if (blocked) ++episode;
-                    print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + parked->metadata.encoded_job_id +
+                    print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(parked->request.job_id) +
                         wire::key("event") + wire::text((blocked ? "memory_blocked" : "memory_resumed")) +
                         wire::key("episode_id") + wire::number(episode) +
                         wire::key("required_bytes") + wire::number(needed) +
@@ -1846,7 +1718,7 @@ private:
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
                         --parked_jobs_;
-                        auto &queue = parked->request.origin != "watch" ? foreground_queue_ : background_queue_;
+                        auto &queue = !parked->request.from_watch ? foreground_queue_ : background_queue_;
                         queue.push_front(std::move(*parked));
                     }
                     condition_.notify_one();
@@ -1854,12 +1726,10 @@ private:
                 continue;
             }
 
-            std::size_t remaining_jobs = 0;
             bool drained = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 active_jobs_ = active_jobs_ > 0 ? active_jobs_ - 1 : 0;
-                remaining_jobs = active_jobs_;
                 drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
                 any_job_failed_ = any_job_failed_ || code != 0;
             }
@@ -1874,7 +1744,7 @@ private:
             if (drained) {
                 drain_condition_.notify_all();
             }
-            print_active_event(job, "job_finished", remaining_jobs);
+            print_job_event(job_id, "job_finished");
         }
     }
 

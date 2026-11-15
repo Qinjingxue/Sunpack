@@ -131,7 +131,7 @@ fn rust_writer_cpp_query_publication_conflict() {
             "{}", String::from_utf8_lossy(&pending.stdout));
     }
     log.flush().unwrap();
-    assert!(log.error().unwrap().is_none());
+    assert!(log.error().is_none());
     let healed = project(&binary, &path, "", "", "", "");
     assert_eq!(healed["rows"][0]["statusText"], "等待分卷");
     assert_eq!(healed["rows"][0]["id"], waiting["rows"][0]["id"]);

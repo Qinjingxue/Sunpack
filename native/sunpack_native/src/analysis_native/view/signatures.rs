@@ -1,7 +1,5 @@
 struct LeadingSignatures {
     head: crate::io::reader::CachedBytes,
-    rar: bool,
-    seven_zip: bool,
     zip_local: Option<u64>,
     zip_eocd: Option<(u64, [u8; 22])>,
 }
@@ -38,8 +36,6 @@ impl LeadingSignatures {
             None
         };
         Ok(Self {
-            rar: head.starts_with(RAR4) || head.starts_with(RAR5),
-            seven_zip: head.starts_with(SEVEN_ZIP),
             zip_local,
             zip_eocd,
             head: prefix,

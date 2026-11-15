@@ -6,30 +6,19 @@
 use crate::analysis_native::structure::{
     has_compression_stream_header, inspect_compression_stream_reader, StreamObservation,
 };
-use crate::io::archive_state::{AnalysisFacts, AnalysisStatus, ArchiveInput, OpenMode, VolumeCompleteness};
+use crate::io::archive_state::AnalysisStatus::{Damaged, Extractable, Weak};
+use crate::io::archive_state::{
+    AnalysisFacts, AnalysisStatus, ArchiveInput, OpenMode, VolumeCompleteness,
+};
 use crate::io::cancellation::{CancellableOnce, Cancellation};
 use crate::io::reader::FileIdentity;
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const STREAM_STRUCTURE_CACHE_ENTRIES: usize = 512;
 
-const RAR_TRUNCATION_ERRORS: &[&str] = &[
-    "rar4_block_header_out_of_range",
-    "rar4_block_size_out_of_range",
-    "rar4_block_payload_out_of_range",
-    "rar4_block_add_size_missing",
-    "rar5_block_header_out_of_range",
-    "rar5_header_size_out_of_range",
-    "rar5_block_payload_out_of_range",
-];
-const SEVEN_ZIP_BOUNDARY_ERRORS: &[&str] = &[
-    "start_header_crc_mismatch",
-    "next_header_out_of_range",
-    "invalid_next_header_range",
-];
-const TAR_BENIGN_ERRORS: &[&str] = &["tar_end_zero_blocks_not_found", "analysis_resource_limit"];
 const ZIP_LOCAL_RECOVERY_ERRORS: &[&str] = &[
     "bad_central_directory_signature",
     "archive_offset_underflow",
@@ -59,16 +48,6 @@ impl ModuleKind {
             _ => return None,
         })
     }
-
-    fn format(self) -> &'static str {
-        match self {
-            Self::Zip => "zip",
-            Self::Rar => "rar",
-            Self::SevenZip => "7z",
-            Self::Tar => "tar",
-            Self::Stream(format) => format,
-        }
-    }
 }
 
 /// Parsed analysis configuration, built once per engine and shared by calls.
@@ -80,7 +59,10 @@ impl NativeAnalysisConfig {
     pub(crate) fn new<T: AsRef<str>>(modules: impl IntoIterator<Item = (T, bool)>) -> Self {
         let mut ordered = Vec::new();
         for (name, enabled) in modules {
-            let Some(kind) = enabled.then(|| ModuleKind::from_name(name.as_ref().trim())).flatten() else {
+            let Some(kind) = enabled
+                .then(|| ModuleKind::from_name(name.as_ref().trim()))
+                .flatten()
+            else {
                 continue;
             };
             if !ordered.contains(&kind) {
@@ -115,92 +97,63 @@ fn strict_subrange(start: u64, end: Option<u64>, size: u64) -> bool {
     matches!(end, Some(end) if start < end && end <= size && (start > 0 || end < size))
 }
 
-struct Segment {
-    start: u64,
-    end: Option<u64>,
-    extractable: bool,
-    password_required: Option<bool>,
-    zip_eocd_offset: Option<u64>,
-    damage_flags: Vec<String>,
+#[derive(Clone)]
+pub(crate) struct AnalysisSegment {
+    pub(crate) status: AnalysisStatus,
+    pub(crate) format_hint: &'static str,
+    pub(crate) start: u64,
+    pub(crate) end: Option<u64>,
+    pub(crate) zip_eocd_offset: Option<u64>,
+    pub(crate) password_required: bool,
+    pub(crate) damage_flags: Vec<String>,
 }
 
-impl Segment {
-    fn new(start: u64, end: Option<u64>, damage_flags: Vec<String>) -> Self {
-        Self {
-            start,
-            end,
-            extractable: false,
-            password_required: None,
-            zip_eocd_offset: None,
-            damage_flags,
-        }
+impl AnalysisSegment {
+    fn range_key(&self) -> (u64, Reverse<u64>) {
+        (self.start, Reverse(self.end.unwrap_or(self.start)))
     }
-}
-
-// Keep only the facts consumed by selection and extraction planning.
-enum EvidenceDetails {
-    Empty,
-    Zip(Box<ZipObservation>),
-    Tar(Box<TarObservation>),
-    Rar(Box<RarObservation>),
-    SevenZip(Box<SevenZipObservation>),
-    Stream(Arc<crate::analysis_native::structure::StreamObservation>),
-}
-
-impl EvidenceDetails {
-    fn password_required(&self) -> bool {
-        match self {
-            Self::Rar(value) => value.password_required.unwrap_or(false),
-            Self::SevenZip(value) => value.password_required,
-            Self::Zip(value) => value.password_required,
-            _ => false,
-        }
-    }
-
 }
 
 struct Evidence {
-    format: &'static str,
-    status: &'static str,
-    segments: Vec<Segment>,
-    details: EvidenceDetails,
+    segment: AnalysisSegment,
+    structure_complete: bool,
+    zip_spanned: bool,
+    proven_end: Option<u64>,
 }
 
 impl Evidence {
     fn new(
-        format: &'static str,
-        status: &'static str,
-        mut segments: Vec<Segment>,
-        details: impl Into<EvidenceDetails>,
+        format_hint: &'static str,
+        status: AnalysisStatus,
+        start: u64,
+        end: Option<u64>,
+        damage_flags: Vec<String>,
     ) -> Self {
-        for segment in &mut segments {
-            segment.extractable |= status == "extractable";
-        }
         Self {
-            format,
-            status,
-            segments,
-            details: details.into(),
+            segment: AnalysisSegment {
+                status,
+                format_hint,
+                start,
+                end,
+                zip_eocd_offset: None,
+                password_required: false,
+                damage_flags,
+            },
+            structure_complete: false,
+            zip_spanned: false,
+            proven_end: None,
         }
     }
 
-    fn range_key(&self) -> (u64, std::cmp::Reverse<u64>) {
-        let extractable = self.segments.iter().any(|segment| segment.extractable);
-        self.segments
-            .iter()
-            .filter(|segment| !extractable || segment.extractable)
-            .map(|segment| {
-                (
-                    segment.start,
-                    std::cmp::Reverse(segment.end.unwrap_or(segment.start)),
-                )
-            })
-            .min()
-            .unwrap_or((u64::MAX, std::cmp::Reverse(0)))
-    }
-
-    fn not_found(format: &'static str) -> Self {
-        Self::new(format, "not_found", Vec::new(), EvidenceDetails::Empty)
+    fn analysis_facts(&self) -> AnalysisFacts {
+        let segment = &self.segment;
+        AnalysisFacts {
+            zip_eocd_offset: segment.zip_eocd_offset.map(|offset| segment.start + offset),
+            zip_spanned: self.zip_spanned,
+            password_required: segment.password_required,
+            structure_complete: self.structure_complete,
+            ..Default::default()
+        }
     }
 }
 
@@ -212,21 +165,10 @@ struct ReportContext<'a> {
     stream_structure: Option<Option<Arc<StreamObservation>>>,
 }
 
-pub(crate) struct AnalysisSegment {
-    pub(crate) status: Option<AnalysisStatus>,
-    pub(crate) format_hint: String,
-    pub(crate) start: u64,
-    pub(crate) end: Option<u64>,
-    pub(crate) zip_eocd_offset: Option<u64>,
-    pub(crate) password_required: bool,
-    pub(crate) damage_flags: Option<Arc<Vec<String>>>,
-}
-
 pub(crate) struct AnalysisReport {
-    pub(crate) format_hint: String,
+    pub(crate) format_hint: &'static str,
     pub(crate) facts: AnalysisFacts,
-    pub(crate) extractable_segments: Vec<AnalysisSegment>,
-    pub(crate) password_segment: Option<AnalysisSegment>,
+    pub(crate) segments: Vec<AnalysisSegment>,
 }
 
 pub(crate) fn analyze_input(
@@ -235,7 +177,8 @@ pub(crate) fn analyze_input(
 ) -> io::Result<AnalysisReport> {
     let cache_bytes = 64 * 1024 * 1024;
     if input.mode == OpenMode::File || (input.parts.is_empty() && input.ranges.is_empty()) {
-        return AnalysisBinaryView::new(&input.entry_path, cache_bytes)?.analyze_report(config, None);
+        return AnalysisBinaryView::new(&input.entry_path, cache_bytes)?
+            .analyze_report(config, None);
     }
     let extents = if input.mode.structured() {
         let mut parts: Vec<_> = input.parts.iter().collect();
@@ -245,7 +188,8 @@ pub(crate) fn analyze_input(
         input.physical_extents().collect::<Vec<_>>()
     };
     if extents.len() == 1 && extents[0].start == 0 && extents[0].end.is_none() {
-        return AnalysisBinaryView::new(&extents[0].path, cache_bytes)?.analyze_report(config, None);
+        return AnalysisBinaryView::new(&extents[0].path, cache_bytes)?
+            .analyze_report(config, None);
     }
     let (reader, starts) = ManagedReader::open_extents(
         extents.iter().map(|e| (e.path.as_str(), e.start, e.end)),
@@ -269,71 +213,21 @@ impl AnalysisBinaryView {
             signatures: LeadingSignatures::read(&self.reader).map_err(reader_error)?,
             stream_structure: None,
         };
-        let mut evidences = Vec::with_capacity(config.modules.len());
+        let size = self.reader.len();
+        let mut plan = SegmentPlan::default();
         for &module in &config.modules {
             cancellation.check()?;
-            evidences.push(match context.run_module(module) {
-                Ok(evidence) => evidence,
-                Err(_) => Evidence::new(module.format(), "error", Vec::new(), EvidenceDetails::Empty),
-            });
+            if let Ok(Some(evidence)) = context.run_module(module) {
+                plan.consider(evidence, size);
+            }
         }
         cancellation.check()?;
-        let size = self.reader.len();
-        // Feasibility comes from format structure, not a cross-format score.
-        let selected = evidences
-            .iter()
-            .enumerate()
-            .filter(|(_, evidence)| evidence.segments.iter().any(|s| s.extractable))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        // Prefer the first proven outer range. Module order only breaks ties
-        // between indistinguishable ranges; independent peers remain planned.
-        let best_selected = selected
-            .iter()
-            .copied()
-            .min_by_key(|index| evidences[*index].range_key());
-        let plan = SegmentPlan::build(&evidences, &selected, size);
-        let to_segment = |(evidence, index): (usize, usize)| {
-            let evidence = &evidences[evidence];
-            let segment = &evidence.segments[index];
-            AnalysisSegment {
-                status: AnalysisStatus::from_evidence(evidence.status),
-                format_hint: evidence.format.to_owned(),
-                start: segment.start,
-                end: segment.end,
-                zip_eocd_offset: segment.zip_eocd_offset,
-                password_required: segment
-                    .password_required
-                    .unwrap_or(evidence.details.password_required()),
-                damage_flags: (!segment.damage_flags.is_empty())
-                    .then(|| Arc::new(segment.damage_flags.clone())),
-            }
-        };
-        let extractable_segments = plan
-            .extractable
-            .into_iter()
-            .map(to_segment)
-            .collect();
-        let password_segment = plan.password_segment.map(to_segment);
-        let primary = best_selected.map(|index| &evidences[index]);
-        let mut facts = primary
-            .map(Evidence::analysis_facts)
-            .unwrap_or_default();
-        if !plan.missing_volume_evidence.is_empty() {
-            facts.volume_completeness = Some(VolumeCompleteness::Missing);
-            facts.missing_volume_evidence = Some(plan.missing_volume_evidence.to_owned());
-        }
-        Ok(AnalysisReport {
-            format_hint: primary.map_or_else(String::new, |e| e.format.to_owned()),
-            facts,
-            extractable_segments,
-            password_segment,
-        })
+        Ok(plan.finish())
     }
 }
 
 impl<'a> ReportContext<'a> {
-    fn run_module(&mut self, module: ModuleKind) -> std::io::Result<Evidence> {
+    fn run_module(&mut self, module: ModuleKind) -> std::io::Result<Option<Evidence>> {
         match module {
             ModuleKind::Zip => self.zip_module(),
             ModuleKind::Rar => self.rar_module(),
@@ -346,142 +240,91 @@ impl<'a> ReportContext<'a> {
 
     // ---- RAR ------------------------------------------------------------
 
-    fn rar_module(&mut self) -> std::io::Result<Evidence> {
-        if !self.signatures.rar {
-            return Ok(Evidence::not_found("rar"));
-        }
-        self.view.probe_rar_native(0).map(|raw| rar_from_native(raw, 0))
+    fn rar_module(&mut self) -> std::io::Result<Option<Evidence>> {
+        let head = self.signatures.head.as_slice();
+        let end = if head.starts_with(RAR5) {
+            self.view.rar5_end()?
+        } else if head.starts_with(RAR4) {
+            self.view.rar4_end()?
+        } else {
+            None
+        };
+        Ok(end.map(|end| {
+            let mut evidence = Evidence::new("rar", Extractable, 0, Some(end), Vec::new());
+            evidence.structure_complete = true;
+            evidence
+        }))
     }
 
     // ---- 7z -------------------------------------------------------------
 
-    fn seven_zip_module(&mut self) -> std::io::Result<Evidence> {
-        if !self.signatures.seven_zip {
-            return Ok(Evidence::not_found("7z"));
+    fn seven_zip_module(&mut self) -> std::io::Result<Option<Evidence>> {
+        let head = self.signatures.head.as_slice();
+        if !head.starts_with(SEVEN_ZIP) {
+            return Ok(None);
         }
-        self.view.probe_seven_zip_native(0).map(|raw| seven_zip_from_native(raw, 0))
+        let raw = self.view.probe_seven_zip_native(head)?;
+        Ok(seven_zip_from_native(raw))
     }
 
     // ---- TAR ------------------------------------------------------------
 
-    fn tar_module(&mut self) -> std::io::Result<Evidence> {
+    fn tar_module(&mut self) -> std::io::Result<Option<Evidence>> {
         // Ordinary analysis owns only a TAR starting at the logical input start.
         // Nonzero TAR candidates belong to the canonical embedded scanner;
         // raw ustar hits can also be bytes inside a compression stream.
-        Ok(self
-            .tar_candidate(0)?
-            .unwrap_or_else(|| Evidence::not_found("tar")))
-    }
-
-    fn tar_candidate(&self, start: u64) -> std::io::Result<Option<Evidence>> {
-        let mut result = self.view.walk_tar(start)?;
-        if let Some(fault) = &result.read_fault {
-            result.damage_flags.extend(native_read_fault_flags(fault));
-        }
-        if !result.error.is_empty() && !TAR_BENIGN_ERRORS.contains(&result.error.as_str()) {
-            result.damage_flags.push(result.error.clone());
-        }
-        result.damage_flags = sorted_unique(result.damage_flags);
-        let mut damage_flags = result.damage_flags.clone();
-        append_read_fault_field(&mut damage_flags, result.read_fault.as_ref());
-        if result.plausible {
-            let segment = Segment::new(start, result.segment_end, damage_flags);
-            return Ok(Some(Evidence::new(
-                "tar", "extractable", vec![segment], EvidenceDetails::Tar(Box::new(result)),
-            )));
-        }
-        if result.magic_matched {
-            if damage_flags.is_empty() { damage_flags.push("tar_metadata_bad".to_owned()); }
-            return Ok(Some(Evidence::new(
-                "tar", "damaged", vec![Segment::new(start, None, damage_flags)],
-                EvidenceDetails::Tar(Box::new(result)),
-            )));
-        }
-        Ok(None)
+        let (end, complete) = match self.view.walk_tar()? {
+            TarObservation::Unrecognized => return Ok(None),
+            TarObservation::Recognized(end) => (end, false),
+            TarObservation::Terminated(end) => (Some(end), true),
+        };
+        let mut evidence = Evidence::new("tar", Extractable, 0, end, Vec::new());
+        evidence.structure_complete = complete;
+        Ok(Some(evidence))
     }
 
     // ---- ZIP ------------------------------------------------------------
 
-    fn zip_module(&mut self) -> std::io::Result<Evidence> {
+    fn zip_module(&mut self) -> std::io::Result<Option<Evidence>> {
         let Some((offset, record)) = self.signatures.zip_eocd.as_ref() else {
-            return Ok(Evidence::not_found("zip"));
+            return Ok(None);
         };
-        let native = self.view.probe_zip_with_disk_starts(*offset, record, self.disk_starts)?;
+        let native = self
+            .view
+            .probe_zip_with_disk_starts(*offset, record, self.disk_starts)?;
         let local = self.signatures.zip_local;
         if native.archive_offset != 0 && local != Some(native.archive_offset) {
             // A terminal record may belong to a ZIP inside a damaged leading
             // input. A different root belongs to the existing embedded stage.
-            return Ok(Evidence::not_found("zip"));
+            return Ok(None);
         }
-        Ok(zip_from_native(native, local, self.view.reader.len()))
+        Ok(Some(zip_from_native(native, local, self.view.reader.len())))
     }
 
     // ---- Compression streams -------------------------------------------
 
-    fn stream_module(&mut self, format: &'static str) -> std::io::Result<Evidence> {
+    fn stream_module(&mut self, format: &'static str) -> std::io::Result<Option<Evidence>> {
         let Some(result) = self.full_stream_structure()? else {
-            return Ok(Evidence::not_found(format));
+            return Ok(None);
         };
-        if result.format != format {
-            return Ok(Evidence::not_found(format));
-        }
-        if !result.magic_matched {
-            return Ok(Evidence::new(format, "not_found", Vec::new(), EvidenceDetails::Stream(result)));
-        }
-        let mut damage_flags = result.damage_flags.clone();
-        let error = result.error.clone();
-        if !error.is_empty() {
-            damage_flags.push(error);
-        }
-        let mut damage_flags = sorted_unique(damage_flags);
-        let structure_complete = result.structure_complete;
-        let boundary_exact = result.boundary_exact;
-        let trailing = result.trailing_bytes;
-        let plausible = result.plausible;
-        if plausible
-            && structure_complete
-            && boundary_exact
-            && damage_flags.is_empty()
-            && trailing == Some(0)
+        if result.format != format
+            || !result.magic_matched
+            || !result.plausible
+            || !result.structure_complete
+            || !result.boundary_exact
+            || !result.damage_flags.is_empty()
+            || !result.error.is_empty()
+            || result.trailing_bytes != Some(0)
         {
-            let end = match result.segment_end.unwrap_or_default() {
-                0 => self.view.reader.len(),
-                value => value,
-            };
-            return Ok(Evidence::new(
-                format,
-                "extractable",
-                vec![Segment::new(0, Some(end), Vec::new())],
-                EvidenceDetails::Stream(result),
-            ));
+            return Ok(None);
         }
-        if plausible {
-            if !structure_complete {
-                damage_flags.push("structure_validation_incomplete".to_string());
-                damage_flags = sorted_unique(damage_flags);
-            }
-
-            let end = result.segment_end;
-            return Ok(Evidence::new(
-                format,
-                "damaged",
-                vec![Segment::new(0, end, damage_flags)],
-                EvidenceDetails::Stream(result),
-            ));
-        }
-        if damage_flags.is_empty() {
-            damage_flags.push("stream_unverified".to_string());
-        }
-        Ok(Evidence::new(
-            format,
-            if damage_flags.iter().any(|flag| flag != "stream_unverified") {
-                "damaged"
-            } else {
-                "weak"
-            },
-            vec![Segment::new(0, None, damage_flags)],
-            EvidenceDetails::Stream(result),
-        ))
+        let end = match result.segment_end.unwrap_or_default() {
+            0 => self.view.reader.len(),
+            value => value,
+        };
+        let mut evidence = Evidence::new(format, Extractable, 0, Some(end), Vec::new());
+        evidence.structure_complete = true;
+        Ok(Some(evidence))
     }
 
     /// Full-stream validation walks the complete structure, so it runs at most once
@@ -505,278 +348,139 @@ impl<'a> ReportContext<'a> {
     }
 }
 
-fn native_read_fault_flags(fault: &ReadFault) -> Vec<String> {
-    let mut flags = vec!["read_error".into()];
-    if fault.code == "unexpected_eof" {
-        flags.extend(["input_truncated".into(), "probably_truncated".into()]);
-    }
-    if fault.possible_missing_volume() {
-        flags.push("missing_volume".into());
-    }
-    flags
-}
-
-fn append_native_field_flag(flags: &mut Vec<String>, fault: Option<&(ReadFault, &'static str)>) {
-    if let Some((fault, _)) = fault {
-        let field = fault.field.trim();
-        if !field.is_empty() {
-            flags.push(format!("field_read_error:{field}"));
-        }
-    }
-}
-
-fn rar_from_native(mut raw: RarObservation, start: u64) -> Evidence {
-    let mut damage_flags = raw
-        .damage_flags
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    if let Some((fault, legacy)) = &raw.read_fault {
-        raw.error = legacy;
-        damage_flags.extend(native_read_fault_flags(fault));
-    }
-    raw.plausible |= raw.header_crc_ok;
-    let error = raw.error;
-    if !error.is_empty() {
-        damage_flags.push(error.into());
-    }
-    if raw.blocks_checked > 0 && RAR_TRUNCATION_ERRORS.contains(&error) {
-        damage_flags.push("probably_truncated".into());
-    }
-    damage_flags = sorted_unique(damage_flags);
-    if !raw.magic_matched {
-        return Evidence::new(
-            "rar",
-            "not_found",
-            Vec::new(),
-            EvidenceDetails::Rar(Box::new(raw)),
-        );
-    }
-    let taxonomy =
-        if damage_flags.iter().any(|flag| flag == "probably_truncated") && raw.blocks_checked > 0 {
-            "probably_truncated"
-        } else if matches!(
-            error,
-            "rar5_main_header_missing" | "rar4_main_header_missing"
-        ) {
-            "valid_encrypted_but_unwalkable"
-        } else {
-            ""
-        };
-    let segment_end = Some(raw.segment_end).filter(|end| *end != 0);
-    let (status, end) = if raw.strong_accept && segment_end.is_some() {
-        ("extractable", segment_end)
-    } else if taxonomy == "probably_truncated" {
-        ("damaged", None)
-    } else if taxonomy == "valid_encrypted_but_unwalkable" {
-        ("damaged", None)
-    } else if raw.plausible {
-        ("damaged", None)
+fn seven_zip_from_native(raw: SevenZipObservation) -> Option<Evidence> {
+    let end = raw.declared_end?;
+    let status = if raw.password_required.is_some() {
+        Extractable
     } else {
-        ("weak", None)
+        Damaged
     };
-    let mut segment_flags = damage_flags;
-    append_native_field_flag(&mut segment_flags, raw.read_fault.as_ref());
-    if taxonomy == "valid_encrypted_but_unwalkable" {
-        segment_flags.push(taxonomy.into());
-        raw.password_required = Some(true);
-    }
-    Evidence::new(
-        "rar",
-        status,
-        vec![Segment::new(start, end, segment_flags)],
-        EvidenceDetails::Rar(Box::new(raw)),
-    )
+    let mut evidence = Evidence::new("7z", status, 0, Some(end), Vec::new());
+    evidence.segment.password_required = raw.password_required.unwrap_or(false);
+    evidence.structure_complete = raw.password_required.is_some();
+    evidence.proven_end = Some(end);
+    Some(evidence)
 }
 
-fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> Evidence {
-    let mut damage_flags = Vec::new();
-    if let Some((fault, legacy)) = &raw.read_fault {
-        raw.error = legacy;
-        damage_flags.extend(native_read_fault_flags(fault));
-    }
-    append_native_field_flag(&mut damage_flags, raw.read_fault.as_ref());
-    if !raw.error.is_empty() {
-        damage_flags.push(raw.error.into());
-    }
-    let unreliable = SEVEN_ZIP_BOUNDARY_ERRORS.contains(&raw.error);
-    if unreliable {
-        damage_flags.push("boundary_unreliable".into());
-    } else if raw.next_header_crc_checked && !raw.next_header_crc_ok {
-        damage_flags.push("directory_integrity_bad_or_unknown".into());
-    }
-    if !raw.magic_matched {
-        return Evidence::new(
-            "7z",
-            "not_found",
-            Vec::new(),
-            EvidenceDetails::SevenZip(Box::new(raw)),
-        );
-    }
-    let status = if raw.strong_accept {
-        "extractable"
-    } else if raw.plausible {
-        "damaged"
-    } else {
-        "weak"
-    };
-    let end = if unreliable {
-        None
-    } else {
-        Some(raw.segment_end).filter(|end| *end != 0).or_else(|| {
-            (raw.next_header_size != 0).then(|| {
-                start
-                    .saturating_add(32)
-                    .saturating_add(raw.next_header_offset)
-                    .saturating_add(raw.next_header_size)
-            })
-        })
-    };
-    Evidence::new(
-        "7z",
-        status,
-        vec![Segment::new(start, end, damage_flags)],
-        EvidenceDetails::SevenZip(Box::new(raw)),
-    )
-}
-
-fn zip_from_native(
-    native: ZipObservation,
-    local: Option<u64>,
-    view_size: u64,
-) -> Evidence {
-    if let Some(start) = local.filter(|_| ZIP_LOCAL_RECOVERY_ERRORS.contains(&native.error.as_str())) {
-        return Evidence::new(
+fn zip_from_native(native: ZipObservation, local: Option<u64>, view_size: u64) -> Evidence {
+    if let Some(start) = local.filter(|_| ZIP_LOCAL_RECOVERY_ERRORS.contains(&native.error)) {
+        let mut evidence = Evidence::new(
             "zip",
-            "damaged",
-            vec![Segment::new(
-                start,
-                None,
-                vec!["central_directory_unreliable".into(), "local_header_recovery".into()],
-            )],
-            EvidenceDetails::Zip(Box::new(native)),
+            Damaged,
+            start,
+            None,
+            if start != 0 && native.password_required {
+                vec![
+                    "central_directory_unreliable".into(),
+                    "local_header_recovery".into(),
+                ]
+            } else {
+                Vec::new()
+            },
         );
+        evidence.segment.password_required = native.password_required;
+        return evidence;
     }
     let archive_offset = native.archive_offset;
-    let end_offset = (native.eocd_offset != 0).then(|| native.eocd_offset + 22 + native.comment_length);
-    let walk_ok = native.central_directory_walk_ok && native.local_header_links_ok;
-    let status = if native.plausible && walk_ok { "extractable" }
-        else if native.plausible { "damaged" } else { "weak" };
-    let mut damage_flags = native.read_fault.as_ref().map(native_read_fault_flags).unwrap_or_default();
-    append_read_fault_field(&mut damage_flags, native.read_fault.as_ref());
-    if !native.error.is_empty() { damage_flags.push(native.error.clone()); }
-    if !native.content_integrity_warning.is_empty() {
-        damage_flags.push("content_integrity_bad_or_unknown".to_owned());
+    let end_offset =
+        (native.eocd_offset != 0).then(|| native.eocd_offset + 22 + native.comment_length);
+    let status = if native.walk_ok { Extractable } else { Weak };
+    let end = end_offset.map(|end| end.min(view_size));
+    let mut damage_flags = Vec::new();
+    if (status == Extractable && strict_subrange(archive_offset, end, view_size))
+        || (archive_offset != 0 && native.password_required)
+    {
+        if !native.error.is_empty() {
+            damage_flags.push(native.error.to_owned());
+        }
+        if native.content_integrity_warning {
+            damage_flags.push("content_integrity_bad_or_unknown".to_owned());
+        }
     }
-    let mut segment = Segment::new(archive_offset, end_offset.map(|end| end.min(view_size)), damage_flags);
-    segment.zip_eocd_offset = native.eocd_offset.checked_sub(archive_offset);
-    Evidence::new("zip", status, vec![segment], EvidenceDetails::Zip(Box::new(native)))
+    let mut evidence = Evidence::new("zip", status, archive_offset, end, damage_flags);
+    evidence.segment.zip_eocd_offset = native.eocd_offset.checked_sub(archive_offset);
+    evidence.segment.password_required = native.password_required;
+    evidence.structure_complete = native.walk_ok;
+    evidence.zip_spanned = native.is_multi_disk;
+    evidence
 }
 
+type PrimaryEvidence = ((u64, Reverse<u64>), &'static str, AnalysisFacts);
+
+#[derive(Default)]
 struct SegmentPlan {
-    extractable: Vec<(usize, usize)>,
-    password_segment: Option<(usize, usize)>,
-    missing_volume_evidence: &'static str,
+    primary: Option<PrimaryEvidence>,
+    carved: Vec<AnalysisSegment>,
+    password_segment: Option<AnalysisSegment>,
+    full_range: bool,
+    missing_volume: bool,
 }
 
 impl SegmentPlan {
-    /// Order the canonical extractable carved segments by physical position.
-    fn build(evidences: &[Evidence], selected: &[usize], size: u64) -> Self {
-        let mut candidates = Vec::new();
-        for &evidence_index in selected {
-            let evidence = &evidences[evidence_index];
-            for (segment_index, segment) in evidence.segments.iter().enumerate() {
-                if !segment.extractable
-                    || !matches!(segment.end, Some(end) if segment.start < end && end <= size)
-                {
-                    continue;
-                }
-                candidates.push((evidence_index, segment_index));
+    fn consider(&mut self, evidence: Evidence, size: u64) {
+        if evidence.proven_end.is_some_and(|end| end > size) {
+            self.missing_volume = true;
+        }
+        let segment = &evidence.segment;
+        let extractable = segment.status == Extractable;
+        if extractable {
+            // Module order breaks ties between the same physical ranges.
+            let key = segment.range_key();
+            if self.primary.as_ref().is_none_or(|(best, _, _)| key < *best) {
+                self.primary = Some((key, segment.format_hint, evidence.analysis_facts()));
+            }
+            if segment.start == 0 && segment.end == Some(size) && size != 0 {
+                self.full_range = true;
             }
         }
-        candidates.sort_by_key(|&(evidence, segment)| {
-            let segment = &evidences[evidence].segments[segment];
-            (segment.start, std::cmp::Reverse(segment.end.unwrap()))
-        });
-        crate::scan::embedded::retain_outer_ranges(&mut candidates, |&(evidence, segment)| {
-            let segment = &evidences[evidence].segments[segment];
+        let segment = evidence.segment;
+        let carved = extractable && strict_subrange(segment.start, segment.end, size);
+        if segment.start != 0
+            && segment.password_required
+            && self
+                .password_segment
+                .as_ref()
+                .is_none_or(|best| segment.start < best.start)
+        {
+            if !carved {
+                self.password_segment = Some(segment);
+                return;
+            }
+            self.password_segment = Some(segment.clone());
+        }
+        if carved {
+            self.carved.push(segment);
+        }
+    }
+
+    fn finish(mut self) -> AnalysisReport {
+        if self.full_range {
+            // Full ranges own later starts. Preserve same-start alternatives,
+            // just as retain_outer_ranges does for other outer ranges.
+            self.carved.retain(|segment| segment.start == 0);
+        }
+        self.carved.sort_by_key(AnalysisSegment::range_key);
+        crate::scan::embedded::retain_outer_ranges(&mut self.carved, |segment| {
             (segment.start, segment.end.unwrap())
         });
-        candidates.retain(|&(evidence, segment)| {
-            let segment = &evidences[evidence].segments[segment];
-            strict_subrange(segment.start, segment.end, size)
-        });
-        let mut password_segment = None::<(usize, usize)>;
-        for (evidence_index, evidence) in evidences.iter().enumerate() {
-            let password_required = evidence.details.password_required();
-            for (segment_index, segment) in evidence.segments.iter().enumerate() {
-                if segment.start == 0 || !segment.password_required.unwrap_or(password_required) {
-                    continue;
-                }
-                let better = match password_segment {
-                    None => true,
-                    Some((best_evidence, best_segment)) => {
-                        segment.start < evidences[best_evidence].segments[best_segment].start
-                    }
-                };
-                if better {
-                    password_segment = Some((evidence_index, segment_index));
-                }
-            }
+        if self.carved.is_empty() {
+            self.carved.extend(self.password_segment);
         }
-
-        // A CRC-valid 7z start header that declares an end beyond the
-        // analyzed logical bytes proves a missing later volume.
-        let mut missing_volume_evidence = "";
-        for evidence in evidences {
-            let expected_end = match &evidence.details {
-                EvidenceDetails::SevenZip(details) if details.start_header_crc_ok => {
-                    let raw = details;
-                    raw.archive_offset
-                        .saturating_add(32)
-                        .saturating_add(raw.next_header_offset)
-                        .saturating_add(raw.next_header_size)
-                }
-                _ => continue,
-            };
-            if expected_end > size {
-                missing_volume_evidence = "seven_zip_start_header_length";
-                break;
-            }
+        let (format_hint, mut facts) = self.primary.map_or_else(
+            || ("", AnalysisFacts::default()),
+            |(_, format, facts)| (format, facts),
+        );
+        // A CRC-valid 7z start header that extends beyond the input proves a
+        // missing later volume.
+        if self.missing_volume {
+            facts.volume_completeness = Some(VolumeCompleteness::Missing);
+            facts.missing_volume_evidence = Some("seven_zip_start_header_length".to_owned());
         }
-
-        Self {
-            extractable: candidates,
-            password_segment,
-            missing_volume_evidence,
+        AnalysisReport {
+            format_hint,
+            facts,
+            segments: self.carved,
         }
-    }
-}
-
-impl Evidence {
-    fn analysis_facts(&self) -> AnalysisFacts {
-        let structure_complete = match &self.details {
-            EvidenceDetails::Rar(value) => value.end_block_found && value.error.is_empty() && value.read_fault.is_none(),
-            EvidenceDetails::SevenZip(value) => value.next_header_crc_ok && value.next_header_nid_valid && value.error.is_empty(),
-            EvidenceDetails::Zip(value) => value.central_directory_walk_ok && value.local_header_links_ok,
-            EvidenceDetails::Tar(value) => value.walk_complete && value.error.is_empty(),
-            EvidenceDetails::Stream(value) => value.structure_complete,
-            _ => false,
-        };
-        let (zip_eocd_offset, zip_spanned) = match &self.details {
-            EvidenceDetails::Zip(value) => (Some(value.eocd_offset), value.is_multi_disk),
-            _ => (None, false),
-        };
-        AnalysisFacts { zip_eocd_offset, zip_spanned,
-            password_required: self.details.password_required(), structure_complete,
-            ..Default::default() }
-    }
-}
-
-fn append_read_fault_field(flags: &mut Vec<String>, fault: Option<&ReadFault>) {
-    if let Some(fault) = fault {
-        let field = fault.field.trim();
-        if !field.is_empty() { flags.push(format!("field_read_error:{field}")); }
     }
 }
 
@@ -920,45 +624,16 @@ pub(crate) fn release_stream_structure_cache_under_roots(roots: &[PathBuf]) {
     crate::collections::trim_deque(&mut entries);
 }
 
-fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
-    values.retain(|value| !value.is_empty());
-    values.sort();
-    values.dedup();
-    values
-}
-
 #[cfg(test)]
 mod report_tests {
     use super::*;
 
-    fn evidence(
-        format: &'static str,
-        status: &'static str,
-        segments: &[(u64, Option<u64>)],
-        password_required: bool,
-    ) -> Evidence {
-        let facts = EvidenceDetails::Zip(Box::new(ZipObservation { password_required, ..Default::default() }));
-        Evidence::new(
-            format,
-            status,
-            segments
-                .iter()
-                .map(|(start, end)| Segment::new(*start, *end, Vec::new()))
-                .collect(),
-            facts,
-        )
-    }
-
-    fn planned(evidences: &[Evidence], plan: &SegmentPlan) -> Vec<(&'static str, u64)> {
-        plan.extractable
-            .iter()
-            .map(|(evidence, segment)| {
-                (
-                    evidences[*evidence].format,
-                    evidences[*evidence].segments[*segment].start,
-                )
-            })
-            .collect()
+    fn plan(evidences: impl IntoIterator<Item = Evidence>, size: u64) -> AnalysisReport {
+        let mut plan = SegmentPlan::default();
+        for evidence in evidences {
+            plan.consider(evidence, size);
+        }
+        plan.finish()
     }
 
     #[test]
@@ -985,63 +660,71 @@ mod report_tests {
 
     #[test]
     fn plan_orders_outer_carved_segments_including_prefix() {
-        let evidences = vec![
-            evidence("rar", "extractable", &[(40, Some(60))], false),
-            evidence("7z", "extractable", &[(4, Some(32)), (0, Some(14))], false),
-            evidence("tar", "extractable", &[(90, None)], false),
-        ];
-        let plan = SegmentPlan::build(&evidences, &[0, 1, 2], 100);
-        assert_eq!(
-            planned(&evidences, &plan),
-            vec![("7z", 0), ("rar", 40)]
+        let report = plan(
+            [
+                Evidence::new("rar", Extractable, 40, Some(60), vec![]),
+                Evidence::new("7z", Extractable, 4, Some(32), vec![]),
+                Evidence::new("7z", Extractable, 0, Some(14), vec![]),
+                Evidence::new("tar", Extractable, 90, None, vec![]),
+            ],
+            100,
         );
+        let planned: Vec<_> = report
+            .segments
+            .iter()
+            .map(|segment| (segment.format_hint, segment.start))
+            .collect();
+        assert_eq!(planned, [("7z", 0), ("rar", 40)]);
+        assert_eq!(report.format_hint, "7z");
+    }
+
+    #[test]
+    fn complete_ranges_suppress_only_later_starts() {
+        let report = plan(
+            [
+                Evidence::new("rar", Extractable, 40, Some(60), vec![]),
+                Evidence::new("tar", Extractable, 0, Some(80), vec![]),
+                Evidence::new("7z", Extractable, 0, Some(100), vec![]),
+            ],
+            100,
+        );
+        assert_eq!(report.format_hint, "7z");
+        assert_eq!(report.segments.len(), 1);
+        assert_eq!(report.segments[0].format_hint, "tar");
     }
 
     #[test]
     fn plan_picks_first_carved_password_segment() {
-        let evidences = vec![
-            evidence(
-                "7z",
-                "damaged",
-                &[(0, None)],
-                true,
-            ),
-            evidence(
-                "rar",
-                "damaged",
-                &[(90, None), (64, None)],
-                true,
-            ),
-            evidence(
-                "zip",
-                "damaged",
-                &[(10, None)],
-                true,
-            ),
-        ];
-        let plan = SegmentPlan::build(&evidences, &[], 200);
-        assert_eq!(plan.password_segment, Some((2, 0)));
-        assert!(plan.extractable.is_empty());
+        let evidences =
+            [("7z", 0), ("rar", 90), ("rar", 64), ("zip", 10)].map(|(format, start)| {
+                let mut evidence = Evidence::new(format, Damaged, start, None, vec![]);
+                evidence.segment.password_required = true;
+                evidence
+            });
+        let report = plan(evidences, 200);
+        assert_eq!(report.segments.len(), 1);
+        assert_eq!(report.segments[0].start, 10);
     }
 
     #[test]
     fn plan_proves_missing_volume_from_seven_zip_declared_end() {
-        let mut seven = evidence("7z", "damaged", &[(0, None)], false);
-        seven.details = EvidenceDetails::SevenZip(Box::new(SevenZipObservation {
-            start_header_crc_ok: true, archive_offset: 0, next_header_offset: 100, next_header_size: 10,
-            ..Default::default()
-        }));
-        let evidences = vec![seven];
-        assert_eq!(
-            SegmentPlan::build(&evidences, &[], 50)
-                .missing_volume_evidence,
-            "seven_zip_start_header_length"
-        );
-        assert_eq!(
-            SegmentPlan::build(&evidences, &[], 142)
-                .missing_volume_evidence,
-            ""
-        );
+        for (size, valid, missing) in [(50, true, true), (142, true, false), (50, false, false)] {
+            let mut bytes = vec![0u8; size];
+            bytes[..6].copy_from_slice(SEVEN_ZIP);
+            bytes[12..20].copy_from_slice(&100u64.to_le_bytes());
+            bytes[20..28].copy_from_slice(&10u64.to_le_bytes());
+            let checksum = crc32(&bytes[12..32]);
+            bytes[8..12].copy_from_slice(&(checksum ^ u32::from(!valid)).to_le_bytes());
+            let view = AnalysisBinaryView {
+                reader: ManagedReader::from_bytes(bytes, ReaderConfig::default()),
+            };
+            let config = NativeAnalysisConfig::new([("seven_zip", true)]);
+            let report = view.analyze_report(&config, None).unwrap();
+            assert_eq!(
+                report.facts.missing_volume_evidence.as_deref(),
+                missing.then_some("seven_zip_start_header_length"),
+            );
+        }
     }
 
     #[test]
@@ -1062,11 +745,13 @@ mod report_tests {
             let view = AnalysisBinaryView::new(&zip_path.to_string_lossy(), 0).unwrap();
             let signatures = LeadingSignatures::read(&view.reader).unwrap();
             let (offset, record) = signatures.zip_eocd.unwrap();
-            let observed = view.probe_zip_with_disk_starts(offset, &record, None).unwrap();
-            assert!(observed.plausible && observed.password_required);
+            let observed = view
+                .probe_zip_with_disk_starts(offset, &record, None)
+                .unwrap();
+            assert!(observed.walk_ok && observed.password_required);
             let evidence = zip_from_native(observed, signatures.zip_local, zip.len() as u64);
-            assert_eq!(evidence.status, "extractable");
-            assert_eq!(evidence.segments[0].end, Some(zip.len() as u64));
+            assert_eq!(evidence.segment.status, Extractable);
+            assert_eq!(evidence.segment.end, Some(zip.len() as u64));
             let facts = evidence.analysis_facts();
             assert!(facts.structure_complete && facts.password_required);
             assert_eq!(facts.zip_eocd_offset, Some(76));
@@ -1084,29 +769,23 @@ mod report_tests {
         let tar_path = crate::test_support::temp_file("typed_tar_facts", &tar);
         {
             let view = AnalysisBinaryView::new(&tar_path.to_string_lossy(), 0).unwrap();
-            let context = ReportContext { view: &view, disk_starts: None,
-                signatures: LeadingSignatures::read(&view.reader).unwrap(), stream_structure: None };
-            let evidence = context.tar_candidate(0).unwrap().unwrap();
-            assert_eq!(evidence.status, "extractable");
-            assert_eq!(evidence.segments[0].end, Some(tar.len() as u64));
+            let mut context = ReportContext {
+                view: &view,
+                disk_starts: None,
+                signatures: LeadingSignatures::read(&view.reader).unwrap(),
+                stream_structure: None,
+            };
+            let evidence = context.tar_module().unwrap().unwrap();
+            assert_eq!(evidence.segment.status, Extractable);
+            assert_eq!(evidence.segment.end, Some(tar.len() as u64));
             assert!(evidence.analysis_facts().structure_complete);
         }
         crate::io::reader::release_reader_resources_under_roots(vec![
-            zip_path.to_string_lossy().into_owned(), tar_path.to_string_lossy().into_owned(),
-        ]).unwrap();
+            zip_path.to_string_lossy().into_owned(),
+            tar_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
         std::fs::remove_file(zip_path).unwrap();
         std::fs::remove_file(tar_path).unwrap();
     }
-
-    #[test]
-    fn read_fault_projects_field_truncation_and_missing_volume_flags() {
-        let fault = ReadFault::short_read("read_record", 0, 22, 10, 10)
-            .with_field(" zip.eocd ", FieldLocation::Tail);
-        let mut flags = native_read_fault_flags(&fault);
-        append_read_fault_field(&mut flags, Some(&fault));
-        assert_eq!(flags, ["read_error", "input_truncated", "probably_truncated",
-            "missing_volume", "field_read_error:zip.eocd"]);
-    }
-
-
 }

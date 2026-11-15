@@ -3,9 +3,9 @@
 use super::resource_lifecycle::{NativeResourceGuard, TrackedFile};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const ENTRY_BYTES: usize = 64;
@@ -85,7 +85,7 @@ pub(crate) struct Store {
     path: PathBuf,
     folder: PathBuf,
     pub manifest: Manifest,
-    current: Option<(String, TrackedFile, TrackedFile)>,
+    current: Option<(TrackedFile, TrackedFile)>,
     compressed: Vec<u8>,
     obsolete: Vec<String>,
     live: Option<Live>,
@@ -335,18 +335,19 @@ impl Store {
             return Err(invalid("unsupported display history"));
         }
         // Unpublished files are disposable, not transactions to replay.
+        let published: HashSet<_> = store
+            .manifest
+            .runs
+            .iter()
+            .chain(store.manifest.live.iter())
+            .map(|r| r.name.as_str())
+            .collect();
         for item in fs::read_dir(&store.folder)? {
             let item = item?;
             let name = item.file_name();
             let name = name.to_string_lossy();
             let stem = name.rsplit_once('.').map(|p| p.0).unwrap_or("");
-            if !store
-                .manifest
-                .runs
-                .iter()
-                .chain(store.manifest.live.iter())
-                .any(|r| r.name == stem)
-            {
+            if !published.contains(stem) {
                 fs::remove_file(item.path())?;
             }
         }
@@ -360,7 +361,7 @@ impl Store {
                 data.set_len(offset(&last).saturating_add(length))?;
             }
             index.set_len(run.count * ENTRY_BYTES as u64)?;
-            store.current = Some((run.name.clone(), data, index));
+            store.current = Some((data, index));
         }
         Ok(store)
     }
@@ -445,10 +446,10 @@ impl Store {
         if new {
             let run = self.create_run("history");
             let (data, index) = files(&self.folder, &run.name);
-            self.current = Some((run.name.clone(), open_sparse(&data)?, open_sparse(&index)?));
+            self.current = Some((open_sparse(&data)?, open_sparse(&index)?));
             self.manifest.runs.push(run);
         }
-        let (_, data, index) = self.current.as_mut().unwrap();
+        let (data, index) = self.current.as_mut().unwrap();
         Self::write_record(
             &mut self.compressed,
             data,
@@ -584,23 +585,42 @@ impl Store {
         Ok(())
     }
     pub(crate) fn expire(&mut self, cutoff: i64) -> io::Result<Option<i64>> {
-        let mut next = None;
-        let mut retained = Vec::new();
-        for mut run in self.manifest.runs.clone() {
-            if run.first > cutoff {
-                next = Some(next.map_or(run.first, |v: i64| v.min(run.first)));
-                retained.push(run);
-                continue;
+        let mut next = self.manifest.runs.iter().map(|run| run.first).min();
+        if next.is_some_and(|first| first <= cutoff) {
+            self.expire_history(cutoff)?;
+            next = self.manifest.runs.iter().map(|run| run.first).min();
+        }
+        let mut expired = false;
+        if let Some(live) = &mut self.live {
+            while let Some(((ts, _), id)) = live.time.first_key_value() {
+                if *ts > cutoff {
+                    break;
+                }
+                let id = id.clone();
+                if !expired {
+                    live.set_revision(0)?;
+                }
+                live.remove(&id)?;
+                self.expired_live.push(id);
+                expired = true;
             }
+        }
+        if expired {
             self.manifest.task_revision += 1;
-            if self.current.as_ref().is_some_and(|r| r.0 == run.name) {
-                self.current = None;
-            }
+            self.finish_live()?;
+        }
+        Ok(next
+            .into_iter()
+            .chain(self.live.iter().map(|live| live.run.first))
+            .min())
+    }
+    fn expire_history(&mut self, cutoff: i64) -> io::Result<()> {
+        let runs = &mut self.manifest.runs;
+        for run in runs
+            .iter_mut()
+            .filter(|run| run.first <= cutoff && run.last > cutoff)
+        {
             let (data_path, index_path) = files(&self.folder, &run.name);
-            if run.last <= cutoff {
-                self.obsolete.push(run.name);
-                continue;
-            }
             let mut index = open_sparse(&index_path)?;
             let mut lo = run.head;
             let mut hi = run.count;
@@ -623,40 +643,22 @@ impl Store {
             zero(&mut data, start, offset(&first))?;
             run.head = lo;
             run.first = stamp(&first);
-            next = Some(next.map_or(run.first, |v: i64| v.min(run.first)));
-            retained.push(run);
         }
-        self.manifest.runs = retained;
+        if runs.last().is_some_and(|run| run.last <= cutoff) {
+            self.current = None;
+        }
+        self.obsolete.extend(
+            runs.extract_if(.., |run| run.last <= cutoff)
+                .map(|run| run.name),
+        );
         if self.current.is_none() {
-            if let Some(run) = self.manifest.runs.last() {
+            if let Some(run) = runs.last() {
                 let (data, index) = files(&self.folder, &run.name);
-                self.current = Some((run.name.clone(), open_sparse(&data)?, open_sparse(&index)?));
+                self.current = Some((open_sparse(&data)?, open_sparse(&index)?));
             }
         }
-        let mut expired = false;
-        if let Some(live) = &mut self.live {
-            while let Some(((ts, _), id)) = live.time.first_key_value() {
-                if *ts > cutoff {
-                    break;
-                }
-                let id = id.clone();
-                self.expired_live.push(id.clone());
-                if !expired {
-                    live.set_revision(0)?;
-                }
-                live.remove(&id)?;
-                expired = true;
-            }
-        }
-        if expired {
-            self.manifest.task_revision += 1;
-        }
-        self.finish_live()?;
-        if let Some(live) = &self.live {
-            let ts = live.run.first;
-            next = Some(next.map_or(ts, |n| n.min(ts)));
-        }
-        Ok(next)
+        self.manifest.task_revision += 1;
+        Ok(())
     }
     pub(crate) fn publish(&mut self) -> io::Result<()> {
         self.manifest.revision = self.manifest.revision.wrapping_add(1);
@@ -669,10 +671,11 @@ impl Store {
         ));
         let _publication =
             NativeResourceGuard::register([self.path.clone(), temp.clone()])?;
-        let mut file = TrackedFile::open_with(&temp, |o| {
+        let mut file = BufWriter::new(TrackedFile::open_with(&temp, |o| {
             o.write(true).create(true).truncate(true);
-        })?;
+        })?);
         serde_json::to_writer(&mut file, &self.manifest).map_err(|e| invalid(&e.to_string()))?;
+        file.flush()?;
         drop(file);
         super::atomic_file::replace(&temp, &self.path)?;
         for name in self.obsolete.drain(..) {

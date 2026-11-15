@@ -31,7 +31,7 @@ impl Log {
 }
 pub(super) fn retention(days: u64) {
     let log = CURRENT.lock().unwrap().upgrade();
-    if let Some(log) = log { let _ = log.events.configure_retention(days.min(u32::MAX as u64) as u32); }
+    if let Some(log) = log { log.events.configure_retention(days.min(u32::MAX as u64) as u32); }
 }
 pub(super) fn event(name: &str, fields: impl FnOnce() -> Value) {
     let Some(log) = CURRENT.lock().unwrap().upgrade() else { return; };

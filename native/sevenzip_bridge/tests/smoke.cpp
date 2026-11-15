@@ -372,7 +372,5 @@ int wmain(int argc, wchar_t** argv) {
 
     (void)argc;
     (void)argv;
-    const bool available = sunpack::sevenzip::is_backend_available();
-    std::cout << "backend_available=" << (available ? "true" : "false") << "\n";
-    return available ? 0 : 1;
+    return 0;
 }

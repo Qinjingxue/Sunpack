@@ -30,14 +30,8 @@ namespace sunpack::sevenzip
             const std::wstring &requested_name = L"")
         {
             PasswordTestResult result;
-            result.backend_available = true;
             result.status = PasswordTestStatus::NeedsVolumeOrTailDamaged;
-            result.is_archive = true;
-            result.damaged = true;
             result.missing_volume = true;
-            result.missing_volume_suspected = true;
-            result.missing_volume_evidence = evidence ? evidence : "";
-            result.missing_volume_name = requested_name;
             result.message = "password probe could not read required tail data; missing volume or damaged tail offset/structure";
             if (evidence && *evidence)
             {
@@ -230,7 +224,7 @@ namespace sunpack::sevenzip
                 if (looks_wrong_password(hr, operation, encrypted))
                 {
                     result.status = PasswordTestStatus::WrongPassword;
-                    result.encrypted = result.password_required = result.wrong_password = true;
+                    result.encrypted = true;
                     result.message = "wrong password";
                     return result;
                 }
@@ -240,10 +234,6 @@ namespace sunpack::sevenzip
         }
 
         PasswordTestResult result;
-
-        result.backend_available = true;
-
-        result.archive_offset = input_ranges.empty() ? 0 : input_ranges.front().start;
         result.archive_type = format_hint;
 
         bool any_format_created = false;
@@ -297,10 +287,6 @@ namespace sunpack::sevenzip
                       }))))
                 {
                     result.status = PasswordTestStatus::NeedsVolumeOrTailDamaged;
-                    result.is_archive = true;
-                    result.damaged = true;
-                    result.missing_stub = true;
-                    result.missing_volume_evidence = "sfx_stub_not_found";
                     result.message = "split self-extracting archive stub is missing";
                     return result;
                 }
@@ -326,7 +312,6 @@ namespace sunpack::sevenzip
                 auto missing = needs_volume_or_tail_damaged_result(
                     "open_volume_callback_not_found",
                     raw_open_callback->missing_volume_name());
-                missing.archive_offset = result.archive_offset;
                 if (!format_hint.empty()) missing.archive_type = format_hint;
                 return missing;
             }
@@ -334,10 +319,6 @@ namespace sunpack::sevenzip
             if (raw_open_callback->volume_open_failed())
             {
                 result.status = PasswordTestStatus::Error;
-                result.is_archive = true;
-                result.volume_open_failed = true;
-                result.missing_volume_name = raw_open_callback->failed_volume_name();
-                result.missing_volume_evidence = "open_volume_callback_open_failed";
                 result.message = "archive split volume could not be opened";
                 return result;
             }
@@ -352,13 +333,12 @@ namespace sunpack::sevenzip
 
             any_opened = true;
             result.archive_type = canonical_archive_type_for_guid(format);
-            result.is_archive = true;
             auto selection = bounded_password_probe_selection(archive, result.archive_type == L"enc");
             if (selection.item_count_known && rar4_rejected_empty_encrypted_headers(
                     archive.Interface(), format, selection.item_count, raw_open_callback->password_requested()))
             {
                 result.status = PasswordTestStatus::WrongPassword;
-                result.encrypted = result.password_required = result.wrong_password = true;
+                result.encrypted = true;
                 result.operation_result = kOpWrongPassword;
                 result.message = "RAR4 encrypted headers could not be decoded";
                 archive->Close();
@@ -366,7 +346,6 @@ namespace sunpack::sevenzip
             }
             last_encryption_evidence = last_encryption_evidence || selection.encrypted;
             result.encrypted = result.encrypted || last_encryption_evidence;
-            result.password_required = result.password_required || last_encryption_evidence;
             if (scan_only && !selection.encrypted && !last_encryption_evidence && selection.item_count_known)
             {
                 archive->Close();
@@ -415,10 +394,7 @@ namespace sunpack::sevenzip
             {
 
                 result.status = PasswordTestStatus::WrongPassword;
-                result.is_archive = true;
                 result.encrypted = true;
-                result.password_required = true;
-                result.wrong_password = true;
 
                 result.message = "wrong password";
 
@@ -450,10 +426,7 @@ namespace sunpack::sevenzip
         {
 
             result.status = PasswordTestStatus::WrongPassword;
-            result.is_archive = true;
             result.encrypted = true;
-            result.password_required = true;
-            result.wrong_password = true;
 
             result.message = "wrong password";
         }
@@ -476,10 +449,7 @@ namespace sunpack::sevenzip
         {
 
             result.status = PasswordTestStatus::WrongPassword;
-            result.is_archive = true;
             result.encrypted = true;
-            result.password_required = true;
-            result.wrong_password = true;
 
             result.message = "wrong password";
         }
@@ -521,7 +491,6 @@ namespace sunpack::sevenzip
             }
             auto current = test_one_password(archive_path, candidate_count == 0 ? empty : candidates[index],
                 part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only);
-            current.attempts = static_cast<int>(index + 1);
             if (native_job_cancelled()) {
                 current.status = PasswordTestStatus::Error;
                 current.message = "password probe cancelled";
@@ -539,7 +508,6 @@ namespace sunpack::sevenzip
         }
         last.status = PasswordTestStatus::WrongPassword;
         last.matched_index = -1;
-        last.attempts = static_cast<int>(count);
         last.message = "wrong password";
         return last;
 #else

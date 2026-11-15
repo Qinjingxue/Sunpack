@@ -495,11 +495,12 @@ impl Process {
     pub(super) async fn submit(
         &self,
         job_id: &str,
-        request: Value,
+        mut request: Value,
         cancellation: &Cancellation,
         interest: WorkerUpdates,
         mut on_update: impl FnMut(Update),
     ) -> io::Result<WorkerFrame> {
+        request["report_progress"] = Value::Bool(interest == WorkerUpdates::All);
         let frame = Arc::new(encode_worker_frame(&request)?);
         drop(request);
         let mailbox = Arc::new(Mailbox {
@@ -1637,7 +1638,9 @@ mod tests {
         let request = json!({
             "job_id": "slow", "operation": "extract", "password": "x".repeat(128 * 1024),
         });
-        let expected = encode_worker_frame(&request).unwrap();
+        let mut expected_request = request.clone();
+        expected_request["report_progress"] = Value::Bool(false);
+        let expected = encode_worker_frame(&expected_request).unwrap();
         let (completed, completion) = mpsc::channel();
         let watch = thread::spawn(move || {
             let result = watch_scheduler.run(1, Origin::Watch, &watch_cancel, |_| {

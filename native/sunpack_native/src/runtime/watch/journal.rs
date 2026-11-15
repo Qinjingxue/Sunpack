@@ -1,9 +1,6 @@
 use super::key;
 use crate::event_log::NativeEventLog;
-use crate::watch_journal::{
-    watch_journal_open, watch_journal_request_flush, watch_journal_seed,
-    watch_journal_submit_append, watch_journal_submit_seal, NativeJournalStream, NativeJournalTicket,
-};
+use crate::watch_journal::{NativeJournalStream, NativeJournalTicket};
 use crate::watch_store::{NativeWatchOperations, NativeWatchState};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
@@ -17,10 +14,10 @@ use std::thread::{self, JoinHandle};
 // Scoped to the admitted scheduler stage: worker publications on other
 // threads retain their own durable boundary.
 thread_local! {
-    static DEFERRED: std::cell::RefCell<Option<(usize, Vec<(NativeJournalTicket, bool)>)>> = const { std::cell::RefCell::new(None) };
+    static DEFERRED: std::cell::RefCell<Option<(usize, Vec<NativeJournalTicket>)>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(super) struct PendingCommits(Vec<(NativeJournalTicket, bool)>);
+pub(super) struct PendingCommits(Vec<NativeJournalTicket>);
 
 struct DeferredScope;
 impl Drop for DeferredScope {
@@ -68,8 +65,7 @@ pub(super) struct Journal {
     checkpoint: Mutex<Option<Checkpoint>>,
     maintenance: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     snapshot: PathBuf,
-    stream_id: String,
-    _stream: NativeJournalStream,
+    stream: NativeJournalStream,
     _lock: File,
 }
 
@@ -92,12 +88,11 @@ impl Journal {
         let mut state = NativeWatchState::new();
         state.outputs = outputs;
         let frontier = Self::restore_state(&state, dir)?;
-        let stream_id = key(&snapshot);
-        let stream = watch_journal_open(stream_id.clone())?;
-        watch_journal_seed(&stream_id, frontier.seq)?;
+        let stream = NativeJournalStream::open_seeded(key(&snapshot), frontier.seq)
+            .map_err(io::Error::other)?;
         let log = Arc::new(NativeEventLog::new(dir.join("events.json"), retention_days.min(u32::MAX.into()) as u32, true)?);
-        state.attach_events(&log)?;
-        log.recover(Some(&state))?;
+        state.attach_events(&log);
+        log.recover(&state);
         Ok(Self {
             state,
             suspended: AtomicBool::new(false),
@@ -106,8 +101,7 @@ impl Journal {
             checkpoint: Mutex::default(),
             maintenance: Mutex::default(),
             snapshot,
-            stream_id,
-            _stream: stream,
+            stream,
             _lock: lock,
         })
     }
@@ -176,7 +170,7 @@ impl Journal {
         let mut checkpoint = self.checkpoint.lock().unwrap();
         self.harvest_checkpoint(checkpoint.take())?;
         let frontier = self.frontier.lock().unwrap();
-        watch_journal_request_flush(self.stream_id.clone(), frontier.seq)?.wait()?;
+        self.stream.request_flush(frontier.seq)?.wait()?;
         self.suspended.store(true, Ordering::Release);
         self.state.unload();
         Ok(())
@@ -220,13 +214,13 @@ impl Journal {
     }
 
     pub(super) fn rebuild_log(&self) -> io::Result<bool> {
-        self.log.rebuild()?;
-        self.log.recover(Some(&self.state))?;
+        self.log.rebuild();
+        self.log.recover(&self.state);
         self.log.flush()?;
-        Ok(self.log.error()?.is_none())
+        Ok(self.log.error().is_none())
     }
 
-    pub(super) fn set_retention(&self, days: u64) -> io::Result<()> {
+    pub(super) fn set_retention(&self, days: u64) {
         self.log
             .configure_retention(days.min(u32::MAX.into()) as u32)
     }
@@ -243,7 +237,7 @@ impl Journal {
             // removed no longer belongs to an active Watch scheduler.
             if self.suspended() { return Ok(()); }
             let operations = prepare(&self.state)?;
-            if operations.__len__() == 0 {
+            if operations.is_empty() {
                 return Ok(());
             }
             let seq = frontier
@@ -251,11 +245,8 @@ impl Journal {
                 .checked_add(1)
                 .ok_or(io::ErrorKind::InvalidData)?;
             let segment = frontier.segment;
-            let ticket = watch_journal_submit_append(
-                self.stream_id.clone(),
-                segment_path(self.snapshot.parent().unwrap(), segment)
-                    .to_string_lossy()
-                    .into_owned(),
+            let ticket = self.stream.submit_task_append(
+                segment_path(self.snapshot.parent().unwrap(), segment),
                 segment,
                 seq,
                 &operations,
@@ -269,11 +260,14 @@ impl Journal {
         let ticket = DEFERRED.with(|slot| {
             let mut slot = slot.borrow_mut();
             if let Some((_, tickets)) = slot.as_mut().filter(|(owner, _)| *owner == self as *const Self as usize) {
-                tickets.push((ticket, durable));
+                tickets.push(ticket);
                 None
             } else { Some(ticket) }
         });
-        match ticket { Some(ticket) => self.wait_commit(ticket, durable), None => Ok(()) }
+        match ticket {
+            Some(ticket) => self.wait_commits(std::slice::from_ref(&ticket)),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn prepare_waits<T>(&self, prepare: impl FnOnce() -> T) -> (T, PendingCommits) {
@@ -289,11 +283,7 @@ impl Journal {
     }
 
     pub(super) fn wait_prepared(&self, tickets: PendingCommits) -> io::Result<()> {
-        let mut durable = Ok(());
-        for (ticket, required) in tickets.0 {
-            if let Err(error) = self.wait_commit(ticket, required) { durable = Err(error); }
-        }
-        durable
+        self.wait_commits(&tickets.0)
     }
 
     pub(super) fn defer_waits<T>(&self, prepare: impl FnOnce() -> T) -> (T, io::Result<()>) {
@@ -301,20 +291,18 @@ impl Journal {
         (result, self.wait_prepared(tickets))
     }
 
-    fn wait_commit(&self, ticket: NativeJournalTicket, durable: bool) -> io::Result<()> {
-        let result = if durable {
-            ticket.wait()
-        } else {
-            ticket.wait_written()
-        };
-        let mut frontier = self.frontier.lock().unwrap();
-        if let Err(error) = result {
-            frontier.fault.get_or_insert_with(|| error.to_string());
-            return Err(error);
+    fn wait_commits(&self, tickets: &[NativeJournalTicket]) -> io::Result<()> {
+        if tickets.is_empty() {
+            return Ok(());
         }
+        let result = NativeJournalTicket::wait_appends(tickets);
+        let mut frontier = self.frontier.lock().unwrap();
+        let bytes = result.inspect_err(|error| {
+            frontier.fault.get_or_insert_with(|| error.to_string());
+        })?;
         // Count all uncheckpointed WAL, including a segment sealed while
         // this caller was awaiting its append. A failed snapshot retires none.
-        frontier.bytes = frontier.bytes.saturating_add(ticket.bytes_written());
+        frontier.bytes = frontier.bytes.saturating_add(bytes);
         ensure_healthy(&frontier)?;
         let needs_checkpoint = frontier.needs_checkpoint();
         drop(frontier);
@@ -349,7 +337,7 @@ impl Journal {
         let ticket = {
             let frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
-            watch_journal_request_flush(self.stream_id.clone(), frontier.seq)?
+            self.stream.request_flush(frontier.seq)?
         };
         ticket.wait()?;
         self.wait_for_checkpoint()?;
@@ -386,11 +374,8 @@ impl Journal {
                 return Ok(());
             }
             let segment = frontier.segment;
-            let seal = watch_journal_submit_seal(
-                self.stream_id.clone(),
-                segment_path(self.snapshot.parent().unwrap(), segment)
-                    .to_string_lossy()
-                    .into_owned(),
+            let seal = self.stream.submit_seal(
+                segment_path(self.snapshot.parent().unwrap(), segment),
                 segment,
                 frontier.seq,
             )?;
@@ -598,7 +583,7 @@ mod tests {
         let journal = Journal::open(&dir, 7).unwrap();
         let (prepared, durable) = journal.defer_waits(|| {
             for generation in 1..=32 {
-                journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(
+                journal.commit(generation % 2 == 1, |_| Ok(NativeWatchOperations::password_generation(
                     generation, generation.to_string()))).unwrap();
                 DEFERRED.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().1.len(), generation as usize));
             }
@@ -607,6 +592,10 @@ mod tests {
         });
         durable.unwrap();
         assert_eq!(prepared, 32);
+        assert_eq!(
+            journal.frontier.lock().unwrap().bytes + crate::wal::FILE_HEADER_BYTES,
+            fs::metadata(segment_path(&dir, 1)).unwrap().len(),
+        );
         assert!(DEFERRED.with(|slot| slot.borrow().is_none()));
         drop(journal);
         let journal = Journal::open(&dir, 7).unwrap();
@@ -954,7 +943,7 @@ mod tests {
         journal.log(serde_json::json!({"event":"service_reload_skipped","reason":"test"}));
         journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
         assert!(journal.flush().is_ok());
-        assert!(journal.log.error().unwrap().is_some());
+        assert!(journal.log.error().is_some());
         // A persistence fault must still fail the same public flush boundary.
         journal.frontier.lock().unwrap().fault = Some("durability fault".into());
         assert!(journal.flush().unwrap_err().to_string().contains("durability fault"));

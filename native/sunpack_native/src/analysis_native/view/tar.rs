@@ -30,7 +30,6 @@ fn parse_octal(field: &[u8]) -> Option<u64> {
 
 #[derive(Clone, Copy)]
 struct TarHeaderIdentity {
-    ustar_magic: bool,
     name_nonempty: bool,
     numeric_fields_valid: bool,
     typeflag_valid: bool,
@@ -42,9 +41,7 @@ fn tar_header_identity(header: &[u8], offset: u64, file_size: u64) -> TarHeaderI
     let stored_checksum = parse_octal(&header[148..156]);
     let member_size = parse_octal(&header[124..136]);
     let computed_checksum = tar_checksum(header);
-    let ustar_magic = matches!(&header[257..263], b"ustar\x00" | b"ustar ");
     TarHeaderIdentity {
-        ustar_magic,
         name_nonempty: header[0..100].iter().any(|byte| *byte != 0),
         numeric_fields_valid: stored_checksum.is_some()
             && member_size.is_some()

@@ -147,6 +147,7 @@ namespace sunpack::sevenzip
             return;
         }
         ++trace->logical_read_call_count;
+        trace->total_bytes_returned += returned;
         if (trace->has_last_logical_read_end && start == trace->last_logical_read_end)
         {
             trace->sequential_read_bytes += returned;
@@ -454,7 +455,7 @@ namespace sunpack::sevenzip
         explicit FileInStream(
             const std::wstring &path,
             ExtractInputTrace *trace = nullptr,
-            std::wstring mode = L"file",
+            const wchar_t *mode = L"file",
             InputPrefetchConfig prefetch_config = input_prefetch_config())
 
             : path_(path),
@@ -480,16 +481,13 @@ namespace sunpack::sevenzip
             if (trace_)
             {
 
-                trace_->mode = std::move(mode);
-
                 trace_->last_source_path = path_;
-
-                if (handle_ != INVALID_HANDLE_VALUE && size_)
+                if (read_file_timing_enabled())
                 {
-
+                    trace_->mode = mode;
                     trace_->virtual_size = size_;
                 }
-                else if (handle_ == INVALID_HANDLE_VALUE)
+                if (handle_ == INVALID_HANDLE_VALUE)
                 {
 
                     trace_->read_error = true;
@@ -552,8 +550,6 @@ namespace sunpack::sevenzip
                 trace_->last_read_requested = size;
 
                 trace_->last_read_returned = 0;
-
-                trace_->last_range_index = 0;
             }
 
             if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
@@ -566,9 +562,6 @@ namespace sunpack::sevenzip
                 prefetch_->after_read(position_);
                 if (trace_)
                 {
-                    trace_->position = position_;
-                    trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-                    trace_->total_bytes_returned += size;
                     trace_->last_read_returned = size;
                     trace_->last_hresult = S_OK;
                     trace_->last_win32_error = 0;
@@ -643,12 +636,6 @@ namespace sunpack::sevenzip
             if (trace_)
             {
 
-                trace_->position = position_;
-
-                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-
-                trace_->total_bytes_returned += read;
-
                 trace_->last_read_returned = read;
 
                 trace_->last_hresult = S_OK;
@@ -695,10 +682,6 @@ namespace sunpack::sevenzip
                 if (trace_)
                 {
 
-                    trace_->last_seek_offset = offset;
-
-                    trace_->last_seek_origin = seekOrigin;
-
                     trace_->last_hresult = hr;
 
                     trace_->last_win32_error = static_cast<int>(error);
@@ -716,24 +699,6 @@ namespace sunpack::sevenzip
             if (prefetch_ && prior_position != position_)
             {
                 prefetch_->invalidate(position_, trace_);
-            }
-
-            if (trace_)
-            {
-
-                trace_->position = position_;
-
-                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-
-                trace_->last_seek_offset = offset;
-
-                trace_->last_seek_origin = seekOrigin;
-
-                trace_->last_seek_new_position = position_;
-
-                trace_->last_hresult = S_OK;
-
-                trace_->last_win32_error = 0;
             }
 
             if (newPosition)
@@ -797,8 +762,6 @@ namespace sunpack::sevenzip
                     open_hresult_ = HRESULT_FROM_WIN32(error.value());
                     continue;
                 }
-                // Keep empty parts so trace indices still identify the
-                // original physical volume. The lookup skips empty spans.
                 ranges_.push_back({std::move(path), 0, length, total_size_});
                 total_size_ += length;
             }
@@ -910,9 +873,6 @@ namespace sunpack::sevenzip
                     const std::size_t index = find_range_index(read_start);
                     const auto &range = ranges_[index];
                     const UInt64 offset_in_range = read_start - range.virtual_offset;
-                    trace_->position = position_;
-                    trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-                    trace_->total_bytes_returned += size;
                     trace_->last_read_virtual_offset = read_start;
                     trace_->last_read_source_offset = range.start + offset_in_range;
                     trace_->last_read_requested = size;
@@ -1070,12 +1030,6 @@ namespace sunpack::sevenzip
                 if (trace_)
                 {
 
-                    trace_->position = position_;
-
-                    trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-
-                    trace_->total_bytes_returned += read;
-
                     trace_->last_read_returned = read;
 
                     trace_->last_hresult = S_OK;
@@ -1134,24 +1088,6 @@ namespace sunpack::sevenzip
                 prefetch_->invalidate(position_, trace_);
             }
 
-            if (trace_)
-            {
-
-                trace_->position = position_;
-
-                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-
-                trace_->last_seek_offset = offset;
-
-                trace_->last_seek_origin = seekOrigin;
-
-                trace_->last_seek_new_position = position_;
-
-                trace_->last_hresult = S_OK;
-
-                trace_->last_win32_error = 0;
-            }
-
             if (newPosition)
             {
 
@@ -1166,7 +1102,6 @@ namespace sunpack::sevenzip
         {
             if (index == traced_index_) return;
             trace_->last_source_path = ranges_[index].path;
-            trace_->last_range_index = static_cast<UInt32>(index);
             traced_index_ = index;
         }
 
@@ -1174,11 +1109,9 @@ namespace sunpack::sevenzip
         {
             if (ranges_.empty() && open_hresult_ == S_OK) open_hresult_ = E_FAIL;
 
-            if (trace_)
+            if (trace_ && read_file_timing_enabled())
             {
-
                 trace_->mode = mode;
-
                 trace_->virtual_size = total_size_;
             }
 

@@ -29,8 +29,7 @@ RootIndex index_roots(const WatchRoots& roots) {
     }
     return index;
 }
-std::string indexed_root(const std::wstring& key,const RootIndex& index) {
-    std::wstring current=key;
+std::string_view indexed_root(std::wstring current,const RootIndex& index) {
     while(!current.empty() && (current.back()==L'\\' || current.back()==L'/')) current.pop_back();
     while(!current.empty()) {
         auto found=index.find(current);

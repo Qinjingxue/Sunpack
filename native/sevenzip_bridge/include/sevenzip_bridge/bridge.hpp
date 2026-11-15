@@ -49,23 +49,11 @@ enum class PasswordTestStatus {
 
 struct PasswordTestResult {
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
-    bool backend_available = false;
-    bool is_archive = false;
     bool encrypted = false;
-    bool password_required = false;
     bool missing_volume = false;
-    bool missing_volume_suspected = false;
-    bool missing_stub = false;
-    bool volume_open_failed = false;
-    bool wrong_password = false;
-    bool damaged = false;
     int matched_index = -1;
-    int attempts = 0;
-    unsigned long long archive_offset = 0;
     int operation_result = 0;
     std::wstring archive_type;
-    std::wstring missing_volume_name;
-    std::string missing_volume_evidence;
     std::string message;
 };
 
@@ -82,8 +70,6 @@ struct ExtractInputTrace {
 #endif
     std::wstring mode;
     unsigned long long virtual_size = 0;
-    unsigned long long position = 0;
-    unsigned long long max_position_seen = 0;
     unsigned long long total_bytes_returned = 0;
     // Populated only when SUNPACK_SEVENZIP_PROFILE_READS=1 in the worker
     // environment. Includes synchronous reads and OVERLAPPED submissions;
@@ -114,12 +100,8 @@ struct ExtractInputTrace {
     bool has_last_logical_read_end = false;
     unsigned long long last_read_virtual_offset = 0;
     unsigned long long last_read_source_offset = 0;
-    unsigned long long last_seek_new_position = 0;
     unsigned int last_read_requested = 0;
     unsigned int last_read_returned = 0;
-    unsigned int last_seek_origin = 0;
-    unsigned int last_range_index = 0;
-    long long last_seek_offset = 0;
     int last_hresult = 0;
     int last_win32_error = 0;
     bool read_error = false;
@@ -146,10 +128,6 @@ struct ExtractOutputItemTrace {
 };
 
 struct ExtractOutputTrace {
-#ifdef SUP7Z_DEBUG
-    PipelineTiming *pipeline_timing = nullptr;
-#endif
-    unsigned long long total_bytes_written = 0;
     int last_hresult = 0;
     std::vector<ExtractOutputItemTrace> items;
     unsigned int metadata_failed_files = 0;
@@ -167,7 +145,6 @@ struct ExtractArchiveResult {
     ExtractPipelineTiming pipeline_timing;
 #endif
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
-    bool backend_available = false;
     bool command_ok = false;
     bool encrypted = false;
     bool damaged = false;
@@ -177,22 +154,16 @@ struct ExtractArchiveResult {
     bool wrong_password = false;
     bool password_rejected = false;
     bool password_crc_proven = false;
-    bool password_candidate_batch = false;
-    bool password_candidate_direct = false;
     bool password_candidates_all_rejected = false;
     bool unsupported_method = false;
     bool output_inventory_complete = false;
     int operation_result = 0;
     unsigned int item_count = 0;
     unsigned int files_written = 0;
-    unsigned int dirs_written = 0;
     unsigned int password_crc_proven_items = 0;
-    unsigned int password_candidate_count = 0;
-    unsigned long long bytes_written = 0;
     unsigned long long failed_item_bytes_written = 0;
     int hresult = 0;
     int matched_index = -1;
-    int password_attempts = 0;
     std::wstring archive_type;
     std::wstring failed_item;
     std::wstring missing_volume_name;
@@ -212,8 +183,6 @@ struct ExtractInputRange {
     unsigned long long end = 0;
     bool has_end = false;
 };
-
-bool is_backend_available();
 
 PasswordTestResult test_password_batch(
     const std::wstring& archive_path,

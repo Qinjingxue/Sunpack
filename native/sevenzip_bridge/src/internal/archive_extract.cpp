@@ -226,24 +226,20 @@ namespace sunpack::sevenzip
 #ifdef _WIN32
         ExtractArchiveResult result;
 
-        result.backend_available = true;
-
 #ifdef SUP7Z_DEBUG
-        auto pipeline_timing = std::make_shared<PipelineTiming>(pipeline_timing_enabled());
+        auto pipeline_timing = pipeline_timing_enabled() ? std::make_unique<PipelineTiming>(true) : nullptr;
         result.input_trace.pipeline_timing = pipeline_timing.get();
-        result.output_trace.pipeline_timing = pipeline_timing.get();
         struct PipelineTimingCapture final
         {
             ExtractArchiveResult &result;
-            std::shared_ptr<PipelineTiming> timing;
+            PipelineTiming *timing;
 
             ~PipelineTimingCapture() noexcept
             {
-                result.pipeline_timing = timing->snapshot();
+                if (timing) result.pipeline_timing = timing->snapshot();
                 result.input_trace.pipeline_timing = nullptr;
-                result.output_trace.pipeline_timing = nullptr;
             }
-        } pipeline_capture{result, pipeline_timing};
+        } pipeline_capture{result, pipeline_timing.get()};
 #endif
 
         bool any_format_created = false;
@@ -550,7 +546,7 @@ namespace sunpack::sevenzip
             raw_extract_callback->set_input_file(archive_path);
 
 #ifdef SUP7Z_DEBUG
-            pipeline_timing->start_pipeline();
+            if (pipeline_timing) pipeline_timing->start_pipeline();
             PipelineThreadCpuScope compute_cpu_scope(pipeline_timing.get());
             PipelineStageScope compute_scope(pipeline_timing.get(), PipelineStage::Compute);
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
@@ -593,11 +589,7 @@ namespace sunpack::sevenzip
 
             result.files_written = raw_extract_callback->files_written();
 
-            result.dirs_written = raw_extract_callback->dirs_written();
-
             result.output_inventory_complete = raw_extract_callback->output_root_initially_empty();
-
-            result.bytes_written = result.output_trace.total_bytes_written;
 
             result.failed_item = raw_extract_callback->failed_item();
 
@@ -822,23 +814,6 @@ namespace sunpack::sevenzip
         result.failure_kind = "backend_unavailable";
         result.message = "native archive extraction is only implemented on Windows";
         return result;
-#endif
-    }
-
-    bool is_backend_available()
-    {
-
-#ifdef _WIN32
-
-        // The 7-Zip backend is part of this image, so it is always present.
-        // Whether a specific format handler can be created is reported by the
-        // open path itself.
-        return true;
-
-#else
-
-        return false;
-
 #endif
     }
 

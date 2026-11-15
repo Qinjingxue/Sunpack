@@ -1,26 +1,14 @@
 impl AnalysisBinaryView {
-    fn read_field_at_bytes(
-        &self,
-        offset: u64,
-        size: usize,
-        field: &'static str,
-        location: FieldLocation,
-    ) -> Result<Vec<u8>, ReadFault> {
-        self.reader
-            .read_exact_field_at(offset, size, field, location)
-    }
-
-    fn read_at_bytes(&self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
-        self.reader.read_at(offset, size).map_err(reader_error)
-    }
-
     fn probe_zip_with_disk_starts(
         &self,
         eocd_offset: u64,
         eocd: &[u8; 22],
         disk_starts: Option<&[u64]>,
     ) -> std::io::Result<ZipObservation> {
-        let mut result = ZipObservation { eocd_offset, ..Default::default() };
+        let mut result = ZipObservation {
+            eocd_offset,
+            ..Default::default()
+        };
 
         let disk_number = u16_le(eocd, 4);
         let central_directory_disk = u16_le(eocd, 6);
@@ -66,8 +54,7 @@ impl AnalysisBinaryView {
             }
             Ok(None) => {}
             Err(crate::formats::zip::zip64::LocateError::Invalid(error)) => {
-
-                result.error = error.to_string();
+                result.error = error;
                 return Ok(result);
             }
             Err(crate::formats::zip::zip64::LocateError::Read(error)) => {
@@ -81,11 +68,11 @@ impl AnalysisBinaryView {
         if is_multi_disk && disk_starts.is_none() {
             // A single physical input cannot resolve PKZIP disk-relative
             // offsets.  MultiVolumeBinaryView supplies the Rust-owned layout.
-            result.error = "zip_multi_disk".to_owned();
+            result.error = "zip_multi_disk";
             return Ok(result);
         }
         if effective_disk_entries != effective_total_entries && !is_multi_disk {
-            result.error = "entry_count_mismatch".to_owned();
+            result.error = "entry_count_mismatch";
             return Ok(result);
         }
         if let Some(starts) = disk_starts.filter(|_| is_multi_disk) {
@@ -96,19 +83,19 @@ impl AnalysisBinaryView {
                 .ok()
                 .is_some_and(|disk| disk < starts.len());
             if !disk_ok || !cd_disk_ok {
-                result.error = "central_directory_disk_offset_out_of_range".to_owned();
+                result.error = "central_directory_disk_offset_out_of_range";
                 return Ok(result);
             }
             if zip64_present
                 && (zip64_declared_total_disks as usize != starts.len()
                     || effective_disk_number as usize + 1 != starts.len())
             {
-                result.error = "zip64_disk_count_mismatch".to_owned();
+                result.error = "zip64_disk_count_mismatch";
                 return Ok(result);
             }
         }
         if !is_multi_disk && directory_end < effective_central_directory_size {
-            result.error = "central_directory_size_out_of_range".to_owned();
+            result.error = "central_directory_size_out_of_range";
             return Ok(result);
         }
         let physical_central_offset = if is_multi_disk {
@@ -118,7 +105,7 @@ impl AnalysisBinaryView {
                 effective_central_directory_disk,
                 effective_central_directory_offset,
             ) else {
-                result.error = "central_directory_disk_offset_out_of_range".to_owned();
+                result.error = "central_directory_disk_offset_out_of_range";
                 return Ok(result);
             };
             offset
@@ -130,22 +117,15 @@ impl AnalysisBinaryView {
             // naive position so carrier/SFX prefixes retain archive_offset.
             if naive_physical_central_offset != declared_physical_central_offset {
                 let naive_ok = self
-                    .read_field_at_bytes(
-                        naive_physical_central_offset,
-                        4,
-                        "zip.central_directory.signature",
-                        FieldLocation::Tail,
-                    )
+                    .reader
+                    .read_cached_at(naive_physical_central_offset, 4)
                     .is_ok_and(|sig| sig.as_slice() == ZIP_CENTRAL);
-                let declared_ok = self
-                    .read_field_at_bytes(
-                        declared_physical_central_offset,
-                        4,
-                        "zip.central_directory.signature",
-                        FieldLocation::Tail,
-                    )
-                    .is_ok_and(|sig| sig.as_slice() == ZIP_CENTRAL);
-                if !naive_ok && declared_ok {
+                if !naive_ok
+                    && self
+                        .reader
+                        .read_cached_at(declared_physical_central_offset, 4)
+                        .is_ok_and(|sig| sig.as_slice() == ZIP_CENTRAL)
+                {
                     declared_physical_central_offset
                 } else {
                     naive_physical_central_offset
@@ -158,7 +138,7 @@ impl AnalysisBinaryView {
             0
         } else {
             if physical_central_offset < effective_central_directory_offset {
-                result.error = "archive_offset_underflow".to_owned();
+                result.error = "archive_offset_underflow";
                 return Ok(result);
             }
             physical_central_offset - effective_central_directory_offset
@@ -169,63 +149,37 @@ impl AnalysisBinaryView {
             .checked_add(effective_central_directory_size)
             .is_none_or(|end| end != directory_end)
         {
-            result.error = "central_directory_size_mismatch".to_owned();
+            result.error = "central_directory_size_mismatch";
             return Ok(result);
         }
         if effective_total_entries == 0 && effective_central_directory_size == 0 {
-            result.plausible = true;
-            result.central_directory_walk_ok = true;
-            result.local_header_links_ok = true;
-
+            result.walk_ok = true;
             return Ok(result);
         }
 
-        let central_sig = match self.read_field_at_bytes(
-            physical_central_offset,
-            4,
-            "zip.central_directory.signature",
-            FieldLocation::Tail,
-        ) {
-            Ok(data) => data,
-            Err(fault) => {
-                result.error = "central_directory_read_failed".to_owned();
-                result.read_fault = Some(fault);
+        match self.reader.read_cached_at(physical_central_offset, 4) {
+            Ok(data) if data.as_slice() == ZIP_CENTRAL => {}
+            Ok(data) if data.len() == 4 => {
+                result.error = "bad_central_directory_signature";
                 return Ok(result);
             }
-        };
-        if central_sig.as_slice() != ZIP_CENTRAL {
-            result.error = "bad_central_directory_signature".to_owned();
-            return Ok(result);
+            _ => {
+                result.error = "central_directory_read_failed";
+                return Ok(result);
+            }
         }
 
-        let walk = (|| {
-            self.walk_zip_central_directory(
-                archive_offset,
-                physical_central_offset,
-                effective_central_directory_size,
-                effective_total_entries as usize,
-                disk_starts.filter(|_| is_multi_disk),
-            )
-        })()?;
-        let ZipDirectoryWalk {
-            directory_ok: cd_ok,
-            links_ok,
-            encrypted_entries,
-            error,
-            content_warning,
-        } = walk;
-
-        result.central_directory_walk_ok = cd_ok;
-
-        result.local_header_links_ok = links_ok;
-        result.password_required = encrypted_entries > 0;
-
-        if error.is_empty() {
-            result.plausible = true;
-            result.content_integrity_warning = content_warning.to_owned();
-        } else {
-            result.error = error.to_string();
-        }
+        let walk = self.walk_zip_central_directory(
+            archive_offset,
+            physical_central_offset,
+            effective_central_directory_size,
+            effective_total_entries as usize,
+            disk_starts.filter(|_| is_multi_disk),
+        )?;
+        result.walk_ok = walk.error.is_empty();
+        result.password_required = walk.password_required;
+        result.error = walk.error;
+        result.content_integrity_warning = result.walk_ok && walk.content_warning;
         Ok(result)
     }
 
@@ -261,34 +215,41 @@ impl AnalysisBinaryView {
         let mut cursor = physical_central_offset;
         let end = physical_central_offset + central_directory_size;
         let mut walk = ZipDirectoryWalk::default();
+        let mut header = [0u8; 46];
+        let mut local = [0u8; 30];
+        let mut extra = Vec::new();
         for index in 0..total_entries {
             if cursor.saturating_add(46) > end {
-                return Ok(walk.failed(false, "central_directory_entry_out_of_range"));
+                return Ok(walk.failed("central_directory_entry_out_of_range"));
             }
-            let header = zip_window_read(&mut directory, cursor, 46)?;
-            if header.len() < 46 || &header[0..4] != ZIP_CENTRAL {
-                return Ok(walk.failed(false, "bad_central_directory_entry_signature"));
+            let count = zip_window_read(&mut directory, cursor, &mut header)?;
+            if count < header.len() || &header[..4] != ZIP_CENTRAL {
+                return Ok(walk.failed("bad_central_directory_entry_signature"));
             }
-            if u16_le(&header, 8) & 0x0001 != 0 {
-                walk.encrypted_entries += 1;
-            }
+            walk.password_required |= u16_le(&header, 8) & 0x0001 != 0;
             let filename_len = u16_le(&header, 28) as u64;
             let extra_len = u16_le(&header, 30) as usize;
             let comment_len = u16_le(&header, 32) as u64;
             let entry_size = 46 + filename_len + extra_len as u64 + comment_len;
             if cursor.saturating_add(entry_size) > end {
-                return Ok(walk.failed(false,
-                    "central_directory_variable_fields_out_of_range",
-                ));
+                return Ok(walk.failed("central_directory_variable_fields_out_of_range"));
             }
-            let extra = if extra_len == 0 {
-                Vec::new()
-            } else {
-                zip_window_read(&mut directory, cursor + 46 + filename_len, extra_len)?
-            };
-            let Some(location) = crate::formats::zip::zip64::central_entry_values(&header, &extra)
-            else {
-                return Ok(walk.failed(true, "zip64_extra_missing_or_invalid"));
+            use crate::formats::zip::zip64::central_entry_values;
+            let mut location = central_entry_values(&header, &[]);
+            if location.is_none() && extra_len != 0 {
+                // Only ZIP64 sentinel fields require the variable extra data.
+                if extra.len() < extra_len {
+                    extra = crate::io::resource_error::zeroed_bytes(extra_len)?;
+                }
+                let count = zip_window_read(
+                    &mut directory,
+                    cursor + 46 + filename_len,
+                    &mut extra[..extra_len],
+                )?;
+                location = central_entry_values(&header, &extra[..count]);
+            }
+            let Some(location) = location else {
+                return Ok(walk.failed("zip64_extra_missing_or_invalid"));
             };
             let local_logical = if let Some(starts) = disk_starts {
                 self.zip_logical_offset_for_disk(starts, location.disk, location.local_offset)
@@ -296,226 +257,95 @@ impl AnalysisBinaryView {
                 archive_offset.checked_add(location.local_offset)
             };
             let Some(local_logical) = local_logical else {
-                return Ok(walk.failed(true, "local_header_link_mismatch"));
+                return Ok(walk.failed("local_header_link_mismatch"));
             };
-            // Fetch once for both link validation and the existing bounded CRC
-            // consistency hint. Later entries only need their four-byte signature.
-            let check_crc = index < 8 && walk.content_warning.is_empty();
-            let local =
-                zip_window_read(&mut locals, local_logical, if check_crc { 30 } else { 4 })?;
-            if local.len() < 4 || &local[..4] != ZIP_LOCAL {
-                return Ok(walk.failed(true, "local_header_link_mismatch"));
+            // Only a prefixed ZIP can become a carved range here. Ordinary
+            // EOCD detection has already ruled out trailing bytes, so its
+            // bounded CRC hint would be discarded.
+            let check_crc = archive_offset != 0 && index < 8 && !walk.content_warning;
+            let length = if check_crc { local.len() } else { 4 };
+            let count = zip_window_read(&mut locals, local_logical, &mut local[..length])?;
+            if count < 4 || &local[..4] != ZIP_LOCAL {
+                return Ok(walk.failed("local_header_link_mismatch"));
             }
-            if check_crc && local.len() >= 30 {
-                walk.content_warning = if u16_le(&local, 6) & 0x0008 != 0 {
-                    "data_descriptor_or_deferred_crc"
-                } else if u32_le(&local, 14) != u32_le(&header, 16) {
-                    "local_header_crc_mismatch"
-                } else {
-                    ""
-                };
+            if check_crc && count == local.len() {
+                walk.content_warning =
+                    u16_le(&local, 6) & 0x0008 != 0 || u32_le(&local, 14) != u32_le(&header, 16);
             }
             cursor += entry_size;
         }
-        walk.directory_ok =
+        let complete =
             crate::formats::zip::central_directory_complete(cursor, end, |offset, length| {
-                zip_window_read(&mut directory, offset, length)
+                let count = zip_window_read(&mut directory, offset, &mut header[..length])?;
+                Ok::<_, io::Error>(header[..count].to_vec())
             })?;
-        walk.links_ok = walk.directory_ok;
-        if !walk.directory_ok {
-            return Ok(walk.failed(false, "central_directory_size_mismatch"));
+        if !complete {
+            return Ok(walk.failed("central_directory_size_mismatch"));
         }
         Ok(walk)
     }
 
-    fn walk_tar(&self, start_offset: u64) -> std::io::Result<TarObservation> {
-        let mut result = TarObservation::default();
-
+    fn walk_tar(&self) -> io::Result<TarObservation> {
         let size = self.reader.len();
-        let mut cursor = start_offset;
-        let mut checked = 0usize;
-        let mut zero_blocks = 0usize;
-        let mut tar_state = crate::formats::tar::TarState::default();
-        if start_offset.saturating_add(TAR_BLOCK_SIZE as u64) > size {
-            let fault = ReadFault::short_read(
-                "read_record",
-                start_offset,
-                TAR_BLOCK_SIZE,
-                size.saturating_sub(start_offset) as usize,
-                size,
-            )
-            .with_field("tar.member.header", FieldLocation::Head);
-            result.error = "short_tar_header".to_owned();
-            result.read_fault = Some(fault);
-            return Ok(result);
-        }
+        let mut cursor = 0u64;
+        let mut seen_member = false;
+        let mut seen_zero = false;
+        let mut state = crate::formats::tar::TarState::default();
         while cursor.saturating_add(TAR_BLOCK_SIZE as u64) <= size {
-            let location = if checked == 0 {
-                FieldLocation::Head
-            } else {
-                FieldLocation::Body
-            };
-            let header = match self.read_field_at_bytes(
-                cursor,
-                TAR_BLOCK_SIZE,
-                "tar.member.header",
-                location,
-            ) {
-                Ok(data) => data,
-                Err(fault) => {
-                    result.error = "tar_header_read_failed".to_owned();
-                    result.read_fault = Some(fault);
-                    return Ok(result);
+            let header = self.reader.read_cached_at(cursor, TAR_BLOCK_SIZE)?;
+            if header.len() != TAR_BLOCK_SIZE {
+                return Ok(TarObservation::Unrecognized);
+            }
+            if header.iter().all(|&byte| byte == 0) {
+                if !seen_member {
+                    return Ok(TarObservation::Unrecognized);
                 }
-            };
-            if header.iter().all(|byte| *byte == 0) {
-                if checked == 0 {
-
-                    result.error = "leading_zero_block".to_owned();
-                    return Ok(result);
-                }
-                zero_blocks += 1;
                 cursor += TAR_BLOCK_SIZE as u64;
-                if zero_blocks >= 2 {
-                    result.plausible = checked > 0;
-
-                    result.walk_complete = true;
-
-                    result.segment_end = Some(cursor);
-
-                    return Ok(result);
+                if seen_zero {
+                    return Ok(TarObservation::Terminated(cursor));
                 }
+                seen_zero = true;
                 continue;
             }
-            // Candidate recognition belongs to the native walker.  This lets
-            // The extraction planner can dispatch damaged TAR files without re-reading or parsing
-            // archive bytes as a fallback.
-            zero_blocks = 0;
-            let first_identity = (checked == 0).then(|| tar_header_identity(&header, cursor, size));
-            if let Some(identity) = first_identity {
-                result.magic_matched = identity.ustar_magic
-                        || (identity.name_nonempty
-                            && identity.numeric_fields_valid
-                            && identity.typeflag_valid);
-            }
-            let member_size = first_identity.map_or_else(
-                || crate::formats::tar::header_size(&header),
-                |identity| identity.validated_size,
-            );
-            let member_size = match member_size {
-                Ok(size) => size,
-                Err(error) => {
-
-                    result.error = error.to_string();
-                    let flag = match header[156] {
-                        b'x' | b'g' => "pax_header_bad",
-                        b'L' | b'K' => "gnu_longname_bad",
-                        b'S' => "sparse_header_bad",
-                        _ if error == "checksum_mismatch" => "tar_checksum_bad",
-                        _ => "tar_metadata_bad",
-                    };
-                    result.damage_flags = [flag].into_iter().map(str::to_owned).collect();
-                    if checked > 0 {
-                        result.plausible = true;
-
-                        result.segment_end = None;
-                    }
-                    return Ok(result);
-                }
+            seen_zero = false;
+            let Ok(member_size) = crate::formats::tar::header_size(&header) else {
+                break;
             };
-            let record = (|| {
-                tar_state.advance_validated(
-                    &header,
-                    member_size,
-                    cursor,
-                    size,
-                    &mut |start, length| {
-                        self.reader
-                            .read_cached_at(start, length)
-                            .map(|data| data.to_vec())
-                    },
-                )
-            })();
-            let next_cursor = match record {
-                Ok(record) => record.next,
-                Err(error) => {
-
-                    result.plausible = checked > 0;
-
-                    if error.kind() == io::ErrorKind::OutOfMemory {
-                        result.plausible = true;
-
-                        result.error = "analysis_resource_limit".to_owned();
-                    } else if error.kind() == io::ErrorKind::UnexpectedEof {
-                        let payload_start = cursor.saturating_add(TAR_BLOCK_SIZE as u64);
-                        let fault = ReadFault::short_read(
-                            "read_declared_range",
-                            payload_start,
-                            usize::try_from(member_size.saturating_add(tar_padding(member_size)))
-                                .unwrap_or(usize::MAX),
-                            size.saturating_sub(payload_start) as usize,
-                            size,
-                        )
-                        .with_field("tar.member.payload", FieldLocation::Tail);
-                        result.error = "member_payload_out_of_range".to_owned();
-                        result.read_fault = Some(fault);
-                    } else {
-                        result.error = error.to_string();
-                        let flag = match header[156] {
-                            b'x' | b'g' => "pax_header_bad",
-                            b'L' | b'K' => "gnu_longname_bad",
-                            b'S' => "sparse_header_bad",
-                            _ => "tar_metadata_bad",
-                        };
-                        result.damage_flags = [flag].into_iter().map(str::to_owned).collect();
-                    }
-                    return Ok(result);
-                }
-            };
-            checked += 1;
-            cursor = next_cursor;
-        }
-        if checked > 0 && cursor == size {
-            result.plausible = true;
-
-            result.walk_complete = true;
-            result.segment_end = Some(cursor);
-
-            result.error = "tar_end_zero_blocks_missing_at_eof".to_owned();
-            result.damage_flags = ["missing_end_block"].into_iter().map(str::to_owned).collect();
-        } else if checked > 0 {
-            result.plausible = true;
-
-            result.segment_end = None;
-
-            let fault = ReadFault::short_read(
-                "read_record",
+            match state.advance_validated(
+                &header,
+                member_size,
                 cursor,
-                TAR_BLOCK_SIZE * 2,
-                size.saturating_sub(cursor).min((TAR_BLOCK_SIZE * 2) as u64) as usize,
                 size,
-            )
-            .with_field("tar.archive.end_zero_blocks", FieldLocation::Tail);
-            result.error = "tar_end_zero_blocks_not_found".to_owned();
-            result.read_fault = Some(fault);
+                &mut |start, length| self.reader.read_at(start, length),
+            ) {
+                Ok(record) => cursor = record.next,
+                Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                    return Ok(TarObservation::Recognized(None));
+                }
+                Err(_) => break,
+            }
+            seen_member = true;
         }
-        Ok(result)
+        // A member ending at EOF identifies TAR even without its terminator.
+        // Otherwise retain the format hint without claiming a bounded range.
+        Ok(if seen_member {
+            TarObservation::Recognized((cursor == size).then_some(cursor))
+        } else {
+            TarObservation::Unrecognized
+        })
     }
 }
 
 /// Results of the single bounded directory walk, shared by all ZIP projections.
 #[derive(Default)]
 struct ZipDirectoryWalk {
-    directory_ok: bool,
-    links_ok: bool,
-    encrypted_entries: usize,
+    password_required: bool,
     error: &'static str,
-    content_warning: &'static str,
+    content_warning: bool,
 }
 
 impl ZipDirectoryWalk {
-    fn failed(mut self, directory_ok: bool, error: &'static str) -> Self {
-        self.directory_ok = directory_ok;
+    fn failed(mut self, error: &'static str) -> Self {
         self.error = error;
         self
     }
@@ -525,8 +355,8 @@ impl ZipDirectoryWalk {
 fn zip_window_read(
     reader: &mut std::io::BufReader<crate::io::reader::SourceCursor>,
     offset: u64,
-    length: usize,
-) -> std::io::Result<Vec<u8>> {
+    bytes: &mut [u8],
+) -> io::Result<usize> {
     use std::io::{Seek, SeekFrom};
     let current = reader.stream_position()?;
     if let Ok(delta) = i64::try_from(i128::from(offset) - i128::from(current)) {
@@ -534,9 +364,8 @@ fn zip_window_read(
     } else {
         reader.seek(SeekFrom::Start(offset))?;
     }
-    let mut bytes = crate::io::resource_error::zeroed_bytes(length)?;
     let mut used = 0;
-    while used < length {
+    while used < bytes.len() {
         match reader.read(&mut bytes[used..]) {
             Ok(0) => break,
             Ok(count) => used += count,
@@ -544,6 +373,5 @@ fn zip_window_read(
             Err(error) => return Err(reader_error(error)),
         }
     }
-    bytes.truncate(used);
-    Ok(bytes)
+    Ok(used)
 }

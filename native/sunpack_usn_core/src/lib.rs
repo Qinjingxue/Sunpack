@@ -9,8 +9,8 @@ mod types;
 
 #[cfg(feature = "client")]
 pub use client::{
-    broker_acquire, broker_for_each_directory_change, broker_probe_volume,
-    broker_read_change_reasons, broker_release, broker_volume_cursor,
+    broker_acquire, broker_for_each_directory_change, broker_read_change_reasons, broker_release,
+    broker_volume_cursor,
 };
 #[cfg(feature = "journal")]
 pub use journal::JournalReader;

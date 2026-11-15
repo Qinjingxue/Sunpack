@@ -118,7 +118,10 @@ def test_disguised_split_head_resolves_unchanged_continuation_names(package, tmp
         assert list(output.rglob(case.marker_name)), (_scan_head(package, case, head), events)
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
-    assert not any(inputs.iterdir())
+    if entry_mode == "cli":
+        assert not inputs.exists()
+    else:
+        assert not any(inputs.iterdir())
 
 
 @pytest.mark.parametrize("entry_mode", ["cli", WATCH])
@@ -156,7 +159,10 @@ def test_opaque_carrier_head_recovers_when_tail_arrives(package, tmp_path, split
         assert list(output.rglob(case.marker_name)), (_scan_head(package, case, head), events)
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
-    assert not any(inputs.iterdir())
+    if entry_mode == "cli":
+        assert not inputs.exists()
+    else:
+        assert not any(inputs.iterdir())
 
 
 @pytest.mark.parametrize("entry_mode", ["cli", WATCH])

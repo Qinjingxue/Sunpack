@@ -736,32 +736,25 @@ namespace sunpack::sevenzip
 
                 dry_run_(dry_run),
 
-                output_trace_(output_trace)
-#ifdef SUP7Z_DEBUG
-                , pipeline_timing_(pipeline_timing)
-#endif
-                ,
-                async_writer_(dry_run ? nullptr : (shared_writer ? std::move(shared_writer) : std::make_shared<AsyncFileWriter>())),
+                output_trace_(output_trace),
+
+                async_writer_(dry_run ? nullptr : std::move(shared_writer)),
 
                 cancel_token_(std::move(cancel_token)),
 
-                async_job_(async_writer_ ? async_writer_->make_job(0, cancel_token_
-#ifdef SUP7Z_DEBUG
-                    , pipeline_timing_
-#endif
-                    ) : nullptr),
-
-                output_root_(win32_extended_path(output_dir)),
+                output_root_(dry_run ? std::filesystem::path{} : std::filesystem::path(win32_extended_path(output_dir))),
 
                 replay_(current_extraction_replay),
-                output_root_initially_empty_(replay_ && replay_->initialized ? replay_->root_was_empty : directory_is_empty_or_missing(output_root_)),
-                output_paths_(output_root_, replay_)
+                output_root_initially_empty_(!dry_run &&
+                    (replay_ && replay_->initialized ? replay_->root_was_empty : directory_is_empty_or_missing(output_root_))),
+                output_paths_(output_root_, dry_run ? nullptr : replay_)
         {
-            if (replay_ && !replay_->initialized) {
-                replay_->root_was_empty = output_root_initially_empty_;
+            if (!dry_run_)
+            {
+                if (replay_ && !replay_->initialized)
+                    replay_->root_was_empty = output_root_initially_empty_;
+                output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
             }
-            output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
-            created_directories_.reserve(static_cast<std::size_t>(estimated_items) + 1U);
             // Query the handler's property schema once. ZIP/7z/stream hot paths
             // need neither a per-file link query nor a link index.
             UInt32 count = 0;
@@ -775,6 +768,17 @@ namespace sunpack::sevenzip
                     SysFreeString(name);
                     if (hr == S_OK && property == kpidHardLink) { supports_hard_links_ = true; break; }
                 }
+            // Register only after callback setup succeeds. A failed
+            // constructor cannot unregister a writer job in its destructor.
+            if (!dry_run_)
+            {
+                if (!async_writer_) async_writer_ = std::make_shared<AsyncFileWriter>();
+                async_job_ = async_writer_->make_job(0, cancel_token_
+#ifdef SUP7Z_DEBUG
+                    , pipeline_timing
+#endif
+                );
+            }
         }
 
         ~ExtractToDiskCallback() { finalize_output(); }
@@ -798,7 +802,6 @@ namespace sunpack::sevenzip
 
         UInt32 files_written() const { return files_written_; }
 
-        UInt32 dirs_written() const { return dirs_written_; }
 
 
         UInt64 completed_bytes() const { return completed_bytes_; }
@@ -839,21 +842,17 @@ namespace sunpack::sevenzip
             if (!async_writer_)
             {
                 output_paths_.clear();
-                for (const auto &item : output_trace_.items)
-                    output_trace_.total_bytes_written += item.bytes_written;
                 finalize_hard_links();
                 return;
             }
 
             const HRESULT writer_error = async_writer_->finish_job(async_job_);
             bool has_failed_file = false;
-            UInt64 total_written = 0;
             UInt32 completed_files = 0;
             for (const auto &state : async_files_)
             {
                 auto snapshot = async_writer_->take_file_snapshot(state);
                 auto &item = output_trace_.items[state->trace_index];
-                total_written += snapshot.written_bytes;
                 const bool decoder_ok = snapshot.operation_result_set &&
                                         snapshot.operation_result == kOpOk;
                 const bool output_ok = snapshot.closed && !snapshot.failed;
@@ -884,7 +883,6 @@ namespace sunpack::sevenzip
                 }
             }
             files_written_ = completed_files;
-            output_trace_.total_bytes_written = total_written;
             if (writer_error != S_OK)
             {
                 output_error_ = true;
@@ -1033,12 +1031,14 @@ namespace sunpack::sevenzip
             if (is_hard_link)
                 hard_link = prop_text(value);
             clear_prop(value);
-            // RAR5 exposes a zero CRC for its payload-less link record. It is
-            // not a checksum of the referenced file; finalization inherits the
-            // verified target receipt instead of comparing against that zero.
-            const bool has_source_crc32 = !is_dir && !is_hard_link &&
-                get_item_property(archive_, index, kpidCRC, value);
-            clear_prop(value);
+            // CRC availability proves a password only on an encrypted
+            // payload. RAR5's payload-less link record cannot prove it.
+            bool has_source_crc32 = false;
+            if (encrypted && !is_hard_link)
+            {
+                has_source_crc32 = get_item_property(archive_, index, kpidCRC, value);
+                clear_prop(value);
+            }
 
             if (name.empty())
             {
@@ -1064,7 +1064,6 @@ namespace sunpack::sevenzip
             if (is_dir && (item.path == L"." || item.path == L"./" || item.path == L".\\"))
             {
                 emit("item_start");
-                dirs_written_ += 1;
                 return S_OK;
             }
 
@@ -1124,8 +1123,6 @@ namespace sunpack::sevenzip
 
                     if (directory_ready)
                     {
-                        dirs_written_ += 1;
-
                         return S_OK;
                     }
                 }
@@ -1417,7 +1414,6 @@ namespace sunpack::sevenzip
                                     item.done = true;
                                     item.operation_result = kOpOk;
                                     ++files_written_;
-                                    output_trace_.total_bytes_written += item.bytes_written;
                                     error = 0;
                                 }
                                 else
@@ -1728,10 +1724,6 @@ namespace sunpack::sevenzip
         std::vector<HardLink> hard_links_;
         bool supports_hard_links_ = false;
 
-#ifdef SUP7Z_DEBUG
-        PipelineTiming *pipeline_timing_ = nullptr;
-#endif
-
         std::shared_ptr<AsyncFileWriter> async_writer_;
 
         std::shared_ptr<std::atomic<bool>> cancel_token_;
@@ -1768,7 +1760,6 @@ namespace sunpack::sevenzip
 
         UInt32 files_written_ = 0;
 
-        UInt32 dirs_written_ = 0;
 
         std::size_t current_trace_index_ = 0;
 

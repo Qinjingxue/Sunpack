@@ -15,18 +15,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub(crate) mod active_outputs;
 
-fn recorded_file_presence(path: &str) -> Option<bool> {
+pub(crate) fn recorded_file_is_absent(path: &str) -> bool {
     match std::fs::metadata(path) {
-        Ok(metadata) => Some(metadata.is_file()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Some(false)
-        }
-        Err(_) => None,
+        Ok(metadata) => !metadata.is_file(),
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
     }
 }
 
@@ -633,11 +628,8 @@ impl NativeWatchOperations {
             .0
             .extend(Arc::unwrap_or_clone(other.operations).0);
     }
-}
-
-impl NativeWatchOperations {
-    pub(crate) fn __len__(&self) -> usize {
-        self.operations.0.len()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.operations.0.is_empty()
     }
 }
 
@@ -818,10 +810,9 @@ impl NativeWatchState {
                 if let Some(members) = group["members"].as_array_mut() {
                     members.retain(|member| {
                         member.as_str().is_some_and(|member| {
-                            *member_presence
+                            !*member_presence
                                 .entry(path_key(member))
-                                .or_insert_with(|| recorded_file_presence(member))
-                                != Some(false)
+                                .or_insert_with(|| recorded_file_is_absent(member))
                         })
                     });
                     if !members.is_empty() {
@@ -1125,12 +1116,8 @@ impl NativeWatchState {
         }
     }
 
-    pub(crate) fn attach_events(
-        &self,
-        log: &crate::event_log::NativeEventLog,
-    ) -> std::io::Result<()> {
-        *self.events.lock().unwrap() = Some(Arc::downgrade(log.shared()?));
-        Ok(())
+    pub(crate) fn attach_events(&self, log: &crate::event_log::NativeEventLog) {
+        *self.events.lock().unwrap() = Some(Arc::downgrade(log.shared()));
     }
 
     pub(crate) fn unload(&self) {
@@ -1260,33 +1247,20 @@ impl NativeWatchState {
         }
     }
 
-    /// ``(key, recorded path)`` in the requested retry-entry scope.
-    pub(crate) fn entry_paths(&self, path: Option<&str>, recursive: bool) -> Vec<(String, String)> {
-        let expected = path.map(path_key);
+    pub(crate) fn entries_in_scope(
+        &self,
+        key: Option<&str>,
+        recursive: bool,
+    ) -> Vec<Arc<EntryRecord>> {
         let data = self.lock();
-        let mut paths: Vec<_> = if let Some(key) = expected.as_ref().filter(|_| !recursive) {
-            data.entries
-                .get(key)
-                .map(|record| (key.clone(), record.path.clone()))
-                .into_iter()
-                .collect()
-        } else {
-            data.entries
-                .iter()
-                .filter(|(key, _)| {
-                    expected
-                        .as_ref()
-                        .is_none_or(|expected| *key == expected || is_path_under(key, expected))
-                })
-                .map(|(key, record)| (key.clone(), record.path.clone()))
-                .collect()
-        };
-        paths.sort();
-        paths
-    }
-
-    pub(crate) fn file_presence(path: &str) -> Option<bool> {
-        recorded_file_presence(path)
+        match key {
+            None => data.entries.values().cloned().collect(),
+            Some(key) if !recursive => data.entries.get(key).cloned().into_iter().collect(),
+            Some(key) => data.entries.iter()
+                .filter(|(candidate, _)| *candidate == key || is_path_under(candidate, key))
+                .map(|(_, record)| Arc::clone(record))
+                .collect(),
+        }
     }
 
     #[cfg(test)]

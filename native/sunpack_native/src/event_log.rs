@@ -32,9 +32,7 @@ impl serde::Serialize for DiagnosticFailure<'_> {
 const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 type Record = Arc<Vec<u8>>;
 fn encode(value: &Value) -> Record {
-    let mut bytes = serde_json::to_vec(value).expect("JSON value");
-    bytes.push(b'\n');
-    Arc::new(bytes)
+    Arc::new(serde_json::to_vec(value).expect("JSON value"))
 }
 fn key(path: &str) -> String {
     crate::path_keys::path_key(path)
@@ -715,7 +713,6 @@ impl Shared {
         let mut state = self.state.lock().unwrap();
         if state.retention_days != retention_days {
             state.retention_days = retention_days;
-            state.live_dirty = self.stateful;
             state.revision += 1;
             self.wake.notify();
         }
@@ -757,7 +754,7 @@ impl Shared {
 struct Owner {
     key: String,
     shared: Arc<Shared>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    thread: Option<JoinHandle<()>>,
 }
 impl Drop for Owner {
     fn drop(&mut self) {
@@ -766,7 +763,7 @@ impl Drop for Owner {
             state.stopping = true;
             self.shared.wake.notify();
         }
-        if let Some(thread) = self.thread.lock().unwrap().take() {
+        if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
         let (owners, retired) = owners();
@@ -908,17 +905,12 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
 }
 
 pub(crate) struct NativeEventLog {
-    owner: Option<Arc<Owner>>,
+    owner: Arc<Owner>,
 }
 impl NativeEventLog {
-    pub(crate) fn shared(&self) -> std::io::Result<&Arc<Shared>> {
-        self.owner
-            .as_ref()
-            .map(|o| &o.shared)
-            .ok_or_else(|| std::io::Error::other("event log is closed"))
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.owner.shared
     }
-}
-impl NativeEventLog {
     pub(crate) fn new(path: PathBuf, retention_days: u32, stateful: bool) -> std::io::Result<Self> {
         let path = std::path::absolute(path)?;
         let (registry, retired) = owners();
@@ -926,8 +918,9 @@ impl NativeEventLog {
         let id = key(&path.to_string_lossy());
         while let Some(owner) = owners.get(&id) {
             if let Some(owner) = owner.upgrade() {
+                drop(owners);
                 owner.shared.configure_retention(retention_days);
-                return Ok(Self { owner: Some(owner) });
+                return Ok(Self { owner });
             }
             owners = retired.wait(owners).unwrap();
         }
@@ -958,79 +951,92 @@ impl NativeEventLog {
         let owner = Arc::new(Owner {
             key: id.clone(),
             shared,
-            thread: Mutex::new(Some(thread)),
+            thread: Some(thread),
         });
         owners.insert(id, Arc::downgrade(&owner));
-        Ok(Self { owner: Some(owner) })
+        Ok(Self { owner })
     }
-    pub(crate) fn configure_retention(&self, retention_days: u32) -> std::io::Result<()> {
-        self.shared()?.configure_retention(retention_days);
-        Ok(())
+    pub(crate) fn configure_retention(&self, retention_days: u32) {
+        self.shared().configure_retention(retention_days);
     }
     pub(crate) fn write(&self, value: Value) -> std::io::Result<()> {
-        self.shared()?.submit(event_value(value)?);
+        self.shared().submit(event_value(value)?);
         Ok(())
     }
     pub(crate) fn write_failure(&self, value: Value, failure: &crate::pipeline::Failure) -> std::io::Result<()> {
         let project = |budget: &mut usize, truncated: &mut bool|
             diagnostic::value(&DiagnosticFailure(failure), budget, truncated);
-        self.shared()?.submit(event_value_with(value, Some(("failure", &project)))?);
+        self.shared().submit(event_value_with(value, Some(("failure", &project)))?);
         Ok(())
     }
-    pub(crate) fn recover(&self, state: Option<&NativeWatchState>) -> std::io::Result<()> {
-        match state {
-            Some(state) => state.with_event_projection(|rows| self.reset(rows)),
-            None => self.reset(Vec::new()),
-        }
+    pub(crate) fn recover(&self, watch: &NativeWatchState) {
+        watch.with_event_projection(|rows| {
+            let shared = self.shared();
+            let mut state = shared.state.lock().unwrap();
+            state.reset_live = true;
+            state.projection = Projection::default();
+            for mut value in rows {
+                let _ = state.projection.apply(&mut value);
+            }
+            state.live_dirty = true;
+            state.revision += 1;
+            shared.wake.notify();
+        });
     }
-    pub(crate) fn rebuild(&self) -> std::io::Result<()> {
-        let shared = self.shared()?;
+    pub(crate) fn rebuild(&self) {
+        let shared = self.shared();
         let mut state = shared.state.lock().unwrap();
         state.rebuild = true;
         state.revision += 1;
         shared.wake.notify();
-        Ok(())
     }
     pub(crate) fn flush(&self) -> std::io::Result<()> {
-        let shared = Arc::clone(self.shared()?);
-        (move || {
-            let mut state = shared.state.lock().unwrap();
-            if state.error.is_some() && !state.stopping {
-                state.revision += 1;
-                shared.wake.notify();
-            }
-            while state.working || state.published != state.revision {
-                state = shared.drained.wait(state).unwrap();
-            }
-            match &state.error {
-                Some(e) => Err(std::io::Error::other(e.clone())),
-                None => Ok(()),
-            }
-        })()
-    }
-    pub(crate) fn error(&self) -> std::io::Result<Option<String>> {
-        Ok(self.shared()?.state.lock().unwrap().error.clone())
-    }
-}
-impl NativeEventLog {
-    pub(crate) fn reset(&self, rows: Vec<Value>) -> std::io::Result<()> {
-        let shared = self.shared()?;
+        let shared = self.shared();
         let mut state = shared.state.lock().unwrap();
-        state.reset_live = true;
-        state.projection = Projection::default();
-        for mut value in rows {
-            let _ = state.projection.apply(&mut value);
+        if state.error.is_some() && !state.stopping {
+            state.revision += 1;
+            shared.wake.notify();
         }
-        state.live_dirty = true;
-        state.revision += 1;
-        shared.wake.notify();
-        Ok(())
+        while state.working || state.published != state.revision {
+            state = shared.drained.wait(state).unwrap();
+        }
+        match &state.error {
+            Some(e) => Err(std::io::Error::other(e.clone())),
+            None => Ok(()),
+        }
+    }
+    pub(crate) fn error(&self) -> Option<String> {
+        self.shared().state.lock().unwrap().error.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_expiration_trims_overlapping_runs_and_reopens_the_surviving_run() {
+        let root = gui_contract::Directory::new("history_overlap");
+        let path = root.0.join("events.json");
+        let mut store = Store::open(path).unwrap();
+        let row = json!({"event":"done","path":"archive.zip"});
+        for ts in [1000, 2000, 1500] {
+            store.append(&row, ts).unwrap();
+        }
+        assert_eq!(store.expire(999).unwrap(), Some(1000));
+        assert_eq!(store.expire(1500).unwrap(), Some(2000));
+        store.publish().unwrap();
+
+        store.append(&row, 3000).unwrap();
+        let [run] = store.manifest.runs.as_slice() else {
+            panic!("expected one surviving run");
+        };
+        assert_eq!((run.head, run.first, run.last, run.count), (1, 2000, 3000, 3));
+        assert_eq!(store.expire(3000).unwrap(), None);
+        store.publish().unwrap();
+        store.append(&row, 4000).unwrap();
+        assert_eq!(store.expire(3000).unwrap(), Some(4000));
+    }
 
     #[test]
     fn archive_diagnostics_do_not_expand_or_change_shared_recovery_receipts() {

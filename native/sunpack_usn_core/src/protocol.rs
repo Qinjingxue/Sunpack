@@ -69,17 +69,17 @@ impl TryFrom<u16> for Status {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Request {
+pub struct Request<'a> {
     pub opcode: Opcode,
     pub request_id: u64,
     pub previous_usn: i64,
     pub current_usn: i64,
     pub file_id: [u8; FILE_ID_BYTES],
     pub file_id_len: u8,
-    pub volume_guid: String,
+    pub volume_guid: &'a str,
 }
 
-impl Request {
+impl<'a> Request<'a> {
     pub fn simple(opcode: Opcode, request_id: u64) -> Self {
         Self {
             opcode,
@@ -88,7 +88,7 @@ impl Request {
             current_usn: 0,
             file_id: [0; FILE_ID_BYTES],
             file_id_len: 0,
-            volume_guid: String::new(),
+            volume_guid: "",
         }
     }
 
@@ -120,7 +120,7 @@ impl Request {
         Ok(bytes)
     }
 
-    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+    pub fn decode(bytes: &'a [u8]) -> io::Result<Self> {
         if bytes.len() != REQUEST_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -146,8 +146,7 @@ impl Request {
         let file_id_width = usize::from(file_id_len);
         file_id[..file_id_width].copy_from_slice(&bytes[32..32 + file_id_width]);
         let volume_guid = std::str::from_utf8(&bytes[48..48 + volume_len])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "volume GUID is not UTF-8"))?
-            .to_owned();
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "volume GUID is not UTF-8"))?;
         Ok(Self {
             opcode,
             request_id: u64::from_le_bytes(bytes[6..14].try_into().unwrap()),
@@ -246,7 +245,7 @@ mod tests {
             current_usn: 101,
             file_id,
             file_id_len: 8,
-            volume_guid: r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned(),
+            volume_guid: r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}",
         };
         assert_eq!(
             Request::decode(&request.encode().unwrap()).unwrap(),
