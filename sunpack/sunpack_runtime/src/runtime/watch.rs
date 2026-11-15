@@ -6489,7 +6489,13 @@ fn recovery_scan_paths(
     result: io::Result<(Vec<PathBuf>, Vec<crate::io::directory_errors::DirectoryReadError>)>,
 ) -> io::Result<Vec<PathBuf>> {
     match result {
-        Ok((paths, _errors)) => Ok(paths),
+        Ok((paths, errors)) => {
+            for (operation, path, error) in errors {
+                journal.log(json!({"event":"crash_resume_scan_failed", "owner_path":owner,
+                    "root":root, "operation":operation, "path":path, "error":error}));
+            }
+            Ok(paths)
+        }
         Err(error) => {
             journal.log(json!({"event":"crash_resume_scan_failed", "owner_path":owner,
                 "root":root, "error":error.to_string()}));

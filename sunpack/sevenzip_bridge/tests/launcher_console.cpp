@@ -42,12 +42,13 @@ void development_entrypoint_contract() {
     fs::remove_all(root);
 }
 
-void key(HANDLE input, wchar_t value) {
+void key(HANDLE input, wchar_t value, WORD repeat = 1) {
     INPUT_RECORD record{};
     record.EventType = KEY_EVENT;
     record.Event.KeyEvent.bKeyDown = TRUE;
-    record.Event.KeyEvent.wRepeatCount = 1;
-    record.Event.KeyEvent.wVirtualKeyCode = value == L'\r' ? VK_RETURN : static_cast<WORD>(VkKeyScanW(value) & 0xff);
+    record.Event.KeyEvent.wRepeatCount = repeat;
+    const SHORT virtual_key = VkKeyScanW(value);
+    record.Event.KeyEvent.wVirtualKeyCode = value == L'\r' ? VK_RETURN : virtual_key == -1 ? 0 : virtual_key & 0xff;
     record.Event.KeyEvent.uChar.UnicodeChar = value;
     DWORD written = 0;
     require(WriteConsoleInputW(input, &record, 1, &written) && written == 1, "inject key");
@@ -140,6 +141,15 @@ int main() {
             require(SetConsoleWindowInfo(output, TRUE, &window) != 0, "shrink viewport");
             for (wchar_t value : std::wstring(L"quietQpassword\r")) key(input, value);
             require(read_input_line().find("quietQpassword") != std::string::npos, "prompt owns Q keys");
+            // The first ReadConsoleW returns the high unit at its exact buffer
+            // boundary. The chunk must contain the whole scalar, not signal EOF.
+            key(input, L'x', 4094);
+            key(input, 0xd83d);
+            key(input, 0xde00);
+            key(input, L'\r');
+            require(read_input_line() == std::string(4094, 'x') + "\xf0\x9f\x98\x80",
+                    "preserve a surrogate pair across console reads");
+            require(read_input_line() == "\r\n", "read the subsequent line terminator");
             expect_empty(server);
             controls.resume(); // Recheck even if line input consumed the event.
             expect_resize(server, 40, 10);

@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn prompt_line_continues_across_more_than_one_frame_limit() {
+    let mut input = PromptInput::default();
+    let chunk = vec![b'x'; 4096];
+    for _ in 0..(MAX_FIELD / chunk.len()) {
+        input.push(chunk.clone()).unwrap();
+        assert!(input.line().is_none());
+    }
+    input.push(b"tail\r".to_vec()).unwrap();
+    let line = input.line().unwrap();
+    assert_eq!(line.len(), MAX_FIELD + 5);
+    assert!(line.ends_with("tail\r"));
+    input.push(b"\nnext\n".to_vec()).unwrap();
+    assert_eq!(input.line().as_deref(), Some("next\n"));
+}
+
+#[test]
 fn output_frames_keep_utf8_boundaries_and_binary_payloads() {
     // Ordinary short-output tests never cross the protocol limit. Check
     // every possible split inside a UTF-8 scalar with one reusable buffer.

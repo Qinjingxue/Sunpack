@@ -3,15 +3,12 @@ use crate::io::display_store::{utc_us, HistoryRecord, Store, DAY_US};
 use crate::io::display_wake::Wake;
 use crate::watch_store::NativeWatchState;
 use serde_json::{json, Value};
-use serde::ser::SerializeStruct;
+use serde::ser::SerializeMap;
 use std::collections::{HashMap, HashSet};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
-
-mod diagnostic;
-use diagnostic::{short_string, MAX_DEPTH, MAX_ITEMS};
 
 /// Per-archive evidence never walks the shared carrier recovery receipts.
 /// Complete recovery data retains its ordinary serializer for durable state/reports.
@@ -19,13 +16,17 @@ struct DiagnosticFailure<'a>(pub &'a crate::pipeline::Failure);
 impl serde::Serialize for DiagnosticFailure<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let failure = self.0;
-        let mut object = serializer.serialize_struct("FailureDiagnostic", 6)?;
-        object.serialize_field("kind", &failure.kind)?;
-        object.serialize_field("message", &failure.message)?;
-        if let Some(context) = &failure.context { object.serialize_field("context", context)?; }
-        if let Some(scope) = &failure.discovery_scope { object.serialize_field("discovery_scope", scope)?; }
-        if let Some(evidence) = &failure.evidence { object.serialize_field("evidence", evidence)?; }
-        if failure.password_retry { object.serialize_field("password_retry", &true)?; }
+        let count = 2 + usize::from(failure.context.is_some())
+            + usize::from(failure.discovery_scope.is_some())
+            + usize::from(failure.evidence.is_some())
+            + usize::from(failure.password_retry);
+        let mut object = serializer.serialize_map(Some(count))?;
+        object.serialize_entry("kind", &failure.kind)?;
+        object.serialize_entry("message", &failure.message)?;
+        if let Some(context) = &failure.context { object.serialize_entry("context", context)?; }
+        if let Some(scope) = &failure.discovery_scope { object.serialize_entry("discovery_scope", scope)?; }
+        if let Some(evidence) = &failure.evidence { object.serialize_entry("evidence", evidence)?; }
+        if failure.password_retry { object.serialize_entry("password_retry", &true)?; }
         object.end()
     }
 }
@@ -39,68 +40,6 @@ fn key(path: &str) -> String {
 }
 fn field<'a>(v: &'a Value, name: &str) -> &'a str {
     v[name].as_str().unwrap_or("")
-}
-
-const DIAGNOSTIC_TEXT_BYTES: usize = 4096;
-pub(crate) fn diagnostic_text(text: &str) -> &str {
-    let mut end = text.len().min(DIAGNOSTIC_TEXT_BYTES);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-fn bounded_value(value: Value, budget: &mut usize, depth: usize, truncated: &mut bool) -> Value {
-    if *budget == 0 || depth == MAX_DEPTH {
-        *truncated = true;
-        return Value::Null;
-    }
-    *budget = budget.saturating_sub(8);
-    match value {
-        Value::String(mut text) => {
-            let length = short_string(&text, *budget, truncated).len();
-            *budget -= length;
-            text.truncate(length);
-            if text.capacity() > length.saturating_mul(2) {
-                text.shrink_to_fit();
-            }
-            Value::String(text)
-        }
-        Value::Array(values) => {
-            *truncated |= values.len() > MAX_ITEMS;
-            let mut result = Vec::with_capacity(values.len().min(MAX_ITEMS));
-            for value in values.into_iter().take(MAX_ITEMS) {
-                if *budget == 0 {
-                    *truncated = true;
-                    break;
-                }
-                result.push(bounded_value(value, budget, depth + 1, truncated));
-            }
-            Value::Array(result)
-        }
-        Value::Object(values) => {
-            *truncated |= values.len() > MAX_ITEMS;
-            let mut result = serde_json::Map::new();
-            for (key, value) in values.into_iter().take(MAX_ITEMS) {
-                if *budget == 0 {
-                    *truncated = true;
-                    break;
-                }
-                let key = short_string(&key, (*budget).min(64), truncated);
-                *budget -= key.len();
-                result.insert(
-                    key.to_owned(),
-                    bounded_value(value, budget, depth + 1, truncated),
-                );
-            }
-            Value::Object(result)
-        }
-        scalar => scalar,
-    }
-}
-
-fn event_value(value: Value) -> std::io::Result<Value> {
-    event_value_with(value, None)
 }
 
 fn state_event(event: &str) -> bool {
@@ -122,71 +61,20 @@ fn state_event(event: &str) -> bool {
     )
 }
 
-type DiagnosticProjection<'a> = (&'a str, &'a dyn Fn(&mut usize, &mut bool) -> Value);
-fn event_value_with(value: Value, diagnostic: Option<DiagnosticProjection<'_>>) -> std::io::Result<Value> {
-    let Value::Object(mut fields) = value else {
-        return Err(std::io::Error::other("event must be an object"));
-    };
-    if let Some((name, _)) = diagnostic { fields.insert(name.to_owned(), Value::Null); }
-    let event_value = fields.remove("event");
-    let mut truncated = false;
-    let event = short_string(
-        event_value.as_ref().and_then(Value::as_str).unwrap_or(""),
-        64,
-        &mut truncated,
-    );
-    let state = state_event(event);
-    let mut budget = DIAGNOSTIC_TEXT_BYTES;
-    let mut result = serde_json::Map::new();
-    result.insert("event".into(), Value::String(event.to_owned()));
-    for name in [
-        "ts",
-        "path",
-        "task_path",
-        "groups",
-        "paths",
-        "processing",
-        "output_dirs",
-        "recursive",
-        "scope",
-        "retire_group",
-        "owner",
-        "task_id",
-    ] {
-        if state || name == "ts" {
-            if let Some(item) = fields.remove(name) {
-                result.insert(name.to_owned(), item);
-            }
+struct HistoryEvent<'a> {
+    fields: &'a serde_json::Map<String, Value>,
+    failure: &'a crate::pipeline::Failure,
+}
+
+impl serde::Serialize for HistoryEvent<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut event = serializer.serialize_map(Some(self.fields.len() + 1))?;
+        for (key, value) in self.fields {
+            event.serialize_entry(key, value)?;
         }
+        event.serialize_entry("failure", &DiagnosticFailure(self.failure))?;
+        event.end()
     }
-    // main's call sites put locating/classifying facts before free-form
-    // diagnostics. serde_json's sorted map must not give a large errors array
-    // the budget intended for those facts. Keep the same shared budget.
-    let priority = [
-        (event == "catalog_rebuilt").then(|| fields.remove_entry("root")).flatten(),
-        (event == "catalog_rebuilt").then(|| fields.remove_entry("reason")).flatten(),
-        fields.remove_entry("error_kind"),
-    ];
-    for (i, (key, item)) in priority.into_iter().flatten().chain(fields).enumerate() {
-        if i == MAX_ITEMS || budget == 0 {
-            truncated = true;
-            break;
-        }
-        let key = short_string(&key, budget.min(64), &mut truncated);
-        if result.contains_key(key) {
-            continue;
-        }
-        budget -= key.len();
-        let item = match diagnostic.filter(|(name, _)| *name == key) {
-            Some((_, project)) => project(&mut budget, &mut truncated),
-            None => bounded_value(item, &mut budget, 0, &mut truncated),
-        };
-        result.insert(key.to_owned(), item);
-    }
-    if truncated {
-        result.insert("truncated".into(), Value::Bool(true));
-    }
-    Ok(Value::Object(result))
 }
 
 #[derive(Default)]
@@ -704,7 +592,6 @@ struct State {
     working: bool,
     error: Option<String>,
     retention_days: u32,
-    dropped: u64,
 }
 pub(crate) struct Shared {
     state: Mutex<State>,
@@ -723,10 +610,23 @@ impl Shared {
         }
     }
 
-    pub(crate) fn submit(&self, mut value: Value) {
+    pub(crate) fn submit(&self, value: Value) -> std::io::Result<()> {
+        self.submit_event(value, None)
+    }
+
+    fn submit_event(&self, mut value: Value, failure: Option<&crate::pipeline::Failure>) -> std::io::Result<()> {
+        let fields = value.as_object_mut().ok_or_else(|| std::io::Error::other("event must be an object"))?;
+        if failure.is_some() {
+            fields.remove("failure");
+        }
         let mut state = self.state.lock().unwrap();
+        // Drain asynchronously in bounded batches. Keep events in order and
+        // let the producer wait for the writer only when the queue is full.
+        while state.queue_bytes >= QUEUE_BYTES && !state.stopping {
+            state = self.drained.wait(state).unwrap();
+        }
         if state.stopping {
-            return;
+            return Err(std::io::Error::other("display writer stopped"));
         }
         if !value["ts"].as_f64().is_some_and(|ts| ts.is_finite()) {
             value["ts"] = json!(utc_us() as f64 / 1_000_000.0);
@@ -737,22 +637,29 @@ impl Shared {
             let changed = !state.projection.dirty.is_empty() || state.projection.full_dirty;
             state.live_dirty |= changed;
             state.projection.trim();
-            if !history && !changed { return; }
-        }
-        if history {
-            // Display logging must never stall extraction or grow without bound
-            // when storage stops making progress. Report overload in the manifest.
-            let row = HistoryRecord::new(&value, timestamp(&value));
-            let bytes = row.memory_bytes();
-            if state.queue.is_empty() || state.queue_bytes + bytes <= QUEUE_BYTES {
-                state.queue_bytes += bytes;
-                state.queue.push(row);
-            } else {
-                state.dropped += 1;
+            if !history && !changed {
+                return Ok(());
             }
         }
+        let result = if history {
+            let ts = timestamp(&value);
+            let row = match failure {
+                Some(failure) => HistoryRecord::new(&value, ts, &HistoryEvent {
+                    fields: value.as_object().unwrap(),
+                    failure,
+                }),
+                None => HistoryRecord::new(&value, ts, &value),
+            };
+            row.map(|row| {
+                state.queue_bytes += row.memory_bytes();
+                state.queue.push(row);
+            })
+        } else {
+            Ok(())
+        };
         state.revision += 1;
         self.wake.notify();
+        result
     }
 }
 struct Owner {
@@ -791,7 +698,7 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
     let mut deadline = None;
     loop {
         let now = utc_us();
-        let (rows, live, days, dropped, revision, rebuild) = {
+        let (rows, live, days, revision, rebuild) = {
             let mut state = shared.state.lock().unwrap();
             let due = deadline.is_some_and(|time| time <= now);
             if state.published == state.revision && !due {
@@ -829,12 +736,13 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             } else {
                 None
             };
-            state.queue_bytes = 0;
+            if std::mem::take(&mut state.queue_bytes) >= QUEUE_BYTES {
+                shared.drained.notify_all();
+            }
             (
                 std::mem::take(&mut state.queue),
                 live,
                 state.retention_days,
-                state.dropped,
                 state.revision,
                 rebuild,
             )
@@ -871,7 +779,6 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 store.update_live(values, reset, cutoff)?;
             }
             deadline = store.expire(cutoff)?.map(|ts| ts.saturating_add(retention));
-            store.manifest.dropped += dropped;
             Ok(())
         })();
         let records_written = result.is_ok();
@@ -906,7 +813,6 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 state.revision += 1;
             }
         }
-        state.dropped = state.dropped.saturating_sub(dropped);
         state.published = revision;
         shared.drained.notify_all();
     }
@@ -946,7 +852,6 @@ impl NativeEventLog {
                 working: true,
                 error: None,
                 retention_days: retention_days.max(1),
-                dropped: 0,
             }),
             wake: Wake::new()?,
             drained: Condvar::new(),
@@ -968,14 +873,10 @@ impl NativeEventLog {
         self.shared().configure_retention(retention_days);
     }
     pub(crate) fn write(&self, value: Value) -> std::io::Result<()> {
-        self.shared().submit(event_value(value)?);
-        Ok(())
+        self.shared().submit(value)
     }
     pub(crate) fn write_failure(&self, value: Value, failure: &crate::pipeline::Failure) -> std::io::Result<()> {
-        let project = |budget: &mut usize, truncated: &mut bool|
-            diagnostic::value(&DiagnosticFailure(failure), budget, truncated);
-        self.shared().submit(event_value_with(value, Some(("failure", &project)))?);
-        Ok(())
+        self.shared().submit_event(value, Some(failure))
     }
     pub(crate) fn recover(&self, watch: &NativeWatchState) {
         watch.with_event_projection(|rows| {

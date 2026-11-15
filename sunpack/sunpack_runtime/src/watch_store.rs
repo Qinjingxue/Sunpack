@@ -767,7 +767,7 @@ pub(crate) struct NativeWatchReplay {
 
 fn entry_event(record: &EntryRecord) -> Value {
     serde_json::json!({"event":record.status,"path":record.path,"ts":record.last_attempt_at,
-        "error":crate::event_log::diagnostic_text(&record.last_error),"error_kind":record.failure_kind})
+        "error":record.last_error,"error_kind":record.failure_kind})
 }
 
 pub(crate) struct NativeWatchState {
@@ -882,7 +882,7 @@ impl NativeWatchState {
         // The authoritative map lock never covers log projection/serialization.
         if let Some(events) = events {
             for notification in notifications {
-                events.submit(notification);
+                let _ = events.submit(notification);
             }
         }
     }

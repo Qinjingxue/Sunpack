@@ -312,21 +312,28 @@ impl RecordIndex {
 
 pub(crate) struct HistoryRecord {
     index: RecordIndex,
-    raw: Vec<u8>,
+    raw: super::scratch::Blob,
 }
 
 impl HistoryRecord {
-    pub(crate) fn new(value: &Value, ts: i64) -> Self {
-        Self {
+    pub(crate) fn new(value: &Value, ts: i64, payload: &impl Serialize) -> io::Result<Self> {
+        let mut raw = super::scratch::Spool::default();
+        rmp_serde::encode::write_named(&mut raw, payload).map_err(io::Error::other)?;
+        Ok(Self {
             index: RecordIndex::new(value, ts),
-            raw: rmp_serde::to_vec(value).expect("display event encodes as MessagePack"),
-        }
+            raw: raw.finish()?,
+        })
     }
 
     pub(crate) fn timestamp(&self) -> i64 { self.index.ts }
 
     pub(crate) fn memory_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.raw.capacity()
+        let bytes = match &self.raw {
+            super::scratch::Blob::Memory(raw) => raw.capacity(),
+            // A mapped record occupies one batch no matter its length.
+            super::scratch::Blob::Mapped(_) => super::scratch::MEMORY_BYTES,
+        };
+        std::mem::size_of::<Self>() + bytes
     }
 }
 

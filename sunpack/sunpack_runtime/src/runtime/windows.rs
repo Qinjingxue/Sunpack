@@ -361,11 +361,12 @@ impl ToastPresenter<'_> {
     pub(super) fn show(&self, payload: &[u8], sequence: u64) -> io::Result<()> {
         let show: unsafe extern "C" fn(*mut c_void, *const u8, u32, u64) -> i32 =
             unsafe { std::mem::transmute(self.library.procedure(b"sunpack_toast_show\0")?) };
+        let size = u32::try_from(payload.len()).map_err(io::Error::other)?;
         hresult(unsafe {
             show(
                 self.context,
                 payload.as_ptr(),
-                payload.len() as u32,
+                size,
                 sequence,
             )
         })

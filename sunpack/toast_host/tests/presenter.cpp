@@ -132,6 +132,33 @@ int main() {
         toast_test::require(!toast_test::banner && toast_test::history.size() == 1);
         toast_test::require(toast_test::history.contains({L"first-f", kToastGroup}));
         toast_test::history.clear();
+
+        // A legal extended-length path can exceed 64 KiB when encoded as UTF-8.
+        std::vector<std::uint8_t> payload(12);
+        payload[0] = static_cast<std::uint8_t>(SnapshotKind::success);
+        payload[2] = 1;
+        const auto text = [&](std::string_view value) {
+            const auto size = static_cast<std::uint32_t>(value.size());
+            for (unsigned shift = 0; shift < 32; shift += 8)
+                payload.push_back(static_cast<std::uint8_t>(size >> shift));
+            payload.insert(payload.end(), value.begin(), value.end());
+        };
+        text("large");
+        for (int field = 0; field < 5; ++field) text({});
+        payload.push_back(static_cast<std::uint8_t>(ActionKind::open_log));
+        text("Open report");
+        std::string path = "C:\\";
+        std::string component;
+        for (int character = 0; character < 250; ++character) component += "\xe8\xb7\xaf";
+        for (int directory = 0; directory < 90; ++directory) path += component + "\\";
+        path += "failure.txt";
+        text(path);
+        ToastContext context;
+        toast_test::require(SUCCEEDED(sunpack_toast_show(&context, payload.data(),
+            static_cast<std::uint32_t>(payload.size()), 10)));
+        toast_test::require(toast_test::banner.Content().GetElementsByTagName(L"action").Length() == 1);
+        toast_test::banner = nullptr;
+        toast_test::history.clear();
         return 0;
     } catch (...) {
         return 1;

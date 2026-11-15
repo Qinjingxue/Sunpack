@@ -26,7 +26,6 @@ impl Drop for DeferredScope {
 
 const CHECKPOINT_RECORDS: u64 = 8192;
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
-const JOURNAL_HARD_BYTES: u64 = 256 * 1024 * 1024;
 const SNAPSHOT_TEMP_NAME: &str = "state.snapshot.tmp";
 
 struct Frontier {
@@ -36,7 +35,6 @@ struct Frontier {
     records: u64,
     bytes: u64,
     fault: Option<String>,
-    checkpoint_error: Option<String>,
     retirement: Option<u64>,
 }
 
@@ -119,7 +117,6 @@ impl Journal {
             records: 0,
             bytes: 0,
             fault: None,
-            checkpoint_error: None,
             retirement: None,
         };
         let mut tail = None;
@@ -453,7 +450,6 @@ impl Journal {
                 // A late append acknowledgement may conservatively retain a
                 // few already checkpointed bytes. Never undercount live WAL.
                 frontier.bytes = frontier.bytes.saturating_sub(checkpoint.bytes);
-                frontier.checkpoint_error = None;
                 frontier.retirement = retirement;
                 ensure_healthy(&frontier)
             }
@@ -466,12 +462,10 @@ impl Journal {
     }
 
     fn record_checkpoint_error(&self, error: io::Error) -> io::Result<()> {
-        let mut frontier = self.frontier.lock().unwrap();
-        frontier.checkpoint_error = Some(error.to_string());
-        let result = ensure_healthy(&frontier);
-        drop(frontier);
+        // The sealed WAL remains replayable. Keep it until a durable
+        // snapshot is published, even if snapshot publication must retry.
         self.log(serde_json::json!({"event":"watch_checkpoint_failed","error":error.to_string()}));
-        result
+        ensure_healthy(&self.frontier.lock().unwrap())
     }
 }
 
@@ -492,12 +486,6 @@ fn join_checkpoint(job: JoinHandle<io::Result<CheckpointResult>>) -> io::Result<
 fn ensure_healthy(frontier: &Frontier) -> io::Result<()> {
     if let Some(error) = &frontier.fault {
         Err(io::Error::other(error.clone()))
-    } else if frontier.bytes >= JOURNAL_HARD_BYTES {
-        match &frontier.checkpoint_error {
-            Some(error) => Err(io::Error::other(format!(
-                "Watch state checkpoint failed at the journal safety limit: {error}"))),
-            None => Ok(()),
-        }
     } else {
         Ok(())
     }

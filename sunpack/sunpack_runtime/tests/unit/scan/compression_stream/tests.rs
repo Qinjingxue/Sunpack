@@ -22,7 +22,8 @@ fn fixed_fields_preserve_refill_edges_eof_and_io_errors() {
         INITIAL_PROBE_BYTES + BUFFER_SIZE - 1,
     ] {
         let source = reader(data.clone());
-        let mut cursor = ByteCursor::new(&source, 0, source.len());
+        let mut read = |offset, count| source.read_cached_at(offset, count);
+        let mut cursor = ByteCursor::new(&mut read, 0, source.len(), CachedBytes::default());
         cursor.read_chunks(start, |_| {}).unwrap();
         assert_eq!(cursor.read_array::<3>().unwrap(), data[start..start + 3]);
         assert_eq!(
@@ -33,7 +34,8 @@ fn fixed_fields_preserve_refill_edges_eof_and_io_errors() {
         assert_eq!(cursor.read_byte().unwrap(), data[start + 11]);
     }
     let source = reader(vec![1, 2]);
-    let mut cursor = ByteCursor::new(&source, 0, source.len());
+    let mut read = |offset, count| source.read_cached_at(offset, count);
+    let mut cursor = ByteCursor::new(&mut read, 0, source.len(), CachedBytes::default());
     assert_eq!(
         cursor.read_array::<3>().unwrap_err().code(),
         "unexpected_end_of_stream"
@@ -97,7 +99,8 @@ fn gzip_optional_headers_keep_crc_terminators_and_concatenated_boundaries() {
                 let end = validate_gzip_structure(&source, 0, source.len(), |start| {
                     members.push(start);
                     Ok(())
-                }).unwrap();
+                })
+                .unwrap();
                 assert_eq!(end, data.len() as u64);
                 assert_eq!(members, [0, member.len() as u64]);
                 if crc {
@@ -154,7 +157,9 @@ fn fixed_deflate_constants_decode_all_rfc_codes_and_short_eof() {
             }
             data.extend_from_slice(&[0xa5, 0x5a]);
             let source = reader(data.clone());
-            let mut cursor = ByteCursor::new(&source, 0, data.len() as u64);
+            let mut read = |offset, count| source.read_cached_at(offset, count);
+            let mut cursor =
+                ByteCursor::new(&mut read, 0, data.len() as u64, CachedBytes::default());
             let mut bits = LsbBits::new(&mut cursor);
             bits.read(prefix as u8).unwrap();
             let tree = if distance {
@@ -171,7 +176,8 @@ fn fixed_deflate_constants_decode_all_rfc_codes_and_short_eof() {
         }
     }
     let source = reader(vec![0]);
-    let mut cursor = ByteCursor::new(&source, 0, 1);
+    let mut read = |offset, count| source.read_cached_at(offset, count);
+    let mut cursor = ByteCursor::new(&mut read, 0, 1, CachedBytes::default());
     let mut bits = LsbBits::new(&mut cursor);
     assert_eq!(FIXED_LITERAL_TREE.decode(&mut bits).unwrap(), 256);
     assert_eq!(
@@ -205,9 +211,12 @@ fn tiny_gzip_boundary_preserves_unrelated_carrier_read_budget() {
 fn deflate_rejects_back_reference_before_any_decoded_byte() {
     // Final fixed-Huffman block starts with a length-three, distance-one pair.
     let source = reader(vec![3, 2]);
-    let mut cursor = ByteCursor::new(&source, 0, source.len());
+    let mut read = |offset, count| source.read_cached_at(offset, count);
+    let mut cursor = ByteCursor::new(&mut read, 0, source.len(), CachedBytes::default());
     assert_eq!(
-        parse_deflate(&mut LsbBits::new(&mut cursor)).unwrap_err().code(),
+        parse_deflate(&mut LsbBits::new(&mut cursor))
+            .unwrap_err()
+            .code(),
         "deflate_distance_out_of_range"
     );
 }
@@ -250,7 +259,9 @@ fn huffman_lookup_preserves_codes_eof_and_following_bytes() {
                     input.extend_from_slice(&[0xa5, 0x5a]);
                 }
                 let source = reader(input.clone());
-                let mut cursor = ByteCursor::new(&source, 0, input.len() as u64);
+                let mut read = |offset, count| source.read_cached_at(offset, count);
+                let mut cursor =
+                    ByteCursor::new(&mut read, 0, input.len() as u64, CachedBytes::default());
                 match order {
                     BitOrder::Lsb => {
                         let mut bits = LsbBits::new(&mut cursor);
@@ -278,7 +289,8 @@ fn huffman_lookup_preserves_codes_eof_and_following_bytes() {
             }
         }
         let source = reader(vec![0xff]);
-        let mut cursor = ByteCursor::new(&source, 0, 1);
+        let mut read = |offset, count| source.read_cached_at(offset, count);
+        let mut cursor = ByteCursor::new(&mut read, 0, 1, CachedBytes::default());
         let error = match order {
             BitOrder::Lsb => tree.decode_lsb(&mut LsbBits::new(&mut cursor)),
             BitOrder::Msb => tree.decode_msb(&mut MsbBits::new(&mut cursor)),
@@ -292,8 +304,7 @@ fn huffman_lookup_preserves_codes_eof_and_following_bytes() {
 fn gzip_token_walk_handles_dynamic_and_concatenated_members() {
     let mut first = Vec::new();
     {
-        let mut encoder =
-            flate2::write::GzEncoder::new(&mut first, flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(&mut first, flate2::Compression::default());
         encoder.write_all(&vec![b'A'; 2 * 1024 * 1024]).unwrap();
         encoder.finish().unwrap();
     }
@@ -304,7 +315,8 @@ fn gzip_token_walk_handles_dynamic_and_concatenated_members() {
     let end = validate_gzip_structure(&source, 0, source.len(), |start| {
         members.push(start);
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(end, data.len() as u64);
     assert_eq!(members, [0, first.len() as u64]);
 }
@@ -328,7 +340,9 @@ fn gzip_boundary_walk_rejects_wrong_later_member_size() {
 
     let source = reader(data);
     assert_eq!(
-        validate_gzip_structure(&source, 0, source.len(), |_| Ok(())).unwrap_err().code(),
+        validate_gzip_structure(&source, 0, source.len(), |_| Ok(()))
+            .unwrap_err()
+            .code(),
         "gzip_isize_mismatch"
     );
 }
@@ -351,17 +365,60 @@ fn gzip_boundary_walk_stops_before_multi_member_carrier_tail() {
 
 #[test]
 fn bzip2_huffman_walk_reaches_stream_end() {
-    let data = bzip2::read::BzEncoder::new(
-        &vec![b'B'; 2 * 1024 * 1024][..],
-        bzip2::Compression::best(),
-    )
-    .bytes()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap();
+    let data =
+        bzip2::read::BzEncoder::new(&vec![b'B'; 2 * 1024 * 1024][..], bzip2::Compression::best())
+            .bytes()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
     let source = reader(data.clone());
     assert_eq!(
         validate_bzip2_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
         data.len() as u64
+    );
+}
+
+#[test]
+fn bzip2_walk_skips_unused_selector_records() {
+    let encoded = bzip2::read::BzEncoder::new(&b"B"[..], bzip2::Compression::best())
+        .bytes()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut bits = encoded
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |shift| (byte >> shift) & 1))
+        .collect::<Vec<_>>();
+    // The single-symbol map uses one group of 16 bits. This fixture has
+    // exactly one table selector, followed by its table definitions.
+    let count_start = 32 + 48 + 32 + 1 + 24 + 16 + 16 + 3;
+    let selector_start = count_start + 15;
+    assert_eq!(
+        &bits[count_start..selector_start],
+        &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    );
+    let selector_end = selector_start
+        + bits[selector_start..]
+            .iter()
+            .position(|&bit| bit == 0)
+            .unwrap()
+        + 1;
+    let extra = 18_008;
+    for (position, bit) in bits[count_start..selector_start].iter_mut().enumerate() {
+        *bit = (((extra + 1) >> (14 - position)) & 1) as u8;
+    }
+    bits.splice(selector_end..selector_end, std::iter::repeat_n(0, extra));
+    let data = bits
+        .chunks_exact(8)
+        .map(|byte| byte.iter().fold(0, |value, bit| value * 2 + bit))
+        .collect::<Vec<_>>();
+    let mut decoded = Vec::new();
+    bzip2::read::BzDecoder::new(data.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, b"B");
+    let source = reader(data);
+    assert_eq!(
+        validate_bzip2_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
+        source.len(),
     );
 }
 
@@ -468,7 +525,9 @@ fn xz_reverse_index_walk_locates_stream_and_checks_index_crc() {
     data[end - 16] ^= 1;
     let damaged = reader(data);
     assert_eq!(
-        resolve_xz_stream_start(&damaged, 0, end as u64).unwrap_err().code(),
+        resolve_xz_stream_start(&damaged, 0, end as u64)
+            .unwrap_err()
+            .code(),
         "xz_index_crc_bad"
     );
 }

@@ -571,54 +571,33 @@ fn partial_write_failure_reaps_before_waking_senders_and_exit_stops_idle_writer(
 }
 
 #[test]
-fn structured_results_keep_bounded_stderr_and_drain_between_jobs() {
+fn worker_transport_diagnostic_survives_unrelated_results() {
     let shared = Shared::default();
-    // A result may drain stderr between reads of one UTF-8 character.
-    // Like main's incremental decoder, retain the unfinished character
-    // privately until the next read, without emitting replacements.
-    struct SplitCharacter<'a> { shared: &'a Shared, read: usize }
-    impl Read for SplitCharacter<'_> {
-        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-            let bytes: &[u8] = match self.read {
-                0 => b"before\xe5\xaf",
-                1 => {
-                    assert_eq!(self.shared.stderr.lock().unwrap().take(), "before");
-                    b"\x86"
-                },
-                _ => return Ok(0),
-            };
-            self.read += 1;
-            output[..bytes.len()].copy_from_slice(bytes);
-            Ok(bytes.len())
-        }
-    }
-    pump_stderr(SplitCharacter { shared: &shared, read: 0 }, &shared);
-    assert_eq!(shared.stderr.lock().unwrap().take(), "密");
-    let first = register(&shared, "first");
-    // Read arbitrary blocks, including split UTF-8, through the same pump
-    // as the child pipe. A long native line must never grow without bound.
-    let text = "密".repeat(STDERR_TAIL_CHARS + 100);
-    pump_stderr(io::Cursor::new(text.as_bytes()), &shared);
-    assert!(shared.stderr.lock().unwrap().bytes.len() <= STDERR_TAIL_BYTES);
-    finish(&shared, "first", false);
-    let frame = first.updates.lock().unwrap().result.take().unwrap().unwrap();
-    assert_eq!(frame.summary["stderr_tail"].as_str().unwrap(), "密".repeat(STDERR_TAIL_CHARS));
-    let second = register(&shared, "second");
-    let lines = (0..60).map(|n| format!("line{n}\n")).collect::<String>();
-    pump_stderr(io::Cursor::new(lines), &shared);
-    finish(&shared, "second", false);
-    let frame = second.updates.lock().unwrap().result.take().unwrap().unwrap();
-    let text = frame.summary["stderr_tail"].as_str().unwrap();
-    assert_eq!(text.lines().count(), STDERR_TAIL_LINES);
-    assert!(text.starts_with("line20\n") && text.ends_with("line59\n"));
-    let success = register(&shared, "success");
-    pump_stderr(io::Cursor::new(b"irrelevant successful-job detail\n"), &shared);
-    dispatch(&shared, json!({"type": "result", "job_id": "success", "status": "ok"}));
-    dispatch(&shared, json!({"type": "native_event", "event": "job_finished", "job_id": "success"}));
-    assert!(success.updates.lock().unwrap().result.take().unwrap().unwrap().summary.get("stderr_tail").is_none());
-    let third = register(&shared, "third");
-    finish(&shared, "third", false);
-    assert!(third.updates.lock().unwrap().result.take().unwrap().unwrap().summary.get("stderr_tail").is_none());
+    let job = register(&shared, "unrelated");
+    // Process stderr has no job ID. Even after another job has completed, its
+    // latest bytes belong to the process exit only. Cross a pipe read boundary
+    // inside a UTF-8 sequence and exceed the opaque stderr safety window.
+    let text = "密".repeat(STDERR_TAIL_BYTES);
+    let history = pump_stderr(io::Cursor::new(text.as_bytes()));
+    finish(&shared, "unrelated", false);
+    let frame = job.updates.lock().unwrap().result.take().unwrap().unwrap();
+    assert!(frame.summary.get("stderr_tail").is_none());
+
+    // Structured errors use the regular worker frame and keep the entire
+    // message, even when a child process could not report it through stderr.
+    let detail = "invalid worker request ".repeat(STDERR_TAIL_BYTES);
+    let bytes = encode_worker_frame(&json!({
+        "type": "worker_fatal",
+        "message": detail,
+    })).unwrap();
+    let error = dispatch_stdout(io::Cursor::new(bytes), &shared).unwrap_err();
+    assert_eq!(error.to_string(), detail);
+
+    let mut fallback = String::new();
+    assert!(history.bytes.len() <= STDERR_TAIL_BYTES);
+    history.append_diagnostic(&mut fallback);
+    assert_eq!(fallback, format!("\nWorker stderr (earlier output omitted)\n{}",
+        "密".repeat(STDERR_TAIL_BYTES / "密".len())));
 }
 
 fn dispatch(shared: &Shared, summary: Value) {

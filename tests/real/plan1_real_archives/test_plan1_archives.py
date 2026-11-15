@@ -1,5 +1,6 @@
 """Real format, codec and layout interoperability through the installed launcher."""
 
+import gzip
 import shutil
 from collections import Counter
 
@@ -185,6 +186,20 @@ def test_stream_codec_headers(package, tmp_path, archive_format, level, options)
         tmp_path, "header", archive_format, compression_level=level, **options,
     )
     assert_archive_round_trip(package, case, tmp_path / "out")
+
+
+@pytest.mark.parametrize("name_len", [300, 8192], ids=["unusable-name", "oversized-header"])
+def test_gzip_extracts_past_long_optional_header_fields(package, tmp_path, name_len):
+    payload = b"gzip optional header fields"
+    encoded = gzip.compress(payload, mtime=0)
+    source = tmp_path / "archive.disguised"
+    # RFC 1952 FNAME and FCOMMENT are NUL-terminated fields.
+    header = encoded[:3] + b"\x18" + encoded[4:10]
+    source.write_bytes(header + b"n" * name_len + b"\0" + b"c" * 70_000 + b"\0" + encoded[10:])
+    output = tmp_path / "out"
+    report = extract_report(package, source, output)
+    assert report["summary"]["success_count"] == 1, report
+    assert [path.read_bytes() for path in output.rglob("*") if path.is_file()] == [payload]
 
 
 @pytest.mark.parametrize("options", [

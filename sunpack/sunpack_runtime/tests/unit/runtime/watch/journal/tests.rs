@@ -124,7 +124,7 @@ fn configured_retention_applies_before_first_writer_pass() {
     {
         let mut store = Store::open(path.clone()).unwrap();
         let row = serde_json::json!({"event":"done", "path":"old.zip", "ts":old as f64 / 1_000_000.0});
-        store.append(&crate::io::display_store::HistoryRecord::new(&row, old)).unwrap();
+        store.append(&crate::io::display_store::HistoryRecord::new(&row, old, &row).unwrap()).unwrap();
         store.publish().unwrap();
     }
     for (days, expected) in [(30, 1), (7, 0)] {
@@ -311,20 +311,23 @@ fn cpp_query_recovers_durable_blocker_after_writer_death() {
 // Exercises the durable writer and replay, not just error classification:
 // an unavailable snapshot must not lose the sealed WAL or stop appends.
 #[test]
-fn snapshot_failure_keeps_wal_live_until_retry_or_safety_limit() {
+fn snapshot_failure_keeps_wal_live_and_retries_above_old_size_limit() {
     let marker = crate::test_support::temp_file("snapshot_retry", b"");
     let dir = marker.with_extension("state");
     let journal = Journal::open(&dir, 7).unwrap();
     let temp = dir.join("state.snapshot.tmp");
     fs::create_dir(&temp).unwrap(); // Fail only snapshot creation, not WAL.
-    journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+    // Inject the size accounting to exercise the same checkpoint path
+    // without allocating, syncing and replaying hundreds of MiB in the test.
+    let old_size_limit = 256 * 1024 * 1024;
+    journal.frontier.lock().unwrap().bytes = old_size_limit;
     journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(1, "one".into()))).unwrap();
     journal.wait_for_checkpoint().unwrap();
-    assert!(journal.frontier.lock().unwrap().checkpoint_error.is_some());
+    assert!(!dir.join("state.snapshot").exists());
     journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
     journal.flush().unwrap();
     assert_eq!(journal.state().password_generation(), 2);
-    assert!(journal.frontier.lock().unwrap().records >= CHECKPOINT_RECORDS);
+    assert!(journal.frontier.lock().unwrap().bytes > old_size_limit);
     assert!(!segments(&dir).unwrap().is_empty());
     drop(journal);
     let journal = Journal::open(&dir, 7).unwrap();
@@ -336,20 +339,10 @@ fn snapshot_failure_keeps_wal_live_until_retry_or_safety_limit() {
     journal.compact().unwrap();
     journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(3, "three".into()))).unwrap();
     journal.flush().unwrap();
-    assert!(journal.frontier.lock().unwrap().checkpoint_error.is_none());
+    assert!(dir.join("state.snapshot").is_file());
     drop(journal);
     let journal = Journal::open(&dir, 7).unwrap();
     assert_eq!(journal.state().password_generation(), 3);
-    {
-        let mut frontier = journal.frontier.lock().unwrap();
-        frontier.bytes = JOURNAL_HARD_BYTES - 1;
-        frontier.checkpoint_error = Some("snapshot unavailable".into());
-        assert!(ensure_healthy(&frontier).is_ok());
-        frontier.bytes += 1;
-        assert!(ensure_healthy(&frontier).is_err());
-        frontier.bytes = 0;
-        frontier.checkpoint_error = None;
-    }
     // Snapshot failures are recoverable; a WAL seal error still poisons
     // persistence and must prevent further mutations.
     let failed = Checkpoint { records: 0, bytes: 0, ready: Arc::new(AtomicBool::new(true)),

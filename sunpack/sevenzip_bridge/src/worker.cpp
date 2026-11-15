@@ -1771,7 +1771,13 @@ int main() {
             }
         }
     } catch (const std::exception& error) {
-        std::cerr << "worker protocol: " << error.what() << "\n";
+        try {
+            print_frame(wire::object() + wire::key("type") + wire::text("worker_fatal") +
+                wire::key("message") + wire::text(error.what()) + wire::end());
+        } catch (...) {
+            // The stdout transport itself can fail.
+            std::cerr << "worker protocol: " << error.what() << "\n";
+        }
         executor.stop(/*cancel_pending_jobs=*/true);
         return 2;
     }

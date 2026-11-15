@@ -132,6 +132,42 @@ fn specialized_7z_kdf_matches_record_by_record_oracle() {
 }
 
 #[test]
+fn password_probe_accepts_7z_aes_without_salt_or_iv() {
+    let mut folder = SevenZipFolderAst {
+        coders: vec![SevenZipCoderAst {
+            method_id: EncoderMethod::ID_AES256_SHA256.to_vec(),
+            properties: Vec::new(),
+            num_in_streams: 1,
+            num_out_streams: 1,
+        }],
+        bind_pairs: Vec::new(),
+        packed_streams: vec![0],
+        main_output_stream: 0,
+        unpack_sizes: SevenZipUnpackSizes::Main(1),
+        expected_crc: Some(crc32(b"a")),
+    };
+    let password = Password::from("pass");
+    assert!(seven_zip_probe_folder_supported(&folder));
+    assert_eq!(
+        seven_zip_aes_key_iv(&[], password.as_slice()).unwrap().0,
+        reference_aes_key_bytes(1, &[], password.as_slice()),
+    );
+
+    folder.coders[0].properties.push(SEVEN_Z_AES_DIRECT_KEY);
+    assert!(seven_zip_probe_folder_supported(&folder));
+    let mut direct_key = [0; 32];
+    direct_key[..password.as_slice().len()].copy_from_slice(password.as_slice());
+    assert_eq!(
+        seven_zip_aes_key_iv(&folder.coders[0].properties, password.as_slice())
+            .unwrap()
+            .0,
+        direct_key,
+    );
+    folder.coders[0].properties[0] = SEVEN_Z_AES_MAX_CYCLES_POWER + 1;
+    assert!(!seven_zip_probe_folder_supported(&folder));
+}
+
+#[test]
 fn seven_zip_kdf_cache_is_bounded_and_preserves_keys() {
     seven_zip_kdf_cache()
         .lock()

@@ -18,7 +18,6 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(800);
-const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 - 20;
 
 // A failed snapshot is consumed. Recreate only when a later snapshot arrives;
 // component initialization failure is terminal, matching the host's lifecycle.
@@ -223,9 +222,10 @@ impl Snapshot {
                 ("duration", &duration),
             ],
         );
-        if !summary.cleanup_warnings.is_empty() {
+        if summary.cleanup_failed != 0 {
             body.push('\n');
-            body.push_str(&summary.cleanup_warnings);
+            body.push_str(&language.translate("cleanup.incomplete",
+                &[("count", &summary.cleanup_failed.to_string())]));
         }
         if summary.interrupted != 0 {
             let interrupted = language.text(if summary.rollback_failed {
@@ -289,9 +289,7 @@ impl Snapshot {
         let actions = self.action.iter().chain(&self.report_action);
         let size = 12 + fields.iter().map(|value| 4 + value.len()).sum::<usize>()
             + actions.clone().map(|(_, label, target)| 9 + label.len() + target.len()).sum::<usize>();
-        if size > MAX_SNAPSHOT_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "toast snapshot exceeds the 64 KiB size limit"));
-        }
+        u32::try_from(size).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let mut result = Vec::with_capacity(size);
         let action_count = u8::from(self.action.is_some()) + u8::from(self.report_action.is_some());
         result.extend([self.kind, mode, action_count, 0]);
@@ -357,21 +355,6 @@ struct Group {
     cancellation: Cancellation,
 }
 
-// Match main's bounded per-request warning lines; completed batches never
-// retain an unbounded list of request receipts.
-fn append_warning(warnings: &mut String, warning: &str) {
-    if warning.is_empty() { return; }
-    let remaining = 2048usize.saturating_sub(warnings.chars().count() + usize::from(!warnings.is_empty()));
-    if remaining == 0 { return; }
-    if !warnings.is_empty() { warnings.push('\n'); }
-    if warning.chars().count() >= remaining {
-        warnings.extend(warning.chars().take(remaining - 1));
-        warnings.push('…');
-    } else {
-        warnings.push_str(warning);
-    }
-}
-
 #[derive(Clone, Default)]
 struct Summary {
     succeeded: usize,
@@ -379,7 +362,7 @@ struct Summary {
     interrupted: usize,
     rollback_failed: bool,
     report_failed: bool,
-    cleanup_warnings: String,
+    cleanup_failed: usize,
     output: Option<PathBuf>,
 }
 
@@ -711,7 +694,6 @@ impl Summary {
     }
 
     fn for_result(
-        language: Language,
         result: &io::Result<Outcome>,
         cancelled: bool,
         output_cleanup_failed: bool,
@@ -731,17 +713,14 @@ impl Summary {
         }
         let mut summary = Self::default();
         match result {
-            Ok(outcome) => return Self::for_outcome(language, outcome, output_cleanup_failed, visible, owner, started),
+            Ok(outcome) => return Self::for_outcome(outcome, output_cleanup_failed, visible, owner, started),
             Err(_) => summary.failed = started.map_or(1, HashSet::len),
         }
-        if output_cleanup_failed {
-            summary.cleanup_warnings = language.translate("cleanup.incomplete", &[("count", "1")]);
-        }
+        summary.cleanup_failed = usize::from(output_cleanup_failed);
         summary
     }
 
     fn for_outcome(
-        language: Language,
         outcome: &Outcome,
         output_cleanup_failed: bool,
         visible: bool,
@@ -773,12 +752,9 @@ impl Summary {
                 .map(|output| containers.get(output).copied().unwrap_or(output));
             summary.output = existing_output_target(outputs);
         }
-        let cleanup_failed = outcome.cleanup_results.iter()
+        summary.cleanup_failed = outcome.cleanup_results.iter()
             .filter(|result| result.status == CleanupStatus::Failed
                 && started.is_none_or(|started| started.contains(&result_owner(&result.path, owner)))).count() + usize::from(output_cleanup_failed);
-        if cleanup_failed != 0 {
-            summary.cleanup_warnings = language.translate("cleanup.incomplete", &[("count", &cleanup_failed.to_string())]);
-        }
         summary
     }
 
@@ -788,7 +764,7 @@ impl Summary {
         self.interrupted += other.interrupted;
         self.rollback_failed |= other.rollback_failed;
         self.report_failed |= other.report_failed;
-        append_warning(&mut self.cleanup_warnings, &other.cleanup_warnings);
+        self.cleanup_failed += other.cleanup_failed;
         if let Some(output) = other.output {
             self.output = existing_output_target(self.output.as_deref().into_iter()
                 .chain(std::iter::once(output.as_path())));
@@ -1100,7 +1076,7 @@ impl Activity {
         let visible = request.visible_roots.contains(&id);
         request.settled_tasks.insert(id);
         if visible { group.active_roots -= 1; }
-        let summary = Summary::for_outcome(group.language, outcome, false, visible, &|_| Some(key.clone()), None);
+        let summary = Summary::for_outcome(outcome, false, visible, &|_| Some(key.clone()), None);
         if summary.failed != 0 { request.pending_reports.insert(id); }
         group.summary.merge(summary);
         group.generation = group.generation.wrapping_add(1);
@@ -1142,7 +1118,7 @@ impl Activity {
         output_cleanup_failed: bool,
         owner: impl Fn(&Path) -> Option<String>,
     ) -> Option<Finish> {
-        let (language, visible, started, settled) = {
+        let (visible, started, settled) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping {
                 return None;
@@ -1153,14 +1129,14 @@ impl Activity {
                 return None;
             };
             let request = &group.requests[&self.request];
-            (group.language, request.visible, if cancelled { request.roots.values().cloned().collect::<HashSet<_>>() }
+            (request.visible, if cancelled { request.roots.values().cloned().collect::<HashSet<_>>() }
                 else { request.started.values().flatten().cloned().collect() }, request.settled.clone())
         };
         // Receipt projection can be large. It must not hold the presentation
         // gate or prevent disable from cancelling an active report writer.
         let started = started.iter().map(|path| result_owner(path, &owner))
             .filter(|root| !settled.contains(root)).collect();
-        let summary = Summary::for_result(language, result, cancelled, output_cleanup_failed, visible,
+        let summary = Summary::for_result(result, cancelled, output_cleanup_failed, visible,
             &owner, Some(&started));
         Some(Finish { activity: self.clone(), summary })
     }

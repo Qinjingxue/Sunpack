@@ -48,7 +48,6 @@ constexpr CLSID kToastActivatorClsid = {
     0xc5a6b4e9, 0x3184, 0x44e2, {0x9f, 0x15, 0x6a, 0x71, 0x80, 0x4f, 0x7a, 0x36}
 };
 
-constexpr std::uint32_t kMaximumSnapshotBytes = 64 * 1024 - 20;
 
 std::mutex g_activation_mutex;
 std::condition_variable g_activation_condition;
@@ -820,7 +819,7 @@ HRESULT sunpack_toast_show(void* raw, const std::uint8_t* data,
                            std::uint32_t size, std::uint64_t sequence) noexcept {
     return protect([&] {
         auto& context = context_on_owner_thread(raw);
-        if (!data || size > kMaximumSnapshotBytes) winrt::throw_hresult(E_INVALIDARG);
+        if (!data) winrt::throw_hresult(E_INVALIDARG);
         const auto snapshot = parse_snapshot(std::span<const std::uint8_t>(data, size));
         if (!context.presenter) {
             context.presenter = std::make_unique<ToastPresenter>();

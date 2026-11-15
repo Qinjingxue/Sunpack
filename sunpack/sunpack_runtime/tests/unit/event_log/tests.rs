@@ -7,42 +7,44 @@ fn history_expiration_trims_overlapping_runs_and_reopens_the_surviving_run() {
     let mut store = Store::open(path).unwrap();
     let row = json!({"event":"done","path":"archive.zip"});
     for ts in [1000, 2000, 1500] {
-        store.append(&HistoryRecord::new(&row, ts)).unwrap();
+        store.append(&HistoryRecord::new(&row, ts, &row).unwrap()).unwrap();
     }
     assert_eq!(store.expire(999).unwrap(), Some(1000));
     assert_eq!(store.expire(1500).unwrap(), Some(2000));
     store.publish().unwrap();
 
-    store.append(&HistoryRecord::new(&row, 3000)).unwrap();
+    store.append(&HistoryRecord::new(&row, 3000, &row).unwrap()).unwrap();
     let [run] = store.manifest.runs.as_slice() else {
         panic!("expected one surviving run");
     };
     assert_eq!((run.head, run.first, run.last, run.count), (1, 2000, 3000, 3));
     assert_eq!(store.expire(3000).unwrap(), None);
     store.publish().unwrap();
-    store.append(&HistoryRecord::new(&row, 4000)).unwrap();
+    store.append(&HistoryRecord::new(&row, 4000, &row).unwrap()).unwrap();
     assert_eq!(store.expire(3000).unwrap(), Some(4000));
 }
 
 #[test]
 fn archive_diagnostics_do_not_expand_or_change_shared_recovery_receipts() {
     let input = crate::io::archive_state::ArchiveInput::file("C:/input.zip".into(), "zip".into(), "input.zip".into());
-    let checkpoint = json!({"schema_version":1,"carrier":"C:/input.zip","input":input,
-        "sources":[],"output":"C:/output","container":"C:/output","files":1,"bytes":1,
-        "encrypted":false,"discovery_source":"embedded"});
+    let checkpoint = json!({"input":input,"sources":[],
+        "report":{"input_id":"item","position":1,"input_count":1,"output":"C:/output",
+            "files":1,"bytes":1,"recovered_complete_files":0}});
+    let evidence = "error details".repeat(1000);
     let mut expected = None;
     for count in [1, 1024] {
         let failure: crate::pipeline::Failure = serde_json::from_value(json!({
-            "kind":"damaged","message":"CRC error","evidence":{"stage":"item_extract"},
+            "kind":"damaged","message":"CRC error",
+            "evidence":{"classification_evidence":evidence,"stage":"item_extract"},
             "recovery":{"inputs":vec![checkpoint.clone();count],"output":"C:/output",
                 "input_count":count,"had_checkpoints":true,"retry_output":true}
         })).unwrap();
-        let project = |budget: &mut usize, truncated: &mut bool|
-            diagnostic::value(&DiagnosticFailure(&failure), budget, truncated);
-        let output = event_value_with(json!({"event":"archive_failure_evidence","path":"C:/input.zip"}),
-            Some(("failure", &project))).unwrap();
+        let event = json!({"event":"archive_failure_evidence","path":"C:/input.zip"});
+        let payload = HistoryEvent { fields: event.as_object().unwrap(), failure: &failure };
+        let output: Value = rmp_serde::from_slice(&rmp_serde::to_vec_named(&payload).unwrap()).unwrap();
         assert_eq!(output["failure"]["kind"], "damaged");
         assert_eq!(output["failure"]["evidence"]["stage"], "item_extract");
+        assert_eq!(output["failure"]["evidence"]["classification_evidence"], evidence);
         assert!(output["failure"].get("recovery").is_none());
         if let Some(expected) = &expected { assert_eq!(&output, expected); }
         else { expected = Some(output); }
@@ -50,28 +52,6 @@ fn archive_diagnostics_do_not_expand_or_change_shared_recovery_receipts() {
         // contract. Only the per-archive diagnostic view omits the group.
         assert_eq!(serde_json::to_value(&failure).unwrap()["recovery"]["inputs"].as_array().unwrap().len(), count);
     }
-}
-
-#[test]
-fn diagnostic_budget_keeps_catalog_location_and_failure_classification() {
-    let rebuilt = event_value(json!({"event":"catalog_rebuilt", "root":"C:/downloads",
-        "reason":"incremental_failed", "errors":vec!["access denied".repeat(300); 64],
-        "zzz":"after exhausted diagnostics"})).unwrap();
-    assert_eq!(rebuilt["root"], "C:/downloads");
-    assert_eq!(rebuilt["reason"], "incremental_failed");
-    assert_eq!(rebuilt["truncated"], true);
-    assert!(rebuilt.get("").is_none());
-    assert!(rebuilt.get("zzz").is_none());
-    assert!(serde_json::to_vec(&rebuilt).unwrap().len() < DIAGNOSTIC_TEXT_BYTES + 256);
-
-    let failed = event_value(json!({"event":"failed_terminal", "path":"C:/archive.zip",
-        "error_kind":"damaged", "error":"failure details".repeat(1000), "zzz":1})).unwrap();
-    assert_eq!(failed["path"], "C:/archive.zip");
-    assert_eq!(failed["error_kind"], "damaged");
-    assert!(failed["error"].as_str().unwrap().len() < DIAGNOSTIC_TEXT_BYTES);
-    assert_eq!(failed["truncated"], true);
-    assert!(failed.get("").is_none());
-    assert!(failed.get("zzz").is_none());
 }
 
 // Hold a writer snapshot across member retirement and completion. Existing

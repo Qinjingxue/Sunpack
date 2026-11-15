@@ -126,7 +126,6 @@ public:
   UInt32 Size32;
 
   AString Name;
-  AString Comment;
   // CByteBuffer Extra;
 
   CItem():
@@ -140,7 +139,6 @@ public:
   void Clear()
   {
     Name.Empty();
-    Comment.Empty();
     // Extra.Free();
   }
 
@@ -150,7 +148,6 @@ public:
     HostOS = a.HostOS;
     Time = a.Time;
     Name = a.Name;
-    Comment = a.Comment;
     // Extra = a.Extra;
   }
 
@@ -204,20 +201,29 @@ static HRESULT ReadUInt16(NDecoder::CCOMCoder *stream, UInt32 &value /* , UInt32
   return S_OK;
 }
 
-static HRESULT ReadString(NDecoder::CCOMCoder *stream, AString &s, size_t limit /* , UInt32 &crc */)
+static HRESULT ReadString(NDecoder::CCOMCoder *stream, AString *name)
 {
-  s.Empty();
-  for (size_t i = 0; i < limit; i++)
+  // A Windows filename that fits is much shorter, even after encoding.
+  // Oversized names fall back to the normal generated output name.
+  static const unsigned kRetainedNameBytes = 4096;
+  for (;;)
   {
     const Byte b = stream->ReadAlignedByte();
     if (stream->InputEofError())
       return S_FALSE;
-    // crc = CRC_UPDATE_BYTE(crc, b);
     if (b == 0)
       return S_OK;
-    s.Add_Char((char)b);
+    if (name)
+    {
+      if (name->Len() < kRetainedNameBytes)
+        name->Add_Char((char)b);
+      else
+      {
+        name->Empty();
+        name = NULL;
+      }
+    }
   }
-  return S_FALSE;
 }
 
 static UInt32 Is_Deflate(const Byte *p, size_t size)
@@ -251,9 +257,6 @@ static UInt32 Is_Deflate(const Byte *p, size_t size)
   }
   return k_IsArc_Res_YES;
 }
-
-static const unsigned kNameMaxLen = 1 << 12;
-static const unsigned kCommentMaxLen = 1 << 16;
 
 API_FUNC_static_IsArc IsArc_Gz(const Byte *p, size_t size)
 {
@@ -305,36 +308,16 @@ API_FUNC_static_IsArc IsArc_Gz(const Byte *p, size_t size)
     }
   }
 
-  if ((flags & NFlags::kName) != 0)
+  for (unsigned flag = NFlags::kName; flag <= NFlags::kComment; flag <<= 1)
   {
-    size_t limit = kNameMaxLen;
-    if (limit > size)
-      limit = size;
-    size_t i;
-    for (i = 0; i < limit && p[i] != 0; i++);
-    if (i == size)
-      return k_IsArc_Res_NEED_MORE;
-    if (i == limit)
-      return k_IsArc_Res_NO;
-    i++;
-    p += i;
-    size -= i;
-  }
-
-  if ((flags & NFlags::kComment) != 0)
-  {
-    size_t limit = kCommentMaxLen;
-    if (limit > size)
-      limit = size;
-    size_t i;
-    for (i = 0; i < limit && p[i] != 0; i++);
-    if (i == size)
-      return k_IsArc_Res_NEED_MORE;
-    if (i == limit)
-      return k_IsArc_Res_NO;
-    i++;
-    p += i;
-    size -= i;
+    if ((flags & flag) != 0)
+    {
+      const Byte *end = (const Byte *)memchr(p, 0, size);
+      if (!end)
+        return k_IsArc_Res_NEED_MORE;
+      size -= (size_t)(end + 1 - p);
+      p = end + 1;
+    }
   }
   
   if ((flags & NFlags::kCrc) != 0)
@@ -384,9 +367,17 @@ HRESULT CItem::ReadHeader(NDecoder::CCOMCoder *stream)
     // crc = CrcUpdate(crc, Extra, xlen);
   }
   if (NameIsPresent())
-    RINOK(ReadString(stream, Name, kNameMaxLen /* , crc */))
+  {
+    RINOK(ReadString(stream, &Name))
+    // FNAME is a single component. Keep multibyte names whose decoded
+    // length is legal on Windows, even if the encoded byte count is larger.
+    if (Name.Len() > 255 && MultiByteToUnicodeString(Name, CP_ACP).Len() > 255)
+      Name.Empty();
+    if (Name.IsEmpty())
+      Flags &= (Byte)~NFlags::kName;
+  }
   if (CommentIsPresent())
-    RINOK(ReadString(stream, Comment, kCommentMaxLen /* , crc */))
+    RINOK(ReadString(stream, NULL))
 
   if (HeaderCrcIsPresent())
   {
@@ -560,7 +551,6 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 /* index */, PROPID propID, PROPVARIAN
       if (_item.NameIsPresent())
         prop = MultiByteToUnicodeString(_item.Name, CP_ACP);
       break;
-    // case kpidComment: if (_item.CommentIsPresent()) prop = MultiByteToUnicodeString(_item.Comment, CP_ACP); break;
     case kpidMTime:
       // gzip specification: MTIME = 0 means no time stamp is available.
       if (_item.Time != 0)

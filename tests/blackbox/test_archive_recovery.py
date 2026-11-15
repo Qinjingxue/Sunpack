@@ -340,7 +340,7 @@ def test_nested_failure_does_not_revoke_outer_source_cleanup(package, tmp_path, 
     else:
         assert not list(output.rglob("good.txt"))
 
-def test_scan_bounds_filesystem_diagnostics_across_targets_and_subtrees(package, tmp_path):
+def test_scan_preserves_filesystem_diagnostics_across_targets_and_subtrees(package, tmp_path):
     archive = tmp_path / "good.wrapped"
     archive.write_bytes(_zip_bytes({"payload.txt": b"valid archive"}))
     plain = tmp_path / "plain.txt"
@@ -374,11 +374,10 @@ def test_scan_bounds_filesystem_diagnostics_across_targets_and_subtrees(package,
         "scan_error_count": 102,
     }
     assert {Path(item["main_path"]) for item in report["items"]} == {archive, inside}
-    assert len(report["errors"]) == 101
-    assert any(missing[0].name in message for message in report["errors"])
-    assert any(message.startswith("Cannot read directory:") and "blocked-" in message
-               for message in report["errors"])
-    assert report["errors"][-1] == "Additional filesystem scan errors omitted from this report: 2"
+    assert len(report["errors"]) == 102
+    assert all(any(str(path) in message for message in report["errors"]) for path in missing)
+    assert all(any(message.startswith("Cannot read directory:") and str(path) in message
+                   for message in report["errors"]) for path in denied)
 
 
 def test_distinct_volume_requests_do_not_expand_original_busy_claim(package, tmp_path):

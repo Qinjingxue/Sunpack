@@ -258,10 +258,17 @@ pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) 
         format_reject_mask: unified_prefilter_mask_from_head(size, prefix),
         ..VolumeAnchor::default()
     };
+    let mut reader = None;
     CheapAnchor::from_probe(
         path,
         probe_cheap_prefix(result, prefix,
-            |offset, len| ManagedReader::open(path)?.read_direct_at(offset, len),
+            |offset, len| {
+                let reader = match &mut reader {
+                    Some(reader) => reader,
+                    slot => slot.insert(ManagedReader::open(path)?),
+                };
+                reader.read_direct_at(offset, len)
+            },
             || ManagedReader::open(path).is_ok_and(|reader| crate::formats::lz4::identity(&reader, 0) == Ok(true)),
         ),
     )
@@ -309,10 +316,10 @@ pub(crate) fn probe_volume_anchor_path_cheap(path: &str) -> VolumeAnchor {
 fn probe_cheap_prefix(
     mut result: VolumeAnchor,
     prefix: &[u8],
-    read: impl Fn(u64, usize) -> std::io::Result<Vec<u8>>,
+    mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
     lz4_identity: impl FnOnce() -> bool,
 ) -> VolumeAnchor {
-    let prefix = complete_anchor_prefix(prefix, &mut result, 0, &read);
+    let prefix = complete_anchor_prefix(prefix, &mut result, 0, &mut read);
     let prefix = prefix.as_ref();
     // Relation is a split-volume recovery layer, not a general archive
     // detector.  The cheap pass only keeps structure that can itself seed
@@ -1259,7 +1266,7 @@ fn probe_anchor_reader_prefix(
 fn probe_standalone_stream(
     prefix: &[u8],
     out: &mut VolumeAnchor,
-    read: impl Fn(u64, usize) -> std::io::Result<Vec<u8>>,
+    read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
     lz4_identity: impl FnOnce() -> bool,
 ) {
     // Confirm the prefix before ruling this file out as a possible volume.

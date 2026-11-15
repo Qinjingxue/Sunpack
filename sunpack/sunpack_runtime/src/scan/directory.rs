@@ -261,7 +261,7 @@ impl NativeWorkerManifest {
         NativeOutputInventory {
             root,
             total_size: self.total_size,
-            unreadable_count: 0,
+            scan_errors: None,
             files: Arc::clone(&self.files),
         }
     }
@@ -271,7 +271,7 @@ impl NativeWorkerManifest {
 pub(crate) struct NativeOutputInventory {
     root: String,
     total_size: u64,
-    unreadable_count: usize,
+    scan_errors: Option<Arc<Vec<DirectoryReadError>>>,
     files: Arc<Vec<OutputFileRecord>>,
 }
 
@@ -295,12 +295,8 @@ impl NativeOutputInventory {
         let (filtered, raw) = (|| {
             let mut records =
                 build_inventory_snapshot_views(&self.root, self.files.as_ref(), options);
-            if self.unreadable_count != 0 {
-                records.errors.push_detail(
-                    Path::new(&self.root),
-                    "output_scan",
-                    self.unreadable_count.to_string(),
-                );
+            if let Some(errors) = &self.scan_errors {
+                records.errors.extend(errors.as_ref().clone());
             }
             populate_relation_anchors(&mut records.raw);
             NativeDirectorySnapshot::from_views(
@@ -852,15 +848,15 @@ fn ancestor_directory_records<'a>(
 pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInventory {
     let root = PathBuf::from(output_dir);
     let mut stats = OutputTreeStats::default();
-    if fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
-        walk_output_tree(&root, &mut stats);
-    } else {
-        stats.unreadable_count += 1;
+    match fs::metadata(&root) {
+        Ok(metadata) if metadata.is_dir() => walk_output_tree(&root, &mut stats),
+        Ok(_) => stats.errors.push(&root, "read_dir", std::io::ErrorKind::NotADirectory.into()),
+        Err(error) => stats.errors.push(&root, "metadata", error),
     }
     NativeOutputInventory {
         root: path_to_string(&root),
         total_size: stats.total_size,
-        unreadable_count: stats.unreadable_count,
+        scan_errors: (!stats.errors.is_empty()).then(|| Arc::new(stats.errors.into_messages())),
         files: Arc::new(stats.files),
     }
 }
@@ -868,28 +864,34 @@ pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInvent
 #[derive(Default)]
 struct OutputTreeStats {
     total_size: u64,
-    unreadable_count: usize,
+    errors: DirectoryReadErrors,
     files: Vec<OutputFileRecord>,
 }
 
 fn walk_output_tree(root: &Path, stats: &mut OutputTreeStats) {
     let mut pending = vec![root.to_path_buf()];
     while let Some(current) = pending.pop() {
-        let entries = match fs::read_dir(current) {
+        let entries = match fs::read_dir(&current) {
             Ok(entries) => entries,
-            Err(_) => {
-                stats.unreadable_count += 1;
+            Err(error) => {
+                stats.errors.push(&current, "read_dir", error);
                 continue;
             }
         };
         for item in entries {
-            let Ok(entry) = item else {
-                stats.unreadable_count += 1;
-                continue;
+            let entry = match item {
+                Ok(entry) => entry,
+                Err(error) => {
+                    stats.errors.push(&current, "read_dir_entry", error);
+                    continue;
+                }
             };
-            let Ok(metadata) = entry.metadata() else {
-                stats.unreadable_count += 1;
-                continue;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    stats.errors.push(&entry.path(), "metadata", error);
+                    continue;
+                }
             };
             #[cfg(windows)]
             if is_reparse_point(&metadata) {
@@ -1001,7 +1003,7 @@ fn scan_directory_impl(
         .as_ref()
         .map(|s| Path::new(&s.root))
         .unwrap_or(&root);
-    let mut errors = DirectoryReadErrors::new(&root);
+    let mut errors = DirectoryReadErrors::default();
     let metadata = match known_metadata
         .map(Ok)
         .unwrap_or_else(|| fs::metadata(&root))
@@ -2095,7 +2097,7 @@ fn scan_catalog(
                 scan_directory_impl(target, effective.max_depth, &options, Some(metadata.clone()), false)?
             }
             Err(error) => {
-                let mut errors = DirectoryReadErrors::new(Path::new(target));
+                let mut errors = DirectoryReadErrors::default();
                 if error.kind() != std::io::ErrorKind::NotFound {
                     errors.push(
                         Path::new(target),

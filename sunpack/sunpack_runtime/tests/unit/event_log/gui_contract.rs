@@ -65,6 +65,24 @@ pub(crate) fn gui_binary() -> PathBuf {
 
 #[test]
 #[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
+fn rust_writer_cpp_query_preserves_oversized_diagnostics() {
+    let binary = gui_binary();
+    let root = Directory::new("gui_large_error");
+    let path = root.0.join("events.json");
+    let log = NativeEventLog::new(path.clone(), 7, true).unwrap();
+    let message = "读".repeat(crate::io::scratch::MEMORY_BYTES / 3 + 1) + " last error";
+    let ts = utc_us() as f64 / 1_000_000.0;
+    log.write(json!({"event":"failed_terminal","path":root.0.join("large.zip"),
+        "ts":ts,"error_kind":"damaged","error":message})).unwrap();
+    log.write(json!({"event":"done","path":root.0.join("after.zip"),"ts":ts})).unwrap();
+    log.flush().unwrap();
+    let failed = project(&binary, &path, "large.zip", "", "", "");
+    assert_eq!(failed["rows"][0]["error"].as_str(), Some(message.as_str()));
+    assert_eq!(project(&binary, &path, "after.zip", "", "", "")["total"], 1);
+}
+
+#[test]
+#[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
 fn rust_writer_cpp_query_publication_conflict() {
     let binary = gui_binary();
     let root = Directory::new("gui_publication");

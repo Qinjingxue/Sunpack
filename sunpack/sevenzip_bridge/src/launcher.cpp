@@ -420,6 +420,13 @@ std::string read_input_line() {
         std::array<wchar_t, 4096> buffer{};
         DWORD read = 0;
         if (!ReadConsoleW(handle, buffer.data(), static_cast<DWORD>(buffer.size() - 1), &read, nullptr)) return {};
+        if (read && IS_HIGH_SURROGATE(buffer[read - 1])) {
+            // ReadConsoleW can divide a UTF-16 pair across reads. Complete it
+            // while the prompt still owns the console input.
+            DWORD continuation = 0;
+            if (!ReadConsoleW(handle, buffer.data() + read, 1, &continuation, nullptr)) return {};
+            read += continuation;
+        }
         return utf8(std::wstring(buffer.data(), read));
     }
     std::array<char, 4096> buffer{};

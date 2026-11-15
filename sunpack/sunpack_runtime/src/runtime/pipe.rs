@@ -431,14 +431,20 @@ impl PromptInput {
                 return None;
             }
         };
+        if end == unread.len() && self.bytes.capacity() > 64 * 1024 {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            if self.start != 0 {
+                bytes.copy_within(self.start.., 0);
+                bytes.truncate(end);
+            }
+            self.start = 0;
+            self.searched = 0;
+            return Some(String::from_utf8(bytes).unwrap_or_else(|error|
+                String::from_utf8_lossy(error.as_bytes()).into_owned()));
+        }
         let line = String::from_utf8_lossy(&unread[..end]).into_owned();
         self.start += end;
         self.searched = self.start;
-        if self.start == self.bytes.len() && self.bytes.capacity() > 64 * 1024 {
-            self.bytes = Vec::new();
-            self.start = 0;
-            self.searched = 0;
-        }
         Some(line)
     }
 
@@ -449,13 +455,12 @@ impl PromptInput {
             self.searched -= self.start;
             self.start = 0;
         }
-        if self.bytes.len().saturating_add(chunk.len()) > MAX_FIELD {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
         self.eof = chunk.is_empty();
         if self.bytes.is_empty() && self.bytes.capacity() < chunk.len() {
             self.bytes = chunk;
         } else {
+            self.bytes.try_reserve(chunk.len()).map_err(|error|
+                io::Error::new(io::ErrorKind::OutOfMemory, error))?;
             self.bytes.extend_from_slice(&chunk);
         }
         Ok(())

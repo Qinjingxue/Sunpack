@@ -5,7 +5,7 @@ use crate::password::rar::rar5_header_decryption_tests::{hex_bytes, PART1_HP_HEX
 fn standalone_gzip_reuses_sample_and_extends_long_headers() {
     use std::io::Write;
 
-    for name_len in [8, 2048] {
+    for name_len in [8, 2048, 70_000] {
         let mut encoder = flate2::GzBuilder::new()
             .filename(vec![b'a'; name_len])
             .write(Vec::new(), flate2::Compression::fast());
@@ -22,6 +22,18 @@ fn standalone_gzip_reuses_sample_and_extends_long_headers() {
             std::fs::remove_file(&path).unwrap();
         }
     }
+
+    // Empty non-final stored blocks are valid DEFLATE. Delay the first
+    // output past both the supplied sample and the old payload probe limit.
+    let mut gzip = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    gzip.extend([0, 0, 0, 255, 255].repeat(400));
+    gzip.extend([1, 1, 0, 254, 255, b'a']);
+    gzip.extend(crc32(b"a").to_le_bytes());
+    gzip.extend(1u32.to_le_bytes());
+    let path = crate::test_support::temp_file("gzip_empty_blocks", &gzip);
+    let anchor = probe_volume_anchor_from_head(path.to_str().unwrap(), gzip.len() as u64, &gzip[..512]);
+    assert!(anchor.anchor().is_some_and(|anchor| anchor.standalone && anchor.format == "gzip"));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

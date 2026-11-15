@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -35,74 +35,57 @@ enum ChildState {
 #[derive(Default)]
 struct Shared {
     state: Mutex<State>,
-    stderr: Mutex<StderrHistory>,
     changed: Condvar,
     shutting_down: AtomicBool,
 }
 
-// Match main's diagnostic tail without allowing an unterminated native line
-// to grow memory. UTF-8 needs at most four bytes per retained character.
-const STDERR_TAIL_CHARS: usize = 4000;
-const STDERR_TAIL_LINES: usize = 40;
-const STDERR_TAIL_BYTES: usize = STDERR_TAIL_CHARS * 4;
+// Opaque stderr from a DLL or a crashing process is a fallback. Controlled
+// worker failures have their own framed diagnostic.
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
 
 #[derive(Default)]
-struct StderrHistory { bytes: VecDeque<u8> }
+struct StderrHistory {
+    bytes: VecDeque<u8>,
+    discarded: bool,
+}
 
 impl StderrHistory {
     fn append(&mut self, bytes: &[u8]) {
+        self.discarded |= bytes.len() > STDERR_TAIL_BYTES;
         let bytes = &bytes[bytes.len().saturating_sub(STDERR_TAIL_BYTES)..];
         let remove = (self.bytes.len() + bytes.len()).saturating_sub(STDERR_TAIL_BYTES);
+        self.discarded |= remove != 0;
         self.bytes.drain(..remove);
         self.bytes.extend(bytes.iter().copied());
     }
 
-    fn take(&mut self) -> String {
-        let bytes: Vec<_> = self.bytes.drain(..).collect();
-        let text = String::from_utf8_lossy(&bytes);
-        let start = text.char_indices().rev().nth(STDERR_TAIL_CHARS - 1)
-            .map_or(0, |(offset, _)| offset);
-        let tail = &text[start..];
-        let lines = tail.strip_suffix('\n').unwrap_or(tail);
-        let start = lines.rmatch_indices('\n').nth(STDERR_TAIL_LINES - 1)
-            .map_or(0, |(offset, _)| offset + 1);
-        tail[start..].to_owned()
+    fn append_diagnostic(mut self, message: &mut String) {
+        if self.bytes.is_empty() {
+            return;
+        }
+        message.push_str("\nWorker stderr");
+        if self.discarded {
+            message.push_str(" (earlier output omitted)");
+            while self.bytes.front().is_some_and(|byte| byte & 0xc0 == 0x80) {
+                self.bytes.pop_front();
+            }
+        }
+        message.push('\n');
+        message.push_str(&String::from_utf8_lossy(self.bytes.make_contiguous()));
     }
 }
 
-fn pump_stderr(mut pipe: impl Read, shared: &Shared) {
+fn pump_stderr(mut pipe: impl Read) -> StderrHistory {
+    let mut history = StderrHistory::default();
     let mut block = [0; 4096];
-    let mut pending = Vec::with_capacity(block.len() + 3);
     loop {
-        let count = match pipe.read(&mut block) {
-            Ok(0) => break,
-            Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        };
-        pending.extend_from_slice(&block[..count]);
-        let mut consumed = 0;
-        // Preserve incomplete UTF-8 across pipe reads. Result publication must
-        // not turn a split character into two replacement characters.
-        while consumed < pending.len() {
-            match std::str::from_utf8(&pending[consumed..]) {
-                Ok(_) => {
-                    shared.stderr.lock().unwrap().append(&pending[consumed..]);
-                    consumed = pending.len();
-                }
-                Err(error) => {
-                    let valid_end = consumed + error.valid_up_to();
-                    shared.stderr.lock().unwrap().append(&pending[consumed..valid_end]);
-                    consumed = valid_end;
-                    let Some(invalid) = error.error_len() else { break; };
-                    shared.stderr.lock().unwrap().append("�".as_bytes());
-                    consumed += invalid;
-                }
-            }
+        match pipe.read(&mut block) {
+            Ok(0) => return history,
+            Ok(count) => history.append(&block[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return history,
         }
-        pending.drain(..consumed);
     }
-    if !pending.is_empty() { shared.stderr.lock().unwrap().append("�".as_bytes()); }
 }
 
 #[derive(Default)]
@@ -123,6 +106,7 @@ struct State {
     mode_reply: Option<(Option<ProcessMode>, bool)>,
     mode_waiter: Option<Waker>,
     closed: Option<WorkerExit>,
+    write_failure: Option<String>,
     input_closed: bool,
     writes: VecDeque<InputFrame>,
     completion_epoch: u64,
@@ -188,7 +172,7 @@ impl WriteCompletion {
 #[derive(Debug)]
 pub(super) struct CommunicationError {
     pub(super) kind: &'static str,
-    message: String,
+    message: Arc<str>,
 }
 impl std::fmt::Display for CommunicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
@@ -198,7 +182,7 @@ impl std::error::Error for CommunicationError {}
 #[derive(Clone)]
 struct WorkerExit {
     failure_kind: &'static str,
-    message: String,
+    message: Arc<str>,
     kind: io::ErrorKind,
 }
 
@@ -232,7 +216,7 @@ impl Job {
     }
 
     fn protocol_error(&mut self, error: io::Error) {
-        self.result = Some(Err(io::Error::new(error.kind(), CommunicationError { kind: "process_io", message: error.to_string() })));
+        self.result = Some(Err(io::Error::new(error.kind(), CommunicationError { kind: "process_io", message: error.to_string().into() })));
         self.accumulator.take();
         // Wake the existing submission waiter to use its ordered cancel write.
         // The result stays private until job_finished stops the native writer.
@@ -379,7 +363,7 @@ impl Process {
             .name("sunpack-worker-stdout".into())
             .spawn(move || run_process(spawn, &owner_child, &owner))
             .map_err(|error| io::Error::new(error.kind(), CommunicationError {
-                kind: "process_start", message: error.to_string(),
+                kind: "process_start", message: error.to_string().into(),
             }))?);
         drop(state);
         Ok(Self { child, shared })
@@ -701,14 +685,13 @@ fn run_process(
     let abandoned = shared.state.lock().unwrap().abort_startup.clone();
     if let Some(reason) = abandoned {
         let _ = reap_child(child, true);
-        shared.fail(reason.message, reason.kind);
+        shared.fail_classified(reason.message, reason.kind, reason.failure_kind);
         return;
     }
     let stderr_owner = match stderr {
         Some(pipe) => {
-            let owner = Arc::clone(shared);
             match thread::Builder::new().name("sunpack-worker-stderr".into())
-                .spawn(move || pump_stderr(pipe, &owner)) {
+                .spawn(move || pump_stderr(pipe)) {
                 Ok(owner) => Some(owner),
                 Err(error) => {
                     let _ = reap_child(child, true);
@@ -725,7 +708,8 @@ fn run_process(
         .name("sunpack-worker-stdin".into())
         .spawn(move || {
             dispatch_stdin(input, &owner, |error| {
-                fail_stdin(&owner_child, &owner, error);
+                owner.state.lock().unwrap().write_failure = Some(error.to_string());
+                let _ = reap_child(&owner_child, true);
             });
         }) {
         Ok(writer) => writer,
@@ -741,18 +725,24 @@ fn run_process(
     // result/failure wake can release leases or start a replacement process.
     let terminate = result.is_err() || !shared.shutting_down.load(Ordering::Acquire);
     let status = reap_child(child, terminate);
-    shared.fail_classified(
-        result.as_ref().err().map_or_else(
+    let stderr = stderr_owner.and_then(|owner| owner.join().ok());
+    let write_failure = shared.state.lock().unwrap().write_failure.take();
+    let mut message = match result {
+        Err(error) => format!("sevenzip_worker transport failed: {error}"),
+        Ok(()) => write_failure.map_or_else(
             || "sevenzip_worker exited before job completion".to_owned(),
-            |error| format!("sevenzip_worker transport failed: {error}"),
+            |error| format!("sevenzip_worker input failed: {error}"),
         ),
+    };
+    if let Some(stderr) = stderr {
+        stderr.append_diagnostic(&mut message);
+    }
+    shared.fail_classified(
+        message,
         worker_exit_kind(status),
-        // Main publishes process-level transport failure after wait(): the
-        // worker is gone. Job-local protocol errors remain process_io.
         "worker_lost",
     );
     let _ = writer.join();
-    if let Some(owner) = stderr_owner { let _ = owner.join(); }
 }
 
 impl Shared {
@@ -947,16 +937,7 @@ impl Shared {
             }
             "progress" | "native_memory" => {}
             _ => match job.accumulator.as_mut().expect("active job accumulator").accept(frame) {
-                Ok(Some(mut frame)) if string(&frame.summary, "type") == "result" => {
-                    let mut stderr = self.stderr.lock().unwrap();
-                    if string(&frame.summary, "status") == "ok" || rejected(&frame) {
-                        stderr.bytes.clear();
-                    } else {
-                        let tail = stderr.take();
-                        if !tail.is_empty() { frame.summary["stderr_tail"] = Value::String(tail); }
-                    }
-                    job.result = Some(Ok(frame));
-                }
+                Ok(Some(frame)) if string(&frame.summary, "type") == "result" => job.result = Some(Ok(frame)),
                 Ok(_) => {}
                 Err(error) => job.protocol_error(error),
             },
@@ -967,13 +948,13 @@ impl Shared {
         self.fail_classified(message, kind, "process_io");
     }
 
-    fn fail_classified(&self, message: String, kind: io::ErrorKind, failure_kind: &'static str) {
+    fn fail_classified(&self, message: impl Into<Arc<str>>, kind: io::ErrorKind, failure_kind: &'static str) {
         let (jobs, parked, writes, ready, mode) = {
             let mut state = self.state.lock().unwrap();
             if state.closed.is_some() {
                 return;
             }
-            let exit = state.abort_startup.take().unwrap_or(WorkerExit { message, kind, failure_kind });
+            let exit = state.abort_startup.take().unwrap_or_else(|| WorkerExit { message: message.into(), kind, failure_kind });
             let jobs = std::mem::take(&mut state.jobs);
             let parked = std::mem::take(&mut state.parked);
             let writes = std::mem::take(&mut state.writes);
@@ -1041,7 +1022,7 @@ impl State {
                         completion: Arc::new(WriteCompletion::default()),
                     });
                 }
-                Err(error) => self.abort_startup = Some(WorkerExit { failure_kind: "process_io", message: error.to_string(), kind: error.kind() }),
+                Err(error) => self.abort_startup = Some(WorkerExit { failure_kind: "process_io", message: error.to_string().into(), kind: error.kind() }),
             }
         }
     }
@@ -1093,6 +1074,7 @@ fn worker_exit_kind(status: Option<std::process::ExitStatus>) -> io::ErrorKind {
     }
 }
 
+#[cfg(test)]
 fn fail_stdin(child: &Mutex<ChildState>, shared: &Shared, error: &io::Error) {
     // Reap before releasing admitted jobs, and preserve the same classification
     // whichever pipe observes the dead worker first (main's abort/on_error).
@@ -1127,17 +1109,20 @@ fn dispatch_stdin(mut input: impl Write, shared: &Shared, failed: impl FnOnce(&i
             // Even a partial write may have admitted a native job. The owner
             // reaps the child before any caller can release its output lease.
             failed(error);
-            // Publish the same reaped-worker classification to this sender as
-            // to queued writes and admitted jobs, not the raw pipe error.
-            let classified = shared.state.lock().unwrap().closed.as_ref().map(WorkerExit::error);
-            write.completion.finish(classified.map_or(result, Err));
+            // Stdout drains any terminal native diagnostic before publishing
+            // one failure to every request, including this in-flight write.
+            let state = shared.state.lock().unwrap();
+            let state = shared.changed.wait_while(state, |state| state.closed.is_none()).unwrap();
+            let failure = state.closed.as_ref().unwrap().error();
+            drop(state);
+            write.completion.finish(Err(failure));
             return;
         }
         write.completion.finish(result);
     }
 }
 
-fn dispatch_stdout(mut output: ChildStdout, shared: &Shared) -> io::Result<()> {
+fn dispatch_stdout(mut output: impl Read, shared: &Shared) -> io::Result<()> {
     let mut decoder = NativeWorkerFrameDecoder::default();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -1146,6 +1131,10 @@ fn dispatch_stdout(mut output: ChildStdout, shared: &Shared) -> io::Result<()> {
             return decoder.finish();
         }
         for frame in decoder.feed(&buffer[..count])? {
+            if string(&frame.summary, "type") == "worker_fatal" {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    string(&frame.summary, "message").to_owned()));
+            }
             shared.event(frame);
         }
         decoder.check()?;

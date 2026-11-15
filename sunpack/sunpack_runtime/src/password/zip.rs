@@ -1,4 +1,5 @@
 use super::PasswordVerification;
+use crate::formats::zip::{zip64, RelationDirectory};
 use crate::io::archive_state::{InputExtent, InputPart};
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
@@ -61,27 +62,181 @@ pub(crate) fn zip_fast_verify_passwords_from_volumes(
     })
 }
 
+fn invalid_password_directory() -> PreparedStatus {
+    PreparedStatus::new(
+        "needs_volume_or_tail_damaged",
+        "ZIP central directory crosses its declared extent",
+    )
+}
+
+fn password_directory(
+    record: &[u8; 22],
+    offset: u64,
+    source_len: u64,
+) -> Result<RelationDirectory, PreparedStatus> {
+    if !record.starts_with(ZIP_EOCD) {
+        return Err(ReadFault::invalid_field(
+            "parse_record",
+            offset,
+            record.len(),
+            source_len,
+            "invalid ZIP EOCD signature",
+        )
+        .with_field("zip.eocd", FieldLocation::Tail)
+        .into());
+    }
+    Ok(RelationDirectory {
+        disk: u32::from(le_u16(record, 4).unwrap()),
+        cd_disk: u32::from(le_u16(record, 6).unwrap()),
+        disk_entries: u64::from(le_u16(record, 8).unwrap()),
+        entries: u64::from(le_u16(record, 10).unwrap()),
+        size: u64::from(le_u32(record, 12).unwrap()),
+        offset: u64::from(le_u32(record, 16).unwrap()),
+        end: offset,
+    })
+}
+
+fn password_directory_needs_zip64(directory: &RelationDirectory) -> bool {
+    directory.disk == u32::from(u16::MAX)
+        || directory.cd_disk == u32::from(u16::MAX)
+        || directory.disk_entries == u64::from(u16::MAX)
+        || directory.entries == u64::from(u16::MAX)
+        || directory.size == u64::from(u32::MAX)
+        || directory.offset == u64::from(u32::MAX)
+}
+
+fn resolve_password_zip64(
+    classic: RelationDirectory,
+    eocd: u64,
+    disk_starts: Option<&[u64]>,
+    mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, ReadFault>,
+) -> Result<Option<(RelationDirectory, zip64::Locator)>, PreparedStatus> {
+    let mut fault = None;
+    let found = zip64::locate_end_record(eocd, disk_starts, |offset, size| {
+        read(offset, size).map_err(|error| {
+            fault = Some(error);
+            std::io::Error::from(std::io::ErrorKind::InvalidData)
+        })
+    })
+    .map_err(|()| {
+        fault.map_or_else(
+            || PreparedStatus::new("damaged", "invalid ZIP64 locator or end record"),
+            PreparedStatus::from,
+        )
+    })?;
+    let Some(found) = found else {
+        return Ok(None);
+    };
+    let record = found.record;
+    if ![
+        (
+            u64::from(classic.disk),
+            u64::from(u16::MAX),
+            u64::from(record.disk),
+        ),
+        (
+            u64::from(classic.cd_disk),
+            u64::from(u16::MAX),
+            u64::from(record.cd_disk),
+        ),
+        (
+            classic.disk_entries,
+            u64::from(u16::MAX),
+            record.disk_entries,
+        ),
+        (classic.entries, u64::from(u16::MAX), record.total_entries),
+        (classic.size, u64::from(u32::MAX), record.cd_size),
+        (classic.offset, u64::from(u32::MAX), record.cd_offset),
+    ]
+    .into_iter()
+    .all(|(field, sentinel, wide)| field == sentinel || field == wide)
+    {
+        return Err(PreparedStatus::new(
+            "damaged",
+            "ZIP64 end record contradicts the classic EOCD",
+        ));
+    }
+    Ok(Some((
+        RelationDirectory {
+            disk: record.disk,
+            cd_disk: record.cd_disk,
+            disk_entries: record.disk_entries,
+            entries: record.total_entries,
+            size: record.cd_size,
+            offset: record.cd_offset,
+            end: found.offset,
+        },
+        found.locator,
+    )))
+}
+
+fn check_password_directory(
+    directory: &RelationDirectory,
+    fits: bool,
+    missing_zip64: bool,
+) -> Result<(), PreparedStatus> {
+    if fits
+        && directory.entries <= directory.size / 46
+        && directory.disk_entries <= directory.entries
+    {
+        return Ok(());
+    }
+    if missing_zip64 {
+        return Err(PreparedStatus::new(
+            "unknown_needs_final_verifier",
+            "ZIP central-directory location requires ZIP64",
+        ));
+    }
+    Err(invalid_password_directory())
+}
+
+fn password_entry_location(
+    fixed: &[u8],
+    read_extra: impl FnOnce() -> Result<Vec<u8>, PreparedStatus>,
+) -> Result<(usize, u64), PreparedStatus> {
+    let disk = le_u16(fixed, 34).unwrap();
+    let offset = le_u32(fixed, 42).unwrap();
+    if disk != u16::MAX && offset != u32::MAX {
+        return Ok((usize::from(disk), u64::from(offset)));
+    }
+    let extra = read_extra()?;
+    zip64::central_entry_values(fixed, &extra)
+        .map(|values| (values.disk as usize, values.local_offset))
+        .ok_or_else(|| PreparedStatus::new("damaged", "invalid ZIP64 central-directory entry"))
+}
+
 fn prepare_zip_volumes(
     volumes: &VolumeSet,
     eocd_offset: Option<u64>,
 ) -> Result<ZipPasswordContext, PreparedStatus> {
     volumes.require_contiguous()?;
-    let (tail, eocd_offset) = if let Some(offset) = eocd_offset {
+    let last_disk = volumes.len() - 1;
+    let (record, local_eocd): ([u8; 22], u64) = if let Some(offset) = eocd_offset {
         let (disk, local) = volumes.advance_disk_offset(0, 0, offset).ok_or_else(|| {
             PreparedStatus::new(
                 "needs_volume_or_tail_damaged",
                 "analyzed ZIP EOCD crosses unavailable volumes",
             )
         })?;
-        let record =
-            volumes.read_disk_spanning_field(disk, local, 22, "zip.eocd", FieldLocation::Tail)?;
-        if !record.starts_with(ZIP_EOCD) {
+        // advance_disk_offset may return the previous disk's exact end.
+        let local = if disk == last_disk {
+            local
+        } else if disk + 1 == last_disk && volumes.volume_len(disk) == Some(local) {
+            0
+        } else {
             return Err(PreparedStatus::new(
-                "damaged",
-                "analyzed ZIP EOCD signature is invalid",
+                "needs_volume_or_tail_damaged",
+                "analyzed ZIP EOCD is outside the final volume",
             ));
-        }
-        (record, 0)
+        };
+        let record = volumes.read_disk_spanning_field(
+            last_disk,
+            local,
+            22,
+            "zip.eocd",
+            FieldLocation::Tail,
+        )?;
+        (record.as_slice().try_into().unwrap(), local)
     } else {
         let tail = volumes.read_last_tail_field(MAX_EOCD_SCAN, "zip.eocd_search_window")?;
         if tail.len() < 22 {
@@ -104,41 +259,73 @@ fn prepare_zip_volumes(
                 )
                 .with_field("zip.eocd", FieldLocation::Tail)
             })?;
-        (tail, offset)
+        let local = volumes.volume_len(last_disk).unwrap() - tail.len() as u64 + offset as u64;
+        (tail[offset..offset + 22].try_into().unwrap(), local)
     };
-    let disk_number = le_u16(&tail, eocd_offset + 4).unwrap_or(u16::MAX) as usize;
-    let central_disk = le_u16(&tail, eocd_offset + 6).unwrap_or(u16::MAX) as usize;
-    let total_entries = le_u16(&tail, eocd_offset + 10).unwrap_or(u16::MAX) as usize;
-    let central_size = le_u32(&tail, eocd_offset + 12).unwrap_or(u32::MAX) as u64;
-    let central_offset = le_u32(&tail, eocd_offset + 16).unwrap_or(u32::MAX) as u64;
-    if disk_number + 1 != volumes.len() {
+    let mut directory =
+        password_directory(&record, local_eocd, volumes.volume_len(last_disk).unwrap())?;
+    let mut boundary = (last_disk, local_eocd);
+    let mut missing_zip64 = password_directory_needs_zip64(&directory);
+    if missing_zip64 {
+        let mut start = 0u64;
+        let mut starts = Vec::with_capacity(volumes.len());
+        for disk in 0..volumes.len() {
+            starts.push(start);
+            start = start
+                .checked_add(volumes.volume_len(disk).unwrap())
+                .ok_or_else(|| PreparedStatus::new("damaged", "ZIP volume offsets overflow"))?;
+        }
+        let absolute_eocd = starts[last_disk] + local_eocd;
+        if let Some((resolved, locator)) =
+            resolve_password_zip64(directory, absolute_eocd, Some(&starts), |offset, size| {
+                let disk = starts.partition_point(|&start| start <= offset) - 1;
+                volumes.read_disk_spanning_field(
+                    disk,
+                    offset - starts[disk],
+                    size,
+                    "zip.zip64_end_record",
+                    FieldLocation::Tail,
+                )
+            })?
+        {
+            if locator.total_disks as usize != volumes.len() {
+                return Err(PreparedStatus::new(
+                    "needs_volume_or_tail_damaged",
+                    "ZIP64 locator disk count differs from available volumes",
+                ));
+            }
+            let disk = starts.partition_point(|&start| start <= resolved.end) - 1;
+            boundary = (disk, resolved.end - starts[disk]);
+            directory = resolved;
+            missing_zip64 = false;
+        }
+    }
+    if directory.disk as usize != last_disk {
         let fault = ReadFault::invalid_field(
             "validate_field",
-            eocd_offset as u64 + 4,
+            local_eocd + 4,
             2,
-            tail.len() as u64,
+            volumes.volume_len(last_disk).unwrap(),
             format!(
                 "declared disk count {} does not match available volume count {}",
-                disk_number + 1,
+                u64::from(directory.disk) + 1,
                 volumes.len()
             ),
         )
         .with_field("zip.eocd.disk_number", FieldLocation::Tail);
         return Err(fault.into());
     }
-    if total_entries == u16::MAX as usize
-        || central_size == u32::MAX as u64
-        || central_offset == u32::MAX as u64
-    {
-        return Err(PreparedStatus::new(
-            "unknown_needs_final_verifier",
-            "zip64 spanned password probing is not supported",
-        ));
-    }
 
-    let mut disk = central_disk;
-    let mut offset = central_offset;
-    for _ in 0..total_entries {
+    let mut disk = directory.cd_disk as usize;
+    let mut offset = directory.offset;
+    let directory_end = volumes.advance_disk_offset(disk, offset, directory.size);
+    check_password_directory(
+        &directory,
+        directory_end.is_some_and(|end| end <= boundary),
+        missing_zip64,
+    )?;
+    let mut remaining = directory.size;
+    for _ in 0..directory.entries {
         let fixed = match volumes.read_disk_spanning_field(
             disk,
             offset,
@@ -164,18 +351,25 @@ fn prepare_zip_volumes(
         let name_len = le_u16(&fixed, 28).unwrap_or(0) as u64;
         let extra_len = le_u16(&fixed, 30).unwrap_or(0) as u64;
         let comment_len = le_u16(&fixed, 32).unwrap_or(0) as u64;
-        let entry_disk = le_u16(&fixed, 34).unwrap_or(u16::MAX) as usize;
-        let local_offset = le_u32(&fixed, 42).unwrap_or(u32::MAX) as u64;
+        let record_len = 46 + name_len + extra_len + comment_len;
+        remaining = remaining
+            .checked_sub(record_len)
+            .ok_or_else(invalid_password_directory)?;
         if flags & 0x0001 != 0 {
-            if entry_disk == u16::MAX as usize || local_offset == u32::MAX as u64 {
-                return Err(PreparedStatus::new(
-                    "unknown_needs_final_verifier",
-                    "zip64 encrypted entry location requires fallback",
-                ));
-            }
+            let (entry_disk, local_offset) = password_entry_location(&fixed, || {
+                let (extra_disk, extra_offset) = volumes
+                    .advance_disk_offset(disk, offset, 46 + name_len)
+                    .ok_or_else(invalid_password_directory)?;
+                Ok(volumes.read_disk_spanning_field(
+                    extra_disk,
+                    extra_offset,
+                    extra_len as usize,
+                    "zip.central_directory.zip64_extra",
+                    FieldLocation::Tail,
+                )?)
+            })?;
             return prepare_zip_volume_entry(volumes, entry_disk, local_offset);
         }
-        let record_len = 46u64 + name_len + extra_len + comment_len;
         let Some(next) = volumes.advance_disk_offset(disk, offset, record_len) else {
             return Err(PreparedStatus::new("needs_volume_or_tail_damaged", "zip central directory crosses unavailable data; missing volume or damaged tail field"));
         };
@@ -520,10 +714,37 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
             )
         }
     };
-    if !record.starts_with(ZIP_EOCD)
-        || le_u16(&record, 4) != Some(0)
-        || le_u16(&record, 6) != Some(0)
-    {
+    let mut directory = password_directory(&record, offset, total_len)?;
+    let mut missing_zip64 = password_directory_needs_zip64(&directory);
+    if missing_zip64 {
+        if let Some((resolved, locator)) =
+            resolve_password_zip64(directory, offset, None, |at, size| {
+                seek_field(
+                    file,
+                    at,
+                    total_len,
+                    "zip.zip64_end_record",
+                    FieldLocation::Tail,
+                )?;
+                let mut bytes = vec![0; size];
+                read_exact_field(
+                    file,
+                    &mut bytes,
+                    total_len,
+                    "zip.zip64_end_record",
+                    FieldLocation::Tail,
+                )?;
+                Ok(bytes)
+            })?
+        {
+            if locator.record_disk != 0 || locator.total_disks != 1 {
+                return Err(invalid_password_directory());
+            }
+            directory = resolved;
+            missing_zip64 = false;
+        }
+    }
+    if directory.disk != 0 || directory.cd_disk != 0 {
         return Err(ReadFault::invalid_field(
             "parse_record",
             offset,
@@ -534,24 +755,17 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
         .with_field("zip.eocd", FieldLocation::Tail)
         .into());
     }
-    let tail = record;
-    let eocd = 0;
-    let total_entries = le_u16(&tail, eocd + 10).unwrap() as usize;
-    let central_size = le_u32(&tail, eocd + 12).unwrap() as u64;
-    let central_offset = le_u32(&tail, eocd + 16).unwrap() as u64;
-    if total_entries == u16::MAX as usize
-        || central_size == u32::MAX as u64
-        || central_offset == u32::MAX as u64
-    {
-        // Unsupported ZIP64 metadata goes through the original final verifier;
-        // its presence alone does not prove a missing volume or damaged tail.
-        return Err(PreparedStatus::new(
-            "unknown_needs_final_verifier",
-            "ZIP central-directory location requires ZIP64",
-        ));
-    }
-    let mut cursor = central_offset;
-    for _ in 0..total_entries {
+    check_password_directory(
+        &directory,
+        directory
+            .offset
+            .checked_add(directory.size)
+            .is_some_and(|end| end <= directory.end),
+        missing_zip64,
+    )?;
+    let mut cursor = directory.offset;
+    let mut remaining = directory.size;
+    for _ in 0..directory.entries {
         let mut fixed = [0u8; 46];
         seek_field(
             file,
@@ -582,13 +796,32 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
         let name_len = le_u16(&fixed, 28).unwrap() as u64;
         let extra_len = le_u16(&fixed, 30).unwrap() as u64;
         let comment_len = le_u16(&fixed, 32).unwrap() as u64;
+        let record_len = 46 + name_len + extra_len + comment_len;
+        remaining = remaining
+            .checked_sub(record_len)
+            .ok_or_else(invalid_password_directory)?;
         if flags & 0x0001 != 0 {
-            let local_offset = le_u32(&fixed, 42).unwrap() as u64;
-            if local_offset == u32::MAX as u64 {
-                return Err(PreparedStatus::new(
-                    "unknown_needs_final_verifier",
-                    "ZIP64 local-header offset requires fallback",
-                ));
+            let (disk, local_offset) = password_entry_location(&fixed, || {
+                let at = cursor + 46 + name_len;
+                seek_field(
+                    file,
+                    at,
+                    total_len,
+                    "zip.central_directory.zip64_extra",
+                    FieldLocation::Tail,
+                )?;
+                let mut bytes = vec![0; extra_len as usize];
+                read_exact_field(
+                    file,
+                    &mut bytes,
+                    total_len,
+                    "zip.central_directory.zip64_extra",
+                    FieldLocation::Tail,
+                )?;
+                Ok(bytes)
+            })?;
+            if disk != 0 {
+                return Err(invalid_password_directory());
             }
             let mut local_fixed = [0u8; 30];
             seek_field(
@@ -641,18 +874,16 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
             header.data_offset = header.data_offset.saturating_add(local_offset);
             return Ok(Some(header));
         }
-        cursor = cursor
-            .checked_add(46 + name_len + extra_len + comment_len)
-            .ok_or_else(|| {
-                ReadFault::invalid_field(
-                    "advance",
-                    cursor,
-                    12,
-                    total_len,
-                    "ZIP central-directory entry length overflow",
-                )
-                .with_field("zip.central_directory.entry_length", FieldLocation::Tail)
-            })?;
+        cursor = cursor.checked_add(record_len).ok_or_else(|| {
+            ReadFault::invalid_field(
+                "advance",
+                cursor,
+                12,
+                total_len,
+                "ZIP central-directory entry length overflow",
+            )
+            .with_field("zip.central_directory.entry_length", FieldLocation::Tail)
+        })?;
     }
     Ok(None)
 }

@@ -6,7 +6,7 @@ fn replayed_entry_event_keeps_business_failure_kind_and_message() {
         path: r"C:\input\archive.zip".into(),
         status: "failed_retryable".into(),
         failure_kind: "wrong_password".into(),
-        last_error: "密码不在密码列表中".into(),
+        last_error: format!("{}末尾诊断", "密码不在密码列表中".repeat(512)),
         size: 0, mtime: 0.0, file_id: String::new(), change_usn: 0,
         attempt_count: 1, failure_stage: String::new(),
         failure_payload: Map::new(), last_attempt_at: 0.0

@@ -16,7 +16,7 @@ use crate::io::archive_state::{
     ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection,
 };
 use crate::io::cancellation::is_cancellation;
-use crate::io::directory_errors::{directory_error_count, DirectoryReadErrors};
+use crate::io::directory_errors::DirectoryReadErrors;
 use crate::io::reader::{
     capture_directory_identity, capture_file_generation, PhysicalFileGeneration,
 };
@@ -1207,17 +1207,13 @@ impl<'run, O: Observer> Run<'run, O> {
             std::mem::replace(&mut *self.scan_errors.lock().unwrap(), DirectoryReadErrors::report())
                 .into_messages()
                 .into_iter()
-                .map(|error| {
-                    let count = directory_error_count(&error);
-                    let (operation, path, detail) = error;
-                    InputError {
-                        path: PathBuf::from(path),
-                        message: detail,
-                        kind: InputErrorKind::FilesystemScan,
-                        scan_operation: Some(operation),
-                        scan_count: (count != 1).then_some(count),
-                        failure: None,
-                    }
+                .map(|(operation, path, detail)| InputError {
+                    path: PathBuf::from(path),
+                    message: detail,
+                    kind: InputErrorKind::FilesystemScan,
+                    scan_operation: Some(operation),
+                    scan_count: None,
+                    failure: None,
                 }),
         );
         Ok(outcome)
@@ -3518,7 +3514,6 @@ fn worker_evidence(
             } else { "zipcrypto_failure_without_password_proof" }.to_owned()),
              None, Some(worker::string(result, "operation_result_name").to_owned()))
         } else { (None, None, None) };
-    let stderr_tail = field("stderr_tail");
     let stage = field("failure_stage");
     let native_kind = field("failure_kind");
     let missing_volume_suspected = flag(result, "missing_volume_suspected");
@@ -3537,7 +3532,7 @@ fn worker_evidence(
         win32_error: input["last_win32_error"].as_i64().unwrap_or_default(),
         read_error,
     });
-    (hresult.is_some() || classification_evidence.is_some() || missing_volume_suspected || stderr_tail.is_some()
+    (hresult.is_some() || classification_evidence.is_some() || missing_volume_suspected
         || stage.is_some()
         || native_kind.is_some()
         || missing_volume_name.is_some()
@@ -3547,7 +3542,6 @@ fn worker_evidence(
         Box::new(FailureEvidence {
             hresult, classification_evidence, password_crc_proven_items, backend_operation_result,
             missing_volume_suspected,
-            stderr_tail,
             stage,
             native_kind,
             missing_volume_name,

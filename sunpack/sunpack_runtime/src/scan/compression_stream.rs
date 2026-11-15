@@ -1,5 +1,6 @@
 use crate::io::reader::{CachedBytes, ManagedReader};
 use crc32fast::{hash as crc32, Hasher};
+use std::borrow::Cow;
 use std::io;
 
 const BUFFER_SIZE: usize = 64 * 1024;
@@ -37,22 +38,27 @@ fn invalid<T>(code: &'static str) -> ValidationResult<T> {
     Err(ValidationError::Invalid(code))
 }
 
-struct ByteCursor<'a> {
-    reader: &'a ManagedReader,
+struct ByteCursor<'a, B = CachedBytes> {
+    read: &'a mut dyn FnMut(u64, usize) -> io::Result<B>,
     pos: u64,
     limit: u64,
     buffer_start: u64,
-    buffer: CachedBytes,
+    buffer: B,
 }
 
-impl<'a> ByteCursor<'a> {
-    fn new(reader: &'a ManagedReader, pos: u64, limit: u64) -> Self {
+impl<'a, B: AsRef<[u8]>> ByteCursor<'a, B> {
+    fn new(
+        read: &'a mut dyn FnMut(u64, usize) -> io::Result<B>,
+        pos: u64,
+        limit: u64,
+        buffer: B,
+    ) -> Self {
         Self {
-            reader,
+            read,
             pos,
             limit,
-            buffer_start: u64::MAX,
-            buffer: CachedBytes::default(),
+            buffer_start: pos,
+            buffer,
         }
     }
 
@@ -61,25 +67,29 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn read_byte(&mut self) -> ValidationResult<u8> {
+        let value = self.available()?[0];
+        self.pos += 1;
+        Ok(value)
+    }
+
+    fn available(&mut self) -> ValidationResult<&[u8]> {
         if self.pos >= self.limit {
             return invalid("unexpected_end_of_stream");
         }
-        let outside = self.buffer_start == u64::MAX
-            || self.pos < self.buffer_start
-            || self.pos >= self.buffer_start + self.buffer.len() as u64;
+        let outside = self.pos < self.buffer_start
+            || self.pos >= self.buffer_start + self.buffer.as_ref().len() as u64;
         if outside {
             self.refill()?;
         }
-        let value = self.buffer[(self.pos - self.buffer_start) as usize];
-        self.pos += 1;
-        Ok(value)
+        let start = (self.pos - self.buffer_start) as usize;
+        Ok(&self.buffer.as_ref()[start..])
     }
 
     fn take_buffered_word(&mut self) -> Option<u32> {
         // Only consume bytes already in this cursor window. A short window
         // still uses the byte path and its existing refill and EOF checks.
         let start = self.pos.checked_sub(self.buffer_start)? as usize;
-        let word = self.buffer.get(start..)?.first_chunk()?;
+        let word = self.buffer.as_ref().get(start..)?.first_chunk()?;
         self.pos += 4;
         Some(u32::from_be_bytes(*word))
     }
@@ -89,15 +99,19 @@ impl<'a> ByteCursor<'a> {
     fn refill(&mut self) -> ValidationResult<()> {
         // Grow after consuming each window so short carrier streams do
         // not jump directly from a tiny probe to a full bulk read.
-        let window_size = if self.buffer_start == u64::MAX {
+        let window_size = if self.buffer.as_ref().is_empty() {
             INITIAL_PROBE_BYTES
         } else {
-            self.buffer.len().saturating_mul(4).min(BUFFER_SIZE)
+            self.buffer
+                .as_ref()
+                .len()
+                .saturating_mul(4)
+                .min(BUFFER_SIZE)
         };
         self.buffer_start = self.pos;
-        let count = window_size.min((self.limit - self.pos) as usize);
-        self.buffer = self.reader.read_cached_at(self.pos, count)?;
-        if self.buffer.is_empty() {
+        let count = (window_size as u64).min(self.limit - self.pos) as usize;
+        self.buffer = (self.read)(self.pos, count)?;
+        if self.buffer.as_ref().is_empty() {
             return invalid("unexpected_end_of_stream");
         }
         Ok(())
@@ -118,16 +132,11 @@ impl<'a> ByteCursor<'a> {
         self.check_read_len(count)?;
         let mut remaining = count;
         while remaining > 0 {
-            // Keep the existing refill/EOF path and consume each window in
-            // bulk. Fixed fields can span a refill boundary.
-            self.read_byte()?;
-            // Include the byte that triggered refill in the same slice;
-            // successful read_byte guarantees at least one available byte.
-            let start = (self.pos - self.buffer_start - 1) as usize;
-            let available = remaining.min(self.buffer.len() - start);
-            append(&self.buffer[start..start + available]);
-            self.pos += available as u64 - 1;
-            remaining -= available;
+            let next = self.available()?;
+            let take = remaining.min(next.len());
+            append(&next[..take]);
+            self.pos += take as u64;
+            remaining -= take;
         }
         Ok(())
     }
@@ -144,15 +153,7 @@ impl<'a> ByteCursor<'a> {
 
     fn skip_header_string(&mut self, mut crc: Option<&mut Hasher>) -> ValidationResult<()> {
         loop {
-            let byte = self.read_byte()?;
-            if let Some(hasher) = crc.as_mut() {
-                hasher.update(&[byte]);
-            }
-            if byte == 0 {
-                return Ok(());
-            }
-            let start = (self.pos - self.buffer_start) as usize;
-            let tail = &self.buffer[start..];
+            let tail = self.available()?;
             let terminator = memchr::memchr(0, tail);
             let consumed = terminator.map_or(tail.len(), |index| index + 1);
             if let Some(hasher) = crc.as_mut() {
@@ -698,69 +699,6 @@ pub(crate) fn gzip_fixed_header_flags(fixed: &[u8; 10]) -> ValidationResult<u8> 
     Ok(flags)
 }
 
-// One optional-header grammar serves streaming validation, identity probes and
-// analysis views, including logical multi-volume readers. Strings and extra
-// fields are consumed in bulk and do not need to be retained.
-trait GzipHeaderInput {
-    fn position(&self) -> u64;
-    fn array<const N: usize>(&mut self) -> ValidationResult<[u8; N]>;
-    fn consume(&mut self, count: usize, crc: Option<&mut Hasher>) -> ValidationResult<()>;
-    fn string(&mut self, crc: Option<&mut Hasher>) -> ValidationResult<()>;
-}
-
-impl GzipHeaderInput for ByteCursor<'_> {
-    fn position(&self) -> u64 {
-        self.pos
-    }
-    fn array<const N: usize>(&mut self) -> ValidationResult<[u8; N]> {
-        self.read_array()
-    }
-    fn consume(&mut self, count: usize, crc: Option<&mut Hasher>) -> ValidationResult<()> {
-        match crc {
-            Some(crc) => self.read_chunks(count, |bytes| crc.update(bytes)),
-            None => self.skip(count as u64),
-        }
-    }
-    fn string(&mut self, crc: Option<&mut Hasher>) -> ValidationResult<()> {
-        self.skip_header_string(crc)
-    }
-}
-
-impl GzipHeaderInput for std::io::Cursor<&[u8]> {
-    fn position(&self) -> u64 {
-        std::io::Cursor::position(self)
-    }
-    fn array<const N: usize>(&mut self) -> ValidationResult<[u8; N]> {
-        let mut bytes = [0; N];
-        std::io::Read::read_exact(self, &mut bytes)
-            .map_err(|_| ValidationError::Invalid("unexpected_end_of_stream"))?;
-        Ok(bytes)
-    }
-    fn consume(&mut self, count: usize, crc: Option<&mut Hasher>) -> ValidationResult<()> {
-        let start = self.position() as usize;
-        let bytes = self
-            .get_ref()
-            .get(start..start.saturating_add(count))
-            .ok_or(ValidationError::Invalid("unexpected_end_of_stream"))?;
-        if let Some(crc) = crc {
-            crc.update(bytes);
-        }
-        self.set_position((start + count) as u64);
-        Ok(())
-    }
-    fn string(&mut self, crc: Option<&mut Hasher>) -> ValidationResult<()> {
-        let start = self.position() as usize;
-        let tail = self
-            .get_ref()
-            .get(start..)
-            .ok_or(ValidationError::Invalid("unexpected_end_of_stream"))?;
-        let len = memchr::memchr(0, tail)
-            .ok_or(ValidationError::Invalid("unexpected_end_of_stream"))?
-            + 1;
-        self.consume(len, crc)
-    }
-}
-
 fn gzip_field<T>(result: ValidationResult<T>, field: &'static str) -> ValidationResult<T> {
     result.map_err(|error| match error {
         ValidationError::Invalid(_) => ValidationError::Invalid(field),
@@ -768,8 +706,8 @@ fn gzip_field<T>(result: ValidationResult<T>, field: &'static str) -> Validation
     })
 }
 
-fn read_gzip_header(input: &mut impl GzipHeaderInput) -> ValidationResult<u64> {
-    let fixed = gzip_field(input.array::<10>(), "short_gzip_header")?;
+fn read_gzip_header(input: &mut ByteCursor<'_, impl AsRef<[u8]>>) -> ValidationResult<()> {
+    let fixed = gzip_field(input.read_array::<10>(), "short_gzip_header")?;
     let flags = gzip_fixed_header_flags(&fixed)?;
     let has_crc = flags & 0x02 != 0;
     let mut hasher = Hasher::new();
@@ -777,37 +715,79 @@ fn read_gzip_header(input: &mut impl GzipHeaderInput) -> ValidationResult<u64> {
         hasher.update(&fixed);
     }
     if flags & 0x04 != 0 {
-        let bytes = gzip_field(input.array::<2>(), "gzip_extra_length_missing")?;
+        let bytes = gzip_field(input.read_array::<2>(), "gzip_extra_length_missing")?;
         if has_crc {
             hasher.update(&bytes);
         }
         let length = u16::from_le_bytes(bytes) as usize;
-        gzip_field(
-            input.consume(length, has_crc.then_some(&mut hasher)),
-            "gzip_extra_out_of_range",
-        )?;
+        let consumed = if has_crc {
+            input.read_chunks(length, |bytes| hasher.update(bytes))
+        } else {
+            input.skip(length as u64)
+        };
+        gzip_field(consumed, "gzip_extra_out_of_range")?;
     }
     for (flag, error) in [
         (0x08, "gzip_name_unterminated"),
         (0x10, "gzip_comment_unterminated"),
     ] {
         if flags & flag != 0 {
-            gzip_field(input.string(has_crc.then_some(&mut hasher)), error)?;
+            gzip_field(
+                input.skip_header_string(has_crc.then_some(&mut hasher)),
+                error,
+            )?;
         }
     }
     if has_crc {
-        let stored = u16::from_le_bytes(gzip_field(input.array::<2>(), "gzip_header_crc_missing")?);
+        let stored = u16::from_le_bytes(gzip_field(
+            input.read_array::<2>(),
+            "gzip_header_crc_missing",
+        )?);
         if stored != (hasher.finalize() & 0xffff) as u16 {
             return invalid("gzip_header_crc_bad");
         }
     }
-    Ok(input.position())
+    Ok(())
 }
 
-pub(crate) fn gzip_payload_offset_from_slice(data: &[u8], start: usize) -> ValidationResult<u64> {
-    let mut input = std::io::Cursor::new(data);
-    input.set_position(start as u64);
-    read_gzip_header(&mut input)
+pub(crate) fn validate_gzip_identity(
+    prefix: &[u8],
+    limit: u64,
+    mut read: impl FnMut(u64, usize) -> io::Result<Vec<u8>>,
+) -> ValidationResult<()> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    let mut read = |offset, count| read(offset, count).map(Cow::Owned);
+    let mut cursor = ByteCursor::new(&mut read, 0, limit, Cow::Borrowed(prefix));
+    read_gzip_header(&mut cursor)?;
+
+    let mut decoder = Decompress::new(false);
+    let mut output = [0; 1024];
+    loop {
+        let next = cursor.available()?;
+        let before = decoder.total_in();
+        let status = decoder
+            .decompress(next, &mut output, FlushDecompress::None)
+            .map_err(|_| ValidationError::Invalid("gzip_deflate_invalid"))?;
+        let consumed = decoder.total_in() - before;
+        cursor.pos += consumed;
+        let produced = decoder.total_out() as usize;
+        if status == Status::StreamEnd {
+            let trailer = cursor.read_array::<8>()?;
+            if trailer[..4] != crc32(&output[..produced]).to_le_bytes()
+                || trailer[4..] != (produced as u32).to_le_bytes()
+            {
+                return invalid("gzip_trailer_mismatch");
+            }
+            return Ok(());
+        }
+        if produced != 0 {
+            return Ok(());
+        }
+        if consumed == 0 {
+            return invalid("gzip_deflate_made_no_progress");
+        }
+    }
 }
 
 pub(crate) fn validate_gzip_structure(
@@ -816,7 +796,8 @@ pub(crate) fn validate_gzip_structure(
     limit: u64,
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
 ) -> ValidationResult<u64> {
-    let mut cursor = ByteCursor::new(reader, offset, limit);
+    let mut read = |offset, count| reader.read_cached_at(offset, count);
+    let mut cursor = ByteCursor::new(&mut read, offset, limit, CachedBytes::default());
     let mut decoded_size = 0u64;
     loop {
         visit(cursor.position())?;
@@ -935,7 +916,8 @@ pub(crate) fn validate_bzip2_structure(
     limit: u64,
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
 ) -> ValidationResult<u64> {
-    let mut cursor = ByteCursor::new(reader, offset, limit);
+    let mut read = |offset, count| reader.read_cached_at(offset, count);
+    let mut cursor = ByteCursor::new(&mut read, offset, limit, CachedBytes::default());
     loop {
         visit(cursor.position())?;
         let header = cursor.read_array::<4>()?;
@@ -957,12 +939,12 @@ pub(crate) fn validate_bzip2_structure(
             let (orig_ptr, n_in_use, group_count, selector_count) =
                 read_bzip2_block_header(|count| bits.read(count))?;
             let alpha_size = n_in_use + 2;
-            if selector_count > 18_002 {
-                return invalid("bzip2_huffman_counts_invalid");
-            }
+            // bzip2 1.0.8 and 7-Zip consume extra selector records emitted
+            // by lbzip2. At most 18,002 can be used by a 900 KB block.
+            let retained = selector_count.min(18_002);
             let mut mtf_groups = [0u8, 1, 2, 3, 4, 5];
-            let mut selectors = Vec::with_capacity(selector_count);
-            for _ in 0..selector_count {
+            let mut selectors = Vec::with_capacity(retained);
+            for slot in 0..selector_count {
                 let mut index = 0usize;
                 while bits.read(1)? != 0 {
                     index += 1;
@@ -970,10 +952,12 @@ pub(crate) fn validate_bzip2_structure(
                         return invalid("bzip2_selector_invalid");
                     }
                 }
-                let value = mtf_groups[index];
-                mtf_groups.copy_within(..index, 1);
-                mtf_groups[0] = value;
-                selectors.push(value);
+                if slot < retained {
+                    let value = mtf_groups[index];
+                    mtf_groups.copy_within(..index, 1);
+                    mtf_groups[0] = value;
+                    selectors.push(value);
+                }
             }
             let mut tables = Vec::with_capacity(group_count);
             for _ in 0..group_count {
@@ -1153,7 +1137,13 @@ fn read_xz_index_boundary(
         return invalid("xz_backward_size_out_of_range");
     }
     let index_crc_pos = footer_start - 4;
-    let mut index_cursor = ByteCursor::new(reader, index_start, index_crc_pos);
+    let mut read = |offset, count| reader.read_cached_at(offset, count);
+    let mut index_cursor = ByteCursor::new(
+        &mut read,
+        index_start,
+        index_crc_pos,
+        CachedBytes::default(),
+    );
     let mut index_hasher = Hasher::new();
     let indicator = index_cursor.read_byte()?;
     index_hasher.update(&[indicator]);
@@ -1363,7 +1353,8 @@ pub(crate) fn validate_zstd_structure(
                 return invalid("zstd_skippable_frame_truncated");
             }
         } else if magic == ZSTD_MAGIC {
-            let mut bytes = ByteCursor::new(reader, cursor + 4, limit);
+            let mut read = |offset, count| reader.read_cached_at(offset, count);
+            let mut bytes = ByteCursor::new(&mut read, cursor + 4, limit, CachedBytes::default());
             let descriptor = bytes.read_byte()?;
             if descriptor & 0x18 != 0 {
                 return invalid("zstd_reserved_or_unused_bit_set");

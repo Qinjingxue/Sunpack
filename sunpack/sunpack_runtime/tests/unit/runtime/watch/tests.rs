@@ -180,7 +180,7 @@ fn recovery_scan_preserves_readable_files_with_local_errors() {
     let manifest: crate::io::display_store::Manifest = serde_json::from_slice(
         &fs::read(directory.join("events.json")).unwrap(),
     ).unwrap();
-    assert_eq!(manifest.runs.iter().map(|run| run.count - run.head).sum::<u64>(), 1);
+    assert_eq!(manifest.runs.iter().map(|run| run.count - run.head).sum::<u64>(), 2);
     drop(journal);
     fs::remove_dir_all(directory).unwrap();
     fs::remove_file(marker).unwrap();

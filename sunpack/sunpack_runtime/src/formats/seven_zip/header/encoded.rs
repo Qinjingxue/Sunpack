@@ -517,45 +517,48 @@ fn decode_lzma(data: &[u8], coder: &SevenZipCoderAst, unpack_size: u64) -> Resul
     collect_decoded(Lzma2Reader::new(compressed, dict_size, None), unpack_size)
 }
 
+const SEVEN_Z_AES_MAX_CYCLES_POWER: u8 = 24;
+const SEVEN_Z_AES_DIRECT_KEY: u8 = 0x3f;
+
+fn seven_zip_aes_properties(properties: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let Some((&b0, rest)) = properties.split_first() else {
+        return Some((0, &[], &[]));
+    };
+    let num_cycles_power = b0 & 0x3f;
+    if num_cycles_power > SEVEN_Z_AES_MAX_CYCLES_POWER && num_cycles_power != SEVEN_Z_AES_DIRECT_KEY
+    {
+        return None;
+    }
+    if b0 & 0xc0 == 0 {
+        return rest.is_empty().then_some((num_cycles_power, &[], &[]));
+    }
+    let (&b1, data) = rest.split_first()?;
+    let iv_size = usize::from(((b0 >> 6) & 1) + (b1 & 15));
+    let salt_size = usize::from(((b0 >> 7) & 1) + (b1 >> 4));
+    (data.len() == salt_size + iv_size)
+        .then(|| (num_cycles_power, &data[..salt_size], &data[salt_size..]))
+}
+
 fn seven_zip_aes_key_iv(
     properties: &[u8],
     password: &[u8],
 ) -> Result<([u8; 32], [u8; 16]), String> {
-    if properties.is_empty() {
-        return Err("encoded_header_decoder_unsupported_method".to_string());
-    }
-    let mut expanded;
-    let properties = if properties.len() == 1 {
-        expanded = vec![0u8; 2];
-        expanded[0] = properties[0];
-        expanded.as_slice()
-    } else {
-        properties
-    };
-    let b0 = properties[0];
-    let num_cycles_power = b0 & 63;
-    let b1 = properties[1];
-    let iv_size = usize::from(((b0 >> 6) & 1) + (b1 & 15));
-    let salt_size = usize::from(((b0 >> 7) & 1) + (b1 >> 4));
-    if 2 + salt_size + iv_size > properties.len() {
-        return Err("encoded_header_decoder_unsupported_method".to_string());
-    }
-    let salt = &properties[2..2 + salt_size];
+    let (num_cycles_power, salt, iv_bytes) = seven_zip_aes_properties(properties)
+        .ok_or_else(|| "encoded_header_decoder_unsupported_method".to_string())?;
     let mut iv = [0u8; 16];
-    iv[..iv_size].copy_from_slice(&properties[2 + salt_size..2 + salt_size + iv_size]);
+    iv[..iv_bytes.len()].copy_from_slice(iv_bytes);
     if password.is_empty() {
         return Err("encoded_header_decode_password_required".to_string());
     }
-    let key = if num_cycles_power == 0x3f {
+    let key = if num_cycles_power == SEVEN_Z_AES_DIRECT_KEY {
         let mut key = [0u8; 32];
+        let salt_size = salt.len();
         key[..salt_size].copy_from_slice(salt);
         let n = password.len().min(key.len().saturating_sub(salt_size));
         key[salt_size..salt_size + n].copy_from_slice(&password[..n]);
         key
     } else {
-        let cycles = 1u32
-            .checked_shl(u32::from(num_cycles_power))
-            .ok_or_else(|| "encoded_header_decoder_unsupported_method".to_string())?;
+        let cycles = 1u32 << num_cycles_power;
         cached_seven_zip_aes_key(cycles, salt, password)?
     };
     Ok((key, iv))
@@ -692,7 +695,7 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
         }
         if method == EncoderMethod::ID_AES256_SHA256 {
             aes_count += 1;
-            if coder.properties.is_empty() || (coder.properties[0] & 63) > 24 {
+            if seven_zip_aes_properties(&coder.properties).is_none() {
                 return false;
             }
         } else if method == EncoderMethod::ID_COPY {

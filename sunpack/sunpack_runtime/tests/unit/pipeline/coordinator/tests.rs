@@ -207,15 +207,6 @@ fn worker_failure_proof_survives_json_and_streamed_report() {
 }
 
 #[test]
-fn worker_stderr_survives_failure_evidence_serialization() {
-    let evidence = worker_evidence(&json!({"stderr_tail":"native detail\n"}), None).unwrap();
-    let encoded = serde_json::to_value(&evidence).unwrap();
-    assert_eq!(encoded["stderr_tail"], "native detail\n");
-    let decoded: FailureEvidence = serde_json::from_value(encoded).unwrap();
-    assert_eq!(decoded.stderr_tail.as_deref(), Some("native detail\n"));
-}
-
-#[test]
 fn password_evidence_controls_retry_without_reclassifying_weak_crc_damage() {
     // A kind-only test cannot distinguish the two inconclusive outcomes.
     // Exercise worker classification, retained evidence, serialization and

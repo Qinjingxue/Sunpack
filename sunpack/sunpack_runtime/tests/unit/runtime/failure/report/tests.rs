@@ -75,7 +75,7 @@ fn failure_receipts_use_creation_context_and_keep_native_evidence_separate() {
     let mut failure = Failure::new(FailureKind::WrongPassword, "raw worker text")
         .with_context(FailureContext::Extraction);
     failure.evidence = Some(Box::new(FailureEvidence {
-        stage: Some("item_extract".into()), stderr_tail: Some("worker detail".into()),
+        stage: Some("item_extract".into()), native_kind: Some("password_invalid".into()),
         ..Default::default()
     }));
     let report = serde_json::to_value(Report::from_failure(&failure, Language::Zh)).unwrap();
@@ -87,7 +87,7 @@ fn failure_receipts_use_creation_context_and_keep_native_evidence_separate() {
     assert_eq!(report["details"], json!({}));
     assert_eq!(report["message_params"], json!({}));
     let restored: Failure = serde_json::from_value(serde_json::to_value(&failure).unwrap()).unwrap();
-    assert_eq!(restored.evidence.unwrap().stderr_tail.as_deref(), Some("worker detail"));
+    assert_eq!(restored.evidence.unwrap().native_kind.as_deref(), Some("password_invalid"));
     assert_eq!(failure.message, "raw worker text");
 
     let warning = Failure::new(FailureKind::Unknown, "raw worker warning")

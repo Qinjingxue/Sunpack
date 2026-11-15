@@ -128,16 +128,16 @@ fn terminal_progress_and_rollback_failure_keep_main_presentation() {
     // Ordinary source cleanup is only a warning, not a rollback failure.
     completed.summary.interrupted = 0;
     completed.summary.rollback_failed = false;
-    completed.summary.cleanup_warnings = Language::En.translate("cleanup.incomplete", &[("count", "1")]);
+    completed.summary.cleanup_failed = 1;
     let snapshot = Snapshot::completed(&completed, None);
     assert_eq!(snapshot.kind, 2);
     assert_eq!(snapshot.title, Language::En.text("toast.final.success.title"));
-    assert!(snapshot.body.ends_with(&completed.summary.cleanup_warnings));
-    let warning = Language::En.translate("cleanup.incomplete", &[("count", "2")]);
-    completed.summary.merge(Summary { cleanup_warnings: warning.clone(), ..Summary::default() });
+    assert!(snapshot.body.ends_with(&Language::En.translate("cleanup.incomplete", &[("count", "1")])));
+    for _ in 0..128 {
+        completed.summary.merge(Summary { cleanup_failed: 2, ..Summary::default() });
+    }
     let snapshot = Snapshot::completed(&completed, None);
-    assert!(snapshot.body.ends_with(&format!("{}\n{}",
-        Language::En.translate("cleanup.incomplete", &[("count", "1")]), warning)));
+    assert!(snapshot.body.ends_with(&Language::En.translate("cleanup.incomplete", &[("count", "257")])));
 
     // An output moved away during recursive cleanup must not widen the
     // Open output target beyond the directory the user can still open.
@@ -149,17 +149,9 @@ fn terminal_progress_and_rollback_failure_keep_main_presentation() {
         output.output = Some(path);
         result.archives.push(output);
     }
-    let summary = Summary::for_outcome(Language::En, &result, false, true, &one_root, None);
+    let summary = Summary::for_outcome(&result, false, true, &one_root, None);
     assert_eq!(summary.output, Some(live));
 
-    // Match main's Unicode-character bound, including its ellipsis.
-    let mut warnings = "界".repeat(2046);
-    append_warning(&mut warnings, "两个警告");
-    assert_eq!(warnings.chars().count(), 2048);
-    assert!(warnings.ends_with("\n…"));
-    let full = warnings.clone();
-    append_warning(&mut warnings, "more");
-    assert_eq!(warnings, full);
     let mut snapshot = Snapshot::stop_failed("batch", Language::En);
     assert_eq!(snapshot.kind, 3);
     assert_eq!(snapshot.title, "SunPack could not confirm stop");
@@ -167,8 +159,9 @@ fn terminal_progress_and_rollback_failure_keep_main_presentation() {
     let target = format!("C:\\{}", "路径".repeat(1500));
     snapshot.action = Some((1, "Open".into(), target.clone()));
     assert!(snapshot.encode().unwrap().ends_with(target.as_bytes()));
-    snapshot.report_action = Some((2, "Report".into(), "路径".repeat(MAX_SNAPSHOT_BYTES / 6)));
-    assert_eq!(snapshot.encode().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    let report_path = format!("C:\\{}failure.txt", ("路径".repeat(126) + "\\").repeat(92));
+    snapshot.report_action = Some((2, "Report".into(), report_path.clone()));
+    assert!(snapshot.encode().unwrap().ends_with(report_path.as_bytes()));
 }
 
 #[test]
@@ -429,7 +422,7 @@ fn settled_roots_survive_sibling_cancel_or_request_error_without_duplicate_repor
         assert_eq!(group.summary.succeeded, 1);
         assert_eq!(group.summary.failed, if cancelled { 1 } else { 2 });
         assert_eq!(group.summary.interrupted, usize::from(cancelled));
-        assert_eq!(group.summary.cleanup_warnings, Language::En.translate("cleanup.incomplete", &[("count", "1")]));
+        assert_eq!(group.summary.cleanup_failed, 1);
         // Only failed roots belong in the report; A's source cleanup
         // remains a warning and must not add a failure entry.
         assert_eq!(group.report.lock().unwrap().failures, if cancelled { 1 } else { 2 });
@@ -502,7 +495,7 @@ fn batched_top_level_tasks_keep_independent_completion_and_reports() {
     outcome.archives.push(archive("a.zip", None));
     outcome.archives.push(archive("A.ZIP", None));
     outcome.archives.push(archive("b.zip", None));
-    let summary = Summary::for_result(Language::En, &Ok(outcome), false, false, true, &|_| None, None);
+    let summary = Summary::for_result(&Ok(outcome), false, false, true, &|_| None, None);
     assert_eq!((summary.succeeded, summary.failed), (2, 0));
 
     // Cancellation can precede receipts or Working events entirely.
@@ -571,7 +564,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
         accepted.partial = true;
         let mut outcome = Outcome::default();
         outcome.archives.push(accepted);
-        let summary = Summary::for_result(Language::En, &Ok(outcome), false, false, true, &one_root, None);
+        let summary = Summary::for_result(&Ok(outcome), false, false, true, &one_root, None);
         assert_eq!((summary.succeeded, summary.failed), (1, 0));
     }
 
