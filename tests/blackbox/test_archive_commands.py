@@ -220,18 +220,20 @@ def test_concurrent_launcher_requests_reserve_distinct_outputs(package, tmp_path
         folder = tmp_path / name
         folder.mkdir()
         archive = folder / "same.zip"
-        archive.write_bytes(_zip({"payload.txt": name.encode()}))
+        archive.write_bytes(_zip({"wrapper/payload.txt": name.encode()}))
         paths.append(archive)
     output = tmp_path / "output"
 
     def extract(path):
-        return package.json("extract", "-c", "k", "-o", output, path)
+        return package.json("extract", "-c", "k", "-r", "1", "--flatten", "-o", output, path)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         reports = list(executor.map(extract, paths))
 
     assert all(report["summary"]["success_count"] == 1 for report in reports)
     assert sorted(path.read_bytes() for path in output.rglob("payload.txt")) == [b"first", b"second"]
+    assert all(path.parent.parent == output for path in output.rglob("payload.txt"))
+    assert not list(output.rglob("*.__sunpack_flatten_work__*"))
 
 
 def test_text_extract_reports_progress_and_actual_output_directory(package, tmp_path):

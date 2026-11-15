@@ -1034,18 +1034,17 @@ impl NativeWatchState {
             }
         };
         let mut owned_paths = Vec::new();
+        let path = Path::new(&output);
+        let creation = if keep.is_none() {
+            Some(crate::scan::scope::OutputRootCreation::create(path, exclusive)
+                .map_err(|error| {
+                    if exclusive && error.kind() == std::io::ErrorKind::AlreadyExists {
+                        crate::pipeline::OutputCreateError::wrap(error)
+                    } else { error }
+                })?)
+        } else { None };
         let identity = (|| -> std::io::Result<Option<String>> {
-            let path = Path::new(&output);
-            if exclusive {
-                crate::scan::scope::create_output_root_exclusive(path)
-                    .map_err(|error| {
-                        // A name collision retries the existing reservation.
-                        // Other mkdir errors are infrastructure failures: keep
-                        // the durable owner on Watch's request recovery path.
-                        if error.kind() == std::io::ErrorKind::AlreadyExists {
-                            crate::pipeline::OutputCreateError::wrap(error)
-                        } else { error }
-                    })?;
+            if keep.is_none() {
                 // Aliases are sampled after mkdir, under the publication
                 // gate. An alias retargeted since reservation cannot create an
                 // unregistered tree in another watched namespace.
@@ -1054,18 +1053,15 @@ impl NativeWatchState {
                 {
                     owned_paths = paths;
                 }
-            } else if keep.is_none() {
-                std::fs::create_dir_all(path)?;
-                let paths = crate::path_keys::output_path_aliases(path)?;
-                if !paths.iter().any(|path| self.owned_root(path).is_some()) { owned_paths = paths; }
             }
             if refresh && path.is_dir() {
-                let (volume, identity, _) = crate::filesystem::watch_path_identity(&output)?;
-                Ok(Some(format!("{volume}|{identity}")))
+                Ok(Some(crate::filesystem::directory_identity(&output)?))
             } else {
                 Ok(None)
             }
         })()?;
+        // All fallible filesystem publication facts have now been captured.
+        creation.into_iter().for_each(crate::scan::scope::OutputRootCreation::commit);
         let register = !owned_paths.is_empty();
         let mut operations = Vec::with_capacity(1);
         let change = if let Some(keep) = keep {

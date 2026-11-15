@@ -667,7 +667,7 @@ struct OutputNames {
     indices: CacheOrder<Arc<str>, OutputHistory>,
     slots: HashMap<Arc<str>, HashMap<Arc<str>, usize>>,
     claimed: BTreeMap<String, OutputClaim>,
-    owners: HashMap<u64, Vec<String>>,
+    owners: HashMap<u64, HashSet<String>>,
 }
 
 const OUTPUT_HISTORY_LIMIT: usize = 256;
@@ -718,7 +718,7 @@ impl Drop for OutputReservationGuard {
 impl OutputNames {
     fn claim(&mut self, key: String, owner: u64, source: String) {
         if !self.claimed.contains_key(&key) {
-            self.owners.entry(owner).or_default().push(key.clone());
+            self.owners.entry(owner).or_default().insert(key.clone());
         }
         self.claimed.insert(key, OutputClaim {
             owner, source,
@@ -728,7 +728,7 @@ impl OutputNames {
     fn release_path(&mut self, key: &str, owner: u64) {
         if self.claimed.get(key).is_none_or(|claim| claim.owner != owner) { return; }
         if let Some(paths) = self.owners.get_mut(&owner) {
-            paths.retain(|path| path != key);
+            paths.remove(key);
             if paths.is_empty() { self.owners.remove(&owner); }
         }
         self.release_key(key);
@@ -1213,8 +1213,8 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             Ok::<_, io::Error>(())
         }.await;
-        let outputs = self.output_names.registry.lock().unwrap().owners
-            .get(&self.output_names.owner).cloned().unwrap_or_default();
+        let outputs: Vec<_> = self.output_names.registry.lock().unwrap().owners
+            .get(&self.output_names.owner).into_iter().flatten().cloned().collect();
         let publication = self.observer.outputs_finished(&outputs);
         rollback?;
         publication?;
@@ -4234,7 +4234,7 @@ impl ClaimedInput {
         let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         let directory = canonical.is_dir();
         let object = if directory {
-            capture_directory_identity(&canonical)
+            capture_directory_identity(&canonical, false)
                 .ok()
                 .map(|identity| identity.object_id())
         } else {

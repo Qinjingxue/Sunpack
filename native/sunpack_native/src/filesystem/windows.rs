@@ -142,11 +142,6 @@ pub(super) fn watch_file_observation_known_kind(
     Ok(WatchFileObservation { file_id: file.id_text(), change_usn: file.usn, change_reasons })
 }
 
-pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i64)> {
-    let observation = watch_path_usn(path)?;
-    Ok((volume_device(path)?, observation.id_text(), observation.usn))
-}
-
 pub(super) fn directory_file_id(path: &Path, volume: &str) -> io::Result<[u8; 16]> {
     let observation = watch_path_usn(path)?;
     if !volume_device(path)?.eq_ignore_ascii_case(volume) {

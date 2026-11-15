@@ -12,10 +12,19 @@ const HAS_SIZE: u8 = 2;
 const HAS_MTIME: u8 = 4;
 const TRANSIENT: u8 = 8;
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "String", into = "String")]
 enum FileId {
     Ntfs { bytes: [u8; 16], len: u8 },
     Other(Box<str>),
+}
+
+impl From<String> for FileId {
+    fn from(value: String) -> Self { Self::new(&value) }
+}
+
+impl From<FileId> for String {
+    fn from(value: FileId) -> Self { value.text() }
 }
 
 impl FileId {
@@ -106,7 +115,7 @@ impl NativeWatchObservation {
 pub(super) struct GeneratedBaseline {
     size: u64,
     mtime: f64,
-    file_id: String,
+    file_id: FileId,
     usn: i64,
 }
 
@@ -123,10 +132,10 @@ pub(super) struct CatalogRow {
 
 impl CatalogRow {
     pub fn remember_generated(&mut self, size: u64, mtime: f64, id: &str, usn: i64) {
-        self.generated = Some(Box::new(GeneratedBaseline { size, mtime, file_id: id.to_owned(), usn }));
+        self.generated = Some(Box::new(GeneratedBaseline { size, mtime, file_id: FileId::new(id), usn }));
     }
     pub fn generated_observation(&self) -> Option<NativeWatchObservation> {
-        self.generated.as_ref().map(|g| NativeWatchObservation::new(g.size, g.mtime, FileId::new(&g.file_id), g.usn))
+        self.generated.as_ref().map(|g| NativeWatchObservation::new(g.size, g.mtime, g.file_id.clone(), g.usn))
     }
 
     pub fn remember_observation(

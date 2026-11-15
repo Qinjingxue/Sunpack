@@ -117,18 +117,12 @@ pub(crate) fn watch_broker_release() -> std::io::Result<()> {
     }
 }
 
-pub(crate) fn watch_path_identity(path: &str) -> std::io::Result<(String, String, i64)> {
-    #[cfg(windows)]
-    {
-        // Output retirement distinguishes a missing directory from transient IO
-        // failures. Preserve io::ErrorKind instead of flattening it to OSError.
-        return windows::watch_path_identity(Path::new(path));
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Err(std::io::Error::other("watch mode requires Windows NTFS"))
-    }
+/// Namespace ownership needs stable object identity, not a change journal.
+/// Reuse the reader's by-handle identity fallback for FAT/exFAT and SMB.
+pub(crate) fn directory_identity(path: &str) -> std::io::Result<String> {
+    let identity = crate::io::reader::capture_directory_identity(Path::new(path), true)?;
+    let (volume, id) = identity.object_id();
+    Ok(format!("{volume:016x}|{}", sunpack_usn_core::protocol::format_file_id(&id)))
 }
 
 /// Identities are valid only across contiguous, successfully read intervals.

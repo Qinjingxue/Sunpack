@@ -938,15 +938,15 @@ impl DirectoryIdentity {
 }
 
 #[cfg(windows)]
-pub(crate) fn capture_directory_identity(path: &Path) -> io::Result<DirectoryIdentity> {
+pub(crate) fn capture_directory_identity(path: &Path, follow_reparse: bool) -> io::Result<DirectoryIdentity> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
         .access_mode(0x0080) // FILE_READ_ATTRIBUTES
         .share_mode(0x0007) // read, write, delete
-        .custom_flags(0x02200000) // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+        .custom_flags(0x02000000 | if follow_reparse { 0 } else { 0x00200000 })
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & 0x0400 != 0 {
+    if !metadata.is_dir() || (!follow_reparse && metadata.file_attributes() & 0x0400 != 0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "checkpoint output is not a regular directory",
@@ -961,7 +961,7 @@ pub(crate) fn capture_directory_identity(path: &Path) -> io::Result<DirectoryIde
 }
 
 #[cfg(not(windows))]
-pub(crate) fn capture_directory_identity(_path: &Path) -> io::Result<DirectoryIdentity> {
+pub(crate) fn capture_directory_identity(_path: &Path, _follow_reparse: bool) -> io::Result<DirectoryIdentity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "directory identity requires Windows",

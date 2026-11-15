@@ -780,8 +780,8 @@ impl Watch {
     }
 
     fn external_output(&self, path: &Path, exclusive: bool) -> io::Result<()> {
-        let create = || (if exclusive { crate::scan::scope::create_output_root_exclusive(path) }
-            else { fs::create_dir_all(path) }).map_err(crate::pipeline::OutputCreateError::wrap);
+        let create = || crate::scan::scope::OutputRootCreation::create(path, exclusive)
+            .map_err(crate::pipeline::OutputCreateError::wrap);
         loop {
             let external = self.external.lock().unwrap();
             let journal = external.as_ref().and_then(|external| external.journal.upgrade())
@@ -791,12 +791,13 @@ impl Watch {
                 // mkdir and reservation share the observer publication gate.
                 let mut created = false;
                 journal.commit(true, |state| {
-                    create()?;
-                    created = true;
+                    let creation = create()?;
                     let paths = crate::path_keys::output_path_aliases(path)?;
                     if !paths.iter().any(|path| state.owned_root(path).is_some()) {
                         state.register_output_paths(&paths, &[&output_identity(&path.to_string_lossy())?]);
                     }
+                    creation.commit();
+                    created = true;
                     Ok(crate::watch_store::NativeWatchOperations::empty())
                 })?;
                 if created { return Ok(()); }
@@ -806,12 +807,13 @@ impl Watch {
             }
             // Startup takes the same lock before arming observers. Keep the
             // reservation visible even if Watch attaches during this request.
-            create()?;
+            let creation = create()?;
             let paths = crate::path_keys::output_path_aliases(path)?;
             let outputs = &self.external.reservations;
             if !paths.iter().any(|path| crate::watch_store::active_outputs::find_owned_root(outputs, path).is_some()) {
                 crate::watch_store::active_outputs::register(outputs, &paths, &[&output_identity(&path.to_string_lossy())?]);
             }
+            creation.commit();
             return Ok(());
         }
     }
@@ -4529,8 +4531,7 @@ fn missing_path(error: &io::Error) -> bool {
 }
 
 fn output_identity(path: &str) -> io::Result<String> {
-    let (volume, identity, _) = filesystem::watch_path_identity(path)?;
-    Ok(format!("{volume}|{identity}"))
+    filesystem::directory_identity(path)
 }
 
 fn user_password_signature(user: &[Arc<str>]) -> String {

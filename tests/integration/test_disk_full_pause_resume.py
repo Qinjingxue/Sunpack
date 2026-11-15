@@ -73,7 +73,7 @@ def _volume_label(root):
 
 
 @contextmanager
-def _vhd(tmp_path):
+def _vhd(tmp_path, filesystem="ntfs"):
     directory = Path(os.environ.get("SUNPACK_SPACE_TEST_VHD_DIR") or tmp_path).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(directory).free < (VHD_MIB + 32) * MIB:
@@ -93,7 +93,7 @@ def _vhd(tmp_path):
             transcript = _diskpart(
                 f'create vdisk file="{image}" maximum={VHD_MIB} type=fixed',
                 select, "attach vdisk", "create partition primary",
-                f"format fs=ntfs quick label={label}", f"assign letter={letter}",
+                f"format fs={filesystem} quick label={label}", f"assign letter={letter}",
             )
             # DiskPart can return success even when a subcommand fails. Never
             # put filler or output on a drive without this run's volume label.
@@ -208,6 +208,34 @@ def test_full_volumes_resume_independently(package, tmp_path):
             assert process.wait(timeout=DEADLINE_SECONDS) == 0
             assert out_a.read_bytes() == payload_a
             assert out_b.read_bytes() == payload_b
+
+
+@pytest.mark.parametrize("filesystem", ["exfat", "fat32"])
+@pytest.mark.parametrize("watching", [False, pytest.param(True, marks=pytest.mark.requires_watch_broker)])
+def test_cli_output_does_not_require_usn(package, tmp_path, filesystem, watching):
+    source = tmp_path / "plain.zip"
+    payload = b"ordinary output on a filesystem without USN"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("wrapper/payload.txt", payload)
+    with _vhd(tmp_path, filesystem) as root, _runtime(package):
+        if watching:
+            watched = tmp_path / "unrelated"
+            watched.mkdir()
+            package.json("watch", "add", watched, "-R")
+            package.json("watch", "start", "--no-tray")
+        # Both output creation and flatten's identity receipts used to query
+        # USN. Exercise each through the launcher, with Watch off/unrelated.
+        try:
+            for flatten in (False, True):
+                output = root / str(flatten)
+                package.json("extract", source, "-o", output, "-r", "1", "-c", "k",
+                             "--flatten" if flatten else "--no-flatten", "--no-pause")
+                assert [path.read_bytes() for path in output.rglob("payload.txt")] == [payload]
+                extracted = output / "plain"
+                assert (extracted / ("payload.txt" if flatten else "wrapper/payload.txt")).is_file()
+        finally:
+            if watching:
+                package.json("watch", "stop")
 
 
 @pytest.mark.parametrize("stop", ["launcher-disconnect", "runtime-shutdown"])

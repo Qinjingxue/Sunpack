@@ -695,8 +695,8 @@ mod tests {
             let journal = Journal::open(&dir, 7).unwrap();
             journal.commit(true, |state| {
                 let operations = NativeWatchOperations::password_generation(1, "one".into());
-                let (volume, id, _) = crate::filesystem::watch_path_identity(owned.to_str().unwrap())?;
-                state.register_output_paths(&[owned.to_string_lossy().into_owned()], &[&format!("{volume}|{id}")]);
+                let identity = crate::filesystem::directory_identity(owned.to_str().unwrap())?;
+                state.register_output_paths(&[owned.to_string_lossy().into_owned()], &[&identity]);
                 Ok(operations)
             }).unwrap();
             journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
@@ -1041,8 +1041,8 @@ mod tests {
             entered.recv().unwrap();
             assert_eq!(filtered.recv_timeout(Duration::from_millis(100)),
                 Err(mpsc::RecvTimeoutError::Timeout));
-            let (volume, id, _) = crate::filesystem::watch_path_identity(output.to_str().unwrap())?;
-            journal.state().register_output_paths(&crate::path_keys::output_path_aliases(&output)?, &[&format!("{volume}|{id}")]);
+            let identity = crate::filesystem::directory_identity(output.to_str().unwrap())?;
+            journal.state().register_output_paths(&crate::path_keys::output_path_aliases(&output)?, &[&identity]);
             Ok(NativeWatchOperations::empty())
         }).unwrap();
         assert_eq!(filtered.recv_timeout(Duration::from_secs(5)).unwrap(), vec![directory.clone()]);
