@@ -260,7 +260,6 @@ impl NativeWorkerManifest {
     pub(crate) fn to_output_inventory(&self, root: String) -> NativeOutputInventory {
         NativeOutputInventory {
             root,
-            file_count: self.files.len(),
             total_size: self.total_size,
             unreadable_count: 0,
             files: Arc::clone(&self.files),
@@ -271,7 +270,6 @@ impl NativeWorkerManifest {
 #[derive(Clone)]
 pub(crate) struct NativeOutputInventory {
     root: String,
-    file_count: usize,
     total_size: u64,
     unreadable_count: usize,
     files: Arc<Vec<OutputFileRecord>>,
@@ -282,7 +280,7 @@ impl NativeOutputInventory {
         &self.root
     }
     pub(crate) fn file_count(&self) -> usize {
-        self.file_count
+        self.files.len()
     }
     pub(crate) fn total_size(&self) -> u64 {
         self.total_size
@@ -861,7 +859,6 @@ pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInvent
     }
     NativeOutputInventory {
         root: path_to_string(&root),
-        file_count: stats.files.len(),
         total_size: stats.total_size,
         unreadable_count: stats.unreadable_count,
         files: Arc::new(stats.files),

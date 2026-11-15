@@ -299,16 +299,10 @@ fn parse_file_usn_record(bytes: &[u8]) -> io::Result<FileUsn> {
 }
 
 pub(super) fn validate_volume_journal(path: &Path) -> io::Result<()> {
-    sunpack_usn_core::broker_volume_cursor(&volume_device(path)?).map(|_| ())
+    super::watch_volume_cursor(&volume_device(path)?).map(|_| ())
 }
 
-pub(super) fn watch_volume_cursor(path: &Path) -> io::Result<(String, u64, i64)> {
-    let volume = volume_device(path)?;
-    let (journal_id, next_usn) = sunpack_usn_core::broker_volume_cursor(&volume)?;
-    Ok((volume, journal_id, next_usn))
-}
-
-fn volume_device(path: &Path) -> io::Result<String> {
+pub(super) fn volume_device(path: &Path) -> io::Result<String> {
     let mount_point = volume_mount_path(path)?;
     let mut volume_name = [0u16; 64];
     if unsafe {

@@ -139,6 +139,9 @@ impl RelationScopeIndex {
         filtered_keys: &HashSet<String>,
         excluded: Option<&HashSet<String>>,
     ) -> Self {
+        if filtered_keys.is_empty() {
+            return Self { rows: Vec::new() };
+        }
         let excluded = excluded.filter(|keys| !keys.is_empty());
         let admitted = |row| excluded.is_none_or(|keys| !keys.contains(&path_key(source.path(row))));
         let selected: HashSet<_> = filtered_keys.iter().map(|key| CaseKey::new(key)).collect();

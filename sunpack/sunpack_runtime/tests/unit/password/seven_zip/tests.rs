@@ -2,14 +2,8 @@ use super::*;
 
 #[test]
 fn analysis_parser_confirms_predecoded_header() {
-    assert!(matches!(
-        read_predecoded_header(&[0x01, 0x00]),
-        HeaderRead::Ok { .. }
-    ));
-    assert!(!matches!(
-        read_predecoded_header(&[0x01, 0xff]),
-        HeaderRead::Ok { .. }
-    ));
+    assert!(predecoded_seven_zip_header_is_supported(&[0x01, 0x00]));
+    assert!(!predecoded_seven_zip_header_is_supported(&[0x01, 0xff]));
 }
 
 #[test]

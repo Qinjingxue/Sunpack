@@ -174,6 +174,10 @@ impl Queue {
 }
 
 impl Admission {
+    fn has_queued_work(&self) -> bool {
+        self.pending != self.active || !self.waiting.is_empty()
+    }
+
     fn queue(&mut self, request: u64, origin: Origin, mut grant: Grant) {
         self.sequence += 1;
         grant.sequence = self.sequence;
@@ -260,19 +264,33 @@ impl Scheduler {
 
     pub(crate) fn next_id(&self) -> u64 { self.next_id.fetch_add(1, Ordering::Relaxed) }
 
-    fn enqueue(self: &Arc<Self>, request: u64, origin: Origin, grant: Grant) {
+    fn acquire_or_queue(
+        self: &Arc<Self>, request: u64, origin: Origin, id: usize, tx: &Signals, stage: &str,
+    ) -> Option<Slot> {
         let mut state = self.state.lock().unwrap();
+        let spare = state.active < state.limit.unwrap_or(self.capacity);
+        if spare && !state.has_queued_work() {
+            // With no older work, hand the slot straight to the request
+            // driver. Queueing would allocate a bucket and send it back to
+            // the same driver as a Granted signal.
+            state.sequence += 1;
+            state.active += 1;
+            state.pending += 1;
+            return Some(Slot(Some(Arc::clone(self))));
+        }
+        let grant = Grant { id, tx: tx.clone(), priority: stage_priority(stage), sequence: 0 };
         if state.pending == MAX_PENDING_JOBS.max(self.capacity) {
             state.waiting.push_back((request, origin, grant));
-            return;
+            return None;
         }
         state.queue(request, origin, grant);
         // A slot release or a capacity increase dispatches pending work.
         // Saturated submissions need only acquire the admission lock once.
-        if state.active < state.limit.unwrap_or(self.capacity) {
+        if spare {
             drop(state);
             self.dispatch();
         }
+        None
     }
 
     /// main's worker handshake can change admission only within the original
@@ -322,12 +340,15 @@ impl Scheduler {
     }
 
     fn release(self: &Arc<Self>) {
-        {
+        let has_queued_work = {
             let mut state = self.state.lock().unwrap();
             state.active -= 1;
             state.pending -= 1;
+            state.has_queued_work()
+        };
+        if has_queued_work {
+            self.dispatch();
         }
-        self.dispatch();
     }
 
     pub(super) fn run<'a, T: Send + 'a>(
@@ -388,17 +409,6 @@ impl Scheduler {
         // even if their notifications arrived before the request was inserted.
         assert!(driver.send(DriverEvent::Start(request, state, finish)).is_ok());
         Join(completed)
-    }
-
-    fn enqueue_poll(
-        self: &Arc<Self>,
-        request: u64,
-        origin: Origin,
-        id: usize,
-        tx: &Signals,
-        stage: &str,
-    ) {
-        self.enqueue(request, origin, Grant { id, tx: tx.clone(), priority: stage_priority(stage), sequence: 0 });
     }
 }
 
@@ -511,8 +521,10 @@ impl<'a> RequestState<'a> {
     fn ready(&mut self, id: usize) -> Option<PollJob<'a>> {
         let stage = self.tasks[&id].wake.stage.lock().unwrap().clone();
         if let Some(stage) = stage.filter(|stage| !stage.cancel.cancelled()) {
+            if let Some(slot) = self.scheduler.acquire_or_queue(self.request, self.origin, id, &self.signals, stage.name) {
+                return Some(self.job(id, Some(slot)));
+            }
             self.tasks.get_mut(&id).unwrap().status = Status::Queued;
-            self.scheduler.enqueue_poll(self.request, self.origin, id, &self.signals, stage.name);
             None
         } else { Some(self.job(id, None)) }
     }

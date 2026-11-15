@@ -1770,7 +1770,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut parent_outputs = Vec::with_capacity(count);
             let report_enabled = this.request.mode == Mode::Extract && task.owned_paths.iter()
                 .all(|path| generations.contains_key(&path_key(path)));
-            let mut report_states = Vec::with_capacity(count);
+            let mut report_states = Vec::new();
             let mut replacement_retained = None;
             let mut replacement_rows = None;
             let mut retry = retry.filter(|_| !multi);
@@ -1995,8 +1995,6 @@ impl<'run, O: Observer> Run<'run, O> {
                         InputCheckpoint::clear_report_output(&mut state);
                     }
                     report_states.push(state);
-                } else {
-                    report_states.push(None);
                 }
                 if keeps_replaced {
                     // A different logical ID leaves the failed first attempt
@@ -2021,18 +2019,21 @@ impl<'run, O: Observer> Run<'run, O> {
             // Settle physical ownership before any successful sibling descends.
             // Promoted retryable sources remain failures, but no longer block
             // flattening the independent retained output subtree.
-            let mut parent_checkpoints: Vec<_> = parent_outputs.iter().enumerate()
-                .map(|(index, (result, _, input, _))| {
-                    let mut checkpoint = (this.request.mode == Mode::Extract
-                        && (multi || result.failure.is_some() || replacement_retained.is_some())).then(||
-                            InputCheckpoint::create(&owner_path, Arc::clone(input), result, &generations, carrier.as_deref())).flatten();
-                    if let Some(checkpoint) = &mut checkpoint {
-                        checkpoint.install_report(report_states[index].take());
-                        checkpoint.set_planned_output(planned_slots[index].as_deref());
-                        checkpoint.set_password_signature(|| candidates.signature(&input.entry_path));
-                    }
-                    checkpoint
-                }).collect();
+            let mut parent_checkpoints: Vec<_> = if this.request.mode == Mode::Extract
+                && (multi || parent_outputs.first().is_some_and(|(result, ..)| result.failure.is_some())
+                    || replacement_retained.is_some())
+            {
+                parent_outputs.iter().enumerate().map(|(index, (result, _, input, _))| {
+                    let mut checkpoint = InputCheckpoint::create(&owner_path, Arc::clone(input),
+                        result, &generations, carrier.as_deref())?;
+                    checkpoint.install_report(report_states.get_mut(index).and_then(Option::take));
+                    checkpoint.set_planned_output(planned_slots[index].as_deref());
+                    checkpoint.set_password_signature(|| candidates.signature(&input.entry_path));
+                    Some(checkpoint)
+                }).collect()
+            } else {
+                Vec::new()
+            };
             let replacement_result = replacement_retained.map(|checkpoint| {
                 let mut retained = checkpoint.result(depth);
                 // First-attempt history precedes the replacement and its children.
@@ -2168,7 +2169,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     children_complete &= descendants.subtree_complete();
                 }
                 carrier_children_complete &= children_complete;
-                let mut checkpoint = parent_checkpoints[index].take();
+                let mut checkpoint = parent_checkpoints.get_mut(index).and_then(Option::take);
                 if let Some(checkpoint) = &mut checkpoint { checkpoint.settle_result(&result); }
                 // A cancelled newly created root remains uncommitted until
                 // request-level rollback has joined all recursive writers.
@@ -2984,7 +2985,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     if matches!(failure.kind, FailureKind::WrongPassword | FailureKind::PasswordInconclusive) {
                         result.password = None;
                     }
-                    if failure.kind == FailureKind::Damaged && flag(value, "password_crc_proven") {
+                    if failure.kind == FailureKind::Damaged && worker::number(value, "password_crc_proven_items") != 0 {
                         result.password = plan
                             .remember_confirmation(matched_index, &self.engine.password_attempts)
                             .map(str::to_owned);
@@ -3064,7 +3065,9 @@ impl<'run, O: Observer> Run<'run, O> {
                         result.files = 0;
                         result.bytes = 0;
                         result.recovered_complete_files = 0;
-                        InputCheckpoint::clear_report_output(&mut report_states[index]);
+                        if let Some(state) = report_states.get_mut(index) {
+                            InputCheckpoint::clear_report_output(state);
+                        }
                     }
                 }
                 *inventory = None;
@@ -3504,10 +3507,11 @@ fn worker_evidence(
     // Explicit rejection takes precedence over fallback evidence in main.
     let weak_failure = !flag(result, "password_candidates_all_rejected")
         && weak_password_failure(result, password_evidence);
+    let proof_count = weak_failure.then(|| worker::number(result, "password_crc_proven_items"))
+        .filter(|count| *count != 0);
     let (classification_evidence, password_crc_proven_items, backend_operation_result) =
-        if weak_failure && flag(result, "password_crc_proven") {
-            (Some("entry_crc_proven_before_failure".to_owned()),
-             Some(worker::number(result, "password_crc_proven_items")), None)
+        if let Some(count) = proof_count {
+            (Some("entry_crc_proven_before_failure".to_owned()), Some(count), None)
         } else if weak_failure {
             (Some(if password_evidence == Some("empty_password_direct") {
                 "empty_password_failed_without_crc_proof"
@@ -3598,7 +3602,7 @@ fn classify_worker_failure(
         return Failure::password();
     } else if weak_password_failure(result, password_evidence)
     {
-        if flag(result, "password_crc_proven") {
+        if worker::number(result, "password_crc_proven_items") != 0 {
             FailureKind::Damaged
         } else if password_evidence == Some("empty_password_direct") {
             return Failure::password();

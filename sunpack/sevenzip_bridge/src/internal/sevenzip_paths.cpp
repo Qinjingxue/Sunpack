@@ -19,6 +19,17 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
+    bool directory_is_empty_or_missing(const std::filesystem::path &path)
+    {
+        std::error_code error;
+        if (!std::filesystem::exists(path, error))
+        {
+            return !error;
+        }
+        const bool empty = std::filesystem::is_empty(path, error);
+        return !error && empty;
+    }
+
     namespace
     {
 

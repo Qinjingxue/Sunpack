@@ -84,7 +84,7 @@ fn rootless_shell_releases_receipts_and_replays_snapshot_and_wal() {
     let paths: Vec<_> = (0..256).map(|index| dir.join(format!("{index}.zip")).to_string_lossy().into_owned()).collect();
     journal.commit(true, |state| Ok(state.pending_operations(paths.iter().map(|path|
         (PendingObservation(path.clone(), 1, 1.0, "id".into(), 1), "root".into(), None)),
-        false, "root", true, true, None)?.0)).unwrap();
+        false, "root", true, None))).unwrap();
     let receipt = Arc::downgrade(&journal.state().pending(&paths[0]).unwrap());
     journal.frontier.lock().unwrap().fault = Some("unavailable WAL".into());
     assert!(journal.suspend().is_err());

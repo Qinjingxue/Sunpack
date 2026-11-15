@@ -2117,7 +2117,7 @@ struct Scheduler {
     toast: Option<super::toast::Toast>,
     cache_deadline: Option<Instant>,
     external: Arc<OutputPublications>,
-    _lease: Option<Arc<BrokerLease>>,
+    broker_lease: Option<Arc<BrokerLease>>,
 }
 
 impl Scheduler {
@@ -2148,10 +2148,6 @@ impl Scheduler {
         snapshot: Snapshot,
         lease: Option<Arc<BrokerLease>>,
     ) -> io::Result<Self> {
-        let lease = match lease {
-            Some(lease) => lease,
-            None => BrokerLease::acquire()?,
-        };
         let root_file = roots_path(&cwd)?;
         let dir = state_dir(&cwd)?;
         let journal = Arc::new(journal::Journal::open_with_outputs(&dir, snapshot.config.watch.event_log_retention_days, Arc::clone(&external.reservations))?);
@@ -2205,7 +2201,7 @@ impl Scheduler {
             cache_deadline: None,
             candidate_diagnostics: CandidateDiagnostics::default(),
             external,
-            _lease: Some(lease),
+            broker_lease: lease,
         };
         scheduler.reconcile_roots(false)?;
         scheduler.activate_scan_options()?;
@@ -2229,16 +2225,21 @@ impl Scheduler {
     }
 
     fn suspend_empty_scheduler(&mut self) -> io::Result<()> {
-        if !self.roots.is_empty() || self.journal.suspended() { return Ok(()); }
+        if !self.roots.is_empty() { return Ok(()); }
+        if self.journal.suspended() {
+            self.broker_lease.take();
+            return Ok(());
+        }
         // Reconciliation has already drained requests and retired removed scopes.
         // Keep only the configuration/tray/log shell; durable recovery belongs to
         // the next scheduler, not to an idle service with no roots.
-        self.root_observers.clear();
-        self.dependency_observers.clear();
-        self.parent_observers.clear();
+        self.root_observers = HashMap::new();
+        self.dependency_observers = HashMap::new();
+        self.parent_observers = HashMap::new();
         self.monitor.take();
         self.toast.take();
         *self.external.lock().unwrap() = None;
+        self.broker_lease.take();
         self.catalog.commit(true);
         self.journal.suspend()?;
         self.catalog.close();
@@ -2376,7 +2377,7 @@ impl Scheduler {
 
     fn reconcile_roots(&mut self, restart_scheduler: bool) -> io::Result<(bool, bool)> {
         let engine = Arc::clone(&self.engine);
-        let (entries, next, policy_changed) = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
+        let (entries, next, policy_changed, lease) = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
         let (entries, rejected) = {
             // Read, classify, and prune the same root policy. GUI and CLI
             // writers share this lock; pruning an older snapshot can remove a
@@ -2422,6 +2423,14 @@ impl Scheduler {
             }
         }
         validate_outputs(&entries)?;
+        // The first root needs the broker for validation and recovery. Keep
+        // this lease local until the root policy is published so a failed add
+        // cannot leave the rootless service holding a connection.
+        let lease = if self.roots.is_empty() && !entries.is_empty() && self.broker_lease.is_none() {
+            Some(BrokerLease::acquire()?)
+        } else {
+            None
+        };
         let new_directories: HashSet<_> = entries
             .iter()
             .filter(|root| !self.roots.contains_key(&key(&root.path)))
@@ -2446,7 +2455,7 @@ impl Scheduler {
                     !old.same_policy(root)
                 })
             });
-            Ok((entries, next, policy_changed))
+            Ok((entries, next, policy_changed, lease))
         })??;
         if next.is_empty() && self.journal.suspended() { return Ok((false, false)); }
         if self.journal.resume()? {
@@ -2471,6 +2480,9 @@ impl Scheduler {
         let refresh_catalog = self.root_progress.observe(policy_changed, self.roots.is_empty());
         self.available_roots.retain(|id| next.contains_key(id));
         self.roots = next;
+        if let Some(lease) = lease {
+            self.broker_lease = Some(lease);
+        }
         if !refresh_catalog && !restart_scheduler {
             // A no-op reload still updates initial-scan markers above. The
             // existing observers and output ownership need no reconciliation.
@@ -2744,7 +2756,7 @@ impl Scheduler {
             let mut tray = self.tray.take();
             // The service shell owns the Broker connection throughout repair.
             // A failed reopen must release its WAL without giving up that lease.
-            let lease = self._lease.clone();
+            let lease = self.broker_lease.clone();
             // Drop the faulted stream and its lock before reopening; never
             // clear a WAL error in place or write the failed memory projection.
             drop(self);
@@ -3186,6 +3198,7 @@ impl Scheduler {
             .collect::<Vec<_>>();
         let mut groups: HashMap<(String, u64), (i64, i64, Vec<NativeDiscoveryScope>)> =
             HashMap::new();
+        let mut volume_cursors = HashMap::new();
         let mut probes = Vec::new();
         let mut reopened = HashSet::new();
         for (id, root, scope) in selected {
@@ -3199,7 +3212,20 @@ impl Scheduler {
             // Use the same directory generation to validate and publish this
             // cursor. A rename may replace its path while recovery is running.
             let identity = output_identity(&scope.root).ok();
-            let current = filesystem::watch_volume_cursor(&scope.root);
+            // Resolve each root independently, including its mount aliases.
+            // Roots on the same physical volume share this checkpoint's USN
+            // upper bound; later changes remain available to the next one.
+            let current = filesystem::watch_volume_device(&scope.root).and_then(|volume| {
+                let (journal, end) = match volume_cursors.get(&volume) {
+                    Some(&cursor) => cursor,
+                    None => {
+                        let cursor = filesystem::watch_volume_cursor(&volume)?;
+                        volume_cursors.insert(volume.clone(), cursor);
+                        cursor
+                    }
+                };
+                Ok((volume, journal, end))
+            });
             let cached = identity.as_deref().and_then(|identity| self.catalog.cursor(&scope, identity));
             if let (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end))) =
                 (&current, &cached)
@@ -3915,22 +3941,18 @@ impl Scheduler {
                 }
             }
             let cursors = (!cursors.is_empty()).then_some(cursors);
-            let (mut operations, _) =
-                state.pending_operations(ordinary, false, "", false, true, cursors)?;
+            let mut operations = state.pending_operations(ordinary, false, "", false, cursors);
             if !forced.is_empty() {
-                let (force, _) = state.pending_operations(forced, true, "", false, true, None)?;
-                operations.extend(force);
+                operations.extend(state.pending_operations(forced, true, "", false, None));
             }
             for (update, force, password_scope) in recoveries {
-                let (recovery, _) = state.pending_operations(
+                operations.extend(state.pending_operations(
                     std::iter::once(update),
                     force,
                     &password_scope.to_string_lossy(),
                     true,
-                    true,
                     None,
-                )?;
-                operations.extend(recovery);
+                ));
             }
             if let Some(owner) = retire {
                 operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
@@ -4580,7 +4602,12 @@ impl Scheduler {
             return Ok(());
         }
         let prepared = self.prepare_ready(now, available)?;
-        if prepared.is_empty() { return Ok(()); }
+        if prepared.is_empty() {
+            // Retirement during readiness can drain the last pending item
+            // without a completion event to arm cache cleanup.
+            self.arm_idle_cleanup();
+            return Ok(());
+        }
         // main persists the first admitted generation before checkpointing the
         // event burst, then submits that same batch without another readiness
         // gate. Events during checkpoint remain independent pending candidates.
@@ -4624,6 +4651,10 @@ impl Scheduler {
                 .entry((pending.root, password_scope, recovery_owner))
                 .or_insert_with(|| (pending.recovery, Vec::new()));
             candidates.push(source);
+        }
+        if groups.is_empty() {
+            self.arm_idle_cleanup();
+            return Ok(());
         }
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_admission", Origin::Watch, || {
@@ -6262,7 +6293,7 @@ fn prepare_flatten(
         let mut operations = NativeWatchOperations::empty();
         operations.set_runtime(format!("flatten|{}", key(root)), Some(json!({
             "owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,
-            "new_identity":new,"root_paths":root_paths,"work_paths":work_paths,
+            "new_identity":new,"work_paths":work_paths,
         })));
         if !owner.is_empty() {
             if let Some(checkpoint) = state.protect_output_operation(
@@ -6324,7 +6355,6 @@ fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root:
     operations.set_runtime(record_key, work_exists.then(|| {
         let mut next = (*record).clone();
         next["outputs_rebased"] = Value::Bool(true);
-        next["root_paths"] = json!(root_paths);
         next
     }));
     let owner = record["owner"]
@@ -6340,8 +6370,7 @@ fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root:
     state.register_output_paths(&paths, &[&current, record["old_identity"].as_str().unwrap_or_default()]);
     if !work_exists {
         if let Some(old) = record["old_identity"].as_str() {
-            let work_paths = work_paths.map(str::to_owned).collect::<Vec<_>>();
-            state.remove_active_output(&work_paths, old);
+            state.remove_active_output(work_paths, old);
         }
     }
     Ok(operations)

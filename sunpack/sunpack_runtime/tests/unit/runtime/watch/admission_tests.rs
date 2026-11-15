@@ -41,7 +41,7 @@ fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
-        external: Arc::default(), _lease: None,
+        external: Arc::default(), broker_lease: None,
     }
 }
 
@@ -190,6 +190,27 @@ fn admission_rejects_capture_during_readiness_without_losing_deadline() {
 }
 
 #[test]
+fn retiring_last_pending_candidate_arms_idle_cleanup() {
+    const CHILD: &str = "SUNPACK_RETIRED_ADMISSION_IDLE_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("retiring_last_pending_candidate_arms_idle_cleanup", CHILD);
+        return;
+    };
+    let base = PathBuf::from(base);
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    let source = base.join("input/disguised.part");
+    fs::write(&source, b"archive generation").unwrap();
+    scheduler.enqueue(&key(&base.join("input")), source.to_string_lossy().into_owned(),
+        CandidateAdmission::Retry).unwrap();
+    assert_eq!(scheduler.pending.len(), 1);
+    assert!(scheduler.cache_deadline.is_none());
+    fs::remove_file(source).unwrap();
+    scheduler.dispatch_ready().unwrap();
+    assert!(scheduler.pending.is_empty());
+    assert!(scheduler.cache_deadline.is_some());
+}
+
+#[test]
 fn output_create_failure_recovers_durable_input_after_restart() {
     const CHILD: &str = "SUNPACK_OUTPUT_RECOVERY_TEST";
     let Some(base) = std::env::var_os(CHILD) else {
@@ -309,7 +330,7 @@ fn checkpoint_submits_the_first_ready_generation() {
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::default(), _lease: None,
+                external: Arc::default(), broker_lease: None,
             };
             let source_text = source.to_str().unwrap();
             if case == "stable" {
@@ -463,7 +484,7 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
-        external: Arc::default(), _lease: None,
+        external: Arc::default(), broker_lease: None,
     };
     scheduler.options = Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap());
     for path in [&good, &bad] {
@@ -533,7 +554,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::default(), _lease: None,
+                external: Arc::default(), broker_lease: None,
             };
             let owner = source.to_str().unwrap();
             let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -542,8 +563,8 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                     [(PendingObservation(owner.into(), candidate.size as i64, candidate.mtime,
                         candidate.observation.file_id.clone(), candidate.observation.change_usn),
                         watched.to_string_lossy().into_owned(), None)],
-                    false, watched.to_str().unwrap(), false, true, None,
-                )?.0)
+                    false, watched.to_str().unwrap(), false, None,
+                ))
             }).unwrap();
             if case == "active" {
                 // The surviving outer archive cannot stand in for a nested
@@ -627,7 +648,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::default(), _lease: Some(lease),
+                external: Arc::default(), broker_lease: Some(lease),
             };
             let owner = source.to_str().unwrap();
             let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -636,8 +657,8 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
                     [(PendingObservation(owner.into(), candidate.size as i64, candidate.mtime,
                         candidate.observation.file_id.clone(), candidate.observation.change_usn),
                         watched.to_string_lossy().into_owned(), None)],
-                    false, watched.to_str().unwrap(), false, true, None,
-                )?.0)
+                    false, watched.to_str().unwrap(), false, None,
+                ))
             }).unwrap();
 
         write_roots(&scheduler.root_file, &[scheduler.roots[&root_id].0.clone()]).unwrap();
@@ -683,9 +704,11 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         fs::write(&held_member, b"unfinished output").unwrap();
         let held = fs::OpenOptions::new().read(true).share_mode(0).open(&held_member).unwrap();
         let receipt = Arc::downgrade(&scheduler.journal.state().pending(owner).unwrap());
+        let broker = Arc::downgrade(scheduler.broker_lease.as_ref().unwrap());
         write_roots(&scheduler.root_file, &[]).unwrap();
         scheduler.reload().unwrap();
         assert!(scheduler.journal.suspended());
+        assert!(broker.upgrade().is_none(), "rootless shell retained the Broker lease");
         assert!(scheduler.pending.is_empty() && scheduler.journal.state().pending_items().is_empty());
         assert!(receipt.upgrade().is_none(), "idle shell retained recovery receipts");
         assert!(scheduler.external.lock().unwrap().is_none());
@@ -707,6 +730,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         write_roots(&scheduler.root_file, &[root]).unwrap();
         scheduler.reload().unwrap();
         assert!(!scheduler.journal.suspended());
+        assert!(scheduler.broker_lease.is_some());
         assert!(!held_output.exists(), "re-attached scheduler lost output cleanup intent");
         assert!(scheduler.pending.contains_key(&key(&source)));
         return;
@@ -752,7 +776,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
             active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
-            external: Arc::default(), _lease: None,
+            external: Arc::default(), broker_lease: None,
         };
         let path = source.to_str().unwrap();
         let failed = watch_candidate_for_path(&source, None).unwrap().unwrap();
@@ -883,7 +907,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
             active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
-            external: Arc::default(), _lease: None,
+            external: Arc::default(), broker_lease: None,
         };
 
         let mut expected = Vec::new();
@@ -962,7 +986,9 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         let root = &mut scheduler.roots.get_mut(&root_id).unwrap().0;
         root.scanned = false;
         write_roots(&scheduler.root_file, std::slice::from_ref(root)).unwrap();
-        assert!(filesystem::watch_volume_cursor(&watched.to_string_lossy()).is_err());
+        assert!(filesystem::watch_volume_device(&watched.to_string_lossy())
+            .and_then(|volume| filesystem::watch_volume_cursor(&volume))
+            .is_err());
         scheduler.checkpoint(&HashMap::new(), true, false).unwrap();
         assert!(read_roots(&scheduler.root_file).unwrap()[0].scanned);
         assert!(scheduler.journal.state().pending(recovery.to_str().unwrap()).is_some());
@@ -995,7 +1021,7 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
         // native filesystem notification against the corresponding waiter.
         scheduler.config_observers.clear();
         let original = Arc::downgrade(&scheduler.journal);
-        let broker_lease = Arc::downgrade(scheduler._lease.as_ref().unwrap());
+        let broker_lease = Arc::downgrade(scheduler.broker_lease.as_ref().unwrap());
         scheduler.journal.fail_for_test();
         let last_error = Arc::new(Mutex::new(None));
         let error = Arc::clone(&last_error);
@@ -1086,12 +1112,12 @@ fn coalesced_watch_completion_keeps_the_leaders_blocker() {
         let id = watch_path_key(&candidate.path);
         let blocker = Arc::new(observed_entry(&candidate, "failed_password", None));
         scheduler.journal.commit(true, |state| {
-            let (mut operations, _) = state.pending_operations(
+            let mut operations = state.pending_operations(
                 [(PendingObservation(candidate.path.clone(), candidate.size as i64,
                     candidate.mtime, candidate.observation.file_id.clone(),
                     candidate.observation.change_usn), String::new(), None)],
-                false, "", false, true, None,
-            )?;
+                false, "", false, None,
+            );
             operations.put_entry(Arc::clone(&blocker));
             Ok(operations)
         }).unwrap();

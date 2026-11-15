@@ -50,7 +50,6 @@ struct FailureReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ReportState {
     input_id: String,
-    logical_name: String,
     position: usize,
     input_count: usize,
     output: PathBuf,
@@ -63,11 +62,20 @@ pub(super) struct ReportState {
 /// receipts. It owns no handles, inventories, or additional filesystem probes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct InputRecovery {
-    inputs: Vec<InputCheckpoint>,
+    inputs: Vec<RecoveryReceipt>,
     output: PathBuf,
     input_count: usize,
     had_checkpoints: bool,
     retry_output: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RecoveryReceipt {
+    input: Arc<ArchiveInput>,
+    report: ReportState,
+    sources: Arc<[SourceGeneration]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<Arc<FailureReceipt>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -192,7 +200,6 @@ impl InputCheckpoint {
         Some(ReportState {
             input_id: old.map(|old| old.input_id.clone())
                 .unwrap_or_else(|| CheckpointKey::for_input(input).0),
-            logical_name: input.logical_name.clone(),
             position: old.map_or(position, |old| old.position), input_count,
             output: result.output.as_deref().or(planned).unwrap_or(Path::new("")).to_path_buf(),
             files: result.files, bytes: result.bytes,
@@ -218,8 +225,7 @@ impl InputCheckpoint {
     /// differs. Main's ID deliberately excludes display name and open mode.
     pub(super) fn same_report_input(&self, input: &ArchiveInput) -> bool {
         let Some(report) = &self.report else { return false; };
-        let start = input.physical_extents().next().map_or(0, |extent| extent.start);
-        report.input_id == format!("{}|{}|{}", path_key(&input.entry_path), input.format_hint, start)
+        report.input_id == CheckpointKey::for_input(input).0
     }
 
     pub(super) fn has_recovered_members(&self) -> bool {
@@ -448,12 +454,18 @@ impl InputRecovery {
         input_count: usize, had_checkpoints: bool, retry_output: bool,
     ) -> Option<Arc<Self>> {
         let inputs: Vec<_> = checkpoints.into_iter()
-            .filter(|checkpoint| (checkpoint.carrier() == carrier || relocated_carrier == Some(checkpoint.carrier())) && checkpoint.report.is_some())
-            .cloned().collect();
+            .filter(|checkpoint| checkpoint.carrier() == carrier || relocated_carrier == Some(checkpoint.carrier()))
+            .filter_map(|checkpoint| Some(RecoveryReceipt {
+                report: checkpoint.report.as_ref()?.clone(),
+                input: Arc::clone(&checkpoint.input),
+                sources: Arc::clone(&checkpoint.sources),
+                failure: checkpoint.failure.clone(),
+            }))
+            .collect();
         if inputs.is_empty() { return None; }
-        let cleared = inputs.iter().all(|checkpoint| checkpoint.report.as_ref().unwrap().output.as_os_str().is_empty());
+        let cleared = inputs.iter().all(|input| input.report.output.as_os_str().is_empty());
         let output = if cleared { PathBuf::new() } else { output.map(Path::to_path_buf).unwrap_or_else(||
-            inputs[0].report.as_ref().unwrap().output.clone()) };
+            inputs[0].report.output.clone()) };
         Some(Arc::new(Self { inputs, output, input_count, had_checkpoints, retry_output: retry_output && !cleared }))
     }
 
@@ -464,7 +476,7 @@ impl InputRecovery {
     }
 
     pub(crate) fn has_password_blocker(&self) -> bool {
-        self.inputs.iter().filter_map(InputCheckpoint::failure).any(Failure::is_password_retry)
+        self.inputs.iter().filter_map(|input| input.failure.as_ref()).any(|receipt| receipt.failure.is_password_retry())
     }
 
     /// Borrow receipts until the final writer consumes them.
@@ -482,11 +494,9 @@ impl InputRecovery {
     pub(super) fn relocate_flatten(&mut self, leaf: &Path, root: &Path) {
         if let Ok(relative) = self.output.strip_prefix(leaf) { self.output = root.join(relative); }
         else if leaf.starts_with(&self.output) && self.output.starts_with(root) { self.output = root.to_path_buf(); }
-        for checkpoint in &mut self.inputs {
-            if let Some(state) = &mut checkpoint.report {
-                if !state.output.as_os_str().is_empty() {
-                    super::relocate_flatten_output(&mut state.output, leaf, root);
-                }
+        for input in &mut self.inputs {
+            if !input.report.output.as_os_str().is_empty() {
+                super::relocate_flatten_output(&mut input.report.output, leaf, root);
             }
         }
     }
@@ -517,7 +527,7 @@ fn layout_matches(saved: &ArchiveInput, input: &ArchiveInput) -> bool {
 
 struct RecoveryReport<'a, F> { recovery: &'a InputRecovery, failure: F }
 struct RecoveryInputs<'a, F> { recovery: &'a InputRecovery, failure: F }
-struct RecoveryInput<'a, F> { checkpoint: &'a InputCheckpoint, failure: F }
+struct RecoveryInput<'a, F> { receipt: &'a RecoveryReceipt, failure: F }
 
 impl<'a, F, T> Serialize for RecoveryReport<'a, F>
 where F: Fn(&'a Failure) -> T, T: Serialize {
@@ -535,8 +545,8 @@ where F: Fn(&'a Failure) -> T, T: Serialize {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut seq = serializer.serialize_seq(Some(self.recovery.inputs.len()))?;
-        for checkpoint in &self.recovery.inputs {
-            seq.serialize_element(&RecoveryInput { checkpoint, failure: &self.failure })?;
+        for receipt in &self.recovery.inputs {
+            seq.serialize_element(&RecoveryInput { receipt, failure: &self.failure })?;
         }
         seq.end()
     }
@@ -545,27 +555,27 @@ impl<'a, F, T> Serialize for RecoveryInput<'a, F>
 where F: Fn(&'a Failure) -> T, T: Serialize {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let checkpoint = self.checkpoint;
-        let state = checkpoint.report.as_ref().expect("captured report state");
-        let error = checkpoint.failure.as_ref().map(|receipt| &receipt.failure);
+        let receipt = self.receipt;
+        let state = &receipt.report;
+        let error = receipt.failure.as_ref().map(|receipt| &receipt.failure);
         let mut blockers = [""; 2];
         let mut count = 0;
         if let Some(error) = error {
             if error.kind == FailureKind::MissingVolume
-                || checkpoint.input.execution_evidence().is_some()
-                || checkpoint.input.analysis.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing)
+                || receipt.input.execution_evidence().is_some()
+                || receipt.input.analysis.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing)
                 || error.evidence.as_deref().is_some_and(|e| e.classification_evidence.as_deref() == Some("password_or_volume_inconclusive"))
             { blockers[count] = "missing_volume"; count += 1; }
             if error.is_password_retry() { blockers[count] = "password"; count += 1; }
         }
         let mut map = serializer.serialize_map(Some(11))?;
-        map.serialize_entry("archive_input", &checkpoint.input.report_with_name(&state.logical_name))?;
+        map.serialize_entry("archive_input", &receipt.input.report())?;
         map.serialize_entry("blockers", &blockers[..count])?;
         map.serialize_entry("bytes_written", &state.bytes)?;
         map.serialize_entry("complete", &error.is_none())?;
         map.serialize_entry("failure", &error.map(&self.failure))?;
         map.serialize_entry("files_written", &state.files)?;
-        map.serialize_entry("generation", &checkpoint.sources)?;
+        map.serialize_entry("generation", &receipt.sources)?;
         map.serialize_entry("input_id", &state.input_id)?;
         map.serialize_entry("output_dir", &state.output)?;
         map.serialize_entry("position", &state.position)?;

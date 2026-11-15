@@ -28,9 +28,9 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-pub(crate) fn parse_record(bytes: &[u8]) -> Result<EndRecord, &'static str> {
+pub(crate) fn parse_record(bytes: &[u8]) -> Option<EndRecord> {
     if bytes.len() < 56 || !bytes.starts_with(b"PK\x06\x06") {
-        return Err("zip64_eocd_invalid");
+        return None;
     }
     let record = EndRecord {
         record_size: u64_at(bytes, 4),
@@ -42,7 +42,7 @@ pub(crate) fn parse_record(bytes: &[u8]) -> Result<EndRecord, &'static str> {
         cd_offset: u64_at(bytes, 48),
     };
     if record.record_size < 44 || record.record_size >= 1 << 62 {
-        return Err("zip64_eocd_size_invalid");
+        return None;
     }
     if record.cd_size >= OFFSET_LIMIT
         || record.cd_offset >= OFFSET_LIMIT
@@ -51,9 +51,9 @@ pub(crate) fn parse_record(bytes: &[u8]) -> Result<EndRecord, &'static str> {
             .checked_add(record.cd_size)
             .is_none_or(|end| end >= OFFSET_LIMIT)
     {
-        return Err("zip64_central_directory_overflow");
+        return None;
     }
-    Ok(record)
+    Some(record)
 }
 
 pub(crate) fn parse_locator(bytes: &[u8]) -> Result<Locator, &'static str> {
@@ -78,50 +78,36 @@ pub(crate) struct LocatedEndRecord {
     pub locator: Locator,
 }
 
-#[derive(Debug)]
-pub(crate) enum LocateError {
-    Read(std::io::Error),
-    Invalid(&'static str),
-}
-
-impl From<std::io::Error> for LocateError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Read(error)
-    }
-}
-
 /// One locator/extent model for byte slices, files and logical volume views.
 /// Try the disk-relative locator first. SFX/carriers can shift that offset;
 /// recover by scanning backwards in bounded windows, accepting only a record
 /// whose declared variable extent ends exactly at the adjacent locator.
-pub(crate) fn locate_end_record(
+/// An absent locator is `Ok(None)`; invalid declarations and failed reads
+/// abort this probe with `Err(())`.
+pub(crate) fn locate_end_record<B: AsRef<[u8]>>(
     eocd: u64,
     disk_starts: Option<&[u64]>,
-    mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
-) -> Result<Option<LocatedEndRecord>, LocateError> {
+    mut read: impl FnMut(u64, usize) -> std::io::Result<B>,
+) -> Result<Option<LocatedEndRecord>, ()> {
     let Some(locator_offset) = eocd.checked_sub(20) else {
         return Ok(None);
     };
+    let mut read = |offset, size| read(offset, size).map_err(drop);
     let bytes = read(locator_offset, 20)?;
+    let bytes = bytes.as_ref();
     if !bytes.starts_with(b"PK\x06\x07") {
         return Ok(None);
     }
-    let locator = parse_locator(&bytes).map_err(LocateError::Invalid)?;
+    let locator = parse_locator(bytes).map_err(drop)?;
     if locator.total_disks == 0 || locator.record_disk >= locator.total_disks {
-        return Err(LocateError::Invalid("zip64_locator_invalid"));
+        return Err(());
     }
     let base = match disk_starts {
-        Some(starts) => *starts
-            .get(locator.record_disk as usize)
-            .ok_or(LocateError::Invalid(
-                "central_directory_disk_offset_out_of_range",
-            ))?,
+        Some(starts) => *starts.get(locator.record_disk as usize).ok_or(())?,
         None => 0,
     };
-    let declared = base
-        .checked_add(locator.record_offset)
-        .ok_or(LocateError::Invalid("zip64_locator_offset_overflow"))?;
-    let check = |offset: u64, fixed: &[u8]| -> Result<Option<LocatedEndRecord>, LocateError> {
+    let declared = base.checked_add(locator.record_offset).ok_or(())?;
+    let check = |offset: u64, fixed: &[u8]| -> Result<Option<LocatedEndRecord>, ()> {
         if fixed.len() < 56 || !fixed.starts_with(b"PK\x06\x06") {
             return Ok(None);
         }
@@ -135,20 +121,20 @@ pub(crate) fn locate_end_record(
         // The extent proves this is the actual record, rather than a magic
         // string inside its extension. Reject invalid fields immediately;
         // a malformed directory declaration must not trigger a file scan.
-        let record = parse_record(fixed).map_err(LocateError::Invalid)?;
+        let record = parse_record(fixed).ok_or(())?;
         Ok(Some(LocatedEndRecord {
             offset,
             record,
             locator,
         }))
     };
-    let fixed_start = locator_offset.checked_sub(56);
+    let fixed_start = locator_offset.checked_sub(56).filter(|&start| start != declared);
     for offset in [Some(declared), fixed_start].into_iter().flatten() {
         if offset
             .checked_add(56)
             .is_some_and(|end| end <= locator_offset)
         {
-            if let Some(found) = check(offset, &read(offset, 56)?)? {
+            if let Some(found) = check(offset, read(offset, 56)?.as_ref())? {
                 return Ok(Some(found));
             }
         }
@@ -160,14 +146,15 @@ pub(crate) fn locate_end_record(
         let start = end.saturating_sub(64 * 1024).max(base);
         let stop = end.saturating_add(55).min(locator_offset);
         let window = read(start, (stop - start) as usize)?;
-        for index in memchr::memmem::rfind_iter(&window, b"PK\x06\x06") {
+        let window = window.as_ref();
+        for index in memchr::memmem::rfind_iter(window, b"PK\x06\x06") {
             if let Some(found) = check(start + index as u64, &window[index..])? {
                 return Ok(Some(found));
             }
         }
         end = start;
     }
-    Err(LocateError::Invalid("zip64_eocd_invalid"))
+    Err(())
 }
 
 /// ZIP64 extra values follow the sentinel fields in this fixed order. All

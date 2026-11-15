@@ -31,45 +31,13 @@ fn parse_seven_zip_header(raw: &[u8], streams: &mut SevenZipStreams) -> Result<(
     }
 }
 
-pub(crate) struct SevenZipEncryptionFacts {
-    pub(crate) password_required: bool,
-    pub(crate) encrypted_payload: bool,
-    pub(crate) scan_complete: bool,
-}
-
-pub(crate) fn seven_zip_encryption_facts_from_next_header(raw: &[u8]) -> SevenZipEncryptionFacts {
-    let Some(&next_header_nid) = raw.first() else {
-        return SevenZipEncryptionFacts {
-            password_required: false,
-            encrypted_payload: false,
-            scan_complete: true,
-        };
-    };
-    let mut streams = SevenZipStreams::default();
-    let mut pos = 1;
-    let parsed = match next_header_nid {
-        SZ_ENCODED_HEADER => parse_seven_zip_streams_info(raw, &mut pos, &mut streams, false),
-        SZ_HEADER => parse_seven_zip_header(raw, &mut streams),
-        _ => Err("unsupported_next_header_nid"),
-    };
-    let encrypted = streams.folders.iter().any(|folder| {
-        folder
-            .coders
-            .iter()
-            .any(|coder| coder.method_id.as_slice() == EncoderMethod::ID_AES256_SHA256)
-    });
-    let encrypted_header = next_header_nid == SZ_ENCODED_HEADER && encrypted;
-    let encrypted_payload = next_header_nid == SZ_HEADER && encrypted;
-    // A plaintext EncodedHeader is only a wrapper around the packed metadata.
-    // For data-only encryption (`-p`, without `-mhe`) the AES coder lives in
-    // that packed metadata and cannot be inspected without the password.  It
-    // is therefore not a proof of an unencrypted archive.  Keep the state
-    // unknown so the password resolver can run its bounded verifier/final
-    // extraction confirmation instead of short-circuiting to empty password.
-    SevenZipEncryptionFacts {
-        password_required: encrypted_header || encrypted_payload,
-        encrypted_payload,
-        scan_complete: next_header_nid == SZ_HEADER && parsed.is_ok(),
+/// Confirm the decoded tree in place after the password probe validates its CRC.
+/// An unsupported tree still requires extraction confirmation.
+pub(crate) fn predecoded_seven_zip_header_is_supported(raw: &[u8]) -> bool {
+    match raw.first() {
+        None => true,
+        Some(&SZ_HEADER) => parse_seven_zip_header(raw, &mut SevenZipStreams::default()).is_ok(),
+        _ => false,
     }
 }
 

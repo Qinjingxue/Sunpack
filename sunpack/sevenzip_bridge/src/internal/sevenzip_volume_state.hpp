@@ -19,7 +19,7 @@ namespace sunpack::sevenzip
         const VolumeKey key;
         const bool persistent = true;
 
-        // 懒创建：dry-run job 与 shared_writer == nullptr 的兜底 writer 没有真实卷身份
+        // 没有卷身份的 writer 不创建空间 gate。
         // （key 为空），此时 gate 保持 nullptr，让这些路径语义完全不变。
         //
         // 生命周期：gate 的存活期 = VolumeState 的存活期，长于 writer facility，因此 gate 里

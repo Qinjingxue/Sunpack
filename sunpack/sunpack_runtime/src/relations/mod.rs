@@ -172,26 +172,6 @@ impl<'a> RelationCandidateData<'a> {
             ),
         }
     }
-
-    pub(crate) fn size(&self) -> Option<u64> {
-        match self.group {
-            NativeRelationGroup::Ordinary(row, _) => row.size,
-            NativeRelationGroup::Proposal(validation) => validation
-                .facts
-                .anchors
-                .get(&path_key(self.entry_path))
-                .map(|anchor| anchor.size),
-        }
-    }
-
-    pub(crate) fn logical_size(&self) -> Option<u64> {
-        match self.group {
-            NativeRelationGroup::Ordinary(row, _) => row.size,
-            NativeRelationGroup::Proposal(validation) => {
-                proposal_logical_size(&validation.proposal, &validation.facts.anchors)
-            }
-        }
-    }
 }
 
 impl NativeRelationGroup {
@@ -256,6 +236,22 @@ impl NativeRelationGroup {
                 .facts
                 .anchors
                 .get(&path_key(validation.proposal.entry_path())),
+        }
+    }
+
+    pub(crate) fn format_hint(&self) -> &'static str {
+        match self {
+            Self::Ordinary(row, _) => row.anchor.as_ref().map_or("", |anchor| anchor.format),
+            Self::Proposal(validation) => validation.proposal.format,
+        }
+    }
+
+    pub(crate) fn logical_size(&self) -> Option<u64> {
+        match self {
+            Self::Ordinary(row, _) => row.size,
+            Self::Proposal(validation) => {
+                proposal_logical_size(&validation.proposal, &validation.facts.anchors)
+            }
         }
     }
 
@@ -383,7 +379,7 @@ impl NativeRelationGroup {
                     is_split: parsed.is_some(),
                     parsed,
                     entry_path: &row.path,
-                    format_hint: anchor.map(|a| a.format).unwrap_or(""),
+                    format_hint: self.format_hint(),
                     needs_password: anchor.is_some_and(|a| a.needs_password),
                     multivolume: anchor.is_some_and(|a| a.multivolume),
                     relation_confirmed: *confirmed,
@@ -401,7 +397,7 @@ impl NativeRelationGroup {
                     group: self,
                     parsed: None,
                     entry_path,
-                    format_hint: proposal.format,
+                    format_hint: self.format_hint(),
                     is_split: true,
                     needs_password: validation.status == ProposalStatus::NeedsPassword,
                     multivolume: true,
@@ -1227,13 +1223,6 @@ pub(crate) fn relations_size_filter_split_family_keys(path: &str) -> Vec<String>
 
 fn may_have_size_deferred_split_identity(path: &str) -> bool {
     let name = basename(path).to_ascii_lowercase();
-    if filename::NameFeatures::parse(&name)
-        .numbers
-        .iter()
-        .any(|n| n.left.ends_with("part") && n.value > 0)
-    {
-        return true;
-    }
     if name.ends_with(".7z")
         || name.ends_with(".zip")
         || name.ends_with(".zipx")
@@ -1261,7 +1250,17 @@ fn may_have_size_deferred_split_identity(path: &str) -> bool {
     let has_family_token = ["7z", "zip", "rar", "exe"]
         .iter()
         .any(|token| name.contains(token));
-    has_family_token && (name.contains(".part") || name.contains("vol") || name.contains(".z"))
+    if has_family_token && (name.contains(".part") || name.contains("vol") || name.contains(".z")) {
+        return true;
+    }
+    // A positive numeric token immediately after "part" also qualifies.
+    // The actual family parser runs only after this allocation-free check.
+    let fields = name.split_once('.').map_or(name.as_str(), |(_, fields)| fields);
+    fields.match_indices("part").any(|(start, marker)| {
+        let tail = &fields[start + marker.len()..];
+        let end = tail.bytes().position(|b| !b.is_ascii_digit()).unwrap_or(tail.len());
+        tail[..end].parse::<u32>().is_ok_and(|number| number > 0)
+    })
 }
 
 fn split_size_family_key(scheme: &str, prefix: &str) -> String {

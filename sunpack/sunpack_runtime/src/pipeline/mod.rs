@@ -397,7 +397,6 @@ pub struct ArchiveResult {
     pub source_paths: Vec<PathBuf>,
     pub password: Option<String>,
     pub discovery_source: DiscoverySource,
-    #[serde(skip)]
     pub partial: bool,
     pub retained: bool,
     pub recovered_complete_files: u64,

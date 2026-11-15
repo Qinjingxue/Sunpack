@@ -20,10 +20,7 @@ pub(crate) fn zip64_relation_disk_numbers(
 ) -> Option<(u32, u32)> {
     let found = zip64::locate_end_record(eocd as u64, None, |offset, size| {
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        Ok(data
-            .get(start..start.saturating_add(size))
-            .unwrap_or_default()
-            .to_vec())
+        Ok(data.get(start..start.saturating_add(size)).unwrap_or_default())
     })
     .ok()??;
     if found.locator.record_offset != tail_start.checked_add(found.offset)?

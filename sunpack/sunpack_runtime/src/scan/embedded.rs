@@ -9,8 +9,8 @@ use crate::io::reader::{CachedBytes, ManagedReader};
 use crate::io::ScanBatch;
 use crate::scan::compression_stream::{
     bzip2_header_block_limit, bzip2_prefix_valid, gzip_fixed_header_flags, parse_xz_footer,
-    resolve_xz_stream_start, validate_bzip2_structure_observed, validate_gzip_structure_observed,
-    validate_xz_header, validate_zstd_structure_observed, ValidationError, ValidationResult,
+    resolve_xz_stream_start, validate_bzip2_structure, validate_gzip_structure,
+    validate_xz_header, validate_zstd_structure, ValidationError, ValidationResult,
 };
 use aho_corasick::{packed, AhoCorasick};
 use crc32fast::hash as crc32;
@@ -639,7 +639,7 @@ fn validate_raw_hits(
         };
         reader.hint_probe_window(hit.offset());
         let fixed = read_at(reader, hit.offset(), 56)?;
-        if let Ok(record) = crate::formats::zip::zip64::parse_record(&fixed) {
+        if let Some(record) = crate::formats::zip::zip64::parse_record(&fixed) {
             if let Some(end) = hit
                 .offset()
                 .checked_add(12 + record.record_size)
@@ -1461,12 +1461,11 @@ fn parse_zip64_end_records(
     if locator.len() != 20 || &locator[..4] != b"PK\x06\x07" {
         return Ok(None);
     }
-    let locator_disk = u32::from_le_bytes(locator[4..8].try_into().unwrap());
     let locator_fields = crate::formats::zip::zip64::parse_locator(&locator)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let recorded_record_offset = locator_fields.record_offset;
     let disk_count = locator_fields.total_disks;
-    if locator_disk != 0 || disk_count != 1 || eocd_offset < 32 {
+    if locator_fields.record_disk != 0 || disk_count != 1 || eocd_offset < 32 {
         return Ok(None);
     }
 
@@ -1823,7 +1822,6 @@ impl FailedSuffixEvidence {
                 if !matches!(
                     code,
                     "decoded_size_overflow"
-                        | "deflate_block_count_overflow"
                         | "lz4_size_overflow"
                         | "os_error"
                 ) {
@@ -1841,8 +1839,8 @@ fn validate_gzip(
     offset: u64,
     suffixes: &mut FailedSuffixEvidence,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
-    let Some(structure) = suffixes.validate(offset, true, |visit| {
-        validate_gzip_structure_observed(file, offset, size, visit)
+    let Some(end) = suffixes.validate(offset, true, |visit| {
+        validate_gzip_structure(file, offset, size, visit)
     })?
     else {
         return Ok(None);
@@ -1850,7 +1848,7 @@ fn validate_gzip(
     Ok(Some(candidate(
         "gzip",
         offset,
-        Some(structure.end_offset),
+        Some(end),
         CandidateKind::Archive,
     )))
 }
@@ -1861,8 +1859,8 @@ fn validate_bzip2(
     offset: u64,
     suffixes: &mut FailedSuffixEvidence,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
-    let Some(structure) = suffixes.validate(offset, true, |visit| {
-        validate_bzip2_structure_observed(file, offset, size, visit)
+    let Some(end) = suffixes.validate(offset, true, |visit| {
+        validate_bzip2_structure(file, offset, size, visit)
     })?
     else {
         return Ok(None);
@@ -1870,7 +1868,7 @@ fn validate_bzip2(
     Ok(Some(candidate(
         "bzip2",
         offset,
-        Some(structure.end_offset),
+        Some(end),
         CandidateKind::Archive,
     )))
 }
@@ -1953,8 +1951,8 @@ fn validate_zstd(
     offset: u64,
     suffixes: &mut FailedSuffixEvidence,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
-    let Some(structure) = suffixes.validate(offset, true, |visit| {
-        validate_zstd_structure_observed(file, offset, size, visit)
+    let Some(end) = suffixes.validate(offset, true, |visit| {
+        validate_zstd_structure(file, offset, size, visit)
     })?
     else {
         return Ok(None);
@@ -1962,7 +1960,7 @@ fn validate_zstd(
     Ok(Some(candidate(
         "zstd",
         offset,
-        Some(structure.end_offset),
+        Some(end),
         CandidateKind::Archive,
     )))
 }

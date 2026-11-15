@@ -438,52 +438,6 @@ namespace sunpack::sevenzip
         std::mutex mutex_;
     };
 
-    class TraceOutStream final : public CMyUnknownImp, public ISequentialOutStream
-    {
-        Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
-        
-
-    public:
-        TraceOutStream(ExtractOutputTrace &trace, std::size_t item_trace_index)
-
-            : trace_(trace),
-              item_trace_index_(item_trace_index)
-        {
-        }
-
-        HRESULT STDMETHODCALLTYPE Write(const void *, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
-        {
-            trace_.items[item_trace_index_].bytes_written += size;
-
-            if (processedSize)
-            {
-
-                *processedSize = size;
-            }
-
-            return S_OK;
-        }
-
-    private:
-
-        ExtractOutputTrace &trace_;
-
-        std::size_t item_trace_index_ = 0;
-
-    };
-
-    inline bool directory_is_empty_or_missing(const std::filesystem::path &path)
-    {
-        std::error_code error;
-        if (!std::filesystem::exists(path, error))
-        {
-            return !error;
-        }
-        error.clear();
-        const bool empty = std::filesystem::is_empty(path, error);
-        return !error && empty;
-    }
-
     inline std::wstring normalized_output_path_key(const std::filesystem::path &path)
     {
         return lower_text(path.lexically_normal().wstring());
@@ -726,8 +680,6 @@ namespace sunpack::sevenzip
 
             ExtractProgressCallback progress,
 
-            bool dry_run,
-
             ExtractOutputTrace &output_trace,
 
             UInt32 estimated_items = 0,
@@ -746,27 +698,22 @@ namespace sunpack::sevenzip
 
                 progress_(std::move(progress)),
 
-                dry_run_(dry_run),
-
                 output_trace_(output_trace),
 
-                async_writer_(dry_run ? nullptr : std::move(shared_writer)),
+                async_writer_(std::move(shared_writer)),
 
                 cancel_token_(std::move(cancel_token)),
 
-                output_root_(dry_run ? std::filesystem::path{} : std::filesystem::path(win32_extended_path(output_dir))),
+                output_root_(win32_extended_path(output_dir)),
 
                 replay_(current_extraction_replay),
-                output_root_initially_empty_(!dry_run &&
-                    (replay_ && replay_->initialized ? replay_->root_was_empty : directory_is_empty_or_missing(output_root_))),
-                output_paths_(output_root_, dry_run ? nullptr : replay_)
+                output_root_initially_empty_(
+                    replay_ && replay_->initialized ? replay_->root_was_empty : directory_is_empty_or_missing(output_root_)),
+                output_paths_(output_root_, replay_)
         {
-            if (!dry_run_)
-            {
-                if (replay_ && !replay_->initialized)
-                    replay_->root_was_empty = output_root_initially_empty_;
-                output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
-            }
+            if (replay_ && !replay_->initialized)
+                replay_->root_was_empty = output_root_initially_empty_;
+            output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
             // Query the handler's property schema once. ZIP/7z/stream hot paths
             // need neither a per-file link query nor a link index.
             UInt32 count = 0;
@@ -782,15 +729,12 @@ namespace sunpack::sevenzip
                 }
             // Register only after callback setup succeeds. A failed
             // constructor cannot unregister a writer job in its destructor.
-            if (!dry_run_)
-            {
-                if (!async_writer_) async_writer_ = std::make_shared<AsyncFileWriter>();
-                async_job_ = async_writer_->make_job(0, cancel_token_
+            if (!async_writer_) async_writer_ = std::make_shared<AsyncFileWriter>();
+            async_job_ = async_writer_->make_job(0, cancel_token_
 #ifdef SUP7Z_DEBUG
-                    , pipeline_timing
+                , pipeline_timing
 #endif
-                );
-            }
+            );
         }
 
         ~ExtractToDiskCallback() { finalize_output(); }
@@ -801,7 +745,7 @@ namespace sunpack::sevenzip
             // Same fallback as 7z.exe for disk input. The canonical entry path
             // already comes from the input plan; do not inspect/reclassify parts.
             WIN32_FILE_ATTRIBUTE_DATA data{};
-            if (!dry_run_ && GetFileAttributesExW(win32_extended_path(path).c_str(),
+            if (GetFileAttributesExW(win32_extended_path(path).c_str(),
                     GetFileExInfoStandard, &data))
             {
                 archive_mtime_ = data.ftLastWriteTime;
@@ -849,13 +793,6 @@ namespace sunpack::sevenzip
             // Decoder callbacks are over. Directory reservations survive until
             // the final snapshot, so a late interruption can replay collisions.
             std::unordered_set<std::wstring>{}.swap(created_directories_);
-            if (!async_writer_)
-            {
-                output_paths_.clear();
-                finalize_hard_links();
-                return;
-            }
-
             const HRESULT writer_error = async_writer_->finish_job(async_job_);
             bool has_failed_file = false;
             for (const auto &state : async_files_)
@@ -1100,34 +1037,25 @@ namespace sunpack::sevenzip
                 if (is_dir)
                 {
 
-                    if (!dry_run_)
-                    {
+                    target = receipt && !receipt->path.empty() ? std::filesystem::path(receipt->path)
+                        : output_paths_.allocate(output_root_ / safe_path.value(), output_root_initially_empty_, true);
+                    if (receipt) receipt->path = target.native();
 
-                        target = receipt && !receipt->path.empty() ? std::filesystem::path(receipt->path)
-                            : output_paths_.allocate(output_root_ / safe_path.value(), output_root_initially_empty_, true);
-                        if (receipt) receipt->path = target.native();
-
-                        directory_ready = ensure_directory(target, &directory_error);
-                        if (directory_ready)
-                        {
-                            const auto metadata = read_item_metadata(index, true);
-                            if (metadata.defined)
-                            {
-                                const auto &text = target.native();
-                                const auto depth = static_cast<std::size_t>(std::count_if(
-                                    text.begin(), text.end(), [](wchar_t c) { return c == L'/' || c == L'\\'; }));
-                                directory_metadata_.push_back({target, metadata, depth, current_trace_index_});
-                            }
-                        }
-
-                    }
-
+                    directory_ready = ensure_directory(target, &directory_error);
                     if (directory_ready)
                     {
+                        const auto metadata = read_item_metadata(index, true);
+                        if (metadata.defined)
+                        {
+                            const auto &text = target.native();
+                            const auto depth = static_cast<std::size_t>(std::count_if(
+                                text.begin(), text.end(), [](wchar_t c) { return c == L'/' || c == L'\\'; }));
+                            directory_metadata_.push_back({std::move(target), metadata, depth, index});
+                        }
                         return S_OK;
                     }
                 }
-                else if (!dry_run_)
+                else
                 {
 
                     target = receipt && !receipt->path.empty() ? std::filesystem::path(receipt->path)
@@ -1173,20 +1101,6 @@ namespace sunpack::sevenzip
                 mark_current_item_failure(E_FAIL);
 
                 return E_FAIL;
-            }
-
-            if (dry_run_)
-            {
-
-                if (is_hard_link) return defer_hard_link(std::move(hard_link));
-
-                // Objects start at refcount 0, so the CMyComPtr constructor
-                // performs the first AddRef and Detach hands that single owned
-                // reference to 7-Zip, which will Release it.
-                CMyComPtr<ISequentialOutStream> stream_owner(new TraceOutStream(output_trace_, current_trace_index_));
-                *outStream = stream_owner.Detach();
-
-                return S_OK;
             }
 
             // Link entries contain no decoder payload. In particular RAR5 must
@@ -1240,10 +1154,6 @@ namespace sunpack::sevenzip
                     failed_item_bytes_written_ = current_async_file_
                         ? async_writer_->accepted_bytes(current_async_file_) : item.bytes_written;
                 }
-                else if (!item.is_dir && dry_run_)
-                {
-                    ++files_written_;
-                }
             }
             else if (opRes != kOpOk)
             {
@@ -1252,15 +1162,12 @@ namespace sunpack::sevenzip
 
             emit(opRes == kOpOk ? "item_done" : "item_failed");
 
-            if (async_writer_)
+            const HRESULT writer_error = async_writer_->current_error(async_job_);
+            if (writer_error != S_OK)
             {
-                const HRESULT writer_error = async_writer_->current_error(async_job_);
-                if (writer_error != S_OK)
-                {
-                    output_error_ = true;
-                    mark_current_item_failure(writer_error);
-                    return writer_error;
-                }
+                output_error_ = true;
+                mark_current_item_failure(writer_error);
+                return writer_error;
             }
             // A composition trial is transactional. Preserve the first receipt
             // and unwind immediately instead of decoding unrelated later items.
@@ -1294,7 +1201,6 @@ namespace sunpack::sevenzip
             if (decoder_ok && output_ok)
             {
                 ++files_written_;
-                record_metadata_errors(snapshot.metadata_errors, item.index, item.path, false);
             }
 
             item.bytes_written = snapshot.written_bytes;
@@ -1428,7 +1334,7 @@ namespace sunpack::sevenzip
                                 const auto target = (output_root_ / source.output_path).make_preferred();
                                 const auto saved = replay_ ? replay_->files.find(item.index) : std::map<std::uint32_t, ReplayFile>::iterator{};
                                 const bool already_created = replay_ && saved != replay_->files.end() && saved->second.complete;
-                                const auto result = dry_run_ || already_created ? AttemptResult{} : retry_with_space_gate(
+                                const auto result = already_created ? AttemptResult{} : retry_with_space_gate(
                                     volume_space_gate(), [&] { return space_terminal_predicate(); }, path.native(),
                                     [&]() noexcept -> AttemptResult
                                     {
@@ -1509,76 +1415,40 @@ namespace sunpack::sevenzip
             return metadata;
         }
 
-        void record_metadata_errors(const ArchiveMetadataErrors &errors, UInt32 index,
-                                    const std::wstring &name, bool is_dir)
-        {
-            if (!errors.first_error()) return;
-            auto &trace = output_trace_;
-            if (trace.metadata_failed_files == 0 && trace.metadata_failed_directories == 0)
-            {
-                trace.metadata_first_item_index = index;
-                trace.metadata_first_item = name;
-                trace.metadata_first_win32_error = errors.first_error();
-                trace.metadata_first_is_attributes = errors.time == 0;
-            }
-            if (is_dir) ++trace.metadata_failed_directories;
-            else ++trace.metadata_failed_files;
-            if (errors.time) ++trace.metadata_failed_times;
-            if (errors.attributes) ++trace.metadata_failed_attributes;
-        }
-
         struct DirectoryMetadata
         {
             std::filesystem::path target;
             ArchiveItemMetadata metadata;
             std::size_t depth;
-            std::size_t trace_index;
+            UInt32 index;
         };
 
         void restore_directory_metadata() noexcept
         {
             // Like 7z: children before parents, original order at equal depth.
             std::sort(directory_metadata_.begin(), directory_metadata_.end(),
-                [this](const DirectoryMetadata &a, const DirectoryMetadata &b)
+                [](const DirectoryMetadata &a, const DirectoryMetadata &b)
                 {
-                    return a.depth != b.depth ? a.depth > b.depth
-                        : output_trace_.items[a.trace_index].index < output_trace_.items[b.trace_index].index;
+                    return a.depth != b.depth ? a.depth > b.depth : a.index < b.index;
                 });
             for (const auto &directory : directory_metadata_)
             {
-                ArchiveMetadataErrors errors;
                 try
                 {
                     ensure_no_reparse_ancestors(directory.target);
                     const HANDLE handle = CreateFileW(win32_extended_path(directory.target.native()).c_str(),
                         FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-                    if (handle == INVALID_HANDLE_VALUE)
+                    if (handle != INVALID_HANDLE_VALUE)
                     {
-                        const DWORD error = GetLastError();
-                        if (directory.metadata.has_times()) errors.time = error;
-                        if (directory.metadata.defined & ArchiveItemMetadata::Attributes) errors.attributes = error;
+                        directory.metadata.restore(handle);
+                        CloseHandle(handle);
                     }
-                    else
-                    {
-                        errors = directory.metadata.restore(handle);
-                        if (!CloseHandle(handle) && !errors.first_error()) errors.time = GetLastError();
-                    }
-                }
-                catch (const std::filesystem::filesystem_error &error)
-                {
-                    if (directory.metadata.has_times()) errors.time = static_cast<DWORD>(error.code().value());
-                    if (directory.metadata.defined & ArchiveItemMetadata::Attributes)
-                        errors.attributes = static_cast<DWORD>(error.code().value());
                 }
                 catch (...)
                 {
-                    if (directory.metadata.has_times()) errors.time = ERROR_NOT_ENOUGH_MEMORY;
-                    if (directory.metadata.defined & ArchiveItemMetadata::Attributes)
-                        errors.attributes = ERROR_NOT_ENOUGH_MEMORY;
+                    // Metadata restoration is best effort.
                 }
-                const auto &item = output_trace_.items[directory.trace_index];
-                record_metadata_errors(errors, item.index, item.path, true);
             }
             std::vector<DirectoryMetadata>{}.swap(directory_metadata_);
         }
@@ -1596,7 +1466,7 @@ namespace sunpack::sevenzip
         // 本 callback 所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
         VolumeSpaceGate *volume_space_gate() const noexcept
         {
-            return async_writer_ ? async_writer_->volume_state()->space_gate.get() : nullptr;
+            return async_writer_->volume_state()->space_gate.get();
         }
 
         // gate 的终态谓词：显式取消或 writer 整体停止，只读 atomic。
@@ -1607,7 +1477,7 @@ namespace sunpack::sevenzip
             return [token, writer]
             {
                 return (token && token->load(std::memory_order_acquire)) ||
-                    (writer && writer->stopping());
+                    writer->stopping();
             };
         }
 
@@ -1724,8 +1594,6 @@ namespace sunpack::sevenzip
         std::vector<DirectoryMetadata> directory_metadata_;
 
         ExtractProgressCallback progress_;
-
-        bool dry_run_ = false;
 
         ExtractOutputTrace &output_trace_;
         std::vector<HardLink> hard_links_;

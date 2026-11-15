@@ -66,7 +66,7 @@ public:
 
 private:
     std::int64_t sample_locked(bool fresh = false);
-    std::int64_t sample_locked(bool fresh, std::uint64_t reserved);
+    void set_admission_locked(NativeMemoryJob &job, std::uint64_t bytes) noexcept;
     void failed_locked(NativeMemoryJob &job, std::uint64_t required, std::int64_t headroom);
     void revoke_locked(NativeMemoryJob &job);
     void monitor();
@@ -88,6 +88,7 @@ private:
     bool stopping_ = false;
     bool reclaim_requested_ = false;
     std::int64_t cached_headroom_ = 0;
+    std::uint64_t reserved_bytes_ = 0;
     ULONGLONG sampled_at_ = 0;
     std::atomic<bool> resample_{true};
 };

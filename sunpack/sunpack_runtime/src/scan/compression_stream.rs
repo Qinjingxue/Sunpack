@@ -9,26 +9,6 @@ const BZIP2_MAGIC: &[u8] = b"BZh";
 const XZ_MAGIC: &[u8] = b"\xfd7zXZ\x00";
 const ZSTD_MAGIC: u32 = 0xfd2fb528;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IntegrityStatus {
-    Verified,
-    Failed,
-    Deferred,
-    NotPresent,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct StructureValidation {
-    pub(crate) end_offset: u64,
-    #[cfg(test)]
-    pub(crate) stream_count: usize,
-    #[cfg(test)]
-    pub(crate) block_count: usize,
-    #[cfg(test)]
-    pub(crate) decoded_size: Option<u64>,
-    pub(crate) integrity: IntegrityStatus,
-}
-
 #[derive(Debug)]
 pub(crate) enum ValidationError {
     Io(io::Error),
@@ -139,7 +119,7 @@ impl<'a> ByteCursor<'a> {
         let mut remaining = count;
         while remaining > 0 {
             // Keep the existing refill/EOF path and consume each window in
-            // bulk. Both heap-backed payloads and fixed fields use this loop.
+            // bulk. Fixed fields can span a refill boundary.
             self.read_byte()?;
             // Include the byte that triggered refill in the same slice;
             // successful read_byte guarantees at least one available byte.
@@ -150,14 +130,6 @@ impl<'a> ByteCursor<'a> {
             remaining -= available;
         }
         Ok(())
-    }
-
-    fn read_exact(&mut self, count: usize) -> ValidationResult<Vec<u8>> {
-        // Reject out-of-range lengths before allocating the payload buffer.
-        self.check_read_len(count)?;
-        let mut output = Vec::with_capacity(count);
-        self.read_chunks(count, |chunk| output.extend_from_slice(chunk))?;
-        Ok(output)
     }
 
     fn read_array<const N: usize>(&mut self) -> ValidationResult<[u8; N]> {
@@ -653,169 +625,16 @@ const DIST_EXTRA: [u8; 30] = [
     13,
 ];
 
-const DEFLATE_WINDOW_SIZE: usize = 32 * 1024;
+const DEFLATE_WINDOW_SIZE: u64 = 32 * 1024;
 
-struct DeflateOutput {
-    decoded_size: u64,
-    verify_limit: Option<u64>,
-    integrity_complete: bool,
-    hasher: Hasher,
-    pending: Vec<u8>,
-    window: Vec<u8>,
-    window_pos: usize,
+fn add_decoded_size(size: u64, count: u64) -> ValidationResult<u64> {
+    size.checked_add(count)
+        .ok_or(ValidationError::Invalid("decoded_size_overflow"))
 }
 
-impl DeflateOutput {
-    fn counting() -> Self {
-        Self {
-            decoded_size: 0,
-            verify_limit: None,
-            integrity_complete: false,
-            hasher: Hasher::new(),
-            pending: Vec::new(),
-            window: Vec::new(),
-            window_pos: 0,
-        }
-    }
-
-    fn verifying(limit: u64) -> Self {
-        Self {
-            decoded_size: 0,
-            verify_limit: Some(limit),
-            integrity_complete: true,
-            hasher: Hasher::new(),
-            pending: Vec::with_capacity(BUFFER_SIZE),
-            window: vec![0; DEFLATE_WINDOW_SIZE],
-            window_pos: 0,
-        }
-    }
-
-    fn is_verifying(&self) -> bool {
-        self.verify_limit.is_some() && self.integrity_complete
-    }
-
-    fn disable_integrity(&mut self) {
-        self.integrity_complete = false;
-        self.pending.clear();
-        self.window.clear();
-        self.window_pos = 0;
-    }
-
-    fn add_count(&mut self, count: u64) -> ValidationResult<()> {
-        self.decoded_size = self
-            .decoded_size
-            .checked_add(count)
-            .ok_or(ValidationError::Invalid("decoded_size_overflow"))?;
-        Ok(())
-    }
-
-    fn flush_pending(&mut self) {
-        if !self.pending.is_empty() {
-            self.hasher.update(&self.pending);
-            self.pending.clear();
-        }
-    }
-
-    fn write_byte(&mut self, byte: u8) -> ValidationResult<()> {
-        if self.is_verifying() {
-            let limit = self.verify_limit.unwrap();
-            if self.decoded_size >= limit {
-                self.disable_integrity();
-                return self.add_count(1);
-            }
-            self.window[self.window_pos] = byte;
-            self.window_pos = (self.window_pos + 1) % DEFLATE_WINDOW_SIZE;
-            self.pending.push(byte);
-            if self.pending.len() == BUFFER_SIZE {
-                self.flush_pending();
-            }
-        }
-        self.add_count(1)
-    }
-
-    fn write_bytes(&mut self, bytes: &[u8]) -> ValidationResult<()> {
-        if !self.is_verifying() {
-            return self.add_count(bytes.len() as u64);
-        }
-        if bytes.len() as u64 > self.verify_limit.unwrap().saturating_sub(self.decoded_size) {
-            self.disable_integrity();
-            return self.add_count(bytes.len() as u64);
-        }
-        let mut next = 0;
-        while next < bytes.len() {
-            let count = (bytes.len() - next)
-                .min(DEFLATE_WINDOW_SIZE - self.window_pos)
-                .min(BUFFER_SIZE - self.pending.len());
-            let slice = &bytes[next..next + count];
-            self.window[self.window_pos..self.window_pos + count].copy_from_slice(slice);
-            self.window_pos = (self.window_pos + count) % DEFLATE_WINDOW_SIZE;
-            self.pending.extend_from_slice(slice);
-            next += count;
-            if self.pending.len() == BUFFER_SIZE {
-                self.flush_pending();
-            }
-        }
-        self.add_count(bytes.len() as u64)
-    }
-
-    fn repeat(&mut self, distance: u64, length: u64) -> ValidationResult<()> {
-        if distance == 0 || distance > self.decoded_size.min(DEFLATE_WINDOW_SIZE as u64) {
-            return invalid("deflate_distance_out_of_range");
-        }
-        if !self.is_verifying() {
-            return self.add_count(length);
-        }
-        if length > self.verify_limit.unwrap().saturating_sub(self.decoded_size) {
-            self.disable_integrity();
-            return self.add_count(length);
-        }
-        // DEFLATE matches have at most 258 bytes. Seed their first period
-        // from the ring, then expand it with slices, including distance=1
-        // and overlapping matches. No heap allocation per match.
-        let mut matched = [0u8; 258];
-        let mut remaining = length;
-        while remaining > 0 {
-            let count = remaining.min(matched.len() as u64) as usize;
-            let distance = distance as usize;
-            let source = (self.window_pos + DEFLATE_WINDOW_SIZE - distance) % DEFLATE_WINDOW_SIZE;
-            let period = distance.min(count);
-            let first = period.min(DEFLATE_WINDOW_SIZE - source);
-            matched[..first].copy_from_slice(&self.window[source..source + first]);
-            matched[first..period].copy_from_slice(&self.window[..period - first]);
-            let mut filled = period;
-            while filled < count {
-                let copied = filled.min(count - filled);
-                matched.copy_within(..copied, filled);
-                filled += copied;
-            }
-            self.write_bytes(&matched[..count])?;
-            remaining -= count as u64;
-        }
-        Ok(())
-    }
-
-    fn decoded_size(&self) -> u64 {
-        self.decoded_size
-    }
-
-    fn finish_checksum(mut self) -> Option<u32> {
-        if !self.is_verifying() {
-            return None;
-        }
-        self.flush_pending();
-        Some(self.hasher.finalize())
-    }
-}
-
-fn parse_deflate(
-    bits: &mut LsbBits<'_, '_>,
-    output: &mut DeflateOutput,
-) -> ValidationResult<usize> {
-    let mut block_count = 0usize;
+fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<u64> {
+    let mut decoded_size = 0u64;
     loop {
-        block_count = block_count
-            .checked_add(1)
-            .ok_or(ValidationError::Invalid("deflate_block_count_overflow"))?;
         let final_block = bits.read(1)? != 0;
         let block_type = bits.read(2)?;
         if block_type == 0 {
@@ -825,13 +644,8 @@ fn parse_deflate(
             if length != !complement {
                 return invalid("deflate_stored_length_mismatch");
             }
-            if output.is_verifying() {
-                let stored = bits.cursor.read_exact(usize::from(length))?;
-                output.write_bytes(&stored)?;
-            } else {
-                bits.cursor.skip(u64::from(length))?;
-                output.add_count(u64::from(length))?;
-            }
+            bits.cursor.skip(u64::from(length))?;
+            decoded_size = add_decoded_size(decoded_size, u64::from(length))?;
         } else if block_type == 1 || block_type == 2 {
             let dynamic_trees;
             let (literal_tree, distance_tree) = if block_type == 1 {
@@ -841,11 +655,10 @@ fn parse_deflate(
                 (dynamic_trees.0.lsb(), dynamic_trees.1.lsb())
             };
             loop {
-                let symbol = literal_tree.decode(bits)?;
-                match symbol {
-                    0..=255 => output.write_byte(symbol as u8)?,
+                let count = match literal_tree.decode(bits)? {
+                    0..=255 => 1,
                     256 => break,
-                    257..=285 => {
+                    symbol @ 257..=285 => {
                         let index = usize::from(symbol - 257);
                         let length = u64::from(LENGTH_BASE[index])
                             + u64::from(bits.read(LENGTH_EXTRA[index])?);
@@ -855,17 +668,21 @@ fn parse_deflate(
                         }
                         let distance = u64::from(DIST_BASE[distance_symbol])
                             + u64::from(bits.read(DIST_EXTRA[distance_symbol])?);
-                        output.repeat(distance, length)?;
+                        if distance > decoded_size.min(DEFLATE_WINDOW_SIZE) {
+                            return invalid("deflate_distance_out_of_range");
+                        }
+                        length
                     }
                     _ => return invalid("invalid_deflate_literal_symbol"),
-                }
+                };
+                decoded_size = add_decoded_size(decoded_size, count)?;
             }
         } else {
             return invalid("reserved_deflate_block_type");
         }
         if final_block {
             bits.align_byte();
-            return Ok(block_count);
+            return Ok(decoded_size);
         }
     }
 }
@@ -993,67 +810,24 @@ pub(crate) fn gzip_payload_offset_from_slice(data: &[u8], start: usize) -> Valid
     read_gzip_header(&mut input)
 }
 
-fn gzip_header(cursor: &mut ByteCursor<'_>) -> ValidationResult<()> {
-    read_gzip_header(cursor).map(|_| ())
-}
-
-fn walk_gzip_structure(
+pub(crate) fn validate_gzip_structure(
     reader: &ManagedReader,
     offset: u64,
     limit: u64,
-    integrity_limit: Option<u64>,
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
-) -> ValidationResult<StructureValidation> {
+) -> ValidationResult<u64> {
     let mut cursor = ByteCursor::new(reader, offset, limit);
-    #[cfg(test)]
-    let mut members = 0usize;
-    let mut blocks = 0usize;
     let mut decoded_size = 0u64;
-    let mut remaining_integrity = integrity_limit;
-    let mut integrity_failed = false;
-    let mut integrity_complete = integrity_limit.is_some();
-
     loop {
         visit(cursor.position())?;
-        gzip_header(&mut cursor)?;
-        let mut output = match remaining_integrity {
-            Some(remaining) => DeflateOutput::verifying(remaining),
-            None => DeflateOutput::counting(),
-        };
-        let member_blocks = {
-            let mut bits = LsbBits::new(&mut cursor);
-            parse_deflate(&mut bits, &mut output)?
-        };
-        let member_size = output.decoded_size();
-        let computed_crc = output.finish_checksum();
+        read_gzip_header(&mut cursor)?;
+        let member_size = parse_deflate(&mut LsbBits::new(&mut cursor))?;
         let trailer = cursor.read_array::<8>()?;
-        let stored_crc = u32::from_le_bytes(trailer[0..4].try_into().unwrap());
         let stored_size = u32::from_le_bytes(trailer[4..8].try_into().unwrap());
         if stored_size != member_size as u32 {
             return invalid("gzip_isize_mismatch");
         }
-
-        if let Some(computed) = computed_crc {
-            if computed != stored_crc {
-                integrity_failed = true;
-            }
-            if let Some(remaining) = remaining_integrity.as_mut() {
-                *remaining = remaining.saturating_sub(member_size);
-            }
-        } else if integrity_limit.is_some() {
-            integrity_complete = false;
-            remaining_integrity = Some(0);
-        }
-
-        decoded_size = decoded_size
-            .checked_add(member_size)
-            .ok_or(ValidationError::Invalid("decoded_size_overflow"))?;
-        blocks = blocks
-            .checked_add(member_blocks)
-            .ok_or(ValidationError::Invalid("deflate_block_count_overflow"))?;
-        #[cfg(test)]
-        { members += 1; }
-
+        decoded_size = add_decoded_size(decoded_size, member_size)?;
         if cursor.position() + 3 > limit {
             break;
         }
@@ -1062,59 +836,7 @@ fn walk_gzip_structure(
             break;
         }
     }
-
-    let integrity = if integrity_failed {
-        IntegrityStatus::Failed
-    } else if integrity_complete {
-        IntegrityStatus::Verified
-    } else {
-        IntegrityStatus::Deferred
-    };
-
-    Ok(StructureValidation {
-        end_offset: cursor.position(),
-        #[cfg(test)]
-        stream_count: members,
-        #[cfg(test)]
-        block_count: blocks,
-        #[cfg(test)]
-        decoded_size: Some(decoded_size),
-        integrity,
-    })
-}
-
-pub(crate) fn analyze_gzip_structure(
-    reader: &ManagedReader,
-    offset: u64,
-    limit: u64,
-    integrity_limit: u64,
-) -> ValidationResult<StructureValidation> {
-    walk_gzip_structure(reader, offset, limit, Some(integrity_limit), |_| Ok(()))
-}
-
-pub(crate) fn validate_gzip_structure(
-    reader: &ManagedReader,
-    offset: u64,
-    limit: u64,
-) -> ValidationResult<StructureValidation> {
-    validate_gzip_structure_observed(reader, offset, limit, |_| Ok(()))
-}
-
-pub(crate) fn validate_gzip_structure_observed(
-    reader: &ManagedReader,
-    offset: u64,
-    limit: u64,
-    visit: impl FnMut(u64) -> ValidationResult<()>,
-) -> ValidationResult<StructureValidation> {
-    walk_gzip_structure(reader, offset, limit, None, visit)
-}
-
-pub(crate) fn validate_bzip2_structure(
-    reader: &ManagedReader,
-    offset: u64,
-    limit: u64,
-) -> ValidationResult<StructureValidation> {
-    validate_bzip2_structure_observed(reader, offset, limit, |_| Ok(()))
+    Ok(cursor.position())
 }
 
 pub(crate) fn bzip2_header_block_limit(header: &[u8; 4]) -> ValidationResult<usize> {
@@ -1207,17 +929,13 @@ fn read_bzip2_block_header(
     Ok((orig_ptr, n_in_use, group_count, selector_count))
 }
 
-pub(crate) fn validate_bzip2_structure_observed(
+pub(crate) fn validate_bzip2_structure(
     reader: &ManagedReader,
     offset: u64,
     limit: u64,
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
-) -> ValidationResult<StructureValidation> {
+) -> ValidationResult<u64> {
     let mut cursor = ByteCursor::new(reader, offset, limit);
-    #[cfg(test)]
-    let mut streams = 0usize;
-    #[cfg(test)]
-    let mut total_blocks = 0usize;
     loop {
         visit(cursor.position())?;
         let header = cursor.read_array::<4>()?;
@@ -1322,11 +1040,7 @@ pub(crate) fn validate_bzip2_structure_observed(
             if nblock == 0 || orig_ptr >= nblock {
                 return invalid("bzip2_orig_ptr_out_of_range");
             }
-            #[cfg(test)]
-            { total_blocks += 1; }
         }
-        #[cfg(test)]
-        { streams += 1; }
         if cursor.position() + 4 > limit {
             break;
         }
@@ -1335,16 +1049,7 @@ pub(crate) fn validate_bzip2_structure_observed(
             break;
         }
     }
-    Ok(StructureValidation {
-        end_offset: cursor.position(),
-        #[cfg(test)]
-        stream_count: streams,
-        #[cfg(test)]
-        block_count: total_blocks,
-        #[cfg(test)]
-        decoded_size: None,
-        integrity: IntegrityStatus::Deferred,
-    })
+    Ok(cursor.position())
 }
 
 pub(crate) fn read_vli_slice(data: &[u8], cursor: &mut usize) -> ValidationResult<u64> {
@@ -1392,13 +1097,12 @@ fn xz_check_size(check_id: u8) -> ValidationResult<u64> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct XzFooter {
-    pub(crate) end: u64,
+    end: u64,
     flags: [u8; 2],
-    check_size: u64,
     index_size: u64,
 }
 
-pub(crate) fn read_xz_footer(reader: &ManagedReader, end: u64) -> ValidationResult<XzFooter> {
+fn read_xz_footer(reader: &ManagedReader, end: u64) -> ValidationResult<XzFooter> {
     let start = end
         .checked_sub(12)
         .ok_or(ValidationError::Invalid("xz_footer_missing"))?;
@@ -1417,10 +1121,10 @@ pub(crate) fn parse_xz_footer(footer: &[u8], end: u64) -> ValidationResult<XzFoo
     if u32::from_le_bytes(footer[0..4].try_into().unwrap()) != crc32(&footer[4..10]) {
         return invalid("xz_footer_crc_bad");
     }
+    xz_check_size(flags[1] & 0x0f)?;
     Ok(XzFooter {
         end,
         flags,
-        check_size: xz_check_size(flags[1] & 0x0f)?,
         index_size: (u64::from(u32::from_le_bytes(footer[4..8].try_into().unwrap())) + 1) * 4,
     })
 }
@@ -1434,22 +1138,13 @@ pub(crate) fn resolve_xz_stream_start(
         return invalid("xz_header_or_footer_missing");
     }
     read_xz_index_boundary(reader, read_xz_footer(reader, end)?, minimum_offset)
-        .map(|index| index.stream_start)
 }
 
-struct XzIndex<'a> {
-    stream_start: u64,
-    record_count: u64,
-    records: ByteCursor<'a>,
-}
-
-// Validate the Index once to locate the stream. Full validation replays only
-// the record fields through a bounded cursor; it never retains a record Vec.
-fn read_xz_index_boundary<'a>(
-    reader: &'a ManagedReader,
+fn read_xz_index_boundary(
+    reader: &ManagedReader,
     footer: XzFooter,
     minimum_offset: u64,
-) -> ValidationResult<XzIndex<'a>> {
+) -> ValidationResult<u64> {
     let footer_start = footer.end - 12;
     let index_start = footer_start
         .checked_sub(footer.index_size)
@@ -1471,7 +1166,6 @@ fn read_xz_index_boundary<'a>(
     if record_count > (index_crc_pos - index_cursor.position()) / 2 {
         return invalid("xz_index_size_mismatch");
     }
-    let records_start = index_cursor.position();
     let mut padded_blocks_size = 0u64;
     for _ in 0..record_count {
         let unpadded = read_vli_index(&mut index_cursor, &mut index_hasher)?;
@@ -1522,11 +1216,7 @@ fn read_xz_index_boundary<'a>(
     if header[6..8] != footer.flags {
         return invalid("xz_stream_flags_mismatch");
     }
-    Ok(XzIndex {
-        stream_start,
-        record_count,
-        records: ByteCursor::new(reader, records_start, index_crc_pos),
-    })
+    Ok(stream_start)
 }
 
 pub(crate) fn validate_xz_header(header: &[u8]) -> ValidationResult<()> {
@@ -1642,116 +1332,6 @@ pub(crate) fn validate_xz_identity(
     Ok(bytes_read)
 }
 
-pub(crate) fn validate_xz_structure_exact(
-    reader: &ManagedReader,
-    offset: u64,
-    limit: u64,
-) -> ValidationResult<StructureValidation> {
-    if limit < offset + 24 {
-        return invalid("xz_header_or_footer_missing");
-    }
-    let mut reverse_end = limit;
-    #[cfg(test)]
-    let mut streams_reversed = 0usize;
-    #[cfg(test)]
-    let mut total_blocks = 0usize;
-    #[cfg(test)]
-    let mut decoded_size = Some(0u64);
-    let mut checksum_present = false;
-    while reverse_end > offset {
-        let mut padding = 0u64;
-        while reverse_end >= offset + 4 {
-            let word = reader.read_cached_at(reverse_end - 4, 4)?;
-            if word.as_slice() != [0, 0, 0, 0] {
-                break;
-            }
-            reverse_end -= 4;
-            padding += 4;
-        }
-        if reverse_end < offset + 24 {
-            return invalid("xz_footer_missing");
-        }
-        let footer = read_xz_footer(reader, reverse_end)?;
-        let check_size = footer.check_size;
-        checksum_present |= check_size != 0;
-        let index_start = (reverse_end - 12)
-            .checked_sub(footer.index_size)
-            .ok_or(ValidationError::Invalid("xz_backward_size_out_of_range"))?;
-        let mut index = read_xz_index_boundary(reader, footer, offset)?;
-        let stream_start = index.stream_start;
-
-        let mut block_cursor = stream_start + 12;
-        for _ in 0..index.record_count {
-            let unpadded = read_vli(|| index.records.read_byte())?;
-            let uncompressed = read_vli(|| index.records.read_byte())?;
-            #[cfg(test)]
-            { decoded_size = decoded_size.and_then(|total| total.checked_add(uncompressed)); }
-            let size_byte = reader.read_cached_at(block_cursor, 1)?;
-            if size_byte.len() != 1 || size_byte[0] == 0 {
-                return invalid("xz_block_header_missing");
-            }
-            let header_size = (u64::from(size_byte[0]) + 1) * 4;
-            if header_size > unpadded || header_size > 1024 {
-                return invalid("xz_block_header_size_invalid");
-            }
-            let block_header = reader.read_cached_at(block_cursor, header_size as usize)?;
-            if block_header.len() != header_size as usize {
-                return invalid("xz_block_header_truncated");
-            }
-            let (declared_compressed, declared_uncompressed) =
-                parse_xz_block_header(&block_header)?;
-            let compressed = unpadded
-                .checked_sub(header_size + check_size)
-                .ok_or(ValidationError::Invalid("xz_index_unpadded_size_invalid"))?;
-            if declared_compressed.is_some_and(|value| value != compressed)
-                || declared_uncompressed.is_some_and(|value| value != uncompressed)
-            {
-                return invalid("xz_block_size_mismatch");
-            }
-            let padded = unpadded + (4 - unpadded % 4) % 4;
-            let padding_size = padded - unpadded;
-            if padding_size > 0 {
-                let padding_offset = block_cursor + header_size + compressed;
-                let padding_bytes = reader.read_cached_at(padding_offset, padding_size as usize)?;
-                if padding_bytes.len() != padding_size as usize
-                    || padding_bytes.iter().any(|byte| *byte != 0)
-                {
-                    return invalid("xz_block_padding_invalid");
-                }
-            }
-            block_cursor = block_cursor
-                .checked_add(padded)
-                .ok_or(ValidationError::Invalid("xz_block_offset_overflow"))?;
-            #[cfg(test)]
-            { total_blocks += 1; }
-        }
-        if block_cursor != index_start {
-            return invalid("xz_block_index_boundary_mismatch");
-        }
-        #[cfg(test)]
-        { streams_reversed += 1; }
-        reverse_end = stream_start;
-        let _ = padding;
-    }
-    if reverse_end != offset {
-        return invalid("xz_trailing_or_leading_data");
-    }
-    Ok(StructureValidation {
-        end_offset: limit,
-        #[cfg(test)]
-        stream_count: streams_reversed,
-        #[cfg(test)]
-        block_count: total_blocks,
-        #[cfg(test)]
-        decoded_size,
-        integrity: if checksum_present {
-            IntegrityStatus::Deferred
-        } else {
-            IntegrityStatus::NotPresent
-        },
-    })
-}
-
 fn read_u32(reader: &ManagedReader, offset: u64, limit: u64) -> ValidationResult<u32> {
     if offset + 4 > limit {
         return invalid("unexpected_end_of_stream");
@@ -1767,21 +1347,10 @@ pub(crate) fn validate_zstd_structure(
     reader: &ManagedReader,
     offset: u64,
     limit: u64,
-) -> ValidationResult<StructureValidation> {
-    validate_zstd_structure_observed(reader, offset, limit, |_| Ok(()))
-}
-
-pub(crate) fn validate_zstd_structure_observed(
-    reader: &ManagedReader,
-    offset: u64,
-    limit: u64,
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
-) -> ValidationResult<StructureValidation> {
+) -> ValidationResult<u64> {
     let mut cursor = offset;
-    let mut frames = 0usize;
-    #[cfg(test)]
-    let mut blocks = 0usize;
-    let mut checksum_present = false;
+    let mut has_frame = false;
     loop {
         visit(cursor)?;
         let magic = read_u32(reader, cursor, limit)?;
@@ -1801,19 +1370,11 @@ pub(crate) fn validate_zstd_structure_observed(
             }
             let single_segment = descriptor & 0x20 != 0;
             let has_checksum = descriptor & 0x04 != 0;
-            checksum_present |= has_checksum;
             let dictionary_size = match descriptor & 0x03 {
                 0 => 0,
                 1 => 1,
                 2 => 2,
                 _ => 4,
-            };
-            let content_size = match (descriptor >> 6, single_segment) {
-                (0, false) => 0,
-                (0, true) => 1,
-                (1, _) => 2,
-                (2, _) => 4,
-                _ => 8,
             };
             let window_size = if single_segment {
                 None
@@ -1823,22 +1384,13 @@ pub(crate) fn validate_zstd_structure_observed(
                 Some(base + (base / 8) * u64::from(value & 7))
             };
             bytes.skip(dictionary_size)?;
-            let content_bytes = bytes.read_exact(content_size as usize)?;
-            let mut frame_content_size = if content_size == 0 {
-                None
-            } else {
-                Some(
-                    content_bytes
-                        .iter()
-                        .enumerate()
-                        .fold(0u64, |value, (index, byte)| {
-                            value | (u64::from(*byte) << (8 * index))
-                        }),
-                )
+            let frame_content_size = match (descriptor >> 6, single_segment) {
+                (0, false) => None,
+                (0, true) => Some(u64::from(bytes.read_byte()?)),
+                (1, _) => Some(u64::from(u16::from_le_bytes(bytes.read_array::<2>()?)) + 256),
+                (2, _) => Some(u64::from(u32::from_le_bytes(bytes.read_array::<4>()?))),
+                _ => Some(u64::from_le_bytes(bytes.read_array::<8>()?)),
             };
-            if content_size == 2 {
-                frame_content_size = frame_content_size.map(|value| value + 256);
-            }
             let window_size = if single_segment {
                 frame_content_size.ok_or(ValidationError::Invalid("zstd_content_size_missing"))?
             } else {
@@ -1856,8 +1408,6 @@ pub(crate) fn validate_zstd_structure_observed(
                     return invalid("zstd_block_header_invalid");
                 }
                 bytes.skip(if block_type == 1 { 1 } else { block_size })?;
-                #[cfg(test)]
-                { blocks += 1; }
                 if last {
                     break;
                 }
@@ -1866,7 +1416,7 @@ pub(crate) fn validate_zstd_structure_observed(
                 bytes.skip(4)?;
             }
             cursor = bytes.position();
-            frames += 1;
+            has_frame = true;
         } else {
             break;
         }
@@ -1878,23 +1428,10 @@ pub(crate) fn validate_zstd_structure_observed(
             break;
         }
     }
-    if frames == 0 {
+    if !has_frame {
         return invalid("zstd_frame_missing");
     }
-    Ok(StructureValidation {
-        end_offset: cursor,
-        #[cfg(test)]
-        stream_count: frames,
-        #[cfg(test)]
-        block_count: blocks,
-        #[cfg(test)]
-        decoded_size: None,
-        integrity: if checksum_present {
-            IntegrityStatus::Deferred
-        } else {
-            IntegrityStatus::NotPresent
-        },
-    })
+    Ok(cursor)
 }
 
 #[cfg(test)]

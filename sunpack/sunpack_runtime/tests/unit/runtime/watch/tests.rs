@@ -722,12 +722,12 @@ fn retained_regroup_handoff_persists_the_new_current_root() {
         let journal = journal::Journal::open(&directory, 7).unwrap();
         journal.commit(true, |state| {
             let candidate = &pending.candidate;
-            let (mut operations, _) = state.pending_operations([(
+            let mut operations = state.pending_operations([(
                 PendingObservation(candidate.path.clone(), candidate.size as i64,
                     candidate.mtime, candidate.observation.file_id.clone(),
                     candidate.observation.change_usn),
                 current.path.to_string_lossy().into_owned(), Some(recovery.record()),
-            )], pending.force, &recovery.password_scope.to_string_lossy(), true, true, None)?;
+            )], pending.force, &recovery.password_scope.to_string_lossy(), true, None);
             operations.put_entry(Arc::clone(&entry));
             Ok(operations)
         }).unwrap();
@@ -875,10 +875,10 @@ fn admitted_password_scope_survives_family_head_retry_and_retained_recovery() {
     };
     assert_eq!(candidate_password_scope(&state, r"C:\output\nested\inner.zip", Some(&retained)), b);
     let pending_path = r"C:\watch\A\pending.zip";
-    let (operations, _) = state.pending_operations([(
+    let operations = state.pending_operations([(
         PendingObservation(pending_path.into(), 42, 1.0, String::new(), 0),
         r"C:\watch".into(), None,
-    )], false, b.to_str().unwrap(), false, true, None).unwrap();
+    )], false, b.to_str().unwrap(), false, None);
     state.apply(&operations);
     assert_eq!(candidate_password_scope(&state, pending_path, None), b);
     // An existing retry entry takes precedence over pending, as in main.
@@ -981,11 +981,10 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
     {
         let journal = journal::Journal::open(&root, 7).unwrap();
         journal.commit(true, |state| {
-            let (operations, _) = state.pending_operations(
+            Ok(state.pending_operations(
                 [(PendingObservation(owner_text.into(), 13, 1.0, String::new(), 0), String::new(), None)],
-                false, "", false, true, None,
-            )?;
-            Ok(operations)
+                false, "", false, None,
+            ))
         }).unwrap();
         let mut blocker = crate::watch_store::EntryRecord {
             path: carrier_text.into(), size: 15, mtime: 1.0, file_id: String::new(),
@@ -1355,7 +1354,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
-        external: Arc::default(), _lease: None,
+        external: Arc::default(), broker_lease: None,
     };
     let limit = scheduler.admission_available();
     let driver = crate::pipeline::Scheduler::new();
@@ -1697,11 +1696,11 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
     {
         let journal = journal::Journal::open(&directory, 7).unwrap();
         journal.commit(true, |state| {
-            state.pending_operations(
+            Ok(state.pending_operations(
                 [(PendingObservation(owner.to_owned(), 13, 1.0, String::new(), 0),
                     String::new(), None)],
-                false, "", false, true, None,
-            ).map(|(operations, _)| operations)
+                false, "", false, None,
+            ))
         }).unwrap();
         journal.commit(true, |state| {
             Ok(state.output_operation(owner, owner.to_owned(),
@@ -1813,7 +1812,7 @@ fn flatten_recovery_rebases_durable_output_identities() {
         let journal = journal::Journal::open(&directory, 7).unwrap();
         journal
             .commit(true, |state| {
-                let (operations, _) = state.pending_operations(
+                Ok(state.pending_operations(
                     [(
                         PendingObservation(owner.to_owned(), 13, 1.0, String::new(), 0),
                         String::new(),
@@ -1822,10 +1821,8 @@ fn flatten_recovery_rebases_durable_output_identities() {
                     false,
                     "",
                     false,
-                    true,
                     None,
-                )?;
-                Ok(operations)
+                ))
             })
             .unwrap();
         journal

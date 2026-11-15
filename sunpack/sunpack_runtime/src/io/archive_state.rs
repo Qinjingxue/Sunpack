@@ -200,19 +200,15 @@ impl ArchiveInput {
 
 /// Main's public archive_input receipt, distinct from the compact worker wire.
 /// All values borrow the canonical input; rendering does not clone a descriptor.
-pub(crate) struct ArchiveInputReport<'a> { input: &'a ArchiveInput, logical_name: &'a str }
+pub(crate) struct ArchiveInputReport<'a>(&'a ArchiveInput);
 
 impl ArchiveInput {
-    #[cfg(test)]
-    pub(crate) fn report(&self) -> ArchiveInputReport<'_> { self.report_with_name(&self.logical_name) }
-    pub(crate) fn report_with_name<'a>(&'a self, logical_name: &'a str) -> ArchiveInputReport<'a> {
-        ArchiveInputReport { input: self, logical_name }
-    }
+    pub(crate) fn report(&self) -> ArchiveInputReport<'_> { ArchiveInputReport(self) }
 }
 
 impl Serialize for ArchiveInputReport<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let input = self.input;
+        let input = self.0;
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("kind", "archive_input")?;
         map.serialize_entry("entry_path", &input.entry_path)?;
@@ -225,7 +221,7 @@ impl Serialize for ArchiveInputReport<'_> {
             map.serialize_entry("parts", &PartsReport(input))?;
         }
         if input.mode == OpenMode::ConcatRanges { map.serialize_entry("ranges", &input.ranges)?; }
-        if !self.logical_name.is_empty() { map.serialize_entry("logical_name", self.logical_name)?; }
+        if !input.logical_name.is_empty() { map.serialize_entry("logical_name", &input.logical_name)?; }
         if !input.volume_style.is_empty() { map.serialize_entry("volume_style", &input.volume_style)?; }
         let analysis = AnalysisReport(input);
         if analysis.has_fields() { map.serialize_entry("analysis", &analysis)?; }

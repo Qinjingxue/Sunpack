@@ -50,7 +50,8 @@ void operator delete(void* value) noexcept { std::free(value); }
 void operator delete(void* value, std::size_t) noexcept { std::free(value); }
 
 
-void request_recovery(const std::filesystem::path& archive, bool after_failure, bool user_cancel) {
+void request_recovery(const std::filesystem::path& archive, const std::filesystem::path& destination,
+                      bool after_failure, bool user_cancel) {
     NativeMemoryManager manager(0, [] { return 1LL << 30; });
     NativeMemoryJob job(manager);
     manager.begin(job);
@@ -59,7 +60,7 @@ void request_recovery(const std::filesystem::path& archive, bool after_failure, 
     ExtractionReplayScope scope(&replay);
     WorkerRequest request;
     request.job_id = "enumeration-withdrawal";
-    request.dry_run = true;
+    request.output_dir = destination.wstring();
     request.archive_input.archive_path = archive.wstring();
     request.archive_input.format_hint = L"zip";
     auto& plan = request.archive_input.volume_attempts;
@@ -103,6 +104,9 @@ void request_recovery(const std::filesystem::path& archive, bool after_failure, 
         if (code != 0) std::cerr << output.str();
         require(code == 0 && replay.volumes.selected == std::vector<std::size_t>{0, 1}, "replay lost the valid composition");
         require(replay.volumes.attempts == (after_failure ? 2 : 1), "replay repeated a rejected composition");
+        std::ifstream member(destination / L"ok.txt", std::ios::binary);
+        std::string contents((std::istreambuf_iterator<char>(member)), {});
+        require(contents == "cursor replay", "replayed composition wrote incorrect output");
     }
     check_final_results(output, 1, user_cancel ? "cancelled" : "ok");
     manager.end(job);
@@ -115,11 +119,14 @@ int main() {
         "\x50\x4b\x03\x04\x14\x00\x00\x00\x00\x00\x61\x87\x68\x5d\x0a\x67\x73\x71\x0d\x00\x00\x00\x0d\x00\x00\x00\x06\x00\x00\x00\x6f\x6b\x2e\x74\x78\x74\x63\x75\x72\x73\x6f\x72\x20\x72\x65\x70\x6c\x61\x79"
         "\x50\x4b\x01\x02\x14\x00\x14\x00\x00\x00\x00\x00\x61\x87\x68\x5d\x0a\x67\x73\x71\x0d\x00\x00\x00\x0d\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x6f\x6b\x2e\x74\x78\x74"
         "\x50\x4b\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00\x34\x00\x00\x00\x31\x00\x00\x00\x00\x00";
-    const auto archive = std::filesystem::temp_directory_path() /
-        (L"sunpack-volume-replay-" + std::to_wstring(GetCurrentProcessId()) + L".zip");
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-volume-replay-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    std::filesystem::create_directories(root);
+    const auto archive = root / L"input.zip";
     { std::ofstream file(archive, std::ios::binary); file.write(zip, sizeof(zip) - 1); }
+    unsigned index = 0;
     for (bool after_failure : {false, true}) for (bool cancel : {false, true})
-        request_recovery(archive, after_failure, cancel);
-    std::filesystem::remove(archive);
+        request_recovery(archive, root / std::to_wstring(++index), after_failure, cancel);
+    std::filesystem::remove_all(root);
     std::cout << "enumeration withdrawal, replay and user cancellation passed\n";
 }

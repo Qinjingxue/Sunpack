@@ -134,7 +134,7 @@ impl<'a> NameProfile<'a> {
         // Old RAR names encode r00 as logical volume 2, r01 as volume 3.
         // A canonical name already establishes this translation; comparing its
         // logical slot to the raw digit would discard every old-style member.
-        if matches!(channel, NumberChannel::Canonical { style, .. } if style == "rar_oldstyle") {
+        if matches!(channel, NumberChannel::Canonical { style: "rar_oldstyle", .. }) {
             return Some(value);
         }
         // Canonical and token channels share the same constant-field mask.
@@ -149,9 +149,8 @@ impl<'a> NameProfile<'a> {
 pub(super) enum NumberChannel {
     RarPart,
     Canonical {
-        format: String,
-        style: String,
-        family: Option<String>,
+        format: &'static str,
+        style: &'static str,
     },
     Token {
         ordinal: usize,
@@ -171,20 +170,13 @@ impl NumberChannel {
                 let value = found.next()?.value;
                 found.all(|n| n.value == value).then_some(value)
             }
-            Self::Canonical {
-                format,
-                style,
-                family,
-            } => {
+            Self::Canonical { format, style } => {
                 let mut found = features.canonical.iter().filter(|p| {
-                    p.family == format
-                        && (p.style == style
-                            || (format == "rar"
-                                && style == "rar_part"
+                    p.family == *format
+                        && (p.style == *style
+                            || (*format == "rar"
+                                && *style == "rar_part"
                                 && p.style == "rar_sfx_part"))
-                        && family
-                            .as_ref()
-                            .is_none_or(|f| case_key(&logical_name_from_parsed(p)) == *f)
                 });
                 let value = found.next()?.number;
                 found.all(|p| p.number == value).then_some(value)

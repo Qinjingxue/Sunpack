@@ -73,7 +73,7 @@ impl NativeWatchState {
         register(&self.outputs, paths, identities);
     }
 
-    pub(crate) fn remove_active_output(&self, paths: &[String], identity: &str) {
+    pub(crate) fn remove_active_output<'a>(&self, paths: impl Iterator<Item = &'a str>, identity: &str) {
         let mut data = self.outputs.lock().unwrap();
         for path in paths {
             let key = path_key(path);

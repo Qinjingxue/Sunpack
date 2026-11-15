@@ -217,7 +217,6 @@ namespace sunpack::sevenzip
         const std::wstring &output_dir,
         const std::wstring &codepage,
         ExtractProgressCallback progress,
-        bool dry_run,
         const std::vector<std::wstring> &canonical_names,
         bool native_volume_input,
         std::shared_ptr<AsyncFileWriter> shared_writer,
@@ -251,17 +250,14 @@ namespace sunpack::sevenzip
         Int32 last_op_res = kOpOk;
         bool last_encryption_evidence = false;
 
-        if (!dry_run)
         {
             // The space gate must come from the already existing shared_writer: this runs
             // before ExtractToDiskCallback exists, and the writer is the only gate source.
             VolumeSpaceGate *space_gate = nullptr;
-#ifdef _WIN32
             if (shared_writer)
             {
                 space_gate = shared_writer->volume_state()->space_gate.get();
             }
-#endif
             // 终态谓词：显式取消（executor stop() 会置真 cancel_tokens_）或
             // writer 整体停止（registry shutdown → AsyncFileWriter::finish()）。
             const TerminalPredicate space_terminal = [cancel_token, shared_writer]
@@ -270,11 +266,7 @@ namespace sunpack::sevenzip
                 {
                     return true;
                 }
-#ifdef _WIN32
                 return shared_writer && shared_writer->stopping();
-#else
-                return false;
-#endif
             };
 
             std::error_code prepare_error;
@@ -521,7 +513,6 @@ namespace sunpack::sevenzip
                 password,
                 output_dir,
                 progress,
-                dry_run,
                 result.output_trace,
                 num_items,
                 shared_writer,
@@ -535,7 +526,6 @@ namespace sunpack::sevenzip
                 password,
                 output_dir,
                 progress,
-                dry_run,
                 result.output_trace,
                 num_items,
                 shared_writer,
@@ -600,46 +590,35 @@ namespace sunpack::sevenzip
             // both password requests and encrypted member properties.
             result.encrypted = result.encrypted || raw_extract_callback->encrypted();
             last_encryption_evidence = last_encryption_evidence || result.encrypted;
-            result.password_crc_proven_items = result.encrypted ? password_crc_proven_items(result.output_trace) : 0;
-            result.password_crc_proven = result.password_crc_proven_items > 0;
-
             result.hresult = static_cast<int>(hr);
 
             if (set_memory_failure(result, "item_extract", hr)) return result;
-            if (volume_read_failed()) return result;
-            if (raw_extract_callback->output_error() &&
+            const bool read_failed = volume_read_failed();
+            if (!read_failed && raw_extract_callback->output_error() &&
                 set_memory_failure(result, "output_write", static_cast<HRESULT>(result.output_trace.last_hresult)))
                 return result;
 
+            if (!read_failed && hr == S_OK && last_op_res == kOpOk && result.failed_item.empty())
+            {
+                result.status = PasswordTestStatus::Ok;
+                result.missing_volume_suspected = false;
+                result.message = "archive extracted";
+                return result;
+            }
+
+            // CRC receipts only decide whether extraction failures can be
+            // attributed to damage after a password was confirmed.
+            if (result.encrypted)
+                result.password_crc_proven_items = password_crc_proven_items(result.output_trace);
+            if (read_failed) return result;
+
             if (hr == S_OK && last_op_res == kOpOk)
             {
-
-                if (!result.failed_item.empty())
-                {
-
-                    result.status = PasswordTestStatus::Damaged;
-
-                    result.command_ok = false;
-
-                    result.damaged = true;
-
-                    result.checksum_error = true;
-
-                    set_failure(result, "item_extract", "checksum_error", hr);
-
-                    result.message = "archive item failed during extraction";
-
-                    return result;
-                }
-
-                result.status = PasswordTestStatus::Ok;
-
-                result.command_ok = true;
-
-                result.missing_volume_suspected = false;
-
-                result.message = dry_run ? "archive dry-run completed" : "archive extracted";
-
+                result.status = PasswordTestStatus::Damaged;
+                result.damaged = true;
+                result.checksum_error = true;
+                set_failure(result, "item_extract", "checksum_error", hr);
+                result.message = "archive item failed during extraction";
                 return result;
             }
 
@@ -656,7 +635,7 @@ namespace sunpack::sevenzip
             }
 
             const std::string trace_damage_kind = output_trace_damage_kind(result.output_trace);
-            if (!trace_damage_kind.empty() && (!last_encryption_evidence || result.password_crc_proven))
+            if (!trace_damage_kind.empty() && (!last_encryption_evidence || result.password_crc_proven_items != 0))
             {
                 result.status = PasswordTestStatus::Damaged;
                 result.damaged = true;

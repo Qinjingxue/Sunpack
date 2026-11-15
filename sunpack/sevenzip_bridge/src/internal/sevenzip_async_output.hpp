@@ -163,7 +163,6 @@ namespace sunpack::sevenzip
             UInt64 written_bytes = 0;
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
-            ArchiveMetadataErrors metadata_errors;
             bool operation_result_set = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
@@ -171,6 +170,7 @@ namespace sunpack::sevenzip
             bool failed = false;
             bool closed = false;
 #ifdef SUP7Z_TEST_IO_FAULTS
+            ArchiveMetadataErrors metadata_errors;
             int win32_error = 0;
             UInt64 accepted_bytes = 0;
             std::size_t peak_active_data_writes = 0;
@@ -287,8 +287,8 @@ namespace sunpack::sevenzip
             HRESULT hresult = S_OK;
 #ifdef SUP7Z_TEST_IO_FAULTS
             int win32_error = 0;
-#endif
             ArchiveMetadataErrors metadata_errors;
+#endif
             bool operation_result_set = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
@@ -871,7 +871,7 @@ namespace sunpack::sevenzip
                 // Earlier successes can be released during extraction. Keep
                 // files with old replay receipts until they are reconciled.
                 if (file->replay || !lock.try_lock() || !file->closed || file->failed ||
-                    !file->operation_result_set || file->operation_result != 0 || file->metadata_errors.first_error())
+                    !file->operation_result_set || file->operation_result != 0)
                     return snapshot;
             }
             else
@@ -881,7 +881,6 @@ namespace sunpack::sevenzip
             snapshot.written_bytes = file->written_bytes;
             snapshot.operation_result = file->operation_result;
             snapshot.hresult = file->hresult;
-            snapshot.metadata_errors = file->metadata_errors;
             snapshot.operation_result_set = file->operation_result_set;
             snapshot.has_mtime_ns = file->has_mtime_ns;
             snapshot.mtime_ns = file->mtime_ns;
@@ -889,6 +888,7 @@ namespace sunpack::sevenzip
             snapshot.failed = file->failed;
             snapshot.closed = file->closed;
 #ifdef SUP7Z_TEST_IO_FAULTS
+            snapshot.metadata_errors = file->metadata_errors;
             snapshot.win32_error = file->win32_error;
             snapshot.accepted_bytes = file->accepted_bytes;
             snapshot.peak_active_data_writes = file->peak_active_data_writes;
@@ -1731,7 +1731,9 @@ namespace sunpack::sevenzip
                 restore_times = !file->failed && result.kind == AttemptResult::Kind::Succeeded;
                 file->handle = INVALID_HANDLE_VALUE;
             }
+#ifdef SUP7Z_TEST_IO_FAULTS
             ArchiveMetadataErrors metadata_errors;
+#endif
             std::optional<UInt64> mtime_ns;
             if (handle != INVALID_HANDLE_VALUE)
             {
@@ -1739,7 +1741,11 @@ namespace sunpack::sevenzip
                 // SetOperationResult, so timestamp restoration must not depend on it.
                 if (restore_times)
                 {
+#ifdef SUP7Z_TEST_IO_FAULTS
                     metadata_errors = file->metadata.restore(handle);
+#else
+                    file->metadata.restore(handle);
+#endif
                 }
                 FILETIME last_write{};
                 if (GetFileTime(handle, nullptr, nullptr, &last_write))
@@ -1765,7 +1771,9 @@ namespace sunpack::sevenzip
             }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+#ifdef SUP7Z_TEST_IO_FAULTS
                 file->metadata_errors = metadata_errors;
+#endif
                 if (mtime_ns)
                 {
                     file->mtime_ns = *mtime_ns;

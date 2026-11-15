@@ -260,14 +260,26 @@ pub(crate) fn watch_directories_changes_cached_impl(
     }
 }
 
-pub(crate) fn watch_volume_cursor(path: &str) -> std::io::Result<(String, u64, i64)> {
+pub(crate) fn watch_volume_device(path: &str) -> std::io::Result<String> {
     #[cfg(windows)]
     {
-        return windows::watch_volume_cursor(Path::new(path));
+        return windows::volume_device(Path::new(path));
     }
     #[cfg(not(windows))]
     {
         let _ = path;
+        Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
+    }
+}
+
+pub(crate) fn watch_volume_cursor(volume: &str) -> std::io::Result<(u64, i64)> {
+    #[cfg(windows)]
+    {
+        return sunpack_usn_core::broker_volume_cursor(volume);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = volume;
         Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
     }
 }

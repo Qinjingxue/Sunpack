@@ -94,11 +94,6 @@ void NativeMemoryManager::changed() noexcept {
     SetEvent(change_);
 }
 std::int64_t NativeMemoryManager::sample_locked(bool fresh) {
-    std::uint64_t reserved = 0;
-    for (const auto *job : jobs_) reserved += job->admission;
-    return sample_locked(fresh, reserved);
-}
-std::int64_t NativeMemoryManager::sample_locked(bool fresh, std::uint64_t reserved) {
     const auto now = GetTickCount64();
     // Reconcile external changes on the existing active-only observation
     // interval. Between samples every managed commit/free debits/refunds this
@@ -108,7 +103,11 @@ std::int64_t NativeMemoryManager::sample_locked(bool fresh, std::uint64_t reserv
         cached_headroom_ = query_ ? query_() : query_windows(reserve_bytes_);
         sampled_at_ = now;
     }
-    return cached_headroom_ - static_cast<std::int64_t>(reserved);
+    return cached_headroom_ - static_cast<std::int64_t>(reserved_bytes_);
+}
+void NativeMemoryManager::set_admission_locked(NativeMemoryJob &job, std::uint64_t bytes) noexcept {
+    reserved_bytes_ = reserved_bytes_ - job.admission + bytes;
+    job.admission = bytes;
 }
 void NativeMemoryManager::begin(NativeMemoryJob &job, std::function<void()> wake) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -129,7 +128,7 @@ void NativeMemoryManager::end(NativeMemoryJob &job) {
     std::lock_guard<std::mutex> lock(mutex_);
     job.running = false;
     job.wake_pending = false;
-    job.admission = 0;
+    set_admission_locked(job, 0);
     job.wake = {};
     jobs_.erase(std::remove(jobs_.begin(), jobs_.end(), &job), jobs_.end());
     SetEvent(change_);
@@ -215,7 +214,7 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool
             BookkeepingScope bookkeeping_scope;
             allocations.emplace(result, Allocation{&job, size});
         } catch (...) { VirtualFree(result, 0, MEM_RELEASE); throw; }
-        job.admission -= credit;
+        set_admission_locked(job, job.admission - credit);
         job.committed += wanted;
         if (optional) job.peak = (std::max)(job.peak, total);
         cached_headroom_ -= static_cast<std::int64_t>(wanted);
@@ -223,7 +222,7 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool
             // The observed dictionary workspace is now funded. Reconcile the
             // small allocations made while rebuilding it, then return the
             // temporary cushion so it cannot suppress useful concurrency.
-            job.admission = 0;
+            set_admission_locked(job, 0);
             sample_locked(true);
         }
         return result;
@@ -288,12 +287,12 @@ void NativeMemoryManager::monitor() {
         bool pressure;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            sample_locked(event == WAIT_OBJECT_0 + 1 || event == WAIT_TIMEOUT);
+            const auto available = sample_locked(event == WAIT_OBJECT_0 + 1 || event == WAIT_TIMEOUT);
             // Refund forecasts before reclaiming real memory. An unconsumed
             // restart reservation is not a working dictionary to protect.
-            if (sample_locked() < 0)
-                for (auto *job : jobs_) job->admission = 0;
-            pressure = !stopping_ && (reclaim_requested_ || sample_locked() < 0);
+            if (available < 0 && reserved_bytes_ != 0)
+                for (auto *job : jobs_) set_admission_locked(*job, 0);
+            pressure = !stopping_ && (reclaim_requested_ || cached_headroom_ < 0);
             reclaim_requested_ = false;
         }
         if (pressure && reclaim_) reclaim_();
@@ -315,10 +314,8 @@ void NativeMemoryManager::monitor() {
                     revoke_locked(*victim);
                 }
             }
-            std::uint64_t reserved = 0;
             bool progressing = false;
             for (auto *job : jobs_) {
-                reserved += job->admission;
                 progressing |= job->running || job->admission != 0;
                 if (job->wake_pending && job->wake) {
                     callbacks.push_back(job->wake);
@@ -332,7 +329,7 @@ void NativeMemoryManager::monitor() {
                 auto &waiter = *it;
                 auto &job = *waiter.job;
                 const bool canceled = stopped || waiter.cancel->load(std::memory_order_acquire);
-                const auto available = sample_locked(false, reserved);
+                const auto available = sample_locked();
                 // Retained replay metadata is already in process commitment;
                 // reserve only the additional workspace, never charge it twice.
                 const auto needed = job.required > job.committed ? job.required - job.committed : 0;
@@ -355,8 +352,7 @@ void NativeMemoryManager::monitor() {
                     (job.failed_headroom < 0 || available > job.failed_headroom);
                 if (canceled || fits) {
                     if (!canceled) {
-                        job.admission = (std::min)(reservation, static_cast<std::uint64_t>(available));
-                        reserved += job.admission;
+                        set_admission_locked(job, (std::min)(reservation, static_cast<std::uint64_t>(available)));
                         progressing |= job.admission != 0;
                         jobs_.push_back(&job);
                     }

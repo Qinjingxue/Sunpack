@@ -23,7 +23,7 @@ fn fixed_fields_preserve_refill_edges_eof_and_io_errors() {
     ] {
         let source = reader(data.clone());
         let mut cursor = ByteCursor::new(&source, 0, source.len());
-        assert_eq!(cursor.read_exact(start).unwrap(), data[..start]);
+        cursor.read_chunks(start, |_| {}).unwrap();
         assert_eq!(cursor.read_array::<3>().unwrap(), data[start..start + 3]);
         assert_eq!(
             cursor.read_array::<8>().unwrap(),
@@ -40,7 +40,7 @@ fn fixed_fields_preserve_refill_edges_eof_and_io_errors() {
     );
     assert_eq!(cursor.position(), 0);
     assert_eq!(
-        cursor.read_exact(usize::MAX).unwrap_err().code(),
+        cursor.read_chunks(usize::MAX, |_| {}).unwrap_err().code(),
         "unexpected_end_of_stream"
     );
 }
@@ -93,16 +93,19 @@ fn gzip_optional_headers_keep_crc_terminators_and_concatenated_boundaries() {
                 member.extend_from_slice(&[0; 8]);
                 let data = member.repeat(2);
                 let source = reader(data.clone());
-                let result = analyze_gzip_structure(&source, 0, source.len(), 1024).unwrap();
-                assert_eq!(result.end_offset, data.len() as u64);
-                assert_eq!(result.stream_count, 2);
-                assert_eq!(result.integrity, IntegrityStatus::Verified);
+                let mut members = Vec::new();
+                let end = validate_gzip_structure(&source, 0, source.len(), |start| {
+                    members.push(start);
+                    Ok(())
+                }).unwrap();
+                assert_eq!(end, data.len() as u64);
+                assert_eq!(members, [0, member.len() as u64]);
                 if crc {
                     let mut damaged = member.clone();
                     damaged[header_len - 1] ^= 1;
                     let source = reader(damaged);
                     assert_eq!(
-                        validate_gzip_structure(&source, 0, source.len())
+                        validate_gzip_structure(&source, 0, source.len(), |_| Ok(()))
                             .unwrap_err()
                             .code(),
                         "gzip_header_crc_bad"
@@ -114,7 +117,7 @@ fn gzip_optional_headers_keep_crc_terminators_and_concatenated_boundaries() {
                     member.len() - 1,
                 ] {
                     let source = reader(member[..end].to_vec());
-                    assert!(validate_gzip_structure(&source, 0, source.len()).is_err());
+                    assert!(validate_gzip_structure(&source, 0, source.len(), |_| Ok(())).is_err());
                 }
             }
         }
@@ -164,7 +167,7 @@ fn fixed_deflate_constants_decode_all_rfc_codes_and_short_eof() {
             }
             bits.align_byte();
             assert_eq!(cursor.position(), byte_count as u64);
-            assert_eq!(cursor.read_exact(2).unwrap(), [0xa5, 0x5a]);
+            assert_eq!(cursor.read_array::<2>().unwrap(), [0xa5, 0x5a]);
         }
     }
     let source = reader(vec![0]);
@@ -192,42 +195,21 @@ fn tiny_gzip_boundary_preserves_unrelated_carrier_read_budget() {
             ..ReaderConfig::default()
         },
     );
-    let result = validate_gzip_structure(&source, 0, source.len()).unwrap();
-    assert_eq!(result.end_offset, end);
-    assert_eq!(result.stream_count, 1);
-    assert_eq!(result.decoded_size, Some(0));
+    assert_eq!(
+        validate_gzip_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
+        end
+    );
 }
 
-// The small archive fixtures cannot force every overlapping match across
-// ring/CRC-buffer boundaries. Compare one bounded matrix to a flat output.
 #[test]
-fn deflate_bulk_output_preserves_overlap_ring_crc_and_integrity_limit() {
-    let seed = (0..BUFFER_SIZE + 37)
-        .map(|i| (i % 251) as u8)
-        .collect::<Vec<_>>();
-    let mut expected = seed.clone();
-    for distance in [1, 2, 3, 7, 258, DEFLATE_WINDOW_SIZE] {
-        for length in [1, 3, 258] {
-            for _ in 0..length {
-                expected.push(expected[expected.len() - distance]);
-            }
-        }
-    }
-    for limit in [expected.len() as u64, expected.len() as u64 - 1, 0] {
-        let mut output = DeflateOutput::verifying(limit);
-        output.write_bytes(&seed).unwrap();
-        for distance in [1, 2, 3, 7, 258, DEFLATE_WINDOW_SIZE] {
-            for length in [1, 3, 258] {
-                output.repeat(distance as u64, length).unwrap();
-            }
-        }
-        assert_eq!(output.decoded_size(), expected.len() as u64);
-        assert_eq!(
-            output.finish_checksum(),
-            (limit >= expected.len() as u64).then(|| crc32(&expected))
-        );
-    }
-    assert!(DeflateOutput::counting().repeat(1, 1).is_err());
+fn deflate_rejects_back_reference_before_any_decoded_byte() {
+    // Final fixed-Huffman block starts with a length-three, distance-one pair.
+    let source = reader(vec![3, 2]);
+    let mut cursor = ByteCursor::new(&source, 0, source.len());
+    assert_eq!(
+        parse_deflate(&mut LsbBits::new(&mut cursor)).unwrap_err().code(),
+        "deflate_distance_out_of_range"
+    );
 }
 
 // Independent coverage: lookahead byte ownership at all bit alignments,
@@ -291,7 +273,7 @@ fn huffman_lookup_preserves_codes_eof_and_following_bytes() {
                 }
                 assert_eq!(cursor.position(), byte_count as u64);
                 if tail {
-                    assert_eq!(cursor.read_exact(2).unwrap(), [0xa5, 0x5a]);
+                    assert_eq!(cursor.read_array::<2>().unwrap(), [0xa5, 0x5a]);
                 }
             }
         }
@@ -318,10 +300,13 @@ fn gzip_token_walk_handles_dynamic_and_concatenated_members() {
     let mut data = first.clone();
     data.extend_from_slice(&first);
     let source = reader(data.clone());
-    let result = validate_gzip_structure(&source, 0, data.len() as u64).unwrap();
-    assert_eq!(result.end_offset, data.len() as u64);
-    assert_eq!(result.stream_count, 2);
-    assert_eq!(result.decoded_size, Some(4 * 1024 * 1024));
+    let mut members = Vec::new();
+    let end = validate_gzip_structure(&source, 0, source.len(), |start| {
+        members.push(start);
+        Ok(())
+    }).unwrap();
+    assert_eq!(end, data.len() as u64);
+    assert_eq!(members, [0, first.len() as u64]);
 }
 
 fn gzip_member(payload: &[u8]) -> Vec<u8> {
@@ -333,51 +318,23 @@ fn gzip_member(payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn gzip_integrity_walk_verifies_many_small_members_in_one_pass() {
-    let member = gzip_member(b"small-member");
-    let mut data = Vec::new();
-    for _ in 0..128 {
-        data.extend_from_slice(&member);
-    }
-    let source = reader(data.clone());
-    let result =
-        analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
-    assert_eq!(result.end_offset, data.len() as u64);
-    assert_eq!(result.stream_count, 128);
-    assert_eq!(result.integrity, IntegrityStatus::Verified);
-}
-
-#[test]
-fn gzip_integrity_walk_bounds_high_ratio_output_without_losing_boundary() {
-    let payload = vec![b'Z'; 16 * 1024 * 1024];
-    let data = gzip_member(&payload);
-    let source = reader(data.clone());
-    let result =
-        analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
-    assert_eq!(result.end_offset, data.len() as u64);
-    assert_eq!(result.decoded_size, Some(payload.len() as u64));
-    assert_eq!(result.integrity, IntegrityStatus::Deferred);
-}
-
-#[test]
-fn gzip_integrity_walk_checks_later_member_crc() {
+fn gzip_boundary_walk_rejects_wrong_later_member_size() {
     let first = gzip_member(b"first");
     let second = gzip_member(b"second");
     let mut data = first;
     data.extend_from_slice(&second);
-    let crc_offset = data.len() - 8;
-    data[crc_offset] ^= 0x80;
+    let size_offset = data.len() - 4;
+    data[size_offset] ^= 0x80;
 
-    let source = reader(data.clone());
-    let result =
-        analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
-    assert_eq!(result.end_offset, data.len() as u64);
-    assert_eq!(result.stream_count, 2);
-    assert_eq!(result.integrity, IntegrityStatus::Failed);
+    let source = reader(data);
+    assert_eq!(
+        validate_gzip_structure(&source, 0, source.len(), |_| Ok(())).unwrap_err().code(),
+        "gzip_isize_mismatch"
+    );
 }
 
 #[test]
-fn gzip_integrity_walk_stops_before_multi_member_carrier_tail() {
+fn gzip_boundary_walk_stops_before_multi_member_carrier_tail() {
     let first = gzip_member(b"first");
     let second = gzip_member(b"second");
     let mut data = first;
@@ -385,12 +342,11 @@ fn gzip_integrity_walk_stops_before_multi_member_carrier_tail() {
     let archive_end = data.len();
     data.extend_from_slice(b"carrier-tail");
 
-    let source = reader(data.clone());
-    let result =
-        analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
-    assert_eq!(result.end_offset, archive_end as u64);
-    assert_eq!(result.stream_count, 2);
-    assert_eq!(result.integrity, IntegrityStatus::Verified);
+    let source = reader(data);
+    assert_eq!(
+        validate_gzip_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
+        archive_end as u64
+    );
 }
 
 #[test]
@@ -403,16 +359,17 @@ fn bzip2_huffman_walk_reaches_stream_end() {
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
     let source = reader(data.clone());
-    let result = validate_bzip2_structure(&source, 0, data.len() as u64).unwrap();
-    assert_eq!(result.end_offset, data.len() as u64);
-    assert!(result.block_count > 0);
+    assert_eq!(
+        validate_bzip2_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
+        data.len() as u64
+    );
 }
 
 #[test]
 fn zstd_block_walk_rejects_truncation() {
     let data = zstd::stream::encode_all(&vec![b'Z'; 1024 * 1024][..], 3).unwrap();
     let source = reader(data[..data.len() - 1].to_vec());
-    assert!(validate_zstd_structure(&source, 0, (data.len() - 1) as u64).is_err());
+    assert!(validate_zstd_structure(&source, 0, (data.len() - 1) as u64, |_| Ok(())).is_err());
 }
 
 // One coarse regression covers the former million-block quotas and the
@@ -426,9 +383,11 @@ fn long_streams_validate_without_archive_wide_quotas() {
     let end = zstd.len() as u64;
     zstd.extend(b"carrier tail");
     let source = reader(zstd);
-    let result = validate_zstd_structure(&source, 0, source.len()).unwrap();
-    assert_eq!((result.block_count, result.end_offset), (COUNT, end));
-    assert!(validate_zstd_structure(&source, 0, end - 1).is_err());
+    assert_eq!(
+        validate_zstd_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
+        end
+    );
+    assert!(validate_zstd_structure(&source, 0, end - 1, |_| Ok(())).is_err());
 
     // Repeat the actual encoder's block bits. Eight copies are byte
     // aligned; 64 identical CRCs fold to zero in the combined CRC.
@@ -454,10 +413,9 @@ fn long_streams_validate_without_archive_wide_quotas() {
     bzip.extend(group.repeat(COUNT / 8));
     bzip.extend([0x17, 0x72, 0x45, 0x38, 0x50, 0x90, 0, 0, 0, 0]);
     let source = reader(bzip);
-    let result = validate_bzip2_structure(&source, 0, source.len()).unwrap();
     assert_eq!(
-        (result.block_count, result.end_offset),
-        (COUNT, source.len())
+        validate_bzip2_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
+        source.len()
     );
 
     let mut xz = vec![0xfd, b'7', b'z', b'X', b'Z', 0, 0, 0];
@@ -495,19 +453,22 @@ fn long_streams_validate_without_archive_wide_quotas() {
         resolve_xz_stream_start(&source, offset, end).unwrap(),
         offset
     );
-    let result = validate_xz_structure_exact(&source, offset, end).unwrap();
-    assert_eq!((result.block_count, result.end_offset), (COUNT, end));
-    assert!(validate_xz_structure_exact(&source, offset, end - 1).is_err());
+    assert!(resolve_xz_stream_start(&source, offset, end - 1).is_err());
 }
 
 #[test]
-fn xz_reverse_index_walk_skips_payload() {
+fn xz_reverse_index_walk_locates_stream_and_checks_index_crc() {
     let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
     encoder.write_all(&vec![b'X'; 2 * 1024 * 1024]).unwrap();
-    let data = encoder.finish().unwrap();
+    let mut data = encoder.finish().unwrap();
+    let end = data.len();
     let source = reader(data.clone());
-    let result = validate_xz_structure_exact(&source, 0, data.len() as u64).unwrap();
-    assert_eq!(result.end_offset, data.len() as u64);
-    assert_eq!(result.stream_count, 1);
-    assert!(result.block_count > 0);
+    assert_eq!(resolve_xz_stream_start(&source, 0, end as u64).unwrap(), 0);
+
+    data[end - 16] ^= 1;
+    let damaged = reader(data);
+    assert_eq!(
+        resolve_xz_stream_start(&damaged, 0, end as u64).unwrap_err().code(),
+        "xz_index_crc_bad"
+    );
 }

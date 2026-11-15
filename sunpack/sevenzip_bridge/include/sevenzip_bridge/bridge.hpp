@@ -96,14 +96,6 @@ struct ExtractOutputItemTrace {
 struct ExtractOutputTrace {
     int last_hresult = 0;
     std::vector<ExtractOutputItemTrace> items;
-    unsigned int metadata_failed_files = 0;
-    unsigned int metadata_failed_directories = 0;
-    unsigned int metadata_failed_times = 0;
-    unsigned int metadata_failed_attributes = 0;
-    bool metadata_first_is_attributes = false;
-    unsigned int metadata_first_item_index = 0;
-    unsigned long metadata_first_win32_error = 0;
-    std::wstring metadata_first_item;
 };
 
 struct ExtractArchiveResult {
@@ -111,7 +103,6 @@ struct ExtractArchiveResult {
     ExtractPipelineTiming pipeline_timing;
 #endif
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
-    bool command_ok = false;
     bool encrypted = false;
     bool damaged = false;
     bool checksum_error = false;
@@ -119,7 +110,6 @@ struct ExtractArchiveResult {
     bool missing_volume_suspected = false;
     bool wrong_password = false;
     bool password_rejected = false;
-    bool password_crc_proven = false;
     bool password_candidates_all_rejected = false;
     bool unsupported_method = false;
     bool output_inventory_complete = false;
@@ -170,7 +160,6 @@ ExtractArchiveResult extract_archive(
     const std::wstring& output_dir,
     const std::wstring& codepage,
     ExtractProgressCallback progress = {},
-    bool dry_run = false,
     const std::vector<std::wstring>& canonical_names = {},
     bool native_volume_input = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,

@@ -31,8 +31,8 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         journal.commit(true, |state| {
             Ok(state.pending_operations(
                 [(PendingObservation(owner_text.into(), 13, 1.0, String::new(), 0),
-                    String::new(), None)], false, "", false, true, None,
-            )?.0)
+                    String::new(), None)], false, "", false, None,
+            ))
         }).unwrap();
         journal.commit(true, |state| {
             Ok(state.output_operation(owner_text, owner_text.into(),
@@ -159,7 +159,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
-                external: Arc::default(), _lease: None,
+                external: Arc::default(), broker_lease: None,
             };
 
         let mut interrupted = NativeWatchOperations::empty();

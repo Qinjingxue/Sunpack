@@ -760,7 +760,6 @@ impl NativeWatchSnapshot {
 /// Records applied from one journal segment.
 pub(crate) struct NativeWatchReplay {
     pub(crate) applied_seq: u64,
-    pub(crate) expected_seq: u64,
     pub(crate) records: u64,
     pub(crate) bytes: u64,
     pub(crate) valid_bytes: u64,
@@ -898,12 +897,10 @@ impl NativeWatchState {
         force: bool,
         password_scope_dir: &str,
         internal_recovery: bool,
-        durable_owner: bool,
         cursors: Option<BTreeMap<String, Cursor>>,
-    ) -> std::io::Result<(NativeWatchOperations, bool)> {
+    ) -> NativeWatchOperations {
         let recovery_batch = cursors.is_some();
         let mut operations = Vec::with_capacity(1);
-        let mut persist_attempt = false;
         for (PendingObservation(path, size, mtime, file_id, change_usn), root, scope) in updates {
             let key = crate::path_keys::path_key(&path);
             let previous = {
@@ -928,9 +925,7 @@ impl NativeWatchState {
                 }
                 previous.cloned()
             };
-            let previous = previous.as_deref();
-            persist_attempt |= previous.is_none_or(|record| record.durable_owner);
-            let mut record = previous.cloned().unwrap_or_default();
+            let mut record = previous.as_deref().cloned().unwrap_or_default();
             if !password_scope_dir.is_empty() {
                 record.password_scope_dir = password_scope_dir.to_owned();
             } else if record.password_scope_dir.is_empty() {
@@ -953,7 +948,7 @@ impl NativeWatchState {
             record.change_usn = change_usn;
             record.force = force;
             record.internal_recovery |= internal_recovery;
-            record.durable_owner |= durable_owner;
+            record.durable_owner = true;
             operations.push(Operation::PutPending(key, Arc::new(record)));
         }
         if let Some(cursors) = cursors {
@@ -961,12 +956,9 @@ impl NativeWatchState {
             merged.extend(cursors);
             operations.push(Operation::SetCursors(merged));
         }
-        Ok((
-            NativeWatchOperations {
-                operations: Arc::new(Operations(operations)),
-            },
-            persist_attempt,
-        ))
+        NativeWatchOperations {
+            operations: Arc::new(Operations(operations)),
+        }
     }
 
     pub(crate) fn protect_output_operation(
@@ -1381,7 +1373,6 @@ fn replay_segment_file(
     let mut reader = wal::Reader::new(file, Kind::TaskWal).map_err(diagnose)?;
     let mut replay = NativeWatchReplay {
         applied_seq: 0,
-        expected_seq,
         records: 0,
         bytes: 0,
         valid_bytes: 0,
@@ -1412,7 +1403,6 @@ fn replay_segment_file(
         replay.bytes += (wal::FRAME_HEADER_BYTES + reader.payload.len()) as u64;
     }
     replay.valid_bytes = reader.valid_end;
-    replay.expected_seq = expected_seq;
     Ok(replay)
 }
 

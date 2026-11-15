@@ -4,6 +4,8 @@
 
 #ifdef _WIN32
 
+#include <filesystem>
+
 #include <optional>
 
 #include <string>
@@ -32,6 +34,8 @@ namespace sunpack::sevenzip
     std::vector<std::wstring> sorted_data_volume_paths(const std::vector<std::wstring> &paths);
 
     std::wstring lower_extension(const std::wstring &path);
+
+    bool directory_is_empty_or_missing(const std::filesystem::path &path);
 
 #endif
 

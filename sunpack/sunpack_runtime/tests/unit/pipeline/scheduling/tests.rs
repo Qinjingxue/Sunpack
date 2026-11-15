@@ -430,8 +430,9 @@ fn global_stage_budget_releases_cancelled_admission_to_oldest_waiter() {
     let scheduler = single_slot();
     let (tx, rx) = mpsc::channel();
     let signals = Signals { tx, driver: None };
-    for id in 0..=MAX_PENDING_JOBS {
-        scheduler.enqueue_poll(1, Origin::Watch, id, &signals, "scan");
+    let first = scheduler.acquire_or_queue(1, Origin::Watch, 0, &signals, "scan").unwrap();
+    for id in 1..=MAX_PENDING_JOBS {
+        assert!(scheduler.acquire_or_queue(1, Origin::Watch, id, &signals, "scan").is_none());
     }
     {
         let state = scheduler.state.lock().unwrap();
@@ -446,7 +447,8 @@ fn global_stage_budget_releases_cancelled_admission_to_oldest_waiter() {
         assert!(state.waiting.is_empty());
         assert_eq!(state.sequence, MAX_PENDING_JOBS as u64 + 1);
     }
-    for _ in 0..MAX_PENDING_JOBS {
+    drop(first);
+    for _ in 1..MAX_PENDING_JOBS {
         let Signal::Granted(id, slot) = rx.recv().unwrap() else { panic!("grant") };
         assert_ne!(id, 1);
         drop(slot);
@@ -462,13 +464,11 @@ fn stage_priority_aging_and_handshake_capacity_match_main() {
     let signals = Signals { tx, driver: None };
     scheduler.configure_capacity(100);
     assert_eq!(scheduler.state.lock().unwrap().limit, Some(2));
-    scheduler.enqueue_poll(1, Origin::Watch, 0, &signals, "scan");
-    scheduler.enqueue_poll(1, Origin::Watch, 1, &signals, "scan");
-    let Signal::Granted(_, first) = rx.recv().unwrap() else { panic!("grant") };
-    let Signal::Granted(_, second) = rx.recv().unwrap() else { panic!("grant") };
+    let first = scheduler.acquire_or_queue(1, Origin::Watch, 0, &signals, "scan").unwrap();
+    let second = scheduler.acquire_or_queue(1, Origin::Watch, 1, &signals, "scan").unwrap();
     scheduler.configure_capacity(1);
-    scheduler.enqueue_poll(1, Origin::Watch, 2, &signals, "background_scan");
-    scheduler.enqueue_poll(1, Origin::Watch, 3, &signals, "cleanup");
+    assert!(scheduler.acquire_or_queue(1, Origin::Watch, 2, &signals, "background_scan").is_none());
+    assert!(scheduler.acquire_or_queue(1, Origin::Watch, 3, &signals, "cleanup").is_none());
     drop(first);
     assert!(rx.try_recv().is_err(), "lowered capacity must wait for executing work");
     drop(second);
@@ -493,19 +493,21 @@ fn stage_priority_aging_and_handshake_capacity_match_main() {
 fn ready_batches_drain_in_order_after_foreground_work() {
     let scheduler = single_slot();
     let (tx, rx) = mpsc::channel();
+    let signals = Signals { tx, driver: None };
+    let first = scheduler.acquire_or_queue(0, Origin::Watch, 0, &signals, "scan").unwrap();
     for (request, origin, index) in [
-        (0, Origin::Watch, 0),
         (1, Origin::Watch, 1),
         (1, Origin::Watch, 2),
         (2, Origin::Watch, 3),
         (3, Origin::Foreground, 4),
     ] {
-        scheduler.enqueue_poll(request, origin, index, &Signals { tx: tx.clone(), driver: None }, "scan");
+        assert!(scheduler.acquire_or_queue(request, origin, index, &signals, "scan").is_none());
     }
+    drop(first);
     let mut order = Vec::new();
     while let Ok(Signal::Granted(id, slot)) = rx.try_recv() {
         order.push(id);
         drop(slot);
     }
-    assert_eq!(order, [0, 4, 1, 2, 3]);
+    assert_eq!(order, [4, 1, 2, 3]);
 }

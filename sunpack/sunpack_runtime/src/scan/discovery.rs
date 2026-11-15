@@ -7,6 +7,7 @@ use crate::relations::{
     build_native_candidate_groups_from_snapshot, collect_relation_cache, resolve_embedded_volumes,
     NativeRelationGroup, RelationCache, RelationProjection,
 };
+use crate::scan::catalog::catalog_stem;
 use crate::scan::directory::{
     filesystem_logical_name, DirectorySnapshotTable,
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
@@ -54,6 +55,13 @@ enum Candidate {
 }
 
 impl Candidate {
+    fn path(&self) -> &str {
+        match self {
+            Self::File(table, row) => &table.paths[*row],
+            Self::Relation(group) => group.entry_path(),
+        }
+    }
+
     fn embedded_source(&self) -> (&str, Option<PeState>) {
         match self {
             Self::File(table, row) => (
@@ -326,7 +334,7 @@ impl NativeEmbeddedBatch {
                 }
                 EmbeddedOutcome::Failed(error) => (None, Some(error)),
                 EmbeddedOutcome::Scan(scan) => {
-                    let path = table.rows[index].embedded_source().0;
+                    let path = table.rows[index].path();
                     let key = path_key(path);
                     let mut anchors = scan.relation_anchors();
                     let has_claims = self.claimed_ranges.contains_key(&key);
@@ -493,23 +501,37 @@ impl NativeEmbeddedBatch {
         let borrowed: Vec<_> = groups.iter().map(|(table, batch)| (&**table, &**batch)).collect();
         let outcomes = scan_embedded_jobs(&borrowed, &jobs)?;
         for (group, index) in jobs {
-            let (_, batch) = &mut groups[group];
-            if !batch.scans.is_empty() && batch.scans.remove(&index).is_some() && batch.scans.is_empty() {
+            groups[group].1.scans.remove(&index);
+        }
+        // Results follow job order, where each group's rows are contiguous.
+        let mut outcomes = outcomes.into_iter().peekable();
+        let mut projected = Vec::new();
+        for (group, (table, batch)) in groups.into_iter().enumerate() {
+            if outcomes.peek().is_some_and(|(selected, _, _)| *selected == group) {
+                let ready = std::iter::from_fn(|| {
+                    outcomes.next_if(|(selected, _, _)| *selected == group)
+                })
+                .map(|(_, index, outcome)| (index, outcome));
+                let mut rows = batch.project_outcomes(table, ready)?;
+                // Supplemental rows supply relation facts, not additional targets.
+                rows.retain(|row| !batch.supplemental.contains(&row.index));
+                batch.enqueue_volume_peers(table);
+                projected.push((group, rows));
+            }
+            if batch.len() == 0 {
+                // All eligible peers have been enqueued, including any added
+                // by this page. Other scopes may still have many pages to scan.
+                batch.ids = Vec::new();
+                batch.cursor = 0;
+                batch.peer_rows = None;
+                batch.seen_paths = HashSet::new();
+            }
+            if batch.scans.is_empty() {
                 batch.scans = HashMap::new();
             }
         }
-        let mut by_group: BTreeMap<usize, Vec<_>> = BTreeMap::new();
-        for (group, index, outcome) in outcomes {
-            by_group.entry(group).or_default().push((index, outcome));
-        }
-        by_group.into_iter().map(|(group, outcomes)| {
-            let (table, batch) = &mut groups[group];
-            let mut rows = batch.project_outcomes(table, outcomes.into_iter())?;
-            // Supplemental rows supply relation facts, not additional targets.
-            rows.retain(|row| !batch.supplemental.contains(&row.index));
-            batch.enqueue_volume_peers(table);
-            Ok((group, rows))
-        }).collect()
+        debug_assert!(outcomes.next().is_none());
+        Ok(projected)
     }
 
     // Volume evidence extends the same physical discovery frontier. Index raw
@@ -521,13 +543,15 @@ impl NativeEmbeddedBatch {
             if !item.anchor.multivolume && !item.anchor.needs_password {
                 continue;
             }
-            let stem = crate::scan::catalog::catalog_stem(&item.anchor.path);
+            let stem = catalog_stem(&item.anchor.path);
             match &table.rows[item.index] {
                 Candidate::File(facts, row) => {
                     for (source, snapshot) in table.relation_sources.iter().enumerate() {
+                        // Only raw snapshots are kept in relation_sources.
+                        // Their scope views preserve the original row order.
                         if Arc::ptr_eq(facts, &snapshot.table)
                             && (snapshot.rows.len() == snapshot.table.paths.len()
-                                || snapshot.rows.contains(row))
+                                || snapshot.rows.binary_search(row).is_ok())
                         {
                             selected.insert((source, stem.clone()));
                         }
@@ -560,7 +584,7 @@ impl NativeEmbeddedBatch {
         self.nominated = self.pending_volumes.len();
         if selected.is_empty() { return; }
         let index = self.peer_rows.get_or_insert_with(|| {
-            self.seen_paths.extend(table.rows.iter().map(|row| path_key(row.embedded_source().0)));
+            self.seen_paths.extend(table.rows.iter().map(|row| path_key(row.path())));
             let mut index: HashMap<(usize, String), Vec<usize>> = HashMap::new();
             // Original candidates already bound every stem this frontier can
             // nominate; appended peers cannot introduce another filename stem.
@@ -577,9 +601,9 @@ impl NativeEmbeddedBatch {
                     if self.seen_paths.contains(&key) || self.excluded.contains(&key)
                         || self.relation_cache.anchors.contains_key(&key) { continue; }
                     let stems = candidate_stems.get_or_insert_with(|| table.rows.iter()
-                        .map(|row| crate::scan::catalog::catalog_stem(row.embedded_source().0))
+                        .map(|row| catalog_stem(row.path()))
                         .collect::<HashSet<_>>());
-                    let stem = crate::scan::catalog::catalog_stem(path);
+                    let stem = catalog_stem(path);
                     if stems.contains(&stem) { index.entry((source, stem)).or_default().push(row); }
                 }
             }
@@ -617,14 +641,7 @@ impl NativeEmbeddedBatch {
                 .iter()
                 .filter_map(|&row| {
                     let path = &snapshot.table.paths[row];
-                    selected.contains(&path_key(path)).then(|| {
-                        case_key(crate::relations::first_dot_stem(
-                            Path::new(path)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or_default(),
-                        ))
-                    })
+                    selected.contains(&path_key(path)).then(|| catalog_stem(path))
                 })
                 .collect();
             if stems.is_empty() {
@@ -639,11 +656,7 @@ impl NativeEmbeddedBatch {
                 if self.excluded.contains(&key) {
                     continue;
                 }
-                let name = Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                if !stems.contains(&case_key(crate::relations::first_dot_stem(name))) {
+                if !stems.contains(&catalog_stem(path)) {
                     continue;
                 }
                 let anchor = cache
@@ -846,14 +859,6 @@ impl NativeEmbeddedBatch {
         // A failed NextHeader inside a carrier can also be damaged standalone
         // data. Require actual peers for this speculative split identity.
         // Index only nominated stems once, rather than rescan scopes per head.
-        let stem = |path: &str| {
-            case_key(crate::relations::first_dot_stem(
-                Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default(),
-            ))
-        };
         let speculative = |group: &NativeRelationGroup| {
             !group.relation_confirmed()
                 && group
@@ -863,7 +868,7 @@ impl NativeEmbeddedBatch {
         let mut peers: HashMap<String, HashSet<String>> = groups
             .iter()
             .filter(|g| speculative(g))
-            .map(|g| (stem(g.entry_path()), HashSet::new()))
+            .map(|g| (catalog_stem(g.entry_path()), HashSet::new()))
             .collect();
         if !peers.is_empty() {
             for snapshot in sources {
@@ -872,7 +877,7 @@ impl NativeEmbeddedBatch {
                         continue;
                     }
                     let path = &snapshot.table.paths[row];
-                    if let Some(paths) = peers.get_mut(&stem(path)) {
+                    if let Some(paths) = peers.get_mut(&catalog_stem(path)) {
                         // Only two distinct witnesses are needed. Retaining
                         // every peer would duplicate a large bucket's paths.
                         if paths.len() >= 2 {
@@ -888,7 +893,7 @@ impl NativeEmbeddedBatch {
             groups.retain(|g| {
                 !speculative(g)
                     || peers
-                        .get(&stem(g.entry_path()))
+                        .get(&catalog_stem(g.entry_path()))
                         .is_some_and(|p| p.len() > 1)
             });
         }
@@ -927,7 +932,7 @@ impl NativeEmbeddedBatch {
             let mut index = 0;
             groups.retain(|_| { let retain = keep[index]; index += 1; retain });
             fallback.retain(|row| !batch.supplemental.contains(&row.index)
-                || owned.contains(&path_key(table.rows[row.index].embedded_source().0)));
+                || owned.contains(&path_key(table.rows[row.index].path())));
         }
         let mut grouped_ranges = HashMap::new();
         let mut seen_facts = HashSet::new();
@@ -939,7 +944,7 @@ impl NativeEmbeddedBatch {
         }
         for row in &mut fallback {
             if let Some(scan) = &mut row.scan {
-                let key = path_key(table.rows[row.index].embedded_source().0);
+                let key = path_key(table.rows[row.index].path());
                 if let Some(ranges) = grouped_ranges.get(&key) {
                     scan.resolutions.retain(|offset, _| {
                         ranges.binary_search_by_key(offset, |(start, _)| *start).is_err()
@@ -988,6 +993,7 @@ impl NativeCandidateTable {
         targets: Option<FileTargets>,
         deep: bool,
     ) -> std::io::Result<()> {
+        debug_assert!(raw_snapshot.rows.windows(2).all(|pair| pair[0] < pair[1]));
         (|| {
             self.targets = targets;
             let selected = self
@@ -1042,7 +1048,7 @@ impl NativeCandidateTable {
         let stems: HashSet<_> = self.rows.iter().filter_map(|row| match row {
             Candidate::Relation(group) => group.entry_anchor()
                 .filter(|a| a.format == "rar" && a.needs_password && !a.standalone)
-                .map(|a| crate::scan::catalog::catalog_stem(&a.path)),
+                .map(|a| catalog_stem(&a.path)),
             _ => None,
         }).collect();
         let mut anchors: HashMap<_, _> = self.rows.iter().filter_map(|row| match row {
@@ -1058,7 +1064,7 @@ impl NativeCandidateTable {
                 let Some(anchor) = snapshot.table.relation_anchors[row].as_ref()
                     .and_then(CheapAnchor::anchor)
                     .filter(|a| a.format == "rar" && a.needs_password)
-                    .filter(|a| stems.contains(&crate::scan::catalog::catalog_stem(&a.path))) else { continue; };
+                    .filter(|a| stems.contains(&catalog_stem(&a.path))) else { continue; };
                 anchors.entry(path_key(&anchor.path)).or_insert_with(|| anchor.clone());
             }
         }
@@ -1239,8 +1245,7 @@ impl NativeCandidateTable {
                     .to_owned(),
             ),
             Candidate::Relation(group) => {
-                let data = group.candidate_data();
-                (data.entry_path.to_owned(), data.format_hint.to_owned())
+                (group.entry_path().to_owned(), group.format_hint().to_owned())
             }
         })
     }
@@ -1456,14 +1461,7 @@ impl NativeCandidateTable {
                 for &index in &ids {
                     let size = match &self.rows[index] {
                         Candidate::File(table, row) => table.sizes[*row],
-                        Candidate::Relation(group) => {
-                            let data = group.candidate_data();
-                            if data.is_split {
-                                data.logical_size()
-                            } else {
-                                data.size()
-                            }
-                        }
+                        Candidate::Relation(group) => group.logical_size(),
                     }
                     .unwrap_or(0);
                     sizes.push(size);
@@ -1502,7 +1500,7 @@ impl NativeCandidateTable {
             if let Candidate::Relation(group) = &self.rows[index] {
                 let scanned_paths = scanned_paths.get_or_insert_with(|| {
                     ids.iter()
-                        .map(|&index| path_key(self.rows[index].embedded_source().0))
+                        .map(|&index| path_key(self.rows[index].path()))
                         .collect()
                 });
                 group.collect_source_ranges(scanned_paths, &mut claimed_ranges, &mut seen_facts);

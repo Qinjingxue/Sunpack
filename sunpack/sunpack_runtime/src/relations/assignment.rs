@@ -51,9 +51,9 @@ impl BucketView<'_> {
         channel: &NumberChannel,
         profile: &NameProfile<'_>,
     ) -> i64 {
-        if matches!(self.format, "7z" | "zip")
+        if matches!(channel, NumberChannel::Token { .. })
+            && matches!(self.format, "7z" | "zip")
             && !self.spanned()
-            && matches!(channel, NumberChannel::Token { .. })
         {
             head.and_then(|i| self.features.get(&i))
                 .and_then(|f| profile.number(channel, f))
@@ -285,8 +285,6 @@ impl BucketView<'_> {
         generic: bool,
         profile: &NameProfile<'_>,
     ) -> Option<VolumeAssignment> {
-        let mut out = fixed.clone();
-        out.unresolved.clear();
         // Raw chunks may be labelled from zero (or another origin). Only a
         // structurally proven head establishes the translation to logical #1;
         // RAR/spanned ZIP internal volume numbers retain their exact meaning.
@@ -320,6 +318,11 @@ impl BucketView<'_> {
                 }
             }
         }
+        let mut out = VolumeAssignment {
+            slots: fixed.slots.clone(),
+            companions: fixed.companions.clone(),
+            unresolved: Vec::with_capacity(fixed.unresolved.len()),
+        };
         let mut inferred = 0;
         for &i in &fixed.unresolved {
             let features = self.features.get(&i)?;
@@ -410,7 +413,7 @@ impl BucketView<'_> {
                     }
             })
             .map(|p| NumberChannel::Canonical {
-                format: self.format.into(),
+                format: self.format,
                 // EXE identifies the carrier, not a competing numbering
                 // scheme. Encrypted SFX heads and ordinary RAR parts share
                 // one canonical mapping before Main Header decryption.
@@ -418,9 +421,7 @@ impl BucketView<'_> {
                     "rar_part"
                 } else {
                     p.style
-                }
-                .into(),
-                family: None,
+                },
             })
             .collect();
         if self.format == "rar"
@@ -757,7 +758,8 @@ pub(super) fn resolve_buckets(
                     })
                     .collect();
                 let mut competing_families = false;
-                let mut families: Vec<(String, Vec<usize>)> = if head_indexes.len() > 1 {
+                let mut families = None;
+                if head_indexes.len() > 1 {
                     let head_families: HashSet<_> = head_indexes
                         .iter()
                         .filter_map(|i| features.get(i).and_then(|f| f.family(format)))
@@ -779,17 +781,13 @@ pub(super) fn resolve_buckets(
                         }
                         if orphan_owned {
                             competing_families = true;
-                            vec![(stem.clone(), members.clone())]
                         } else {
-                            grouped.into_iter().collect()
+                            families = Some(grouped.into_iter().collect());
                         }
                     } else {
                         competing_families = true;
-                        vec![(stem.clone(), members.clone())]
                     }
-                } else {
-                    vec![(stem.clone(), members.clone())]
-                };
+                }
                 // A complete local set is independent even when another directory
                 // has a gap. Only the remaining members may pair across directories.
                 let mut local_assignments = HashMap::new();
@@ -835,7 +833,7 @@ pub(super) fn resolve_buckets(
                             if !remaining.is_empty() {
                                 local_families.push((stem.clone(), remaining));
                             }
-                            families = local_families;
+                            families = Some(local_families);
                         }
                     }
                 }
@@ -858,7 +856,7 @@ pub(super) fn resolve_buckets(
                             .push(i);
                     }
                 }
-                for (family, indexes) in families {
+                for (family, indexes) in families.unwrap_or_else(|| vec![(stem.clone(), members)]) {
                     // The display name may use canonical spelling even when every
                     // slot was structural. This never participates in assignment.
                     if let Some(i) = indexes.iter().find(|i| facts[i].exact_slot == Some(1)) {

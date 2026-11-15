@@ -5,7 +5,7 @@ import json
 import pytest
 
 from tests.helpers.tool_config import get_optional_rar
-from tests.real.nested_cases import assert_nested_outputs, build_nested_case
+from tests.real.nested_cases import NESTED_FIXTURE_CANDIDATE_RATIO, assert_nested_outputs, build_nested_case
 
 
 @pytest.mark.parametrize("outer_format", ["7z", "zip", "rar"])
@@ -15,7 +15,10 @@ def test_cli_disguised_split_carrier_multilevel_passwords(package, tmp_path, out
         pytest.skip("RAR writer is required")
     case = build_nested_case(tmp_path, f"cli-{outer_format}", outer_format)
     output = tmp_path / "out"
-    package.configure(filesystem={"scan_filters": [{"name": "size_range", "enabled": False}]})
+    package.configure(
+        filesystem={"scan_filters": [{"name": "size_range", "enabled": False}]},
+        embedded_scan={"recursive_candidate_ratio": NESTED_FIXTURE_CANDIDATE_RATIO},
+    )
     passwords = ["definitely-wrong", *(case.passwords if leaf_password_known else case.passwords[:2])]
     candidates = [arg for password in passwords for arg in ("-p", password)]
     report = package.json(
@@ -36,7 +39,10 @@ def test_concurrent_nested_groups_isolate_password_failure_and_cleanup(package, 
     healthy = build_nested_case(tmp_path, "healthy", "7z")
     blocked = build_nested_case(tmp_path, "blocked", "zip")
     output = tmp_path / "out"
-    package.configure(filesystem={"scan_filters": [{"name": "size_range", "enabled": False}]})
+    package.configure(
+        filesystem={"scan_filters": [{"name": "size_range", "enabled": False}]},
+        embedded_scan={"recursive_candidate_ratio": NESTED_FIXTURE_CANDIDATE_RATIO},
+    )
     scopes = [
         {"value": value, "scopes": [str(case.outer.archive_dir)]}
         for case, values in ((healthy, healthy.passwords), (blocked, blocked.passwords[:2]))

@@ -33,7 +33,7 @@ fn targeted_volume_peer_scan_reuses_known_facts_and_ignores_other_stems() {
         path: format!("unrelated-{index}.bin"), relation_member_eligible: true, ..Default::default()
     }));
     let source = Arc::new(NativeDirectorySnapshot::build_table(records));
-    let snapshot = NativeDirectorySnapshot { rows: Arc::new((0..source.paths.len()).collect()), table: Arc::clone(&source) };
+    let snapshot = NativeDirectorySnapshot { rows: Arc::new((0..source.paths.len() - 1).collect()), table: Arc::clone(&source) };
     let other_path = head.parent().unwrap().join("other-scope").join(head.file_name().unwrap()).to_string_lossy().into_owned();
     let other_table = Arc::new(NativeDirectorySnapshot::build_table(vec![DirectoryEntryRecord {
         path: other_path.clone(), relation_member_eligible: true, ..Default::default()
@@ -58,11 +58,14 @@ fn targeted_volume_peer_scan_reuses_known_facts_and_ignores_other_stems() {
     // Only the unselected same-stem source remains indexed; 10,000 other
     // stems never allocate persistent buckets, and this scope cannot scan it.
     assert_eq!(batch.peer_rows.as_ref().unwrap().len(), 1);
-    assert_eq!(table.rows[1].embedded_source().0, paths[1]);
+    assert_eq!(table.rows[1].path(), paths[1]);
     // Re-entering this request reuses its rows, without a second peer job.
     NativeEmbeddedBatch::scan_pages(vec![(&mut table, &mut batch)], 256).unwrap();
     assert_eq!(table.rows.len(), 258);
     assert_eq!(batch.len(), 0);
+    assert!(batch.peer_rows.is_none());
+    assert_eq!(batch.seen_paths.capacity(), 0);
+    assert_eq!(batch.ids.capacity(), 0);
     NativeEmbeddedBatch::scan_pages(vec![(&mut table, &mut batch)], 256).unwrap();
     assert!(table.rows.iter().all(|row| matches!(row, Candidate::File(facts, _) if Arc::ptr_eq(facts, &source))));
     {

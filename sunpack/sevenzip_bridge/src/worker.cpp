@@ -35,6 +35,7 @@
 #include "internal/archive_operations.hpp"
 #include "internal/sevenzip_formats.hpp"
 #include "internal/sevenzip_sdk.hpp"
+#include "internal/sevenzip_paths.hpp"
 #include "internal/native_memory.hpp"
 #include "internal/extraction_replay.hpp"
 #include "internal/native_cpu_budget.hpp"
@@ -103,7 +104,8 @@ sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
 ) {
     using namespace sunpack::sevenzip;
     ExtractArchiveResult result;
-    result.status = probe.status;
+    // An apparently successful probe with no usable match is still a failure.
+    result.status = probe.status == PasswordTestStatus::Ok ? PasswordTestStatus::Error : probe.status;
     result.archive_type = probe.archive_type;
     result.matched_index = probe.matched_index;
     result.password_candidates_all_rejected = probe.status == PasswordTestStatus::WrongPassword;
@@ -343,7 +345,6 @@ struct WorkerRequest {
     std::wstring output_dir;
     std::wstring password;
     std::wstring codepage;
-    bool dry_run = false;
     bool report_progress = false;
     bool password_verified = false;
     bool scan_only = false;
@@ -372,7 +373,6 @@ WorkerRequest parse_worker_request(const std::string& request_frame) {
     request.output_dir = utf8_to_wide(fields.string_field("output_dir", ""));
     request.password = utf8_to_wide(fields.string_field("password", ""));
     request.codepage = utf8_to_wide(fields.string_field("codepage", ""));
-    request.dry_run = fields.bool_field("dry_run", false);
     request.report_progress = fields.bool_field("report_progress");
     request.password_verified = fields.bool_field("password_verified", false);
     request.scan_only = fields.string_field("operation", "extract") == "scan";
@@ -680,7 +680,7 @@ void select_volume_attempt(const WorkerArchiveInput& source,
 bool uncertain_volume_password(const sunpack::sevenzip::ExtractArchiveResult& result,
                                const sunpack::sevenzip::ExtractionReplay& replay) {
     using namespace sunpack::sevenzip;
-    return result.encrypted && !result.password_crc_proven &&
+    return result.encrypted && result.password_crc_proven_items == 0 &&
         !FAILED(result.input_trace.read_hresult) && result.status != PasswordTestStatus::Error &&
         (result.failure_stage == "item_extract" || result.failure_stage == "archive_open") &&
         (result.password_rejected || result.operation_result == kOpWrongPassword ||
@@ -693,10 +693,10 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
                                 const sunpack::sevenzip::ExtractionReplay& replay,
                                 bool password_verified) {
     using namespace sunpack::sevenzip;
-    if ((result.status == PasswordTestStatus::Ok && result.command_ok) ||
+    if (result.status == PasswordTestStatus::Ok ||
         ((result.wrong_password || result.password_rejected) && !password_verified &&
-         !result.password_crc_proven && !uncertain_volume_password(result, replay)) ||
-        (result.encrypted && !result.password_crc_proven && !password_verified && !uncertain_volume_password(result, replay)) ||
+         result.password_crc_proven_items == 0 && !uncertain_volume_password(result, replay)) ||
+        (result.encrypted && result.password_crc_proven_items == 0 && !password_verified && !uncertain_volume_password(result, replay)) ||
         result.unsupported_method || result.status == PasswordTestStatus::BackendUnavailable ||
         result.status == PasswordTestStatus::Error ||
         (FAILED(result.input_trace.read_hresult) && result.missing_volume_evidence != "open_volume_file_missing")) return false;
@@ -704,7 +704,7 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
     if (result.failure_stage != "archive_open" && result.failure_stage != "item_extract") return false;
     if (result.failure_kind != "structure_recognition" && result.failure_kind != "checksum_error" &&
         result.failure_kind != "data_error" && result.failure_kind != "corrupted_data" && result.failure_kind != "headers_error" &&
-        !((password_verified || result.password_crc_proven || uncertain_volume_password(result, replay)) && result.failure_kind == "encrypted_or_wrong_password") &&
+        !((password_verified || result.password_crc_proven_items != 0 || uncertain_volume_password(result, replay)) && result.failure_kind == "encrypted_or_wrong_password") &&
         result.failure_kind != "unexpected_end" && result.failure_kind != "missing_volume_or_tail") return false;
     // Binary readers record whether a variable source/range participated.
     // Seeks, fixed tails and failures confined to the fixed head are not proof.
@@ -713,7 +713,7 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
 
 int run_request(
     const WorkerRequest& request,
-    // The job's output-volume write facility, borrowed from the registry lease held by worker_loop; null for dry runs.
+    // The registry lease in worker_loop covers the output-volume writer.
     const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
     const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr
 ) {
@@ -731,12 +731,11 @@ int run_request(
     const std::wstring& password = request.password;
     const std::wstring& format_hint = request.archive_input.format_hint;
     const std::wstring& codepage = request.codepage;
-    const bool dry_run = request.dry_run;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
-    if (archive_path.empty() || (!dry_run && !request.scan_only && output_dir.empty())) {
+    if (archive_path.empty() || (!request.scan_only && output_dir.empty())) {
         print_frame(
             (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
-            (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message") + wire::text("archive_path is required; output_dir is required unless dry_run is true") + wire::end()));
+            (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message") + wire::text("archive_path is required; extraction also requires output_dir") + wire::end()));
         return 2;
     }
 
@@ -772,10 +771,8 @@ int run_request(
         auto& cursor = volume_replay->volumes;
         if (!cursor.started) {
             cursor.reserve(request.archive_input.volume_attempts);
-            std::error_code error;
             const auto root = std::filesystem::path(win32_extended_path(output_dir));
-            const bool output_owned = dry_run ||
-                ((!std::filesystem::exists(root, error) || std::filesystem::is_empty(root, error)) && !error);
+            const bool output_owned = directory_is_empty_or_missing(root);
             if (!output_owned) {
                 print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                     (wire::key("status") + wire::text("failed") + wire::key("failure_stage") + wire::text("output_prepare") + wire::key("failure_kind") + wire::text("output_filesystem") + wire::key("message") + wire::text("volume composition trials require an empty output directory") + wire::end()));
@@ -792,7 +789,7 @@ int run_request(
         return extract_archive(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
             format_hint, selected_password, output_dir, codepage,
             request.report_progress ? ExtractProgressCallback{std::ref(attempt_progress)} : ExtractProgressCallback{},
-            dry_run, archive_input.canonical_names, request.archive_input.native_volume_input, shared_writer, cancel_token);
+            archive_input.canonical_names, request.archive_input.native_volume_input, shared_writer, cancel_token);
     };
 
     ExtractArchiveResult result;
@@ -819,15 +816,13 @@ int run_request(
                 result = ExtractArchiveResult{};
             }
             if (cursor.discard_pending) {
-                if (!dry_run) {
-                    const auto error = discard_candidate_output(output_dir);
-                    if (error) {
-                        result.status = PasswordTestStatus::Error;
-                        result.failure_stage = "candidate_cleanup";
-                        result.failure_kind = "output_filesystem";
-                        result.message = error.message();
-                        break;
-                    }
+                const auto error = discard_candidate_output(output_dir);
+                if (error) {
+                    result.status = PasswordTestStatus::Error;
+                    result.failure_stage = "candidate_cleanup";
+                    result.failure_kind = "output_filesystem";
+                    result.message = error.message();
+                    break;
                 }
                 volume_replay->clear_output();
                 volume_replay->uncertain_read.store(false, std::memory_order_relaxed);
@@ -870,10 +865,8 @@ int run_request(
             auto *replay = current_extraction_replay;
             if (password_candidates.size() > 1 && replay && !replay->candidates_started) {
                 replay->candidates_started = true;
-                std::error_code error;
                 const auto root = std::filesystem::path(win32_extended_path(output_dir));
-                replay->candidate_output_owned = !dry_run &&
-                    (!std::filesystem::exists(root, error) || std::filesystem::is_empty(root, error)) && !error;
+                replay->candidate_output_owned = directory_is_empty_or_missing(root);
             }
             // Existing outputs belong to a continuation/user. Keep the read-only
             // diagnostic fallback there; fresh outputs can confirm by extracting.
@@ -911,12 +904,12 @@ int run_request(
                     // Confirmation shares the real extraction and its CRC receipts.
                     // Only ambiguous failures need the existing read-only probe.
                     result = extract_with_password(password_candidates[index]);
-                    const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
+                    const bool direct_ok = result.status == PasswordTestStatus::Ok;
                     const bool uncertain_password = volume_trials && uncertain_volume_password(result, *volume_replay);
                     if (uncertain_password) volume_replay->volume_password_uncertain = true;
                     // ENC authenticates the password during Open; later MAC/CRC failures are data damage.
                     if (!direct_ok && !uncertain_password && result.encrypted && result.archive_type != L"enc" &&
-                        !result.password_crc_proven &&
+                        result.password_crc_proven_items == 0 &&
                         !(cancel_token && cancel_token->load(std::memory_order_acquire)) &&
                         result.status != PasswordTestStatus::Error && result.failure_kind != "resource_unavailable" &&
                         !(current_native_memory_job() && current_native_memory_job()->revoked.load(std::memory_order_acquire)) &&
@@ -936,7 +929,7 @@ int run_request(
                             result.message = "wrong password";
                         }
                     }
-                    result.matched_index = direct_ok || result.password_crc_proven ? static_cast<int>(index) : -1;
+                    result.matched_index = direct_ok || result.password_crc_proven_items != 0 ? static_cast<int>(index) : -1;
                     result.password_candidates_all_rejected =
                         result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
                     if (direct_ok || (!result.password_candidates_all_rejected && !uncertain_password) || password_candidates.size() == 1 ||
@@ -955,12 +948,12 @@ int run_request(
 
         if (auto *memory = current_native_memory_job()) {
             if ((result.failure_kind == "resource_unavailable" ||
-                 (memory->denied.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok))) &&
+                 (memory->denied.load(std::memory_order_acquire) && result.status != PasswordTestStatus::Ok)) &&
                 !memory->revoked.load(std::memory_order_acquire))
                 memory->owner.retry(*memory);
             // An interrupted attempt is internal. Never publish its provisional
             // damage/password/output errors or a final result to the caller.
-            if (memory->revoked.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok)) return kMemoryRetry;
+            if (memory->revoked.load(std::memory_order_acquire) && result.status != PasswordTestStatus::Ok) return kMemoryRetry;
         }
 
         if (cancel_token && cancel_token->load(std::memory_order_acquire)) return interrupted_result(job_id);
@@ -999,9 +992,9 @@ int run_request(
             !result.unsupported_method &&
             result.status != PasswordTestStatus::BackendUnavailable &&
             result.status != PasswordTestStatus::Error &&
-            !(result.status == PasswordTestStatus::Ok && result.command_ok);
+            result.status != PasswordTestStatus::Ok;
         if (execution_input_failure) {
-            // Python already proved this split tail from the same structural
+            // Rust already proved this split tail from the same structural
             // analysis that produced ArchiveInputDescriptor. Do not perform a
             // second native scan: execute first, then use the analysis fact only
             // to classify a real backend failure. A later-completed archive can
@@ -1016,7 +1009,7 @@ int run_request(
         }
     }
 
-    const bool ok = result.status == PasswordTestStatus::Ok && result.command_ok;
+    const bool ok = result.status == PasswordTestStatus::Ok;
     std::string volume_selection;
     if (volume_trials && ok) {
         const auto& cursor = volume_replay->volumes;
@@ -1025,9 +1018,9 @@ int run_request(
         for (const auto source : cursor.selected) wire::append_number(volume_selection, source);
         volume_selection += wire::end() + wire::end();
     }
-    const std::string manifest_field = (ok && !dry_run)
+    const std::string manifest_field = ok
         ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result) : "";
-    const auto complete_files = !ok && !dry_run ? std::count_if(
+    const auto complete_files = !ok ? std::count_if(
         result.output_trace.items.begin(), result.output_trace.items.end(),
         [](const ExtractOutputItemTrace& item) {
             return !item.is_dir && item.done && !item.failed && item.operation_result == 0;
@@ -1039,16 +1032,6 @@ int run_request(
         wire::key("operation_result_name") + wire::text(operation_result_name(result.operation_result));
     const std::string input_trace_field = FAILED(result.input_trace.read_hresult) ?
         wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
-    const auto &output_trace = result.output_trace;
-    const std::string metadata_warning_field = (output_trace.metadata_failed_files || output_trace.metadata_failed_directories) ?
-        (wire::key("metadata_warning") + wire::object() + wire::key("file_count")) + wire::number(output_trace.metadata_failed_files) +
-        wire::key("directory_count") + wire::number(output_trace.metadata_failed_directories) +
-        wire::key("time_failure_count") + wire::number(output_trace.metadata_failed_times) +
-        wire::key("attribute_failure_count") + wire::number(output_trace.metadata_failed_attributes) +
-        wire::key("operation") + wire::text((output_trace.metadata_first_is_attributes ? "attributes" : "time")) +
-        wire::key("first_item_index") + wire::number(output_trace.metadata_first_item_index) +
-        wire::key("first_item") + wire::text(wide_to_utf8(output_trace.metadata_first_item)) +
-        wire::key("win32_error") + wire::number(output_trace.metadata_first_win32_error) + wire::end() : "";
 #ifdef SUP7Z_DEBUG
     const std::string pipeline_timing_field = pipeline_timing_enabled() ?
         wire::key("pipeline_timing") + pipeline_timing_wire(result.pipeline_timing) : "";
@@ -1066,7 +1049,6 @@ int run_request(
         wire::key("missing_volume_name") + wire::text(wide_to_utf8(result.missing_volume_name)) +
         wire::key("wrong_password") + wire::boolean(result.wrong_password) +
         wire::key("password_rejected") + wire::boolean(result.password_rejected) +
-        wire::key("password_crc_proven") + wire::boolean(result.password_crc_proven) +
         wire::key("password_crc_proven_items") + wire::number(result.password_crc_proven_items) +
         wire::key("password_candidates_all_rejected") + wire::boolean(result.password_candidates_all_rejected) +
         wire::key("matched_index") + wire::number(result.matched_index) +
@@ -1076,7 +1058,7 @@ int run_request(
         wire::key("archive_type") + wire::text(wide_to_utf8(result.archive_type)) +
         manifest_field +
         wire::key("failed_item") + wire::text(wide_to_utf8(result.failed_item)) +
-        wire::key("message") + wire::text(result.message) + metadata_warning_field +
+        wire::key("message") + wire::text(result.message) +
         failure_fields + input_trace_field
 #ifdef SUP7Z_DEBUG
         + pipeline_timing_field
@@ -1602,7 +1584,7 @@ private:
                         code = 1;
                         print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                             (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("input_changed") + wire::key("failure_stage") + wire::text("native_replay") + wire::key("message") + wire::text("archive input changed while waiting for memory; rescan required") + wire::end()));
-                    } else if (!job.request.dry_run && !job.request.scan_only) {
+                    } else if (!job.request.scan_only) {
                         const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
                         auto lease = writer_registry_->acquire(key);
                         register_cancel_writer(job_id, lease.writer_pointer());

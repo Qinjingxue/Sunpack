@@ -92,8 +92,8 @@ void check_extract_to_disk_callback()
     std::printf("ExtractToDiskCallback\n");
     ExtractOutputTrace trace;
     auto *raw = new ExtractToDiskCallback(
-        nullptr, L"", L"",
-        ExtractProgressCallback{}, true, trace, 0);
+        nullptr, L"", std::filesystem::temp_directory_path().wstring(),
+        ExtractProgressCallback{}, trace, 0);
     CMyComPtr<IArchiveExtractCallback> callback(raw);
     auto *probe = raw;
 
@@ -164,46 +164,42 @@ void check_archive_root_directory_entries()
     {
         std::printf("  %s %ls\n", entry.is_dir ? "directory" : "file", entry.name);
         CMyComPtr<IInArchive> archive(new EntryArchive(entry.name, entry.is_dir));
-        ++index;
-        for (const bool dry_run : {false, true})
+        const auto output = root / std::to_wstring(++index);
+        std::vector<std::string> events;
+        ExtractOutputTrace trace;
+        auto *raw = new ExtractToDiskCallback(
+            archive.Interface(), L"", output.wstring(),
+            [&events](const ExtractProgressEvent &event) { events.emplace_back(event.event); }, trace, 1);
+        CMyComPtr<IArchiveExtractCallback> callback(raw);
+        CMyComPtr<ISequentialOutStream> stream;
+        const HRESULT hr = callback->GetStream(0, &stream, kExtractMode);
+        check(!stream && trace.items.size() == 1, "callback records the member without an output stream");
+        if (entry.accepted)
         {
-            const auto output = root / (std::to_wstring(index) + (dry_run ? L"-dry" : L"-disk"));
-            std::vector<std::string> events;
-            ExtractOutputTrace trace;
-            auto *raw = new ExtractToDiskCallback(
-                archive.Interface(), L"", output.wstring(),
-                [&events](const ExtractProgressEvent &event) { events.emplace_back(event.event); }, dry_run, trace, 1);
-            CMyComPtr<IArchiveExtractCallback> callback(raw);
-            CMyComPtr<ISequentialOutStream> stream;
-            const HRESULT hr = callback->GetStream(0, &stream, kExtractMode);
-            check(!stream && trace.items.size() == 1, "callback records the member without an output stream");
-            if (entry.accepted)
+            check(hr == S_OK && callback->SetOperationResult(kOpOk) == S_OK,
+                  "root directory entry succeeds as a no-op");
+            check(raw->files_written() == 0 &&
+                  !raw->output_error() && raw->failed_item().empty(),
+                  "root directory entry writes no files");
+            check(!std::filesystem::exists(output) || std::filesystem::is_empty(output),
+                  "root directory entry creates no child output");
+            check(events == std::vector<std::string>{"item_start", "item_done"},
+                  "root directory entry reports start and completion");
+            if (trace.items.size() == 1)
             {
-                check(hr == S_OK && callback->SetOperationResult(kOpOk) == S_OK,
-                      "root directory entry succeeds as a no-op");
-                check(raw->files_written() == 0 &&
-                      !raw->output_error() && raw->failed_item().empty(),
-                      "root directory entry writes no files");
-                check(!std::filesystem::exists(output) || std::filesystem::is_empty(output),
-                      "root directory entry creates no child output");
-                check(events == std::vector<std::string>{"item_start", "item_done"},
-                      "root directory entry reports start and completion");
-                if (trace.items.size() == 1)
-                {
-                    const auto &item = trace.items.front();
-                    check(item.is_dir && item.done && !item.failed && item.output_path.empty(),
-                          "root directory trace completes without an output path");
-                }
+                const auto &item = trace.items.front();
+                check(item.is_dir && item.done && !item.failed && item.output_path.empty(),
+                      "root directory trace completes without an output path");
             }
-            else
-            {
-                check(hr == E_INVALIDARG && raw->output_error() && raw->failed_item() == entry.name &&
-                      raw->files_written() == 0,
-                      "unsafe output path is rejected");
-                check(trace.items.size() == 1 && trace.items.front().failed &&
-                      trace.last_hresult == E_INVALIDARG,
-                      "unsafe output path retains its failure trace");
-            }
+        }
+        else
+        {
+            check(hr == E_INVALIDARG && raw->output_error() && raw->failed_item() == entry.name &&
+                  raw->files_written() == 0,
+                  "unsafe output path is rejected");
+            check(trace.items.size() == 1 && trace.items.front().failed &&
+                  trace.last_hresult == E_INVALIDARG,
+                  "unsafe output path retains its failure trace");
         }
     }
     std::filesystem::remove_all(root);
@@ -221,7 +217,7 @@ void check_completed_outputs_release_past_decoder_failure()
         CMyComPtr<IInArchive> archive(new EntryArchive(L"entry", false));
         ExtractOutputTrace trace;
         auto *raw = new ExtractToDiskCallback(
-            archive.Interface(), L"", root.wstring(), {}, false, trace, 65, writer);
+            archive.Interface(), L"", root.wstring(), {}, trace, 65, writer);
         CMyComPtr<IArchiveExtractCallback> callback(raw);
         for (UInt32 index = 0; index < 64; ++index)
         {
@@ -393,7 +389,7 @@ void check_archive_open_start_and_carrier_fallback()
             output.write(tail.data(), tail.size());
         }
         observed_logical_read_bytes = 0;
-        const auto result = extract_archive(path.wstring(), {path.wstring()}, {}, L"rar", L"", root.wstring(), L"", {}, true);
+        const auto result = extract_archive(path.wstring(), {path.wstring()}, {}, L"rar", L"", (root / L"output").wstring(), L"");
         check(result.status == PasswordTestStatus::Ok && result.archive_type == L"rar4",
               "RAR4 opens with a generic family hint, including carrier prefix fallback");
         if (!prefix) {
@@ -402,7 +398,7 @@ void check_archive_open_start_and_carrier_fallback()
         } else {
             const std::vector<ExtractInputRange> ranges = {{path.wstring(), prefix, prefix + rar.size(), true}};
             observed_logical_read_bytes = 0;
-            const auto carved = extract_archive(path.wstring(), {}, ranges, L"rar", L"", root.wstring(), L"", {}, true);
+            const auto carved = extract_archive(path.wstring(), {}, ranges, L"rar", L"", (root / L"carved").wstring(), L"");
             check(carved.status == PasswordTestStatus::Ok && carved.archive_type == L"rar4" &&
                   observed_logical_read_bytes > 0 && observed_logical_read_bytes < (512u << 10),
                   "canonical carrier range opens without consuming the underlying prefix and tail");

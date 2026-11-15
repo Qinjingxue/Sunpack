@@ -1,6 +1,6 @@
 use super::PasswordVerification;
 use crate::formats::seven_zip::{
-    seven_zip_encryption_facts_from_next_header, RelationNextHeader, SevenZipPasswordProbe,
+    predecoded_seven_zip_header_is_supported, RelationNextHeader, SevenZipPasswordProbe,
     SEVEN_Z_HEADER_SIZE, SEVEN_Z_MAGIC,
 };
 use crate::io::archive_state::InputExtent;
@@ -196,7 +196,7 @@ fn seven_zip_tail_requirement(
 fn find_first_conclusive_header_with_probe(
     candidates: &[Arc<str>],
     probe: &SevenZipPasswordProbe,
-) -> Option<(usize, HeaderRead)> {
+) -> Option<(usize, Result<(), String>)> {
     let cancellation = Cancellation::current();
     if cancellation.cancelled() {
         return None;
@@ -227,30 +227,17 @@ fn find_first_conclusive_header_with_probe(
     }?;
     Some((
         possible.0,
-        match possible.1 {
-            Ok(decoded) => read_predecoded_header(&decoded),
-            Err(error) => HeaderRead::Unsupported(error),
-        },
+        possible.1.and_then(|decoded| {
+            predecoded_seven_zip_header_is_supported(&decoded)
+                .then_some(())
+                .ok_or_else(|| "7z decoded header requires extraction confirmation".into())
+        }),
     ))
 }
 
-fn read_predecoded_header(decoded_header: &[u8]) -> HeaderRead {
-    // The decoder already proved the header CRC. Reuse the analysis parser:
-    // FilesInfo properties are skipped in place, without per-file objects or
-    // another whole-header copy. Unhandled trees retain extraction fallback.
-    let facts = seven_zip_encryption_facts_from_next_header(decoded_header);
-    if facts.scan_complete {
-        HeaderRead::Ok {
-            payload_encrypted: facts.encrypted_payload,
-        }
-    } else {
-        HeaderRead::Unsupported("7z decoded header requires extraction confirmation".into())
-    }
-}
-
-fn conclusive_status(index: usize, outcome: HeaderRead) -> std::io::Result<PasswordVerification> {
+fn conclusive_status(index: usize, outcome: Result<(), String>) -> std::io::Result<PasswordVerification> {
     match outcome {
-        HeaderRead::Ok { .. } => status_with_details(
+        Ok(()) => status_with_details(
             "match",
             index as i32,
             (index + 1) as i32,
@@ -258,11 +245,9 @@ fn conclusive_status(index: usize, outcome: HeaderRead) -> std::io::Result<Passw
             Some(false),
             Some("7z_encrypted_header"),
         ),
-        HeaderRead::Unsupported(message) => {
+        Err(message) => {
             status("unknown_needs_final_verifier", -1, index as i32, &message)
         }
-        HeaderRead::Damaged(message) => status("damaged", -1, index as i32, &message),
-        HeaderRead::WrongPasswordOrPasswordRequired => unreachable!("filtered outcome"),
     }
 }
 
