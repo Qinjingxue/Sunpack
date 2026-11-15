@@ -40,15 +40,3 @@ fn refresh_rescans_when_output_is_published_after_enumeration() {
     fs::remove_dir(&output).unwrap();
     fs::remove_dir(&root).unwrap();
 }
-
-#[test]
-fn ordinary_commit_keeps_usn_identity_cache_until_idle_commit() {
-    let state = crate::watch_store::NativeWatchState::new();
-    let catalog = super::NativeWatchCatalog::new(&state, None);
-    catalog.recovery_ids.lock().unwrap().insert("volume".into(), Default::default());
-    catalog.commit(false);
-    catalog.commit(false);
-    assert_eq!(catalog.recovery_ids.lock().unwrap().len(), 1);
-    catalog.commit(true);
-    assert!(catalog.recovery_ids.lock().unwrap().is_empty());
-}

@@ -10,7 +10,7 @@ use std::env;
 use std::io;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
@@ -34,12 +34,52 @@ use windows_sys::Win32::System::Services::{
 };
 
 static REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
-static STATE: OnceLock<Mutex<ClientState>> = OnceLock::new();
+static STATE: Mutex<ClientState> = Mutex::new(ClientState {
+    idle: None,
+    leases: 0,
+    generation: 0,
+});
 
-#[derive(Default)]
 struct ClientState {
-    connection: Option<BrokerConnection>,
+    idle: Option<BrokerConnection>,
     leases: usize,
+    generation: u64,
+}
+
+impl ClientState {
+    fn lock() -> io::Result<MutexGuard<'static, Self>> {
+        STATE
+            .lock()
+            .map_err(|_| io::Error::other("broker client state poisoned"))
+    }
+
+    fn generation(&self) -> io::Result<u64> {
+        if self.leases == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "SunPack Watch Broker has not been acquired",
+            ));
+        }
+        Ok(self.generation)
+    }
+
+    fn take_idle(&mut self, generation: u64) -> io::Result<Option<BrokerConnection>> {
+        if self.generation()? != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "SunPack Watch Broker lease ended",
+            ));
+        }
+        Ok(self.idle.take())
+    }
+
+    fn recycle(&mut self, generation: u64, connection: BrokerConnection) -> Option<BrokerConnection> {
+        if self.leases != 0 && self.generation == generation && self.idle.is_none() {
+            self.idle = Some(connection);
+            return None;
+        }
+        Some(connection)
+    }
 }
 
 struct BrokerConnection(HANDLE);
@@ -98,31 +138,34 @@ impl BrokerConnection {
 }
 
 pub fn broker_acquire() -> io::Result<()> {
-    let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
-    let mut state = state
-        .lock()
-        .map_err(|_| io::Error::other("broker client state poisoned"))?;
-    if state.connection.is_none() {
-        state.connection = Some(connect_and_hello()?);
+    let mut state = ClientState::lock()?;
+    if state.leases != 0 {
+        state.leases += 1;
+        return Ok(());
     }
+    drop(state);
+    let connection = connect_and_hello(None)?;
+    let mut state = ClientState::lock()?;
     state.leases += 1;
+    let generation = state.generation;
+    let retired = state.recycle(generation, connection);
+    drop(state);
+    drop(retired);
     Ok(())
 }
 
 pub fn broker_release() -> io::Result<()> {
-    let Some(state) = STATE.get() else {
-        return Ok(());
-    };
-    let mut state = state
-        .lock()
-        .map_err(|_| io::Error::other("broker client state poisoned"))?;
+    let mut state = ClientState::lock()?;
     if state.leases == 0 {
         return Ok(());
     }
     state.leases -= 1;
     if state.leases == 0 {
-        // Disconnecting ends the server-side lease, including on process exit.
-        state.connection = None;
+        // In-flight requests close their own pipes when they finish.
+        state.generation = state.generation.wrapping_add(1);
+        let idle = state.idle.take();
+        drop(state);
+        drop(idle);
     }
     Ok(())
 }
@@ -183,8 +226,7 @@ pub fn broker_for_each_directory_change(
         while cursor < end {
             request.request_id = next_request_id();
             request.previous_usn = cursor;
-            // The pipe is unlocked after each complete frame. Parsing and
-            // applying the page can proceed alongside other broker requests.
+            // Return the pipe before running the caller's page observer.
             let response = transact_request(&request, &query, &mut payload)?;
             if response.journal_id != journal
                 || response.next_usn <= cursor
@@ -227,42 +269,34 @@ fn transact_request(
     query: &[u8],
     payload: &mut Vec<u8>,
 ) -> io::Result<Response> {
-    let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
     // Only these read-only requests are safe to replay after the pipe dies:
     // a request may have reached the broker before the connection was lost.
     let replay_safe = matches!(
         request.opcode,
         Opcode::ProbeVolume | Opcode::ReadChangeReasons
     );
+    let (generation, mut idle) = {
+        let mut state = ClientState::lock()?;
+        (state.generation()?, state.idle.take())
+    };
     loop {
-        let mut state = state
-            .lock()
-            .map_err(|_| io::Error::other("broker client state poisoned"))?;
-        if state.leases == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "SunPack Watch Broker has not been acquired",
-            ));
-        }
-        if state.connection.is_none() {
-            state.connection = Some(connect_and_hello()?);
-        }
-        match state
-            .connection
-            .as_mut()
-            .unwrap()
-            .transact(request, query, payload)
-        {
-            // Business errors have completed their exchange and keep the lease.
-            Ok(response) => return ensure_ok(response),
+        let mut connection = match idle.take() {
+            Some(connection) => connection,
+            None => connect_and_hello(Some(generation))?,
+        };
+        match connection.transact(request, query, payload) {
+            Ok(response) => {
+                // Keep one idle pipe to preserve the broker lease. Surplus
+                // connections release their server threads when work ends.
+                let retired = ClientState::lock()?.recycle(generation, connection);
+                drop(retired);
+                return ensure_ok(response);
+            }
             Err(error) => {
-                state.connection.take();
+                drop(connection);
                 if !replay_safe || !is_transient_broker_io(&error) {
                     return Err(error);
                 }
-                // Give other callers the chance to release or reconnect while
-                // this request backs off after the broken exchange.
-                drop(state);
                 thread::sleep(Duration::from_millis(50));
             }
         }
@@ -286,31 +320,56 @@ fn is_transient_broker_io(error: &io::Error) -> bool {
     )
 }
 
-fn connect_and_hello() -> io::Result<BrokerConnection> {
+fn connect_and_hello(generation: Option<u64>) -> io::Result<BrokerConnection> {
+    let pipe_name = wide(&configured_name(
+        PIPE_NAME_ENV,
+        PIPE_NAME,
+        TEST_PIPE_NAME_PREFIX,
+    ));
+    if generation.is_none() {
+        start_service()?;
+    }
+    let mut starting_service = false;
     loop {
-        // Service manager/start failures are real OS errors. Never hide them
-        // behind an unlimited retry loop (e.g. missing service or no access).
-        let mut connection = match start_service().and_then(|_| connect_pipe()) {
-            Ok(connection) => connection,
-            // Include a restart raced by connect_pipe after the last lease left.
-            Err(error) if matches!(error.raw_os_error(), Some(1053 | 1055 | 1061)) => {
-                thread::sleep(Duration::from_millis(50));
-                continue;
+        if let Some(generation) = generation {
+            // Under pipe saturation, reuse a returning connection even if
+            // the service still has no free pipe instance.
+            match ClientState::lock()?.take_idle(generation) {
+                Ok(Some(idle)) => return Ok(idle),
+                Ok(None) => {}
+                // Complete Hello if this request started the service. It
+                // only exits automatically once it has seen a lease.
+                Err(_) if starting_service => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
-        };
-        match connection.transact(
-            &Request::simple(Opcode::Hello, next_request_id()),
-            &[],
-            &mut Vec::new(),
-        ) {
-            Ok(response) => {
-                // Protocol errors and explicit broker rejection are terminal.
-                ensure_ok(response)?;
-                return Ok(connection);
+        }
+        match open_pipe(&pipe_name) {
+            Ok(mut connection) => {
+                match connection.transact(
+                    &Request::simple(Opcode::Hello, next_request_id()),
+                    &[],
+                    &mut Vec::new(),
+                ) {
+                    Ok(response) => {
+                        ensure_ok(response)?;
+                        return Ok(connection);
+                    }
+                    Err(error) if is_transient_broker_io(&error) => {
+                        drop(connection);
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            Err(error) if is_transient_broker_io(&error) => {
-                thread::sleep(Duration::from_millis(50));
+            Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                // If it vanished after we observed RUNNING, drive the SCM
+                // again. It can also be between RUNNING and its first pipe.
+                start_service()?;
+                starting_service = true;
+                wait_for_pipe(&pipe_name)?;
+            }
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                wait_for_pipe(&pipe_name)?;
             }
             Err(error) => return Err(error),
         }
@@ -340,6 +399,18 @@ fn ensure_ok(response: Response) -> io::Result<Response> {
 }
 
 fn start_service() -> io::Result<()> {
+    loop {
+        match start_service_once() {
+            // A last-lease shutdown can race a new connection.
+            Err(error) if matches!(error.raw_os_error(), Some(1053 | 1055 | 1061)) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn start_service_once() -> io::Result<()> {
     let manager = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
         return Err(io::Error::last_os_error());
@@ -488,45 +559,31 @@ fn query_service_status(
     }
 }
 
-fn connect_pipe() -> io::Result<BrokerConnection> {
-    let pipe_name = wide(&configured_name(
-        PIPE_NAME_ENV,
-        PIPE_NAME,
-        TEST_PIPE_NAME_PREFIX,
-    ));
-    loop {
-        let handle = unsafe {
-            CreateFileW(
-                pipe_name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                null_mut(),
-            )
-        };
-        if handle != INVALID_HANDLE_VALUE {
-            let mode = PIPE_READMODE_MESSAGE;
-            if unsafe { SetNamedPipeHandleState(handle, &mode, null(), null()) } == 0 {
-                let error = io::Error::last_os_error();
-                unsafe { CloseHandle(handle) };
-                return Err(error);
-            }
-            return Ok(BrokerConnection(handle));
-        }
-        let error = unsafe { GetLastError() };
-        if error != ERROR_FILE_NOT_FOUND && error != ERROR_PIPE_BUSY {
-            return Err(io::Error::from_raw_os_error(error as i32));
-        }
-        if error == ERROR_FILE_NOT_FOUND {
-            // The last lease may have left after start_service observed RUNNING.
-            // Reuse SCM startup instead of waiting forever for an exited broker.
-            start_service()?;
-        }
-        if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), 50) } != 0 {
-            continue;
-        }
+fn open_pipe(pipe_name: &[u16]) -> io::Result<BrokerConnection> {
+    let handle = unsafe {
+        CreateFileW(
+            pipe_name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let connection = BrokerConnection(handle);
+    let mode = PIPE_READMODE_MESSAGE;
+    if unsafe { SetNamedPipeHandleState(handle, &mode, null(), null()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(connection)
+}
+
+fn wait_for_pipe(pipe_name: &[u16]) -> io::Result<()> {
+    if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), 50) } == 0 {
         match unsafe { GetLastError() } {
             ERROR_SEM_TIMEOUT => {}
             // The SCM can report RUNNING before the first pipe is created.
@@ -535,6 +592,7 @@ fn connect_pipe() -> io::Result<BrokerConnection> {
             error => return Err(io::Error::from_raw_os_error(error as i32)),
         }
     }
+    Ok(())
 }
 
 fn write_exact(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {

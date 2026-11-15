@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::io;
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -232,6 +232,17 @@ fn query_or_create_journal(
 ) -> io::Result<(u64, i64)> {
     match query() {
         Err(error) if error.raw_os_error() == Some(ERROR_JOURNAL_NOT_ACTIVE) => {
+            // Independent read handles can probe the same inactive journal.
+            // Serialize creation only, since creating an active journal can
+            // change its size settings.
+            static CREATE: Mutex<()> = Mutex::new(());
+            let _creating = CREATE
+                .lock()
+                .map_err(|_| io::Error::other("journal creation lock poisoned"))?;
+            match query() {
+                Err(error) if error.raw_os_error() == Some(ERROR_JOURNAL_NOT_ACTIVE) => {}
+                result => return result,
+            }
             create()?;
             query()
         }

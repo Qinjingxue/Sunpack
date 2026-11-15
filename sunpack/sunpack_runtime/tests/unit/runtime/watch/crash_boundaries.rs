@@ -149,7 +149,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 available_roots: HashSet::from([key(&watched)]),
                 user_password_signature: user_password_signature(&settings.user_passwords),
                 settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
-                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), recovery_ids: HashMap::new(), journal,
                 options: None,
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),

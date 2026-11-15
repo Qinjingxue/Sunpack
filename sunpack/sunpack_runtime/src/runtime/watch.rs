@@ -2096,6 +2096,7 @@ struct Scheduler {
     engine: Arc<Engine>,
     journal: Arc<journal::Journal>,
     catalog: Arc<NativeWatchCatalog>,
+    recovery_ids: HashMap<String, filesystem::DirectoryRecoveryCache>,
     options: Option<NativeDirectoryScanOptions>,
     deep_options: NativeDirectoryScanOptions,
     passwords: Arc<BuiltinStore>,
@@ -2179,6 +2180,7 @@ impl Scheduler {
             engine,
             journal,
             catalog,
+            recovery_ids: HashMap::new(),
             options: None,
             deep_options,
             passwords,
@@ -2240,7 +2242,7 @@ impl Scheduler {
         self.toast.take();
         *self.external.current.write().unwrap() = None;
         self.broker_lease.take();
-        self.catalog.commit(true);
+        self.commit_idle_catalog();
         self.journal.suspend()?;
         self.catalog.close();
         self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(), None));
@@ -2255,6 +2257,11 @@ impl Scheduler {
         self.hub.clear_idle_completed_families();
         self.cache_deadline = None;
         Ok(())
+    }
+
+    fn commit_idle_catalog(&mut self) {
+        self.recovery_ids = HashMap::new();
+        self.catalog.commit(true);
     }
 
     fn observe_config(
@@ -2494,6 +2501,7 @@ impl Scheduler {
             if refresh_catalog {
                 self.root_observers.clear();
                 self.dependency_observers.clear();
+                self.recovery_ids.clear();
                 let scopes: Arc<[_]> = self.roots.values()
                     .map(|(_, scope)| scope.clone()).collect::<Vec<_>>().into();
                 let mut external = self.external.current.write().unwrap();
@@ -2837,8 +2845,9 @@ impl Scheduler {
         }
         *self.external.current.write().unwrap() = None;
         *self.hub.claims.lock().unwrap() = HashMap::new();
-        self.engine.run_stage("watch_close", Origin::Watch, || {
-            self.catalog.commit(true);
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_close", Origin::Watch, || {
+            self.commit_idle_catalog();
             self.catalog.close();
             self.journal.log(json!({"event":"watch_stopped"}));
             self.journal.flush()
@@ -2962,7 +2971,7 @@ impl Scheduler {
                     }, || {
                         self.checkpoint(&HashMap::new(), true, false)?;
                         engine.run_stage("catalog_maintenance", Origin::Watch, || {
-                            self.catalog.commit(true);
+                            self.commit_idle_catalog();
                             self.hub.clear_idle_completed_families();
                             self.journal.state().trim_idle_storage();
                             self.pending.shrink_to_fit();
@@ -3193,20 +3202,17 @@ impl Scheduler {
         path_changes: &HashMap<PathBuf, PathChange>,
     ) -> io::Result<()> {
         if self.options.is_none() { return Ok(()); }
-        let selected = self
-            .roots
-            .iter()
-            .filter(|(id, _)| all_roots || changed.contains_key(*id))
-            .map(|(id, (root, scope))| (id.clone(), root.clone(), scope.clone()))
-            .collect::<Vec<_>>();
-        let mut groups: HashMap<(String, u64), (i64, i64, Vec<NativeDiscoveryScope>)> =
+        use rayon::prelude::*;
+
+        let mut groups: HashMap<String, (u64, i64, i64, Vec<NativeDiscoveryScope>)> =
             HashMap::new();
-        let mut volume_cursors = HashMap::new();
         let mut probes = Vec::new();
         let mut reopened = HashSet::new();
-        for (id, root, scope) in selected {
+        for (id, (root, scope)) in self.roots.iter()
+            .filter(|(id, _)| all_roots || changed.contains_key(*id))
+        {
             if !root.path.is_dir() {
-                self.available_roots.remove(&id);
+                self.available_roots.remove(id);
                 continue;
             }
             if self.available_roots.insert(id.clone()) && !startup {
@@ -3215,19 +3221,30 @@ impl Scheduler {
             // Use the same directory generation to validate and publish this
             // cursor. A rename may replace its path while recovery is running.
             let identity = output_identity(&scope.root).ok();
-            // Resolve each root independently, including its mount aliases.
-            // Roots on the same physical volume share this checkpoint's USN
-            // upper bound; later changes remain available to the next one.
-            let current = filesystem::watch_volume_device(&scope.root).and_then(|volume| {
-                let (journal, end) = match volume_cursors.get(&volume) {
-                    Some(&cursor) => cursor,
-                    None => {
-                        let cursor = filesystem::watch_volume_cursor(&volume)?;
-                        volume_cursors.insert(volume.clone(), cursor);
-                        cursor
-                    }
-                };
-                Ok((volume, journal, end))
+            let volume = filesystem::watch_volume_device(&scope.root);
+            probes.push((id.clone(), root.clone(), scope.clone(), identity, volume));
+        }
+        // Mount aliases share one checkpoint boundary per physical volume.
+        let volumes: HashSet<_> = probes.iter()
+            .filter_map(|(_, _, _, _, volume)| volume.as_deref().ok()).collect();
+        let volume_cursors: HashMap<_, _> = volumes.into_par_iter()
+            .map(|volume| (volume.to_owned(), filesystem::watch_volume_cursor(volume).map_err(Arc::new)))
+            .collect();
+        if !self.recovery_ids.is_empty() {
+            let mounted_roots: HashMap<_, _> = probes.iter().filter_map(|(_, _, scope, _, volume)| {
+                Some((crate::path_keys::path_key(&scope.root), volume.as_deref().ok()?))
+            }).collect();
+            // A root can be remounted without a policy edit. Retire the old
+            // cache before any volume starts reusing directory identities.
+            self.recovery_ids.retain(|volume, cache| {
+                !cache.roots.keys().any(|root| {
+                    mounted_roots.get(root).is_some_and(|current| *current != volume)
+                })
+            });
+        }
+        let probes = probes.into_iter().map(|(id, root, scope, identity, volume)| {
+            let current = volume.map_err(Arc::new).and_then(|volume| {
+                volume_cursors[volume.as_str()].clone().map(|(journal, end)| (volume, journal, end))
             });
             let cached = identity.as_deref().and_then(|identity| self.catalog.cursor(&scope, identity));
             if let (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end))) =
@@ -3240,18 +3257,14 @@ impl Scheduler {
                                 && (0..=i128::from(*end)).contains(&cursor.next_usn)
                         })
                         .map_or(*old_end, |cursor| (*old_end).min(cursor.next_usn as i64));
-                    let entry = groups.entry((volume.clone(), *journal)).or_insert((
-                        start,
-                        *end,
-                        Vec::new(),
-                    ));
-                    entry.0 = entry.0.min(start);
-                    entry.1 = entry.1.max(*end);
-                    entry.2.push(scope.clone());
+                    let (_, first, _, scopes) = groups.entry(volume.clone())
+                        .or_insert_with(|| (*journal, start, *end, Vec::new()));
+                    *first = (*first).min(start);
+                    scopes.push(scope.clone());
                 }
             }
-            probes.push((id, root, scope, identity, current, cached));
-        }
+            (id, root, scope, identity, current, cached)
+        }).collect::<Vec<_>>();
         if !reopened.is_empty() {
             // Old snapshots can have only an outside literal name while its
             // physical watched volume is offline. Resolve those legacy names
@@ -3263,11 +3276,14 @@ impl Scheduler {
             let passwords = self.passwords.snapshot();
             self.retry_password_failures(&passwords, Some(&reopened))?;
         }
-        let mut ranges = HashMap::new();
-        for ((volume, journal), (start, end, scopes)) in groups {
-            let changed = self
-                .catalog
-                .recover_changes(&scopes, &volume, journal, start, end)
+        let jobs: Vec<_> = groups.into_iter().map(|(volume, range)| {
+            let cache = self.recovery_ids.remove(&volume).unwrap_or_default();
+            (volume, range, cache)
+        }).collect();
+        let catalog = &self.catalog;
+        let recovered: Vec<_> = jobs.into_par_iter().map(|(volume, (journal, start, end, scopes), mut cache)| {
+            let changed = catalog
+                .recover_changes(&scopes, &volume, journal, start, end, &mut cache)
                 .map(|mut paths| {
                     paths.sort_unstable_by_key(String::len);
                     paths.into_iter().map(|path| {
@@ -3275,7 +3291,14 @@ impl Scheduler {
                         (path, id)
                     }).collect::<Vec<_>>()
                 });
-            ranges.insert((volume, journal), (end, changed));
+            (volume, changed, cache)
+        }).collect();
+        let mut ranges = HashMap::with_capacity(recovered.len());
+        for (volume, changed, cache) in recovered {
+            if !cache.roots.is_empty() {
+                self.recovery_ids.insert(volume.clone(), cache);
+            }
+            ranges.insert(volume, changed);
         }
         let mut marks = HashSet::new();
         let mut admitted = HashSet::new();
@@ -3290,13 +3313,13 @@ impl Scheduler {
                         && journal == old_journal
                         && (1..=*end).contains(old_end) =>
                 {
-                    ranges.get(&(volume.clone(), *journal))
+                    ranges.get(volume)
                 }
                 _ => None,
             };
             let mut paths = Vec::new();
             let mut errors = Vec::new();
-            let rebuild = !root.scanned || range.is_none_or(|(_, entries)| entries.is_err());
+            let rebuild = !root.scanned || range.is_none_or(|entries| entries.is_err());
             if rebuild {
                 // Only startup without a trusted persisted cursor establishes
                 // a conservative baseline. During a running session the in-memory
@@ -3341,7 +3364,7 @@ impl Scheduler {
                         }
                     }
                 }
-            } else if let Some((_, Ok(changes))) = range {
+            } else if let Some(Ok(changes)) = range {
                 let mut covered = HashSet::new();
                 let mut full_refresh = false;
                 // A directory notification can arrive before its USN record
@@ -3442,10 +3465,7 @@ impl Scheduler {
                 self.retry_volume_peers(&scope, &stem, &mut retried)?;
             }
             match (current, identity) {
-                (Ok((volume, journal, mut end)), Some(identity)) if errors.is_empty() => {
-                    if let Some((current_end, Ok(_))) = range {
-                        end = *current_end;
-                    }
+                (Ok((volume, journal, end)), Some(identity)) if errors.is_empty() => {
                     let changed = cached.as_ref().is_none_or(|(old_volume, old_journal, old_end)| {
                         (old_volume, *old_journal, *old_end) != (&volume, journal, end)
                     });

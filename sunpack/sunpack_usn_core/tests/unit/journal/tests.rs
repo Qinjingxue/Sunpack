@@ -24,7 +24,7 @@ fn probe_creates_journal_only_for_not_active_error() {
     let result = query_or_create_journal(
         || {
             queries.set(queries.get() + 1);
-            if queries.get() == 1 {
+            if queries.get() <= 2 {
                 Err(io::Error::from_raw_os_error(ERROR_JOURNAL_NOT_ACTIVE))
             } else {
                 Ok((42, 100))
@@ -36,10 +36,15 @@ fn probe_creates_journal_only_for_not_active_error() {
         },
     );
     assert_eq!(result.unwrap(), (42, 100));
-    assert_eq!((queries.get(), creates.get()), (2, 1));
+    assert_eq!((queries.get(), creates.get()), (3, 1));
 
     assert_eq!(
         query_or_create_journal(|| Ok((7, 50)), || panic!("journal already exists")).unwrap(),
+        (7, 50)
+    );
+    let mut queries = [Err(io::Error::from_raw_os_error(ERROR_JOURNAL_NOT_ACTIVE)), Ok((7, 50))].into_iter();
+    assert_eq!(
+        query_or_create_journal(|| queries.next().unwrap(), || panic!("another probe created the journal")).unwrap(),
         (7, 50)
     );
     let error = query_or_create_journal(
@@ -68,7 +73,7 @@ fn probe_propagates_create_or_requery_failures() {
         || Ok(()),
     )
     .unwrap_err();
-    assert_eq!(queries.get(), 2);
+    assert_eq!(queries.get(), 3);
     assert_eq!(error.raw_os_error(), Some(ERROR_JOURNAL_NOT_ACTIVE));
 }
 

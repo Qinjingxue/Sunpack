@@ -1354,7 +1354,6 @@ pub(crate) struct NativeWatchCatalog {
     outputs: crate::watch_store::active_outputs::OutputReservations,
     store: Mutex<Option<super::catalog_store::CatalogStore>>,
     error: Mutex<Option<String>>,
-    recovery_ids: Mutex<HashMap<String, crate::filesystem::DirectoryRecoveryCache>>,
 }
 
 struct CatalogTables {
@@ -1393,7 +1392,6 @@ impl NativeWatchCatalog {
             outputs: Arc::clone(&outputs.outputs),
             store: Mutex::new(store),
             error: Mutex::new(error),
-            recovery_ids: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1826,7 +1824,6 @@ impl NativeWatchCatalog {
             .map(CatalogRow::is_dir)
     }
     pub(crate) fn retain_roots(&self, roots: Vec<String>) {
-        self.recovery_ids.lock().unwrap().clear();
         let keys: HashSet<_> = roots
             .iter()
             .map(|root| crate::path_keys::path_key(root))
@@ -1848,45 +1845,22 @@ impl NativeWatchCatalog {
     }
     pub(crate) fn recover_changes(
         &self,
-
         scopes: &[crate::scan::scope::NativeDiscoveryScope],
         volume: &str,
         journal: u64,
         start_usn: i64,
         end_usn: i64,
+        cache: &mut crate::filesystem::DirectoryRecoveryCache,
     ) -> std::io::Result<Vec<String>> {
-        (|| {
-            if start_usn == end_usn || scopes.is_empty() {
-                return Ok(Vec::new());
-            }
-            let directories: HashSet<_> = scopes
-                .iter()
-                .flat_map(|scope| self.directory_paths(scope))
-                .collect();
-            let roots: Vec<_> = scopes.iter().map(|scope| scope.root.clone()).collect();
-            let root_keys: HashSet<_> = roots
-                .iter()
-                .map(|root| crate::path_keys::path_key(root))
-                .collect();
-            // Never hold the catalog write lock over broker IO. Recovery's
-            // identity cache has its own lifetime and is cleared on root edits.
-            let mut caches = self.recovery_ids.lock().unwrap();
-            // A configured path can be remounted on another volume without a
-            // root-list edit. Do not retain identities for its departed volume.
-            caches.retain(|cached_volume, cache| {
-                cached_volume == volume || !cache.roots.keys().any(|root| root_keys.contains(root))
-            });
-            crate::filesystem::watch_directories_changes_cached_impl(
-                directories.into_iter().collect(),
-                &roots,
-                volume,
-                journal,
-                start_usn,
-                end_usn,
-                caches.entry(volume.to_owned()).or_default(),
-            )
-            .map_err(|error| std::io::Error::other(error.to_string()))
-        })()
+        if start_usn == end_usn || scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let directories: HashSet<_> = scopes.iter()
+            .flat_map(|scope| self.directory_paths(scope)).collect();
+        let roots: Vec<_> = scopes.iter().map(|scope| scope.root.clone()).collect();
+        crate::filesystem::watch_directories_changes_cached_impl(
+            directories.into_iter().collect(), &roots, volume, journal, start_usn, end_usn, cache,
+        )
     }
     pub(crate) fn set_cursor(
         &self,
@@ -1923,9 +1897,6 @@ impl NativeWatchCatalog {
 
     pub(crate) fn commit(&self, idle: bool) {
         (|| {
-            if idle {
-                self.recovery_ids.lock().unwrap().clear();
-            }
             let mut tables = self.catalogs.lock().unwrap();
             // Commit is already event-driven. Reclaim deletion high water even
             // when no pipeline completion has armed Watch's idle-maintenance timer.
@@ -1949,7 +1920,6 @@ impl NativeWatchCatalog {
     }
     pub(crate) fn close(&self) {
         (|| {
-            self.recovery_ids.lock().unwrap().clear();
             let tables = self.catalogs.lock().unwrap();
             let mut slot = self.store.lock().unwrap();
             if let Some(mut store) = slot.take() {

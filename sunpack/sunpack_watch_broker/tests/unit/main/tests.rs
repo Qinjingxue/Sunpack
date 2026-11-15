@@ -240,7 +240,7 @@ fn journal_read_requires_a_bounded_usn_interval_and_file_identity() {
 }
 
 #[test]
-fn dispatcher_serializes_per_volume_but_keeps_volumes_independent() {
+fn dispatcher_reuses_volume_contexts_and_allows_overlapping_reads() {
     let dispatcher = JournalDispatcher::new().unwrap();
     let deadline = Instant::now() + VOLUME_CONTEXT_IDLE_TTL;
     let first = dispatcher
@@ -263,6 +263,22 @@ fn dispatcher_serializes_per_volume_but_keeps_volumes_independent() {
         .unwrap();
     assert!(Arc::ptr_eq(&first, &same));
     assert!(!Arc::ptr_eq(&first, &other));
+
+    let busy = first.lock().unwrap();
+    let cached_address = std::ptr::from_ref(&*busy).addr();
+    let (sent, result) = std::sync::mpsc::channel();
+    thread::scope(|workers| {
+        workers.spawn(|| {
+            let result = dispatcher.with_reader(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}",
+                |reader| Ok(std::ptr::from_ref(reader).addr() != cached_address),
+            );
+            let _ = sent.send(result);
+        });
+        let concurrent = result.recv_timeout(Duration::from_secs(5));
+        drop(busy);
+        assert!(concurrent.unwrap().unwrap());
+    });
 }
 
 #[test]

@@ -1,4 +1,42 @@
 use super::*;
+use crate::protocol::REQUEST_BYTES;
+use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
+use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+};
+
+static TEST_CLIENT: Mutex<()> = Mutex::new(());
+
+fn listen(name: &[u16], instances: u32) -> BrokerConnection {
+    let pipe = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            instances,
+            4096,
+            4096,
+            0,
+            null(),
+        )
+    };
+    assert_ne!(pipe, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+    BrokerConnection(pipe)
+}
+
+fn accept(server: &BrokerConnection) {
+    assert!(unsafe {
+        ConnectNamedPipe(server.0, null_mut()) != 0 || GetLastError() == ERROR_PIPE_CONNECTED
+    });
+}
+
+fn seed_lease(connection: BrokerConnection) {
+    let mut state = STATE.lock().unwrap();
+    assert_eq!(state.leases, 0);
+    state.leases = 1;
+    state.idle = Some(connection);
+}
 
 #[test]
 fn startup_follows_retiring_instances_but_propagates_real_failures() {
@@ -89,63 +127,15 @@ fn replay_only_transport_failures_not_permission_or_protocol_failures() {
 
 #[test]
 fn directory_recovery_allows_another_request_between_pages() {
-    use crate::protocol::REQUEST_BYTES;
-    use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
-    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
-    use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_TYPE_MESSAGE, PIPE_WAIT,
-    };
-
+    let _test_client = TEST_CLIENT.lock().unwrap();
     let name = wide(&format!(
         r"\\.\pipe\SunPack.WatchBroker.Test.interleave.{}",
         std::process::id()
     ));
-    let pipe = unsafe {
-        CreateNamedPipeW(
-            name.as_ptr(),
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            1,
-            4096,
-            4096,
-            0,
-            null(),
-        )
-    };
-    assert_ne!(pipe, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
-    let server = BrokerConnection(pipe);
-    let client = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        )
-    };
-    assert_ne!(
-        client,
-        INVALID_HANDLE_VALUE,
-        "{}",
-        io::Error::last_os_error()
-    );
-    let client = BrokerConnection(client);
-    assert!(unsafe {
-        ConnectNamedPipe(server.0, null_mut()) != 0 || GetLastError() == ERROR_PIPE_CONNECTED
-    });
-    let mode = PIPE_READMODE_MESSAGE;
-    assert_ne!(
-        unsafe { SetNamedPipeHandleState(client.0, &mode, null(), null()) },
-        0
-    );
-
-    let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
-    *state.lock().unwrap() = ClientState {
-        connection: Some(client),
-        leases: 1,
-    };
+    let server = listen(&name, 1);
+    let client = open_pipe(&name).unwrap();
+    accept(&server);
+    seed_lease(client);
     thread::scope(|workers| {
         let server = workers.spawn(move || {
             // Keep ownership of the pipe in this thread even if a reply assertion fails.
@@ -189,7 +179,7 @@ fn directory_recovery_allows_another_request_between_pages() {
             0,
             3,
             |index, name| {
-                if index != 0 || state.try_lock().is_err() {
+                if index != 0 || STATE.try_lock().is_err() {
                     return Err(io::Error::other(
                         "directory observer ran inside the pipe lock",
                     ));
@@ -209,6 +199,91 @@ fn directory_recovery_allows_another_request_between_pages() {
         server_result.unwrap();
         assert_eq!(names, ["first", "second"]);
     });
+}
+
+#[test]
+fn overlapping_request_uses_another_pipe_and_release_closes_both() {
+    use std::sync::mpsc;
+
+    let _test_client = TEST_CLIENT.lock().unwrap();
+    let pipe_name = format!("{TEST_PIPE_NAME_PREFIX}parallel.{}", std::process::id());
+    let name = wide(&pipe_name);
+    let slow = listen(&name, 2);
+    let client = open_pipe(&name).unwrap();
+    accept(&slow);
+    seed_lease(client);
+    let fast = listen(&name, 2);
+    let previous_name = env::var_os(PIPE_NAME_ENV);
+    env::set_var(PIPE_NAME_ENV, &pipe_name);
+    let guard_timeout = Duration::from_secs(5);
+
+    let (started, running) = mpsc::channel();
+    let (finish, resume) = mpsc::channel();
+    let (probed, probe_result) = mpsc::channel();
+    let result = thread::scope(|workers| {
+        let slow_server = workers.spawn(move || {
+            let slow = slow;
+            let mut bytes = [0; REQUEST_BYTES];
+            read_exact(slow.0, &mut bytes).unwrap();
+            let request = Request::decode(&bytes).unwrap();
+            assert_eq!(request.opcode, Opcode::ReadDirectoriesChanges);
+            let mut length = [0; 4];
+            let mut query = [0; 8 + FILE_ID_BYTES];
+            read_exact(slow.0, &mut length).unwrap();
+            assert_eq!(u32::from_le_bytes(length) as usize, query.len());
+            read_exact(slow.0, &mut query).unwrap();
+            started.send(()).unwrap();
+            resume.recv_timeout(guard_timeout).unwrap();
+            let mut reply = Response::ok(request.request_id);
+            reply.journal_id = 42;
+            reply.next_usn = 2;
+            write_exact(slow.0, &reply.encode()).unwrap();
+            assert!(is_transient_broker_io(&read_exact(slow.0, &mut bytes).unwrap_err()));
+        });
+        let directory = workers.spawn(|| {
+            broker_for_each_directory_change("volume", 42, &[[1; FILE_ID_BYTES]], 1, 2, |_, _| {
+                panic!("expected an empty page")
+            })
+        });
+        running.recv_timeout(guard_timeout).unwrap();
+        let fast_server = workers.spawn(move || {
+            accept(&fast);
+            let mut bytes = [0; REQUEST_BYTES];
+            for opcode in [Opcode::Hello, Opcode::ProbeVolume] {
+                read_exact(fast.0, &mut bytes)?;
+                let request = Request::decode(&bytes)?;
+                assert_eq!(request.opcode, opcode);
+                let mut reply = Response::ok(request.request_id);
+                reply.journal_id = 42;
+                reply.next_usn = 2;
+                write_exact(fast.0, &reply.encode())?;
+            }
+            assert!(is_transient_broker_io(&read_exact(fast.0, &mut bytes).unwrap_err()));
+            Ok::<_, io::Error>(())
+        });
+        let probe = workers.spawn(move || {
+            let _ = probed.send(broker_volume_cursor("volume"));
+        });
+
+        let result = probe_result.recv_timeout(guard_timeout);
+        broker_release().unwrap();
+        // Let the blocked request finish after the last lease has left.
+        let _ = finish.send(());
+        if !matches!(result, Ok(Ok(_))) {
+            // Unblock the test listener if the client failed before opening it.
+            drop(open_pipe(&name));
+        }
+        probe.join().unwrap();
+        directory.join().unwrap().unwrap();
+        slow_server.join().unwrap();
+        fast_server.join().unwrap().unwrap();
+        result
+    });
+    match previous_name {
+        Some(name) => env::set_var(PIPE_NAME_ENV, name),
+        None => env::remove_var(PIPE_NAME_ENV),
+    }
+    assert_eq!(result.unwrap().unwrap(), (42, 2));
 }
 
 #[test]

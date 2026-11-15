@@ -31,7 +31,7 @@ fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
         available_roots: HashSet::from([root]),
         user_password_signature: user_password_signature(&settings.user_passwords),
         settings: Arc::new(settings), engine: Arc::new(Engine::new(worker)),
-        catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+        catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), recovery_ids: HashMap::new(), journal,
         options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
         deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
         passwords: BuiltinStore::shared(base).unwrap(), hub: Arc::new(Hub::new()),
@@ -43,6 +43,22 @@ fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
         tray: None, monitor: None, toast: None, cache_deadline: None,
         external: Arc::default(), broker_lease: None,
     }
+}
+
+#[test]
+fn ordinary_commit_keeps_usn_identity_cache_until_idle_commit() {
+    const CHILD: &str = "SUNPACK_USN_CACHE_LIFETIME_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("ordinary_commit_keeps_usn_identity_cache_until_idle_commit", CHILD);
+        return;
+    };
+    let base = PathBuf::from(base);
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    scheduler.recovery_ids.insert("volume".into(), Default::default());
+    scheduler.catalog.commit(false);
+    assert_eq!(scheduler.recovery_ids.len(), 1);
+    scheduler.commit_idle_catalog();
+    assert!(scheduler.recovery_ids.is_empty());
 }
 
 #[test]
@@ -320,7 +336,7 @@ fn checkpoint_submits_the_first_ready_generation() {
                 available_roots: HashSet::from([root_id.clone()]),
                 user_password_signature: user_password_signature(&settings.user_passwords),
                 settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
-                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), recovery_ids: HashMap::new(), journal,
                 options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
@@ -475,7 +491,7 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
             recursive: true, deep: false, scanned: true }, scope))]),
         available_roots: HashSet::from([root.clone()]),
         user_password_signature: user_password_signature(&settings.user_passwords),
-        settings: Arc::new(settings), engine, catalog, journal,
+        settings: Arc::new(settings), engine, catalog, recovery_ids: HashMap::new(), journal,
         options: None, deep_options: options,
         passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
         root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
@@ -544,7 +560,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 available_roots: HashSet::from([root_id.clone()]),
                 user_password_signature: user_password_signature(&settings.user_passwords),
                 settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
-                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), recovery_ids: HashMap::new(), journal,
                 options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
@@ -638,7 +654,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
                 available_roots: HashSet::from([root_id.clone()]),
                 user_password_signature: user_password_signature(&settings.user_passwords),
                 settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
-                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), recovery_ids: HashMap::new(), journal,
                 options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
@@ -766,7 +782,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             available_roots: HashSet::from([root_id.clone()]),
             user_password_signature: user_password_signature(&settings.user_passwords),
             settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
-            catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+            catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), recovery_ids: HashMap::new(), journal,
             options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
             deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
             passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
@@ -897,7 +913,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             available_roots: HashSet::from([root_id.clone()]),
             user_password_signature: user_password_signature(&settings.user_passwords),
             settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
-            catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+            catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), recovery_ids: HashMap::new(), journal,
             options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
             deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
             passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),

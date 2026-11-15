@@ -38,7 +38,7 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
         roots: BTreeMap::new(), available_roots: HashSet::new(),
         user_password_signature: user_password_signature(&settings.user_passwords),
         settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
-        catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+        catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), recovery_ids: HashMap::new(), journal,
         options: None,
         deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
         passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),

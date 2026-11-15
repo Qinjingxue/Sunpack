@@ -6,7 +6,7 @@ use std::ffi::{c_void, OsString};
 use std::io;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 use sunpack_usn_core::protocol::{
@@ -407,10 +407,14 @@ impl JournalDispatcher {
     ) -> io::Result<T> {
         let deadline = Instant::now() + VOLUME_CONTEXT_IDLE_TTL;
         let reader = self.reader_for(volume_guid, deadline)?;
-        let result = reader
-            .lock()
-            .map_err(|_| io::Error::other("journal state poisoned"))
-            .and_then(|mut reader| operation(&mut reader));
+        let result = match reader.try_lock() {
+            Ok(mut cached) => operation(&mut cached),
+            // Synchronous operations on one volume handle serialize in
+            // Windows. Use a separate handle for overlapping requests.
+            Err(TryLockError::WouldBlock) => JournalReader::new(volume_guid.into())
+                .and_then(|mut reader| operation(&mut reader)),
+            Err(TryLockError::Poisoned(_)) => Err(io::Error::other("journal state poisoned")),
+        };
         drop(reader);
         // An expired entry can stay pinned by a slow journal operation. Wake
         // the accept loop after releasing the pin so it can reap without polling.
