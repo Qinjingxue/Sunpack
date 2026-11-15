@@ -202,7 +202,6 @@ struct Options {
     prompt_passwords: bool,
     no_builtins: bool,
     no_tray: bool,
-    once: bool,
     start: bool,
     rule_stdin: bool,
 }
@@ -222,7 +221,7 @@ const COMMANDS: &[(&str, &str)] = &[
 enum OptionId {
     Help, Json, Verbose, NoPause, Pause, Recursive, Deep, Password, PasswordFile,
     AskPassword, NoBuiltins, Recur, Cleanup, Output, Flatten, NoFlatten, Direct,
-    Once, NoTray, Start, RuleStdin,
+    NoTray, Start, RuleStdin,
 }
 
 #[derive(Clone, Copy)]
@@ -283,7 +282,6 @@ const OPTION_SPECS: &[OptionSpec] = &[
     OptionSpec { id: OptionId::Flatten, names: "-f/--flatten", metavar: "", scope: OptionScope::Extract, help: "cli.flatten", watch_help: "cli.flatten", watch_order: 14 },
     OptionSpec { id: OptionId::NoFlatten, names: "-F/--no-flatten", metavar: "", scope: OptionScope::Extract, help: "cli.no_flatten", watch_help: "cli.no_flatten", watch_order: 15 },
     OptionSpec { id: OptionId::Direct, names: "--direct-file/--direct", metavar: "", scope: OptionScope::Extract, help: "cli.extract.direct_file", watch_help: "cli.extract.direct_file", watch_order: 16 },
-    OptionSpec { id: OptionId::Once, names: "--once", metavar: "", scope: OptionScope::WatchStart, help: "cli.watch.once", watch_help: "cli.watch.once", watch_order: 17 },
     OptionSpec { id: OptionId::NoTray, names: "--no-tray", metavar: "", scope: OptionScope::WatchStart, help: "cli.watch.no_tray", watch_help: "cli.watch.no_tray", watch_order: 18 },
     OptionSpec { id: OptionId::Start, names: "-s/--start", metavar: "", scope: OptionScope::WatchAdd, help: "cli.watch.start_after_add", watch_help: "cli.watch.start_after_add", watch_order: 7 },
     OptionSpec { id: OptionId::RuleStdin, names: "--scan-rule-stdin", metavar: "", scope: OptionScope::Validate, help: "", watch_help: "", watch_order: 20 },
@@ -502,7 +500,6 @@ impl Options {
                 }
                 Some(OptionId::AskPassword) => options.prompt_passwords = true,
                 Some(OptionId::NoBuiltins) => options.no_builtins = true,
-                Some(OptionId::Once) => options.once = true,
                 Some(OptionId::NoTray) => options.no_tray = true,
                 Some(OptionId::Start) => options.start = true,
                 Some(OptionId::RuleStdin) => {
@@ -829,7 +826,7 @@ pub(super) async fn run(
         "version" => show_version(session),
         "doctor" => doctor(cwd, generation.unwrap().into_inspection().map(|(path, _, settings)| (path, settings)),
             session, options.json, language),
-        "watch" => watch_command(host, cwd, &options, session, language, &cancel).await,
+        "watch" => watch_command(host, cwd, &options, session, language).await,
         _ => unreachable!(),
     };
     crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
@@ -2584,17 +2581,11 @@ async fn watch_command(
     options: &Options,
     session: &dyn Session,
     language: Language,
-    cancel: &Cancellation,
 ) -> io::Result<(i32, CommandResult)> {
     let mut result = CommandResult::new("watch");
     result.inputs = json!({"action": options.action});
     let mut code = 0;
     match options.action.as_str() {
-        "start" if options.once => {
-            code = host.watch.run_once_async(cwd, host.engine(cwd)?, cancel).await?;
-            result.inputs["once"] = Value::Bool(true);
-            result.summary = json!({"exit_code": code});
-        }
         "start" => result.summary = host.watch.start_async(cwd, host.engine(cwd)?, !options.no_tray).await?,
         "stop" => result.summary = host.watch.stop_async().await?,
         "reload" => result.summary = host.watch.reload_async().await?,
@@ -2614,7 +2605,7 @@ async fn watch_command(
                 host.watch
                     .add_async(cwd, &paths, output, options.deep, options.recursive).await?;
             result.summary["start_requested"] = Value::Bool(options.start);
-            if options.start && !host.watch.is_enabled() {
+            if options.start && !host.watch.is_running() {
                 result.summary["start"] = host.watch.start_async(cwd, host.engine(cwd)?, true).await?;
                 if result.summary["start"]["running"] == Value::Bool(true) {
                     crate::pipeline::stage("cli", &Cancellation::new()).await?;
@@ -2831,7 +2822,6 @@ mod option_tests {
             vec!["passwords", "--recursive"],
             vec!["watch", "--start", "add", "root"],
             vec!["watch", "start", "--start"],
-            vec!["watch", "add", "--once", "root"],
             vec!["watch", "remove", "-R", "root"],
             vec!["config", "show", "--scan-rule-stdin"],
             vec!["doctor", "--verbose"],
@@ -2914,13 +2904,13 @@ mod option_tests {
             assert!(parse(&["passwords", "--password", password]).is_err());
         }
         assert_eq!(parse(&["extract", "a.zip", "--", "-b.zip"]).unwrap().paths, ["a.zip", "-b.zip"]);
-        let value = parse(&["watch", "--json", "start", "--once"]).unwrap();
-        assert!(value.once);
+        let value = parse(&["watch", "--json", "start", "--no-tray"]).unwrap();
+        assert!(value.no_tray);
         assert!(value.json); // main restores explicitly supplied parent flags
         assert!(parse(&["watch", "start", "--json"]).unwrap().json);
         assert!(parse(&["config", "validate", "--scan-rule-stdin"]).unwrap().rule_stdin);
         assert!(parse(&["--", "extract", "file.zip"]).is_err());
-        assert!(parse(&["watch", "--json", "--", "start", "--once"]).is_err());
+        assert!(parse(&["watch", "--json", "--", "start", "--no-tray"]).is_err());
         assert_eq!(parse(&["watch", "startup", "--", "status"]).unwrap().paths, ["status"]);
         assert_eq!(parse(&["watch", "startup", "status", "--"]).unwrap().paths, ["status"]);
         assert_eq!(parse(&["pw", "-jp=x"]).unwrap().passwords[0].as_ref(), "=x");
@@ -2935,7 +2925,7 @@ mod option_tests {
             vec!["extract", "-hvpsecret"],
             vec!["extract", "-hFf"],
             vec!["--unknown", "extract", "--help"],
-            vec!["watch", "--once", "start", "--help"],
+            vec!["watch", "--no-tray", "start", "--help"],
             vec!["watch", "start", "--unknown", "--help"],
             vec!["watch", "--help", "invalid"],
             vec!["--unknown", "extract"],

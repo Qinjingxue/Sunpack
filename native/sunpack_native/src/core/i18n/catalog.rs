@@ -131,7 +131,6 @@ pub(super) static MESSAGES: &[(&str, &str, &str)] = &[
     ("cli.watch.help", "Manage watched folders and the background service", "管理监控目录和后台服务"),
     ("cli.watch.list", "List watched folders", "列出监控目录"),
     ("cli.watch.no_tray", "Hide the tray icon", "隐藏托盘图标"),
-    ("cli.watch.once", "Run one watch pass", "运行一轮监控"),
     ("cli.watch.output_dir", "Watched folder output root", "监控目录的输出根目录"),
     ("cli.watch.output_dir_single_path", "The --out-dir option requires exactly one watched folder", "--out-dir 选项只能与一个监控目录一起使用"),
     ("cli.watch.paths", "Folders to add or remove", "添加或移除的目录"),

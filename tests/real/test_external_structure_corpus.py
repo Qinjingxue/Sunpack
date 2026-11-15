@@ -88,7 +88,8 @@ def test_empty_archive_preserves_output_without_recursive_children(
     package.configure(post_extract={"flatten_single_directory": flatten})
     if origin == "watch":
         package.json("watch", "add", "-d", "-o", output, watched)
-        package.json("watch", "start", "--once", "--no-tray")
+        with package.watch_session():
+            package.await_watch_event("done", path=archive.name)
     else:
         report = package.json("extract", "-d", "-r", "*", "-c", "k", "-o", output, archive)
         assert report["summary"]["success_count"] == 1, report

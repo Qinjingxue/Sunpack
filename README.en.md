@@ -277,7 +277,6 @@ When reporting a problem, you can attach relevant logs. Default locations for in
 
 - Watch events: `%ProgramData%\SunPack\.sunpack_watch\events.json` and `events.json.store`
 - Extraction failure reports: `%ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt`
-- Windows notifications: `%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl`
 - Background runtime: `%ProgramData%\SunPack\runtime-*.state.events.json` and matching `.store` directories
 
 Include both the display manifest and its `.store` directory; display history is not a JSONL text log. State always lives in `.sunpack_watch` under the data directory. Remove passwords, private paths and other sensitive information before posting.

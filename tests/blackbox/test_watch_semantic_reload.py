@@ -103,8 +103,7 @@ def test_watch_restart_keeps_carrier_outputs_and_retries_retained_child(package,
     while time.monotonic() < deadline:
         try:
             display = native_fixture("display_events", path=str(events))
-            blocked = any(row.get("event") == "failed_password"
-                          for row in (*display["history"], *display["live"]))
+            blocked = next((row for row in display["live"] if row.get("event") == "failed_password"), None)
             ordinary_files = list(output.rglob("ordinary.txt"))
             if blocked and len(ordinary_files) == 1:
                 ordinary, = ordinary_files
@@ -119,7 +118,8 @@ def test_watch_restart_keeps_carrier_outputs_and_retries_retained_child(package,
     assert ordinary.read_bytes() == b"retained ordinary"
     assert package.run("--persistent-shutdown").returncode == 0
     package.configure(user_passwords=["recovered-key"])
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_event("done", path=Path(blocked["path"]).name)
     assert [path.read_bytes() for path in output.rglob("secret.txt")] == [b"retained child"]
     assert list(output.rglob("ordinary.txt")) == [ordinary]
     assert (ordinary.stat().st_ino, ordinary.stat().st_mtime_ns) == identity

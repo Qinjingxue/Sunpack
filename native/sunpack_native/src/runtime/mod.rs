@@ -55,7 +55,7 @@ pub fn main() -> i32 {
         Some("watch" | "w")
             if !args
                 .iter()
-                .any(|arg| matches!(arg.as_str(), "--once" | "-h" | "--help")) =>
+                .any(|arg| matches!(arg.as_str(), "-h" | "--help")) =>
         {
             windows::launch_watch_request(&cwd, &args)
         }

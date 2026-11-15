@@ -307,8 +307,8 @@ pub(super) struct ToastLibrary(LibraryHandle);
 
 impl ToastLibrary {
     pub(super) fn load(cwd: &Path) -> io::Result<Self> {
-        // WinRT retains final notifications and their callbacks after a
-        // presenter exits. Match main's single process-lifetime DLL reference.
+        // WinRT retains final notifications after a presenter exits.
+        // Match main's single process-lifetime DLL reference.
         static MODULE: Mutex<Option<usize>> = Mutex::new(None);
         let mut module = MODULE.lock().unwrap();
         if let Some(raw) = *module { return Ok(Self(raw as LibraryHandle)); }
@@ -338,14 +338,13 @@ impl ToastLibrary {
         hresult(unsafe { self_test() })
     }
 
-    pub(super) fn presenter(&self, log: &Path) -> io::Result<ToastPresenter<'_>> {
-        type Create = unsafe extern "C" fn(*const u16, *const u16, *mut *mut c_void) -> i32;
+    pub(super) fn presenter(&self) -> io::Result<ToastPresenter<'_>> {
+        type Create = unsafe extern "C" fn(*const u16, *mut *mut c_void) -> i32;
         let create: Create =
-            unsafe { std::mem::transmute(self.procedure(b"sunpack_toast_create_presenter\0")?) };
+            unsafe { std::mem::transmute(self.procedure(b"sunpack_toast_create_context\0")?) };
         let exe = wide(std::env::current_exe()?.as_os_str());
-        let log = wide(log.as_os_str());
         let mut context = null_mut();
-        hresult(unsafe { create(exe.as_ptr(), log.as_ptr(), &mut context) })?;
+        hresult(unsafe { create(exe.as_ptr(), &mut context) })?;
         Ok(ToastPresenter {
             library: self,
             context,
@@ -419,7 +418,7 @@ pub(super) fn activate_toast(cwd: &Path, identity: &str) -> io::Result<i32> {
     let result = pipe::submit_existing(cwd, identity, &["--cancel-watch-batch".into(), id.clone()], false);
     if !matches!(result, Ok(Some(0))) {
         let language = crate::core::config::load_language(cwd);
-        let presenter = library.presenter(Path::new(""))?;
+        let presenter = library.presenter()?;
         presenter.show(&super::toast::Snapshot::stop_failed(&id, language).encode()?, 1)?;
     }
     result.map(|code| code.unwrap_or(1))

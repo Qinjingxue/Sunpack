@@ -31,10 +31,8 @@ body:
       label: "Logs and screenshots (optional)"
       description: |
         Default log locations for installed SunPack:
-        Watch: %ProgramData%\SunPack\.sunpack_watch\events.jsonl
+        Watch: %ProgramData%\SunPack\.sunpack_watch\events.json and events.json.store
         Extraction failures: %ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt
-        Windows notifications: %ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl
-        Background runtime: %ProgramData%\SunPack\runtime-*.state.events.jsonl
+        Background runtime: %ProgramData%\SunPack\runtime-*.state.events.json and the matching .store directories
 
-        If you changed watch.state_dir, the first three are in that custom directory.
         Paste error messages or drag and drop logs/screenshots here. Remove passwords and private information first.

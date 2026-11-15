@@ -284,7 +284,7 @@ if ($advanced.PSObject.Properties['watch'] -and $advanced.watch -is [pscustomobj
                 $owned = if ($record.PSIsContainer) {
                     $record.Name -in @('events.json.store', 'bootstrap.events.json.store', 'failures')
                 } else {
-                    $record.Name -match '^(?:state\.(?:json|snapshot|journal\.\d{20}\.(?:wal|jsonl))|catalog\.(?:snapshot|wal)\.bin|(?:bootstrap\.)?events\.jsonl?|toast_host_events\.jsonl|logical-input-recovery|fixed-state-directory)$'
+                    $record.Name -match '^(?:state\.(?:json|snapshot|journal\.\d{20}\.(?:wal|jsonl))|catalog\.(?:snapshot|wal)\.bin|(?:bootstrap\.)?events\.jsonl?|logical-input-recovery|fixed-state-directory)$'
                 }
                 if (-not $owned) { continue }
                 if (($dataDirectory + [IO.Path]::DirectorySeparatorChar).StartsWith(

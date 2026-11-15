@@ -350,7 +350,7 @@ def test_watch_action_help_lists_available_options(package):
 
 
 @pytest.mark.requires_watch_broker
-def test_watch_once_consumes_archive_and_persists_completion(package, tmp_path):
+def test_watch_persists_completion_across_restart(package, tmp_path):
     if "SUNPACK_WATCH_BROKER_PIPE_NAME" not in package.env:
         pytest.skip("The isolated Watch Broker service is required")
     watched = tmp_path / "watched"
@@ -361,11 +361,13 @@ def test_watch_once_consumes_archive_and_persists_completion(package, tmp_path):
         archive.writestr("received.txt", b"watch payload")
     package.json("watch", "add", watched, "-o", output)
     assert package.json("watch", "list")["summary"]["count"] == 1
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_event("done", path=source.name)
     assert next(output.rglob("received.txt")).read_bytes() == b"watch payload"
     assert source.is_file()
     assert package.run("--persistent-shutdown").returncode == 0
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_admission()
     assert len(list(output.rglob("received.txt"))) == 1
 
 
@@ -429,7 +431,6 @@ def test_continuous_watch_retries_retained_nested_input_after_password_edit(pack
         lambda: not retained.exists() and any(output.rglob(marker.name)),
         "Editing the password table did not resume the retained nested archive",
     )
-    assert package.json("watch", "start", "--once")["summary"]["exit_code"] == 0
     status = package.json("watch", "status")["summary"]
     assert status["running"] and status["generation"] == started["generation"]
     assert package.json("watch", "stop")["summary"]["stopped"]
@@ -496,22 +497,6 @@ def test_main_cli_contracts_preserve_parent_flags_and_reject_abbreviations(packa
     assert "the following arguments are required: command" in abbreviated_help.stderr
     empty = package.json("passwords", "--no-bpw", "--pw-file=", "-p", "explicit")
     assert empty["items"][0]["user_passwords"] == ["explicit"]
-
-
-@pytest.mark.requires_watch_broker
-def test_standalone_watch_once_keeps_continuous_status(package, tmp_path):
-    # The existing once test has continuous Watch enabled. This covers the
-    # independent host status/generation contract without starting a service.
-    watched = tmp_path / "once-root"
-    watched.mkdir()
-    package.json("watch", "add", watched)
-    before = package.json("watch", "status")["summary"]
-    assert not before["running"]
-    assert package.json("watch", "start", "--once")["summary"]["exit_code"] == 0
-    after = package.json("watch", "status")["summary"]
-    assert not after["running"]
-    assert after["generation"] == before["generation"]
-    assert after["last_error"] == before["last_error"] == ""
 
 
 def test_watch_drive_relative_receipts_preserve_client_path_spelling(package, tmp_path):

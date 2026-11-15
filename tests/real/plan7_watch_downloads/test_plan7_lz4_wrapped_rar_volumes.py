@@ -87,9 +87,8 @@ def test_plan7_lz4_wrapped_volumes(package, tmp_path, format, mode, cleanup, ord
 
     if order == "stale-tail":
         watch.await_event("suspended_missing_volume", path=case.entry_path.name)
-        package.json("watch", "start", "--once", "--no-tray")
         watch.restart()
-        package.json("watch", "start", "--once", "--no-tray")
+        package.await_watch_admission()
         assert not list(watch.output.rglob(case.marker_name))
         assert generated.read_bytes() == parts[-1].read_bytes()
         first.rename(tmp_path / "consumed-wrapper.lz4")

@@ -34,9 +34,8 @@ def test_unchanged_generated_inventory_does_not_enqueue_children(package, tmp_pa
     watch.start()
     source = download(watch, outer)
     watch.await_event("done", path=source.name)
-    package.json("watch", "start", "--once", "--no-tray")
     watch.restart()
-    package.json("watch", "start", "--once", "--no-tray")
+    package.await_watch_admission()
     watch.stop()
     assert [p.read_bytes() for p in watch.output.rglob("inner.zip")] == [inner]
     assert not list(watch.output.rglob("forbidden.txt"))
@@ -66,15 +65,13 @@ def test_raw_tail_arrival_resolves_generated_head_without_inheriting_its_old_gat
     watch.start()
     downloaded = download(watch, outer)
     watch.await_event("done", path=downloaded.name)
-    package.json("watch", "start", "--once", "--no-tray")
     assert not list(watch.output.rglob(payload.name))
     head, = (path for path in watch.output.rglob(parts[0].name) if path.is_file())
     arrivals = [download(watch, part) for part in parts[1:]]
     watch.await_event("failed_password", path=parts[0].name)
-    package.json("watch", "start", "--once", "--no-tray")
     watch.restart()
     watch.passwords(["secret-key"])
-    package.json("watch", "start", "--once", "--no-tray")
+    wait_for(lambda: any(watch.output.rglob(payload.name)), "recovered generated split head")
     watch.stop()
     assert [path.read_bytes() for path in watch.output.rglob(payload.name)] == [payload.read_bytes()]
     assert not head.exists(), "the generated head is consumed under keep"
@@ -140,9 +137,10 @@ def test_in_place_recovery_expires_with_its_source(package, tmp_path, mutation):
             return not any(Path(row.get("path", "")) == retained for row in live)
         wait_for(recovery_retired, "live recovery retirement before retry")
     watch.passwords(["secret-key"])
-    package.json("watch", "start", "--once", "--no-tray")
+    if mutation is None:
+        watch.await_event("done", path=retained.name)
     watch.restart()
-    package.json("watch", "start", "--once", "--no-tray")
+    package.await_watch_admission()
     watch.stop()
     assert source.is_file(), "keep applies to the original outer source"
     assert not list(watch.output.rglob("third-level.txt")), "retry must preserve the remaining recursion depth"

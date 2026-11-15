@@ -31,10 +31,8 @@ body:
       label: "日志与截图（选填）"
       description: |
         安装版默认日志位置：
-        Watch：%ProgramData%\SunPack\.sunpack_watch\events.jsonl
+        Watch：%ProgramData%\SunPack\.sunpack_watch\events.json 和 events.json.store
         解压失败：%ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt
-        Windows 通知：%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl
-        后台 Runtime：%ProgramData%\SunPack\runtime-*.state.events.jsonl
+        后台 Runtime：%ProgramData%\SunPack\runtime-*.state.events.json 及对应的 .store 目录
 
-        若修改过 watch.state_dir，前三项在自定义状态目录下。
         可直接粘贴报错或拖入日志、截图；上传前请清除密码和私人信息。

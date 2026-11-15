@@ -56,9 +56,10 @@ password and reader caches.
 
 Watch runs install a uniquely named temporary Broker service using the existing
 service-management script, and remove it afterward. They do not reuse or alter
-the installed release service. `watch state-persistence` uses `watch start --once`
-to measure bootstrap and extraction, then restarts the runtime to measure recovery
-of completed state. `--copies` controls the number of retained archives.
+the installed release service. `watch state-persistence` measures startup, admission,
+and graceful stop of Watch, which finishes submitted work and flushes completed
+state. Later rounds restart the runtime with the retained archives and completed
+state. `--copies` controls the number of retained archives.
 
 `watch live-arrival` starts continuous Watch on an empty root and publishes fully
 written files by same-volume rename. Each latency ends when Watch removes the

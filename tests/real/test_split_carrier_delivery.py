@@ -255,7 +255,8 @@ def test_watch_embedded_rar_tail_before_head_is_retried(package, tmp_path):
 
     watch = watch_setup(package, tmp_path, passwords=["wrong-key", case.password], cleanup="d", start=False)
     tail = download(watch, wrapped[-1], mode="direct")
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_admission()
     watch.assert_no_terminal_failures()
     assert tail.read_bytes() == wrapped[-1].read_bytes()
     assert not marker_present(watch.output, case.marker_name)

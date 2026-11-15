@@ -97,8 +97,8 @@ def _configure_watch(app, args, inputs, outputs, *, live=False):
 
 
 @contextmanager
-def _name_changes(directory):
-    """Wake for native file-name changes instead of polling the watched tree."""
+def _directory_changes(directory, filters=0x3):
+    """Wait for directory changes using Windows change notifications."""
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.FindFirstChangeNotificationW.argtypes = (wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD)
     kernel.FindFirstChangeNotificationW.restype = wintypes.HANDLE
@@ -106,7 +106,7 @@ def _name_changes(directory):
     kernel.WaitForSingleObject.restype = wintypes.DWORD
     kernel.FindNextChangeNotification.argtypes = (wintypes.HANDLE,)
     kernel.FindCloseChangeNotification.argtypes = (wintypes.HANDLE,)
-    handle = kernel.FindFirstChangeNotificationW(str(directory), True, 0x3)  # File and directory names.
+    handle = kernel.FindFirstChangeNotificationW(str(directory), True, filters)
     if handle in (None, ctypes.c_void_p(-1).value):
         raise ctypes.WinError(ctypes.get_last_error())
 
@@ -131,7 +131,7 @@ def _watch_arrivals(app, workspace, args, corpus, skipped):
     app.run("watch", "start", "--no-tray", require_broker=True)
     rows = []
     sampler = app.sampler()
-    with _name_changes(inputs) as wait, sampler:
+    with _directory_changes(inputs) as wait, sampler:
         for run in range(args.runs):
             if run and args.arrival_interval_ms:
                 time.sleep(args.arrival_interval_ms / 1000)
@@ -190,6 +190,35 @@ def _watch_arrivals(app, workspace, args, corpus, skipped):
             print(f"Watch wave {run + 1}: {len(arrivals)} arrivals in {elapsed:.3f}s", flush=True)
     app.run("watch", "stop")
     return rows, [sample.to_dict() for sample in sampler.samples]
+
+
+def _watch_persistence(app):
+    state = app.data / ".sunpack_watch"
+    state.mkdir(exist_ok=True)
+    sampler = app.sampler()
+    # Journal and display publication wake the admission check. Stopping then
+    # drains the admitted requests and flushes the completed state for restart.
+    with _directory_changes(state, 0x13) as wait, sampler:
+        started = time.perf_counter()
+        start = app.run("watch", "start", "--no-tray", require_broker=True)
+        try:
+            while True:
+                status = app.run("watch", "status")["response"]["summary"]
+                if not status["running"] or status["last_error"]:
+                    raise RuntimeError(f"Watch scheduler failed: {status}")
+                if status["pending"] == 0:
+                    break
+                wait()
+        finally:
+            stop = app.run("watch", "stop")
+        seconds = time.perf_counter() - started
+    return {
+        "seconds": seconds,
+        "returncode": stop["returncode"],
+        "response": start["response"],
+        **app.memory_result(sampler.samples, require_broker=True),
+        "samples": [sample.to_dict() for sample in sampler.samples],
+    }
 
 
 def main(argv=None):
@@ -283,17 +312,21 @@ def main(argv=None):
                 for run in range(args.runs):
                     if args.cold or args.mode == "watch":
                         app.shutdown()
-                    if args.mode in ("scan", "memory", "watch"):
+                    if args.mode == "watch":
+                        measurement = _watch_persistence(app)
+                        rows.append({
+                            "case": "bootstrap" if run == 0 else "completed-state-restart",
+                            "run": run, "output": output_summary(workspace.outputs), **measurement,
+                        })
+                    elif args.mode in ("scan", "memory"):
                         output = workspace.outputs / f"round-{run}"
                         command = ("scan", "-R", "-d", inputs, *password_args) if args.mode == "scan" else (
-                            ("watch", "start", "--once", "--no-tray") if args.mode == "watch" else
-                            ("extract", "-R", "-d", "-r", args.recursive, "-c", "k", "--no-flatten", "--no-pause", "-o", output, inputs, *password_args)
+                            "extract", "-R", "-d", "-r", args.recursive, "-c", "k", "--no-flatten", "--no-pause", "-o", output, inputs, *password_args
                         )
-                        measurement = app.run(*command, require_broker=args.mode == "watch")
+                        measurement = app.run(*command)
                         if args.mode == "memory" and not measurement["response"]["summary"]["processed_count"]:
                             raise RuntimeError("The extraction workload found no archive inputs.")
-                        observed = workspace.outputs if args.mode == "watch" else output
-                        rows.append({"case": "directory" if args.mode != "watch" else ("bootstrap" if run == 0 else "completed-state-restart"), "run": run, "output": output_summary(observed), **measurement})
+                        rows.append({"case": "directory", "run": run, "output": output_summary(output), **measurement})
                         if output.exists():
                             shutil.rmtree(output)
                     else:

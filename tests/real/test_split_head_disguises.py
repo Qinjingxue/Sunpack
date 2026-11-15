@@ -82,8 +82,7 @@ def _cli_extract(package, source, output):
     return json.loads(result.stdout)
 
 
-def _watch_result(package, watch):
-    package.json("watch", "start", "--once", "--no-tray")
+def _watch_results(watch):
     display = watch.display()
     return [
         (Path(row.get("path", "")).name, row["event"], row.get("error_kind") or row.get("failure", {}).get("kind"))
@@ -114,8 +113,8 @@ def test_disguised_split_head_resolves_unchanged_continuation_names(package, tmp
         for part in sorted(inputs.iterdir()):
             stage_initial(watch, part)
         inputs = watch.root
-        events = _watch_result(package, watch)
-        assert list(output.rglob(case.marker_name)), (_scan_head(package, case, head), events)
+        with package.watch_session():
+            watch.await_archive(case)
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
     if entry_mode == "cli":
@@ -150,13 +149,15 @@ def test_opaque_carrier_head_recovers_when_tail_arrives(package, tmp_path, split
         stage_initial(watch, middle)
         inputs = watch.root
         head = inputs / head.name
-        before = _watch_result(package, watch)
+        watch.start()
+        watch.await_event("suspended_missing_volume", path=head.name)
+        before = _watch_results(watch)
         assert any(kind == "missing_volume" for _, _, kind in before), before
         assert not list(output.rglob(case.marker_name))
         assert head.is_file() and (inputs / middle.name).is_file()
         download(watch, tail, mode="direct")
-        events = _watch_result(package, watch)
-        assert list(output.rglob(case.marker_name)), (_scan_head(package, case, head), events)
+        watch.await_archive(case)
+        watch.stop()
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
     if entry_mode == "cli":
@@ -186,12 +187,15 @@ def test_continuation_waits_for_disguised_entry(package, tmp_path, split_set, en
         watch = watch_setup(package, tmp_path, passwords=PASSWORDS, cleanup="d", start=False)
         stage_initial(watch, inputs / middle.name)
         inputs = watch.root
-        assert not _watch_result(package, watch)
+        with package.watch_session():
+            package.await_watch_admission()
+        assert not _watch_results(watch)
         assert (inputs / middle.name).is_file()
         head = _head_file(original_head, tmp_path, case.archive_format, "carrier-opaque")
         stage_initial(watch, head)
         stage_initial(watch, tail)
-        _watch_result(package, watch)
+        with package.watch_session():
+            watch.await_archive(case)
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
     assert not any(inputs.iterdir())

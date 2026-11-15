@@ -11,10 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import psutil
-import pytest
 
 from tests.helpers.marker_utils import marker_was_extracted, open_shared_file
 from tests.helpers.native_fixture import file_inventory, native_fixture
+from tests.helpers.package import wait_for as wait_for
 from tests.helpers.real_archives import ArchiveFixtureFactory, STREAM_FORMATS
 from tests.real.archive_boundary import assert_extracted
 
@@ -112,16 +112,6 @@ def watch_setup(package, base, *, passwords=(*WRONG_PASSWORDS, PASSWORD),
     if start:
         watch.start()
     return watch
-
-
-def wait_for(condition, description, timeout=60):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = condition()
-        if value:
-            return value
-        time.sleep(0.025)
-    pytest.fail(f"Did not observe {description}")
 
 
 def source_directory_cleaned(directory):

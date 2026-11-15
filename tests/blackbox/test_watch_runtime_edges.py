@@ -106,19 +106,21 @@ def test_watch_output_home_expansion_in_add_and_roots_file(package, tmp_path):
     assert str(home / "added-output") in roots.read_text(encoding="utf-8")
     with roots.open("a", encoding="utf-8") as stream:
         stream.write(f"{loaded} | ~\\loaded-output | false | false | false\n")
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        _wait_for_output(home / "added-output", "first.txt", b"added output")
+        _wait_for_output(home / "loaded-output", "second.txt", b"roots file output")
     assert [p.read_bytes() for p in (home / "added-output").rglob("first.txt")] == [b"added output"]
     assert [p.read_bytes() for p in (home / "loaded-output").rglob("second.txt")] == [b"roots file output"]
     assert not (added / "~").exists()
     assert not (loaded / "~").exists()
 
 
-def test_cold_watch_once_collects_the_clipboard_before_dispatch(package, tmp_path):
+def test_watch_imports_clipboard_passwords_after_adding_a_root(package, tmp_path):
     watched = tmp_path / "watched"
     watched.mkdir()
     output = tmp_path / "out"
     payload = tmp_path / "secret.txt"
-    payload.write_bytes(b"one-shot clipboard password")
+    payload.write_bytes(b"clipboard password")
     subprocess.run(
         [str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", "-pclipboard-only-key",
          str(watched / "secret.7z"), str(payload)],
@@ -138,19 +140,25 @@ if ($null -ne $previous) {
     }
 }
 try {
-    [System.Windows.Forms.Clipboard]::SetText("discarded`nretained`nclipboard-only-key")
-    # With no roots, even once must not import the current clipboard.
-    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch start --once --no-tray --json
-    if ($LASTEXITCODE -ne 0) { throw "empty-root once failed" }
+    [System.Windows.Forms.Clipboard]::SetText("rootless-value")
+    # A rootless Watch has no clipboard monitor until its first root is added.
+    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch start --no-tray --json
+    if ($LASTEXITCODE -ne 0) { throw "rootless Watch failed to start" }
     $passwords = Get-Content -Raw $env:SUNPACK_CLIPBOARD_TEST_PASSWORDS | ConvertFrom-Json
     if (@($passwords.clipboard_history).Count -gt 0 -and $null -ne $passwords.clipboard_history) {
-        throw "empty-root once imported clipboard passwords"
+        throw "rootless Watch imported clipboard passwords"
     }
     & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch add $env:SUNPACK_CLIPBOARD_TEST_ROOT -o $env:SUNPACK_CLIPBOARD_TEST_OUTPUT --json
     if ($LASTEXITCODE -ne 0) { throw "watch add failed" }
-    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch start --once --no-tray --json
-    $result = $LASTEXITCODE
+    [System.Windows.Forms.Clipboard]::SetText(("discarded", "retained", "clipboard-only-key") -join [Environment]::NewLine)
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while (-not (Get-ChildItem $env:SUNPACK_CLIPBOARD_TEST_OUTPUT -Filter secret.txt -File -Recurse -ErrorAction SilentlyContinue)) {
+        if ([DateTime]::UtcNow -ge $deadline) { throw "Watch did not extract the clipboard-protected archive" }
+        Start-Sleep -Milliseconds 25
+    }
 } finally {
+    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch stop --json
+    $result = $LASTEXITCODE
     if ($saved.GetFormats($false).Count -gt 0) {
         [System.Windows.Forms.Clipboard]::SetDataObject($saved, $true)
     } else {
@@ -174,7 +182,7 @@ exit $result
     assert document["clipboard_history"] == ["retained", "clipboard-only-key"]
 
 
-def test_once_drains_admitted_work_without_waiting_for_a_busy_pending_file(package, tmp_path):
+def test_watch_stop_leaves_busy_pending_file_for_restart(package, tmp_path):
     import ctypes
     from ctypes import wintypes
 
@@ -197,7 +205,8 @@ def test_once_drains_admitted_work_without_waiting_for_a_busy_pending_file(packa
     handle = kernel.CreateFileW(str(busy), 0x40000000, 7, None, 3, 0x80, None)
     assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
     try:
-        package.json("watch", "start", "--once", "--no-tray", timeout=30)
+        with package.watch_session():
+            _wait_for_output(output, "ready.txt", b"drain this round")
         assert [path.read_bytes() for path in output.rglob("ready.txt")] == [b"drain this round"]
         assert not list(output.rglob("busy.txt"))
         assert not package.json("watch", "status")["summary"]["running"]
@@ -206,7 +215,8 @@ def test_once_drains_admitted_work_without_waiting_for_a_busy_pending_file(packa
         assert package.run("--persistent-shutdown").returncode == 0
     finally:
         assert kernel.CloseHandle(handle), ctypes.get_last_error()
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        _wait_for_output(output, "busy.txt", b"recover after unlock")
     assert [path.read_bytes() for path in output.rglob("busy.txt")] == [b"recover after unlock"]
     assert [path.read_bytes() for path in output.rglob("ready.txt")] == [b"drain this round"]
 
@@ -290,19 +300,17 @@ def test_settled_outputs_ignore_old_writes_but_admit_changes_after_restart(
         else:
             source.replace(watched / source.name)
         _wait_for_output(real, inner.name, inner.read_bytes())
-        # A real admission round and drain, not a sleep-based negative check.
-        package.json("watch", "start", "--once", "--no-tray")
         assert package.json("watch", "stop")["summary"]["stopped"]
         assert not list(real.rglob("generated.txt"))
         assert package.run("--persistent-shutdown").returncode == 0
-        package.json("watch", "start", "--once", "--no-tray")
+        package.json("watch", "start", "--no-tray")
+        package.await_watch_admission()
         assert not list(real.rglob("generated.txt"))
         history = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))["history"]
         assert not [row for row in history if row["event"] in {"candidate_active", "pipeline_request_started"}
                     and Path(row.get("path", "")).name == inner.name], history
         nested, = real.rglob(inner.name)
         output = nested.parent
-        package.json("watch", "start", "--no-tray")
         incoming = tmp_path / "external.zip"
         _zip(incoming, "external.txt", b"new input at the old output path")
         incoming.replace(output / incoming.name)
@@ -311,7 +319,6 @@ def test_settled_outputs_ignore_old_writes_but_admit_changes_after_restart(
         _zip(replacement, "changed.txt", b"changed nested archive is now an input")
         replacement.replace(nested)
         _wait_for_output(real, "changed.txt", b"changed nested archive is now an input")
-        package.json("watch", "start", "--once", "--no-tray")
         assert package.json("watch", "stop")["summary"]["stopped"]
         assert not list(real.rglob("generated.txt"))
     finally:

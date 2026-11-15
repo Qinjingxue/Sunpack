@@ -138,7 +138,8 @@ def test_retained_carrier_retries_without_touching_user_file(package, tmp_path, 
         assert report["summary"]["failed_count"] == 0, report
     elif layout == "wrapped-split-head":
         watch.passwords([secret])
-        package.json("watch", "start", "--once", "--no-tray")
+        with package.watch_session():
+            watch.await_archive(locked)
         assert list(output.rglob(locked.marker_name)), (
             [row for row in watch.display()["live"] if row["event"] == "suspended_missing_volume"],
             [str(path) for path in output.rglob("inner.7z.002.opaque")],

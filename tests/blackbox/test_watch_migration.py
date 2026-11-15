@@ -62,8 +62,10 @@ def test_watch_catalog_loss_rebuilds_baseline_without_replaying_existing_sources
     _zip(changed, "changed.txt", b"old generation")
 
     package.json("watch", "add", watched, "-o", output)
-    blocked = package.run("watch", "start", "--once", "--no-tray", "--json")
-    assert blocked.returncode == 0, (blocked.stdout, blocked.stderr)
+    with package.watch_session():
+        package.await_watch_event("suspended_missing_volume", path=parts[0].name)
+        package.await_watch_event("done", path=retained.name)
+        package.await_watch_event("done", path=changed.name)
     assert not list(output.rglob(payload.name))
     retained_outputs = list(output.rglob("retained.txt"))
     assert len(retained_outputs) == 1
@@ -92,7 +94,8 @@ def test_watch_catalog_loss_rebuilds_baseline_without_replaying_existing_sources
     _zip(changed, "changed.txt", b"new generation")
     os.utime(changed, ns=(before.st_atime_ns, before.st_mtime_ns))
     assert changed.stat().st_size == before.st_size
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_event("done", path=parts[0].name)
     assert [path.read_bytes() for path in output.rglob(payload.name)] == [content]
     assert list(output.rglob("retained.txt")) == retained_outputs
     assert retained_outputs[0].read_bytes() == b"already completed"
@@ -261,7 +264,11 @@ def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(packa
             except psutil.NoSuchProcess:
                 pass
 
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        if cancel_before_crash:
+            package.await_watch_admission()
+        else:
+            package.await_watch_event("done", path=source.name)
     assert source.is_file()
     assert not list(output.rglob("uncommitted.txt"))
     expected = [] if cancel_before_crash else [b"original generation"]
@@ -276,14 +283,16 @@ def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(packa
         assert not list(watched.glob("nested.data.*"))
         # A second fresh runtime must not replay the recovered generation again.
         assert package.run("--persistent-shutdown").returncode == 0
-        package.json("watch", "start", "--once", "--no-tray")
+        with package.watch_session():
+            package.await_watch_admission()
         assert [path.read_bytes() for path in output.rglob("payload.txt")] == expected
         assert list(output.rglob("nested-payload.bin")) == nested_outputs
         assert nested_outputs[0].read_bytes() == nested_content
         return
     _zip(incoming, "payload.txt", b"replacement generation")
     incoming.replace(source)
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        _wait_for(lambda: any(output.rglob("payload.txt")), "Watch did not process the replacement generation")
     assert [path.read_bytes() for path in output.rglob("payload.txt")] == [b"replacement generation"]
 
 

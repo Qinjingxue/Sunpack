@@ -39,7 +39,7 @@ fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
         parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
         volume_checks: HashMap::new(),
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-        active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+        active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
         external: Arc::default(), _lease: None,
     }
@@ -122,7 +122,7 @@ fn output_create_failure_recovers_durable_input_after_restart() {
     let root = key(&base.join("input"));
     scheduler.enqueue(&root, source.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
     scheduler.dispatch_ready().unwrap();
-    scheduler.drain_active(&mut Ok(0)).unwrap();
+    scheduler.drain_active(&mut Ok(())).unwrap();
     scheduler.journal.flush().unwrap();
     assert!(scheduler.journal.state().pending(source.to_str().unwrap()).is_some(),
         "mkdir failure deleted durable work: {}",
@@ -136,7 +136,7 @@ fn output_create_failure_recovers_durable_input_after_restart() {
     restarted.recover_pending(None).unwrap();
     assert!(restarted.pending.contains_key(&key(&source)));
     restarted.dispatch_ready().unwrap();
-    restarted.drain_active(&mut Ok(0)).unwrap();
+    restarted.drain_active(&mut Ok(())).unwrap();
     assert_eq!(fs::read(output.join("archive/payload.txt")).unwrap(), b"restored output permission");
     assert!(restarted.journal.state().pending(source.to_str().unwrap()).is_none());
     assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), original);
@@ -206,7 +206,7 @@ fn checkpoint_submits_the_first_ready_generation() {
                 parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
                 volume_checks: HashMap::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-                active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+                active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
                 external: Arc::default(), _lease: None,
             };
@@ -288,7 +288,7 @@ fn checkpoint_submits_the_first_ready_generation() {
             held.lock().unwrap().take();
             scheduler.hub.claims.lock().unwrap().clear();
             scheduler.hub.stop();
-            scheduler.drain_active(&mut Ok(0)).unwrap();
+            scheduler.drain_active(&mut Ok(())).unwrap();
         }
         return;
     }
@@ -361,7 +361,7 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
         parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
         volume_checks: HashMap::new(),
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-        active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+        active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
         external: Arc::default(), _lease: None,
     };
@@ -385,7 +385,7 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
         Ok(())
     }));
     scheduler.dispatch_ready().unwrap();
-    scheduler.drain_active(&mut Ok(0)).unwrap();
+    scheduler.drain_active(&mut Ok(())).unwrap();
     drop(protected);
     assert!(scheduler.pending.contains_key(&key(&bad)), "sharing error must requeue the affected archive");
     assert!(!scheduler.pending.contains_key(&key(&good)), "independent archive was retried");
@@ -431,7 +431,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
                 volume_checks: HashMap::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-                active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+                active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
                 external: Arc::default(), _lease: None,
             };
@@ -525,7 +525,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
                 parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
                 volume_checks: HashMap::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-                active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+                active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
                 external: Arc::default(), _lease: Some(lease),
             };
@@ -650,7 +650,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
             volume_checks: HashMap::new(),
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-            active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+            active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
             external: Arc::default(), _lease: None,
         };
@@ -780,7 +780,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
             volume_checks: HashMap::new(),
             pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-            active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+            active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
             tray: None, monitor: None, toast: None, cache_deadline: None,
             external: Arc::default(), _lease: None,
         };
@@ -889,7 +889,7 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
             output: None, recursive: true, deep: false, scanned: true }]).unwrap();
         let hub = Arc::new(Hub::new());
         let mut scheduler = Scheduler::open(base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
-            Arc::clone(&hub), true, false, Arc::default(), config::load_snapshot(&base).unwrap()).unwrap();
+            Arc::clone(&hub), false, Arc::default(), config::load_snapshot(&base).unwrap()).unwrap();
         // This test drives explicit reloads deterministically; do not race the
         // native filesystem notification against the corresponding waiter.
         scheduler.config_observers.clear();
@@ -898,17 +898,14 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
         scheduler.journal.fail_for_test();
         let last_error = Arc::new(Mutex::new(None));
         let error = Arc::clone(&last_error);
-        let (once, once_wait) = command_reply();
-        assert!(hub.queue_once(once));
-        let thread = std::thread::spawn(move || scheduler.run_service(false, &error));
-        assert!(block_on(once_wait.wait()).is_err());
+        let (rebuild, rebuild_wait) = command_reply();
+        hub.update(|signals| signals.rebuild.push(rebuild));
+        let thread = std::thread::spawn(move || scheduler.run_service(&error));
+        assert!(block_on(rebuild_wait.wait()).unwrap(), "the service log outlives its faulted WAL");
         assert!(!hub.stopped.load(Ordering::Acquire));
         assert!(original.upgrade().is_none(), "faulted Journal must be released before reload");
         assert!(broker_lease.upgrade().is_some(), "the repair shell keeps the original Broker lease");
         assert!(last_error.lock().unwrap().is_some());
-        let (rebuild, rebuild_wait) = command_reply();
-        hub.update(|signals| signals.rebuild.push(rebuild));
-        assert!(block_on(rebuild_wait.wait()).unwrap(), "the service log outlives its faulted WAL");
         // Service-only configuration still applies while the data scheduler is
         // unavailable, without attempting to reopen its failed state stream.
         fs::write(base.join("sunpack_advanced_config.json"), br#"{"runtime":{"process_mode":"background"},"watch":{"clipboard_monitor_enabled":false,"toast_enabled":false,"tray_enabled":false}}"#).unwrap();
@@ -922,7 +919,7 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
         assert!(block_on(reload_wait.wait()).unwrap());
         assert!(broker_lease.upgrade().is_some(), "reopening reuses the service's Broker lease");
         hub.stop();
-        assert_eq!(thread.join().unwrap().unwrap(), 0);
+        thread.join().unwrap().unwrap();
         assert!(broker_lease.upgrade().is_none(), "service shutdown releases the Broker lease");
         return;
     }
@@ -949,11 +946,11 @@ fn a_retired_toast_activation_is_successful_and_leaves_current_request_running()
         fs::write(base.join("native/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let mut scheduler = Scheduler::open(base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
-            Arc::new(Hub::new()), false, false, Arc::default(), config::load_snapshot(&base).unwrap()).unwrap();
+            Arc::new(Hub::new()), false, Arc::default(), config::load_snapshot(&base).unwrap()).unwrap();
         let retired = "80000000000000000000000000000000";
         assert!(!scheduler.cancel_display_batch(retired).unwrap());
         let toast = super::super::toast::Toast::start(
-            &base, Arc::clone(&scheduler.engine), base.join("state/toast_host_events.jsonl"),
+            &base, Arc::clone(&scheduler.engine), base.join("state/failures"),
             7, |_, _| {},
         ).unwrap();
         let current = toast.register(Arc::from("00000000000000000000000000000001"), crate::core::i18n::Language::En);
@@ -978,7 +975,7 @@ fn coalesced_watch_completion_keeps_the_leaders_blocker() {
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let mut scheduler = Scheduler::open(
             base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
-            Arc::new(Hub::new()), false, false, Arc::default(),
+            Arc::new(Hub::new()), false, Arc::default(),
             config::load_snapshot(&base).unwrap(),
         ).unwrap();
         scheduler.journal.resume().unwrap();

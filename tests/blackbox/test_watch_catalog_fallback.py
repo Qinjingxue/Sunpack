@@ -73,5 +73,6 @@ def test_relative_roots_file_input_uses_runtime_working_directory(package, tmp_p
     _zip(watched / "input.zip", "input.txt", b"process cwd")
     (package.data / "sunpack_watch_roots.txt").write_text(
         f"relative-input | {output} | false | false | false\n", encoding="utf-8")
-    package.json("watch", "start", "--once", "--no-tray", cwd=cwd)
+    with package.watch_session(cwd=cwd):
+        package.await_watch_event("done", path="input.zip")
     assert [p.read_bytes() for p in output.rglob("input.txt")] == [b"process cwd"]

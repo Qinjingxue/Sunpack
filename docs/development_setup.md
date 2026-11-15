@@ -167,7 +167,7 @@ ctest --test-dir native\toast_host\build-x64 -C Release --output-on-failure
 Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_toast.dll -Force
 ```
 
-A continuously running watch creates Windows notification capability according to `watch.toast_enabled` and sends progress, completion, and failure notifications as configured. Ordinary CLI requests and `watch start --once` do not create notification capability. Notification failure reports are written to `.sunpack_watch/failures` under the writable data directory.
+A continuously running watch creates Windows notification capability according to `watch.toast_enabled` and sends progress, completion, and failure notifications as configured. Notification failure reports are written to `.sunpack_watch/failures` under the writable data directory.
 
 ## Smoke checks
 

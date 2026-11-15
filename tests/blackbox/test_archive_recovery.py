@@ -115,8 +115,8 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
     passwords.write_text(json.dumps({"passwords": [{"value": "first-key"}]}), encoding="utf-8")
     package.json("watch", "add", "-d", "-o", output, watched)
 
-    blocked = package.run("watch", "start", "--once", "--no-tray", "--json")
-    assert blocked.returncode in (0, 1), (blocked.stdout, blocked.stderr)
+    with package.watch_session():
+        package.await_watch_event("failed_password", path=carrier.name)
     first_path = _only_output(output, "first.txt", first)
     assert not list(output.rglob("second.txt"))
     if nested:
@@ -135,7 +135,8 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
         worker.wait(timeout=30)
     # Reopening the successful sibling would now fail its password probe.
     passwords.write_text(json.dumps({"passwords": [{"value": "second-key"}]}), encoding="utf-8")
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_event("done", path=carrier.name)
     assert _only_output(output, "first.txt", first) == first_path
     second_path = _only_output(output, "second.txt", second)
     assert first_path.parent.parent == second_path.parent.parent

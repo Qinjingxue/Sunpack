@@ -228,7 +228,8 @@ def _watch_encrypted_rar5_recovery(package, tmp_path, project=None):
     output = tmp_path / "out"
     package.configure(post_extract={"archive_cleanup_mode": "d", "flatten_single_directory": False})
     package.json("watch", "add", "-d", "-o", output, case.archive_dir)
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_event("failed_password", root=case.archive_dir)
     events = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))
     blocked = [row for row in (*events["history"], *events["live"])
                if row.get("event") == "failed_password"]
@@ -240,8 +241,8 @@ def _watch_encrypted_rar5_recovery(package, tmp_path, project=None):
     assert all(path.is_file() for path in parts if path != parts[1])
     assert package.run("--persistent-shutdown").returncode == 0
     package.configure(user_passwords=[PASSWORD])
-    result = package.run("watch", "start", "--once", "--no-tray", "--json")
-    assert result.returncode in (0, 1), (result.stdout, result.stderr)
+    with package.watch_session():
+        package.await_watch_event("suspended_missing_volume", root=case.archive_dir)
     assert all(path.is_file() for path in parts if path != parts[1])
     assert not list(output.rglob(case.marker_name))
     events = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))
@@ -250,7 +251,8 @@ def _watch_encrypted_rar5_recovery(package, tmp_path, project=None):
     if project:
         project("volumes", [path for path in parts if path != parts[1]], parts[0])
     parts[1].write_bytes(missing)
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_event("done", root=case.archive_dir)
     sibling = _one_marker(output, case)
     assert (sibling, sibling.stat().st_ino, sibling.stat().st_mtime_ns) == before
     assert all(not path.exists() for path in parts)
@@ -269,8 +271,8 @@ def test_watch_format_volume_arrival_survives_runtime_restart(package, tmp_path,
     output = tmp_path / "out"
     package.configure(post_extract={"archive_cleanup_mode": "d", "flatten_single_directory": False})
     package.json("watch", "add", "-d", "-o", output, case.archive_dir)
-    blocked = package.run("watch", "start", "--once", "--no-tray", "--json")
-    assert blocked.returncode in (0, 1), (blocked.stdout, blocked.stderr)
+    with package.watch_session():
+        package.await_watch_event("suspended_missing_volume", path=parts[0].name)
     siblings = list(output.rglob("sibling.txt"))
     assert len(siblings) == 1, siblings
     sibling = siblings[0]
@@ -280,7 +282,8 @@ def test_watch_format_volume_arrival_survives_runtime_restart(package, tmp_path,
     shutdown = package.run("--persistent-shutdown")
     assert shutdown.returncode == 0, (shutdown.stdout, shutdown.stderr)
     parts[1].write_bytes(missing)
-    package.json("watch", "start", "--once", "--no-tray")
+    with package.watch_session():
+        package.await_watch_event("done", path=parts[0].name)
     sibling = _one_marker(output, case)
     assert (sibling, sibling.stat().st_ino, sibling.stat().st_mtime_ns) == before
     assert all(not path.exists() for path in parts)

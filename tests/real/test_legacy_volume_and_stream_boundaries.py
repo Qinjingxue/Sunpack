@@ -120,7 +120,9 @@ def test_standalone_sfx_is_independent_of_same_stem_missing_split(package, tmp_p
         watch = watch_setup(package, tmp_path, passwords=[], cleanup="d", start=False)
         for source in [executable, *present]:
             stage_initial(watch, source)
-        package.json("watch", "start", "--once", "--no-tray")
+        with package.watch_session():
+            watch.await_event("done", path=executable.name)
+            watch.await_event("suspended_missing_volume")
         inputs = watch.root
     assert_extracted(standalone, output, exact=True)
     assert {path.name: path.read_bytes() for path in inputs.iterdir()} == original

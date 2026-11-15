@@ -1534,17 +1534,14 @@ impl Toast {
     pub(super) fn start(
         cwd: &Path,
         engine: Arc<crate::pipeline::Engine>,
-        diagnostic: PathBuf,
+        report_directory: PathBuf,
         retention: u64,
         report_error: impl Fn(&'static str, &io::Error) + Send + 'static,
     ) -> io::Result<Self> {
         let cwd = cwd.to_owned();
         let reports = Arc::new(Reports {
             cancellation: Cancellation::new(),
-            directory: diagnostic
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join("failures"),
+            directory: report_directory,
             retention: AtomicU64::new(retention),
         });
         let shared = Arc::new(Shared::default());
@@ -1654,7 +1651,7 @@ impl Toast {
                         available = show_snapshot(
                             &mut presenter,
                             || match library.get_or_init(|| ToastLibrary::load(&cwd)) {
-                                Ok(library) => library.presenter(&diagnostic),
+                                Ok(library) => library.presenter(),
                                 Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
                             },
                             |presenter| presenter.show(&payload, sequence),
@@ -2434,7 +2431,7 @@ mod tests {
         let engine = Arc::new(crate::pipeline::Engine::new(directory.0.join("unused-worker.exe")));
         for _ in 0..3 {
             let reported = Arc::clone(&errors);
-            let host = Toast::start(&directory.0, Arc::clone(&engine), directory.0.join("toast.log"), 7,
+            let host = Toast::start(&directory.0, Arc::clone(&engine), directory.0.join("failures"), 7,
                 move |_, _| { reported.fetch_add(1, Ordering::Relaxed); }).unwrap();
             drop(host);
         }

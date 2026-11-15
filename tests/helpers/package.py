@@ -2,11 +2,26 @@ import json
 import os
 import shutil
 import subprocess
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import psutil
+
+
+from tests.helpers.native_fixture import native_fixture
+
+
+def wait_for(condition, description, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = condition()
+        if value:
+            return value
+        time.sleep(0.025)
+    pytest.fail(f"Did not observe {description}")
 
 
 @dataclass
@@ -32,6 +47,44 @@ class Package:
         result = self.run(*arguments, "--json", cwd=cwd, timeout=timeout)
         assert result.returncode == code, (result.stdout, result.stderr)
         return json.loads(result.stdout)
+
+    @contextmanager
+    def watch_session(self, *, cwd=None):
+        self.json("watch", "start", "--no-tray", cwd=cwd)
+        try:
+            yield
+        finally:
+            assert self.json("watch", "stop", cwd=cwd)["summary"]["stopped"]
+
+    def await_watch_admission(self):
+        # Start publishes the recovered pending count. Once the scheduler has
+        # submitted it, stop drains the submitted work, including ignored inputs.
+        def admitted():
+            status = self.json("watch", "status")["summary"]
+            assert status["running"] and not status["last_error"], status
+            return status["pending"] == 0
+
+        wait_for(admitted, "admission of startup Watch candidates")
+
+    def await_watch_event(self, *kinds, path=None, after=0, root=None):
+        events = self.data / ".sunpack_watch" / "events.json"
+
+        def find():
+            if not events.is_file():
+                return None
+            try:
+                display = native_fixture("display_events", path=str(events))
+            except subprocess.CalledProcessError:
+                return None  # The display store can be publishing its manifest.
+            for row in (*display["live"], *display["history"]):
+                if row["event"] not in kinds or row["ts"] <= after:
+                    continue
+                source = Path(row.get("path", ""))
+                if (path is None or source.name == path) and (root is None or source.parent == root):
+                    return row
+            return None
+
+        return wait_for(find, f"Watch event {kinds} for {path or root or self.data}", timeout=15)
 
     def configure(self, *, live=True, **overrides):
         path = self.data / "sunpack_config.json"

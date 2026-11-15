@@ -1,5 +1,4 @@
 import io
-import json
 import zipfile
 from pathlib import Path
 
@@ -23,16 +22,12 @@ BLOCKERS = {
 }
 
 
-def _watch_once(package, watch):
-    result = package.run("watch", "start", "--once", "--no-tray", "--json")
-    assert result.returncode in (0, 1), (result.stdout, result.stderr)
-    assert json.loads(result.stdout)["summary"]["exit_code"] == result.returncode
+def _watch_failures(watch, *, root=None):
     display = watch.display()
-    rows = [*display["history"], *display["live"]]
-    return result.returncode, [
-        row for row in rows
+    return [
+        row for row in (*display["history"], *display["live"])
         if row["event"] in {*BLOCKERS, "failed_terminal"}
-        and Path(row.get("path", "")).parent == watch.root
+        and (root is None or Path(row.get("path", "")).parent == root)
     ]
 
 
@@ -83,8 +78,14 @@ def test_real_pkzip_disks_classify_wrong_password_and_missing_volumes(
             write_passwords(package, root, passwords)
             package.json("watch", "add", "-d", root, "-o", output)
             try:
-                _, events = _watch_once(package, watch)
-                failures = {BLOCKERS.get(row["event"], "failed_terminal") for row in events}
+                with package.watch_session():
+                    if not expected:
+                        watch.await_archive(case)
+                    elif "unrecognized" in expected:
+                        package.await_watch_admission()
+                    else:
+                        package.await_watch_event(*BLOCKERS, "failed_terminal", root=watch.root)
+                failures = {BLOCKERS.get(row["event"], "failed_terminal") for row in _watch_failures(watch, root=root)}
             finally:
                 package.json("watch", "remove", root)
         if expected:
@@ -166,10 +167,10 @@ def test_watch_nested_split_groups_persist_distinct_blockers(package, tmp_path):
     package.configure(filesystem={"scan_filters_enabled": False}, recursive_extract="*")
     write_passwords(package, watch.root, ["wrong-candidate", "known"])
     package.json("watch", "add", "-d", watch.root, "-o", output)
-    code, events = _watch_once(package, watch)
-    # Like main, --once reports service execution, while archive blockers are
-    # recorded in Watch state rather than propagated as its process exit code.
-    assert code == 0
+    with package.watch_session():
+        watch.await_event("failed_password", path="wrong.z01.图片")
+        watch.await_event("suspended_missing_volume", path="missing.z01.图片")
+    events = _watch_failures(watch)
     assert {
         Path(row["path"]).name: row["event"] for row in events
     } == {
@@ -214,19 +215,19 @@ def test_watch_dual_faults_resume_after_each_blocker_is_resolved(
     package.json("watch", "add", "-d", watch.root, "-o", watch.output)
 
     remaining = set(BLOCKERS)
-    for _ in range(2):
-        code, events = _watch_once(package, watch)
-        assert code == 0 and events
-        blocker = events[-1]["event"]
-        assert blocker in remaining, events
-        remaining.remove(blocker)
-        assert not list(watch.output.rglob(case.marker_name))
-        if blocker == "suspended_missing_volume":
-            missing.write_bytes(missing_data)
-        else:
-            write_passwords(package, watch.root, [password])
-
-    code, _ = _watch_once(package, watch)
-    assert code == 0
+    after = 0
+    with package.watch_session():
+        for _ in range(2):
+            row = package.await_watch_event(*BLOCKERS, after=after, root=watch.root)
+            after = row["ts"]
+            blocker = row["event"]
+            assert blocker in remaining, row
+            remaining.remove(blocker)
+            assert not list(watch.output.rglob(case.marker_name))
+            if blocker == "suspended_missing_volume":
+                missing.write_bytes(missing_data)
+            else:
+                write_passwords(package, watch.root, [password])
+        watch.await_archive(case)
     assert_extracted(case, watch.output)
     assert all(path.is_file() for path in disguised)

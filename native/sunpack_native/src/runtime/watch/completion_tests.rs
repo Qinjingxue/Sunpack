@@ -46,7 +46,7 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
         parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
         volume_checks: HashMap::new(),
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
-        active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+        active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
         external: Arc::default(), _lease: None,
     };
