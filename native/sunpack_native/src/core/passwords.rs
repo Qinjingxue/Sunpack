@@ -209,26 +209,28 @@ impl IndexBuilder {
         value
     }
 
-    fn finish(self, previous: &PasswordSnapshot) -> PasswordSnapshot {
-        let bucket = |mut values: Vec<Arc<str>>, previous: Option<&Bucket>| {
+    fn finish(self, previous: &PasswordSnapshot) -> Option<PasswordSnapshot> {
+        let mut changed = self.scoped.len() != previous.scoped.len();
+        let mut bucket = |mut values: Vec<Arc<str>>, previous: Option<&Bucket>| {
             let mut seen = HashSet::with_capacity(values.len());
             values.retain(|value| seen.insert(value.clone()));
             if let Some(previous) = previous.filter(|old| old.values.as_ref() == values) {
                 previous.clone()
             } else {
+                changed = true;
                 Bucket::new(values)
             }
         };
-        PasswordSnapshot::new(
-            bucket(self.global, Some(&previous.global)),
-            self.scoped
-                .into_iter()
-                .map(|(scope, values)| {
-                    let values = bucket(values, previous.scoped.get(scope.as_ref()));
-                    (scope, values)
-                })
-                .collect(),
-        )
+        let global = bucket(self.global, Some(&previous.global));
+        let scoped = self
+            .scoped
+            .into_iter()
+            .map(|(scope, values)| {
+                let values = bucket(values, previous.scoped.get(scope.as_ref()));
+                (scope, values)
+            })
+            .collect();
+        changed.then(|| PasswordSnapshot::new(global, scoped))
     }
 }
 
@@ -468,17 +470,7 @@ impl BuiltinStore {
             let value = index.intern(&value);
             index.global.push(value);
         }
-        let updated = index.finish(&state.snapshot);
-        let previous = &state.snapshot;
-        let same = Arc::ptr_eq(&updated.global.values, &previous.global.values)
-            && updated.scoped.len() == previous.scoped.len()
-            && updated.scoped.iter().all(|(key, bucket)| {
-                previous
-                    .scoped
-                    .get(key)
-                    .is_some_and(|old| Arc::ptr_eq(&bucket.values, &old.values))
-            });
-        if !same {
+        if let Some(updated) = index.finish(&state.snapshot) {
             state.snapshot = Arc::new(updated);
         }
         Ok(state.snapshot.clone())
@@ -723,7 +715,7 @@ mod tests {
             .unwrap()
             .read_passwords(Some(&mut index))
             .unwrap();
-        let snapshot = index.finish(&PasswordSnapshot::default());
+        let snapshot = index.finish(&PasswordSnapshot::default()).unwrap();
         // Existing Watch records contain these fingerprints. A schema or
         // ordering change here would retry unchanged failed archives on upgrade.
         assert_eq!(snapshot.signature(), "0871aed6a34a4efb389027260eaaf30f");
@@ -740,7 +732,7 @@ mod tests {
         let mut changed = IndexBuilder::default();
         Document::parse(&text.replace("\"value\":\"child\"", "\"value\":\"new child\""))
             .unwrap().read_passwords(Some(&mut changed)).unwrap();
-        let changed = changed.finish(&snapshot);
+        let changed = changed.finish(&snapshot).unwrap();
         assert_ne!(snapshot.scope_signature(Path::new(r"C:\Downloads\child\deep")),
             changed.scope_signature(Path::new(r"C:\Downloads\child\deep")));
         assert_eq!(snapshot.scope_signature(Path::new(r"C:\different")),

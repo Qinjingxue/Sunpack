@@ -2374,7 +2374,7 @@ mod tests {
                 assert_eq!(candidates[1].offset, inner);
                 assert_eq!(candidates[1].end_offset, Some(inner_end));
             }
-            assert!(source.stats().unwrap().read_bytes <= data.len() as u64 * 3);
+            assert!(source.stats().read_bytes <= data.len() as u64 * 3);
         }
     }
 

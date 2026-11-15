@@ -40,8 +40,9 @@ impl From<io::Error> for ValidationError {
     }
 }
 
+#[cfg(test)]
 impl ValidationError {
-    pub(crate) fn code(&self) -> &'static str {
+    fn code(&self) -> &'static str {
         match self {
             Self::Io(_) => "os_error",
             Self::Invalid(code) => code,
@@ -1139,7 +1140,6 @@ fn read_bzip2_prefix(prefix: &[u8; 10]) -> ValidationResult<(usize, bool)> {
 
 // Stream header, marker and CRC (14 bytes), then at most 315 bits through
 // the selector count. Detection already has these bytes in its file head.
-pub(crate) const BZIP2_IDENTITY_BYTES: usize = 54;
 
 /// Validate a bounded leading header. The result indicates an empty first stream.
 pub(crate) fn validate_bzip2_identity(prefix: &[u8], file_size: u64) -> ValidationResult<bool> {

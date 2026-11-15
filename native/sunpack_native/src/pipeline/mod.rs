@@ -511,30 +511,38 @@ impl Outcome {
             }
             return;
         }
-        let mut groups: HashMap<(String, usize), Vec<ArchiveResult>> = HashMap::new();
-        let mut order = Vec::new();
-        for archive in std::mem::take(&mut self.archives) {
+        // Most physical archives have a single result. Keep their first result
+        // inline and allocate a sibling vector only for multi-segment inputs.
+        let mut positions = HashMap::new();
+        let mut groups: Vec<(ArchiveResult, Vec<ArchiveResult>)> = Vec::new();
+        for mut archive in std::mem::take(&mut self.archives) {
             let key = (crate::path_keys::path_key(&archive.path.to_string_lossy()), archive.depth);
-            if !groups.contains_key(&key) { order.push(key.clone()); }
-            groups.entry(key).or_default().push(archive);
+            archive.release_extract_provenance();
+            match positions.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(groups.len());
+                    groups.push((archive, Vec::new()));
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    groups[*entry.get()].1.push(archive);
+                }
+            }
         }
-        for key in order {
-            let mut entries = groups.remove(&key).expect("completed physical input");
-            if entries.iter().all(|entry| entry.failure.is_none() && !entry.partial) {
-                let output = common_ancestor(entries.iter().filter_map(|entry| entry.output.as_deref()));
-                let mut summary = entries.remove(0);
-                summary.output = output;
-                for entry in entries {
-                    summary.files += entry.files;
-                    summary.bytes += entry.bytes;
+        drop(positions);
+        self.archives.reserve(groups.len());
+        for (mut first, siblings) in groups {
+            let entries = std::iter::once(&first).chain(&siblings);
+            let succeeded = entries.clone().all(|entry| entry.failure.is_none() && !entry.partial);
+            if succeeded {
+                first.output = common_ancestor(entries.filter_map(|entry| entry.output.as_deref()));
+                for entry in siblings {
+                    first.files += entry.files;
+                    first.bytes += entry.bytes;
                 }
-                summary.release_extract_provenance();
-                self.archives.push(summary);
+                self.archives.push(first);
             } else {
-                for entry in &mut entries {
-                    entry.release_extract_provenance();
-                }
-                self.archives.extend(entries);
+                self.archives.push(first);
+                self.archives.extend(siblings);
             }
         }
     }

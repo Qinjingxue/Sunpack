@@ -1,13 +1,14 @@
 use crate::postprocess::WatchCandidateRow;
 use crate::scan::catalog::NativeWatchObservation;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 
 // The observer and scheduler share one bounded tracker. Notifications may be
 // coalesced for wakeup/catalog work, never for cadence learning.
 #[derive(Default)]
-pub(super) struct Activities(std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<ActivityInner>>>);
+pub(super) struct Activities(std::sync::Mutex<std::collections::HashMap<Arc<str>, std::sync::Weak<ActivityInner>>>);
 
 #[derive(Clone)]
 pub(super) struct Activity(std::sync::Arc<ActivityInner>);
@@ -21,7 +22,7 @@ pub(super) struct Observation {
 
 struct ActivityInner {
     state: std::sync::Mutex<ActivityState>,
-    registration: std::sync::OnceLock<(String, std::sync::Weak<Activities>)>,
+    registration: std::sync::OnceLock<(Arc<str>, std::sync::Weak<Activities>)>,
 }
 
 #[derive(Default)]
@@ -39,7 +40,7 @@ impl Drop for ActivityInner {
                 let mut entries = registry.0.lock().unwrap();
                 if entries.get(key).is_some_and(|value| std::ptr::eq(value.as_ptr(), self)) {
                     entries.remove(key);
-                    if entries.is_empty() { entries.shrink_to_fit(); }
+                    crate::collections::trim_map(&mut entries);
                 }
             }
         }
@@ -47,13 +48,14 @@ impl Drop for ActivityInner {
 }
 
 impl Activities {
-    pub(super) fn bind(self: &std::sync::Arc<Self>, key: String, make: impl FnOnce() -> Activity) -> Activity {
+    pub(super) fn bind(self: &Arc<Self>, key: &str, make: impl FnOnce() -> Activity) -> Activity {
         let mut entries = self.0.lock().unwrap();
-        if let Some(inner) = entries.get(&key).and_then(std::sync::Weak::upgrade) {
+        if let Some(inner) = entries.get(key).and_then(std::sync::Weak::upgrade) {
             return Activity(inner);
         }
         let activity = make();
-        activity.0.registration.get_or_init(|| (key.clone(), std::sync::Arc::downgrade(self)));
+        let key = Arc::<str>::from(key);
+        activity.0.registration.get_or_init(|| (Arc::clone(&key), Arc::downgrade(self)));
         entries.insert(key, std::sync::Arc::downgrade(&activity.0));
         activity
     }
@@ -373,8 +375,8 @@ mod tests {
     fn shared_samples_survive_coalescing_and_retire_with_the_last_owner() {
         use std::sync::Arc;
         let registry = Arc::new(Activities::default());
-        let owner = registry.bind("path".into(), Activity::default);
-        let signal = registry.bind("path".into(), Activity::default);
+        let owner = registry.bind("path", Activity::default);
+        let signal = registry.bind("path", Activity::default);
         let now = Instant::now();
         let mut candidate = WatchCandidateRow {
             path: "path".into(), size: 100, mtime: 0.0,

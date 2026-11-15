@@ -46,11 +46,6 @@ pub(crate) fn unified_prefilter_mask_from_head(file_size: u64, head: &[u8]) -> u
     rejected
 }
 
-pub(crate) fn confirm_compression_format_identity_native(path: &str, format: &str) -> bool {
-    let result = inspect_compression_stream_identity_impl(path);
-    result.format == format && result.plausible && result.error.is_empty()
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum StreamStructure {
     Complete(&'static str),

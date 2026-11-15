@@ -1474,7 +1474,7 @@ impl RootObserver {
                     if !scope.contains(&path.to_string_lossy()) { continue; }
                     let key = key(path);
                     if hub.claims.lock().unwrap().contains_key(&key) { continue; }
-                    let activity = hub.activities.bind(key.clone(), || {
+                    let activity = hub.activities.bind(&key, || {
                         catalog.observation(&path.to_string_lossy())
                             .as_ref().map_or_else(quiet::Activity::default, quiet::Activity::saved)
                     });
@@ -3655,7 +3655,7 @@ impl Scheduler {
             .or_else(|| captured.map(|value| value.observation.change_usn))
             .or_else(|| previous.as_ref().map(|value| value.change_usn))
             .or_else(|| blocked.as_ref().map(|value| value.change_usn));
-        let activity = self.hub.activities.bind(id.clone(), || {
+        let activity = self.hub.activities.bind(&id, || {
             self.pending.get(&id).map(|pending| pending.quiet.clone())
                 .or_else(|| tracker.clone()).unwrap_or_else(|| previous.as_ref()
                     .map_or_else(quiet::Activity::default, quiet::Activity::saved))
@@ -6957,7 +6957,7 @@ mod tests {
         let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
         let hub = Arc::new(Hub::new());
         let source = watched.join("growing.zip");
-        let activity = hub.activities.bind(key(&source), quiet::Activity::default);
+        let activity = hub.activities.bind(&key(&source), quiet::Activity::default);
         let observer = RootObserver::start(&watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]),
             &watched.join("builtin_passwords.json"), &hub, &journal, &catalog, false).unwrap();
         let mut file = fs::File::create(&source).unwrap();

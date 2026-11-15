@@ -670,7 +670,8 @@ mod tests {
         let old = utc_us() - 10 * DAY_US;
         {
             let mut store = Store::open(path.clone()).unwrap();
-            store.append(&serde_json::json!({"event":"done", "path":"old.zip", "ts":old as f64 / 1_000_000.0}), old).unwrap();
+            let row = serde_json::json!({"event":"done", "path":"old.zip", "ts":old as f64 / 1_000_000.0});
+            store.append(&crate::io::display_store::HistoryRecord::new(&row, old)).unwrap();
             store.publish().unwrap();
         }
         for (days, expected) in [(30, 1), (7, 0)] {

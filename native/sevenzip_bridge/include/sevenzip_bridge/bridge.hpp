@@ -68,40 +68,9 @@ struct ExtractInputTrace {
 #ifdef SUP7Z_DEBUG
     PipelineTiming *pipeline_timing = nullptr;
 #endif
-    std::wstring mode;
-    unsigned long long virtual_size = 0;
-    unsigned long long total_bytes_returned = 0;
-    // Populated only when SUNPACK_SEVENZIP_PROFILE_READS=1 in the worker
-    // environment. Includes synchronous reads and OVERLAPPED submissions;
-    // completion waits are accounted for in prefetch_consumer_wait_ns.
-    unsigned long long read_file_call_count = 0;
-    unsigned long long read_file_wall_ns = 0;
-    unsigned long long read_file_max_wall_ns = 0;
-    // Logical IInStream access pattern, populated only when input-read
-    // profiling is enabled, describing the access requested by the embedded
-    // 7-Zip decoder.
-    unsigned long long logical_read_call_count = 0;
-    unsigned long long sequential_read_bytes = 0;
-    unsigned long long nonsequential_read_bytes = 0;
-    unsigned long long sequential_run_count = 0;
-    unsigned long long max_sequential_run_bytes = 0;
-    unsigned long long current_sequential_run_bytes = 0;
-    unsigned long long seek_count = 0;
-    unsigned long long seek_forward_bytes = 0;
-    unsigned long long seek_backward_bytes = 0;
-    // Prefetch state and counters, populated only when input-read profiling
-    // is enabled.
-    bool prefetch_enabled = false;
-    unsigned long long prefetch_hit_count = 0;
-    unsigned long long prefetch_miss_count = 0;
-    unsigned long long prefetch_invalidation_count = 0;
-    unsigned long long prefetch_consumer_wait_ns = 0;
-    unsigned long long last_logical_read_end = 0;
-    bool has_last_logical_read_end = false;
     unsigned long long last_read_virtual_offset = 0;
     unsigned long long last_read_source_offset = 0;
     unsigned int last_read_requested = 0;
-    unsigned int last_read_returned = 0;
     int read_hresult = 0;
     std::wstring last_source_path;
 };

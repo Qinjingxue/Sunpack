@@ -117,8 +117,7 @@ impl JournalReader {
             let reasons = read_change_reasons_from_volume(
                 volume,
                 journal_id,
-                expected_file_id,
-                expected_file_id_len as usize,
+                file_id_value(&expected_file_id[..usize::from(expected_file_id_len)]),
                 previous_usn,
                 current_usn,
             )?;
@@ -403,7 +402,8 @@ fn scan_directories_page(
             changed.extend(changes.into_iter().flatten().cloned());
         }
         if returned_next <= cursor {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
                 "USN recovery made no progress; fallback scan required",
             ));
         }
@@ -443,7 +443,8 @@ fn record_directory_changes<'a>(
         3 => (16, 40, Some((72, 74))),
         4 => (16, 40, None),
         _ => {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
                 "unknown USN record; fallback scan required",
             ))
         }
@@ -470,7 +471,10 @@ fn record_directory_changes<'a>(
     }
     if let Some(index) = parents.get(&parent) {
         let Some((length_offset, offset_offset)) = name_offsets else {
-            return Err(io::Error::other("USN V4 record requires fallback scan"));
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "USN V4 record requires fallback scan",
+            ));
         };
         if record.len() < offset_offset + 2 {
             return Err(io::Error::new(
@@ -520,8 +524,7 @@ fn record_directory_changes<'a>(
 fn read_change_reasons_from_volume(
     volume: HANDLE,
     journal_id: u64,
-    expected_file_id: &[u8; FILE_ID_BYTES],
-    expected_file_id_len: usize,
+    expected_file_id: u128,
     previous_usn: i64,
     current_usn: i64,
 ) -> io::Result<ChangeReasons> {
@@ -537,7 +540,6 @@ fn read_change_reasons_from_volume(
             if let Some(reason) = record_change_reason(
                 record,
                 expected_file_id,
-                expected_file_id_len,
                 previous_usn,
                 current_usn,
             )? {
@@ -564,8 +566,7 @@ fn read_change_reasons_from_volume(
 
 fn record_change_reason(
     record: &[u8],
-    expected_file_id: &[u8; FILE_ID_BYTES],
-    expected_file_id_len: usize,
+    expected_file_id: u128,
     previous_usn: i64,
     current_usn: i64,
 ) -> io::Result<Option<u32>> {
@@ -591,11 +592,7 @@ fn record_change_reason(
     let usn = i64::from_le_bytes(record[usn_offset..usn_offset + 8].try_into().unwrap());
     if usn <= previous_usn
         || usn > current_usn
-        || !file_ids_equal(
-            &record[8..file_id_end],
-            expected_file_id,
-            expected_file_id_len,
-        )
+        || file_id_value(&record[8..file_id_end]) != expected_file_id
     {
         return Ok(None);
     }
@@ -604,16 +601,12 @@ fn record_change_reason(
     )))
 }
 
-fn file_ids_equal(record: &[u8], expected: &[u8; FILE_ID_BYTES], expected_len: usize) -> bool {
-    let mut record_end = record.len();
-    while record_end > 0 && record[record_end - 1] == 0 {
-        record_end -= 1;
+fn file_id_value(bytes: &[u8]) -> u128 {
+    match bytes.len() {
+        8 => u128::from(u64::from_le_bytes(bytes.try_into().unwrap())),
+        FILE_ID_BYTES => u128::from_le_bytes(bytes.try_into().unwrap()),
+        _ => unreachable!(),
     }
-    let mut expected_end = expected_len;
-    while expected_end > 0 && expected[expected_end - 1] == 0 {
-        expected_end -= 1;
-    }
-    record[..record_end] == expected[..expected_end]
 }
 
 fn device_io_control(
@@ -738,7 +731,7 @@ mod tests {
         expected[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let mut record = [0u8; FILE_ID_BYTES];
         record[..8].copy_from_slice(&expected[..8]);
-        assert!(file_ids_equal(&record, &expected, 8));
+        assert_eq!(file_id_value(&record), file_id_value(&expected[..8]));
         assert_eq!(
             crate::protocol::format_file_id(&record),
             "00000000000000000807060504030201"
@@ -747,16 +740,15 @@ mod tests {
 
     #[test]
     fn parses_v2_v3_and_v4_reason_layouts_with_exclusive_lower_bound() {
-        let expected = 0x1234u128.to_le_bytes();
+        let expected = 0x1234;
         for major in [2u16, 3, 4] {
-            let width = if major == 2 { 8 } else { 16 };
             let value = record(major, 0x1234, 101, 0x0000_0002);
             assert_eq!(
-                record_change_reason(&value, &expected, width, 100, 101).unwrap(),
+                record_change_reason(&value, expected, 100, 101).unwrap(),
                 Some(0x0000_0002)
             );
             assert_eq!(
-                record_change_reason(&value, &expected, width, 101, 102).unwrap(),
+                record_change_reason(&value, expected, 101, 102).unwrap(),
                 None
             );
         }

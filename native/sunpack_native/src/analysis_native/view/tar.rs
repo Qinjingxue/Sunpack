@@ -24,47 +24,13 @@ fn u64_le(bytes: &[u8], offset: usize) -> u64 {
     ])
 }
 
-fn parse_octal(field: &[u8]) -> Option<u64> {
-    crate::formats::tar::number(field)
-}
+pub(super) fn tar_header_identity(header: &[u8], file_size: u64) -> bool {
+    use crate::formats::tar::{header_size, number, padding};
 
-#[derive(Clone, Copy)]
-struct TarHeaderIdentity {
-    name_nonempty: bool,
-    numeric_fields_valid: bool,
-    typeflag_valid: bool,
-    payload_in_range: bool,
-    validated_size: Result<u64, &'static str>,
-}
-
-fn tar_header_identity(header: &[u8], offset: u64, file_size: u64) -> TarHeaderIdentity {
-    let stored_checksum = parse_octal(&header[148..156]);
-    let member_size = parse_octal(&header[124..136]);
-    let computed_checksum = tar_checksum(header);
-    TarHeaderIdentity {
-        name_nonempty: header[0..100].iter().any(|byte| *byte != 0),
-        numeric_fields_valid: stored_checksum.is_some()
-            && member_size.is_some()
-            && parse_octal(&header[100..108]).is_some()
-            && parse_octal(&header[108..116]).is_some()
-            && parse_octal(&header[116..124]).is_some()
-            && parse_octal(&header[136..148]).is_some(),
-        typeflag_valid: header[156] == 0 || (0x20..0x7f).contains(&header[156]),
-        payload_in_range: member_size.is_some_and(|size| {
-            offset.saturating_add(TAR_BLOCK_SIZE as u64)
-                .saturating_add(size).saturating_add(tar_padding(size)) <= file_size
-        }),
-        validated_size: crate::formats::tar::checked_header_size(
-            stored_checksum,
-            member_size,
-            computed_checksum,
-        ),
-    }
-}
-
-fn tar_checksum(header: &[u8]) -> u64 {
-    crate::formats::tar::checksum(header)
-}
-fn tar_padding(size: u64) -> u64 {
-    crate::formats::tar::padding(size)
+    let Ok(size) = header_size(header) else { return false; };
+    (TAR_BLOCK_SIZE as u64).saturating_add(size).saturating_add(padding(size)) <= file_size
+        && header[..100].iter().any(|byte| *byte != 0)
+        && (header[156] == 0 || (0x20..0x7f).contains(&header[156]))
+        && [100..108, 108..116, 116..124, 136..148].into_iter()
+            .all(|field| number(&header[field]).is_some())
 }

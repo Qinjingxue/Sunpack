@@ -9,18 +9,17 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
 enum Phase {
     Queued,
     Preparing,
     Working,
     ResolvingVolumes,
-    Finished(TaskStatus),
+    Finished(TaskCompletion),
 }
 
 struct TaskRow {
     path: PathBuf,
-    offset: Option<u64>,
+    segment: bool,
     parent: Option<TaskId>,
     children: BTreeSet<TaskId>,
     label: String,
@@ -28,7 +27,6 @@ struct TaskRow {
     phase: Phase,
     wait: ResourceWait,
     progress: Option<(u64, u64)>,
-    result: Option<TaskCompletion>,
     detail: Option<String>,
 }
 
@@ -62,7 +60,7 @@ impl Panel {
         while let Some(id) = pending.pop() {
             if let Some(task) = self.tasks.get_mut(&id) {
                 pending.extend(task.children.iter().copied());
-                if let Some(result) = &mut task.result { result.relocate_output(old, new); }
+                if let Phase::Finished(result) = &mut task.phase { result.relocate_output(old, new); }
             }
         }
     }
@@ -113,15 +111,7 @@ impl Panel {
             }
             // main keeps the current row until the execution result is known.
             Event::Finalizing { .. } => return,
-            Event::Finished { id, result, .. } => {
-                let status = result.status;
-                if let Some(task) = self.tasks.get_mut(&id) {
-                    if status == TaskStatus::Complete { task.progress = Some((1, 1)); }
-                    task.result = Some(result);
-                    task.detail = None;
-                }
-                (id, Some(Phase::Finished(status)))
-            },
+            Event::Finished { id, result, .. } => (id, Some(Phase::Finished(result))),
             Event::Progress {
                 id,
                 completed_bytes,
@@ -166,22 +156,27 @@ impl Panel {
                 return;
             }
         };
+        let phase_changed = phase.is_some();
         if let Some((phase, task)) = phase.zip(self.tasks.get_mut(&id)) {
-            task.phase = phase;
             task.wait = ResourceWait::default();
-            if matches!(phase, Phase::Preparing | Phase::Working | Phase::ResolvingVolumes) {
-                task.progress = None;
+            match &phase {
+                Phase::Preparing | Phase::Working | Phase::ResolvingVolumes => task.progress = None,
+                Phase::Finished(result) => {
+                    if result.status == TaskStatus::Complete { task.progress = Some((1, 1)); }
+                    task.detail = None;
+                }
+                Phase::Queued => {}
             }
+            task.phase = phase;
         }
         if !prompting {
-            self.redraw(session, language, phase.is_some() && self.should_show(id));
+            self.redraw(session, language, phase_changed && self.should_show(id));
         }
     }
 
     fn register(&mut self, language: Language, id: TaskId, parent: Option<TaskId>,
         path: PathBuf, segment: Option<crate::pipeline::Segment>) {
         let is_segment = segment.is_some();
-        let offset = segment.as_ref().map(|segment| segment.offset);
         let label = if let Some(segment) = segment {
             let label = language
                 .translate("cli.scan.segment", &[("index", &segment.index.to_string())]);
@@ -206,7 +201,7 @@ impl Panel {
         self.tasks.insert(
             id,
             TaskRow {
-                path, offset,
+                path, segment: is_segment,
                 parent,
                 label,
                 children: BTreeSet::new(),
@@ -214,7 +209,6 @@ impl Panel {
                 phase: Phase::Queued,
                 wait: ResourceWait::default(),
                 progress: None,
-                result: None,
                 detail: None,
             },
         );
@@ -235,7 +229,8 @@ impl Panel {
     }
 
     pub(super) fn take_scope_output(&mut self, id: TaskId) -> Option<PathBuf> {
-        self.tasks.get_mut(&id)?.result.as_mut()?.output.take()
+        let Phase::Finished(result) = &mut self.tasks.get_mut(&id)?.phase else { return None; };
+        result.output.take()
     }
 
     pub(super) fn remove(&mut self, id: TaskId) {
@@ -403,7 +398,7 @@ impl Panel {
                 else { std::borrow::Cow::Borrowed(task.label.as_str()) };
             emit_row(&mut rows, &mut writer, Some(id), width, unicode, format_args!("{prefix}{edge}{label}"))?;
             let detail_prefix = format!("{prefix}{continuation}  ");
-            if !task.carrier || matches!(task.phase, Phase::Finished(TaskStatus::Failed)) {
+            if !task.carrier || matches!(&task.phase, Phase::Finished(result) if result.status == TaskStatus::Failed) {
                 if rows.len() == height {
                     rows.pop();
                     emit_row(&mut rows, &mut writer, None, width, unicode, format_args!("{}", ellipsis(unicode)))?;
@@ -412,8 +407,8 @@ impl Panel {
                 emit_row(&mut rows, &mut writer, Some(id), width, unicode, format_args!("{detail_prefix}{}", row_status(
                     task, width.saturating_sub(display_width(&detail_prefix)), language,
                 )))?;
-                if let Some(result) = &task.result {
-                    let detail = super::task_detail(result.status, result.failure.as_ref(), result.discovery.map(|source| (source, task.path.as_path())), task.offset.is_some(), self.verbose, language);
+                if let Phase::Finished(result) = &task.phase {
+                    let detail = super::task_detail(result.status, result.failure.as_ref(), result.discovery.map(|source| (source, task.path.as_path())), task.segment, self.verbose, language);
                     let output = result.output.as_ref().filter(|_| self.verbose).map(|output| language.translate(
                         "report.detail.output", &[("output", &output.to_string_lossy())],
                     ));
@@ -505,19 +500,19 @@ fn append_progress(text: &mut String, progress: Option<(u64, u64)>, bar: bool) {
 }
 
 fn row_status(task: &TaskRow, available: usize, language: Language) -> String {
-    if matches!(task.phase, Phase::Finished(TaskStatus::Skipped)) {
+    if matches!(&task.phase, Phase::Finished(result) if result.status == TaskStatus::Skipped) {
         // main never gives skipped rows a progress bar or a known percentage.
         return status_text(language.text("report.status.skipped"), None, "", Some(0));
     }
     let (status, hint) = if task.wait.disk || task.wait.memory {
         wait_status(task.wait, language)
     } else {
-        let status = match task.phase {
+        let status = match &task.phase {
             Phase::Queued => "report.status.waiting",
             Phase::Preparing => "report.status.preparing",
             Phase::Working => "report.status.extracting",
             Phase::ResolvingVolumes => "report.status.resolving_volumes",
-            Phase::Finished(status) => super::task_status_key(status),
+            Phase::Finished(result) => super::task_status_key(result.status),
         };
         (language.text(status), String::new())
     };
@@ -661,7 +656,7 @@ mod tests {
         assert_eq!(row.label, "new.001");
         assert_eq!(row.parent, Some(1));
         assert!(row.children.is_empty());
-        assert!(row.progress.is_none() && row.result.is_none());
+        assert!(row.progress.is_none());
         assert!(!row.wait.disk && !row.wait.memory);
         assert!(matches!(row.phase, Phase::Preparing));
         assert!(!panel.tasks.contains_key(&3));
@@ -776,15 +771,18 @@ mod tests {
         }
         for (id, expected) in [(2, "root/nested"), (3, "root/nested/deep"),
                                (4, "root"), (5, "elsewhere/output"), (6, "root/queued")] {
-            assert_eq!(panel.tasks[&id].result.as_ref().unwrap().output.as_deref(), Some(std::path::Path::new(expected)));
+            let Phase::Finished(result) = &panel.tasks[&id].phase else { panic!("expected completion for {id}"); };
+            assert_eq!(result.output.as_deref(), Some(std::path::Path::new(expected)));
         }
         // Task topology, not the number of unrelated rows or even their path
         // spelling, determines the relocation's visit set.
-        panel.tasks.get_mut(&5).unwrap().result.as_mut().unwrap().output = Some("root/wrapper/leaf/unrelated".into());
+        let Phase::Finished(result) = &mut panel.tasks.get_mut(&5).unwrap().phase else { panic!("expected completion"); };
+        result.output = Some("root/wrapper/leaf/unrelated".into());
         panel.relocate_outputs(1, old, new);
-        assert_eq!(panel.tasks[&5].result.as_ref().unwrap().output.as_deref(),
+        let Phase::Finished(result) = &mut panel.tasks.get_mut(&5).unwrap().phase else { panic!("expected completion"); };
+        assert_eq!(result.output.as_deref(),
             Some(std::path::Path::new("root/wrapper/leaf/unrelated")));
-        panel.tasks.get_mut(&5).unwrap().result.as_mut().unwrap().output = Some("elsewhere/output".into());
+        result.output = Some("elsewhere/output".into());
         let rows = panel.rows(terminal.size, true, Language::En);
         assert!(rows.iter().all(|row| !row.text.contains("wrapper")));
         assert!(rows.iter().any(|row| row.text.contains("elsewhere")));
@@ -838,7 +836,7 @@ mod tests {
         panel.write_scope(1, true, Language::En, &mut settled).unwrap();
         assert!(String::from_utf8(settled).unwrap().lines().any(|line| line.ends_with("[Skipped]  --%")));
         panel.tasks.get_mut(&1).unwrap().label = "carrier\r\nname".into();
-        panel.tasks.get_mut(&2).unwrap().result = Some(TaskCompletion::failed(
+        panel.tasks.get_mut(&2).unwrap().phase = Phase::Finished(TaskCompletion::failed(
             &Failure::new(FailureKind::FilesystemError, "first\nsecond")));
         let mut text = Vec::new();
         panel.write_scope(1, true, Language::En, &mut text).unwrap();

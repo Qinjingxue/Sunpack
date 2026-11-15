@@ -109,14 +109,12 @@ namespace sunpack::sevenzip
                 VolumeSpaceGate &gate = *state->space_gate;
 
                 std::uint64_t free_bytes = 0;
-                std::uint64_t total_bytes = 0;
-                if (!gate.query_free_bytes(&free_bytes, &total_bytes))
+                if (!gate.query_free_bytes(&free_bytes, nullptr))
                 {
                     // 卷暂时不可查询（拔盘 / UNC 断开 / 权限变化 / query_root 未解析）：
                     // query_free_bytes 已撤销任何在途 probe；保留诊断并等待下一次
                     // 成功且可用空间大于 0 的采样，绝不直接转 Ready。
                     const unsigned long error = gate.last_query_error();
-                    gate.note_query_failure(error);
                     maybe_emit_status(state, 0, false, error, now);
                     continue;
                 }

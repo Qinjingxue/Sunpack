@@ -189,8 +189,10 @@ pub(crate) struct ReaderStats {
 #[derive(Clone)]
 pub(crate) struct ManagedReader {
     source: Arc<dyn ByteSource>,
-    state: Arc<ReaderState>,
+    cache: Option<Arc<RequestCache>>,
     shared_blocks: bool,
+    #[cfg(test)]
+    counters: Arc<ReaderCounters>,
 }
 
 #[derive(Default)]
@@ -307,11 +309,24 @@ impl ByteSource for ProbeSource {
     }
 }
 
-struct ReaderState {
-    config: ReaderConfig,
+struct RequestCache {
+    capacity: usize,
     inner: Mutex<ReaderInner>,
-    #[cfg(test)]
-    uncached_read_bytes: AtomicU64,
+}
+
+impl RequestCache {
+    fn lock(&self) -> io::Result<MutexGuard<'_, ReaderInner>> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::other("managed reader lock poisoned"))
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ReaderCounters {
+    read_bytes: AtomicU64,
+    cache_hits: AtomicU64,
 }
 
 #[derive(Default)]
@@ -319,8 +334,6 @@ struct ReaderInner {
     cache: HashMap<(u64, usize), CachedSlice>,
     order: VecDeque<(u64, usize)>,
     cache_size: usize,
-    #[cfg(test)]
-    stats: ReaderStats,
 }
 
 impl ManagedReader {
@@ -328,12 +341,14 @@ impl ManagedReader {
         Self {
             source,
             shared_blocks: true,
-            state: Arc::new(ReaderState {
-                config,
-                inner: Mutex::new(ReaderInner::default()),
-                #[cfg(test)]
-                uncached_read_bytes: AtomicU64::new(0),
+            cache: (config.cache_bytes > 0).then(|| {
+                Arc::new(RequestCache {
+                    capacity: config.cache_bytes,
+                    inner: Mutex::default(),
+                })
             }),
+            #[cfg(test)]
+            counters: Arc::default(),
         }
     }
 
@@ -380,11 +395,9 @@ impl ManagedReader {
     /// cache. Its transient reads use the existing direct source path, so
     /// search/validation windows do not become process-wide retained blocks.
     pub(crate) fn probe_reader(&self) -> Self {
-        Self {
-            source: Arc::clone(&self.source),
-            state: Arc::clone(&self.state),
-            shared_blocks: false,
-        }
+        let mut probe = self.clone();
+        probe.shared_blocks = false;
+        probe
     }
 
     pub(crate) fn windowed_probe_reader(&self) -> Self {
@@ -427,7 +440,7 @@ impl ManagedReader {
             return Ok(Vec::new());
         }
         let read_len = len.min((self.len() - offset) as usize);
-        if !self.uses_request_state() {
+        if self.cache.is_none() {
             let result = if self.shared_blocks {
                 self.source.read_at(offset, read_len)
             } else {
@@ -438,8 +451,8 @@ impl ManagedReader {
                     .into_io_error()
             })?;
             #[cfg(test)]
-            self.state
-                .uncached_read_bytes
+            self.counters
+                .read_bytes
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             return Ok(data);
         }
@@ -459,8 +472,8 @@ impl ManagedReader {
         let read_len = len.min((self.len() - offset) as usize);
         let data = self.source.read_direct_at(offset, read_len)?;
         #[cfg(test)]
-        self.state
-            .uncached_read_bytes
+        self.counters
+            .read_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(data)
     }
@@ -475,7 +488,7 @@ impl ManagedReader {
             return Ok(0);
         }
         let read_len = buffer.len().min((self.len() - offset) as usize);
-        if !self.uses_request_state() {
+        if self.cache.is_none() {
             let result = if self.shared_blocks {
                 self.source.read_into_at(offset, &mut buffer[..read_len])
             } else {
@@ -487,8 +500,8 @@ impl ManagedReader {
                     .into_io_error()
             })?;
             #[cfg(test)]
-            self.state
-                .uncached_read_bytes
+            self.counters
+                .read_bytes
                 .fetch_add(count as u64, Ordering::Relaxed);
             return Ok(count);
         }
@@ -527,24 +540,10 @@ impl ManagedReader {
             return Ok(Vec::new());
         }
         let read_len = len.min((self.len() - offset) as usize);
-        if !self.uses_request_state() {
-            let slices = self.source_slices_at(offset, read_len).map_err(|error| {
-                ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
-                    .into_io_error()
-            })?;
-            #[cfg(test)]
-            let count = slices.iter().map(|slice| slice.len()).sum::<usize>();
-            #[cfg(test)]
-            self.state
-                .uncached_read_bytes
-                .fetch_add(count as u64, Ordering::Relaxed);
-            return Ok(slices);
+        if let Some(cache) = self.cache.as_deref().filter(|cache| read_len <= cache.capacity) {
+            return Ok(vec![self.read_request_cached_slice_at(cache, offset, read_len)?]);
         }
-
-        if self.state.config.cache_bytes > 0 && read_len <= self.state.config.cache_bytes {
-            return Ok(vec![self.read_request_cached_slice_at(offset, read_len)?]);
-        }
-        self.read_request_source_slices_at(offset, read_len)
+        self.read_source_slices_at(offset, read_len)
     }
 
     pub(crate) fn read_cached_at(&self, offset: u64, len: usize) -> io::Result<CachedBytes> {
@@ -553,12 +552,9 @@ impl ManagedReader {
             return Ok(CachedBytes::Owned(Vec::new()));
         }
         let read_len = len.min((self.len() - offset) as usize);
-        if self.uses_request_state()
-            && self.state.config.cache_bytes > 0
-            && read_len <= self.state.config.cache_bytes
-        {
+        if let Some(cache) = self.cache.as_deref().filter(|cache| read_len <= cache.capacity) {
             return Ok(CachedBytes::Slice(
-                self.read_request_cached_slice_at(offset, read_len)?,
+                self.read_request_cached_slice_at(cache, offset, read_len)?,
             ));
         }
 
@@ -576,57 +572,41 @@ impl ManagedReader {
 
     fn read_request_cached_slice_at(
         &self,
+        cache: &RequestCache,
         offset: u64,
         read_len: usize,
     ) -> io::Result<CachedSlice> {
         let key = (offset, read_len);
         {
-            let inner = self.lock_inner()?;
-            #[cfg(test)]
-            let mut inner = inner;
+            let inner = cache.lock()?;
             if let Some(data) = inner.cache.get(&key).cloned() {
                 #[cfg(test)]
-                { inner.stats.cache_hits += 1; }
+                self.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(data);
             }
         }
 
-        let slices = self.read_request_source_slices_at(offset, read_len)?;
+        let slices = self.read_source_slices_at(offset, read_len)?;
         let data = coalesce_cached_slices(slices)?;
-        self.lock_inner()?
-            .store_cache_entry(key, data.clone(), self.state.config.cache_bytes);
+        cache.lock()?.store_cache_entry(key, data.clone(), cache.capacity);
         Ok(data)
     }
 
-    fn read_request_source_slices_at(
+    fn read_source_slices_at(
         &self,
         offset: u64,
         read_len: usize,
     ) -> io::Result<Vec<CachedSlice>> {
-        // Account concurrent reads atomically; IO volume never limits correctness.
-        #[cfg(test)]
-        let reserved = read_len as u64;
-        #[cfg(test)]
-        {
-            let mut inner = self.lock_inner()?;
-            inner.stats.read_bytes += reserved;
-        }
-
-        let result = self.source_slices_at(offset, read_len).map_err(|error| {
+        let slices = self.source_slices_at(offset, read_len).map_err(|error| {
             ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
                 .into_io_error()
-        });
+        })?;
         #[cfg(test)]
-        let count = result
-            .as_ref()
-            .map(|slices| slices.iter().map(|slice| slice.len()).sum::<usize>() as u64)
-            .unwrap_or(0);
-        #[cfg(test)]
-        if count < reserved {
-            let mut inner = self.lock_inner()?;
-            inner.stats.read_bytes = inner.stats.read_bytes.saturating_sub(reserved - count);
-        }
-        result
+        self.counters.read_bytes.fetch_add(
+            slices.iter().map(|slice| slice.len() as u64).sum(),
+            Ordering::Relaxed,
+        );
+        Ok(slices)
     }
 
     fn source_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
@@ -642,12 +622,11 @@ impl ManagedReader {
     }
 
     #[cfg(test)]
-    pub(crate) fn stats(&self) -> io::Result<ReaderStats> {
-        let mut stats = self.lock_inner()?.stats;
-        stats.read_bytes = stats
-            .read_bytes
-            .saturating_add(self.state.uncached_read_bytes.load(Ordering::Relaxed));
-        Ok(stats)
+    pub(crate) fn stats(&self) -> ReaderStats {
+        ReaderStats {
+            read_bytes: self.counters.read_bytes.load(Ordering::Relaxed),
+            cache_hits: self.counters.cache_hits.load(Ordering::Relaxed),
+        }
     }
 
     pub(crate) fn cursor(&self) -> SourceCursor {
@@ -684,16 +663,6 @@ impl ManagedReader {
             })
     }
 
-    fn lock_inner(&self) -> io::Result<MutexGuard<'_, ReaderInner>> {
-        self.state
-            .inner
-            .lock()
-            .map_err(|_| io::Error::other("managed reader lock poisoned"))
-    }
-
-    fn uses_request_state(&self) -> bool {
-        self.state.config.cache_bytes > 0
-    }
 }
 
 pub(crate) struct NativeArchiveSession {
@@ -989,7 +958,7 @@ impl BlockLoad {
 }
 
 enum BlockLoadClaim {
-    Cached,
+    Cached(Arc<[u8]>),
     Owned(Arc<BlockLoad>),
     Waiting(Arc<BlockLoad>),
 }
@@ -1627,8 +1596,8 @@ impl ReaderManager {
         // Recheck the cache while holding the load registry. A loader publishes
         // the block before removing its registry entry, so this closes the
         // cache-check/claim race without holding any lock across physical I/O.
-        if self.contains_block(key)? {
-            return Ok(BlockLoadClaim::Cached);
+        if let Some(block) = self.cached_block(key)? {
+            return Ok(BlockLoadClaim::Cached(block));
         }
         if let Some(load) = loads.get(&key.index) {
             return Ok(BlockLoadClaim::Waiting(Arc::clone(load)));
@@ -1674,7 +1643,7 @@ impl ReaderManager {
             }
 
             match self.claim_block_load(source, &key)? {
-                BlockLoadClaim::Cached => continue,
+                BlockLoadClaim::Cached(block) => return Ok(block),
                 BlockLoadClaim::Waiting(load) => {
                     load.wait()?;
                     continue;
@@ -1700,14 +1669,6 @@ impl ReaderManager {
                 }
             }
         }
-    }
-
-    fn contains_block(&self, key: &BlockKey) -> io::Result<bool> {
-        let shard_index = cache_shard_index(key);
-        let shard = self.cache_shards[shard_index]
-            .lock()
-            .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-        Ok(shard.entries.contains_key(key))
     }
 
     fn cached_block(&self, key: &BlockKey) -> io::Result<Option<Arc<[u8]>>> {
@@ -2099,7 +2060,7 @@ mod tests {
             cursor.read_exact(&mut [0; 8]).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
-        assert_eq!(reader.stats().unwrap().read_bytes, 4);
+        assert_eq!(reader.stats().read_bytes, 4);
         let _ = std::fs::remove_file(path);
     }
 
@@ -2110,7 +2071,7 @@ mod tests {
             ManagedReader::open_with_config(&path, ReaderConfig { cache_bytes: 8 }).unwrap();
         assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
         assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
-        let stats = reader.stats().unwrap();
+        let stats = reader.stats();
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
         let _ = std::fs::remove_file(path);
@@ -2176,7 +2137,7 @@ mod tests {
                 observed.sort_unstable();
                 assert_eq!(observed, [0, 1, 2, 3]);
             });
-            assert_eq!(reader.stats().unwrap().read_bytes, 4);
+            assert_eq!(reader.stats().read_bytes, 4);
         }
     }
 
@@ -2297,7 +2258,7 @@ mod tests {
         let reader = ManagedReader::open(&path).unwrap();
         let probe = reader.probe_reader();
         assert!(Arc::ptr_eq(&reader.source, &probe.source));
-        assert!(Arc::ptr_eq(&reader.state, &probe.state));
+        assert!(reader.cache.is_none() && probe.cache.is_none());
         assert_eq!(
             reader.file_identity().unwrap(),
             probe.file_identity().unwrap()
@@ -2345,8 +2306,8 @@ mod tests {
             panic!("request windows must remain shared");
         };
         assert!(first.shares_backing(&second));
-        assert_eq!(reader.stats().unwrap().read_bytes, 4);
-        assert_eq!(reader.stats().unwrap().cache_hits, 1);
+        assert_eq!(reader.stats().read_bytes, 4);
+        assert_eq!(reader.stats().cache_hits, 1);
         let _ = std::fs::remove_file(path);
     }
 
@@ -2449,7 +2410,7 @@ mod tests {
             assert_eq!(sparse.read_at(offset, 16).unwrap(), [0x5a; 16]);
             assert_eq!(sparse.read_at(offset + 16, 8).unwrap(), [0x5a; 8]);
         }
-        assert_eq!(sparse_source.stats().unwrap().read_bytes, 48);
+        assert_eq!(sparse_source.stats().read_bytes, 48);
         let _ = std::fs::remove_file(first);
         let _ = std::fs::remove_file(second);
     }
@@ -2462,8 +2423,8 @@ mod tests {
         let probe = reader.probe_reader();
         let first = probe.read_cached_at(0, 4).unwrap();
         assert_eq!(&*probe.read_cached_at(0, 4).unwrap(), b"abcd");
-        assert_eq!(reader.stats().unwrap().read_bytes, 4);
-        assert_eq!(reader.stats().unwrap().cache_hits, 1);
+        assert_eq!(reader.stats().read_bytes, 4);
+        assert_eq!(reader.stats().cache_hits, 1);
         let identity = reader.file_identity().unwrap();
         assert!(!cached_source_has_blocks(identity.source_id));
         manager()
@@ -2484,7 +2445,7 @@ mod tests {
         buffer.fill(0);
         assert_eq!(reader.read_into_at(0, &mut buffer).unwrap(), 4);
         assert_eq!(&buffer, b"abcd");
-        let stats = reader.stats().unwrap();
+        let stats = reader.stats();
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
         let _ = std::fs::remove_file(path);
@@ -2516,7 +2477,7 @@ mod tests {
         assert!(first.shares_backing(&second));
         assert_eq!(after - before, 0);
 
-        let stats = reader.stats().unwrap();
+        let stats = reader.stats();
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
         let _ = std::fs::remove_file(path);
@@ -2537,10 +2498,10 @@ mod tests {
 
         assert_eq!(&*reader.read_cached_at(0, 4).unwrap(), b"abcd");
         assert_eq!(&*reader.read_cached_at(0, 4).unwrap(), b"abcd");
-        let stats = reader.stats().unwrap();
+        let stats = reader.stats();
         assert_eq!(stats.read_bytes, 8);
         assert_eq!(stats.cache_hits, 0);
-        assert_eq!(reader.lock_inner().unwrap().cache_size, 0);
+        assert_eq!(reader.cache.as_ref().unwrap().lock().unwrap().cache_size, 0);
         let _ = std::fs::remove_file(path);
     }
 
@@ -2563,7 +2524,7 @@ mod tests {
         let second = reader.read_cached_at(BLOCK_SIZE as u64, 4).unwrap();
         assert_eq!(&*second, b"next");
         assert_eq!(&*first, b"keep");
-        assert!(reader.lock_inner().unwrap().cache_size <= BLOCK_SIZE);
+        assert!(reader.cache.as_ref().unwrap().lock().unwrap().cache_size <= BLOCK_SIZE);
 
         let _ = std::fs::remove_file(path);
     }
@@ -2685,9 +2646,9 @@ mod tests {
         let first_key = BlockKey::new(&first, 0);
         let second_key = BlockKey::new(&second, 0);
         let other_key = BlockKey::new(&other, 0);
-        assert!(manager().contains_block(&first_key).unwrap());
-        assert!(manager().contains_block(&second_key).unwrap());
-        assert!(manager().contains_block(&other_key).unwrap());
+        assert!(manager().cached_block(&first_key).unwrap().is_some());
+        assert!(manager().cached_block(&second_key).unwrap().is_some());
+        assert!(manager().cached_block(&other_key).unwrap().is_some());
 
         let roots = vec![
             std::fs::canonicalize(&first_path).unwrap_or_else(|_| first_path.clone()),
@@ -2697,9 +2658,9 @@ mod tests {
 
         assert!(first.closed.load(Ordering::Acquire));
         assert!(second.closed.load(Ordering::Acquire));
-        assert!(!manager().contains_block(&first_key).unwrap());
-        assert!(!manager().contains_block(&second_key).unwrap());
-        assert!(manager().contains_block(&other_key).unwrap());
+        assert!(!manager().cached_block(&first_key).unwrap().is_some());
+        assert!(!manager().cached_block(&second_key).unwrap().is_some());
+        assert!(manager().cached_block(&other_key).unwrap().is_some());
         assert_eq!(other.read_at(0, 8).unwrap(), b"qrstuvwx");
 
         let other_root = std::fs::canonicalize(&other_path).unwrap_or_else(|_| other_path.clone());
@@ -2736,7 +2697,7 @@ mod tests {
         assert_eq!(middle - before, 1);
         assert_eq!(after - middle, 0);
 
-        let stats = reader.stats().unwrap();
+        let stats = reader.stats();
         assert_eq!(stats.read_bytes, 3);
         assert_eq!(stats.cache_hits, 1);
         let _ = std::fs::remove_file(first_path);
@@ -3146,11 +3107,11 @@ mod tests {
         // The superseded source stays reusable only while an older reader
         // can still address its blocks. Retiring its final borrow must free
         // them without a cache-pressure event or releasing the current file.
-        assert!(manager().contains_block(&old_key).unwrap());
+        assert!(manager().cached_block(&old_key).unwrap().is_some());
         drop(old_source);
         drop(second);
         drop(third);
-        assert!(!manager().contains_block(&old_key).unwrap());
+        assert!(!manager().cached_block(&old_key).unwrap().is_some());
         assert_eq!(current.read_at(0, 4).unwrap(), b"last");
         std::fs::remove_file(path).unwrap();
     }

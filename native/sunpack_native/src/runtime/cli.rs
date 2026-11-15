@@ -1554,27 +1554,20 @@ async fn archives(
     };
     let foreground = windows::Foreground::enter_async(&engine, &host.watch, settings.runtime.process_mode).await;
     let execution = async {
-    let mut overrides = serde_json::Map::new();
-    if let Some((depth, value)) = &options.depth {
+    if let Some((depth, _)) = &options.depth {
         settings.recursive_extract = *depth;
-        overrides.insert("recursive_extract".into(), json!(value));
     }
     if let Some(cleanup) = options.cleanup {
         settings.post_extract.archive_cleanup_mode = cleanup;
-        overrides.insert("archive_cleanup_mode".into(), json!(cleanup.option()));
     }
     if let Some(flatten) = options.flatten {
         settings.post_extract.flatten_single_directory = flatten;
-        overrides.insert("flatten_single_directory".into(), json!(flatten));
     }
     let output = options
         .output
         .as_deref()
         .map(|value| resolve(cwd, value))
         .transpose()?;
-    if let Some(path) = &output {
-        overrides.insert("output_dir".into(), json!(path));
-    }
     let scan = options.command == "scan";
     let mut candidate_paths = inputs.clone();
     let mut user = match cli_passwords(cwd, options, session, language).await {
@@ -1653,9 +1646,10 @@ async fn archives(
     let mut generated_sources = Vec::new();
     loop {
         let began = Instant::now();
-        let mut request = Request::new(
+        let mut request = Request::with_config(
             std::mem::take(&mut candidate_paths),
             if scan { Mode::Scan } else { Mode::Extract },
+            Arc::clone(&settings),
         );
         request.output_root = output.clone();
         request.output_base = common_root.clone();
@@ -1665,7 +1659,6 @@ async fn archives(
         request.deep = options.deep;
         request.passwords = user.iter().chain(&clipboard).cloned().collect();
         request.password_snapshot = builtin.clone();
-        request.config = Arc::clone(&settings);
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
         request.generated_sources = std::mem::take(&mut generated_sources);
@@ -1707,6 +1700,19 @@ async fn archives(
         }
         if options.json {
             let mut result = CommandResult::new(options.command);
+            let mut overrides = serde_json::Map::new();
+            if let Some((_, value)) = &options.depth {
+                overrides.insert("recursive_extract".into(), json!(value));
+            }
+            if let Some(cleanup) = options.cleanup {
+                overrides.insert("archive_cleanup_mode".into(), json!(cleanup.option()));
+            }
+            if let Some(flatten) = options.flatten {
+                overrides.insert("flatten_single_directory".into(), json!(flatten));
+            }
+            if let Some(path) = &output {
+                overrides.insert("output_dir".into(), json!(path));
+            }
             let groups = failures::archive_groups(&current.archives);
             let counts = ArchiveSummary::from_groups(&groups, language, true);
             let filesystem_errors = current.errors.iter().filter(|error| error.kind == InputErrorKind::FilesystemScan);

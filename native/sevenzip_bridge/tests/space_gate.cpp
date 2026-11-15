@@ -620,8 +620,6 @@ void g18_sampling_controls_probe() {
           "G-18: unresolved volume query fails");
     check(synthetic->last_query_error() == ERROR_PATH_NOT_FOUND,
           "G-18: query failure preserves diagnostics");
-    synthetic->note_query_failure(5);
-    check(synthetic->last_query_error() == 5, "G-18: explicit query failure recorded");
     check(synthetic->phase() == VolumeSpacePhase::Blocked,
           "G-18: an unqueryable volume remains Blocked");
     wchar_t temp[MAX_PATH + 1]{};
@@ -1240,7 +1238,6 @@ void g32_query_failure_invalidates_inflight_probe() {
     std::uint64_t ignored_total = 0;
     check(!gate->query_free_bytes(&ignored_free, &ignored_total),
           "G-32: synthetic detached volume must be unqueryable");
-    gate->note_query_failure(gate->last_query_error());
     check(gate->phase() == VolumeSpacePhase::Blocked,
           "G-32: query failure must revoke the in-flight probe");
     check(!gate->poll(0), "G-32: zero space cannot rearm a revoked probe");
@@ -1288,7 +1285,6 @@ void g33_late_query_failure_does_not_rewrite_completed_resume() {
     std::uint64_t ignored_total = 0;
     check(!gate->query_free_bytes(&ignored_free, &ignored_total),
           "G-33: synthetic volume query must fail after the completed resume");
-    gate->note_query_failure(gate->last_query_error());
 
     check(gate->phase() == VolumeSpacePhase::Ready,
           "G-33: later query failure must not retroactively reopen a completed episode");

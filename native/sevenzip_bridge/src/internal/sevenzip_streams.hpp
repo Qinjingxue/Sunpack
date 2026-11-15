@@ -16,8 +16,6 @@
 
 #include <array>
 
-#include <chrono>
-
 #include <cstring>
 
 #include <filesystem>
@@ -39,17 +37,11 @@
 namespace sunpack::sevenzip
 {
 
-    inline bool read_file_timing_enabled() noexcept
-    {
-        static const bool enabled = []
-        {
-            const char *value = std::getenv("SUNPACK_SEVENZIP_PROFILE_READS");
-            return value && value[0] == '1';
-        }();
-        return enabled;
-    }
-
 #ifdef _WIN32
+
+#ifdef SUP7Z_TEST_IO_FAULTS
+    inline thread_local UInt64 observed_logical_read_bytes = 0;
+#endif
 
     struct InputPrefetchConfig
     {
@@ -102,105 +94,15 @@ namespace sunpack::sevenzip
         return config;
     }
 
-    class ReadFileWallTimer final
-    {
-    public:
-        explicit ReadFileWallTimer(ExtractInputTrace *trace) noexcept
-            : trace_(read_file_timing_enabled() ? trace : nullptr)
-#ifdef SUP7Z_DEBUG
-              , pipeline_scope_(trace ? trace->pipeline_timing : nullptr, PipelineStage::Input)
-#endif
-        {
-            if (trace_)
-            {
-                started_ = std::chrono::steady_clock::now();
-            }
-        }
-
-        ~ReadFileWallTimer() noexcept
-        {
-            if (!trace_)
-            {
-                return;
-            }
-            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now() - started_)
-                                     .count();
-            const auto elapsed_ns = elapsed > 0 ? static_cast<unsigned long long>(elapsed) : 0ULL;
-            ++trace_->read_file_call_count;
-            trace_->read_file_wall_ns += elapsed_ns;
-            trace_->read_file_max_wall_ns = std::max(trace_->read_file_max_wall_ns, elapsed_ns);
-        }
-
-    private:
-        ExtractInputTrace *trace_ = nullptr;
-        std::chrono::steady_clock::time_point started_{};
-#ifdef SUP7Z_DEBUG
-        PipelineStageScope pipeline_scope_;
-#endif
-    };
-
-    inline void record_logical_read(ExtractInputTrace *trace, UInt64 start, UInt32 returned) noexcept
-    {
-        if (!trace || !read_file_timing_enabled() || returned == 0)
-        {
-            return;
-        }
-        ++trace->logical_read_call_count;
-        trace->total_bytes_returned += returned;
-        if (trace->has_last_logical_read_end && start == trace->last_logical_read_end)
-        {
-            trace->sequential_read_bytes += returned;
-            trace->current_sequential_run_bytes += returned;
-        }
-        else
-        {
-            trace->nonsequential_read_bytes += returned;
-            ++trace->sequential_run_count;
-            trace->current_sequential_run_bytes = returned;
-        }
-        trace->max_sequential_run_bytes = std::max(trace->max_sequential_run_bytes, trace->current_sequential_run_bytes);
-        trace->last_logical_read_end = start + returned;
-        trace->has_last_logical_read_end = true;
-    }
-
-    inline void record_logical_seek(ExtractInputTrace *trace, UInt64 from, UInt64 to) noexcept
-    {
-        if (!trace || !read_file_timing_enabled())
-        {
-            return;
-        }
-        ++trace->seek_count;
-        if (to > from)
-        {
-            trace->seek_forward_bytes += to - from;
-        }
-        else if (from > to)
-        {
-            trace->seek_backward_bytes += from - to;
-        }
-        if (from != to)
-        {
-            trace->has_last_logical_read_end = false;
-        }
-    }
-
-    inline void record_read_span(ExtractInputTrace &trace, UInt64 offset, UInt64 source,
-                                 UInt32 requested, UInt32 returned) noexcept
-    {
-        trace.last_read_virtual_offset = offset;
-        trace.last_read_source_offset = source;
-        trace.last_read_requested = requested;
-        trace.last_read_returned = returned;
-    }
-
     inline void record_input_error(ExtractInputTrace *trace, const std::wstring &path,
                                    HRESULT hr, UInt64 offset = 0,
                                    UInt64 source = 0, UInt32 requested = 0) noexcept
     {
         if (!trace || FAILED(trace->read_hresult)) return;
         trace->read_hresult = hr;
-        record_read_span(*trace, offset, source, requested, 0);
+        trace->last_read_virtual_offset = offset;
+        trace->last_read_source_offset = source;
+        trace->last_read_requested = requested;
         try { trace->last_source_path = path; }
         catch (const std::bad_alloc &) { trace->last_source_path.clear(); }
     }
@@ -224,9 +126,12 @@ namespace sunpack::sevenzip
         using Resolver = std::function<bool(UInt64, PrefetchSource &)>;
 
         OverlappedPrefetcher(InputPrefetchConfig config, UInt64 size, Resolver resolver,
-                            ExtractInputTrace *trace = nullptr)
+                            [[maybe_unused]] ExtractInputTrace *trace = nullptr)
             : window_bytes_(config.window_bytes), virtual_size_(size),
-              resolver_(std::move(resolver)), trace_(trace),
+              resolver_(std::move(resolver)),
+#ifdef SUP7Z_DEBUG
+              pipeline_timing_(trace ? trace->pipeline_timing : nullptr),
+#endif
               enabled_(config.enabled && config.window_bytes && size)
         {
             if (!enabled_) return;
@@ -247,13 +152,12 @@ namespace sunpack::sevenzip
 
         bool enabled() const noexcept { return enabled_; }
 
-        bool consume(UInt64 offset, void *data, UInt32 size, ExtractInputTrace *trace)
+        bool consume(UInt64 offset, void *data, UInt32 size)
         {
             if (!enabled() || !size)
             {
                 return false;
             }
-            const bool profiling = trace && read_file_timing_enabled();
             // A decoder read may straddle the two windows. Verify coverage
             // before copying; an uncovered or short read uses the direct path.
             UInt64 cursor = offset;
@@ -263,15 +167,12 @@ namespace sunpack::sevenzip
                 Slot *slot = find(cursor);
                 if (!slot || slot->state == State::Failed)
                 {
-                    if (profiling) ++trace->prefetch_miss_count;
                     return false;
                 }
                 const UInt32 count = static_cast<UInt32>(std::min<UInt64>(remaining, slot->offset + slot->size - cursor));
                 cursor += count;
                 remaining -= count;
             }
-            const auto started = profiling ? std::chrono::steady_clock::now()
-                                           : std::chrono::steady_clock::time_point{};
             cursor = offset;
             remaining = size;
             auto *destination = static_cast<unsigned char *>(data);
@@ -282,18 +183,13 @@ namespace sunpack::sevenzip
                 {
                     DWORD read = 0;
 #ifdef SUP7Z_DEBUG
-                    PipelineStageScope input_scope(trace_ ? trace_->pipeline_timing : nullptr, PipelineStage::Input);
+                    PipelineStageScope input_scope(pipeline_timing_, PipelineStage::Input);
 #endif
                     const BOOL ok = GetOverlappedResult(slot.handle, &slot.overlapped, &read, TRUE);
                     slot.state = ok && read == slot.size ? State::Ready : State::Failed;
                 }
                 if (slot.state != State::Ready)
                 {
-                    if (profiling)
-                    {
-                        ++trace->prefetch_miss_count;
-                        trace->prefetch_consumer_wait_ns += elapsed_ns(started);
-                    }
                     return false;
                 }
                 const auto displacement = static_cast<std::size_t>(cursor - slot.offset);
@@ -303,23 +199,13 @@ namespace sunpack::sevenzip
                 destination += count;
                 remaining -= count;
             }
-            if (profiling)
-            {
-                ++trace->prefetch_hit_count;
-                trace->prefetch_consumer_wait_ns += elapsed_ns(started);
-            }
             return true;
         }
 
         void after_read(UInt64 end) { advance_safely(end); }
 
-        void invalidate(UInt64 next, ExtractInputTrace *trace)
+        void invalidate(UInt64 next)
         {
-            if (trace && read_file_timing_enabled() &&
-                std::any_of(slots_.begin(), slots_.end(), [](const Slot &slot) { return slot.state != State::Empty; }))
-            {
-                ++trace->prefetch_invalidation_count;
-            }
             cancel();
             next_offset_ = next;
         }
@@ -336,12 +222,6 @@ namespace sunpack::sevenzip
             UInt32 size = 0;
             State state = State::Empty;
         };
-
-        static unsigned long long elapsed_ns(std::chrono::steady_clock::time_point started) noexcept
-        {
-            return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - started).count());
-        }
 
         Slot *find(UInt64 offset) noexcept
         {
@@ -446,7 +326,9 @@ namespace sunpack::sevenzip
                 {
                     // Submission itself can block on cached Windows I/O; it
                     // belongs in consumer blocking time as well as the wait.
-                    ReadFileWallTimer timer(trace_);
+#ifdef SUP7Z_DEBUG
+                    PipelineStageScope input_scope(pipeline_timing_, PipelineStage::Input);
+#endif
                     ok = ReadFile(slot.handle, slot.bytes.get(), slot.size, &read, &slot.overlapped);
                     if (!ok) error = GetLastError();
                 }
@@ -460,7 +342,9 @@ namespace sunpack::sevenzip
         UInt64 virtual_size_;
         UInt64 next_offset_ = 0;
         Resolver resolver_;
-        ExtractInputTrace *trace_;
+#ifdef SUP7Z_DEBUG
+        PipelineTiming *pipeline_timing_;
+#endif
         bool enabled_;
         // At most two file handles, even for thousands of volumes/ranges.
         std::array<Slot, 2> slots_;
@@ -475,7 +359,6 @@ namespace sunpack::sevenzip
         explicit FileInStream(
             const std::wstring &path,
             ExtractInputTrace *trace = nullptr,
-            const wchar_t *mode = L"file",
             InputPrefetchConfig prefetch_config = input_prefetch_config())
 
             : path_(path),
@@ -489,7 +372,7 @@ namespace sunpack::sevenzip
             const DWORD open_error = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
             open_hresult_ = HRESULT_FROM_WIN32(open_error);
             // A failed constructor does not run ~FileInStream. Keep the input
-            // handle owned while trace/prefetch setup can still allocate.
+            // handle owned while prefetch setup can still allocate.
             std::unique_ptr<void, decltype(&CloseHandle)> handle_owner(
                 handle_ == INVALID_HANDLE_VALUE ? nullptr : handle_, &CloseHandle);
             LARGE_INTEGER size{};
@@ -498,12 +381,6 @@ namespace sunpack::sevenzip
                 size_ = static_cast<UInt64>(size.QuadPart);
             }
 
-            if (trace_ && read_file_timing_enabled())
-            {
-                trace_->last_source_path = path_;
-                trace_->mode = mode;
-                trace_->virtual_size = size_;
-            }
             if (handle_ == INVALID_HANDLE_VALUE)
                 record_input_error(trace_, path_, open_hresult_);
 
@@ -515,10 +392,6 @@ namespace sunpack::sevenzip
                         source = PrefetchSource{&path_, offset, size_ - offset};
                         return true;
                     }, trace_);
-            }
-            if (trace_ && read_file_timing_enabled())
-            {
-                trace_->prefetch_enabled = prefetch_ && prefetch_->enabled();
             }
             handle_owner.release();
         }
@@ -548,17 +421,16 @@ namespace sunpack::sevenzip
             }
 
             const UInt64 read_start = position_;
-            const bool profiling = trace_ && read_file_timing_enabled() && !FAILED(trace_->read_hresult);
-            if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
+            if (prefetch_ && prefetch_->consume(position_, data, size))
             {
                 position_ += size;
                 // The decoder handle is independent of the OVERLAPPED handles.
                 // Reposition it only if a later read misses the prefetch cache.
                 file_pointer_dirty_ = true;
-                record_logical_read(trace_, read_start, size);
+#ifdef SUP7Z_TEST_IO_FAULTS
+                observed_logical_read_bytes += size;
+#endif
                 prefetch_->after_read(position_);
-                if (profiling)
-                    record_read_span(*trace_, read_start, read_start, size, size);
                 if (processedSize)
                 {
                     *processedSize = size;
@@ -585,7 +457,9 @@ namespace sunpack::sevenzip
             BOOL ok = FALSE;
             DWORD error = ERROR_SUCCESS;
             {
-                ReadFileWallTimer timer(trace_);
+#ifdef SUP7Z_DEBUG
+                PipelineStageScope input_scope(trace_ ? trace_->pipeline_timing : nullptr, PipelineStage::Input);
+#endif
                 ok = ReadFile(handle_, data, size, &read, nullptr);
                 if (!ok)
                 {
@@ -609,10 +483,9 @@ namespace sunpack::sevenzip
                 prefetch_->after_read(position_);
             }
 
-            record_logical_read(trace_, read_start, read);
-
-            if (profiling)
-                record_read_span(*trace_, read_start, read_start, size, read);
+#ifdef SUP7Z_TEST_IO_FAULTS
+            observed_logical_read_bytes += read;
+#endif
 
             if (processedSize)
             {
@@ -649,11 +522,9 @@ namespace sunpack::sevenzip
             position_ = static_cast<UInt64>(new_pos.QuadPart);
             file_pointer_dirty_ = false;
 
-            record_logical_seek(trace_, prior_position, position_);
-
             if (prefetch_ && prior_position != position_)
             {
-                prefetch_->invalidate(position_, trace_);
+                prefetch_->invalidate(position_);
             }
 
             if (newPosition)
@@ -721,7 +592,7 @@ namespace sunpack::sevenzip
                 ranges_.push_back({std::move(path), 0, length, total_size_});
                 total_size_ += length;
             }
-            initialize(prefetch_config, L"multi_file");
+            initialize(prefetch_config);
         }
 
         explicit MultiRangeInStream(
@@ -776,7 +647,7 @@ namespace sunpack::sevenzip
                 total_size_ += length;
             }
 
-            initialize(prefetch_config, ranges_.size() == 1 ? L"file_range" : L"concat_ranges");
+            initialize(prefetch_config);
         }
 
         ~MultiRangeInStream()
@@ -806,23 +677,15 @@ namespace sunpack::sevenzip
                 return E_FAIL;
             }
 
-            const UInt64 read_start = position_;
-            const bool profiling = trace_ && read_file_timing_enabled() && !FAILED(trace_->read_hresult);
             auto *out = static_cast<unsigned char *>(data);
 
-            if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
+            if (prefetch_ && prefetch_->consume(position_, data, size))
             {
                 position_ += size;
-                record_logical_read(trace_, read_start, size);
+#ifdef SUP7Z_TEST_IO_FAULTS
+                observed_logical_read_bytes += size;
+#endif
                 prefetch_->after_read(position_);
-                if (profiling)
-                {
-                    const std::size_t index = find_range_index(read_start);
-                    const auto &range = ranges_[index];
-                    const UInt64 source = range.start + (read_start - range.virtual_offset);
-                    record_read_span(*trace_, read_start, source, size, size);
-                    trace_source(index);
-                }
                 if (processedSize)
                 {
                     *processedSize = size;
@@ -887,7 +750,9 @@ namespace sunpack::sevenzip
                 BOOL ok = FALSE;
                 DWORD error = ERROR_SUCCESS;
                 {
-                    ReadFileWallTimer timer(trace_);
+#ifdef SUP7Z_DEBUG
+                    PipelineStageScope input_scope(trace_ ? trace_->pipeline_timing : nullptr, PipelineStage::Input);
+#endif
                     ok = ReadFile(cached_handle_, out + total_read, want, &read, nullptr);
                     if (!ok)
                     {
@@ -907,11 +772,6 @@ namespace sunpack::sevenzip
                     return hr;
                 }
 
-                if (profiling)
-                {
-                    record_read_span(*trace_, position_, source_offset, want, read);
-                    trace_source(index);
-                }
                 if (read == 0)
                 {
                     break;
@@ -921,7 +781,9 @@ namespace sunpack::sevenzip
                 cached_handle_position_ += read;
             }
 
-            record_logical_read(trace_, read_start, total_read);
+#ifdef SUP7Z_TEST_IO_FAULTS
+            observed_logical_read_bytes += total_read;
+#endif
 
             if (prefetch_ && total_read)
             {
@@ -964,11 +826,9 @@ namespace sunpack::sevenzip
             const UInt64 prior_position = position_;
             position_ = static_cast<UInt64>(next);
 
-            record_logical_seek(trace_, prior_position, position_);
-
             if (prefetch_ && prior_position != position_)
             {
-                prefetch_->invalidate(position_, trace_);
+                prefetch_->invalidate(position_);
             }
 
             if (newPosition)
@@ -981,22 +841,9 @@ namespace sunpack::sevenzip
         }
 
     private:
-        void trace_source(std::size_t index)
-        {
-            if (index == traced_index_) return;
-            trace_->last_source_path = ranges_[index].path;
-            traced_index_ = index;
-        }
-
-        void initialize(InputPrefetchConfig prefetch_config, const wchar_t *mode)
+        void initialize(InputPrefetchConfig prefetch_config)
         {
             if (ranges_.empty() && open_hresult_ == S_OK) open_hresult_ = E_FAIL;
-
-            if (trace_ && read_file_timing_enabled())
-            {
-                trace_->mode = mode;
-                trace_->virtual_size = total_size_;
-            }
 
             if (is_open() && total_size_ && prefetch_config.enabled)
             {
@@ -1010,10 +857,6 @@ namespace sunpack::sevenzip
                         source = PrefetchSource{&range.path, range.start + displacement, range.length - displacement};
                         return true;
                     }, trace_);
-            }
-            if (trace_ && read_file_timing_enabled())
-            {
-                trace_->prefetch_enabled = prefetch_ && prefetch_->enabled();
             }
         }
 
@@ -1096,7 +939,6 @@ namespace sunpack::sevenzip
         UInt64 position_ = 0;
 
         ExtractInputTrace *trace_ = nullptr;
-        std::size_t traced_index_ = static_cast<std::size_t>(-1);
         bool physical_volume_ = false;
 
         HANDLE cached_handle_ = INVALID_HANDLE_VALUE;

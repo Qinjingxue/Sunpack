@@ -1,5 +1,5 @@
 //! Best-effort display history. Business state remains in the existing task store.
-use crate::io::display_store::{utc_us, Store, DAY_US};
+use crate::io::display_store::{utc_us, HistoryRecord, Store, DAY_US};
 use crate::io::display_wake::Wake;
 use crate::watch_store::NativeWatchState;
 use serde_json::{json, Value};
@@ -103,20 +103,8 @@ fn event_value(value: Value) -> std::io::Result<Value> {
     event_value_with(value, None)
 }
 
-type DiagnosticProjection<'a> = (&'a str, &'a dyn Fn(&mut usize, &mut bool) -> Value);
-fn event_value_with(value: Value, diagnostic: Option<DiagnosticProjection<'_>>) -> std::io::Result<Value> {
-    let Value::Object(mut fields) = value else {
-        return Err(std::io::Error::other("event must be an object"));
-    };
-    if let Some((name, _)) = diagnostic { fields.insert(name.to_owned(), Value::Null); }
-    let event_value = fields.remove("event");
-    let mut truncated = false;
-    let event = short_string(
-        event_value.as_ref().and_then(Value::as_str).unwrap_or(""),
-        64,
-        &mut truncated,
-    );
-    let state = matches!(
+fn state_event(event: &str) -> bool {
+    matches!(
         event,
         "pipeline_sources_claimed"
             | "processing_started"
@@ -131,7 +119,23 @@ fn event_value_with(value: Value, diagnostic: Option<DiagnosticProjection<'_>>) 
             | "no_tasks_found"
             | "pipeline_request_coalesced"
             | "pipeline_sources_released"
+    )
+}
+
+type DiagnosticProjection<'a> = (&'a str, &'a dyn Fn(&mut usize, &mut bool) -> Value);
+fn event_value_with(value: Value, diagnostic: Option<DiagnosticProjection<'_>>) -> std::io::Result<Value> {
+    let Value::Object(mut fields) = value else {
+        return Err(std::io::Error::other("event must be an object"));
+    };
+    if let Some((name, _)) = diagnostic { fields.insert(name.to_owned(), Value::Null); }
+    let event_value = fields.remove("event");
+    let mut truncated = false;
+    let event = short_string(
+        event_value.as_ref().and_then(Value::as_str).unwrap_or(""),
+        64,
+        &mut truncated,
     );
+    let state = state_event(event);
     let mut budget = DIAGNOSTIC_TEXT_BYTES;
     let mut result = serde_json::Map::new();
     result.insert("event".into(), Value::String(event.to_owned()));
@@ -356,7 +360,8 @@ impl Projection {
         };
         format!("{}|{}", owner, physical)
     }
-    fn apply(&mut self, value: &mut Value) -> Option<Record> {
+    /// Update the live projection and report whether to persist this event in history.
+    fn apply(&mut self, value: &mut Value) -> bool {
         self.order += 1;
         let event = field(value, "event").to_owned();
         if event == "pipeline_sources_claimed" {
@@ -450,7 +455,7 @@ impl Projection {
                     self.insert(id, task);
                 }
             }
-            return None;
+            return false;
         }
         let path = field(value, "path").to_owned();
         let physical = key(&path);
@@ -475,12 +480,12 @@ impl Projection {
                     self.remove(&id);
                 }
             }
-            return None;
+            return false;
         }
         if event == "task_retired" && field(value, "scope") == "task" {
             value["task_id"] = json!(id);
             self.remove(&id);
-            return None;
+            return false;
         }
         if event == "blocker_cleared" {
             let path = if field(value, "task_path").is_empty() {
@@ -493,7 +498,7 @@ impl Projection {
             if self.tasks.get(&id).is_some_and(|t| t.blocked) {
                 self.remove(&id);
             }
-            return None;
+            return false;
         }
         if event == "candidate_departed" || event == "task_retired" {
             // Source cleanup does not end an in-flight execution. Its original
@@ -536,7 +541,7 @@ impl Projection {
                 }
                 self.insert(id, task);
             }
-            return None;
+            return false;
         }
         if event == "no_tasks_found" || event == "pipeline_request_coalesced" {
             value["task_id"] = json!(id);
@@ -549,7 +554,7 @@ impl Projection {
             }) {
                 self.remove(&id);
             }
-            return None;
+            return false;
         }
         if !path.is_empty()
             && matches!(
@@ -581,7 +586,7 @@ impl Projection {
             {
                 // A transferred request can finish after the real owner. Keep
                 // only routing metadata until those in-flight owners release.
-                return None;
+                return false;
             }
             if field(value, "task_id").is_empty() && !self.tasks.contains_key(&id) {
                 id = self.instance_id(owner, &physical);
@@ -597,7 +602,7 @@ impl Projection {
             {
                 value["task_id"] = json!(self.instance_id(owner, &physical));
                 value["event"] = json!("stale_task_completion");
-                return None;
+                return false;
             }
             value["task_id"] = json!(id);
             let mut task = self.remove(&id).unwrap_or_default();
@@ -647,13 +652,13 @@ impl Projection {
                 if let Some(group) = task.group {
                     value["group"] = Arc::unwrap_or_clone(group);
                 }
-                return Some(encode(value));
+                return true;
             }
             task.status = Some(encode(value));
             self.insert(id, task);
-            return None;
+            return false;
         }
-        Some(encode(value))
+        true
     }
     fn updates(
         &mut self,
@@ -688,7 +693,7 @@ impl Projection {
 
 struct State {
     projection: Projection,
-    queue: Vec<Record>,
+    queue: Vec<HistoryRecord>,
     queue_bytes: usize,
     live_dirty: bool,
     reset_live: bool,
@@ -726,22 +731,21 @@ impl Shared {
         if !value["ts"].as_f64().is_some_and(|ts| ts.is_finite()) {
             value["ts"] = json!(utc_us() as f64 / 1_000_000.0);
         }
-        let row = if self.stateful {
-            state.projection.apply(&mut value)
-        } else {
-            Some(encode(&value))
-        };
-        let changed = !state.projection.dirty.is_empty() || state.projection.full_dirty;
-        state.live_dirty |= changed;
-        state.projection.trim();
-        if row.is_none() && !changed {
-            return;
+        let mut history = true;
+        if self.stateful && state_event(field(&value, "event")) {
+            history = state.projection.apply(&mut value);
+            let changed = !state.projection.dirty.is_empty() || state.projection.full_dirty;
+            state.live_dirty |= changed;
+            state.projection.trim();
+            if !history && !changed { return; }
         }
-        if let Some(row) = row {
+        if history {
             // Display logging must never stall extraction or grow without bound
             // when storage stops making progress. Report overload in the manifest.
-            if state.queue.is_empty() || state.queue_bytes + row.len() <= QUEUE_BYTES {
-                state.queue_bytes += row.len();
+            let row = HistoryRecord::new(&value, timestamp(&value));
+            let bytes = row.memory_bytes();
+            if state.queue.is_empty() || state.queue_bytes + bytes <= QUEUE_BYTES {
+                state.queue_bytes += bytes;
                 state.queue.push(row);
             } else {
                 state.dropped += 1;
@@ -847,10 +851,8 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             let retention = i64::from(days).saturating_mul(DAY_US);
             let cutoff = now.saturating_sub(retention);
             for row in rows {
-                let value: Value = serde_json::from_slice(&row)?;
-                let ts = timestamp(&value);
-                if ts > cutoff {
-                    store.append(&value, ts)?;
+                if row.timestamp() > cutoff {
+                    store.append(&row)?;
                 }
             }
             if let Some((live, reset)) = live {
@@ -1027,20 +1029,20 @@ mod tests {
         let mut store = Store::open(path).unwrap();
         let row = json!({"event":"done","path":"archive.zip"});
         for ts in [1000, 2000, 1500] {
-            store.append(&row, ts).unwrap();
+            store.append(&HistoryRecord::new(&row, ts)).unwrap();
         }
         assert_eq!(store.expire(999).unwrap(), Some(1000));
         assert_eq!(store.expire(1500).unwrap(), Some(2000));
         store.publish().unwrap();
 
-        store.append(&row, 3000).unwrap();
+        store.append(&HistoryRecord::new(&row, 3000)).unwrap();
         let [run] = store.manifest.runs.as_slice() else {
             panic!("expected one surviving run");
         };
         assert_eq!((run.head, run.first, run.last, run.count), (1, 2000, 3000, 3));
         assert_eq!(store.expire(3000).unwrap(), None);
         store.publish().unwrap();
-        store.append(&row, 4000).unwrap();
+        store.append(&HistoryRecord::new(&row, 4000)).unwrap();
         assert_eq!(store.expire(3000).unwrap(), Some(4000));
     }
 
@@ -1133,11 +1135,8 @@ mod tests {
         assert_eq!(old["members"], json!([path, member]));
         assert_eq!(current["members"], json!([path]));
 
-        let row = projection
-            .apply(&mut json!({"event":"done","path":path,
-            "owner":"run","ts":2}))
-            .unwrap();
-        let row: Value = serde_json::from_slice(&row).unwrap();
+        let mut row = json!({"event":"done","path":path,"owner":"run","ts":2});
+        assert!(projection.apply(&mut row));
         assert_eq!(row["group"], *current);
         assert!(projection.tasks.is_empty());
         projection.apply(&mut json!({"event":"pipeline_sources_released",
@@ -1162,13 +1161,11 @@ mod tests {
             projection.apply(&mut claim);
             let mut completion =
                 json!({"event":"done","path":sibling,"owner":index.to_string(),"ts":2});
-            let row = projection.apply(&mut completion).unwrap();
-            let row: Value = serde_json::from_slice(&row).unwrap();
-            assert_eq!(row["group"]["members"].as_array().unwrap().len(), 2);
+            assert!(projection.apply(&mut completion));
+            assert_eq!(completion["group"]["members"].as_array().unwrap().len(), 2);
             assert!(projection.tasks.is_empty());
-            assert!(projection
-                .apply(&mut json!({"event":"done","path":path,"owner":index.to_string(),"ts":2}))
-                .is_none());
+            assert!(!projection
+                .apply(&mut json!({"event":"done","path":path,"owner":index.to_string(),"ts":2})));
             projection.apply(&mut json!({"event":"pipeline_sources_released","owner":index.to_string(),"path":path}));
             assert!(
                 projection.aliases.is_empty()

@@ -239,30 +239,31 @@ impl CandidateSet {
 
     fn for_path<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
         let recent = self.sources.cache.recent();
-        let mut eligible = HashMap::with_capacity(recent.len());
-        if !recent.is_empty() {
-            let wanted: HashSet<&str> = recent.iter().map(Arc::as_ref).collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let priority = if recent.is_empty() {
+            Vec::new()
+        } else {
+            let mut positions: HashMap<_, _> = recent.iter().enumerate()
+                .map(|(index, password)| (password.as_ref(), index)).collect();
+            let mut priority = vec![None; recent.len()];
             for password in self.configured(path) {
-                if wanted.contains(password.as_ref()) {
-                    eligible.insert(password.as_ref(), password);
-                    if eligible.len() == wanted.len() {
+                if let Some(index) = positions.remove(password.as_ref()) {
+                    priority[index] = Some(password);
+                    seen.insert(password.as_ref());
+                    if positions.is_empty() {
                         break;
                     }
                 }
             }
-        }
-        let priority: Vec<_> = recent
-            .iter()
-            .filter_map(|password| eligible.get(password.as_ref()).copied())
-            .collect();
-        let mut seen: HashSet<&str> = HashSet::new();
+            priority
+        };
         priority
             .into_iter()
-            .chain(self.configured(path))
-            .filter(move |value| {
+            .flatten()
+            .chain(self.configured(path).filter(move |value| {
                 let value: &'b Arc<str> = *value;
                 seen.insert(value.as_ref())
-            })
+            }))
     }
 
     pub(super) fn for_embedded(&self, path: &str) -> Vec<Arc<str>> {

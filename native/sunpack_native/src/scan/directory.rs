@@ -461,7 +461,8 @@ impl NativeDirectoryScanOptions {
         scope: &crate::scan::scope::NativeDiscoveryScope,
         seed: &str,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
-        state.validate_generated(scope, Some(seed))?;
+        let stem = catalog_stem(seed);
+        state.validate_generated(scope, Some(&stem))?;
         let (filtered, raw) = (|| {
             let root = Path::new(&scope.root);
             let mut filter_scratch = PathFilterScratch::new(&self.options);
@@ -471,16 +472,16 @@ impl NativeDirectoryScanOptions {
                 let mut records = Vec::new();
                 let mut cells = Vec::new();
                 if let Some(catalog) = data.get_mut(&crate::path_keys::path_key(&scope.root)) {
-                    if let Some(bucket) = catalog.buckets.get(catalog_stem(seed).as_str()) {
+                    if let Some(bucket) = catalog.buckets.get(stem.as_str()) {
                         for key in bucket.iter() {
                             let Some(row) = catalog.rows.get_mut(key) else {
                                 continue;
                             };
                             let mut record = row.record();
-                            let visible = row.generated.is_some() || scope.contains(&record.path);
-                            if visible && !state.is_owned(&record.path) {
+                            let in_scope = scope.contains_key(key);
+                            if (in_scope || row.generated.is_some()) && !state.is_owned(&record.path) {
                                 let generated_root = Path::new(&record.path).parent().unwrap_or(root);
-                                let root = if scope.contains(&record.path) { root } else { generated_root };
+                                let root = if in_scope { root } else { generated_root };
                                 record.relation_member_eligible = !file_under_rejected_directory(
                                     Path::new(&record.path),
                                     root,
@@ -509,13 +510,14 @@ impl NativeDirectoryScanOptions {
                 (records, cells)
             };
             let mut accepted = HashSet::new();
-            for row in &raw {
-                if row.relation_member_eligible
-                    && numeric_ranges_allow(&self.options.size_ranges, row.size)
-                {
-                    accepted.extend(crate::relations::relations_size_filter_split_family_keys(
-                        &row.path,
-                    ));
+            let size_ranges = &self.options.size_ranges;
+            if !size_ranges.is_empty() {
+                for row in &raw {
+                    if row.relation_member_eligible && numeric_ranges_allow(size_ranges, row.size) {
+                        accepted.extend(crate::relations::relations_size_filter_split_family_keys(
+                            &row.path,
+                        ));
+                    }
                 }
             }
             let filtered = raw
@@ -523,10 +525,11 @@ impl NativeDirectoryScanOptions {
                 .enumerate()
                 .filter(|(_, r)| {
                     r.relation_member_eligible
-                        && (numeric_ranges_allow(&self.options.size_ranges, r.size)
-                            || crate::relations::relations_size_filter_split_family_keys(&r.path)
-                                .iter()
-                                .any(|k| accepted.contains(k)))
+                        && (numeric_ranges_allow(size_ranges, r.size)
+                            || (!accepted.is_empty()
+                                && crate::relations::relations_size_filter_split_family_keys(&r.path)
+                                    .iter()
+                                    .any(|k| accepted.contains(k))))
                 })
                 .map(|(index, _)| index)
                 .collect();
@@ -1485,10 +1488,10 @@ impl NativeWatchCatalog {
 
     /// Exact-path receipts never follow a rename. Notifications, startup and
     /// dependency lookup all use this validator, including USN content reasons.
-    pub(crate) fn validate_generated(&self, scope: &crate::scan::scope::NativeDiscoveryScope, seed: Option<&str>) -> std::io::Result<Vec<String>> {
+    pub(crate) fn validate_generated(&self, scope: &crate::scan::scope::NativeDiscoveryScope, stem: Option<&str>) -> std::io::Result<Vec<String>> {
         self.validate_generated_keys(scope, |table| {
-            if let Some(seed) = seed {
-                table.buckets.get(catalog_stem(seed).as_str()).into_iter().flat_map(|bucket| bucket.iter()).cloned().collect()
+            if let Some(stem) = stem {
+                table.buckets.get(stem).into_iter().flat_map(|bucket| bucket.iter()).cloned().collect()
             } else {
                 table.rows.iter().filter(|(_, row)| row.generated.is_some()).map(|(key, _)| Arc::clone(key)).collect()
             }

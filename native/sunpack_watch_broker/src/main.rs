@@ -492,10 +492,10 @@ fn handle_request(
                     Status::InvalidRequest
                 } else if error.kind() == io::ErrorKind::NotFound {
                     Status::NotFound
-                } else if error.to_string().contains("fallback scan") {
-                    Status::ScanLimit
                 } else if error.raw_os_error().is_some() {
                     Status::JournalUnavailable
+                } else if error.kind() == io::ErrorKind::Unsupported {
+                    Status::ScanLimit
                 } else {
                     Status::InternalError
                 };

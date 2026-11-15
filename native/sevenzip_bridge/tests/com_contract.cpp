@@ -352,17 +352,19 @@ void check_archive_open_start_and_carrier_fallback()
             output.write(reinterpret_cast<const char *>(rar.data()), rar.size());
             output.write(tail.data(), tail.size());
         }
+        observed_logical_read_bytes = 0;
         const auto result = extract_archive(path.wstring(), {path.wstring()}, {}, L"rar", L"", root.wstring(), L"", {}, true);
         check(result.status == PasswordTestStatus::Ok && result.archive_type == L"rar4",
               "RAR4 opens with a generic family hint, including carrier prefix fallback");
         if (!prefix) {
-            check(result.input_trace.total_bytes_returned > 0 && result.input_trace.total_bytes_returned < (512u << 10),
+            check(observed_logical_read_bytes > 0 && observed_logical_read_bytes < (512u << 10),
                   "wrong RAR handler does not consume the large carrier tail");
         } else {
             const std::vector<ExtractInputRange> ranges = {{path.wstring(), prefix, prefix + rar.size(), true}};
+            observed_logical_read_bytes = 0;
             const auto carved = extract_archive(path.wstring(), {}, ranges, L"rar", L"", root.wstring(), L"", {}, true);
             check(carved.status == PasswordTestStatus::Ok && carved.archive_type == L"rar4" &&
-                  carved.input_trace.total_bytes_returned > 0 && carved.input_trace.total_bytes_returned < (512u << 10),
+                  observed_logical_read_bytes > 0 && observed_logical_read_bytes < (512u << 10),
                   "canonical carrier range opens without consuming the underlying prefix and tail");
         }
     }
@@ -393,7 +395,7 @@ void check_prefetch_lifetime_and_seek()
                 return true;
             });
         prefetch.after_read(1);
-        prefetch.invalidate(400, nullptr);
+        prefetch.invalidate(400);
         prefetch.after_read(400);
         unsigned char expected[64];
         std::memset(expected, 400 % 251, sizeof(expected));
@@ -403,7 +405,7 @@ void check_prefetch_lifetime_and_seek()
             DWORD count = 0;
             written &= WriteFile(pipe, expected, sizeof(expected), &count, nullptr) && count == sizeof(expected);
         }
-        check(written && prefetch.consume(400, bytes, 64, nullptr) && !std::memcmp(bytes, expected, sizeof(bytes)),
+        check(written && prefetch.consume(400, bytes, 64) && !std::memcmp(bytes, expected, sizeof(bytes)),
               "seek cancels pending reads before reusing their buffers and OVERLAPPED structures");
         prefetch.after_read(464); // Leave a real pending read for destruction.
     }
@@ -413,7 +415,7 @@ void check_prefetch_lifetime_and_seek()
 
     wchar_t executable[MAX_PATH]{};
     GetModuleFileNameW(nullptr, executable, MAX_PATH);
-    auto *raw = new FileInStream(executable, nullptr, L"file", {true, 64});
+    auto *raw = new FileInStream(executable, nullptr, {true, 64});
     CMyComPtr<IInStream> stream(raw);
     UInt32 read = 0;
     check(stream->Read(bytes, 64, &read) == S_OK && read == 64, "file stream starts with direct read");
@@ -425,7 +427,7 @@ void check_prefetch_lifetime_and_seek()
           "backward relative Seek recalibrates the decoder handle");
     unsigned char expected[65]{};
     InputPrefetchConfig disabled{false, 64};
-    auto *direct_raw = new FileInStream(executable, nullptr, L"file", disabled);
+    auto *direct_raw = new FileInStream(executable, nullptr, disabled);
     CMyComPtr<IInStream> direct(direct_raw);
     direct->Read(expected, 65, &read);
     check(stream->Read(bytes, 1, &read) == S_OK && read == 1 && bytes[0] == expected[63],
@@ -450,7 +452,7 @@ void check_prefetch_virtual_inputs()
         // The virtual-input checks below cannot exercise OVERLAPPED buffer
         // reuse or a physical short read. Reuse this tiny fixture to cover
         // cross-window reads, direct fallback, EOF and seek/close ownership.
-        auto *raw = new FileInStream(first.wstring(), nullptr, L"file", {true, 64});
+        auto *raw = new FileInStream(first.wstring(), nullptr, {true, 64});
         CMyComPtr<IInStream> stream(raw);
         unsigned char bytes[300]{};
         UInt32 read = 0;
@@ -487,14 +489,13 @@ void check_prefetch_virtual_inputs()
                 return true;
             });
         short_read.after_read(240);
-        check(!short_read.consume(240, bytes, 64, nullptr),
+        check(!short_read.consume(240, bytes, 64),
               "short OVERLAPPED completion falls back without publishing a partial window");
     }
     {
         const auto empty = root / L"empty.bin";
         std::ofstream(empty, std::ios::binary).close();
-        ExtractInputTrace trace;
-        auto *raw = new MultiRangeInStream(std::vector<std::wstring>{first.wstring(), empty.wstring(), second.wstring()}, &trace, {true, 64});
+        auto *raw = new MultiRangeInStream(std::vector<std::wstring>{first.wstring(), empty.wstring(), second.wstring()}, nullptr, {true, 64});
         CMyComPtr<IInStream> stream(raw);
         unsigned char bytes[513]{};
         bool correct = true;
@@ -509,8 +510,8 @@ void check_prefetch_virtual_inputs()
         UInt64 position = 0;
         stream->Seek(-33, FILE_END, &position);
         correct = position == 480 && stream->Read(bytes, 33, &read) == S_OK && read == 33;
-        check(correct && !std::memcmp(bytes, payload + 480, 33) && trace.last_source_path == second.wstring(),
-              "volume seek discards prefetched windows and reports the physical path across an empty part");
+        check(correct && !std::memcmp(bytes, payload + 480, 33),
+              "volume seek discards prefetched windows across an empty part");
     }
     {
         // Same physical inputs represent an embedded payload whose prefix and
@@ -583,7 +584,6 @@ void check_output_path_reservations()
 
 int main()
 {
-    _putenv_s("SUNPACK_SEVENZIP_PROFILE_READS", "1");
     check_extract_callback();
     check_extract_to_disk_callback();
     check_archive_root_directory_entries();

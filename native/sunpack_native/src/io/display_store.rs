@@ -294,6 +294,42 @@ fn kind(value: &Value) -> u32 {
         _ => 0,
     }
 }
+
+struct RecordIndex {
+    ts: i64,
+    kind: u32,
+    filter: [u64; 4],
+}
+
+impl RecordIndex {
+    fn new(value: &Value, ts: i64) -> Self {
+        let kind = kind(value);
+        // The GUI discards non-task records before looking at the search bits.
+        let filter = if kind == 0 { [0; 4] } else { filter(value) };
+        Self { ts, kind, filter }
+    }
+}
+
+pub(crate) struct HistoryRecord {
+    index: RecordIndex,
+    raw: Vec<u8>,
+}
+
+impl HistoryRecord {
+    pub(crate) fn new(value: &Value, ts: i64) -> Self {
+        Self {
+            index: RecordIndex::new(value, ts),
+            raw: rmp_serde::to_vec(value).expect("display event encodes as MessagePack"),
+        }
+    }
+
+    pub(crate) fn timestamp(&self) -> i64 { self.index.ts }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.raw.capacity()
+    }
+}
+
 impl Store {
     pub(crate) fn rebuild(path: PathBuf) -> io::Result<Self> {
         let folder = path.with_file_name(format!(
@@ -390,15 +426,12 @@ impl Store {
         data: &mut TrackedFile,
         index: &mut TrackedFile,
         slot: u64,
-        value: &Value,
-        ts: i64,
+        raw: &[u8],
+        record: &RecordIndex,
     ) -> io::Result<([u8; ENTRY_BYTES], u64)> {
-        let mut raw = super::scratch::Spool::default();
-        rmp_serde::encode::write(&mut raw, value).map_err(|e| invalid(&e.to_string()))?;
-        let raw = raw.finish()?;
         let position = data.seek(SeekFrom::End(0))?;
         let (packed_length, raw_length, size) = if raw.len() <= super::scratch::MEMORY_BYTES {
-            let len = compress_block(&raw, compressed)?;
+            let len = compress_block(raw, compressed)?;
             data.write_all(&compressed[..len])?;
             (len as u32, raw.len() as u32, len as u64)
         } else {
@@ -422,21 +455,22 @@ impl Store {
             (0, 0, end - position)
         };
         let mut bytes = [0; ENTRY_BYTES];
-        bytes[..8].copy_from_slice(&ts.to_le_bytes());
+        bytes[..8].copy_from_slice(&record.ts.to_le_bytes());
         bytes[8..16].copy_from_slice(&position.to_le_bytes());
         bytes[16..20].copy_from_slice(&packed_length.to_le_bytes());
         bytes[20..24].copy_from_slice(&raw_length.to_le_bytes());
-        bytes[24..28].copy_from_slice(&kind(value).to_le_bytes());
+        bytes[24..28].copy_from_slice(&record.kind.to_le_bytes());
         bytes[28..32].copy_from_slice(&(slot as u32).to_le_bytes());
-        for (i, bits) in filter(value).iter().enumerate() {
+        for (i, bits) in record.filter.iter().enumerate() {
             bytes[32 + i * 8..40 + i * 8].copy_from_slice(&bits.to_le_bytes());
         }
         index.seek(SeekFrom::Start(slot * ENTRY_BYTES as u64))?;
         index.write_all(&bytes)?;
         Ok((bytes, size))
     }
-    pub(crate) fn append(&mut self, value: &Value, ts: i64) -> io::Result<()> {
-        if kind(value) != 0 {
+    pub(crate) fn append(&mut self, record: &HistoryRecord) -> io::Result<()> {
+        let ts = record.timestamp();
+        if record.index.kind != 0 {
             self.manifest.task_revision += 1;
         }
         let new = self
@@ -457,8 +491,8 @@ impl Store {
             data,
             index,
             run.count,
-            value,
-            ts,
+            &record.raw,
+            &record.index,
         )?;
         if run.count == 0 {
             run.first = ts;
@@ -531,13 +565,15 @@ impl Store {
             } else {
                 (Arc::from(id), live.free.pop().unwrap_or(live.run.count))
             };
+            let mut raw = super::scratch::Spool::default();
+            rmp_serde::encode::write(&mut raw, &value).map_err(|e| invalid(&e.to_string()))?;
             let (bytes, size) = Self::write_record(
                 &mut self.compressed,
                 &mut live.data,
                 &mut live.index,
                 slot,
-                &value,
-                ts,
+                &raw.finish()?,
+                &RecordIndex::new(&value, ts),
             )?;
             live.run.count = live.run.count.max(slot + 1);
             live.bytes += size;

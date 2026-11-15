@@ -550,41 +550,38 @@ fn resolve_shared_carrier_volumes(
     let selected = by_path.keys().cloned().collect();
     // Materialize only the active stem scopes once, independently of the
     // number of logical heads. Never scan the entire directory per segment.
-    let scopes: Vec<HashMap<String, Vec<RelationInput>>> = snapshots
-        .iter()
-        .map(|snapshot| {
-            let view = snapshot.without_path_keys(excluded);
-            let source = RelationSource::Snapshot(&view, Some(&cache));
-            let mut buckets: HashMap<String, Vec<RelationInput>> = HashMap::new();
-            for index in RelationScopeIndex::build(&source, &selected).rows {
-                let row = source.materialize(index);
-                buckets
-                    .entry(case_key(first_dot_stem(&row.name)))
-                    .or_default()
-                    .push(row);
-            }
-            buckets
-        })
-        .collect();
     let mut proposals = Vec::new();
     let mut mappings = HashSet::new();
-    for buckets in &scopes {
-        for scope in buckets.values() {
+    for snapshot in snapshots {
+        let view = snapshot.without_path_keys(excluded);
+        let source = RelationSource::Snapshot(&view, Some(&cache));
+        let mut buckets: HashMap<String, Vec<RelationInput>> = HashMap::new();
+        for index in RelationScopeIndex::build(&source, &selected).rows {
+            let row = source.materialize(index);
+            buckets.entry(case_key(first_dot_stem(&row.name))).or_default().push(row);
+        }
+        for scope in buckets.into_values() {
             // A physical row can contain several logical volume slices. Keep
             // all already analyzed anchors before slot/layout construction;
             // never choose a representative anchor and try to repair it later.
-            let mut rows = Vec::new();
-            for row in scope {
+            let mut rows = Vec::with_capacity(scope.len());
+            for mut row in scope {
                 if let Some(options) = by_path.get(&row.path_key) {
-                    for anchor in options {
-                        let mut slice = row.clone();
-                        slice.anchor = Some((*anchor).clone());
-                        slice.anchor_cell = None;
-                        rows.push(slice);
+                    let (last, previous) = options.split_last().expect("selected path has anchors");
+                    row.anchor_cell = None;
+                    // A single anchor was already installed in the cache
+                    // and copied into this row by materialize().
+                    if !previous.is_empty() {
+                        row.anchor = None;
+                        for anchor in previous {
+                            let mut slice = row.clone();
+                            slice.anchor = Some((*anchor).clone());
+                            rows.push(slice);
+                        }
+                        row.anchor = Some((*last).clone());
                     }
-                } else {
-                    rows.push(row.clone());
                 }
+                rows.push(row);
             }
             let name_index = BucketIndex::build(&rows, Some(&selected));
             // Proven logical slices may share a physical lease. Ordinary path
@@ -603,39 +600,39 @@ fn resolve_shared_carrier_volumes(
                 if !selected {
                     continue;
                 }
-                let group = NativeRelationGroup::Proposal(validation);
-                let NativeRelationGroup::Proposal(ref validation) = group else { unreachable!() };
                 let mapping: Vec<_> = validation.proposal.volumes.iter().map(|part| {
-                    let anchor = validation.facts.anchors.get(&path_key(&part.0));
-                    (path_key(&part.0), validation.proposal.format.clone(), part.1, anchor.and_then(|a| a.structure_offset),
+                    let key = path_key(&part.0);
+                    let anchor = validation.facts.anchors.get(&key);
+                    (key, part.1, anchor.and_then(|a| a.structure_offset),
                         anchor.and_then(|a| a.payload_end))
                 }).collect();
-                if mappings.insert(mapping) { proposals.push(group); }
+                if mappings.insert((validation.proposal.format.clone(), mapping)) {
+                    proposals.push(validation);
+                }
             }
         }
     }
+    drop(mappings);
     // Alternative sources are request-owned leases. A successful input only
     // commits its selected extents; overlapping candidates do not erase heads.
     let mut covered = HashSet::new();
     let mut output = Vec::new();
-    for group in proposals {
-        if let NativeRelationGroup::Proposal(validation) = &group {
-            covered.extend(validation.proposal.volumes.iter().filter_map(|part| {
-                validation
-                    .facts
-                    .anchors
-                    .get(&path_key(&part.0))
-                    .map(|a| (path_key(&a.path), a.structure_offset))
-            }));
-            if let Some(plan) = &validation.attempts {
-                covered.extend(
-                    plan.sources
-                        .iter()
-                        .map(|source| (path_key(&source.path), Some(source.start))),
-                );
-            }
+    for validation in proposals {
+        covered.extend(validation.proposal.volumes.iter().filter_map(|part| {
+            validation
+                .facts
+                .anchors
+                .get(&path_key(&part.0))
+                .map(|a| (path_key(&a.path), a.structure_offset))
+        }));
+        if let Some(plan) = &validation.attempts {
+            covered.extend(
+                plan.sources
+                    .iter()
+                    .map(|source| (path_key(&source.path), Some(source.start))),
+            );
         }
-        output.push(group);
+        output.push(NativeRelationGroup::Proposal(validation));
     }
     for mut anchor in anchors {
         if covered.contains(&(path_key(&anchor.path), anchor.structure_offset)) {
@@ -722,11 +719,6 @@ fn build_candidate_groups_from_source(
     // including competitors whose head was not selected by the caller.
     let validation_owned_paths: Vec<HashSet<String>> =
         validations.iter().map(validation_owned_paths).collect();
-    let selected: Vec<_> = validation_owned_paths
-        .iter()
-        .map(|owned| !owned.is_disjoint(filtered_keys))
-        .collect();
-
     let password_conflicted = conflicting_proposal_indexes(
         &validations,
         &validation_owned_paths,
@@ -741,8 +733,8 @@ fn build_candidate_groups_from_source(
             continue;
         }
         let owned = &validation_owned_paths[index];
-        claimed_paths.extend(owned.iter().cloned());
-        if selected[index] {
+        claimed_paths.extend(owned.iter().map(String::as_str));
+        if !owned.is_disjoint(filtered_keys) {
             selected_groups.push(index);
         }
     }
@@ -758,11 +750,11 @@ fn build_candidate_groups_from_source(
             continue;
         }
         let owned = &validation_owned_paths[index];
-        if owned.iter().any(|path| claimed_paths.contains(path)) {
+        if owned.iter().any(|path| claimed_paths.contains(path.as_str())) {
             continue;
         }
-        password_paths.extend(owned.iter().cloned());
-        if selected[index] {
+        password_paths.extend(owned.iter().map(String::as_str));
+        if !owned.is_disjoint(filtered_keys) {
             selected_groups.push(index);
         }
     }
@@ -797,12 +789,12 @@ fn build_candidate_groups_from_source(
         let owned = &validation_owned_paths[index];
         if owned
             .iter()
-            .any(|path| claimed_paths.contains(path) || password_paths.contains(path))
+            .any(|path| claimed_paths.contains(path.as_str()) || password_paths.contains(path.as_str()))
         {
             continue;
         }
-        claimed_paths.extend(owned.iter().cloned());
-        if selected[index] {
+        claimed_paths.extend(owned.iter().map(String::as_str));
+        if !owned.is_disjoint(filtered_keys) {
             selected_groups.push(index);
         }
     }
@@ -817,8 +809,8 @@ fn build_candidate_groups_from_source(
 
     for row in directory_rows.into_iter().filter(|row| {
         filtered_keys.contains(&row.path_key)
-            && !claimed_paths.contains(&row.path_key)
-            && !password_paths.contains(&row.path_key)
+            && !claimed_paths.contains(row.path_key.as_str())
+            && !password_paths.contains(row.path_key.as_str())
             && !row.anchor.as_ref().is_some_and(|a| {
                 !a.standalone && !a.is_volume_entry()
                     && (a.multivolume || a.continuation_from_previous)

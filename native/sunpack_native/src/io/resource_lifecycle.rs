@@ -9,7 +9,13 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 #[derive(Default)]
 struct NativeRegistry {
     resources: HashMap<u64, Vec<PathBuf>>,
-    promotions: HashMap<u64, Vec<PathBuf>>,
+    promotions: HashMap<u64, ActivePromotion>,
+}
+
+struct ActivePromotion {
+    roots: Vec<PathBuf>,
+    // The gate rejects overlapping registrations, so this count only falls.
+    remaining: usize,
 }
 
 #[derive(Default)]
@@ -154,23 +160,23 @@ fn handle_path_is_under(_file: &File, _root: &Path) -> io::Result<bool> {
 
 fn open_shared_reader(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
+    configure_shared_reader(&mut options);
+    options.open(path)
+}
+
+fn configure_shared_reader(options: &mut std::fs::OpenOptions) {
     options.read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(0x1 | 0x2 | 0x4);
     }
-    options.open(path)
 }
 
 impl TrackedFile {
     pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
-        let resource = NativeResourceGuard::register([path.to_path_buf()])?;
-        let file = File::open(path)?;
-        Ok(Self {
-            file,
-            _resource: FileResource::Owned { _guard: resource },
+        Self::open_with(path, |options| {
+            options.read(true);
         })
     }
 
@@ -193,13 +199,7 @@ impl TrackedFile {
     }
 
     pub(crate) fn open_reader(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
-        let resource = NativeResourceGuard::register([path.to_path_buf()])?;
-        let file = open_shared_reader(path)?;
-        Ok(Self {
-            file,
-            _resource: FileResource::Owned { _guard: resource },
-        })
+        Self::open_with(path, configure_shared_reader)
     }
 
     pub(crate) fn write_shared(&self, buffer: &[u8]) -> io::Result<()> {
@@ -270,7 +270,7 @@ impl NativeResourceGuard {
         if registry
             .promotions
             .values()
-            .any(|roots| paths_overlap(&paths, roots))
+            .any(|promotion| paths_overlap(&paths, &promotion.roots))
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -286,13 +286,22 @@ impl Drop for NativeResourceGuard {
     fn drop(&mut self) {
         let state = registry();
         if let Ok(mut registry) = state.registry.lock() {
-            registry.resources.remove(&self.id);
+            let Some(paths) = registry.resources.remove(&self.id) else {
+                return;
+            };
+            let mut ready = false;
+            for promotion in registry.promotions.values_mut() {
+                if promotion.remaining > 0 && paths_overlap(&paths, &promotion.roots) {
+                    promotion.remaining -= 1;
+                    ready |= promotion.remaining == 0;
+                }
+            }
             // Keep small tables reusable across short-lived probes, but
             // do not retain a concurrent workload's peak allocation.
             if registry.resources.capacity() > 256 {
                 crate::collections::trim_map(&mut registry.resources);
             }
-            if !registry.promotions.is_empty() {
+            if ready {
                 state.changed.notify_all();
             }
         }
@@ -363,10 +372,15 @@ impl Promotion {
         {
             let mut registry = state.registry.lock()
                 .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-            if registry.promotions.values().any(|roots| paths_overlap(&keys, roots)) {
+            if registry.promotions.values().any(|promotion| paths_overlap(&keys, &promotion.roots)) {
                 return Err(io::Error::other("overlapping native promotion already active"));
             }
-            registry.promotions.insert(id, keys);
+            let remaining = registry
+                .resources
+                .values()
+                .filter(|paths| paths_overlap(paths, &keys))
+                .count();
+            registry.promotions.insert(id, ActivePromotion { roots: keys, remaining });
         }
         let guard = Self(id);
         // Evict cached handles before joining live readers. The published gate
@@ -375,8 +389,7 @@ impl Promotion {
         let registry = state.registry.lock()
             .map_err(|_| io::Error::other("native resource registry poisoned"))?;
         let _registry = state.changed.wait_while(registry, |registry| {
-            let roots = &registry.promotions[&id];
-            registry.resources.values().any(|paths| paths_overlap(paths, roots))
+            registry.promotions[&id].remaining != 0
         }).map_err(|_| io::Error::other("native resource registry poisoned"))?;
         Ok(guard)
     }

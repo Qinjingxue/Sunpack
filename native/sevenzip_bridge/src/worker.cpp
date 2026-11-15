@@ -402,41 +402,16 @@ void print_job_event(const std::string& job_id, const char* event) {
         wire::key("job_id") + wire::text(job_id) + wire::key("event") + wire::text(event) + wire::end());
 }
 
-std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace, bool profiling) {
+std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace) {
     const auto win32_error = HRESULT_FACILITY(trace.read_hresult) == FACILITY_WIN32 ? HRESULT_CODE(trace.read_hresult) : 0;
-    auto payload = wire::object() +
-        wire::key("read_error") + wire::boolean(FAILED(trace.read_hresult)) +
+    return wire::object() +
+        wire::key("read_error") + wire::boolean(true) +
         wire::key("last_win32_error") + wire::number(win32_error) +
         (wire::key("last_read") + wire::object() + wire::key("virtual_offset")) + wire::number(trace.last_read_virtual_offset) +
         wire::key("source_path") + wire::text(wide_to_utf8(trace.last_source_path)) +
         wire::key("source_offset") + wire::number(trace.last_read_source_offset) +
         wire::key("requested") + wire::number(trace.last_read_requested) +
-        wire::key("returned") + wire::number(trace.last_read_returned) +
-        wire::end();
-    if (profiling) {
-        payload +=
-            wire::key("mode") + wire::text(wide_to_utf8(trace.mode)) +
-            wire::key("virtual_size") + wire::number(trace.virtual_size) +
-            wire::key("total_bytes_returned") + wire::number(trace.total_bytes_returned) +
-            wire::key("read_file_call_count") + wire::number(trace.read_file_call_count) +
-            wire::key("read_file_wall_ns") + wire::number(trace.read_file_wall_ns) +
-            wire::key("read_file_max_wall_ns") + wire::number(trace.read_file_max_wall_ns) +
-            wire::key("logical_read_call_count") + wire::number(trace.logical_read_call_count) +
-            wire::key("sequential_read_bytes") + wire::number(trace.sequential_read_bytes) +
-            wire::key("nonsequential_read_bytes") + wire::number(trace.nonsequential_read_bytes) +
-            wire::key("sequential_run_count") + wire::number(trace.sequential_run_count) +
-            wire::key("max_sequential_run_bytes") + wire::number(trace.max_sequential_run_bytes) +
-            wire::key("seek_count") + wire::number(trace.seek_count) +
-            wire::key("seek_forward_bytes") + wire::number(trace.seek_forward_bytes) +
-            wire::key("seek_backward_bytes") + wire::number(trace.seek_backward_bytes) +
-            wire::key("prefetch_enabled") + wire::boolean(trace.prefetch_enabled) +
-            wire::key("prefetch_hit_count") + wire::number(trace.prefetch_hit_count) +
-            wire::key("prefetch_miss_count") + wire::number(trace.prefetch_miss_count) +
-            wire::key("prefetch_invalidation_count") + wire::number(trace.prefetch_invalidation_count) +
-            wire::key("prefetch_consumer_wait_ns") + wire::number(trace.prefetch_consumer_wait_ns);
-    }
-    payload += wire::end();
-    return payload;
+        wire::end() + wire::end();
 }
 
 // Bound each serialized event by bytes, including its routing envelope. The
@@ -1062,9 +1037,8 @@ int run_request(
         wire::key("failure_kind") + wire::text(result.failure_kind) +
         wire::key("hresult") + wire::number(result.hresult) +
         wire::key("operation_result_name") + wire::text(operation_result_name(result.operation_result));
-    const bool profile_reads = read_file_timing_enabled();
-    const std::string input_trace_field = (FAILED(result.input_trace.read_hresult) || profile_reads) ?
-        wire::key("input_trace") + input_trace_wire(result.input_trace, profile_reads) : "";
+    const std::string input_trace_field = FAILED(result.input_trace.read_hresult) ?
+        wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
     const auto &output_trace = result.output_trace;
     const std::string metadata_warning_field = (output_trace.metadata_failed_files || output_trace.metadata_failed_directories) ?
         (wire::key("metadata_warning") + wire::object() + wire::key("file_count")) + wire::number(output_trace.metadata_failed_files) +
@@ -1795,7 +1769,7 @@ int main() {
     const auto memory_reserve_bytes = sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes(worker_count);
     NativeJobExecutor executor(worker_count, memory_reserve_bytes);
     print_frame(
-        (wire::object() + wire::key("type") + wire::text("worker_ready") + wire::key("sizing_mode") + wire::text("dynamic") + wire::key("logical_processors")) + wire::number(worker_count) +
+        (wire::object() + wire::key("type") + wire::text("worker_ready")) +
         wire::key("thread_capacity") + wire::number(worker_count) +
         (wire::key("memory_management") + wire::text("commitment_replay")) +
         wire::key("memory_reserve_bytes") +

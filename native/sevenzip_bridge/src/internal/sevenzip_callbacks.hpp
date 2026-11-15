@@ -59,7 +59,7 @@ namespace sunpack::sevenzip
                 opened_ = stream->is_open();
                 if (!opened_) record(stream->open_hresult());
             } else {
-                auto* stream = new FileInStream(path, nullptr, L"file", prefetch);
+                auto* stream = new FileInStream(path, nullptr, prefetch);
                 stream_ = stream;
                 opened_ = stream->is_open();
                 if (!opened_) record(stream->open_hresult());
@@ -825,7 +825,7 @@ namespace sunpack::sevenzip
 
         bool output_root_initially_empty() const { return output_root_initially_empty_; }
 
-#if defined(_WIN32) && defined(SUP7Z_TEST_IO_FAULTS)
+#ifdef SUP7Z_TEST_IO_FAULTS
         bool ensure_directory_for_test(const std::wstring &directory, int *out_error_code)
         {
             std::error_code error;
@@ -1129,7 +1129,7 @@ namespace sunpack::sevenzip
                 {
 
                     target = receipt && !receipt->path.empty() ? std::filesystem::path(receipt->path)
-                        : available_output_path(output_root_ / safe_path.value());
+                        : output_paths_.allocate(output_root_ / safe_path.value(), output_root_initially_empty_);
                     if (receipt) receipt->path = target.native();
 
                     directory_ready = ensure_directory(target.parent_path(), &directory_error);
@@ -1313,6 +1313,8 @@ namespace sunpack::sevenzip
                 }
                 output_trace_.last_hresult = static_cast<int>(snapshot.hresult);
             }
+            // The settled file only needs its archive name for hard link lookup.
+            if (!supports_hard_links_) std::wstring{}.swap(item.path);
         }
 
         struct HardLink
@@ -1592,11 +1594,7 @@ namespace sunpack::sevenzip
         // 本 callback 所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
         VolumeSpaceGate *volume_space_gate() const noexcept
         {
-#ifdef _WIN32
             return async_writer_ ? async_writer_->volume_state()->space_gate.get() : nullptr;
-#else
-            return nullptr;
-#endif
         }
 
         // gate 的终态谓词：显式取消或 writer 整体停止，只读 atomic。
@@ -1606,21 +1604,9 @@ namespace sunpack::sevenzip
             const auto writer = async_writer_;
             return [token, writer]
             {
-                if (token && token->load(std::memory_order_acquire))
-                {
-                    return true;
-                }
-#ifdef _WIN32
-                return writer && writer->stopping();
-#else
-                return false;
-#endif
+                return (token && token->load(std::memory_order_acquire)) ||
+                    (writer && writer->stopping());
             };
-        }
-
-        std::filesystem::path available_output_path(const std::filesystem::path &requested)
-        {
-            return output_paths_.allocate(requested, output_root_initially_empty_);
         }
 
         // 可暂停的目录创建，与根输出目录创建共用同一个原语。
@@ -1702,16 +1688,6 @@ namespace sunpack::sevenzip
             for (const auto &part : relative)
             {
                 current /= part;
-                std::error_code error;
-                const auto status = std::filesystem::symlink_status(current, error);
-                if (!error && std::filesystem::is_symlink(status))
-                {
-                    throw std::filesystem::filesystem_error(
-                        "output path traverses a symbolic link",
-                        current,
-                        std::make_error_code(std::errc::permission_denied));
-                }
-#ifdef _WIN32
                 const DWORD attributes = GetFileAttributesW(current.c_str());
                 if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                 {
@@ -1720,7 +1696,6 @@ namespace sunpack::sevenzip
                         current,
                         std::make_error_code(std::errc::permission_denied));
                 }
-#endif
             }
         }
 

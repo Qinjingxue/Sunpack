@@ -4,14 +4,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crc32fast::hash as crc32;
 use memchr::memmem;
 
-use crate::analysis_native::structure::unified_prefilter_mask_from_head;
+use crate::analysis_native::structure::{compression_prefix_identity, unified_prefilter_mask_from_head, StructuralStreamKind};
 use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
 use crate::io::reader::ManagedReader;
 use crate::io::resource_lifecycle::{NativeReadScope, TrackedFile};
 use crate::password::rar::{
     rar5_archive_encryption_header, rar5_encryption_identity, Rar5EncryptionIdentity,
 };
-use crate::scan::compression_stream::validate_bzip2_identity;
 use crate::scan::pe_overlay::{probe_pe_prefix, PeState};
 use std::borrow::Cow;
 
@@ -261,9 +260,10 @@ pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) 
     };
     CheapAnchor::from_probe(
         path,
-        probe_cheap_prefix(result, prefix, path, |offset, len| {
-            ManagedReader::open(path)?.read_at(offset, len)
-        }),
+        probe_cheap_prefix(result, prefix,
+            |offset, len| ManagedReader::open(path)?.read_direct_at(offset, len),
+            || ManagedReader::open(path).is_ok_and(|reader| crate::formats::lz4::identity(&reader, 0) == Ok(true)),
+        ),
     )
 }
 
@@ -300,16 +300,17 @@ pub(crate) fn probe_volume_anchor_path_cheap(path: &str) -> VolumeAnchor {
     };
     result.bytes_read += prefix.len() as u64;
     result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix);
-    probe_cheap_prefix(result, &prefix, path, |offset, len| {
-        reader.read_at(offset, len)
-    })
+    probe_cheap_prefix(result, &prefix,
+        |offset, len| reader.read_direct_at(offset, len),
+        || crate::formats::lz4::identity(&reader, 0) == Ok(true),
+    )
 }
 
 fn probe_cheap_prefix(
     mut result: VolumeAnchor,
     prefix: &[u8],
-    path: &str,
     read: impl Fn(u64, usize) -> std::io::Result<Vec<u8>>,
+    lz4_identity: impl FnOnce() -> bool,
 ) -> VolumeAnchor {
     let prefix = complete_anchor_prefix(prefix, &mut result, 0, &read);
     let prefix = prefix.as_ref();
@@ -340,7 +341,7 @@ fn probe_cheap_prefix(
     let pe = probe_pe_prefix(prefix, result.size);
     result.pe_state = pe.state();
     result.pe_image_end = pe.image_end();
-    probe_standalone_stream(prefix, &mut result, Some(path));
+    probe_standalone_stream(prefix, &mut result, read, lz4_identity);
     result
 }
 
@@ -1234,7 +1235,8 @@ fn probe_anchor_reader_prefix(
         return Ok(true);
     }
     if format.is_empty() && offset == 0 {
-        probe_standalone_stream(prefix, result, None);
+        probe_standalone_stream(prefix, result, |offset, len| reader.read_direct_at(offset, len),
+            || crate::formats::lz4::identity(reader, 0) == Ok(true));
         if !result.format.is_empty() {
             return Ok(true);
         }
@@ -1254,35 +1256,26 @@ fn probe_anchor_reader_prefix(
     Ok(!result.format.is_empty())
 }
 
-fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor, path: Option<&str>) {
+fn probe_standalone_stream(
+    prefix: &[u8],
+    out: &mut VolumeAnchor,
+    read: impl Fn(u64, usize) -> std::io::Result<Vec<u8>>,
+    lz4_identity: impl FnOnce() -> bool,
+) {
+    // Confirm the prefix before ruling this file out as a possible volume.
+    // Continuation bytes can coincide with a leading stream signature.
     let format = if prefix.starts_with(sunpack_enc::MAGIC) {
-        "enc"
+        sunpack_enc::Header::parse(prefix, out.size).is_ok().then_some("enc")
     } else if crate::formats::lz4::leading(prefix) {
-        "lz4"
-    } else if prefix.starts_with(b"\x1f\x8b") {
-        "gzip"
-    } else if prefix.starts_with(b"BZh") {
-        "bzip2"
-    } else if prefix.starts_with(b"\xfd7zXZ\x00") {
-        "xz"
-    } else if prefix.starts_with(b"\x28\xb5\x2f\xfd") {
-        "zstd"
+        lz4_identity().then_some("lz4")
+    } else if let Some(kind) = StructuralStreamKind::from_header(prefix) {
+        compression_prefix_identity(kind, prefix, out.size, read).then_some(kind.format())
     } else if prefix.get(257..262) == Some(b"ustar") {
-        "tar"
+        crate::analysis_native::view::tar_header_identity(prefix, out.size).then_some("tar")
     } else {
-        return;
+        None
     };
-    // A continuation volume may start with arbitrary compressed/encrypted
-    // bytes. Magic alone must not remove it from its archive's cohort.
-    // Keep the canonical identity fact on the anchor for Detection to reuse.
-    let confirmed = if format == "bzip2" {
-        validate_bzip2_identity(prefix, out.size).is_ok()
-    } else {
-        crate::analysis_native::confirm_format_identity_native(path.unwrap_or(&out.path), format)
-    };
-    if !confirmed {
-        return;
-    }
+    let Some(format) = format else { return; };
     out.format = format;
     out.strong = true;
     out.standalone = true;
@@ -1333,6 +1326,29 @@ fn u32_le(data: &[u8], offset: usize) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::password::rar::rar5_header_decryption_tests::{hex_bytes, PART1_HP_HEX, PART2_HP_HEX, SINGLE_HP_HEX};
+
+    #[test]
+    fn standalone_gzip_reuses_sample_and_extends_long_headers() {
+        use std::io::Write;
+
+        for name_len in [8, 2048] {
+            let mut encoder = flate2::GzBuilder::new()
+                .filename(vec![b'a'; name_len])
+                .write(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(b"sample").unwrap();
+            let gzip = encoder.finish().unwrap();
+            let path = crate::test_support::temp_file("gzip_anchor_prefix", &gzip);
+            let prefix = &gzip[..gzip.len().min(512)];
+            if prefix.len() == gzip.len() {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let anchor = probe_volume_anchor_from_head(path.to_str().unwrap(), gzip.len() as u64, prefix);
+            assert!(anchor.anchor().is_some_and(|anchor| anchor.standalone && anchor.format == "gzip"));
+            if prefix.len() != gzip.len() {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn bare_mz_does_not_expand_or_authorize_nonleading_archive_probes() {

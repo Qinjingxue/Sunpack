@@ -792,7 +792,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             let kind = event.kind();
             let mut signals = Signals::default();
             let id = key(&path);
-            let activity = scheduler.hub.activities.bind(id.clone(), quiet::Activity::default);
+            let activity = scheduler.hub.activities.bind(&id, quiet::Activity::default);
             let observation = activity.capture(&path, &scheduler.hub.claims, &id).unwrap().unwrap();
             signals.changes.root_changed(&root_id, [(path.clone(), PathChange {
                 modified_only: kind == "modified", event: Some(event),

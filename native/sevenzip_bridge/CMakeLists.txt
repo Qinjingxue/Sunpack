@@ -357,6 +357,7 @@ endfunction()
 set(SUP7Z_WRITER_SOURCES
     src/internal/archive_extract.cpp
     src/internal/password_testing.cpp
+    src/internal/sevenzip_streams.cpp
     src/internal/sevenzip_volume_registry.cpp
 )
 set(SUP7Z_COMMON_SOURCES
@@ -368,7 +369,6 @@ set(SUP7Z_COMMON_SOURCES
     src/internal/sevenzip_properties.cpp
     src/internal/sevenzip_sdk.cpp
     src/internal/sevenzip_status.cpp
-    src/internal/sevenzip_streams.cpp
     src/internal/sevenzip_writer_meters.cpp
     src/internal/zlib_ng_deflate_decoder.cpp
 )
@@ -381,7 +381,7 @@ endif()
 add_library(sunpack_sevenzip_common OBJECT ${SUP7Z_COMMON_SOURCES})
 add_library(sunpack_sevenzip_core STATIC
     ${SUP7Z_WRITER_SOURCES} $<TARGET_OBJECTS:sunpack_sevenzip_common>)
-# The writer and callbacks are header-defined. Compile all their users in
+# The writer, callbacks and streams are header-defined. Compile all their users in
 # each test binary with the same layout, sharing unaffected objects.
 add_library(sunpack_sevenzip_io_test_core STATIC
     ${SUP7Z_WRITER_SOURCES} $<TARGET_OBJECTS:sunpack_sevenzip_common>)
@@ -545,7 +545,7 @@ add_executable(sunpack_sevenzip_com_contract
 )
 apply_release_optimizations(sunpack_sevenzip_com_contract)
 apply_source_charset(sunpack_sevenzip_com_contract)
-target_link_libraries(sunpack_sevenzip_com_contract PRIVATE sunpack_sevenzip_core)
+target_link_libraries(sunpack_sevenzip_com_contract PRIVATE sunpack_sevenzip_io_test_core)
 sup7z_attach_bundled_7z(sunpack_sevenzip_com_contract)
 target_include_directories(sunpack_sevenzip_com_contract
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

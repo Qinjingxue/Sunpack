@@ -470,48 +470,6 @@ impl SegmentPlan {
     }
 }
 
-// ---- Format identity confirmation ----------------------------------------
-
-/// Confirm a routed single-file TAR or compression stream by format identity.
-pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
-    match format {
-        "enc" => {
-            let Ok(reader) = ManagedReader::open(path) else {
-                return false;
-            };
-            let Ok(header) = reader.read_direct_at(0, 40) else {
-                return false;
-            };
-            sunpack_enc::Header::parse(&header, reader.len()).is_ok()
-        }
-        "tar" => {
-            let reader = match ManagedReader::open(path) {
-                Ok(reader) => reader,
-                Err(_) => return false,
-            };
-            if reader.len() < TAR_BLOCK_SIZE as u64 {
-                return false;
-            }
-            let Ok(header) = reader.read_direct_at(0, TAR_BLOCK_SIZE) else {
-                return false;
-            };
-            if header.len() != TAR_BLOCK_SIZE {
-                return false;
-            }
-            let identity = tar_header_identity(&header, 0, reader.len());
-            identity.validated_size.is_ok()
-                && identity.name_nonempty
-                && identity.numeric_fields_valid
-                && identity.typeflag_valid
-                && identity.payload_in_range
-        }
-        "gzip" | "bzip2" | "xz" | "zstd" | "lz4" => {
-            crate::analysis_native::confirm_compression_format_identity_native(path, format)
-        }
-        _ => false,
-    }
-}
-
 // ---- Full-stream structure cache -----------------------------------------
 
 type StreamStructureSlot = CancellableOnce<Result<Option<StreamStructure>, Arc<io::Error>>>;
@@ -748,7 +706,7 @@ mod report_tests {
         tar[148..156].fill(b' ');
         tar[156] = b'0';
         tar[257..263].copy_from_slice(b"ustar\0");
-        let checksum = format!("{:06o}\0 ", tar_checksum(&tar[..TAR_BLOCK_SIZE]));
+        let checksum = format!("{:06o}\0 ", crate::formats::tar::checksum(&tar[..TAR_BLOCK_SIZE]));
         tar[148..156].copy_from_slice(checksum.as_bytes());
         let tar_path = crate::test_support::temp_file("typed_tar_facts", &tar);
         {
