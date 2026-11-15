@@ -4,13 +4,14 @@ use super::*;
 fn file_usn_observation_preserves_identity_without_a_journal_record() {
     for (version, length, usn_offset, expected_file_id) in [
         (2u16, 64usize, 24usize, "0000000000001234"),
-        (3, 80, 40, "00000000000000000000000000001234"),
-        (4, 64, 40, "00000000000000000000000000001234"),
+        (3, 80, 40, "00000000000000070000000000001234"),
+        (4, 64, 40, "00000000000000070000000000001234"),
     ] {
         let mut record = vec![0u8; length];
         record[..4].copy_from_slice(&(length as u32).to_le_bytes());
         record[4..6].copy_from_slice(&version.to_le_bytes());
         record[8..16].copy_from_slice(&0x1234u64.to_le_bytes());
+        if version >= 3 { record[16..24].copy_from_slice(&7u64.to_le_bytes()); }
         for usn in [0i64, 127] {
             record[usn_offset..usn_offset + 8].copy_from_slice(&usn.to_le_bytes());
             let observation = parse_file_usn_record(&record)
@@ -18,6 +19,9 @@ fn file_usn_observation_preserves_identity_without_a_journal_record() {
             assert_eq!(observation.id_text(), expected_file_id);
             assert_eq!(observation.usn, usn);
         }
+        record[..4].copy_from_slice(&(usn_offset as u32).to_le_bytes());
+        assert!(parse_file_usn_record(&record).is_err());
+        record[..4].copy_from_slice(&(length as u32).to_le_bytes());
         record[usn_offset..usn_offset + 8].copy_from_slice(&(-1i64).to_le_bytes());
         assert!(parse_file_usn_record(&record).is_err());
     }

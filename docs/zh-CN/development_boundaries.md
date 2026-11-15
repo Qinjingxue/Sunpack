@@ -6,7 +6,7 @@ Windows 运行时位于 `sunpack/sunpack_runtime`。模块依赖方向为 `runti
 
 | 层 | 职责 |
 | --- | --- |
-| `runtime` | CLI 与 Watch 入口、启动器会话、NTFS 就绪判断、Watch 状态、托盘和通知 |
+| `runtime` | CLI 与 Watch 入口、启动器会话、NTFS/ReFS 就绪判断、Watch 状态、托盘和通知 |
 | `pipeline` | 发现、解压准入、worker 请求、递归处理、检查点和清理 |
 | `core` | 类型化配置、密码快照、本地化、资源路径和共享 Windows 进程设施 |
 | 原生计算模块 | 格式分析、逻辑读取、分卷关系、密码探测、目录扫描和输出清单 |

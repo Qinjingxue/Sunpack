@@ -2392,7 +2392,7 @@ impl Scheduler {
                 let filesystem = filesystems.entry(directory.to_owned()).or_insert_with(|| {
                     filesystem::watch_filesystem_type(&directory.to_string_lossy()).ok()
                 });
-                if let Some(filesystem) = filesystem.as_ref().filter(|name| !name.eq_ignore_ascii_case("NTFS")) {
+                if let Some(filesystem) = filesystem.as_ref().filter(|name| !filesystem::supports_watch_filesystem(name)) {
                     rejected.push((entry.path.clone(), filesystem.clone()));
                     false
                 } else {
@@ -2408,9 +2408,9 @@ impl Scheduler {
             let paths = rejected.iter().map(|(path, filesystem)| {
                 format!("{} ({filesystem})", path.display())
             }).collect::<Vec<_>>().join("\n");
-            let message = self.settings.cli.language.translate("watch.non_ntfs_removed", &[("paths", &paths)]);
+            let message = self.settings.cli.language.translate("watch.unsupported_filesystem_removed", &[("paths", &paths)]);
             self.journal.log(json!({
-                "event":"watch_non_ntfs_roots_removed",
+                "event":"watch_unsupported_filesystem_roots_removed",
                 "roots":rejected.iter().map(|(path, _)| path).collect::<Vec<_>>(),
                 "message":message,
             }));
@@ -2428,7 +2428,7 @@ impl Scheduler {
             .filter_map(|root| nearest_directory(&root.path))
             .collect();
         for directory in new_directories {
-            filesystem::validate_ntfs_watch_root(&directory.to_string_lossy())?;
+            filesystem::validate_watch_root(&directory.to_string_lossy())?;
         }
         let dir = state_dir(&self.cwd)?;
         let state = dir.to_string_lossy().into_owned();
@@ -3204,11 +3204,11 @@ impl Scheduler {
             if let (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end))) =
                 (&current, &cached)
             {
-                if volume == old_volume && journal == old_journal && (1..=*end).contains(old_end) {
+                if volume == old_volume && journal == old_journal && (0..=*end).contains(old_end) {
                     let start = self.journal.state().watch_cursor(volume)
                         .filter(|cursor| {
                             cursor.journal_id == i128::from(*journal)
-                                && (1..=i128::from(*end)).contains(&cursor.next_usn)
+                                && (0..=i128::from(*end)).contains(&cursor.next_usn)
                         })
                         .map_or(*old_end, |cursor| (*old_end).min(cursor.next_usn as i64));
                     let entry = groups.entry((volume.clone(), *journal)).or_insert((

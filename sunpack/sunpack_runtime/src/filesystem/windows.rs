@@ -230,7 +230,7 @@ impl FileUsn {
 fn read_file_usn(handle: Handle) -> io::Result<FileUsn> {
     let request = ReadFileUsnData {
         min_major_version: 2,
-        max_major_version: 4,
+        max_major_version: 3,
     };
     let mut output = [0u8; 4096];
     let mut bytes_returned = 0u32;
@@ -256,7 +256,7 @@ fn parse_file_usn_record(bytes: &[u8]) -> io::Result<FileUsn> {
     if bytes.len() < 32 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "NTFS returned a truncated USN record",
+            "filesystem returned a truncated USN record",
         ));
     }
     let record_length = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
@@ -264,7 +264,7 @@ fn parse_file_usn_record(bytes: &[u8]) -> io::Result<FileUsn> {
     if record_length > bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "NTFS returned an invalid USN record length",
+            "filesystem returned an invalid USN record length",
         ));
     }
     let (file_id_end, usn_offset) = match major_version {
@@ -277,10 +277,10 @@ fn parse_file_usn_record(bytes: &[u8]) -> io::Result<FileUsn> {
             ))
         }
     };
-    if bytes.len() < usn_offset + 8 {
+    if record_length < usn_offset + 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "NTFS returned a truncated USN identity",
+            "filesystem returned a truncated USN identity",
         ));
     }
     let change_usn = i64::from_le_bytes(bytes[usn_offset..usn_offset + 8].try_into().unwrap());
@@ -289,7 +289,7 @@ fn parse_file_usn_record(bytes: &[u8]) -> io::Result<FileUsn> {
     if change_usn < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "NTFS returned a negative file USN",
+            "filesystem returned a negative file USN",
         ));
     }
     let file_id = &bytes[8..file_id_end];

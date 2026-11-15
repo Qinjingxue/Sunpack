@@ -48,7 +48,7 @@
 
 ### 系统要求
 
-SunPack 仅支持 Windows 10 版本 1709 及更高版本和 Windows 11。其中Watch模式仅支持NTFS文件系统。
+SunPack 仅支持 Windows 10 版本 1709 及更高版本和 Windows 11。其中Watch 模式支持 NTFS 和 ReFS 文件系统。
 
 从 [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest) 下载最新的 `sunpack-windows-<arch>-<version>-setup.exe`
 

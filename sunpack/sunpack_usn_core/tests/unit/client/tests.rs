@@ -177,7 +177,7 @@ fn directory_recovery_allows_another_request_between_pages() {
                     write_exact(server.0, &payload).unwrap();
                 }
             };
-            serve(Opcode::ReadDirectoriesChanges, 1, 2, b"first");
+            serve(Opcode::ReadDirectoriesChanges, 0, 2, b"first");
             serve(Opcode::ProbeVolume, 0, 3, b"");
             serve(Opcode::ReadDirectoriesChanges, 2, 3, b"second");
         });
@@ -186,7 +186,7 @@ fn directory_recovery_allows_another_request_between_pages() {
             "volume",
             42,
             &[[1; FILE_ID_BYTES]],
-            1,
+            0,
             3,
             |index, name| {
                 if index != 0 || state.try_lock().is_err() {

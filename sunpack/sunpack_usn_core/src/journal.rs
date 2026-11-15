@@ -40,6 +40,8 @@ struct ReadUsnJournalData {
     timeout: u64,
     bytes_to_wait_for: u64,
     usn_journal_id: u64,
+    min_major_version: u16,
+    max_major_version: u16,
 }
 
 fn read_usn_journal_request(start_usn: i64, usn_journal_id: u64) -> ReadUsnJournalData {
@@ -50,6 +52,10 @@ fn read_usn_journal_request(start_usn: i64, usn_journal_id: u64) -> ReadUsnJourn
         timeout: 0,
         bytes_to_wait_for: 0,
         usn_journal_id,
+        // READ_USN_JOURNAL_DATA_V1: ReFS needs the full 128-bit V3 IDs.
+        // V2/V3 carry names; V4 extent records cannot drive directory recovery.
+        min_major_version: 2,
+        max_major_version: 3,
     }
 }
 
@@ -132,7 +138,7 @@ impl JournalReader {
         start_usn: i64,
         end_usn: i64,
     ) -> io::Result<DirectoryChangesPage> {
-        if start_usn <= 0 || end_usn <= start_usn || directories.is_empty() {
+        if start_usn < 0 || end_usn <= start_usn || directories.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid directory recovery query",

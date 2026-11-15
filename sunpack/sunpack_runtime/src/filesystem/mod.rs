@@ -16,7 +16,7 @@ pub(crate) fn watch_file_observation(
     _path: &Path,
     _since_usn: Option<i64>,
 ) -> std::io::Result<WatchFileObservation> {
-    Err(std::io::Error::other("watch mode requires Windows NTFS"))
+    Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
 }
 
 pub(crate) fn watch_file_observation_known_kind(
@@ -43,32 +43,38 @@ pub(crate) fn watch_filesystem_type(path: &str) -> std::io::Result<String> {
     #[cfg(not(windows))]
     {
         let _ = path;
-        Err(std::io::Error::other("watch mode requires Windows NTFS"))
+        Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
     }
 }
 
-pub(crate) fn validate_ntfs_watch_root(path: &str) -> std::io::Result<()> {
+pub(crate) fn supports_watch_filesystem(name: &str) -> bool {
+    name.eq_ignore_ascii_case("NTFS") || name.eq_ignore_ascii_case("ReFS")
+}
+
+pub(crate) fn validate_watch_root(path: &str) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let path = Path::new(path);
         let filesystem = windows::filesystem_type(path)?;
-        if !filesystem.eq_ignore_ascii_case("NTFS") {
+        if !supports_watch_filesystem(&filesystem) {
             return Err(std::io::Error::other(format!(
-                "watch mode requires NTFS: '{}' is on {}",
+                "watch mode requires NTFS or ReFS: '{}' is on {}",
                 path.display(),
                 filesystem
             )));
         }
-        windows::watch_file_observation(path, None).map_err(|error| {
+        // Probe/create through the existing broker before observing a file on
+        // a fresh volume. Both NTFS and ReFS use the same first-use path.
+        windows::validate_volume_journal(path).map_err(|error| {
             std::io::Error::other(format!(
-                "watch mode requires readable NTFS file identity for '{}': {}",
+                "watch mode requires volume-level USN journal access for '{}': {}",
                 path.display(),
                 error
             ))
         })?;
-        windows::validate_volume_journal(path).map_err(|error| {
+        windows::watch_file_observation(path, None).map_err(|error| {
             std::io::Error::other(format!(
-                "watch mode requires volume-level NTFS USN journal access for '{}': {}",
+                "watch mode requires readable file identity for '{}': {}",
                 path.display(),
                 error
             ))
@@ -78,7 +84,7 @@ pub(crate) fn validate_ntfs_watch_root(path: &str) -> std::io::Result<()> {
     #[cfg(not(windows))]
     {
         let _ = path;
-        Err(std::io::Error::other("watch mode requires Windows NTFS"))
+        Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
     }
 }
 
@@ -102,7 +108,7 @@ pub(crate) fn watch_broker_acquire() -> std::io::Result<()> {
     }
     #[cfg(not(windows))]
     {
-        Err(std::io::Error::other("watch mode requires Windows NTFS"))
+        Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
     }
 }
 
@@ -250,7 +256,7 @@ pub(crate) fn watch_directories_changes_cached_impl(
             end_usn,
             cache,
         );
-        Err(std::io::Error::other("watch mode requires Windows NTFS"))
+        Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
     }
 }
 
@@ -262,7 +268,7 @@ pub(crate) fn watch_volume_cursor(path: &str) -> std::io::Result<(String, u64, i
     #[cfg(not(windows))]
     {
         let _ = path;
-        Err(std::io::Error::other("watch mode requires Windows NTFS"))
+        Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
     }
 }
 
@@ -274,6 +280,6 @@ pub(crate) fn watch_file_is_ready(path: &str) -> std::io::Result<bool> {
     #[cfg(not(windows))]
     {
         let _ = path;
-        Err(std::io::Error::other("watch mode requires Windows NTFS"))
+        Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
     }
 }

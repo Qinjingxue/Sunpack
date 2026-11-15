@@ -6,7 +6,7 @@ The Windows runtime lives in `sunpack/sunpack_runtime`. Its dependency direction
 
 | Layer | Responsibility |
 | --- | --- |
-| `runtime` | CLI and Watch entry points, persistent launcher sessions, NTFS readiness, Watch state, tray, and notifications |
+| `runtime` | CLI and Watch entry points, persistent launcher sessions, NTFS/ReFS readiness, Watch state, tray, and notifications |
 | `pipeline` | Discovery, extraction admission, worker requests, recursive processing, checkpoints, and cleanup |
 | `core` | Typed configuration, password snapshots, localization, resource paths, and shared Windows process facilities |
 | Native computation | Format analysis, logical readers, volume relationships, password probes, directory scans, and output inventories |

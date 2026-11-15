@@ -322,7 +322,7 @@ fn request_shape_is_valid(request: &Request<'_>) -> bool {
         Opcode::ReadDirectoriesChanges => {
             !request.volume_guid.is_empty()
                 && request.file_id_len == 0
-                && request.previous_usn > 0
+                && request.previous_usn >= 0
                 && request.current_usn > request.previous_usn
         }
     }

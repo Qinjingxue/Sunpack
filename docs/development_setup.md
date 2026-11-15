@@ -19,7 +19,7 @@ Main project directories:
 
 ```text
 sunpack/sunpack_runtime/      Rust orchestration and computation, CLI and Watch
-sunpack/sunpack_usn_core/     Shared NTFS/USN Rust core
+sunpack/sunpack_usn_core/     Shared NTFS/ReFS USN Rust core
 sunpack/sunpack_watch_broker/ Windows Watch Broker service
 sunpack/sevenzip_bridge/      Windows 7z.dll bridge and worker
 sunpack/toast_host/           Windows toast DLL
@@ -80,7 +80,7 @@ On x64, setup also prepares the acceptance fixture generators under `tools/`: Wi
 
 ## USN Watch Broker
 
-watch uses the NTFS USN Journal to determine whether file contents have changed and whether a file has crossed a write boundary. Operations that need volume-level Journal access are concentrated in `sunpack/sunpack_usn_core` and `sunpack/sunpack_watch_broker`. Watch consumes the typed file observations and state directly.
+watch uses the NTFS/ReFS USN Journal to determine whether file contents have changed and whether a file has crossed a write boundary. Operations that need volume-level Journal access are concentrated in `sunpack/sunpack_usn_core` and `sunpack/sunpack_watch_broker`. Watch consumes the typed file observations and state directly.
 
 ### Components and lifecycle
 
@@ -108,7 +108,7 @@ previous_usn < usn <= current_usn
 
 Each observation reads at most 1 MiB of reason data, supports USN record versions 2, 3, and 4, and distinguishes all reasons from the reasons with `CLOSE` removed. Content changes such as overwrite, extension, and truncation enter the watch content-change path; metadata-only changes are not treated as content writes.
 
-Before a watch root starts, the path is verified to be on an NTFS volume with a readable Journal. If the Journal is unavailable, the volume identity is invalid, or the broker cannot be reached, watch startup fails and reports the reason.
+Before a watch root starts, the path is verified to be on an NTFS or ReFS volume with a readable Journal. A missing Journal is created through the Broker before file observation. If creation or reading fails, the volume identity is invalid, or the broker cannot be reached, watch startup fails and reports the reason.
 
 ### Local manual build
 
@@ -186,7 +186,7 @@ Run the CLI boundary tests after building the development artifacts:
 .\.venv\Scripts\python.exe -m pytest -q tests\blackbox
 ```
 
-When pytest is run directly, cases that need the Windows NTFS Watch Broker are skipped. Full acceptance is done through `run_acceptance_tests.ps1`, which prepares an isolated test service, runs Rust correctness tests and the CLI and Watch boundary tests, and automatically uninstalls the test service at the end:
+When pytest is run directly, cases that need the Windows Watch Broker are skipped. Full acceptance is done through `run_acceptance_tests.ps1`, which prepares an isolated test service, runs Rust correctness tests and the CLI and Watch boundary tests, and automatically uninstalls the test service at the end:
 
 ```powershell
 .\run_acceptance_tests.ps1 -NoWait
@@ -226,3 +226,24 @@ The build process:
 3. Stage configuration, password data, scripts, and license files
 4. Check PE architecture and run packaged CLI smoke tests
 5. Run the selected acceptance tests and create the installer with Inno Setup
+
+### NTFS and ReFS USN contract
+
+Both filesystems use the same Broker and recovery path. A missing journal
+(`ERROR_JOURNAL_NOT_ACTIVE`) is created once with the existing 32 MiB / 8 MiB
+settings before file observation; other errors retain their original failure.
+No periodic journal polling or additional resident index is introduced.
+
+The volume read uses [`READ_USN_JOURNAL_DATA_V1`](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-read_usn_journal_data_v1)
+with versions 2–3. Per-file reads request the same range. V3 carries full
+128-bit file and parent IDs; V2 IDs are zero-extended for matching. Directory
+recovery accepts a zero initial cursor but still checks journal identity and
+retained bounds. Existing `FileIdInfo` identities and compact catalog IDs
+preserve all 128 bits ([Microsoft identity requirements](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information)).
+V4 extent records lack filenames and are not requested.
+
+ReFS regression coverage uses simulated V3 records with nonzero high 64-bit
+file and parent IDs, plus the existing tests for journal creation, version
+negotiation, zero cursors and paged recovery. These tests need neither a ReFS
+volume nor permission to create one. Real-volume checks are temporary local
+validation and are not part of the repository test suite or CI requirements.

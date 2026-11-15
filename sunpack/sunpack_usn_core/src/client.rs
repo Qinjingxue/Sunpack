@@ -162,7 +162,7 @@ pub fn broker_for_each_directory_change(
     end: i64,
     mut observe: impl FnMut(usize, &str) -> io::Result<()>,
 ) -> io::Result<()> {
-    if directories.is_empty() || start <= 0 || end <= start {
+    if directories.is_empty() || start < 0 || end <= start {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid directory recovery query",

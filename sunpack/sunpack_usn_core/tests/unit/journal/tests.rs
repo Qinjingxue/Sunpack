@@ -3,7 +3,7 @@ use super::*;
 fn record(major: u16, file_id: u128, usn: i64, reason: u32) -> Vec<u8> {
     let (length, file_id_end, usn_offset, reason_offset) = match major {
         2 => (60usize, 16usize, 24usize, 40usize),
-        3 => (64usize, 24usize, 40usize, 56usize),
+        3 => (80usize, 24usize, 40usize, 56usize),
         4 => (64usize, 24usize, 40usize, 48usize),
         _ => unreachable!(),
     };
@@ -94,9 +94,10 @@ fn compares_v2_and_zero_extended_v3_file_ids() {
 
 #[test]
 fn parses_v2_v3_and_v4_reason_layouts_with_exclusive_lower_bound() {
-    let expected = 0x1234;
     for major in [2u16, 3, 4] {
-        let value = record(major, 0x1234, 101, 0x0000_0002);
+        let expected = if major == 2 { 0x1234 } else { (7u128 << 64) | 0x1234 };
+        let value = record(major, expected, 101, 0x0000_0002);
+        assert_eq!(record_change_reason(&value, expected ^ (1u128 << 64), 100, 101).unwrap(), None);
         assert_eq!(
             record_change_reason(&value, expected, 100, 101).unwrap(),
             Some(0x0000_0002)
@@ -122,16 +123,17 @@ fn close_only_reason_is_excluded_from_non_close_aggregate() {
 fn directory_recovery_dispatches_ids_and_requires_reliable_names() {
     // Reason parsing tests never exercise parent dispatch, both rename names,
     // or nameless/unknown records. This one in-memory case covers that gap.
-    let parents = HashMap::from([(11u128.to_le_bytes(), 0), (22u128.to_le_bytes(), 1)]);
     let mut scratch = Default::default();
     for major in [2, 3] {
+        let high = if major == 2 { 0 } else { 7u128 << 64 };
+        let parents = HashMap::from([((high | 11).to_le_bytes(), 0), ((high | 22).to_le_bytes(), 1)]);
         let width = if major == 2 { 8 } else { 16 };
         let base = if major == 2 { 60 } else { 76 };
         let length_offset = if major == 2 { 56 } else { 72 };
         for name in ["Old.opaque", "New.001", "新🔐.002"] {
-            let mut row = record(major, 22, 100, 0x1000);
+            let mut row = record(major, high | 22, 100, 0x1000);
             row.resize(base, 0);
-            row[8 + width..8 + 2 * width].copy_from_slice(&11u128.to_le_bytes()[..width]);
+            row[8 + width..8 + 2 * width].copy_from_slice(&(high | 11).to_le_bytes()[..width]);
             let encoded: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
             row[length_offset..length_offset + 2]
                 .copy_from_slice(&(encoded.len() as u16).to_le_bytes());
@@ -164,6 +166,7 @@ fn directory_recovery_dispatches_ids_and_requires_reliable_names() {
             .is_err());
         }
     }
+    let parents = HashMap::from([(11u128.to_le_bytes(), 0)]);
     let mut nameless = record(4, 33, 100, 1);
     nameless[24..40].copy_from_slice(&11u128.to_le_bytes());
     assert!(record_directory_changes(
@@ -195,7 +198,7 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
         let name = format!("{index:04}-{}-新🔐.001", "x".repeat(120));
         expected.insert((0, name.clone()));
         for _ in 0..2 {
-            let mut row = record(2, 22, records.len() as i64 + 1, 0x1000);
+            let mut row = record(2, 22, records.len() as i64, 0x1000);
             row[16..24].copy_from_slice(&11u64.to_le_bytes());
             let encoded: Vec<_> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
             row[56..58].copy_from_slice(&(encoded.len() as u16).to_le_bytes());
@@ -206,8 +209,8 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
             records.push(row);
         }
     }
-    let end_usn = records.len() as i64 + 1;
-    let mut cursor = 1;
+    let end_usn = records.len() as i64;
+    let mut cursor = 0;
     let mut actual = BTreeSet::new();
     let mut pages = 0;
     while cursor < end_usn {
@@ -217,7 +220,7 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
             cursor,
             end_usn,
             |start, output| {
-                let mut index = (start - 1) as usize;
+                let mut index = start as usize;
                 let mut used = 8;
                 while let Some(row) = records.get(index) {
                     if used + row.len() > output.len() {
@@ -227,7 +230,7 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
                     used += row.len();
                     index += 1;
                 }
-                output[..8].copy_from_slice(&(index as i64 + 1).to_le_bytes());
+                output[..8].copy_from_slice(&(index as i64).to_le_bytes());
                 Ok(used)
             },
         )
@@ -255,4 +258,9 @@ fn journal_request_preserves_record_aligned_start_usn() {
     let request = read_usn_journal_request(8_192, 42);
     assert_eq!(request.start_usn, 8_192);
     assert_eq!(request.usn_journal_id, 42);
+    // Verify the Windows ABI, including the V1 extension beyond the V0 prefix.
+    assert_eq!(std::mem::size_of_val(&request), 48);
+    assert_eq!(std::mem::offset_of!(ReadUsnJournalData, min_major_version), 40);
+    assert_eq!((request.min_major_version, request.max_major_version), (2, 3));
+    assert_eq!((request.timeout, request.bytes_to_wait_for), (0, 0));
 }

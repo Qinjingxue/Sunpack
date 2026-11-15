@@ -267,5 +267,5 @@ pub(super) static MESSAGES: &[(&str, &str, &str)] = &[
     ("watch.error_title", "SunPack - Watch error", "SunPack - 监控错误"),
     ("watch.failure.extraction_failed", "Watch extraction failed", "监控解压失败"),
     ("watch.failure.no_accepted_outcome", "Watch pipeline returned no accepted target outcome", "监控处理未返回可接受的目标结果"),
-    ("watch.non_ntfs_removed", "Folder monitoring only supports NTFS. The following paths use unsupported filesystems and have been removed from the watch list:\n\n{paths}\n\nNo files or folders were deleted. Monitoring will continue for the remaining paths.", "目录监控仅支持 NTFS。以下路径使用不支持的文件系统，已从监控列表中移除：\n\n{paths}\n\n未删除任何文件或目录，将继续监控其余路径。"),
+    ("watch.unsupported_filesystem_removed", "Folder monitoring only supports NTFS and ReFS. The following paths use unsupported filesystems and have been removed from the watch list:\n\n{paths}", "目录监控仅支持 NTFS 和 ReFS。以下路径使用不支持的文件系统，已从监控列表中移除：\n\n{paths}"),
 ];

@@ -19,7 +19,7 @@ SunPack 是 Windows-only 项目。Cargo 构建 Rust 运行时和 Watch Broker，
 
 ```text
 sunpack/sunpack_runtime/      Rust 调度与计算核心、CLI 和 Watch
-sunpack/sunpack_usn_core/     NTFS/USN 共用 Rust 核心
+sunpack/sunpack_usn_core/     NTFS/ReFS USN 共用 Rust 核心
 sunpack/sunpack_watch_broker/ Windows Watch Broker 服务
 sunpack/sevenzip_bridge/      Windows 7z.dll bridge 与 worker
 sunpack/toast_host/           Windows toast DLL
@@ -80,7 +80,7 @@ x64 环境还会在 `tools/` 下准备验收测试的压缩包生成器：WinRAR
 
 ## USN Watch Broker
 
-watch 使用 NTFS USN Journal 判断文件内容变化和文件是否已经跨过写入边界。需要访问卷级 Journal 的操作集中在 `sunpack/sunpack_usn_core` 和 `sunpack/sunpack_watch_broker`，Watch 直接消费 Rust 文件观察结果和状态。
+watch 使用 NTFS/ReFS USN Journal 判断文件内容变化和文件是否已经跨过写入边界。需要访问卷级 Journal 的操作集中在 `sunpack/sunpack_usn_core` 和 `sunpack/sunpack_watch_broker`，Watch 直接消费 Rust 文件观察结果和状态。
 
 ### 组件和生命周期
 
@@ -108,7 +108,7 @@ previous_usn < usn <= current_usn
 
 每次观察最多读取 1 MiB 的 reason 数据，支持 USN record version 2、3、4，并区分全部 reason 与去除 `CLOSE` 后的 reason。覆盖、扩展、截断等内容变化会进入 watch 的内容变更路径；仅元数据变化不会被当作内容写入。
 
-watch 根启动前会验证路径位于 NTFS 卷且 Journal 可读。Journal 不可用、卷标识无效或 broker 不可连接时，watch 启动失败并报告原因。
+watch 根启动前会验证路径位于 NTFS 或 ReFS 卷且 Journal 可读。Journal 不存在时，先由 Broker 自动创建，再观察文件身份；创建或读取失败、卷标识无效或 broker 不可连接时，watch 启动失败并报告原因。
 
 ### 本地手动构建
 
@@ -186,7 +186,7 @@ cargo test --locked --manifest-path sunpack\Cargo.toml --workspace --profile ci
 .\.venv\Scripts\python.exe -m pytest -q tests\blackbox
 ```
 
-直接运行 pytest 时，需要 Windows NTFS Watch Broker 的用例会被跳过。完整验收通过 `run_acceptance_tests.ps1` 准备隔离测试服务，运行 Rust 正确性测试和 CLI、Watch 黑盒测试，结束后自动卸载测试服务：
+直接运行 pytest 时，需要 Windows Watch Broker 的用例会被跳过。完整验收通过 `run_acceptance_tests.ps1` 准备隔离测试服务，运行 Rust 正确性测试和 CLI、Watch 黑盒测试，结束后自动卸载测试服务：
 
 ```powershell
 .\run_acceptance_tests.ps1 -NoWait
@@ -226,3 +226,22 @@ cargo test --locked --manifest-path sunpack\Cargo.toml --workspace --profile ci
 3. 放入配置、密码表、辅助脚本、许可证及其他发行文件
 4. 检查 PE 架构，运行打包后的 CLI smoke tests
 5. 按构建参数运行验收测试，用 Inno Setup 创建安装器
+
+### NTFS / ReFS 的 USN 约定
+
+两种文件系统共用 Broker 和日志恢复链路。仅当查询返回
+`ERROR_JOURNAL_NOT_ACTIVE` 时，复用原有 32 MiB / 8 MiB 参数创建日志，
+然后重新查询；Watch 先完成该步骤，再观察文件身份。其他错误照常报告，
+不增加周期轮询或常驻索引。
+
+卷读取按微软的 [READ_USN_JOURNAL_DATA_V1 说明](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-read_usn_journal_data_v1)
+请求 V2–V3，单文件查询采用相同版本范围。V3 的文件和父目录 ID 完整保留
+128 位，V2 补零匹配；目录恢复允许初始游标为 0，仍校验日志 ID 和保留边界。
+现有 FileIdInfo、目录身份及紧凑 catalog 沿用完整 ID，符合微软的
+[ReFS 身份要求](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information)。
+不请求缺少文件名的 V4 范围记录。
+
+ReFS 回归覆盖使用高 64 位非零的文件及父目录 ID 构造模拟 V3 记录，
+并复用现有日志创建、版本请求、零游标和分页恢复测试。不依赖真实 ReFS 卷，
+也不要求 CI 有创建 ReFS 卷的权限。真实卷验证仅作为本地临时验证，不纳入
+项目测试套件或 CI 要求。

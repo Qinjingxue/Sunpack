@@ -231,6 +231,12 @@ fn journal_read_requires_a_bounded_usn_interval_and_file_identity() {
     assert!(request_shape_is_valid(&request));
     request.current_usn = 100;
     assert!(!request_shape_is_valid(&request));
+    request.opcode = Opcode::ReadDirectoriesChanges;
+    request.file_id_len = 0;
+    request.previous_usn = 0;
+    assert!(request_shape_is_valid(&request));
+    request.previous_usn = -1;
+    assert!(!request_shape_is_valid(&request));
 }
 
 #[test]

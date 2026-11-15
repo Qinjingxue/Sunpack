@@ -15,7 +15,7 @@ const TRANSIENT: u8 = 8;
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(from = "String", into = "String")]
 enum FileId {
-    Ntfs { bytes: [u8; 16], len: u8 },
+    Usn { bytes: [u8; 16], len: u8 },
     Other(Box<str>),
 }
 
@@ -45,7 +45,7 @@ impl FileId {
                 };
                 bytes[index] = digit(pair[0]) * 16 + digit(pair[1]);
             }
-            Self::Ntfs {
+            Self::Usn {
                 bytes,
                 len: (value.len() / 2) as u8,
             }
@@ -56,7 +56,7 @@ impl FileId {
     fn text(&self) -> String {
         match self {
             Self::Other(value) => value.to_string(),
-            Self::Ntfs { bytes, len } => {
+            Self::Usn { bytes, len } => {
                 const HEX: &[u8] = b"0123456789abcdef";
                 let mut text = String::with_capacity(*len as usize * 2);
                 for byte in &bytes[..*len as usize] {
