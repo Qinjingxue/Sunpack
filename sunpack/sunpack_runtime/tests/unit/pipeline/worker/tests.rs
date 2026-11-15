@@ -4,6 +4,48 @@ use std::future::Future;
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[test]
+fn native_worker_accepts_chunked_request_then_an_ordinary_request() {
+    let executable = crate::test_support::built_worker().unwrap();
+    let config = WorkerConfig { space_poll_interval_ms: None, space_status_report_interval_ms: None };
+    let process = Process::start(&executable, &config, ProcessMode::Normal).unwrap();
+    let cancellation = Cancellation::new();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(b"chunked worker request").unwrap();
+    let path = crate::test_support::temp_file("chunked_worker_request", &gzip.finish().unwrap());
+    let archive = Arc::new(ArchiveInput::file(
+        path.to_string_lossy().into_owned(), "gzip".into(), "item.gz".into(),
+    ));
+    let result = super::super::scheduling::block_on(async {
+        process.ready(&cancellation).await?;
+        let candidate: Arc<str> = Arc::from("candidate".repeat(96));
+        for count in [1400, 1] {
+            let request = WorkerRequest {
+                job_id: count.to_string(),
+                operation: "scan",
+                origin: "foreground",
+                output_dir: String::new(),
+                output_volume_key: String::new(),
+                archive_input: Arc::clone(&archive),
+                password_candidates: Arc::new(vec![Arc::clone(&candidate); count]),
+                password: None,
+                password_verified: false,
+                encrypted: None,
+                codepage: None,
+                report_progress: false,
+            };
+            assert_eq!(small_request(&request)?.is_some(), count == 1);
+            let result = process.submit(request, &cancellation, WorkerUpdates::None, |_| {}).await?;
+            assert_eq!(result.summary["status"], "ok", "{}", result.summary);
+            assert_eq!(result.summary["archive_type"], "gzip");
+        }
+        Ok::<_, io::Error>(())
+    });
+    drop(process);
+    std::fs::remove_file(path).unwrap();
+    result.unwrap();
+}
+
 struct GatedInput {
     entered: mpsc::SyncSender<Vec<u8>>,
     release: mpsc::Receiver<()>,
@@ -450,11 +492,12 @@ fn blocked_submit_and_cancel_release_the_only_host_slot_and_drain_in_order() {
     let mut expected_request = request.clone();
     expected_request["report_progress"] = Value::Bool(false);
     let expected = encode_worker_frame(&expected_request).unwrap();
+    let payload = InputPayload::Frame(Arc::new(expected.clone()));
     let (completed, completion) = mpsc::channel();
     let watch = thread::spawn(move || {
         let result = watch_scheduler.run(1, Origin::Watch, &watch_cancel, |_| {
-            Box::pin(watch_process.submit(
-                "slow", request, &watch_cancel, WorkerUpdates::None, |_| {},
+            Box::pin(watch_process.submit_payload(
+                "slow", payload, &watch_cancel, WorkerUpdates::None, |_| {},
             ))
         });
         completed.send(result.is_ok()).unwrap();

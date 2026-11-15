@@ -274,7 +274,7 @@ fn sole_enc_candidate_after_cached_rejections_uses_worker_confirmation() {
         .plan(&input, None, &Cancellation::new())
         .unwrap()
         .unwrap();
-    assert_eq!(plan.candidates, [Arc::<str>::from("confirm-in-worker")]);
+    assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("confirm-in-worker")]);
     assert_eq!(plan.encrypted, Some(true));
     assert!(plan.verified_password.is_none());
 
@@ -289,7 +289,7 @@ fn explicit_empty_enc_candidate_is_not_absent_or_implicit() {
     let cache = AttemptCache::default();
     let empty = CandidateSet::new(Arc::from([Arc::from("")]), None, &cache, None);
     let plan = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
-    assert_eq!(plan.candidates, [Arc::<str>::from("")]);
+    assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
     let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
     assert_eq!(absent.plan(&input, None, &Cancellation::new()).unwrap()
         .err().unwrap().kind, FailureKind::PasswordRequired);
@@ -297,7 +297,7 @@ fn explicit_empty_enc_candidate_is_not_absent_or_implicit() {
     cache.reject(Key::for_input(&input, &sessions).unwrap(), &[Arc::from("wrong")]);
     let mixed = CandidateSet::new(Arc::from([Arc::from("wrong"), Arc::from("")]), None, &cache, None);
     let plan = mixed.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
-    assert_eq!(plan.candidates, [Arc::<str>::from("")]);
+    assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
     let key = Key::for_input(&input, &sessions).unwrap();
     cache.remember_proof(key, Some(Arc::from("")));
     let cached = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();

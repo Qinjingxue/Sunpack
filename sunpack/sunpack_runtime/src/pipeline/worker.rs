@@ -5,9 +5,11 @@ use super::{ResourceWait, WorkerUpdates};
 #[cfg(test)]
 pub(crate) use tests::coalesced_wait_batches;
 use crate::core::config::{ProcessMode, WorkerConfig};
+use crate::io::archive_state::ArchiveInput;
 use crate::io::cancellation::{cancelled_io, Cancellation};
 use crate::scan::worker_event::{NativeWorkerResultAccumulator, WorkerFrame};
-use crate::scan::worker_wire::{encode_worker_frame, NativeWorkerFrameDecoder};
+use crate::scan::worker_wire::{encode_worker_frame, small_request, write_request, NativeWorkerFrameDecoder};
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
@@ -123,8 +125,38 @@ impl Drop for ModeWaiter<'_> {
 // touching the pipe. Awaiting its receipt gives submit/cancel drain backpressure
 // without retaining a scheduler slot or creating a thread per request.
 struct InputFrame {
-    bytes: Arc<Vec<u8>>,
+    payload: InputPayload,
     completion: Arc<WriteCompletion>,
+}
+
+#[derive(Clone)]
+enum InputPayload {
+    Frame(Arc<Vec<u8>>),
+    Request(Arc<WorkerRequest>, Cancellation),
+}
+
+#[derive(Serialize)]
+pub(super) struct WorkerRequest {
+    pub job_id: String,
+    pub operation: &'static str,
+    pub origin: &'static str,
+    pub output_dir: String,
+    pub output_volume_key: String,
+    #[serde(serialize_with = "serialize_archive_input")]
+    pub archive_input: Arc<ArchiveInput>,
+    pub password_candidates: Arc<Vec<Arc<str>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<Arc<str>>,
+    pub password_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codepage: Option<&'static str>,
+    pub report_progress: bool,
+}
+
+fn serialize_archive_input<S: Serializer>(input: &ArchiveInput, serializer: S) -> Result<S::Ok, S::Error> {
+    input.worker_input().serialize(serializer)
 }
 
 #[derive(Default)]
@@ -493,15 +525,29 @@ impl Process {
 
     pub(super) async fn submit(
         &self,
+        mut request: WorkerRequest,
+        cancellation: &Cancellation,
+        interest: WorkerUpdates,
+        on_update: impl FnMut(Update),
+    ) -> io::Result<WorkerFrame> {
+        request.report_progress = interest == WorkerUpdates::All;
+        cancellation.check_io()?;
+        let job_id = request.job_id.clone();
+        let payload = match small_request(&request)? {
+            Some(bytes) => InputPayload::Frame(Arc::new(bytes)),
+            None => InputPayload::Request(Arc::new(request), cancellation.clone()),
+        };
+        self.submit_payload(&job_id, payload, cancellation, interest, on_update).await
+    }
+
+    async fn submit_payload(
+        &self,
         job_id: &str,
-        mut request: Value,
+        payload: InputPayload,
         cancellation: &Cancellation,
         interest: WorkerUpdates,
         mut on_update: impl FnMut(Update),
     ) -> io::Result<WorkerFrame> {
-        request["report_progress"] = Value::Bool(interest == WorkerUpdates::All);
-        let frame = Arc::new(encode_worker_frame(&request)?);
-        drop(request);
         let mailbox = Arc::new(Mailbox {
             interest,
             ..Mailbox::default()
@@ -513,8 +559,15 @@ impl Process {
         self.shared.register(job_id, Arc::clone(&mailbox))?;
         let mut active = ActiveSubmission(Some(self));
         let result = async {
+            let mut retry = false;
             loop {
-                self.send(Arc::clone(&frame)).wait().await?;
+                if let Err(error) = self.shared.send_payload(payload.clone()).wait().await {
+                    let mut state = self.shared.state.lock().unwrap();
+                    if state.jobs.remove(job_id).is_some() && retry {
+                        state.grant_retry();
+                    }
+                    return Err(error);
+                }
                 let result = self
                     .wait(job_id, &mailbox, cancellation, &mut on_update)
                     .await?;
@@ -522,6 +575,7 @@ impl Process {
                     return Ok(result);
                 }
                 poll_fn(|cx| self.shared.poll_retry(job_id, &mailbox, cancellation, cx)).await?;
+                retry = true;
             }
         }
         .await;
@@ -744,6 +798,10 @@ fn run_process(
 
 impl Shared {
     fn send(&self, bytes: Arc<Vec<u8>>) -> Arc<WriteCompletion> {
+        self.send_payload(InputPayload::Frame(bytes))
+    }
+
+    fn send_payload(&self, payload: InputPayload) -> Arc<WriteCompletion> {
         let completion = Arc::new(WriteCompletion::default());
         let mut state = self.state.lock().unwrap();
         if let Some(reason) = &state.closed {
@@ -755,7 +813,7 @@ impl Shared {
             )));
         } else {
             state.writes.push_back(InputFrame {
-                bytes,
+                payload,
                 completion: Arc::clone(&completion),
             });
             self.changed.notify_all();
@@ -1015,7 +1073,7 @@ impl State {
                 Ok(bytes) => {
                     self.startup_command = Some(mode);
                     self.writes.push_back(InputFrame {
-                        bytes: Arc::new(bytes),
+                        payload: InputPayload::Frame(Arc::new(bytes)),
                         completion: Arc::new(WriteCompletion::default()),
                     });
                 }
@@ -1101,7 +1159,11 @@ fn dispatch_stdin(mut input: impl Write, shared: &Shared, failed: impl FnOnce(&i
             }
             write
         };
-        let result = input.write_all(&write.bytes);
+        let result = match write.payload {
+            InputPayload::Frame(bytes) => input.write_all(&bytes).map(Ok),
+            InputPayload::Request(request, cancellation) =>
+                write_request(&mut input, request.as_ref(), &cancellation),
+        };
         if let Err(error) = &result {
             // Even a partial write may have admitted a native job. The owner
             // reaps the child before any caller can release its output lease.
@@ -1115,7 +1177,7 @@ fn dispatch_stdin(mut input: impl Write, shared: &Shared, failed: impl FnOnce(&i
             write.completion.finish(Err(failure));
             return;
         }
-        write.completion.finish(result);
+        write.completion.finish(result.unwrap());
     }
 }
 

@@ -145,75 +145,32 @@ impl<'de> MapAccess<'de> for &mut Decoder<'de> {
     }
 }
 
-fn sized(out: &mut Vec<u8>, tag: u8, data: &[u8]) -> io::Result<()> {
-    let size = u32::try_from(data.len())
-        .map_err(|_| protocol_error("worker string exceeds u32 length"))?;
-    out.push(tag);
-    out.extend_from_slice(&size.to_le_bytes());
-    out.extend_from_slice(data);
-    Ok(())
-}
-
-fn encode(out: &mut Vec<u8>, value: &Value, depth: usize) -> io::Result<()> {
-    if depth > 64 {
-        return Err(protocol_error("worker value nesting exceeds schema"));
-    }
-    match value {
-        Value::Null => out.push(1),
-        Value::Bool(value) => out.push(if *value { 3 } else { 2 }),
-        Value::Number(value) => {
-            if let Some(n) = value.as_u64() {
-                if n <= u8::MAX as u64 {
-                    out.extend_from_slice(&[11, n as u8]);
-                } else if n <= u32::MAX as u64 {
-                    out.push(12);
-                    out.extend_from_slice(&(n as u32).to_le_bytes());
-                } else {
-                    out.push(4);
-                    out.extend_from_slice(&n.to_le_bytes());
-                }
-            } else if let Some(n) = value.as_i64() {
-                out.push(5);
-                out.extend_from_slice(&n.to_le_bytes());
-            } else if let Some(n) = value.as_f64() {
-                out.push(6);
-                out.extend_from_slice(&n.to_le_bytes());
-            } else {
-                return Err(protocol_error("unsupported worker number"));
-            }
-        }
-        Value::String(text) => sized(out, 7, text.as_bytes())?,
-        Value::Array(items) => {
-            out.push(9);
-            for item in items {
-                encode(out, item, depth + 1)?;
-            }
-            out.push(0);
-        }
-        Value::Object(fields) => {
-            out.push(10);
-            for (key, value) in fields {
-                sized(out, 7, key.as_bytes())?;
-                encode(out, value, depth + 1)?;
-            }
-            out.push(0);
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn encode_worker_frame(value: &Value) -> io::Result<Vec<u8>> {
     if !value.is_object() {
         return Err(protocol_error("worker object expected"));
     }
-    let mut out = Vec::with_capacity(1024);
-    out.extend_from_slice(b"SPBF\0\0\0\0");
-    encode(&mut out, value, 0)?;
-    let size = u32::try_from(out.len() - 8)
-        .map_err(|_| protocol_error("worker frame exceeds u32 length"))?;
-    out[4..8].copy_from_slice(&size.to_le_bytes());
-    Ok(out)
+    let mut frame = Vec::with_capacity(1024);
+    frame.extend_from_slice(&HEADER);
+    request::encode(&mut frame, value)?;
+    finish_frame(&mut frame, false)?;
+    Ok(frame)
 }
+
+const HEADER: [u8; 8] = *b"SPBF\0\0\0\0";
+const MORE: u32 = 1 << 31;
+const REQUEST_CHUNK_BYTES: usize = 512 * 1024;
+
+fn finish_frame(frame: &mut [u8], more: bool) -> io::Result<()> {
+    let len = u32::try_from(frame.len() - HEADER.len()).ok().filter(|len| *len < MORE)
+        .ok_or_else(|| protocol_error("worker frame exceeds protocol length"))?;
+    let size = len | if more { MORE } else { 0 };
+    frame[4..8].copy_from_slice(&size.to_le_bytes());
+    Ok(())
+}
+
+#[path = "worker_wire/request.rs"]
+mod request;
+pub(crate) use request::{small_request, write_request};
 
 pub(super) fn frame_payload(frame: &[u8]) -> io::Result<&[u8]> {
     let size = frame_size(frame)?;

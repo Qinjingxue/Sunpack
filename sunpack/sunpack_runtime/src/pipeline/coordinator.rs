@@ -32,7 +32,9 @@ use crate::scan::directory::{
 };
 use crate::scan::worker_event::WorkerFrame;
 use serde::Deserialize;
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::future::poll_fn;
@@ -2736,7 +2738,7 @@ impl<'run, O: Observer> Run<'run, O> {
         outcome: &mut Outcome,
     ) -> io::Result<Executed> {
         let LogicalInput {
-            mut input,
+            input,
             password,
             failure,
         } = logical;
@@ -2863,6 +2865,7 @@ impl<'run, O: Observer> Run<'run, O> {
             .map(|path| path.to_string_lossy())
             .unwrap_or_default();
         self.notify(|| Event::Waiting { id });
+        let mut input = Arc::new(input);
         let native = match self.engine.worker(&self.request.config.performance.worker, &self.request.cancel).await {
             Ok(worker) => {
                 if super::scheduling::in_stage() {
@@ -2878,25 +2881,22 @@ impl<'run, O: Observer> Run<'run, O> {
                     crate::filesystem::resolve_output_volume_key(&output_string)
                         .unwrap_or_else(|| format!("job:{job_id}"))
                 };
-                let mut request = json!({
-                    "job_id": job_id, "operation": if self.request.mode == Mode::Scan { "scan" } else { "extract" },
-                    "origin": if self.request.origin == Origin::Watch { "watch" } else { "foreground" },
-                    "output_dir": output_string, "output_volume_key": volume_key,
-                    "archive_input": input.worker_input(), "password_candidates": plan.candidates,
-                });
-                if let Some(password) = &plan.verified_password {
-                    request["password"] = Value::String(password.to_string());
-                    request["password_verified"] = Value::Bool(true);
-                }
-                if let Some(encrypted) = plan.encrypted {
-                    request["encrypted"] = Value::Bool(encrypted);
-                }
-                if let Some(codepage) = codepage {
-                    request["codepage"] = Value::from(codepage);
-                }
+                let request = worker::WorkerRequest {
+                    job_id,
+                    operation: if self.request.mode == Mode::Scan { "scan" } else { "extract" },
+                    origin: if self.request.origin == Origin::Watch { "watch" } else { "foreground" },
+                    output_dir: output_string.to_string(),
+                    output_volume_key: volume_key,
+                    archive_input: Arc::clone(&input),
+                    password_candidates: Arc::clone(&plan.candidates),
+                    password: plan.verified_password.clone(),
+                    password_verified: plan.verified_password.is_some(),
+                    encrypted: plan.encrypted,
+                    codepage,
+                    report_progress: false,
+                };
                 worker
                     .submit(
-                        &job_id,
                         request,
                         &self.request.cancel,
                         self.observer.worker_updates(),
@@ -2956,7 +2956,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         .and_then(|raw| {
                             VolumeSelection::deserialize(raw).map_err(io::Error::from)
                         });
-                    match selected.and_then(|selected| input.select_volumes(&selected)) {
+                    match selected.and_then(|selected| Arc::make_mut(&mut input).select_volumes(&selected)) {
                         Ok(()) => {
                             result.source_paths =
                                 input.physical_paths().map(PathBuf::from).collect();
@@ -3046,7 +3046,7 @@ impl<'run, O: Observer> Run<'run, O> {
             planned_output: output,
             result,
             inventory,
-            input: Arc::new(input),
+            input,
         })
     }
 

@@ -71,15 +71,18 @@ stream adapters remain specialized below this shared protocol.
 
 ## Binary pipe frames
 
-Both stdin and stdout use `SPBF` (four bytes), a little-endian `u32` payload
-length, and one typed object. There is no newline delimiter, JSON parser,
-protocol negotiation, or fallback. Deploy the worker and Rust extension together.
-Stderr remains diagnostic text.
+Both directions use `SPBF` (four bytes), a little-endian 32-bit length, and
+binary typed values. On stdin the high bit marks a continuation. Requests up
+to 512 KiB use one frame. Larger requests carry the same object across
+successive frames of at most 512 KiB, with the high bit clear on the final
+frame. An empty continuation discards the unfinished request. The worker
+parses fields and collection items directly into the request and admits it
+only after the complete object ends at the final frame boundary. Deploy the
+worker and Rust runtime together. Stderr remains diagnostic text.
 
 The codecs are `src/internal/worker_wire.hpp` and
-`../sunpack_runtime/src/scan/worker_wire.rs`. Python forwards bytes and receives
-decoded event envelopes; manifest rows and trace items stay in Rust throughout
-assembly, progress reporting, and recursive discovery.
+`../sunpack_runtime/src/scan/worker_wire.rs`. Manifest rows and trace items
+stay in Rust throughout assembly, progress reporting, and recursive discovery.
 
 | Tag | Value |
 | --- | --- |

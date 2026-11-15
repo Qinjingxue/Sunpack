@@ -142,196 +142,210 @@ sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
     return result;
 }
 
-std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
-    const std::vector<std::string_view>& objects,
-    std::string_view default_path
-) {
-    using sunpack::sevenzip::ExtractInputRange;
-    std::vector<ExtractInputRange> ranges;
-    ranges.reserve(objects.size());
-    for (const auto object_frame : objects) {
-        const wire::ObjectView object(object_frame);
-        unsigned long long start = 0;
-        unsigned long long end = 0;
-        const bool has_start =
-            object.uint_field("start", &start);
-        const bool has_end =
-            object.uint_field("end", &end);
-        const std::string_view path = object.string_field("path", default_path);
-        if (path.empty() && default_path.empty()) {
-            continue;
-        }
-        ExtractInputRange range;
-        range.path = utf8_to_wide(path.empty() ? default_path : path);
-        range.start = has_start ? start : 0;
-        range.end = end;
-        range.has_end = has_end;
-        ranges.push_back(std::move(range));
+template<class Field>
+void read_object(wire::RequestReader& reader, Field field) {
+    reader.object();
+    while (reader.next()) {
+        const auto key = reader.text();
+        field(key);
     }
-    return ranges;
 }
 
-WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& request) {
-    WorkerArchiveInput input;
-    const wire::ObjectView descriptor = request.object_field("archive_input");
-    if (!descriptor.valid()) {
-        input.validation_error = "archive_input descriptor is required";
-        return input;
-    }
-    const std::string_view entry_path = descriptor.string_field("entry_path", "");
-    input.archive_path = utf8_to_wide(entry_path);
-    const std::string_view mode = descriptor.string_field("open_mode", "file");
-    input.native_volume_input = mode == "native_volumes";
-    input.format_hint = utf8_to_wide(descriptor.string_field("format_hint", ""));
+template<class Item>
+void read_array(wire::RequestReader& reader, Item item) {
+    reader.array();
+    while (reader.next()) item();
+}
 
-    const auto attempts = descriptor.object_field("volume_attempts");
-    if (attempts.valid()) {
-        auto& plan = input.volume_attempts;
-        attempts.uint_field("head_size_from_total", &plan.head_size_from_total);
-        attempts.uint_field("minimum_size", &plan.minimum_size);
-        plan.sources = parse_ranges_from_objects(attempts.array_field("sources"), "");
-        for (auto raw : attempts.array_field("domains")) {
-            std::vector<std::size_t> choices;
-            if (!wire::ObjectView(raw).index_array_field("choices", choices) ||
-                std::any_of(choices.begin(), choices.end(), [&](auto i) { return i >= plan.sources.size(); })) {
-                input.validation_error = "invalid volume attempt domain"; return input;
-            }
-            plan.domains.push_back(std::move(choices));
-        }
-        for (auto raw : attempts.array_field("tail_totals")) {
-            unsigned long long source = 0, total = 0;
-            const wire::ObjectView entry(raw);
-            if (!entry.uint_field("source", &source) || source >= plan.sources.size() ||
-                !entry.uint_field("total", &total) || !total) {
-                input.validation_error = "invalid volume tail total"; return input;
-            }
-            if (plan.tail_totals.empty()) plan.tail_totals.resize(plan.sources.size());
-            plan.tail_totals[source] = total;
-        }
-        for (auto raw_layout : attempts.array_field("layouts")) {
-            std::vector<sunpack::sevenzip::VolumeAttemptSlot> slots;
-            unsigned long long previous = 0;
-            std::unordered_set<std::wstring> names;
-            const wire::ObjectView layout(raw_layout);
-            for (auto raw_slot : layout.array_field("slots")) {
-                const wire::ObjectView slot(raw_slot);
-                unsigned long long number = 0;
-                sunpack::sevenzip::VolumeAttemptSlot parsed;
-                parsed.name = utf8_to_wide(slot.string_field("canonical_name", ""));
-                unsigned long long domain = 0;
-                if (!slot.uint_field("number", &number) || number <= previous || number > INT_MAX ||
-                    (slots.empty() && number != 1) || parsed.name.empty() || !names.insert(parsed.name).second ||
-                    !slot.uint_field("domain", &domain) || domain >= plan.domains.size()) {
-                    input.validation_error = "invalid volume attempt slot"; return input;
+bool read_extent_field(wire::RequestReader& reader, std::string_view key,
+                       sunpack::sevenzip::ExtractInputRange& range) {
+    if (key == "path") range.path = utf8_to_wide(reader.text());
+    else if (key == "start") range.start = reader.number();
+    else if (key == "end") {
+        range.end = reader.number();
+        range.has_end = true;
+    } else return false;
+    return true;
+}
+
+sunpack::sevenzip::ExtractInputRange read_range(wire::RequestReader& reader) {
+    sunpack::sevenzip::ExtractInputRange range;
+    read_object(reader, [&](auto key) {
+        if (!read_extent_field(reader, key, range)) reader.skip();
+    });
+    return range;
+}
+
+void read_volume_plan(wire::RequestReader& reader, WorkerArchiveInput& input) {
+    auto& plan = input.volume_attempts;
+    read_object(reader, [&](auto key) {
+        if (key == "head_size_from_total") plan.head_size_from_total = reader.number();
+        else if (key == "minimum_size") plan.minimum_size = reader.number();
+        else if (key == "sources") {
+            read_array(reader, [&] { plan.sources.push_back(read_range(reader)); });
+        } else if (key == "domains") {
+            read_array(reader, [&] {
+                auto& choices = plan.domains.emplace_back();
+                read_object(reader, [&](auto field) {
+                    if (field != "choices") { reader.skip(); return; }
+                    read_array(reader, [&] { choices.push_back(static_cast<std::size_t>(reader.number())); });
+                });
+            });
+        } else if (key == "tail_totals") {
+            read_array(reader, [&] {
+                std::uint64_t source = UINT64_MAX, total = 0;
+                read_object(reader, [&](auto field) {
+                    if (field == "source") source = reader.number();
+                    else if (field == "total") total = reader.number();
+                    else reader.skip();
+                });
+                if (source >= plan.sources.size() || !total) {
+                    input.validation_error = "invalid volume tail total";
+                    return;
                 }
-                parsed.number = static_cast<unsigned int>(number);
-                parsed.domain = static_cast<std::size_t>(domain);
-                previous = number;
-                slots.push_back(std::move(parsed));
-            }
-            if (slots.empty()) { input.validation_error = "empty volume attempt layout"; return input; }
-            unsigned long long minimum = 0;
-            layout.uint_field("minimum_slots", &minimum);
-            if (minimum && (minimum < 2 || minimum > slots.size() ||
-                    slots.back().number != slots.size())) {
-                input.validation_error = "invalid variable volume layout"; return input;
-            }
-            plan.minimum_slots.push_back(static_cast<std::size_t>(minimum));
-            plan.layouts.push_back(std::move(slots));
-        }
-        if (plan.sources.empty() || plan.layouts.empty() ||
-            std::any_of(plan.sources.begin(), plan.sources.end(), [](const auto& source) {
-                return source.path.empty() || (source.has_end && source.end < source.start);
-            })) { input.validation_error = "invalid volume attempt sources"; return input; }
-        // A composition plan supplies every range and canonical name used
-        // during execution. The descriptor's fixed composition is redundant.
-        return input;
-    }
+                if (plan.tail_totals.empty()) plan.tail_totals.resize(plan.sources.size());
+                plan.tail_totals[static_cast<std::size_t>(source)] = total;
+            });
+        } else if (key == "layouts") {
+            read_array(reader, [&] {
+                auto& slots = plan.layouts.emplace_back();
+                std::uint64_t minimum = 0, previous = 0;
+                std::unordered_set<std::wstring> names;
+                read_object(reader, [&](auto field) {
+                    if (field == "minimum_slots") minimum = reader.number();
+                    else if (field == "slots") {
+                        read_array(reader, [&] {
+                            sunpack::sevenzip::VolumeAttemptSlot slot;
+                            std::uint64_t number = 0, domain = UINT64_MAX;
+                            read_object(reader, [&](auto member) {
+                                if (member == "number") number = reader.number();
+                                else if (member == "domain") domain = reader.number();
+                                else if (member == "canonical_name") slot.name = utf8_to_wide(reader.text());
+                                else reader.skip();
+                            });
+                            if (number <= previous || number > INT_MAX || (slots.empty() && number != 1) ||
+                                slot.name.empty() || !names.insert(slot.name).second || domain == UINT64_MAX) {
+                                input.validation_error = "invalid volume attempt slot";
+                                return;
+                            }
+                            slot.number = static_cast<unsigned int>(number);
+                            slot.domain = static_cast<std::size_t>(domain);
+                            previous = number;
+                            slots.push_back(std::move(slot));
+                        });
+                    } else reader.skip();
+                });
+                if (slots.empty() || (minimum && (minimum < 2 || minimum > slots.size() ||
+                    slots.back().number != slots.size()))) input.validation_error = "invalid volume attempt layout";
+                plan.minimum_slots.push_back(static_cast<std::size_t>(minimum));
+            });
+        } else reader.skip();
+    });
+    if (!input.validation_error.empty()) return;
+    if (plan.sources.empty() || plan.layouts.empty() ||
+        std::any_of(plan.sources.begin(), plan.sources.end(), [](const auto& source) {
+            return source.path.empty() || (source.has_end && source.end < source.start);
+        })) input.validation_error = "invalid volume attempt sources";
+    else if (std::any_of(plan.domains.begin(), plan.domains.end(), [&](const auto& choices) {
+        return choices.empty() || std::any_of(choices.begin(), choices.end(),
+            [&](auto source) { return source >= plan.sources.size(); });
+    })) input.validation_error = "invalid volume attempt domain";
+    else if (std::any_of(plan.layouts.begin(), plan.layouts.end(), [&](const auto& slots) {
+        return std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.domain >= plan.domains.size(); });
+    })) input.validation_error = "invalid volume attempt slot";
+}
 
-    const wire::ObjectView analysis = descriptor.object_field("analysis");
-    const wire::ObjectView execution_analysis = analysis.object_field("execution");
-    input.analyzed_missing_volume_evidence =
-        execution_analysis.string_field("missing_volume_evidence", "");
+enum class InputMode { File, FileRange, ConcatRanges, NativeVolumes, SfxWithVolumes };
 
-    struct ParsedPart {
-        int number;
-        std::wstring path;
-        std::wstring canonical_name;
-        unsigned long long start = 0;
-        unsigned long long end = 0;
-        bool has_end = false;
-    };
-    if (mode == "concat_ranges") {
-        input.ranges = parse_ranges_from_objects(descriptor.array_field("ranges"), entry_path);
-        if (input.ranges.empty()) input.validation_error = "concat_ranges descriptor requires ranges";
-        return input;
-    }
-    const auto part_objects = descriptor.array_field("parts");
-    if (mode == "file_range") {
-        input.ranges = parse_ranges_from_objects(part_objects, entry_path);
-        if (input.ranges.empty()) {
-            input.validation_error = "file_range descriptor requires canonical parts with extents";
-        }
-        return input;
-    }
-    const bool structured = mode == "native_volumes" || mode == "sfx_with_volumes";
-    std::vector<ParsedPart> structured_parts;
-    if (structured) structured_parts.reserve(part_objects.size());
-    else input.part_paths.reserve(part_objects.size());
-    for (const auto object_frame : part_objects) {
-        const wire::ObjectView object(object_frame);
-        const std::string_view path = object.string_field("path", "");
-        if (path.empty()) continue;
-        if (!structured) {
-            input.part_paths.push_back(utf8_to_wide(path));
-            continue;
-        }
-        unsigned long long number = 0;
-        const std::string_view canonical_name = object.string_field("canonical_name", "");
-        if (!object.uint_field("volume_number", &number) || number == 0 || number > INT_MAX ||
-            canonical_name.empty()) {
-            input.validation_error = "structured volume part requires volume_number and canonical_name";
-            continue;
-        }
-        unsigned long long start = 0, end = 0;
-        object.uint_field("start", &start);
-        const bool has_end = object.uint_field("end", &end);
-        if (has_end && end < start) input.validation_error = "structured volume extent is reversed";
-        structured_parts.push_back({static_cast<int>(number), utf8_to_wide(path),
-                                    utf8_to_wide(canonical_name), start, end, has_end});
-    }
-    if (structured) {
-        const bool has_ranges = std::any_of(structured_parts.begin(), structured_parts.end(),
-            [](const ParsedPart &part) { return part.start != 0 || part.has_end; });
-        if (has_ranges) input.ranges.reserve(structured_parts.size());
-        else input.part_paths.reserve(structured_parts.size());
-        input.canonical_names.reserve(structured_parts.size());
-        for (std::size_t index = 0; index < structured_parts.size(); ++index) {
-            // Volume numbers are the Relations contract, so a gap is a proven
-            // missing volume rather than a malformed request.  It is reported
-            // before any stream is opened: concatenating the remaining parts
-            // would shift every later byte and misreport the set as damaged.
-            const bool head_ok = index != 0 || structured_parts[index].number == 1;
-            const bool ordered = index == 0 || structured_parts[index].number > structured_parts[index - 1].number;
-            if (!head_ok) input.missing_volume_number = 1;
-            if (!ordered) {
+InputMode read_input_mode(std::string_view mode) {
+    if (mode == "file_range") return InputMode::FileRange;
+    if (mode == "concat_ranges") return InputMode::ConcatRanges;
+    if (mode == "native_volumes") return InputMode::NativeVolumes;
+    if (mode == "sfx_with_volumes") return InputMode::SfxWithVolumes;
+    return InputMode::File;
+}
+
+void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input, InputMode mode) {
+    const bool structured = mode == InputMode::NativeVolumes || mode == InputMode::SfxWithVolumes;
+    bool has_ranges = false;
+    std::uint64_t previous = 0;
+    read_array(reader, [&] {
+        sunpack::sevenzip::ExtractInputRange range;
+        std::uint64_t number = 0;
+        std::wstring name;
+        read_object(reader, [&](auto key) {
+            if (structured && key == "volume_number") number = reader.number();
+            else if (structured && key == "canonical_name") name = utf8_to_wide(reader.text());
+            else if (!read_extent_field(reader, key, range)) reader.skip();
+        });
+        if (mode == InputMode::FileRange) {
+            if (range.path.empty()) range.path = input.archive_path;
+            if (!range.path.empty()) input.ranges.push_back(std::move(range));
+        } else if (range.path.empty()) return;
+        else if (!structured) input.part_paths.push_back(std::move(range.path));
+        else {
+            if (!number || number > INT_MAX || name.empty()) {
+                input.validation_error = "structured volume part requires volume_number and canonical_name";
+                return;
+            }
+            if (number <= previous) {
                 input.validation_error = "structured volume sequence must be ordered and unique";
-                break;
+                return;
             }
-            if (input.missing_volume_number == 0 && index > 0 &&
-                structured_parts[index].number != structured_parts[index - 1].number + 1) {
-                input.missing_volume_number = structured_parts[index - 1].number + 1;
-            }
-            auto& part = structured_parts[index];
-            if (has_ranges) input.ranges.push_back({std::move(part.path), part.start, part.end, part.has_end});
-            else input.part_paths.push_back(std::move(part.path));
-            input.canonical_names.push_back(std::move(part.canonical_name));
+            if (range.has_end && range.end < range.start)
+                input.validation_error = "structured volume extent is reversed";
+            if (!input.missing_volume_number && number != previous + 1)
+                input.missing_volume_number = static_cast<int>(previous + 1);
+            previous = number;
+            has_ranges |= range.start != 0 || range.has_end;
+            input.ranges.push_back(std::move(range));
+            input.canonical_names.push_back(std::move(name));
         }
-        if (input.canonical_names.empty()) {
-            input.validation_error = "structured volume descriptor has no parts";
-        }
+    });
+    if (structured && !has_ranges) {
+        input.part_paths.reserve(input.ranges.size());
+        for (auto& range : input.ranges) input.part_paths.push_back(std::move(range.path));
+        std::vector<sunpack::sevenzip::ExtractInputRange>().swap(input.ranges);
     }
+}
 
+WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
+    WorkerArchiveInput input;
+    InputMode mode = InputMode::File;
+    bool attempts = false;
+    read_object(reader, [&](auto key) {
+        if (key == "entry_path") input.archive_path = utf8_to_wide(reader.text());
+        else if (key == "open_mode") mode = read_input_mode(reader.text());
+        else if (key == "format_hint") input.format_hint = utf8_to_wide(reader.text());
+        else if (key == "parts" && mode != InputMode::ConcatRanges) read_input_parts(reader, input, mode);
+        else if (key == "ranges" && mode == InputMode::ConcatRanges) {
+            read_array(reader, [&] {
+                auto range = read_range(reader);
+                if (range.path.empty()) range.path = input.archive_path;
+                if (!range.path.empty()) input.ranges.push_back(std::move(range));
+            });
+        } else if (key == "volume_attempts") {
+            attempts = true;
+            read_volume_plan(reader, input);
+        } else if (key == "analysis") {
+            read_object(reader, [&](auto field) {
+                if (field != "execution") { reader.skip(); return; }
+                read_object(reader, [&](auto finding) {
+                    if (finding == "missing_volume_evidence") input.analyzed_missing_volume_evidence = reader.text();
+                    else reader.skip();
+                });
+            });
+        } else reader.skip();
+    });
+    input.native_volume_input = mode == InputMode::NativeVolumes;
+    if (!attempts && input.validation_error.empty()) {
+        if (mode == InputMode::ConcatRanges && input.ranges.empty())
+            input.validation_error = "concat_ranges descriptor requires ranges";
+        else if (mode == InputMode::FileRange && input.ranges.empty())
+            input.validation_error = "file_range descriptor requires canonical parts with extents";
+        else if ((mode == InputMode::NativeVolumes || mode == InputMode::SfxWithVolumes) && input.canonical_names.empty())
+            input.validation_error = "structured volume descriptor has no parts";
+    }
     return input;
 }
 
@@ -352,38 +366,33 @@ struct WorkerRequest {
     WorkerArchiveInput archive_input;
 };
 
-WorkerRequest parse_worker_request(const std::string& request_frame) {
-    const wire::ObjectView fields(request_frame);
+WorkerRequest parse_worker_request(wire::RequestReader& reader) {
     WorkerRequest request;
-    request.worker_command = fields.string_field("worker_command", "");
-    request.job_id = fields.string_field("job_id", "");
-    request.from_watch = fields.string_field("origin") == "watch";
-    request.output_volume_key = fields.string_field("output_volume_key", "");
-    request.process_mode = fields.string_field("mode", "normal");
-
-    if (
-        request.worker_command == "cancel" ||
-        request.worker_command == "set_process_mode" ||
-        request.worker_command == "shutdown"
-    ) {
-        return request;
-    }
-
-    request.output_dir = utf8_to_wide(fields.string_field("output_dir", ""));
-    request.password = utf8_to_wide(fields.string_field("password", ""));
-    request.codepage = utf8_to_wide(fields.string_field("codepage", ""));
-    request.report_progress = fields.bool_field("report_progress");
-    request.password_verified = fields.bool_field("password_verified", false);
-    request.scan_only = fields.string_field("operation", "extract") == "scan";
-    request.encrypted = fields.bool_field("encrypted", false) ? 1 :
-        (fields.bool_field("encrypted", true) ? -1 : 0);
-
-    const auto candidates = fields.array_field("password_candidates");
-    request.password_candidates.reserve(candidates.size());
-    for (const auto candidate : candidates) {
-        request.password_candidates.push_back(utf8_to_wide(wire::Reader(candidate).text()));
-    }
-    request.archive_input = parse_archive_input_descriptor(fields);
+    bool has_archive_input = false;
+    read_object(reader, [&](auto key) {
+        if (key == "worker_command") request.worker_command = reader.text();
+        else if (key == "job_id") request.job_id = reader.text();
+        else if (key == "origin") request.from_watch = reader.text() == "watch";
+        else if (key == "output_volume_key") request.output_volume_key = reader.text();
+        else if (key == "mode") request.process_mode = reader.text();
+        else if (key == "output_dir") request.output_dir = utf8_to_wide(reader.text());
+        else if (key == "password") request.password = utf8_to_wide(reader.text());
+        else if (key == "codepage") request.codepage = utf8_to_wide(reader.text());
+        else if (key == "report_progress") request.report_progress = reader.boolean();
+        else if (key == "password_verified") request.password_verified = reader.boolean();
+        else if (key == "operation") request.scan_only = reader.text() == "scan";
+        else if (key == "encrypted") request.encrypted = reader.boolean() ? 1 : 0;
+        else if (key == "password_candidates") {
+            read_array(reader, [&] { request.password_candidates.push_back(utf8_to_wide(reader.text())); });
+        } else if (key == "archive_input") {
+            request.archive_input = read_archive_input(reader);
+            has_archive_input = true;
+        }
+        else reader.skip();
+    });
+    reader.finish();
+    if (!has_archive_input && request.worker_command.empty())
+        request.archive_input.validation_error = "archive_input descriptor is required";
     return request;
 }
 
@@ -1764,11 +1773,15 @@ int main() {
             wire::number(memory_reserve_bytes) +
         wire::key("process_mode") + wire::text(requested_process_mode) +
         wire::key("process_mode_applied") + wire::boolean(process_mode_applied) + wire::end());
-    std::string frame;
+    wire::RequestReader reader(std::cin);
     try {
-        while (wire::read(std::cin, frame)) {
-            WorkerRequest request = parse_worker_request(frame);
-            std::string().swap(frame);
+        while (reader.start()) {
+            WorkerRequest request;
+            try {
+                request = parse_worker_request(reader);
+            } catch (const wire::AbandonedRequest&) {
+                continue;
+            }
             const bool shutdown = request.worker_command == "shutdown";
             const int code = run_message(std::move(request), executor);
             if (shutdown) {

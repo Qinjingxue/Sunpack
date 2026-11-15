@@ -520,7 +520,7 @@ impl CandidateSet {
         }
         let plan = PasswordPlan {
             verified_password: None,
-            candidates: pending,
+            candidates: Arc::new(pending),
             encrypted: needs_password.then_some(true),
             evidence,
             cache_key: key,
@@ -553,7 +553,7 @@ fn open_sessions(input: &ArchiveInput) -> io::Result<Vec<NativeArchiveSession>> 
 
 pub(super) struct PasswordPlan {
     pub verified_password: Option<Arc<str>>,
-    pub candidates: Vec<Arc<str>>,
+    pub candidates: Arc<Vec<Arc<str>>>,
     pub encrypted: Option<bool>,
     pub evidence: Option<&'static str>,
     cache_key: Option<Key>,
@@ -563,7 +563,7 @@ impl PasswordPlan {
     fn empty_fallback() -> Self {
         Self {
             verified_password: None,
-            candidates: vec![Arc::from("")],
+            candidates: Arc::new(vec![Arc::from("")]),
             encrypted: None,
             evidence: Some("empty_password_direct"),
             cache_key: None,
@@ -573,7 +573,7 @@ impl PasswordPlan {
     fn clear() -> Self {
         Self {
             verified_password: None,
-            candidates: Vec::new(),
+            candidates: Arc::default(),
             encrypted: Some(false),
             evidence: None,
             cache_key: None,
@@ -583,7 +583,7 @@ impl PasswordPlan {
     fn verified(password: Arc<str>) -> Self {
         Self {
             verified_password: Some(password),
-            candidates: Vec::new(),
+            candidates: Arc::default(),
             encrypted: Some(true),
             evidence: None,
             cache_key: None,

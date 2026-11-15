@@ -13,7 +13,6 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <vector>
 
 namespace wire {
 enum Tag : unsigned char { kEnd, kNull, kFalse, kTrue, kU64, kI64, kF64, kText, kBytes, kArray, kObject, kU8, kU32 };
@@ -51,115 +50,153 @@ inline void write(std::ostream& stream, const std::string& payload) {
     stream.write(header.data(), header.size()); stream.write(payload.data(), payload.size());
     if (!stream) throw std::runtime_error("worker frame write failed");
 }
-class Reader {
-public:
-    explicit Reader(std::string_view value) : data(value) {}
-    std::string_view take(std::size_t n) {
-        if (n > data.size()) throw std::runtime_error("truncated worker value");
-        auto result = data.substr(0, n); data.remove_prefix(n); return result;
-    }
-    unsigned char byte() { return static_cast<unsigned char>(take(1)[0]); }
-    std::uint64_t integer(unsigned bytes) {
-        const auto raw = take(bytes); std::uint64_t n = 0;
-        for (unsigned i = 0; i < bytes; ++i) n |= static_cast<std::uint64_t>(static_cast<unsigned char>(raw[i])) << (8*i);
-        return n;
-    }
-    std::string_view text() {
-        if (byte() != kText) throw std::runtime_error("worker text expected");
-        return take(static_cast<std::size_t>(integer(4)));
-    }
-    void skip(unsigned depth = 0) {
-        if (depth > 64) throw std::runtime_error("worker value nesting exceeds schema");
-        switch (byte()) {
-        case kNull: case kFalse: case kTrue: return;
-        case kU8: take(1); return;
-        case kU32: take(4); return;
-        case kU64: case kI64: case kF64: take(8); return;
-        case kText: case kBytes: take(static_cast<std::size_t>(integer(4))); return;
-        case kArray: while (!data.empty() && data.front() != kEnd) skip(depth+1); break;
-        case kObject: while (!data.empty() && data.front() != kEnd) { text(); skip(depth+1); } break;
-        default: throw std::runtime_error("invalid worker value tag");
-        }
-        if (byte() != kEnd) throw std::runtime_error("worker container end expected");
-    }
-    std::string_view data;
-};
-inline bool read(std::istream& stream, std::string& payload) {
-    char header[8]; stream.read(header, 8);
-    if (!stream.gcount() && stream.eof()) return false;
-    if (stream.gcount() != 8 || std::memcmp(header, "SPBF", 4)) throw std::runtime_error("invalid worker frame header");
-    Reader reader(std::string_view(header+4, 4)); const auto size = reader.integer(4);
-    payload.clear();
-    // Grow only as bytes arrive; a damaged length cannot preallocate gigabytes.
-    char block[65536]; std::uint64_t remaining = size;
-    while (remaining) {
-        const auto count = static_cast<std::streamsize>((std::min)(remaining, std::uint64_t{sizeof(block)}));
-        stream.read(block, count);
-        if (stream.gcount() != count) throw std::runtime_error("truncated worker frame");
-        payload.append(block, static_cast<std::size_t>(count)); remaining -= count;
-    }
-    return true;
+inline std::uint64_t read_integer(std::string_view bytes) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < bytes.size(); ++i)
+        value |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[i])) << (8 * i);
+    return value;
 }
 
-class ObjectView {
-    struct Field { std::string_view key, value; };
-    std::vector<Field> fields_;
-    bool valid_ = false;
-    std::optional<std::string_view> raw_field(std::string_view key) const {
-        for (const auto& field : fields_) if (field.key == key) return field.value;
-        return std::nullopt;
+inline std::optional<std::uint32_t> read_size(std::istream& stream) {
+    char header[8]; stream.read(header, 8);
+    if (!stream.gcount() && stream.eof()) return std::nullopt;
+    if (stream.gcount() != 8 || std::memcmp(header, "SPBF", 4)) throw std::runtime_error("invalid worker frame header");
+    return static_cast<std::uint32_t>(read_integer(std::string_view(header + 4, 4)));
+}
+inline constexpr std::uint32_t kMore = 1u << 31;
+inline constexpr std::uint32_t kRequestChunkBytes = 512 * 1024;
+struct AbandonedRequest {};
+
+// One typed object may span any number of SPBF frames. Parse values directly
+// into the job. Only a scalar that crosses a frame boundary needs scratch space.
+class RequestReader {
+    std::istream& input_;
+    std::string buffer_, split_;
+    std::string_view data_;
+    bool more_ = false;
+
+    void load(std::uint32_t size) {
+        more_ = (size & kMore) != 0;
+        size &= ~kMore;
+        if (size == 0 || size > kRequestChunkBytes)
+            throw std::runtime_error("invalid worker request fragment size");
+        buffer_.resize(size);
+        input_.read(buffer_.data(), size);
+        if (input_.gcount() != size) throw std::runtime_error("truncated worker request fragment");
+        data_ = buffer_;
     }
+
+    void require_data() {
+        if (!data_.empty()) return;
+        if (!more_) throw std::runtime_error("truncated worker request value");
+        const auto size = read_size(input_);
+        if (!size) throw std::runtime_error("truncated worker request fragments");
+        if (*size == 0) throw AbandonedRequest{};
+        load(*size);
+    }
+
+    unsigned char peek() {
+        require_data();
+        return static_cast<unsigned char>(data_.front());
+    }
+
+    unsigned char byte() {
+        const auto tag = peek();
+        data_.remove_prefix(1);
+        return tag;
+    }
+
+    std::string_view take(std::size_t count) {
+        if (count <= data_.size()) {
+            const auto value = data_.substr(0, count);
+            data_.remove_prefix(count);
+            return value;
+        }
+        split_.clear();
+        while (count != 0) {
+            require_data();
+            const auto size = (std::min)(count, data_.size());
+            split_.append(data_.data(), size);
+            data_.remove_prefix(size);
+            count -= size;
+        }
+        return split_;
+    }
+
+    void discard(std::size_t count) {
+        while (count != 0) {
+            require_data();
+            const auto size = (std::min)(count, data_.size());
+            data_.remove_prefix(size);
+            count -= size;
+        }
+    }
+
+    void expect(Tag tag) {
+        if (byte() != tag) throw std::runtime_error("unexpected worker request value tag");
+    }
+
+    std::uint64_t integer(unsigned width) { return read_integer(take(width)); }
+
 public:
-    std::vector<std::string_view> array_field(std::string_view key) const {
-        std::vector<std::string_view> out; const auto raw = raw_field(key);
-        if (!raw) return out;
-        Reader reader(*raw); if (reader.byte() != kArray) throw std::runtime_error("worker array expected");
-        while (!reader.data.empty() && reader.data.front() != kEnd) {
-            const auto before = reader.data; reader.skip(); out.push_back(before.substr(0, before.size()-reader.data.size()));
+    explicit RequestReader(std::istream& input) : input_(input) {}
+    bool start() {
+        // Keep the ordinary request buffer warm without pinning large
+        // allocations across an idle wait for the next request.
+        constexpr std::size_t retained_bytes = 32 * 1024;
+        data_ = {};
+        if (buffer_.capacity() > retained_bytes) std::string().swap(buffer_);
+        if (split_.capacity() > retained_bytes) std::string().swap(split_);
+        const auto size = read_size(input_);
+        if (size) load(*size);
+        return size.has_value();
+    }
+    void finish() const {
+        if (!data_.empty() || more_) throw std::runtime_error("trailing worker request data");
+    }
+    std::string_view text() {
+        expect(kText);
+        const auto size = static_cast<std::size_t>(integer(4));
+        return take(size);
+    }
+    std::uint64_t number() {
+        const auto tag = byte();
+        if (tag == kU8) return integer(1);
+        if (tag == kU32) return integer(4);
+        if (tag == kU64) return integer(8);
+        throw std::runtime_error("worker unsigned integer expected");
+    }
+    bool boolean() {
+        const auto tag = byte();
+        if (tag != kTrue && tag != kFalse) throw std::runtime_error("worker boolean expected");
+        return tag == kTrue;
+    }
+    void object() { expect(kObject); }
+    void array() { expect(kArray); }
+    bool next() {
+        if (peek() != kEnd) return true;
+        byte();
+        return false;
+    }
+    void skip(unsigned depth = 0) {
+        if (depth == 64) throw std::runtime_error("worker value nesting exceeds schema");
+        switch (byte()) {
+        case kNull: case kFalse: case kTrue: return;
+        case kU8: discard(1); return;
+        case kU32: discard(4); return;
+        case kU64: case kI64: case kF64: discard(8); return;
+        case kText: case kBytes: discard(static_cast<std::size_t>(integer(4))); return;
+        case kArray: while (next()) skip(depth + 1); return;
+        case kObject:
+            while (next()) {
+                expect(kText);
+                discard(static_cast<std::size_t>(integer(4)));
+                skip(depth + 1);
+            }
+            return;
+        default: throw std::runtime_error("invalid worker request tag");
         }
-        return out;
-    }
-    ObjectView() = default;
-    explicit ObjectView(std::string_view data) {
-        Reader reader(data); if (reader.byte() != kObject) throw std::runtime_error("worker object expected");
-        while (!reader.data.empty() && reader.data.front() != kEnd) {
-            const auto key = reader.text(); const auto before = reader.data; reader.skip();
-            fields_.push_back({key, before.substr(0, before.size()-reader.data.size())});
-        }
-        if (reader.byte() != kEnd || !reader.data.empty()) throw std::runtime_error("invalid worker object end");
-        valid_ = true;
-    }
-    bool valid() const noexcept { return valid_; }
-    std::string_view string_field(std::string_view key, std::string_view fallback = {}) const {
-        auto raw = raw_field(key); return raw ? Reader(*raw).text() : fallback;
-    }
-    bool uint_field(std::string_view key, unsigned long long* out) const {
-        auto raw = raw_field(key); if (!raw || raw->front() == kNull) return false;
-        Reader reader(*raw); const auto tag = reader.byte();
-        if (tag != kU8 && tag != kU32 && tag != kU64) throw std::runtime_error("worker unsigned integer expected");
-        *out = reader.integer(tag == kU8 ? 1 : tag == kU32 ? 4 : 8); return true;
-    }
-    bool bool_field(std::string_view key, bool fallback = false) const {
-        auto raw = raw_field(key); if (!raw) return fallback;
-        if (raw->front() != kTrue && raw->front() != kFalse) throw std::runtime_error("worker boolean expected");
-        return raw->front() == kTrue;
-    }
-    ObjectView object_field(std::string_view key) const {
-        auto raw = raw_field(key); return raw && raw->front() != kNull ? ObjectView(*raw) : ObjectView();
-    }
-    bool index_array_field(std::string_view key, std::vector<std::size_t>& out) const {
-        const auto raw = raw_field(key);
-        if (!raw) return false;
-        Reader reader(*raw);
-        if (reader.byte() != kArray) throw std::runtime_error("worker array expected");
-        while (!reader.data.empty() && reader.data.front() != kEnd) {
-            const auto tag = reader.byte();
-            if (tag != kU8 && tag != kU32 && tag != kU64) return false;
-            const auto value = reader.integer(tag == kU8 ? 1 : tag == kU32 ? 4 : 8);
-            if (value > SIZE_MAX) return false;
-            out.push_back(static_cast<std::size_t>(value));
-        }
-        return !out.empty();
     }
 };
+
 } // namespace wire

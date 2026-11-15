@@ -20,17 +20,86 @@ void require(bool condition, const char* message) {
 
 void check_final_results(const std::ostringstream& output, unsigned expected_count, std::string_view expected_status = {}) {
     std::istringstream frames(output.str());
-    std::string payload;
+    wire::RequestReader reader(frames);
     unsigned count = 0;
-    while (wire::read(frames, payload)) {
-        const wire::ObjectView frame(payload);
-        if (frame.string_field("type") != "result") continue;
+    while (reader.start()) {
+        std::string type, status;
+        read_object(reader, [&](auto key) {
+            if (key == "type") type = reader.text();
+            else if (key == "native_status") status = reader.text();
+            else reader.skip();
+        });
+        reader.finish();
+        if (type != "result") continue;
         ++count;
         if (!expected_status.empty()) {
-            require(frame.string_field("native_status") == expected_status, "request emitted an unexpected final status");
+            require(status == expected_status, "request emitted an unexpected final status");
         }
     }
     require(count == expected_count, "request emitted an unexpected number of final results");
+}
+
+void check_chunked_request(const std::filesystem::path& archive) {
+    const auto path = wide_to_utf8(archive.wstring());
+    auto slot = [](unsigned number, const char* name) {
+        return wire::object() + wire::key("number") + wire::number(number) +
+            wire::key("domain") + wire::number(0) + wire::key("canonical_name") + wire::text(name) + wire::end();
+    };
+    auto extent = [&](std::uint64_t start, std::uint64_t end) {
+        return wire::object() + wire::key("path") + wire::text(path) +
+            wire::key("start") + wire::number(start) + wire::key("end") + wire::number(end) + wire::end();
+    };
+    const auto body = wire::object() + wire::key("job_id") + wire::text("chunked") +
+        wire::key("archive_input") + wire::object() +
+        wire::key("entry_path") + wire::text(path) +
+        wire::key("open_mode") + wire::text("native_volumes") +
+        wire::key("format_hint") + wire::text("zip") +
+        wire::key("volume_attempts") + wire::object() +
+        wire::key("sources") + wire::array() + extent(0, 40) + extent(40, std::filesystem::file_size(archive)) + wire::end() +
+        wire::key("layouts") + wire::array() + wire::object() +
+        wire::key("slots") + wire::array() + slot(1, "one") + slot(2, "two") + wire::end() +
+        wire::key("minimum_slots") + wire::number(2) + wire::end() + wire::end() +
+        wire::key("domains") + wire::array() + wire::object() +
+        wire::key("choices") + wire::array() + wire::number(0) + wire::number(1) + wire::end() +
+        wire::end() + wire::end() +
+        wire::key("tail_totals") + wire::array() + wire::object() + wire::key("source") + wire::number(1) +
+        wire::key("total") + wire::number(UINT64_C(0x123456789)) + wire::end() + wire::end() +
+        wire::end() + wire::end() +
+        wire::key("password_candidates") + wire::array() + wire::text("\xe8\xb7\xaf") + wire::end() + wire::end();
+    std::string frames;
+    auto fragment = [&](std::string_view bytes, bool more) {
+        frames += "SPBF";
+        wire::little(frames, bytes.size() | (more ? wire::kMore : 0), 4);
+        frames += bytes;
+    };
+    const std::string_view payload(body);
+    fragment(payload.substr(0, payload.size() / 2), true);
+    fragment({}, false);
+    // Small fragments force numeric fields, strings and collection records
+    // to cross boundaries in a real request, with no huge test fixture.
+    for (std::size_t offset = 0; offset < payload.size(); offset += 3) {
+        fragment(payload.substr(offset, 3), offset + 3 < payload.size());
+    }
+    fragment(wire::object() + wire::key("worker_command") + wire::text("shutdown") + wire::end(), false);
+
+    std::istringstream input(std::move(frames));
+    wire::RequestReader reader(input);
+    require(reader.start(), "missing cancelled request");
+    bool abandoned = false;
+    try { parse_worker_request(reader); } catch (const wire::AbandonedRequest&) { abandoned = true; }
+    require(abandoned, "partial request was admitted");
+    require(reader.start(), "cancelled request consumed the following transaction");
+    const auto request = parse_worker_request(reader);
+    const auto& plan = request.archive_input.volume_attempts;
+    require(request.job_id == "chunked" && request.archive_input.validation_error.empty() &&
+            request.archive_input.archive_path == archive.wstring() && plan.sources.size() == 2 &&
+            plan.sources[1].start == 40 && plan.layouts.size() == 1 && plan.layouts[0][1].name == L"two" &&
+            plan.domains == std::vector<std::vector<std::size_t>>{{0, 1}} &&
+            plan.minimum_slots[0] == 2 && plan.tail_totals[1] == UINT64_C(0x123456789) &&
+            request.password_candidates == std::vector<std::wstring>{L"\u8def"},
+            "chunk boundary corrupted the request");
+    require(reader.start() && parse_worker_request(reader).worker_command == "shutdown" && !reader.start(),
+        "chunked request consumed the following control frame");
 }
 }
 
@@ -123,6 +192,7 @@ int main() {
     std::filesystem::create_directories(root);
     const auto archive = root / L"input.zip";
     { std::ofstream file(archive, std::ios::binary); file.write(zip, sizeof(zip) - 1); }
+    check_chunked_request(archive);
     unsigned index = 0;
     for (bool after_failure : {false, true}) for (bool cancel : {false, true})
         request_recovery(archive, root / std::to_wstring(++index), after_failure, cancel);

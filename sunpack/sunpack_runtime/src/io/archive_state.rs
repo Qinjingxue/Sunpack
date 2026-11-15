@@ -168,8 +168,8 @@ impl ArchiveInput {
             entry_path: &self.entry_path,
             open_mode: self.mode,
             format_hint: &self.format_hint,
-            parts: if attempts.is_some() { &[] } else { &self.parts },
-            ranges: &self.ranges,
+            parts: if attempts.is_some() || self.mode == OpenMode::ConcatRanges { &[] } else { &self.parts },
+            ranges: if attempts.is_none() && self.mode == OpenMode::ConcatRanges { &self.ranges } else { &[] },
             volume_attempts: attempts,
             analysis: self
                 .execution_evidence()
