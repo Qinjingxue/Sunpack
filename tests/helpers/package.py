@@ -110,7 +110,7 @@ def package(tmp_path, repo_root):
     target = {"x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}[arch]
     suffix = "-ci" if profile == "ci" else ""
     built = repo_root / ".cache" / "rust-target" / arch / target / profile
-    wrapper = repo_root / "native" / "sevenzip_bridge" / f"build-{arch}{suffix}" / "Release"
+    wrapper = repo_root / "sunpack" / "sevenzip_bridge" / f"build-{arch}{suffix}" / "Release"
     tool_root = repo_root / ("tools" if arch == "x64" else "tools-arm64")
     sources = {
         "bin/sunpack.exe": wrapper / "sunpack_launcher.exe",

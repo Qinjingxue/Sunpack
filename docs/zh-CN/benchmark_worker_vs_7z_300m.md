@@ -13,7 +13,7 @@
 | 仓库 HEAD       | `b9fdfa6d`                                                                    |
 | worker 源码     | commit `b9fdfa6d` |
 | BZip2 并行宽度  | 最多 4 个 lane：调用线程加最多 3 个 worker 线程                               |
-| worker 二进制   | `native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe`        |
+| worker 二进制   | `sunpack/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe`       |
 | 7-Zip CLI       | 7-Zip 26.03 (x64)，`tools/7z.exe`                                             |
 | 7-Zip SHA-256   | `6ee3c0ed0b27663c1b948ae85a7c0bb073aed1498983182f3f0df1f6a8c30b2f`            |
 | worker SHA-256  | `03b96534876d1e847abf9f00dd73b120880a39a7959889964943e0bec6b56bc4`            |
@@ -129,7 +129,7 @@ Set-Location ..\sunpack-benchmark-b9fdfa6d
 uv run python -m benchmarks extraction worker-vs-7z-300m `
   --sunpack-version v0.7.9 `
   --worker-source-commit b9fdfa6d `
-  --worker native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
+  --worker sunpack/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
   --small-files 8 --large-files 2 --large-file-mib 150 `
   --runs 5 --warmups 0 `
   --json-out benchmarks/results/worker-vs-7z-300m-v0.7.9-b9fdfa6-rss-20261003.json
@@ -140,7 +140,7 @@ uv run python -m benchmarks extraction worker-vs-7z-300m `
 ```powershell
 uv run python benchmarks/scenarios/worker_vs_7z_300m.py `
   --sunpack-version v0.7.9 --worker-source-commit b9fdfa6d `
-  --worker native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
+  --worker sunpack/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
   --small-files 8 --large-files 2 `
   --large-file-mib 150 --runs 5 --warmups 0 `
   --json-out benchmarks/results/worker-vs-7z-300m-v0.7.9-b9fdfa6-rss-20261003.json

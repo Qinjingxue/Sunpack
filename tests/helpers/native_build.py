@@ -19,7 +19,7 @@ def sevenzip_build_dir() -> Path:
     if profile not in {"ci", "release"}:
         raise ValueError(f"Unsupported SUNPACK_TEST_BUILD_PROFILE: {profile!r}")
     suffix = "-ci" if profile == "ci" else ""
-    return ROOT / "native" / "sevenzip_bridge" / f"build-{arch}{suffix}" / "Release"
+    return ROOT / "sunpack" / "sevenzip_bridge" / f"build-{arch}{suffix}" / "Release"
 
 
 def sevenzip_artifact(name: str) -> Path:

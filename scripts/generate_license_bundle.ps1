@@ -48,7 +48,7 @@ foreach ($file in (Get-ChildItem -LiteralPath $GuiLicenseRoot -File | Sort-Objec
 }
 if ($MetadataPath) { $metadata = Get-Content -LiteralPath $MetadataPath -Raw -Encoding UTF8 | ConvertFrom-Json }
 else {
-    $json = & cargo metadata --locked --format-version 1 --filter-platform $Target --manifest-path (Join-Path $RepoRoot 'native/Cargo.toml')
+    $json = & cargo metadata --locked --format-version 1 --filter-platform $Target --manifest-path (Join-Path $RepoRoot 'sunpack/Cargo.toml')
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed; license bundle was not generated' }
     $metadata = ($json -join "`n") | ConvertFrom-Json
 }

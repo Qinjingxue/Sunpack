@@ -25,9 +25,9 @@ execution result without rereading source archives or output files.
 ## Build
 
 ```powershell
-cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-x64 -A x64
-cmake --build native\sevenzip_bridge\build-x64 --config Release
-ctest --test-dir native\sevenzip_bridge\build-x64 -C Release --output-on-failure
+cmake -S sunpack\sevenzip_bridge -B sunpack\sevenzip_bridge\build-x64 -A x64
+cmake --build sunpack\sevenzip_bridge\build-x64 --config Release
+ctest --test-dir sunpack\sevenzip_bridge\build-x64 -C Release --output-on-failure
 ```
 
 On x64 the build assembles the upstream 7-Zip hot paths
@@ -48,7 +48,7 @@ before launching that worker to collect timing. `setup_windows_dev.ps1 -BuildPro
 Release runtime output:
 
 ```text
-native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe
+sunpack\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe
 ```
 
 Development and release scripts copy it to:
@@ -77,7 +77,7 @@ protocol negotiation, or fallback. Deploy the worker and Rust extension together
 Stderr remains diagnostic text.
 
 The codecs are `src/internal/worker_wire.hpp` and
-`../sunpack_native/src/scan/worker_wire.rs`. Python forwards bytes and receives
+`../sunpack_runtime/src/scan/worker_wire.rs`. Python forwards bytes and receives
 decoded event envelopes; manifest rows and trace items stay in Rust throughout
 assembly, progress reporting, and recursive discovery.
 

@@ -45,7 +45,7 @@ SHA hardware supports incomplete groups; SHA2 remains optional independently of
 NEON. Argon2 and portable SHA compression retain their upstream runtime backends.
 Correctness tests cover official vectors, direct ISA paths, short/tail groups,
 CTR offsets, CPU credits, corruption and cancellation:
-`cargo test --manifest-path native/Cargo.toml --locked -p sunpack-enc --release --lib`.
+`cargo test --manifest-path sunpack/Cargo.toml --locked -p sunpack-enc --release --lib`.
 
 ENC produces one unnamed authenticated item. Existing recursive discovery,
 verification, cleanup and CLI/Watch scheduling own the resulting payload; the

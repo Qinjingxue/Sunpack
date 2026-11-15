@@ -27,7 +27,7 @@ and release-compliance guidance.
 SunPack vendors a trimmed and modified 7-Zip 26.05 runtime subset at the
 historical directory name:
 
-`native/sevenzip_bridge/7z2604-src/`
+`sunpack/sevenzip_bridge/7z2604-src/`
 
 The 26.05 update imports the Shrink decoder rewrite, container-handler
 initialization fixes and string-copy cleanup while preserving SunPack's codec,
@@ -40,7 +40,7 @@ That subtree is not covered by SunPack's MIT License. It remains under the
 upstream 7-Zip source license. The authoritative license file imported with the
 source is:
 
-`native/sevenzip_bridge/7z2604-src/DOC/License.txt`
+`sunpack/sevenzip_bridge/7z2604-src/DOC/License.txt`
 
 A convenience copy is distributed at
 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt).
@@ -69,7 +69,7 @@ reproduced in the 7-Zip source license file referenced above.
 
 SunPack vendors the runtime build subset of zlib-ng 2.3.3 at:
 
-`native/sevenzip_bridge/zlib-ng-2.3.3/`
+`sunpack/sevenzip_bridge/zlib-ng-2.3.3/`
 
 The imported files are pinned to upstream commit
 `12731092979c6d07f42da27da673a9f6c7b13586` and are used for selected ZIP
@@ -113,7 +113,7 @@ rebuild/relink requirements for the exact code used to produce the binary.
 ## LZ4 1.10.0 and xxHash
 
 SunPack vendors the unmodified LZ4 1.10.0 library sources and bundled xxHash at
-`native/third_party/lz4/`. They are compiled into the Rust extension and the
+`sunpack/third_party/lz4/`. They are compiled into the Rust extension and the
 archive worker for LZ4 Frame decoding. The library remains under
 the BSD 2-Clause license. The full notice is distributed at
 [licenses/lz4-license.txt](licenses/lz4-license.txt).
@@ -123,7 +123,7 @@ Source: https://github.com/lz4/lz4/tree/v1.10.0/lib
 ## RustCrypto Twofish
 
 The Twofish-256 key schedule and q permutations in
-`native/sunpack_enc/src/twofish.rs` are adapted from RustCrypto twofish 0.7.1
+`sunpack/sunpack_enc/src/twofish.rs` are adapted from RustCrypto twofish 0.7.1
 by Alexander Krotov (2017), under the MIT license. SunPack expands the keyed
 S-box/MDS tables during key setup and shares them across CTR tasks.
 The full notice is distributed at [licenses/twofish-license.txt](licenses/twofish-license.txt).
@@ -133,7 +133,7 @@ Source: https://github.com/RustCrypto/block-ciphers/tree/twofish-v0.7.1/twofish
 ## RustCrypto Serpent
 
 The Serpent-256 key schedule and Boolean S-box circuits in
-`native/sunpack_enc/src/serpent.rs` are adapted from RustCrypto serpent 0.6.0,
+`sunpack/sunpack_enc/src/serpent.rs` are adapted from RustCrypto serpent 0.6.0,
 Copyright (c) 2019-2024 The RustCrypto Project Developers and
 Copyright (c) 2019 Jonathan Serra, under the MIT license. SunPack uses the same
 circuits for scalar blocks and eight-block AVX2 encryption, sharing one expanded
@@ -145,7 +145,7 @@ Source: https://github.com/RustCrypto/block-ciphers/tree/serpent-v0.6.0/serpent
 ## RustCrypto Threefish
 
 The Threefish-1024 key schedule and round constants in
-`native/sunpack_enc/src/threefish.rs` are adapted from RustCrypto threefish 0.5.2,
+`sunpack/sunpack_enc/src/threefish.rs` are adapted from RustCrypto threefish 0.5.2,
 Copyright (c) 2016-2017 Christian Barcenas, Artyom Pavlov, under the MIT license.
 SunPack uses a zero tweak, constant-rotation round cycles, and four-block AVX2
 encryption with scalar tails. The full notice is distributed at
@@ -156,7 +156,7 @@ Source: https://github.com/RustCrypto/block-ciphers/tree/threefish-v0.5.2/threef
 ## RustCrypto Magma/GOST
 
 The GOST 28147-89 TestSbox constants and key ordering in
-`native/sunpack_enc/src/gost.rs` are adapted from RustCrypto magma 0.9.0,
+`sunpack/sunpack_enc/src/gost.rs` are adapted from RustCrypto magma 0.9.0,
 Copyright (c) 2017 Artyom Pavlov, under the MIT license. SunPack shares
 compile-time substitution/rotation tables and interleaves independent blocks.
 The full notice is distributed at
@@ -166,7 +166,7 @@ Source: https://github.com/RustCrypto/block-ciphers/tree/magma-v0.9.0/magma
 
 ## RustCrypto RC6
 
-The RC6-32/20/32 key expansion and rounds in `native/sunpack_enc/src/rc6.rs`
+The RC6-32/20/32 key expansion and rounds in `sunpack/sunpack_enc/src/rc6.rs`
 are adapted from RustCrypto rc6 0.1.0, Copyright (c) 2017 Damian Czaja,
 under the MIT license. SunPack uses an AVX2 backend with eight blocks per
 vector state, interleaved states, and scalar tails. The full notice is
@@ -177,7 +177,7 @@ Source: https://github.com/RustCrypto/block-ciphers/tree/rc6-v0.1.0/rc6
 ## RustCrypto Blowfish
 
 The Blowfish key expansion and initial P/S constants in
-`native/sunpack_enc/src/blowfish.rs` and `blowfish_init.rs` are adapted from
+`sunpack/sunpack_enc/src/blowfish.rs` and `blowfish_init.rs` are adapted from
 RustCrypto blowfish 0.9.1, Copyright (c) 2006-2009 Graydon Hoare and
 Copyright (c) 2009-2013 Mozilla Foundation, under the MIT license.
 SunPack interleaves independent blocks and shares one expanded key across

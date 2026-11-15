@@ -66,7 +66,7 @@ function Resolve-Launcher {
     $target = if ($arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
     foreach ($profile in @("ci", "release")) {
         $suffix = if ($profile -eq "ci") { "-ci" } else { "" }
-        $launcher = Join-Path $RepoRoot "native\sevenzip_bridge\build-$arch$suffix\Release\sunpack_launcher.exe"
+        $launcher = Join-Path $RepoRoot "sunpack\sevenzip_bridge\build-$arch$suffix\Release\sunpack_launcher.exe"
         $runtime = Join-Path $RepoRoot ".cache\rust-target\$arch\$target\$profile\sunpack-runtime.exe"
         if ((Test-Path -LiteralPath $launcher -PathType Leaf) -and
             (Test-Path -LiteralPath $runtime -PathType Leaf)) {

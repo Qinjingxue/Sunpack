@@ -7,7 +7,7 @@ from tests.helpers.real_archives import ArchiveCase
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ENC_VECTOR = ROOT / "native" / "sunpack_enc" / "tests" / "data" / "algorithm_0.mov"
+ENC_VECTOR = ROOT / "sunpack" / "sunpack_enc" / "tests" / "data" / "algorithm_0.mov"
 ENC_PASSWORD = "sunpack-test"
 ENC_MARKER_NAME = "inside.txt"
 ENC_MARKER_TEXT = "SunPack official ENC v4 compatibility\n"

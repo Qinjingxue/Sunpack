@@ -1,12 +1,12 @@
 项目为windows-only项目，使用.venv作为开发环境，使用uv管理依赖
 
-主程序代码在 native\sunpack_native，core 负责配置、密码和系统资源，pipeline 负责归档调度，runtime 负责 CLI、Watch 和 Windows 集成
+主程序代码在 sunpack\sunpack_runtime，core 负责配置、密码和系统资源，pipeline 负责归档调度，runtime 负责 CLI、Watch 和 Windows 集成
 
-native的7z.dll worker和C++ CLI启动器代码在native\sevenzip_bridge
+7z.dll worker和C++ CLI启动器代码在sunpack\sevenzip_bridge
 
-USN和watch监控服务代码在：native\sunpack_usn_core和native\sunpack_watch_broker
+USN和watch监控服务代码在：sunpack\sunpack_usn_core和sunpack\sunpack_watch_broker
 
-toast通知组件代码在：native\toast_host
+toast通知组件代码在：sunpack\toast_host
 
 scripts下是构建脚本，开发环境安装脚本，注册右键菜单脚本
 

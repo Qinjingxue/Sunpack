@@ -2,7 +2,7 @@
 
 **English** | [简体中文](zh-CN/development_boundaries.md)
 
-The Windows runtime lives in `native/sunpack_native`. Its dependency direction is `runtime → pipeline → core`. Both the pipeline and core use the existing archive analysis, I/O, and filesystem modules.
+The Windows runtime lives in `sunpack/sunpack_runtime`. Its dependency direction is `runtime → pipeline → core`. Both the pipeline and core use the existing archive analysis, I/O, and filesystem modules.
 
 | Layer | Responsibility |
 | --- | --- |

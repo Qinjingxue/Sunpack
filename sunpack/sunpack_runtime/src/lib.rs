@@ -31,7 +31,7 @@ mod test_support {
             .duration_since(UNIX_EPOCH)
             .expect("time should be monotonic enough for tests")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("sunpack_native_{name}_{nonce}.bin"));
+        let path = std::env::temp_dir().join(format!("sunpack_runtime_{name}_{nonce}.bin"));
         fs::write(&path, contents).expect("write test file");
         path
     }

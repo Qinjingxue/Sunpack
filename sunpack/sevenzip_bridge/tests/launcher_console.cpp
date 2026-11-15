@@ -16,13 +16,13 @@ void development_entrypoint_contract() {
     wchar_t temporary[MAX_PATH];
     require(GetTempPathW(MAX_PATH, temporary) != 0, "temporary directory");
     const auto root = fs::path(temporary) / (L"SunPack-launch-layout-" + std::to_wstring(GetCurrentProcessId()));
-    fs::create_directories(root / L"native");
-    std::ofstream(root / L"native" / L"Cargo.toml") << "[workspace]";
+    fs::create_directories(root / L"sunpack");
+    std::ofstream(root / L"sunpack" / L"Cargo.toml") << "[workspace]";
     std::ofstream(root / L"sunpack_advanced_config.json") << "{}";
     for (const auto* arch : {L"x64", L"arm64"}) {
         for (const auto* profile : {L"ci", L"release"}) {
             const auto build = std::wstring(L"build-") + arch + (std::wstring(profile) == L"ci" ? L"-ci" : L"");
-            const auto executable = root / L"native" / L"sevenzip_bridge" / build / L"Release" / L"sunpack_launcher.exe";
+            const auto executable = root / L"sunpack" / L"sevenzip_bridge" / build / L"Release" / L"sunpack_launcher.exe";
             const auto context = install_context(executable.wstring());
             const auto target = std::wstring(arch) == L"arm64" ? L"aarch64-pc-windows-msvc" : L"x86_64-pc-windows-msvc";
             const auto expected = root / L".cache" / L"rust-target" / arch / target / profile / L"sunpack-runtime.exe";

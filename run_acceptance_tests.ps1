@@ -561,7 +561,7 @@ try {
     # Use the optimized CI profile for the harness, even when the public CLI
     # and its fixtures below are tested from the release build.
     Invoke-TestStep -Label "Rust correctness tests" -Command @(
-        "cargo", "test", "--quiet", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
+        "cargo", "test", "--quiet", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
         "--workspace", "--profile", "ci", "--target", $target,
         "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
     )

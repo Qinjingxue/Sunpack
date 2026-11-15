@@ -126,8 +126,8 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         let base = PathBuf::from(base);
         let watched = base.join("watched");
         fs::create_dir_all(&watched).unwrap();
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let source = watched.join("source.001");
         let sibling = watched.join("source.002");

@@ -611,15 +611,15 @@ $venvScripts = Join-Path $venvPath "Scripts"
 $installerScriptPath = Join-Path $repoRoot "installer\SunPack.iss"
 $iconPath = Join-Path $repoRoot "sunpack.ico"
 $applicationManifestPath = Join-Path $repoRoot "sunpack.manifest"
-$nativeCrateRoot = Join-Path $repoRoot "native\sunpack_native"
+$nativeCrateRoot = Join-Path $repoRoot "sunpack\sunpack_runtime"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
-$nativeWorkspaceLock = Join-Path $repoRoot "native\Cargo.lock"
-$watchBrokerCargoToml = Join-Path $repoRoot "native\sunpack_watch_broker\Cargo.toml"
+$nativeWorkspaceLock = Join-Path $repoRoot "sunpack\Cargo.lock"
+$watchBrokerCargoToml = Join-Path $repoRoot "sunpack\sunpack_watch_broker\Cargo.toml"
 $rustTargetDir = Join-Path $repoRoot (".cache\rust-target\" + $buildArch)
 $watchBrokerBuildPath = Join-Path $rustTargetDir ("$rustTarget\release\sunpack-watch-broker.exe")
-$sevenZipWrapperRoot = Join-Path $repoRoot "native\sevenzip_bridge"
+$sevenZipWrapperRoot = Join-Path $repoRoot "sunpack\sevenzip_bridge"
 $sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch)
-$toastHostRoot = Join-Path $repoRoot "native\toast_host"
+$toastHostRoot = Join-Path $repoRoot "sunpack\toast_host"
 $toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch)
 $toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
 $sevenZipWorkerPath = Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"
@@ -652,7 +652,7 @@ Assert-PathExists -LiteralPath $installerScriptPath -Description "Inno Setup ins
 $innoCompiler = Get-InnoSetupCompiler -PreferredPath $InnoCompilerPath
 Assert-PathExists -LiteralPath $iconPath -Description "SunPack icon"
 Assert-PathExists -LiteralPath $applicationManifestPath -Description "Windows application manifest"
-Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_native Cargo manifest"
+Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_runtime Cargo manifest"
 Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust workspace lockfile"
 Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
 Assert-PathExists -LiteralPath (Join-Path $sevenZipWrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
@@ -686,10 +686,10 @@ New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 Write-Step "Building Rust runtime and Windows Watch Broker"
 $rustFlags = 'target.' + $rustTarget + '.rustflags=[''-C'', ''target-feature=+crt-static'']'
 $cargoArgs = @(
-    "build", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
+    "build", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
     "--release", "--target", $rustTarget, "--target-dir", $rustTargetDir,
     "--jobs", [string]$BuildJobs, "--config", $rustFlags,
-    "-p", "sunpack-native", "-p", "sunpack-watch-broker",
+    "-p", "sunpack-runtime", "-p", "sunpack-watch-broker",
     "--bin", "sunpack-runtime", "--bin", "sunpack-watch-broker"
 )
 if ($runAcceptanceTests) {

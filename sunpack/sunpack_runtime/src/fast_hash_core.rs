@@ -2,7 +2,7 @@
 use std::ffi::c_void;
 use std::io::{self, Read};
 
-// Layout of XXH64_state_t in the bundled native/third_party/lz4/xxhash.h.
+// Layout of XXH64_state_t in the bundled sunpack/third_party/lz4/xxhash.h.
 // Inline states own no pointers or buffers outside this object.
 #[repr(C)]
 #[derive(Default)]

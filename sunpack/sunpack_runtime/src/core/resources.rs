@@ -33,7 +33,7 @@ fn checkout_root(path: &Path) -> Option<PathBuf> {
     // Match main's module-root-first policy: the invoking directory may itself
     // be a different checkout, but must not replace the running application's root.
     path.ancestors()
-        .find(|root| root.join("native/Cargo.toml").is_file())
+        .find(|root| root.join("sunpack/Cargo.toml").is_file())
         .map(Path::to_path_buf)
 }
 
@@ -64,7 +64,7 @@ fn development_launcher(root: &Path, exe: &Path) -> io::Result<PathBuf> {
             "Build the native launcher and runtime with setup_windows_dev.ps1 (ci or release)")),
     };
     let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
-    Ok(root.join(format!("native/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")))
+    Ok(root.join(format!("sunpack/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")))
 }
 
 pub(crate) fn resource_roots(cwd: &Path) -> Vec<PathBuf> {
@@ -115,18 +115,18 @@ pub fn worker_path(cwd: &Path) -> io::Result<PathBuf> {
 pub fn toast_library_path(cwd: &Path) -> io::Result<PathBuf> {
     find_toast_library(resource_roots(cwd)).ok_or_else(|| io::Error::new(
         io::ErrorKind::NotFound,
-        r"Optional sunpack_toast.dll was not found under tools\ or native\toast_host\build.",
+        r"Optional sunpack_toast.dll was not found under tools\ or sunpack\toast_host\build.",
     ))
 }
 
 fn find_toast_library(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     const DLL: &str = "sunpack_toast.dll";
     let build = if cfg!(target_arch = "aarch64") {
-        "native/toast_host/build-arm64/Release"
+        "sunpack/toast_host/build-arm64/Release"
     } else {
-        "native/toast_host/build-x64/Release"
+        "sunpack/toast_host/build-x64/Release"
     };
-    let dirs = [build, "native/toast_host/build/Release", "native/toast_host/build/Debug"];
+    let dirs = [build, "sunpack/toast_host/build/Release", "sunpack/toast_host/build/Debug"];
     for root in roots {
         if let Some(path) = dirs.into_iter().chain(tool_dirs()).chain([""])
             .map(|dir| root.join(dir).join(DLL)).find(|path| path.is_file()) {
@@ -194,8 +194,8 @@ mod entrypoint_tests {
     fn source_layout_finds_its_own_checkout_from_the_runtime_executable() {
         let temp = env::temp_dir().join(format!("sunpack-resource-roots-{}", std::process::id()));
         let application = temp.join("application");
-        std::fs::create_dir_all(application.join("native")).unwrap();
-        std::fs::write(application.join("native/Cargo.toml"), "[workspace]").unwrap();
+        std::fs::create_dir_all(application.join("sunpack")).unwrap();
+        std::fs::write(application.join("sunpack/Cargo.toml"), "[workspace]").unwrap();
         let exe = application.join(".cache/rust-target/x64/target/ci/sunpack-runtime.exe");
         assert_eq!(checkout_root(&exe), Some(application));
         std::fs::remove_dir_all(temp).unwrap();
@@ -207,7 +207,7 @@ mod entrypoint_tests {
         let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
         for (profile, suffix) in [("ci", "-ci"), ("release", "")] {
             let exe = root.join(".cache/rust-target").join(arch).join("target").join(profile).join("sunpack-runtime.exe");
-            assert_eq!(development_launcher(root, &exe).unwrap(), root.join(format!("native/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")));
+            assert_eq!(development_launcher(root, &exe).unwrap(), root.join(format!("sunpack/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")));
         }
         assert!(development_launcher(root, &root.join("debug/sunpack-runtime.exe")).is_err());
     }
@@ -217,7 +217,7 @@ mod entrypoint_tests {
         let marker = crate::test_support::temp_file("toast_lookup", b"");
         let root = marker.with_extension("checkout");
         let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
-        let current = root.join(format!("native/toast_host/build-{arch}/Release/sunpack_toast.dll"));
+        let current = root.join(format!("sunpack/toast_host/build-{arch}/Release/sunpack_toast.dll"));
         let staged = root.join("tools/sunpack_toast.dll");
         for file in [&current, &staged] {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();

@@ -175,8 +175,8 @@ fn checkpoint_submits_the_first_ready_generation() {
     const CHILD: &str = "SUNPACK_ADMISSION_CHECKPOINT_TEST";
     if let Some(base) = std::env::var_os(CHILD) {
         let base = PathBuf::from(base);
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         for case in ["stable", "resnapshot", "content", "claim", "owned", "owned_content", "error", "stop"] {
             let directory = base.join(case);
@@ -401,8 +401,8 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
     const CHILD: &str = "SUNPACK_SURVIVING_OUTPUT_RECOVERY_TEST";
     if let Some(base) = std::env::var_os(CHILD) {
         let base = PathBuf::from(base);
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         for case in ["source", "missing", "active"] {
             let directory = base.join(case);
@@ -494,8 +494,8 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
     const CHILD: &str = "SUNPACK_RELOAD_PENDING_RECOVERY_TEST";
     if let Some(base) = std::env::var_os(CHILD) {
         let base = PathBuf::from(base);
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         let configuration = base.join("sunpack_advanced_config.json");
         fs::write(&configuration, br#"{"cli":{"language":"en"}}"#).unwrap();
         let directory = base.join("recovery");
@@ -620,8 +620,8 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
     const CHILD: &str = "SUNPACK_PASSWORD_RETRY_QUIET_TEST";
     if let Some(base) = std::env::var_os(CHILD) {
         let base = PathBuf::from(base);
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let directory = base.join("password");
         let watched = directory.join("watched");
@@ -754,8 +754,8 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             std::env::set_var(sunpack_usn_core::PIPE_NAME_ENV,
                 format!("{}{suffix}", sunpack_usn_core::TEST_PIPE_NAME_PREFIX));
         }
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let directory = base.join("events");
         let watched = directory.join("watched");
@@ -881,8 +881,8 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
     const CHILD: &str = "SUNPACK_SCHEDULER_FAULT_SERVICE_TEST";
     if let Some(base) = std::env::var_os(CHILD) {
         let base = PathBuf::from(base);
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), br#"{"watch":{"clipboard_monitor_enabled":false,"toast_enabled":false}}"#).unwrap();
         let watched = base.join("watched");
         fs::create_dir_all(&watched).unwrap();
@@ -943,8 +943,8 @@ fn a_retired_toast_activation_is_successful_and_leaves_current_request_running()
     const CHILD: &str = "SUNPACK_WATCH_RETIRED_TOAST_TEST";
     if let Some(base) = std::env::var_os(CHILD) {
         let base = PathBuf::from(base);
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let mut scheduler = Scheduler::open(base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
             Arc::new(Hub::new()), false, Arc::default(), config::load_snapshot(&base).unwrap()).unwrap();
@@ -971,8 +971,8 @@ fn coalesced_watch_completion_keeps_the_leaders_blocker() {
         let base = PathBuf::from(base);
         let watched = base.join("watched");
         fs::create_dir_all(&watched).unwrap();
-        fs::create_dir_all(base.join("native")).unwrap();
-        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::create_dir_all(base.join("sunpack")).unwrap();
+        fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
         let mut scheduler = Scheduler::open(
             base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),

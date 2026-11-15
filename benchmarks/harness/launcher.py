@@ -24,7 +24,7 @@ class NativePackage:
         self.install.mkdir(parents=True)
         self.data.mkdir(parents=True)
         target = {"x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}[arch]
-        wrapper = REPO_ROOT / "native/sevenzip_bridge" / f"build-{arch}{'-ci' if profile == 'ci' else ''}" / "Release"
+        wrapper = REPO_ROOT / "sunpack/sevenzip_bridge" / f"build-{arch}{'-ci' if profile == 'ci' else ''}" / "Release"
         package = launcher.resolve().parent if launcher else None
         if package is not None and package.name.lower() == "bin":
             package = package.parent

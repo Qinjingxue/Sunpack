@@ -22,9 +22,9 @@ if (Test-Path -LiteralPath $statePath) {
 $inputs = if ($Scope -eq "gui") {
     @("gui", "tests/gui", "scripts/build_gui.ps1",
       "scripts/restore_native_cache_times.ps1", "sunpack.manifest",
-      "sunpack_advanced_config.json", "native/third_party/lz4")
+      "sunpack_advanced_config.json", "sunpack/third_party/lz4")
 } else {
-    @("native", "scripts", ":(exclude)scripts/build_gui.ps1", "sunpack.manifest",
+    @("sunpack", "scripts", ":(exclude)scripts/build_gui.ps1", "sunpack.manifest",
       "sunpack.ico", "sunpack_advanced_config.json")
 }
 $tracked = @(& git -C $repoRoot -c core.quotepath=false ls-files --stage -- $inputs)

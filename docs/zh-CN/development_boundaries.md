@@ -2,7 +2,7 @@
 
 [English](../development_boundaries.md) | **简体中文**
 
-Windows 运行时位于 `native/sunpack_native`。模块依赖方向为 `runtime → pipeline → core`。调度层和共享基础层使用现有归档分析、I/O 和文件系统模块。
+Windows 运行时位于 `sunpack/sunpack_runtime`。模块依赖方向为 `runtime → pipeline → core`。调度层和共享基础层使用现有归档分析、I/O 和文件系统模块。
 
 | 层 | 职责 |
 | --- | --- |

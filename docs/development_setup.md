@@ -18,13 +18,13 @@ SunPack is a Windows-only project. Cargo builds the Rust runtime and Watch Broke
 Main project directories:
 
 ```text
-native/sunpack_native/      Rust orchestration and computation, CLI and Watch
-native/sunpack_usn_core/    Shared NTFS/USN Rust core
-native/sunpack_watch_broker/Windows Watch Broker service
-native/sevenzip_bridge/     Windows 7z.dll bridge and worker
-native/toast_host/          Windows toast DLL
-tools/                      x64 external tools and native build outputs
-tools-arm64/                ARM64 external tools and native build outputs
+sunpack/sunpack_runtime/      Rust orchestration and computation, CLI and Watch
+sunpack/sunpack_usn_core/     Shared NTFS/USN Rust core
+sunpack/sunpack_watch_broker/ Windows Watch Broker service
+sunpack/sevenzip_bridge/      Windows 7z.dll bridge and worker
+sunpack/toast_host/           Windows toast DLL
+tools/                        x64 external tools and native build outputs
+tools-arm64/                  ARM64 external tools and native build outputs
 ```
 
 ## Python dependencies
@@ -75,12 +75,12 @@ On x64, setup also prepares the acceptance fixture generators under `.sunpack_te
 
 ## USN Watch Broker
 
-watch uses the NTFS USN Journal to determine whether file contents have changed and whether a file has crossed a write boundary. Operations that need volume-level Journal access are concentrated in `native/sunpack_usn_core` and `native/sunpack_watch_broker`. Watch consumes the typed file observations and state directly.
+watch uses the NTFS USN Journal to determine whether file contents have changed and whether a file has crossed a write boundary. Operations that need volume-level Journal access are concentrated in `sunpack/sunpack_usn_core` and `sunpack/sunpack_watch_broker`. Watch consumes the typed file observations and state directly.
 
 ### Components and lifecycle
 
-- `native/sunpack_usn_core` is a Windows-only Rust crate containing volume identification, Journal probing, bounded USN reason reads, and the named pipe client protocol.
-- `native/sunpack_watch_broker` compiles to `sunpack-watch-broker.exe` and runs as a Windows service, holding volume-level Journal access.
+- `sunpack/sunpack_usn_core` is a Windows-only Rust crate containing volume identification, Journal probing, bounded USN reason reads, and the named pipe client protocol.
+- `sunpack/sunpack_watch_broker` compiles to `sunpack-watch-broker.exe` and runs as a Windows service, holding volume-level Journal access.
 - At startup, watch acquires a process-level lease. The first lease starts the service on demand and establishes a local named pipe connection. Later leases in the same process reuse the connection. Releasing the last lease closes the connection.
 - The service starts on demand. It exits if the first client has not connected within 5 seconds; after the last lease is released it waits 1 second before exiting. Each service keeps at most 64 clients and 64 volume contexts.
 
@@ -110,7 +110,7 @@ Before a watch root starts, the path is verified to be on an NTFS volume with a 
 x64:
 
 ```powershell
-cargo build --locked --manifest-path native\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
+cargo build --locked --manifest-path sunpack\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
 ```
 
 For ARM64, replace the target triple and target directory with `aarch64-pc-windows-msvc` and `.cache\rust-target\arm64`. The output file is:
@@ -144,16 +144,16 @@ Repository scripts can install or uninstall a temporary service; the scripts rej
 ### Rust runtime
 
 ```powershell
-cargo build --locked --manifest-path native\Cargo.toml -p sunpack-native --bin sunpack-runtime --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
+cargo build --locked --manifest-path sunpack\Cargo.toml -p sunpack-runtime --bin sunpack-runtime --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
 ```
 
 ### C++ embedded 7-Zip worker
 
 ```powershell
-cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-x64 -A x64
-cmake --build native\sevenzip_bridge\build-x64 --config Release
-ctest --test-dir native\sevenzip_bridge\build-x64 -C Release --output-on-failure
-Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe tools\sunpack_sevenzip_worker.exe -Force
+cmake -S sunpack\sevenzip_bridge -B sunpack\sevenzip_bridge\build-x64 -A x64
+cmake --build sunpack\sevenzip_bridge\build-x64 --config Release
+ctest --test-dir sunpack\sevenzip_bridge\build-x64 -C Release --output-on-failure
+Copy-Item sunpack\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe tools\sunpack_sevenzip_worker.exe -Force
 ```
 
 The product worker embeds the retained 7-Zip sources and does not load `7z.dll` at run time.
@@ -161,10 +161,10 @@ The product worker embeds the retained 7-Zip sources and does not load `7z.dll` 
 ### Windows toast
 
 ```powershell
-cmake -S native\toast_host -B native\toast_host\build-x64 -A x64
-cmake --build native\toast_host\build-x64 --config Release
-ctest --test-dir native\toast_host\build-x64 -C Release --output-on-failure
-Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_toast.dll -Force
+cmake -S sunpack\toast_host -B sunpack\toast_host\build-x64 -A x64
+cmake --build sunpack\toast_host\build-x64 --config Release
+ctest --test-dir sunpack\toast_host\build-x64 -C Release --output-on-failure
+Copy-Item sunpack\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_toast.dll -Force
 ```
 
 A continuously running watch creates Windows notification capability according to `watch.toast_enabled` and sends progress, completion, and failure notifications as configured. Notification failure reports are written to `.sunpack_watch/failures` under the writable data directory.
@@ -172,7 +172,7 @@ A continuously running watch creates Windows notification capability according t
 ## Smoke checks
 
 ```powershell
-cargo test --locked --manifest-path native\Cargo.toml --workspace --profile ci
+cargo test --locked --manifest-path sunpack\Cargo.toml --workspace --profile ci
 ```
 
 ## Testing

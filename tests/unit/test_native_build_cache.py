@@ -16,13 +16,13 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.fixture
 def cache_checkout(tmp_path):
     (tmp_path / "scripts").mkdir()
-    (tmp_path / "native").mkdir()
+    (tmp_path / "sunpack").mkdir()
     script = tmp_path / "scripts" / "restore_native_cache_times.ps1"
     shutil.copyfile(ROOT / "scripts" / script.name, script)
-    source = tmp_path / "native" / "source.cpp"
+    source = tmp_path / "sunpack" / "source.cpp"
     source.write_text("int value = 1;\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(tmp_path), "add", "native", "scripts"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "sunpack", "scripts"], check=True, capture_output=True)
 
     def run(key, profile="ci", scope="native"):
         result = subprocess.run(

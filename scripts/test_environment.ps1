@@ -74,7 +74,7 @@ function Get-NativeArtifactRefreshReasons {
         [ValidateSet("x64", "arm64")][string]$Arch = "x64",
         [ValidateSet("release", "ci")][string]$BuildProfile = "ci"
     )
-    $nativeRoot = Join-Path $RepoRoot "native"
+    $nativeRoot = Join-Path $RepoRoot "sunpack"
     $toolsRoot = if ($Arch -eq "arm64") { Join-Path $RepoRoot "tools-arm64" } else { Join-Path $RepoRoot "tools" }
     $buildSuffix = if ($BuildProfile -eq "ci") { "-ci" } else { "" }
     $sevenZipOutputs = Join-Path $nativeRoot "sevenzip_bridge\build-$Arch$buildSuffix\Release"
@@ -100,12 +100,12 @@ function Get-NativeArtifactRefreshReasons {
                 (Join-Path $RepoRoot "sunpack.manifest"),
                 (Join-Path $RepoRoot "sunpack.ico")
             )),
-            (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_native")),
+            (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_runtime")),
             (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_enc"))
         ) },
         @{ Name = "Native test fixture"; Artifact = (Join-Path $toolsRoot "real_fixture.exe"); InputTime = @(
             $sharedRustTime, $lz4Time,
-            (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_native")),
+            (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_runtime")),
             (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_enc"))
         ) },
         @{ Name = "Watch Broker"; Artifact = (Get-WatchBrokerBuildPath -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile); InputTime = @(

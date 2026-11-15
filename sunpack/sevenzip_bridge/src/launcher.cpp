@@ -118,7 +118,7 @@ InstallContext install_context(const std::wstring& executable) {
         const bool ci = name.size() >= 3 && name.compare(name.size() - 3, 3, L"-ci") == 0;
         const auto arch = ci ? name.substr(0, name.size() - 3) : name;
         if ((arch == L"build-x64" || arch == L"build-arm64") &&
-            file_exists((root / L"native" / L"Cargo.toml").wstring())) {
+            file_exists((root / L"sunpack" / L"Cargo.toml").wstring())) {
             const auto target = arch == L"build-arm64"
                 ? L"aarch64-pc-windows-msvc" : L"x86_64-pc-windows-msvc";
             const auto platform = arch == L"build-arm64" ? L"arm64" : L"x64";

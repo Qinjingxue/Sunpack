@@ -75,7 +75,7 @@ def bridge(*, source_root: Path = ROOT, meter: bool = False, destination: Path |
         raise ValueError("A candidate source root requires an explicit destination, separate from the reference probe")
     dest = (destination or CACHE / ("bridge-meter" if meter else "bridge")).resolve()
     (dest / "src/scan").mkdir(parents=True, exist_ok=True)
-    native = source_root / "native/sunpack_native/src"
+    native = source_root / "sunpack/sunpack_runtime/src"
     root = (NATIVE / "bridge_root.rs").read_text(encoding="utf-8")
     embedded = (native / "scan/embedded.rs").read_text(encoding="utf-8")
     begin = embedded.index("#[derive(Debug, Clone, PartialEq, Eq)]\n#[repr(C)]\nstruct RawHit")

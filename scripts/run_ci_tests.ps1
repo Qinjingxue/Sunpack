@@ -104,7 +104,7 @@ try {
     $target = if ($Arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
     Write-Host "Native test build: $Arch/$BuildProfile"
     Invoke-TestStep -Label "Rust correctness tests" -Command @(
-        "cargo", "test", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
+        "cargo", "test", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
         "--workspace", "--profile", $BuildProfile, "--target", $target,
         "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
     )

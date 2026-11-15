@@ -14,7 +14,7 @@ build/
 dist/
 release/
 
-native/**/build-x64/
+sunpack/**/build-x64/
 # Rust native build artifacts
 
 # Virtual environments
@@ -62,10 +62,10 @@ test_extract/
 GEMINI.md
 test_extract_folder/
 test_targz/
-native/sunpack_native/target/
-native/**/target/
-native/target/
-native/sevenzip_bridge/build-*/
+sunpack/sunpack_runtime/target/
+sunpack/**/target/
+sunpack/target/
+sunpack/sevenzip_bridge/build-*/
 .sunpack/
 .sunpack_watch_validation/
 .sunpack_test_installer/
@@ -99,7 +99,7 @@ tests/real/corpus/
 
 演示样本/
 
-native/toast_host/build-*/
+sunpack/toast_host/build-*/
 /tools-arm64/
 runtime-v2-0000000000000000.state.events.json.store/
 runtime-v2-0000000000000000.state.events.json

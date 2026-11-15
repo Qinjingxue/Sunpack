@@ -24,8 +24,8 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
         return;
     };
     let base = PathBuf::from(base);
-    fs::create_dir_all(base.join("native")).unwrap();
-    fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+    fs::create_dir_all(base.join("sunpack")).unwrap();
+    fs::write(base.join("sunpack/Cargo.toml"), b"").unwrap();
     fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
     let directory = base.join("state");
     let settings = Arc::new(Config::default());

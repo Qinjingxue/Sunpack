@@ -1,10 +1,10 @@
 [package]
-name = "sunpack-native"
+name = "sunpack-runtime"
 edition = "2021"
 license = "MIT"
 
 [lib]
-name = "sunpack_native"
+name = "sunpack_runtime"
 crate-type = ["rlib"]
 
 [dependencies]

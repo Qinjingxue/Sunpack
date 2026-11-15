@@ -322,7 +322,7 @@ def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu
         shutil.copyfile(Path(__file__).resolve().parents[2] / "scripts" / name, scripts_dir / name)
     arch = "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x64"
     target = {"arm64": "aarch64-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc"}[arch]
-    stub = tmp_path / "native" / "sevenzip_bridge" / f"build-{arch}-ci" / "Release" / "sunpack_launcher.exe"
+    stub = tmp_path / "sunpack" / "sevenzip_bridge" / f"build-{arch}-ci" / "Release" / "sunpack_launcher.exe"
     stub.parent.mkdir(parents=True)
     shutil.copyfile(native_argument_recorder, stub)
     runtime = tmp_path / ".cache" / "rust-target" / arch / target / "ci" / "sunpack-runtime.exe"

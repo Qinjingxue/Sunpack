@@ -688,23 +688,23 @@ $venvPath = Join-Path $repoRoot ".venv"
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
 $venvScripts = Join-Path $venvPath "Scripts"
 $projectPath = Join-Path $repoRoot "pyproject.toml"
-$nativeCrateRoot = Join-Path $repoRoot "native\sunpack_native"
+$nativeCrateRoot = Join-Path $repoRoot "sunpack\sunpack_runtime"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
-$nativeWorkspaceLock = Join-Path $repoRoot "native\Cargo.lock"
-$watchBrokerCargoToml = Join-Path $repoRoot "native\sunpack_watch_broker\Cargo.toml"
+$nativeWorkspaceLock = Join-Path $repoRoot "sunpack\Cargo.lock"
+$watchBrokerCargoToml = Join-Path $repoRoot "sunpack\sunpack_watch_broker\Cargo.toml"
 $rustTargetDir = Join-Path $repoRoot (".cache\rust-target\" + $buildArch)
 $watchBrokerBuildPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
-$sevenZipWrapperRoot = Join-Path $repoRoot "native\sevenzip_bridge"
+$sevenZipWrapperRoot = Join-Path $repoRoot "sunpack\sevenzip_bridge"
 $buildSuffix = if ($BuildProfile -eq "ci") { "-ci" } else { "" }
 $lto = if ($BuildProfile -eq "ci") { "OFF" } else { "ON" }
 $sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch + $buildSuffix)
-$toastHostRoot = Join-Path $repoRoot "native\toast_host"
+$toastHostRoot = Join-Path $repoRoot "sunpack\toast_host"
 $toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch + $buildSuffix)
 $toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
 $sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
 
 Assert-PathExists -LiteralPath $projectPath -Description "pyproject.toml"
-Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_native Cargo manifest"
+Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_runtime Cargo manifest"
 Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust workspace lockfile"
 Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"

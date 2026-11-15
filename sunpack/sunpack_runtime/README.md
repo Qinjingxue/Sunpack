@@ -1,4 +1,4 @@
-# sunpack_native
+# sunpack_runtime
 
 The Windows runtime shares typed archive inputs, directory snapshots, password
 data, and output inventories across CLI, Watch, and the native computation
@@ -13,7 +13,7 @@ C++ worker embeds the 7-Zip backend and communicates over SPBF.
 
 ```powershell
 .\scripts\setup_windows_dev.ps1
-cargo test --locked --manifest-path native\Cargo.toml --workspace --profile ci
+cargo test --locked --manifest-path sunpack\Cargo.toml --workspace --profile ci
 ```
 
 The packaging script stages `sunpack-runtime.exe` with the CLI launcher, worker,

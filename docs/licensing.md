@@ -22,12 +22,12 @@ scope and preserved SunPack modifications.
 
 The repository keeps its 7-Zip 26.05 runtime subset at the historical path:
 
-`native/sevenzip_bridge/7z2604-src/`
+`sunpack/sevenzip_bridge/7z2604-src/`
 
 That subtree is governed by the upstream 7-Zip source license, not by SunPack's
 MIT License. The authoritative copy bundled with the source tree is:
 
-`native/sevenzip_bridge/7z2604-src/DOC/License.txt`
+`sunpack/sevenzip_bridge/7z2604-src/DOC/License.txt`
 
 A convenience copy is also kept at:
 
@@ -65,7 +65,7 @@ boundaries easy to audit and reduces merge friction when updating 7-Zip.
 The native ZIP Deflate fast path vendors the required zlib-ng 2.3.3 build
 sources at:
 
-`native/sevenzip_bridge/zlib-ng-2.3.3/`
+`sunpack/sevenzip_bridge/zlib-ng-2.3.3/`
 
 Those files are pinned to upstream commit
 `12731092979c6d07f42da27da673a9f6c7b13586` and remain under the upstream

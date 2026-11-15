@@ -26,7 +26,7 @@ void native_context_menu_entrypoint(Fixture& fixture) {
         "param([Parameter(Mandatory=$true)][string]$AppPath)\nSet-Content -LiteralPath (Join-Path $PSScriptRoot 'enabled.txt') -Value $AppPath -Encoding UTF8");
     atomic_write(app / "scripts" / "unregister_context_menu.ps1",
         "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'disabled.txt') -Value 'ok' -Encoding UTF8");
-    CliCommand cli{app / "native" / "sunpack_launcher.exe", fixture.dir, {}, app};
+    CliCommand cli{app / "sunpack" / "sunpack_launcher.exe", fixture.dir, {}, app};
     Handle stop(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     set_context_menu_enabled(cli, true, stop);
     const auto enabled = read_file(app / "scripts" / "enabled.txt");

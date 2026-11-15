@@ -18,13 +18,13 @@ SunPack 是 Windows-only 项目。Cargo 构建 Rust 运行时和 Watch Broker，
 项目主要目录：
 
 ```text
-native/sunpack_native/      Rust 调度与计算核心、CLI 和 Watch
-native/sunpack_usn_core/    NTFS/USN 共用 Rust 核心
-native/sunpack_watch_broker/Windows Watch Broker 服务
-native/sevenzip_bridge/     Windows 7z.dll bridge 与 worker
-native/toast_host/          Windows toast DLL
-tools/                      x64 外部工具和原生构建产物
-tools-arm64/                ARM64 外部工具和原生构建产物
+sunpack/sunpack_runtime/      Rust 调度与计算核心、CLI 和 Watch
+sunpack/sunpack_usn_core/     NTFS/USN 共用 Rust 核心
+sunpack/sunpack_watch_broker/ Windows Watch Broker 服务
+sunpack/sevenzip_bridge/      Windows 7z.dll bridge 与 worker
+sunpack/toast_host/           Windows toast DLL
+tools/                        x64 外部工具和原生构建产物
+tools-arm64/                  ARM64 外部工具和原生构建产物
 ```
 
 ## Python 依赖
@@ -75,12 +75,12 @@ x64 环境还会在 `.sunpack_test_tools/` 下准备验收测试的压缩包生�
 
 ## USN Watch Broker
 
-watch 使用 NTFS USN Journal 判断文件内容变化和文件是否已经跨过写入边界。需要访问卷级 Journal 的操作集中在 `native/sunpack_usn_core` 和 `native/sunpack_watch_broker`，Watch 直接消费 Rust 文件观察结果和状态。
+watch 使用 NTFS USN Journal 判断文件内容变化和文件是否已经跨过写入边界。需要访问卷级 Journal 的操作集中在 `sunpack/sunpack_usn_core` 和 `sunpack/sunpack_watch_broker`，Watch 直接消费 Rust 文件观察结果和状态。
 
 ### 组件和生命周期
 
-- `native/sunpack_usn_core` 是 Windows-only Rust crate，包含卷标识、Journal 探测、有限范围的 USN reason 读取以及命名管道客户端协议。
-- `native/sunpack_watch_broker` 编译为 `sunpack-watch-broker.exe`，以 Windows service 运行，持有卷级 Journal 访问能力。
+- `sunpack/sunpack_usn_core` 是 Windows-only Rust crate，包含卷标识、Journal 探测、有限范围的 USN reason 读取以及命名管道客户端协议。
+- `sunpack/sunpack_watch_broker` 编译为 `sunpack-watch-broker.exe`，以 Windows service 运行，持有卷级 Journal 访问能力。
 - watch 启动时先取得一个进程级 lease。第一个 lease 负责按需启动服务并建立本地 named pipe 连接，同一进程中的后续 lease 复用连接，最后一个 lease 释放时关闭连接。
 - 服务按需启动。第一个客户端在 5 秒内未连接时服务退出；最后一个 lease 释放后等待 1 秒再退出。每个服务最多保留 64 个客户端和 64 个卷上下文。
 
@@ -110,7 +110,7 @@ watch 根启动前会验证路径位于 NTFS 卷且 Journal 可读。Journal 不
 x64：
 
 ```powershell
-cargo build --locked --manifest-path native\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
+cargo build --locked --manifest-path sunpack\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
 ```
 
 ARM64 将目标三元组和目标目录替换为 `aarch64-pc-windows-msvc` 与 `.cache\rust-target\arm64`。输出文件为：
@@ -144,16 +144,16 @@ Pipe:    \\.\pipe\SunPack.WatchBroker.Test.<id>
 ### Rust 运行时
 
 ```powershell
-cargo build --locked --manifest-path native\Cargo.toml -p sunpack-native --bin sunpack-runtime --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
+cargo build --locked --manifest-path sunpack\Cargo.toml -p sunpack-runtime --bin sunpack-runtime --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
 ```
 
 ### C++ 内嵌 7-Zip worker
 
 ```powershell
-cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-x64 -A x64
-cmake --build native\sevenzip_bridge\build-x64 --config Release
-ctest --test-dir native\sevenzip_bridge\build-x64 -C Release --output-on-failure
-Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe tools\sunpack_sevenzip_worker.exe -Force
+cmake -S sunpack\sevenzip_bridge -B sunpack\sevenzip_bridge\build-x64 -A x64
+cmake --build sunpack\sevenzip_bridge\build-x64 --config Release
+ctest --test-dir sunpack\sevenzip_bridge\build-x64 -C Release --output-on-failure
+Copy-Item sunpack\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe tools\sunpack_sevenzip_worker.exe -Force
 ```
 
 产品 worker 内嵌保留的 7-Zip 源码，运行时不加载 `7z.dll`。
@@ -161,10 +161,10 @@ Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe t
 ### Windows toast
 
 ```powershell
-cmake -S native\toast_host -B native\toast_host\build-x64 -A x64
-cmake --build native\toast_host\build-x64 --config Release
-ctest --test-dir native\toast_host\build-x64 -C Release --output-on-failure
-Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_toast.dll -Force
+cmake -S sunpack\toast_host -B sunpack\toast_host\build-x64 -A x64
+cmake --build sunpack\toast_host\build-x64 --config Release
+ctest --test-dir sunpack\toast_host\build-x64 -C Release --output-on-failure
+Copy-Item sunpack\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_toast.dll -Force
 ```
 
 持续运行的 watch 按 `watch.toast_enabled` 创建 Windows 通知能力，并按配置发送进度、完成和失败通知。通知失败报告写入可写数据目录下的 `.sunpack_watch/failures`。
@@ -172,7 +172,7 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 ## 验证
 
 ```powershell
-cargo test --locked --manifest-path native\Cargo.toml --workspace --profile ci
+cargo test --locked --manifest-path sunpack\Cargo.toml --workspace --profile ci
 ```
 
 ## 测试

@@ -24,7 +24,7 @@
 uv sync --locked --extra test
 .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci
 .\.venv\Scripts\python.exe -m pytest tests -m "not requires_watch_broker"
-cargo test --manifest-path native/Cargo.toml --locked --workspace --profile ci
+cargo test --manifest-path sunpack/Cargo.toml --locked --workspace --profile ci
 ```
 
 `requires_watch_broker` 用例需要专用服务和管道；未配置时跳过。验收入口负责启动和清理隔离服务。运行本地 CI 或完整验收：

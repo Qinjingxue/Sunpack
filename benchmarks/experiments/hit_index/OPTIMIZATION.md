@@ -144,7 +144,7 @@ Watch 验证包含真实载体、WAL 恢复和密码续作；本轮未运行依�
 .venv/Scripts/python.exe -m benchmarks scan hit-index --corpus-manifest benchmarks/results/scan.hit-index/20261103T105334Z-7f153eff/corpus.json --reference-bridge benchmarks/.cache/hit-index-optimization/before/reference-probe.dll --candidate-bridge benchmarks/.cache/hit-index-optimization/reused-stats-probe/target/release/sunpack_hit_index_probe.dll --reference-module-root benchmarks/.cache/hit-index-optimization/before-release/module --candidate-module-root benchmarks/.cache/hit-index-optimization/reused-stats-release/module --conformance-report benchmarks/results/scan.hit-index/20261103T132934Z-88814886/report.json --full-scan --strict
 ```
 
-扩展构建使用 `cargo build --offline --release --manifest-path native/Cargo.toml -p sunpack-native`，
+扩展构建使用 `cargo build --offline --release --manifest-path sunpack/Cargo.toml -p sunpack-runtime`，
 原版对其独立源码快照使用相同命令和 profile，分别复制到表中 module root。
 最终 Python 回归日志为 `benchmarks/.cache/hit-index-optimization/pytest-reused-stats-release.log`，263 项 Rust 测试也在最终源码上重新通过。
 
