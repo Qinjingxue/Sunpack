@@ -433,7 +433,7 @@ pub(crate) fn build_native_candidate_groups_from_snapshot(
     let filtered_keys: HashSet<String> = filtered_snapshot
         .rows
         .iter()
-        .filter(|&&row| !filtered_snapshot.table.is_dirs[row])
+        .filter(|&&row| !filtered_snapshot.table.is_dir(row))
         .map(|&row| path_key(&filtered_snapshot.table.paths[row]))
         .collect();
     if filtered_keys.is_empty() {

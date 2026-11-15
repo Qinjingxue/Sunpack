@@ -124,6 +124,14 @@ def wait_for(condition, description, timeout=60):
     pytest.fail(f"Did not observe {description}")
 
 
+def source_directory_cleaned(directory):
+    try:
+        with os.scandir(directory) as entries:
+            return next(entries, None) is None
+    except FileNotFoundError:
+        return True
+
+
 def download(watch, source, *, mode="rename", directory=None, interrupt=False, resume=False):
     directory = directory or watch.root
     directory.mkdir(parents=True, exist_ok=True)

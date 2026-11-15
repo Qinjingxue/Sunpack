@@ -102,11 +102,7 @@ pub struct Request {
 
 /// A one-shot handoff of the existing relation plan, not a second discovery.
 /// Its directory snapshot is released with the submitted request.
-pub(crate) struct PreparedVolume {
-    path: String,
-    generations: Vec<(String, crate::io::reader::PhysicalFileGeneration)>,
-    tasks: std::sync::Mutex<Option<Vec<discovery::Task>>>,
-}
+pub(crate) struct PreparedVolume(std::sync::Mutex<Option<discovery::PreparedVolumePlan>>);
 
 impl Request {
     pub fn new(inputs: Vec<PathBuf>, mode: Mode) -> Self {
@@ -202,7 +198,7 @@ pub struct Failure {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Box<FailureContext>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discovery_scope: Option<Box<FailureScope>>,
+    pub discovery_scope: Option<Arc<FailureScope>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recovery: Option<Arc<checkpoint::InputRecovery>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -250,30 +250,24 @@ impl Drop for BrokerLease {
     }
 }
 
-// Keep synchronous tests/OS callbacks compatible, while async commands await
-// the existing reply cell. Dropping an unserved command always wakes its caller.
-enum CommandReply<T> {
-    #[cfg(test)]
-    Sync(mpsc::SyncSender<io::Result<T>>),
-    Async(Option<Arc<Reply<T>>>),
-}
+// Dropping an unserved command wakes its caller.
+struct CommandReply<T>(Option<Arc<Reply<T>>>);
+
 impl<T> CommandReply<T> {
-    fn send(mut self, value: io::Result<T>) -> io::Result<()> {
-        match &mut self {
-            #[cfg(test)]
-            Self::Sync(send) => send.send(value).map_err(|_| io::Error::other("Watch reply disconnected")),
-            Self::Async(reply) => { reply.take().unwrap().complete(value); Ok(()) }
-        }
+    fn send(mut self, value: io::Result<T>) {
+        self.0.take().unwrap().complete(value);
     }
 }
 impl<T> Drop for CommandReply<T> {
     fn drop(&mut self) {
-        if let Self::Async(Some(reply)) = self { reply.complete(Err(io::ErrorKind::Interrupted.into())); }
+        if let Some(reply) = self.0.take() {
+            reply.complete(Err(io::ErrorKind::Interrupted.into()));
+        }
     }
 }
 fn command_reply<T: Default>() -> (CommandReply<T>, Arc<Reply<T>>) {
     let reply = Arc::new(Reply::default());
-    (CommandReply::Async(Some(Arc::clone(&reply))), reply)
+    (CommandReply(Some(Arc::clone(&reply))), reply)
 }
 
 // The once caller and a concurrent stop can both observe terminal completion.
@@ -383,13 +377,14 @@ impl Watch {
     pub(super) fn generation(&self) -> u64 { self.generation.load(Ordering::Acquire) }
 
     pub(super) fn status(&self, cwd: &Path) -> io::Result<Value> {
+        let state_dir = state_dir(cwd)?;
         let slot = self.running.lock().unwrap();
         let run = slot.as_ref().filter(|run| run.continuous());
         Ok(json!({
             "running": run.is_some(), "generation": self.generation.load(Ordering::Relaxed),
             "pending": run.map_or(0, |run| run.hub.pending_count.load(Ordering::Relaxed)),
             "last_error": self.last_error.lock().unwrap().as_deref().unwrap_or(""),
-            "state_dir": state_dir(cwd)?,
+            "state_dir": state_dir,
         }))
     }
 
@@ -466,11 +461,11 @@ impl Watch {
                 Scheduler::open(cwd, engine, worker_hub, !once, tray, external, snapshot)
             }) {
                 Ok(scheduler) => {
-                    let _ = ready.send(Ok(()));
+                    ready.send(Ok(()));
                     scheduler.run_service(once, &last_error)
                 }
                 Err(error) => {
-                    let _ = ready.send(Err(io::Error::new(error.kind(), error.to_string())));
+                    ready.send(Err(io::Error::new(error.kind(), error.to_string())));
                     Err(error)
                 }
             };
@@ -1765,51 +1760,74 @@ struct Pending {
 #[derive(Default)]
 struct CandidateDiagnostics {
     paths: HashMap<Arc<str>, u8>,
-    order: VecDeque<(Instant, Arc<str>, usize)>,
-    next_expiry: Option<Instant>,
+    readiness: VecDeque<DiagnosticExpiry>,
+    observations: VecDeque<DiagnosticExpiry>,
+    sequence: u64,
+}
+
+struct DiagnosticExpiry {
+    expires: Instant,
+    sequence: u64,
+    path: Arc<str>,
+    flag: u8,
 }
 
 impl CandidateDiagnostics {
     fn retire_first(&mut self) {
-        if let Some((_, path, event)) = self.order.pop_front() {
-            Self::remove_event(&mut self.paths, &path, event);
-        }
+        let queue = match (self.readiness.front(), self.observations.front()) {
+            (Some(wait), Some(observation)) if wait.sequence > observation.sequence => &mut self.observations,
+            (Some(_), _) => &mut self.readiness,
+            (None, _) => &mut self.observations,
+        };
+        Self::remove_event(&mut self.paths, queue.pop_front().unwrap());
+        if queue.is_empty() { *queue = VecDeque::new(); }
     }
 
-    fn remove_event(paths: &mut HashMap<Arc<str>, u8>, path: &str, event: usize) {
-        let events = paths.get_mut(path).unwrap();
-        *events &= !(1 << event);
-        if *events == 0 { paths.remove(path); }
+    fn remove_event(paths: &mut HashMap<Arc<str>, u8>, entry: DiagnosticExpiry) {
+        let events = paths.get_mut(&entry.path).unwrap();
+        *events &= !entry.flag;
+        if *events == 0 { paths.remove(&entry.path); }
     }
 
     fn clear_expired(&mut self, now: Instant) {
-        if self.next_expiry.is_none_or(|expiry| expiry > now) { return; }
-        let paths = &mut self.paths;
-        self.order.retain(|(expiry, path, event)| {
-            if *expiry > now { return true; }
-            Self::remove_event(paths, path, *event);
-            false
-        });
-        self.next_expiry = self.order.iter().map(|(expiry, _, _)| *expiry).min();
-        if self.order.is_empty() {
-            self.paths = HashMap::new();
-            self.order = VecDeque::new();
+        for queue in [&mut self.readiness, &mut self.observations] {
+            while queue.front().is_some_and(|entry| entry.expires <= now) {
+                Self::remove_event(&mut self.paths, queue.pop_front().unwrap());
+            }
+            if queue.is_empty() { *queue = VecDeque::new(); }
         }
+        if self.paths.is_empty() && self.paths.capacity() != 0 { self.paths = HashMap::new(); }
     }
 
-    fn deadline(&self) -> Option<Instant> { self.next_expiry }
+    fn deadline(&self) -> Option<Instant> {
+        self.readiness.front().into_iter().chain(self.observations.front())
+            .map(|entry| entry.expires).min()
+    }
 
-    fn admit(&mut self, now: Instant, id: &str, event: usize, seconds: u64) -> bool {
+    fn len(&self) -> usize { self.readiness.len() + self.observations.len() }
+
+    fn admit(&mut self, now: Instant, id: &str, event: usize) -> bool {
         self.clear_expired(now);
         let flag = 1 << event;
         if self.paths.get(id).is_some_and(|events| events & flag != 0) { return false; }
-        if self.order.len() == 2048 { self.retire_first(); }
+        if self.len() == 2048 { self.retire_first(); }
         let id = self.paths.get_key_value(id).map(|(id, _)| Arc::clone(id))
             .unwrap_or_else(|| Arc::from(id));
-        let expiry = now + std::time::Duration::from_secs(seconds);
         *self.paths.entry(Arc::clone(&id)).or_default() |= flag;
-        self.order.push_back((expiry, id, event));
-        self.next_expiry = Some(self.next_expiry.map_or(expiry, |next| next.min(expiry)));
+        // Each queue has a fixed lifetime, so timestamps from the scheduler
+        // keep its expirations ordered even when the two classes interleave.
+        let (queue, seconds) = if event < 2 {
+            (&mut self.readiness, 30)
+        } else {
+            (&mut self.observations, 300)
+        };
+        self.sequence += 1;
+        queue.push_back(DiagnosticExpiry {
+            expires: now + std::time::Duration::from_secs(seconds),
+            sequence: self.sequence,
+            path: id,
+            flag,
+        });
         true
     }
 
@@ -1823,12 +1841,12 @@ impl CandidateDiagnostics {
 
     fn log_observation(&mut self, journal: &journal::Journal, now: Instant,
         id: &str, path: &str, error: &io::Error, event: Option<&CandidateEvent>) {
-        if !self.admit(now, id, 2, 300) { return; }
+        if !self.admit(now, id, 2) { return; }
         journal.log(Self::observation_record(path, error, event));
     }
 
     fn log_unobservable(&mut self, journal: &journal::Journal, now: Instant, id: &str, path: &str) {
-        if self.admit(now, id, 3, 300) {
+        if self.admit(now, id, 3) {
             journal.log(json!({"event":"candidate_ignored", "path":path,
                 "reason":"not_a_file_or_unreadable"}));
         }
@@ -1844,7 +1862,7 @@ impl CandidateDiagnostics {
 
     fn log_wait(&mut self, journal: &journal::Journal, now: Instant, id: &str,
                 path: &str, error: Option<&io::Error>) {
-        if !self.admit(now, id, usize::from(error.is_some()), 30) { return; }
+        if !self.admit(now, id, usize::from(error.is_some())) { return; }
         match error {
             Some(error) => journal.log(json!({
                 "event":"candidate_error", "path":path,
@@ -2086,12 +2104,27 @@ struct Completed {
     outputs: BTreeMap<String, String>,
 }
 
-#[derive(serde::Serialize)]
 struct SourceGroup {
     path: PathBuf,
-    name: String,
     members: Vec<String>,
-    multipart: bool,
+}
+
+impl SourceGroup {
+    fn record(&self) -> impl serde::Serialize + '_ {
+        #[derive(serde::Serialize)]
+        struct Record<'a> {
+            path: &'a Path,
+            name: std::borrow::Cow<'a, str>,
+            members: &'a [String],
+            multipart: bool,
+        }
+        Record {
+            path: &self.path,
+            name: self.path.file_name().unwrap_or(self.path.as_os_str()).to_string_lossy(),
+            members: &self.members,
+            multipart: self.members.len() > 1,
+        }
+    }
 }
 
 // Logical tasks own groups; physical members may have several live consumers.
@@ -2826,7 +2859,7 @@ impl Scheduler {
             }
             let signals = self.hub.wait_drain(cancellation_observed);
             for (batch, waiter) in signals.cancel {
-                let _ = waiter.send(self.cancel_display_batch(&batch));
+                waiter.send(self.cancel_display_batch(&batch));
             }
             let failed_before_harvest = result.is_err();
             if let Err(error) = self.complete_roots(signals.roots) { *result = Err(error); }
@@ -2873,12 +2906,12 @@ impl Scheduler {
             let mut repaired = None;
             while !hub.stopped.load(Ordering::Acquire) {
                 let signals = hub.wait(None);
-                for ( _, waiter) in signals.cancel { let _ = waiter.send(Ok(false)); }
-                for waiter in signals.once { let _ = waiter.send(Err(io::Error::other(error.to_string()))); }
+                for ( _, waiter) in signals.cancel { waiter.send(Ok(false)); }
+                for waiter in signals.once { waiter.send(Err(io::Error::other(error.to_string()))); }
                 if !signals.rebuild.is_empty() {
                     log.rebuild();
                     let rebuilt = log.flush().is_ok();
-                    for waiter in signals.rebuild { let _ = waiter.send(Ok(rebuilt)); }
+                    for waiter in signals.rebuild { waiter.send(Ok(rebuilt)); }
                 }
                 for root in signals.roots { root.reply.complete(Err(io::Error::other(error.to_string()))); }
                 if !signals.reload { continue; }
@@ -2909,7 +2942,7 @@ impl Scheduler {
                     Ok(true)
                 })();
                 for waiter in signals.reload_waiters {
-                    let _ = waiter.send(reload.as_ref().copied()
+                    waiter.send(reload.as_ref().copied()
                         .map_err(|error: &io::Error| io::Error::new(error.kind(), error.to_string())));
                 }
                 match reload {
@@ -2937,13 +2970,13 @@ impl Scheduler {
         } else { Signals::default() };
         drop(signals.cancel);
         for waiter in signals.reload_waiters {
-            let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
+            waiter.send(Err(io::ErrorKind::Interrupted.into()));
         }
         for waiter in signals.once {
-            let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
+            waiter.send(Err(io::ErrorKind::Interrupted.into()));
         }
         for waiter in signals.rebuild {
-            let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
+            waiter.send(Err(io::ErrorKind::Interrupted.into()));
         }
         *self.external.lock().unwrap() = None;
         *self.hub.claims.lock().unwrap() = HashMap::new();
@@ -2987,7 +3020,7 @@ impl Scheduler {
             let mut signals = self.hub.wait(deadline);
             self.candidate_diagnostics.clear_expired(Instant::now());
             for (batch, waiter) in signals.cancel {
-                let _ = waiter.send(self.cancel_display_batch(&batch));
+                waiter.send(self.cancel_display_batch(&batch));
             }
             // Claims arrive from pipeline workers. Remove each queued deadline
             // once; keep its observation for generation-safe completion.
@@ -3006,19 +3039,19 @@ impl Scheduler {
             if let Some(error) = completion_error {
                 return Err(error);
             }
+            let mut buckets = HashSet::new();
+            let mut retried = HashSet::new();
             for (root, output) in signals.published_outputs {
-                if let Some((_, scope)) = self.roots.get(&watch_path_key(&root)) {
-                    let scope = scope.clone();
-                    let mut retried = HashSet::new();
-                    let mut buckets = HashSet::new();
-                    if buckets.insert(crate::scan::catalog::catalog_stem(&output)) {
-                        self.retry_volume_peers(&scope, &output, &mut retried)?;
+                let root = watch_path_key(&root);
+                if let Some((_, scope)) = self.roots.get(&root) {
+                    if buckets.insert((root, crate::scan::catalog::catalog_stem(&output))) {
+                        self.retry_volume_peers(&scope.clone(), &output, &mut retried)?;
                     }
                 }
             }
             for waiter in signals.rebuild {
                 let result = self.engine.run_stage("catalog_maintenance", Origin::Watch, || self.journal.rebuild_log()).and_then(|result| result);
-                let _ = waiter.send(result);
+                waiter.send(result);
             }
             if signals.password_changed || !signals.reload_waiters.is_empty() {
                 self.password_update(false)?;
@@ -3043,7 +3076,7 @@ impl Scheduler {
                     }
                 }
                 for waiter in signals.reload_waiters {
-                    let _ = waiter.send(
+                    waiter.send(
                         reload.as_ref().copied().map_err(|error| io::Error::new(error.kind(), error.to_string())),
                     );
                 }
@@ -3079,7 +3112,7 @@ impl Scheduler {
                     .pending_count
                     .store(self.pending.len(), Ordering::Relaxed);
                 for waiter in signals.once {
-                    let _ = waiter.send(
+                    waiter.send(
                         result
                             .as_ref()
                             .map(|_| ())
@@ -5443,18 +5476,11 @@ impl Scheduler {
             }
             let group = SourceGroup {
                 path: archive.path.clone(),
-                name: archive
-                    .path
-                    .file_name()
-                    .unwrap_or(archive.path.as_os_str())
-                    .to_string_lossy()
-                    .into_owned(),
                 members: archive
                     .source_paths
                     .iter()
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect(),
-                multipart: archive.source_paths.len() > 1,
             };
             let directory = archive.path.parent().unwrap_or(Path::new(""));
             // Keep the failed input in place with its remaining recursion
@@ -5589,7 +5615,7 @@ impl Scheduler {
                 && (recorded_file_is_absent(&canonical)
                     || (!retryable
                         && group.is_some_and(|group| {
-                            group.multipart
+                            group.members.len() > 1
                                 && group.members.iter().any(|path| {
                                     match filesystem::watch_file_is_ready(path) {
                                         Ok(ready) => !ready,
@@ -6058,7 +6084,7 @@ fn make_entry(
     if password { blockers.push("password"); }
     let mut payload = json!({"blockers":blockers});
     if let Some(group) = group {
-        payload["source_group"] = json!(group);
+        payload["source_group"] = json!(group.record());
     }
     if let Some(recovery) = recovery {
         payload["discovery_scope"] = Value::Object(recovery.record());
@@ -6179,6 +6205,21 @@ impl WatchObserver {
     fn owner_for_path(&self, path: &Path) -> Option<String> {
         output_owner(&self.outputs.lock().unwrap().paths, &key(path)).map(str::to_owned)
     }
+
+    fn publish_output(&self, archive: &ArchiveResult, path: &Path, exclusive: bool) -> io::Result<()> {
+        let Some(owner) = self.owner(archive).or_else(|| self.owner_for_path(path)) else {
+            return Err(io::Error::other("Watch output has no durable input owner"));
+        };
+        let output = path.to_string_lossy().into_owned();
+        let task = archive.path.to_string_lossy().into_owned();
+        self.journal.commit(true, |state| {
+            state
+                .output_operation(&owner, task, output, None, exclusive)?
+                .ok_or_else(|| io::Error::other("Watch input owner was retired before output"))
+        })?;
+        self.outputs.lock().unwrap().insert(key(path), owner);
+        Ok(())
+    }
 }
 
 impl Observer for WatchObserver {
@@ -6285,12 +6326,6 @@ impl Observer for WatchObserver {
         }
         let group = Arc::new(SourceGroup {
             path: path.to_owned(),
-            name: path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .into_owned(),
-            multipart: members.len() > 1,
             members,
         });
         {
@@ -6310,7 +6345,7 @@ impl Observer for WatchObserver {
         });
         self.journal.log(
             json!({"event":"pipeline_sources_claimed","path":path,"owner":self.batch,
-            "processing":true,"groups":[group]}),
+            "processing":true,"groups":[group.record()]}),
         );
         Ok(())
     }
@@ -6322,35 +6357,13 @@ impl Observer for WatchObserver {
     }
 
     fn register_output(&self, archive: &ArchiveResult, path: &Path) -> io::Result<()> {
-        let Some(owner) = self.owner(archive).or_else(|| self.owner_for_path(path)) else {
-            return Err(io::Error::other("Watch output has no durable input owner"));
-        };
-        let output = path.to_string_lossy().into_owned();
-        let task = archive.path.to_string_lossy().into_owned();
-        self.journal.commit(true, |state| {
-            state
-                .output_operation(&owner, task, output, None, true)?
-                .ok_or_else(|| io::Error::other("Watch input owner was retired before output"))
-        })?;
-        self.outputs.lock().unwrap().insert(key(path), owner);
-        Ok(())
+        self.publish_output(archive, path, true)
     }
 
     fn reuse_output(&self, archive: &ArchiveResult, path: &Path) -> io::Result<()> {
         // Decryption can replace a provisional tail representative with the
         // actual carrier. Its retained output already routes to the WAL owner.
-        let Some(owner) = self.owner(archive).or_else(|| self.owner_for_path(path)) else {
-            return Err(io::Error::other("Watch output has no durable input owner"));
-        };
-        // The retained carrier already owns this child namespace. The existing
-        // start operation republishes its identity without exclusive mkdir.
-        self.journal.commit(true, |state| {
-            state.output_operation(&owner, archive.path.to_string_lossy().into_owned(),
-                path.to_string_lossy().into_owned(), None, false)?
-                .ok_or_else(|| io::Error::other("Watch input owner was retired before output"))
-        })?;
-        self.outputs.lock().unwrap().insert(key(path), owner);
-        Ok(())
+        self.publish_output(archive, path, false)
     }
 
     fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path) -> io::Result<()> {
@@ -6959,11 +6972,11 @@ mod tests {
         history.log_observation(&journal, observation_at, "observe", "observe", &error, None);
         history.log_wait(&journal, observation_at, "later", "later", Some(&error));
         history.clear_expired(now + std::time::Duration::from_secs(61));
-        assert_eq!(history.order.len(), 1);
+        assert_eq!(history.len(), 1);
         assert!(history.paths.contains_key("observe"));
         assert!(!history.paths.contains_key("later"));
         history.log_observation(&journal, now + std::time::Duration::from_secs(330), "observe", "observe", &error, None);
-        assert_eq!(history.order.len(), 1);
+        assert_eq!(history.len(), 1);
         let at = now + std::time::Duration::from_secs(331);
         history.log_observation(&journal, at, "observe", "observe", &error, None);
         assert_eq!(history.deadline(), Some(at + std::time::Duration::from_secs(300)));
@@ -6971,7 +6984,7 @@ mod tests {
             let path = index.to_string();
             history.log_wait(&journal, at, &path, &path, None);
         }
-        assert_eq!(history.order.len(), 2048);
+        assert_eq!(history.len(), 2048);
         assert_eq!(history.paths.len(), 2048);
         assert!(!history.paths.contains_key("path"));
         history.clear_expired(at + std::time::Duration::from_secs(30));
@@ -7505,7 +7518,7 @@ mod tests {
         let alias = Path::new(r"C:\watch\outer.part2.zip");
         let other = Path::new(r"C:\watch\other.zip");
         let group = Arc::new(SourceGroup {
-            path: head.into(), name: "outer".into(), multipart: true,
+            path: head.into(),
             members: vec![head.to_string_lossy().into(), alias.to_string_lossy().into()],
         });
         let groups = HashMap::from([(key(head), Arc::clone(&group)), (key(alias), group)]);
@@ -7756,8 +7769,9 @@ mod tests {
     fn drain_wakes_after_stop_cancellation_and_panicking_batch_completion() {
         let hub = Arc::new(Hub::new());
         hub.stop();
-        let (waiter, _) = mpsc::sync_channel(1);
-        assert!(!hub.queue_once(CommandReply::Sync(waiter)));
+        let (waiter, result) = command_reply();
+        assert!(!hub.queue_once(waiter));
+        assert_eq!(block_on(result.wait()).unwrap_err().kind(), io::ErrorKind::Interrupted);
         let (send, receive) = mpsc::channel();
         let worker_hub = Arc::clone(&hub);
         let waiter = thread::spawn(move || {
@@ -7830,11 +7844,13 @@ mod tests {
 
     #[test]
     fn policy_drain_preserves_next_generation_notifications_without_applying_passwords() {
+        use std::future::Future;
+
         let hub = Hub::new();
-        let (reload, reload_result) = mpsc::sync_channel(1);
-        let (once, once_result) = mpsc::sync_channel(1);
-        hub.queue_reload(Some(CommandReply::Sync(reload)));
-        assert!(hub.queue_once(CommandReply::Sync(once)));
+        let (reload, reload_result) = command_reply();
+        let (once, once_result) = command_reply();
+        hub.queue_reload(Some(reload));
+        assert!(hub.queue_once(once));
         hub.update(|signals| {
             signals.changes.root_changed("old-root", [(PathBuf::from("archive.zip"), PathChange::default())]);
             signals.password_changed = true;
@@ -7848,12 +7864,15 @@ mod tests {
         assert!(pending.reload);
         assert!(pending.password_changed);
         assert!(pending.changes.changed_roots.contains_key("old-root"));
-        assert!(reload_result.try_recv().is_err());
-        assert!(once_result.try_recv().is_err());
-        pending.reload_waiters.into_iter().next().unwrap().send(Ok(true)).unwrap();
-        pending.once.into_iter().next().unwrap().send(Ok(())).unwrap();
-        assert!(reload_result.recv().unwrap().unwrap());
-        once_result.recv().unwrap().unwrap();
+        let mut context = std::task::Context::from_waker(Waker::noop());
+        let mut reload_result = std::pin::pin!(reload_result.wait());
+        let mut once_result = std::pin::pin!(once_result.wait());
+        assert!(reload_result.as_mut().poll(&mut context).is_pending());
+        assert!(once_result.as_mut().poll(&mut context).is_pending());
+        pending.reload_waiters.into_iter().next().unwrap().send(Ok(true));
+        pending.once.into_iter().next().unwrap().send(Ok(()));
+        assert!(block_on(reload_result).unwrap());
+        block_on(once_result).unwrap();
     }
 
     #[test]
@@ -7938,7 +7957,7 @@ mod tests {
             for result in [Ok(false), Ok(false), Err(io::Error::other("apply failed")), Err(io::Error::other("apply failed"))] {
                 let signals = worker_hub.wait(None);
                 assert_eq!(signals.reload_waiters.len(), 1);
-                signals.reload_waiters.into_iter().next().unwrap().send(result).unwrap();
+                signals.reload_waiters.into_iter().next().unwrap().send(result);
             }
             worker_hub.wait(None);
             finished.0.complete(&Ok(0));
@@ -8018,8 +8037,8 @@ mod tests {
 
     #[test]
     fn physical_completion_consumes_claimed_siblings_before_release_reobservation() {
-        let group = Arc::new(SourceGroup { path: "split.001".into(), name: "split".into(),
-            multipart: true, members: vec!["split.001".into(), "split.002".into(), "split.003".into()] });
+        let group = Arc::new(SourceGroup { path: "split.001".into(),
+            members: vec!["split.001".into(), "split.002".into(), "split.003".into()] });
         let groups: HashMap<_, _> = group.members.iter()
             .map(|path| (watch_path_key(path), Arc::clone(&group))).collect();
         let now = Instant::now();
@@ -8153,7 +8172,7 @@ mod tests {
         let discovered = base.join("not-admitted.002");
         scheduler.hub.claims.lock().unwrap().insert(key(&discovered), Arc::from("first"));
         assert_eq!(scheduler.admission_available(), 0, "discovered physical claims do not consume candidate slots");
-        let group = Arc::new(SourceGroup { path: head.into(), name: "family".into(), multipart: true,
+        let group = Arc::new(SourceGroup { path: head.into(),
             members: vec![names[0].clone(), names[1].clone(), discovered.to_string_lossy().into_owned()] });
         let root = || RootCompleted {
             request: 1,
@@ -8227,8 +8246,8 @@ mod tests {
         let a = Path::new(r"C:\watch\a.001");
         let b = Path::new(r"C:\watch\b.001");
         let tail = Path::new(r"C:\watch\shared.002");
-        let group = |head: &Path| Arc::new(SourceGroup { path: head.into(), name: "head".into(),
-            multipart: true, members: vec![head.to_string_lossy().into_owned(), tail.to_string_lossy().into_owned()] });
+        let group = |head: &Path| Arc::new(SourceGroup { path: head.into(),
+            members: vec![head.to_string_lossy().into_owned(), tail.to_string_lossy().into_owned()] });
         let mut groups = SourceGroups::default();
         groups.insert(group(a));
         groups.plan(key(b), vec![key(b), key(tail)]);
@@ -8283,7 +8302,7 @@ mod tests {
         let output = Path::new(r"C:\watch\a");
         let other_output = Path::new(r"C:\watch\b");
         let retained = Path::new(r"C:\watch\nested.zip");
-        let group = Arc::new(SourceGroup { path: head.into(), name: "a".into(), multipart: true,
+        let group = Arc::new(SourceGroup { path: head.into(),
             members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
         let hub = Arc::new(Hub::new());
         let mut observer = WatchObserver {
@@ -8309,7 +8328,7 @@ mod tests {
         // Register two heads using the same admitted tail. Finishing one
         // leaves the tail's WAL and output receipts available to aggregate.
         let other_group = Arc::new(SourceGroup {
-            path: other.into(), name: "b".into(), multipart: true,
+            path: other.into(),
             members: vec![other.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()],
         });
         observer.roots_planned([

@@ -10,7 +10,9 @@ from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree, cr
 from tests.helpers.real_archives import create_tar_archive, create_zip_multidisk_archive
 from tests.real.archive_boundary import extract_report
 from tests.real.enc_support import ENC_PASSWORD, create_enc_case
-from tests.real.plan7_watch_downloads.plan7_support import FACTORY, download, wait_for, watch_setup
+from tests.real.plan7_watch_downloads.plan7_support import (
+    FACTORY, download, source_directory_cleaned, wait_for, watch_setup,
+)
 
 
 def _payload_directory(output, case):
@@ -64,11 +66,11 @@ def test_one_carrier_supplies_two_independent_split_heads(package, tmp_path, ent
     else:
         watch = watch_setup(package, tmp_path, passwords=passwords, cleanup="d", recursive=True)
         sources = batch.rename(watch.root / batch.name)
-        wait_for(lambda: (not sources.exists() or not any(sources.iterdir())), "cleanup after both split inputs commit")
+        wait_for(lambda: source_directory_cleaned(sources), "cleanup after both split inputs commit")
         watch.stop()
         watch.assert_no_terminal_failures()
     assert _payload_directory(output, seven) != _payload_directory(output, zip_case)
-    assert (not sources.exists() or not any(sources.iterdir()))
+    assert source_directory_cleaned(sources)
 
 
 @pytest.mark.requires_watch_broker
@@ -95,7 +97,7 @@ def test_watch_password_retry_preserves_completed_split_input_with_shared_head(p
     watch.passwords(["wrong", zip_case.password])
     watch.start()
     watch.await_archive(zip_case)
-    wait_for(lambda: (not sources.exists() or not any(sources.iterdir())), "cleanup of the shared carrier and both sets of volumes")
+    wait_for(lambda: source_directory_cleaned(sources), "cleanup of the shared carrier and both sets of volumes")
     watch.stop()
 
     assert _payload_directory(watch.output, seven) == first.parent

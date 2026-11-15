@@ -15,6 +15,7 @@
 #ifdef _WIN32
 
 #include <algorithm>
+#include <deque>
 
 #include <cstddef>
 
@@ -366,9 +367,7 @@ namespace sunpack::sevenzip
             std::shared_ptr<AsyncFileWriter> writer,
             AsyncFileWriter::FileStatePtr file) : writer_(std::move(writer)),
                                                   file_(std::move(file))
-        {
-            magic_.reserve(512);
-        }
+        {}
 
         ~AsyncFileOutStream()
         {
@@ -391,6 +390,19 @@ namespace sunpack::sevenzip
                 }
                 return E_FAIL;
             }
+            constexpr std::size_t prefix_limit = 512;
+            const auto prefix_size = magic_.size() + std::min<std::size_t>(prefix_limit - magic_.size(), size);
+            if (prefix_size > magic_.capacity())
+            {
+                // Reserve before accepting output so recording the prefix
+                // cannot allocate after the writer consumes bytes.
+                try { magic_.reserve(std::min(prefix_limit, std::max(prefix_size, magic_.capacity() * 2))); }
+                catch (const std::bad_alloc &)
+                {
+                    if (processedSize) *processedSize = 0;
+                    return E_OUTOFMEMORY;
+                }
+            }
             UInt32 consumed = 0;
             HRESULT hr = S_OK;
             while (consumed < size) {
@@ -405,10 +417,10 @@ namespace sunpack::sevenzip
                 position_ += done;
                 if (hr != S_OK || done != amount) break;
             }
-            if (consumed != 0 && magic_.size() < 512)
+            if (consumed != 0 && magic_.size() < prefix_limit)
             {
                 const auto *bytes = static_cast<const unsigned char *>(data);
-                const std::size_t take = std::min<std::size_t>(512 - magic_.size(), consumed);
+                const std::size_t take = std::min<std::size_t>(prefix_limit - magic_.size(), consumed);
                 magic_.insert(magic_.end(), bytes, bytes + take);
             }
             if (processedSize)
@@ -798,13 +810,11 @@ namespace sunpack::sevenzip
         }
 
         Int32 operation_result() const { return operation_result_; }
-        bool password_requested() const { return password_requested_; }
+        bool encrypted() const { return encrypted_; }
 
         UInt32 files_written() const { return files_written_; }
 
 
-
-        UInt64 completed_bytes() const { return completed_bytes_; }
 
         const std::wstring &failed_item() const { return failed_item_; }
 
@@ -848,41 +858,12 @@ namespace sunpack::sevenzip
 
             const HRESULT writer_error = async_writer_->finish_job(async_job_);
             bool has_failed_file = false;
-            UInt32 completed_files = 0;
             for (const auto &state : async_files_)
             {
                 auto snapshot = async_writer_->take_file_snapshot(state);
-                auto &item = output_trace_.items[state->trace_index];
-                const bool decoder_ok = snapshot.operation_result_set &&
-                                        snapshot.operation_result == kOpOk;
-                const bool output_ok = snapshot.closed && !snapshot.failed;
-                if (decoder_ok && output_ok)
-                {
-                    ++completed_files;
-                    record_metadata_errors(snapshot.metadata_errors, item.index, item.path, false);
-                }
-
-                item.bytes_written = snapshot.written_bytes;
-                item.operation_result = snapshot.operation_result;
-                item.magic = std::move(snapshot.magic);
-                item.has_mtime_ns = snapshot.has_mtime_ns;
-                item.mtime_ns = snapshot.mtime_ns;
-                item.failed = item.failed || !decoder_ok || !output_ok;
-                item.done = decoder_ok && output_ok;
-
-                if (snapshot.failed)
-                {
-                    has_failed_file = true;
-                    output_error_ = true;
-                    if (failed_item_.empty())
-                    {
-                        failed_item_ = item.path;
-                        failed_item_bytes_written_ = snapshot.written_bytes;
-                    }
-                    output_trace_.last_hresult = static_cast<int>(snapshot.hresult);
-                }
+                has_failed_file |= snapshot.failed;
+                apply_file_snapshot(state->trace_index, std::move(snapshot));
             }
-            files_written_ = completed_files;
             if (writer_error != S_OK)
             {
                 output_error_ = true;
@@ -907,13 +888,15 @@ namespace sunpack::sevenzip
                 for (const auto &item : output_trace_.items)
                     if (!item.is_dir && item.done && !item.output_path.empty() && replay_->files.find(item.index) == replay_->files.end()) {
                         auto &receipt = replay_->files[item.index];
-                        receipt.path = (output_root_ / item.output_path).native();
+                        receipt.path = (output_root_ / item.output_path).make_preferred().native();
                         receipt.created = receipt.complete = true;
                         receipt.written.add(0, item.bytes_written);
                         receipt.has_mtime = item.has_mtime_ns;
                         receipt.mtime = item.mtime_ns;
                     }
             }
+            async_files_.clear();
+            current_async_file_.reset();
             output_paths_.clear();
         }
 
@@ -986,6 +969,21 @@ namespace sunpack::sevenzip
                 return S_OK;
             }
 
+            // Collect settled files in batches without waiting for the writer.
+            // The trace already carries the completed output's replay receipt.
+            constexpr std::size_t snapshot_batch = 64;
+            if (!async_files_.empty() && async_files_.size() % snapshot_batch == 0)
+            {
+                while (!async_files_.empty())
+                {
+                    const auto &front = async_files_.front();
+                    auto snapshot = async_writer_->take_file_snapshot(front, true);
+                    if (!snapshot.closed) break;
+                    apply_file_snapshot(front->trace_index, std::move(snapshot));
+                    async_files_.pop_front();
+                }
+            }
+
             PROPVARIANT value{};
 
             bool is_dir = false;
@@ -1056,6 +1054,7 @@ namespace sunpack::sevenzip
             item.path = std::move(name);
             item.is_dir = is_dir;
             item.encrypted = encrypted;
+            encrypted_ |= encrypted;
             item.expected_size = expected_size;
             item.has_expected_size = has_expected_size;
             item.has_source_crc32 = has_source_crc32;
@@ -1278,13 +1277,44 @@ namespace sunpack::sevenzip
                 return E_POINTER;
             }
 
-            password_requested_ = true;
+            encrypted_ = true;
             *password = SysAllocString(password_.c_str());
 
             return *password ? S_OK : E_OUTOFMEMORY;
         }
 
     private:
+        void apply_file_snapshot(std::size_t trace_index, AsyncFileWriter::FileSnapshot snapshot)
+        {
+            auto &item = output_trace_.items[trace_index];
+            const bool decoder_ok = snapshot.operation_result_set && snapshot.operation_result == kOpOk;
+            const bool output_ok = snapshot.closed && !snapshot.failed;
+            if (decoder_ok && output_ok)
+            {
+                ++files_written_;
+                record_metadata_errors(snapshot.metadata_errors, item.index, item.path, false);
+            }
+
+            item.bytes_written = snapshot.written_bytes;
+            item.operation_result = snapshot.operation_result;
+            item.magic = std::move(snapshot.magic);
+            item.has_mtime_ns = snapshot.has_mtime_ns;
+            item.mtime_ns = snapshot.mtime_ns;
+            item.failed = item.failed || !decoder_ok || !output_ok;
+            item.done = decoder_ok && output_ok;
+
+            if (snapshot.failed)
+            {
+                output_error_ = true;
+                if (failed_item_.empty())
+                {
+                    failed_item_ = item.path;
+                    failed_item_bytes_written_ = snapshot.written_bytes;
+                }
+                output_trace_.last_hresult = static_cast<int>(snapshot.hresult);
+            }
+        }
+
         struct HardLink
         {
             std::size_t trace;
@@ -1732,7 +1762,7 @@ namespace sunpack::sevenzip
 
         mutable std::recursive_mutex state_mutex_;
 
-        std::vector<AsyncFileWriter::FileStatePtr> async_files_;
+        std::deque<AsyncFileWriter::FileStatePtr> async_files_;
 
         AsyncFileWriter::FileStatePtr current_async_file_;
 
@@ -1772,7 +1802,7 @@ namespace sunpack::sevenzip
         bool output_error_ = false;
 
         bool output_finalized_ = false;
-        bool password_requested_ = false;
+        bool encrypted_ = false;
     };
 
 #endif

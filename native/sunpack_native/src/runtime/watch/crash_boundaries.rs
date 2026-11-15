@@ -166,8 +166,8 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         interrupted.put_entry(Arc::new(observed_entry(&old, "interrupted", None)));
         scheduler.journal.commit(true, |_| Ok(interrupted)).unwrap();
         fs::write(&source, b"replacement generation with a different size").unwrap();
-        let group = Arc::new(SourceGroup { path: source.clone(), name: "source".into(),
-            members: vec![old.path.clone(), same.path.clone()], multipart: true });
+        let group = Arc::new(SourceGroup { path: source.clone(),
+            members: vec![old.path.clone(), same.path.clone()] });
         let groups: HashMap<_, _> = group.members.iter().map(|path| (watch_path_key(path), Arc::clone(&group))).collect();
         scheduler.hub.claims.lock().unwrap().extend(groups.keys().map(|path| (path.clone(), Arc::<str>::from("owner"))));
         let dirty = HashSet::from([key(&source), key(&sibling)]);

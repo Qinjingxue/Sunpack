@@ -240,12 +240,10 @@ impl Engine {
             .iter().enumerate()
             .map(|(index, source)| (path_key(&source.path().to_string_lossy()), index))
             .collect();
-        let cleanup_boundaries = request.cleanup_boundaries.iter().chain(request.inputs.iter().filter(|p| p.is_dir()))
-            .map(|path| resolved_key(path)).collect();
-        let request = Arc::new(request);
+        let cleanup_boundaries = cleanup_boundaries(&request);
         Ok(Arc::new(Run {
             engine: self.clone(),
-            request: Arc::clone(&request),
+            request: Arc::new(request),
             resolve_aliases,
             candidates,
             options,
@@ -413,8 +411,8 @@ struct CleanupOwner {
 }
 
 impl CleanupOwner {
-    fn new(registry: Arc<Mutex<CleanupRefs>>, paths: &[String]) -> Self {
-        let mut owner = Self { registry, paths: HashSet::new() };
+    fn new(registry: &Arc<Mutex<CleanupRefs>>, paths: &[String]) -> Self {
+        let mut owner = Self { registry: Arc::clone(registry), paths: HashSet::new() };
         owner.refresh(paths);
         owner
     }
@@ -442,8 +440,9 @@ impl CleanupOwner {
             entry.0 -= 1;
             entry.1 |= !eligible;
             if entry.0 == 0 {
-                if !entry.1 { allowed.insert(key.clone()); }
+                let remove = !entry.1;
                 refs.paths.remove(&key);
+                if remove { allowed.insert(key); }
             }
         }
         allowed
@@ -493,11 +492,8 @@ impl CleanupTasks {
             return std::mem::take(&mut self.failures).into_values().collect();
         };
         let key = namespace_key(root);
-        let base = key.trim_end_matches('\\');
-        // The ASCII successor of '\\' bounds all keys starting with base + '\\'.
-        let descendants = format!("{base}\\")..format!("{base}]");
         self.failures.remove(&key).into_iter().chain(
-            self.failures.extract_if(descendants, |_, _| true).map(|(_, failure)| failure),
+            self.failures.extract_if(descendant_key_range(&key), |_, _| true).map(|(_, failure)| failure),
         ).collect()
     }
 }
@@ -1037,13 +1033,7 @@ impl CreatedOutputs {
 
     fn commit_key(&mut self, key: &str) {
         self.0.remove(key);
-        let prefix = format!("{}\\", key.trim_end_matches('\\'));
-        let keys: Vec<_> = self.0.range(prefix.clone()..)
-            .take_while(|(key, _)| key.starts_with(&prefix))
-            .map(|(key, _)| key.clone()).collect();
-        for key in keys {
-            self.0.remove(&key);
-        }
+        self.0.extract_if(descendant_key_range(key), |_, _| true).for_each(drop);
     }
 
     fn relocate(&mut self, source: &Path, destination: &Path) {
@@ -1296,6 +1286,8 @@ impl<'run, O: Observer> Run<'run, O> {
         spawner: Spawner<'run>,
         requested: Option<Arc<WatchGenerations>>,
     ) -> io::Result<Outcome> {
+        // Blocked paths are only used while projecting discovery candidates.
+        drop(batch.blocked_paths);
         // Scan has no request claim to reveal aliases. Reuse the resolved
         // paths from deduplication for read leases in both modes.
         let resolved_paths = if depth == 1 && batch.tasks.len() > 1
@@ -1541,20 +1533,19 @@ impl<'run, O: Observer> Run<'run, O> {
         true
     }
 
-    fn cleanup_owner(&self, task: &Task) -> CleanupOwner {
-        let paths = if self.request.mode == Mode::Extract { task.owned_paths.as_slice() } else { &[] };
-        CleanupOwner::new(Arc::clone(&self.cleanup_refs), paths)
+    fn cleanup_owner(&self, task: &Task) -> Option<CleanupOwner> {
+        (self.request.mode == Mode::Extract).then(|| CleanupOwner::new(&self.cleanup_refs, &task.owned_paths))
     }
 
     #[cfg(test)]
-    fn register_task(&self, task: Task) -> (Task, CleanupOwner, Option<HashSet<String>>, Option<Arc<WatchGenerations>>) {
+    fn register_task(&self, task: Task) -> (Task, Option<CleanupOwner>, Option<HashSet<Arc<str>>>, Option<Arc<WatchGenerations>>) {
         let sources = self.cleanup_owner(&task);
         (task, sources, None, None)
     }
 
     fn execute_task(
         self: &Arc<Self>,
-        (mut task, mut sources, keys, requested): (Task, CleanupOwner, Option<HashSet<String>>, Option<Arc<WatchGenerations>>),
+        (mut task, mut sources, keys, requested): (Task, Option<CleanupOwner>, Option<HashSet<Arc<str>>>, Option<Arc<WatchGenerations>>),
         task_id: TaskId,
         depth: usize,
         inherited_scope: Option<Arc<RecursiveScope>>,
@@ -1580,7 +1571,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut shell = this.engine.shell.branch();
             let (mut generations, missing) = this.capture_generations(&task);
             let discovered = task.source != DiscoverySource::Direct;
-            let discovery_scope = task.scope.take();
+            let (discovery_scope, retry) = task.take_context(this.request.mode == Mode::Extract);
             let admission = this.task_admission(&task, &generations, &missing, discovered, watch_root,
                 |path| requested.as_ref().and_then(|members| members.get(path))
                     .or_else(|| captured.as_ref().and_then(|members| members.get(path))))?;
@@ -1656,13 +1647,15 @@ impl<'run, O: Observer> Run<'run, O> {
                 } else {
                     vec![receipt(task.entry(), task.source, depth)]
                 };
+                let discovery_scope = discovery_scope.as_deref()
+                    .filter(|_| this.request.mode == Mode::Extract)
+                    .map(|scope| Arc::new(super::FailureScope::from_scope(scope)));
                 for result in &mut completed {
                     result.failure.get_or_insert_with(|| failure.clone());
                     if this.request.mode == Mode::Extract {
                         if admission { result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect(); }
-                        if let Some(scope) = discovery_scope.as_deref() {
-                            result.failure.as_mut().unwrap().discovery_scope =
-                                Some(Box::new(super::FailureScope::from_scope(scope)));
+                        if let Some(scope) = &discovery_scope {
+                            result.failure.as_mut().unwrap().discovery_scope = Some(Arc::clone(scope));
                         }
                     }
                 }
@@ -1782,7 +1775,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut report_states = Vec::with_capacity(count);
             let mut replacement_retained = None;
             let mut replacement_rows = None;
-            let mut retry = task.retry.filter(|_| !multi);
+            let mut retry = retry.filter(|_| !multi);
             let mut physical_sources = task.owned_paths;
             let mut superseded_candidates = HashSet::new();
             for (index, (((logical, checkpoint), retry_slot), &original_id)) in
@@ -1905,7 +1898,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             had_checkpoints |= replacement_checkpoint.is_some();
                             executed.result.output = None;
                             this.observer.after_output(&executed.result)?;
-                            if this.request.mode == Mode::Extract { sources.refresh(&replacement.owned_paths); }
+                            if let Some(sources) = &mut sources { sources.refresh(&replacement.owned_paths); }
                             drop(lease);
                             let requested = this.requested_generation(&replacement, watch_root);
                             lease = this.claim_task(&replacement, None).await?;
@@ -2069,7 +2062,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     !superseded_candidates.contains(&path_key(path))
                         || retained.contains(&path_key(path))
                 });
-                if this.request.mode == Mode::Extract { sources.refresh(&physical_sources); }
+                if let Some(sources) = &mut sources { sources.refresh(&physical_sources); }
             }
             // A replaced attempt is report history after successful cleanup,
             // not a failed input of the replacement's physical execution.
@@ -2280,10 +2273,11 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             if this.request.mode == Mode::Extract {
                 if let Some(scope) = discovery_scope.as_deref() {
+                    let mut report_scope = None;
                     for failure in completed.iter_mut().filter_map(|result| result.failure.as_mut()) {
-                        if failure.discovery_scope.is_none() {
-                            failure.discovery_scope = Some(Box::new(super::FailureScope::from_scope(scope)));
-                        }
+                        failure.discovery_scope.get_or_insert_with(|| Arc::clone(
+                            report_scope.get_or_insert_with(|| Arc::new(super::FailureScope::from_scope(scope)))
+                        ));
                     }
                 }
             }
@@ -2318,7 +2312,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 })
                 .collect();
             let mut root_cleanup = None;
-            if this.request.mode == Mode::Extract && sources_complete {
+            if let Some(sources) = sources.as_mut().filter(|_| sources_complete) {
                 if let Some(family) = completed_family {
                     stage("output_state", &Cancellation::default()).await?;
                     this.observer.sources_processed(family,
@@ -2605,7 +2599,7 @@ impl<'run, O: Observer> Run<'run, O> {
         ).then_some(checkpoint)
     }
 
-    async fn claim_task(&self, task: &Task, keys: Option<HashSet<String>>) -> io::Result<Lease> {
+    async fn claim_task(&self, task: &Task, keys: Option<HashSet<Arc<str>>>) -> io::Result<Lease> {
         let keys = keys.unwrap_or_else(|| source_lease_keys(task, &HashMap::new()));
         self.engine.leases.acquire_shared(keys, self.output_names.owner, &self.request.cancel).await
     }
@@ -3956,10 +3950,16 @@ fn resolved_key(path: &Path) -> String {
     }
 }
 
-fn source_lease_keys(task: &Task, resolved: &HashMap<String, Arc<str>>) -> HashSet<String> {
+fn source_lease_keys(task: &Task, resolved: &HashMap<String, Arc<str>>) -> HashSet<Arc<str>> {
     task.owned_paths.iter().map(|path| {
-        resolved.get(path).map_or_else(|| resolved_key(Path::new(path)), |key| key.to_string())
+        resolved.get(path).map_or_else(|| Arc::from(resolved_key(Path::new(path))), Arc::clone)
     }).collect()
+}
+
+fn cleanup_boundaries(request: &Request) -> HashSet<String> {
+    if request.mode == Mode::Scan { return HashSet::new(); }
+    request.cleanup_boundaries.iter().chain(request.inputs.iter().filter(|path| path.is_dir()))
+        .map(|path| resolved_key(path)).collect()
 }
 
 fn dedup_resolved_plans(tasks: &mut Vec<Task>) -> HashMap<String, Arc<str>> {
@@ -4002,6 +4002,12 @@ fn namespace_key(path: &Path) -> String {
     ))
 }
 
+fn descendant_key_range(key: &str) -> std::ops::Range<String> {
+    let base = key.trim_end_matches('\\');
+    // ']' immediately follows '\\' in the normalized path's byte order.
+    format!("{base}\\")..format!("{base}]")
+}
+
 fn cleanup_owned_output(path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -4029,7 +4035,7 @@ struct Leases {
 
 #[derive(Default)]
 struct LeaseState {
-    active: HashMap<String, (Option<u64>, usize)>,
+    active: HashMap<Arc<str>, (Option<u64>, usize)>,
     requests: HashMap<u64, RequestClaim>,
     watch: HashMap<Arc<str>, Vec<ActiveWatchFamily>>,
     next_waiter: u64,
@@ -4041,7 +4047,7 @@ struct LeaseState {
 enum LeaseBlocker {
     Request(u64),
     Watch(u64),
-    Path(String),
+    Path(Arc<str>),
 }
 
 type WatchSettlement = OnceLock<io::Result<()>>;
@@ -4320,7 +4326,7 @@ impl Drop for RequestClaimGuard {
 
 struct Lease {
     owner: Arc<Leases>,
-    keys: HashSet<String>,
+    keys: HashSet<Arc<str>>,
 }
 
 impl Leases {
@@ -4458,20 +4464,20 @@ impl Leases {
     #[cfg(test)]
     async fn acquire(
         self: &Arc<Self>,
-        keys: HashSet<String>,
+        keys: HashSet<Arc<str>>,
         cancel: &Cancellation,
     ) -> io::Result<Lease> {
         self.acquire_paths(keys, None, cancel).await
     }
 
     async fn acquire_shared(
-        self: &Arc<Self>, keys: HashSet<String>, request: u64, cancel: &Cancellation,
+        self: &Arc<Self>, keys: HashSet<Arc<str>>, request: u64, cancel: &Cancellation,
     ) -> io::Result<Lease> {
         self.acquire_paths(keys, Some(request), cancel).await
     }
 
     async fn acquire_paths(
-        self: &Arc<Self>, keys: HashSet<String>,
+        self: &Arc<Self>, keys: HashSet<Arc<str>>,
         request: Option<u64>, cancel: &Cancellation,
     ) -> io::Result<Lease> {
         let mut waiting = LeaseWait {
@@ -4489,7 +4495,7 @@ impl Leases {
             }).cloned().map(LeaseBlocker::Path).collect();
             if blockers.is_empty() {
                 for key in &keys {
-                    state.active.entry(key.clone()).or_insert((request, 0)).1 += 1;
+                    state.active.entry(Arc::clone(key)).or_insert((request, 0)).1 += 1;
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -4538,19 +4544,18 @@ impl Drop for LeaseWait<'_> {
 impl Drop for Lease {
     fn drop(&mut self) {
         let mut state = self.owner.state.lock().unwrap();
-        let active = &mut state.active;
-        let mut released = Vec::new();
-        for key in &self.keys {
-            let (_, count) = active.get_mut(key).expect("lease owns its path");
+        let mut waiters = Vec::new();
+        for key in self.keys.drain() {
+            let (_, count) = state.active.get_mut(&key).expect("lease owns its path");
             *count -= 1;
-            if *count == 0 { active.remove(key); released.push(key); }
+            if *count == 0 {
+                state.active.remove(&key);
+                waiters.extend(state.released(&LeaseBlocker::Path(key)));
+            }
         }
-        if active.capacity() > 256.max(active.len().saturating_mul(4)) {
-            let target = active.len().saturating_mul(2);
-            active.shrink_to(target);
+        if state.active.capacity() > 256 {
+            crate::collections::trim_map(&mut state.active);
         }
-        let waiters: Vec<_> = released.into_iter()
-            .flat_map(|key| state.released(&LeaseBlocker::Path(key.clone()))).collect();
         drop(state);
         for waker in waiters { waker.wake(); }
     }
@@ -4575,20 +4580,20 @@ mod tests {
         let registry = Arc::new(Mutex::new(CleanupRefs::default()));
         let paths = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
         let key = |path: &str| namespace_key(Path::new(path));
-        let mut first = CleanupOwner::new(Arc::clone(&registry), &paths(&["a.001", "tail.002"]));
-        let mut second = CleanupOwner::new(Arc::clone(&registry), &paths(&["b.001", "tail.002"]));
+        let mut first = CleanupOwner::new(&registry, &paths(&["a.001", "tail.002"]));
+        let mut second = CleanupOwner::new(&registry, &paths(&["b.001", "tail.002"]));
         assert_eq!(first.release(true), HashSet::from([key("a.001")]));
         assert_eq!(second.release(true), HashSet::from([key("b.001"), key("tail.002")]));
         assert!(registry.lock().unwrap().paths.is_empty());
 
-        let first = CleanupOwner::new(Arc::clone(&registry), &paths(&["a.001", "tail.002"]));
-        let mut second = CleanupOwner::new(Arc::clone(&registry), &paths(&["b.001", "tail.002"]));
+        let first = CleanupOwner::new(&registry, &paths(&["a.001", "tail.002"]));
+        let mut second = CleanupOwner::new(&registry, &paths(&["b.001", "tail.002"]));
         drop(first); // Includes cancelled and never-dispatched batch owners.
         assert_eq!(second.release(true), HashSet::from([key("b.001")]));
         assert!(registry.lock().unwrap().paths.is_empty());
 
-        let mut first = CleanupOwner::new(Arc::clone(&registry), &paths(&["a.001", "old.002"]));
-        let mut second = CleanupOwner::new(Arc::clone(&registry), &paths(&["b.001", "new.002"]));
+        let mut first = CleanupOwner::new(&registry, &paths(&["a.001", "old.002"]));
+        let mut second = CleanupOwner::new(&registry, &paths(&["b.001", "new.002"]));
         first.refresh(&paths(&["a.001", "new.002"]));
         assert!(!registry.lock().unwrap().paths.contains_key(&key("old.002")));
         assert_eq!(second.release(true), HashSet::from([key("b.001")]));
@@ -4604,7 +4609,7 @@ mod tests {
         impl Wake for Noop { fn wake(self: Arc<Self>) {} }
         let leases = Arc::new(Leases::default());
         let cancel = Cancellation::new();
-        let keys = || HashSet::from(["tail.002".to_owned()]);
+        let keys = || HashSet::from([Arc::from("tail.002")]);
         let first = super::super::scheduling::block_on(leases.acquire_shared(keys(), 1, &cancel)).unwrap();
         let second = super::super::scheduling::block_on(leases.acquire_shared(keys(), 1, &cancel)).unwrap();
         let waker = Waker::from(Arc::new(Noop));
@@ -4642,7 +4647,7 @@ mod tests {
         }
         let leases = Arc::new(Leases::default());
         let cancel = Cancellation::new();
-        let keys = |paths: &[&str]| paths.iter().map(|path| (*path).to_owned()).collect();
+        let keys = |paths: &[&str]| paths.iter().copied().map(Arc::from).collect();
         let first = super::super::scheduling::block_on(leases.acquire(keys(&["a"]), &cancel)).unwrap();
         let second = super::super::scheduling::block_on(leases.acquire(keys(&["b"]), &cancel)).unwrap();
         let unrelated = super::super::scheduling::block_on(leases.acquire(keys(&["c"]), &cancel)).unwrap();
@@ -4699,7 +4704,7 @@ mod tests {
         let other_path = [PathBuf::from("claim-family.7z.002")];
         let first = leases.reserve_request(1, Origin::Foreground, &first_path, &cancel).unwrap();
         let family: HashSet<_> = ["claim-family.7z.001", "claim-family.7z.002"]
-            .into_iter().map(str::to_owned).collect();
+            .into_iter().map(Arc::from).collect();
         let held = super::super::scheduling::block_on(leases.acquire(family.clone(), &cancel)).unwrap();
         // A different original volume remains admissible while the resolved
         // physical family is in use; the same original selection is still busy.
@@ -5351,8 +5356,7 @@ mod tests {
             checkpoints: HashMap::new(),
             checkpoint_anchors: OnceLock::new(),
             generated_sources: HashMap::new(),
-            cleanup_boundaries: request.cleanup_boundaries.iter().chain(request.inputs.iter().filter(|p| p.is_dir()))
-                .map(|path| resolved_key(path)).collect(),
+            cleanup_boundaries: cleanup_boundaries(request),
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
             cleanup_refs: Arc::default(),
@@ -5411,7 +5415,7 @@ mod tests {
             inputs: vec![LogicalInput { password_probe: None, password: None,
                 input: ArchiveInput::file(path.to_string_lossy().into_owned(), "7z".into(), "split".into()),
                 failure: None }],
-            source: DiscoverySource::Relations, retry: None, scope: None,
+            source: DiscoverySource::Relations, context: None,
         };
         let engine = Engine::new(PathBuf::from("unused-worker"));
         let leases = &engine.leases;
@@ -5516,7 +5520,7 @@ mod tests {
             inputs: vec![LogicalInput { password_probe: None,
                 input,
                 password: None, failure: None }],
-            source: DiscoverySource::Relations, retry: None, scope: None,
+            source: DiscoverySource::Relations, context: None,
         };
         let (generations, missing) = run.capture_generations(&task);
         assert_eq!(generations.len(), 3, "launcher remains owned for cleanup");
@@ -5532,7 +5536,7 @@ mod tests {
             inputs: vec![LogicalInput { password_probe: None,
                 input: ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
                 password: None, failure: None }],
-            source: DiscoverySource::Relations, retry: None, scope: None };
+            source: DiscoverySource::Relations, context: None };
         assert!(matches!(run.task_admission(&single, &partial, &[], true, true, |_| None).unwrap(), TaskAdmission::Execute(None)));
         assert_eq!(observer.queries.load(Ordering::SeqCst), 0);
         assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, |path| generations.get(path)).unwrap(),
@@ -5559,7 +5563,7 @@ mod tests {
             primary: None,
             owned_paths: [&head, &tail, &alternative, &launcher].map(|path| path.to_string_lossy().into_owned()).into(),
             inputs: vec![LogicalInput { password_probe: None, input: alternative_input, password: None, failure: None }],
-            source: DiscoverySource::Relations, retry: None, scope: None,
+            source: DiscoverySource::Relations, context: None,
         };
         let uncached = Reuse { output: output.join("absent"), events: Mutex::default(), queries: 0.into() };
         let uncached = test_run(&engine, &request, &uncached);
@@ -5612,8 +5616,7 @@ mod tests {
             owned_paths: vec![input.entry_path.clone()],
             inputs: vec![LogicalInput { password_probe: None, input, password: Some(Arc::from("secret")), failure: None }],
             source: DiscoverySource::Direct,
-            retry: None,
-            scope: None,
+            context: None,
         };
         run.plan_inputs(&mut task).unwrap();
         assert_eq!(task.inputs.len(), 1);
@@ -5706,9 +5709,9 @@ mod tests {
                     input,
                     password: None, failure: None,
                 }],
-                source: DiscoverySource::Relations, retry: None,
-                scope: Some(Arc::new(crate::scan::scope::NativeDiscoveryScope::new(
-                    path.parent().unwrap().to_string_lossy().into_owned(), Some(0), Vec::new()))),
+                source: DiscoverySource::Relations,
+                context: Some(discovery::TaskContext::Report(Arc::new(crate::scan::scope::NativeDiscoveryScope::new(
+                    path.parent().unwrap().to_string_lossy().into_owned(), Some(0), Vec::new())))),
             };
             let (generations, absent) = run.capture_generations(&task);
             assert_eq!(absent, vec![missing.clone()]);
@@ -5810,9 +5813,9 @@ mod tests {
             }).collect();
             let task = Task {
                 primary: None, inputs, owned_paths: vec![path.to_string_lossy().into_owned()],
-                source: DiscoverySource::Embedded, retry: None,
-                scope: Some(Arc::new(crate::scan::scope::NativeDiscoveryScope::new(
-                    path.parent().unwrap().to_string_lossy().into_owned(), Some(0), Vec::new()))),
+                source: DiscoverySource::Embedded,
+                context: Some(discovery::TaskContext::Report(Arc::new(crate::scan::scope::NativeDiscoveryScope::new(
+                    path.parent().unwrap().to_string_lossy().into_owned(), Some(0), Vec::new())))),
             };
             let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner|
                 run.execute_task(run.register_task(task), 1, 1, None, spawner)).unwrap();
@@ -5893,7 +5896,7 @@ mod tests {
         let task = Task {
             primary: None, owned_paths: vec![input.entry_path.clone()],
             inputs: inputs.into_iter().map(|input| LogicalInput { password_probe: None, input, password: None, failure: None }).collect(),
-            source: DiscoverySource::Embedded, retry: None, scope: None,
+            source: DiscoverySource::Embedded, context: None,
         };
         let ids = run.queue_inputs(&task, 1000, 1, &[Some(&checkpoint), None], 7, true);
         assert_eq!(ids.len(), 2);
@@ -5931,8 +5934,7 @@ mod tests {
                         owned_paths: vec![input.entry_path.clone()],
                         inputs: vec![LogicalInput { password_probe: None, input: input.clone(), password: None, failure: None }],
                         source: DiscoverySource::Detection,
-                        retry: None,
-                        scope: None,
+                        context: None,
                     };
                     let outcome = Scheduler::new().run(1, origin, &request.cancel, |spawner| {
                         run.execute_task(run.register_task(task), 1, depth, None, spawner)
@@ -5946,8 +5948,7 @@ mod tests {
                         owned_paths: vec![input.entry_path.clone()],
                         inputs: vec![LogicalInput { password_probe: None, input: input.clone(), password: None, failure: None }],
                         source: DiscoverySource::Direct,
-                        retry: None,
-                        scope: None,
+                        context: None,
                     };
                     assert!(matches!(run.task_admission(&direct, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
                     // A replacement can be classified Relations while retaining
@@ -6043,8 +6044,7 @@ mod tests {
                 owned_paths: inputs.iter().map(|input| input.entry_path.clone()).collect(),
                 inputs: inputs.into_iter().map(|input| LogicalInput { password_probe: None, input, password: None, failure: None }).collect(),
                 source: DiscoverySource::Embedded,
-                retry: None,
-                scope: None,
+                context: None,
             };
             let scheduler = Scheduler::new();
             let outcome = run.recursion.serve(&request.cancel,
@@ -6184,12 +6184,11 @@ mod tests {
         }
         let task = Task {
             primary: None, inputs: vec![LogicalInput { password_probe: None, input, password: None, failure: None }],
-            owned_paths: vec![source.to_string_lossy().into_owned()], source: DiscoverySource::Embedded, retry: None,
-            scope: None,
+            owned_paths: vec![source.to_string_lossy().into_owned()], source: DiscoverySource::Embedded, context: None,
         };
         let scheduler = Scheduler::new();
         scheduler.configure_capacity(1);
-        let source_key = resolved_key(&source);
+        let source_key = Arc::from(resolved_key(&source));
         let leases = Arc::clone(&engine.leases);
         let outcome = scheduler.run(1, Origin::Foreground, &request.cancel, |spawner| Box::pin(async move {
             let outcome = run.execute_task(run.register_task(task), 1, 1, None, spawner.clone()).await;
@@ -6623,8 +6622,7 @@ mod tests {
                     }],
                     owned_paths: Vec::new(),
                     source: DiscoverySource::Direct,
-                    retry: None,
-                    scope: None,
+                    context: None,
                 }],
                 errors: Vec::new(),
                 scan_errors: DirectoryReadErrors::report(),
@@ -6673,7 +6671,9 @@ mod tests {
         let [task] = discovered.tasks.as_slice() else {
             panic!("expected an incomplete volume group");
         };
-        let context = task.retry.as_deref().unwrap();
+        let Some(discovery::TaskContext::Retry(context)) = &task.context else {
+            panic!("expected retained volume resolution context");
+        };
         let mut original = receipt(task.entry(), task.source, 1);
         let output = root.join("damaged-output");
         fs::create_dir(&output).unwrap();
@@ -6747,8 +6747,7 @@ mod tests {
                 owned_paths: vec![input.entry_path.clone()],
                 inputs: vec![LogicalInput { password_probe: None, input, password: None,
                     failure: blocked.then(|| Failure::new(FailureKind::MissingVolume, "missing")) }],
-                source: DiscoverySource::Direct, retry: None,
-                scope: None,
+                source: DiscoverySource::Direct, context: None,
             }
         };
         for (candidate, blocked) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -7199,8 +7198,7 @@ mod tests {
                 inputs: inputs.into_iter().map(|input| LogicalInput { password_probe: None, input, password: None, failure: None }).collect(),
                 owned_paths: vec![source.to_string_lossy().into_owned()],
                 source: DiscoverySource::Embedded,
-                retry: None,
-                scope: None,
+                context: None,
             };
             let outcome = Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
                 run.execute_task(run.register_task(task), 1, 1, None, spawner)
@@ -7290,8 +7288,7 @@ mod tests {
                                 input, password: None, failure: None,
                             }).collect(),
                             owned_paths: vec![source.to_string_lossy().into_owned()],
-                            source: DiscoverySource::Embedded, retry: None,
-                            scope: None,
+                            source: DiscoverySource::Embedded, context: None,
                         };
                         let outcome = run.recursion.serve(&request.cancel,
                             |depth, pending| observer.allow_recursive(depth, pending),
@@ -7818,7 +7815,7 @@ mod tests {
                     let task = Task { primary: None, inputs: inputs.iter().cloned().map(|input|
                         LogicalInput { input, password_probe: None, password: None, failure: None }).collect(),
                         owned_paths: vec![source.to_string_lossy().into_owned()],
-                        source: DiscoverySource::Embedded, retry: None, scope: None };
+                        source: DiscoverySource::Embedded, context: None };
                     let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
                         let run = Arc::clone(&run);
                         Box::pin(async move {
@@ -7849,7 +7846,7 @@ mod tests {
                         let task = Task { primary: None, inputs: inputs.into_iter().map(|input|
                             LogicalInput { input, password_probe: None, password: None, failure: None }).collect(),
                             owned_paths: vec![source.to_string_lossy().into_owned()],
-                            source: DiscoverySource::Embedded, retry: None, scope: None };
+                            source: DiscoverySource::Embedded, context: None };
                         let retained = Scheduler::new().run(2, Origin::Foreground, &continued.cancel, |spawner| {
                         let run = Arc::clone(&run);
                         Box::pin(async move {
@@ -7941,8 +7938,7 @@ mod tests {
                 inputs: vec![LogicalInput { password_probe: None, input, password: None, failure: None }],
                 owned_paths: Vec::new(),
                 source: DiscoverySource::Direct,
-                retry: None,
-                scope: None,
+                context: None,
             }],
             errors: Vec::new(),
             scan_errors: DirectoryReadErrors::report(),
@@ -7962,7 +7958,7 @@ mod tests {
             tasks: vec![Task {
                 primary: None,
                 inputs: vec![LogicalInput { password_probe: None, input, password: None, failure: None }],
-                owned_paths: Vec::new(), source: DiscoverySource::Direct, retry: None, scope: None,
+                owned_paths: Vec::new(), source: DiscoverySource::Direct, context: None,
             }],
             errors: Vec::new(), scan_errors: DirectoryReadErrors::report(), blocked_paths: HashSet::new(),
         };

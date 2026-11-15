@@ -8,7 +8,7 @@ from tests.helpers.marker_utils import marker_present
 from tests.helpers.native_fixture import assemble_carrier
 from tests.real.archive_boundary import assert_extracted, extract_report, failure_kinds
 from tests.real.plan7_watch_downloads.plan7_support import (
-    FACTORY, Watch, download, stage_initial, wait_for, watch_setup,
+    FACTORY, Watch, download, source_directory_cleaned, stage_initial, wait_for, watch_setup,
 )
 
 
@@ -49,7 +49,7 @@ def test_nested_carrier_ratio_is_local_to_each_extracted_tree(package, tmp_path,
     else:
         watch = watch_setup(package, tmp_path, passwords=[], cleanup="d", recursive=True)
         target = inputs.rename(watch.root / inputs.name)
-        wait_for(lambda: not any(target.iterdir()), "cleanup of both extracted outer archives")
+        wait_for(lambda: source_directory_cleaned(target), "cleanup of both extracted outer archives")
         watch.stop()
         watch.assert_no_terminal_failures()
 

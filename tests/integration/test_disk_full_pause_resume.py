@@ -76,10 +76,13 @@ def _volume_label(root):
 def _vhd(tmp_path, filesystem="ntfs"):
     directory = Path(os.environ.get("SUNPACK_SPACE_TEST_VHD_DIR") or tmp_path).resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(directory).free < (VHD_MIB + 32) * MIB:
-        pytest.skip("not enough host space for a private 32 MiB VHD and 32 MiB reserve")
-    label = f"SP{uuid.uuid4().hex[:12]}"
-    image = directory / f"{label}.vhdx"
+    # The partition must remain big enough for FAT32 after VHD alignment.
+    image_mib = 64 if filesystem == "fat32" else VHD_MIB
+    if shutil.disk_usage(directory).free < (image_mib + 32) * MIB:
+        pytest.skip(f"not enough host space for a private {image_mib} MiB VHD and 32 MiB reserve")
+    nonce = uuid.uuid4().hex
+    label = f"SP{nonce[:9].upper()}"
+    image = directory / f"SP{nonce}.vhdx"
     select = f'select vdisk file="{image}"'
     try:
         with _diskpart_lock():
@@ -91,7 +94,7 @@ def _vhd(tmp_path, filesystem="ntfs"):
                 pytest.skip("no free drive letter for a private VHD")
             root = Path(f"{letter}:\\")
             transcript = _diskpart(
-                f'create vdisk file="{image}" maximum={VHD_MIB} type=fixed',
+                f'create vdisk file="{image}" maximum={image_mib} type=fixed',
                 select, "attach vdisk", "create partition primary",
                 f"format fs={filesystem} quick label={label}", f"assign letter={letter}",
             )

@@ -37,8 +37,14 @@ pub(super) struct Task {
     pub primary: Option<Box<ArchiveInput>>,
     pub owned_paths: Vec<String>,
     pub source: DiscoverySource,
-    pub retry: Option<Arc<RetryScope>>,
-    pub scope: Option<Arc<NativeDiscoveryScope>>,
+    pub context: Option<TaskContext>,
+}
+
+// A retry snapshot already owns its report scope. Scope-only tasks can drop
+// the snapshot as soon as discovery is complete.
+pub(super) enum TaskContext {
+    Report(Arc<NativeDiscoveryScope>),
+    Retry(Arc<RetryScope>),
 }
 
 impl Task {
@@ -58,8 +64,7 @@ impl Task {
             primary: None,
             owned_paths,
             source,
-            retry: None,
-            scope: None,
+            context: None,
         }
     }
 
@@ -70,6 +75,17 @@ impl Task {
     pub(super) fn input_paths(&self) -> impl Iterator<Item = &str> {
         self.inputs.iter().flat_map(|logical| logical.input.physical_paths())
     }
+
+    pub(super) fn take_context(&mut self, report: bool) -> (Option<Arc<NativeDiscoveryScope>>, Option<Arc<RetryScope>>) {
+        match self.context.take() {
+            Some(TaskContext::Report(scope)) => (report.then_some(scope), None),
+            Some(TaskContext::Retry(retry)) => {
+                let scope = (report && self.source != DiscoverySource::Direct).then(|| Arc::clone(&retry.scope));
+                (scope, Some(retry))
+            }
+            None => (None, None),
+        }
+    }
 }
 
 pub(super) struct Discovered {
@@ -77,6 +93,12 @@ pub(super) struct Discovered {
     pub errors: Vec<InputError>,
     pub scan_errors: DirectoryReadErrors,
     pub(super) blocked_paths: HashSet<String>,
+}
+
+pub(super) struct PreparedVolumePlan {
+    path: String,
+    generations: Vec<(String, crate::io::reader::PhysicalFileGeneration)>,
+    tasks: Vec<Task>,
 }
 
 impl Default for Discovered {
@@ -183,10 +205,11 @@ pub(super) fn discover(
     let mut prepared = HashSet::new();
     let mut prepared_tasks = Vec::new();
     for plan in &request.prepared_volumes {
-        if let Some(tasks) = plan.tasks.lock().unwrap().take().filter(|_| plan.generations.iter().all(|(path, before)|
+        let plan = plan.0.lock().unwrap().take();
+        if let Some(plan) = plan.filter(|plan| plan.generations.iter().all(|(path, before)|
             crate::io::reader::capture_file_generation(Path::new(path)).is_ok_and(|now| now == *before))) {
-            prepared.insert(path_key(&plan.path));
-            prepared_tasks.extend(tasks);
+            prepared.insert(plan.path);
+            prepared_tasks.extend(plan.tasks);
         }
     }
     let mut seen = HashSet::new();
@@ -197,10 +220,11 @@ pub(super) fn discover(
             .discovery_scope
             .as_ref()
             .is_none_or(|scope| scope.contains(&path) || (request.watch_catalog.as_ref().is_some_and(|catalog| catalog.dependency_contains(scope, &path))))
-            && !prepared.contains(&path_key(&path))
-            && seen.insert(path_key(&path))
         {
-            paths.push(path);
+            let key = path_key(&path);
+            if !prepared.contains(&key) && seen.insert(key) {
+                paths.push(path);
+            }
         }
     }
     let (kinds, errors) = classify_scan_targets(&paths);
@@ -439,6 +463,7 @@ pub(super) fn discover(
     retain_logical_retry_scopes(logical_scopes.into_values(), &mut retry_scopes);
     assign_retry_scopes(&mut result.tasks, &retry_scopes);
     if !prepared_tasks.is_empty() {
+        suppress_prepared_continuations(&prepared_tasks, &mut result.tasks);
         // Preserve the prepared retry scopes, and coalesce a peer admitted in
         // the same batch through the existing shared-input projection.
         prepared_tasks.append(&mut result.tasks);
@@ -446,6 +471,63 @@ pub(super) fn discover(
         if result.tasks.len() > 1 { merge_shared_inputs(&mut result.tasks, &mut result.blocked_paths); }
     }
     Ok(result)
+}
+
+fn suppress_prepared_continuations(prepared: &[Task], tasks: &mut Vec<Task>) {
+    fn headless_missing(task: &Task) -> Option<&ArchiveInput> {
+        let [logical] = task.inputs.as_slice() else { return None; };
+        let input = &logical.input;
+        (task.source == DiscoverySource::Relations
+            && logical.failure.as_ref().is_some_and(|failure| matches!(
+                failure.context.as_deref(),
+                Some(super::FailureContext::Discovery { reason, .. }) if reason == "missing_volume"
+            ))
+            && input.volume_attempts.is_none()
+            && input.ranges.is_empty() && !input.parts.is_empty()
+            && input.parts.iter().all(|part| part.volume_number.is_some_and(|number| number > 1)))
+            .then_some(input)
+    }
+
+    fn covers(claim: &InputExtent, member: &InputExtent) -> bool {
+        claim.start <= member.start
+            && claim.end.is_none_or(|end| member.end.is_some_and(|member_end| end >= member_end))
+    }
+
+    if !tasks.iter().any(|task| headless_missing(task).is_some()) { return; }
+    let mut claimed = HashMap::<_, Vec<_>>::new();
+    for (plan, logical) in prepared.iter().flat_map(|task| &task.inputs).enumerate() {
+        let input = &logical.input;
+        if logical.failure.is_some() || !input.mode.structured()
+            || input.analysis.volume_completeness != Some(VolumeCompleteness::Complete)
+            || input.volume_attempts.is_some()
+        {
+            continue;
+        }
+        for extent in input.physical_extents() {
+            claimed.entry(path_key(&extent.path)).or_default()
+                .push((plan, input.format_hint.as_str(), extent));
+        }
+    }
+    if claimed.is_empty() { return; }
+    tasks.retain(|task| {
+        let Some(input) = headless_missing(task) else { return true; };
+        // A tail-only selection can project a missing-head proposal while
+        // the real head's generation-checked plan bypasses this discovery.
+        // Require one complete archive to cover every member's byte range.
+        let first = &input.parts[0].extent;
+        let Some(first_claims) = claimed.get(&path_key(&first.path)) else { return true; };
+        let others: Vec<_> = input.parts[1..].iter().map(|part| {
+            (claimed.get(&path_key(&part.extent.path)), &part.extent)
+        }).collect();
+        !first_claims.iter().any(|&(plan, format, claim)| {
+            format == input.format_hint && covers(claim, first)
+                && others.iter().all(|&(claims, extent)| {
+                    claims.is_some_and(|claims| claims.iter().any(|&(owner, _, claim)|
+                        owner == plan && covers(claim, extent)
+                    ))
+                })
+        })
+    });
 }
 
 /// The filtered/raw output snapshot is cheap preparation, not archive discovery.
@@ -571,21 +653,26 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
         let key = path_key(&input.entry_path);
         let bucket = has_buckets.then(|| crate::scan::catalog::catalog_stem(&input.entry_path));
         let selected = if let Some(by_bucket) = &by_bucket {
-            bucket.as_deref().and_then(|bucket| by_bucket.get(bucket)).map(|scope| Arc::clone(scope))
+            bucket.as_deref().and_then(|bucket| by_bucket.get(bucket)).copied()
         } else if let Some(by_root) = &by_root {
             path_ancestors(&key).find_map(|root| {
                 by_root.get(root)
                     .filter(|scope| scope.scope.contains_key(&key))
-                    .map(|scope| Arc::clone(scope))
+                    .copied()
             })
         } else {
             let scope = &scopes[0];
-            scope.scope.contains_key(&key).then(|| Arc::clone(scope))
+            scope.scope.contains_key(&key).then_some(scope)
         };
-        if task.source != DiscoverySource::Direct {
-            task.scope = selected.as_ref().map(|scope| Arc::clone(&scope.scope));
-        }
-        if task.inputs.len() == 1 && may_split { task.retry = selected; }
+        task.context = selected.and_then(|scope| {
+            if task.inputs.len() == 1 && may_split {
+                Some(TaskContext::Retry(Arc::clone(scope)))
+            } else if task.source != DiscoverySource::Direct {
+                Some(TaskContext::Report(Arc::clone(&scope.scope)))
+            } else {
+                None
+            }
+        });
     }
 }
 
@@ -674,16 +761,19 @@ pub(super) fn find_watch_volume(
     let mut seen = HashSet::new();
     let mut generations = Vec::new();
     for task in &mut discovered.tasks {
-        task.scope = Some(Arc::clone(&context.scope));
-        task.retry = Some(Arc::clone(&context));
+        task.context = Some(if task.inputs.len() == 1 {
+            TaskContext::Retry(Arc::clone(&context))
+        } else {
+            TaskContext::Report(Arc::clone(&context.scope))
+        });
         for path in &task.owned_paths {
             if seen.insert(path_key(path)) {
                 generations.push((path.clone(), crate::io::reader::capture_file_generation(Path::new(path))?));
             }
         }
     }
-    Ok(Some(Arc::new(super::PreparedVolume { path: path.into_owned(), generations,
-        tasks: std::sync::Mutex::new(Some(discovered.tasks)) })))
+    let plan = PreparedVolumePlan { path: path_key(&path), generations, tasks: discovered.tasks };
+    Ok(Some(Arc::new(super::PreparedVolume(std::sync::Mutex::new(Some(plan))))))
 }
 
 fn watch_discovery_error(path: PathBuf, error: io::Error) -> InputError {
@@ -1319,7 +1409,9 @@ mod tests {
             assert_eq!(task.inputs.len(), 1);
             assert_eq!(task.owned_paths.len(), 1);
             assert!(expected.remove(&path_key(&task.entry().entry_path)));
-            let retry = task.retry.as_ref().unwrap();
+            let Some(TaskContext::Retry(retry)) = &task.context else {
+                panic!("expected a retained volume resolution context");
+            };
             assert_eq!(
                 retry.scope.key(),
                 path_key(
@@ -1442,7 +1534,9 @@ mod tests {
                     path_key(&task.entry().entry_path),
                     path_key(&archive.to_string_lossy())
                 );
-                let retry = task.retry.as_ref().unwrap();
+                let Some(TaskContext::Retry(retry)) = &task.context else {
+                    panic!("expected a retained volume resolution context");
+                };
                 assert_eq!(retry.scope.key(), path_key(&child.to_string_lossy()));
                 assert!(retry
                     .snapshot
@@ -1520,24 +1614,25 @@ mod tests {
             None,
         )];
         assign_retry_scopes(&mut tasks, &scopes);
-        assert_eq!(tasks[0].retry.as_ref().unwrap().scope.key(), inner.key());
-        assert_eq!(tasks[0].scope.as_ref().unwrap().key(), inner.key());
+        let (scope, retry) = tasks[0].take_context(true);
+        assert_eq!(retry.unwrap().scope.key(), inner.key());
+        assert_eq!(scope.unwrap().key(), inner.key());
         // Scope is a discovery fact, not a split-retry capability. A TAR and a
         // multi-input carrier retain it without retaining the retry snapshot.
-        tasks[0].retry = None;
         tasks[0].inputs[0].input.format_hint = "tar".into();
         assign_retry_scopes(&mut tasks, &scopes);
-        assert!(tasks[0].retry.is_none());
-        assert_eq!(tasks[0].scope.as_ref().unwrap().key(), inner.key());
+        let (scope, retry) = tasks[0].take_context(true);
+        assert!(retry.is_none());
+        assert_eq!(scope.unwrap().key(), inner.key());
         let input = tasks[0].entry().clone();
         tasks[0].inputs.push(LogicalInput { password_probe: None, input, password: None, failure: None });
         assign_retry_scopes(&mut tasks, &scopes);
-        assert!(tasks[0].retry.is_none());
-        assert_eq!(tasks[0].scope.as_ref().unwrap().key(), inner.key());
-        tasks[0].scope = None;
+        let (scope, retry) = tasks[0].take_context(true);
+        assert!(retry.is_none());
+        assert_eq!(scope.unwrap().key(), inner.key());
         tasks[0].source = DiscoverySource::Direct;
         assign_retry_scopes(&mut tasks, &scopes);
-        assert!(tasks[0].scope.is_none());
+        assert!(tasks[0].context.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

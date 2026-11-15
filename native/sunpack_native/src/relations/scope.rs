@@ -19,7 +19,7 @@ impl<'a> RelationSource<'a> {
         (0..len).filter_map(|offset| match self {
             Self::Snapshot(snapshot, _) => {
                 let row = snapshot.rows[offset];
-                (!snapshot.table.is_dirs[row]).then_some(row)
+                (!snapshot.table.is_dir(row)).then_some(row)
             }
             #[cfg(test)]
             Self::Physical(_) => Some(offset),
@@ -61,7 +61,7 @@ impl<'a> RelationSource<'a> {
         let (size, relation_member_eligible) = match self {
             Self::Snapshot(snapshot, _) => (
                 snapshot.table.sizes[row],
-                snapshot.table.relation_member_eligible[row],
+                snapshot.table.relation_member_eligible(row),
             ),
             #[cfg(test)]
             Self::Physical(rows) => (rows[row].size, rows[row].relation_member_eligible),

@@ -271,7 +271,7 @@ namespace sunpack::sevenzip
             std::wstring path;
             const ArchiveItemMetadata metadata;
             std::shared_ptr<VolumeSpaceGate> space_gate;
-            std::atomic<UInt64> accepted_bytes{0};
+            UInt64 accepted_bytes = 0;
             UInt64 next_write_offset = 0;
             std::mutex producer_mutex;
             Buffer *staging_buffer = nullptr;
@@ -346,8 +346,6 @@ namespace sunpack::sevenzip
         };
 
         static constexpr std::size_t kBufferSize = 1U << 20;
-        static constexpr std::size_t kDefaultWriterCount = 4;
-        static constexpr std::size_t kMaxWriterCount = 8;
         static constexpr std::size_t kDefaultJobInFlightBytes = 32U << 20;
         static constexpr std::size_t kDefaultFileInFlightBytes = 8U << 20;
 
@@ -436,7 +434,7 @@ namespace sunpack::sevenzip
             if (file->staging_buffer && file->staging_buffer->size && !enqueue_staging_locked(file, true))
                 return terminal_result_locked(file->job);
             file->next_write_offset += size;
-            file->accepted_bytes.fetch_add(size, std::memory_order_relaxed);
+            file->accepted_bytes += size;
             return S_OK;
         }
 
@@ -628,7 +626,7 @@ namespace sunpack::sevenzip
                             ++job->pending_jobs;
                             ++file->outstanding_data;
                         }
-                        file->accepted_bytes.fetch_add(chunk, std::memory_order_relaxed);
+                        file->accepted_bytes += chunk;
                         file->new_writes = true;
 #ifdef SUP7Z_TEST_IO_FAULTS
                         test_accepted_bytes_.fetch_add(chunk, std::memory_order_relaxed);
@@ -812,13 +810,14 @@ namespace sunpack::sevenzip
 
         UInt64 accepted_bytes(const FileStatePtr &file) const noexcept
         {
-            return file ? file->accepted_bytes.load(std::memory_order_relaxed) : 0;
+            std::lock_guard<std::mutex> lock(mutex_);
+            return file ? file->accepted_bytes : 0;
         }
 
         bool is_quiescent() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (queued_jobs_ != 0 || !active_files_.empty())
+            if (!work_queue_.empty() || !active_files_.empty())
             {
                 return false;
             }
@@ -858,14 +857,26 @@ namespace sunpack::sevenzip
             file->operation_result_set = true;
         }
 
-        FileSnapshot take_file_snapshot(const FileStatePtr &file) const noexcept
+        FileSnapshot take_file_snapshot(const FileStatePtr &file, bool completed_only = false) const noexcept
         {
             FileSnapshot snapshot;
             if (!file)
             {
                 return snapshot;
             }
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+            if (completed_only)
+            {
+                // Earlier successes can be released during extraction. Keep
+                // files with old replay receipts until they are reconciled.
+                if (file->replay || !lock.try_lock() || !file->closed || file->failed ||
+                    !file->operation_result_set || file->operation_result != 0 || file->metadata_errors.first_error())
+                    return snapshot;
+            }
+            else
+            {
+                lock.lock();
+            }
             snapshot.written_bytes = file->written_bytes;
             snapshot.operation_result = file->operation_result;
             snapshot.hresult = file->hresult;
@@ -878,7 +889,7 @@ namespace sunpack::sevenzip
             snapshot.closed = file->closed;
 #ifdef SUP7Z_TEST_IO_FAULTS
             snapshot.win32_error = file->win32_error;
-            snapshot.accepted_bytes = file->accepted_bytes.load(std::memory_order_relaxed);
+            snapshot.accepted_bytes = file->accepted_bytes;
             snapshot.peak_active_data_writes = file->peak_active_data_writes;
 #endif
             return snapshot;
@@ -902,7 +913,7 @@ namespace sunpack::sevenzip
             drain_cancelled_retries();
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                producer_cv_.wait(lock, [this] { return queued_jobs_ == 0 && active_files_.empty(); });
+                producer_cv_.wait(lock, [this] { return work_queue_.empty() && active_files_.empty(); });
             }
             // No packet can reference a recycled buffer or a closed file now.
             space_wake_->disable();
@@ -916,8 +927,7 @@ namespace sunpack::sevenzip
     private:
         void unregister_file_locked(const FileStatePtr &file) noexcept
         {
-            // Callbacks retain closed files for final snapshots. Registry
-            // membership follows I/O lifetime rather than shared_ptr lifetime.
+            // The registry owns each file only while I/O is in progress.
             const auto index = file->active_index;
             assert(index < active_files_.size() && active_files_[index] == file);
             if (index + 1 != active_files_.size())
@@ -1049,7 +1059,7 @@ namespace sunpack::sevenzip
             {
                 return file && file->staging_buffer &&
                        file->staging_buffer->size == kBufferSize &&
-                       queued_jobs_ < queue_limit_;
+                       work_queue_.size() < queue_limit_;
             }
             if (file->staging_buffer)
             {
@@ -1158,7 +1168,7 @@ namespace sunpack::sevenzip
             {
                 return false;
             }
-            if (!force_queue && queued_jobs_ >= queue_limit_)
+            if (!force_queue && work_queue_.size() >= queue_limit_)
             {
                 return false;
             }
@@ -1194,7 +1204,6 @@ namespace sunpack::sevenzip
             }
             file->staging_buffer = nullptr;
             file->next_write_offset += buffer->size;
-            ++queued_jobs_;
             return true;
         }
 
@@ -1218,7 +1227,6 @@ namespace sunpack::sevenzip
                     if (direct_close) *direct_close = true;
                     return false;
                 }
-                ++queued_jobs_;
                 return true;
             }
             catch (...)
@@ -1292,9 +1300,8 @@ namespace sunpack::sevenzip
                     if (work_queue_.empty()) continue;
                     item = std::move(work_queue_.front());
                     work_queue_.pop_front();
-                    --queued_jobs_;
-                    wake_producers = queued_jobs_ == queue_limit_ - 1 ||
-                        (queued_jobs_ == 0 && active_files_.empty());
+                    wake_producers = work_queue_.size() == queue_limit_ - 1 ||
+                        (work_queue_.empty() && active_files_.empty());
                 }
                 // Dequeue changes only queue capacity. Data completion wakes
                 // producers when it returns buffers or releases byte budgets.
@@ -1867,7 +1874,6 @@ namespace sunpack::sevenzip
         const std::size_t writer_count_;
         const std::size_t buffer_count_;
         const std::size_t queue_limit_;
-        std::size_t queued_jobs_ = 0;
         // 必须是 atomic：gate 的 terminal predicate 会无锁读它。
         std::atomic<bool> stopping_{false};
 

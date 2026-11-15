@@ -111,12 +111,20 @@ impl NativeWatchObservation {
     }
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct GeneratedBaseline {
     size: u64,
     mtime: f64,
     file_id: FileId,
-    usn: i64,
+    pub(super) usn: i64,
+}
+
+impl GeneratedBaseline {
+    pub(super) fn source_changed(&self, current: &crate::postprocess::WatchCandidateRow) -> bool {
+        crate::postprocess::watch_source_changed(
+            self.size, self.mtime, &self.file_id.text(), self.usn, current,
+        )
+    }
 }
 
 pub(super) struct CatalogRow {
@@ -177,6 +185,9 @@ impl CatalogRow {
         path.push_str(&self.name);
         path
     }
+    pub fn matches_path(&self, path: &str) -> bool {
+        path.strip_prefix(self.parent.as_ref()) == Some(self.name.as_ref())
+    }
     pub fn is_dir(&self) -> bool {
         self.flags & DIRECTORY != 0
     }
@@ -194,7 +205,7 @@ impl CatalogRow {
             && self.is_dir() == record.is_dir
             && self.size() == record.size
             && self.mtime_ns() == record.mtime_ns
-            && record.path.strip_prefix(self.parent.as_ref()) == Some(self.name.as_ref())
+            && self.matches_path(&record.path)
     }
     pub fn record(&self) -> DirectoryEntryRecord {
         DirectoryEntryRecord {
@@ -316,7 +327,7 @@ impl ScopeCatalog {
             if !transient
                 && old.persistent()
                 && old.is_dir() == record.is_dir
-                && record.path.strip_prefix(old.parent.as_ref()) == Some(old.name.as_ref())
+                && old.matches_path(&record.path)
             {
                 if old.size() != record.size || old.mtime_ns() != record.mtime_ns {
                     old.cheap_anchor = None;

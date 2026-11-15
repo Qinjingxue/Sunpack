@@ -58,7 +58,7 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
     let other = other_path.as_path();
     for path in [head, tail, other] { fs::write(path, b"archive").unwrap(); }
     let group = Arc::new(SourceGroup {
-        path: head.into(), name: "outer".into(), multipart: true,
+        path: head.into(),
         members: vec![head.to_string_lossy().into(), tail.to_string_lossy().into()],
     });
     let groups = HashMap::from([(key(head), Arc::clone(&group)), (key(tail), group)]);

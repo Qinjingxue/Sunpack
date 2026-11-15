@@ -1,6 +1,6 @@
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -30,19 +30,33 @@ pub(crate) struct DirectoryEntryRecord {
 pub(crate) struct DirectorySnapshotTable {
     scan_errors: Vec<DirectoryReadError>,
     pub(crate) paths: Vec<String>,
-    pub(crate) is_dirs: Vec<bool>,
     pub(crate) sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
-    pub(crate) relation_member_eligible: Vec<bool>,
     pub(crate) relation_anchors: Vec<Option<CheapAnchor>>,
     pub(crate) relation_anchor_cells: Vec<Option<CheapAnchorCell>>,
-    pub(crate) file_routes: Vec<u8>,
+    routes: Vec<u8>,
 }
 
+const DIRECTORY_ROUTE: u8 = 0;
 pub(crate) const FILE_ROUTE_RELATIONS: u8 = 1;
 pub(crate) const FILE_ROUTE_DETECTION: u8 = 2;
 pub(crate) const FILE_ROUTE_RESIDUAL: u8 = 3;
+const RELATION_ELIGIBLE: u8 = 1 << 2;
 const FORMAT_REJECT_TAR: u32 = 1 << 3;
+
+impl DirectorySnapshotTable {
+    pub(crate) fn file_route(&self, row: usize) -> u8 {
+        self.routes[row] & !RELATION_ELIGIBLE
+    }
+
+    pub(crate) fn is_dir(&self, row: usize) -> bool {
+        self.file_route(row) == DIRECTORY_ROUTE
+    }
+
+    pub(crate) fn relation_member_eligible(&self, row: usize) -> bool {
+        self.routes[row] & RELATION_ELIGIBLE != 0
+    }
+}
 
 pub(crate) struct NativeDirectorySnapshot {
     pub(crate) table: Arc<DirectorySnapshotTable>,
@@ -69,7 +83,7 @@ impl NativeDirectorySnapshot {
             self.rows
                 .iter()
                 .copied()
-                .filter(|&row| self.table.file_routes[row] == route)
+                .filter(|&row| self.table.file_route(row) == route)
                 .collect(),
         )
     }
@@ -102,25 +116,21 @@ impl NativeDirectorySnapshot {
         let mut table = DirectorySnapshotTable {
             scan_errors: Vec::new(),
             paths: Vec::with_capacity(records.len()),
-            is_dirs: Vec::with_capacity(records.len()),
             sizes: Vec::with_capacity(records.len()),
             mtimes_ns: Vec::with_capacity(records.len()),
-            relation_member_eligible: Vec::with_capacity(records.len()),
             relation_anchors: Vec::with_capacity(records.len()),
             relation_anchor_cells: Vec::new(),
-            file_routes: Vec::with_capacity(records.len()),
+            routes: Vec::with_capacity(records.len()),
         };
         for record in records {
             let route = filesystem_file_route(record.is_dir, record.relation_anchor.as_ref());
             table.paths.push(record.path);
-            table.is_dirs.push(record.is_dir);
             table.sizes.push(record.size);
             table.mtimes_ns.push(record.mtime_ns);
-            table
-                .relation_member_eligible
-                .push(record.relation_member_eligible);
             table.relation_anchors.push(record.relation_anchor);
-            table.file_routes.push(route);
+            table
+                .routes
+                .push(route | u8::from(record.relation_member_eligible) * RELATION_ELIGIBLE);
         }
         table
     }
@@ -129,7 +139,7 @@ impl NativeDirectorySnapshot {
         self.rows.iter().map(|&row| {
             (
                 self.table.paths[row].as_str(),
-                self.table.is_dirs[row],
+                self.table.is_dir(row),
                 self.table.sizes[row],
                 self.table.mtimes_ns[row],
             )
@@ -154,7 +164,7 @@ impl NativeDirectorySnapshot {
 
 fn filesystem_file_route(is_dir: bool, fact: Option<&CheapAnchor>) -> u8 {
     if is_dir {
-        return 0;
+        return DIRECTORY_ROUTE;
     }
     let Some(fact) = fact else {
         return FILE_ROUTE_RESIDUAL;
@@ -692,9 +702,6 @@ fn build_inventory_snapshot_views(
             size_accepted_split_families.extend(family_keys);
         } else if !family_keys.is_empty() {
             size_deferred.push((index, family_keys));
-            raw_files[index].relation_member_eligible = true;
-        } else {
-            raw_files[index].relation_member_eligible = true;
         }
     }
     for (index, family_keys) in size_deferred {
@@ -725,28 +732,13 @@ fn build_inventory_snapshot_views(
         }
     }
 
-    let mut raw = ancestor_directory_records(&root, raw_files.iter());
-    let file_start = raw.len();
-    let directory_rows: HashMap<&str, usize> = raw
-        .iter()
-        .enumerate()
-        .map(|(index, record)| (record.path.as_str(), index))
-        .collect();
-
-    // Directory entries are derived before mtime filtering to preserve the ordered
-    // Directory filters preserve empty parents: a directory can remain after its last file is rejected
-    // by the final mtime stage.
-    let mut filtered: Vec<usize> = ancestor_directory_records(
+    // Keep parents of files accepted before the final mtime filter, even
+    // when that final filter removes every file in a directory.
+    let (mut raw, mut filtered) = ancestor_directory_records(
         &root,
-        raw_files
-            .iter()
-            .enumerate()
-            .filter_map(|(index, record)| pre_mtime_accepted[index].then_some(record)),
-    )
-    .into_iter()
-    .map(|record| directory_rows[record.path.as_str()])
-    .collect();
-    drop(directory_rows);
+        raw_files.iter().zip(pre_mtime_accepted.iter().copied()),
+    );
+    let file_start = raw.len();
     // Unlike directory enumeration, a worker manifest may name the same output
     // more than once. Preserve its existing last-record projection for aliases.
     let file_rows: HashMap<&str, usize> = raw_files
@@ -755,7 +747,7 @@ fn build_inventory_snapshot_views(
         .map(|(index, record)| (record.path.as_str(), file_start + index))
         .collect();
     filtered.extend(raw_files.iter().enumerate().filter_map(|(index, record)| {
-        (pre_mtime_accepted[index] && numeric_ranges_allow(&options.mtime_ranges, record.mtime_ns))
+        (pre_mtime_accepted[index] && record.relation_member_eligible)
             .then(|| file_rows[record.path.as_str()])
     }));
     drop(file_rows);
@@ -812,40 +804,46 @@ fn path_is_within_root(path: &Path, root: &Path) -> bool {
 
 fn ancestor_directory_records<'a>(
     root: &Path,
-    files: impl Iterator<Item = &'a DirectoryEntryRecord>,
-) -> Vec<DirectoryEntryRecord> {
-    let mut directories = HashSet::new();
-    for file in files {
-        let mut parent = Path::new(&file.path).parent();
-        while let Some(directory) = parent {
+    files: impl Iterator<Item = (&'a DirectoryEntryRecord, bool)>,
+) -> (Vec<DirectoryEntryRecord>, Vec<usize>) {
+    let mut directories = HashMap::new();
+    for (file, accepted) in files {
+        for directory in Path::new(&file.path).ancestors().skip(1) {
             if directory == root || !path_is_within_root(directory, root) {
                 break;
             }
-            directories.insert(directory.to_path_buf());
-            parent = directory.parent();
+            match directories.entry(directory) {
+                Entry::Vacant(entry) => {
+                    entry.insert(accepted);
+                }
+                Entry::Occupied(mut entry) if accepted && !*entry.get() => {
+                    entry.insert(true);
+                }
+                // This directory's ancestors already have the same visibility.
+                Entry::Occupied(_) => break,
+            }
         }
     }
-    let mut directories: Vec<PathBuf> = directories.into_iter().collect();
-    directories.sort_by(|left, right| {
-        left.components()
-            .count()
-            .cmp(&right.components().count())
-            .then_with(|| {
-                crate::path_keys::case_key(&left.to_string_lossy())
-                    .cmp(&crate::path_keys::case_key(&right.to_string_lossy()))
-            })
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by_cached_key(|(path, _)| {
+        (
+            path.components().count(),
+            crate::path_keys::case_key(&path.to_string_lossy()),
+        )
     });
-    directories
-        .into_iter()
-        .map(|path| DirectoryEntryRecord {
-            path: path_to_string(&path),
+    let mut raw = Vec::with_capacity(directories.len());
+    let mut filtered = Vec::new();
+    for (path, accepted) in directories {
+        if accepted {
+            filtered.push(raw.len());
+        }
+        raw.push(DirectoryEntryRecord {
+            path: path_to_string(path),
             is_dir: true,
-            size: None,
-            mtime_ns: None,
-            relation_member_eligible: false,
-            relation_anchor: None,
-        })
-        .collect()
+            ..Default::default()
+        });
+    }
+    (raw, filtered)
 }
 
 pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInventory {
@@ -1488,58 +1486,84 @@ impl NativeWatchCatalog {
     /// Exact-path receipts never follow a rename. Notifications, startup and
     /// dependency lookup all use this validator, including USN content reasons.
     pub(crate) fn validate_generated(&self, scope: &crate::scan::scope::NativeDiscoveryScope, seed: Option<&str>) -> std::io::Result<Vec<String>> {
-        let mut tables = self.catalogs.lock().unwrap();
-        let Some(table) = tables.get(scope.key()) else { return Ok(Vec::new()); };
-        let keys = if let Some(seed) = seed {
-            table.buckets.get(catalog_stem(seed).as_str()).into_iter().flat_map(|bucket| bucket.iter()).cloned().collect()
-        } else { table.rows.iter().filter(|(_, row)| row.generated.is_some()).map(|(key, _)| Arc::clone(key)).collect() };
-        self.validate_generated_keys(scope, keys, &mut tables)
+        self.validate_generated_keys(scope, |table| {
+            if let Some(seed) = seed {
+                table.buckets.get(catalog_stem(seed).as_str()).into_iter().flat_map(|bucket| bucket.iter()).cloned().collect()
+            } else {
+                table.rows.iter().filter(|(_, row)| row.generated.is_some()).map(|(key, _)| Arc::clone(key)).collect()
+            }
+        })
     }
 
     pub(crate) fn validate_generated_paths(&self, scope: &crate::scan::scope::NativeDiscoveryScope, paths: &HashSet<PathBuf>) -> std::io::Result<Vec<String>> {
-        let mut tables = self.catalogs.lock().unwrap();
-        let Some(table) = tables.get(scope.key()) else { return Ok(Vec::new()); };
-        let mut keys = HashSet::new();
-        for path in paths {
-            let key = crate::path_keys::path_key(&path.to_string_lossy());
-            keys.extend(table.rows.range::<str, _>((std::ops::Bound::Included(key.as_str()), std::ops::Bound::Unbounded))
-                .take_while(|(k, _)| k.starts_with(&key))
-                .filter(|(k, _)| k.as_ref() == key || crate::watch_store::is_path_under(k, &key))
-                .filter(|(_, row)| row.generated.is_some()).map(|(key, _)| Arc::clone(key)));
-        }
-        self.validate_generated_keys(scope, keys.into_iter().collect(), &mut tables)
+        self.validate_generated_keys(scope, |table| {
+            let mut keys = HashSet::new();
+            for path in paths {
+                let key = crate::path_keys::path_key(&path.to_string_lossy());
+                keys.extend(table.rows.range::<str, _>((std::ops::Bound::Included(key.as_str()), std::ops::Bound::Unbounded))
+                    .take_while(|(k, _)| k.starts_with(&key))
+                    .filter(|(k, _)| k.as_ref() == key || crate::watch_store::is_path_under(k, &key))
+                    .filter(|(_, row)| row.generated.is_some()).map(|(key, _)| Arc::clone(key)));
+            }
+            keys.into_iter().collect()
+        })
     }
 
-    fn validate_generated_keys(&self, scope: &crate::scan::scope::NativeDiscoveryScope, keys: Vec<Arc<str>>,
-        tables: &mut HashMap<String, ScopeCatalog>) -> std::io::Result<Vec<String>> {
-        let table = tables.get_mut(scope.key()).unwrap();
-        let mut invalidated = Vec::new();
-        let mut removed = Vec::new();
-        let mut changed = Vec::new();
-        for key in keys {
-            let Some(row) = table.rows.get_mut(key.as_ref()) else { continue; };
-            let Some(before) = row.generated_observation() else { continue; };
-            let path = row.path();
-            let invalid = match crate::postprocess::watch_candidate_for_path(Path::new(&path), Some(before.change_usn)) {
-                Ok(Some(current)) => crate::postprocess::watch_source_changed(before.size, before.mtime, &before.file_id(), before.change_usn, &current),
+    fn validate_generated_keys(
+        &self,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        select_keys: impl FnOnce(&ScopeCatalog) -> Vec<Arc<str>>,
+    ) -> std::io::Result<Vec<String>> {
+        let baselines: Vec<_> = {
+            let tables = self.catalogs.lock().unwrap();
+            let Some(table) = tables.get(scope.key()) else { return Ok(Vec::new()); };
+            select_keys(table).into_iter().filter_map(|key| {
+                let row = table.rows.get(key.as_ref())?;
+                let baseline = row.generated.as_deref()?;
+                Some((key, row.path(), baseline.clone()))
+            }).collect()
+        };
+        let mut stale = Vec::new();
+        for (key, path, before) in baselines {
+            let invalid = match crate::postprocess::watch_candidate_for_path(Path::new(&path), Some(before.usn)) {
+                Ok(Some(current)) => before.source_changed(&current),
                 Ok(None) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(error) => return Err(error),
             };
-            if !invalid { continue; }
-            invalidated.push(path.clone());
-            if scope.contains(&path) {
-                row.generated = None;
-                changed.push(key);
-                table.touch(&path);
-            } else {
-                table.remove(key.as_ref());
-                removed.push(key.to_string());
+            if invalid {
+                stale.push((key, path, before));
             }
         }
+        if stale.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tables = self.catalogs.lock().unwrap();
+        let Some(table) = tables.get_mut(scope.key()) else { return Ok(Vec::new()); };
+        let mut invalidated = Vec::new();
+        let mut removed = Vec::new();
+        let mut changed = Vec::new();
+        for (key, path, before) in stale {
+            let Some(row) = table.rows.get_mut(key.as_ref()) else { continue; };
+            // File I/O ran outside the catalog lock. Apply the result only
+            // to the same path and baseline we observed.
+            if row.generated.as_deref() != Some(&before) || !row.matches_path(&path) {
+                continue;
+            }
+            if scope.contains_key(&key) {
+                row.generated = None;
+                table.touch(&path);
+                changed.push(key);
+            } else {
+                removed.push(key.to_string());
+            }
+            invalidated.push(path);
+        }
+        table.remove_many(removed.iter().map(String::as_str));
         if !removed.is_empty() || !changed.is_empty() {
+            let rows = changed.iter().filter_map(|key| tables[scope.key()].rows.get(key.as_ref())).collect();
             self.persist(&tables, super::catalog_store::DeltaView { scope: scope.key(), removed: &removed,
-                rows: changed.iter().filter_map(|key| tables[scope.key()].rows.get(key.as_ref())).collect(), stamp: None }, false);
+                rows, stamp: None }, false);
         }
         Ok(invalidated)
     }

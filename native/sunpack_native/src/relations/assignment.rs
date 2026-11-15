@@ -1115,6 +1115,7 @@ mod tests {
                 assert_eq!(group.parts_len(), physical.len());
                 assert!(validation_owned_paths(&group).contains("same.shared"));
                 for layout in &plan.layouts {
+                    let layout = &layout.slots;
                     let first = &plan.sources[layout[0].1[0]];
                     assert_eq!(first.path, head.path);
                     assert_eq!(first.start, head.structure_offset.unwrap_or(0));
@@ -1169,11 +1170,11 @@ mod tests {
         let groups = resolve(&rows);
         let plan = groups[0].attempts.as_ref().unwrap();
         assert_eq!(
-            plan.layouts.iter().map(Vec::len).collect::<Vec<_>>(),
+            plan.layouts.iter().map(|layout| layout.slots.len()).collect::<Vec<_>>(),
             vec![3, 2]
         );
-        assert_eq!(plan.sources[plan.layouts[0][1].1[0]].path, "same.middle");
-        assert_eq!(plan.sources[plan.layouts[1][1].1[0]].path, "same.short");
+        assert_eq!(plan.sources[plan.layouts[0].slots[1].1[0]].path, "same.middle");
+        assert_eq!(plan.sources[plan.layouts[1].slots[1].1[0]].path, "same.short");
     }
 
     #[test]
@@ -1193,10 +1194,10 @@ mod tests {
         rows.push(row("same.part258", "7z", None, true));
         let groups = resolve(&rows);
         let plan = groups[0].attempts.as_ref().unwrap();
-        assert!(plan.layouts.iter().map(Vec::len).sum::<usize>() <= 3 * rows.len());
-        let family = plan.minimum_slots.iter().position(|n| *n == 2).unwrap();
-        assert_eq!(plan.layouts[family].len(), 258);
-        assert!(plan.layouts[family]
+        assert!(plan.layouts.iter().map(|layout| layout.slots.len()).sum::<usize>() <= 3 * rows.len());
+        let family = plan.layouts.iter().find(|layout| layout.minimum_slots == 2).unwrap();
+        assert_eq!(family.slots.len(), 258);
+        assert!(family.slots
             .last()
             .unwrap()
             .1
@@ -1205,9 +1206,8 @@ mod tests {
         assert!(plan
             .layouts
             .iter()
-            .zip(&plan.minimum_slots)
-            .any(|(layout, minimum)| *minimum == 0
-                && layout
+            .any(|layout| layout.minimum_slots == 0
+                && layout.slots
                     .last()
                     .unwrap()
                     .1
@@ -1340,7 +1340,7 @@ mod tests {
             ];
             let groups = resolve(&rows);
             let plan = groups[0].attempts.as_ref().unwrap();
-            let (_, choices) = &plan.layouts.last().unwrap()[1];
+            let (_, choices) = &plan.layouts.last().unwrap().slots[1];
             assert_eq!(choices.len(), 3);
             assert_eq!(plan.sources[choices[0]].path, rows[1].path);
         }
@@ -1416,9 +1416,9 @@ mod tests {
         ];
         let groups = resolve(&rows);
         let plan = groups[0].attempts.as_ref().unwrap();
-        assert_eq!(plan.layouts[0].len(), 4);
+        assert_eq!(plan.layouts[0].slots.len(), 4);
         for layout in &plan.layouts {
-            if let Some((_, choices)) = layout.iter().find(|(n, _)| *n == 2) {
+            if let Some((_, choices)) = layout.slots.iter().find(|(n, _)| *n == 2) {
                 assert!(choices
                     .iter()
                     .all(|i| plan.sources[*i].path == rows[1].path));

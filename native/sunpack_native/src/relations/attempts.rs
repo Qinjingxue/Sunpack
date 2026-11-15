@@ -14,13 +14,18 @@ pub(super) struct VolumeAttempts {
     // Initial sources are in group path order, one per physical file. Carrier
     // variants append ranges for those same paths without adding group members.
     base_source_count: usize,
-    pub layouts: Vec<Vec<(u32, Arc<Vec<usize>>)>>,
-    // One maximum prefix and terminal domain represent every admitted length.
-    // Zero denotes an ordinary fixed layout.
-    pub minimum_slots: Vec<usize>,
+    pub layouts: Vec<AttemptLayout>,
     pub head_size_from_total: Option<u64>,
     pub minimum_size: Option<u64>,
     pub tail_totals: Vec<(usize, u64)>,
+}
+
+#[derive(Debug)]
+pub(super) struct AttemptLayout {
+    pub slots: Vec<(u32, Arc<Vec<usize>>)>,
+    // One maximum prefix and terminal domain represent every admitted length.
+    // Zero denotes an ordinary fixed layout.
+    pub minimum_slots: usize,
 }
 
 impl VolumeAttempts {
@@ -38,10 +43,7 @@ impl VolumeAttempts {
         let mut domains = Domains::default();
         let mut heads = HashMap::new();
         let mut filtered = HashMap::new();
-        for (layout, minimum) in std::mem::take(&mut self.layouts)
-            .into_iter()
-            .zip(std::mem::take(&mut self.minimum_slots))
-        {
+        for AttemptLayout { slots: layout, minimum_slots } in std::mem::take(&mut self.layouts) {
             let mut interiors = HashMap::new();
             let mut sizes = None::<HashSet<u64>>;
             for (_, choices) in layout.iter().skip(1) {
@@ -137,17 +139,15 @@ impl VolumeAttempts {
                     trimmed.push((*number, domain));
                 }
                 if trimmed.iter().all(|(_, choices)| !choices.is_empty())
-                    && !self.layouts.contains(&trimmed)
+                    && !self.layouts.iter().any(|layout| layout.slots == trimmed)
                 {
-                    self.layouts.push(trimmed);
-                    self.minimum_slots.push(minimum);
+                    self.layouts.push(AttemptLayout { slots: trimmed, minimum_slots });
                 }
             }
             // Equal disk size is a geometry hypothesis, not format identity.
             // Retain the original for nonuniform disks and unpadded carriers.
-            if !self.layouts.contains(&layout) {
-                self.layouts.push(layout);
-                self.minimum_slots.push(minimum);
+            if !self.layouts.iter().any(|existing| existing.slots == layout) {
+                self.layouts.push(AttemptLayout { slots: layout, minimum_slots });
             }
         }
         self
@@ -635,16 +635,6 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
         let base_source_count = sources.len();
         sources.extend(variants);
         let positions: HashMap<_, _> = sources.iter().enumerate().map(|(n, i)| (*i, n)).collect();
-        let remapped: HashMap<_, _> = domains
-            .0
-            .iter()
-            .map(|choices| {
-                (
-                    Arc::as_ptr(choices),
-                    Arc::new(choices.iter().map(|i| positions[i]).collect::<Vec<_>>()),
-                )
-            })
-            .collect();
         let assignment = VolumeAssignment {
             slots: BTreeMap::from([(1, head)]),
             ..Default::default()
@@ -683,6 +673,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
         } else {
             Vec::new()
         };
+        let mut remapped = HashMap::new();
         proposal.attempts = Some(VolumeAttempts {
             head_size_from_total,
             tail_totals,
@@ -694,14 +685,19 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
                     AttemptSource::new(&view.rows[*i].path, view.rows[*i].anchor.as_ref().unwrap())
                 })
                 .collect(),
-            minimum_slots: layouts.iter().map(|(_, minimum)| *minimum).collect(),
             layouts: layouts
                 .into_iter()
-                .map(|(layout, _)| {
-                    layout
+                .map(|(layout, minimum_slots)| AttemptLayout {
+                    minimum_slots,
+                    slots: layout
                         .into_iter()
-                        .map(|(n, choices)| (n, Arc::clone(&remapped[&Arc::as_ptr(&choices)])))
-                        .collect()
+                        .map(|(number, choices)| {
+                            let mapped = remapped.entry(Arc::as_ptr(&choices)).or_insert_with(|| {
+                                Arc::new(choices.iter().map(|i| positions[i]).collect::<Vec<_>>())
+                            });
+                            (number, Arc::clone(mapped))
+                        })
+                        .collect(),
                 })
                 .collect(),
         });
@@ -717,8 +713,7 @@ impl VolumeAttempts {
         let layouts = self
             .layouts
             .iter()
-            .zip(&self.minimum_slots)
-            .map(|(layout, &minimum_slots)| {
+            .map(|AttemptLayout { slots: layout, minimum_slots }| {
                 let slots = layout
                     .iter()
                     .map(|&(number, ref choices)| {
@@ -747,7 +742,7 @@ impl VolumeAttempts {
                     .into_boxed_slice();
                 VolumeLayout {
                     slots,
-                    minimum_slots,
+                    minimum_slots: *minimum_slots,
                 }
             })
             .collect::<Vec<_>>()

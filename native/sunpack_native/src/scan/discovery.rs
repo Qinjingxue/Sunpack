@@ -239,7 +239,7 @@ impl NativeCandidateTable {
             let routed: HashSet<_> = targeted
                 .rows
                 .iter()
-                .filter(|&&row| targeted.table.file_routes[row] == FILE_ROUTE_RELATIONS)
+                .filter(|&&row| targeted.table.file_route(row) == FILE_ROUTE_RELATIONS)
                 .map(|&row| path_key(&targeted.table.paths[row]))
                 .collect();
             groups.retain(|group| match group {
@@ -534,7 +534,7 @@ impl NativeEmbeddedBatch {
             let mut candidate_stems = None;
             for (source, snapshot) in table.relation_sources.iter().enumerate() {
                 for &row in snapshot.rows.iter() {
-                    if snapshot.table.is_dirs[row] || !snapshot.table.relation_member_eligible[row]
+                    if snapshot.table.is_dir(row) || !snapshot.table.relation_member_eligible(row)
                         || snapshot.table.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor).is_some() {
                         continue;
                     }
@@ -597,7 +597,7 @@ impl NativeEmbeddedBatch {
                 continue;
             }
             for &row in snapshot.rows.iter() {
-                if !snapshot.table.relation_member_eligible[row] {
+                if !snapshot.table.relation_member_eligible(row) {
                     continue;
                 }
                 let path = &snapshot.table.paths[row];
@@ -834,7 +834,7 @@ impl NativeEmbeddedBatch {
         if !peers.is_empty() {
             for snapshot in sources {
                 for &row in snapshot.rows.iter() {
-                    if !snapshot.table.relation_member_eligible[row] {
+                    if !snapshot.table.relation_member_eligible(row) {
                         continue;
                     }
                     let path = &snapshot.table.paths[row];
@@ -978,8 +978,8 @@ impl NativeCandidateTable {
                     .map(|group| Candidate::Relation(Box::new(group))),
             );
             for &row in filtered_snapshot.rows.iter() {
-                if !filtered_snapshot.table.is_dirs[row]
-                    && filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
+                if !filtered_snapshot.table.is_dir(row)
+                    && filtered_snapshot.table.file_route(row) != FILE_ROUTE_RELATIONS
                 {
                     self.rows
                         .push(Candidate::File(Arc::clone(&filtered_snapshot.table), row));
@@ -1011,7 +1011,7 @@ impl NativeCandidateTable {
         if stems.is_empty() { return anchors.into_values().collect(); }
         for snapshot in &self.relation_sources {
             for &row in snapshot.rows.iter() {
-                if !snapshot.table.relation_member_eligible[row] { continue; }
+                if !snapshot.table.relation_member_eligible(row) { continue; }
                 let Some(anchor) = snapshot.table.relation_anchors[row].as_ref()
                     .and_then(CheapAnchor::anchor)
                     .filter(|a| a.format == "rar" && a.needs_password)
@@ -1272,7 +1272,7 @@ impl NativeCandidateTable {
             .enumerate()
             .filter_map(|(index, row)| match row {
                 Candidate::File(table, file_index)
-                    if table.file_routes[*file_index] == FILE_ROUTE_DETECTION =>
+                    if table.file_route(*file_index) == FILE_ROUTE_DETECTION =>
                 {
                     Some(index)
                 }
@@ -1353,7 +1353,7 @@ impl NativeCandidateTable {
             !claimed.is_empty() || !blocked.is_empty() || !speculative.is_empty();
         for (index, row) in self.rows.iter().enumerate() {
             if let Candidate::File(table, file_index) = row {
-                let residual = table.file_routes[*file_index] == FILE_ROUTE_RESIDUAL;
+                let residual = table.file_route(*file_index) == FILE_ROUTE_RESIDUAL;
                 if !has_path_constraints {
                     if residual {
                         routes.embedded.push(index);

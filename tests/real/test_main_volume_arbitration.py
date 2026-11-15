@@ -10,7 +10,7 @@ from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree
 from tests.helpers.real_archives import create_encrypted_rar_archive, create_zip_multidisk_archive
 from tests.real.archive_boundary import assert_extracted, extract_report, require_generator
 from tests.real.plan7_watch_downloads.plan7_support import (
-    FACTORY, download, wait_for, watch_setup,
+    FACTORY, download, source_directory_cleaned, wait_for, watch_setup,
 )
 
 
@@ -40,11 +40,11 @@ def test_competing_number_columns_choose_the_valid_complete_order(package, tmp_p
     else:
         watch = watch_setup(package, tmp_path, passwords=[], cleanup="d", recursive=True)
         delivered = case.archive_dir.rename(watch.root / case.archive_dir.name)
-        wait_for(lambda: not any(delivered.iterdir()), "cleanup of the correctly ordered volume set")
+        wait_for(lambda: source_directory_cleaned(delivered), "cleanup of the correctly ordered volume set")
         watch.stop()
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
-    assert not any(delivered.iterdir())
+    assert source_directory_cleaned(delivered)
 
 
 @pytest.mark.parametrize("entry_mode", ["cli", WATCH])
@@ -80,7 +80,7 @@ def test_encrypted_rar_carrier_is_not_borrowed_as_same_size_7z_middle(package, t
     else:
         watch = watch_setup(package, tmp_path, passwords=passwords, cleanup="d", recursive=True)
         inputs = inputs.rename(watch.root / inputs.name)
-        wait_for(lambda: not any(inputs.iterdir()), "cleanup of both independent archives")
+        wait_for(lambda: source_directory_cleaned(inputs), "cleanup of both independent archives")
         watch.stop()
         watch.assert_no_terminal_failures()
     parents = []
@@ -89,7 +89,7 @@ def test_encrypted_rar_carrier_is_not_borrowed_as_same_size_7z_middle(package, t
         assert_exact_tree(marker.parent, case.metadata["expected_files"])
         parents.append(marker.parent)
     assert parents[0] != parents[1]
-    assert not any(inputs.iterdir())
+    assert source_directory_cleaned(inputs)
 
 
 @pytest.mark.parametrize("entry_mode", ["cli", WATCH])
