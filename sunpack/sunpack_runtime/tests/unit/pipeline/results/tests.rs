@@ -1,4 +1,5 @@
 use super::*;
+use crate::pipeline::CleanupStatus;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 #[test]

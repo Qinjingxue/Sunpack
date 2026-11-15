@@ -183,7 +183,6 @@ pub(super) static MESSAGES: &[(&str, &str, &str)] = &[
     ("failure.warning_busy_or_partial", "Warning (file is busy or partially failed)", "警告 (文件被占用或部分失败)"),
     ("failure.worker_process_failed", "7z worker failure ({kind}): {message}", "7z 工作进程故障（{kind}）：{message}"),
     ("filesystem_scan.metadata", "Cannot read file or directory information: {path} ({error})", "无法读取文件或目录信息：{path}（{error}）"),
-    ("filesystem_scan.output_scan", "Output scan incomplete: {path} ({error} unreadable entries)", "输出扫描不完整：{path}（{error} 个条目无法读取）"),
     ("filesystem_scan.read_dir", "Cannot read directory: {path} ({error})", "无法读取目录：{path}（{error}）"),
     ("filesystem_scan.read_dir_entry", "Cannot enumerate directory entries: {path} ({error})", "无法枚举目录条目：{path}（{error}）"),
     ("interrupt.cleaned", "Cleaned unfinished output and kept completed results", "未完成输出已清理，已完成结果已保留"),

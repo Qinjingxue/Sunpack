@@ -6,7 +6,7 @@ use super::*;
 #[test]
 fn frames_reject_corruption_and_recover_only_incomplete_tails() {
     let mut bytes = file_header(Kind::TaskWal).to_vec();
-    append_frame(&mut bytes, 7, |out| {
+    append_frame(&mut bytes, &mut Vec::new(), 7, |out| {
         rmp_serde::encode::write(out, &vec!["雪", "payload"]).map_err(invalid)
     })
     .unwrap();
@@ -46,12 +46,13 @@ fn frames_reject_corruption_and_recover_only_incomplete_tails() {
 #[test]
 fn fragmented_replay_releases_consumed_payload_and_commits_only_complete_transactions() {
     let mut bytes = file_header(Kind::TaskWal).to_vec();
-    append_frame(&mut bytes, 1, |out| out.write_all(b"first")).unwrap();
+    let mut buffer = Vec::new();
+    append_frame(&mut bytes, &mut buffer, 1, |out| out.write_all(b"first")).unwrap();
     let first_end = bytes.len();
     let large = vec![0x5a; crate::io::scratch::MEMORY_BYTES + 17];
-    append_frame(&mut bytes, 2, |out| out.write_all(&large)).unwrap();
+    append_frame(&mut bytes, &mut buffer, 2, |out| out.write_all(&large)).unwrap();
     let large_end = bytes.len();
-    append_frame(&mut bytes, 3, |out| out.write_all(b"last")).unwrap();
+    append_frame(&mut bytes, &mut buffer, 3, |out| out.write_all(b"last")).unwrap();
 
     let mut reader = Reader::new(Cursor::new(&bytes), Kind::TaskWal).unwrap();
     assert_eq!(reader.next().unwrap(), Some(1));

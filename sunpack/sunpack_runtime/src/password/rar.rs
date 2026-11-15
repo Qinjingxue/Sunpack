@@ -30,6 +30,7 @@ const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
 const RAR_INITIAL_PREFIX_SCAN: usize = 16 * 1024;
 const RAR3_KDF_ITERATIONS: u32 = 0x40000;
 const RAR4_MIN_HEADER_SIZE: usize = 7;
+const RAR4_HEADER_TYPES: std::ops::RangeInclusive<u8> = 0x72..=0x7b;
 const PARALLEL_PASSWORD_THRESHOLD: usize = 4;
 const RAR5_MAX_KDF_LOG: u8 = 24;
 const RAR4_MAIN_HEADER_PASSWORD: u16 = 0x0080;
@@ -77,15 +78,20 @@ where
     plaintext
 }
 
-fn decrypt_cbc_bytes<C>(cipher: &C, iv: &[u8; 16], encrypted: &[u8]) -> Vec<u8>
+fn decrypt_cbc_header<C>(
+    cipher: &C,
+    mut previous: [u8; 16],
+    first_plaintext: [u8; 16],
+    header: &mut [u8],
+)
 where
     C: BlockCipherDecrypt,
 {
-    let mut previous = *iv;
-    encrypted
-        .chunks_exact(16)
-        .flat_map(|block| decrypt_cbc_block(cipher, &mut previous, block))
-        .collect()
+    header[..16].copy_from_slice(&first_plaintext);
+    for block in header[16..].chunks_exact_mut(16) {
+        let plaintext = decrypt_cbc_block(cipher, &mut previous, block);
+        block.copy_from_slice(&plaintext);
+    }
 }
 
 pub(crate) fn rar_fast_verify_passwords_with_reader(
@@ -525,7 +531,7 @@ fn parse_rar4_block(data: &[u8], offset: usize) -> Option<Rar4Block> {
         return None;
     }
     let header_type = data[offset + 2];
-    if !(0x72..=0x7b).contains(&header_type) {
+    if !RAR4_HEADER_TYPES.contains(&header_type) {
         return None;
     }
     let flags = u16::from_le_bytes([data[offset + 3], data[offset + 4]]);
@@ -559,17 +565,17 @@ fn parse_rar4_block(data: &[u8], offset: usize) -> Option<Rar4Block> {
 /// block headers are AES-CBC encrypted.
 fn decrypt_rar4_header(encrypted: &[u8], password: &str, salt_source: &[u8]) -> Option<Rar4Block> {
     let salt: &[u8; 8] = salt_source.get(..8)?.try_into().ok()?;
-    let (key, iv) = derive_rar3_key_iv(password, Some(salt))?;
+    let (key, mut previous) = derive_rar3_key_iv(password, Some(salt))?;
     let cipher = Aes128::new_from_slice(&key).ok()?;
     let first = encrypted.get(..16)?;
-    let plain = decrypt_cbc_block(&cipher, &mut iv.clone(), first);
+    let plain = decrypt_cbc_block(&cipher, &mut previous, first);
     let size = u16::from_le_bytes([plain[5], plain[6]]) as usize;
-    if size < RAR4_MIN_HEADER_SIZE {
+    if size < RAR4_MIN_HEADER_SIZE || !RAR4_HEADER_TYPES.contains(&plain[2]) {
         return None;
     }
     let aligned = size.checked_add(15)? & !15;
-    let encrypted = encrypted.get(..aligned)?;
-    let full = decrypt_cbc_bytes(&cipher, &iv, encrypted);
+    let mut full = encrypted.get(..aligned)?.to_vec();
+    decrypt_cbc_header(&cipher, previous, plain, &mut full);
     parse_rar4_block(&full[..size], 0)
 }
 
@@ -1197,14 +1203,7 @@ fn probe_rar5_encrypted_terminal(
         .checked_add(RAR5_SIGNATURE.len() as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RAR5 offset overflow"))?;
     let prefix = reader.read_at(block_offset, 7)?;
-    let Some((header_size, after_size)) = read_vint(&prefix, 4) else {
-        return Ok(Some(RarTerminalProof::default()));
-    };
-    let size_bytes = after_size.saturating_sub(4);
-    let total_size = 4usize
-        .checked_add(size_bytes)
-        .and_then(|value| value.checked_add(usize::try_from(header_size).ok()?));
-    let Some(total_size) = total_size.filter(|size| (7..=2 * 1024 * 1024).contains(size)) else {
+    let Some(total_size) = rar5_header_len(&prefix).filter(|size| *size >= 7) else {
         return Ok(Some(RarTerminalProof::default()));
     };
     // Discovery, fast verification and the terminal walk share the same
@@ -1323,28 +1322,25 @@ fn read_rar5_encrypted_header(
     }
     let mut previous = iv_array;
     let first_plaintext = decrypt_cbc_block(cipher, &mut previous, &first_ciphertext);
-    let Some((header_size, after_size)) = read_vint(&first_plaintext, 4) else {
-        return Ok(None);
-    };
-    let size_bytes = after_size.saturating_sub(4);
-    let Some(total_size) = 4usize
-        .checked_add(size_bytes)
-        .and_then(|value| value.checked_add(usize::try_from(header_size).ok()?))
-        .filter(|size| (7..=2 * 1024 * 1024).contains(size))
-    else {
+    let Some(total_size) = rar5_header_len(&first_plaintext).filter(|size| *size >= 7) else {
         return Ok(None);
     };
     let aligned_size = total_size
         .checked_add(15)
         .map(|value| value & !15)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RAR5 header size overflow"))?;
-    let encrypted = reader.read_at(encrypted_offset, aligned_size)?;
-    if encrypted.len() != aligned_size {
+    let mut header = if aligned_size == 16 {
+        first_ciphertext
+    } else {
+        reader.read_at(encrypted_offset, aligned_size)?
+    };
+    if header.len() != aligned_size {
         return Ok(None);
     }
-    let plaintext = decrypt_cbc_bytes(cipher, &iv_array, &encrypted);
+    decrypt_cbc_header(cipher, previous, first_plaintext, &mut header);
+    header.truncate(total_size);
     Ok(Some((
-        plaintext[..total_size].to_vec(),
+        header,
         encrypted_offset
             .checked_add(aligned_size as u64)
             .ok_or_else(|| {
@@ -1369,7 +1365,7 @@ fn probe_rar4_encrypted_terminal(
     let Some(header_size) = prefix
         .get(5..7)
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
-        .filter(|size| (RAR4_MIN_HEADER_SIZE..=2 * 1024 * 1024).contains(size))
+        .filter(|size| *size >= RAR4_MIN_HEADER_SIZE)
     else {
         return Ok(Some(RarTerminalProof::default()));
     };
@@ -1432,7 +1428,7 @@ fn walk_rar4_encrypted_headers(
         let mut previous = iv;
         let first_plaintext = decrypt_cbc_block(&cipher, &mut previous, &first_ciphertext);
         let header_size = u16::from_le_bytes([first_plaintext[5], first_plaintext[6]]) as usize;
-        if !(RAR4_MIN_HEADER_SIZE..=2 * 1024 * 1024).contains(&header_size) {
+        if header_size < RAR4_MIN_HEADER_SIZE || !RAR4_HEADER_TYPES.contains(&first_plaintext[2]) {
             return Ok(incomplete(password_matched));
         }
         let aligned_size = header_size
@@ -1441,16 +1437,20 @@ fn walk_rar4_encrypted_headers(
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "RAR4 header size overflow")
             })?;
-        let encrypted = reader.read_at(encrypted_offset, aligned_size)?;
-        if encrypted.len() != aligned_size {
+        let mut header = if aligned_size == 16 {
+            first_ciphertext
+        } else {
+            reader.read_at(encrypted_offset, aligned_size)?
+        };
+        if header.len() != aligned_size {
             return Ok(incomplete(password_matched));
         }
-        let plaintext = decrypt_cbc_bytes(&cipher, &iv, &encrypted);
-        let full = &plaintext[..header_size];
+        decrypt_cbc_header(&cipher, previous, first_plaintext, &mut header);
+        let full = &header[..header_size];
         let stored_crc = u16::from_le_bytes([full[0], full[1]]);
         let header_type = full[2];
         let header_flags = u16::from_le_bytes([full[3], full[4]]);
-        if crc32(&full[2..]) as u16 != stored_crc || !(0x72..=0x7b).contains(&header_type) {
+        if crc32(&full[2..]) as u16 != stored_crc {
             return Ok(incomplete(password_matched));
         }
         password_matched = true;

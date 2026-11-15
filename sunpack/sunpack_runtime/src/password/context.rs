@@ -126,7 +126,7 @@ fn cache() -> &'static Mutex<VecDeque<Entry>> {
     CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// Initialize once per input, outside the cache lock and without the GIL.
+/// Initialize once per input, outside the cache lock.
 /// Unrelated archives and all candidate calculations remain concurrent.
 pub(crate) fn verify_prepared(
     key: InputKey,
@@ -142,6 +142,7 @@ pub(crate) fn verify_prepared(
     let mut prepare = Some(prepare);
     let slot = loop {
         let slot = {
+            let _retired_entries;
             let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
             let entry = if let Some(index) = entries.iter().position(|(old, _)| *old == key) {
                 // Insertion already retired conflicting generations. A current
@@ -154,11 +155,11 @@ pub(crate) fn verify_prepared(
                     .iter()
                     .map(|member| (&member.generation.path, &member.generation))
                     .collect();
-                retain(&mut entries, |old, _| {
+                _retired_entries = retire_where(&mut entries, |old| {
                     // Concurrent discovery snapshots may contain different
                     // volume sets. Their exact keys keep facts independent;
                     // only a changed physical generation invalidates a borrower.
-                    !old.members.iter().any(|left| {
+                    old.members.iter().any(|left| {
                         generations
                             .get(&left.generation.path)
                             .is_some_and(|right| left.generation != **right)
@@ -170,14 +171,14 @@ pub(crate) fn verify_prepared(
             entries.push_back(entry);
             slot
         };
-        let ready = (|| {
-            slot.value.get_or_init(&cancellation, || {
+        let ready = slot
+            .value
+            .get_or_init(&cancellation, || {
                 prepare
                     .take()
                     .expect("only the initializer consumes prepare")()
             })
-        })()
-        .is_some();
+            .is_some();
         if ready {
             break slot;
         }
@@ -198,21 +199,30 @@ pub(crate) fn verify_prepared(
         Ok(context) => context.verify(candidates),
         Err(status) => Ok(status.verification()),
     });
+    // Destruction of large contexts and their keys follows unlock. A slot
+    // removed by a concurrent invalidation may have only this borrower left.
+    let _retired_slot;
+    let mut evicted = Vec::new();
     let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
     let retired = slot.retired.load(Ordering::Acquire);
     // Physical failures may be transient; do not memoize them as archive facts.
     // Keep oversized material discoverable by concurrent borrowers until
     // the final borrower returns. It never consumes the idle cache budget.
-    if matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error")
+    if retired
+        || matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error")
         || matches!(prepared, Err(PreparedStatus::Status(_,message)) if message.starts_with("resource_unavailable:"))
         || (Arc::strong_count(&slot) == 2
             && matches!(prepared, Ok(context) if context.retained_bytes() > MAX_CONTEXT_BYTES))
     {
-        entries.retain(|(_, current)| !Arc::ptr_eq(current, &slot));
+        if let Some(index) = entries.iter().position(|(_, current)| Arc::ptr_eq(current, &slot)) {
+            evicted.push(entries.remove(index).unwrap());
+        }
+        _retired_slot = slot;
+    } else {
+        // A finished borrower must be invisible to eviction before another
+        // borrower can acquire the lock and check the cache limits.
+        drop(slot);
     }
-    // A finished borrower must be invisible to eviction before another
-    // borrower can acquire the lock and check the cache limits.
-    drop(slot);
     let mut bytes: usize = entries
         .iter()
         .filter_map(|(_, slot)| slot.value.get())
@@ -227,13 +237,14 @@ pub(crate) fn verify_prepared(
         else {
             break;
         };
-        let (_, slot) = entries.remove(index).unwrap();
+        let entry = entries.remove(index).unwrap();
         bytes = bytes.saturating_sub(
-            slot.value
+            entry.1.value
                 .get()
                 .and_then(|result| result.as_ref().ok())
                 .map_or(0, PasswordContext::retained_bytes),
         );
+        evicted.push(entry);
     }
     crate::collections::trim_deque(&mut entries);
     if retired {
@@ -262,33 +273,43 @@ fn input_changed() -> std::io::Error {
 
 pub(crate) fn clear() {
     let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-    retain(&mut entries, |_, _| false);
-    crate::collections::trim_deque(&mut entries);
+    for (_, slot) in entries.iter() {
+        slot.retired.store(true, Ordering::Release);
+    }
+    let retired = std::mem::take(&mut *entries);
+    drop(entries);
+    drop(retired);
 }
 
 pub(crate) fn release_under_roots(roots: &[PathBuf]) {
     let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-    retain(&mut entries, |key, _| {
-        !key.members.iter().any(|member| {
+    let retired = retire_where(&mut entries, |key| {
+        key.members.iter().any(|member| {
             roots
                 .iter()
                 .any(|root| member.generation.path.starts_with(root))
         })
     });
     crate::collections::trim_deque(&mut entries);
+    drop(entries);
+    drop(retired);
 }
 
-fn retain(
+fn retire_where(
     entries: &mut VecDeque<Entry>,
-    mut keep: impl FnMut(&InputKey, &Arc<PreparedSlot>) -> bool,
-) {
-    entries.retain(|(key, slot)| {
-        let keep = keep(key, slot);
-        if !keep {
-            slot.retired.store(true, Ordering::Release);
+    mut remove: impl FnMut(&InputKey) -> bool,
+) -> Vec<Entry> {
+    let mut retired = Vec::new();
+    for _ in 0..entries.len() {
+        let entry = entries.pop_front().unwrap();
+        if remove(&entry.0) {
+            entry.1.retired.store(true, Ordering::Release);
+            retired.push(entry);
+        } else {
+            entries.push_back(entry);
         }
-        keep
-    });
+    }
+    retired
 }
 
 #[cfg(test)]

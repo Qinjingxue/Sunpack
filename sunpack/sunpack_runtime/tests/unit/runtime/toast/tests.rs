@@ -1,4 +1,5 @@
 use super::*;
+use crate::pipeline::CleanupStatus;
 use crate::pipeline::{ArchiveResult, CleanupResult, Segment};
 
 fn one_root(_: &Path) -> Option<String> { Some("root".into()) }
@@ -8,11 +9,9 @@ fn queued(id: TaskId, path: &str, parent: Option<TaskId>, index: usize) -> Event
         id,
         parent,
         path: PathBuf::from(path),
-        depth: 1,
         segment: parent.map(|_| Segment {
             format: "zip".into(),
             index,
-            count: 2,
             offset: 0,
             end_offset: None,
         }),
@@ -22,13 +21,11 @@ fn queued(id: TaskId, path: &str, parent: Option<TaskId>, index: usize) -> Event
 fn progress(
     activity: &Activity,
     id: TaskId,
-    path: &str,
     completed_bytes: u64,
     total_bytes: u64,
 ) {
     activity.event(Event::Progress {
         id,
-        path: PathBuf::from(path),
         completed_bytes,
         total_bytes,
     });
@@ -177,9 +174,9 @@ fn overlapping_requests_share_progress_stop_and_cleanup_result() {
     a.event(queued(2, "carrier", Some(1), 1));
     a.event(queued(3, "carrier", Some(1), 2));
     b.event(queued(4, "ordinary.7z", None, 0));
-    progress(&a, 2, "carrier", 20, 100);
-    progress(&a, 3, "carrier", 80, 200);
-    progress(&b, 4, "ordinary.7z", 100, 200);
+    progress(&a, 2, 20, 100);
+    progress(&a, 3, 80, 200);
+    progress(&b, 4, 100, 200);
     let initial = current(&publisher);
     assert_eq!(initial.progress, Some(0.4));
     assert_eq!(initial.label, "2 archives");
@@ -213,8 +210,6 @@ fn overlapping_requests_share_progress_stop_and_cleanup_result() {
     a.event(Event::Finalizing { id: 2 });
     a.event(Event::Finished {
         id: 2,
-        path: "carrier".into(),
-        depth: 1,
         result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None },
     });
     let snapshot = current(&publisher);
@@ -226,7 +221,7 @@ fn overlapping_requests_share_progress_stop_and_cleanup_result() {
     assert_eq!(stopped, [first, second]);
     let later = publisher.register(Arc::from("00000000000000000000000000000003"), Language::En);
     later.event(queued(5, "later.zip", None, 0));
-    progress(&later, 5, "later.zip", 5, 10);
+    progress(&later, 5, 5, 10);
     assert_eq!(current(&publisher).title, Language::En.text("toast.progress.title"));
     // Earlier requests remain in cancellation cleanup; new work is visible
     // immediately and another Stop captures it in the same batch.
@@ -328,8 +323,8 @@ fn failed_report_service_releases_completion_gate_without_publishing_partial_rep
     let publisher = publisher(directory.0.clone());
     let activity = publisher.register(Arc::from("42"), Language::En);
     activity.event(queued(1, "a.zip", None, 0));
-    progress(&activity, 1, "a.zip", 1, 2);
-    activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
+    progress(&activity, 1, 1, 2);
+    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
     let mut outcome = Outcome::default();
     outcome.archives.push(archive("a.zip", Some(FailureKind::Damaged)));
     activity.root_finished(1, &outcome);
@@ -350,15 +345,15 @@ fn later_root_uses_its_own_name_after_an_earlier_completion_is_published() {
     let activity = publisher.register(Arc::from("41"), Language::En);
     activity.event(queued(1, "a.zip", None, 0));
     activity.event(queued(2, "b.zip", None, 0));
-    progress(&activity, 1, "a.zip", 1, 2);
+    progress(&activity, 1, 1, 2);
     let mut outcome = Outcome::default();
     outcome.archives.push(archive("a.zip", None));
-    activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
+    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
     activity.root_finished(1, &outcome);
     activity.report_finished(1, false);
     finish_debounce(&publisher);
     take_completed(&publisher);
-    progress(&activity, 2, "b.zip", 1, 2);
+    progress(&activity, 2, 1, 2);
     assert_eq!(current(&publisher).label, "b.zip");
 }
 
@@ -372,9 +367,9 @@ fn settled_roots_survive_sibling_cancel_or_request_error_without_duplicate_repor
         let activity = publisher.register(Arc::from("40"), Language::En);
         for (id, path) in [(1, "a.zip"), (2, "b.zip"), (3, "c.zip")] {
             activity.event(queued(id, path, None, 0));
-            progress(&activity, id, path, 1, 2);
+            progress(&activity, id, 1, 2);
         }
-        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
+        activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
         assert_eq!(current(&publisher).status, "0/3 finished");
         let mut done = Outcome::default();
         done.archives.push(archive("a.zip", None));
@@ -401,7 +396,7 @@ fn settled_roots_survive_sibling_cancel_or_request_error_without_duplicate_repor
         assert_eq!(current(&publisher).status, "1/3 finished");
         let mut failed = Outcome::default();
         failed.archives.push(archive("c.zip", Some(FailureKind::Damaged)));
-        activity.event(Event::Finished { id: 3, path: "c.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
+        activity.event(Event::Finished { id: 3, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
         activity.root_finished(3, &failed);
         assert!(activity.needs_root_report(3));
         activity.record_root(3, Path::new("c.zip"), &failed);
@@ -438,15 +433,15 @@ fn batched_top_level_tasks_keep_independent_completion_and_reports() {
     let activity = publisher.register(Arc::from("30"), Language::En);
     for (id, path) in [(1, "a.zip"), (2, "b.zip"), (3, "c.zip"), (4, "d.zip")] {
         activity.event(queued(id, path, None, 0));
-        if id != 4 { progress(&activity, id, path, 1, 2); }
+        if id != 4 { progress(&activity, id, 1, 2); }
     }
     assert_eq!(current(&publisher).status, "0/3 finished");
     assert_eq!(current(&publisher).label, "3 archives");
     // A root can finish before later descendants are queued. Retain its
     // scalar ancestry until the native request itself has completed.
-    activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
+    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
     activity.event(queued(5, "a/nested.zip", Some(1), 1));
-    progress(&activity, 5, "a/nested.zip", 1, 2);
+    progress(&activity, 5, 1, 2);
     assert_eq!(current(&publisher).status, "0/3 finished");
     let owner = |path: &Path| {
         let path = path.to_string_lossy().to_ascii_lowercase();
@@ -526,7 +521,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
     {
         let activity = publisher.register(Arc::from(format!("1{index}")), Language::En);
         activity.event(queued(1, "retry.zip", None, 0));
-        progress(&activity, 1, "retry.zip", 1, 2);
+        progress(&activity, 1, 1, 2);
         let mut outcome = Outcome::default();
         outcome.archives.push(archive("successful-sibling.zip", None));
         outcome.archives.push(archive("retry.zip", Some(kind)));
@@ -547,7 +542,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
     {
         let activity = publisher.register(Arc::from(format!("3{index}")), Language::En);
         activity.event(queued(1, "carrier.bin", None, 0));
-        progress(&activity, 1, "carrier.bin", 1, 2);
+        progress(&activity, 1, 1, 2);
         let mut outcome = Outcome::default();
         let mut partial = archive("carrier.bin", Some(kind));
         partial.partial = true;
@@ -570,7 +565,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
 
     let activity = publisher.register(Arc::from("20"), Language::En);
     activity.event(queued(1, "terminal.zip", None, 0));
-    progress(&activity, 1, "terminal.zip", 1, 2);
+    progress(&activity, 1, 1, 2);
     let mut outcome = Outcome::default();
     outcome.archives.push(archive("successful-sibling.zip", None));
     outcome.archives.push(archive("terminal.zip", Some(FailureKind::Damaged)));
@@ -585,7 +580,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
     outcome.errors.push(crate::pipeline::InputError {
         path: "log-only-scan".into(), message: "log-only-scan".into(),
         kind: InputErrorKind::FilesystemScan, scan_operation: Some("read".into()),
-        scan_count: Some(7), failure: None,
+        failure: None,
     });
     let result = Ok(outcome);
     activity.record(Path::new("terminal.zip"), &result, false, one_root);
@@ -615,7 +610,7 @@ fn debounce_coalesces_requests_without_waiting_for_invisible_scans() {
     c.event(queued(3, "slow-scan.zip", None, 0));
     let a = publisher.register(Arc::from("01"), Language::En);
     a.event(queued(1, "outer.zip", None, 0));
-    progress(&a, 1, "outer.zip", 2, 2);
+    progress(&a, 1, 2, 2);
     a.finish(&success(), false, false, one_root);
     let first_deadline = publisher.shared.state.lock().unwrap()
         .group.as_ref().unwrap().finalize_at.unwrap();
@@ -627,7 +622,7 @@ fn debounce_coalesces_requests_without_waiting_for_invisible_scans() {
         state.settle(first_deadline - Duration::from_millis(1));
         assert!(state.completed.is_empty());
     }
-    progress(&b, 2, "next.zip", 1, 2);
+    progress(&b, 2, 1, 2);
     assert!(publisher.shared.state.lock().unwrap().group.as_ref().unwrap().finalize_at.is_none());
     assert_eq!(current(&publisher).status, "1/2 finished");
     b.finish(&success(), false, false, one_root);
@@ -639,7 +634,7 @@ fn debounce_coalesces_requests_without_waiting_for_invisible_scans() {
         assert_eq!(state.group.as_ref().unwrap().requests.len(), 1);
         assert_ne!(state.group.as_ref().unwrap().id, completed.id);
     }
-    progress(&c, 3, "slow-scan.zip", 1, 2);
+    progress(&c, 3, 1, 2);
     assert_eq!(current(&publisher).label, "slow-scan.zip");
     assert_eq!(current(&publisher).status, "0/1 finished");
     c.finish(&success(), false, false, one_root);
@@ -757,7 +752,7 @@ fn semantic_reload_retires_debouncing_and_in_flight_batches() {
         let publisher = publisher(directory.0.clone());
         let old = publisher.register(Arc::from("01"), Language::En);
         old.event(queued(1, "old.zip", None, 0));
-        progress(&old, 1, "old.zip", 1, 2);
+        progress(&old, 1, 1, 2);
         let stale_progress = current(&publisher);
         let failure = Err(io::Error::other("old failure"));
         old.record(Path::new("old.zip"), &failure, false, one_root);
@@ -770,7 +765,7 @@ fn semantic_reload_retires_debouncing_and_in_flight_batches() {
         assert!(publisher.shared.state.lock().unwrap().clear);
         let new = publisher.register(Arc::from("02"), Language::Zh);
         new.event(queued(2, "new.zip", None, 0));
-        progress(&new, 2, "new.zip", 1, 2);
+        progress(&new, 2, 1, 2);
         assert!(!publisher.shared.present(&stale_progress.batch, || panic!("stale progress")));
         if let Some(completed) = completed {
             assert!(!publisher.shared.present_completed(&completed, || panic!("stale completion")));
@@ -793,7 +788,7 @@ fn presenter_shutdown_discards_queued_report_and_draft_with_live_activity() {
     let publisher = publisher(directory.0.clone());
     let activity = publisher.register(Arc::from("01"), Language::En);
     activity.event(queued(1, "failed.zip", None, 0));
-    progress(&activity, 1, "failed.zip", 1, 2);
+    progress(&activity, 1, 1, 2);
     let failure = Err(io::Error::other("failure"));
     activity.record(Path::new("failed.zip"), &failure, false, one_root);
     activity.finish(&failure, false, false, one_root);
@@ -825,9 +820,9 @@ fn stopping_remaining_work_preserves_the_batch_failure_report() {
     let failed = publisher.register(Arc::from("01"), Language::En);
     let running = publisher.register(Arc::from("02"), Language::En);
     failed.event(queued(1, "failed.zip", None, 0));
-    progress(&failed, 1, "failed.zip", 1, 2);
+    progress(&failed, 1, 1, 2);
     running.event(queued(2, "running.zip", None, 0));
-    progress(&running, 2, "running.zip", 1, 2);
+    progress(&running, 2, 1, 2);
     let failure = Err(io::Error::other("archive failure before user stop"));
     failed.record(Path::new("failed.zip"), &failure, false, one_root);
     failed.finish(&failure, false, false, one_root);
@@ -849,7 +844,7 @@ fn stopping_remaining_work_preserves_the_batch_failure_report() {
 
     let next = publisher.register(Arc::from("03"), Language::En);
     next.event(queued(3, "next.zip", None, 0));
-    progress(&next, 3, "next.zip", 1, 2);
+    progress(&next, 3, 1, 2);
     let next_batch = current(&publisher).batch;
     assert_ne!(batch, next_batch);
     assert!(publisher.stop_group(&batch).is_empty());
@@ -862,7 +857,7 @@ fn report_publication_does_not_block_progress_and_reset_cancels_its_io() {
     let publisher = publisher(directory.0.clone());
     let first = publisher.register(Arc::from("01"), Language::En);
     first.event(queued(1, "first.zip", None, 0));
-    progress(&first, 1, "first.zip", 1, 2);
+    progress(&first, 1, 1, 2);
     let failure = Err(io::Error::other("first failure"));
     first.record(Path::new("first.zip"), &failure, false, one_root);
     first.finish(&failure, false, false, one_root);
@@ -877,8 +872,8 @@ fn report_publication_does_not_block_progress_and_reset_cancels_its_io() {
     let publication = publisher.publish(&engine, completed);
     let next = publisher.register(Arc::from("02"), Language::En);
     next.event(queued(2, "next.zip", None, 0));
-    progress(&next, 2, "next.zip", 1, 2);
-    progress(&next, 2, "next.zip", 1, 2);
+    progress(&next, 2, 1, 2);
+    progress(&next, 2, 1, 2);
     let snapshot = current(&publisher);
     assert!(publisher.shared.present(&snapshot.batch, || {}));
     assert!(!cancel.cancelled());
@@ -899,10 +894,10 @@ fn native_presentation_releases_state_before_sending_progress_and_completion() {
     let publisher = publisher(directory.0.clone());
     let first = publisher.register(Arc::from("01"), Language::En);
     first.event(queued(1, "first.zip", None, 0));
-    progress(&first, 1, "first.zip", 1, 2);
+    progress(&first, 1, 1, 2);
     assert!(publisher.shared.present(&current(&publisher).batch, || {
         assert!(publisher.shared.state.try_lock().is_ok());
-        progress(&first, 1, "first.zip", 1, 2);
+        progress(&first, 1, 1, 2);
     }));
     first.finish(&success(), false, false, one_root);
     finish_debounce(&publisher);
@@ -911,8 +906,8 @@ fn native_presentation_releases_state_before_sending_progress_and_completion() {
         assert!(publisher.shared.state.try_lock().is_ok());
         let next = publisher.register(Arc::from("02"), Language::En);
         next.event(queued(2, "next.zip", None, 0));
-        progress(&next, 2, "next.zip", 1, 2);
-        progress(&next, 2, "next.zip", 1, 2);
+        progress(&next, 2, 1, 2);
+        progress(&next, 2, 1, 2);
         assert_ne!(current(&publisher).batch, completed.id.as_ref());
     }));
     assert_eq!(publisher.shared.state.lock().unwrap().group.iter().count(), 1);
@@ -926,7 +921,7 @@ fn new_visible_work_invalidates_in_flight_completion_without_losing_report() {
     let publisher = publisher(directory.0.clone());
     let first = publisher.register(Arc::from("01"), Language::En);
     first.event(queued(1, "first.zip", None, 0));
-    progress(&first, 1, "first.zip", 1, 2);
+    progress(&first, 1, 1, 2);
     let failure = Err(io::Error::other("first failure"));
     first.record(Path::new("first.zip"), &failure, false, one_root);
     first.finish(&failure, false, false, one_root);
@@ -948,7 +943,7 @@ fn new_visible_work_invalidates_in_flight_completion_without_losing_report() {
     let stale_report = ready.recv().unwrap();
     let next = publisher.register(Arc::from("02"), Language::En);
     next.event(queued(2, "next.zip", None, 0));
-    progress(&next, 2, "next.zip", 1, 2);
+    progress(&next, 2, 1, 2);
     assert_eq!(current(&publisher).batch, batch.as_ref());
     assert_eq!(current(&publisher).status, "1/2 finished");
     let failure = Err(io::Error::other("second failure"));

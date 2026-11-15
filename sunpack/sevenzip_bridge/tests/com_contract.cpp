@@ -178,8 +178,7 @@ void check_archive_root_directory_entries()
         {
             check(hr == S_OK && callback->SetOperationResult(kOpOk) == S_OK,
                   "root directory entry succeeds as a no-op");
-            check(raw->files_written() == 0 &&
-                  !raw->output_error() && raw->failed_item().empty(),
+            check(raw->files_written() == 0 && !raw->output_error(),
                   "root directory entry writes no files");
             check(!std::filesystem::exists(output) || std::filesystem::is_empty(output),
                   "root directory entry creates no child output");
@@ -194,8 +193,7 @@ void check_archive_root_directory_entries()
         }
         else
         {
-            check(hr == E_INVALIDARG && raw->output_error() && raw->failed_item() == entry.name &&
-                  raw->files_written() == 0,
+            check(hr == E_INVALIDARG && raw->output_error() && raw->files_written() == 0,
                   "unsafe output path is rejected");
             check(trace.items.size() == 1 && trace.items.front().failed &&
                   trace.last_hresult == E_INVALIDARG,

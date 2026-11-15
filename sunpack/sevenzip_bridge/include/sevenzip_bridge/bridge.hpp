@@ -89,7 +89,6 @@ struct ExtractOutputItemTrace {
     bool has_mtime_ns = false;
     unsigned long long mtime_ns = 0;
     std::vector<unsigned char> magic;
-    std::wstring path;
     std::wstring output_path;
 };
 
@@ -117,11 +116,9 @@ struct ExtractArchiveResult {
     unsigned int item_count = 0;
     unsigned int files_written = 0;
     unsigned int password_crc_proven_items = 0;
-    unsigned long long failed_item_bytes_written = 0;
     int hresult = 0;
     int matched_index = -1;
     std::wstring archive_type;
-    std::wstring failed_item;
     std::wstring missing_volume_name;
     std::string failure_stage;
     std::string failure_kind;

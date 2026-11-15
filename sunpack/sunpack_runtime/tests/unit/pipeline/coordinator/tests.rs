@@ -6,8 +6,7 @@ impl Outcome {
         self.archives.iter().filter(|archive| archive.failure.is_none() || archive.partial).count()
     }
     fn failed(&self) -> usize {
-        self.archives.len() - self.succeeded() + self.errors.iter()
-            .filter(|error| error.kind != InputErrorKind::Cleanup).map(InputError::count).sum::<usize>()
+        self.archives.len() - self.succeeded() + self.errors.len()
     }
 }
 
@@ -1192,12 +1191,12 @@ fn replacement_display_reuses_parent_or_registers_retained_failure_without_execu
     let events = Mutex::new(Vec::new());
     let observer = |event: Event| { events.lock().unwrap().push(event); };
     let run = test_run(&engine, &request, &observer);
-    assert_eq!(run.replan_input(1, 1, &input, Some(&checkpoint)), (1, None));
+    assert_eq!(run.replan_input(1, &input, Some(&checkpoint)), (1, None));
     assert!(matches!(events.lock().unwrap().as_slice(), [Event::Replanned { id: 1, .. }]));
     events.lock().unwrap().clear();
     let mut replacement = input.clone();
     replacement.entry_path = source.with_extension("first").to_string_lossy().into_owned();
-    let (active, retained) = run.replan_input(1, 1, &replacement, Some(&checkpoint));
+    let (active, retained) = run.replan_input(1, &replacement, Some(&checkpoint));
     let retained = retained.unwrap();
     assert_ne!(active, 1);
     assert_ne!(active, retained);
@@ -1238,13 +1237,13 @@ fn retry_panel_uses_checkpoint_positions_without_creating_execution_work() {
         inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
         source: DiscoverySource::Embedded, context: None,
     };
-    let ids = run.queue_inputs(&task, 1000, 1, &[Some(&checkpoint), None], 7, true);
+    let ids = run.queue_inputs(&task, 1000, &[Some(&checkpoint), None], true);
     assert_eq!(ids.len(), 2);
     let events = events.lock().unwrap();
     assert_eq!(events.len(), 2);
     for (event, position) in events.iter().zip([2, 4]) {
         assert!(matches!(event, Event::Queued { parent: Some(1000), segment: Some(segment), .. }
-            if segment.index == position && segment.count == 7));
+            if segment.index == position));
     }
     assert!(matches!(&events[0], Event::Queued { id, .. } if *id == ids[1]));
     assert!(matches!(&events[1], Event::Queued { id, .. } if *id == ids[0]));
@@ -1536,7 +1535,7 @@ fn source_cleanup_runs_after_consumer_finish_and_is_joined_by_request() {
     assert!(finished.load(Ordering::Acquire));
     assert_eq!(source.exists(), locked, "request returned before background cleanup settled");
     assert_eq!(outcome.cleanup_results.len(), usize::from(locked));
-    assert_eq!(outcome.errors.iter().filter(|error| error.kind == InputErrorKind::Cleanup).count(), usize::from(locked));
+    assert!(outcome.errors.is_empty());
     assert_eq!(fs::read(output.join("payload")).unwrap(), b"keep");
     drop(held);
     if locked { fs::remove_file(source).unwrap(); }
@@ -2933,8 +2932,7 @@ fn rollback_isolates_cleanup_failures_and_preserves_journal_errors() {
         assert_eq!(fs::read(&bad).unwrap(), b"replacement must survive");
         assert!(!good.exists());
         assert_eq!(outcome.cleanup_results.len(), 1);
-        assert_eq!(outcome.errors[0].kind, InputErrorKind::Cleanup);
-        assert_eq!(outcome.errors[0].path, bad);
+        assert_eq!(outcome.cleanup_results[0].path, bad);
         assert_eq!(outcome.checkpoints.len(), 1);
         assert_eq!(outcome.checkpoints[0].output(), bad);
         assert_eq!(outcome.archives[0].output.as_ref(), Some(&bad));

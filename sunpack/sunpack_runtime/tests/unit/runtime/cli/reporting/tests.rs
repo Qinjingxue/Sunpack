@@ -5,13 +5,13 @@ use std::sync::mpsc;
 #[test]
 fn replan_discards_pending_old_attempt_but_keeps_registration_and_new_progress() {
     let reports = Reports::default();
-    reports.notify(Event::Queued { id: 7, parent: None, path: "old.002".into(), depth: 1, segment: None });
+    reports.notify(Event::Queued { id: 7, parent: None, path: "old.002".into(), segment: None });
     reports.notify(Event::Working { id: 7 });
-    reports.notify(Event::Progress { id: 7, path: "old.002".into(), completed_bytes: 9, total_bytes: 10 });
+    reports.notify(Event::Progress { id: 7, completed_bytes: 9, total_bytes: 10 });
     reports.notify(Event::ResourceWait { id: 7, path: "old.002".into(), state: Default::default() });
     reports.notify(Event::Replanned { id: 7, path: "new.001".into() });
     reports.notify(Event::Working { id: 7 });
-    reports.notify(Event::Progress { id: 7, path: "new.001".into(), completed_bytes: 1, total_bytes: 10 });
+    reports.notify(Event::Progress { id: 7, completed_bytes: 1, total_bytes: 10 });
     let events = reports.take_events();
     assert_eq!(events.len(), 4);
     assert!(matches!(&events[0], Event::Queued { .. }));

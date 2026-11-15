@@ -1,6 +1,6 @@
 //! Request-local result blocks. Recursive returns splice ownership rather than
 //! copying every descendant through every ancestor. Public results remain Vecs.
-use super::{ArchiveResult, CleanupResult, CleanupStatus, FailureKind, InputError,
+use super::{ArchiveResult, CleanupResult, FailureKind, InputError,
     InputErrorKind, InputCheckpoint, Outcome, GeneratedSource, ScanTaskFailure};
 use std::collections::LinkedList;
 #[cfg(test)]
@@ -18,11 +18,11 @@ impl ResultFacts for ArchiveResult {
 }
 impl ResultFacts for InputError {
     fn incomplete(&self) -> bool {
-        !matches!(self.kind, InputErrorKind::Cleanup | InputErrorKind::EmbeddedDiscovery)
+        self.kind != InputErrorKind::EmbeddedDiscovery
     }
 }
 impl ResultFacts for CleanupResult {
-    fn incomplete(&self) -> bool { self.mode == "flatten" && self.status == CleanupStatus::Failed }
+    fn incomplete(&self) -> bool { self.mode == "flatten" }
 }
 impl ResultFacts for InputCheckpoint {}
 impl ResultFacts for GeneratedSource {}

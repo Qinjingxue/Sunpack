@@ -9,12 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
 
-const DURABLE_SINGLE_PROBE_MICROS: u64 = 50;
-const DURABLE_BURST_COALESCE_MICROS: u64 = 500;
-const DURABLE_SLOW_STORAGE_COALESCE_MICROS: u64 = 750;
-const DURABLE_SLOW_STORAGE_THRESHOLD_MICROS: u64 = 10_000;
 const WRITER_BATCH_MAX_RECORDS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
@@ -253,7 +248,6 @@ struct StreamState {
     write_calls: u64,
     #[cfg(test)]
     flush_calls: u64,
-    last_flush_micros: u64,
 }
 
 impl StreamState {
@@ -275,7 +269,6 @@ impl StreamState {
             write_calls: 0,
             #[cfg(test)]
             flush_calls: 0,
-            last_flush_micros: 0,
         }
     }
 }
@@ -675,6 +668,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
         stream.written_seq
     };
     let mut payload = crate::io::scratch::Spool::default();
+    let mut frame_buffer = Vec::new();
     let mut requested = 0;
     for item in batch {
         if previous.checked_add(1) != Some(item.seq) {
@@ -690,7 +684,9 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
             return Err(wal::invalid("mixed WAL types"));
         }
         let start = payload.len()?;
-        wal::append_frame(&mut payload, item.seq, |out| item.operations.encode(out))?;
+        wal::append_frame(&mut payload, &mut frame_buffer, item.seq, |out| {
+            item.operations.encode(out)
+        })?;
         // Only a ticket that reached its written/durable frontier reads this count.
         item.bytes_written
             .store(payload.len()? - start, Ordering::Release);
@@ -881,71 +877,21 @@ fn close_ready_segments(stream: &mut StreamState) {
     });
 }
 
-fn adaptive_coalesce_window(activity_during_probe: bool, last_flush_micros: u64) -> u64 {
-    if !activity_during_probe {
-        return DURABLE_SINGLE_PROBE_MICROS;
-    }
-    if last_flush_micros >= DURABLE_SLOW_STORAGE_THRESHOLD_MICROS {
-        DURABLE_SLOW_STORAGE_COALESCE_MICROS
-    } else {
-        DURABLE_BURST_COALESCE_MICROS
-    }
-}
-
 fn next_flush_work(shared: &Shared) -> FlushWork {
     let mut state = lock_state(shared);
     loop {
         let candidate = state
             .streams
-            .iter()
-            .find(|(_, stream)| {
+            .values_mut()
+            .find(|stream| {
                 stream.error.is_none()
                     && stream.requested_seq > stream.durable_seq
                     && stream.written_seq >= stream.requested_seq
-            })
-            .map(|(key, stream)| (key.clone(), stream.written_seq, stream.requested_seq));
+            });
 
-        if let Some((key, initial_written, initial_requested)) = candidate {
-            // Probe briefly first. An isolated commit pays only 50us rather than
-            // the old fixed 500us. If writer/requested frontiers are still
-            // advancing, extend the window so a burst shares one physical flush.
-            drop(state);
-            thread::sleep(Duration::from_micros(DURABLE_SINGLE_PROBE_MICROS));
-            state = lock_state(shared);
-            let (activity, window) = {
-                let Some(stream) = state.streams.get(key.as_ref()) else {
-                    continue;
-                };
-                if stream.error.is_some()
-                    || stream.requested_seq <= stream.durable_seq
-                    || stream.written_seq < stream.requested_seq
-                {
-                    continue;
-                }
-                let activity = stream.written_seq > initial_written
-                    || stream.requested_seq > initial_requested;
-                (
-                    activity,
-                    adaptive_coalesce_window(activity, stream.last_flush_micros),
-                )
-            };
-            if activity && window > DURABLE_SINGLE_PROBE_MICROS {
-                drop(state);
-                thread::sleep(Duration::from_micros(window - DURABLE_SINGLE_PROBE_MICROS));
-                state = lock_state(shared);
-            }
-
-            let Some(stream) = state.streams.get_mut(key.as_ref()) else {
-                continue;
-            };
-            if stream.error.is_some()
-                || stream.requested_seq <= stream.durable_seq
-                || stream.written_seq < stream.requested_seq
-            {
-                continue;
-            }
+        if let Some(stream) = candidate {
             let target = stream.written_seq;
-            // A single flusher syncs every dirty segment through this snapshot.
+            // Coalesce the records already written through this snapshot.
             // Appends published during I/O have a higher sequence than target.
             let files: Vec<_> = stream
                 .segments
@@ -957,6 +903,7 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
             if files.is_empty() {
                 stream.durable_seq = stream.durable_seq.max(target);
                 close_ready_segments(stream);
+                let key = Arc::clone(&stream.id.key);
                 retire_closed_stream(&mut state, &key);
                 shared.cv.notify_all();
                 continue;
@@ -984,11 +931,9 @@ fn flusher_loop(shared: Arc<Shared>) {
             target,
             files,
         } = work;
-        let flush_started = Instant::now();
         #[cfg(test)]
         let flush_calls = files.len() as u64;
         let result = files.into_iter().try_for_each(|file| file.sync_all());
-        let flush_micros = flush_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
 
         let mut state = lock_state(&shared);
         let Some(stream_state) = state.streams.get_mut(stream.key.as_ref()) else {
@@ -1010,7 +955,6 @@ fn flusher_loop(shared: Arc<Shared>) {
         {
             stream_state.flush_calls += flush_calls;
         }
-        stream_state.last_flush_micros = flush_micros;
         stream_state.durable_seq = stream_state.durable_seq.max(target);
         close_ready_segments(stream_state);
         retire_closed_stream(&mut state, &stream.key);

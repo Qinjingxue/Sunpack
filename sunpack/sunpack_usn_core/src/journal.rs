@@ -155,13 +155,9 @@ impl JournalReader {
                     "recovery end USN is beyond journal head",
                 ));
             }
-            read_directories_changes_from_volume(
-                volume,
-                journal_id,
-                directories,
-                start_usn,
-                end_usn,
-            )
+            scan_directories_page(journal_id, directories, start_usn, end_usn, |cursor, output| {
+                read_journal_page(volume, journal_id, cursor, output)
+            })
         })
     }
 
@@ -286,22 +282,6 @@ fn query_journal_bounds(volume: HANDLE) -> io::Result<(u64, i64, i64)> {
             .max(i64::from_le_bytes(output[24..32].try_into().unwrap())),
         i64::from_le_bytes(output[16..24].try_into().unwrap()),
     ))
-}
-
-fn read_directories_changes_from_volume(
-    volume: HANDLE,
-    journal_id: u64,
-    directories: &[[u8; FILE_ID_BYTES]],
-    start_usn: i64,
-    end_usn: i64,
-) -> io::Result<DirectoryChangesPage> {
-    scan_directories_page(
-        journal_id,
-        directories,
-        start_usn,
-        end_usn,
-        |cursor, output| read_journal_page(volume, journal_id, cursor, output),
-    )
 }
 
 fn read_journal_page(
@@ -466,10 +446,8 @@ fn record_directory_changes<'a>(
     if usn < start_usn || usn >= end_usn {
         return Ok(result);
     }
-    let mut file = [0u8; FILE_ID_BYTES];
-    let mut parent = file;
-    file[..width].copy_from_slice(&record[8..8 + width]);
-    parent[..width].copy_from_slice(&record[8 + width..8 + 2 * width]);
+    let file = file_id_value(&record[8..8 + width]).to_le_bytes();
+    let parent = file_id_value(&record[8 + width..8 + 2 * width]).to_le_bytes();
     let [directory, child] = scratch;
     if let Some(index) = parents.get(&file) {
         directory.0 = *index;

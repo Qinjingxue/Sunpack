@@ -772,7 +772,9 @@ impl OutputNames {
             return true;
         }
         let prefix = format!("{}\\", key.trim_end_matches('\\'));
-        self.claimed.range(prefix.clone()..).next()
+        self.claimed.range::<str, _>((
+            std::ops::Bound::Included(prefix.as_str()), std::ops::Bound::Unbounded,
+        )).next()
             .is_some_and(|(path, _)| path.starts_with(&prefix))
     }
 
@@ -866,7 +868,7 @@ impl OutputNames {
         let mut occupied_preferred = None;
         let mut rebased_parent: Option<(PathBuf, String)> = None;
         loop {
-            let (path, key, slot, suffix, base_key) = {
+            let (path, key, slot, suffix) = {
                 let mut names = registry.lock().unwrap();
                 let (base, base_parent, suffix) = match names.conflicting_ancestor(&parent, owner, input.as_deref()) {
                     Some(ancestor) => {
@@ -893,7 +895,7 @@ impl OutputNames {
                     None => (preferred.as_path(), parent.as_str(), None),
                 };
                 let (path, key, slot) = names.next_available(base, base_parent, occupied_preferred.as_deref());
-                (path, key, slot, suffix, Self::candidate_key(base, base_parent))
+                (path, key, slot, suffix)
             };
             // A query must not reserve a tree that may already exist on disk:
             // peers may legitimately create children there. Only the numbered
@@ -903,14 +905,14 @@ impl OutputNames {
             let occupied = names.has_under(&key);
             let candidate_parent = key.rsplit_once('\\').unwrap().0;
             let conflicting = names.conflicting_ancestor(candidate_parent, owner, input.as_deref()).is_some();
-            if let Some((family, index)) = slot {
+            if let Some((family, index)) = &slot {
                 // Another request may have evicted this bounded history while
                 // we were on the network. Claims, not history, prove exclusivity.
-                if names.indices.peek_mut(&family).is_some() {
+                if names.indices.peek_mut(family).is_some() {
                     if occupied || matches!(checked, Ok(false)) && !conflicting {
-                        names.observe_slot(&key, &family, index);
+                        names.observe_slot(&key, family, *index);
                     } else if !matches!(checked, Ok(true)) {
-                        names.indices.peek_mut(&family).unwrap().release(index);
+                        names.indices.peek_mut(family).unwrap().release(*index);
                     }
                 }
             }
@@ -929,7 +931,7 @@ impl OutputNames {
                     names.claim(key.clone(), owner, source);
                     return Ok(Ok((path, key)));
                 }
-                Ok(true) => occupied_preferred = Some(base_key),
+                Ok(true) => occupied_preferred = Some(slot.map_or(key, |(family, _)| family.to_string())),
                 Err(error) => return Ok(Err(file_failure(error))),
             }
         }
@@ -1186,7 +1188,6 @@ impl<'run, O: Observer> Run<'run, O> {
         self.drain_cleanup(None, &mut cleanup).await;
         if let Ok(outcome) = &mut executed {
             outcome.cleanup_results.append(&mut cleanup.cleanup_results);
-            outcome.errors.append(&mut cleanup.errors);
         }
         // Scheduler completion joins every writer, even on cancellation. Never
         // roll back a tree while a native job or recursive branch can write it.
@@ -1216,7 +1217,6 @@ impl<'run, O: Observer> Run<'run, O> {
                     message: detail,
                     kind: InputErrorKind::FilesystemScan,
                     scan_operation: Some(operation),
-                    scan_count: None,
                     failure: None,
                 }),
         );
@@ -1244,9 +1244,7 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             failures.append(&mut results);
         }
-        for failure in failures {
-            record_cleanup_failure(outcome, failure);
-        }
+        outcome.cleanup_results.extend(failures);
     }
 
     fn filtered_options(&self) -> io::Result<&NativeDirectoryScanOptions> {
@@ -1355,7 +1353,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 } else {
                     Ok(())
                 };
-                let id = this.queue_task(task.entry(), depth, parent_id, || None);
+                let id = this.queue_task(task.entry(), parent_id, || None);
                 let mut result = match ready {
                     Ok(()) => this.execute_task((task, sources, keys, requested), id, depth, scope, children).await,
                     Err(error) => Err(error),
@@ -1393,7 +1391,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 BatchTaskResult::Completed(branch) => branch,
                 BatchTaskResult::Cancelled(id, cancelled) => {
                     self.notify(|| Event::Finished {
-                        id, path: cancelled.path.clone(), depth,
+                        id,
                         result: super::TaskCompletion::from_result(&cancelled),
                     });
                     outcome.archives.push(cancelled);
@@ -1449,7 +1447,6 @@ impl<'run, O: Observer> Run<'run, O> {
     fn queue_task(
         &self,
         input: &ArchiveInput,
-        depth: usize,
         parent: Option<TaskId>,
         segment: impl FnOnce() -> Option<Segment>,
     ) -> TaskId {
@@ -1458,14 +1455,13 @@ impl<'run, O: Observer> Run<'run, O> {
             id,
             parent,
             path: PathBuf::from(&input.entry_path),
-            depth,
             segment: segment(),
         });
         id
     }
 
-    fn queue_inputs(&self, task: &Task, task_id: TaskId, depth: usize,
-        previous: &[Option<&InputCheckpoint>], report_count: usize, has_retained: bool) -> Vec<TaskId> {
+    fn queue_inputs(&self, task: &Task, task_id: TaskId,
+        previous: &[Option<&InputCheckpoint>], has_retained: bool) -> Vec<TaskId> {
         let count = task.inputs.len();
         let position = |index: usize| previous.get(index).copied().flatten()
             .and_then(InputCheckpoint::report_position).unwrap_or(index + 1);
@@ -1473,8 +1469,8 @@ impl<'run, O: Observer> Run<'run, O> {
             if count == 1 { return task_id; }
             let input = &task.inputs[index].input;
             let extent = input.physical_extents().next();
-            self.queue_task(input, depth, Some(task_id), || Some(Segment {
-                format: input.format_hint.clone(), index: position(index), count: report_count,
+            self.queue_task(input, Some(task_id), || Some(Segment {
+                format: input.format_hint.clone(), index: position(index),
                 offset: extent.map_or(0, |extent| extent.start),
                 end_offset: extent.and_then(|extent| extent.end),
             }))
@@ -1495,7 +1491,7 @@ impl<'run, O: Observer> Run<'run, O> {
         }
     }
 
-    fn replan_input(&self, task_id: TaskId, depth: usize, input: &ArchiveInput,
+    fn replan_input(&self, task_id: TaskId, input: &ArchiveInput,
         previous: Option<&InputCheckpoint>) -> (TaskId, Option<TaskId>) {
         self.notify(|| Event::Replanned {
             id: task_id, path: PathBuf::from(&input.entry_path),
@@ -1507,21 +1503,21 @@ impl<'run, O: Observer> Run<'run, O> {
         // retained first attempt by stable position. No execution is queued.
         let segment = |input: &ArchiveInput, index| {
             let extent = input.physical_extents().next();
-            Segment { format: input.format_hint.clone(), index, count: 2,
+            Segment { format: input.format_hint.clone(), index,
                 offset: extent.map_or(0, |extent| extent.start),
                 end_offset: extent.and_then(|extent| extent.end) }
         };
-        let active = self.queue_task(input, depth, Some(task_id), || Some(segment(input, 1)));
-        let retained = self.queue_task(previous.input(), depth, Some(task_id),
+        let active = self.queue_task(input, Some(task_id), || Some(segment(input, 1)));
+        let retained = self.queue_task(previous.input(), Some(task_id),
             || Some(segment(previous.input(), previous.report_position().unwrap_or(1))));
         if let Some(failure) = previous.failure() {
             self.notify(|| {
                 let mut result = super::TaskCompletion::failed(failure);
                 result.output = previous.has_output().then(|| previous.output().to_path_buf());
-                Event::Finished { id: retained, path: previous.entry().to_path_buf(), depth, result }
+                Event::Finished { id: retained, result }
             });
         }
-        self.notify(|| Event::Started { id: active, path: PathBuf::from(&input.entry_path), depth });
+        self.notify(|| Event::Started { id: active });
         (active, Some(retained))
     }
 
@@ -1586,11 +1582,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     return Ok(outcome);
                 }
             };
-            this.notify(|| Event::Started {
-                id: task_id,
-                path: PathBuf::from(&task.entry().entry_path),
-                depth,
-            });
+            this.notify(|| Event::Started { id: task_id });
             let preflight_failures = if task.inputs.len() > 1
                 && !missing.is_empty() {
                 task.inputs.iter().map(|logical| logical.failure.clone()).collect::<Vec<_>>()
@@ -1618,12 +1610,12 @@ impl<'run, O: Observer> Run<'run, O> {
                 // preflight prevents execution. Queued here only registers the
                 // observer row; no segment is submitted to the scheduler.
                 if task.inputs.len() > 1 {
-                    for (index, id) in this.queue_inputs(&task, task_id, depth, &[], task.inputs.len(), false).into_iter().enumerate() {
+                    for (index, id) in this.queue_inputs(&task, task_id, &[], false).into_iter().enumerate() {
                         let logical = &task.inputs[index];
                         let original = if discovery_blocked { logical.failure.as_ref() }
                             else { preflight_failures.get(index).and_then(Option::as_ref) };
                         this.notify(|| Event::Finished {
-                            id, path: PathBuf::from(&logical.input.entry_path), depth,
+                            id,
                             result: original.map_or_else(|| super::TaskCompletion {
                                 discovery: None, status: super::TaskStatus::Skipped, failure: None, output: None,
                             }, super::TaskCompletion::failed),
@@ -1668,7 +1660,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         super::TaskCompletion::from_group(&completed)
                     } else { super::TaskCompletion::from_result(&completed[0]) };
                     if admission && this.request.mode == Mode::Scan { completion.failure = Some(failure.clone()); }
-                    Event::Finished { id: task_id, path: owner_path.clone(), depth, result: completion }
+                    Event::Finished { id: task_id, result: completion }
                 });
                 if this.request.mode == Mode::Scan {
                     outcome.scan_failures.push(ScanTaskFailure {
@@ -1708,7 +1700,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 report_previous.iter().flatten().map(|checkpoint| checkpoint.report_input_count())
                     .max().unwrap_or(0).max(count)
             } else { count };
-            let ids = this.queue_inputs(&task, task_id, depth, &report_previous, report_count, retained.iter().any(Option::is_some));
+            let ids = this.queue_inputs(&task, task_id, &report_previous, retained.iter().any(Option::is_some));
             let mut carrier = if this.request.mode == Mode::Extract && multi {
                 let existing = retained
                     .iter()
@@ -1792,11 +1784,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 let planned_slot = planned_slots.get(index).and_then(Option::as_deref);
                 let mut id = original_id;
                 if multi {
-                    this.notify(|| Event::Started {
-                        id,
-                        path: PathBuf::from(&logical.input.entry_path),
-                        depth,
-                    });
+                    this.notify(|| Event::Started { id });
                 }
                 let before_worker = logical.failure.is_some();
                 let mut attempted = logical.input.volume_attempts.as_ref().map(|_| {
@@ -1944,7 +1932,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             split_input = replacement.entry().mode.structured()
                                 || replacement.entry().physical_paths().nth(1).is_some();
                             physical_sources = std::mem::take(&mut replacement.owned_paths);
-                            let (active, retained) = this.replan_input(task_id, depth,
+                            let (active, retained) = this.replan_input(task_id,
                                 replacement.entry(), replacement_checkpoint.as_ref());
                             id = active;
                             replacement_rows = retained.map(|retained| (active, retained));
@@ -2016,9 +2004,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 // for every recursive subtree and the final source cleanup.
                 if multi || replacement_rows.is_some() {
                     this.notify(|| Event::Finished {
-                        id,
-                        path: result.path.clone(),
-                        depth,
+                    id,
                         result: super::TaskCompletion::from_result(&result),
                     });
                 }
@@ -2068,8 +2054,8 @@ impl<'run, O: Observer> Run<'run, O> {
                     })
                     .collect();
                 physical_sources.retain(|path| {
-                    !superseded_candidates.contains(&path_key(path))
-                        || retained.contains(&path_key(path))
+                    let key = path_key(path);
+                    !superseded_candidates.contains(&key) || retained.contains(&key)
                 });
                 if let Some(sources) = &mut sources { sources.refresh(&physical_sources); }
             }
@@ -2390,7 +2376,7 @@ impl<'run, O: Observer> Run<'run, O> {
             if multi {
                 for (&id, result) in ids.iter().zip(&completed) {
                     this.notify(|| Event::Finished {
-                        id, path: result.path.clone(), depth,
+                        id,
                         result: super::TaskCompletion::from_result(result),
                     });
                 }
@@ -2399,7 +2385,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 // The execution result stays first and the retained first
                 // attempt is appended to the physical result group.
                 for (id, result) in [active, retained].into_iter().zip(&completed) {
-                    this.notify(|| Event::Finished { id, path: result.path.clone(), depth,
+                    this.notify(|| Event::Finished { id,
                         result: super::TaskCompletion::from_result(result) });
                 }
             }
@@ -2413,12 +2399,6 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 this.notify(|| Event::Finished {
                     id: task_id,
-                    path: if multi {
-                        owner_path
-                    } else {
-                        result.path.clone()
-                    },
-                    depth,
                     result: {
                         let mut completion = super::TaskCompletion::from_group(&completed);
                         // A carrier's physical container is not derivable from
@@ -2453,9 +2433,7 @@ impl<'run, O: Observer> Run<'run, O> {
             // Watch releases this root's admission claim after publication.
             // Its source cleanup shares the task lease until it has finished.
             if let Some(cleanup) = root_cleanup {
-                for failure in cleanup.wait().await {
-                    record_cleanup_failure(&mut outcome, failure);
-                }
+                outcome.cleanup_results.append(&mut cleanup.wait().await.into());
             }
             if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
                 this.observer.scope_finished(task_id, outcome.archives.iter()).await?;
@@ -2720,7 +2698,7 @@ impl<'run, O: Observer> Run<'run, O> {
         // cleanup-only companions that are outside the cache key.
         result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect();
         result.output = Some(output);
-        self.notify(|| Event::Finished { id, path: result.path.clone(), depth,
+        self.notify(|| Event::Finished { id,
             result: super::TaskCompletion::from_result(&result) });
         outcome.archives.push(result);
     }
@@ -2905,7 +2883,6 @@ impl<'run, O: Observer> Run<'run, O> {
                                 worker::Update::Started => Event::Working { id },
                                 worker::Update::Progress(progress) => Event::Progress {
                                     id,
-                                    path: result.path.clone(),
                                     completed_bytes: progress.completed,
                                     total_bytes: progress.total,
                                 },
@@ -3384,13 +3361,6 @@ fn flatten_result(
                 receipt.path = new.join(suffix);
             }
         }
-        for error in &mut children.errors {
-            if error.kind == InputErrorKind::Cleanup {
-                if let Some(suffix) = relative_to(&error.path, &old) {
-                    error.path = new.join(suffix);
-                }
-            }
-        }
         result.output = Some(new);
     }
     Ok(())
@@ -3398,7 +3368,7 @@ fn flatten_result(
 
 fn record_cleanup(outcome: &mut Outcome, path: &Path, mode: &'static str, removed: io::Result<()>) {
     if let Some(failure) = cleanup_failure(path, mode, removed) {
-        record_cleanup_failure(outcome, failure);
+        outcome.cleanup_results.push(failure);
     }
 }
 
@@ -3414,18 +3384,6 @@ fn cleanup_failure(path: &Path, mode: &'static str, removed: io::Result<()>) -> 
         error_code: error.raw_os_error().unwrap_or(0),
         message: error.to_string(),
     })
-}
-
-fn record_cleanup_failure(outcome: &mut Outcome, failure: CleanupResult) {
-    outcome.errors.push(InputError {
-        path: failure.path.clone(),
-        message: failure.message.clone(),
-        kind: InputErrorKind::Cleanup,
-        scan_operation: None,
-        scan_count: None,
-        failure: None,
-    });
-    outcome.cleanup_results.push(failure);
 }
 
 fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> ArchiveResult {

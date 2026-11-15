@@ -1,3 +1,5 @@
+use crate::pipeline::CleanupStatus;
+
 #[test]
 fn password_retry_keeps_only_failed_carrier_siblings_and_generated_anchors() {
     let marker = crate::test_support::temp_file("cli_retry_scope", b"source");
@@ -115,7 +117,7 @@ fn help_sections_and_disk_wait_text_match_main() {
                 display: Mutex::default(), reporting: reporting::Reports::default(),
                 prompt: false, visible: true, verbose: false,
             };
-            progress.notify(Event::Queued { id: 1, parent: None, path: "input.zip".into(), depth: 1, segment: None });
+            progress.notify(Event::Queued { id: 1, parent: None, path: "input.zip".into(), segment: None });
             progress.notify(Event::ResourceWait {
                 id: 1, path: "input.zip".into(),
                 state: crate::pipeline::ResourceWait { disk: true, memory: true, volume_error, ..Default::default() },
@@ -161,7 +163,7 @@ fn disk_episode_survives_worker_and_reporting_coalescing() {
             display: Mutex::default(), reporting: reporting::Reports::default(),
             prompt: false, visible: true, verbose: false,
         };
-        progress.notify(Event::Queued { id: 1, parent: None, path: "input.zip".into(), depth: 1, segment: None });
+        progress.notify(Event::Queued { id: 1, parent: None, path: "input.zip".into(), segment: None });
         let emit = |state| progress.notify(Event::ResourceWait { id: 1, path: "input.zip".into(), state });
         let expected = format!("input.zip: {}\n", language.text("report.status.disk_resume_hint"));
         emit(frames[0]);
@@ -294,9 +296,9 @@ fn settled_failure_and_partial_trees_keep_the_last_known_progress() {
             prompt: false, visible: true, verbose: false,
         };
         assert!(matches!(progress.worker_updates(), crate::pipeline::WorkerUpdates::All));
-        progress.notify(Event::Queued { id: 7, parent: None, path: "embedded.bin".into(), depth: 1, segment: None });
+        progress.notify(Event::Queued { id: 7, parent: None, path: "embedded.bin".into(), segment: None });
         if known {
-            progress.notify(Event::Progress { id: 7, path: "embedded.bin".into(), completed_bytes: 40, total_bytes: 100 });
+            progress.notify(Event::Progress { id: 7, completed_bytes: 40, total_bytes: 100 });
         }
         progress.flush_events();
         if !interactive { assert!(input.stdout.lock().unwrap().is_empty()); }
@@ -311,7 +313,7 @@ fn settled_failure_and_partial_trees_keep_the_last_known_progress() {
               scan_layout: Default::default(),
         };
         // Production publishes the terminal task fact before scope reporting.
-        progress.notify(Event::Finished { id: 7, path: archive.path.clone(), depth: 1,
+        progress.notify(Event::Finished { id: 7,
             result: crate::pipeline::TaskCompletion::from_result(&archive) });
         progress.finish_scope(7, &[archive]).unwrap();
         let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
@@ -394,11 +396,11 @@ fn carrier_final_and_scan_reports_keep_parent_status_and_detail_indentation() {
             (5, None, 3, None),
         ] {
             let archive = &archives[position];
-            progress.notify(Event::Queued { id, parent, path: archive.path.clone(), depth: archive.depth,
+            progress.notify(Event::Queued { id, parent, path: archive.path.clone(),
                 segment: segment.map(|index| crate::pipeline::Segment {
-                    index, count: 2, offset: archive.offset, end_offset: archive.end_offset, format: archive.format.clone(),
+                    index, offset: archive.offset, end_offset: archive.end_offset, format: archive.format.clone(),
                 }) });
-            progress.notify(Event::Finished { id, path: archive.path.clone(), depth: archive.depth,
+            progress.notify(Event::Finished { id,
                 result: if id == 1 { crate::pipeline::TaskCompletion::from_group(&archives[..2]) }
                     else { crate::pipeline::TaskCompletion::from_result(archive) } });
         }
@@ -458,8 +460,8 @@ fn summary_output_requires_an_accepted_root_input_but_verbose_keeps_failure_outp
         archives.push(nested);
         let mut completion = crate::pipeline::TaskCompletion::from_group(&archives[..archives.len() - 1]);
         completion.output = Some(PathBuf::from("rescued-output"));
-        progress.notify(Event::Queued { id: 1, parent: None, path: "carrier.bin".into(), depth: 1, segment: None });
-        progress.notify(Event::Finished { id: 1, path: "carrier.bin".into(), depth: 1, result: completion });
+        progress.notify(Event::Queued { id: 1, parent: None, path: "carrier.bin".into(), segment: None });
+        progress.notify(Event::Finished { id: 1, result: completion });
         progress.finish_scope(1, &archives).unwrap();
         assert!(String::from_utf8(session.stdout.lock().unwrap().clone()).unwrap().contains("rescued-output"));
         let display = progress.display.lock().unwrap();
@@ -582,16 +584,15 @@ fn scan_json_keeps_main_sparse_fields_without_internal_failure_evidence() {
     outcome.scan_failures.push(crate::pipeline::ScanTaskFailure {
         path: "a-first-in-sorted-items.zip".into(), archives: 2..3, preflight: None,
     });
-    outcome.errors.push(InputError { path: "folder".into(), message: "3".into(),
-        kind: InputErrorKind::FilesystemScan, scan_operation: Some("output_scan".into()),
-        scan_count: Some(3), failure: None });
+    outcome.errors.push(InputError { path: "folder".into(), message: "access denied".into(),
+        kind: InputErrorKind::FilesystemScan, scan_operation: Some("read_dir".into()), failure: None });
     let (_, report) = report_scan(outcome, vec![], &options, &Input::default(), Language::En).unwrap();
     assert_eq!(report.errors, [
-        "Output scan incomplete: folder (3 unreadable entries)".to_owned(),
+        "Cannot read directory: folder (access denied)".to_owned(),
         format!("input.bin [{}]", Language::En.text("failure.embedded_extract_failed")),
         format!("a-first-in-sorted-items.zip [{}]", Language::En.text("failure.unsupported")),
     ]);
-    assert_eq!(report.summary, json!({"archive_count": 3, "failed_count": 2, "scan_error_count": 3, "input_error_count": 0}));
+    assert_eq!(report.summary, json!({"archive_count": 3, "failed_count": 2, "scan_error_count": 1, "input_error_count": 0}));
     assert_eq!(report.items[0]["main_path"], "a-first-in-sorted-items.zip");
     let item = &report.items[1];
     assert!(item.get("format").is_none());
@@ -670,7 +671,7 @@ fn deeply_nested_final_tree_uses_an_explicit_traversal_stack() {
         for id in 1..=count {
             panel.update(&session, Language::En, Event::Queued {
                 id, parent: (id > 1).then_some(id - 1), path: format!("{id}.zip").into(),
-                depth: id as usize, segment: None,
+                segment: None,
             }, true);
         }
         panel.write_scope(1, true, Language::En, &mut io::sink()).unwrap();
@@ -686,7 +687,7 @@ fn scope_completion_flushes_queued_panel_events_before_removing_the_scope() {
         display: Mutex::default(), reporting: reporting::Reports::default(),
         prompt: false, visible: true, verbose: false,
     };
-    progress.notify(Event::Queued { id: 7, parent: None, path: "test.zip".into(), depth: 1, segment: None });
+    progress.notify(Event::Queued { id: 7, parent: None, path: "test.zip".into(), segment: None });
     progress.finish_scope(7, &[]).unwrap();
     input.stdout.lock().unwrap().clear();
     progress.flush_events();
@@ -708,10 +709,10 @@ fn completed_scope_releases_only_its_panel_tree() {
         let mut child = report_archive("child.zip", 0);
         child.depth = 2;
         let other = report_archive("other.zip", 0);
-        progress.notify(Event::Queued { id: 3, parent: None, path: other.path.clone(), depth: 1, segment: None });
-        progress.notify(Event::Queued { id: 1, parent: None, path: parent.path.clone(), depth: 1, segment: None });
-        progress.notify(Event::Queued { id: 2, parent: Some(1), path: child.path.clone(), depth: 2, segment: None });
-        progress.notify(Event::Finished { id: 2, path: child.path.clone(), depth: 2,
+        progress.notify(Event::Queued { id: 3, parent: None, path: other.path.clone(), segment: None });
+        progress.notify(Event::Queued { id: 1, parent: None, path: parent.path.clone(), segment: None });
+        progress.notify(Event::Queued { id: 2, parent: Some(1), path: child.path.clone(), segment: None });
+        progress.notify(Event::Finished { id: 2,
             result: crate::pipeline::TaskCompletion { discovery: None, status: TaskStatus::Skipped,
                 failure: None, output: None } });
         progress.finish_scope(1, &[parent, child]).unwrap();

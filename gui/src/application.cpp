@@ -182,7 +182,7 @@ void Application::refresh_error_texts() {
 }
 bool Application::field_pending(const std::string& id) const {
     auto match=[&](const Json& job){return job.is_object() && job.value("kind",std::string())=="config" && job.value("key",std::string())==id;};
-    return match(active_save_) || std::any_of(saves_.begin(),saves_.end(),match);
+    return (active_save_ && match(*active_save_)) || std::any_of(saves_.begin(),saves_.end(),match);
 }
 void Application::save_field(const std::string& id,Json draft) {
     try {
@@ -222,9 +222,9 @@ void Application::queue_save(Json job) {
     start_save();
 }
 void Application::start_save() {
-    if(active_save_.is_null() && !saves_.empty()) {
-        active_save_=std::move(saves_.front()); saves_.pop_front();
-        { std::lock_guard<std::mutex> lock(mutex_); commands_.push_back(Json{{"op","commit"},{"payload",active_save_}}); }
+    if(!active_save_ && !saves_.empty()) {
+        active_save_=std::make_shared<const Json>(std::move(saves_.front())); saves_.pop_front();
+        { std::lock_guard<std::mutex> lock(mutex_); commands_.emplace_back(active_save_); }
         cv_.notify_one();
     }
     Json pending=Json::array(), records={{"passwords",false},{"roots",false}};
@@ -233,13 +233,14 @@ void Application::start_save() {
         auto kind=job.at("kind").get<std::string>();
         if(kind=="config") pending.push_back(job["key"]); else records[kind]=true;
     };
-    include(active_save_); for(auto& job:saves_) include(job);
+    if(active_save_) include(*active_save_);
+    for(const auto& job:saves_) include(job);
     auto text=pending.dump(); ui_page_set_json(page_,"pendingFields",text.c_str());
     text=records.dump(); ui_page_set_json(page_,"recordSaving",text.c_str());
-    ui_page_set_bool(page_,"saving",!active_save_.is_null());
+    ui_page_set_bool(page_,"saving",bool(active_save_));
 }
 void Application::acknowledge_save(const Json& ack) {
-    const auto& job=ack.at("job"); auto kind=job.at("kind").get<std::string>();
+    const auto& job=*active_save_; auto kind=job.at("kind").get<std::string>();
     bool ok=ack.at("ok").get<bool>();
     if(kind=="roots") {
         Json records=Json::array(),pending=Json::array();
@@ -290,7 +291,7 @@ void Application::acknowledge_save(const Json& ack) {
         if(!ok) reply["error"]=page_value(page_,"saveErrors")["@root:"+job["edits"][0]["row"].get<std::string>()];
         auto encoded=reply.dump();
         if(ui_page_call_json(page_,"rootSaved",encoded.c_str())!=0) throw std::runtime_error("uiBindingFailed");
-        active_save_=Json(); return;
+        active_save_.reset(); return;
     }
     save_error(kind=="passwords"?"@password:"+job["key"].get<std::string>():job["key"].get<std::string>(),ack.at("error"));
     if(kind=="passwords") {
@@ -354,7 +355,7 @@ void Application::acknowledge_save(const Json& ack) {
         if(!ok) reply["error"]=page_value(page_,"saveErrors")["@password:"+job["key"].get<std::string>()];
         auto encoded=reply.dump();
         if(ui_page_call_json(page_,"passwordSaved",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
-        active_save_=Json();
+        active_save_.reset();
         return;
     }
     if(ok && kind=="config") {
@@ -376,7 +377,7 @@ void Application::acknowledge_save(const Json& ack) {
             queued["fields"][0]["original"]=original; queued["fields"][0]["draft"]["original"]=original;
         }
     }
-    active_save_=Json();
+    active_save_.reset();
 }
 void Application::schedule_task_range() {
     // Defer data edits until the virtual list has finished realization/layout.
@@ -397,7 +398,7 @@ void Application::apply_pending() {
     auto task_snapshot=take("tasks");
     VisualBatch visual(window_);
     auto ack=take("saveAck");
-    const bool cell_ack=!ack.is_null() && (ack["job"]["kind"]=="passwords" || ack["job"]["kind"]=="roots");
+    const bool cell_ack=!ack.is_null() && active_save_ && ((*active_save_)["kind"]=="passwords" || (*active_save_)["kind"]=="roots");
     if(cell_ack) acknowledge_save(ack);
     auto password_snapshot=take("passwords");
     auto directory_snapshot=take("directories");
@@ -446,7 +447,7 @@ void Application::apply_pending() {
         }
     }
     if(!action.is_null()) set_error("actionError",action.get<std::string>());
-    if(!ack.is_null() && !cell_ack) acknowledge_save(ack);
+    if(!ack.is_null() && active_save_ && !cell_ack) acknowledge_save(ack);
     if(!ack.is_null()) ui_page_call_json(page_,"prunePasswordDrafts","{}");
     if(!ack.is_null() || !directory_snapshot.is_null()) ui_page_call_json(page_,"pruneRootDrafts","{}");
     if(patch.contains("fields") || !ack.is_null()) sync_toggles();
@@ -658,7 +659,7 @@ void Application::dispatch() {
 void Application::handle_command(Json command) {
     if(!command.is_object()) return;
     auto op=command.value("op",std::string());
-    auto p=command.value("payload",Json::object());
+    auto& p=command.at("payload");
     if(op=="refreshSearch") return;
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
     if(op=="copyTaskText") {
@@ -802,11 +803,16 @@ void Application::handle_command(Json command) {
         return;
     }
     { std::lock_guard<std::mutex> lock(mutex_);
-      if(op=="filterTasks" || op=="taskPage") ++task_query_generation_;
-      if(op=="filterTasks" || op=="taskPage") commands_.erase(std::remove_if(commands_.begin(),commands_.end(),[](const auto& pending){
-          auto op=pending.value("op",std::string()); return op=="filterTasks" || op=="taskPage";
-      }),commands_.end());
-      commands_.push_back(std::move(command)); }
+      if(op=="filterTasks" || op=="taskPage") {
+          ++task_query_generation_;
+          commands_.erase(std::remove_if(commands_.begin(),commands_.end(),[](const Command& pending){
+              const auto* message=std::get_if<Json>(&pending);
+              if(!message) return false;
+              const auto op=message->find("op");
+              return op!=message->end() && (*op=="filterTasks" || *op=="taskPage");
+          }),commands_.end());
+      }
+      commands_.emplace_back(std::move(command)); }
     cv_.notify_one();
 }
 void Application::finish_date_popup(UINT_PTR generation) {
@@ -1064,7 +1070,7 @@ void Application::work() {
             if(retry.attempts<3) retry.due=Clock::now()+std::chrono::milliseconds(delays[retry.attempts++]);
         };
         for(;;) {
-            unsigned flags; std::deque<Json> commands; uint64_t query_generation;
+            unsigned flags; std::deque<Command> commands; uint64_t query_generation;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 auto deadline=Clock::time_point::max();
@@ -1089,8 +1095,10 @@ void Application::work() {
                 }
                 catch(const std::exception& e) { errors["fileObserver"]=e.what(); }
             }
-            for(auto& command:commands) {
-                auto op=command.value("op",std::string()); auto p=command.value("payload",Json::object());
+            for(const auto& command:commands) {
+                const auto* message=std::get_if<Json>(&command);
+                const auto op=message?message->value("op",std::string()):"commit";
+                const auto& p=message?message->at("payload"):*std::get<Save>(command);
                 try {
                     if(op=="taskWindow") {
                         task_window=p.at("window").get<std::vector<std::string>>();
@@ -1140,9 +1148,11 @@ void Application::work() {
                                 password_edits.push_back({{"operation","addMany"},{"values",std::move(tail)},{"scopes",edit["scopes"]}});
                             }
                         }
-                        auto result=save_changes(dir,p.value("fields",Json::array()),
+                        const Json no_edits=Json::array();
+                        const auto fields=p.find("fields");
+                        auto result=save_changes(dir,fields!=p.end()?*fields:no_edits,
                             password_edits,
-                            kind=="roots"?p.at("edits"):Json::array(),
+                            kind=="roots"?p.at("edits"):no_edits,
                             &saved_passwords,last_passwords);
                         std::string password_original;
                         for(auto& section:result["saved"]) {
@@ -1172,7 +1182,8 @@ void Application::work() {
                             if(section=="roots") flags|=Roots;
                         }
                         auto message=result["error"].get<std::string>();
-                        edit_feedback["saveAck"]={{"job",p},{"ok",message.empty()},{"error",message}};
+                        // The sole in-flight save already belongs to the UI.
+                        edit_feedback["saveAck"]={{"ok",message.empty()},{"error",message}};
                         if(kind=="passwords") {
                             edit_feedback["saveAck"]["passwordOriginal"]=password_original;
                             edit_feedback["saveAck"]["passwordRebases"]=std::move(saved_passwords.rebases);
@@ -1204,7 +1215,7 @@ void Application::work() {
                     } else throw std::runtime_error("uiOperationUnknown");
                 } catch(const std::exception& e) {
                     auto message=std::string(e.what());
-                    if(op=="commit") edit_feedback["saveAck"]={{"job",p},{"ok",false},{"error",message}};
+                    if(op=="commit") edit_feedback["saveAck"]={{"ok",false},{"error",message}};
                     else if(op=="contextMenu") edit_feedback["actionError"]=message;
                     else publish({{"busy",false},{"actionError",message}});
                 }

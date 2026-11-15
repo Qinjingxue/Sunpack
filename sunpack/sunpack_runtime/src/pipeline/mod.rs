@@ -105,7 +105,8 @@ pub struct Request {
 pub(crate) struct PreparedVolume(std::sync::Mutex<Option<discovery::PreparedVolumePlan>>);
 
 impl Request {
-    pub fn new(inputs: Vec<PathBuf>, mode: Mode) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(inputs: Vec<PathBuf>, mode: Mode) -> Self {
         Self::with_config(inputs, mode, Arc::new(Config::default()))
     }
 
@@ -305,33 +306,21 @@ pub struct FailureRead {
     pub read_error: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct InputError {
     pub path: PathBuf,
     pub message: String,
     pub kind: InputErrorKind,
-    #[serde(skip)]
     pub(crate) failure: Option<Box<Failure>>,
-    #[serde(rename = "operation", skip_serializing_if = "Option::is_none")]
     pub scan_operation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scan_count: Option<usize>,
 }
 
-impl InputError {
-    pub(crate) fn count(&self) -> usize {
-        self.scan_count.unwrap_or(1)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputErrorKind {
     InvalidInput,
     FilesystemScan,
     EmbeddedDiscovery,
     WatchDiscoveryIo,
-    Cleanup,
 }
 
 #[derive(Debug, Serialize)]
@@ -369,16 +358,11 @@ impl std::error::Error for OutputCreateError {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupStatus {
-    Deleted,
-    Recycled,
-    Kept,
-    Missing,
     Failed,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 pub struct ArchiveResult {
-    #[serde(skip)]
     pub(crate) scan_layout: ScanLayout,
     pub path: PathBuf,
     pub format: String,
@@ -390,9 +374,7 @@ pub struct ArchiveResult {
     pub depth: usize,
     pub offset: u64,
     pub end_offset: Option<u64>,
-    #[serde(serialize_with = "serialize_volume_completeness")]
     pub(crate) volume_completeness: Option<VolumeCompleteness>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) volume_attempts: Option<Box<crate::io::archive_state::VolumeAttemptPlan>>,
     pub source_paths: Vec<PathBuf>,
     pub password: Option<String>,
@@ -400,12 +382,6 @@ pub struct ArchiveResult {
     pub partial: bool,
     pub retained: bool,
     pub recovered_complete_files: u64,
-}
-
-fn serialize_volume_completeness<S: serde::Serializer>(
-    value: &Option<VolumeCompleteness>, serializer: S,
-) -> Result<S::Ok, S::Error> {
-    value.map(VolumeCompleteness::as_str).serialize(serializer)
 }
 
 /// Sparse presentation facts retained while the canonical input is available.
@@ -467,22 +443,16 @@ pub(crate) struct ScanTaskFailure {
     pub(crate) preflight: Option<Box<Failure>>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 pub struct Outcome {
     pub archives: Vec<ArchiveResult>,
     pub errors: Vec<InputError>,
-    #[serde(skip)]
     pub(crate) scan_failures: Vec<ScanTaskFailure>,
-    #[serde(skip)]
     pub checkpoints: Vec<InputCheckpoint>,
     pub cleanup_results: Vec<CleanupResult>,
-    #[serde(skip)]
     pub(crate) generated_sources: Vec<GeneratedSource>,
-    #[serde(skip)]
     pub(crate) coalesced_from: Option<u64>,
-    #[serde(skip)]
     scan_incomplete: bool,
-    #[serde(skip)]
     uncommitted: bool,
 }
 
@@ -499,7 +469,7 @@ impl Outcome {
         if !self.settled() { return; }
         // A blocked descendant needs its ancestors and successful siblings on
         // the next attempt. Release receipts only when this entire root is done.
-        if !self.scan_incomplete && self.errors.is_empty()
+        if !self.scan_incomplete && self.errors.is_empty() && self.cleanup_results.is_empty()
             && self.archives.iter().all(|archive| archive.failure.is_none())
         {
             self.checkpoints = Vec::new();
@@ -567,22 +537,6 @@ impl Outcome {
         inputs
     }
 
-    pub fn succeeded(&self) -> usize {
-        self.archives
-            .iter()
-            .filter(|archive| archive.failure.is_none() || archive.partial)
-            .count()
-    }
-
-    pub fn failed(&self) -> usize {
-        self.archives.len() - self.succeeded()
-            + self
-                .errors
-                .iter()
-                .filter(|error| error.kind != InputErrorKind::Cleanup)
-                .map(InputError::count)
-                .sum::<usize>()
-    }
 }
 
 impl ArchiveResult {
@@ -609,7 +563,6 @@ pub type TaskId = u64;
 pub struct Segment {
     pub format: String,
     pub index: usize,
-    pub count: usize,
     pub offset: u64,
     pub end_offset: Option<u64>,
 }
@@ -718,13 +671,10 @@ pub enum Event {
         id: TaskId,
         parent: Option<TaskId>,
         path: PathBuf,
-        depth: usize,
         segment: Option<Segment>,
     },
     Started {
         id: TaskId,
-        path: PathBuf,
-        depth: usize,
     },
     /// A physical retry replaces the display plan, not the execution task.
     Replanned {
@@ -748,7 +698,6 @@ pub enum Event {
     },
     Progress {
         id: TaskId,
-        path: PathBuf,
         completed_bytes: u64,
         total_bytes: u64,
     },
@@ -759,8 +708,6 @@ pub enum Event {
     },
     Finished {
         id: TaskId,
-        path: PathBuf,
-        depth: usize,
         result: TaskCompletion,
     },
     Skipped {

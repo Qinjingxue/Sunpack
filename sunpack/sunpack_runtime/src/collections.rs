@@ -95,14 +95,17 @@ impl<K: Eq + Hash + Clone, V> CacheOrder<K, V> {
         self.slots.iter().map(|entry| (&entry.key, &entry.value))
     }
 
-    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+    pub(crate) fn remove<Q: Eq + Hash + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+    {
         let index = self.entries.remove(key)?;
         self.unlink(index);
         let removed = self.slots.swap_remove(index);
         // Repair references to the last slot if swap_remove moved it.
         if let Some(moved) = self.slots.get(index) {
             let (previous, next) = (moved.previous, moved.next);
-            *self.entries.get_mut(&moved.key).unwrap() = index;
+            *self.entries.get_mut::<K>(&moved.key).unwrap() = index;
             if let Some(previous) = previous {
                 self.slots[previous].next = Some(index);
             } else {

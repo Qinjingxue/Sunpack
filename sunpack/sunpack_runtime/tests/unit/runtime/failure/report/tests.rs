@@ -43,15 +43,15 @@ fn missing_volume_wrapper_borrows_recovery_and_streams_both_receipts() {
 }
 
 #[test]
-fn scan_failure_preserves_main_receipt_and_count() {
-    let error = InputError { path: "folder".into(), message: "3".into(),
+fn scan_failure_preserves_operation_and_message() {
+    let error = InputError { path: "folder".into(), message: "access denied".into(),
         kind: crate::pipeline::InputErrorKind::FilesystemScan,
-        scan_operation: Some("output_scan".into()), scan_count: Some(3), failure: None };
+        scan_operation: Some("read_dir".into()), failure: None };
     let report = serde_json::to_value(Report::filesystem_scan(&error, Language::En)).unwrap();
     assert_eq!(report, json!({"kind": "filesystem_error", "stage": "filesystem_scan",
-        "message": "Output scan incomplete: folder (3 unreadable entries)",
-        "message_key": "filesystem_scan.output_scan", "message_params": {"path": "folder", "error": "3"},
-        "user_action": "", "causes": [], "details": {"path": "folder", "operation": "output_scan", "count": 3}}));
+        "message": "Cannot read directory: folder (access denied)",
+        "message_key": "filesystem_scan.read_dir", "message_params": {"path": "folder", "error": "access denied"},
+        "user_action": "", "causes": [], "details": {"path": "folder", "operation": "read_dir", "count": 1}}));
 }
 
 #[test]

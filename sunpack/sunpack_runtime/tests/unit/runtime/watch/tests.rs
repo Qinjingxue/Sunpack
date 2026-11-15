@@ -772,16 +772,14 @@ fn scan_diagnostics_do_not_override_watch_completion() {
     let outputs = BTreeMap::from([
         (key(Path::new(r"C:\watch\outer")), root.to_string_lossy().into_owned()),
     ]);
-    let mut errors = vec![
-        InputError { path: nested.into(), message: "scan denied".into(),
-            kind: InputErrorKind::FilesystemScan,
-            failure: None,
-            scan_operation: Some("read_directory".into()), scan_count: Some(2) },
-        InputError { path: root.into(), message: "cleanup failed".into(),
-            kind: InputErrorKind::Cleanup, failure: None, scan_operation: None, scan_count: None },
-    ];
-    // Neither diagnostic may override a successful archive or its retry
-    // cause, even when the diagnostic resolves to that archive's owner.
+    let mut errors = vec![InputError {
+        path: nested.into(), message: "scan denied".into(),
+        kind: InputErrorKind::FilesystemScan,
+        failure: None,
+        scan_operation: Some("read_dir".into()),
+    }];
+    // Scan diagnostics cannot override an archive result even when they
+    // resolve to the same owner.
     assert!(completion_input_errors(&errors, &outputs, &HashMap::new(), &[]).is_empty());
     errors.push(InputError {
         path: nested.into(),
@@ -789,15 +787,37 @@ fn scan_diagnostics_do_not_override_watch_completion() {
         kind: InputErrorKind::EmbeddedDiscovery,
         failure: Some(Box::new(crate::pipeline::Failure::new(FailureKind::FilesystemError, "embedded read failed"))),
         scan_operation: None,
-        scan_count: None,
     });
     let paths = completion_input_errors(&errors, &outputs, &HashMap::new(), &[]);
     assert_eq!(paths.len(), 2);
     assert_eq!(paths[&key(root)].failure.as_ref().unwrap().kind, FailureKind::FilesystemError);
     assert_eq!(paths[&key(nested)].message, "embedded read failed");
     // The projection borrows; CLI and diagnostics retain the original data.
-    assert_eq!(errors.len(), 3);
-    assert_eq!(errors[0].scan_count, Some(2));
+    assert_eq!(errors.len(), 2);
+    assert_eq!(errors[0].message, "scan denied");
+
+    let inputs = [r"C:\watch\first\series.001", r"C:\watch\second\series.001"]
+        .map(|path| WatchCandidateRow {
+            path: path.into(), size: 0, mtime: 0.0,
+            observation: crate::filesystem::WatchFileObservation {
+                file_id: String::new(), change_usn: 0, change_reasons: None,
+            },
+        });
+    let errors = [
+        InputError {
+            path: inputs[1].path.as_str().into(), message: "admitted source".into(),
+            kind: InputErrorKind::EmbeddedDiscovery, failure: None,
+            scan_operation: None,
+        },
+        InputError {
+            path: r"C:\watch\series.002".into(), message: "residual peer".into(),
+            kind: InputErrorKind::EmbeddedDiscovery, failure: None,
+            scan_operation: None,
+        },
+    ];
+    let paths = completion_input_errors(&errors, &BTreeMap::new(), &HashMap::new(), &inputs);
+    assert_eq!(paths[&watch_path_key(&inputs[0].path)].message, "residual peer");
+    assert_eq!(paths[&watch_path_key(&inputs[1].path)].message, "admitted source");
 }
 
 pub(super) fn completion_archive(path: &str, depth: usize, kind: Option<FailureKind>) -> ArchiveResult {
@@ -1026,7 +1046,9 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
         assert!(input_checkpoints(journal.state().entry(owner_text).as_deref()).next().is_none());
         let retained = input_checkpoints(journal.state().entry(carrier_text).as_deref()).collect::<io::Result<Vec<_>>>().unwrap();
         assert_eq!(retained.len(), 2);
-        let nested_receipt = retained.iter().find(|checkpoint| checkpoint.entry() == nested).unwrap();
+        let nested_receipt = retained.iter()
+            .find(|checkpoint| checkpoint.carrier() == nested)
+            .unwrap();
         let nested_receipt = serde_json::to_value(nested_receipt).unwrap();
         assert_eq!(nested_receipt["failure"]["failure"]["kind"], "damaged");
         assert_eq!(nested_receipt["failure"]["partial"], true);

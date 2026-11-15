@@ -727,6 +727,7 @@ namespace sunpack::sevenzip
                     SysFreeString(name);
                     if (hr == S_OK && property == kpidHardLink) { supports_hard_links_ = true; break; }
                 }
+            if (supports_hard_links_) hard_link_names_.reserve(estimated_items);
             // Register only after callback setup succeeds. A failed
             // constructor cannot unregister a writer job in its destructor.
             if (!async_writer_) async_writer_ = std::make_shared<AsyncFileWriter>();
@@ -760,10 +761,7 @@ namespace sunpack::sevenzip
 
 
 
-        const std::wstring &failed_item() const { return failed_item_; }
-
-
-        UInt64 failed_item_bytes_written() const { return failed_item_bytes_written_; }
+        bool failed_item_had_data() const { return failed_item_had_data_; }
 
         bool output_error() const { return output_error_; }
 
@@ -815,6 +813,7 @@ namespace sunpack::sevenzip
                 operation_result_ = kOpDataError;
             }
             finalize_hard_links();
+            decltype(hard_link_names_){}.swap(hard_link_names_);
             restore_directory_metadata();
             const auto *memory = current_native_memory_job();
             if (replay_ && (is_cancelled() || std::uncaught_exceptions() ||
@@ -990,28 +989,29 @@ namespace sunpack::sevenzip
             current_trace_index_ = output_trace_.items.size() - 1;
             current_trace_active_ = true;
             item.index = index;
-            item.path = std::move(name);
             item.is_dir = is_dir;
             item.encrypted = encrypted;
             encrypted_ |= encrypted;
             item.expected_size = expected_size;
             item.has_expected_size = has_expected_size;
             item.has_source_crc32 = has_source_crc32;
+            // Keep names only for potential hard-link targets. Positions
+            // correspond to trace entries, including empty directory slots.
+            if (supports_hard_links_)
+                hard_link_names_.push_back(is_dir ? std::wstring{} : std::move(name));
+            const auto &member_name = supports_hard_links_ && !is_dir ? hard_link_names_.back() : name;
 
             // Like 7z's normal x mode, ignore entries denoting the output root.
-            if (is_dir && (item.path == L"." || item.path == L"./" || item.path == L".\\"))
+            if (is_dir && (member_name == L"." || member_name == L"./" || member_name == L".\\"))
             {
                 emit("item_start");
                 return S_OK;
             }
 
-            const auto safe_path = safe_relative_item_path(item.path);
+            const auto safe_path = safe_relative_item_path(member_name);
 
             if (!safe_path.has_value())
             {
-
-                failed_item_ = item.path;
-                failed_item_bytes_written_ = 0;
 
                 output_error_ = true;
 
@@ -1072,9 +1072,6 @@ namespace sunpack::sevenzip
 
                 if (!directory_ready)
                 {
-                    failed_item_ = item.path;
-                    failed_item_bytes_written_ = item.bytes_written;
-
                     output_error_ = true;
 
                     // 透传真实错误码：空间不足与路径不可用必须能被上层区分。
@@ -1092,9 +1089,6 @@ namespace sunpack::sevenzip
             catch (...)
             {
                 // Preserve the explicit allocation error above for replay.
-
-                failed_item_ = item.path;
-                failed_item_bytes_written_ = item.bytes_written;
 
                 output_error_ = true;
 
@@ -1131,10 +1125,7 @@ namespace sunpack::sevenzip
                 return E_ABORT;
             }
 
-            if (current_async_file_)
-            {
-                async_writer_->record_operation_result(current_async_file_, opRes);
-            }
+            const bool had_data = async_writer_->record_operation_result(current_async_file_, opRes);
 
             if (opRes != kOpOk || operation_result_ == kOpOk)
             {
@@ -1148,17 +1139,8 @@ namespace sunpack::sevenzip
                 item.operation_result = opRes;
                 item.done = opRes == kOpOk && !item.failed;
                 item.failed = item.failed || opRes != kOpOk;
-                if (opRes != kOpOk)
-                {
-                    if (failed_item_.empty()) failed_item_ = item.path;
-                    failed_item_bytes_written_ = current_async_file_
-                        ? async_writer_->accepted_bytes(current_async_file_) : item.bytes_written;
-                }
             }
-            else if (opRes != kOpOk)
-            {
-                failed_item_bytes_written_ = 0;
-            }
+            if (opRes != kOpOk) failed_item_had_data_ = had_data;
 
             emit(opRes == kOpOk ? "item_done" : "item_failed");
 
@@ -1214,15 +1196,8 @@ namespace sunpack::sevenzip
             if (snapshot.failed)
             {
                 output_error_ = true;
-                if (failed_item_.empty())
-                {
-                    failed_item_ = item.path;
-                    failed_item_bytes_written_ = snapshot.written_bytes;
-                }
                 output_trace_.last_hresult = static_cast<int>(snapshot.hresult);
             }
-            // The settled file only needs its archive name for hard link lookup.
-            if (!supports_hard_links_) std::wstring{}.swap(item.path);
         }
 
         struct HardLink
@@ -1269,10 +1244,6 @@ namespace sunpack::sevenzip
                 // failed filesystem operation. Preserve the decoder's error.
                 output_error_ = output_error_ || output_failure;
                 if (operation_result_ == kOpOk) operation_result_ = kOpDataError;
-                if (failed_item_.empty())
-                {
-                    failed_item_ = item.path;
-                }
                 if (output_failure)
                 {
                     output_trace_.last_hresult = static_cast<int>(HRESULT_FROM_WIN32(error));
@@ -1289,12 +1260,12 @@ namespace sunpack::sevenzip
                     links.emplace(hard_links_[i].trace, i);
                     items[hard_links_[i].trace].done = false;
                 }
-                for (std::size_t i = 0; i < items.size(); ++i)
-                    if (!items[i].is_dir)
-                    {
-                        const auto found = targets.find(archive_path_key(items[i].path));
-                        if (found != targets.end()) found->second.push_back(i);
-                    }
+                for (std::size_t i = 0; i < hard_link_names_.size(); ++i)
+                {
+                    if (hard_link_names_[i].empty()) continue;
+                    const auto found = targets.find(archive_path_key(hard_link_names_[i]));
+                    if (found != targets.end()) found->second.push_back(i);
+                }
                 for (auto &link : hard_links_)
                 {
                     const auto &candidates = targets.at(link.target);
@@ -1597,6 +1568,7 @@ namespace sunpack::sevenzip
 
         ExtractOutputTrace &output_trace_;
         std::vector<HardLink> hard_links_;
+        std::vector<std::wstring> hard_link_names_;
         bool supports_hard_links_ = false;
 
         std::shared_ptr<AsyncFileWriter> async_writer_;
@@ -1631,8 +1603,6 @@ namespace sunpack::sevenzip
 
         UInt64 total_bytes_ = 0;
 
-        UInt64 failed_item_bytes_written_ = 0;
-
         UInt32 current_index_ = 0;
 
         UInt32 files_written_ = 0;
@@ -1640,7 +1610,7 @@ namespace sunpack::sevenzip
 
         std::size_t current_trace_index_ = 0;
 
-        std::wstring failed_item_;
+        bool failed_item_had_data_ = false;
 
         Int32 operation_result_ = kOpOk;
 

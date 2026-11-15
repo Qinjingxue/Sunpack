@@ -464,8 +464,11 @@ impl BucketView<'_> {
         )
     }
 
-    fn solve(&self) -> (VolumeAssignment, Option<RelationFailureReason>) {
-        let mut fixed = match self.fixed() {
+    fn solve(
+        &self,
+        fixed: Result<VolumeAssignment, RelationFailureReason>,
+    ) -> (VolumeAssignment, Option<RelationFailureReason>) {
+        let mut fixed = match fixed {
             Ok(fixed) => fixed,
             Err(reason) => {
                 // Preserve each physical member without inventing a slot for
@@ -720,18 +723,15 @@ pub(super) fn resolve_buckets(
                         continue;
                     }
                 }
-                let structural_only = BucketView {
+                let mut initial_fixed = (heads <= 1).then(|| BucketView {
                     rows,
                     indexes: &members,
                     facts: &facts,
                     features: &features,
                     format,
                     loose_numeric_allowed: false,
-                };
-                let need_names = heads > 1
-                    || structural_only
-                        .fixed()
-                        .map_or(true, |a| !a.unresolved.is_empty());
+                }.fixed());
+                let need_names = !matches!(&initial_fixed, Some(Ok(a)) if a.unresolved.is_empty());
                 if need_names {
                     for &i in &members {
                         features.entry(i).or_insert_with(|| {
@@ -812,7 +812,7 @@ pub(super) fn resolve_buckets(
                                 format,
                                 loose_numeric_allowed: true,
                             };
-                            let (assignment, reason) = view.solve();
+                            let (assignment, reason) = view.solve(view.fixed());
                             if reason.is_none() && view.complete(&assignment) {
                                 complete.extend(indexes.iter().copied());
                                 local_assignments.insert(indexes[0], assignment);
@@ -891,7 +891,9 @@ pub(super) fn resolve_buckets(
                                 Some(RelationFailureReason::AmbiguousVolumeMapping),
                             )
                         } else {
-                            view.solve()
+                            // A one-head view retains the original membership.
+                            // Its fixed slots were already checked before names.
+                            view.solve(initial_fixed.take().unwrap_or_else(|| view.fixed()))
                         };
                     let logical = if family == *stem {
                         assignment

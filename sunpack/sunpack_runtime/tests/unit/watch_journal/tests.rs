@@ -172,22 +172,6 @@ fn seal_waits_for_durable_boundary_and_releases_segment() {
 }
 
 #[test]
-fn adaptive_coalescing_keeps_idle_commit_short_and_extends_bursts() {
-    assert_eq!(
-        adaptive_coalesce_window(false, 0),
-        DURABLE_SINGLE_PROBE_MICROS
-    );
-    assert_eq!(
-        adaptive_coalesce_window(true, 1_000),
-        DURABLE_BURST_COALESCE_MICROS
-    );
-    assert_eq!(
-        adaptive_coalesce_window(true, DURABLE_SLOW_STORAGE_THRESHOLD_MICROS),
-        DURABLE_SLOW_STORAGE_COALESCE_MICROS
-    );
-}
-
-#[test]
 fn writer_batches_already_queued_appends_without_waiting() {
     let shared = Arc::new(Shared::new());
     let (tx, rx) = mpsc::channel();

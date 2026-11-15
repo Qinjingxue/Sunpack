@@ -86,6 +86,7 @@ impl NativeWatchState {
     pub(crate) fn owned_event_records<'a>(&self, paths: impl Iterator<Item = &'a Path>) -> BTreeMap<String, Arc<OutputReservation>> {
         let data = self.outputs.lock().unwrap();
         let mut records = BTreeMap::new();
+        if data.is_empty() { return records; }
         for path in paths {
             let key = path_key(&path.to_string_lossy());
             for parent in crate::path_keys::path_ancestors(&key) {
@@ -98,6 +99,7 @@ impl NativeWatchState {
     }
 
     pub(crate) fn owned_event_filter(&self, boundary: &Path, records: BTreeMap<String, Arc<OutputReservation>>) -> Option<OwnedEventFilter> {
+        if records.is_empty() { return None; }
         let data = self.outputs.lock().unwrap();
         let owned: HashSet<_> = records.into_iter().filter_map(|(key, record)| {
             data.get(&key).is_some_and(|value| Arc::ptr_eq(value, &record)).then_some(key)

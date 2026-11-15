@@ -435,13 +435,6 @@ impl ConfigSources {
     }
 }
 
-pub fn load_raw(cwd: &Path) -> io::Result<(PathBuf, Value)> {
-    let sources = resolve_sources(cwd);
-    let value = sources.load(cwd)?;
-    Ok((sources.primary().to_path_buf(), value))
-}
-
-
 struct Generation {
     stamp: Option<[Option<PhysicalFileGeneration>; 3]>,
     snapshot: Snapshot,
@@ -600,7 +593,7 @@ pub(crate) fn read_generation(cwd: &Path, sources: ConfigSources, mode: ReadMode
 }
 
 pub fn load_language(cwd: &Path) -> Language {
-    load_raw(cwd).map_or_else(|_| default_language(), |(_, raw)| raw_language(&raw))
+    resolve_sources(cwd).load(cwd).map_or_else(|_| default_language(), |raw| raw_language(&raw))
 }
 
 fn raw_language(raw: &Value) -> Language {

@@ -3,7 +3,7 @@ use super::windows::ToastLibrary;
 use crate::core::i18n::Language;
 use crate::failure_report::{append_failure_report, publish_failure_report, FailureRecord};
 use crate::pipeline::{
-    ArchiveResult, Cancellation, CleanupStatus, Event, FailureKind, InputError, InputErrorKind,
+    ArchiveResult, Cancellation, Event, FailureKind, InputError, InputErrorKind,
     Outcome, ResourceWait, TaskId,
 };
 use serde::{ser::SerializeSeq, Serialize, Serializer};
@@ -753,8 +753,7 @@ impl Summary {
             summary.output = existing_output_target(outputs);
         }
         summary.cleanup_failed = outcome.cleanup_results.iter()
-            .filter(|result| result.status == CleanupStatus::Failed
-                && started.is_none_or(|started| started.contains(&result_owner(&result.path, owner)))).count() + usize::from(output_cleanup_failed);
+            .filter(|result| started.is_none_or(|started| started.contains(&result_owner(&result.path, owner)))).count() + usize::from(output_cleanup_failed);
         summary
     }
 

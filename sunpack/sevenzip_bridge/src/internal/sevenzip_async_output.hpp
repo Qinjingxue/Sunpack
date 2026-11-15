@@ -272,13 +272,13 @@ namespace sunpack::sevenzip
             std::wstring path;
             const ArchiveItemMetadata metadata;
             std::shared_ptr<VolumeSpaceGate> space_gate;
-            UInt64 accepted_bytes = 0;
             UInt64 next_write_offset = 0;
             std::mutex producer_mutex;
             Buffer *staging_buffer = nullptr;
             std::size_t inflight_bytes = 0;
             std::size_t outstanding_data = 0;
 #ifdef SUP7Z_TEST_IO_FAULTS
+            UInt64 accepted_bytes = 0;
             std::size_t active_data_writes = 0;
             std::size_t peak_active_data_writes = 0;
 #endif
@@ -435,7 +435,9 @@ namespace sunpack::sevenzip
             if (file->staging_buffer && file->staging_buffer->size && !enqueue_staging_locked(file, true))
                 return terminal_result_locked(file->job);
             file->next_write_offset += size;
+#ifdef SUP7Z_TEST_IO_FAULTS
             file->accepted_bytes += size;
+#endif
             return S_OK;
         }
 
@@ -627,9 +629,9 @@ namespace sunpack::sevenzip
                             ++job->pending_jobs;
                             ++file->outstanding_data;
                         }
-                        file->accepted_bytes += chunk;
                         file->new_writes = true;
 #ifdef SUP7Z_TEST_IO_FAULTS
+                        file->accepted_bytes += chunk;
                         test_accepted_bytes_.fetch_add(chunk, std::memory_order_relaxed);
                         test_pending_bytes_.fetch_add(chunk, std::memory_order_relaxed);
 #endif
@@ -809,12 +811,6 @@ namespace sunpack::sevenzip
             return current_win32_error_locked(job);
         }
 
-        UInt64 accepted_bytes(const FileStatePtr &file) const noexcept
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            return file ? file->accepted_bytes : 0;
-        }
-
         bool is_quiescent() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -847,15 +843,17 @@ namespace sunpack::sevenzip
         }
 #endif
 
-        void record_operation_result(const FileStatePtr &file, Int32 operation_result) noexcept
+        bool record_operation_result(const FileStatePtr &file, Int32 operation_result) noexcept
         {
             if (!file)
             {
-                return;
+                return false;
             }
             std::lock_guard<std::mutex> lock(mutex_);
             file->operation_result = operation_result;
             file->operation_result_set = true;
+            // new_writes includes staging; the cursor also covers replayed bytes.
+            return operation_result != 0 && (file->new_writes || file->next_write_offset != 0);
         }
 
         FileSnapshot take_file_snapshot(const FileStatePtr &file, bool completed_only = false) const noexcept

@@ -795,31 +795,20 @@ fn handle_pool_keeps_recent_file_source_alive_between_readers() {
     drop(first);
     let second = manager().open_file(&path).unwrap();
     assert_eq!(first_ptr, Arc::as_ptr(&second));
-    // The old reuse check alone cannot catch unbounded hit history. Use a
-    // local pool so concurrent tests cannot affect its retention or LRU.
+    // Use a local pool so concurrent readers cannot change the LRU order.
     let other = temp_file("managed_reader_other_handle", b"second");
     let third = manager().open_file(&other).unwrap();
-    let mut pool = HandlePool {
-        entries: HashMap::new(),
-        order: VecDeque::new(),
-        generation: 0,
-        capacity: 2,
-    };
-    pool.insert(Arc::clone(&second));
-    pool.insert(Arc::clone(&third));
-    for _ in 0..2000 {
-        assert_eq!(
-            Arc::as_ptr(&pool.touch(&second.identity.path, &second.physical).unwrap()),
-            first_ptr
-        );
-    }
-    assert!(pool.order.len() <= pool.capacity * 2);
-    pool.capacity = 1;
-    pool.insert(Arc::clone(&second));
-    assert!(pool.entries.contains_key(&second.identity.path));
-    assert!(!pool.entries.contains_key(&third.identity.path));
+    let newest = temp_file("managed_reader_newest_handle", b"third");
+    let fourth = manager().open_file(&newest).unwrap();
+    let mut pool = CacheOrder::default();
+    pool.insert(Arc::clone(&second.identity.path), Arc::clone(&second), 2);
+    pool.insert(Arc::clone(&third.identity.path), Arc::clone(&third), 2);
+    assert_eq!(Arc::as_ptr(pool.get_mut(second.identity.path.as_ref()).unwrap()), first_ptr);
+    let (_, retired) = pool.insert(Arc::clone(&fourth.identity.path), fourth, 2).unwrap();
+    assert!(Arc::ptr_eq(&third, &retired));
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(other);
+    let _ = std::fs::remove_file(newest);
 }
 
 #[test]

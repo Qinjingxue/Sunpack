@@ -221,7 +221,7 @@ impl<'a> Report<'a> {
             kind: "filesystem_error", stage: "filesystem_scan", message,
             message_key: key.into(), message_params: json!({"path": error.path, "error": error.message}),
             user_action: "", causes: vec![],
-            details: json!({"path": error.path, "operation": operation, "count": error.count()}), recovery: None,
+            details: json!({"path": error.path, "operation": operation, "count": 1}), recovery: None,
         }
     }
 

@@ -466,16 +466,16 @@ namespace sunpack::sevenzip
             any_opened = true;
 
             UInt32 num_items = 0;
-
+            bool item_count_read;
 #ifdef SUP7Z_DEBUG
-            bool item_count_read = false;
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ItemProbe);
                 item_count_read = archive->GetNumberOfItems(&num_items) == S_OK;
             }
 #else
-            if (archive->GetNumberOfItems(&num_items) == S_OK)
+            item_count_read = archive->GetNumberOfItems(&num_items) == S_OK;
 #endif
+            if (item_count_read)
             {
 
                 result.item_count = num_items;
@@ -581,10 +581,6 @@ namespace sunpack::sevenzip
 
             result.output_inventory_complete = raw_extract_callback->output_root_initially_empty();
 
-            result.failed_item = raw_extract_callback->failed_item();
-
-            result.failed_item_bytes_written = raw_extract_callback->failed_item_bytes_written();
-
             // Some solid/encrypted handlers ask for a password before GetStream
             // and can fail before an item trace exists. The callback records
             // both password requests and encrypted member properties.
@@ -598,7 +594,7 @@ namespace sunpack::sevenzip
                 set_memory_failure(result, "output_write", static_cast<HRESULT>(result.output_trace.last_hresult)))
                 return result;
 
-            if (!read_failed && hr == S_OK && last_op_res == kOpOk && result.failed_item.empty())
+            if (!read_failed && hr == S_OK && last_op_res == kOpOk)
             {
                 result.status = PasswordTestStatus::Ok;
                 result.missing_volume_suspected = false;
@@ -611,16 +607,6 @@ namespace sunpack::sevenzip
             if (result.encrypted)
                 result.password_crc_proven_items = password_crc_proven_items(result.output_trace);
             if (read_failed) return result;
-
-            if (hr == S_OK && last_op_res == kOpOk)
-            {
-                result.status = PasswordTestStatus::Damaged;
-                result.damaged = true;
-                result.checksum_error = true;
-                set_failure(result, "item_extract", "checksum_error", hr);
-                result.message = "archive item failed during extraction";
-                return result;
-            }
 
             if (raw_extract_callback->output_error())
             {
@@ -665,7 +651,7 @@ namespace sunpack::sevenzip
                 }
 
                 if (!password.empty() && (last_op_res == kOpDataError || last_op_res == kOpCrcError) &&
-                    (result.files_written > 0 || result.failed_item_bytes_written > 0))
+                    (result.files_written > 0 || raw_extract_callback->failed_item_had_data()))
                 {
 
                     result.status = PasswordTestStatus::Damaged;

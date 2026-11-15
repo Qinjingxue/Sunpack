@@ -16,8 +16,8 @@ mod wal;
 mod watch_journal;
 mod watch_store;
 
-pub mod core;
-pub mod pipeline;
+mod core;
+mod pipeline;
 pub mod runtime;
 
 #[cfg(test)]

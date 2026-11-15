@@ -33,7 +33,6 @@ fn queued(id: TaskId, parent: Option<TaskId>, path: &str, segment: Option<Segmen
         id,
         parent,
         path: path.into(),
-        depth: if id == 5 { 2 } else { 1 },
         segment,
     }
 }
@@ -48,7 +47,7 @@ fn physical_replan_replaces_rows_without_carrying_old_progress_or_waits() {
     assert_eq!(panel.tasks[&2].detail.as_deref(), Some("[EXTRACT] Start: old.002"));
     panel.update(&terminal, Language::En, queued(3, Some(2), "old segment", None), true);
     panel.update(&terminal, Language::En, Event::Progress {
-        id: 2, path: "old.002".into(), completed_bytes: 90, total_bytes: 100,
+        id: 2, completed_bytes: 90, total_bytes: 100,
     }, true);
     panel.update(&terminal, Language::En, Event::ResourceWait {
         id: 2, path: "old.002".into(), state: ResourceWait { disk: true, ..Default::default() },
@@ -86,7 +85,7 @@ fn progress_rounding_and_post_worker_phase_match_main() {
     panel.update(&terminal, Language::En, queued(1, None, "archive.zip", None), true);
     panel.update(&terminal, Language::En, Event::Working { id: 1 }, true);
     panel.update(&terminal, Language::En, Event::Progress {
-        id: 1, path: "archive.zip".into(), completed_bytes: 29, total_bytes: 100,
+        id: 1, completed_bytes: 29, total_bytes: 100,
     }, true);
     let before = row_status(&panel.tasks[&1], 80, Language::En);
     panel.update(&terminal, Language::En, Event::Finalizing { id: 1 }, true);
@@ -94,7 +93,7 @@ fn progress_rounding_and_post_worker_phase_match_main() {
     assert!(terminal.output.lock().unwrap().is_empty());
     panel.last_render = None;
     panel.update(&terminal, Language::En, Event::Progress {
-        id: 1, path: "archive.zip".into(), completed_bytes: 290, total_bytes: 1000,
+        id: 1, completed_bytes: 290, total_bytes: 1000,
     }, false);
     assert!(panel.last_render.is_none(), "unchanged percent must not traverse the viewport");
     assert_eq!(panel.tasks[&1].progress, Some((290, 1000)));
@@ -118,7 +117,7 @@ fn live_titles_and_status_share_settled_layout_across_widths_and_resize() {
                 // Prompt suspension changes state without touching the terminal.
                 terminal.output.lock().unwrap().clear();
                 panel.update(&terminal, language, Event::Progress {
-                    id: 1, path: name.into(), completed_bytes: 60, total_bytes: 100,
+                    id: 1, completed_bytes: 60, total_bytes: 100,
                 }, true);
                 assert!(terminal.output.lock().unwrap().is_empty());
                 panel.redraw(&terminal, language, true);
@@ -154,18 +153,18 @@ fn flatten_relocates_visible_and_buffered_descendant_outputs() {
     for (id, path) in [(3, "root/wrapper/leaf/nested/deep"),
                        (4, "root/wrapper"), (5, "elsewhere/output")] {
         panel.update(&terminal, Language::En, Event::Finished {
-            id, path: "nested.zip".into(), depth: 1,
+            id,
             result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None, output: Some(path.into()) },
         }, false);
     }
     reports.notify(queued(6, Some(1), "queued.zip", None));
     reports.notify(Event::Finished {
-        id: 6, path: "queued.zip".into(), depth: 1,
+        id: 6,
         result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None,
             output: Some("root/wrapper/leaf/queued".into()) },
     });
     reports.notify(Event::Finished {
-        id: 2, path: "nested.zip".into(), depth: 1,
+        id: 2,
         result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None,
             output: Some("root/wrapper/leaf/nested".into()) },
     });
@@ -200,7 +199,7 @@ fn event_batch_renders_once_without_rebuilding_intermediate_viewports() {
     panel.begin_batch();
     for id in 1..=5 {
         panel.update(&terminal, Language::En, queued(id, None, "archive.zip", None), false);
-        panel.update(&terminal, Language::En, Event::Started { id, path: "archive.zip".into(), depth: 1 }, false);
+        panel.update(&terminal, Language::En, Event::Started { id }, false);
     }
     assert!(terminal.output.lock().unwrap().is_empty());
     assert!(panel.frame.is_none());
@@ -217,18 +216,18 @@ fn task_preflight_keeps_failed_segments_and_marks_unexecuted_rows_skipped() {
     panel.update(&terminal, Language::En, queued(1, None, "carrier.bin", None), true);
     for id in [2, 3] {
         panel.update(&terminal, Language::En, queued(id, Some(1), "carrier.bin", Some(Segment {
-            format: "zip".into(), index: id as usize - 1, count: 2,
+            format: "zip".into(), index: id as usize - 1,
             offset: 0, end_offset: None,
         })), true);
         let result = if id == 2 {
             TaskCompletion::failed(&Failure::new(FailureKind::Damaged, "damaged"))
         } else { TaskCompletion { discovery: None, status: TaskStatus::Skipped, failure: None, output: None } };
         panel.update(&terminal, Language::En, Event::Finished {
-            id, path: "carrier.bin".into(), depth: 1, result,
+            id, result,
         }, true);
     }
     panel.update(&terminal, Language::En, Event::Finished {
-        id: 1, path: "carrier.bin".into(), depth: 1,
+        id: 1,
         result: TaskCompletion::failed(&Failure::new(FailureKind::MissingVolume, "missing volume")),
     }, true);
     let rows = panel.rows(terminal.size, true, Language::En);
@@ -255,20 +254,20 @@ fn task_preflight_keeps_failed_segments_and_marks_unexecuted_rows_skipped() {
             reason: "needs_password".into(), path: "carrier.bin".into(), error: String::new(),
         });
     panel.update(&terminal, Language::En, Event::Finished {
-        id: 2, path: "carrier.bin".into(), depth: 1, result: TaskCompletion::failed(&failure),
+        id: 2, result: TaskCompletion::failed(&failure),
     }, true);
     assert!(panel.rows(terminal.size, true, Language::En).iter().any(|row|
         row.id == Some(2) && row.text.contains(&format!("carrier.bin: {}", Language::En.text("failure.password_not_in_list")))));
     // Ordinary input aggregation does not repeat segment details at the carrier.
     panel.update(&terminal, Language::En, Event::Finished {
-        id: 1, path: "carrier.bin".into(), depth: 1,
+        id: 1,
         result: TaskCompletion { discovery: None, status: TaskStatus::Failed, failure: None, output: None },
     }, true);
     assert_eq!(panel.rows(terminal.size, true, Language::En).iter().filter(|row| row.id == Some(1)).count(), 2);
     // Parent task_finished formats an otherwise empty password error;
     // only executor segment rows retain the no-detail password convention.
     panel.update(&terminal, Language::En, Event::Finished {
-        id: 1, path: "carrier.bin".into(), depth: 1,
+        id: 1,
         result: TaskCompletion::failed(&Failure::new(FailureKind::WrongPassword, "password")),
     }, true);
     assert!(panel.rows(terminal.size, true, Language::En).iter().any(|row|
@@ -286,14 +285,14 @@ fn finished_rows_project_results_while_other_work_is_running() {
         }
         for (id, status) in [(4, TaskStatus::Partial), (5, TaskStatus::Complete)] {
             panel.update(&terminal, Language::En, queued(id, Some(1), "carrier", Some(Segment {
-                format: "zip".into(), index: (id - 3) as usize, count: 2,
+                format: "zip".into(), index: (id - 3) as usize,
                 offset: id * 100, end_offset: Some(id * 100 + 50),
             })), false);
             panel.update(&terminal, Language::En, Event::Progress {
-                id, path: "carrier".into(), completed_bytes: 6, total_bytes: 10,
+                id, completed_bytes: 6, total_bytes: 10,
             }, false);
             panel.update(&terminal, Language::En, Event::Finished {
-                id, path: "carrier".into(), depth: 1,
+                id,
                 result: TaskCompletion { discovery: None, status,
                     failure: (status == TaskStatus::Partial).then(|| Failure::new(FailureKind::Damaged, "raw")),
                     output: Some(format!("output-{id}").into()),
@@ -301,7 +300,7 @@ fn finished_rows_project_results_while_other_work_is_running() {
             }, false);
         }
         panel.update(&terminal, Language::En, Event::Finished {
-            id: 3, path: "cancelled.zip".into(), depth: 1,
+            id: 3,
             result: TaskCompletion { discovery: None, status: TaskStatus::Failed,
                 failure: Some(Failure::new(FailureKind::Cancelled, "raw")), output: None },
         }, false);
@@ -317,7 +316,7 @@ fn finished_rows_project_results_while_other_work_is_running() {
         assert!(text.contains("slow.zip"));
         // Authoritative carrier finalization can change a segment's output.
         panel.update(&terminal, Language::En, Event::Finished {
-            id: 4, path: "carrier".into(), depth: 1,
+            id: 4,
             result: TaskCompletion { discovery: None, status: TaskStatus::Failed,
                 failure: Some(Failure::new(FailureKind::Damaged, "raw")), output: None },
         }, false);
@@ -354,7 +353,6 @@ fn live_frame_keeps_same_path_segments_and_sibling_archives_independent() {
             Some(Segment {
                 format: "zip".into(),
                 index,
-                count: 2,
                 offset: 100 * index as u64,
                 end_offset: Some(100 * index as u64 + 50),
             }),
@@ -364,7 +362,6 @@ fn live_frame_keeps_same_path_segments_and_sibling_archives_independent() {
     update(Event::Working { id: 3 });
     update(Event::Progress {
         id: 3,
-        path: carrier.clone(),
         completed_bytes: 6,
         total_bytes: 10,
     });
@@ -379,8 +376,6 @@ fn live_frame_keeps_same_path_segments_and_sibling_archives_independent() {
     update(queued(5, Some(4), "nested.zip", None));
     update(Event::Started {
         id: 5,
-        path: "nested.zip".into(),
-        depth: 2,
     });
 
     let rows: Vec<_> = panel

@@ -3809,6 +3809,7 @@ impl Scheduler {
         // Retire blockers from the replaced generation before peer recovery
         // can invalidate that old input and discard this new pending arrival.
         if let Some(retired) = interrupted.or_else(|| blocked.as_ref().filter(|_| !blocked_unchanged)) {
+            self.volume_checks.remove(&id);
             self.journal.commit(false, |state| {
                 Ok(if state.entry(&candidate.path).is_some_and(|current| Arc::ptr_eq(retired, &current)) {
                     crate::watch_store::NativeWatchOperations::retire_entries(std::iter::once(id.clone()))
@@ -5265,11 +5266,7 @@ impl Scheduler {
                 );
             }
         }
-        for cleanup in outcome
-            .cleanup_results
-            .iter()
-            .filter(|cleanup| cleanup.status == crate::pipeline::CleanupStatus::Failed)
-        {
+        for cleanup in &outcome.cleanup_results {
             self.journal.log(
                 json!({"event":"pipeline_cleanup_failed","path":cleanup.path,
                 "owner":batch,"cleanup":cleanup}),
@@ -5790,22 +5787,31 @@ fn completion_input_errors<'a>(
     use crate::scan::catalog::catalog_stem;
     use crate::pipeline::InputErrorKind;
     let mut paths = HashMap::new();
+    let mut admissions = None;
     for error in errors {
-        if matches!(error.kind, InputErrorKind::Cleanup | InputErrorKind::FilesystemScan) {
+        if error.kind == InputErrorKind::FilesystemScan {
             continue;
         }
         let path = key(&error.path);
-        let owner = completion_owner(&error.path, outputs, groups).or_else(|| {
-            if error.kind != InputErrorKind::EmbeddedDiscovery
-                || inputs.iter().any(|input| watch_path_key(&input.path) == path)
-            {
+        let owner = completion_owner_key(&path, outputs, groups).or_else(|| {
+            if error.kind != InputErrorKind::EmbeddedDiscovery {
                 return None;
             }
             // A residual peer can fail discovery for its catalog bucket
             // without having been explicitly admitted as a source.
-            let stem = catalog_stem(&path);
-            inputs.iter().find(|input| catalog_stem(&input.path) == stem)
-                .map(|input| watch_path_key(&input.path))
+            let (exact, by_stem) = admissions.get_or_insert_with(|| {
+                let mut exact = HashSet::with_capacity(inputs.len());
+                let mut by_stem = HashMap::new();
+                for input in inputs {
+                    exact.insert(watch_path_key(&input.path));
+                    by_stem.entry(catalog_stem(&input.path)).or_insert(input.path.as_str());
+                }
+                (exact, by_stem)
+            });
+            if exact.contains(&path) {
+                return None;
+            }
+            by_stem.get(&catalog_stem(&path)).map(|path| watch_path_key(path))
         });
         paths.entry(path).or_insert(error);
         if let Some(owner) = owner {

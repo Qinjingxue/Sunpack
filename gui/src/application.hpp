@@ -7,6 +7,7 @@
 #include <mutex>
 #include <atomic>
 #include <map>
+#include <variant>
 
 namespace spg {
 class FindController;
@@ -26,7 +27,9 @@ class Application {
     Handle service_refresh_{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::deque<Json> commands_;
+    using Save = std::shared_ptr<const Json>;
+    using Command = std::variant<Json, Save>;
+    std::deque<Command> commands_;
     Json pending_ = Json::object();
     bool notified_ = false, stopping_ = false, choosing_directory_ = false, shown_ = false;
     bool task_range_pending_ = false;
@@ -53,7 +56,7 @@ class Application {
     void reveal();
     // UI-thread queue: one write in flight, latest completed edit per key.
     std::deque<Json> saves_;
-    Json active_save_;
+    Save active_save_;
     std::unique_ptr<DatePopup> date_popup_;
     std::unique_ptr<FindController> find_;
     UINT_PTR date_generation_ = 0;

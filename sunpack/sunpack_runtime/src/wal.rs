@@ -36,7 +36,7 @@ const WRITE_FRAME_BYTES: usize = 1024 * 1024;
 struct Fragments<'a, W> {
     output: &'a mut W,
     seq: u64,
-    buffer: Vec<u8>,
+    buffer: &'a mut Vec<u8>,
 }
 impl<W: Write> Fragments<'_, W> {
     fn emit(&mut self, more: bool) -> io::Result<()> {
@@ -49,10 +49,10 @@ impl<W: Write> Fragments<'_, W> {
         header[4..12].copy_from_slice(&self.seq.to_le_bytes());
         let mut hash = Hasher::new();
         hash.update(&header[..12]);
-        hash.update(&self.buffer);
+        hash.update(self.buffer);
         header[12..].copy_from_slice(&hash.finalize().to_le_bytes());
         self.output.write_all(&header)?;
-        self.output.write_all(&self.buffer)?;
+        self.output.write_all(self.buffer)?;
         self.buffer.clear();
         Ok(())
     }
@@ -76,14 +76,12 @@ impl<W: Write> Write for Fragments<'_, W> {
 }
 pub(crate) fn append_frame<W: Write>(
     output: &mut W,
+    buffer: &mut Vec<u8>,
     seq: u64,
     encode: impl FnOnce(&mut dyn Write) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut writer = Fragments {
-        output,
-        seq,
-        buffer: Vec::new(),
-    };
+    buffer.clear();
+    let mut writer = Fragments { output, seq, buffer };
     encode(&mut writer)?;
     writer.emit(false)
 }

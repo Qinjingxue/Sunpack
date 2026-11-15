@@ -52,7 +52,7 @@ impl EncodingKind {
 struct EncodingScore {
     kind: EncodingKind,
     score: i64,
-    decoded_count: usize,
+    has_decoded_name: bool,
 }
 
 pub(crate) fn analyze_zip_filename_encoding(
@@ -147,14 +147,7 @@ fn scan_zip_names(
         .checked_add(central_size_u64)
         .ok_or_else(|| io::Error::other("ZIP central range overflow"))?;
     let mut cursor = central_logical_offset;
-    let mut accumulators = [
-        EncodingKind::Cp437,
-        EncodingKind::Utf8,
-        EncodingKind::Cp936,
-        EncodingKind::Cp950,
-        EncodingKind::Cp932,
-    ]
-    .map(EncodingAccumulator::new);
+    let mut scoring = FilenameScoring::new();
     let mut authoritative_all = true;
     let mut ascii_only = true;
     let mut window_start = 0u64;
@@ -192,17 +185,16 @@ fn scan_zip_names(
             return Ok(None);
         };
         if !record.name.is_empty() {
+            let ascii = record.name.is_ascii();
             let authoritative = if record.flags & ZIP_UTF8_FLAG != 0 {
-                std::str::from_utf8(record.name).is_ok()
+                ascii || std::str::from_utf8(record.name).is_ok()
             } else {
                 valid_unicode_path_name(record.name, record.extra)
             };
             authoritative_all &= authoritative;
-            ascii_only &= record.name.is_ascii();
+            ascii_only &= ascii;
             if !authoritative {
-                for accumulator in &mut accumulators {
-                    accumulator.observe(record.name)?;
-                }
+                scoring.observe(record.name, ascii)?;
             }
         }
         checked += 1;
@@ -216,14 +208,64 @@ fn scan_zip_names(
     {
         return Ok(None);
     }
-    Ok(select_scores(accumulators.map(EncodingAccumulator::finish)))
+    Ok(scoring.finish())
+}
+
+struct FilenameScoring {
+    accumulators: [EncodingAccumulator; 5],
+    has_unflagged_ascii: bool,
+}
+
+impl FilenameScoring {
+    fn new() -> Self {
+        Self {
+            accumulators: [
+                EncodingKind::Cp437,
+                EncodingKind::Utf8,
+                EncodingKind::Cp936,
+                EncodingKind::Cp950,
+                EncodingKind::Cp932,
+            ]
+            .map(EncodingAccumulator::new),
+            has_unflagged_ascii: false,
+        }
+    }
+
+    fn observe(&mut self, raw: &[u8], ascii: bool) -> io::Result<()> {
+        if ascii {
+            self.has_unflagged_ascii = true;
+            // ASCII has one interpretation. Compute its common penalties once,
+            // while keeping each encoding's component deduplication intact.
+            let name = std::str::from_utf8(raw).expect("ASCII ZIP name");
+            for part in name.split(['/', '\\']) {
+                let score = windows_component_penalty(part);
+                if score != 0 {
+                    for accumulator in &mut self.accumulators {
+                        accumulator.observe_component(part, score)?;
+                    }
+                }
+            }
+        } else {
+            for accumulator in &mut self.accumulators {
+                accumulator.observe(raw)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Option<&'static str> {
+        select_scores(
+            self.accumulators
+                .map(|value| value.finish(self.has_unflagged_ascii)),
+        )
+    }
 }
 
 struct EncodingAccumulator {
     kind: EncodingKind,
     score: i64,
-    decoded_count: usize,
-    count: usize,
+    decoded: bool,
+    failed_decode: bool,
     components: SpillSet,
     units: HashSet<(u8, u8)>,
 }
@@ -232,75 +274,56 @@ impl EncodingAccumulator {
         Self {
             kind,
             score: 0,
-            decoded_count: 0,
-            count: 0,
+            decoded: false,
+            failed_decode: false,
             components: SpillSet::default(),
             units: HashSet::new(),
         }
     }
     fn observe(&mut self, raw: &[u8]) -> io::Result<()> {
-        self.count += 1;
-        if raw.is_ascii() {
-            self.decoded_count += 1;
-            return self.observe_components(std::str::from_utf8(raw).unwrap());
-        }
         if let Some(decoded) = decode_bytes(self.kind, raw) {
-            self.decoded_count += 1;
-            self.observe_components(&decoded)?;
+            self.decoded = true;
+            for part in decoded.split(['/', '\\']) {
+                self.observe_component(part, score_decoded_name(part, self.kind))?;
+            }
         } else {
+            self.failed_decode = true;
             self.score = self.score.saturating_sub(12);
         }
         observe_legacy_units(raw, self.kind, &mut self.units);
         Ok(())
     }
-    fn observe_components(&mut self, decoded: &str) -> io::Result<()> {
-        for part in decoded.split(['/', '\\']).filter(|part| !part.is_empty()) {
-            let score = score_decoded_name(part, self.kind);
-            if score != 0 && self.components.insert(part)? {
-                self.score = self.score.saturating_add(score);
-            }
+    fn observe_component(&mut self, part: &str, score: i64) -> io::Result<()> {
+        if score != 0 && self.components.insert(part)? {
+            self.score = self.score.saturating_add(score);
         }
         Ok(())
     }
-    fn finish(self) -> EncodingScore {
+    fn finish(self, has_ascii: bool) -> EncodingScore {
         EncodingScore {
             kind: self.kind,
             score: self
                 .score
                 .saturating_add(legacy_units_score(self.units, self.kind))
-                .saturating_add(if self.decoded_count == self.count {
-                    4
-                } else {
-                    0
-                }),
-            decoded_count: self.decoded_count,
+                .saturating_add(if self.failed_decode { 0 } else { 4 }),
+            has_decoded_name: self.decoded || has_ascii,
         }
     }
 }
 
 #[cfg(test)]
 fn select_codepage(raw_names: &[&[u8]]) -> Option<&'static str> {
-    let scores = [
-        EncodingKind::Cp437,
-        EncodingKind::Utf8,
-        EncodingKind::Cp936,
-        EncodingKind::Cp950,
-        EncodingKind::Cp932,
-    ]
-    .map(|kind| {
-        let mut accumulator = EncodingAccumulator::new(kind);
-        for name in raw_names {
-            accumulator.observe(name).unwrap();
-        }
-        accumulator.finish()
-    });
-    select_scores(scores)
+    let mut scoring = FilenameScoring::new();
+    for name in raw_names {
+        scoring.observe(name, name.is_ascii()).unwrap();
+    }
+    scoring.finish()
 }
 fn select_scores(mut scores: [EncodingScore; 5]) -> Option<&'static str> {
     scores.sort_by(|left, right| right.score.cmp(&left.score));
     let best = &scores[0];
     let lead = best.score.saturating_sub(scores[1].score);
-    (best.kind == EncodingKind::Cp437 || (best.score >= 12 && lead >= 6 && best.decoded_count > 0))
+    (best.kind == EncodingKind::Cp437 || (best.score >= 12 && lead >= 6 && best.has_decoded_name))
         .then(|| best.kind.codepage())
 }
 
@@ -389,26 +412,20 @@ fn legacy_units_score(units: HashSet<(u8, u8)>, encoding: EncodingKind) -> i64 {
         .sum()
 }
 
+fn windows_component_penalty(component: &str) -> i64 {
+    let mut control = false;
+    let mut reserved = false;
+    for byte in component.bytes() {
+        control |= byte < b' ' && !matches!(byte, b'\t' | b'\n' | b'\r');
+        reserved |= matches!(byte, b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*');
+    }
+    -20 * i64::from(control)
+        - 10 * i64::from(reserved)
+        - 3 * i64::from(matches!(component, "." | ".."))
+}
+
 fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> i64 {
-    let mut score = 0i64;
-
-    if decoded.contains('\0')
-        || decoded
-            .chars()
-            .any(|ch| ch < ' ' && !matches!(ch, '\t' | '\n' | '\r'))
-    {
-        score -= 20;
-    }
-    if decoded
-        .chars()
-        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
-    {
-        score -= 10;
-    }
-    if decoded == "." || decoded == ".." {
-        score -= 3;
-    }
-
+    let mut score = windows_component_penalty(decoded);
     // ASCII contributes only the format-independent penalties above.
     // Full-directory scans must not run five Unicode scoring passes over it.
     if decoded.is_ascii() {

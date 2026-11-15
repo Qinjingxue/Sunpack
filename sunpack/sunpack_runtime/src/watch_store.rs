@@ -771,7 +771,7 @@ fn entry_event(record: &EntryRecord) -> Value {
 }
 
 pub(crate) struct NativeWatchState {
-    pub(crate) data: Arc<Mutex<StateData>>,
+    data: Mutex<StateData>,
     pub(crate) outputs: active_outputs::OutputReservations,
     events: Mutex<Option<std::sync::Weak<crate::event_log::Shared>>>,
 }
@@ -782,11 +782,11 @@ impl NativeWatchState {
         // state mutation + notifications. The data-map lock still ends before
         // member checks and projection serialization.
         let _publication = self.events.lock().unwrap();
-        publish(Self::event_projection(&self.data))
+        publish(self.event_projection())
     }
-    pub(crate) fn event_projection(data: &Mutex<StateData>) -> Vec<Value> {
+    fn event_projection(&self) -> Vec<Value> {
         let mut entries: Vec<_> = {
-            let data = data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let data = self.lock();
             data.entries
                 .values()
                 .filter(|record| {
@@ -1107,7 +1107,7 @@ impl NativeWatchState {
 
     pub(crate) fn new() -> Self {
         Self {
-            data: Arc::new(Mutex::new(StateData::default())),
+            data: Mutex::default(),
             outputs: Arc::default(),
             events: Mutex::new(None),
         }

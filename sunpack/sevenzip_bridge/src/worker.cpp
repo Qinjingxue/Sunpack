@@ -1072,7 +1072,6 @@ int run_request(
         volume_selection +
         wire::key("archive_type") + wire::text(wide_to_utf8(result.archive_type)) +
         manifest_field +
-        wire::key("failed_item") + wire::text(wide_to_utf8(result.failed_item)) +
         wire::key("message") + wire::text(result.message) +
         failure_fields + input_trace_field
 #ifdef SUP7Z_DEBUG

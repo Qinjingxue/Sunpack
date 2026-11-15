@@ -5,7 +5,7 @@ use crate::core::i18n::Language;
 use crate::core::{passwords, resources};
 use crate::io::cancellation::is_cancellation;
 use crate::pipeline::{
-    ArchiveResult, Cancellation, CleanupStatus, Engine, Event, FailureKind, InputError,
+    ArchiveResult, Cancellation, Engine, Event, FailureKind, InputError,
     InputErrorKind, Mode, Observer, Outcome, Request, TaskId, TaskStatus,
 };
 use serde::Serialize;
@@ -1684,9 +1684,7 @@ async fn archives(
             let errors = current
                 .cleanup_results
                 .into_iter()
-                .filter(|receipt| {
-                    receipt.mode == "rollback" && receipt.status == CleanupStatus::Failed
-                })
+                .filter(|receipt| receipt.mode == "rollback")
                 .map(|receipt| format!("{}: {}", receipt.path.display(), receipt.message))
                 .collect();
             return interrupted(options, session, language, Some(&inputs), errors);
@@ -1712,7 +1710,7 @@ async fn archives(
             let groups = failures::archive_groups(&current.archives);
             let counts = ArchiveSummary::from_groups(&groups, language, true);
             let filesystem_errors = current.errors.iter().filter(|error| error.kind == InputErrorKind::FilesystemScan);
-            let scan_errors = filesystem_errors.clone().map(InputError::count).sum::<usize>();
+            let scan_errors = filesystem_errors.clone().count();
             let invalid_inputs = current
                 .errors
                 .iter()
@@ -1767,7 +1765,7 @@ async fn archives(
         // together even when a formerly nested carrier is now a root.
         candidate_paths = password_retry_paths(&current.archives);
         record_archive_status(&mut archive_status, retries, &current.archives);
-        had_input_error |= current.errors.iter().any(|error| error.kind != InputErrorKind::Cleanup);
+        had_input_error |= !current.errors.is_empty();
         drop(current.archives);
         drop(current.errors);
         drop(current.cleanup_results);
@@ -1820,7 +1818,7 @@ fn report_extract_round(
     let counts = ArchiveSummary::collect(&current.archives, language, false);
     let scan_errors = current.errors.iter()
         .filter(|error| error.kind == InputErrorKind::FilesystemScan)
-        .map(InputError::count).sum::<usize>();
+        .count();
     let input_errors = current.errors.iter()
         .filter(|error| error.kind == InputErrorKind::InvalidInput).count() + counts.input_errors;
     let failed = counts.failed + current.errors.iter()
@@ -1920,10 +1918,7 @@ fn report_extract_round(
             language.text("report.partial_complete"),
         )?;
     }
-    let cleanup_failures = current.cleanup_results
-        .iter()
-        .filter(|receipt| receipt.status == CleanupStatus::Failed)
-        .count();
+    let cleanup_failures = current.cleanup_results.len();
     if cleanup_failures > 0 {
         let message = language.translate(
             "cleanup.incomplete",
@@ -1934,7 +1929,7 @@ fn report_extract_round(
             Stream::Err,
             &language.translate("report.postprocess_warning", &[("message", &message)]),
         )?;
-        for receipt in current.cleanup_results.iter().filter(|receipt| receipt.status == CleanupStatus::Failed) {
+        for receipt in &current.cleanup_results {
             line(session, Stream::Err, &format!("  {}: {}", receipt.path.display(), receipt.message))?;
         }
     }
@@ -1953,8 +1948,7 @@ fn report_scan(
         .errors
         .iter()
         .filter(|error| error.kind == InputErrorKind::FilesystemScan)
-        .map(InputError::count)
-        .sum::<usize>();
+        .count();
     let input_errors = outcome
         .errors
         .iter()

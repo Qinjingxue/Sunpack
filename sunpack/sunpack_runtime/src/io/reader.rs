@@ -1,3 +1,4 @@
+use crate::collections::CacheOrder;
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::ReadFault;
 use crate::io::resource_lifecycle::TrackedFile;
@@ -1184,20 +1185,8 @@ struct CachedSource {
     indices: HashSet<u64>,
 }
 
-struct HandleEntry {
-    source: Arc<FileSource>,
-    generation: u64,
-}
-
-struct HandlePool {
-    entries: HashMap<Arc<Path>, HandleEntry>,
-    order: VecDeque<(Arc<Path>, u64)>,
-    generation: u64,
-    capacity: usize,
-}
-
 struct ReaderManager {
-    handles: Mutex<HandlePool>,
+    handles: Mutex<CacheOrder<Arc<Path>, Arc<FileSource>>>,
     cache_shards: Box<[Mutex<CacheShard>]>,
 }
 
@@ -1319,12 +1308,10 @@ impl ReaderManager {
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        let entries = std::mem::take(&mut handles.entries);
-        let retired = std::mem::take(&mut handles.order);
+        let retired = std::mem::take(&mut *handles);
         drop(handles);
-        drop(retired);
-        for entry in entries.values() {
-            entry.source.close()?;
+        for (_, source) in retired.iter() {
+            source.close()?;
         }
         // A retired handle cannot publish a block after its close. Keep the
         // sources alive until their cache shards have been cleared.
@@ -1351,14 +1338,11 @@ impl ReaderManager {
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        let sources = handles
-            .entries
-            .extract_if(|path, _| path_is_under_roots(path, roots))
-            .map(|(_, entry)| entry.source)
-            .collect::<Vec<_>>();
-        handles.discard_stale_order();
-        crate::collections::trim_map(&mut handles.entries);
-        crate::collections::trim_deque(&mut handles.order);
+        let matching: Vec<_> = handles.iter()
+            .filter(|(path, _)| path_is_under_roots(path, roots))
+            .map(|(path, _)| Arc::clone(path))
+            .collect();
+        let sources: Vec<_> = matching.iter().filter_map(|path| handles.remove(path)).collect();
         drop(handles);
         for source in &sources {
             source.close()?;
@@ -1394,8 +1378,9 @@ impl ReaderManager {
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        if let Some(existing) = handles.touch(&canonical, &physical) {
-            return Ok(existing);
+        let existing = handles.get_mut(canonical.as_path());
+        if let Some(existing) = existing.as_ref().filter(|source| source.physical == physical) {
+            return Ok(Arc::clone(existing));
         }
         let source = Arc::new(FileSource {
             identity: FileIdentity {
@@ -1408,7 +1393,14 @@ impl ReaderManager {
             closed: AtomicBool::new(false),
             block_loads: Mutex::new(HashMap::new()),
         });
-        let retired = handles.insert(Arc::clone(&source));
+        // Active readers can keep the old generation. Drop retired sources
+        // outside the handle lock, as their destruction also takes shard locks.
+        let retired = if let Some(existing) = existing {
+            Some(std::mem::replace(existing, Arc::clone(&source)))
+        } else {
+            handles.insert(Arc::clone(&source.identity.path), Arc::clone(&source), DEFAULT_HANDLE_CAPACITY)
+                .map(|(_, source)| source)
+        };
         drop(handles);
         drop(retired);
 
@@ -1527,64 +1519,6 @@ impl ReaderManager {
 
 }
 
-impl HandlePool {
-    fn touch(&mut self, path: &Path, physical: &PhysicalFileGeneration) -> Option<Arc<FileSource>> {
-        let entry = self.entries.get_mut(path)?;
-        if entry.source.physical != *physical {
-            return None;
-        }
-        self.generation = self.generation.wrapping_add(1);
-        entry.generation = self.generation;
-        let source = Arc::clone(&entry.source);
-        self.order
-            .push_back((Arc::clone(&source.identity.path), self.generation));
-        self.compact_order();
-        Some(source)
-    }
-
-    fn insert(&mut self, source: Arc<FileSource>) -> Option<HandleEntry> {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        let path = source.identity.path.clone();
-        // Replace the pooled source for this path. Active readers retain
-        // their own Arc and continue reading the old generation independently.
-        let mut retired = self
-            .entries
-            .insert(path.clone(), HandleEntry { source, generation });
-        self.order.push_back((path, generation));
-        while self.entries.len() > self.capacity {
-            let Some((old_path, old_generation)) = self.order.pop_front() else {
-                break;
-            };
-            if let std::collections::hash_map::Entry::Occupied(entry) = self.entries.entry(old_path)
-            {
-                if entry.get().generation == old_generation {
-                    retired = Some(entry.remove());
-                }
-            }
-        }
-        self.compact_order();
-        retired
-    }
-
-    fn compact_order(&mut self) {
-        // Cache hits create stale history too, even when no eviction occurs.
-        // Amortize compaction while keeping one current row per live handle.
-        if self.order.len() > self.capacity.max(self.entries.len()).saturating_mul(2) {
-            self.discard_stale_order();
-        }
-    }
-
-    fn discard_stale_order(&mut self) {
-        let entries = &self.entries;
-        self.order.retain(|(path, generation)| {
-            entries
-                .get(path)
-                .is_some_and(|entry| entry.generation == *generation)
-        });
-    }
-}
-
 fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
@@ -1646,12 +1580,9 @@ pub(crate) fn invalidate_reader_path(path: &Path) {
     let Some(manager) = MANAGER.get() else { return };
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut handles = manager.handles.lock().unwrap_or_else(|e| e.into_inner());
-    let retired = handles.entries.remove(path.as_path());
-    if retired.is_some() {
-        // Do not close a source used by an older request. Its late block loads
-        // carry its source id and cannot repopulate the new source's cache.
-        handles.compact_order();
-    }
+    // Do not close a source used by an older request. Its late block loads
+    // carry its source id and cannot repopulate the new source's cache.
+    let retired = handles.remove(path.as_path());
     drop(handles);
     drop(retired);
 }
@@ -1665,12 +1596,7 @@ fn manager() -> &'static ReaderManager {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         ReaderManager {
-            handles: Mutex::new(HandlePool {
-                entries: HashMap::new(),
-                order: VecDeque::new(),
-                generation: 0,
-                capacity: DEFAULT_HANDLE_CAPACITY,
-            }),
+            handles: Mutex::default(),
             cache_shards,
         }
     })

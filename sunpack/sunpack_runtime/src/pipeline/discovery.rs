@@ -239,7 +239,6 @@ pub(super) fn discover(
                 kind: InputErrorKind::InvalidInput,
                 failure: None,
                 scan_operation: None,
-                scan_count: None,
             }),
             _ => {}
         }
@@ -759,7 +758,7 @@ pub(super) fn find_watch_volume(
 fn watch_discovery_error(path: PathBuf, error: io::Error) -> InputError {
     InputError {
         path, message: error.to_string(), kind: InputErrorKind::WatchDiscoveryIo,
-        failure: None, scan_operation: None, scan_count: None,
+        failure: None, scan_operation: None,
     }
 }
 
@@ -939,7 +938,6 @@ impl Discovered {
                         kind: InputErrorKind::EmbeddedDiscovery,
                         failure: Some(Box::new(failure)),
                         scan_operation: None,
-                        scan_count: None,
                     });
                 } else {
                     let mut task = project_task(

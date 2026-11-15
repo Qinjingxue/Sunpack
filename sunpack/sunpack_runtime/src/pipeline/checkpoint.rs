@@ -112,9 +112,6 @@ impl GeneratedSource {
 
 impl InputCheckpoint {
 
-    pub fn entry(&self) -> &Path {
-        Path::new(&self.input.entry_path)
-    }
     pub fn carrier(&self) -> &Path {
         &self.carrier
     }

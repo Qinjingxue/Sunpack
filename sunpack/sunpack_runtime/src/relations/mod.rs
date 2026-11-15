@@ -1132,17 +1132,20 @@ fn split_family_for_proposal<'a>(format: &str, style: &'a str) -> Cow<'a, str> {
 }
 
 fn get_logical_name(filename: &str, is_archive: bool) -> String {
-    if let Some(parsed) = parse_relation_numbered_volume(filename) {
-        return logical_name_from_parsed(&parsed);
-    }
-    let regexes = regex_cache().acquire();
-    if let Some(suffix) = regexes
-        .zip_zero_numbered_suffix_re()
-        .find(filename)
-        .or_else(|| regexes.archive_numbered_suffix_re().find(filename))
-        .or_else(|| regexes.plain_numeric_suffix_re().find(filename))
-    {
-        return clean_logical_name(&filename[..suffix.start()]);
+    // The display-name fallback also recognizes Unicode decimal digits.
+    if filename.bytes().any(|b| b.is_ascii_digit() || !b.is_ascii()) {
+        let regexes = regex_cache().acquire();
+        if let Some(parsed) = primary_numbered_volume(basename(filename), &regexes) {
+            return logical_name_from_parsed(&parsed);
+        }
+        if let Some(suffix) = regexes
+            .zip_zero_numbered_suffix_re()
+            .find(filename)
+            .or_else(|| regexes.archive_numbered_suffix_re().find(filename))
+            .or_else(|| regexes.plain_numeric_suffix_re().find(filename))
+        {
+            return clean_logical_name(&filename[..suffix.start()]);
+        }
     }
 
     let (base, ext) = split_ext(filename);
@@ -1161,17 +1164,21 @@ fn logical_name_from_parsed(parsed: &ParsedVolume) -> String {
 }
 
 fn parse_relation_numbered_volume(path: &str) -> Option<ParsedVolume> {
-    let (_, filename) = split_relation_path(path);
-    let regexes = regex_cache().acquire();
-    let parsed = parse_volume_candidates_with_regexes(filename, &regexes)
+    let filename = basename(path);
+    has_numbered_suffix(filename)
+        .then(|| primary_numbered_volume(filename, &regex_cache().acquire()))
+        .flatten()
+}
+
+fn primary_numbered_volume(filename: &str, regexes: &RelationRegexes) -> Option<ParsedVolume> {
+    parse_volume_candidates_with_regexes(filename, regexes)
         .into_iter()
         .find(|candidate| {
             !candidate.decorated
                 || (candidate.family == "rar"
                     && matches!(candidate.style, "rar_part" | "rar_sfx_part")
                     && regexes.parse_marker_numbered_re().is_match(filename))
-        })?;
-    Some(parsed)
+        })
 }
 
 /// Return the exact split-family identities a path can participate in.
@@ -1281,7 +1288,17 @@ fn parse_numbered_volume_name(filename: &str) -> Option<ParsedVolume> {
 /// decoration; the naked-number interpretation remains available only as a
 /// weak fallback candidate.
 fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
-    parse_volume_candidates_with_regexes(filename, &regex_cache().acquire())
+    if has_numbered_suffix(filename) {
+        parse_volume_candidates_with_regexes(filename, &regex_cache().acquire())
+    } else {
+        Vec::new()
+    }
+}
+
+fn has_numbered_suffix(filename: &str) -> bool {
+    filename
+        .split_once('.')
+        .is_some_and(|(_, suffix)| suffix.bytes().any(|b| b.is_ascii_digit()))
 }
 
 fn parse_volume_candidates_with_regexes(
@@ -1441,10 +1458,11 @@ fn parse_zip_split_volume(filename: &str, regexes: &RelationRegexes) -> Option<P
 
 fn push_unique_volume_candidate(candidates: &mut Vec<ParsedVolume>, candidate: ParsedVolume) {
     if candidates.iter().any(|existing| {
-        case_key(&existing.prefix) == case_key(&candidate.prefix)
-            && existing.number == candidate.number
-            && existing.style == candidate.style
+        existing.style == candidate.style
             && existing.family == candidate.family
+            && existing.number == candidate.number
+            && (existing.prefix == candidate.prefix
+                || case_key(&existing.prefix) == case_key(&candidate.prefix))
     }) {
         return;
     }
@@ -1465,20 +1483,14 @@ fn parse_marker_numbered_volume(path: &str, regexes: &RelationRegexes) -> Option
         .map(|value| value.as_str())
         .unwrap_or_default();
     let (prefix, trailing_prefix_family) = strip_trailing_archive_token(raw_prefix);
-    let mut declared_families: HashSet<&'static str> = basename(raw_prefix)
+    let mut declared_families = basename(raw_prefix)
         .split('.')
         .filter_map(archive_family)
-        .collect();
-    declared_families.extend(
-        tail.split('.')
-            .filter(|token| !token.is_empty())
-            .filter_map(archive_family_hint),
-    );
-    let family = if declared_families.len() == 1 {
-        *declared_families.iter().next()?
-    } else {
-        "generic"
-    };
+        .chain(tail.split('.').filter_map(archive_family_hint));
+    let family = declared_families
+        .next()
+        .filter(|first| declared_families.all(|family| family == *first))
+        .unwrap_or("generic");
     let prefix_has_exe = raw_prefix
         .rsplit('.')
         .next()
@@ -1527,24 +1539,10 @@ fn strip_trailing_archive_token(value: &str) -> (&str, Option<&'static str>) {
         .unwrap_or((value, None))
 }
 
-fn split_relation_path(path: &str) -> (&str, &str) {
-    let Some((separator_index, separator)) = path
-        .char_indices()
-        .rfind(|(_, character)| matches!(character, '/' | '\\'))
-    else {
-        return ("", path);
-    };
-    let filename_index = separator_index + separator.len_utf8();
-    (&path[..filename_index], &path[filename_index..])
-}
-
 fn archive_family(value: &str) -> Option<&'static str> {
-    match value.to_ascii_lowercase().as_str() {
-        "7z" => Some("7z"),
-        "zip" | "zipx" => Some("zip"),
-        "rar" | "exe" => Some("rar"),
-        _ => None,
-    }
+    [("7z", "7z"), ("zip", "zip"), ("zipx", "zip"), ("rar", "rar"), ("exe", "rar")]
+        .into_iter()
+        .find_map(|(token, family)| value.eq_ignore_ascii_case(token).then_some(family))
 }
 
 fn archive_family_hint(value: &str) -> Option<&'static str> {
@@ -1552,13 +1550,16 @@ fn archive_family_hint(value: &str) -> Option<&'static str> {
         return Some(family);
     }
     let lower = value.to_ascii_lowercase();
-    let mut families = HashSet::new();
-    for (token, family) in [("7z", "7z"), ("zip", "zip"), ("rar", "rar"), ("exe", "rar")] {
-        if lower.contains(token) {
-            families.insert(family);
-        }
+    match (
+        lower.contains("7z"),
+        lower.contains("zip"),
+        lower.contains("rar") || lower.contains("exe"),
+    ) {
+        (true, false, false) => Some("7z"),
+        (false, true, false) => Some("zip"),
+        (false, false, true) => Some("rar"),
+        _ => None,
     }
-    (families.len() == 1).then(|| *families.iter().next().expect("one family"))
 }
 
 pub(crate) fn first_dot_stem(name: &str) -> &str {

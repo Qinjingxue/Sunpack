@@ -151,7 +151,6 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
     result.failure = Some(Failure::new(FailureKind::MissingVolume, "missing volume"));
     result.partial = true;
     result.recovered_complete_files = 1;
-    assert_eq!(serde_json::to_value(&result).unwrap()["partial"], true);
     let partial = InputCheckpoint::create(&source, Arc::new(input.clone()), &result, &generations, None).unwrap();
     // Exercise the persisted representation, not just in-memory equality.
     let partial: InputCheckpoint = serde_json::from_slice(

@@ -46,7 +46,7 @@ fn carrier_outputs_survive_snapshot_and_incremental_replay() {
         let operations = Operations(changes.into_iter()
             .map(|change| Operation::Output(path_key(&owner), change)).collect());
         let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
-        wal::append_frame(&mut file, seq, |out| {
+        wal::append_frame(&mut file, &mut Vec::new(), seq, |out| {
             rmp_serde::encode::write(out, &operations).map_err(wal::invalid)
         }).unwrap();
         file.flush().unwrap();
