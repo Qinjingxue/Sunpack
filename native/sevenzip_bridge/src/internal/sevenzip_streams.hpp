@@ -1020,7 +1020,12 @@ namespace sunpack::sevenzip
         ExtractionReplay* attempt_replay_ = current_extraction_replay;
         std::size_t find_range_index(UInt64 position) const
         {
-
+            if (cached_index_ < ranges_.size())
+            {
+                const auto &cached = ranges_[cached_index_];
+                if (position >= cached.virtual_offset && position - cached.virtual_offset < cached.length)
+                    return cached_index_;
+            }
             const auto upper = std::upper_bound(
                 ranges_.begin(), ranges_.end(), position,
                 [](UInt64 value, const NormalizedInputRange &range)

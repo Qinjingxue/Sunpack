@@ -1,7 +1,7 @@
 //! ENC's quick block is a strong, bounded password proof. Authentication belongs
 //! to extraction. Reuse the existing generation-aware prepared-context cache.
 use super::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
-use super::input::{parse_ranges, ranges_key, ranges_total_len, VirtualRangeReader};
+use super::input::{parse_ranges, ranges_key, VirtualRangeReader};
 use super::PasswordVerification;
 use crate::io::archive_state::InputExtent;
 use crate::io::cancellation::Cancellation;
@@ -46,9 +46,10 @@ pub(crate) fn enc_fast_verify_passwords_from_ranges(
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges, sessions)?;
-    let length = ranges_total_len(&parsed);
     verify_prepared(ranges_key("enc", &parsed)?, candidates, || {
-        prepare(VirtualRangeReader::new(parsed.into()), length).map(PasswordContext::Enc)
+        let reader = VirtualRangeReader::new(&parsed);
+        let length = reader.len();
+        prepare(reader, length).map(PasswordContext::Enc)
     })
 }
 

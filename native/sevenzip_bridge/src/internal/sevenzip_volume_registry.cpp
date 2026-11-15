@@ -37,40 +37,58 @@ namespace sunpack::sevenzip
 
     VolumeWriterRegistry::Lease VolumeWriterRegistry::acquire(const std::string &key)
     {
-        std::shared_ptr<AsyncFileWriter> writer;
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
             auto found = entries_.find(key);
-            // Publish a new volume only after its facility is fully constructed.
-            // Failed construction otherwise leaves an entry with no reap deadline.
-            Entry pending;
-            Entry &entry = found == entries_.end() ? pending : found->second;
-            if (found == entries_.end())
+            const bool new_volume = found == entries_.end();
+            if (new_volume)
             {
                 const bool persistent = !key.empty() && key.rfind("job:", 0) != 0;
-                entry.state = make_volume_state(key, persistent);
+                auto state = make_volume_state(key, persistent);
+                if (!key.empty())
+                {
+                    state->space_gate = std::make_shared<VolumeSpaceGate>(key, std::string{}, sink_);
+                }
+                found = entries_.emplace(key, Entry{std::move(state)}).first;
+            }
+            Entry &entry = found->second;
+            if (entry.writer)
+            {
+                ++entry.leases;
+                entry.reap_deadline = {};
+                return Lease(this, entry.writer);
+            }
+            if (entry.leases != 0)
+            {
+                writer_ready_.wait(lock);
+                continue;
             }
 
-            if (!entry.state->space_gate && !key.empty())
+            // The provisional lease keeps this entry alive and lets other
+            // volumes acquire writers while we start threads and create IOCP.
+            entry.leases = 1;
+            lock.unlock();
+            std::shared_ptr<AsyncFileWriter> writer;
+            try
             {
-                entry.state->space_gate = std::make_shared<VolumeSpaceGate>(
-                    key, std::string{}, sink_);
+                writer = std::make_shared<AsyncFileWriter>(entry.state, config_);
             }
-
-            if (!entry.writer)
+            catch (...)
             {
-                entry.writer = std::make_shared<AsyncFileWriter>(
-                    entry.state, config_);
+                lock.lock();
+                if (new_volume) entries_.erase(key);
+                else entry.leases = 0;
+                lock.unlock();
+                writer_ready_.notify_all();
+                throw;
             }
-            ++entry.leases;
-            entry.reap_deadline = std::chrono::steady_clock::time_point{};
-            writer = entry.writer;
-            if (found == entries_.end())
-            {
-                entries_.emplace(key, std::move(pending));
-            }
+            lock.lock();
+            entry.writer = writer;
+            lock.unlock();
+            writer_ready_.notify_all();
+            return Lease(this, std::move(writer));
         }
-        return Lease(this, std::move(writer));
     }
 
     void VolumeWriterRegistry::release(const std::string &key) noexcept
@@ -100,10 +118,10 @@ namespace sunpack::sevenzip
             for (auto it = entries_.begin(); it != entries_.end();)
             {
                 Entry &entry = it->second;
-                // Only persistent entries survive without a writer.
                 if (!entry.writer)
                 {
-                    ++retained_states;
+                    // An initialization in progress has a provisional lease.
+                    if (entry.leases == 0) ++retained_states;
                     ++it;
                     continue;
                 }
@@ -133,7 +151,7 @@ namespace sunpack::sevenzip
                 std::size_t to_remove = retained_states - kMaxRetainedVolumeStates;
                 for (auto it = entries_.begin(); it != entries_.end() && to_remove != 0;)
                 {
-                    if (!it->second.writer)
+                    if (!it->second.writer && it->second.leases == 0)
                     {
                         it = entries_.erase(it);
                         --to_remove;
@@ -237,7 +255,12 @@ namespace sunpack::sevenzip
     {
         std::vector<std::shared_ptr<AsyncFileWriter>> writers;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_);
+            writer_ready_.wait(lock, [this] {
+                return std::none_of(entries_.begin(), entries_.end(), [](const auto &item) {
+                    return !item.second.writer && item.second.leases != 0;
+                });
+            });
             for (auto &item : entries_)
             {
                 if (item.second.writer)

@@ -2931,29 +2931,8 @@ impl<'run, O: Observer> Run<'run, O> {
         );
         let output_string = output
             .as_ref()
-            .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
-        let volume_key = if output_string.is_empty() {
-            String::new()
-        } else {
-            crate::filesystem::resolve_output_volume_key(&output_string)
-                .unwrap_or_else(|| format!("job:{job_id}"))
-        };
-        let mut request = json!({
-            "job_id": job_id, "operation": if self.request.mode == Mode::Scan { "scan" } else { "extract" },
-            "origin": if self.request.origin == Origin::Watch { "watch" } else { "foreground" },
-            "output_dir": output_string, "output_volume_key": volume_key,
-            "archive_input": input.worker_input(), "password_candidates": plan.candidates,
-        });
-        if let Some(password) = &plan.verified_password {
-            request["password"] = Value::String(password.to_string());
-            request["password_verified"] = Value::Bool(true);
-        }
-        if let Some(encrypted) = plan.encrypted {
-            request["encrypted"] = Value::Bool(encrypted);
-        }
-        if let Some(codepage) = codepage {
-            request["codepage"] = Value::from(codepage);
-        }
+            .map(|path| path.to_string_lossy())
+            .unwrap_or_default();
         self.notify(|| Event::Waiting { id });
         let native = match self.engine.worker(&self.request.config.performance.worker, &self.request.cancel).await {
             Ok(worker) => {
@@ -2961,6 +2940,30 @@ impl<'run, O: Observer> Run<'run, O> {
                     self.request.cancel.check_io()?;
                 } else {
                     stage("extract_prepare", &self.request.cancel).await?;
+                }
+                // Materialize the worker request only when it can be sent.
+                // Pending jobs keep their plans without a second JSON copy.
+                let volume_key = if output_string.is_empty() {
+                    String::new()
+                } else {
+                    crate::filesystem::resolve_output_volume_key(&output_string)
+                        .unwrap_or_else(|| format!("job:{job_id}"))
+                };
+                let mut request = json!({
+                    "job_id": job_id, "operation": if self.request.mode == Mode::Scan { "scan" } else { "extract" },
+                    "origin": if self.request.origin == Origin::Watch { "watch" } else { "foreground" },
+                    "output_dir": output_string, "output_volume_key": volume_key,
+                    "archive_input": input.worker_input(), "password_candidates": plan.candidates,
+                });
+                if let Some(password) = &plan.verified_password {
+                    request["password"] = Value::String(password.to_string());
+                    request["password_verified"] = Value::Bool(true);
+                }
+                if let Some(encrypted) = plan.encrypted {
+                    request["encrypted"] = Value::Bool(encrypted);
+                }
+                if let Some(codepage) = codepage {
+                    request["codepage"] = Value::from(codepage);
                 }
                 worker
                     .submit(

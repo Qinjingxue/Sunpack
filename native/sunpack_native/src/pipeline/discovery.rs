@@ -622,7 +622,9 @@ fn retain_logical_retry_scopes(
             continue;
         };
         let retry = Arc::new(RetryScope {
-            snapshot: scope_view(&source.snapshot, &scope),
+            // Retry takes a fresh inventory within scope. It uses the old
+            // snapshot only to reuse anchors for paths in that inventory.
+            snapshot: source.snapshot.share_rows(),
             scope: Arc::new(scope),
             bucket: source.bucket.clone(),
         });
@@ -741,7 +743,9 @@ pub(super) fn find_watch_volume(
     let path = path.to_string_lossy();
     let (filtered, raw) = if let Some(catalog) = &request.watch_catalog {
         options.catalog_snapshot(catalog, scope, &path)?
-    } else { scan_discovery_scope(options, scope, &HashMap::new(), &mut HashMap::new())? };
+    } else {
+        options.scan_scope(scope)?
+    };
     let mut verified = HashMap::new();
     let targets = FileTargets::new(vec![(path.to_string(), filesystem_logical_name(&path))]);
     let mut table = directory_table(&filtered, &raw, Some(targets), candidates, &mut verified, request)?;
@@ -1538,11 +1542,6 @@ mod tests {
                     panic!("expected a retained volume resolution context");
                 };
                 assert_eq!(retry.scope.key(), path_key(&child.to_string_lossy()));
-                assert!(retry
-                    .snapshot
-                    .rows
-                    .iter()
-                    .all(|&row| { retry.scope.contains(&retry.snapshot.table.paths[row]) }));
             }
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -1605,7 +1604,12 @@ mod tests {
             &scopes[0].snapshot.table,
             &scopes[1].snapshot.table
         ));
-        assert_eq!(*scopes[1].snapshot.rows, *inner_raw.rows);
+        assert!(Arc::ptr_eq(&scopes[0].snapshot.rows, &scopes[1].snapshot.rows));
+        let (_, refreshed) = options.refresh_relation_bucket(
+            &scopes[1].scope, &head.to_string_lossy(), &scopes[1].snapshot, None,
+        ).unwrap();
+        assert!(refreshed.records().any(|(path, _, _, _)| path == head.to_string_lossy()));
+        assert!(refreshed.records().all(|(path, _, _, _)| inner.contains(path)));
         let head = head.to_string_lossy().into_owned();
         let mut tasks = vec![Task::single(
             ArchiveInput::file(head.clone(), "7z".into(), "split".into()),

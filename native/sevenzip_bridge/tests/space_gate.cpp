@@ -1014,70 +1014,21 @@ void g26_registration_covers_root_directory_creation() {
     registry->shutdown();
 }
 
-// discontinuity 只由真实卷状态变化推进
-void g27_only_real_transitions_advance_the_discontinuity_generation() {
-    // transition.discontinuity 只在真正的 Ready→Blocked / Probing→Ready 上为 true，
-    // 补发通知必须为 false。
+void g27_late_registration_reuses_the_episode() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g27", log);
 
     gate->register_job("J1");
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    {
-        const auto transitions = log->snapshot();
-        check(transitions.size() == 1 && transitions.front().kind ==
-                  VolumeSpaceTransition::Kind::Blocked,
-              "G-27: 首次失败必须只有一条 blocked");
-        check(transitions.front().discontinuity,
-              "G-27: 真实的 Ready→Blocked 必须 discontinuity = true");
-    }
-
-    // 补发通知：新 job 注册到已经 blocked 的卷上。
+    const auto episode = gate->episode_id();
     log->clear();
     check(gate->register_job("J2"), "G-27: 注册必须成功");
-    {
-        const auto transitions = log->snapshot();
-        check(transitions.size() == 1,
-              "G-27: 已 blocked 的卷注册新 job 必须恰好补发一条");
-        check(!transitions.front().discontinuity,
-              "G-27: 补发通知**不是**卷可写性变化 → discontinuity 必须为 false"
-              "（否则 blocked 卷持续进入新 job 会让 controller 反复 reset learning）");
-        check(transitions.front().kind == VolumeSpaceTransition::Kind::Blocked,
-              "G-27: 补发的事件类型仍是 space_blocked");
-    }
-
-    // 同一 episode 内 probe 失败：不发事件（也就无从推进 generation）。
-    log->clear();
-    check(gate->poll(500 * kMib), "G-27: 必须能发放许可");
-    {
-        auto result = gate->try_wait({});
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-27: 拿到许可");
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    }
-    check(log->total() == 0,
-          "G-27: Probing→Blocked 不得产生任何事件（更不能推进 generation）");
-
-    // 真实恢复（Probing -> Ready）必须 discontinuity = true。
-    check(gate->poll(600 * kMib), "G-27: 必须能再次发放许可");
-    log->clear();
-    {
-        auto result = gate->try_wait({});
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-27: 拿到许可");
-        result.lease.report_success();
-    }
-    {
-        const auto transitions = log->snapshot();
-        check(transitions.size() == 1 &&
-                  transitions.front().kind == VolumeSpaceTransition::Kind::Resumed,
-              "G-27: 恢复必须只有一条 resumed");
-        check(transitions.front().discontinuity,
-              "G-27: 真实的 Probing→Ready 必须 discontinuity = true");
-    }
-
-    // 恢复之后再次注册：卷已是 Ready，不该有任何补发。
-    log->clear();
-    gate->register_job("J3");
-    check(log->total() == 0, "G-27: Ready 卷注册新 job 不得补发任何事件");
+    const auto transitions = log->snapshot();
+    check(transitions.size() == 1 &&
+              transitions.front().kind == VolumeSpaceTransition::Kind::Blocked &&
+              transitions.front().episode_id == episode &&
+              transitions.front().job_ids == std::vector<std::string>{"J2"},
+          "G-27: 仅向新 job 补发当前 episode 的 blocked 事件");
 }
 
 // 一个 job 在同一 episode 内恰好收到一条 blocked（去重）
@@ -1507,8 +1458,8 @@ int main(int argc, char **argv) {
         {"G-25 two volumes recover independently", g25_two_volumes_recover_independently},
         {"G-26 registration covers root directory creation",
          g26_registration_covers_root_directory_creation},
-        {"G-27 only real transitions advance discontinuity",
-         g27_only_real_transitions_advance_the_discontinuity_generation},
+        {"G-27 late registration reuses the episode",
+         g27_late_registration_reuses_the_episode},
         {"G-28 one blocked per job per episode", g28_one_blocked_per_job_per_episode},
         {"G-29 no late blocked after recovery", g29_no_late_blocked_after_recovery},
         {"G-30 positive samples retry after failure", g30_positive_samples_retry_after_failure},

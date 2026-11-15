@@ -547,19 +547,26 @@ pub(super) fn resolve_buckets(
     index: &BucketIndex,
     cached: Option<&RelationCache>,
 ) -> Vec<ProposalValidation> {
+    const FORMATS: [&str; 3] = ["rar", "zip", "7z"];
     let mut output = Vec::new();
     for (stem, bucket) in &index.rows_by_stem {
-        let mut physical_paths = HashSet::new();
-        let shared_carrier = bucket.iter().any(|i| !physical_paths.insert(rows[*i].path_key.as_str()));
-        let formats: HashSet<_> = bucket
+        let mut present = [false; FORMATS.len()];
+        for anchor in bucket
             .iter()
             .filter_map(|i| rows[*i].anchor.as_ref())
-            .filter(|a| !a.standalone && matches!(a.format, "rar" | "zip" | "7z"))
-            .map(|a| a.format)
-            .collect();
+            .filter(|a| !a.standalone)
+        {
+            if let Some(index) = FORMATS.iter().position(|&format| format == anchor.format) {
+                present[index] = true;
+            }
+        }
+        let require_family_hint = present.iter().filter(|&&found| found).count() > 1 && {
+            let mut physical_paths = HashSet::new();
+            bucket.iter().all(|i| physical_paths.insert(rows[*i].path_key.as_str()))
+        };
         let mut features = HashMap::new();
-        for format in ["rar", "zip", "7z"] {
-            if !formats.contains(format) {
+        for (format, found) in FORMATS.into_iter().zip(present) {
+            if !found {
                 continue;
             }
             let mut members = Vec::new();
@@ -590,7 +597,7 @@ pub(super) fn resolve_buckets(
                 // Independent slices share a scope, not a filename family.
                 // Opaque continuation disks remain candidates just as in each
                 // head's original scope; known other formats were excluded above.
-                if !shared_carrier && formats.len() > 1 && !f.owned {
+                if require_family_hint && !f.owned {
                     let suffix = row.name.split_once('.').map_or("", |(_, s)| s);
                     if archive_family_hint(suffix) != Some(format) {
                         continue;

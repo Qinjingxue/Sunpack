@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -37,7 +38,6 @@ namespace sunpack::sevenzip
         enum class Kind
         {
             Blocked, // space_blocked
-            Status,  // space_status（只由 monitor 生成）
             Resumed, // space_resumed
         };
 
@@ -49,9 +49,6 @@ namespace sunpack::sevenzip
         double blocked_seconds = 0.0;
         bool query_ok = true;
         unsigned long query_error = 0;
-        // 仅真实的卷可写性变化（Ready→Blocked / Probing→Ready）为 true；register_job() 的
-        // 补发只是事件补齐，必须保持 false，否则会反复 reset controller 的自适应学习。
-        bool discontinuity = false;
         std::vector<std::string> job_ids;
     };
 
@@ -431,8 +428,8 @@ namespace sunpack::sevenzip
         WaitResult decide_locked(const std::shared_ptr<VolumeSpaceGate> &self,
                                  const TerminalPredicate &terminal) noexcept;
         VolumeSpaceTransition make_transition_locked(VolumeSpaceTransition::Kind kind,
-                                                     bool discontinuity) const;
-        void emit_transitions(const std::vector<VolumeSpaceTransition> &transitions) noexcept;
+                                                     const std::string *new_job = nullptr) const;
+        void emit_transition(const std::optional<VolumeSpaceTransition> &transition) noexcept;
 
         // synthetic 卷的查询根解析：锁外做 Win32 调用，锁内只提交结果。
         // GetVolumePathNameW 绝不能在 gate mutex_ 内执行：对失联 UNC / 坏盘的一次慢解析会
@@ -542,7 +539,7 @@ namespace sunpack::sevenzip
             return false;
         }
 
-        std::vector<VolumeSpaceTransition> transitions;
+        std::optional<VolumeSpaceTransition> transition;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (std::find(affected_jobs_.begin(), affected_jobs_.end(), job_id) !=
@@ -551,19 +548,15 @@ namespace sunpack::sevenzip
                 return false;
             }
             affected_jobs_.push_back(job_id);
-            if (phase_ != VolumeSpacePhase::Ready)
+            if (sink_ && phase_ != VolumeSpacePhase::Ready)
             {
                 // 事件补齐：job 已注册，却因 producer backpressure 没有任何 writer 线程
                 // 进入 gate->wait()。
-                VolumeSpaceTransition transition =
-                    make_transition_locked(VolumeSpaceTransition::Kind::Blocked,
-                                           /*discontinuity=*/false);
-                transition.job_ids.clear();
-                transition.job_ids.push_back(job_id);
-                transitions.push_back(std::move(transition));
+                transition.emplace(make_transition_locked(VolumeSpaceTransition::Kind::Blocked,
+                                                          &job_id));
             }
         }
-        emit_transitions(transitions);
+        emit_transition(transition);
         return true;
     }
 
@@ -586,7 +579,7 @@ namespace sunpack::sevenzip
     inline bool VolumeSpaceGate::report_space_failure(
         unsigned long win32_error, std::wstring_view failed_path) noexcept
     {
-        std::vector<VolumeSpaceTransition> transitions;
+        std::optional<VolumeSpaceTransition> transition;
         bool opened_episode = false;
 
         resolve_query_root_outside_lock(std::wstring(failed_path));
@@ -606,15 +599,15 @@ namespace sunpack::sevenzip
 
                 // blocked 事件必须在同一把锁内生成：否则"进入 Blocked"与"事件可见"之间
                 // 会出现可插队窗口（新 job 收到迟到 blocked、或与补发重复投递）。
-                transitions.push_back(make_transition_locked(
-                    VolumeSpaceTransition::Kind::Blocked, /*discontinuity=*/true));
+                if (sink_) transition.emplace(make_transition_locked(
+                    VolumeSpaceTransition::Kind::Blocked));
             }
             // Blocked / Probing：只更新失败证据；Probing 期间绝不夺走现有 probe ownership，
             // "盘是否已恢复"的裁决权属于当前 probe owner 的真实操作。
         }
 
         wake_waiters();
-        emit_transitions(transitions);
+        emit_transition(transition);
         return opened_episode;
     }
 
@@ -787,7 +780,7 @@ namespace sunpack::sevenzip
 
     inline void VolumeSpaceGate::settle_success(std::uint64_t token) noexcept
     {
-        std::vector<VolumeSpaceTransition> transitions;
+        std::optional<VolumeSpaceTransition> transition;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!owns_probe_locked(token))
@@ -799,11 +792,11 @@ namespace sunpack::sevenzip
             probe_owner_token_ = 0;
             last_win32_error_ = 0;
             blocked_since_ = std::chrono::steady_clock::time_point{};
-            transitions.push_back(make_transition_locked(
-                VolumeSpaceTransition::Kind::Resumed, /*discontinuity=*/true));
+            if (sink_) transition.emplace(make_transition_locked(
+                VolumeSpaceTransition::Kind::Resumed));
         }
         wake_waiters(); // 全部等待者恢复
-        emit_transitions(transitions);
+        emit_transition(transition);
     }
 
     inline void VolumeSpaceGate::settle_space_failure(
@@ -895,18 +888,18 @@ namespace sunpack::sevenzip
 #endif
 
     inline VolumeSpaceTransition VolumeSpaceGate::make_transition_locked(
-        VolumeSpaceTransition::Kind kind, bool discontinuity) const
+        VolumeSpaceTransition::Kind kind, const std::string *new_job) const
     {
         VolumeSpaceTransition transition;
         transition.kind = kind;
-        transition.discontinuity = discontinuity;
         transition.volume_key = volume_key_;
         transition.episode_id = episode_id_;
         transition.win32_error = last_win32_error_;
         transition.free_bytes = last_free_bytes_;
         transition.query_ok = last_query_ok_;
         transition.query_error = last_query_error_;
-        transition.job_ids = affected_jobs_;
+        if (new_job) transition.job_ids.push_back(*new_job);
+        else transition.job_ids = affected_jobs_;
         if (blocked_since_ != std::chrono::steady_clock::time_point{})
         {
             transition.blocked_seconds =
@@ -916,19 +909,15 @@ namespace sunpack::sevenzip
         return transition;
     }
 
-    inline void VolumeSpaceGate::emit_transitions(
-        const std::vector<VolumeSpaceTransition> &transitions) noexcept
+    inline void VolumeSpaceGate::emit_transition(
+        const std::optional<VolumeSpaceTransition> &transition) noexcept
     {
         // sink 必须在 gate 锁释放之后调用：sink 会取 g_output_mutex 并做 IO。
-        if (!sink_)
-        {
-            return;
-        }
-        for (const auto &transition : transitions)
+        if (transition)
         {
             try
             {
-                sink_(transition);
+                sink_(*transition);
             }
             catch (...)
             {

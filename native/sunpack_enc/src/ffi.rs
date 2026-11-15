@@ -166,7 +166,7 @@ pub unsafe extern "C" fn sup_enc_open(
             data: std::ptr::null_mut(),
             len: 0,
         });
-        let opened = Decoder::open_with_workspace_budget(
+        let opened = Decoder::open_with_budget(
             &mut input,
             length,
             pw,

@@ -267,8 +267,12 @@ impl Scheduler {
             return;
         }
         state.queue(request, origin, grant);
-        drop(state);
-        self.dispatch();
+        // A slot release or a capacity increase dispatches pending work.
+        // Saturated submissions need only acquire the admission lock once.
+        if state.active < state.limit.unwrap_or(self.capacity) {
+            drop(state);
+            self.dispatch();
+        }
     }
 
     /// main's worker handshake can change admission only within the original

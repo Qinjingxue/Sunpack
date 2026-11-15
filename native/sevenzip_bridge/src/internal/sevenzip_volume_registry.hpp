@@ -7,6 +7,7 @@
 #ifdef _WIN32
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -100,6 +101,7 @@ namespace sunpack::sevenzip
         {
             VolumeStatePtr state;
             std::shared_ptr<AsyncFileWriter> writer;
+            // A lease without a writer belongs to the thread initializing it.
             std::size_t leases = 0;
             std::chrono::steady_clock::time_point reap_deadline{};
         };
@@ -110,6 +112,7 @@ namespace sunpack::sevenzip
         // gate 只在新建 entry 时创建并注入 sink；已有 entry 的 gate 不得重设。
         const VolumeSpaceChangeSink sink_;
         mutable std::mutex mutex_;
+        std::condition_variable writer_ready_;
         std::unordered_map<std::string, Entry> entries_;
     };
 

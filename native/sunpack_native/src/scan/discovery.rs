@@ -509,18 +509,45 @@ impl NativeEmbeddedBatch {
     // row references only when needed, then consume each source/stem once.
     fn enqueue_volume_peers(&mut self, table: &mut NativeCandidateTable) {
         let mut selected = HashSet::new();
+        let mut relations = HashMap::new();
         for item in &self.pending_volumes[self.nominated..] {
-            if !item.anchor.multivolume && !item.anchor.needs_password { continue; }
+            if !item.anchor.multivolume && !item.anchor.needs_password {
+                continue;
+            }
             let stem = crate::scan::catalog::catalog_stem(&item.anchor.path);
-            let key = path_key(&item.anchor.path);
+            match &table.rows[item.index] {
+                Candidate::File(facts, row) => {
+                    for (source, snapshot) in table.relation_sources.iter().enumerate() {
+                        if Arc::ptr_eq(facts, &snapshot.table)
+                            && (snapshot.rows.len() == snapshot.table.paths.len()
+                                || snapshot.rows.contains(row))
+                        {
+                            selected.insert((source, stem.clone()));
+                        }
+                    }
+                }
+                Candidate::Relation(_) => {
+                    relations.insert(path_key(&item.anchor.path), stem);
+                }
+            }
+        }
+        if !relations.is_empty() {
+            // Several relation anchors can come from one carrier or one page.
+            // Test their membership together, even when source views overlap.
+            let mut matched = HashSet::new();
             for (source, snapshot) in table.relation_sources.iter().enumerate() {
-                let contains = match &table.rows[item.index] {
-                    Candidate::File(facts, row) => Arc::ptr_eq(facts, &snapshot.table)
-                        && (snapshot.rows.len() == snapshot.table.paths.len() || snapshot.rows.contains(row)),
-                    Candidate::Relation(_) => snapshot.rows.iter()
-                        .any(|&row| path_key(&snapshot.table.paths[row]) == key),
-                };
-                if contains { selected.insert((source, stem.clone())); }
+                matched.clear();
+                for &row in snapshot.rows.iter() {
+                    let key = path_key(&snapshot.table.paths[row]);
+                    if let Some((key, stem)) = relations.get_key_value(&key) {
+                        if matched.insert(key) {
+                            selected.insert((source, stem.clone()));
+                        }
+                        if matched.len() == relations.len() {
+                            break;
+                        }
+                    }
+                }
             }
         }
         self.nominated = self.pending_volumes.len();

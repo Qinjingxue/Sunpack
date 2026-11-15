@@ -107,7 +107,7 @@ pub(crate) fn rar_fast_verify_passwords_from_ranges(
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let parsed: std::sync::Arc<[_]> = parse_ranges(ranges, sessions)?.into();
+    let parsed = parse_ranges(ranges, sessions)?;
     verify_prepared(ranges_key("rar", &parsed)?, candidates, || {
         prepare_rar(|offset, len, field| read_ranges_at_field(&parsed, offset, len, field))
             .map(PasswordContext::Rar)

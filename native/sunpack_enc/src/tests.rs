@@ -67,6 +67,7 @@ fn open_returns_kdf_credits_before_io_and_on_password_failure() {
                     &mut input,
                     FIXTURES[9].len() as u64,
                     &pw(password),
+                    Workspace::default(),
                     |wanted| {
                         assert_eq!(wanted, 3);
                         let extra = wanted.min(grant);
@@ -95,6 +96,7 @@ fn open_returns_kdf_credits_before_io_and_on_password_failure() {
                 &mut Cursor::new(bytes),
                 bytes.len() as u64,
                 &pw("sunpack-test"),
+                Workspace::default(),
                 |_| panic!("invalid header requested credits"),
                 |_| panic!("unexpected release"),
             )
@@ -112,16 +114,23 @@ fn open_returns_kdf_credits_before_io_and_on_password_failure() {
 fn pw(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
-fn decode(bytes: &[u8], password: &str, expected: &[u8]) {
-    let mut workspace = Workspace::default();
-    let mut input = Cursor::new(bytes);
-    let decoder = Decoder::open(
-        &mut input,
-        bytes.len() as u64,
+fn open_without_extra_credits(
+    input: &mut (impl Read + Seek),
+    length: u64,
+    password: &str,
+) -> Result<Decoder> {
+    Decoder::open_with_budget(
+        input,
+        length,
         &pw(password),
-        &mut workspace,
+        Workspace::default(),
+        |_| 0,
+        |_| unreachable!("no extra CPU credits were granted"),
     )
-    .unwrap();
+}
+fn decode(bytes: &[u8], password: &str, expected: &[u8]) {
+    let mut input = Cursor::new(bytes);
+    let decoder = open_without_extra_credits(&mut input, bytes.len() as u64, password).unwrap();
     assert_eq!(decoder.output_size(), expected.len() as u64);
     let mut output = Vec::new();
     let mut progress = Vec::new();
@@ -251,13 +260,8 @@ fn corruption_cancellation_and_short_reads() {
         .unwrap()
         .matches(&pw("sunpack-test"), &mut Workspace::default())
         .unwrap());
-    let decoder = Decoder::open(
-        &mut input,
-        damaged.len() as u64,
-        &pw("sunpack-test"),
-        &mut Workspace::default(),
-    )
-    .unwrap();
+    let decoder =
+        open_without_extra_credits(&mut input, damaged.len() as u64, "sunpack-test").unwrap();
     assert_eq!(decoder.output_size(), 0);
     assert_eq!(
         decoder
@@ -273,13 +277,9 @@ fn corruption_cancellation_and_short_reads() {
             let mut damaged = fixture.to_vec();
             damaged[offset] ^= 1;
             let mut input = Cursor::new(&damaged);
-            let decoder = Decoder::open(
-                &mut input,
-                damaged.len() as u64,
-                &pw("sunpack-test"),
-                &mut Workspace::default(),
-            )
-            .unwrap();
+            let decoder =
+                open_without_extra_credits(&mut input, damaged.len() as u64, "sunpack-test")
+                    .unwrap();
             assert_eq!(
                 decoder
                     .decrypt_with_budget(
@@ -296,13 +296,8 @@ fn corruption_cancellation_and_short_reads() {
     }
     let data = FIXTURES[0];
     let mut input = Cursor::new(data);
-    let decoder = Decoder::open(
-        &mut input,
-        data.len() as u64,
-        &pw("sunpack-test"),
-        &mut Workspace::default(),
-    )
-    .unwrap();
+    let decoder =
+        open_without_extra_credits(&mut input, data.len() as u64, "sunpack-test").unwrap();
     assert_eq!(
         decoder
             .decrypt_with_budget(
@@ -328,13 +323,8 @@ fn corruption_cancellation_and_short_reads() {
         }
     }
     let mut input = Short(Cursor::new(data));
-    let decoder = Decoder::open(
-        &mut input,
-        data.len() as u64,
-        &pw("sunpack-test"),
-        &mut Workspace::default(),
-    )
-    .unwrap();
+    let decoder =
+        open_without_extra_credits(&mut input, data.len() as u64, "sunpack-test").unwrap();
     let mut output = Vec::new();
     decoder
         .decrypt_with_budget(&mut input, &mut output, |_| 0, |_| (), |_| Ok(()))

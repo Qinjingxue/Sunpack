@@ -6,7 +6,7 @@ use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use crate::password::input::{
-    parse_ranges, parse_volumes, ranges_key, ranges_total_len, VirtualRangeReader, VolumeSet,
+    parse_ranges, parse_volumes, ranges_key, VirtualRangeReader, VolumeSet,
 };
 use hmac::{Hmac, Mac};
 use rayon::prelude::*;
@@ -41,15 +41,11 @@ pub(crate) fn zip_fast_verify_passwords_from_ranges(
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges, sessions)?;
-    let total_len = ranges_total_len(&parsed);
     let key = ranges_key("zip", &parsed)?;
     verify_prepared(key, candidates, || {
-        prepare_zip_stream(
-            &mut VirtualRangeReader::new(parsed.into()),
-            total_len,
-            eocd_offset,
-        )
-        .map(PasswordContext::Zip)
+        let mut reader = VirtualRangeReader::new(&parsed);
+        let total_len = reader.len();
+        prepare_zip_stream(&mut reader, total_len, eocd_offset).map(PasswordContext::Zip)
     })
 }
 

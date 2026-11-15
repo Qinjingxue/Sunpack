@@ -9,7 +9,7 @@ use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
-use crate::password::input::{parse_ranges, ranges_key, ranges_total_len, VirtualRangeReader};
+use crate::password::input::{parse_ranges, ranges_key, VirtualRangeReader};
 use rayon::prelude::*;
 use sevenz_rust2::{Archive, EncoderMethod, Error as SevenZipError, Password};
 use std::io::{Read, Seek, SeekFrom};
@@ -52,10 +52,10 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_ranges(
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges, sessions)?;
-    let total_len = ranges_total_len(&parsed);
     verify_prepared(ranges_key("7z", &parsed)?, candidates, || {
-        prepare_seven_zip(VirtualRangeReader::new(parsed.into()), total_len)
-            .map(PasswordContext::SevenZip)
+        let reader = VirtualRangeReader::new(&parsed);
+        let total_len = reader.len();
+        prepare_seven_zip(reader, total_len).map(PasswordContext::SevenZip)
     })
 }
 

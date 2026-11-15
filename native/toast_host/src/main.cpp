@@ -285,7 +285,7 @@ std::string utf16_to_utf8(std::wstring_view value) {
     return result;
 }
 
-std::string_view dismissal_reason_name(ToastDismissalReason reason) noexcept {
+const char* dismissal_reason_name(ToastDismissalReason reason) noexcept {
     switch (reason) {
     case ToastDismissalReason::TimedOut:
         return "TimedOut";
@@ -300,7 +300,7 @@ std::string_view dismissal_reason_name(ToastDismissalReason reason) noexcept {
 
 void write_dismissal_event(
     const std::wstring& log_path,
-    std::string_view kind,
+    SnapshotKind kind,
     ToastDismissalReason reason,
     const SYSTEMTIME& now
 ) noexcept {
@@ -329,37 +329,33 @@ void write_dismissal_event(
         );
         if (file == INVALID_HANDLE_VALUE) return;
     }
-    char timestamp[32]{};
-    const int timestamp_length = std::snprintf(
-        timestamp,
-        sizeof(timestamp),
-        "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+    char line[192];
+    const int length = std::snprintf(
+        line,
+        sizeof(line),
+        "{\"time\":\"%04hu-%02hu-%02huT%02hu:%02hu:%02hu.%03huZ\","
+        "\"event\":\"toast_dismissed\",\"kind\":\"%s\",\"reason\":\"%s\"}\r\n",
         now.wYear,
         now.wMonth,
         now.wDay,
         now.wHour,
         now.wMinute,
         now.wSecond,
-        now.wMilliseconds
+        now.wMilliseconds,
+        kind == SnapshotKind::progress ? "progress" : "final",
+        dismissal_reason_name(reason)
     );
-    std::string line = "{\"time\":\"";
-    if (timestamp_length > 0) {
-        line.append(timestamp, static_cast<std::size_t>(timestamp_length));
+    if (length > 0 && static_cast<std::size_t>(length) < sizeof(line)) {
+        DWORD written = 0;
+        WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr);
     }
-    line += "\",\"event\":\"toast_dismissed\",\"kind\":\"";
-    line += kind;
-    line += "\",\"reason\":\"";
-    line += dismissal_reason_name(reason);
-    line += "\"}\r\n";
-    DWORD written = 0;
-    WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
     CloseHandle(file);
 }
 
 // Dismissal callbacks run on Windows notification threads. They only enqueue;
 // one owner drains on teardown, and late callbacks hold a weak reference.
 class DiagnosticLog {
-    struct Event { std::string kind; ToastDismissalReason reason; SYSTEMTIME time; };
+    struct Event { SnapshotKind kind; ToastDismissalReason reason; SYSTEMTIME time; };
     std::wstring path_;
     std::mutex mutex_;
     std::condition_variable wake_;
@@ -379,12 +375,12 @@ public:
             for(auto& event:batch) write_dismissal_event(path_,event.kind,event.reason,event.time);
         }
     }) {}
-    void submit(std::string kind,ToastDismissalReason reason) {
+    void submit(SnapshotKind kind,ToastDismissalReason reason) {
         std::lock_guard<std::mutex> lock(mutex_);
         if(stopping_) return;
         if(queue_.size()==1024) queue_.pop_front();
         SYSTEMTIME now{}; GetSystemTime(&now);
-        queue_.push_back({std::move(kind),reason,now}); wake_.notify_one();
+        queue_.push_back({kind,reason,now}); wake_.notify_one();
     }
     void stop() noexcept {
         { std::lock_guard<std::mutex> lock(mutex_); stopping_=true; wake_.notify_one(); }
@@ -743,14 +739,13 @@ private:
         }
     }
 
-    void observe_dismissal(const ToastNotification& toast, std::string_view kind) {
+    void observe_dismissal(const ToastNotification& toast, SnapshotKind kind) {
         if (diagnostic_log_.expired()) return;
-        const std::string kind_name(kind);
-        toast.Dismissed([log = diagnostic_log_, kind_name](
+        toast.Dismissed([log = diagnostic_log_, kind](
             const ToastNotification&,
             const ToastDismissedEventArgs& args
         ) noexcept {
-            try { if(auto writer=log.lock()) writer->submit(kind_name,args.Reason()); } catch(...) {}
+            try { if(auto writer=log.lock()) writer->submit(kind,args.Reason()); } catch(...) {}
         });
     }
 
@@ -791,7 +786,7 @@ private:
         toast.Group(kToastGroup);
         toast.Data(data);
         toast.SuppressPopup(false);
-        observe_dismissal(toast, "progress");
+        observe_dismissal(toast, snapshot.kind);
         // A silent replacement can leave the old banner alive while changing
         // its history entry. Hide the owned object before replacing its XML.
         hide_progress_popup();
@@ -829,7 +824,7 @@ private:
         toast.Tag(final_tag);
         toast.Group(kToastGroup);
         toast.SuppressPopup(false);
-        observe_dismissal(toast, "final");
+        observe_dismissal(toast, snapshot.kind);
         notifier_.Show(toast);
     }
 
@@ -946,10 +941,10 @@ int self_test() {
         {
             ToastContext context;
             context.diagnostic_log = callback_log;
-            callback_log->submit("progress",ToastDismissalReason::UserCanceled);
-            callback_log->submit("final",ToastDismissalReason::TimedOut);
+            callback_log->submit(SnapshotKind::progress,ToastDismissalReason::UserCanceled);
+            callback_log->submit(SnapshotKind::success,ToastDismissalReason::TimedOut);
         }
-        callback_log->submit("late",ToastDismissalReason::ApplicationHidden);
+        callback_log->submit(SnapshotKind::failure,ToastDismissalReason::ApplicationHidden);
         callback_log.reset();
         HANDLE file=CreateFileW(temporary.path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
         if(file==INVALID_HANDLE_VALUE) return 8;

@@ -275,9 +275,9 @@ impl Projection {
             self.dirty_bytes = self.dirty_bytes.saturating_sub(id.len());
         }
     }
-    fn expire_live(&mut self, ids: Vec<String>, cutoff: i64) {
+    fn expire_live(&mut self, ids: Vec<Arc<str>>, cutoff: i64) {
         for id in ids {
-            if let Some(task) = self.tasks.get_mut(&id) {
+            if let Some(task) = self.tasks.get_mut(id.as_ref()) {
                 if task.stamp > cutoff {
                     continue;
                 }
@@ -1180,7 +1180,7 @@ mod tests {
             json!({"event":"suspended_missing_volume","path":"C:/abandoned.002","ts":1});
         projection.apply(&mut waiting);
         let id = projection.tasks.keys().next().unwrap().clone();
-        projection.expire_live(vec![id], 2_000_000);
+        projection.expire_live(vec![id.into()], 2_000_000);
         assert!(projection.tasks.is_empty() && projection.aliases.is_empty());
     }
 }

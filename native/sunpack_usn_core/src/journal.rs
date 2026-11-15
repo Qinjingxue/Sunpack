@@ -362,25 +362,22 @@ fn scan_directories_page(
     let mut cursor = start_usn;
     let mut payload_bytes = 0usize;
     let mut changed = BTreeSet::new();
-    // Page-local scratch; draining results retains capacity for the next record.
-    let mut changes = Vec::new();
-    let mut name_units = Vec::new();
+    let mut scratch = Default::default();
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     while cursor < end_usn {
         let bytes_returned = read(cursor, &mut output)?;
         let (returned_next, mut records) = split_journal_reply(&output, bytes_returned)?;
         while !records.is_empty() {
             let record = next_journal_record(&mut records)?;
-            record_directory_changes(
+            let record = record_directory_changes(
                 record,
                 &parents,
                 cursor,
                 end_usn,
-                &mut changes,
-                &mut name_units,
+                &mut scratch,
             )?;
-            changes.retain(|change| !changed.contains(change));
-            let added: usize = changes.iter().map(|change| 8 + change.1.len()).sum();
+            let changes = record.changes.map(|change| change.filter(|item| !changed.contains(*item)));
+            let added: usize = changes.iter().flatten().map(|change| 8 + change.1.len()).sum();
             if added > MAX_DIRECTORY_RESPONSE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -388,10 +385,7 @@ fn scan_directories_page(
                 ));
             }
             if payload_bytes + added > MAX_DIRECTORY_RESPONSE_BYTES {
-                let major = u16::from_le_bytes(record[4..6].try_into().unwrap());
-                let usn_offset = if major == 2 { 24 } else { 40 };
-                let next_usn =
-                    i64::from_le_bytes(record[usn_offset..usn_offset + 8].try_into().unwrap());
+                let next_usn = record.usn;
                 if next_usn <= start_usn {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -406,7 +400,7 @@ fn scan_directories_page(
                 });
             }
             payload_bytes += added;
-            changed.extend(changes.drain(..));
+            changed.extend(changes.into_iter().flatten().cloned());
         }
         if returned_next <= cursor {
             return Err(io::Error::other(
@@ -423,15 +417,20 @@ fn scan_directories_page(
     })
 }
 
-fn record_directory_changes(
+type DirectoryChange = (u32, String);
+
+struct DirectoryRecord<'a> {
+    usn: i64,
+    changes: [Option<&'a DirectoryChange>; 2],
+}
+
+fn record_directory_changes<'a>(
     record: &[u8],
     parents: &HashMap<[u8; FILE_ID_BYTES], u32>,
     start_usn: i64,
     end_usn: i64,
-    changes: &mut Vec<(u32, String)>,
-    name_units: &mut Vec<u16>,
-) -> io::Result<()> {
-    changes.clear();
+    scratch: &'a mut [DirectoryChange; 2],
+) -> io::Result<DirectoryRecord<'a>> {
     if record.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -456,15 +455,18 @@ fn record_directory_changes(
         ));
     }
     let usn = i64::from_le_bytes(record[usn_offset..usn_offset + 8].try_into().unwrap());
+    let mut result = DirectoryRecord { usn, changes: [None; 2] };
     if usn < start_usn || usn >= end_usn {
-        return Ok(());
+        return Ok(result);
     }
     let mut file = [0u8; FILE_ID_BYTES];
     let mut parent = file;
     file[..width].copy_from_slice(&record[8..8 + width]);
     parent[..width].copy_from_slice(&record[8 + width..8 + 2 * width]);
+    let [directory, child] = scratch;
     if let Some(index) = parents.get(&file) {
-        changes.push((*index, String::new()));
+        directory.0 = *index;
+        result.changes[0] = Some(directory);
     }
     if let Some(index) = parents.get(&parent) {
         let Some((length_offset, offset_offset)) = name_offsets else {
@@ -492,23 +494,27 @@ fn record_directory_changes(
                 "invalid USN file name range",
             ));
         }
-        name_units.clear();
-        name_units.extend(
-            record[offset..offset + length]
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
-        );
-        let name = String::from_utf16(name_units)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid USN UTF-16"))?;
-        if name.contains(['/', '\\']) || name == "." || name == ".." || name.contains('\0') {
+        // Retain scratch capacity when a journal repeats the same child name.
+        // The page only allocates an owned copy for a new directory/name pair.
+        child.0 = *index;
+        child.1.clear();
+        child.1.reserve(length / 2);
+        let units = record[offset..offset + length]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+        for ch in char::decode_utf16(units) {
+            child.1.push(ch.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid USN UTF-16"))?);
+        }
+        let name = child.1.as_str();
+        if name.contains(['/', '\\', '\0']) || name == "." || name == ".." {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid USN child name",
             ));
         }
-        changes.push((*index, name));
+        result.changes[1] = Some(child);
     }
-    Ok(())
+    Ok(result)
 }
 
 fn read_change_reasons_from_volume(
@@ -771,8 +777,7 @@ mod tests {
         // Reason parsing tests never exercise parent dispatch, both rename names,
         // or nameless/unknown records. This one in-memory case covers that gap.
         let parents = HashMap::from([(11u128.to_le_bytes(), 0), (22u128.to_le_bytes(), 1)]);
-        let mut changes = Vec::new();
-        let mut name_units = Vec::new();
+        let mut scratch = Default::default();
         for major in [2, 3] {
             let width = if major == 2 { 8 } else { 16 };
             let base = if major == 2 { 60 } else { 76 };
@@ -787,20 +792,19 @@ mod tests {
                 row[length_offset + 2..length_offset + 4]
                     .copy_from_slice(&(base as u16).to_le_bytes());
                 row.extend_from_slice(&encoded);
-                record_directory_changes(&row, &parents, 100, 101, &mut changes, &mut name_units)
-                    .unwrap();
-                assert_eq!(changes, vec![(1, String::new()), (0, name.to_owned())]);
-                record_directory_changes(&row, &parents, 99, 100, &mut changes, &mut name_units)
-                    .unwrap();
-                assert!(changes.is_empty());
+                let changes = record_directory_changes(&row, &parents, 100, 101, &mut scratch)
+                    .unwrap().changes;
+                assert_eq!(changes, [Some(&(1, String::new())), Some(&(0, name.to_owned()))]);
+                let changes = record_directory_changes(&row, &parents, 99, 100, &mut scratch)
+                    .unwrap().changes;
+                assert_eq!(changes, [None; 2]);
                 row[base..base + 2].copy_from_slice(&0xdc00u16.to_le_bytes());
                 assert!(record_directory_changes(
                     &row,
                     &parents,
                     100,
                     101,
-                    &mut changes,
-                    &mut name_units
+                    &mut scratch,
                 )
                 .is_err());
                 row[length_offset..length_offset + 2].copy_from_slice(&1u16.to_le_bytes());
@@ -809,8 +813,7 @@ mod tests {
                     &parents,
                     100,
                     101,
-                    &mut changes,
-                    &mut name_units
+                    &mut scratch,
                 )
                 .is_err());
             }
@@ -822,8 +825,7 @@ mod tests {
             &parents,
             100,
             101,
-            &mut changes,
-            &mut name_units
+            &mut scratch,
         )
         .is_err());
         nameless[4..6].copy_from_slice(&5u16.to_le_bytes());
@@ -832,8 +834,7 @@ mod tests {
             &parents,
             100,
             101,
-            &mut changes,
-            &mut name_units
+            &mut scratch,
         )
         .is_err());
     }

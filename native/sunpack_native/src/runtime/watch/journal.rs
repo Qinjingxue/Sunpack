@@ -369,12 +369,21 @@ impl Journal {
             if !frontier.needs_checkpoint() {
                 if let Some(boundary) = frontier.retirement {
                     let dir = self.snapshot.parent().unwrap().to_owned();
+                    let notify = self.maintenance.lock().unwrap().clone();
                     let ready = Arc::new(AtomicBool::new(false));
+                    let completed = Arc::clone(&ready);
                     let job = thread::Builder::new().name("sunpack-watch-retirement".into())
                         .stack_size(512 * 1024)
-                        .spawn(move || Ok(CheckpointResult::Published {
-                            retirement: retire_segments(&dir, boundary).then_some(boundary),
-                        }))?;
+                        .spawn(move || {
+                            let retirement = retire_segments(&dir, boundary).then_some(boundary);
+                            // A persistent sharing conflict gets one immediate
+                            // retry; only success wakes another maintenance turn.
+                            if retirement.is_none() {
+                                completed.store(true, Ordering::Release);
+                                if let Some(notify) = notify { notify(); }
+                            }
+                            Ok(CheckpointResult::Published { retirement })
+                        })?;
                     *active = Some(Checkpoint { job, records: 0, bytes: 0, ready });
                 }
                 return Ok(());
@@ -420,9 +429,7 @@ impl Journal {
                 // Make the result harvestable before waking idle maintenance:
                 // the callback can run before JoinHandle::is_finished flips.
                 completed.store(true, Ordering::Release);
-                if retirement.is_some() {
-                    if let Some(notify) = notify { notify(); }
-                }
+                if let Some(notify) = notify { notify(); }
                 Ok(CheckpointResult::Published { retirement })
             });
         match job {
@@ -926,6 +933,7 @@ mod tests {
         journal.compact().unwrap();
         journal.wait_for_checkpoint().unwrap();
         assert!(!wal.exists());
+        assert_eq!(notifications.load(Ordering::Relaxed), 2);
         assert!(journal.frontier.lock().unwrap().retirement.is_none());
         assert_eq!(fs::read(dir.join("state.snapshot")).unwrap(), snapshot);
         // Leave another covered segment locked through shutdown. Opening the

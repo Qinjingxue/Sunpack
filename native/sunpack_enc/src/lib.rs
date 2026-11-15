@@ -244,7 +244,7 @@ pub struct PasswordProbe {
     quick: [u8; 32],
 }
 impl PasswordProbe {
-    pub fn read<R: Read + Seek>(input: &mut R, length: u64) -> Result<Self> {
+    fn read<R: Read + Seek>(input: &mut R, length: u64) -> Result<Self> {
         input.seek(SeekFrom::Start(0))?;
         let mut bytes = [0u8; 72];
         input.read_exact(&mut bytes)?;
@@ -302,35 +302,9 @@ impl<F: FnMut(usize)> Drop for CpuLease<'_, F> {
     }
 }
 impl Decoder {
-    pub fn open<R: Read + Seek>(
-        input: &mut R,
-        length: u64,
-        password: &[u16],
-        workspace: &mut Workspace,
-    ) -> Result<Self> {
-        let probe = PasswordProbe::read(input, length)?;
-        let keys = probe.keys(password, workspace)?;
-        Self::finish_open(input, length, probe, keys)
-    }
     /// Worker final KDF: borrow at most three extra credits, then return them
     /// before reading recovery framing. No derived keys cross process boundaries.
-    pub fn open_with_budget<R: Read + Seek>(
-        input: &mut R,
-        length: u64,
-        password: &[u16],
-        acquire: impl FnMut(usize) -> usize,
-        release: impl FnMut(usize),
-    ) -> Result<Self> {
-        Self::open_with_workspace_budget(
-            input,
-            length,
-            password,
-            Workspace::default(),
-            acquire,
-            release,
-        )
-    }
-    fn open_with_workspace_budget<R: Read + Seek>(
+    fn open_with_budget<R: Read + Seek>(
         input: &mut R,
         length: u64,
         password: &[u16],
@@ -361,14 +335,7 @@ impl Decoder {
             probe.keys(password, &mut workspace)?
         };
         drop(workspace); // return large KDF memory before recovery/payload I/O
-        Self::finish_open(input, length, probe, keys)
-    }
-    fn finish_open<R: Read + Seek>(
-        input: &mut R,
-        length: u64,
-        probe: PasswordProbe,
-        keys: Keys,
-    ) -> Result<Self> {
+
         // A password-only Test must succeed after a valid quick proof even if
         // recovery framing is damaged. Report that damage during real Extract,
         // so generic encrypted-CRC heuristics cannot turn it into a bad password.

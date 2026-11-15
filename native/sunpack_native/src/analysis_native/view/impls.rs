@@ -316,9 +316,9 @@ impl AnalysisBinaryView {
                 member_size,
                 cursor,
                 size,
-                &mut |start, length| self.reader.read_at(start, length),
+                &mut |start, length| self.reader.read_cached_at(start, length),
             ) {
-                Ok(record) => cursor = record.next,
+                Ok(next) => cursor = next,
                 Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
                     return Ok(TarObservation::Recognized(None));
                 }

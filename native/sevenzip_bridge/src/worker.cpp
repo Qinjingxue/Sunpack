@@ -1448,21 +1448,6 @@ private:
         monitor_condition_.notify_one();
     }
 
-    // Space events go out on the `progress` channel, one per affected job, with a real job_id: both dispatchers drop events whose job_id is empty or unknown.
-    static const char* space_event_name(
-        sunpack::sevenzip::VolumeSpaceTransition::Kind kind
-    ) noexcept {
-        switch (kind) {
-            case sunpack::sevenzip::VolumeSpaceTransition::Kind::Blocked:
-                return "space_blocked";
-            case sunpack::sevenzip::VolumeSpaceTransition::Kind::Resumed:
-                return "space_resumed";
-            case sunpack::sevenzip::VolumeSpaceTransition::Kind::Status:
-            default:
-                return "space_status";
-        }
-    }
-
     static std::string space_event_payload(
         const char* event,
         const std::string& job_id,
@@ -1485,24 +1470,6 @@ private:
             wire::key("volume_query_ok") + wire::boolean(query_ok) +
             wire::key("volume_query_error") + wire::number(query_error) + wire::end();
         return payload;
-    }
-
-    static void print_volume_space_event(
-        const sunpack::sevenzip::VolumeSpaceTransition& transition
-    ) noexcept {
-        const char* event = space_event_name(transition.kind);
-        for (const auto& job_id : transition.job_ids) {
-            print_frame(space_event_payload(
-                event,
-                job_id,
-                transition.volume_key,
-                transition.episode_id,
-                transition.win32_error,
-                transition.free_bytes,
-                transition.blocked_seconds,
-                transition.query_ok,
-                transition.query_error));
-        }
     }
 
     void print_volume_space_status(
@@ -1538,23 +1505,23 @@ private:
     void on_space_transition(
         const sunpack::sevenzip::VolumeSpaceTransition& transition
     ) noexcept {
-        using Kind = sunpack::sevenzip::VolumeSpaceTransition::Kind;
-        switch (transition.kind) {
-            case Kind::Blocked:
-            case Kind::Resumed:
-                if (transition.kind == Kind::Blocked) {
-                    // A blocked volume is itself a controller event. Wake the
-                    // monitor directly instead of relying on unrelated job
-                    // admission/completion notifications.
-                    space_monitor_->note_blocked();
-                    request_monitor_recheck();
-                }
-                break;
-            case Kind::Status:
-            default:
-                break;
+        const bool blocked = transition.kind == sunpack::sevenzip::VolumeSpaceTransition::Kind::Blocked;
+        if (blocked) {
+            space_monitor_->note_blocked();
+            request_monitor_recheck();
         }
-        print_volume_space_event(transition);
+        for (const auto& job_id : transition.job_ids) {
+            print_frame(space_event_payload(
+                blocked ? "space_blocked" : "space_resumed",
+                job_id,
+                transition.volume_key,
+                transition.episode_id,
+                transition.win32_error,
+                transition.free_bytes,
+                transition.blocked_seconds,
+                transition.query_ok,
+                transition.query_error));
+        }
     }
 
     void monitor_loop() noexcept {

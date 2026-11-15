@@ -2079,6 +2079,7 @@ fn walk_tar_candidate(
     if header.len() < 512 || &header[257..262] != TAR_USTAR {
         return Err(ValidationError::Invalid("tar_header_invalid"));
     }
+    let mut first_header = Some(header);
     let mut cursor = offset;
     let mut state = crate::formats::tar::TarState::default();
     loop {
@@ -2087,7 +2088,10 @@ fn walk_tar_candidate(
         if state.boundary_context_free() {
             visit(cursor)?;
         }
-        let current = read_at(file, cursor, 512)?;
+        let current = match first_header.take() {
+            Some(header) => header,
+            None => read_at(file, cursor, 512)?,
+        };
         if current.len() != 512 {
             return Err(ValidationError::Invalid("tar_header_missing"));
         }
@@ -2103,11 +2107,10 @@ fn walk_tar_candidate(
                 "member_walk_checksums_and_end_blocks",
             ));
         }
-        let record = state.advance(&current, cursor, size, &mut |start, size| {
-            Ok(read_at(file, start, size)?.to_vec())
-        });
-        let record = match record {
-            Ok(record) => record,
+        cursor = match state.advance(&current, cursor, size, &mut |start, size| {
+            read_at(file, start, size)
+        }) {
+            Ok(next) => next,
             Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
                 return Ok(logical_candidate(
                     "tar",
@@ -2125,7 +2128,6 @@ fn walk_tar_candidate(
                 })
             }
         };
-        cursor = record.next;
     }
 }
 

@@ -17,6 +17,7 @@ use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
 use crate::scan::directory::{NativeDirectoryScanOptions, NativeWatchCatalog};
 use crate::scan::scope::NativeDiscoveryScope;
 use crate::watch_store::{is_path_under, recorded_file_is_absent, watch_path_key};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -4268,7 +4269,7 @@ impl Scheduler {
         &self,
         entry: &crate::watch_store::EntryRecord,
     ) -> Option<(String, Option<Arc<Recovery>>)> {
-        route_blocker(entry, &self.roots, |path| self.catalog.is_owned(path))
+        route_blocker(entry, &self.roots)
     }
 
     fn recover_pending(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
@@ -4356,36 +4357,27 @@ impl Scheduler {
             }
             let source = Path::new(&pending.path);
             let entry = state.entry(&pending.path);
-            let borrowed = entry.as_ref().and_then(|entry| {
-                entry
-                    .failure_payload
-                    .get("details")?
-                    .get("retry_output_dir")?
-                    .as_str()
-            });
-            let checkpoints = input_checkpoints(state, &pending.path).collect::<io::Result<Vec<_>>>()?;
             // Failure recovery may retain a carrier across a retry. Successful
             // work is recovered through the pending output records below.
-            let retained_containers = checkpoints.iter()
-                .filter_map(crate::pipeline::InputCheckpoint::retained_container)
-                .map(key)
-                .collect::<HashSet<_>>();
+            let mut retained_containers = HashSet::new();
+            for checkpoint in input_checkpoints(entry.as_deref()) {
+                if let Some(container) = checkpoint?.retained_container() {
+                    retained_containers.insert(key(container));
+                }
+            }
             let mut revisit = BTreeMap::new();
             let mut inspected_outputs = HashSet::new();
             let mut cleanup_failed = false;
-            let mut has_active_output = false;
+            let has_active_output = !pending.active_outputs.is_empty();
             for (task, output) in pending.active_outputs.iter() {
-                if borrowed != Some(output.as_str()) {
-                    has_active_output = true;
-                }
-                if pending.committed_roots.contains(output)
-                    || borrowed == Some(output.as_str())
-                    || (!retained_containers.is_empty()
-                        && retained_containers.contains(&watch_path_key(output)))
-                {
+                if pending.committed_roots.contains(output) {
                     continue;
                 }
-                if inspected_outputs.insert(watch_path_key(output)) {
+                let output_key = watch_path_key(output);
+                if retained_containers.contains(&output_key) {
+                    continue;
+                }
+                if inspected_outputs.insert(output_key) {
                     if recovery_output_matches(&pending, output) {
                         if let Err(error) = crate::postprocess::remove_owned_tree(Path::new(output)) {
                             cleanup_failed = true;
@@ -5490,10 +5482,10 @@ impl Scheduler {
                 scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), Some(0), Vec::new()),
                 password_scope: active.password_scope.clone(),
             };
-            let mut entry = make_entry(
+            let mut entry = make_blocker(
                 &candidate,
                 &super::failure::message(failure, self.settings.cli.language),
-                Some(input_failure),
+                input_failure,
                 self.journal.state().entry(&candidate.path).as_deref(),
                 &active.passwords,
                 &self.user_password_signature,
@@ -5571,7 +5563,8 @@ impl Scheduler {
             let failure_message = failure.map(|failure| super::failure::message(failure, self.settings.cli.language));
             let error = failure_message.as_deref()
                 .or_else(|| input_error.map(|error| error.message.as_str()));
-            let retryable = input_failure.is_some_and(InputFailure::retryable);
+            let blocker = input_failure.filter(|input| input.retryable());
+            let retryable = blocker.is_some();
             // A multipart request has one logical result and one blocker.
             // Physical sibling generations only need their pending WAL retired.
             let candidate = if completed.cancelled {
@@ -5659,18 +5652,18 @@ impl Scheduler {
                     .state()
                     .entry(&candidate.path)
                     .filter(|entry| entry.status == "interrupted")
-            } else {
+            } else if let Some(blocker) = blocker {
                 error.map(|error| {
-                    let record_error = if discovery_failure.is_some() && retryable {
-                        input_failure.and_then(InputFailure::failure)
+                    let record_error = if discovery_failure.is_some() {
+                        blocker.failure()
                             .map(|failure| super::failure::message(failure, self.settings.cli.language))
                     } else {
                         None
                     };
-                    let mut entry = make_entry(
+                    let mut entry = make_blocker(
                         &candidate,
                         record_error.as_deref().unwrap_or(error),
-                        input_failure,
+                        blocker,
                         self.journal.state().entry(&candidate.path).as_deref(),
                         &active.passwords,
                         &self.user_password_signature,
@@ -5691,6 +5684,8 @@ impl Scheduler {
                     if regrouped_recovery.is_some() { regrouped_recoveries.push(candidate.path.clone()); }
                     entry
                 })
+            } else {
+                None
             };
             if let Some(record) = &record {
                 if password_updated(record, &self.user_password_signature) {
@@ -5703,6 +5698,8 @@ impl Scheduler {
                 "failed_terminal"
             } else if let Some(record) = &record {
                 record.status.as_str()
+            } else if error.is_some() {
+                "failed_terminal"
             } else if archives.is_some() {
                 "done"
             } else {
@@ -5728,7 +5725,7 @@ impl Scheduler {
             }
             operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
                 &candidate.path,
-                record.filter(|entry| entry.status != "failed_terminal"),
+                record,
             ));
         }
         if !completed.cancelled {
@@ -5874,26 +5871,18 @@ fn nested_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailure
 fn route_blocker(
     entry: &crate::watch_store::EntryRecord,
     roots: &BTreeMap<String, (Root, NativeDiscoveryScope)>,
-    is_owned: impl Fn(&str) -> bool,
 ) -> Option<(String, Option<Arc<Recovery>>)> {
     let payload = &entry.failure_payload;
     if let Some(root) = payload.get("source_input_root").and_then(Value::as_str) {
         let root = watch_path_key(root);
-        let (_, watched_scope) = roots.get(&root)?;
+        roots.get(&root)?;
         if let Some(scope) = payload.get("discovery_scope").and_then(Value::as_object) {
             let password_scope = payload
                 .get("password_scope_dir")
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let recovery = Recovery::from_record(scope, password_scope)?;
-            if recovery.scope.contains(&entry.path)
-                && (watch_path_key(&recovery.scope.root) != root
-                    || !watched_scope.contains(&entry.path)
-                    || is_owned(&entry.path)
-                    || payload.get("details").is_some_and(|details| {
-                        details["nested_input"].as_bool() == Some(true)
-                    }))
-            {
+            if recovery.scope.contains(&entry.path) {
                 return Some((root, Some(Arc::new(recovery))));
             }
         }
@@ -6002,7 +5991,7 @@ fn completion_archives<'a>(
             let partial = crate::pipeline::TaskStatus::of(archive) == crate::pipeline::TaskStatus::Partial;
             match counted.entry((path.clone(), archive.depth)) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let owner = completion_owner_key(&path, outputs, groups).unwrap_or(path);
+                    let owner = completion_owner_key(&path, outputs, groups).unwrap_or_else(|| path.clone());
                     let count = counts.entry(owner.clone()).or_default();
                     count.success_count += 1;
                     count.partial_success_count += usize::from(partial);
@@ -6015,19 +6004,26 @@ fn completion_archives<'a>(
                 _ => {}
             }
         }
-        for path in archive.source_paths.iter().chain(std::iter::once(&archive.path)) {
-            by_path.entry(key(path)).or_default().push(archive);
+        for source in archive.source_paths.iter().filter(|source| *source != &archive.path) {
+            let source = key(source);
+            if source != path { by_path.entry(source).or_default().push(archive); }
         }
         if archive.depth > 1 && !archive.partial && archive.failure.is_some() && !nested_retry(archive, failures)
         {
             // Nested retry blockers get their own durable entry below. All
             // other nested failures belong to the original top-level card.
-            if let Some(owner) = output_owner(outputs, &key(&archive.path)) {
+            if let Some(owner) = output_owner(outputs, &path) {
                 let owner = watch_path_key(owner);
                 let owner = groups.get(&owner).map(|group| key(&group.path)).unwrap_or(owner);
-                by_path.entry(owner).or_default().push(archive);
+                if owner != path {
+                    let related = by_path.entry(owner).or_default();
+                    if related.last().is_none_or(|last| !std::ptr::eq(*last, archive)) {
+                        related.push(archive);
+                    }
+                }
             }
         }
+        by_path.entry(path).or_default().push(archive);
     }
     (by_path, counts)
 }
@@ -6063,10 +6059,10 @@ fn candidate_password_scope(
     scope.unwrap_or_else(|| Path::new(path).parent().unwrap_or(Path::new("")).to_owned())
 }
 
-fn make_entry(
+fn make_blocker(
     candidate: &WatchCandidateRow,
     error: &str,
-    failure: Option<&InputFailure<'_>>,
+    failure: &InputFailure<'_>,
     previous: Option<&crate::watch_store::EntryRecord>,
     passwords: &crate::core::passwords::PasswordSnapshot,
     user_signature: &str,
@@ -6074,35 +6070,33 @@ fn make_entry(
     recovery: Option<&Recovery>,
     password_scope: &Path,
 ) -> Arc<crate::watch_store::EntryRecord> {
-    let kind = failure.and_then(InputFailure::failure).map(|failure| failure.kind);
-    let password = failure.is_some_and(|input| input.failed && input.password.is_some());
-    let missing = failure.is_some_and(|input| input.failed && input.missing.is_some());
-    let status = if missing { "suspended_missing_volume" }
-        else if password { "failed_password" } else { "failed_terminal" };
+    debug_assert!(failure.retryable());
+    let kind = failure.failure().map(|failure| failure.kind);
+    let password = failure.password.is_some();
+    let missing = failure.missing.is_some();
+    let status = if missing { "suspended_missing_volume" } else { "failed_password" };
     let mut blockers = Vec::new();
     if missing { blockers.push("missing_volume"); }
     if password { blockers.push("password"); }
-    let mut payload = json!({"blockers":blockers});
+    let mut payload = serde_json::Map::new();
+    payload.insert("blockers".into(), json!(blockers));
     if let Some(group) = group {
-        payload["source_group"] = json!(group.record());
+        payload.insert("source_group".into(), json!(group.record()));
     }
     if let Some(recovery) = recovery {
-        payload["discovery_scope"] = Value::Object(recovery.record());
-        payload["details"] = json!({"nested_input":true});
+        payload.insert("discovery_scope".into(), Value::Object(recovery.record()));
     }
-    payload["password_scope_dir"] = json!(password_scope);
+    payload.insert("password_scope_dir".into(), json!(password_scope));
     if password {
-        payload["password_signature"] = json!(password_source_signature(user_signature, &passwords.scope_signature(password_scope)));
+        payload.insert("password_signature".into(), json!(password_source_signature(user_signature, &passwords.scope_signature(password_scope))));
     }
-    let kind = serde_json::to_value(kind)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default();
     let mut entry = observed_entry(candidate, status, previous);
     entry.last_error = error.to_owned();
-    entry.failure_kind = kind;
+    if let Ok(Value::String(kind)) = serde_json::to_value(kind) {
+        entry.failure_kind = kind;
+    }
     entry.failure_stage = "extraction".to_owned();
-    entry.failure_payload = payload.as_object().unwrap().clone();
+    entry.failure_payload = payload;
     Arc::new(entry)
 }
 
@@ -6526,7 +6520,8 @@ fn restore_checkpoints(
     owner: &str,
     outputs: &mut BTreeMap<String, String>,
 ) -> io::Result<Vec<crate::pipeline::InputCheckpoint>> {
-    let checkpoints = input_checkpoints(state, owner).collect::<io::Result<Vec<_>>>()?;
+    let entry = state.entry(owner);
+    let checkpoints = input_checkpoints(entry.as_deref()).collect::<io::Result<Vec<_>>>()?;
     // Reusing a receipt deliberately skips register_output's exclusive create.
     // Restore its routing separately, before the engine discovers children.
     for checkpoint in &checkpoints {
@@ -6545,13 +6540,13 @@ fn restore_checkpoints(
 }
 
 fn input_checkpoints(
-    state: &crate::watch_store::NativeWatchState,
-    owner: &str,
-) -> impl Iterator<Item = io::Result<crate::pipeline::InputCheckpoint>> {
-    let values = state.entry(owner)
-        .and_then(|entry| entry.failure_payload.get("input_checkpoints").and_then(Value::as_array).cloned())
-        .unwrap_or_default();
-    values.into_iter().map(|record| serde_json::from_value(record).map_err(io::Error::other))
+    entry: Option<&crate::watch_store::EntryRecord>,
+) -> impl Iterator<Item = io::Result<crate::pipeline::InputCheckpoint>> + '_ {
+    entry.and_then(|entry| entry.failure_payload.get("input_checkpoints"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|record| crate::pipeline::InputCheckpoint::deserialize(record).map_err(io::Error::other))
 }
 
 fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool) -> io::Result<Vec<String>> {
@@ -7372,15 +7367,15 @@ mod tests {
         for status in ["failed_password", "suspended_missing_volume"] {
             let mut entry = observed_entry(&candidate, status, None);
             let roots = BTreeMap::from([(id.clone(), (root.clone(), recursive.clone()))]);
-            assert!(route_blocker(&entry, &roots, |_| false).is_some());
-            assert!(route_blocker(&entry, &BTreeMap::new(), |_| false).is_none());
+            assert!(route_blocker(&entry, &roots).is_some());
+            assert!(route_blocker(&entry, &BTreeMap::new()).is_none());
             let roots = BTreeMap::from([(id.clone(), (root.clone(), shallow.clone()))]);
-            assert!(route_blocker(&entry, &roots, |_| false).is_none());
+            assert!(route_blocker(&entry, &roots).is_none());
             // A different current root may legitimately own the old input.
             let sub = Root { path: r"C:\watch\sub".into(), ..root.clone() };
             let roots = BTreeMap::from([(key(&sub.path), (sub,
                 NativeDiscoveryScope::new(r"C:\watch\sub".into(), None, Vec::new())))]);
-            assert!(route_blocker(&entry, &roots, |_| false).is_some());
+            assert!(route_blocker(&entry, &roots).is_some());
 
             // Promoted recovery is intentionally allowed outside the ordinary
             // scan scope, but only while its original input root still exists.
@@ -7390,8 +7385,8 @@ mod tests {
                 &NativeDiscoveryScope::new(r"D:\output".into(), Some(0), Vec::new()))));
             entry.failure_payload.insert("password_scope_dir".into(), json!(r"C:\watch"));
             let roots = BTreeMap::from([(id.clone(), (root.clone(), shallow.clone()))]);
-            assert!(route_blocker(&entry, &roots, |_| true).unwrap().1.is_some());
-            assert!(route_blocker(&entry, &BTreeMap::new(), |_| true).is_none());
+            assert!(route_blocker(&entry, &roots).unwrap().1.is_some());
+            assert!(route_blocker(&entry, &BTreeMap::new()).is_none());
         }
     }
 
@@ -7419,7 +7414,6 @@ mod tests {
         let payload = &mut Arc::make_mut(&mut entry).failure_payload;
         payload.insert("discovery_scope".into(), Value::Object(recovery.record()));
         payload.insert("password_scope_dir".into(), json!(recovery.password_scope));
-        payload.insert("details".into(), json!({"nested_input":true}));
         let mut pending = Pending {
             root: watch_path_key(r"C:\watch\old"), candidate,
             quiet: quiet::Activity::default(), due: Instant::now(), force: true, recovery: None,
@@ -7427,7 +7421,7 @@ mod tests {
         let due = pending.due;
         // Old A was removed; current B covers the retained file. This is the
         // exact fallback route that completion must hand to an existing queue.
-        let (route, _) = route_blocker(&entry, &roots, |_| false).unwrap();
+        let (route, _) = route_blocker(&entry, &roots).unwrap();
         handoff_nested_blocker(&mut entry, &route, &roots[&route].0,
             recovery, Some(&mut pending));
         assert_eq!(pending.root, root_id);
@@ -7456,7 +7450,7 @@ mod tests {
             assert_eq!(record.change_usn, 9);
             assert_eq!(record.password_scope_dir, r"C:\passwords");
             let entry = journal.state().entry(&pending.candidate.path).unwrap();
-            let (route, recovery) = route_blocker(&entry, &roots, |_| true).unwrap();
+            let (route, recovery) = route_blocker(&entry, &roots).unwrap();
             assert_eq!(route, root_id);
             assert!(recovery.unwrap().scope.contains(&pending.candidate.path));
         }
@@ -7533,6 +7527,8 @@ mod tests {
             completion_archive(r"C:\watch\outer\inner.zip", 2, Some(FailureKind::Damaged))];
         let failures = outcome.input_failures();
         let (projected, _) = completion_archives(&outcome, &outputs, &groups, &failures);
+        assert_eq!(projected[&key(head)].len(), 2);
+        assert_eq!(projected[&key(alias)].len(), 1);
         assert_eq!(completion_failed_archive(&projected[&key(head)], &failures).unwrap().failure.as_ref().unwrap().kind, FailureKind::Damaged);
         assert!(completion_failed_archive(&projected[&key(other)], &failures).is_none());
         assert!(output_owner(&outputs, &key(Path::new(r"C:\watch\outer-other\inner.zip"))).is_none());
@@ -7569,7 +7565,7 @@ mod tests {
             outcome.archives.push(completion_archive(path, 1, Some(kind)));
             let failures = outcome.input_failures();
             let failure = &failures[&crate::path_keys::path_key(path)];
-            let entry = make_entry(&candidate, "blocked", Some(failure), None,
+            let entry = make_blocker(&candidate, "blocked", failure, None,
                 &passwords, &user_signature, None, None, b);
             assert_eq!(entry.failure_payload["password_scope_dir"], json!(b));
             if failure.password.is_some() {
@@ -7632,7 +7628,7 @@ mod tests {
             },
         };
         let passwords = crate::core::passwords::PasswordSnapshot::default();
-        let entry = make_entry(&candidate, "carrier blocked", Some(carrier), None,
+        let entry = make_blocker(&candidate, "carrier blocked", carrier, None,
             &passwords, &user_password_signature(&[]), None, None, Path::new(retained_path).parent().unwrap());
         assert_eq!(entry.status, "suspended_missing_volume");
         assert_eq!(entry.failure_payload["blockers"], json!(["missing_volume", "password"]));
@@ -7722,8 +7718,8 @@ mod tests {
         }
         {
             let journal = journal::Journal::open(&root, 7).unwrap();
-            assert!(input_checkpoints(journal.state(), owner_text).next().is_none());
-            let retained = input_checkpoints(journal.state(), carrier_text).collect::<io::Result<Vec<_>>>().unwrap();
+            assert!(input_checkpoints(journal.state().entry(owner_text).as_deref()).next().is_none());
+            let retained = input_checkpoints(journal.state().entry(carrier_text).as_deref()).collect::<io::Result<Vec<_>>>().unwrap();
             assert_eq!(retained.len(), 2);
             let nested_receipt = retained.iter().find(|checkpoint| checkpoint.entry() == nested).unwrap();
             let nested_receipt = serde_json::to_value(nested_receipt).unwrap();

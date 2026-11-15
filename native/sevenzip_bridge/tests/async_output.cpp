@@ -8,11 +8,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // Fail allocations only on the cleanup caller, leaving IOCP threads available
@@ -20,8 +22,10 @@
 // sealing/shutdown; this detects stranded staging buffers without an OOM load.
 thread_local bool reject_cleanup_allocations = false;
 thread_local std::ptrdiff_t fail_allocation_after = -1;
+thread_local std::function<void()> before_allocation;
 
 void* operator new(std::size_t size) {
+    if (before_allocation) std::exchange(before_allocation, {})();
     if (reject_cleanup_allocations) throw std::bad_alloc();
     if (fail_allocation_after == 0) {
         fail_allocation_after = -1;
@@ -582,6 +586,45 @@ bool registry_creation_failure_does_not_retain_entries() {
     }
 }
 
+bool registry_creation_allows_other_volumes() {
+    AsyncWriterConfig config;
+    config.threads_per_volume = 1;
+    config.buffer_count = 4;
+    config.idle_timeout = std::chrono::milliseconds::zero();
+    VolumeWriterRegistry registry(config);
+    const std::string cold = "cold-volume";
+    const std::string warm = "warm-volume";
+    auto warm_lease = registry.acquire(warm);
+    registry.acquire(cold).reset();
+    registry.reap_idle();
+
+    // Recreating a retained volume allocates first in writer construction.
+    // Stall there while a different volume requests its existing writer.
+    std::promise<void> starting;
+    std::promise<void> continue_creation;
+    const auto resume = continue_creation.get_future();
+    auto creator = std::async(std::launch::async, [&] {
+        before_allocation = [&] {
+            starting.set_value();
+            resume.wait();
+        };
+        return registry.acquire(cold);
+    });
+    starting.get_future().wait();
+    auto other = std::async(std::launch::async, [&] { return registry.acquire(warm); });
+    auto same = std::async(std::launch::async, [&] { return registry.acquire(cold); });
+    const bool independent = other.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    continue_creation.set_value();
+    const auto first = creator.get();
+    const auto reused = same.get();
+    const auto unrelated = other.get();
+    if (!independent || &first.writer() != &reused.writer() || &warm_lease.writer() != &unrelated.writer()) {
+        std::cerr << "writer construction blocked another volume or duplicated a facility\n";
+        return false;
+    }
+    return true;
+}
+
 // Ordinary extraction and facility expiry do not test pressure reclamation
 // across small pools. Eight 1 MiB outputs expose that gap, then reuse every
 // writer to verify that trimming does not invalidate its buffer descriptors.
@@ -745,6 +788,7 @@ int main() {
         quiescence_tracks_jobs_and_files(directory) &&
         configuration_is_snapshotted_not_reread(directory) &&
         registry_creation_failure_does_not_retain_entries() &&
+        registry_creation_allows_other_volumes() &&
         registry_routes_by_volume_and_releases_leases(directory) &&
         registry_reclaims_aggregate_small_pools(directory) &&
         registry_reclaims_idle_facilities(directory);

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) const ENTRY_BYTES: usize = 64;
 const RECORD_BLOCK_BYTES: usize = 1024 * 1024;
@@ -50,8 +51,8 @@ struct Live {
     run: Run,
     data: TrackedFile,
     index: TrackedFile,
-    rows: HashMap<String, (u64, [u8; ENTRY_BYTES])>,
-    time: BTreeMap<(i64, u64), String>,
+    rows: HashMap<Arc<str>, (u64, [u8; ENTRY_BYTES])>,
+    time: BTreeMap<(i64, u64), Arc<str>>,
     free: Vec<u64>,
     bytes: u64,
     revision: u64,
@@ -67,17 +68,22 @@ impl Live {
     }
     fn remove(&mut self, id: &str) -> io::Result<()> {
         if let Some((slot, bytes)) = self.rows.remove(id) {
-            self.time.remove(&(stamp(&bytes), slot));
-            let size = record_size(&mut self.data, &bytes)?;
             zero(
                 &mut self.index,
                 slot * ENTRY_BYTES as u64,
                 (slot + 1) * ENTRY_BYTES as u64,
             )?;
-            zero(&mut self.data, offset(&bytes), offset(&bytes) + size)?;
-            self.bytes -= size;
+            self.release_data(slot, &bytes)?;
             self.free.push(slot);
         }
+        Ok(())
+    }
+
+    fn release_data(&mut self, slot: u64, bytes: &[u8; ENTRY_BYTES]) -> io::Result<()> {
+        let size = record_size(&mut self.data, bytes)?;
+        zero(&mut self.data, offset(bytes), offset(bytes) + size)?;
+        self.bytes -= size;
+        self.time.remove(&(stamp(bytes), slot));
         Ok(())
     }
 }
@@ -89,7 +95,7 @@ pub(crate) struct Store {
     compressed: Vec<u8>,
     obsolete: Vec<String>,
     live: Option<Live>,
-    pub(crate) expired_live: Vec<String>,
+    pub(crate) expired_live: Vec<Arc<str>>,
 }
 fn files(folder: &Path, name: &str) -> (PathBuf, PathBuf) {
     (
@@ -383,18 +389,18 @@ impl Store {
         compressed: &mut Vec<u8>,
         data: &mut TrackedFile,
         index: &mut TrackedFile,
-        run: &mut Run,
+        slot: u64,
         value: &Value,
         ts: i64,
-    ) -> io::Result<[u8; ENTRY_BYTES]> {
+    ) -> io::Result<([u8; ENTRY_BYTES], u64)> {
         let mut raw = super::scratch::Spool::default();
         rmp_serde::encode::write(&mut raw, value).map_err(|e| invalid(&e.to_string()))?;
         let raw = raw.finish()?;
         let position = data.seek(SeekFrom::End(0))?;
-        let (packed_length, raw_length) = if raw.len() <= super::scratch::MEMORY_BYTES {
+        let (packed_length, raw_length, size) = if raw.len() <= super::scratch::MEMORY_BYTES {
             let len = compress_block(&raw, compressed)?;
             data.write_all(&compressed[..len])?;
-            (len as u32, raw.len() as u32)
+            (len as u32, raw.len() as u32, len as u64)
         } else {
             // Zero sizes in the fixed index select a u64 envelope of bounded
             // LZ4 blocks. Publish the index only after the complete record.
@@ -413,7 +419,7 @@ impl Store {
             data.seek(SeekFrom::Start(position))?;
             data.write_all(&header)?;
             data.seek(SeekFrom::Start(end))?;
-            (0, 0)
+            (0, 0, end - position)
         };
         let mut bytes = [0; ENTRY_BYTES];
         bytes[..8].copy_from_slice(&ts.to_le_bytes());
@@ -421,18 +427,13 @@ impl Store {
         bytes[16..20].copy_from_slice(&packed_length.to_le_bytes());
         bytes[20..24].copy_from_slice(&raw_length.to_le_bytes());
         bytes[24..28].copy_from_slice(&kind(value).to_le_bytes());
-        bytes[28..32].copy_from_slice(&(run.count as u32).to_le_bytes());
+        bytes[28..32].copy_from_slice(&(slot as u32).to_le_bytes());
         for (i, bits) in filter(value).iter().enumerate() {
             bytes[32 + i * 8..40 + i * 8].copy_from_slice(&bits.to_le_bytes());
         }
-        index.seek(SeekFrom::Start(run.count * ENTRY_BYTES as u64))?;
+        index.seek(SeekFrom::Start(slot * ENTRY_BYTES as u64))?;
         index.write_all(&bytes)?;
-        if run.count == 0 {
-            run.first = ts;
-        }
-        run.last = ts;
-        run.count += 1;
-        Ok(bytes)
+        Ok((bytes, size))
     }
     pub(crate) fn append(&mut self, value: &Value, ts: i64) -> io::Result<()> {
         if kind(value) != 0 {
@@ -450,15 +451,21 @@ impl Store {
             self.manifest.runs.push(run);
         }
         let (data, index) = self.current.as_mut().unwrap();
+        let run = self.manifest.runs.last_mut().unwrap();
         Self::write_record(
             &mut self.compressed,
             data,
             index,
-            self.manifest.runs.last_mut().unwrap(),
+            run.count,
             value,
             ts,
-        )
-        .map(|_| ())
+        )?;
+        if run.count == 0 {
+            run.first = ts;
+        }
+        run.last = ts;
+        run.count += 1;
+        Ok(())
     }
     fn new_live(&self) -> io::Result<Live> {
         let mut run = self.create_run("live");
@@ -502,33 +509,40 @@ impl Store {
         }
         for row in rows {
             let (id, value) = row?;
-            if value.as_ref().is_some_and(|(ts, _)| *ts <= cutoff) {
-                self.expired_live.push(id.clone());
-            }
-            if let Some(live) = &mut self.live {
-                live.remove(&id)?;
-            }
-            if let Some((ts, value)) = value.filter(|(ts, _)| *ts > cutoff) {
-                if self.live.is_none() {
-                    self.live = Some(self.new_live()?);
+            let expired = value.as_ref().is_some_and(|(ts, _)| *ts <= cutoff);
+            let Some((ts, value)) = value.filter(|_| !expired) else {
+                if let Some(live) = &mut self.live {
+                    live.remove(&id)?;
                 }
-                let live = self.live.as_mut().unwrap();
-                let slot = live.free.pop().unwrap_or(live.run.count);
-                let count = live.run.count.max(slot + 1);
-                live.run.count = slot;
-                let bytes = Self::write_record(
-                    &mut self.compressed,
-                    &mut live.data,
-                    &mut live.index,
-                    &mut live.run,
-                    &value,
-                    ts,
-                )?;
-                live.run.count = count;
-                live.bytes += record_size(&mut live.data, &bytes)?;
-                live.time.insert((ts, slot), id.clone());
-                live.rows.insert(id, (slot, bytes));
+                if expired {
+                    self.expired_live.push(Arc::from(id));
+                }
+                continue;
+            };
+            if self.live.is_none() {
+                self.live = Some(self.new_live()?);
             }
+            let live = self.live.as_mut().unwrap();
+            let (id, slot) = if let Some((id, (slot, bytes))) = live.rows.remove_entry(id.as_str()) {
+                // Readers already reject this revision. Overwrite the index slot
+                // directly and reclaim only the old record's data.
+                live.release_data(slot, &bytes)?;
+                (id, slot)
+            } else {
+                (Arc::from(id), live.free.pop().unwrap_or(live.run.count))
+            };
+            let (bytes, size) = Self::write_record(
+                &mut self.compressed,
+                &mut live.data,
+                &mut live.index,
+                slot,
+                &value,
+                ts,
+            )?;
+            live.run.count = live.run.count.max(slot + 1);
+            live.bytes += size;
+            live.time.insert((ts, slot), Arc::clone(&id));
+            live.rows.insert(id, (slot, bytes));
         }
         self.manifest.task_revision += 1;
         self.finish_live()
@@ -559,8 +573,7 @@ impl Store {
         let old = self.live.as_mut().unwrap();
         let mut buffer = [0u8; 65536];
         for ((ts, _), id) in &old.time {
-            let (_, bytes) = old.rows[id];
-            let mut bytes = bytes;
+            let (_, mut bytes) = old.rows[id];
             let size = record_size(&mut old.data, &bytes)?;
             let position = new.data.stream_position()?;
             old.data.seek(SeekFrom::Start(offset(&bytes)))?;
@@ -601,7 +614,7 @@ impl Store {
                 if !expired {
                     live.set_revision(0)?;
                 }
-                live.remove(&id)?;
+                live.remove(id.as_ref())?;
                 self.expired_live.push(id);
                 expired = true;
             }

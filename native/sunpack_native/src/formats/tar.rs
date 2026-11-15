@@ -1,19 +1,22 @@
 //! Shared TAR member semantics for discovery and analysis.
-use std::collections::HashMap;
+use crate::io::reader::CachedBytes;
 use std::io;
 
 const BLOCK: u64 = 512;
-pub(crate) const MAX_METADATA: usize = 1024 * 1024;
-type ReadAt<'a> = dyn FnMut(u64, usize) -> io::Result<Vec<u8>> + 'a;
+const MAX_METADATA: usize = 1024 * 1024;
+type ReadAt<'a> = dyn FnMut(u64, usize) -> io::Result<CachedBytes> + 'a;
 
 #[derive(Default)]
 pub(crate) struct TarState {
-    global: HashMap<String, String>,
-    local: HashMap<String, String>,
+    global_size: Option<PaxSize>,
+    local_size: Option<PaxSize>,
 }
 
-pub(crate) struct TarRecord {
-    pub(crate) next: u64,
+#[derive(Clone, Copy)]
+enum PaxSize {
+    Empty,
+    Value(u64),
+    Invalid,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -94,7 +97,7 @@ pub(crate) fn padding(size: u64) -> u64 {
     (BLOCK - size % BLOCK) % BLOCK
 }
 
-fn read_exact(read: &mut ReadAt<'_>, start: u64, size: usize) -> io::Result<Vec<u8>> {
+fn read_exact(read: &mut ReadAt<'_>, start: u64, size: usize) -> io::Result<CachedBytes> {
     let data = read(start, size)?;
     if data.len() != size {
         return Err(truncated());
@@ -104,7 +107,7 @@ fn read_exact(read: &mut ReadAt<'_>, start: u64, size: usize) -> io::Result<Vec<
 
 impl TarState {
     pub(crate) fn boundary_context_free(&self) -> bool {
-        !self.global.contains_key("size") && !self.local.contains_key("size")
+        self.global_size.is_none() && self.local_size.is_none()
     }
 
     /// Metadata records use their own raw length. Overrides apply only to the
@@ -115,7 +118,7 @@ impl TarState {
         offset: u64,
         total: u64,
         read: &mut ReadAt<'_>,
-    ) -> io::Result<TarRecord> {
+    ) -> io::Result<u64> {
         let raw_size = header_size(header).map_err(|_| invalid("invalid TAR member header"))?;
         self.advance_validated(header, raw_size, offset, total, read)
     }
@@ -127,7 +130,7 @@ impl TarState {
         offset: u64,
         total: u64,
         read: &mut ReadAt<'_>,
-    ) -> io::Result<TarRecord> {
+    ) -> io::Result<u64> {
         let kind = header[156];
         let (sparse_span, sparse_end) = if kind == b'S' {
             sparse_span(header, offset, total, read)?
@@ -139,21 +142,14 @@ impl TarState {
             .and_then(|n| n.checked_add(sparse_span))
             .ok_or_else(truncated)?;
         let metadata = matches!(kind, b'x' | b'g' | b'L' | b'K');
-        let effective = |key: &str| {
-            self.local
-                .get(key)
-                .or_else(|| self.global.get(key))
-                .filter(|v| !v.is_empty())
-        };
         let physical_size = if metadata {
             raw_size
-        } else if let Some(value) = effective("size") {
-            let size = value
-                .parse::<i128>()
-                .map_err(|_| invalid("invalid TAR extended size: size"))?;
-            u64::try_from(size.max(0)).map_err(|_| invalid("invalid TAR extended size: size"))?
         } else {
-            raw_size
+            match self.local_size.or(self.global_size) {
+                Some(PaxSize::Value(size)) => size,
+                Some(PaxSize::Invalid) => return Err(invalid("invalid TAR extended size: size")),
+                Some(PaxSize::Empty) | None => raw_size,
+            }
         };
         let next = start
             .checked_add(physical_size)
@@ -161,23 +157,18 @@ impl TarState {
             .filter(|n| *n <= total)
             .ok_or_else(truncated)?;
         if matches!(kind, b'x' | b'g') {
-            let parsed = pax(read, start, raw_size)?;
-            if kind == b'g' {
-                for (key, value) in parsed {
-                    if value.is_empty() {
-                        self.global.remove(&key);
-                    } else {
-                        self.global.insert(key, value);
-                    }
+            if let Some(size) = pax_size(read, start, raw_size)? {
+                if kind == b'g' {
+                    self.global_size = (!matches!(size, PaxSize::Empty)).then_some(size);
+                } else {
+                    self.local_size = Some(size);
                 }
-            } else {
-                self.local.extend(parsed);
             }
-            return Ok(TarRecord { next });
+            return Ok(next);
         }
         if matches!(kind, b'L' | b'K') {
             // Names do not affect discovery boundaries; the worker consumes them.
-            return Ok(TarRecord { next });
+            return Ok(next);
         }
         if kind == b'S' {
             let size = number(&header[483..495])
@@ -186,14 +177,13 @@ impl TarState {
                 return Err(invalid("old GNU sparse extent exceeds logical size"));
             }
         }
-        self.local.clear();
-        Ok(TarRecord { next })
+        self.local_size = None;
+        Ok(next)
     }
 }
 
-fn pax(read: &mut ReadAt<'_>, start: u64, size: u64) -> io::Result<HashMap<String, String>> {
-    let mut records = HashMap::<String, String>::new();
-    let mut retained = 0usize;
+fn pax_size(read: &mut ReadAt<'_>, start: u64, size: u64) -> io::Result<Option<PaxSize>> {
+    let mut parsed = None;
     let mut cursor = 0u64;
     while cursor < size {
         let prefix = read_exact(read, start + cursor, (size - cursor).min(256) as usize)?;
@@ -208,38 +198,51 @@ fn pax(read: &mut ReadAt<'_>, start: u64, size: u64) -> io::Result<HashMap<Strin
             .filter(|n| *n > space as u64 + 2 && *n <= size - cursor)
             .ok_or_else(|| invalid("invalid PAX extended header"))?;
         let end = cursor + length;
-        if read_exact(read, start + end - 1, 1)?[0] != b'\n' {
+        let complete = length <= prefix.len() as u64;
+        let last = if complete {
+            prefix[length as usize - 1]
+        } else {
+            read_exact(read, start + end - 1, 1)?[0]
+        };
+        if last != b'\n' {
             return Err(invalid("invalid PAX extended header"));
         }
         let body = &prefix[space + 1..prefix.len().min(length as usize - 1)];
-        if let Some(equal) = body.iter().position(|b| *b == b'=') {
-            if let Ok(key) = std::str::from_utf8(&body[..equal]) {
-                if key != "size" {
-                    cursor = end;
-                    continue;
-                }
-                let value_start = cursor + space as u64 + equal as u64 + 2;
-                let value_len = (end - 1 - value_start) as usize;
-                let old = records.get(key).map_or(0, String::len);
-                if key.len() + value_len > MAX_METADATA
-                    || retained.saturating_sub(old) + value_len > MAX_METADATA
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::OutOfMemory,
-                        "PAX metadata exceeds metadata budget",
-                    ));
-                }
-                let value = String::from_utf8(read_exact(read, start + value_start, value_len)?)
-                    .map_err(|_| invalid("invalid PAX extended header"))?;
-                retained = retained.saturating_sub(old) + value.len();
-                records.insert(key.to_string(), value);
+        if let Some(value) = body.strip_prefix(b"size=") {
+            let value_start = cursor + space as u64 + 6;
+            let value_len = (end - 1 - value_start) as usize;
+            if value_len > MAX_METADATA - "size".len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "PAX metadata exceeds metadata budget",
+                ));
             }
-        } else if length <= prefix.len() as u64 {
+            let remainder;
+            let value = if complete {
+                value
+            } else {
+                remainder = read_exact(read, start + value_start, value_len)?;
+                &remainder
+            };
+            let value =
+                std::str::from_utf8(value).map_err(|_| invalid("invalid PAX extended header"))?;
+            // Keep invalid numeric values dormant until this override applies.
+            // A later record can mask or replace them before any real member.
+            parsed = Some(if value.is_empty() {
+                PaxSize::Empty
+            } else {
+                value
+                    .parse::<i128>()
+                    .ok()
+                    .and_then(|size| u64::try_from(size.max(0)).ok())
+                    .map_or(PaxSize::Invalid, PaxSize::Value)
+            });
+        } else if complete && !body.contains(&b'=') {
             return Err(invalid("invalid PAX extended header"));
         }
         cursor = end;
     }
-    Ok(records)
+    Ok(parsed)
 }
 
 fn sparse_span(
@@ -322,8 +325,7 @@ mod tests {
             assert_eq!(
                 state
                     .advance_validated(&header, size, 0, total, &mut read)
-                    .unwrap()
-                    .next,
+                    .unwrap(),
                 total
             );
             for (size, offset, total) in [
@@ -358,6 +360,35 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
+    #[test]
+    fn local_pax_size_masks_global_only_for_the_next_member() {
+        let mut state = TarState::default();
+        let mut header = [0u8; 512];
+        let total = 2 * BLOCK;
+        for (kind, body) in [(b'g', b"10 size=x\n".as_slice()), (b'x', b"8 size=\n")] {
+            header[156] = kind;
+            state
+                .advance_validated(&header, body.len() as u64, 0, total, &mut |start, size| {
+                    let offset = (start - BLOCK) as usize;
+                    Ok(CachedBytes::Owned(body[offset..offset + size].to_vec()))
+                })
+                .unwrap();
+        }
+        header[156] = b'0';
+        let read = &mut |_, _| unreachable!();
+        assert_eq!(
+            state.advance_validated(&header, 1, 0, total, read).unwrap(),
+            total
+        );
+        assert_eq!(
+            state
+                .advance_validated(&header, 1, 0, total, read)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     // Generate fixed sparse records on demand: ordinary TAR samples never
     // cross the old extension quota; no 32 MiB fixture is retained here.
     #[test]
@@ -372,7 +403,7 @@ mod tests {
             reads += 1;
             let mut block = vec![0u8; size];
             block[504] = u8::from(start + BLOCK < total);
-            Ok(block)
+            Ok(CachedBytes::Owned(block))
         };
         assert_eq!(
             sparse_span(&header, 0, total, &mut read).unwrap(),

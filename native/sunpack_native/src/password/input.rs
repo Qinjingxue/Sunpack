@@ -4,9 +4,7 @@ use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, NativeArchiveSession};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
 
-#[derive(Clone)]
 pub(crate) struct RangeSpec {
     reader: ManagedReader,
     start: u64,
@@ -39,7 +37,7 @@ impl InputReaders {
         if let Some(reader) = self.0.get(&Self::key(path)?) {
             return Ok(reader.clone());
         }
-        Ok((ManagedReader::open(path))?)
+        ManagedReader::open(path)
     }
 }
 
@@ -48,7 +46,7 @@ pub(crate) fn parse_ranges(
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<Vec<RangeSpec>> {
     let readers = InputReaders::new(sessions)?;
-    let mut parsed = Vec::new();
+    let mut parsed = Vec::with_capacity(ranges.len());
     let mut cursor = 0u64;
     for range in ranges {
         let (path, start, end) = (&range.path, range.start, range.end);
@@ -74,13 +72,6 @@ pub(crate) fn parse_ranges(
     Ok(parsed)
 }
 
-pub(crate) fn ranges_total_len(ranges: &[RangeSpec]) -> u64 {
-    ranges
-        .last()
-        .map(|item| item.virtual_start + item.len)
-        .unwrap_or(0)
-}
-
 pub(crate) fn ranges_key(format: &'static str, ranges: &[RangeSpec]) -> std::io::Result<InputKey> {
     Ok(InputKey::new(
         format,
@@ -95,18 +86,18 @@ pub(crate) fn ranges_key(format: &'static str, ranges: &[RangeSpec]) -> std::io:
 /// Read up to `max_len` bytes at a logical offset; the result is shorter only
 /// at the end of the logical input.
 pub(crate) fn read_ranges_at_field(
-    ranges: &Arc<[RangeSpec]>,
+    ranges: &[RangeSpec],
     offset: u64,
     max_len: usize,
     field: &'static str,
 ) -> Result<Vec<u8>, ReadFault> {
-    let total_len = ranges_total_len(ranges);
+    let mut reader = VirtualRangeReader::new(ranges);
+    let total_len = reader.len();
     let requested = max_len.min(total_len.saturating_sub(offset) as usize);
     let mut data = vec![0u8; requested];
     if requested == 0 {
         return Ok(data);
     }
-    let mut reader = VirtualRangeReader::new(ranges.clone());
     let len = reader
         .seek(SeekFrom::Start(offset))
         .and_then(|_| reader.read(&mut data))
@@ -118,15 +109,17 @@ pub(crate) fn read_ranges_at_field(
     Ok(data)
 }
 
-pub(crate) struct VirtualRangeReader {
-    ranges: Arc<[RangeSpec]>,
+pub(crate) struct VirtualRangeReader<'a> {
+    ranges: &'a [RangeSpec],
     position: u64,
     total_len: u64,
 }
 
-impl VirtualRangeReader {
-    pub(crate) fn new(ranges: Arc<[RangeSpec]>) -> Self {
-        let total_len = ranges_total_len(&ranges);
+impl<'a> VirtualRangeReader<'a> {
+    pub(crate) fn new(ranges: &'a [RangeSpec]) -> Self {
+        let total_len = ranges
+            .last()
+            .map_or(0, |item| item.virtual_start + item.len);
         Self {
             ranges,
             position: 0,
@@ -134,32 +127,34 @@ impl VirtualRangeReader {
         }
     }
 
-    fn current_range(&self) -> Option<&RangeSpec> {
-        let index = self
-            .ranges
-            .partition_point(|range| range.virtual_start + range.len <= self.position);
-        self.ranges.get(index).filter(|range| {
-            self.position >= range.virtual_start && self.position < range.virtual_start + range.len
-        })
+    pub(crate) fn len(&self) -> u64 {
+        self.total_len
     }
 }
 
-impl Read for VirtualRangeReader {
+impl Read for VirtualRangeReader<'_> {
     fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() || self.position >= self.total_len {
             return Ok(0);
         }
-        let mut total_read = 0usize;
-        while !buf.is_empty() && self.position < self.total_len {
-            let Some(range) = self.current_range() else {
+        let mut index = self
+            .ranges
+            .partition_point(|range| range.virtual_start + range.len <= self.position);
+        let mut total_read = 0;
+        while let Some(range) = self.ranges.get(index) {
+            if buf.is_empty() {
                 break;
-            };
+            }
             let local_offset = self.position - range.virtual_start;
-            let available = (range.len - local_offset) as usize;
-            let to_read = available.min(buf.len());
+            if local_offset == range.len {
+                index += 1;
+                continue;
+            }
+            let to_read = (range.len - local_offset).min(buf.len() as u64) as usize;
             let physical_offset = range.start + local_offset;
-            let reader = range.reader.clone();
-            let read_now = reader.read_into_at(physical_offset, &mut buf[..to_read])?;
+            let read_now = range
+                .reader
+                .read_into_at(physical_offset, &mut buf[..to_read])?;
             if read_now == 0 {
                 break;
             }
@@ -172,7 +167,7 @@ impl Read for VirtualRangeReader {
     }
 }
 
-impl Seek for VirtualRangeReader {
+impl Seek for VirtualRangeReader<'_> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let next = match pos {
             SeekFrom::Start(value) => value as i128,
@@ -190,7 +185,6 @@ impl Seek for VirtualRangeReader {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct VolumeSpec {
     pub(crate) reader: ManagedReader,
     pub(crate) number: u32,
@@ -203,7 +197,7 @@ pub(crate) fn parse_volumes(
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<Vec<VolumeSpec>> {
     let readers = InputReaders::new(sessions)?;
-    let mut parsed = Vec::new();
+    let mut parsed = Vec::with_capacity(parts.len());
     for item in parts {
         let number = item
             .volume_number
@@ -227,7 +221,7 @@ pub(crate) fn parse_volumes(
             end,
         });
     }
-    parsed.sort_by_key(|volume| volume.number);
+    parsed.sort_unstable_by_key(|volume| volume.number);
     if parsed
         .windows(2)
         .any(|pair| pair[0].number == pair[1].number)
@@ -240,7 +234,7 @@ pub(crate) fn parse_volumes(
 }
 
 pub(crate) struct VolumeSet {
-    volumes: Arc<[VolumeSpec]>,
+    volumes: Vec<VolumeSpec>,
 }
 
 impl VolumeSet {
@@ -261,9 +255,7 @@ impl VolumeSet {
     }
 
     pub(crate) fn new(volumes: Vec<VolumeSpec>) -> Self {
-        Self {
-            volumes: volumes.into(),
-        }
+        Self { volumes }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -448,7 +440,7 @@ mod tests {
     fn virtual_ranges_read_and_seek_across_files() {
         let first = temp_file("password_range_first", b"012345");
         let second = temp_file("password_range_second", b"abcdef");
-        let ranges: Arc<[RangeSpec]> = vec![
+        let ranges = [
             RangeSpec {
                 reader: ManagedReader::open(&first).unwrap(),
                 start: 2,
@@ -463,9 +455,8 @@ mod tests {
                 len: 4,
                 virtual_start: 3,
             },
-        ]
-        .into();
-        let mut reader = VirtualRangeReader::new(ranges);
+        ];
+        let mut reader = VirtualRangeReader::new(&ranges);
         let mut all = [0u8; 7];
         reader.read_exact(&mut all).unwrap();
         assert_eq!(&all, b"234bcde");
