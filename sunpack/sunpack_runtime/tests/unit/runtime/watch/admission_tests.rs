@@ -46,6 +46,66 @@ fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
 }
 
 #[test]
+fn startup_catalog_rebuild_observes_replacements_before_skipping_blockers() {
+    const CHILD: &str = "SUNPACK_CATALOG_REPLACEMENT_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("startup_catalog_rebuild_observes_replacements_before_skipping_blockers", CHILD);
+        return;
+    };
+    let base = PathBuf::from(base);
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    scheduler.catalog = Arc::new(NativeWatchCatalog::new(scheduler.journal.state(),
+        Some(base.join("catalog").to_string_lossy().into_owned())));
+    let scope = scheduler.roots.values().next().unwrap().1.clone();
+    let directory = base.join("input/intake");
+    let incoming = base.join("incoming");
+    fs::create_dir_all(&directory).unwrap();
+    fs::create_dir(&incoming).unwrap();
+    let unchanged = base.join("input/unchanged.zip");
+    fs::write(&unchanged, b"unchanged").unwrap();
+    let mut replaced = Vec::new();
+    for (index, status) in [None, Some("failed_password"), Some("suspended_missing_volume")].into_iter().enumerate() {
+        let name = format!("archive-{index}.zip");
+        let path = directory.join(&name);
+        fs::write(&path, b"old bytes").unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let replacement = incoming.join(name);
+        fs::write(&replacement, b"new bytes").unwrap();
+        fs::File::options().write(true).open(&replacement).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original.modified().unwrap())).unwrap();
+        let before = watch_candidate_for_path(&path, None).unwrap().unwrap();
+        let after = watch_candidate_for_path(&replacement, None).unwrap().unwrap();
+        assert_eq!((before.size, before.mtime), (after.size, after.mtime));
+        assert_ne!(before.observation.file_id, after.observation.file_id);
+        if let Some(status) = status {
+            scheduler.journal.commit(false, |_| {
+                let mut operations = crate::watch_store::NativeWatchOperations::empty();
+                operations.put_entry(Arc::new(observed_entry(&before, status, None)));
+                Ok(operations)
+            }).unwrap();
+        }
+        replaced.push((before, after.observation.file_id));
+    }
+    scheduler.options.as_ref().unwrap().catalog_update(&scheduler.catalog, &scope, None).unwrap();
+    let stable = watch_candidate_for_path(&unchanged, None).unwrap().unwrap();
+    for before in replaced.iter().map(|(before, _)| before).chain([&stable]) {
+        scheduler.catalog.remember_observation(&before.path, before.size, before.mtime,
+            &before.observation.file_id, before.observation.change_usn, true);
+    }
+    // An invalid journal forces the full recovery path without relying on a
+    // Broker or timing a journal rollover. Ordinary USN replay is black-box tested.
+    scheduler.catalog.set_cursor(&scope, output_identity(&scope.root).unwrap(), "retired-volume".into(), 0, 0);
+    fs::rename(&directory, base.join("retired")).unwrap();
+    fs::rename(&incoming, &directory).unwrap();
+    scheduler.checkpoint_blocking(&HashMap::new(), true, true, &HashMap::new()).unwrap();
+    assert_eq!(scheduler.pending.len(), replaced.len());
+    assert!(!scheduler.pending.contains_key(&key(&unchanged)));
+    for (before, current_id) in replaced {
+        assert_eq!(scheduler.pending[&watch_path_key(&before.path)].candidate.observation.file_id, current_id);
+    }
+}
+
+#[test]
 fn watch_replays_a_generated_file_change_after_output_promotion() {
     const CHILD: &str = "SUNPACK_GENERATED_PROMOTION_TEST";
     let Some(base) = std::env::var_os(CHILD) else {

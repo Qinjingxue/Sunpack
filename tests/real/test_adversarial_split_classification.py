@@ -102,7 +102,7 @@ def test_same_named_encrypted_split_sets_keep_distinct_blockers(package, tmp_pat
 
 
 @pytest.mark.parametrize("origin", ["cli", WATCH])
-def test_foreign_rar_continuation_does_not_create_password_failure(package, tmp_path, origin):
+def test_foreign_rar_continuation_keeps_failures_attributed_to_each_file(package, tmp_path, origin):
     # A byte-distinct RAR5 disk has exactly the missing disk's name, length,
     # and volume number. Its header uses the foreign set's password, but that
     # set's SFX head is outside the input root and is never submitted.
@@ -110,7 +110,8 @@ def test_foreign_rar_continuation_does_not_create_password_failure(package, tmp_
     staged = tmp_path / "staged-sets"
     disk_name = _stage_same_named_sets(package, tmp_path / "fixtures", staged, "rar")
     inputs = (staged / "incomplete").rename(tmp_path / "watch")
-    copyfile(staged / "complete" / disk_name, inputs / disk_name)
+    foreign_disk = inputs / disk_name
+    copyfile(staged / "complete" / disk_name, foreign_disk)
     original_inputs = file_inventory(inputs)
     output = tmp_path / "out"
 
@@ -122,4 +123,7 @@ def test_foreign_rar_continuation_does_not_create_password_failure(package, tmp_
 
     assert not any(path.is_file() for path in output.rglob("*"))
     assert file_inventory(inputs) == original_inputs
-    assert {kind for _, kind in failures} <= {"missing_volume"}, failures
+    # The foreign disk has its own unavailable password and its own absent head.
+    # The original set has its password and still lacks the matching second disk.
+    assert {kind for path, kind in failures if path == foreign_disk} <= {"wrong_password", "missing_volume"}, failures
+    assert {kind for path, kind in failures if path != foreign_disk} <= {"missing_volume"}, failures

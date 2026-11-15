@@ -29,7 +29,10 @@ fn refresh_rescans_when_output_is_published_after_enumeration() {
     }))));
 
     let (errors, arrivals) = options.catalog_refresh(&catalog, &scope, None).unwrap();
-    assert!(errors.is_empty() && arrivals.is_empty());
+    assert!(errors.is_empty());
+    // Published output retains its identity baseline for ordinary admission;
+    // returning it for observation does not make it a new arrival.
+    assert_eq!(arrivals, vec![file.to_str().unwrap().to_owned()]);
     assert_eq!(catalog.path_is_directory(&scope, path), Some(true));
     assert!(catalog.generated_observation(file.to_str().unwrap()).is_some());
     assert!(!catalog.is_owned(path));

@@ -3387,12 +3387,14 @@ impl Scheduler {
                 // Initial inventory is not an explicit retry. Only paths
                 // reported by startup recovery bypass an interrupted entry.
                 let admission = if startup && index < recovered_paths {
-                    if self.journal.state().entry(&path).is_some_and(|entry| {
-                        matches!(entry.status.as_str(), "failed_password" | "suspended_missing_volume")
-                    }) {
-                        continue;
-                    }
-                    if self.catalog.observation(&path).is_some() {
+                    // A blocker belongs to its recorded file generation. Let
+                    // ordinary observation reject unchanged failures only after
+                    // checking identity; a replaced parent can reuse every name.
+                    if self.catalog.observation(&path).is_some()
+                        || self.journal.state().entry(&path).is_some_and(|entry| {
+                            matches!(entry.status.as_str(), "failed_password" | "suspended_missing_volume")
+                        })
+                    {
                         CandidateAdmission::Observe
                     } else { CandidateAdmission::ExplicitRetry }
                 } else {
@@ -3775,9 +3777,11 @@ impl Scheduler {
             return Ok(());
         }
         if !unchanged { self.catalog.content_changed(&path); }
-        if let Some(interrupted) = interrupted {
+        // Retire blockers from the replaced generation before peer recovery
+        // can invalidate that old input and discard this new pending arrival.
+        if let Some(retired) = interrupted.or_else(|| blocked.as_ref().filter(|_| !blocked_unchanged)) {
             self.journal.commit(false, |state| {
-                Ok(if state.entry(&candidate.path).is_some_and(|current| Arc::ptr_eq(interrupted, &current)) {
+                Ok(if state.entry(&candidate.path).is_some_and(|current| Arc::ptr_eq(retired, &current)) {
                     crate::watch_store::NativeWatchOperations::retire_entries(std::iter::once(id.clone()))
                 } else {
                     crate::watch_store::NativeWatchOperations::empty()

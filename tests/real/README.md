@@ -13,7 +13,7 @@
 | [嵌套 RAR5 SFX 与尾部独立加密 7z](test_adversarial_carriers.py) | SFX 本身是 RAR 数据头卷，其他 RAR 卷位于伪装载体内。外部 7-Zip 对同一 SFX 分别验证 RAR5 和 7z，SunPack 必须解出两份且完整后才能清理源输入。 | CLI 和 Watch 均解出 RAR、漏掉 7z，仍报告完成并清理源载体。 |
 | [两组 RAR5 共享全部三个卷载体](test_adversarial_carriers.py) | 中间载体上的区段顺序反转，使用不同密码校验同格式卷组能按区段正确配对，不串卷或重复输出。 | CLI 和 Watch 均通过。 |
 | [同名伪装加密卷组的失败分类](test_adversarial_split_classification.py) | 同一递归扫描里，完整组只缺密码，另一组有正确密码但缺中间卷。缺卷允许没有识别结果。 | 7z 和 RAR5 SFX 的 CLI、Watch 四个用例均通过。 |
-| [外来 RAR5 第二卷顶替缺卷](test_adversarial_split_classification.py) | 用同名、同尺寸、同卷号但来自另一归档的真实第二卷填入缺口。提交的头卷有正确密码，外来卷组的头未提交。 | CLI 把外来第二卷报成 `wrong_password`，Watch 将其记为 `failed_password`。真正的 SFX 头卷均报告缺卷，源文件保留。 |
+| [外来 RAR5 第二卷顶替缺卷](test_adversarial_split_classification.py) | 用同名、同尺寸、同卷号的外来第二卷填入缺口。原组已提供密码，外来卷的头卷及密码均未提供。按文件核对失败归属。 | CLI 和 Watch 均将缺卷归于原 SFX 头卷，将密码错误归于外来第二卷，并保留源文件。 |
 | [进程树提交内存上限](test_archive_job_memory_pressure.py) | 各入口一次提交三个使用 32 MiB LZMA2 字典的 7z，验证运行时与 worker 均在同一个 72 MiB Windows Job 中，三个 40 MiB 输出都必须完整。 | CLI 和 Watch 均通过。校准运行中两个入口各收到一次系统内存限额通知，解包仍完成。 |
 | [CLI 和 Watch 的并发时序](../blackbox/test_watch_migration.py) | 用暂停真实 worker 和观察输出预留固定时序。覆盖 Watch 取消与同名 CLI 解压重叠、取消时源文件已经原地更新、CLI 输出预留后 Watch 停止并重启。 | 三个用例均通过。 |
 

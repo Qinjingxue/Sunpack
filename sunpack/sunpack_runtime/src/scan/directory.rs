@@ -2176,10 +2176,16 @@ fn apply_catalog_scan(
         if needs_removal {
             present.insert(Arc::clone(&key));
         }
-        let unchanged = catalog
-            .rows
-            .get(&key)
-            .is_some_and(|old| old.matches(&record));
+        let old = catalog.rows.get(&key);
+        let unchanged = old.is_some_and(|old| old.matches(&record));
+        // Enumeration cannot prove that an observed path still names the same
+        // file. Reuse Watch admission's identity/USN check, retaining its old
+        // baseline and leaving unchanged catalog rows and caches untouched.
+        if report_changes && !record.is_dir
+            && (!unchanged || old.is_some_and(|old| old.observation.is_some()))
+        {
+            changed_paths.push(record.path.clone());
+        }
         let observation = if baseline && !record.is_dir && record.size.is_some_and(|size| size > 0) {
             // Enumeration already supplies size and mtime. Only read the
             // identity/USN once; do not stat every settled output again.
@@ -2191,9 +2197,6 @@ fn apply_catalog_scan(
         } else { None };
         if !unchanged || observation.is_some() {
             mutated = true;
-            if report_changes && !record.is_dir {
-                changed_paths.push(record.path.clone());
-            }
             if changed.is_some() {
                 changed_keys.push(Arc::clone(&key));
             }
