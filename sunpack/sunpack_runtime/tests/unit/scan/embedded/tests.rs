@@ -182,15 +182,13 @@ fn lz4_suffixes_keep_payload_roots_and_own_long_concatenations() {
             stored_hits(&[]).view(0),
         )
         .unwrap();
-        assert_eq!(candidates[0].offset, root);
+        assert_eq!(candidates.len(), 1);
         if root == 0 {
-            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].offset, root);
             assert_eq!(candidates[0].end_offset, Some(inner_end));
         } else {
-            assert_eq!(candidates.len(), 2);
-            assert_eq!(candidates[0].end_offset, None);
-            assert_eq!(candidates[1].offset, inner);
-            assert_eq!(candidates[1].end_offset, Some(inner_end));
+            assert_eq!(candidates[0].offset, inner);
+            assert_eq!(candidates[0].end_offset, Some(inner_end));
         }
         assert!(source.stats().read_bytes <= data.len() as u64 * 3);
     }

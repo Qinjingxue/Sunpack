@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn pax_size_streams_long_values_and_preserves_numeric_semantics() {
+    // A zero-padded record length can place the value just beyond the prefix.
+    let record = format!("{:0250} size=7\n", 258).into_bytes();
+    let parsed = pax_size(&mut |start, count| {
+        Ok(CachedBytes::Owned(record[start as usize..start as usize + count].to_vec()))
+    }, 0, record.len() as u64).unwrap();
+    assert!(matches!(parsed, Some(PaxSize::Value(7))));
+    // Leading zeros are valid beyond the old quota. Only numeric overflow or
+    // invalid digits reject a value; each read stays bounded independently.
+    for (suffix, expected) in [(b"7".as_slice(), Some(7)), (b"x", None)] {
+        let len = 1024 * 1024 + 17;
+        let mut read = |start: u64, count: usize| {
+            assert!(count <= 4096);
+            let mut bytes = vec![b'0'; count];
+            if start + count as u64 == len { bytes[count - 1] = suffix[0]; }
+            Ok(CachedBytes::Owned(bytes))
+        };
+        let parsed = pax_size_value(&mut read, 0, len, b"000").unwrap();
+        assert_eq!(match parsed { PaxSize::Value(value) => Some(value), _ => None }, expected);
+    }
+    for value in ["", "+", "-1", "18446744073709551615", "18446744073709551616",
+        "-170141183460469231731687303715884105728", "170141183460469231731687303715884105728"] {
+        let parsed = pax_size_value(&mut |_, _| unreachable!(), 0, value.len() as u64, value.as_bytes()).unwrap();
+        if value.is_empty() { assert!(matches!(parsed, PaxSize::Empty)); }
+        else { assert_eq!(match parsed { PaxSize::Value(value) => Some(value), _ => None },
+            value.parse::<i128>().ok().and_then(|value| u64::try_from(value.max(0)).ok())); }
+    }
+}
+
 fn header_with_base256_size(size: u64) -> [u8; 512] {
     let mut header = [0u8; 512];
     header[..4].copy_from_slice(b"file");
@@ -16,7 +46,7 @@ fn gnu_names_skip_payload_reads_but_keep_checked_boundaries() {
     // No body allocation is needed even above the former metadata quota.
     // Checking only ordinary members would miss an early metadata return.
     for kind in [b'L', b'K'] {
-        let size = MAX_METADATA as u64 + 1;
+        let size = 1024 * 1024 + 1;
         let mut header = header_with_base256_size(size);
         header[156] = kind;
         let total = BLOCK + size + padding(size);

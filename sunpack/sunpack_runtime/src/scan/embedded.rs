@@ -231,18 +231,6 @@ pub(crate) struct ResolvedEmbeddedScan {
 }
 
 impl NativeScanResult {
-    /// A verified leading stream can still be damaged after its prefix. Keep
-    /// that existing fact when the full walk cannot prove an end, so deep mode
-    /// does not silently discard recoverable inputs. No second parser or I/O.
-    pub(crate) fn retain_leading_stream(&mut self, anchor: &VolumeAnchor) {
-        if anchor.strong && anchor.standalone
-            && matches!(anchor.format, "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc")
-            && !self.candidates.iter().any(|candidate| candidate.offset == 0)
-        {
-            self.candidates.insert(0, candidate(anchor.format, 0, None, CandidateKind::Archive));
-        }
-    }
-
     /// A physical source may contain several independent volume inputs. ZIP
     /// local records without a volume proof still nominate only one hypothesis.
     pub(crate) fn relation_anchors(&self) -> Vec<VolumeAnchor> {
@@ -306,8 +294,7 @@ impl NativeScanResult {
     pub(crate) fn has_independent_archive(&self) -> bool {
         self.candidates
             .iter()
-            .any(|c| c.volume_anchor.is_none()
-                && (c.end_offset.is_some() || (c.is_logical_archive() && !c.password_required())))
+            .any(|c| c.volume_anchor.is_none() && (c.end_offset.is_some() || c.format == "enc"))
     }
 
     pub(crate) fn is_primary_lz4(&self) -> bool {
@@ -1215,8 +1202,7 @@ fn validate_candidate(
                     return Ok(None);
                 }
             }
-            let mut incomplete = None;
-            let resolved = suffixes.validate(offset, true, |visit| {
+            let Some(index) = suffixes.validate(offset, true, |visit| {
                 let index =
                     crate::formats::lz4::walk_observed(file, offset, file_size, &mut |node| {
                         visit(node).map_err(|_| "known_failed_suffix")
@@ -1224,12 +1210,9 @@ fn validate_candidate(
                 if index.complete {
                     Ok(index)
                 } else {
-                    let error = index.error;
-                    incomplete = Some(index);
-                    Err(ValidationError::Invalid(error))
+                    Err(ValidationError::Invalid(index.error))
                 }
-            })?;
-            let Some(index) = resolved.or(incomplete) else {
+            })? else {
                 return Ok(None);
             };
             if index.frames == 0 {
@@ -1238,7 +1221,7 @@ fn validate_candidate(
             Ok(Some(candidate(
                 "lz4",
                 offset,
-                index.complete.then_some(index.end),
+                Some(index.end),
                 CandidateKind::Archive,
             )))
         }
@@ -2053,8 +2036,7 @@ fn validate_tar(
     offset: u64,
     suffixes: &mut FailedSuffixEvidence,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
-    // TAR's walk cap accepts an unresolved logical archive. Do not shortcut a
-    // joined suffix inside the walk: its failure could be beyond that cap.
+    // PAX metadata can change the interpretation of later member sizes.
     suffixes.validate(offset, false, |visit| {
         walk_tar_candidate(file, size, offset, visit)
     })
@@ -2105,14 +2087,6 @@ fn walk_tar_candidate(
             read_at(file, start, size)
         }) {
             Ok(next) => next,
-            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
-                return Ok(candidate(
-                    "tar",
-                    offset,
-                    None,
-                    CandidateKind::Archive,
-                ));
-            }
             Err(error) => {
                 return Err(match error.kind() {
                     io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {

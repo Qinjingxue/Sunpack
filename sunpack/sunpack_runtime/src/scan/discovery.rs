@@ -425,11 +425,7 @@ fn scan_embedded_jobs(
                                 EmbeddedOutcome::read_error(path, Arc::clone(error))
                             }
                             None => {
-                                scan_embedded_candidate(path, batch.force_scan, pe, parallel_files,
-                                    match &table.rows[index] {
-                                        Candidate::File(facts, row) if batch.force_scan => facts.relation_anchors[*row].as_ref().and_then(CheapAnchor::anchor),
-                                        _ => None,
-                                    })
+                                scan_embedded_candidate(path, batch.force_scan, pe, parallel_files)
                             }
                         };
                         if !matches!(outcome, EmbeddedOutcome::Residual) {
@@ -1585,7 +1581,6 @@ fn scan_embedded_candidate(
     force_scan: bool,
     pe_state: Option<PeState>,
     parallel_files: usize,
-    leading: Option<&crate::analysis_native::volume_anchor::VolumeAnchor>,
 ) -> EmbeddedOutcome {
     if path.is_empty() {
         return EmbeddedOutcome::Residual;
@@ -1616,11 +1611,8 @@ fn scan_embedded_candidate(
     #[cfg(test)]
     peer_scan_tests::record_scan(path);
     match scan_embedded_path(path, parallel_files) {
-        Ok(mut scan) => {
-            if let Some(anchor) = leading { scan.retain_leading_stream(anchor); }
-            if scan.has_candidates() { EmbeddedOutcome::Scan(Arc::new(scan)) }
-            else { EmbeddedOutcome::Residual }
-        },
+        Ok(scan) if scan.has_candidates() => EmbeddedOutcome::Scan(Arc::new(scan)),
+        Ok(_) => EmbeddedOutcome::Residual,
         Err(error) => EmbeddedOutcome::read_error(path, Arc::new(error)),
     }
 }

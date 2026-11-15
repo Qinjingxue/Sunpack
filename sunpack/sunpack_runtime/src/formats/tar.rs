@@ -3,7 +3,6 @@ use crate::io::reader::CachedBytes;
 use std::io;
 
 const BLOCK: u64 = 512;
-const MAX_METADATA: usize = 1024 * 1024;
 type ReadAt<'a> = dyn FnMut(u64, usize) -> io::Result<CachedBytes> + 'a;
 
 #[derive(Default)]
@@ -210,39 +209,50 @@ fn pax_size(read: &mut ReadAt<'_>, start: u64, size: u64) -> io::Result<Option<P
         let body = &prefix[space + 1..prefix.len().min(length as usize - 1)];
         if let Some(value) = body.strip_prefix(b"size=") {
             let value_start = cursor + space as u64 + 6;
-            let value_len = (end - 1 - value_start) as usize;
-            if value_len > MAX_METADATA - "size".len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "PAX metadata exceeds metadata budget",
-                ));
-            }
-            let remainder;
-            let value = if complete {
-                value
-            } else {
-                remainder = read_exact(read, start + value_start, value_len)?;
-                &remainder
-            };
-            let value =
-                std::str::from_utf8(value).map_err(|_| invalid("invalid PAX extended header"))?;
             // Keep invalid numeric values dormant until this override applies.
             // A later record can mask or replace them before any real member.
-            parsed = Some(if value.is_empty() {
-                PaxSize::Empty
-            } else {
-                value
-                    .parse::<i128>()
-                    .ok()
-                    .and_then(|size| u64::try_from(size.max(0)).ok())
-                    .map_or(PaxSize::Invalid, PaxSize::Value)
-            });
+            parsed = Some(pax_size_value(read, start + value_start, end - 1 - value_start, value)?);
         } else if complete && !body.contains(&b'=') {
             return Err(invalid("invalid PAX extended header"));
         }
         cursor = end;
     }
     Ok(parsed)
+}
+
+fn pax_size_value(read: &mut ReadAt<'_>, start: u64, len: u64, prefix: &[u8]) -> io::Result<PaxSize> {
+    if len == 0 { return Ok(PaxSize::Empty); }
+    let mut offset = 0;
+    let mut magnitude = 0u128;
+    let mut negative = false;
+    let mut digits = false;
+    while offset < len {
+        let window;
+        let bytes = if offset == 0 && !prefix.is_empty() {
+            prefix
+        } else {
+            window = read_exact(read, start + offset, (len - offset).min(4096) as usize)?;
+            &window
+        };
+        for &byte in bytes {
+            let first = offset == 0;
+            offset += 1;
+            if first && matches!(byte, b'+' | b'-') {
+                negative = byte == b'-';
+                continue;
+            }
+            if !byte.is_ascii_digit() { return Ok(PaxSize::Invalid); }
+            digits = true;
+            let limit = i128::MAX as u128 + u128::from(negative);
+            let Some(next) = magnitude.checked_mul(10)
+                .and_then(|value| value.checked_add(u128::from(byte - b'0')))
+                .filter(|value| *value <= limit) else { return Ok(PaxSize::Invalid); };
+            magnitude = next;
+        }
+    }
+    Ok(if !digits { PaxSize::Invalid }
+        else if negative { PaxSize::Value(0) }
+        else { u64::try_from(magnitude).map_or(PaxSize::Invalid, PaxSize::Value) })
 }
 
 fn sparse_span(

@@ -1136,9 +1136,12 @@ fn project_segments(
         let resolved_end = resolution.as_ref().and_then(|result| result.end_offset);
         let end = resolved_end.or(item.end_offset);
         let failure = resolution.as_ref().and_then(|result| result.failure_reason);
-        let standalone = item.is_logical_archive()
-            && (resolved_end.is_some() || (item.volume_anchor.is_none() && !item.password_required()));
-        if !standalone && failure.is_none() {
+        // ENC has a validated public header but no public archive length.
+        // Every other standalone input requires a verified boundary.
+        let confirmed = item.is_logical_archive()
+            && (resolved_end.is_some() || (item.volume_anchor.is_none()
+                && (item.end_offset.is_some() || item.format == "enc")));
+        if !confirmed && failure.is_none() {
             continue;
         }
         let mut input = ArchiveInput::file(path.clone(), item.format.to_owned(), name.clone());

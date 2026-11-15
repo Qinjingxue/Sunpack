@@ -1,14 +1,51 @@
 """Physical discovery errors and final output namespace parity."""
 import ctypes
+import bz2
+import gzip
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 import io
 import subprocess
+import tarfile
 import time
 import zipfile
 
 import psutil
 import pytest
+
+
+def test_deep_rejects_unproven_streams_and_keeps_enc(package, tmp_path, repo_root):
+    # Offset-zero prefix facts and partial walks must not become tasks. Check
+    # both plain inputs and embedded offsets in one scan, alongside real ENC.
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    header = tarfile.TarInfo("member").tobuf(format=tarfile.USTAR_FORMAT)
+    empty_lz4 = bytes.fromhex("04224d1860408200000000")
+    value = b"9" * (1024 * 1024 + 1)
+    body = b" size=" + value + b"\n"
+    length = len(body) + 1
+    while len(str(length)) + len(body) != length:
+        length = len(str(length)) + len(body)
+    body = str(length).encode() + body
+    pax = tarfile.TarInfo("pax")
+    pax.type = tarfile.XHDTYPE
+    pax.size = len(body)
+    oversized_pax = pax.tobuf(format=tarfile.USTAR_FORMAT) + body + bytes(-len(body) % 512) + header
+    for name, data in [
+        ("gzip", gzip.compress(b"payload")[:-4]),
+        ("bzip", bz2.compress(b"payload")[:-8]),
+        ("tar", header),
+        ("lz4", empty_lz4 + empty_lz4[:7]),
+        ("pax", oversized_pax),
+    ]:
+        for prefix in (b"", b"opaque carrier\0"):
+            (inputs / f"{name}-{len(prefix)}.bin").write_bytes(prefix + data)
+    encrypted = inputs / "cipher.bin"
+    encrypted.write_bytes((repo_root / "tests/data/enc_parallel/algorithm_0.enc").read_bytes())
+    report = package.json("scan", "-d", "--no-bpw", "--password=sunpack-test", inputs)
+    assert report["summary"]["archive_count"] == 1, report
+    assert report["summary"]["failed_count"] == 0, report
+    assert report["items"][0]["format"] == "enc", report
 
 
 def test_direct_read_failure_is_reported_once_without_fallback(package, tmp_path):
