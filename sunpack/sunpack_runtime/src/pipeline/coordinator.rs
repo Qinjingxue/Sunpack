@@ -10,11 +10,10 @@ use super::{
     Event, Failure, FailureEvidence, FailureKind, FailureRead, InputError, InputErrorKind, Mode,
     Observer, Origin, Outcome as PublicOutcome, Request, ScanTaskFailure, Segment, TaskId,
 };
-use crate::analysis_native::{analyze_input, NativeAnalysisConfig};
 use crate::collections::CacheOrder;
 use crate::core::config::{CleanupMode, ContentRequirement, ProcessMode, Recursion, WorkerConfig};
 use crate::io::archive_state::{
-    archive_input_slices, ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection,
+    ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection,
 };
 use crate::io::cancellation::is_cancellation;
 use crate::io::directory_errors::{directory_error_count, DirectoryReadErrors};
@@ -213,14 +212,6 @@ impl Engine {
         };
         let options = OnceLock::new();
         let deep_options = request.deep.then(unfiltered).transpose()?;
-        let analysis = NativeAnalysisConfig::new(
-            request
-                .config
-                .analysis
-                .modules
-                .iter()
-                .map(|module| (module.name.to_string(), module.enabled)),
-        );
         let output_base = request
             .output_root
             .as_ref()
@@ -248,7 +239,6 @@ impl Engine {
             candidates,
             options,
             deep_options,
-            analysis,
             observer: ObserverRef::Owned(observer, std::marker::PhantomData),
             recursion: RecursivePrompts::default(),
             output_names: OutputReservationGuard { registry: Arc::clone(&self.output_names), owner: request_id },
@@ -383,7 +373,6 @@ struct Run<'a, O> {
     candidates: CandidateSet,
     options: OnceLock<io::Result<NativeDirectoryScanOptions>>,
     deep_options: Option<NativeDirectoryScanOptions>,
-    analysis: NativeAnalysisConfig,
     observer: ObserverRef<'a, O>,
     recursion: RecursivePrompts,
     output_names: OutputReservationGuard,
@@ -1581,9 +1570,8 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut outcome = Outcome::default();
             let mut shell = this.engine.shell.branch();
             let (mut generations, missing) = this.capture_generations(&task);
-            let discovered = task.source != DiscoverySource::Direct;
             let (discovery_scope, retry) = task.take_context(this.request.mode == Mode::Extract);
-            let admission = this.task_admission(&task, &generations, &missing, discovered, watch_root,
+            let admission = this.task_admission(&task, &generations, &missing, watch_root,
                 |path| requested.as_ref().and_then(|members| members.get(path))
                     .or_else(|| captured.as_ref().and_then(|members| members.get(path))))?;
             drop((requested, captured));
@@ -1604,11 +1592,10 @@ impl<'run, O: Observer> Run<'run, O> {
                 depth,
             });
             let preflight_failures = if task.inputs.len() > 1
-                && discovered && !missing.is_empty() {
+                && !missing.is_empty() {
                 task.inputs.iter().map(|logical| logical.failure.clone()).collect::<Vec<_>>()
             } else { Vec::new() };
-            this.admit_missing_inputs(&mut task, &missing, discovered);
-            this.plan_inputs(&mut task)?;
+            this.admit_missing_inputs(&mut task, &missing);
             this.observer.claim_sources(
                 Path::new(&task.entry().entry_path),
                 &task.owned_paths,
@@ -1916,7 +1903,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             stage("preflight", cancel).await?;
                             let (current_generations, missing) = this.capture_generations(&replacement);
                             generations = current_generations;
-                            let admission = this.task_admission(&replacement, &generations, &missing, discovered, watch_root,
+                            let admission = this.task_admission(&replacement, &generations, &missing, watch_root,
                                 |path| requested.as_ref().and_then(|members| members.get(path)))?;
                             drop(requested);
                             completed_family = match admission {
@@ -1930,7 +1917,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                     return Ok(outcome);
                                 }
                             };
-                            this.admit_missing_inputs(&mut replacement, &missing, discovered);
+                            this.admit_missing_inputs(&mut replacement, &missing);
                             this.observer.claim_sources(
                                 Path::new(&replacement.entry().entry_path),
                                 &replacement.owned_paths,
@@ -2639,8 +2626,8 @@ impl<'run, O: Observer> Run<'run, O> {
         (generations, missing)
     }
 
-    fn admit_missing_inputs(&self, task: &mut Task, missing: &[PathBuf], discovered: bool) {
-        if !discovered || missing.is_empty() { return; }
+    fn admit_missing_inputs(&self, task: &mut Task, missing: &[PathBuf]) {
+        if missing.is_empty() { return; }
         // main has a task-level discovery blocker only when every segment
         // failed discovery. Otherwise admission precedes all segment work.
         if task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
@@ -2670,13 +2657,12 @@ impl<'run, O: Observer> Run<'run, O> {
         task: &Task,
         generations: &HashMap<String, PhysicalFileGeneration>,
         missing: &[PathBuf],
-        discovered: bool,
         watch_root: bool,
         requested: impl Fn(&str) -> Option<&'a PhysicalFileGeneration>,
     ) -> io::Result<TaskAdmission> {
         // Check the resolved physical family only after its lease is acquired.
         // Departed discovery proposals are not successful output reuse.
-        if discovered && !missing.is_empty() {
+        if !missing.is_empty() {
             let departed: HashSet<_> = missing.iter().map(|path| path_key(&path.to_string_lossy())).collect();
             if task.input_paths().all(|path| departed.contains(&path_key(path))) {
                 return Ok(TaskAdmission::Departed);
@@ -2728,83 +2714,6 @@ impl<'run, O: Observer> Run<'run, O> {
         outcome.archives.push(result);
     }
 
-    fn plan_inputs(&self, task: &mut Task) -> io::Result<()> {
-        if task.inputs.len() != 1 || task.inputs[0].failure.is_some() {
-            return Ok(());
-        }
-        let original = &mut task.inputs[0];
-        if task.source != DiscoverySource::Direct {
-            return Ok(());
-        }
-        // Detection already walks LZ4 and routes any independent, bounded
-        // archive to Embedded. A second analysis cannot recover a new plan.
-        let report = match analyze_input(&original.input, &self.analysis) {
-            Ok(report) => report,
-            // Planning is advisory, as in main. A transient analysis read must
-            // not replace the original input with a terminal extraction failure.
-            Err(error) if !is_cancellation(&error) && !self.request.cancel.cancelled() => {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        if !report.format_hint.is_empty() {
-            original.input.format_hint = report.format_hint.to_owned();
-        }
-        let previous = &original.input.analysis;
-        let mut facts = report.facts;
-        facts.origin = previous.origin;
-        facts.planning_applied = true;
-        // Main keeps the descriptor's discovery facts while updating advisory
-        // execution/format facts; planning is not a new discovery receipt.
-        facts.volume_completeness = previous.volume_completeness;
-        facts.zip_eocd_offset = facts.zip_eocd_offset.or(previous.zip_eocd_offset);
-        facts.password_required |= previous.password_required;
-        facts.structure_complete |= previous.structure_complete;
-        facts.status = previous.status;
-        facts.damage_flags = previous.damage_flags.clone();
-        original.input.analysis = facts;
-        let selected = report.segments;
-        if selected.is_empty() {
-            return Ok(());
-        }
-        let slices: Vec<_> = selected
-            .iter()
-            .map(|item| (item.format_hint, item.start, item.end))
-            .collect();
-        let (projected, probe) = archive_input_slices(&original.input, &slices)?;
-        let probe_zip_eocd = selected[0].zip_eocd_offset;
-        let logical: Vec<_> = projected
-            .into_iter()
-            .zip(selected)
-            .filter_map(|(input, segment)| {
-                let mut input = input?;
-                input.analysis.origin = crate::io::archive_state::AnalysisOrigin::Planned;
-                input.analysis.status = Some(segment.status);
-                input.analysis.zip_eocd_offset = segment.zip_eocd_offset;
-                input.analysis.password_required = segment.password_required;
-                input.analysis.damage_flags = (!segment.damage_flags.is_empty())
-                    .then(|| Arc::new(segment.damage_flags));
-                input.analysis.structure_complete = input.format_hint == "lz4";
-                Some(LogicalInput {
-                    input,
-                    password_probe: None,
-                    password: None,
-                    failure: None,
-                })
-            })
-            .collect();
-        if !logical.is_empty() {
-            task.inputs = logical;
-        } else {
-            original.password_probe = probe.map(|mut probe| {
-                probe.analysis = original.input.analysis.clone();
-                probe.analysis.zip_eocd_offset = probe_zip_eocd.or(probe.analysis.zip_eocd_offset);
-                Box::new(probe)
-            });
-        }
-        Ok(())
-    }
-
     async fn execute_input(
         &self,
         logical: LogicalInput,
@@ -2819,7 +2728,6 @@ impl<'run, O: Observer> Run<'run, O> {
     ) -> io::Result<Executed> {
         let LogicalInput {
             mut input,
-            password_probe,
             password,
             failure,
         } = logical;
@@ -2890,7 +2798,7 @@ impl<'run, O: Observer> Run<'run, O> {
         } else {
             None
         };
-        let plan = match candidates.plan(password_probe.as_deref().unwrap_or(&input), password, &self.request.cancel) {
+        let plan = match candidates.plan(&input, password, &self.request.cancel) {
             Ok(Ok(plan)) => plan,
             Ok(Err(failure)) => {
                 result.failure = Some(failure.with_context(super::FailureContext::PasswordResolution));
@@ -2923,7 +2831,6 @@ impl<'run, O: Observer> Run<'run, O> {
                 });
             }
         };
-        drop(password_probe);
         if let Some(password) = &plan.verified_password {
             result.password = Some(password.to_string());
         }
@@ -3536,7 +3443,6 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
         source_paths,
         password: None,
         discovery_source: source,
-        damage_flags: input.analysis.damage_flags.clone(),
         partial: false,
         retained: false,
         recovered_complete_files: 0,
@@ -4362,7 +4268,7 @@ impl Leases {
             // candidates. Only share a result when it is valid for both runs.
             request.deep == owner.deep && request.max_depth == owner.max_depth
                 && request.output_root == owner.output_root && request.password_scope == owner.password_scope
-                && request.direct == owner.direct && request.recursive == owner.recursive
+                && request.recursive == owner.recursive
                 && Arc::ptr_eq(&request.config, &owner.config)
                 && match (&request.password_snapshot, &owner.password_snapshot) {
                     (Some(request), Some(owner)) => Arc::ptr_eq(request, owner),

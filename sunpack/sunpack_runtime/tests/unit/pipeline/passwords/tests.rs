@@ -242,11 +242,9 @@ fn preflight_read_failure_retains_machine_readable_evidence() {
     // An advisory tail hint does not turn this same damaged file into a
     // confirmed missing volume. Relation discovery may confirm it.
     let mut hinted = input.clone();
-    hinted.analysis.planning_applied = true;
     hinted.analysis.missing_volume_evidence = Some("seven_zip_start_header_length".into());
     assert_eq!(candidates.plan(&hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
         FailureKind::Damaged);
-    hinted.analysis.planning_applied = false;
     hinted.analysis.origin = crate::io::archive_state::AnalysisOrigin::Relations;
     assert_eq!(candidates.plan(&hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
         FailureKind::MissingVolume);

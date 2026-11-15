@@ -269,7 +269,7 @@ void editing(Fixture& f) {
             assert(!describe_setting("/analysis/modules/0/max_probe_bytes",name,language)["known"].get<bool>());
         assert(!describe_setting("/analysis/modules/0/enabled","tar_gz",language)["known"].get<bool>());
         auto module=config_fields(parse_json(R"({"analysis":{"modules":[{"name":"gzip","enabled":true}]}})"),"",language);
-        assert(module.size()==1 && module[0]["known"].get<bool>() && module[0]["module"]=="gzip" && module[0]["blockLabel"]=="GZIP");
+        for(auto& field:module) assert(!field["known"].get<bool>() && field["editor"]=="readonly");
     }
 }
 // Existing file/edit tests only check rejection. This coarse scenario catches

@@ -1,3 +1,4 @@
+use crate::io::archive_state::archive_input_slices;
 use super::*;
 
 impl Outcome {
@@ -246,8 +247,8 @@ fn password_evidence_controls_retry_without_reclassifying_weak_crc_damage() {
                 failure: Some(failure), files: 0, bytes: 0, encrypted: Some(true),
                 depth: 1, offset: 123, end_offset: None, volume_completeness: None,
                 volume_attempts: None, source_paths: vec!["carrier.bin".into()],
-                password: None, discovery_source: DiscoverySource::Direct,
-                damage_flags: None, partial: false, retained: false,
+                password: None, discovery_source: DiscoverySource::Embedded,
+                partial: false, retained: false,
                 recovered_complete_files: 0,   scan_layout: Default::default(),
             }],
             ..PublicOutcome::default()
@@ -553,7 +554,7 @@ fn preflight_damage_keeps_a_proven_password_in_scan_and_extract() {
         let run = test_run(&engine, &request, &observer);
         let mut input = ArchiveInput::file("damaged.rar".into(), "rar".into(), "damaged".into());
         input.analysis.password_required = true;
-        let logical = LogicalInput { password_probe: None, input, password: Some(Arc::from("confirmed")),
+        let logical = LogicalInput { input, password: Some(Arc::from("confirmed")),
             failure: Some(Failure::new(FailureKind::Damaged, "missing ENDARC")) };
         let mut shell = engine.shell.branch();
         let mut outcome = Outcome::default();
@@ -614,11 +615,11 @@ fn worker_failure_preserves_only_noncontradicted_strong_password() {
         input.analysis.password_required = true;
         // No discovery-supplied password: only the real probe's strong
         // plan can populate the failed result, not an existing receipt.
-        let logical = LogicalInput { password_probe: None, input, password: None, failure: None };
+        let logical = LogicalInput { input, password: None, failure: None };
         let mut shell = engine.shell.branch();
         let mut outcome = Outcome::default();
         let result = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |_| {
-            Box::pin(run.execute_input(logical, 1, DiscoverySource::Direct,
+            Box::pin(run.execute_input(logical, 1, DiscoverySource::Embedded,
                 1, None, None, &run.candidates, &mut shell, &mut outcome))
         }).unwrap().result;
         let submitted = responder.join().unwrap();
@@ -645,7 +646,7 @@ fn recovery_selection_uses_unique_physical_anchors_without_io() {
     arrived.entry_path = source.with_extension("first").to_string_lossy().into_owned();
     arrived.parts = Box::new([crate::io::archive_state::InputPart::range(
         crate::io::archive_state::InputExtent { path: old.entry_path.clone(), start: 0, end: None })]);
-    let logical = |input| LogicalInput { password_probe: None, input, password: None, failure: None };
+    let logical = |input| LogicalInput { input, password: None, failure: None };
     let engine = Engine::new(PathBuf::from("unused-worker"));
     let observer = |_: Event| {};
     let mut request = Request::new(Vec::new(), Mode::Extract);
@@ -721,11 +722,11 @@ fn password_failure_keeps_real_planned_output_after_cleanup() {
     let run = test_run(&engine, &request, &observer);
     let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "rar".into(), "encrypted".into());
     input.analysis.password_required = true;
-    let logical = LogicalInput { password_probe: None, input, password: None, failure: None };
+    let logical = LogicalInput { input, password: None, failure: None };
     let mut shell = engine.shell.branch();
     let mut outcome = Outcome::default();
     let executed = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |_| {
-        Box::pin(run.execute_input(logical, 1, DiscoverySource::Direct,
+        Box::pin(run.execute_input(logical, 1, DiscoverySource::Embedded,
             1, None, None, &run.candidates, &mut shell, &mut outcome))
     }).unwrap();
     assert!(matches!(executed.result.failure.as_ref().unwrap().context.as_deref(),
@@ -782,7 +783,6 @@ fn test_run<'a, O: Observer>(
         candidates: CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None),
         options: OnceLock::new(),
         deep_options: None,
-        analysis: NativeAnalysisConfig::new(Vec::<(String, bool)>::new()),
         observer: ObserverRef::Borrowed(observer),
         recursion: RecursivePrompts::default(),
         output_names: OutputReservationGuard { registry: Arc::clone(&engine.output_names), owner: 1 },
@@ -811,7 +811,7 @@ fn replacement_worker_spawn_failure_preserves_start_classification() {
     let run = test_run(&engine, &request, &observer);
     let logical = LogicalInput {
         input: ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
-        password_probe: None, password: None, failure: None,
+        password: None, failure: None,
     };
     let mut shell = engine.shell.branch();
     let mut outcome = Outcome::default();
@@ -820,7 +820,7 @@ fn replacement_worker_spawn_failure_preserves_start_classification() {
             // The first borrow and handshake succeed inside this request.
             let started = engine.worker(&request.config.performance.worker, &request.cancel).await.unwrap();
             assert!(Arc::ptr_eq(&started, &initial));
-            run.execute_input(logical, 1, DiscoverySource::Direct, 1, None, None,
+            run.execute_input(logical, 1, DiscoverySource::Embedded, 1, None, None,
                 &run.candidates, &mut shell, &mut outcome).await
         })
     }).unwrap().result;
@@ -847,7 +847,7 @@ fn watch_family_join_preserves_owner_and_propagates_infrastructure_error() {
         primary: None,
         owned_paths: [path, &tail1, &tail2].into_iter()
             .map(|member| member.to_string_lossy().into_owned()).collect(),
-        inputs: vec![LogicalInput { password_probe: None, password: None,
+        inputs: vec![LogicalInput { password: None,
             input: ArchiveInput::file(path.to_string_lossy().into_owned(), "7z".into(), "split".into()),
             failure: None }],
         source: DiscoverySource::Relations, context: None,
@@ -952,7 +952,7 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
     )).into();
     let task = Task {
         primary: None, owned_paths: [&head, &tail, &launcher].map(|path| path.to_string_lossy().into_owned()).into(),
-        inputs: vec![LogicalInput { password_probe: None,
+        inputs: vec![LogicalInput {
             input,
             password: None, failure: None }],
         source: DiscoverySource::Relations, context: None,
@@ -962,24 +962,24 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
     assert_eq!(run.requested_generation(&task, true).unwrap().len(), 2);
     // Foreground/nested tasks and incomplete observations do not consume
     // the Watch-only completed family fact.
-    assert!(matches!(run.task_admission(&task, &generations, &[], true, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
+    assert!(matches!(run.task_admission(&task, &generations, &[], false, |_| None).unwrap(), TaskAdmission::Execute(None)));
     let mut partial = generations.clone();
     partial.remove(&path_key(&tail.to_string_lossy()));
-    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, |_| None).unwrap(), TaskAdmission::Execute(None)));
-    assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true, |_| None).unwrap(), TaskAdmission::Departed));
+    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, |_| None).unwrap(), TaskAdmission::Execute(None)));
+    assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, |_| None).unwrap(), TaskAdmission::Departed));
     let single = Task { primary: None, owned_paths: vec![head.to_string_lossy().into_owned()],
-        inputs: vec![LogicalInput { password_probe: None,
+        inputs: vec![LogicalInput {
             input: ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
             password: None, failure: None }],
         source: DiscoverySource::Relations, context: None };
-    assert!(matches!(run.task_admission(&single, &partial, &[], true, true, |_| None).unwrap(), TaskAdmission::Execute(None)));
+    assert!(matches!(run.task_admission(&single, &partial, &[], true, |_| None).unwrap(), TaskAdmission::Execute(None)));
     assert_eq!(observer.queries.load(Ordering::SeqCst), 0);
-    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, |path| generations.get(path)).unwrap(),
+    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, |path| generations.get(path)).unwrap(),
         TaskAdmission::Completed(ref path) if path == &output));
-    assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true,
+    assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true,
         |path| generations.get(path)).unwrap(), TaskAdmission::Departed));
     let changed = HashMap::from([(path_key(&head.to_string_lossy()), generations[&path_key(&tail.to_string_lossy())].clone())]);
-    assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, true, |path| generations.get(path)).unwrap(), TaskAdmission::Execute(None)));
+    assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, |path| generations.get(path)).unwrap(), TaskAdmission::Execute(None)));
     assert_eq!(observer.queries.swap(0, Ordering::SeqCst), 1);
     assert!(missing.is_empty());
     // A successful worker can select only two of three candidate sources.
@@ -997,14 +997,14 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
     let alternative_task = Task {
         primary: None,
         owned_paths: [&head, &tail, &alternative, &launcher].map(|path| path.to_string_lossy().into_owned()).into(),
-        inputs: vec![LogicalInput { password_probe: None, input: alternative_input, password: None, failure: None }],
+        inputs: vec![LogicalInput { input: alternative_input, password: None, failure: None }],
         source: DiscoverySource::Relations, context: None,
     };
     let uncached = Reuse { output: output.join("absent"), events: Mutex::default(), queries: 0.into() };
     let uncached = test_run(&engine, &request, &uncached);
     let (physical, missing) = uncached.capture_generations(&alternative_task);
     let TaskAdmission::Execute(Some(cache_key)) = uncached.task_admission(
-        &alternative_task, &physical, &missing, true, true, |_| None,
+        &alternative_task, &physical, &missing, true, |_| None,
     ).unwrap() else { panic!("uncached speculative family should execute"); };
     let candidate_paths = [&head, &tail, &alternative].map(|path| path_key(&path.to_string_lossy()));
     assert_eq!(cache_key.len(), candidate_paths.len());
@@ -1036,90 +1036,6 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
 }
 
 #[test]
-fn advisory_planning_read_error_preserves_the_original_input() {
-    // The analysis open fails, but the later extraction path must still
-    // receive the original input rather than a fabricated terminal failure.
-    let path = crate::test_support::temp_file("planning_read_error", b"archive");
-    fs::remove_file(&path).unwrap();
-    let engine = Engine::new(PathBuf::from("unused-worker"));
-    let request = Request::new(vec![path.clone()], Mode::Scan);
-    let observer = |_: Event| {};
-    let run = test_run(&engine, &request, &observer);
-    let input = ArchiveInput::file(path.to_string_lossy().into_owned(), "rar".into(), "archive".into());
-    let mut task = Task {
-        primary: None,
-        owned_paths: vec![input.entry_path.clone()],
-        inputs: vec![LogicalInput { password_probe: None, input, password: Some(Arc::from("secret")), failure: None }],
-        source: DiscoverySource::Direct,
-        context: None,
-    };
-    run.plan_inputs(&mut task).unwrap();
-    assert_eq!(task.inputs.len(), 1);
-    assert_eq!(task.inputs[0].input.entry_path, path.to_string_lossy());
-    assert_eq!(task.inputs[0].input.format_hint, "rar");
-    assert_eq!(task.inputs[0].password.as_deref(), Some("secret"));
-    assert!(task.inputs[0].failure.is_none());
-    // Restore a valid archive before the next stage, modelling the end of
-    // the transient read failure. Confirm the original logical input reaches
-    // the real worker submission path using the existing test transport.
-    fs::write(&path, encrypted_rar_fixture()).unwrap();
-    struct Input(mpsc::Sender<Vec<u8>>);
-    impl io::Write for Input {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let _ = self.0.send(bytes.to_vec());
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
-    }
-    let (sent, received) = mpsc::channel();
-    let process = Process::with_test_input(Input(sent));
-    engine.worker.lock().unwrap().process = Some(Arc::clone(&process));
-    struct CancelOnPanic(Cancellation);
-    impl Drop for CancelOnPanic {
-        fn drop(&mut self) {
-            if std::thread::panicking() { self.0.cancel(); }
-        }
-    }
-    let responder_cancel = request.cancel.clone();
-    let responder = std::thread::spawn(move || {
-        // A transport assertion must wake the awaiting request too, rather
-        // than leave the scheduler parked after this thread has unwound.
-        let _cancel_on_panic = CancelOnPanic(responder_cancel);
-        let bytes = received.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("planning error suppressed worker submission");
-        let mut decoder = crate::scan::worker_wire::NativeWorkerFrameDecoder::default();
-        let frames = decoder.feed(&bytes).unwrap();
-        decoder.finish().unwrap();
-        let submitted = &frames[0].summary;
-        let id = &submitted["job_id"];
-        process.test_event(json!({"type":"result", "job_id":id,
-            "status":"ok", "archive_type":"rar", "encrypted":true}));
-        process.test_event(json!({"type":"native_event", "event":"job_finished", "job_id":id}));
-        submitted.clone()
-    });
-    let logical = task.inputs.remove(0);
-    let cancel_input = logical.input.clone();
-    let mut shell = engine.shell.branch();
-    let mut outcome = Outcome::default();
-    let result = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |_| {
-        Box::pin(run.execute_input(logical, 1, DiscoverySource::Direct,
-            1, None, None, &run.candidates, &mut shell, &mut outcome))
-    }).unwrap().result;
-    let submitted = responder.join().unwrap();
-    assert_eq!(submitted["operation"], "scan");
-    assert_eq!(submitted["password"], "secret");
-    assert!(result.failure.is_none());
-    // With an existing, readable input, this must be a cancellation error,
-    // not the earlier NotFound error accidentally satisfying is_err().
-    task.inputs.push(LogicalInput { password_probe: None, input: cancel_input, password: None, failure: None });
-    request.cancel.cancel();
-    let error = request.cancel.run(|| run.plan_inputs(&mut task)).unwrap_err();
-    assert!(is_cancellation(&error));
-    release_reader_resources_under_roots(vec![path.to_string_lossy().into_owned()]).unwrap();
-    fs::remove_file(path).unwrap();
-}
-
-#[test]
 fn partial_departure_is_an_admission_failure_and_keeps_surviving_generation() {
     let path = crate::test_support::temp_file("partial_departure", b"archive");
     let missing = path.with_extension("missing");
@@ -1140,7 +1056,7 @@ fn partial_departure_is_an_admission_failure_and_keeps_surviving_generation() {
         let mut task = Task {
             primary: None,
             owned_paths: [&path, &missing, &companion].map(|path| path.to_string_lossy().into_owned()).into(),
-            inputs: vec![LogicalInput { password_probe: None,
+            inputs: vec![LogicalInput {
                 input,
                 password: None, failure: None,
             }],
@@ -1152,26 +1068,24 @@ fn partial_departure_is_an_admission_failure_and_keeps_surviving_generation() {
         assert_eq!(absent, vec![missing.clone()]);
         assert_eq!(generations.len(), 1);
         assert_eq!(generations[&path_key(&path.to_string_lossy())], capture_file_generation(&path).unwrap());
-        assert!(matches!(run.task_admission(&task, &generations, &absent, true, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
-        run.admit_missing_inputs(&mut task, &absent, false);
-        assert!(task.inputs[0].failure.is_none());
+        assert!(matches!(run.task_admission(&task, &generations, &absent, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
         task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
             .with_context(super::super::FailureContext::Discovery {
                 discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
                 path: path.clone(), error: String::new(),
             }));
-        run.admit_missing_inputs(&mut task, &absent, true);
+        run.admit_missing_inputs(&mut task, &absent);
         assert_eq!(task.inputs[0].failure.as_ref().unwrap().kind, FailureKind::Unsupported);
         let input = task.inputs[0].input.clone();
-        task.inputs.push(LogicalInput { password_probe: None, input, password: None, failure: None });
-        run.admit_missing_inputs(&mut task, &absent, true);
+        task.inputs.push(LogicalInput { input, password: None, failure: None });
+        run.admit_missing_inputs(&mut task, &absent);
         assert!(task.inputs.iter().all(|logical| matches!(logical.failure.as_ref().unwrap().context.as_deref(),
             Some(super::super::FailureContext::InputAdmission { .. }))));
         task.inputs.pop();
         task.inputs[0].failure = None;
         if count == 2 {
             let input = task.inputs[0].input.clone();
-            task.inputs.push(LogicalInput { password_probe: None, input, password: Some(Arc::from("known")), failure: None });
+            task.inputs.push(LogicalInput { input, password: Some(Arc::from("known")), failure: None });
             task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
                 .with_context(super::super::FailureContext::Discovery {
                     discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
@@ -1237,7 +1151,7 @@ fn discovery_blocked_tasks_register_display_segments_without_executing_them() {
         let events = Mutex::new(Vec::new());
         let observer = |event: Event| { events.lock().unwrap().push(event); };
         let run = test_run(&engine, &request, &observer);
-        let inputs = (0..count).map(|index| LogicalInput { password_probe: None,
+        let inputs = (0..count).map(|index| LogicalInput {
             input: ArchiveInput::file(path.to_string_lossy().into_owned(), "zip".into(), "carrier".into()),
             password: Some(Arc::from("known")),
             failure: Some(Failure::new(if index == 0 { FailureKind::Unsupported } else { FailureKind::Damaged },
@@ -1330,7 +1244,7 @@ fn retry_panel_uses_checkpoint_positions_without_creating_execution_work() {
     let run = test_run(&engine, &request, &observer);
     let task = Task {
         primary: None, owned_paths: vec![input.entry_path.clone()],
-        inputs: inputs.into_iter().map(|input| LogicalInput { password_probe: None, input, password: None, failure: None }).collect(),
+        inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
         source: DiscoverySource::Embedded, context: None,
     };
     let ids = run.queue_inputs(&task, 1000, 1, &[Some(&checkpoint), None], 7, true);
@@ -1367,7 +1281,7 @@ fn departed_discovered_tasks_skip_before_started_across_modes_and_depths() {
                 let task = Task {
                     primary: None,
                     owned_paths: vec![input.entry_path.clone()],
-                    inputs: vec![LogicalInput { password_probe: None, input: input.clone(), password: None, failure: None }],
+                    inputs: vec![LogicalInput { input: input.clone(), password: None, failure: None }],
                     source: DiscoverySource::Detection,
                     context: None,
                 };
@@ -1377,21 +1291,7 @@ fn departed_discovered_tasks_skip_before_started_across_modes_and_depths() {
                 assert!(outcome.archives.is_empty());
                 assert!(outcome.errors.is_empty());
                 assert!(matches!(events.lock().unwrap().as_slice(), [Event::Skipped { id: 1 }]));
-                // Direct user selections are not stale discovery proposals.
-                let direct = Task {
-                    primary: None,
-                    owned_paths: vec![input.entry_path.clone()],
-                    inputs: vec![LogicalInput { password_probe: None, input: input.clone(), password: None, failure: None }],
-                    source: DiscoverySource::Direct,
-                    context: None,
-                };
-                assert!(matches!(run.task_admission(&direct, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
-                // A replacement can be classified Relations while retaining
-                // the original Direct task's no-silent-skip boundary.
-                let mut replacement = direct;
-                replacement.source = DiscoverySource::Relations;
-                assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
-                assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], true, false, |_| None).unwrap(), TaskAdmission::Departed));
+
             }
         }
     }
@@ -1477,7 +1377,7 @@ fn retained_carrier_outputs_do_not_reenter_recursive_discovery() {
         let task = Task {
             primary: None,
             owned_paths: inputs.iter().map(|input| input.entry_path.clone()).collect(),
-            inputs: inputs.into_iter().map(|input| LogicalInput { password_probe: None, input, password: None, failure: None }).collect(),
+            inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
             source: DiscoverySource::Embedded,
             context: None,
         };
@@ -1618,7 +1518,7 @@ fn source_cleanup_runs_after_consumer_finish_and_is_joined_by_request() {
         Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
     }
     let task = Task {
-        primary: None, inputs: vec![LogicalInput { password_probe: None, input, password: None, failure: None }],
+        primary: None, inputs: vec![LogicalInput { input, password: None, failure: None }],
         owned_paths: vec![source.to_string_lossy().into_owned()], source: DiscoverySource::Embedded, context: None,
     };
     let scheduler = Scheduler::new();
@@ -2050,13 +1950,13 @@ fn cancelled_batch_does_not_swallow_unrelated_journal_io_errors() {
         let batch = Discovered {
             tasks: vec![Task {
                 primary: None,
-                inputs: vec![LogicalInput { password_probe: None,
+                inputs: vec![LogicalInput {
                     input: ArchiveInput::file("child.zip".into(), "zip".into(), "child".into()),
                     password: None,
                     failure: Some(Failure::new(FailureKind::Damaged, "preflight failure")),
                 }],
                 owned_paths: Vec::new(),
-                source: DiscoverySource::Direct,
+                source: DiscoverySource::Embedded,
                 context: None,
             }],
             errors: Vec::new(),
@@ -2180,9 +2080,9 @@ fn alias_dedup_covers_candidate_and_preflight_failure_plans() {
         Task {
             primary: None,
             owned_paths: vec![input.entry_path.clone()],
-            inputs: vec![LogicalInput { password_probe: None, input, password: None,
+            inputs: vec![LogicalInput { input, password: None,
                 failure: blocked.then(|| Failure::new(FailureKind::MissingVolume, "missing")) }],
-            source: DiscoverySource::Direct, context: None,
+            source: DiscoverySource::Embedded, context: None,
         }
     };
     for (candidate, blocked) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -2212,7 +2112,7 @@ fn ancestor_rebases_share_number_history_and_reuse_released_slots() {
     let source = crate::test_support::temp_file("ancestor_history", b"input");
     let base = source.with_extension("output");
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
-    let result = receipt(&input, DiscoverySource::Direct, 1);
+    let result = receipt(&input, DiscoverySource::Embedded, 1);
     let names = Mutex::new(OutputNames::default());
     assert_eq!(OutputNames::plan(&names, base.clone(), &result.path, 1, None).unwrap().unwrap(), base);
     for index in 1..=32 {
@@ -2340,7 +2240,7 @@ fn output_registration_does_not_hold_naming_gate_and_failure_releases_only_its_c
     let source = crate::test_support::temp_file("unlocked_output_registration", b"input");
     let preferred = source.with_extension("output");
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
-    let result = receipt(&input, DiscoverySource::Direct, 1);
+    let result = receipt(&input, DiscoverySource::Embedded, 1);
     let names = Mutex::new(OutputNames::default());
     let failure = OutputNames::reserve(&names, preferred.clone(), &result, &Register(&names), 1, None)
         .unwrap().unwrap_err();
@@ -2372,7 +2272,7 @@ fn output_creation_collision_retries_without_reusing_external_directory() {
     let source = crate::test_support::temp_file("output_create_collision", b"input");
     let preferred = source.with_extension("output");
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
-    let result = receipt(&input, DiscoverySource::Direct, 1);
+    let result = receipt(&input, DiscoverySource::Embedded, 1);
     let names = Mutex::new(OutputNames::default());
     let output = OutputNames::reserve(&names, preferred.clone(), &result,
         &Collision(preferred.clone()), 1, None).unwrap().unwrap();
@@ -2418,7 +2318,7 @@ fn independent_output_trees_survive_peer_cleanup_and_creation_failure() {
     let source = crate::test_support::temp_file("output_isolation", b"input");
     let root = source.with_extension("output");
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
-    let result = receipt(&input, DiscoverySource::Direct, 1);
+    let result = receipt(&input, DiscoverySource::Embedded, 1);
     // Match main's coarse lifecycle: both orders, same/different request
     // owners, owned recursion, foreign input and continued output refusal.
     for descendant_first in [false, true] {
@@ -2513,7 +2413,7 @@ fn output_history_survives_requests_rechecks_released_slots_and_stays_bounded() 
     let preferred = root.join("archive");
     fs::create_dir(&preferred).unwrap();
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
-    let result = receipt(&input, DiscoverySource::Direct, 1);
+    let result = receipt(&input, DiscoverySource::Embedded, 1);
     let names = Mutex::new(OutputNames::default());
     let family = output_key(&preferred);
     for owner in 1..=32 {
@@ -2564,7 +2464,7 @@ fn completed_failures_are_carried_until_their_dependencies_change() {
     )]);
     let mut keys = Vec::new();
     for kind in [None, Some(FailureKind::Damaged), Some(FailureKind::WrongPassword)] {
-        let mut result = receipt(&input, DiscoverySource::Direct, 1);
+        let mut result = receipt(&input, DiscoverySource::Embedded, 1);
         result.failure = kind.map(|kind| Failure::new(kind, "failed"));
         // Successful receipts do not require opening any output directory.
         if kind.is_none() { result.output = Some(source.with_extension("not-created")); }
@@ -2630,7 +2530,7 @@ fn complete_carrier_keeps_salvage_only_with_a_complete_sibling() {
         }
         let task = Task {
             primary: None,
-            inputs: inputs.into_iter().map(|input| LogicalInput { password_probe: None, input, password: None, failure: None }).collect(),
+            inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
             owned_paths: vec![source.to_string_lossy().into_owned()],
             source: DiscoverySource::Embedded,
             context: None,
@@ -2719,7 +2619,7 @@ fn retained_carrier_recomputes_content_policy_without_reexecuting_inputs() {
                     }
                     let task = Task {
                         primary: None,
-                        inputs: inputs.iter().cloned().map(|input| LogicalInput { password_probe: None,
+                        inputs: inputs.iter().cloned().map(|input| LogicalInput {
                             input, password: None, failure: None,
                         }).collect(),
                         owned_paths: vec![source.to_string_lossy().into_owned()],
@@ -2766,7 +2666,7 @@ fn split_recovery_warning_preserves_original_failure_and_confirmation() {
         (true, true, FailureKind::MissingVolume, true, false),
         (true, false, FailureKind::WrongPassword, false, false),
     ] {
-        let mut result = receipt(&input, DiscoverySource::Direct, 1);
+        let mut result = receipt(&input, DiscoverySource::Embedded, 1);
         result.partial = partial;
         let mut failure = Failure::new(kind, "native cause");
         failure.evidence = worker_evidence(&json!({"missing_volume_suspected": suspected}), None);
@@ -2780,10 +2680,10 @@ fn split_recovery_warning_preserves_original_failure_and_confirmation() {
     }
     // One confirmed missing-volume cause suppresses a speculative carrier
     // warning, even when another independently recovered segment is damaged.
-    let mut first = receipt(&input, DiscoverySource::Direct, 1);
+    let mut first = receipt(&input, DiscoverySource::Embedded, 1);
     first.partial = true;
     first.failure = Some(Failure::new(FailureKind::Damaged, "CRC"));
-    let mut second = receipt(&input, DiscoverySource::Direct, 1);
+    let mut second = receipt(&input, DiscoverySource::Embedded, 1);
     second.partial = true;
     second.failure = Some(Failure::new(FailureKind::MissingVolume, "part2"));
     let mut results = [first, second];
@@ -2857,7 +2757,7 @@ fn replacement_recreates_the_original_numbered_reservation() {
     let preferred = source.with_extension("output");
     fs::create_dir(&preferred).unwrap();
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
-    let result = receipt(&input, DiscoverySource::Direct, 1);
+    let result = receipt(&input, DiscoverySource::Embedded, 1);
     let request = Request::new(vec![source.clone()], Mode::Extract);
     let engine = Engine::new(PathBuf::from("unused-worker"));
     let observer = |_: Event| {};
@@ -2965,14 +2865,14 @@ fn failed_output_cleanup_is_local_but_journal_failure_propagates() {
     }
     let source = crate::test_support::temp_file("discard_failure", b"archive");
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
-    let mut failed = receipt(&input, DiscoverySource::Direct, 1);
+    let mut failed = receipt(&input, DiscoverySource::Embedded, 1);
     failed.failure = Some(Failure::new(FailureKind::Damaged, "failed"));
     let engine = Engine::new(PathBuf::from("unused-worker"));
     let request = Request::new(vec![source.clone()], Mode::Extract);
     let observer = Journal { fail: false };
     let run = test_run(&engine, &request, &observer);
     let mut outcome = Outcome::default();
-    outcome.archives.push(receipt(&input, DiscoverySource::Direct, 1));
+    outcome.archives.push(receipt(&input, DiscoverySource::Embedded, 1));
     // Replaced non-directory output fails independently of ACL privileges.
     CreatedOutputs::register(&run.created_outputs, &source, &failed);
     assert!(!run.discard_failed_output(&failed, &source, &mut outcome).unwrap());
@@ -3017,7 +2917,7 @@ fn rollback_isolates_cleanup_failures_and_preserves_journal_errors() {
         let created = Mutex::default();
         let mut outcome = Outcome::default();
         for output in [&bad, &good, &nested] {
-            let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+            let mut archive = receipt(&input, DiscoverySource::Embedded, 1);
             archive.output = Some(output.clone());
             archive.files = 1;
             archive.bytes = 12;
@@ -3096,7 +2996,7 @@ fn cancellation_joins_nested_writer_then_rolls_back_only_uncommitted_trees() {
     let old = root.join("a");
     let punctuation = root.join("a (2)");
     let new = root.join("relocated");
-    let ownership = receipt(&input, DiscoverySource::Direct, 1);
+    let ownership = receipt(&input, DiscoverySource::Embedded, 1);
     for path in [&old, &old.join("child"), &punctuation] {
         CreatedOutputs::register(&moving, path, &ownership);
     }
@@ -3108,7 +3008,7 @@ fn cancellation_joins_nested_writer_then_rolls_back_only_uncommitted_trees() {
     let mut outcome = Outcome::default();
     let created = Mutex::default();
     for path in [&parent, &nested, &sibling, &retry_child, &retained_finished, &retained_segment] {
-        let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+        let mut archive = receipt(&input, DiscoverySource::Embedded, 1);
         archive.output = Some(path.clone());
         CreatedOutputs::register(&created, path, &archive);
         outcome.archives.push(archive);
@@ -3247,7 +3147,7 @@ fn request_cancellation_rolls_back_partial_but_not_complete_or_continued_outputs
                 let observer = CancelAfterTask { cancel: request.cancel.clone(), enabled: cancel_after };
                 let run = test_run(&engine, &request, &observer);
                 let task = Task { primary: None, inputs: inputs.iter().cloned().map(|input|
-                    LogicalInput { input, password_probe: None, password: None, failure: None }).collect(),
+                    LogicalInput { input, password: None, failure: None }).collect(),
                     owned_paths: vec![source.to_string_lossy().into_owned()],
                     source: DiscoverySource::Embedded, context: None };
                 let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
@@ -3278,7 +3178,7 @@ fn request_cancellation_rolls_back_partial_but_not_complete_or_continued_outputs
                             .or_default().insert(checkpoint.key(), index);
                     }
                     let task = Task { primary: None, inputs: inputs.into_iter().map(|input|
-                        LogicalInput { input, password_probe: None, password: None, failure: None }).collect(),
+                        LogicalInput { input, password: None, failure: None }).collect(),
                         owned_paths: vec![source.to_string_lossy().into_owned()],
                         source: DiscoverySource::Embedded, context: None };
                     let retained = Scheduler::new().run(2, Origin::Foreground, &continued.cancel, |spawner| {
@@ -3327,10 +3227,10 @@ fn retained_parent_does_not_publish_new_child_before_its_commit_boundary() {
         let request = Request::new(Vec::new(), Mode::Extract);
         let observer = Roots(std::sync::atomic::AtomicUsize::new(0));
         let run = test_run(&engine, &request, &observer);
-        let mut outer = receipt(&input, DiscoverySource::Direct, 1);
+        let mut outer = receipt(&input, DiscoverySource::Embedded, 1);
         outer.retained = true;
         outer.output = Some(parent.clone());
-        let mut nested = receipt(&input, DiscoverySource::Direct, 2);
+        let mut nested = receipt(&input, DiscoverySource::Embedded, 2);
         nested.output = Some(child.clone());
         nested.partial = partial;
         if partial { nested.failure = Some(Failure::new(FailureKind::Damaged, "accepted files")); }
@@ -3371,9 +3271,9 @@ fn cancelled_recursive_batch_returns_incomplete_outcome_not_parent_unwind() {
     let batch = Discovered {
         tasks: vec![Task {
             primary: None,
-            inputs: vec![LogicalInput { password_probe: None, input, password: None, failure: None }],
+            inputs: vec![LogicalInput { input, password: None, failure: None }],
             owned_paths: Vec::new(),
-            source: DiscoverySource::Direct,
+            source: DiscoverySource::Embedded,
             context: None,
         }],
         errors: Vec::new(),
@@ -3393,8 +3293,8 @@ fn cancelled_recursive_batch_returns_incomplete_outcome_not_parent_unwind() {
     let batch = Discovered {
         tasks: vec![Task {
             primary: None,
-            inputs: vec![LogicalInput { password_probe: None, input, password: None, failure: None }],
-            owned_paths: Vec::new(), source: DiscoverySource::Direct, context: None,
+            inputs: vec![LogicalInput { input, password: None, failure: None }],
+            owned_paths: Vec::new(), source: DiscoverySource::Embedded, context: None,
         }],
         errors: Vec::new(), scan_errors: DirectoryReadErrors::report(), blocked_paths: HashSet::new(),
     };
@@ -3433,7 +3333,7 @@ fn flatten_work_avoids_unmaterialized_output_claim_and_releases_its_slot() {
     fs::create_dir_all(output.join("wrapper")).unwrap();
     fs::write(output.join("wrapper/payload.txt"), b"payload").unwrap();
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "sample".into());
-    let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+    let mut archive = receipt(&input, DiscoverySource::Embedded, 1);
     archive.output = Some(output.clone());
     let mut work = output.as_os_str().to_os_string();
     work.push(".__sunpack_flatten_work__");
@@ -3475,13 +3375,13 @@ fn flatten_rebases_rollback_receipts_when_root_spelling_is_unchanged() {
     fs::write(leaf.join("ordinary.txt"), b"keep").unwrap();
     fs::write(child.join("payload.txt"), b"child").unwrap();
     let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "parent".into());
-    let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+    let mut archive = receipt(&input, DiscoverySource::Embedded, 1);
     archive.output = Some(output.clone());
-    let mut nested = receipt(&input, DiscoverySource::Direct, 2);
+    let mut nested = receipt(&input, DiscoverySource::Embedded, 2);
     nested.output = Some(child.clone());
     let created = Mutex::new(CreatedOutputs::default());
     CreatedOutputs::register(&created, &output, &archive);
-    let mut leaf_archive = receipt(&input, DiscoverySource::Direct, 2);
+    let mut leaf_archive = receipt(&input, DiscoverySource::Embedded, 2);
     leaf_archive.path = output.join("inner.zip");
     CreatedOutputs::register(&created, &leaf, &leaf_archive);
     CreatedOutputs::register(&created, &child, &nested);
@@ -3515,7 +3415,7 @@ fn flatten_failure_keeps_extraction_successful_and_reports_output() {
         "zip".into(),
         "sample".into(),
     );
-    let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+    let mut archive = receipt(&input, DiscoverySource::Embedded, 1);
     archive.output = Some(output.clone());
     let mut outcome = Outcome::default();
 

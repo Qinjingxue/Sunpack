@@ -299,3 +299,12 @@ fn sparse_map_valid(block: &[u8], start: usize, count: usize, previous_end: &mut
 #[cfg(test)]
 #[path = "../../tests/unit/formats/tar/tests.rs"]
 mod tests;
+
+pub(crate) fn header_identity(header: &[u8], file_size: u64) -> bool {
+    let Ok(size) = header_size(header) else { return false; };
+    BLOCK.saturating_add(size).saturating_add(padding(size)) <= file_size
+        && header[..100].iter().any(|byte| *byte != 0)
+        && (header[156] == 0 || (0x20..0x7f).contains(&header[156]))
+        && [100..108, 108..116, 116..124, 136..148].into_iter()
+            .all(|field| number(&header[field]).is_some())
+}

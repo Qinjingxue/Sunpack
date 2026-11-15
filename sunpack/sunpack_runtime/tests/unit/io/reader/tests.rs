@@ -1098,3 +1098,180 @@ fn bug_regression_in_place_write_with_restored_mtime_invalidates_blocks() {
     assert_eq!(current.read_at(0, 4).unwrap(), b"last");
     std::fs::remove_file(path).unwrap();
 }
+
+// Test source for cross-boundary cache and fault injection.
+impl ManagedReader {
+    pub(crate) fn open_volumes(paths: &[String], config: ReaderConfig) -> io::Result<Self> {
+        let source = MultiVolumeSource::open(paths)?;
+        Ok(Self::new(Arc::new(source), config))
+    }
+
+    pub(crate) fn open_extents<'a>(
+        extents: impl IntoIterator<Item = (&'a str, u64, Option<u64>)>,
+        config: ReaderConfig,
+    ) -> io::Result<(Self, Vec<u64>)> {
+        let source = MultiVolumeSource::open_extents(extents)?;
+        let disk_starts = source.volumes.iter().map(|volume| volume.start).collect();
+        Ok((Self::new(Arc::new(source), config), disk_starts))
+    }
+
+}
+
+struct Volume {
+    start: u64,
+    end: u64,
+    physical_start: u64,
+    source: Arc<FileSource>,
+}
+
+struct MultiVolumeSource {
+    len: u64,
+    volumes: Vec<Volume>,
+}
+
+impl MultiVolumeSource {
+    fn read_into_mode(&self, offset: u64, buffer: &mut [u8], direct: bool) -> io::Result<usize> {
+        if offset >= self.len || buffer.is_empty() {
+            return Ok(0);
+        }
+        let len = buffer.len().min((self.len - offset) as usize);
+        let end = offset + len as u64;
+        let mut written = 0usize;
+        for volume in &self.volumes[self.overlapping(offset, end)] {
+            let logical_start = offset.max(volume.start);
+            let logical_end = end.min(volume.end);
+            let chunk_len = (logical_end - logical_start) as usize;
+            let target = &mut buffer[written..written + chunk_len];
+            let count = if direct {
+                volume.source.read_direct_into_at(
+                    volume.physical_start + (logical_start - volume.start),
+                    target,
+                )?
+            } else {
+                volume.source.read_into_at(
+                    volume.physical_start + (logical_start - volume.start),
+                    target,
+                )?
+            };
+            written += count;
+            if count != chunk_len {
+                break;
+            }
+        }
+        Ok(written)
+    }
+
+    /// Ordered physical extents share this lookup across every read mode.
+    fn overlapping(&self, offset: u64, end: u64) -> std::ops::Range<usize> {
+        if offset >= end {
+            return 0..0;
+        }
+        let first = self.volumes.partition_point(|volume| volume.end <= offset);
+        let tail = &self.volumes[first..];
+        let count = tail.partition_point(|volume| volume.start < end);
+        first..first + count
+    }
+
+    #[cfg(test)]
+    fn open(paths: &[String]) -> io::Result<Self> {
+        Self::open_extents(paths.iter().map(|path| (path.as_str(), 0, None)))
+    }
+
+    fn open_extents<'a>(
+        extents: impl IntoIterator<Item = (&'a str, u64, Option<u64>)>,
+    ) -> io::Result<Self> {
+        let extents = extents.into_iter();
+        let mut cursor = 0u64;
+        let mut volumes = Vec::with_capacity(extents.size_hint().0);
+        for (path, physical_start, physical_end) in extents {
+            let source = manager().open_file(path.as_ref())?;
+            let length = physical_end
+                .unwrap_or(source.len())
+                .min(source.len())
+                .checked_sub(physical_start)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid archive extent")
+                })?;
+            let end = cursor.checked_add(length).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "multi-volume size overflow")
+            })?;
+            volumes.push(Volume {
+                start: cursor,
+                end,
+                physical_start,
+                source,
+            });
+            cursor = end;
+        }
+        if volumes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-volume reader requires at least one volume",
+            ));
+        }
+        Ok(Self {
+            len: cursor,
+            volumes,
+        })
+    }
+}
+
+impl ByteSource for MultiVolumeSource {
+    fn validate_cached_range(&self, offset: u64, len: usize) -> io::Result<()> {
+        for volume in &self.volumes[self.overlapping(offset, offset.saturating_add(len as u64))] {
+            volume.source.ensure_open()?;
+        }
+        Ok(())
+    }
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let len = len.min(self.len.saturating_sub(offset) as usize);
+        let mut output = crate::io::resource_error::zeroed_bytes(len)?;
+        let count = self.read_into_mode(offset, &mut output, false)?;
+        output.truncate(count);
+        Ok(output)
+    }
+
+    fn read_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        self.read_into_mode(offset, buffer, false)
+    }
+
+    fn read_direct_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        self.read_into_mode(offset, buffer, true)
+    }
+
+    fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
+        if offset >= self.len || len == 0 {
+            return Ok(Vec::new());
+        }
+        let len = len.min((self.len - offset) as usize);
+        let end = offset + len as u64;
+        let mut slices = Vec::new();
+        for volume in &self.volumes[self.overlapping(offset, end)] {
+            let logical_start = offset.max(volume.start);
+            let logical_end = end.min(volume.end);
+            let chunk_len = (logical_end - logical_start) as usize;
+            let volume_slices = volume.source.read_slices_at(
+                volume.physical_start + (logical_start - volume.start),
+                chunk_len,
+            )?;
+            let produced = volume_slices.iter().map(|slice| slice.len()).sum::<usize>();
+            slices.extend(volume_slices);
+            if produced != chunk_len {
+                break;
+            }
+        }
+        Ok(slices)
+    }
+
+    fn read_direct_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let len = len.min(self.len.saturating_sub(offset) as usize);
+        let mut output = crate::io::resource_error::zeroed_bytes(len)?;
+        let count = self.read_into_mode(offset, &mut output, true)?;
+        output.truncate(count);
+        Ok(output)
+    }
+}

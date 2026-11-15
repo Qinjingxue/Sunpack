@@ -112,7 +112,6 @@ impl<'a> Report<'a> {
                     DiscoverySource::Embedded => "embedded_boundary",
                     DiscoverySource::Relations => "relations",
                     DiscoverySource::Detection => "detection",
-                    DiscoverySource::Direct => "direct",
                 };
                 details = json!({"path": path, "reason": reason});
                 // Preflight uses the localized discovery reason when it has a

@@ -88,27 +88,18 @@ pub(crate) enum AnalysisOrigin {
     Relations,
     RelationsFallback,
     Embedded,
-    Planned,
 }
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AnalysisStatus { Error, Weak, Damaged, Extractable }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AnalysisFacts {
     #[serde(default)]
     pub origin: AnalysisOrigin,
-    #[serde(default)]
-    pub planning_applied: bool,
-    pub status: Option<AnalysisStatus>,
     pub zip_eocd_offset: Option<u64>,
     pub volume_completeness: Option<VolumeCompleteness>,
     pub missing_volume_evidence: Option<String>,
     pub password_required: bool,
     pub structure_complete: bool,
     pub zip_spanned: bool,
-    pub damage_flags: Option<Arc<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,9 +156,9 @@ impl ArchiveInput {
     pub(crate) fn execution_evidence(&self) -> Option<&str> {
         let facts = &self.analysis;
         // Relation discovery emits its confirmed missing-volume fact directly.
-        // Advisory planning only exports it for a structured multi-part input;
-        // a single-file internal hint is not confirmed missing-volume evidence.
-        let eligible = !facts.planning_applied && facts.origin == AnalysisOrigin::Relations
+        // Other origins require a structured multi-part input; a single-file
+        // hint is not confirmed missing-volume evidence.
+        let eligible = facts.origin == AnalysisOrigin::Relations
             || self.mode.structured() && self.parts.len() > 1;
         eligible.then_some(facts.missing_volume_evidence.as_deref()).flatten()
     }
@@ -311,10 +302,10 @@ struct AnalysisReport<'a>(&'a ArchiveInput);
 impl AnalysisReport<'_> {
     fn has_fields(&self) -> bool {
         let facts = &self.0.analysis;
-        if facts.origin == AnalysisOrigin::RelationsFallback && !facts.planning_applied { return false; }
-        facts.origin == AnalysisOrigin::Planned || facts.origin != AnalysisOrigin::Plain && facts.volume_completeness.is_some()
+        if facts.origin == AnalysisOrigin::RelationsFallback { return false; }
+        facts.origin != AnalysisOrigin::Plain && facts.volume_completeness.is_some()
             || (self.0.format_hint == "lz4" && facts.structure_complete)
-            || (facts.origin != AnalysisOrigin::Embedded || facts.planning_applied) && facts.zip_eocd_offset.is_some()
+            || facts.origin != AnalysisOrigin::Embedded && facts.zip_eocd_offset.is_some()
             || self.0.execution_evidence().is_some()
             || facts.origin == AnalysisOrigin::Embedded && facts.password_required
     }
@@ -323,40 +314,27 @@ impl Serialize for AnalysisReport<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let facts = &self.0.analysis;
         let mut map = serializer.serialize_map(None)?;
-        if facts.origin == AnalysisOrigin::Relations && self.0.volume_attempts.is_some() && !facts.planning_applied {
+        if facts.origin == AnalysisOrigin::Relations && self.0.volume_attempts.is_some() {
             map.serialize_entry("volume_completeness", "unknown")?;
             return map.end();
         }
-        if facts.origin == AnalysisOrigin::Planned {
-            if let Some(status) = facts.status { map.serialize_entry("status", &status)?; }
-            map.serialize_entry("damage_flags", facts.damage_flags.as_deref().map(Vec::as_slice).unwrap_or(&[]))?;
-            if self.0.format_hint == "lz4" && facts.structure_complete { map.serialize_entry("structure_complete", &true)?; }
+        if let Some(completeness) = facts.volume_completeness {
+            if facts.origin != AnalysisOrigin::Plain { map.serialize_entry("volume_completeness", completeness.as_str())?; }
+        }
+        if matches!(facts.origin, AnalysisOrigin::Relations | AnalysisOrigin::RelationsFallback) {
             if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
+        }
+        if facts.origin != AnalysisOrigin::Embedded {
+            if let Some(evidence) = self.0.execution_evidence() {
+                map.serialize_entry("execution", &WireExecution { missing_volume_evidence: evidence })?;
+            }
+        }
+        if self.0.format_hint == "lz4" && facts.structure_complete { map.serialize_entry("structure_complete", &true)?; }
+        if facts.origin == AnalysisOrigin::Plain {
+            if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
+        }
+        if facts.origin == AnalysisOrigin::Embedded {
             if facts.password_required { map.serialize_entry("password_required", &true)?; }
-        } else {
-            if let Some(completeness) = facts.volume_completeness {
-                // Only discovery installs this public fact; an advisory planning
-                // conclusion is represented by execution.missing_volume_evidence.
-                if facts.origin != AnalysisOrigin::Plain { map.serialize_entry("volume_completeness", completeness.as_str())?; }
-            }
-            if matches!(facts.origin, AnalysisOrigin::Relations | AnalysisOrigin::RelationsFallback) {
-                if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
-            }
-            if facts.origin != AnalysisOrigin::Embedded {
-                if let Some(evidence) = self.0.execution_evidence() {
-                    map.serialize_entry("execution", &WireExecution { missing_volume_evidence: evidence })?;
-                }
-            }
-            if self.0.format_hint == "lz4" && facts.structure_complete { map.serialize_entry("structure_complete", &true)?; }
-            if facts.origin == AnalysisOrigin::Plain {
-                if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
-            }
-            if facts.origin == AnalysisOrigin::Embedded {
-                if facts.password_required { map.serialize_entry("password_required", &true)?; }
-                if facts.planning_applied {
-                    if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
-                }
-            }
         }
         map.end()
     }
@@ -639,108 +617,8 @@ fn range_segment(path: &str, start: u64, end: Option<u64>) -> io::Result<Segment
     })
 }
 
-/// Resolve the physical layout once for all selected analysis ranges.
-pub(crate) fn archive_input_slices(
-    source: &ArchiveInput,
-    slices: &[(&str, u64, Option<u64>)],
-) -> io::Result<(Vec<Option<ArchiveInput>>, Option<ArchiveInput>)> {
-    let Some(&(first_format, first_start, first_end)) = slices.first() else {
-        return Ok((Vec::new(), None));
-    };
-    let segments = build_segments(source)?;
-    let total = segments
-        .iter()
-        .try_fold(0u64, |sum, part| sum.checked_add(part.len()))
-        .ok_or_else(|| invalid("input size overflow"))?;
-    let projected: Vec<_> = slices
-        .iter()
-        .map(|&(format, start, end)| {
-            project_input_slice(source, &segments, total, format, start, end, false)
-        })
-        .collect();
-    let probe = projected[0]
-        .is_none()
-        .then(|| {
-            project_input_slice(
-                source,
-                &segments,
-                total,
-                first_format,
-                first_start,
-                first_end,
-                true,
-            )
-        })
-        .flatten();
-    Ok((projected, probe))
-}
-
-fn project_input_slice(
-    source: &ArchiveInput,
-    segments: &[Segment],
-    total: u64,
-    format: &str,
-    start: u64,
-    end: Option<u64>,
-    probe: bool,
-) -> Option<ArchiveInput> {
-    let mut end = end.or(probe.then_some(total))?;
-    if start >= end || end > total {
-        return None;
-    }
-    if format == "rar" && segments.len() > 1 {
-        // RAR callbacks use independent volume containers. Preserve their
-        // sequence for extraction. A password probe may use a bounded head.
-        if !probe || start == 0 {
-            return probe.then(|| source.clone());
-        }
-        end = end.min(segments[0].len());
-        if start >= end {
-            return None;
-        }
-    } else if start == 0 && end == total {
-        return probe.then(|| source.clone());
-    }
-    let mut cursor = 0;
-    let mut mapped = Vec::new();
-    for Segment::Range {
-        path,
-        start: base,
-        len,
-    } in segments
-    {
-        let stop = cursor + len;
-        let begin = start.max(cursor);
-        let finish = end.min(stop);
-        if begin < finish {
-            mapped.push(InputExtent {
-                path: path.clone(),
-                start: base + (begin - cursor),
-                end: Some(base + (finish - cursor)),
-            });
-        }
-        cursor = stop;
-        if cursor >= end {
-            break;
-        }
-    }
-    if mapped.is_empty() {
-        return None;
-    }
-    let mut input = ArchiveInput::file(
-        source.entry_path.clone(),
-        format.to_owned(),
-        source.logical_name.clone(),
-    );
-    if mapped.len() == 1 {
-        input.mode = OpenMode::FileRange;
-        input.parts = Box::new([InputPart::range(mapped.pop().unwrap())]);
-    } else {
-        input.mode = OpenMode::ConcatRanges;
-        input.ranges = mapped.into_boxed_slice();
-    }
-    Some(input)
-}
+#[cfg(test)]
+pub(crate) use tests::archive_input_slices;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)

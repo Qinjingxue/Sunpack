@@ -85,7 +85,6 @@ pub struct Request {
     pub(crate) output_base: Option<PathBuf>,
     pub max_depth: usize,
     pub recursive: bool,
-    pub direct: bool,
     pub deep: bool,
     pub passwords: Arc<[Arc<str>]>,
     pub password_snapshot: Option<Arc<PasswordSnapshot>>,
@@ -118,7 +117,6 @@ impl Request {
             output_base: None,
             max_depth: 0,
             recursive: false,
-            direct: false,
             deep: false,
             passwords: Arc::from([]),
             password_snapshot: None,
@@ -140,9 +138,8 @@ impl Request {
 pub enum DiscoverySource {
     Relations,
     Detection,
-    Embedded,
     #[default]
-    Direct,
+    Embedded,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -401,7 +398,6 @@ pub struct ArchiveResult {
     pub password: Option<String>,
     pub discovery_source: DiscoverySource,
     #[serde(skip)]
-    pub(crate) damage_flags: Option<Arc<Vec<String>>>,
     pub partial: bool,
     pub retained: bool,
     pub recovered_complete_files: u64,
@@ -587,7 +583,6 @@ impl ArchiveResult {
         // Cleanup and recovery already consumed these fields.
         self.source_paths = Vec::new();
         self.password = None;
-        self.damage_flags = None;
         self.volume_attempts = None;
     }
 }

@@ -35,7 +35,7 @@ fn assert_view(view: HitView<'_>, expected: &[RawHit]) {
         cursor.seek_ge(offset);
         assert_eq!(cursor.next().as_ref(), expected.get(rank));
     }
-    for tags in [1, 1 << 1, 1 << 12, (1 << 5) | (1 << 13), TAGS] {
+    for tags in [1, 1 << 1, 1 << 12, (1 << 5) | (1 << PATTERNS.len()), TAGS] {
         let subset = expected
             .iter()
             .filter(|h| tags & (1 << h.pattern) != 0)
@@ -105,9 +105,9 @@ fn codecs_and_index_queries_preserve_the_sorted_multiset() {
                 hits.push(RawHit::new(
                     base + offset as u64,
                     match mode {
-                        0 | 2 | 4 | 5 | 8 | 9 | 11 => 13,
+                        0 | 2 | 4 | 5 | 8 | 9 | 11 => PATTERNS.len() as u8,
                         3 => (i % 3 * 5) as u8,
-                        _ => (i % 14) as u8,
+                        _ => (i % (PATTERNS.len() + 1)) as u8,
                     },
                 ));
             }
@@ -143,7 +143,7 @@ fn codecs_and_index_queries_preserve_the_sorted_multiset() {
             for stream in 0..2 {
                 let expected = hits
                     .iter()
-                    .filter(|h| usize::from(h.pattern == 13) == stream)
+                    .filter(|h| usize::from(h.pattern as usize == PATTERNS.len()) == stream)
                     .cloned()
                     .collect::<Vec<_>>();
                 assert_view(streamed.view(stream), &expected);
@@ -154,8 +154,8 @@ fn codecs_and_index_queries_preserve_the_sorted_multiset() {
         used.into_iter().all(|yes| yes),
         "representations exercised: {used:?}"
     );
-    let mut maximum = (0..14)
-        .map(|pattern| RawHit::new(u64::MAX, pattern))
+    let mut maximum = (0..=PATTERNS.len())
+        .map(|pattern| RawHit::new(u64::MAX, pattern as u8))
         .collect::<Vec<_>>();
     maximum.sort_unstable_by_key(RawHit::hit_name);
     let store = HitStorage::from_hits(&maximum);
@@ -180,15 +180,15 @@ fn reordered_read_windows_reconcile_boundaries_and_spill() {
         for i in 0..10000 {
             random = random.wrapping_mul(1664525).wrapping_add(1013904223);
             let offset = start + (random as u64 % chunk as u64);
-            let pattern = (i % 14) as u8;
+            let pattern = (i % (PATTERNS.len() + 1)) as u8;
             source_hits.push(RawHit::new(offset, pattern));
-            expected[usize::from(pattern == 13)].push(RawHit::new(offset, pattern));
+            expected[usize::from(pattern as usize == PATTERNS.len())].push(RawHit::new(offset, pattern));
         }
         if ordinal != 0 {
-            for (distance, pattern) in [(1, 9), (11, 13), (257, 9), (268, 9)] {
+            for (distance, pattern) in [(1, 9), (11, PATTERNS.len() as u8), (257, 9), (268, 9)] {
                 let hit = RawHit::new(start - distance, pattern);
                 source_hits.push(hit.clone());
-                expected[usize::from(pattern == 13)].push(hit);
+                expected[usize::from(pattern as usize == PATTERNS.len())].push(hit);
             }
         }
         source_hits.sort_unstable_by_key(|h| {

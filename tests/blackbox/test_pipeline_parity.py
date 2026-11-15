@@ -145,7 +145,7 @@ def test_damaged_zipcrypto_remembers_password_proved_by_earlier_member(package, 
     _damage_stored_member(source, "second.txt", encryption_header=12)
 
     report = package.json(
-        "extract", "--direct-file", "--no-builtin-pw", "-p", "proof-key",
+        "extract", "-d", "--no-builtin-pw", "-p", "proof-key",
         "-o", tmp_path / "output", source, code=1,
     )
 
@@ -153,16 +153,16 @@ def test_damaged_zipcrypto_remembers_password_proved_by_earlier_member(package, 
     assert report["items"][0]["recent_passwords"] == ["proof-key"]
 
 
-def test_direct_fallback_does_not_force_unproven_signature_format(package, tmp_path):
+def test_deep_detect_finds_zip_after_unproven_signature(package, tmp_path):
     package.configure(embedded_scan={"enabled": False})
     source = tmp_path / "disguised.bin"
-    # Invalid 7z start-header CRC, followed by an ordinary ZIP. With embedded
-    # scanning disabled only the worker's direct auto-detection can open it.
+    # Deep detection overrides disabled automatic Embedded scanning and finds
+    # the ZIP after an invalid 7z prefix without worker auto-detection.
     source.write_bytes(b"7z\xbc\xaf\x27\x1c\x00\x04" + b"\xff" * 24)
     with zipfile.ZipFile(source, "a") as archive:
         archive.writestr("payload.txt", b"direct fallback")
     output = tmp_path / "out"
-    report = package.json("extract", "--direct-file", "-r", "1", "-o", output, source)
+    report = package.json("extract", "-d", "-r", "1", "-o", output, source)
     assert report["summary"]["success_count"] == 1
     assert [p.read_bytes() for p in output.rglob("payload.txt")] == [b"direct fallback"]
 
@@ -208,41 +208,6 @@ def test_failed_first_segment_keeps_its_output_name_for_password_retry(package, 
     assert ordinary.read_bytes() == b"ordinary"
     assert ordinary.parent.name == secret.parent.name + "(1)"
     assert ordinary.parent.parent == secret.parent.parent == output / "carrier"
-
-
-def test_direct_truncated_single_7z_tail_is_not_confirmed_missing_volume(package, tmp_path):
-    # Preserve a valid start header whose next-header range exceeds EOF. The
-    # opaque prefix bypasses Relations' offset-zero anchor; disabled Embedded
-    # leaves this explicit file to the same Direct advisory/worker path.
-    (tmp_path / "payload.txt").write_bytes(b"payload" * 256)
-    complete = tmp_path / "complete.7z"
-    subprocess.run(
-        [str(package.tools / "7z.exe"), "a", "-t7z", str(complete), "payload.txt"],
-        cwd=tmp_path, check=True, capture_output=True,
-    )
-    data = complete.read_bytes()
-    next_header = 32 + int.from_bytes(data[12:20], "little")
-    assert next_header >= 32 and next_header < len(data)
-    source = tmp_path / "carrier.bin"
-    source.write_bytes(b"opaque-prefix\0" + data[:next_header])
-    package.configure(embedded_scan={"enabled": False})
-    report = package.json(
-        "extract", "--direct-file", "--no-builtin-pw", "-r", "1", "-c", "k",
-        "-o", tmp_path / "out", source, code=1,
-    )
-    assert report["summary"]["failed_count"] == 1, report
-    assert report["tasks"][0]["failures"][0]["kind"] != "missing_volume", report
-
-    def check_blockers(value):
-        if isinstance(value, dict):
-            assert "missing_volume" not in value.get("blockers", []), report
-            for child in value.values():
-                check_blockers(child)
-        elif isinstance(value, list):
-            for child in value:
-                check_blockers(child)
-
-    check_blockers(report)
 
 
 def test_unreplaced_missing_volume_preflight_has_no_extraction_receipt(package, tmp_path):

@@ -260,14 +260,11 @@ fn shared_walk_keeps_child_rows_and_retry_scope_local() {
     assert!(retry.is_none());
     assert_eq!(scope.unwrap().key(), inner.key());
     let input = tasks[0].entry().clone();
-    tasks[0].inputs.push(LogicalInput { password_probe: None, input, password: None, failure: None });
+    tasks[0].inputs.push(LogicalInput { input, password: None, failure: None });
     assign_retry_scopes(&mut tasks, &scopes);
     let (scope, retry) = tasks[0].take_context(true);
     assert!(retry.is_none());
     assert_eq!(scope.unwrap().key(), inner.key());
-    tasks[0].source = DiscoverySource::Direct;
-    assign_retry_scopes(&mut tasks, &scopes);
-    assert!(tasks[0].context.is_none());
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -9,7 +9,7 @@ fn password_retry_keeps_only_failed_carrier_siblings_and_generated_anchors() {
         serde_json::from_value::<crate::pipeline::InputCheckpoint>(json!({
             "schema_version":1,"carrier":carrier,"input":input,"sources":[{"path":source,"generation":generation}],
             "output":format!("{carrier}-output"),"container":null,"files":1,"bytes":1,
-            "encrypted":false,"discovery_source":"direct","failure":failure
+            "encrypted":false,"discovery_source":"embedded","failure":failure
         })).unwrap()
     };
     let generated = |source: &str| serde_json::from_value::<crate::pipeline::GeneratedSource>(
@@ -265,8 +265,8 @@ fn retry_replaces_all_carrier_segments_when_nested_input_becomes_root() {
             failure: failed.then(|| crate::pipeline::Failure::new(FailureKind::WrongPassword, "password")),
             files: 0, bytes: 0, encrypted: None, depth, offset, end_offset: None,
             volume_completeness: None, volume_attempts: None, source_paths: vec![],
-            password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
-            damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
+            password: None, discovery_source: crate::pipeline::DiscoverySource::Embedded,
+            partial: false, retained: false, recovered_complete_files: 0,
               scan_layout: Default::default(),
         }
     }
@@ -306,8 +306,8 @@ fn settled_failure_and_partial_trees_keep_the_last_known_progress() {
             failure: Some(crate::pipeline::Failure::new(FailureKind::Damaged, "damage")),
             files: 0, bytes: 0, encrypted: None, depth: 1, offset: 123,
             end_offset: None, volume_completeness: None, volume_attempts: None,
-            source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
-            damage_flags: None, partial, retained: false, recovered_complete_files: 0,
+            source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Embedded,
+            partial, retained: false, recovered_complete_files: 0,
               scan_layout: Default::default(),
         };
         // Production publishes the terminal task fact before scope reporting.
@@ -331,8 +331,8 @@ fn report_archive(path: &str, offset: u64) -> ArchiveResult {
         path: path.into(), format: "zip".into(), output: None, failure: None,
         files: 0, bytes: 0, encrypted: None, depth: 1, offset,
         end_offset: None, volume_completeness: None, volume_attempts: None,
-        source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
-        damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
+        source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Embedded,
+        partial: false, retained: false, recovered_complete_files: 0,
           scan_layout: crate::pipeline::ScanLayout { range: offset != 0, volumes: false },
     }
 }
@@ -563,7 +563,6 @@ fn scan_json_keeps_main_sparse_fields_without_internal_failure_evidence() {
     let options = Options::parse(&["scan".into(), "--json".into(), "-v".into(), "input.bin".into()]).unwrap();
     let mut archive = report_archive("input.bin", 0);
     archive.format.clear();
-    archive.damage_flags = Some(Arc::default());
     let mut failure = crate::pipeline::Failure::new(FailureKind::Damaged, "damage");
     failure.evidence = Some(Box::new(crate::pipeline::FailureEvidence {
         stage: Some("item_extract".into()), ..Default::default()
@@ -600,7 +599,7 @@ fn scan_json_keeps_main_sparse_fields_without_internal_failure_evidence() {
     assert!(item.get("failure").is_none());
     assert_eq!(item["error_kind"], "damaged");
     assert_eq!(item["error"], Language::En.text("failure.damaged"));
-    assert_eq!(item["discovery_source"], "direct");
+    assert_eq!(item["discovery_source"], "embedded");
 }
 
 // Both renderers consume descriptor facts, not a guessed meaning for a

@@ -146,7 +146,7 @@ def _wait_for(predicate, message):
 def _extract(package, diagnostic_dir, *archives, output=None):
     stderr = diagnostic_dir / "extract.stderr"
     stdout = diagnostic_dir / "extract.stdout"
-    arguments = ["extract", "--direct-file", "-c", "k", "-r", "1", "--no-flatten", "--no-pause"]
+    arguments = ["extract", "-d", "-c", "k", "-r", "1", "--no-flatten", "--no-pause"]
     if output is not None:
         arguments.extend(("-o", str(output)))
     with stdout.open("wb") as out, stderr.open("wb") as err:

@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 pub(super) struct LogicalInput {
     // Password evidence may have a bounded view without a proven extraction end.
-    pub password_probe: Option<Box<ArchiveInput>>,
     pub input: ArchiveInput,
     pub password: Option<Arc<str>>,
     pub failure: Option<Failure>,
@@ -57,7 +56,6 @@ impl Task {
         Self {
             inputs: vec![LogicalInput {
                 input,
-                password_probe: None,
                 password: None,
                 failure,
             }],
@@ -80,7 +78,7 @@ impl Task {
         match self.context.take() {
             Some(TaskContext::Report(scope)) => (report.then_some(scope), None),
             Some(TaskContext::Retry(retry)) => {
-                let scope = (report && self.source != DiscoverySource::Direct).then(|| Arc::clone(&retry.scope));
+                let scope = report.then(|| Arc::clone(&retry.scope));
                 (scope, Some(retry))
             }
             None => (None, None),
@@ -234,8 +232,8 @@ pub(super) fn discover(
     for (path, kind) in paths.into_iter().zip(kinds) {
         match kind {
             1 => files.push(path),
-            2 if !request.direct => directories.push(path),
-            2 | 3 => result.errors.push(InputError {
+            2 => directories.push(path),
+            3 => result.errors.push(InputError {
                 path: PathBuf::from(path),
                 message: "A regular input file is required".to_owned(),
                 kind: InputErrorKind::InvalidInput,
@@ -301,7 +299,7 @@ pub(super) fn discover(
         let logical_scope = request.discovery_scope.clone().unwrap_or_else(|| {
             NativeDiscoveryScope::new(
                 parent.to_string_lossy().into_owned(),
-                if request.direct { Some(0) } else { max_depth },
+                max_depth,
                 Vec::new(),
             )
         });
@@ -334,7 +332,6 @@ pub(super) fn discover(
     let mut shared_roots = HashMap::new();
     if request.recursive
         && options.can_share_recursive_context()
-        && !request.direct
         && request.discovery_scope.is_none()
         && request.watch_catalog.is_none()
     {
@@ -382,7 +379,7 @@ pub(super) fn discover(
         let scope = request.discovery_scope.clone().unwrap_or_else(|| {
             NativeDiscoveryScope::new(
                 parent,
-                if request.direct { Some(0) } else { max_depth },
+                max_depth,
                 Vec::new(),
             )
         });
@@ -395,7 +392,7 @@ pub(super) fn discover(
             result.scan_errors.extend(filtered.scan_errors());
         }
         let mut table = NativeCandidateTable::new();
-        table.append_directory(&raw, &filtered, Some(FileTargets::new(targets)))?;
+        table.append_directory(&raw, &filtered, Some(FileTargets::new(targets)), request.deep)?;
         match probe_relations(&mut table, &filtered, &raw, candidates, &mut verified, request) {
             Ok(()) => tables.push(table),
             Err(error) if request.watch_catalog.is_some() && !crate::io::cancellation::is_cancellation(&error) => {
@@ -441,25 +438,6 @@ pub(super) fn discover(
         }
     }
     result.project(&mut tables, candidates, &verified, request, false)?;
-    if request.direct {
-        let covered: HashSet<_> = result
-            .tasks
-            .iter()
-            .flat_map(|task| task.owned_paths.iter().map(|path| path_key(path)))
-            .collect();
-        for path in files.into_iter().filter(|path| {
-            let key = path_key(path);
-            !covered.contains(&key) && !result.blocked_paths.contains(&key)
-        }) {
-            let name = filesystem_logical_name(&path);
-            result.tasks.push(Task::single(
-                ArchiveInput::file(path.clone(), String::new(), name),
-                vec![path],
-                DiscoverySource::Direct,
-                None,
-            ));
-        }
-    }
     retain_logical_retry_scopes(logical_scopes.into_values(), &mut retry_scopes);
     assign_retry_scopes(&mut result.tasks, &retry_scopes);
     if !prepared_tasks.is_empty() {
@@ -666,13 +644,11 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
             let scope = &scopes[0];
             scope.scope.contains_key(&key).then_some(scope)
         };
-        task.context = selected.and_then(|scope| {
+        task.context = selected.map(|scope| {
             if task.inputs.len() == 1 && may_split {
-                Some(TaskContext::Retry(Arc::clone(scope)))
-            } else if task.source != DiscoverySource::Direct {
-                Some(TaskContext::Report(Arc::clone(&scope.scope)))
+                TaskContext::Retry(Arc::clone(scope))
             } else {
-                None
+                TaskContext::Report(Arc::clone(&scope.scope))
             }
         });
     }
@@ -796,7 +772,7 @@ fn directory_table(
     request: &Request,
 ) -> io::Result<NativeCandidateTable> {
     let mut table = NativeCandidateTable::new();
-    table.append_directory(raw, filtered, targets)?;
+    table.append_directory(raw, filtered, targets, request.deep)?;
     probe_relations(&mut table, filtered, raw, candidates, verified, request)?;
     Ok(table)
 }
@@ -810,6 +786,7 @@ fn probe_relations(
     request: &Request,
 ) -> io::Result<()> {
     use rayon::prelude::*;
+    if request.deep { return Ok(()); }
     let pending = table.encrypted_rar_anchors();
     if pending.is_empty() { return Ok(()); }
     let resolved = pending.into_par_iter().map(|anchor| request.cancel.run(|| {
@@ -910,6 +887,9 @@ impl Discovered {
         request: &Request,
         recursive: bool,
     ) -> io::Result<NativeEmbeddedBatch> {
+        if request.deep {
+            return Ok(table.prepare_deep());
+        }
         let mut routes = table.resolve()?;
         for &(index, status) in &routes.relation_events {
             if matches!(status, 1 | 2) {
@@ -931,12 +911,10 @@ impl Discovered {
             }
         }
         let embedded = request.config.embedded_scan;
-        let force = request.deep && !recursive;
         Ok(table.prepare_embedded(
             &mut routes,
             recursive,
-            force,
-            embedded.enabled || force,
+            embedded.enabled,
             embedded.recursive_candidate_ratio,
         ))
     }
@@ -1158,9 +1136,9 @@ fn project_segments(
         let resolved_end = resolution.as_ref().and_then(|result| result.end_offset);
         let end = resolved_end.or(item.end_offset);
         let failure = resolution.as_ref().and_then(|result| result.failure_reason);
-        let exact = item.is_logical_archive()
-            && (resolved_end.is_some() || (item.volume_anchor.is_none() && item.end_offset.is_some()));
-        if !exact && failure.is_none() {
+        let standalone = item.is_logical_archive()
+            && (resolved_end.is_some() || (item.volume_anchor.is_none() && !item.password_required()));
+        if !standalone && failure.is_none() {
             continue;
         }
         let mut input = ArchiveInput::file(path.clone(), item.format.to_owned(), name.clone());
@@ -1174,7 +1152,7 @@ fn project_segments(
         }
         input.analysis.origin = AnalysisOrigin::Embedded;
         input.analysis.password_required = item.password_required();
-        input.analysis.structure_complete = item.format == "lz4";
+        input.analysis.structure_complete = item.format == "lz4" && end.is_some();
         input.analysis.volume_completeness = Some(if end.is_some() {
             VolumeCompleteness::Complete
         } else {
@@ -1192,7 +1170,6 @@ fn project_segments(
         }
         inputs.push(LogicalInput {
             input,
-            password_probe: None,
             password: resolution.and_then(|result| result.password),
             failure,
         });

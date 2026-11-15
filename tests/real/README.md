@@ -10,7 +10,7 @@
 
 | 场景 | 独立覆盖 | 实测结果 |
 | --- | --- | --- |
-| [嵌套 RAR5 SFX 与尾部独立加密 7z](test_adversarial_carriers.py) | SFX 本身是 RAR 数据头卷，其他 RAR 卷位于伪装载体内。外部 7-Zip 对同一 SFX 分别验证 RAR5 和 7z，SunPack 必须解出两份且完整后才能清理源输入。 | CLI 和 Watch 均解出 RAR、漏掉 7z，仍报告完成并清理源载体。 |
+| [嵌套 RAR5 SFX 与尾部独立加密 7z](test_adversarial_carriers.py) | SFX 本身是 RAR 数据头卷，其他 RAR 卷位于伪装载体内。外部 7-Zip 对同一 SFX 分别验证 RAR5 和 7z，SunPack 必须解出两份且完整后才能清理源输入。 | 开启 deep detect 后，CLI 和 Watch 均提取 RAR 与尾部 7z，完整处理后清理源载体。 |
 | [两组 RAR5 共享全部三个卷载体](test_adversarial_carriers.py) | 中间载体上的区段顺序反转，使用不同密码校验同格式卷组能按区段正确配对，不串卷或重复输出。 | CLI 和 Watch 均通过。 |
 | [同名伪装加密卷组的失败分类](test_adversarial_split_classification.py) | 同一递归扫描里，完整组只缺密码，另一组有正确密码但缺中间卷。缺卷允许没有识别结果。 | 7z 和 RAR5 SFX 的 CLI、Watch 四个用例均通过。 |
 | [外来 RAR5 第二卷顶替缺卷](test_adversarial_split_classification.py) | 用同名、同尺寸、同卷号的外来第二卷填入缺口。原组已提供密码，外来卷的头卷及密码均未提供。按文件核对失败归属。 | CLI 和 Watch 均将缺卷归于原 SFX 头卷，将密码错误归于外来第二卷，并保留源文件。 |

@@ -901,10 +901,6 @@
     "performance": {
       "zh": "高级性能配置",
       "en": "Advanced performance"
-    },
-    "analysis": {
-      "zh": "压缩包分析",
-      "en": "Archive analysis"
     }
   },
   "fields": {
@@ -1256,60 +1252,6 @@
       },
       "min": 0,
       "max": 1
-    },
-    "/analysis/modules/@zip/enabled": {
-      "label": {
-        "zh": "ZIP",
-        "en": "ZIP"
-      }
-    },
-    "/analysis/modules/@rar/enabled": {
-      "label": {
-        "zh": "RAR",
-        "en": "RAR"
-      }
-    },
-    "/analysis/modules/@seven_zip/enabled": {
-      "label": {
-        "zh": "7z",
-        "en": "7z"
-      }
-    },
-    "/analysis/modules/@tar/enabled": {
-      "label": {
-        "zh": "TAR",
-        "en": "TAR"
-      }
-    },
-    "/analysis/modules/@gzip/enabled": {
-      "label": {
-        "zh": "GZIP",
-        "en": "GZIP"
-      }
-    },
-    "/analysis/modules/@bzip2/enabled": {
-      "label": {
-        "zh": "BZIP2",
-        "en": "BZIP2"
-      }
-    },
-    "/analysis/modules/@xz/enabled": {
-      "label": {
-        "zh": "XZ",
-        "en": "XZ"
-      }
-    },
-    "/analysis/modules/@lz4/enabled": {
-      "label": {
-        "zh": "LZ4",
-        "en": "LZ4"
-      }
-    },
-    "/analysis/modules/@zstd/enabled": {
-      "label": {
-        "zh": "Zstandard",
-        "en": "Zstandard"
-      }
     },
     "/watch/event_log_retention_days": {
       "label": {

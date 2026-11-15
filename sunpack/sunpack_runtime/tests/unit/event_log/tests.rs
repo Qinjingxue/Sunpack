@@ -29,7 +29,7 @@ fn archive_diagnostics_do_not_expand_or_change_shared_recovery_receipts() {
     let input = crate::io::archive_state::ArchiveInput::file("C:/input.zip".into(), "zip".into(), "input.zip".into());
     let checkpoint = json!({"schema_version":1,"carrier":"C:/input.zip","input":input,
         "sources":[],"output":"C:/output","container":"C:/output","files":1,"bytes":1,
-        "encrypted":false,"discovery_source":"direct"});
+        "encrypted":false,"discovery_source":"embedded"});
     let mut expected = None;
     for count in [1, 1024] {
         let failure: crate::pipeline::Failure = serde_json::from_value(json!({

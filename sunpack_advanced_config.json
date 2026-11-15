@@ -244,45 +244,5 @@
   "embedded_scan": {
     "enabled": true,
     "recursive_candidate_ratio": 0.3
-  },
-  "analysis": {
-    "modules": [
-      {
-        "name": "zip",
-        "enabled": true
-      },
-      {
-        "name": "rar",
-        "enabled": true
-      },
-      {
-        "name": "seven_zip",
-        "enabled": true
-      },
-      {
-        "name": "tar",
-        "enabled": true
-      },
-      {
-        "name": "gzip",
-        "enabled": true
-      },
-      {
-        "name": "bzip2",
-        "enabled": true
-      },
-      {
-        "name": "xz",
-        "enabled": true
-      },
-      {
-        "name": "lz4",
-        "enabled": true
-      },
-      {
-        "name": "zstd",
-        "enabled": true
-      }
-    ]
   }
 }

@@ -41,11 +41,11 @@ def _extract_batch(package, tmp_path, entry_mode, head, cases, passwords):
     )
     output = tmp_path / "out"
     if entry_mode == "cli":
-        report = extract_report(package, inputs, output, passwords=passwords, cleanup="d", code=(0, 1))
+        report = extract_report(package, inputs, output, passwords=passwords, cleanup="d", code=(0, 1), deep=True)
         summary = report["summary"]
         assert summary["failed_count"] == summary["partial_success_count"] == 0, report
     else:
-        watch = watch_setup(package, tmp_path, passwords=passwords, cleanup="d", recursive=True)
+        watch = watch_setup(package, tmp_path, passwords=passwords, cleanup="d", recursive=True, deep=True)
         inputs = inputs.rename(watch.root / inputs.name)
         try:
             event = package.await_watch_event(
@@ -129,3 +129,28 @@ def test_two_rar_groups_use_different_ranges_of_each_shared_carrier(package, tmp
         parts = [right, left] if index == 2 else [left, right]
         assemble_carrier(inputs / f"共享.part{index}.rar.图片", parts, seed=825 + index)
     _extract_batch(package, tmp_path, entry_mode, inputs / "共享.part1.rar.图片", cases, passwords)
+
+
+def test_selected_head_discovers_independent_archive_in_known_continuation(package, tmp_path):
+    # Only the head is selected. A directly recognizable continuation must
+    # still receive full scanning when it is found through volume recovery.
+    require_generator("rar")
+    generated = tmp_path / "generated"
+    rar = create_encrypted_rar_archive(
+        generated, "selected", password="rar-key", header_encrypt=False,
+        split=True, payload_size=103 * 1024, split_volume_size=40 * 1024,
+    )
+    peer = FACTORY.create(generated, "overlay", "7z", password="overlay-key", payload_size=8192)
+    tails = sorted(path for path in rar.archive_dir.iterdir() if path != rar.entry_path)
+    assert len(tails) >= 2
+    tail = tails[0]
+    tail.write_bytes(tail.read_bytes() + b"\0independent overlay\0" + peer.entry_path.read_bytes())
+    _test_archive(package, rar.entry_path, "rar5", "rar-key")
+    _test_archive(package, tail, "7z", peer.password)
+    output = tmp_path / "out"
+    report = extract_report(
+        package, rar.entry_path, output, passwords=["rar-key", peer.password], cleanup="d", deep=True,
+    )
+    assert report["summary"]["failed_count"] == 0, report
+    _assert_payloads(output, [rar, peer])
+    assert source_directory_cleaned(rar.archive_dir)

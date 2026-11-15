@@ -789,8 +789,8 @@ pub(super) fn completion_archive(path: &str, depth: usize, kind: Option<FailureK
         failure: kind.map(|kind| crate::pipeline::Failure::new(kind, format!("{kind:?}"))),
         files: 0, bytes: 0, encrypted: None, depth, offset: 0, end_offset: None,
         volume_completeness: None, volume_attempts: None, source_paths: vec![path.into()],
-        password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
-        damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
+        password: None, discovery_source: crate::pipeline::DiscoverySource::Embedded,
+        partial: false, retained: false, recovered_complete_files: 0,
           scan_layout: Default::default(),
     }
 }
@@ -967,7 +967,7 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
             "input":input,
             "sources":[{"path":source,"generation":capture_file_generation(source).unwrap()}],
             "output":output,
-            "container":null,"files":1,"bytes":4,"encrypted":false,"discovery_source":"direct",
+            "container":null,"files":1,"bytes":4,"encrypted":false,"discovery_source":"embedded",
             "failure":partial.then(|| json!({
                 "partial":true,"password_signature":null,
                 "failure":{"kind":"damaged","message":"accepted recovery"},
@@ -1720,7 +1720,7 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
                 "sources":[{"path":source,"generation":capture_file_generation(&source)?}],
                 "output":output,
                 "container":container,
-                "files":1,"bytes":9,"encrypted":false,"discovery_source":"direct",
+                "files":1,"bytes":9,"encrypted":false,"discovery_source":"embedded",
             }]));
             operations.put_entry(Arc::new(blocker));
             Ok(operations)
@@ -1755,8 +1755,7 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
             files: 0, bytes: 0, encrypted: None, depth: 2, offset: 0,
             end_offset: None, volume_completeness: None, volume_attempts: None,
             source_paths: vec![nested.clone()], password: None,
-            discovery_source: crate::pipeline::DiscoverySource::Direct, damage_flags: None,
-            partial: false, retained: false, recovered_complete_files: 0,
+            discovery_source: crate::pipeline::DiscoverySource::Embedded,             partial: false, retained: false, recovered_complete_files: 0,
               scan_layout: Default::default(),
         };
         observer.register_output(&archive, &nested_output).unwrap();

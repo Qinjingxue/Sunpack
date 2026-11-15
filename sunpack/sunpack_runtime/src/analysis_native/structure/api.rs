@@ -45,29 +45,3 @@ pub(crate) fn unified_prefilter_mask_from_head(file_size: u64, head: &[u8]) -> u
     }
     rejected
 }
-
-#[derive(Clone, Copy)]
-pub(crate) enum StreamStructure {
-    Complete(&'static str),
-    Lz4 { end: u64 },
-}
-
-pub(crate) fn inspect_compression_stream_reader(
-    reader: &ManagedReader,
-    header: &[u8],
-) -> std::io::Result<Option<StreamStructure>> {
-    if let Some(kind) = StructuralStreamKind::from_header(header) {
-        return complete_structural_stream(reader, kind)
-            .map(|format| format.map(StreamStructure::Complete));
-    }
-    if crate::formats::lz4::leading(header) {
-        let file_size = reader.len();
-        let index = crate::formats::lz4::walk(reader, 0, file_size);
-        return Ok(index.complete.then_some(StreamStructure::Lz4 { end: index.end }));
-    }
-    Ok(None)
-}
-
-pub(crate) fn has_compression_stream_header(header: &[u8]) -> bool {
-    StructuralStreamKind::from_header(header).is_some() || crate::formats::lz4::leading(header)
-}

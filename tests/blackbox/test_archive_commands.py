@@ -265,7 +265,7 @@ def test_partial_content_policy_uses_verified_members_and_retains_source(package
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
 
     output = tmp_path / "partial"
-    report = package.json("extract", "--direct-file", "-c", "d", "-o", output, source)
+    report = package.json("extract", "-d", "-c", "d", "-o", output, source)
     assert report["summary"]["partial_success_count"] == 1
     assert report["summary"]["success_count"] == report["summary"]["failed_count"] == 0
     failure, = report["tasks"][0]["failures"]
@@ -278,7 +278,7 @@ def test_partial_content_policy_uses_verified_members_and_retains_source(package
     settings["extraction"]["content_requirement"] = "complete"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     rejected_output = tmp_path / "complete"
-    result = package.run("extract", "--direct-file", "-c", "d", "-o", rejected_output, source, "--json")
+    result = package.run("extract", "-d", "-c", "d", "-o", rejected_output, source, "--json")
     assert result.returncode != 0
     assert source.is_file()
     assert not list(rejected_output.rglob("good.txt"))

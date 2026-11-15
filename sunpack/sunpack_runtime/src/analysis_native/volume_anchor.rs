@@ -1271,7 +1271,7 @@ fn probe_standalone_stream(
     } else if let Some(kind) = StructuralStreamKind::from_header(prefix) {
         compression_prefix_identity(kind, prefix, out.size, read).then_some(kind.format())
     } else if prefix.get(257..262) == Some(b"ustar") {
-        crate::analysis_native::view::tar_header_identity(prefix, out.size).then_some("tar")
+        crate::formats::tar::header_identity(prefix, out.size).then_some("tar")
     } else {
         None
     };

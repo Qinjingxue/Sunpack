@@ -286,8 +286,7 @@ fn archive(name: &str, failure: Option<FailureKind>) -> ArchiveResult {
         files: 1, bytes: 42, encrypted: None, depth: 1,
         offset: 0, end_offset: None, volume_completeness: None,
         volume_attempts: None, source_paths: Vec::new(), password: None,
-        discovery_source: crate::pipeline::DiscoverySource::Direct, damage_flags: None,
-        partial: false, retained: false, recovered_complete_files: 0,
+        discovery_source: crate::pipeline::DiscoverySource::Embedded,         partial: false, retained: false, recovered_complete_files: 0,
           scan_layout: Default::default(),
     }
 }

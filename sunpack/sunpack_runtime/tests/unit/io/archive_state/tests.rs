@@ -6,26 +6,18 @@ fn recovery_descriptor_uses_main_contract_without_worker_projection_fields() {
     input.analysis.origin = AnalysisOrigin::Embedded;
     input.analysis.volume_completeness = Some(VolumeCompleteness::Complete);
     input.analysis.password_required = true;
-    // Embedded's execution-only ZIP offset does not occur in main's
-    // descriptor until planning installs it into the existing analysis.
+    // Embedded keeps its execution-only ZIP offset out of the report.
     input.analysis.zip_eocd_offset = Some(8);
     assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"],
         serde_json::json!({"volume_completeness":"complete", "password_required":true}));
-    input.analysis.planning_applied = true;
-    assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"]["zip_eocd_offset"], 8);
-    input.analysis.origin = AnalysisOrigin::Planned;
-    input.analysis.status = Some(AnalysisStatus::Damaged);
-    assert!(serde_json::to_string(&input.report()).unwrap().ends_with(
-        r#""analysis":{"status":"damaged","damage_flags":[],"zip_eocd_offset":8,"password_required":true}}"#));
     let persisted = serde_json::to_vec(&input).unwrap();
     let restored: ArchiveInput = serde_json::from_slice(&persisted).unwrap();
     assert_eq!(serde_json::to_string(&input.report()).unwrap(), serde_json::to_string(&restored.report()).unwrap());
 }
 
 #[test]
-fn recovery_descriptor_does_not_export_single_file_planning_hints() {
+fn recovery_descriptor_exports_only_supported_missing_volume_evidence() {
     let mut input = ArchiveInput::file("truncated.7z".into(), "7z".into(), "truncated".into());
-    input.analysis.planning_applied = true;
     input.analysis.missing_volume_evidence = Some("seven_zip_start_header_length".into());
     assert!(serde_json::to_value(input.report()).unwrap().get("analysis").is_none());
     assert!(serde_json::to_value(input.worker_input()).unwrap().get("analysis").is_none());
@@ -40,11 +32,10 @@ fn recovery_descriptor_does_not_export_single_file_planning_hints() {
         "seven_zip_start_header_length");
     assert_eq!(serde_json::to_value(input.worker_input()).unwrap()["analysis"]["execution"]["missing_volume_evidence"],
         "seven_zip_start_header_length");
-    // A relation conclusion is a different producer: main exports this
-    // fact before planning even when only the first known volume exists.
+    // Relations exports its conclusion even when only the first known
+    // volume exists.
     input.parts = Box::new([input.parts[0].clone()]);
     input.analysis.origin = AnalysisOrigin::Relations;
-    input.analysis.planning_applied = false;
     input.analysis.missing_volume_evidence = Some("relation_missing_volume".into());
     assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"]["execution"]["missing_volume_evidence"],
         "relation_missing_volume");
@@ -176,4 +167,107 @@ fn shared_volume_domains_are_indexed_once_and_validate_checkpoint_geometry() {
     let mut wrong = trimmed;
     wrong[0].extent.end = Some(6);
     assert!(!plan.admits_parts(&wrong));
+}
+
+/// Construct sliced inputs for execution fixtures.
+pub(crate) fn archive_input_slices(
+    source: &ArchiveInput,
+    slices: &[(&str, u64, Option<u64>)],
+) -> io::Result<(Vec<Option<ArchiveInput>>, Option<ArchiveInput>)> {
+    let Some(&(first_format, first_start, first_end)) = slices.first() else {
+        return Ok((Vec::new(), None));
+    };
+    let segments = build_segments(source)?;
+    let total = segments
+        .iter()
+        .try_fold(0u64, |sum, part| sum.checked_add(part.len()))
+        .ok_or_else(|| invalid("input size overflow"))?;
+    let projected: Vec<_> = slices
+        .iter()
+        .map(|&(format, start, end)| {
+            project_input_slice(source, &segments, total, format, start, end, false)
+        })
+        .collect();
+    let probe = projected[0]
+        .is_none()
+        .then(|| {
+            project_input_slice(
+                source,
+                &segments,
+                total,
+                first_format,
+                first_start,
+                first_end,
+                true,
+            )
+        })
+        .flatten();
+    Ok((projected, probe))
+}
+
+fn project_input_slice(
+    source: &ArchiveInput,
+    segments: &[Segment],
+    total: u64,
+    format: &str,
+    start: u64,
+    end: Option<u64>,
+    probe: bool,
+) -> Option<ArchiveInput> {
+    let mut end = end.or(probe.then_some(total))?;
+    if start >= end || end > total {
+        return None;
+    }
+    if format == "rar" && segments.len() > 1 {
+        // RAR callbacks use independent volume containers. Preserve their
+        // sequence for extraction. A password probe may use a bounded head.
+        if !probe || start == 0 {
+            return probe.then(|| source.clone());
+        }
+        end = end.min(segments[0].len());
+        if start >= end {
+            return None;
+        }
+    } else if start == 0 && end == total {
+        return probe.then(|| source.clone());
+    }
+    let mut cursor = 0;
+    let mut mapped = Vec::new();
+    for Segment::Range {
+        path,
+        start: base,
+        len,
+    } in segments
+    {
+        let stop = cursor + len;
+        let begin = start.max(cursor);
+        let finish = end.min(stop);
+        if begin < finish {
+            mapped.push(InputExtent {
+                path: path.clone(),
+                start: base + (begin - cursor),
+                end: Some(base + (finish - cursor)),
+            });
+        }
+        cursor = stop;
+        if cursor >= end {
+            break;
+        }
+    }
+    if mapped.is_empty() {
+        return None;
+    }
+    let mut input = ArchiveInput::file(
+        source.entry_path.clone(),
+        format.to_owned(),
+        source.logical_name.clone(),
+    );
+    if mapped.len() == 1 {
+        input.mode = OpenMode::FileRange;
+        input.parts = Box::new([InputPart::range(mapped.pop().unwrap())]);
+    } else {
+        input.mode = OpenMode::ConcatRanges;
+        input.ranges = mapped.into_boxed_slice();
+    }
+    Some(input)
 }

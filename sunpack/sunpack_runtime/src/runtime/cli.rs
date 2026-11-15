@@ -192,7 +192,6 @@ struct Options {
     pause: bool,
     deep: bool,
     recursive: bool,
-    direct: bool,
     flatten: Option<bool>,
     depth: Option<(Recursion, String)>,
     cleanup: Option<CleanupMode>,
@@ -220,7 +219,7 @@ const COMMANDS: &[(&str, &str)] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OptionId {
     Help, Json, Verbose, NoPause, Pause, Recursive, Deep, Password, PasswordFile,
-    AskPassword, NoBuiltins, Recur, Cleanup, Output, Flatten, NoFlatten, Direct,
+    AskPassword, NoBuiltins, Recur, Cleanup, Output, Flatten, NoFlatten,
     NoTray, Start, RuleStdin,
 }
 
@@ -281,7 +280,6 @@ const OPTION_SPECS: &[OptionSpec] = &[
     OptionSpec { id: OptionId::Output, names: "-o/--out-dir", metavar: "OUTPUT_DIR", scope: OptionScope::ExtractOrAdd, help: "cli.output_dir", watch_help: "cli.watch.output_dir", watch_order: 6 },
     OptionSpec { id: OptionId::Flatten, names: "-f/--flatten", metavar: "", scope: OptionScope::Extract, help: "cli.flatten", watch_help: "cli.flatten", watch_order: 14 },
     OptionSpec { id: OptionId::NoFlatten, names: "-F/--no-flatten", metavar: "", scope: OptionScope::Extract, help: "cli.no_flatten", watch_help: "cli.no_flatten", watch_order: 15 },
-    OptionSpec { id: OptionId::Direct, names: "--direct-file/--direct", metavar: "", scope: OptionScope::Extract, help: "cli.extract.direct_file", watch_help: "cli.extract.direct_file", watch_order: 16 },
     OptionSpec { id: OptionId::NoTray, names: "--no-tray", metavar: "", scope: OptionScope::WatchStart, help: "cli.watch.no_tray", watch_help: "cli.watch.no_tray", watch_order: 18 },
     OptionSpec { id: OptionId::Start, names: "-s/--start", metavar: "", scope: OptionScope::WatchAdd, help: "cli.watch.start_after_add", watch_help: "cli.watch.start_after_add", watch_order: 7 },
     OptionSpec { id: OptionId::RuleStdin, names: "--scan-rule-stdin", metavar: "", scope: OptionScope::Validate, help: "", watch_help: "", watch_order: 20 },
@@ -463,7 +461,6 @@ impl Options {
                 }
                 Some(OptionId::Recursive) => options.recursive = true,
                 Some(OptionId::Deep) => options.deep = true,
-                Some(OptionId::Direct) => options.direct = true,
                 Some(OptionId::Flatten) => {
                     if options.flatten == Some(false) { return Err(argument_error(command, &options.action, "-f", "not allowed with argument -F/--no-flatten")); }
                     options.flatten = Some(true)
@@ -1655,7 +1652,6 @@ async fn archives(
         request.output_base = common_root.clone();
         request.max_depth = max_depth;
         request.recursive = options.recursive;
-        request.direct = options.direct;
         request.deep = options.deep;
         request.passwords = user.iter().chain(&clipboard).cloned().collect();
         request.password_snapshot = builtin.clone();
@@ -1746,7 +1742,7 @@ async fn archives(
             }
             result.inputs = json!({
                 "paths": inputs, "common_root": common_root, "json": true, "verbose": options.verbose,
-                "direct_file": options.direct, "deep_detect": options.deep, "config_overrides": overrides,
+                "deep_detect": options.deep, "config_overrides": overrides,
             });
             result.summary = json!({
                 "success_count": counts.success, "failed_count": failed, "scan_error_count": scan_errors,
@@ -2062,9 +2058,6 @@ fn report_scan(
                 }
                 if options.verbose {
                     obj.insert("discovery_source".into(), json!(entry.discovery_source));
-                    if let Some(flags) = entry.damage_flags.as_ref().filter(|flags| !flags.is_empty()) {
-                        obj.insert("damage_flags".into(), json!(flags));
-                    }
                 }
                 if let Some(failure) = &entry.failure {
                     obj.insert("error".into(), json!(failure_message(failure, language)));
@@ -2157,15 +2150,9 @@ fn report_scan(
                         crate::pipeline::DiscoverySource::Relations => "relations",
                         crate::pipeline::DiscoverySource::Detection => "detection",
                         crate::pipeline::DiscoverySource::Embedded => "embedded",
-                        crate::pipeline::DiscoverySource::Direct => "direct",
                     };
                     let text = language.translate("cli.scan.source", &[("source", source)]);
                     line(session, Stream::Out, &format!("{prefix}{text}"))?;
-                    if let Some(flags) = entry.damage_flags.as_ref().filter(|flags| !flags.is_empty()) {
-                        let text =
-                            language.translate("cli.scan.damage", &[("flags", &flags.join(", "))]);
-                        line(session, Stream::Out, &format!("{prefix}{text}"))?;
-                    }
                 }
             }
         }

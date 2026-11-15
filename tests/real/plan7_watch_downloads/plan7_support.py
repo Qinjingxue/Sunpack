@@ -97,7 +97,7 @@ def write_passwords(package, root, passwords):
 
 
 def watch_setup(package, base, *, passwords=(*WRONG_PASSWORDS, PASSWORD),
-                cleanup="k", flatten=False, recursive=False, start=True, output_inside=False):
+                cleanup="k", flatten=False, recursive=False, start=True, output_inside=False, deep=True):
     root = base / "watch"
     output = (root if output_inside else base) / "out"
     root.mkdir(parents=True, exist_ok=True)
@@ -107,7 +107,9 @@ def watch_setup(package, base, *, passwords=(*WRONG_PASSWORDS, PASSWORD),
     )
     write_passwords(package, root, passwords)
     arguments = ["-R"] if recursive else []
-    package.json("watch", "add", "-d", *arguments, root, "-o", output)
+    if deep:
+        arguments.append("-d")
+    package.json("watch", "add", *arguments, root, "-o", output)
     watch = Watch(package, root, output)
     if start:
         watch.start()

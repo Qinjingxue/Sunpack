@@ -417,7 +417,11 @@ fn scan_embedded_jobs(
                                 EmbeddedOutcome::read_error(path, Arc::clone(error))
                             }
                             None => {
-                                scan_embedded_candidate(path, batch.force_scan, pe, parallel_files)
+                                scan_embedded_candidate(path, batch.force_scan, pe, parallel_files,
+                                    match &table.rows[index] {
+                                        Candidate::File(facts, row) if batch.force_scan => facts.relation_anchors[*row].as_ref().and_then(CheapAnchor::anchor),
+                                        _ => None,
+                                    })
                             }
                         };
                         if !matches!(outcome, EmbeddedOutcome::Residual) {
@@ -565,7 +569,7 @@ impl NativeEmbeddedBatch {
             for (source, snapshot) in table.relation_sources.iter().enumerate() {
                 for &row in snapshot.rows.iter() {
                     if snapshot.table.is_dir(row) || !snapshot.table.relation_member_eligible(row)
-                        || snapshot.table.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor).is_some() {
+                        || (!self.force_scan && snapshot.table.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor).is_some()) {
                         continue;
                     }
                     let path = &snapshot.table.paths[row];
@@ -982,6 +986,7 @@ impl NativeCandidateTable {
         raw_snapshot: &NativeDirectorySnapshot,
         filtered_snapshot: &NativeDirectorySnapshot,
         targets: Option<FileTargets>,
+        deep: bool,
     ) -> std::io::Result<()> {
         (|| {
             self.targets = targets;
@@ -989,6 +994,18 @@ impl NativeCandidateTable {
                 .targets
                 .as_ref()
                 .and_then(|targets| targets.select(filtered_snapshot));
+            if deep {
+                // Embedded is the only producer in deep mode. Keep raw peers
+                // for directed volume recovery, without pre-grouping or
+                // decrypting these archives on another discovery route.
+                let selected = selected.as_ref().unwrap_or(filtered_snapshot);
+                self.rows.extend(selected.rows.iter().copied()
+                    .filter(|&row| !selected.table.is_dir(row))
+                    .map(|row| Candidate::File(Arc::clone(&selected.table), row)));
+                self.retain_targets();
+                self.relation_sources.push(raw_snapshot.share_rows());
+                return;
+            }
             let groups = self.relation_groups(
                 raw_snapshot,
                 filtered_snapshot,
@@ -1400,18 +1417,25 @@ impl NativeCandidateTable {
         Ok(routes)
     }
 
+    pub(crate) fn prepare_deep(&self) -> NativeEmbeddedBatch {
+        NativeEmbeddedBatch {
+            ids: (0..self.rows.len()).collect(),
+            force_scan: true,
+            ..NativeEmbeddedBatch::default()
+        }
+    }
+
     /// Finish primary projection before calling: only embedded/relation rows survive.
     pub(crate) fn prepare_embedded(
         &mut self,
         routes: &mut NativeDiscoveryRoutes,
         recursive: bool,
-        force_scan: bool,
         enabled: bool,
         recursive_ratio: f64,
     ) -> NativeEmbeddedBatch {
         let mut ids = std::mem::take(&mut routes.embedded);
         let ratio = recursive_ratio.clamp(0.0, 1.0);
-        let select_all = enabled && (force_scan || !recursive);
+        let select_all = enabled && !recursive;
         if !select_all {
             let mut threshold = 0.0;
             let mut sizes = Vec::new();
@@ -1496,7 +1520,7 @@ impl NativeCandidateTable {
         }
         let mut prepass = std::mem::take(&mut routes.scans);
         let scans = if ids.len() == self.rows.len() {
-            // A full deep scan already uses every row; do not duplicate its
+            // All rows are selected; do not duplicate their
             // candidate storage or prepass map merely to reproduce the same indices.
             prepass
         } else {
@@ -1538,7 +1562,7 @@ impl NativeCandidateTable {
             nominated: 0,
             peer_rows: None,
             seen_paths: HashSet::new(),
-            force_scan,
+            force_scan: false,
         };
         if enabled && (select_all || ratio > 0.0) {
             batch.enqueue_volume_peers(self);
@@ -1552,6 +1576,7 @@ fn scan_embedded_candidate(
     force_scan: bool,
     pe_state: Option<PeState>,
     parallel_files: usize,
+    leading: Option<&crate::analysis_native::volume_anchor::VolumeAnchor>,
 ) -> EmbeddedOutcome {
     if path.is_empty() {
         return EmbeddedOutcome::Residual;
@@ -1582,8 +1607,11 @@ fn scan_embedded_candidate(
     #[cfg(test)]
     peer_scan_tests::record_scan(path);
     match scan_embedded_path(path, parallel_files) {
-        Ok(scan) if scan.has_candidates() => EmbeddedOutcome::Scan(Arc::new(scan)),
-        Ok(_) => EmbeddedOutcome::Residual,
+        Ok(mut scan) => {
+            if let Some(anchor) = leading { scan.retain_leading_stream(anchor); }
+            if scan.has_candidates() { EmbeddedOutcome::Scan(Arc::new(scan)) }
+            else { EmbeddedOutcome::Residual }
+        },
         Err(error) => EmbeddedOutcome::read_error(path, Arc::new(error)),
     }
 }

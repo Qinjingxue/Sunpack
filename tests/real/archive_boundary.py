@@ -31,13 +31,11 @@ def require_generator(archive_format, *, sfx=False, seven_zip_lz4=False):
 
 
 def extract_report(package, inputs, output, *, passwords=(), cleanup="k", recursive=False,
-                   recur="*", code=0, deep=True, direct=False):
+                   recur="*", code=0, deep=True):
     paths = [inputs] if isinstance(inputs, (Path, str)) else inputs
     flags = ["-R"] if recursive else []
     if deep:
         flags.append("-d")
-    if direct:
-        flags.append("--direct-file")
     password_args = [f"--password={password}" for password in passwords]
     result = package.run(
         "extract", "--json", "--no-pause", "--no-bpw", "--no-flatten",

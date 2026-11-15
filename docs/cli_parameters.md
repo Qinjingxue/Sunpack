@@ -52,7 +52,7 @@ JSON `summary.scan_error_count` counts filesystem scan errors, including errors 
 
 `extract --json` reports archive and input failures in `tasks[].failures`. `scan --json` reports a logical archive error as `items[].error` and `items[].error_kind`; it does not expose the internal worker evidence or recovery preview. Scan fields are sparse: byte ranges appear for range inputs or embedded extents, and volume fields only for actual volume layouts or confirmed missing volumes. Internal unknown completeness is omitted; unresolved volume attempt plans use `pending` (or `missing` when confirmed). Retained extraction outputs are listed in `summary.recovered_outputs`.
 
-For `extract`, `summary.failed_count` and each attempt's `failed_count` count archive processing failures. `input_error_count` separately counts invalid inputs, such as a directory passed to `--direct-file`; these use `[Input error]` in text output. Attempts also include `scan_error_count` and `input_error_count`. Bounded filesystem diagnostic details are stored once in `summary.scan_failures`; each attempt's `failures` contains archive and input failures. Classification uses structured failure kinds and target results. All error categories remain in `errors` and cause a nonzero exit code, even when other archives succeed.
+For `extract`, `summary.failed_count` and each attempt's `failed_count` count archive processing failures. `input_error_count` separately counts invalid inputs, such as an unsupported filesystem object; these use `[Input error]` in text output. Attempts also include `scan_error_count` and `input_error_count`. Bounded filesystem diagnostic details are stored once in `summary.scan_failures`; each attempt's `failures` contains archive and input failures. Classification uses structured failure kinds and target results. All error categories remain in `errors` and cause a nonzero exit code, even when other archives succeed.
 
 ## extract
 
@@ -72,13 +72,12 @@ Options:
 | `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | Read passwords from a text file, one per line. |
 | `-a`, `--ask-pw` | Prompt for passwords interactively in the terminal; an empty line ends input. |
 | `--no-builtin-pw`, `--no-bpw` | Disable persistent JSON passwords, including clipboard history. |
-| `-d`, `--deep-detect` | Enable a full embedded scan for unresolved candidates and disable all filesystem scan filters for this request. |
+| `-d`, `--deep-detect` | Use Embedded as the sole archive discovery entry, scanning complete files in every extraction round; disable filesystem scan filters and the recursive Embedded size-ratio heuristic. Recursion depth and authorization still apply. |
 | `-r VALUE`, `--recur VALUE` | Override the number of nested extraction rounds; accepts a positive integer, `*`, or `?`. |
 | `-c VALUE`, `--cleanup VALUE` | Override how the original archive is handled on success: `d` delete, `r` Recycle Bin, `k` keep. |
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | Set the output root; relative paths are resolved against the current command directory. |
 | `-f`, `--flatten` | Lift the contents of a single top-level directory after extraction. |
 | `-F`, `--no-flatten` | Keep the extracted directory structure. |
-| `--direct-file`, `--direct` | Treat every input path directly as an archive, skipping directory scanning and automatic candidate discovery. |
 
 When `--out-dir` is given, results land under "output root / the input path relative to its common root / archive name"; when it is omitted, results land next to the archive. When a nested archive is produced inside the output root, the sub-archive still computes its own output location from where it sits.
 
@@ -95,7 +94,7 @@ sunpack.exe extract D:\Downloads
 sunpack.exe extract D:\A.7z -p 123456 -p secret
 sunpack.exe extract D:\Archives --pw-file .\passwords.txt --cleanup r
 sunpack.exe extract D:\Nested --recur * --no-flatten
-sunpack.exe extract --direct-file D:\MaybeArchive.bin
+sunpack.exe extract --deep-detect D:\MaybeArchive.bin
 sunpack.exe extract D:\Archives -o E:\Unpacked
 ```
 
@@ -121,9 +120,9 @@ sunpack.exe scan [options] <paths...>
 
 Ambiguous volumes retain compact slot candidates and layouts, without expanding combinations, and remain pending actual extraction. A bounded password test does not establish archive integrity or validate an entire volume set. Scan does not extract, create output directories, inspect contents that require extraction, verify outputs, flatten directories, or clean source files.
 
-The password input options are shared with extract. `-v` adds existing discovery sources and damage facts without extra analysis; `--json` independently selects the output format.
+The password input options are shared with extract. `-v` adds existing discovery sources without extra analysis; `--json` independently selects the output format.
 
-`--deep-detect` performs a full embedded scan on candidates not resolved by normal detection and disables all filesystem scan filters for this request, for scan. `--recursive` determines the directory scope. Each CLI request uses its own arguments, even when it shares a runtime with deep monitoring of the same input directory.
+`--deep-detect` uses full-file Embedded discovery instead of the normal Relations/Detection prepass and disables filesystem scan filters for this request. Embedded reuses the existing password and volume resolver after discovering anchors. `--recursive` determines the directory scope. Each CLI request uses its own arguments, even when it shares a runtime with deep monitoring of the same input directory.
 
 Examples:
 

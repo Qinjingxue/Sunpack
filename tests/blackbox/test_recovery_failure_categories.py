@@ -82,7 +82,7 @@ def test_allow_partial_rejects_nonrecoverable_worker_failure_after_complete_memb
     )
     output = tmp_path / "out"
     report = package.json(
-        "extract", "--direct-file", "--no-builtin-pw", "-p", "first-key",
+        "extract", "-d", "--no-builtin-pw", "-p", "first-key",
         "-r", "*", "-c", "d", "-o", output, source, code=1,
     )
     assert report["summary"]["failed_count"] == 1, report

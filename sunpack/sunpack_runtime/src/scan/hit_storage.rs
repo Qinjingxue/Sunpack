@@ -24,7 +24,8 @@ const DESC_BYTES: usize = 16;
 const PATCH: u32 = 5;
 const BITMAP: u32 = 6;
 const GROUP: u32 = 7;
-const SPARSE_TYPES: u32 = 1 << 25;
+// Reserve all sixteen tag bits (11..=26), including future signatures.
+const SPARSE_TYPES: u32 = 1 << 27;
 const RUNS: u32 = 1 << 30;
 const WIDE: u32 = 1 << 31;
 const CHECKPOINT: usize = 8;
@@ -135,7 +136,7 @@ impl TypePlan {
     fn new<T: Copy + Into<usize>>(n: usize, counts: &[T; 16]) -> Self {
         let mut tags = 0;
         let mut dominant = 0;
-        for i in 0..14 {
+        for i in 0..=PATTERNS.len() {
             if counts[i].into() != 0 {
                 tags |= 1 << i;
             }

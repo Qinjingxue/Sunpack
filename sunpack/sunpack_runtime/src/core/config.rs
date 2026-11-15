@@ -31,7 +31,6 @@ pub struct Config {
     pub post_extract: PostExtractConfig,
     pub filesystem: FilesystemConfig,
     pub performance: PerformanceConfig,
-    pub analysis: AnalysisConfig,
 }
 
 #[derive(Clone, PartialEq)]
@@ -168,17 +167,6 @@ pub struct PerformanceConfig {
 pub struct WorkerConfig {
     pub space_poll_interval_ms: Option<u64>,
     pub space_status_report_interval_ms: Option<u64>,
-}
-
-#[derive(Clone, PartialEq)]
-pub struct AnalysisConfig {
-    pub modules: Arc<[AnalysisModule]>,
-}
-
-#[derive(Clone, PartialEq)]
-pub struct AnalysisModule {
-    pub name: Box<str>,
-    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -880,21 +868,6 @@ impl Config {
             .enumerate()
             .map(|(index, filter)| ScanFilter::parse(index, filter))
             .collect::<io::Result<Arc<[_]>>>()?;
-        // A supplied module list replaces the defaults, including a null
-        // value that the analysis engine treats as no configured modules.
-        let modules = at(value, &["analysis", "modules"])
-            .unwrap_or(&defaults()["analysis"]["modules"])
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry["name"].as_str()?.trim();
-                (!name.is_empty()).then(|| AnalysisModule {
-                    name: name.into(),
-                    enabled: json_truthy(&entry["enabled"]),
-                })
-            })
-            .collect();
         let mut user_passwords: Vec<Arc<str>> = match value.get("user_passwords") {
             None | Some(Value::Null) => Vec::new(),
             Some(value) => serde::Deserialize::deserialize(value)
@@ -969,7 +942,6 @@ impl Config {
                     .filter(|&interval| interval >= 1000),
                 },
             },
-            analysis: AnalysisConfig { modules },
         })
     }
 }

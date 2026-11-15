@@ -430,8 +430,7 @@ impl InputCheckpoint {
                 .collect(),
             password: None,
             discovery_source: self.discovery_source,
-            damage_flags: None,
-            partial: self.failure.as_ref().is_some_and(|receipt| receipt.partial),
+                        partial: self.failure.as_ref().is_some_and(|receipt| receipt.partial),
             retained: true,
             recovered_complete_files: self
                 .failure

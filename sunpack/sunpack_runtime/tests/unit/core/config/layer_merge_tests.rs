@@ -1,14 +1,6 @@
 use super::*;
 
 #[test]
-fn explicit_null_analysis_modules_does_not_enable_builtins() {
-    let default = Config::parse(&serde_json::json!({"analysis": null})).unwrap();
-    let disabled = Config::parse(&serde_json::json!({"analysis": {"modules": null}})).unwrap();
-    assert!(!default.analysis.modules.is_empty());
-    assert!(disabled.analysis.modules.is_empty());
-}
-
-#[test]
 fn observed_invalid_edit_is_consumed_while_inspection_stays_strict() {
     let path = crate::test_support::temp_file("observed_config", br#"{"cli":{"language":"en"}}"#);
     let sources = ConfigSources { simple: Some(path.clone()), ..Default::default() };

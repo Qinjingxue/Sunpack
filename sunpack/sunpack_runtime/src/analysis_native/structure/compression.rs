@@ -1,13 +1,3 @@
-use crate::scan::compression_stream::{
-    analyze_gzip_structure, gzip_payload_offset_from_slice, validate_bzip2_identity, validate_bzip2_structure,
-    validate_gzip_structure, validate_xz_identity, validate_xz_structure_exact,
-    validate_zstd_structure, IntegrityStatus, ValidationError,
-};
-use std::io;
-
-const EAGER_STREAM_INTEGRITY_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const STREAM_STRUCTURE_DECODE_MAX_BYTES: u64 = 8 * 1024 * 1024;
-
 #[derive(Clone, Copy)]
 pub(super) enum StructuralStreamKind {
     Gzip,
@@ -135,47 +125,3 @@ fn zstd_prefix_identity(data: &[u8], file_size: u64) -> bool {
     let stored_size = if block_type == 1 { 1 } else { block_size };
     block_header_offset as u64 + 3 + stored_size <= file_size
 }
-
-fn complete_structural_stream(
-    reader: &ManagedReader,
-    kind: StructuralStreamKind,
-) -> io::Result<Option<&'static str>> {
-    let size = reader.len();
-    let eager_integrity = size <= EAGER_STREAM_INTEGRITY_MAX_BYTES;
-    let validation = match kind {
-        StructuralStreamKind::Gzip if eager_integrity => {
-            analyze_gzip_structure(reader, 0, size, STREAM_STRUCTURE_DECODE_MAX_BYTES)
-        }
-        StructuralStreamKind::Gzip => validate_gzip_structure(reader, 0, size),
-        StructuralStreamKind::Bzip2 => validate_bzip2_structure(reader, 0, size),
-        StructuralStreamKind::Xz => validate_xz_structure_exact(reader, 0, size),
-        StructuralStreamKind::Zstd => validate_zstd_structure(reader, 0, size),
-    };
-    match validation {
-        Ok(facts) if facts.end_offset == size && facts.integrity != IntegrityStatus::Failed => {}
-        Ok(_) | Err(ValidationError::Invalid(_)) => return Ok(None),
-        Err(ValidationError::Io(error)) => return Err(crate::io::resource_error::to_io_error(error)),
-    }
-
-    if eager_integrity && matches!(kind, StructuralStreamKind::Bzip2) {
-        // The structural walk checks stored checksums against their block
-        // headers. Preserve eager verification of the first member's decoded
-        // content, reading through the same bounded reader.
-        let decoder = bzip2::read::BzDecoder::new(reader.cursor());
-        let mut bounded = decoder.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
-        match io::copy(&mut bounded, &mut io::sink()) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof
-                || error.get_ref().is_some_and(|cause| cause.is::<bzip2::Error>()) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(crate::io::resource_error::to_io_error(error)),
-        }
-    }
-    Ok(Some(kind.format()))
-}
-
-#[cfg(test)]
-#[path = "../../../tests/unit/analysis_native/structure/compression/complete_stream_tests.rs"]
-mod complete_stream_tests;

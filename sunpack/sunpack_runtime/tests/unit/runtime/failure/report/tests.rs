@@ -23,8 +23,7 @@ fn missing_volume_wrapper_borrows_recovery_and_streams_both_receipts() {
         failure: Some(failure), files: 0, bytes: 0, encrypted: None, depth: 0,
         offset: 0, end_offset: None, volume_completeness: None,
         volume_attempts: None, source_paths: vec![], password: None,
-        discovery_source: DiscoverySource::Embedded, damage_flags: None,
-        partial: false, retained: false, recovered_complete_files: 0,
+        discovery_source: DiscoverySource::Embedded,         partial: false, retained: false, recovered_complete_files: 0,
           scan_layout: Default::default(),
     }];
     let report = archive_report(&[&archives[0]], Language::En).unwrap();
@@ -132,8 +131,7 @@ fn single_discovery_failure_remains_a_leaf() {
         failure: Some(failure), files: 0, bytes: 0, encrypted: None, depth: 0,
         offset: 0, end_offset: None, volume_completeness: None,
         volume_attempts: None, source_paths: vec![], password: None,
-        discovery_source: DiscoverySource::Embedded, damage_flags: None,
-        partial: false, retained: false, recovered_complete_files: 0,
+        discovery_source: DiscoverySource::Embedded,         partial: false, retained: false, recovered_complete_files: 0,
           scan_layout: Default::default(),
     }];
     let reports = serde_json::to_value(collect(&archives, Language::En)).unwrap();

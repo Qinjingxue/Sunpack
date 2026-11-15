@@ -23,7 +23,7 @@ def test_direct_read_failure_is_reported_once_without_fallback(package, tmp_path
     handle = kernel.CreateFileW(str(source), 0x40000000, 6, None, 3, 0x80, None)
     assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
     try:
-        report = package.json("extract", "--direct-file", "-d", source, code=1)
+        report = package.json("extract", "-d", source, code=1)
     finally:
         kernel.CloseHandle(handle)
     assert report["summary"]["scan_error_count"] == 0, report
@@ -158,7 +158,6 @@ def test_recursive_file_targets_share_embedded_relation_candidates(
     if embedded:
         head.write_bytes(b"carrier prefix\0" + head.read_bytes())
     tails = [tail.rename(other / tail.name) for tail in tails]
-    original = {part: part.read_bytes() for part in [head, *tails]}
     ordinary = root / "ordinary.zip"
     with zipfile.ZipFile(ordinary, "w") as archive:
         archive.writestr("ordinary.txt", b"ordinary")
@@ -171,28 +170,12 @@ def test_recursive_file_targets_share_embedded_relation_candidates(
     combined_out = tmp_path / "combined"
     assert alone["summary"]["failed_count"] == 1
     combined = package.json("extract", "-d", "-R", "-c", cleanup, "-r", "1",
-                            "-o", combined_out, ordinary, head, code=0 if embedded else 1)
-    assert combined["summary"]["failed_count"] == int(not embedded)
-    assert combined["summary"]["success_count"] == 1 + int(embedded)
+                            "-o", combined_out, ordinary, head)
+    assert combined["summary"]["failed_count"] == 0
+    assert combined["summary"]["success_count"] == 2
     assert next(combined_out.rglob("ordinary.txt")).read_bytes() == b"ordinary"
-    if embedded:
-        assert next(combined_out.rglob(payload.name)).read_bytes() == content
-        assert all(part.exists() == (cleanup == "k") for part in [head, *tails])
-        return
-
-    assert not list(combined_out.rglob(payload.name))
-    assert {part: part.read_bytes() for part in original} == original
-
-    # Ordinary split discovery picks up the tails inside the original boundary.
-    nested = child / "download"
-    nested.mkdir()
-    for tail in tails:
-        tail.rename(nested / tail.name)
-    recovered = tmp_path / "recovered"
-    report = package.json("extract", "-d", "-R", "-c", "k", "-r", "1",
-                          "-o", recovered, head)
-    assert report["summary"]["success_count"] == 1
-    assert next(recovered.rglob(payload.name)).read_bytes() == content
+    assert next(combined_out.rglob(payload.name)).read_bytes() == content
+    assert all(part.exists() == (cleanup == "k") for part in [head, *tails])
 
 
 def _nested_mixed_carrier(package, tmp_path, *, recursive_child=False):

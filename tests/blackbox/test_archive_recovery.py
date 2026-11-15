@@ -255,7 +255,7 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
     carrier.write_bytes(content)
 
     output = tmp_path / "out"
-    report = package.json("extract", "--direct-file", "-r", "*", "-c", "d", "-o", output, carrier)
+    report = package.json("extract", "-d", "-r", "*", "-c", "d", "-o", output, carrier)
     assert report["summary"]["success_count"] == 1
     assert report["summary"]["partial_success_count"] == 1
     assert report["summary"]["recovered_outputs"][0]["complete_files"] == intact_files
@@ -289,7 +289,7 @@ def test_failed_nonempty_output_is_retained_without_partial_success(package, tmp
         post_extract={"flatten_single_directory": False},
     )
     output = tmp_path / "out"
-    report = package.json("extract", "--direct-file", "-r", "*", "-c", "d", "-o", output, source, code=1)
+    report = package.json("extract", "-d", "-r", "*", "-c", "d", "-o", output, source, code=1)
     assert report["summary"]["failed_count"] == 1, report
     assert report["summary"]["partial_success_count"] == 0, report
     assert report["summary"]["success_count"] == int(nested), report
@@ -324,7 +324,7 @@ def test_nested_failure_does_not_revoke_outer_source_cleanup(package, tmp_path, 
     )
     output = tmp_path / "out"
     report = package.json(
-        "extract", "--direct-file", "-r", "*", "-c", cleanup, "-o", output, source,
+        "extract", "-d", "-r", "*", "-c", cleanup, "-o", output, source,
         code=0 if requirement == "allow_partial" else 1,
     )
     assert report["summary"]["success_count"] == 1, report

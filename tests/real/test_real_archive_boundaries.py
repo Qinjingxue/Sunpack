@@ -34,7 +34,7 @@ def test_real_windows_name_and_path_boundaries(package, tmp_path, case_id, membe
             archive.writestr(name, payload.encode("utf-8"))
     output = tmp_path / "out"
     report = extract_report(
-        package, source, output, recur="1", deep=False, direct=True, code=int(not expect_success),
+        package, source, output, recur="1", deep=True, code=int(not expect_success),
     )
     assert not list(tmp_path.rglob("escape.txt"))
     assert report["summary"]["success_count"] == int(expect_success)
@@ -68,7 +68,7 @@ def test_real_damage_patterns(package, tmp_path, case_id, damage, expected_succe
         case = FACTORY.create(tmp_path, case_id, "zip", payload_size=260 * 1024)
         corrupt_file(case.entry_path, mode=damage)
     report = extract_report(
-        package, case.entry_path, tmp_path / "out", recur="1", deep=False, direct=True,
+        package, case.entry_path, tmp_path / "out", recur="1", deep=True,
         code=int(not expected_success),
     )
     assert report["summary"]["success_count"] == int(expected_success)

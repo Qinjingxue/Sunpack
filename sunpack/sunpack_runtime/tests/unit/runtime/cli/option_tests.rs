@@ -72,11 +72,11 @@ fn password_display_escapes_controls_without_changing_candidates() {
 fn option_aliases_share_values_without_leaking_action_scope() {
     let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
     for args in [
-        vec!["e", "-vRd", "-psecret", "-Ppasswords.txt", "-r1", "-ck", "-odest", "-fa", "--no-bpw", "--direct", "a.zip"],
-        vec!["extract", "--verbose", "--recursive", "--deep-detect", "--password=secret", "--pw-file=passwords.txt", "--recur=1", "--cleanup=k", "--out-dir=dest", "--flatten", "--ask-pw", "--no-builtin-pw", "--direct-file", "a.zip"],
+        vec!["e", "-vRd", "-psecret", "-Ppasswords.txt", "-r1", "-ck", "-odest", "-fa", "--no-bpw", "a.zip"],
+        vec!["extract", "--verbose", "--recursive", "--deep-detect", "--password=secret", "--pw-file=passwords.txt", "--recur=1", "--cleanup=k", "--out-dir=dest", "--flatten", "--ask-pw", "--no-builtin-pw", "a.zip"],
     ] {
         let value = parse(&args).unwrap();
-        assert!(value.verbose && value.recursive && value.deep && value.direct);
+        assert!(value.verbose && value.recursive && value.deep);
         assert!(value.prompt_passwords && value.no_builtins);
         assert_eq!(value.flatten, Some(true));
         assert_eq!(value.depth, Some((Recursion::Fixed(1), "1".into())));
@@ -111,7 +111,8 @@ fn argparse_option_resolution_and_boundaries() {
     assert_eq!(value.passwords[0].as_ref(), "-secret");
     assert_eq!(value.output.as_deref(), Some("dest"));
     assert_eq!(value.paths, ["file.zip"]);
-    assert!(parse(&["extract", "--direct", "file.zip"]).unwrap().direct);
+    assert!(parse(&["extract", "--direct", "file.zip"]).is_err());
+    assert!(parse(&["extract", "--direct-file", "file.zip"]).is_err());
     for args in [
         vec!["extract", "a.zip", "--cle", "d"],
         vec!["scan", "a.zip", "--recurs"],

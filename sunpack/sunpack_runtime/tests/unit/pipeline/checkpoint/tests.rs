@@ -12,8 +12,7 @@ fn recovery_receipts_preserve_pre_cleanup_facts_and_relocate_only_outputs() {
         path: source.clone(), format: "zip".into(), output: None, failure: None,
         files: 0, bytes: 0, encrypted: None, depth: 1, offset: 0, end_offset: None,
         volume_completeness: None, volume_attempts: None, source_paths: vec![source.clone()],
-        password: None, discovery_source: DiscoverySource::Direct, damage_flags: None,
-        partial: false, retained: false, recovered_complete_files: 0,
+        password: None, discovery_source: DiscoverySource::Embedded,         partial: false, retained: false, recovered_complete_files: 0,
          scan_layout: Default::default(),
     };
     result.failure = Some(Failure::new(FailureKind::Damaged, "damaged").with_context(super::super::FailureContext::Extraction));
@@ -62,13 +61,11 @@ fn recovery_receipts_preserve_pre_cleanup_facts_and_relocate_only_outputs() {
     assert!(recovery.aggregated());
     let mut hinted = checkpoint.clone();
     let facts = &mut Arc::make_mut(&mut hinted.input).analysis;
-    facts.planning_applied = true;
     facts.missing_volume_evidence = Some("seven_zip_start_header_length".into());
     let hinted_report = InputRecovery::capture(&[hinted.clone()], &source, None, None, 1, false, true)
         .unwrap().report(render);
     assert_eq!(hinted_report["inputs"][0]["blockers"], serde_json::json!([]));
     let facts = &mut Arc::make_mut(&mut hinted.input).analysis;
-    facts.planning_applied = false;
     facts.origin = crate::io::archive_state::AnalysisOrigin::Relations;
     let confirmed_report = InputRecovery::capture(&[hinted], &source, None, None, 1, false, true)
         .unwrap().report(render);
@@ -148,7 +145,7 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
         output: output.clone(),
         planned_output: None,
         container: None, files: 1, bytes: 7, encrypted: None,
-        discovery_source: DiscoverySource::Direct, failure: None,
+        discovery_source: DiscoverySource::Embedded, failure: None,
     };
     let mut result = complete.result(1);
     result.failure = Some(Failure::new(FailureKind::MissingVolume, "missing volume"));

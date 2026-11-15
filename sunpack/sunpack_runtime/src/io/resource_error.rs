@@ -34,11 +34,3 @@ pub(crate) fn zeroed_bytes(len: usize) -> io::Result<Vec<u8>> {
     bytes.resize(len, 0);
     Ok(bytes)
 }
-
-pub(crate) fn to_io_error(error: io::Error) -> io::Error {
-    if error.kind() != io::ErrorKind::OutOfMemory && is_memory_error(&error) {
-        io::Error::new(io::ErrorKind::OutOfMemory, error)
-    } else {
-        error
-    }
-}

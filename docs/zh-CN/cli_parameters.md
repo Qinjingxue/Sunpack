@@ -52,7 +52,7 @@ JSON 的 `summary.scan_error_count` 统计文件系统扫描错误，包括省�
 
 `extract --json` 在 `tasks[].failures` 中报告归档和输入失败。`scan --json` 通过 `items[].error` 和 `items[].error_kind` 报告逻辑归档错误，不公开内部 worker 证据或恢复预览。scan 按事实稀疏输出字段：区间输入或嵌入区段显示字节范围，实际分卷布局或确认缺卷时才显示分卷字段；内部 unknown 完整度不公开，尚未解决的分卷尝试计划显示 `pending`（确认缺卷时为 `missing`）。最终保留的提取输出列于 `summary.recovered_outputs`。
 
-`extract` 的 `summary.failed_count` 和各轮处理的 `failed_count` 统计归档处理失败；`input_error_count` 单独统计无效输入，例如向 `--direct-file` 传入目录，文本中显示为 `[输入错误]`。各轮处理另有 `scan_error_count` 和 `input_error_count`。受预算限制的文件系统诊断详情集中保存在 `summary.scan_failures`，各轮的 `failures` 保存归档失败和输入错误。分类依据结构化错误类别和目标结果。所有错误类别均保留在 `errors` 中，并使退出码非零，即使其他归档处理成功也是如此。
+`extract` 的 `summary.failed_count` 和各轮处理的 `failed_count` 统计归档处理失败；`input_error_count` 单独统计无效输入，例如不支持的文件系统对象，文本中显示为 `[输入错误]`。各轮处理另有 `scan_error_count` 和 `input_error_count`。受预算限制的文件系统诊断详情集中保存在 `summary.scan_failures`，各轮的 `failures` 保存归档失败和输入错误。分类依据结构化错误类别和目标结果。所有错误类别均保留在 `errors` 中，并使退出码非零，即使其他归档处理成功也是如此。
 
 ## extract
 
@@ -72,13 +72,12 @@ sunpack.exe extract [options] <paths...>
 | `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
 | `-a`, `--ask-pw` | 在终端交互输入密码，空行结束。 |
 | `--no-builtin-pw`, `--no-bpw` | 禁用 JSON 持久化密码及其中的剪贴板历史。 |
-| `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块。 |
+| `-d`, `--deep-detect` | 以 Embedded 为唯一归档发现入口，每轮扫描完整文件；关闭文件系统过滤和递归 Embedded 大小比例筛选，仍遵守递归深度和授权。 |
 | `-r VALUE`, `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
 | `-c VALUE`, `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录；相对路径按当前命令目录解析。 |
 | `-f`, `--flatten` | 解压后提升单一顶层目录的内容。 |
 | `-F`, `--no-flatten` | 保留解压目录结构。 |
-| `--direct-file`, `--direct` | 将每个输入路径直接作为归档尝试，跳过目录扫描和自动候选发现。 |
 
 `--out-dir` 指定后，结果落在“输出根 / 输入路径相对公共根的部分 / 归档名”下；未指定时落在归档旁边。嵌套归档在输出根内生成时，子归档仍使用自身所在位置计算输出。
 
@@ -95,7 +94,7 @@ sunpack.exe extract D:\Downloads
 sunpack.exe extract D:\A.7z -p 123456 -p secret
 sunpack.exe extract D:\Archives --pw-file .\passwords.txt --cleanup r
 sunpack.exe extract D:\Nested --recur * --no-flatten
-sunpack.exe extract --direct-file D:\MaybeArchive.bin
+sunpack.exe extract --deep-detect D:\MaybeArchive.bin
 sunpack.exe extract D:\Archives -o E:\Unpacked
 ```
 
@@ -121,9 +120,9 @@ sunpack.exe scan [options] <paths...>
 
 分卷歧义使用现有卷位候选和布局的紧凑表示，不展开组合，状态为“等待实际解压验证”。有限密码测试不代表整包完整或整套分卷已验证。scan 不解压、不创建输出目录、不递归进入尚未解压的内容，也不验证输出、扁平化或清理源文件。
 
-支持与 extract 相同的密码输入参数。`-v` 仅增加已有发现来源和损坏信息，不额外分析；`--json` 独立控制输出格式。
+支持与 extract 相同的密码输入参数。`-v` 仅增加已有发现来源，不额外分析；`--json` 独立控制输出格式。
 
-`--deep-detect` 会对普通检测未解决的候选执行完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块，目录范围由 `--recursive` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
+`--deep-detect` 跳过前置 Relations/Detection，仅通过完整文件 Embedded 扫描发现归档，并关闭本次请求的文件系统过滤；发现锚点后复用现有密码与分卷解析。目录范围由 `--recursive` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
 
 示例：
 

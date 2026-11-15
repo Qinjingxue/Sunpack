@@ -309,17 +309,16 @@ def test_launcher_restarts_while_previous_runtime_drains(package):
     assert int(state.read_text(encoding="utf-8").splitlines()[3]) != owner.pid
 
 
-def test_extract_reports_invalid_input_and_filesystem_errors_separately(package, tmp_path):
+def test_extract_reports_filesystem_errors_without_archive_failures(package, tmp_path):
     missing = tmp_path / "missing.zip"
-    report = package.json("extract", "--direct-file", tmp_path, missing, code=1)
+    report = package.json("extract", "-d", tmp_path, missing, code=1)
     assert report["summary"]["failed_count"] == 0
-    assert report["summary"]["input_error_count"] == 1
+    assert report["summary"]["input_error_count"] == 0
     assert report["summary"]["scan_error_count"] == 1
-    assert report["tasks"][0]["failures"][0]["kind"] == "invalid_input"
 
-    result = package.run("extract", "--direct-file", tmp_path, missing)
+    result = package.run("extract", "-d", tmp_path, missing)
     assert result.returncode == 1
-    assert all(label in result.stderr for label in ("[Input error]", "[Scan error]", "[Scan incomplete]"))
+    assert all(label in result.stderr for label in ("[Scan error]", "[Scan incomplete]"))
 
 
 def test_text_extract_keeps_nested_archive_under_its_carrier_segment(package, tmp_path):
