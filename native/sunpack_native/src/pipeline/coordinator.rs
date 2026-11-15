@@ -1010,26 +1010,33 @@ struct CreatedOutput {
 }
 
 impl CreatedOutputs {
-    fn register(&mut self, path: &Path, result: &ArchiveResult) {
-        self.0.insert(output_key(path), CreatedOutput {
+    fn register(registry: &Mutex<Self>, path: &Path, result: &ArchiveResult) {
+        let key = output_key(path);
+        let output = CreatedOutput {
             path: path.to_owned(),
             archive: result.path.clone(),
             sources: result.source_paths.clone(),
-        });
+        };
+        registry.lock().unwrap().0.insert(key, output);
     }
 
-    fn commit_if_unowned(&mut self, root: &Path) {
+    fn commit_if_unowned(registry: &Mutex<Self>, root: &Path) {
         let key = output_key(root);
+        let mut outputs = registry.lock().unwrap();
         if !crate::path_keys::path_ancestors(&key).skip(1)
-            .any(|ancestor| self.0.contains_key(ancestor))
+            .any(|ancestor| outputs.0.contains_key(ancestor))
         {
-            self.commit(root);
+            outputs.commit_key(&key);
         }
     }
 
-    fn commit(&mut self, root: &Path) {
+    fn commit(registry: &Mutex<Self>, root: &Path) {
         let key = output_key(root);
-        self.0.remove(&key);
+        registry.lock().unwrap().commit_key(&key);
+    }
+
+    fn commit_key(&mut self, key: &str) {
+        self.0.remove(key);
         let prefix = format!("{}\\", key.trim_end_matches('\\'));
         let keys: Vec<_> = self.0.range(prefix.clone()..)
             .take_while(|(key, _)| key.starts_with(&prefix))
@@ -2144,7 +2151,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                         if output_is_gone(output, ran_recursive_children) {
                             this.observer.discard_output(&result.path, &result.source_paths, output)?;
-                            this.created_outputs.lock().unwrap().commit(output);
+                            CreatedOutputs::commit(&this.created_outputs, output);
                             result.output = None;
                         }
                     }
@@ -2180,7 +2187,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     // back. Match main's commit/check then retire ordering.
                     if commit_completed && !multi && physical_complete {
                         if let Some(output) = result.output.as_deref() {
-                            this.created_outputs.lock().unwrap().commit_if_unowned(output);
+                            CreatedOutputs::commit_if_unowned(&this.created_outputs, output);
                         }
                     }
                 }
@@ -2253,12 +2260,11 @@ impl<'run, O: Observer> Run<'run, O> {
                 // early. Accepted partial/salvage bytes survive normal request
                 // completion, but a later cancelled sibling must discard them.
                 if physical_complete {
-                    let mut created = this.created_outputs.lock().unwrap();
                     if let Some(root) = carrier.as_deref() {
-                        created.commit_if_unowned(root);
+                        CreatedOutputs::commit_if_unowned(&this.created_outputs, root);
                     }
                     for output in completed.iter().filter_map(|result| result.output.as_deref()) {
-                        created.commit_if_unowned(output);
+                        CreatedOutputs::commit_if_unowned(&this.created_outputs, output);
                     }
                 }
             }
@@ -2267,7 +2273,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     if output_is_gone(root, true) {
                         if let Some(result) = completed.first() {
                             this.observer.discard_output(&result.path, &result.source_paths, root)?;
-                            this.created_outputs.lock().unwrap().commit(root);
+                            CreatedOutputs::commit(&this.created_outputs, root);
                         }
                     }
                 }
@@ -2687,7 +2693,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         Some((path, current.unwrap().clone()))
                     } else {
                         let previous = requested(&path)?;
-                        current.is_none_or(|current| current.matches_input(&previous.persisted()))
+                        current.is_none_or(|current| current.matches_input(previous))
                             .then(|| (path, previous.clone()))
                     }
                 }).collect::<Option<SourceGenerations>>()
@@ -2838,7 +2844,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     // current attempt rather than accepting the old receipt.
                     match self.observer.reuse_output(&result, path) {
                         Ok(()) => {
-                            self.created_outputs.lock().unwrap().register(path, &result);
+                            CreatedOutputs::register(&self.created_outputs, path, &result);
                             Ok(path.to_owned())
                         }
                         Err(error) if error.get_ref().is_some_and(|inner| inner.is::<super::OutputCreateError>()) => {
@@ -3166,7 +3172,7 @@ impl<'run, O: Observer> Run<'run, O> {
         self.observer.discard_output(&result.path, &result.source_paths, path)?;
         // No recursive children have started for this worker's failed output.
         // Retire ownership only after both deletion and journal update succeed.
-        self.created_outputs.lock().unwrap().commit(path);
+        CreatedOutputs::commit(&self.created_outputs, path);
         Ok(true)
     }
 
@@ -3282,7 +3288,7 @@ impl<'run, O: Observer> Run<'run, O> {
     fn recreate_reserved_output(&self, path: &Path, result: &ArchiveResult) -> io::Result<Result<PathBuf, Failure>> {
         match self.observer.register_output(result, path) {
             Ok(()) => {
-                self.created_outputs.lock().unwrap().register(path, result);
+                CreatedOutputs::register(&self.created_outputs, path, result);
                 Ok(Ok(path.to_owned()))
             }
             Err(error) if error.get_ref().is_some_and(|inner| inner.is::<super::OutputCreateError>()) => {
@@ -3304,7 +3310,7 @@ impl<'run, O: Observer> Run<'run, O> {
             preferred, result, &*self.observer, self.output_names.owner, input,
         )?;
         if let Ok(path) = &reserved {
-            self.created_outputs.lock().unwrap().register(path, result);
+            CreatedOutputs::register(&self.created_outputs, path, result);
         }
         Ok(reserved)
     }
@@ -6080,7 +6086,7 @@ mod tests {
                 fs::create_dir(&slot).unwrap();
                 fs::write(sibling.join("keep"), b"unchanged").unwrap();
                 fs::write(slot.join("old"), b"previous attempt").unwrap();
-                let sibling_before = capture_file_generation(&sibling.join("keep")).unwrap().persisted();
+                let sibling_before = capture_file_generation(&sibling.join("keep")).unwrap();
                 let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(),
                     container.file_name().unwrap().to_string_lossy().into_owned());
                 let inputs: Vec<_> = archive_input_slices(&input, &[
@@ -6132,7 +6138,7 @@ mod tests {
                 fs::write(slot.join("new"), b"current attempt").unwrap();
                 assert_eq!(slot.join("old").exists(), cleanup_locked);
                 assert_eq!(fs::read_dir(&container).unwrap().count(), 2);
-                assert_eq!(capture_file_generation(&sibling.join("keep")).unwrap().persisted(), sibling_before);
+                assert_eq!(capture_file_generation(&sibling.join("keep")).unwrap(), sibling_before);
                 assert_eq!(fs::read(sibling.join("keep")).unwrap(), b"unchanged");
                 drop(held);
                 drop(run);
@@ -6676,7 +6682,7 @@ mod tests {
         original.failure = Some(Failure::new(FailureKind::MissingVolume, "missing"));
         let observer = |_: Event| {};
         let run = test_run(&engine, &request, &observer);
-        run.created_outputs.lock().unwrap().register(&output, &original);
+        CreatedOutputs::register(&run.created_outputs, &output, &original);
 
         let last = root.join("split.7z.002");
         let mut writer = fs::File::create(&last).unwrap();
@@ -7377,7 +7383,7 @@ mod tests {
         let mut checkpoint = InputCheckpoint::create(&source, Arc::new(first.clone()), &failed, &generations, None).unwrap();
         checkpoint.install_report(InputCheckpoint::report_state(&first, &failed,
             Some(&output), None, 1, 1));
-        run.created_outputs.lock().unwrap().register(&output, &failed);
+        CreatedOutputs::register(&run.created_outputs, &output, &failed);
         let mut outcome = Outcome::default();
         // Exercise real retry cleanup. The second input then fails before
         // writing output, while the original checkpoint still has partial facts.
@@ -7536,7 +7542,7 @@ mod tests {
         let mut outcome = Outcome::default();
         outcome.archives.push(receipt(&input, DiscoverySource::Direct, 1));
         // Replaced non-directory output fails independently of ACL privileges.
-        run.created_outputs.lock().unwrap().register(&source, &failed);
+        CreatedOutputs::register(&run.created_outputs, &source, &failed);
         assert!(!run.discard_failed_output(&failed, &source, &mut outcome).unwrap());
         assert_eq!(outcome.archives.len(), 1);
         assert_eq!(outcome.cleanup_results.len(), 1);
@@ -7576,7 +7582,7 @@ mod tests {
             fs::create_dir_all(&bad).unwrap();
             fs::create_dir_all(&nested).unwrap();
             fs::write(nested.join("payload"), b"partial data").unwrap();
-            let mut created = CreatedOutputs::default();
+            let created = Mutex::default();
             let mut outcome = Outcome::default();
             for output in [&bad, &good, &nested] {
                 let mut archive = receipt(&input, DiscoverySource::Direct, 1);
@@ -7584,13 +7590,14 @@ mod tests {
                 archive.files = 1;
                 archive.bytes = 12;
                 outcome.checkpoints.push(InputCheckpoint::create(&source, Arc::new(input.clone()), &archive, &generations, None).unwrap());
-                created.register(output, &archive);
+                CreatedOutputs::register(&created, output, &archive);
                 outcome.archives.push(archive);
             }
             // Deterministic unsafe-root failure, independent of ACLs/admin rights.
             fs::remove_dir(&bad).unwrap();
             fs::write(&bad, b"replacement must survive").unwrap();
             let observer = Discards { fail: journal_fails, paths: Mutex::default() };
+            let mut created = created.into_inner().unwrap();
             let result = created.rollback(&observer, &mut outcome);
             if journal_fails {
                 assert_eq!(result.unwrap_err().to_string(), "journal unavailable");
@@ -7653,34 +7660,35 @@ mod tests {
         let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "parent".into());
         // A punctuation sibling sorts between the exact key and descendants.
         // Relocation must scan the separator-prefixed range independently.
-        let mut moving = CreatedOutputs::default();
+        let moving = Mutex::default();
         let old = root.join("a");
         let punctuation = root.join("a (2)");
         let new = root.join("relocated");
         let ownership = receipt(&input, DiscoverySource::Direct, 1);
         for path in [&old, &old.join("child"), &punctuation] {
-            moving.register(path, &ownership);
+            CreatedOutputs::register(&moving, path, &ownership);
         }
+        let mut moving = moving.into_inner().unwrap();
         moving.relocate(&old, &new);
         assert!(moving.0.contains_key(&output_key(&new.join("child"))));
         assert!(!moving.0.contains_key(&output_key(&old.join("child"))));
         assert!(moving.0.contains_key(&output_key(&punctuation)));
         let mut outcome = Outcome::default();
-        let mut created = CreatedOutputs::default();
+        let created = Mutex::default();
         for path in [&parent, &nested, &sibling, &retry_child, &retained_finished, &retained_segment] {
             let mut archive = receipt(&input, DiscoverySource::Direct, 1);
             archive.output = Some(path.clone());
-            created.register(path, &archive);
+            CreatedOutputs::register(&created, path, &archive);
             outcome.archives.push(archive);
         }
-        created.commit_if_unowned(&sibling);
+        CreatedOutputs::commit_if_unowned(&created, &sibling);
         // A freshly created parent still owns its completed nested output.
-        created.commit_if_unowned(&nested);
-        assert!(created.0.contains_key(&output_key(&nested)));
+        CreatedOutputs::commit_if_unowned(&created, &nested);
+        assert!(created.lock().unwrap().0.contains_key(&output_key(&nested)));
         // A retained parent does not own rollback: commit the completed child
         // before deleting its archive source. A later sibling cancellation
         // must not delete the only remaining copy of that child's content.
-        created.commit_if_unowned(&retained_finished);
+        CreatedOutputs::commit_if_unowned(&created, &retained_finished);
         fs::remove_file(&retained_source).unwrap();
         let cancel = Cancellation::new();
         let gate = Arc::new(Mutex::new((false, None::<Waker>)));
@@ -7725,7 +7733,7 @@ mod tests {
         stopper.join().unwrap();
         assert!(nested.join("writer-finished.txt").is_file());
         let observer = Discards(Mutex::default());
-        created.rollback(&observer, &mut outcome).unwrap();
+        created.into_inner().unwrap().rollback(&observer, &mut outcome).unwrap();
         assert!(!parent.exists());
         assert!(!retry_child.exists());
         assert_eq!(fs::read(sibling.join("kept.txt")).unwrap(), b"committed");
@@ -7893,7 +7901,7 @@ mod tests {
             nested.output = Some(child.clone());
             nested.partial = partial;
             if partial { nested.failure = Some(Failure::new(FailureKind::Damaged, "accepted files")); }
-            run.created_outputs.lock().unwrap().register(&child, &nested);
+            CreatedOutputs::register(&run.created_outputs, &child, &nested);
             let mut outcome = Outcome::default();
             outcome.archives = vec![outer, nested].into();
             outcome.uncommitted = true; // cancellation preceded the child's durable commit
@@ -8040,11 +8048,11 @@ mod tests {
         let mut nested = receipt(&input, DiscoverySource::Direct, 2);
         nested.output = Some(child.clone());
         let created = Mutex::new(CreatedOutputs::default());
-        created.lock().unwrap().register(&output, &archive);
+        CreatedOutputs::register(&created, &output, &archive);
         let mut leaf_archive = receipt(&input, DiscoverySource::Direct, 2);
         leaf_archive.path = output.join("inner.zip");
-        created.lock().unwrap().register(&leaf, &leaf_archive);
-        created.lock().unwrap().register(&child, &nested);
+        CreatedOutputs::register(&created, &leaf, &leaf_archive);
+        CreatedOutputs::register(&created, &child, &nested);
         let mut children = Outcome::default();
         children.archives.push(nested);
         let observer = Discards(Mutex::default());

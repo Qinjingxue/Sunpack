@@ -185,6 +185,26 @@ namespace sunpack::sevenzip
         }
     }
 
+    inline void record_read_span(ExtractInputTrace &trace, UInt64 offset, UInt64 source,
+                                 UInt32 requested, UInt32 returned) noexcept
+    {
+        trace.last_read_virtual_offset = offset;
+        trace.last_read_source_offset = source;
+        trace.last_read_requested = requested;
+        trace.last_read_returned = returned;
+    }
+
+    inline void record_input_error(ExtractInputTrace *trace, const std::wstring &path,
+                                   HRESULT hr, UInt64 offset = 0,
+                                   UInt64 source = 0, UInt32 requested = 0) noexcept
+    {
+        if (!trace || FAILED(trace->read_hresult)) return;
+        trace->read_hresult = hr;
+        record_read_span(*trace, offset, source, requested, 0);
+        try { trace->last_source_path = path; }
+        catch (const std::bad_alloc &) { trace->last_source_path.clear(); }
+    }
+
     struct PrefetchSource
     {
         const std::wstring *path = nullptr;
@@ -478,26 +498,14 @@ namespace sunpack::sevenzip
                 size_ = static_cast<UInt64>(size.QuadPart);
             }
 
-            if (trace_)
+            if (trace_ && read_file_timing_enabled())
             {
-
                 trace_->last_source_path = path_;
-                if (read_file_timing_enabled())
-                {
-                    trace_->mode = mode;
-                    trace_->virtual_size = size_;
-                }
-                if (handle_ == INVALID_HANDLE_VALUE)
-                {
-
-                    trace_->read_error = true;
-
-                    trace_->last_hresult = open_hresult_;
-                    if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
-
-                    trace_->last_win32_error = static_cast<int>(open_error);
-                }
+                trace_->mode = mode;
+                trace_->virtual_size = size_;
             }
+            if (handle_ == INVALID_HANDLE_VALUE)
+                record_input_error(trace_, path_, open_hresult_);
 
             if (size_ && prefetch_config.enabled)
             {
@@ -540,18 +548,7 @@ namespace sunpack::sevenzip
             }
 
             const UInt64 read_start = position_;
-            if (trace_)
-            {
-
-                trace_->last_read_virtual_offset = position_;
-
-                trace_->last_read_source_offset = position_;
-
-                trace_->last_read_requested = size;
-
-                trace_->last_read_returned = 0;
-            }
-
+            const bool profiling = trace_ && read_file_timing_enabled() && !FAILED(trace_->read_hresult);
             if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
             {
                 position_ += size;
@@ -560,12 +557,8 @@ namespace sunpack::sevenzip
                 file_pointer_dirty_ = true;
                 record_logical_read(trace_, read_start, size);
                 prefetch_->after_read(position_);
-                if (trace_)
-                {
-                    trace_->last_read_returned = size;
-                    trace_->last_hresult = S_OK;
-                    trace_->last_win32_error = 0;
-                }
+                if (profiling)
+                    record_read_span(*trace_, read_start, read_start, size, size);
                 if (processedSize)
                 {
                     *processedSize = size;
@@ -581,13 +574,7 @@ namespace sunpack::sevenzip
                 {
                     const DWORD error = GetLastError();
                     const HRESULT hr = HRESULT_FROM_WIN32(error);
-                    if (trace_)
-                    {
-                        trace_->read_error = true;
-                        trace_->last_hresult = hr;
-                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
-                        trace_->last_win32_error = static_cast<int>(error);
-                    }
+                    record_input_error(trace_, path_, hr, read_start, read_start, size);
                     return hr;
                 }
                 file_pointer_dirty_ = false;
@@ -610,16 +597,7 @@ namespace sunpack::sevenzip
 
                 const HRESULT hr = HRESULT_FROM_WIN32(error);
 
-                if (trace_)
-                {
-
-                    trace_->read_error = true;
-
-                    trace_->last_hresult = hr;
-                    if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
-
-                    trace_->last_win32_error = static_cast<int>(error);
-                }
+                record_input_error(trace_, path_, hr, read_start, read_start, size);
 
                 return hr;
             }
@@ -633,15 +611,8 @@ namespace sunpack::sevenzip
 
             record_logical_read(trace_, read_start, read);
 
-            if (trace_)
-            {
-
-                trace_->last_read_returned = read;
-
-                trace_->last_hresult = S_OK;
-
-                trace_->last_win32_error = 0;
-            }
+            if (profiling)
+                record_read_span(*trace_, read_start, read_start, size, read);
 
             if (processedSize)
             {
@@ -672,23 +643,7 @@ namespace sunpack::sevenzip
             if (positioned)
                 positioned = SetFilePointerEx(handle_, distance, &new_pos, seekOrigin);
 
-            if (!positioned)
-            {
-
-                const DWORD error = GetLastError();
-
-                const HRESULT hr = HRESULT_FROM_WIN32(error);
-
-                if (trace_)
-                {
-
-                    trace_->last_hresult = hr;
-
-                    trace_->last_win32_error = static_cast<int>(error);
-                }
-
-                return hr;
-            }
+            if (!positioned) return HRESULT_FROM_WIN32(GetLastError());
 
             const UInt64 prior_position = position_;
             position_ = static_cast<UInt64>(new_pos.QuadPart);
@@ -760,6 +715,7 @@ namespace sunpack::sevenzip
                 if (error)
                 {
                     open_hresult_ = HRESULT_FROM_WIN32(error.value());
+                    record_input_error(trace_, path, open_hresult_);
                     continue;
                 }
                 ranges_.push_back({std::move(path), 0, length, total_size_});
@@ -788,22 +744,12 @@ namespace sunpack::sevenzip
                     continue;
                 }
 
-                UInt64 file_size = 0;
-
-                try
+                std::error_code error;
+                const UInt64 file_size = std::filesystem::file_size(input.path, error);
+                if (error)
                 {
-
-                    file_size = static_cast<UInt64>(std::filesystem::file_size(input.path));
-                }
-                catch (const std::filesystem::filesystem_error& error)
-                {
-                    open_hresult_ = HRESULT_FROM_WIN32(error.code().value());
-                    if (trace_) {
-                        trace_->read_error = true;
-                        trace_->last_win32_error = error.code().value();
-                        trace_->last_hresult = open_hresult_;
-                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
-                    }
+                    open_hresult_ = HRESULT_FROM_WIN32(error.value());
+                    record_input_error(trace_, input.path, open_hresult_);
                     continue;
                 }
 
@@ -861,6 +807,7 @@ namespace sunpack::sevenzip
             }
 
             const UInt64 read_start = position_;
+            const bool profiling = trace_ && read_file_timing_enabled() && !FAILED(trace_->read_hresult);
             auto *out = static_cast<unsigned char *>(data);
 
             if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
@@ -868,18 +815,13 @@ namespace sunpack::sevenzip
                 position_ += size;
                 record_logical_read(trace_, read_start, size);
                 prefetch_->after_read(position_);
-                if (trace_)
+                if (profiling)
                 {
                     const std::size_t index = find_range_index(read_start);
                     const auto &range = ranges_[index];
-                    const UInt64 offset_in_range = read_start - range.virtual_offset;
-                    trace_->last_read_virtual_offset = read_start;
-                    trace_->last_read_source_offset = range.start + offset_in_range;
-                    trace_->last_read_requested = size;
-                    trace_->last_read_returned = size;
+                    const UInt64 source = range.start + (read_start - range.virtual_offset);
+                    record_read_span(*trace_, read_start, source, size, size);
                     trace_source(index);
-                    trace_->last_hresult = S_OK;
-                    trace_->last_win32_error = 0;
                 }
                 if (processedSize)
                 {
@@ -908,45 +850,13 @@ namespace sunpack::sevenzip
                 const UInt64 remaining = range->length - offset_in_range;
 
                 const UInt32 want = static_cast<UInt32>(std::min<UInt64>(size - total_read, remaining));
-
-                if (trace_)
-                {
-
-                    trace_->last_read_virtual_offset = position_;
-
-                    trace_->last_read_source_offset = range->start + offset_in_range;
-
-                    trace_->last_read_requested = want;
-
-                    trace_->last_read_returned = 0;
-
-                    trace_source(index);
-                }
-
+                const UInt64 source_offset = range->start + offset_in_range;
                 const HRESULT open_result = ensure_cached_handle(index);
-
                 if (open_result != S_OK)
                 {
-
-                    const DWORD error = GetLastError();
-
-                    const HRESULT hr = open_result;
-
-                    if (trace_)
-                    {
-
-                        trace_->read_error = true;
-
-                        trace_->last_hresult = hr;
-                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
-
-                        trace_->last_win32_error = static_cast<int>(error);
-                    }
-
-                    return hr;
+                    record_input_error(trace_, range->path, open_result, position_, source_offset, want);
+                    return open_result;
                 }
-
-                const UInt64 source_offset = range->start + offset_in_range;
 
                 if (cached_handle_position_ != source_offset)
                 {
@@ -964,16 +874,7 @@ namespace sunpack::sevenzip
 
                         close_cached_handle();
 
-                        if (trace_)
-                        {
-
-                            trace_->read_error = true;
-
-                            trace_->last_hresult = hr;
-                            if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
-
-                            trace_->last_win32_error = static_cast<int>(error);
-                        }
+                        record_input_error(trace_, range->path, hr, position_, source_offset, want);
 
                         return hr;
                     }
@@ -1001,41 +902,23 @@ namespace sunpack::sevenzip
 
                     const HRESULT hr = HRESULT_FROM_WIN32(error);
 
-                    if (trace_)
-                    {
-
-                        trace_->read_error = true;
-
-                        trace_->last_hresult = hr;
-                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
-
-                        trace_->last_win32_error = static_cast<int>(error);
-                    }
+                    record_input_error(trace_, range->path, hr, position_, source_offset, want);
 
                     return hr;
                 }
 
+                if (profiling)
+                {
+                    record_read_span(*trace_, position_, source_offset, want, read);
+                    trace_source(index);
+                }
                 if (read == 0)
                 {
-
                     break;
                 }
-
                 total_read += read;
-
                 position_ += read;
-
                 cached_handle_position_ += read;
-
-                if (trace_)
-                {
-
-                    trace_->last_read_returned = read;
-
-                    trace_->last_hresult = S_OK;
-
-                    trace_->last_win32_error = 0;
-                }
             }
 
             record_logical_read(trace_, read_start, total_read);

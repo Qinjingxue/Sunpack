@@ -854,8 +854,7 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 }
             }
             if let Some((live, reset)) = live {
-                let mut values = Vec::with_capacity(live.len());
-                for (id, row) in live {
+                let values = live.into_iter().map(|(id, row)| {
                     let value = if let Some((status, group)) = row {
                         let mut value: Value = serde_json::from_slice(&status)?;
                         if let Some(group) = group {
@@ -865,20 +864,27 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                     } else {
                         None
                     };
-                    values.push((id, value));
-                }
+                    Ok((id, value))
+                });
                 store.update_live(values, reset, cutoff)?;
             }
             deadline = store.expire(cutoff)?.map(|ts| ts.saturating_add(retention));
             store.manifest.dropped += dropped;
-            store.publish()
+            Ok(())
         })();
+        let records_written = result.is_ok();
+        let result = result.and_then(|()| store.as_mut().unwrap().publish());
+        // A sharing conflict at publication leaves the written records and
+        // pending manifest intact. Retry on the next event or explicit flush.
+        let publication_blocked = records_written && result.as_ref().is_err_and(|error| {
+            crate::io::atomic_file::sharing_conflict(error)
+        });
         let expired = store
             .as_mut()
             .map(|store| std::mem::take(&mut store.expired_live))
             .unwrap_or_default();
         let mut state = shared.state.lock().unwrap();
-        if result.is_ok() && !expired.is_empty() {
+        if records_written && !expired.is_empty() {
             state.projection.expire_live(
                 expired,
                 now.saturating_sub(i64::from(days).saturating_mul(DAY_US)),
@@ -886,7 +892,7 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
         }
         state.working = false;
         state.error = result.err().map(|error| error.to_string());
-        if state.error.is_some() {
+        if state.error.is_some() && !publication_blocked {
             deadline = None;
             store = None;
             state.live_dirty = true;

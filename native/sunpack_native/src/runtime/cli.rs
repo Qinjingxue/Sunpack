@@ -2964,7 +2964,7 @@ mod recursive_prompt_tests {
     #[test]
     fn password_retry_keeps_only_failed_carrier_siblings_and_generated_anchors() {
         let marker = crate::test_support::temp_file("cli_retry_scope", b"source");
-        let generation = crate::io::reader::capture_file_generation(&marker).unwrap().persisted();
+        let generation = crate::io::reader::capture_file_generation(&marker).unwrap();
         let checkpoint = |carrier: &str, source: &str, failed: bool| {
             let input = crate::io::archive_state::ArchiveInput::file(source.into(), "zip".into(), source.into());
             let failure = failed.then(|| json!({"partial":false,"password_signature":null,

@@ -51,49 +51,26 @@ pub(crate) fn confirm_compression_format_identity_native(path: &str, format: &st
     result.format == format && result.plausible && result.error.is_empty()
 }
 
-#[cfg(test)]
-fn inspect_compression_stream_structure(
-    path: &str,
-) -> std::io::Result<StreamObservation> {
-    let Ok(reader) = ManagedReader::open(path) else {
-        return Ok(compression_empty("os_error", "", false));
-    };
-    let header = (reader.read_cached_at(0, 32))?;
-    inspect_compression_stream_reader(&reader, &header)
+#[derive(Clone, Copy)]
+pub(crate) enum StreamStructure {
+    Complete(&'static str),
+    Lz4 { end: u64 },
 }
 
 pub(crate) fn inspect_compression_stream_reader(
     reader: &ManagedReader,
     header: &[u8],
-) -> std::io::Result<StreamObservation> {
+) -> std::io::Result<Option<StreamStructure>> {
     if let Some(kind) = StructuralStreamKind::from_header(header) {
-        if reader.len() > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-            return inspect_structural_stream(reader, kind);
-        }
-        return match kind {
-            StructuralStreamKind::Gzip => inspect_gzip(reader),
-            StructuralStreamKind::Bzip2 => inspect_bzip2(reader),
-            StructuralStreamKind::Xz => inspect_xz(reader),
-            StructuralStreamKind::Zstd => inspect_zstd(reader),
-        };
+        return complete_structural_stream(reader, kind)
+            .map(|format| format.map(StreamStructure::Complete));
     }
     if crate::formats::lz4::leading(header) {
         let file_size = reader.len();
         let index = crate::formats::lz4::walk(reader, 0, file_size);
-        if index.frames == 0 && matches!(index.error, "" | "lz4_magic_not_found") {
-            return Ok(compression_empty("ambiguous_skippable_stream", "", false));
-        }
-        return Ok(StreamObservation {
-            format: "lz4".into(), magic_matched: index.magic_matched(),
-            plausible: index.frames > 0, error: index.error.into(),
-            damage_flags: if index.error.is_empty() { Vec::new() } else { vec![index.error.into()] },
-            structure_complete: index.complete, boundary_exact: index.complete,
-            segment_end: index.complete.then_some(index.end),
-            trailing_bytes: Some(file_size.saturating_sub(index.end)),
-            stream_count: index.frames,
-        });
+        return Ok(index.complete.then_some(StreamStructure::Lz4 { end: index.end }));
     }
-    Ok(compression_empty("compression_stream_magic_not_found", "", false))
+    Ok(None)
 }
 
 pub(crate) fn has_compression_stream_header(header: &[u8]) -> bool {

@@ -302,11 +302,10 @@ struct PendingEmbeddedVolume {
 }
 
 impl NativeEmbeddedBatch {
-    pub(crate) fn claims_offset(&self, key: &str, offset: u64) -> bool {
+    fn claims_offset(&self, key: &str, offset: u64) -> bool {
         self.claimed_ranges.get(key).is_some_and(|ranges| {
-            ranges
-                .iter()
-                .any(|&(start, end)| start <= offset && offset < end)
+            let preceding = ranges.partition_point(|&(start, _)| start <= offset);
+            preceding != 0 && offset < ranges[preceding - 1].1
         })
     }
 
@@ -327,7 +326,9 @@ impl NativeEmbeddedBatch {
                     let path = table.rows[index].embedded_source().0;
                     let key = path_key(path);
                     let mut anchors = scan.relation_anchors();
-                    if self.claimed_ranges.contains_key(&key) {
+                    let has_claims = self.claimed_ranges.contains_key(&key);
+                    let independent = (has_claims || !anchors.is_empty()) && scan.has_independent_archive();
+                    if has_claims {
                         // Only proven extents (or the identical known anchor)
                         // exclude another head; an opaque chunk's EOF does not.
                         // Independent encrypted archives still use the normal
@@ -337,12 +338,11 @@ impl NativeEmbeddedBatch {
                                 || (!a.multivolume && a.needs_password)
                                 || !self.claims_offset(&key, a.structure_offset.unwrap_or(0))
                         });
-                        if anchors.is_empty() && !scan.has_independent_archive() {
+                        if anchors.is_empty() && !independent {
                             continue;
                         }
                     }
                     if !anchors.is_empty() {
-                        let independent = scan.has_independent_archive();
                         for mut anchor in anchors {
                             anchor.path = path.to_owned();
                             let retain_scan = anchor.needs_password || independent;
@@ -904,11 +904,16 @@ impl NativeEmbeddedBatch {
         for group in groups.iter().filter(|group| group.unresolved_password_group()) {
             group.collect_source_ranges(&anchor_paths, &mut grouped_ranges, &mut seen_facts);
         }
+        for ranges in grouped_ranges.values_mut() {
+            ranges.sort_unstable();
+        }
         for row in &mut fallback {
             if let Some(scan) = &mut row.scan {
                 let key = path_key(table.rows[row.index].embedded_source().0);
                 if let Some(ranges) = grouped_ranges.get(&key) {
-                    scan.resolutions.retain(|offset, _| !ranges.iter().any(|(start, _)| start == offset));
+                    scan.resolutions.retain(|offset, _| {
+                        ranges.binary_search_by_key(offset, |(start, _)| *start).is_err()
+                    });
                 }
             }
         }
@@ -1475,6 +1480,19 @@ impl NativeCandidateTable {
                     excluded.remove(&path_key(path));
                 }
             }
+        }
+        for ranges in claimed_ranges.values_mut() {
+            ranges.sort_unstable();
+            // A contained or empty interval cannot extend coverage. Keep
+            // increasing ends so the last preceding start answers a lookup.
+            let mut end = 0;
+            ranges.retain(|&(start, stop)| {
+                if stop <= end || stop <= start {
+                    return false;
+                }
+                end = stop;
+                true
+            });
         }
         let mut prepass = std::mem::take(&mut routes.scans);
         let scans = if ids.len() == self.rows.len() {

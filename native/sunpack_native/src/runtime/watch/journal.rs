@@ -30,6 +30,7 @@ const JOURNAL_HARD_BYTES: u64 = 256 * 1024 * 1024;
 const SNAPSHOT_TEMP_NAME: &str = "state.snapshot.tmp";
 
 struct Frontier {
+    stream: Option<NativeJournalStream>,
     seq: u64,
     segment: u64,
     records: u64,
@@ -59,13 +60,14 @@ struct Checkpoint {
 
 pub(super) struct Journal {
     state: NativeWatchState,
+    // Foreground publication checks this while holding the external output
+    // gate. It must not acquire the frontier lock just to choose a route.
     suspended: AtomicBool,
     log: Arc<NativeEventLog>,
     frontier: Mutex<Frontier>,
     checkpoint: Mutex<Option<Checkpoint>>,
     maintenance: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     snapshot: PathBuf,
-    stream: NativeJournalStream,
     _lock: File,
 }
 
@@ -88,8 +90,6 @@ impl Journal {
         let mut state = NativeWatchState::new();
         state.outputs = outputs;
         let frontier = Self::restore_state(&state, dir)?;
-        let stream = NativeJournalStream::open_seeded(key(&snapshot), frontier.seq)
-            .map_err(io::Error::other)?;
         let log = Arc::new(NativeEventLog::new(dir.join("events.json"), retention_days.min(u32::MAX.into()) as u32, true)?);
         state.attach_events(&log);
         log.recover(&state);
@@ -101,7 +101,6 @@ impl Journal {
             checkpoint: Mutex::default(),
             maintenance: Mutex::default(),
             snapshot,
-            stream,
             _lock: lock,
         })
     }
@@ -114,6 +113,7 @@ impl Journal {
             Err(error) => return Err(error),
         };
         let mut frontier = Frontier {
+            stream: None,
             seq: checkpoint,
             segment: checkpoint + 1,
             records: 0,
@@ -150,6 +150,8 @@ impl Journal {
         if retire_segments(dir, retirement_boundary) {
             frontier.retirement = Some(retirement_boundary);
         }
+        frontier.stream = Some(NativeJournalStream::open_seeded(key(&snapshot), frontier.seq)
+            .map_err(io::Error::other)?);
         Ok(frontier)
     }
 
@@ -169,16 +171,20 @@ impl Journal {
         self.flush()?;
         let mut checkpoint = self.checkpoint.lock().unwrap();
         self.harvest_checkpoint(checkpoint.take())?;
-        let frontier = self.frontier.lock().unwrap();
-        self.stream.request_flush(frontier.seq)?.wait()?;
+        let mut frontier = self.frontier.lock().unwrap();
+        let Some(stream) = frontier.stream.as_ref() else { return Ok(()); };
+        // Foreground work can append between flush and acquiring the lock.
+        // Finish that prefix before releasing the idle stream and its handles.
+        stream.request_flush(frontier.seq)?.wait()?;
+        let released = frontier.stream.take().unwrap().close().map_err(io::Error::other);
         self.suspended.store(true, Ordering::Release);
         self.state.unload();
-        Ok(())
+        released
     }
 
     pub(super) fn resume(&self) -> io::Result<bool> {
         let mut frontier = self.frontier.lock().unwrap();
-        if !self.suspended() { return Ok(false); }
+        if frontier.stream.is_some() { return Ok(false); }
         // Load into a temporary state so an IO error cannot publish a partially
         // replayed generation to the live catalog or a later retry.
         let restored = NativeWatchState::new();
@@ -235,7 +241,7 @@ impl Journal {
             ensure_healthy(&frontier)?;
             // A foreground publication captured before the final root was
             // removed no longer belongs to an active Watch scheduler.
-            if self.suspended() { return Ok(()); }
+            let Some(stream) = frontier.stream.as_ref() else { return Ok(()); };
             let operations = prepare(&self.state)?;
             if operations.is_empty() {
                 return Ok(());
@@ -245,7 +251,7 @@ impl Journal {
                 .checked_add(1)
                 .ok_or(io::ErrorKind::InvalidData)?;
             let segment = frontier.segment;
-            let ticket = self.stream.submit_task_append(
+            let ticket = stream.submit_task_append(
                 segment_path(self.snapshot.parent().unwrap(), segment),
                 segment,
                 seq,
@@ -337,9 +343,9 @@ impl Journal {
         let ticket = {
             let frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
-            self.stream.request_flush(frontier.seq)?
+            frontier.stream.as_ref().map(|stream| stream.request_flush(frontier.seq)).transpose()?
         };
-        ticket.wait()?;
+        if let Some(ticket) = ticket { ticket.wait()?; }
         self.wait_for_checkpoint()?;
         self.compact()?;
         self.wait_for_checkpoint()?;
@@ -359,7 +365,7 @@ impl Journal {
         let (checkpoint, seal, boundary, records, bytes) = {
             let mut frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
-            if self.suspended() { return Ok(()); }
+            let Some(stream) = frontier.stream.as_ref() else { return Ok(()); };
             if !frontier.needs_checkpoint() {
                 if let Some(boundary) = frontier.retirement {
                     let dir = self.snapshot.parent().unwrap().to_owned();
@@ -374,7 +380,7 @@ impl Journal {
                 return Ok(());
             }
             let segment = frontier.segment;
-            let seal = self.stream.submit_seal(
+            let seal = stream.submit_seal(
                 segment_path(self.snapshot.parent().unwrap(), segment),
                 segment,
                 frontier.seq,
@@ -627,6 +633,8 @@ mod tests {
         journal.suspend().unwrap();
         assert!(receipt.upgrade().is_none());
         assert!(journal.state().pending_items().is_empty());
+        // The idle shell also gives up the current, unsealed WAL handle.
+        drop(OpenOptions::new().read(true).share_mode(0).open(segment_path(&dir, 2)).unwrap());
         // Rootless diagnostics/maintenance never checkpoint the empty view over
         // the saved generation or append work captured by the former scheduler.
         journal.compact().unwrap();
@@ -738,7 +746,7 @@ mod tests {
     #[test]
     #[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
     fn cpp_query_recovers_durable_blocker_after_writer_death() {
-        use crate::event_log::gui_contract::{gui_binary, project, Directory, DirectoryNotification};
+        use crate::event_log::gui_contract::{gui_binary, project, Directory};
         use crate::watch_store::EntryRecord;
         use serde_json::json;
         use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
@@ -757,12 +765,11 @@ mod tests {
             assert!(live["rows"].as_array().unwrap().iter().any(|row| row["status"] == "taskProcessing"));
 
             // Freeze publication at the old manifest. The production commit
-            // path still fsyncs its WAL while the display writer is blocked.
-            // Leave a real unpublished history append on disk at the same time.
+            // path still fsyncs its WAL when the display writer cannot publish.
+            // Leave a staged history append on disk at the same time.
             let _held = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path).unwrap();
-            let changed = DirectoryNotification::new(&dir);
             journal.log(json!({"event":"done","path":dir.join("unpublished.zip"),"owner":"unpublished"}));
-            changed.wait_for_temp(&dir.join("events.json.tmp"));
+            journal.event_log().flush().unwrap_err();
             journal.commit(true, |_| {
                 let mut operations = NativeWatchOperations::empty();
                 operations.put_entry(Arc::new(EntryRecord {
@@ -806,7 +813,22 @@ mod tests {
         kill_test_journal_owner("cpp_query_recovers_durable_blocker_after_writer_death", |command| {
             command.env(CHILD, &dir.0);
         });
-        assert!(dir.0.join("events.json.tmp").is_file());
+        let manifest: crate::io::display_store::Manifest =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let published_records: u64 = manifest.runs.iter().map(|run| run.count).sum();
+        let history_index_bytes: u64 = fs::read_dir(dir.0.join("events.json.store"))
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("history-") && name.ends_with(".index")
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        assert_eq!(history_index_bytes,
+            (published_records + 1) * crate::io::display_store::ENTRY_BYTES as u64);
+        assert!(!dir.0.join("events.json.tmp").exists());
 
         let journal = Journal::open(&dir.0, 7).unwrap();
         journal.event_log().flush().unwrap();

@@ -403,9 +403,10 @@ void print_job_event(const std::string& job_id, const char* event) {
 }
 
 std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace, bool profiling) {
+    const auto win32_error = HRESULT_FACILITY(trace.read_hresult) == FACILITY_WIN32 ? HRESULT_CODE(trace.read_hresult) : 0;
     auto payload = wire::object() +
-        wire::key("read_error") + wire::boolean(trace.read_error) +
-        wire::key("last_win32_error") + wire::number(trace.last_win32_error) +
+        wire::key("read_error") + wire::boolean(FAILED(trace.read_hresult)) +
+        wire::key("last_win32_error") + wire::number(win32_error) +
         (wire::key("last_read") + wire::object() + wire::key("virtual_offset")) + wire::number(trace.last_read_virtual_offset) +
         wire::key("source_path") + wire::text(wide_to_utf8(trace.last_source_path)) +
         wire::key("source_offset") + wire::number(trace.last_read_source_offset) +
@@ -705,7 +706,7 @@ bool uncertain_volume_password(const sunpack::sevenzip::ExtractArchiveResult& re
                                const sunpack::sevenzip::ExtractionReplay& replay) {
     using namespace sunpack::sevenzip;
     return result.encrypted && !result.password_crc_proven &&
-        !result.input_trace.read_error && result.status != PasswordTestStatus::Error &&
+        !FAILED(result.input_trace.read_hresult) && result.status != PasswordTestStatus::Error &&
         (result.failure_stage == "item_extract" || result.failure_stage == "archive_open") &&
         (result.password_rejected || result.operation_result == kOpWrongPassword ||
          result.operation_result == kOpCrcError || result.operation_result == kOpDataError ||
@@ -723,7 +724,7 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
         (result.encrypted && !result.password_crc_proven && !password_verified && !uncertain_volume_password(result, replay)) ||
         result.unsupported_method || result.status == PasswordTestStatus::BackendUnavailable ||
         result.status == PasswordTestStatus::Error ||
-        (result.input_trace.read_error && result.missing_volume_evidence != "open_volume_file_missing")) return false;
+        (FAILED(result.input_trace.read_hresult) && result.missing_volume_evidence != "open_volume_file_missing")) return false;
     if (result.missing_volume) return true;
     if (result.failure_stage != "archive_open" && result.failure_stage != "item_extract") return false;
     if (result.failure_kind != "structure_recognition" && result.failure_kind != "checksum_error" &&
@@ -1062,7 +1063,7 @@ int run_request(
         wire::key("hresult") + wire::number(result.hresult) +
         wire::key("operation_result_name") + wire::text(operation_result_name(result.operation_result));
     const bool profile_reads = read_file_timing_enabled();
-    const std::string input_trace_field = (!ok || profile_reads) ?
+    const std::string input_trace_field = (FAILED(result.input_trace.read_hresult) || profile_reads) ?
         wire::key("input_trace") + input_trace_wire(result.input_trace, profile_reads) : "";
     const auto &output_trace = result.output_trace;
     const std::string metadata_warning_field = (output_trace.metadata_failed_files || output_trace.metadata_failed_directories) ?

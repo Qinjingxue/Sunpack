@@ -1127,7 +1127,7 @@ impl CompletedFamilies {
             let cache = self.0.lock().unwrap();
             let (_, previous, output) = &cache.ordered[cache.by_family.get(&family)?];
             if !current.iter().zip(&previous.ordered).all(|((_, current), (_, previous))|
-                current.matches_input(&previous.persisted())) {
+                current.matches_input(previous)) {
                 return None;
             }
             Arc::clone(output)
@@ -1160,7 +1160,7 @@ impl CompletedFamilies {
             // Require the entire current family, not only the old request's head.
             if !generations.ordered.iter().all(|(member, previous)| {
                 crate::io::reader::capture_file_generation(Path::new(member.as_ref()))
-                    .is_ok_and(|current| current.matches_input(&previous.persisted()))
+                    .is_ok_and(|current| current.matches_input(previous))
             }) { continue; }
             let live = output.is_dir();
             let mut cache = self.0.lock().unwrap();
@@ -7667,7 +7667,7 @@ mod tests {
             serde_json::from_value::<crate::pipeline::InputCheckpoint>(json!({
                 "schema_version":1,"carrier":source,
                 "input":input,
-                "sources":[{"path":source,"generation":capture_file_generation(source).unwrap().persisted()}],
+                "sources":[{"path":source,"generation":capture_file_generation(source).unwrap()}],
                 "output":output,
                 "container":null,"files":1,"bytes":4,"encrypted":false,"discovery_source":"direct",
                 "failure":partial.then(|| json!({
@@ -8470,7 +8470,7 @@ mod tests {
                     "input":crate::io::archive_state::ArchiveInput::file(
                         source.to_string_lossy().into_owned(), "zip".into(), "logical-input".into(),
                     ),
-                    "sources":[{"path":source,"generation":capture_file_generation(&source)?.persisted()}],
+                    "sources":[{"path":source,"generation":capture_file_generation(&source)?}],
                     "output":output,
                     "container":container,
                     "files":1,"bytes":9,"encrypted":false,"discovery_source":"direct",

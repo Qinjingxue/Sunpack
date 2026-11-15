@@ -17,17 +17,6 @@ pub(crate) enum IntegrityStatus {
     NotPresent,
 }
 
-impl IntegrityStatus {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Verified => "verified",
-            Self::Failed => "failed",
-            Self::Deferred => "deferred",
-            Self::NotPresent => "not_present",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct StructureValidation {
     pub(crate) end_offset: u64,

@@ -103,16 +103,14 @@ namespace sunpack::sevenzip
 
               archive_path_(std::move(archive_path)),
 
-              part_ranges_(part_ranges),
+              part_paths_(part_paths.empty() ? nullptr : &part_paths),
+              part_ranges_(part_ranges.empty() ? nullptr : &part_ranges),
 
               volume_prefetch_config_(volume_prefetch_config), cancel_token_(std::move(cancel_token))
         {
 
-            const auto part_count = part_paths.empty() ? part_ranges_.size() : part_paths.size();
+            const auto part_count = part_paths.empty() ? part_ranges.size() : part_paths.size();
             const bool canonical = !canonical_names.empty() && canonical_names.size() == part_count;
-            // Canonical range inputs already own one physical path per alias.
-            if (!canonical || part_ranges_.size() != part_count)
-                part_paths_ = part_paths;
             if (canonical)
             {
                 for (std::size_t index = 0; index < canonical_names.size(); ++index)
@@ -124,9 +122,9 @@ namespace sunpack::sevenzip
                 return;
             }
 
-            for (std::size_t index = 0; index < part_paths_.size(); ++index)
+            for (std::size_t index = 0; index < part_paths.size(); ++index)
             {
-                const auto &path = part_paths_[index];
+                const auto &path = part_paths[index];
                 const std::wstring name = lower_path(std::filesystem::path(path).filename().wstring());
 
                 if (!name.empty())
@@ -141,9 +139,8 @@ namespace sunpack::sevenzip
             if (!archive_path_.empty())
             {
 
-                const auto found = std::find(part_paths_.begin(), part_paths_.end(), archive_path_);
-                const std::size_t index = static_cast<std::size_t>(found - part_paths_.begin());
-                if (found == part_paths_.end()) part_paths_.push_back(archive_path_);
+                const auto found = std::find(part_paths.begin(), part_paths.end(), archive_path_);
+                const std::size_t index = static_cast<std::size_t>(found - part_paths.begin());
                 const std::wstring name = lower_path(std::filesystem::path(archive_path_).filename().wstring());
 
                 if (!name.empty())
@@ -224,8 +221,9 @@ namespace sunpack::sevenzip
             }
 
             const auto index = found->second;
-            const auto* range = index < part_ranges_.size() ? &part_ranges_[index] : nullptr;
-            const auto &path = range ? range->path : part_paths_[index];
+            const auto* range = part_ranges_ && index < part_ranges_->size() ? &(*part_ranges_)[index] : nullptr;
+            const auto &path = range ? range->path : part_paths_ && index < part_paths_->size()
+                ? (*part_paths_)[index] : archive_path_;
             auto* stream = new VolumeInStream(path, range, volume_prefetch_config_, input_error_);
             CMyComPtr<IInStream> stream_holder(stream);
             const bool opened = stream->is_open();
@@ -277,8 +275,10 @@ namespace sunpack::sevenzip
 
         std::wstring archive_path_;
 
-        std::vector<std::wstring> part_paths_;
-        std::vector<ExtractInputRange> part_ranges_;
+        // Both production callers own their input lists until the handler
+        // releases this callback, including the password batch's cache.
+        const std::vector<std::wstring> *part_paths_;
+        const std::vector<ExtractInputRange> *part_ranges_;
 
         const InputPrefetchConfig volume_prefetch_config_;
         std::shared_ptr<std::atomic<bool>> cancel_token_;

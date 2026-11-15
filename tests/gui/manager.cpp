@@ -58,20 +58,22 @@ std::string event(const std::string& type,const fs::path& p,int ts) {
 // Windows identity/root policy. No benchmark assertions or implementation-mirroring tests.
 void projection(Fixture& f) {
     auto p=f.dir/"events.json", source=f.dir/L"伪装.bin.001";
-    std::string history;
-    for(int i=0;i<350;++i) history+=event("done",f.dir/("carrier-"+std::to_string(i)+".001"),i+1);
-    publish_events(p,history);
+    std::array<std::string,3> history;
+    for(int i=0;i<350;++i) history[i%3]+=event("done",f.dir/("carrier-"+std::to_string(i)+".001"),i+1);
+    publish_events(p,history[0]);
+    publish_events(p,history[1],read_json(p).at("runs"));
+    publish_events(p,history[2],read_json(p).at("runs"),true);
     EventLog log; log.set_path(p); assert(log.refresh()); assert(!log.refresh());
-    View view; std::unordered_set<std::string> ids; size_t pages=0;
+    View view; int next=349; size_t pages=0;
     for(;;) {
         auto result=log.query({},view);
         assert(result["rows"].size()<=100);
-        for(auto& row:result["rows"]) assert(ids.insert(row["id"].get<std::string>()).second);
+        for(auto& row:result["rows"]) assert(row["name"]=="carrier-"+std::to_string(next--)+".001");
         ++pages;
         if(!result["hasMore"].get<bool>()) break;
         view.task_cursor=result["next"].get<std::string>();
     }
-    assert(ids.size()==350 && pages==4);
+    assert(next==-1 && pages==4);
     view.task_cursor.clear(); view.task_query="carrier-349";
     assert(log.query({},view)["total"]==1);
     log.cancelled=[]{return true;}; view.task_query="not-present";

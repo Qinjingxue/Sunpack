@@ -3,7 +3,7 @@ use super::catalog::{CatalogRow, ScopeCatalog};
 use super::directory::DirectoryEntryRecord;
 use crate::io::scratch::Spool;
 use crate::wal::{self, Kind};
-use crate::watch_journal::{self, NativeJournalStream};
+use crate::watch_journal::NativeJournalStream;
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -87,7 +87,6 @@ impl<'de> Deserialize<'de> for ScopeInput {
 
 pub(super) struct CatalogStore {
     folder: PathBuf,
-    stream: String,
     handle: Option<NativeJournalStream>,
     seq: u64,
     edits: usize,
@@ -116,10 +115,6 @@ impl CatalogStore {
         let _ = fs::remove_file(folder.join("catalog.snapshot.bin.tmp"));
         let mut store = Self {
             folder: folder.to_owned(),
-            stream: folder
-                .join("catalog.wal.bin")
-                .to_string_lossy()
-                .into_owned(),
             handle: None,
             seq: 0,
             edits: 0,
@@ -201,7 +196,14 @@ impl CatalogStore {
             }
         }
         store.handle = Some(
-            watch_journal::open_cache(store.stream.clone(), store.seq).map_err(io::Error::other)?,
+            NativeJournalStream::open_seeded(
+                folder
+                    .join("catalog.wal.bin")
+                    .to_string_lossy()
+                    .into_owned(),
+                store.seq,
+            )
+            .map_err(io::Error::other)?,
         );
         Ok(store)
     }
@@ -241,13 +243,11 @@ impl CatalogStore {
             .write_all(&(self.pending_deltas as u32).to_be_bytes())?;
         let bytes = std::mem::take(&mut self.pending).finish()?;
         let next = self.seq + 1;
-        let written = watch_journal::append_cache(
-            &self.stream,
-            &self.folder.join("catalog.wal.bin"),
-            next,
-            bytes,
-        )
-        .map_err(io::Error::other)?;
+        let written = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| io::Error::other("catalog stream is closed"))?
+            .append_catalog(self.folder.join("catalog.wal.bin"), next, bytes)?;
         self.wal_bytes = self.wal_bytes.saturating_add(written);
         self.seq = next;
         self.pending_deltas = 0;
@@ -258,7 +258,11 @@ impl CatalogStore {
             return Ok(());
         }
         self.commit()?;
-        watch_journal::flush_cache(&self.stream, self.seq).map_err(io::Error::other)?;
+        self.handle
+            .as_ref()
+            .ok_or_else(|| io::Error::other("catalog stream is closed"))?
+            .request_flush(self.seq)?
+            .wait()?;
         #[derive(Serialize)]
         struct View<'a> {
             stamps: &'a HashMap<String, Stamp>,
@@ -275,15 +279,16 @@ impl CatalogStore {
         file.sync_all()?;
         drop(file);
         replace(&temp, &self.folder.join("catalog.snapshot.bin"))?;
-        if let Some(mut handle) = self.handle.take() {
-            watch_journal::close_cache(&mut handle).map_err(io::Error::other)?;
+        if let Some(handle) = self.handle.take() {
+            handle.close().map_err(io::Error::other)?;
         }
         let wal = self.folder.join("catalog.wal.bin");
         if wal.exists() {
-            fs::remove_file(wal)?;
+            fs::remove_file(&wal)?;
         }
         self.handle = Some(
-            watch_journal::open_cache(self.stream.clone(), self.seq).map_err(io::Error::other)?,
+            NativeJournalStream::open_seeded(wal.to_string_lossy().into_owned(), self.seq)
+                .map_err(io::Error::other)?,
         );
         self.edits = 0;
         self.wal_bytes = 0;
@@ -303,10 +308,10 @@ impl CatalogStore {
 
 impl Drop for CatalogStore {
     fn drop(&mut self) {
-        if let Some(mut handle) = self.handle.take() {
+        if let Some(handle) = self.handle.take() {
             // The writer must release its stream before another owner loads
             // and retires the WAL. Drop of a bare stream queues this asynchronously.
-            let _ = watch_journal::close_cache(&mut handle);
+            let _ = handle.close();
         }
     }
 }

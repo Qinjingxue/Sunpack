@@ -484,11 +484,11 @@ impl Store {
     }
     pub(crate) fn update_live(
         &mut self,
-        rows: Vec<(String, Option<(i64, Value)>)>,
+        rows: impl ExactSizeIterator<Item = io::Result<(String, Option<(i64, Value)>)>>,
         reset: bool,
         cutoff: i64,
     ) -> io::Result<()> {
-        if rows.is_empty() && !reset {
+        if rows.len() == 0 && !reset {
             return Ok(());
         }
         if reset {
@@ -500,7 +500,8 @@ impl Store {
         if let Some(live) = &mut self.live {
             live.set_revision(0)?;
         }
-        for (id, value) in rows {
+        for row in rows {
+            let (id, value) = row?;
             if value.as_ref().is_some_and(|(ts, _)| *ts <= cutoff) {
                 self.expired_live.push(id.clone());
             }
@@ -661,6 +662,10 @@ impl Store {
         Ok(())
     }
     pub(crate) fn publish(&mut self) -> io::Result<()> {
+        // A single unusually large group must not leave large scratch buffers resident.
+        if self.compressed.capacity() > 2 * RECORD_BLOCK_BYTES {
+            self.compressed = Vec::new();
+        }
         self.manifest.revision = self.manifest.revision.wrapping_add(1);
         if let Some(live) = &mut self.live {
             live.set_revision(self.manifest.task_revision)?;
@@ -677,15 +682,14 @@ impl Store {
         serde_json::to_writer(&mut file, &self.manifest).map_err(|e| invalid(&e.to_string()))?;
         file.flush()?;
         drop(file);
-        super::atomic_file::replace(&temp, &self.path)?;
+        if let Err(error) = super::atomic_file::replace_once(&temp, &self.path) {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
         for name in self.obsolete.drain(..) {
             let (data, index) = files(&self.folder, &name);
             fs::remove_file(data)?;
             fs::remove_file(index)?;
-        }
-        // A single unusually large group must not leave large scratch buffers resident.
-        if self.compressed.capacity() > 2 * RECORD_BLOCK_BYTES {
-            self.compressed = Vec::new();
         }
         Ok(())
     }

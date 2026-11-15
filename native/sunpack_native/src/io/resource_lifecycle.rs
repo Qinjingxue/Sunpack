@@ -80,6 +80,17 @@ impl NativeReadScope {
 
 #[cfg(windows)]
 fn handle_path_is_under(file: &File, root: &[u16]) -> io::Result<bool> {
+    with_handle_path(file, |path| handle_path_has_root(path, root))
+}
+
+#[cfg(windows)]
+pub(crate) fn resolved_reader_path(file: &File) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    with_handle_path(file, |path| PathBuf::from(std::ffi::OsString::from_wide(path)))
+}
+
+#[cfg(windows)]
+fn with_handle_path<T>(file: &File, visit: impl FnOnce(&[u16]) -> T) -> io::Result<T> {
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     extern "system" {
@@ -102,7 +113,7 @@ fn handle_path_is_under(file: &File, root: &[u16]) -> io::Result<bool> {
     if len == 0 {
         return Err(io::Error::last_os_error());
     } else if (len as usize) < stack.len() {
-        Ok(handle_path_has_root(&stack[..len as usize], root))
+        Ok(visit(&stack[..len as usize]))
     } else {
         let mut data = vec![0u16; len as usize + 1];
         let actual = unsafe {
@@ -116,7 +127,7 @@ fn handle_path_is_under(file: &File, root: &[u16]) -> io::Result<bool> {
         if actual == 0 || actual as usize >= data.len() {
             return Err(io::Error::last_os_error());
         }
-        Ok(handle_path_has_root(&data[..actual as usize], root))
+        Ok(visit(&data[..actual as usize]))
     }
 }
 

@@ -1167,12 +1167,12 @@ impl NativeWatchState {
     /// Configuration retirement only visits resident state, never file-index rows.
     pub(crate) fn scope_retirement_operations(
         &self,
-
         scopes: &[crate::scan::scope::NativeDiscoveryScope],
     ) -> NativeWatchOperations {
-        let operations = (|| {
+        let scope_roots: HashSet<_> = scopes.iter().map(|scope| path_key(&scope.root)).collect();
+        let (mut operations, cursor_check) = {
             let data = self.lock();
-            let recovery_paths: Vec<_> = data
+            let recovery_roots: HashSet<_> = data
                 .pending
                 .values()
                 .flat_map(|record| {
@@ -1183,65 +1183,61 @@ impl NativeWatchState {
                         .chain(record.committed_roots.iter())
                         .map(|path| path_key(path))
                 })
+                .map(|mut key| {
+                    key.truncate(key.trim_end_matches('\\').len());
+                    key
+                })
                 .collect();
-            let mut operations: Vec<_> = data
+            let operations = data
                 .entries
                 .iter()
                 .filter(|(key, record)| {
-                    !scopes.iter().any(|scope| scope.contains(&record.path))
+                    let record_key = crate::path_keys::path_key(&record.path);
+                    !scopes.iter().any(|scope| scope.contains_key(&record_key))
                         && !record
                             .failure_payload
                             .get("source_input_root")
                             .and_then(Value::as_str)
                             .filter(|_| record.failure_payload.contains_key("discovery_scope"))
-                            .is_some_and(|root| {
-                                scopes
-                                    .iter()
-                                    .any(|scope| path_key(&scope.root) == path_key(root))
-                            })
+                            .is_some_and(|root| scope_roots.contains(&path_key(root)))
                         && !data.pending.contains_key(*key)
-                        && !recovery_paths
-                            .iter()
-                            .any(|root| *key == root || is_path_under(key, root))
+                        && !crate::path_keys::path_ancestors(key)
+                            .any(|ancestor| recovery_roots.contains(ancestor))
                 })
                 .map(|(key, _)| Operation::Delete(Collection::Entries, key.clone()))
-                .collect();
-            if data.cursors.is_empty() {
-                return operations;
-            }
+                .collect::<Vec<_>>();
+            let cursor_check = (!data.cursors.is_empty()).then(|| {
+                let directories: HashSet<_> = scopes
+                    .iter()
+                    .map(|scope| scope.root.as_str())
+                    .chain(data.pending.values().map(|record| {
+                        Path::new(&record.path)
+                            .parent()
+                            .and_then(Path::to_str)
+                            .unwrap_or(&record.path)
+                    }))
+                    .collect();
+                (
+                    directories.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                    data.cursors.clone(),
+                )
+            });
+            (operations, cursor_check)
+        };
 
-            // Resolve each root/recovery directory once using the existing
-            // volume resolver. An inaccessible volume is not proof of disuse.
-            let directories: HashSet<_> = scopes
-                .iter()
-                .map(|scope| scope.root.as_str())
-                .chain(data.pending.values().map(|record| {
-                    Path::new(&record.path)
-                        .parent()
-                        .and_then(Path::to_str)
-                        .unwrap_or(&record.path)
-                }))
-                .collect();
-            let mut volumes = HashSet::new();
-            for directory in directories {
-                match crate::filesystem::resolve_output_volume_key(directory) {
-                    Some(volume) => {
-                        volumes.insert(volume.to_lowercase());
-                    }
-                    _ => return operations,
+        // The journal commit orders cursor changes. Release the resident state
+        // lock for readers while the resolver accesses the filesystem.
+        if let Some((directories, mut cursors)) = cursor_check {
+            if let Some(volumes) = directories.iter().map(|directory| {
+                crate::filesystem::resolve_output_volume_key(directory).map(|volume| volume.to_lowercase())
+            }).collect::<Option<HashSet<_>>>() {
+                let previous_count = cursors.len();
+                cursors.retain(|key, _| volumes.contains(key));
+                if cursors.len() != previous_count {
+                    operations.push(Operation::SetCursors(cursors));
                 }
             }
-            if data.cursors.keys().any(|key| !volumes.contains(key)) {
-                let cursors = data
-                    .cursors
-                    .iter()
-                    .filter(|(key, _)| volumes.contains(*key))
-                    .map(|(key, cursor)| (key.clone(), *cursor))
-                    .collect();
-                operations.push(Operation::SetCursors(cursors));
-            }
-            operations
-        })();
+        }
         NativeWatchOperations {
             operations: Arc::new(Operations(operations)),
         }

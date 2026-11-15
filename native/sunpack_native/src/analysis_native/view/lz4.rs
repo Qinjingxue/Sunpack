@@ -5,24 +5,10 @@ impl<'a> ReportContext<'a> {
         {
             return Ok(None);
         }
-        let Some(facts) = self.full_stream_structure()? else {
+        let Some(StreamStructure::Lz4 { end }) = self.full_stream_structure()? else {
             return Ok(None);
         };
-        if facts.format != "lz4"
-            || !facts.structure_complete
-            || (facts.stream_count == 0
-                && matches!(facts.error.as_str(), "" | "lz4_magic_not_found"))
-        {
-            return Ok(None);
-        }
-        let flags = if !facts.error.is_empty()
-            && strict_subrange(0, facts.segment_end, self.view.reader.len())
-        {
-            vec![facts.error.clone()]
-        } else {
-            Vec::new()
-        };
-        let mut evidence = Evidence::new("lz4", Extractable, 0, facts.segment_end, flags);
+        let mut evidence = Evidence::new("lz4", Extractable, 0, Some(end), Vec::new());
         evidence.structure_complete = true;
         Ok(Some(evidence))
     }

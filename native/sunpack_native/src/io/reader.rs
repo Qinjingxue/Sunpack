@@ -364,6 +364,7 @@ impl ManagedReader {
         Ok((Self::new(Arc::new(source), config), disk_starts))
     }
 
+    #[cfg(test)]
     pub(crate) fn from_bytes(data: Vec<u8>, config: ReaderConfig) -> Self {
         let data: Arc<[u8]> = Arc::from(data);
         Self::new(Arc::new(BytesSource { data }), config)
@@ -506,6 +507,7 @@ impl ManagedReader {
         Ok(written)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_all(&self) -> io::Result<Vec<u8>> {
         let len = usize::try_from(self.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "file is too large for memory")
@@ -788,10 +790,12 @@ impl Seek for SourceCursor {
     }
 }
 
+#[cfg(test)]
 struct BytesSource {
     data: Arc<[u8]>,
 }
 
+#[cfg(test)]
 impl ByteSource for BytesSource {
     fn len(&self) -> u64 {
         self.data.len() as u64
@@ -828,20 +832,12 @@ pub(crate) struct FileIdentity {
     source_id: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Cached and durable generation of the same file object. Native write time
+/// already records the last-write timestamp on Windows.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PhysicalFileGeneration {
     len: u64,
-    modified: Option<SystemTime>,
-    created: Option<SystemTime>,
-    #[cfg(windows)]
-    windows: WindowsFileGeneration,
-}
-
-/// Durable receipt values. The signed tuple also represents file times before
-/// the Unix epoch, which can be present in archives and Windows metadata.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PersistedFileGeneration {
-    len: u64,
+    #[cfg(not(windows))]
     modified: Option<(bool, u64, u32)>,
     created: Option<(bool, u64, u32)>,
     #[cfg(windows)]
@@ -861,27 +857,16 @@ impl PhysicalFileGeneration {
     }
     /// Input recovery follows the source identity, size and last-write time.
     /// Cache and mutation receipts keep the stronger full-generation equality.
-    pub(crate) fn matches_input(&self, saved: &PersistedFileGeneration) -> bool {
+    pub(crate) fn matches_input(&self, saved: &Self) -> bool {
         self.len == saved.len
-            && self.modified.map(persisted_file_time) == saved.modified
             && {
                 #[cfg(windows)]
                 { self.windows.volume == saved.windows.volume
                     && self.windows.file_id == saved.windows.file_id
                     && self.windows.write_time == saved.windows.write_time }
                 #[cfg(not(windows))]
-                { true }
+                { self.modified == saved.modified }
             }
-    }
-
-    pub(crate) fn persisted(&self) -> PersistedFileGeneration {
-        PersistedFileGeneration {
-            len: self.len,
-            modified: self.modified.map(persisted_file_time),
-            created: self.created.map(persisted_file_time),
-            #[cfg(windows)]
-            windows: self.windows.clone(),
-        }
     }
 }
 
@@ -1601,7 +1586,11 @@ impl ReaderManager {
     fn open_file(&self, path: &Path) -> io::Result<Arc<FileSource>> {
         // Inspect the handle opened through the current path, never the pooled
         // handle: rename/replacement can leave that handle on the old file.
-        let file = open_reader_file(path)?;
+        let file = TrackedFile::open_reader(path)?;
+        #[cfg(windows)]
+        let canonical = super::resource_lifecycle::resolved_reader_path(&file)
+            .unwrap_or_else(|_| path.to_path_buf());
+        #[cfg(not(windows))]
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let physical = physical_file_generation(&file)?;
         let mut handles = self
@@ -1910,8 +1899,9 @@ pub(crate) fn physical_file_generation(file: &File) -> io::Result<PhysicalFileGe
     let metadata = file.metadata()?;
     Ok(PhysicalFileGeneration {
         len: metadata.len(),
-        modified: metadata.modified().ok(),
-        created: metadata.created().ok(),
+        #[cfg(not(windows))]
+        modified: metadata.modified().ok().map(persisted_file_time),
+        created: metadata.created().ok().map(persisted_file_time),
         #[cfg(windows)]
         windows: windows_file_generation(file)?,
     })
@@ -2050,10 +2040,6 @@ fn read_file_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn open_reader_file(path: &Path) -> io::Result<TrackedFile> {
-    TrackedFile::open_reader(path)
-}
-
 #[cfg(unix)]
 fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
@@ -2075,26 +2061,29 @@ mod tests {
     fn input_recovery_ignores_metadata_only_changes_but_receipts_do_not() {
         let path = temp_file("input_generation", b"archive");
         let original = capture_file_generation(&path).unwrap();
-        let saved = original.persisted();
+        let saved = &original;
         let mut changed = original.clone();
-        changed.created = Some(std::time::UNIX_EPOCH);
+        changed.created = Some((false, 1, 0));
         #[cfg(windows)]
         { changed.windows.change_time = changed.windows.change_time.wrapping_add(1); }
-        assert!(changed.matches_input(&saved));
-        assert_ne!(changed.persisted(), saved);
+        assert!(changed.matches_input(saved));
+        assert_ne!(&changed, saved);
         changed.len += 1;
-        assert!(!changed.matches_input(&saved));
+        assert!(!changed.matches_input(saved));
         changed = original.clone();
-        changed.modified = Some(std::time::UNIX_EPOCH);
-        assert!(!changed.matches_input(&saved));
+        #[cfg(windows)]
+        { changed.windows.write_time = changed.windows.write_time.wrapping_add(1); }
+        #[cfg(not(windows))]
+        { changed.modified = Some((false, 1, 0)); }
+        assert!(!changed.matches_input(saved));
         #[cfg(windows)]
         {
             changed = original.clone();
             changed.windows.file_id[0] ^= 1;
-            assert!(!changed.matches_input(&saved));
+            assert!(!changed.matches_input(saved));
             changed = original.clone();
             changed.windows.volume = changed.windows.volume.wrapping_add(1);
-            assert!(!changed.matches_input(&saved));
+            assert!(!changed.matches_input(saved));
         }
         std::fs::remove_file(path).unwrap();
     }

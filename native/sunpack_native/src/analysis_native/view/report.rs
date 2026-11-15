@@ -4,7 +4,7 @@
 // segment boundaries, selection, and the extraction segment plan.
 
 use crate::analysis_native::structure::{
-    has_compression_stream_header, inspect_compression_stream_reader, StreamObservation,
+    has_compression_stream_header, inspect_compression_stream_reader, StreamStructure,
 };
 use crate::io::archive_state::AnalysisStatus::{Damaged, Extractable, Weak};
 use crate::io::archive_state::{
@@ -162,7 +162,7 @@ struct ReportContext<'a> {
     view: &'a AnalysisBinaryView,
     disk_starts: Option<&'a [u64]>,
     signatures: LeadingSignatures,
-    stream_structure: Option<Option<Arc<StreamObservation>>>,
+    stream_structure: Option<Option<StreamStructure>>,
 }
 
 pub(crate) struct AnalysisReport {
@@ -304,24 +304,10 @@ impl<'a> ReportContext<'a> {
     // ---- Compression streams -------------------------------------------
 
     fn stream_module(&mut self, format: &'static str) -> std::io::Result<Option<Evidence>> {
-        let Some(result) = self.full_stream_structure()? else {
-            return Ok(None);
-        };
-        if result.format != format
-            || !result.magic_matched
-            || !result.plausible
-            || !result.structure_complete
-            || !result.boundary_exact
-            || !result.damage_flags.is_empty()
-            || !result.error.is_empty()
-            || result.trailing_bytes != Some(0)
-        {
+        if !matches!(self.full_stream_structure()?, Some(StreamStructure::Complete(detected)) if detected == format) {
             return Ok(None);
         }
-        let end = match result.segment_end.unwrap_or_default() {
-            0 => self.view.reader.len(),
-            value => value,
-        };
+        let end = self.view.reader.len();
         let mut evidence = Evidence::new(format, Extractable, 0, Some(end), Vec::new());
         evidence.structure_complete = true;
         Ok(Some(evidence))
@@ -329,21 +315,21 @@ impl<'a> ReportContext<'a> {
 
     /// Full-stream validation walks the complete structure, so it runs at most once
     /// per analysis and once per physical file generation across analyses.
-    fn full_stream_structure(&mut self) -> io::Result<Option<Arc<StreamObservation>>> {
-        if let Some(structure) = &self.stream_structure {
-            return Ok(structure.clone());
+    fn full_stream_structure(&mut self) -> io::Result<Option<StreamStructure>> {
+        if let Some(structure) = self.stream_structure {
+            return Ok(structure);
         }
         let reader = &self.view.reader;
         let header = self.signatures.head.as_slice();
         let structure = if has_compression_stream_header(header) {
-            Some(match reader.file_identity().ok() {
+            match reader.file_identity().ok() {
                 Some(identity) => stream_structure_cached(identity, reader, header)?,
-                None => Arc::new(inspect_compression_stream_reader(reader, header)?),
-            })
+                None => inspect_compression_stream_reader(reader, header)?,
+            }
         } else {
             None
         };
-        self.stream_structure = Some(structure.clone());
+        self.stream_structure = Some(structure);
         Ok(structure)
     }
 }
@@ -528,7 +514,7 @@ pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
 
 // ---- Full-stream structure cache -----------------------------------------
 
-type StreamStructureSlot = CancellableOnce<Result<Arc<StreamObservation>, Arc<io::Error>>>;
+type StreamStructureSlot = CancellableOnce<Result<Option<StreamStructure>, Arc<io::Error>>>;
 type StreamStructureEntry = (FileIdentity, Arc<StreamStructureSlot>);
 
 fn stream_structure_cache() -> &'static Mutex<VecDeque<StreamStructureEntry>> {
@@ -540,7 +526,7 @@ fn stream_structure_cached(
     identity: FileIdentity,
     reader: &ManagedReader,
     header: &[u8],
-) -> io::Result<Arc<StreamObservation>> {
+) -> io::Result<Option<StreamStructure>> {
     let cancellation = Cancellation::current();
     cancellation.check()?;
     let slot = loop {
@@ -561,9 +547,7 @@ fn stream_structure_cached(
         let ready = slot
             .get_or_init(&cancellation, || {
                 let reader = reader.with_config(ReaderConfig::default());
-                inspect_compression_stream_reader(&reader, header)
-                    .map(Arc::new)
-                    .map_err(Arc::new)
+                inspect_compression_stream_reader(&reader, header).map_err(Arc::new)
             })
             .is_some();
         if ready {
@@ -581,7 +565,7 @@ fn stream_structure_cached(
     let result = slot.get().expect("completed stream structure");
     let invalid = result.is_err();
     let result = cancellation.check().and_then(|()| match result {
-        Ok(value) => Ok(Arc::clone(value)),
+        Ok(value) => Ok(*value),
         Err(error) => Err(io::Error::new(error.kind(), Arc::clone(error))),
     });
     let mut entries = stream_structure_cache()

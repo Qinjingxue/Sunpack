@@ -237,10 +237,11 @@ void check_open_callback_canonical_range()
 
     const std::wstring path(executable, length);
     const std::wstring name = L"archive.part2.rar";
+    const std::vector<ExtractInputRange> ranges{{path, 1, 2, true}};
 
     auto *raw = new OpenCallback(
         L"", L"archive.part1.rar", {}, {name}, InputPrefetchConfig{false}, {},
-        {{path, 1, 2, true}});
+        ranges);
     CMyComPtr<IArchiveOpenCallback> callback(raw);
 
     CMyComPtr<IInStream> stream;
@@ -529,6 +530,24 @@ void check_prefetch_virtual_inputs()
         }
         check(correct && !std::memcmp(bytes, payload + 3, 248) && !std::memcmp(bytes + 248, payload + 264, 243),
               "range prefetch respects embedded payload offsets and clipped range ends");
+    }
+    {
+        ExtractInputTrace trace;
+        auto *raw = new MultiRangeInStream(
+            std::vector<std::wstring>{first.wstring(), second.wstring()}, &trace, {false});
+        CMyComPtr<IInStream> stream(raw);
+        std::filesystem::remove(second);
+        char byte = 0;
+        UInt32 read = 0;
+        const auto boundary = std::filesystem::file_size(first);
+        const auto missing = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        check(stream->Seek(boundary, FILE_BEGIN, nullptr) == S_OK &&
+              stream->Read(&byte, 1, &read) == missing && read == 0 &&
+              stream->Seek(0, FILE_BEGIN, nullptr) == S_OK &&
+              stream->Read(&byte, 1, &read) == S_OK && read == 1 &&
+              trace.read_hresult == missing && trace.last_source_path == second.wstring() &&
+              trace.last_read_virtual_offset == boundary && trace.last_read_source_offset == 0,
+              "a later valid read does not overwrite evidence of a disappeared volume");
     }
     std::filesystem::remove_all(root);
 }

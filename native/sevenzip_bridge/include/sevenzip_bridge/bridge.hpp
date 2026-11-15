@@ -102,9 +102,6 @@ struct ExtractInputTrace {
     unsigned long long last_read_source_offset = 0;
     unsigned int last_read_requested = 0;
     unsigned int last_read_returned = 0;
-    int last_hresult = 0;
-    int last_win32_error = 0;
-    bool read_error = false;
     int read_hresult = 0;
     std::wstring last_source_path;
 };

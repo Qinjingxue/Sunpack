@@ -284,13 +284,6 @@ fn walk_inner(
         index.end = cursor;
     }
 }
-impl Index {
-    pub(crate) fn magic_matched(&self) -> bool {
-        self.frames > 0 || self.error.starts_with("lz4_") && self.error != "lz4_magic_not_found"
-    }
-
-}
-
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct DecodeResult {

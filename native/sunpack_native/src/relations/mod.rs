@@ -321,9 +321,7 @@ impl NativeRelationGroup {
                 // but cannot suppress a different anchor later in the file.
                 let end = end.unwrap_or_else(|| start.saturating_add(1));
                 if let Some(extents) = ranges.get_mut(key) {
-                    if !extents.contains(&(start, end)) {
-                        extents.push((start, end));
-                    }
+                    extents.push((start, end));
                 } else {
                     ranges.insert(key.to_owned(), vec![(start, end)]);
                 }

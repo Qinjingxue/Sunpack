@@ -207,7 +207,7 @@ struct Job {
     result: Option<io::Result<WorkerFrame>>,
     disk: Episode,
     memory: Episode,
-    resources: ResourceWait,
+    volume_error: Option<u64>,
 }
 
 impl Job {
@@ -219,7 +219,7 @@ impl Job {
             result: None,
             disk: Episode::default(),
             memory: Episode::default(),
-            resources: ResourceWait::default(),
+            volume_error: None,
         }
     }
 
@@ -231,29 +231,36 @@ impl Job {
         self.mailbox.update(|updates| updates.cancel_requested = true);
     }
 
-    fn resource_event(&mut self, event: &str, summary: &Value) -> bool {
-        let episode = number(summary, "episode_id");
-        let previous = self.resources;
-        match event {
-            "space_blocked" | "space_status" | "space_resumed" => {
-                if self.disk.update(episode, event == "space_resumed") {
-                    self.resources.disk = !self.disk.resumed;
-                    self.resources.disk_episode = self.disk.id;
-                    self.resources.volume_error = (self.resources.disk
-                        && summary.get("volume_query_ok").and_then(Value::as_bool) == Some(false))
-                    .then(|| number(summary, "volume_query_error"));
-                }
-            }
-            "memory_blocked" | "memory_resumed" => {
-                if self.memory.update(episode, event == "memory_resumed") {
-                    self.resources.memory = !self.memory.resumed;
-                }
-            }
-            _ => return false,
+    fn resource_wait(&self) -> ResourceWait {
+        ResourceWait {
+            disk: self.disk.blocked == Some(true),
+            disk_episode: self.disk.id,
+            memory: self.memory.blocked == Some(true),
+            volume_error: self.volume_error,
         }
-        if previous != self.resources && self.mailbox.interest != WorkerUpdates::None {
-            self.mailbox
-                .update(|updates| updates.resources = Some(self.resources));
+    }
+
+    fn resource_event(&mut self, event: &str, summary: &Value) -> bool {
+        let (disk, blocked) = match event {
+            "space_blocked" | "space_status" => (true, true),
+            "space_resumed" => (true, false),
+            "memory_blocked" => (false, true),
+            "memory_resumed" => (false, false),
+            _ => return false,
+        };
+        let previous = self.resource_wait();
+        let current = if disk { &mut self.disk } else { &mut self.memory };
+        if !current.update(number(summary, "episode_id"), blocked) {
+            return true;
+        }
+        if disk {
+            self.volume_error = (blocked
+                && summary.get("volume_query_ok").and_then(Value::as_bool) == Some(false))
+            .then(|| number(summary, "volume_query_error"));
+        }
+        let resources = self.resource_wait();
+        if previous != resources {
+            self.mailbox.update(|updates| updates.resources = Some(resources));
         }
         true
     }
@@ -262,17 +269,18 @@ impl Job {
 #[derive(Default)]
 struct Episode {
     id: u64,
-    resumed: bool,
+    // None is the unseen state, before the first blocked or resumed frame.
+    blocked: Option<bool>,
 }
 
 impl Episode {
-    fn update(&mut self, id: u64, resumed: bool) -> bool {
+    fn update(&mut self, id: u64, blocked: bool) -> bool {
         // Gate callbacks can leave the gate lock and arrive out of order.
-        if id < self.id || (id == self.id && self.resumed) {
+        if id < self.id || (id == self.id && self.blocked == Some(false)) {
             return false;
         }
         self.id = id;
-        self.resumed = resumed;
+        self.blocked = Some(blocked);
         true
     }
 }

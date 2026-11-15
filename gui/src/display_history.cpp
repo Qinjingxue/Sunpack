@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <string_view>
 #include <tuple>
 #include <streambuf>
@@ -117,7 +118,7 @@ struct RunReader {
     bool unordered=false, filtered=false;
     std::vector<Entry> selected;
     uint64_t cache_start=0;
-    RunReader(const fs::path& folder,const Json& run,const std::optional<Cursor>& before,uint64_t revision):name(run_name(run)),
+    RunReader(const fs::path& folder,const Json& run,const std::optional<Cursor>& before,uint64_t revision,bool read_ahead):name(run_name(run)),
         data_path(folder/(name+".data")),index(open_reader(folder/(name+".index"))),revision(revision) {
         head=run.at("head").get<uint64_t>(); count=run.at("count").get<uint64_t>();
         unordered=run.value("unordered",false);
@@ -128,12 +129,19 @@ struct RunReader {
         auto end=count;
         if(before && !unordered) {
             uint64_t lo=head,hi=count;
-            while(lo<hi) { auto middle=lo+(hi-lo)/2; auto row=at(middle);
-                if(Cursor{row.time,name,middle}<*before) lo=middle+1; else hi=middle;
+            while(lo<hi) {
+                auto middle=lo+(hi-lo)/2;
+                int64_t time;
+                read_at(index,middle*EntryBytes,&time,sizeof(time));
+                if(Cursor{time,name,middle}<*before) lo=middle+1; else hi=middle;
             }
             end=lo;
         }
-        if(end>head) { position=int64_t(end-1); current=at(uint64_t(position)); }
+        if(end>head) {
+            position=int64_t(end-1);
+            if(read_ahead) current=at(uint64_t(position));
+            else read_at(index,uint64_t(position)*EntryBytes,&current,EntryBytes);
+        }
     }
     void validate() const {
         if(unordered) {
@@ -145,7 +153,7 @@ struct RunReader {
     Entry at(uint64_t pos) {
         if(cache.empty() || pos<cache_start || pos>=cache_start+cache.size()) {
             cache_start=pos>255?std::max(head,pos-255):head;
-            auto length=std::min<uint64_t>(512,count-cache_start);
+            auto length=pos-cache_start+1;
             cache.resize(size_t(length)); read_at(index,cache_start*EntryBytes,cache.data(),cache.size()*EntryBytes);
         }
         return cache[size_t(pos-cache_start)];
@@ -285,7 +293,9 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     }
     std::vector<std::unique_ptr<RunReader>> runs;
     auto revision=manifest.value("task_revision",uint64_t(0));
-    for(const auto& run:manifest.at("runs")) runs.push_back(std::make_unique<RunReader>(folder,run,before,revision));
+    const auto& historical=manifest.at("runs");
+    for(const auto& run:historical)
+        runs.push_back(std::make_unique<RunReader>(folder,run,before,revision,historical.size()==1));
     auto query=folded(view.task_query); auto bits=filter(query);
     // UTC microseconds are already indexed, including in old stores. Check
     // local display time before rejecting the path bloom, decode candidates
@@ -325,42 +335,56 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     };
     const bool filter_values=!query.empty() || !view.task_root.empty();
     if(manifest.contains("live") && manifest["live"].is_object()) {
-        auto live=std::make_unique<RunReader>(folder,manifest["live"],before,revision);
+        auto live=std::make_unique<RunReader>(folder,manifest["live"],before,revision,true);
         if(live->unordered) {
             // Keep at most one page of live candidates. Only filters on record
             // contents need decoding before the merge with historical runs.
-            auto earlier=[](const Entry& a,const Entry& b) { return std::tie(a.time,a.offset)<std::tie(b.time,b.offset); };
+            auto newer=[](const Entry& a,const Entry& b) { return std::tie(a.time,a.offset)>std::tie(b.time,b.offset); };
+            live->selected.reserve(PageRows+1);
             while(live->position>=0) {
                 if((++scanned&63)==0 && cancelled && cancelled()) return Json();
                 auto key=live->key(); auto row=live->current;
-                if((!before || key<*before) && (live->selected.size()<PageRows+1 || earlier(live->selected.front(),row)) && matches_entry(row)) {
+                if((!before || key<*before) && (live->selected.size()<PageRows+1 || newer(row,live->selected.front())) && matches_entry(row)) {
                     if(!filter_values || matches_value(live->value(packed,raw))) {
-                        auto at=std::lower_bound(live->selected.begin(),live->selected.end(),row,earlier);
-                        live->selected.insert(at,row);
-                        if(live->selected.size()>PageRows+1) live->selected.erase(live->selected.begin());
+                        if(live->selected.size()==PageRows+1) {
+                            std::pop_heap(live->selected.begin(),live->selected.end(),newer);
+                            live->selected.pop_back();
+                        }
+                        live->selected.push_back(row);
+                        std::push_heap(live->selected.begin(),live->selected.end(),newer);
                     }
                 }
                 live->previous();
             }
+            std::sort_heap(live->selected.begin(),live->selected.end(),newer);
+            std::reverse(live->selected.begin(),live->selected.end());
             live->filtered=true; live->position=int64_t(live->selected.size())-1;
             if(live->position>=0) live->current=live->selected.back();
         }
         runs.push_back(std::move(live));
     }
-    for(;;) {
+    const auto earlier=[](const RunReader* a,const RunReader* b) { return a->key()<b->key(); };
+    std::vector<RunReader*> heads;
+    heads.reserve(runs.size());
+    for(const auto& run:runs) if(run->position>=0) heads.push_back(run.get());
+    std::priority_queue merge(earlier,std::move(heads));
+    const auto advance=[&](RunReader* run) {
+        run->previous();
+        if(run->position>=0) merge.push(run);
+    };
+    while(!merge.empty()) {
         if((++scanned&63)==0 && cancelled && cancelled()) return Json();
-        RunReader* selected=nullptr;
-        for(auto& run:runs) if(run->position>=0 && (!selected || run->key()>selected->key())) selected=run.get();
-        if(!selected) break;
+        auto* selected=merge.top();
+        merge.pop();
         auto cursor=selected->key(); auto record=selected->current;
         // The unordered live run already applied both filters in its bounded
         // selection. Decode again only when the row fits on the page.
-        if(!selected->filtered && !matches_entry(record)) { selected->previous(); continue; }
+        if(!selected->filtered && !matches_entry(record)) { advance(selected); continue; }
         const bool check_value=filter_values && !selected->filtered;
         Json value;
         if(check_value) {
             value=selected->value(packed,raw);
-            if(!matches_value(value)) { selected->previous(); continue; }
+            if(!matches_value(value)) { advance(selected); continue; }
         }
         if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
         // These are independent snapshots. Keep the first card for each ID.
@@ -371,7 +395,7 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
             previous_timestamp=row.timestamp;
             projected.push_back(std::move(row));
         }
-        bytes+=record.raw?record.raw:PageBytes; last=std::move(cursor); selected->previous();
+        bytes+=record.raw?record.raw:PageBytes; last=std::move(cursor); advance(selected);
     }
     if(cancelled && cancelled()) return Json();
     // Even an empty/filtered page can have crossed a live-slot mutation.

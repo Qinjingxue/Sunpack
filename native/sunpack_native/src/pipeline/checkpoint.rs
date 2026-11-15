@@ -5,9 +5,7 @@ use super::{ArchiveResult, DiscoverySource, Failure, FailureKind};
 use crate::io::archive_state::ArchiveInput;
 #[cfg(test)]
 use crate::io::archive_state::OpenMode;
-use crate::io::reader::{
-    capture_file_generation, PersistedFileGeneration, PhysicalFileGeneration,
-};
+use crate::io::reader::{capture_file_generation, PhysicalFileGeneration};
 use crate::path_keys::path_key;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -75,7 +73,7 @@ pub(crate) struct InputRecovery {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SourceGeneration {
     path: PathBuf,
-    generation: PersistedFileGeneration,
+    generation: PhysicalFileGeneration,
 }
 
 /// A generated source generation, retained at its original path for a later retry.
@@ -90,7 +88,7 @@ impl GeneratedSource {
     pub(super) fn from_generation(path: &Path, generation: &PhysicalFileGeneration) -> Self {
         Self(SourceGeneration {
             path: path.to_path_buf(),
-            generation: generation.persisted(),
+            generation: generation.clone(),
         })
     }
 
@@ -99,7 +97,7 @@ impl GeneratedSource {
     }
 
     pub(crate) fn matches(&self, generation: &PhysicalFileGeneration) -> bool {
-        generation.persisted() == self.0.generation
+        generation == &self.0.generation
     }
 
 }
@@ -144,7 +142,7 @@ impl InputCheckpoint {
             };
             sources.push(SourceGeneration {
                 path: path.clone(),
-                generation: generation.persisted(),
+                generation: generation.clone(),
             });
         }
         if sources.is_empty() {
@@ -723,7 +721,7 @@ mod tests {
             carrier: source.clone(),
             input: Arc::new(input.clone()), report: None,
             sources: vec![SourceGeneration {
-                path: source.clone(), generation: generations[&key].persisted(),
+                path: source.clone(), generation: generations[&key].clone(),
             }].into(),
             output: output.clone(),
             planned_output: None,

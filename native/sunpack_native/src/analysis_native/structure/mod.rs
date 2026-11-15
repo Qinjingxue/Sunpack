@@ -5,4 +5,3 @@ use std::io::Read;
 include!("constants.rs");
 include!("api.rs");
 include!("compression.rs");
-include!("util.rs");

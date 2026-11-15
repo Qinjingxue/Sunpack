@@ -3,16 +3,13 @@ use super::*;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use windows_sys::Win32::Foundation::{ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::FileSystem::{
-    FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 pub(crate) struct Directory(pub(crate) PathBuf);
 
@@ -66,31 +63,6 @@ pub(crate) fn gui_binary() -> PathBuf {
     binary
 }
 
-pub(crate) struct DirectoryNotification(HANDLE);
-
-impl DirectoryNotification {
-    pub(crate) fn new(path: &Path) -> Self {
-        let wide: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
-        let handle = unsafe { FindFirstChangeNotificationW(wide.as_ptr(), 0, FILE_NOTIFY_CHANGE_FILE_NAME) };
-        assert_ne!(handle, INVALID_HANDLE_VALUE, "{}", std::io::Error::last_os_error());
-        Self(handle)
-    }
-
-    pub(crate) fn wait_for_temp(&self, path: &Path) {
-        while !path.is_file() {
-            let result = unsafe { WaitForSingleObject(self.0, 10_000) };
-            assert_eq!(result, WAIT_OBJECT_0, "writer did not stage the manifest: {path:?}");
-            assert_ne!(unsafe { FindNextChangeNotification(self.0) }, 0);
-        }
-    }
-}
-
-impl Drop for DirectoryNotification {
-    fn drop(&mut self) {
-        unsafe { FindCloseChangeNotification(self.0) };
-    }
-}
-
 #[test]
 #[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
 fn rust_writer_cpp_query_publication_conflict() {
@@ -117,29 +89,35 @@ fn rust_writer_cpp_query_publication_conflict() {
     let waiting = project(&binary, &path, "", "", "", "");
     assert_eq!(waiting["rows"][0]["statusText"], "等待密码");
 
-    {
-        let _held = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path).unwrap();
-        let before = fs::read(&path).unwrap();
-        let changed = DirectoryNotification::new(&root.0);
-        log.write(json!({"event":"suspended_missing_volume","path":source})).unwrap();
-        // The real writer updates the mutable index before staging publication.
-        // Wait for that boundary so the reader cannot accidentally see old slots.
-        changed.wait_for_temp(&root.0.join("events.json.tmp"));
-        assert_eq!(fs::read(&path).unwrap(), before);
-        let pending = query_output(&binary, &path, [""; 4]);
-        assert_eq!(pending.status.code(), Some(ERROR_SHARING_VIOLATION as i32),
-            "{}", String::from_utf8_lossy(&pending.stdout));
-    }
+    let held = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path).unwrap();
+    let before = fs::read(&path).unwrap();
+    log.write(json!({"event":"suspended_missing_volume","path":source})).unwrap();
+    log.write(json!({"event":"done","path":root.0.join("staged.zip")})).unwrap();
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let log = &log;
+        scope.spawn(move || { let _ = send.send(log.flush()); });
+        let flush = receive.recv_timeout(std::time::Duration::from_secs(10));
+        if matches!(&flush, Ok(Err(_))) {
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let pending = query_output(&binary, &path, [""; 4]);
+            assert_eq!(pending.status.code(), Some(ERROR_SHARING_VIOLATION as i32),
+                "{}", String::from_utf8_lossy(&pending.stdout));
+        }
+        drop(held);
+        assert!(flush.expect("display flush waited for an external handle").is_err());
+    });
     log.flush().unwrap();
     assert!(log.error().is_none());
-    let healed = project(&binary, &path, "", "", "", "");
+    assert_eq!(project(&binary, &path, "staged.zip", "", "", "")["total"], 1);
+    let healed = project(&binary, &path, "carrier.001", "", "", "");
     assert_eq!(healed["rows"][0]["statusText"], "等待分卷");
     assert_eq!(healed["rows"][0]["id"], waiting["rows"][0]["id"]);
     log.write(json!({"event":"done","owner":"test","path":source,
         "output_dirs":["retained-output"]})).unwrap();
     log.flush().unwrap();
     drop(log);
-    let offline = project(&binary, &path, "", "", "", "");
+    let offline = project(&binary, &path, "carrier.001", "", "", "");
     assert_eq!(offline["rows"][0]["status"], "taskSucceeded");
     assert_eq!(offline["rows"][0]["outputs"], json!(["retained-output"]));
     assert!(!root.0.join("events.json.tmp").exists());

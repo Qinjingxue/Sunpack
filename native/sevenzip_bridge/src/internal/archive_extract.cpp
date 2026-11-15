@@ -388,10 +388,10 @@ namespace sunpack::sevenzip
             if (!stream_opened)
             {
 
-                if (set_memory_failure(result, "input_open", static_cast<HRESULT>(result.input_trace.last_hresult)))
+                const HRESULT error = static_cast<HRESULT>(result.input_trace.read_hresult);
+                if (set_memory_failure(result, "input_open", error))
                     return result;
 
-                const HRESULT error = static_cast<HRESULT>(result.input_trace.read_hresult);
                 if (!canonical_names.empty() && (error == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || error == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))) {
                     set_missing_volume_failure(result, "input_open", "open_volume_file_missing",
                         result.input_trace.last_source_path, error);
@@ -400,7 +400,7 @@ namespace sunpack::sevenzip
 
                 result.status = PasswordTestStatus::Error;
 
-                set_failure(result, "input_open", "input_stream", static_cast<HRESULT>(result.input_trace.last_hresult));
+                set_failure(result, "input_open", "input_stream", error);
 
                 result.message = "archive file could not be opened";
 
@@ -437,13 +437,13 @@ namespace sunpack::sevenzip
                 const HRESULT error = FAILED(callback_error) ? callback_error : static_cast<HRESULT>(result.input_trace.read_hresult);
                 if (!FAILED(error)) return false;
                 if (set_memory_failure(result, "input_read", error)) return true;
+                if (FAILED(callback_error))
+                    record_input_error(&result.input_trace, raw_open_callback->failed_volume_name(), callback_error);
                 if (error == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || error == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)) {
-                    set_missing_volume_failure(result, "input_read", "open_volume_file_missing",
-                        raw_open_callback->failed_volume_name(), error);
+                    const auto &name = FAILED(callback_error) ? raw_open_callback->failed_volume_name()
+                        : result.input_trace.last_source_path;
+                    set_missing_volume_failure(result, "input_read", "open_volume_file_missing", name, error);
                 } else {
-                    result.input_trace.read_error = true;
-                    result.input_trace.last_hresult = static_cast<int>(error);
-                    result.input_trace.last_win32_error = HRESULT_FACILITY(error) == FACILITY_WIN32 ? HRESULT_CODE(error) : 0;
                     result.status = PasswordTestStatus::Error;
                     set_failure(result, "input_read", "input_stream", error);
                     result.message = "archive volume could not be read";
