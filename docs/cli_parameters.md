@@ -72,7 +72,7 @@ Options:
 | `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | Read passwords from a text file, one per line. |
 | `-a`, `--ask-pw` | Prompt for passwords interactively in the terminal; an empty line ends input. |
 | `--no-builtin-pw`, `--no-bpw` | Disable persistent JSON passwords, including clipboard history. |
-| `-d`, `--deep-detect` | Use Embedded as the sole archive discovery entry, scanning complete files in every extraction round; disable filesystem scan filters and the recursive Embedded size-ratio heuristic. Recursion depth and authorization still apply. |
+| `-d`, `--deep-detect` | Use Embedded as the sole archive discovery entry. The first round scans all input files without filesystem scan filters; nested rounds retain filesystem filtering, `embedded_scan.recursive_candidate_ratio`, recursion depth and authorization. Selected files receive full-file scanning. |
 | `-r VALUE`, `--recur VALUE` | Override the number of nested extraction rounds; accepts a positive integer, `*`, or `?`. |
 | `-c VALUE`, `--cleanup VALUE` | Override how the original archive is handled on success: `d` delete, `r` Recycle Bin, `k` keep. |
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | Set the output root; relative paths are resolved against the current command directory. |

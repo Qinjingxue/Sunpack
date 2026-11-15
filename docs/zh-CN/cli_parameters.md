@@ -72,7 +72,7 @@ sunpack.exe extract [options] <paths...>
 | `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
 | `-a`, `--ask-pw` | 在终端交互输入密码，空行结束。 |
 | `--no-builtin-pw`, `--no-bpw` | 禁用 JSON 持久化密码及其中的剪贴板历史。 |
-| `-d`, `--deep-detect` | 以 Embedded 为唯一归档发现入口，每轮扫描完整文件；关闭文件系统过滤和递归 Embedded 大小比例筛选，仍遵守递归深度和授权。 |
+| `-d`, `--deep-detect` | 以 Embedded 为唯一归档发现入口。首轮关闭文件系统过滤并扫描全部输入；递归轮次保留文件系统过滤、`embedded_scan.recursive_candidate_ratio` 比例筛选、递归深度和授权。被选中的文件执行完整文件扫描。 |
 | `-r VALUE`, `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
 | `-c VALUE`, `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录；相对路径按当前命令目录解析。 |

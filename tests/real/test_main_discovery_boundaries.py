@@ -17,10 +17,12 @@ def entry_mode(request):
     return request.param
 
 
-def test_nested_carrier_ratio_is_local_to_each_extracted_tree(package, tmp_path, entry_mode):
+@pytest.mark.parametrize("ratio", [0, 0.3], ids=["disabled", "per-tree"])
+def test_nested_carrier_ratio_is_local_to_each_extracted_tree(package, tmp_path, entry_mode, ratio):
     # Main compares a carrier to its own extracted tree. Two equal-sized
     # carriers must make opposite decisions in one batch because only one
-    # of their trees contains a large unrelated file.
+    # of their trees contains a large unrelated file. Zero disables nested
+    # Embedded scanning without disabling the first Deep discovery round.
     inputs = tmp_path / "inputs"
     inputs.mkdir()
     expected = b"nested payload selected by its own tree's size"
@@ -36,26 +38,28 @@ def test_nested_carrier_ratio_is_local_to_each_extracted_tree(package, tmp_path,
                 outer.writestr("asset.bin", b"x" * (10 * carrier.stat().st_size))
 
     package.configure(
-        embedded_scan={"enabled": True, "recursive_candidate_ratio": 0.3},
+        embedded_scan={"enabled": True, "recursive_candidate_ratio": ratio},
         filesystem={"scan_filters_enabled": False},
         recursive_authorization={"enabled": False},
     )
     output = tmp_path / "out"
     if entry_mode == "cli":
-        report = extract_report(package, inputs, output, cleanup="d")
-        assert report["summary"]["success_count"] == 3, report
+        report = extract_report(package, inputs, output, cleanup="d", deep=True)
+        assert report["summary"]["success_count"] == (3 if ratio else 2), report
         assert report["summary"]["failed_count"] == 0, report
         assert not any(inputs.iterdir())
     else:
-        watch = watch_setup(package, tmp_path, passwords=[], cleanup="d", recursive=True)
+        watch = watch_setup(package, tmp_path, passwords=[], cleanup="d", recursive=True, deep=True)
         target = inputs.rename(watch.root / inputs.name)
         wait_for(lambda: source_directory_cleaned(target), "cleanup of both extracted outer archives")
         watch.stop()
         watch.assert_no_terminal_failures()
 
-    assert [path.read_bytes() for path in output.rglob("sparse-leaf.txt")] == [expected]
+    assert [path.read_bytes() for path in output.rglob("sparse-leaf.txt")] == ([expected] if ratio else [])
     assert not marker_present(output, "dense-leaf.txt")
-    assert not marker_present(output, "sparse.opaque")
+    assert [path.read_bytes() for path in output.rglob("sparse.opaque")] == (
+        [] if ratio else [(tmp_path / "sparse.opaque").read_bytes()]
+    )
     assert [path.read_bytes() for path in output.rglob("dense.opaque")] == [
         (tmp_path / "dense.opaque").read_bytes()
     ]

@@ -1417,7 +1417,18 @@ impl NativeCandidateTable {
         Ok(routes)
     }
 
-    pub(crate) fn prepare_deep(&self) -> NativeEmbeddedBatch {
+    pub(crate) fn prepare_deep(&mut self, recursive: bool, recursive_ratio: f64) -> NativeEmbeddedBatch {
+        if recursive {
+            // Deep changes the discovery producer, not the nested scan budget.
+            // Reuse selection and row compaction before any full-file I/O.
+            let mut routes = NativeDiscoveryRoutes {
+                embedded: (0..self.rows.len()).collect(),
+                ..NativeDiscoveryRoutes::default()
+            };
+            let mut batch = self.prepare_embedded(&mut routes, true, true, recursive_ratio);
+            batch.force_scan = true;
+            return batch;
+        }
         NativeEmbeddedBatch {
             ids: (0..self.rows.len()).collect(),
             force_scan: true,

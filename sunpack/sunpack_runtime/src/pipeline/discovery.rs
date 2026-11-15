@@ -888,7 +888,7 @@ impl Discovered {
         recursive: bool,
     ) -> io::Result<NativeEmbeddedBatch> {
         if request.deep {
-            return Ok(table.prepare_deep());
+            return Ok(table.prepare_deep(recursive, request.config.embedded_scan.recursive_candidate_ratio));
         }
         let mut routes = table.resolve()?;
         for &(index, status) in &routes.relation_events {
