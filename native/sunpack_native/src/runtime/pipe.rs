@@ -357,7 +357,7 @@ impl Header {
 struct Connection {
     peer: transport::Peer,
     output: output::Output,
-    prompt: Mutex<Option<Arc<PromptAnswer>>>,
+    prompt: Mutex<Option<Arc<Reply<Vec<u8>>>>>,
     input: Mutex<PromptInput>,
     cancel: Cancellation,
     finishing: AtomicBool,
@@ -366,28 +366,14 @@ struct Connection {
     flags: u32,
 }
 
-#[derive(Default)]
-struct PromptAnswer {
-    reply: Reply<Vec<u8>>,
-    completed: AtomicBool,
-}
-impl PromptAnswer {
-    fn complete(&self, value: io::Result<Vec<u8>>) {
-        // Input and cancellation race for the same one-shot, like main's
-        // Future.done check. A late cancellation must not replace an answer.
-        if !self.completed.swap(true, Ordering::AcqRel) { self.reply.complete(value); }
-    }
-    async fn wait(&self) -> io::Result<Vec<u8>> { self.reply.wait().await }
-}
-
 struct PromptReply<'a> {
-    slot: &'a Mutex<Option<Arc<PromptAnswer>>>,
-    reply: Arc<PromptAnswer>,
+    slot: &'a Mutex<Option<Arc<Reply<Vec<u8>>>>>,
+    reply: Arc<Reply<Vec<u8>>>,
     _cancellation: Option<crate::io::cancellation::Subscription>,
 }
 impl<'a> PromptReply<'a> {
-    fn new(slot: &'a Mutex<Option<Arc<PromptAnswer>>>, cancel: &Cancellation) -> io::Result<Option<Self>> {
-        let reply = Arc::new(PromptAnswer::default());
+    fn new(slot: &'a Mutex<Option<Arc<Reply<Vec<u8>>>>>, cancel: &Cancellation) -> io::Result<Option<Self>> {
+        let reply = Arc::new(Reply::default());
         {
             let mut pending = slot.lock().unwrap();
             if cancel.cancelled() { return Ok(None); }
@@ -1349,6 +1335,7 @@ mod async_connection_tests {
         cancel.cancel();
         assert!(block_on(first.reply.wait()).unwrap().is_empty());
         partial_reply.complete(Ok(b"late".to_vec()));
+        assert!(block_on(first.reply.wait()).is_err());
         drop(first);
         assert!(slot.lock().unwrap().as_ref().is_some_and(|reply| Arc::ptr_eq(reply, &next.reply)));
         next.reply.complete(Ok(b"yes".to_vec()));

@@ -20,6 +20,7 @@ pub(crate) enum IntegrityStatus {
 #[derive(Clone, Debug)]
 pub(crate) struct StructureValidation {
     pub(crate) end_offset: u64,
+    #[cfg(test)]
     pub(crate) stream_count: usize,
     #[cfg(test)]
     pub(crate) block_count: usize,
@@ -1004,6 +1005,7 @@ fn walk_gzip_structure(
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
 ) -> ValidationResult<StructureValidation> {
     let mut cursor = ByteCursor::new(reader, offset, limit);
+    #[cfg(test)]
     let mut members = 0usize;
     let mut blocks = 0usize;
     let mut decoded_size = 0u64;
@@ -1049,7 +1051,8 @@ fn walk_gzip_structure(
         blocks = blocks
             .checked_add(member_blocks)
             .ok_or(ValidationError::Invalid("deflate_block_count_overflow"))?;
-        members += 1;
+        #[cfg(test)]
+        { members += 1; }
 
         if cursor.position() + 3 > limit {
             break;
@@ -1070,6 +1073,7 @@ fn walk_gzip_structure(
 
     Ok(StructureValidation {
         end_offset: cursor.position(),
+        #[cfg(test)]
         stream_count: members,
         #[cfg(test)]
         block_count: blocks,
@@ -1210,6 +1214,7 @@ pub(crate) fn validate_bzip2_structure_observed(
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
 ) -> ValidationResult<StructureValidation> {
     let mut cursor = ByteCursor::new(reader, offset, limit);
+    #[cfg(test)]
     let mut streams = 0usize;
     #[cfg(test)]
     let mut total_blocks = 0usize;
@@ -1320,7 +1325,8 @@ pub(crate) fn validate_bzip2_structure_observed(
             #[cfg(test)]
             { total_blocks += 1; }
         }
-        streams += 1;
+        #[cfg(test)]
+        { streams += 1; }
         if cursor.position() + 4 > limit {
             break;
         }
@@ -1331,6 +1337,7 @@ pub(crate) fn validate_bzip2_structure_observed(
     }
     Ok(StructureValidation {
         end_offset: cursor.position(),
+        #[cfg(test)]
         stream_count: streams,
         #[cfg(test)]
         block_count: total_blocks,
@@ -1644,6 +1651,7 @@ pub(crate) fn validate_xz_structure_exact(
         return invalid("xz_header_or_footer_missing");
     }
     let mut reverse_end = limit;
+    #[cfg(test)]
     let mut streams_reversed = 0usize;
     #[cfg(test)]
     let mut total_blocks = 0usize;
@@ -1720,7 +1728,8 @@ pub(crate) fn validate_xz_structure_exact(
         if block_cursor != index_start {
             return invalid("xz_block_index_boundary_mismatch");
         }
-        streams_reversed += 1;
+        #[cfg(test)]
+        { streams_reversed += 1; }
         reverse_end = stream_start;
         let _ = padding;
     }
@@ -1729,6 +1738,7 @@ pub(crate) fn validate_xz_structure_exact(
     }
     Ok(StructureValidation {
         end_offset: limit,
+        #[cfg(test)]
         stream_count: streams_reversed,
         #[cfg(test)]
         block_count: total_blocks,
@@ -1873,6 +1883,7 @@ pub(crate) fn validate_zstd_structure_observed(
     }
     Ok(StructureValidation {
         end_offset: cursor,
+        #[cfg(test)]
         stream_count: frames,
         #[cfg(test)]
         block_count: blocks,

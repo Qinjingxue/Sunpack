@@ -995,12 +995,10 @@ impl CompletedGenerations {
 #[derive(Default)]
 struct CompletedFamilies(Mutex<CompletedFamilyCache>);
 
-#[derive(Default)]
-struct CompletedFamilyCache {
-    sequence: u64,
-    by_family: HashMap<CompletedFamilyKey, u64>,
-    ordered: BTreeMap<u64, (CompletedFamilyKey, Arc<CompletedGenerations>, Arc<Path>)>,
-}
+type CompletedFamilyCache = crate::collections::CacheOrder<
+    CompletedFamilyKey,
+    (Arc<CompletedGenerations>, Arc<Path>),
+>;
 
 impl CompletedFamilies {
     fn remember(&self, generations: SourceGenerations, deep: bool, output: &Path) {
@@ -1012,13 +1010,7 @@ impl CompletedFamilies {
         let family = (Arc::from(members), deep);
         let generations = Arc::new(CompletedGenerations::new(generations));
         let output = Arc::from(output);
-        let mut cache = self.0.lock().unwrap();
-        if let Some(previous) = cache.by_family.get(&family).copied() { cache.ordered.remove(&previous); }
-        cache.insert(family, generations, output);
-        if cache.ordered.len() > COMPLETED_FAMILY_LIMIT {
-            let (_, (family, _, _)) = cache.ordered.pop_first().unwrap();
-            cache.by_family.remove(&family);
-        }
+        self.0.lock().unwrap().insert(family, (generations, output), COMPLETED_FAMILY_LIMIT);
     }
 
     fn output(&self, generations: &SourceGenerations, deep: bool) -> Option<PathBuf> {
@@ -1031,8 +1023,8 @@ impl CompletedFamilies {
         let (members, current): (Vec<_>, Vec<_>) = current.into_iter().unzip();
         let family = (Arc::from(members), deep);
         let output = {
-            let cache = self.0.lock().unwrap();
-            let (_, previous, output) = &cache.ordered[cache.by_family.get(&family)?];
+            let mut cache = self.0.lock().unwrap();
+            let (previous, output) = cache.peek_mut(&family)?;
             if !current.iter().zip(&previous.ordered).all(|((_, current), (_, previous))|
                 current.matches_input(previous)) {
                 return None;
@@ -1041,11 +1033,11 @@ impl CompletedFamilies {
         };
         let live = output.is_dir();
         let mut cache = self.0.lock().unwrap();
-        let sequence = cache.validated_sequence(&family, &output, live)?;
+        if !Self::validate_output(&mut cache, &family, &output, live) { return None; }
         // Late completion/failure checks must use the validated live names too.
         // Share each name with the membership index and retain unchanged names,
         // without filesystem observations beyond admission's snapshot.
-        let (_, previous, _) = cache.ordered.get_mut(&sequence).unwrap();
+        let (previous, _) = cache.get_mut(&family).unwrap();
         if current.iter().zip(&previous.ordered).any(|((path, _), (stored, _))| stored.as_ref() != path.as_str()) {
             let previous = Arc::make_mut(previous);
             for ((path, _), (stored, _)) in current.iter().zip(&mut previous.ordered) {
@@ -1054,16 +1046,15 @@ impl CompletedFamilies {
             previous.by_path.clear();
             previous.by_path.extend(previous.ordered.iter().map(|(path, _)| Arc::clone(path)));
         }
-        cache.refresh(sequence);
         Some(output.to_path_buf())
     }
 
     fn covers(&self, path: &Path, deep: bool) -> bool {
         let path = key(path);
-        let candidates: Vec<_> = self.0.lock().unwrap().ordered.values()
-            .filter(|(family, generations, _)| family.1 == deep && generations.by_path.contains(path.as_str()))
-            .cloned().collect();
-        for (family, generations, output) in candidates {
+        let candidates: Vec<_> = self.0.lock().unwrap().iter()
+            .filter(|(family, (generations, _))| family.1 == deep && generations.by_path.contains(path.as_str()))
+            .map(|(family, receipt)| (family.clone(), receipt.clone())).collect();
+        for (family, (generations, output)) in candidates {
             // Require the entire current family, not only the old request's head.
             if !generations.ordered.iter().all(|(member, previous)| {
                 crate::io::reader::capture_file_generation(Path::new(member.as_ref()))
@@ -1071,36 +1062,19 @@ impl CompletedFamilies {
             }) { continue; }
             let live = output.is_dir();
             let mut cache = self.0.lock().unwrap();
-            let Some(sequence) = cache.validated_sequence(&family, &output, live) else { continue; };
-            if Arc::ptr_eq(&cache.ordered[&sequence].1, &generations) {
-                cache.refresh(sequence);
+            if Self::validate_output(&mut cache, &family, &output, live)
+                && cache.peek_mut(&family).is_some_and(|(current, _)| Arc::ptr_eq(current, &generations)) {
+                cache.get(&family);
                 return true;
             }
         }
         false
     }
-}
-
-impl CompletedFamilyCache {
-    fn insert(&mut self, family: CompletedFamilyKey, generations: Arc<CompletedGenerations>, output: Arc<Path>) {
-        self.sequence += 1;
-        self.by_family.insert(family.clone(), self.sequence);
-        self.ordered.insert(self.sequence, (family, generations, output));
-    }
-
-    fn validated_sequence(&mut self, family: &CompletedFamilyKey, output: &Arc<Path>, live: bool) -> Option<u64> {
-        let sequence = *self.by_family.get(family)?;
+    fn validate_output(cache: &mut CompletedFamilyCache, family: &CompletedFamilyKey, output: &Arc<Path>, live: bool) -> bool {
         // An old probe cannot refresh or remove a replacement receipt.
-        if !Arc::ptr_eq(output, &self.ordered[&sequence].2) { return None; }
-        if live { return Some(sequence); }
-        self.by_family.remove(family);
-        self.ordered.remove(&sequence);
-        None
-    }
-
-    fn refresh(&mut self, sequence: u64) {
-        let (family, generations, output) = self.ordered.remove(&sequence).unwrap();
-        self.insert(family, generations, output);
+        if !cache.peek_mut(family).is_some_and(|(_, current)| Arc::ptr_eq(output, current)) { return false; }
+        if !live { cache.remove(family); }
+        live
     }
 }
 
@@ -2895,13 +2869,13 @@ impl Scheduler {
             if let Some(error) = completion_error {
                 return Err(error);
             }
-            let mut buckets = HashSet::new();
-            let mut retried = HashSet::new();
-            for (root, output) in signals.published_outputs {
-                let root = watch_path_key(&root);
-                if let Some((_, scope)) = self.roots.get(&root) {
-                    if buckets.insert((root, crate::scan::catalog::catalog_stem(&output))) {
-                        self.retry_volume_peers(&scope.clone(), &output, &mut retried)?;
+            if !signals.published_outputs.is_empty() && self.journal.state().has_entries() {
+                let buckets: HashSet<_> = signals.published_outputs.into_iter().map(|(root, output)|
+                    (watch_path_key(&root), crate::scan::catalog::catalog_stem(&output))).collect();
+                let mut retried = HashSet::new();
+                for (root, stem) in buckets {
+                    if let Some((_, scope)) = self.roots.get(&root) {
+                        self.retry_volume_peers(&scope.clone(), &stem, &mut retried)?;
                     }
                 }
             }
@@ -3097,10 +3071,12 @@ impl Scheduler {
         // refreshing the durable inventory or advancing its USN stamp. The
         // captured burst is reconciled once at admission/recovery instead.
         let mut retried = HashSet::new();
+        let retry_volumes = self.journal.state().has_entries();
         for (id, paths) in changed {
             let Some((root, scope)) = self.roots.get(id) else { continue };
             let deep = root.deep;
             let scope = scope.clone();
+            let mut stems = HashSet::new();
             for path in paths {
                 let source = path.to_string_lossy();
                 if !scope.contains(&source) || self.catalog.is_owned(&source) { continue; }
@@ -3118,7 +3094,11 @@ impl Scheduler {
                 let event = change.and_then(|change| change.event.as_ref());
                 self.observe_candidate_with_event(id, source.to_string(), CandidateAdmission::Observe,
                     None, None, tracker, event, observation)?;
-                self.retry_volume_peers(&scope, &source, &mut retried)?;
+                if retry_volumes { stems.insert(crate::scan::catalog::catalog_stem(&source)); }
+            }
+            // Check a stem once against the inventory after this event burst.
+            for stem in stems {
+                self.retry_volume_peers(&scope, &stem, &mut retried)?;
             }
         }
         if self.cache_deadline.is_none() { self.arm_idle_cleanup(); }
@@ -3245,6 +3225,7 @@ impl Scheduler {
         let mut marks = HashSet::new();
         let mut admitted = HashSet::new();
         let mut retried = HashSet::new();
+        let retry_volumes = self.journal.state().has_entries();
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
         for (id, root, scope, identity, current, cached) in probes {
@@ -3375,6 +3356,7 @@ impl Scheduler {
                     marks.insert(id.clone());
                 }
             }
+            let mut stems = HashSet::new();
             for (index, path) in paths.into_iter().enumerate() {
                 // Initial inventory is not an explicit retry. Only paths
                 // reported by startup recovery bypass an interrupted entry.
@@ -3396,8 +3378,11 @@ impl Scheduler {
                         None, None, None, Some(path_changes.get(Path::new(&path)).and_then(|change| change.event.as_ref()).unwrap_or(&CandidateEvent::Business(
                             if index >= recovered_paths { "initial_scan" }
                             else if startup { "startup_usn_recovery" } else { "usn_recovery" }))), None)?;
-                    self.retry_volume_peers(&scope, &path, &mut retried)?;
+                    if retry_volumes { stems.insert(crate::scan::catalog::catalog_stem(&path)); }
                 }
+            }
+            for stem in stems {
+                self.retry_volume_peers(&scope, &stem, &mut retried)?;
             }
             match (current, identity) {
                 (Ok((volume, journal, mut end)), Some(identity)) if errors.is_empty() => {
@@ -3566,7 +3551,7 @@ impl Scheduler {
             }
         }
         self.journal.log(json!({"event":"candidate_departed","path":path,"recursive":recursive}));
-        self.catalog.forget_observation(path, recursive, true);
+        self.catalog.forget_missing_observation(path, recursive);
         self.retire_missing_entries(Some(&path_key), recursive)
     }
 
@@ -3601,16 +3586,6 @@ impl Scheduler {
             active.dirty.insert(id.to_owned());
         }
         true
-    }
-
-    fn enqueue_with_recovery(
-        &mut self,
-        root_id: &str,
-        path: String,
-        recovery: Option<Arc<Recovery>>,
-    ) -> io::Result<()> {
-        self.observe_candidate_with_event(root_id, path, CandidateAdmission::Retry, recovery, None, None,
-            Some(&CandidateEvent::Business("volume_changed")), None)
     }
 
     #[cfg(test)]
@@ -4020,9 +3995,8 @@ impl Scheduler {
         Ok(())
     }
 
-    fn retry_volume_peers(&mut self, scope: &NativeDiscoveryScope, seed: &str, retried: &mut HashSet<String>) -> io::Result<()> {
-        for peer in self.catalog.bucket_paths(scope, seed) {
-            let id = watch_path_key(&peer);
+    fn retry_volume_peers(&mut self, scope: &NativeDiscoveryScope, stem: &str, retried: &mut HashSet<Arc<str>>) -> io::Result<()> {
+        for id in self.catalog.bucket_keys(scope, stem) {
             if retried.contains(&id) { continue; }
             if let Some(entry) = self.journal.state().entry_by_key(&id)
                 .filter(|entry| entry.status == "suspended_missing_volume") {
@@ -4065,9 +4039,15 @@ impl Scheduler {
                 return Ok(());
             }
         };
-        let found = prepared.is_some();
+        if prepared.is_some() {
+            // A claim or a replacement can arrive during lookup. Keep a
+            // prepared plan only while there is an admission to hand it to.
+            self.volume_checks.remove(&id);
+            self.observe_candidate_with_event(&root, entry.path.clone(), CandidateAdmission::Retry,
+                recovery, None, None, Some(&CandidateEvent::Business("volume_changed")), None)?;
+            if !self.pending.contains_key(&id) { return Ok(()); }
+        }
         self.volume_checks.insert(id, (revision, prepared));
-        if found { self.enqueue_with_recovery(&root, entry.path.clone(), recovery)?; }
         Ok(())
     }
 
@@ -4634,7 +4614,10 @@ impl Scheduler {
         }
         // A checkpoint may have queued another generation under this key.
         // Retiring the admitted generation must not clear that update's WAL work.
-        if !self.pending.contains_key(id) { self.unpublished.remove(id); }
+        if !self.pending.contains_key(id) {
+            self.unpublished.remove(id);
+            self.volume_checks.remove(id);
+        }
         self.journal.commit(false, |state| {
             Ok(if state.pending(&pending.candidate.path).is_some_and(|record| {
                 record.matches_observation(&pending.candidate) && !record.has_output_work()
@@ -4650,6 +4633,7 @@ impl Scheduler {
 
     fn retire_admission(&mut self, id: &str, pending: &Pending) -> io::Result<()> {
         self.unpublished.remove(id);
+        self.volume_checks.remove(id);
         let path = &pending.candidate.path;
         if self
             .roots
@@ -4921,6 +4905,9 @@ impl Scheduler {
                 self.unpublished.remove(&id);
             }
         }
+        // Claims now see the cancellation flag. The scheduler applies any
+        // completion after this commit, so the durable wait needs no claim lock.
+        drop(claimed);
         if let Err(error) = self.journal.commit(true, |_| Ok(interrupted)) {
             self.journal.log(json!({"event":"watch_cancel_persistence_failed","owner":batch,"error":error.to_string()}));
         }
@@ -5597,8 +5584,10 @@ impl Scheduler {
         let discovery_retry = outcome.errors.iter()
             .any(|error| error.kind == crate::pipeline::InputErrorKind::WatchDiscoveryIo);
         self.persist_candidates(BTreeMap::new(), discovery_retry)?;
-        self.volume_checks.retain(|path, _| self.journal.state().entry_by_key(path)
-            .is_some_and(|entry| entry.status == "suspended_missing_volume"));
+        let state = self.journal.state().lock();
+        self.volume_checks.retain(|path, (_, plan)| state.has_missing_volume(path)
+            && (plan.is_none() || self.pending.contains_key(path)));
+        drop(state);
         self.arm_idle_cleanup();
         Ok((outcome, finish))
     }
@@ -6035,6 +6024,8 @@ impl WatchObserver {
 }
 
 impl Observer for WatchObserver {
+    const PUBLISHES_ROOTS: bool = true;
+
     fn coalesced(&self) {
         self.claimed.lock().unwrap().coalesced = true;
     }
@@ -6567,7 +6558,7 @@ mod tests {
         fs::remove_dir(&output).unwrap();
         assert_eq!(cache.output(&refreshed, false), None);
         assert!(!cache.covers(&head, false));
-        assert!(cache.0.lock().unwrap().by_family.is_empty());
+        assert_eq!(cache.0.lock().unwrap().len(), 0);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -6619,7 +6610,7 @@ mod tests {
         hub.clear_idle_completed_families();
         let cache = &hub.completed_families;
         assert_eq!(cache.output(&generations, false), None);
-        assert!(cache.0.lock().unwrap().by_family.is_empty());
+        assert_eq!(cache.0.lock().unwrap().len(), 0);
         fs::remove_dir(output).unwrap();
         fs::remove_file(head).unwrap();
         fs::remove_file(tail).unwrap();
@@ -6640,15 +6631,14 @@ mod tests {
         for n in 1..COMPLETED_FAMILY_LIMIT {
             let family: CompletedFamilyKey = (Arc::from([CompletedMember::Path(format!("other-{n}"))]), false);
             let generations = Arc::new(CompletedGenerations::new(vec![(format!("other-{n}"), generation.clone())]));
-            cache.0.lock().unwrap().insert(family, generations, Arc::from(directory.as_path()));
+            cache.0.lock().unwrap().insert(family, (generations, Arc::from(directory.as_path())), COMPLETED_FAMILY_LIMIT);
         }
         assert!(cache.covers(&head, false));
         cache.remember(HashMap::from([(key(&head), generation)]), true, &directory);
         assert!(cache.covers(&head, false));
         let cache = cache.0.lock().unwrap();
-        assert_eq!(cache.ordered.len(), COMPLETED_FAMILY_LIMIT);
-        assert_eq!(cache.by_family.len(), COMPLETED_FAMILY_LIMIT);
-        assert!(!cache.by_family.keys().any(|(members, _)| members.iter().any(|member| matches!(member, CompletedMember::Path(path) if path == "other-1"))));
+        assert_eq!(cache.len(), COMPLETED_FAMILY_LIMIT);
+        assert!(!cache.iter().any(|((members, _), _)| members.iter().any(|member| matches!(member, CompletedMember::Path(path) if path == "other-1"))));
         fs::remove_dir_all(directory).unwrap();
     }
 

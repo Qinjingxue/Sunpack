@@ -209,6 +209,46 @@ void check_archive_root_directory_entries()
     std::filesystem::remove_all(root);
 }
 
+void check_completed_outputs_release_past_decoder_failure()
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-output-snapshots-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(root);
+    {
+        AsyncWriterConfig config;
+        config.threads_per_volume = 1;
+        auto writer = std::make_shared<AsyncFileWriter>(make_volume_state("", false), config);
+        CMyComPtr<IInArchive> archive(new EntryArchive(L"entry", false));
+        ExtractOutputTrace trace;
+        auto *raw = new ExtractToDiskCallback(
+            archive.Interface(), L"", root.wstring(), {}, false, trace, 65, writer);
+        CMyComPtr<IArchiveExtractCallback> callback(raw);
+        for (UInt32 index = 0; index < 64; ++index)
+        {
+            CMyComPtr<ISequentialOutStream> stream;
+            check(callback->GetStream(index, &stream, kExtractMode) == S_OK && stream &&
+                  callback->SetOperationResult(index == 0 ? kOpDataError : kOpOk) == S_OK,
+                  "decoder receipt reached the writer");
+        }
+        // Close-only jobs share the same FIFO with one writer. Draining this
+        // sentinel proves all earlier closes have completed before the sweep.
+        const auto sentinel_job = writer->make_job();
+        const auto sentinel = writer->make_file(sentinel_job, (root / L"sentinel").wstring(), 0, 0);
+        writer->close_file(sentinel, {});
+        check(writer->finish_job(sentinel_job) == S_OK, "all earlier output closes drained");
+        {
+            CMyComPtr<ISequentialOutStream> stream;
+            check(callback->GetStream(64, &stream, kExtractMode) == S_OK && stream &&
+                  callback->SetOperationResult(kOpOk) == S_OK, "receipt sweep reached");
+            check(raw->files_written() == 63, "settled outputs behind a failed decoder receipt are released");
+        }
+        raw->finalize_output();
+        check(raw->files_written() == 64 && trace.items.front().failed &&
+              trace.items.front().operation_result == kOpDataError, "finalization retains the failed receipt");
+    }
+    std::filesystem::remove_all(root);
+}
+
 void check_open_callback()
 {
     std::printf("OpenCallback\n");
@@ -587,6 +627,7 @@ int main()
     check_extract_callback();
     check_extract_to_disk_callback();
     check_archive_root_directory_entries();
+    check_completed_outputs_release_past_decoder_failure();
     check_open_callback();
     check_open_callback_canonical_range();
     check_streams();

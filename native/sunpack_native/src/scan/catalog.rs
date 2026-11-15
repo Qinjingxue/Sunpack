@@ -70,7 +70,7 @@ impl FileId {
 }
 
 /// Accepted-event metadata, independent of a newer directory scan.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct NativeWatchObservation {
     // Accepted-event metadata must survive a newer scan until admission. It is
     // a different version from the directory view, not a second directory row.

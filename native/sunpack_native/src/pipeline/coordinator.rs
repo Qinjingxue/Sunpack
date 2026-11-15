@@ -1361,7 +1361,11 @@ impl<'run, O: Observer> Run<'run, O> {
                 let offset = extent.map_or(0, |extent| extent.start);
                 let end_offset = extent.and_then(|extent| extent.end);
                 let discovery_source = task.source;
-                let ready = stage("report", &Cancellation::default()).await;
+                let ready = if this.observer.worker_updates() == super::WorkerUpdates::All {
+                    stage("report", &Cancellation::default()).await
+                } else {
+                    Ok(())
+                };
                 let id = this.queue_task(task.entry(), depth, parent_id, || None);
                 let mut result = match ready {
                     Ok(()) => this.execute_task((task, sources, keys, requested), id, depth, scope, children).await,
@@ -1430,10 +1434,17 @@ impl<'run, O: Observer> Run<'run, O> {
     }
 
     async fn finish_root(&self, id: TaskId, path: &Path, result: io::Result<Outcome>) -> io::Result<Outcome> {
+        let compact = self.request.mode == Mode::Extract;
+        if !compact && !O::PUBLISHES_ROOTS {
+            return result;
+        }
         if result.as_ref().is_ok_and(Outcome::settled) {
             stage("report", &Cancellation::default()).await?;
-            let mut outcome = self.observer.root_finished(id, path, result.unwrap().into(), self.output_names.owner).await?;
-            if self.request.mode == Mode::Extract {
+            let mut outcome = result.unwrap().into();
+            if O::PUBLISHES_ROOTS {
+                outcome = self.observer.root_finished(id, path, outcome, self.output_names.owner).await?;
+            }
+            if compact {
                 outcome.compact_completed_extract();
             }
             Ok(outcome.into())
@@ -2158,10 +2169,12 @@ impl<'run, O: Observer> Run<'run, O> {
                     && children_complete
                     && !cancel.cancelled()
                 {
-                    if let Some(output) = result.output.as_deref() {
-                        this.drain_cleanup(Some(output), &mut descendants).await;
+                    if !ran_recursive_children {
+                        if let Some(output) = result.output.as_deref() {
+                            this.drain_cleanup(Some(output), &mut descendants).await;
+                        }
+                        stage("postprocess", cancel).await?;
                     }
-                    stage("postprocess", cancel).await?;
                     flatten_result(
                         &*this.observer, task_id, &mut result, &mut descendants, Some(&this.created_outputs), &this.output_names,
                     )?;
@@ -3349,7 +3362,7 @@ impl<'run, O: Observer> Run<'run, O> {
         for path in existing {
             let removed = match cleanup {
                 CleanupMode::Delete => remove_owned_file(path),
-                CleanupMode::Recycle => super::cleanup::recycle(std::iter::once(path.as_path())),
+                CleanupMode::Recycle => super::cleanup::recycle(path),
                 CleanupMode::Keep => unreachable!("keep produced receipts without filesystem work"),
             };
             if removed.is_ok() {
@@ -7873,6 +7886,8 @@ mod tests {
     fn retained_parent_does_not_publish_new_child_before_its_commit_boundary() {
         struct Roots(std::sync::atomic::AtomicUsize);
         impl Observer for Roots {
+            const PUBLISHES_ROOTS: bool = true;
+
             fn notify(&self, _: Event) {}
             async fn root_finished(&self, _: TaskId, _: &Path, _: PublicOutcome, _: u64) -> io::Result<PublicOutcome> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8116,6 +8131,8 @@ mod tests {
     fn completed_extract_compacts_segments_but_keeps_nested_summary_and_retry_receipts() {
         struct DetailedPublication(std::sync::atomic::AtomicBool);
         impl Observer for DetailedPublication {
+            const PUBLISHES_ROOTS: bool = true;
+
             fn notify(&self, _: Event) {}
             async fn root_finished(&self, _: TaskId, _: &Path, outcome: PublicOutcome, _: u64) -> io::Result<PublicOutcome> {
                 assert_eq!(outcome.archives.len(), 3);

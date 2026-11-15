@@ -70,10 +70,14 @@ def test_blacklisted_middle_volume_is_admitted_after_rename(package, tmp_path, e
     )
     head, middle, tail = sorted(case.archive_dir.iterdir())
     parts = [path.rename(path.with_name(f"{path.name}.图片")) for path in (head, middle, tail)]
-    package.configure(filesystem={"scan_filters_enabled": True, "scan_filters": [{
-        "name": "blacklist", "enabled": True,
-        "full_names": [{"value": r"\Afiltered\.7z\.002\.图片\z", "regex": True}],
-    }]})
+    package.configure(
+        live=False,
+        filesystem={"scan_filters_enabled": True, "scan_filters": [{
+            "name": "blacklist", "enabled": True,
+            "full_names": [{"value": r"\Afiltered\.7z\.002\.图片\z", "regex": True}],
+        }]},
+        post_extract={"archive_cleanup_mode": "d"},
+    )
     passwords = ["wrong", case.password]
     output = tmp_path / "out"
     if entry_mode == "cli":
@@ -83,7 +87,6 @@ def test_blacklisted_middle_volume_is_admitted_after_rename(package, tmp_path, e
         root = tmp_path / "watch"
         root.mkdir()
         watch = Watch(package, root, output)
-        package.configure(post_extract={"archive_cleanup_mode": "d"})
         watch.passwords(passwords)
         package.json("watch", "add", root, "-o", output)
         for part in parts:

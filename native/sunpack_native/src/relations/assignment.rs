@@ -40,7 +40,7 @@ pub(super) struct BucketView<'a> {
     pub(super) indexes: &'a [usize],
     pub(super) facts: &'a HashMap<usize, StructuralFacts>,
     pub(super) features: &'a HashMap<usize, NameFeatures>,
-    pub(super) format: &'a str,
+    pub(super) format: &'static str,
     pub(super) loose_numeric_allowed: bool,
 }
 
@@ -632,7 +632,7 @@ pub(super) fn resolve_buckets(
                         output.push(ProposalValidation {
                             status: ProposalStatus::NeedsPassword,
                             proposal: RelationProposal {
-                                format: format.into(), logical_name: stem.clone(), style: "rar_part".into(),
+                                format, logical_name: stem.clone(), style: "rar_part",
                                 width: 3, volumes: members.iter().map(|i| (rows[*i].path.clone(), 0)).collect(),
                                 companions: Vec::new(),
                             },
@@ -1012,9 +1012,9 @@ pub(super) fn materialize(
         attempts: None,
         status: ProposalStatus::Inconclusive,
         proposal: RelationProposal {
-            format: view.format.into(),
+            format: view.format,
             logical_name: logical.into(),
-            style: style.into(),
+            style,
             width: family_width,
             volumes,
             companions: assignment

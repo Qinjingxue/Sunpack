@@ -722,7 +722,8 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             &HashSet::new(),
         ).unwrap();
         assert!(!scheduler.pending.contains_key(&id), "an unrelated invalid tail must not execute the blocker");
-        scheduler.enqueue_with_recovery(&root_id, path.into(), None).unwrap();
+        scheduler.observe_candidate_with_event(&root_id, path.into(), CandidateAdmission::Retry,
+            None, None, None, Some(&CandidateEvent::Business("volume_changed")), None).unwrap();
         assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9),
             "quiet summary after volume arrival: {:?}", scheduler.pending[&id].quiet.summary());
         assert_eq!(scheduler.pending[&id].quiet.summary(), (10.0, Some(2.0), 1.0, 0.0));

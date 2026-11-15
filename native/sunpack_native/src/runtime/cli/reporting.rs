@@ -28,17 +28,26 @@ struct State {
 #[derive(Default)]
 pub(crate) struct Reply<T>(Mutex<ReplyState<T>>);
 
-#[derive(Default)]
-struct ReplyState<T> {
-    value: Option<io::Result<T>>,
-    waker: Option<Waker>,
+enum ReplyState<T> {
+    Pending(Option<Waker>),
+    Ready(io::Result<T>),
+    Consumed,
+}
+
+impl<T> Default for ReplyState<T> {
+    fn default() -> Self {
+        Self::Pending(None)
+    }
 }
 
 impl<T> Reply<T> {
     pub(crate) fn complete(&self, value: io::Result<T>) {
         let mut state = self.0.lock().unwrap();
-        state.value = Some(value);
-        let waker = state.waker.take();
+        // Cancellation and input can publish concurrently. A consumed reply
+        // stays terminal so a late publisher cannot store a second payload.
+        let ReplyState::Pending(waker) = &mut *state else { return };
+        let waker = waker.take();
+        *state = ReplyState::Ready(value);
         drop(state);
         if let Some(waker) = waker {
             waker.wake();
@@ -47,9 +56,17 @@ impl<T> Reply<T> {
     pub(crate) async fn wait(&self) -> io::Result<T> {
         poll_fn(|cx| {
             let mut state = self.0.lock().unwrap();
-            match state.value.take() {
-                Some(value) => Poll::Ready(value),
-                None => { state.waker = Some(cx.waker().clone()); Poll::Pending }
+            match &mut *state {
+                ReplyState::Pending(waker) => {
+                    *waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+                ReplyState::Ready(_) => {
+                    let ReplyState::Ready(value) = std::mem::replace(&mut *state, ReplyState::Consumed)
+                        else { unreachable!() };
+                    Poll::Ready(value)
+                }
+                ReplyState::Consumed => Poll::Ready(Err(io::Error::other("reply already consumed"))),
             }
         }).await
     }

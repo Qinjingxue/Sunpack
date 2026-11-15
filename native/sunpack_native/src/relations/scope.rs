@@ -134,34 +134,54 @@ pub(super) struct RelationScopeIndex {
 }
 
 impl RelationScopeIndex {
-    pub fn build(source: &RelationSource<'_>, filtered_keys: &HashSet<String>) -> Self {
+    pub fn build(
+        source: &RelationSource<'_>,
+        filtered_keys: &HashSet<String>,
+        excluded: Option<&HashSet<String>>,
+    ) -> Self {
+        let excluded = excluded.filter(|keys| !keys.is_empty());
+        let admitted = |row| excluded.is_none_or(|keys| !keys.contains(&path_key(source.path(row))));
         let selected: HashSet<_> = filtered_keys.iter().map(|key| CaseKey::new(key)).collect();
         let mut rows = Vec::new();
-        let mut stems = HashSet::new();
+        let mut all_selected = true;
         for row in source.indices() {
-            if selected.contains(&CaseKey::new(source.path(row))) {
+            if selected.contains(&CaseKey::new(source.path(row))) && admitted(row) {
                 rows.push(row);
-                stems.insert(CaseKey::new(first_dot_stem(source.name(row))));
+            } else {
+                all_selected = false;
             }
         }
-        let active: HashSet<_> = source
-            .indices()
-            // Inspect anchors only inside nominated stems. Cached anchors use
-            // full Windows path keys; unrelated rows need no such allocation.
-            .filter(|&row| stems.contains(&CaseKey::new(first_dot_stem(source.name(row)))))
-            .filter(|&row| source.anchor(row).is_some_and(BucketIndex::has_seed))
-            .map(|row| CaseKey::new(first_dot_stem(source.name(row))))
-            .collect();
+        if all_selected || rows.is_empty() {
+            return Self { rows };
+        }
+        let stem = |row| CaseKey::new(first_dot_stem(source.name(row)));
+        let stems: HashSet<_> = rows.iter().copied().map(stem).collect();
+        let mut active = HashSet::new();
+        // Inspect anchors and normalize ownership keys only within nominated
+        // stems. Stop looking for seeds once every stem is represented.
+        for row in source.indices() {
+            let key = stem(row);
+            if stems.contains(&key) && !active.contains(&key)
+                && admitted(row) && source.anchor(row).is_some_and(BucketIndex::has_seed)
+            {
+                active.insert(key);
+                if active.len() == stems.len() {
+                    break;
+                }
+            }
+        }
         if active.is_empty() {
             return Self { rows };
         }
-        let selected_rows: HashSet<_> = rows.into_iter().collect();
+        // Both iterations follow the same source order, so selected rows
+        // merge back into the retained scopes without a second row index.
+        let mut selected_rows = rows.into_iter().peekable();
         Self {
             rows: source
                 .indices()
                 .filter(|&row| {
-                    selected_rows.contains(&row)
-                        || active.contains(&CaseKey::new(first_dot_stem(source.name(row))))
+                    selected_rows.next_if_eq(&row).is_some()
+                        || (active.contains(&stem(row)) && admitted(row))
                 })
                 .collect(),
         }
@@ -190,7 +210,7 @@ mod tests {
 
     fn scope(rows: &[RelationInput], selected: &[usize]) -> RelationScopeIndex {
         let keys = selected.iter().map(|&i| rows[i].path_key.clone()).collect();
-        RelationScopeIndex::build(&RelationSource::Physical(rows), &keys)
+        RelationScopeIndex::build(&RelationSource::Physical(rows), &keys, None)
     }
 
     #[test]

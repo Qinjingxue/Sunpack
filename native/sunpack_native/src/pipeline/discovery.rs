@@ -15,7 +15,7 @@ use crate::scan::directory::{
 use crate::scan::discovery::{
     CandidateProjection, EmbeddedPageRow, FileTargets, NativeCandidateTable, NativeEmbeddedBatch,
 };
-use crate::scan::embedded::{EmbeddedCandidate, NativeScanResult, RarInputResolution};
+use crate::scan::embedded::{NativeScanResult, RarInputResolution};
 use crate::scan::nested_authorization::authorize_nested_candidates;
 use crate::scan::scope::NativeDiscoveryScope;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1116,15 +1116,14 @@ fn project_segments(
 ) -> io::Result<Option<Task>> {
     let path = task.entry().entry_path.clone();
     let name = task.entry().logical_name.clone();
-    let split = task.entry().mode.structured();
     let mut errors = HashMap::new();
     let unresolved: Vec<_> = scan
         .candidates()
         .iter()
         .filter_map(|item| {
-            (item.candidate_kind == "logical_archive"
+            (item.is_logical_archive()
                 && item.volume_anchor.is_none()
-                && password_required(item)
+                && item.password_required()
                 && item.end_offset.is_none()
                 && !resolutions.contains_key(&item.offset))
             .then_some(item.offset)
@@ -1158,23 +1157,9 @@ fn project_segments(
         let resolution = resolutions.remove(&item.offset);
         let resolved_end = resolution.as_ref().and_then(|result| result.end_offset);
         let end = resolved_end.or(item.end_offset);
-        let failure = resolution
-            .as_ref()
-            .and_then(|result| result.failure_reason)
-            .or_else(|| {
-                (!split
-                    && item.candidate_kind == "logical_archive"
-                    && item.volume_anchor.is_none()
-                    && item.boundary_kind != "exact"
-                    && item.validation == "start_header_crc_truncated_declared_range")
-                    .then_some("embedded_truncated")
-            });
-        let exact = item.candidate_kind == "logical_archive"
-            && (resolved_end.is_some()
-                || (item.volume_anchor.is_none()
-                    && item.boundary_kind == "exact"
-                    && item.extractable
-                    && end.is_some()));
+        let failure = resolution.as_ref().and_then(|result| result.failure_reason);
+        let exact = item.is_logical_archive()
+            && (resolved_end.is_some() || (item.volume_anchor.is_none() && item.end_offset.is_some()));
         if !exact && failure.is_none() {
             continue;
         }
@@ -1188,7 +1173,7 @@ fn project_segments(
             })]);
         }
         input.analysis.origin = AnalysisOrigin::Embedded;
-        input.analysis.password_required = password_required(item);
+        input.analysis.password_required = item.password_required();
         input.analysis.structure_complete = item.format == "lz4";
         input.analysis.volume_completeness = Some(if end.is_some() {
             VolumeCompleteness::Complete
@@ -1218,14 +1203,6 @@ fn project_segments(
     task.source = DiscoverySource::Embedded;
     task.inputs = inputs;
     Ok(Some(task))
-}
-
-fn password_required(item: &EmbeddedCandidate) -> bool {
-    item.format == "rar"
-        && (item
-            .validation
-            .starts_with("rar4_header_encrypted_main_header_crc")
-            || item.validation.starts_with("rar5_encryption_header_crc"))
 }
 
 fn embedded_read_failure(path: &str, error: String) -> Failure {

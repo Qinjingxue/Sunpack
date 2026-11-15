@@ -1,5 +1,5 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_reader_at_offset, upgrade_relation_rar_end_reader, VolumeAnchor, FIRST, RAR_VERSION_5,
+    probe_volume_anchor_reader_at_offset, upgrade_relation_rar_end_reader, VolumeAnchor, FIRST,
     SEVEN_ZIP_CARRIER_INTERRUPTED, ZIP_CARRIER_CHECKED, ZIP_LOCAL_HEADER, ZIP_SPLIT_START,
     ZIP_TAIL_CHECKED,
 };
@@ -119,21 +119,32 @@ const DEFAULT_IOCP_WORKERS: usize = 4;
 #[cfg(test)]
 const TEST_IOCP_CHUNK_SIZE: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateKind {
+    Archive,
+    Anchor,
+    SplitZipLocal,
+    EncryptedRar,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EmbeddedCandidate {
     pub(crate) format: &'static str,
     pub(crate) offset: u64,
     pub(crate) end_offset: Option<u64>,
-    pub(crate) validation: &'static str,
-    pub(crate) candidate_kind: &'static str,
-    pub(crate) boundary_kind: &'static str,
-    pub(crate) extractable: bool,
-    #[serde(skip)]
-    pub(crate) lz4_index: Option<Box<crate::formats::lz4::Index>>,
-    #[serde(rename = "eocd_offset", skip_serializing_if = "Option::is_none")]
     pub(crate) zip_eocd_offset: Option<u64>,
-    #[serde(skip)]
     pub(crate) volume_anchor: Option<Box<VolumeAnchor>>,
+    kind: CandidateKind,
+}
+
+impl EmbeddedCandidate {
+    pub(crate) fn is_logical_archive(&self) -> bool {
+        matches!(self.kind, CandidateKind::Archive | CandidateKind::EncryptedRar)
+    }
+
+    pub(crate) fn password_required(&self) -> bool {
+        self.kind == CandidateKind::EncryptedRar
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,15 +239,16 @@ impl NativeScanResult {
         let mut boundaries = self
             .candidates
             .iter()
-            .filter(|c| c.boundary_kind == "exact" || c.volume_anchor.is_some())
+            .filter(|c| c.end_offset.is_some() || c.volume_anchor.is_some())
             .peekable();
         self.candidates
             .iter()
             .filter_map(|first| {
+                let split = first.kind == CandidateKind::SplitZipLocal;
                 if first.volume_anchor.is_none() {
                     if first.format != "zip"
                         || first.end_offset.is_some()
-                        || (zip_hypothesis && first.validation != "zip_split_local_header")
+                        || (zip_hypothesis && !split)
                     {
                         return None;
                     }
@@ -244,7 +256,6 @@ impl NativeScanResult {
                 } else if first.format == "zip" {
                     zip_hypothesis = true;
                 }
-                let split = first.validation == "zip_split_local_header";
                 let mut anchor =
                     first
                         .volume_anchor
@@ -282,25 +293,25 @@ impl NativeScanResult {
     pub(crate) fn has_independent_archive(&self) -> bool {
         self.candidates
             .iter()
-            .any(|c| c.boundary_kind == "exact" && c.extractable && c.volume_anchor.is_none())
+            .any(|c| c.end_offset.is_some() && c.volume_anchor.is_none())
     }
 
     pub(crate) fn is_primary_lz4(&self) -> bool {
         !self
             .candidates
             .iter()
-            .any(|item| item.candidate_kind == "logical_archive")
+            .any(EmbeddedCandidate::is_logical_archive)
             || (self.candidates.len() == 1
                 && self.candidates[0].format == "lz4"
                 && self.candidates[0].offset == 0
                 && (self.candidates[0].end_offset == Some(self.file_size)
-                    || self.candidates[0].boundary_kind != "exact"))
+                    || self.candidates[0].end_offset.is_none()))
     }
 
     pub(crate) fn primary_analysis(&self) -> Option<crate::io::archive_state::AnalysisFacts> {
-        let index = self.candidates.first()?.lz4_index.as_ref()?;
+        let candidate = self.candidates.first().filter(|item| item.format == "lz4")?;
         Some(crate::io::archive_state::AnalysisFacts {
-            structure_complete: index.complete,
+            structure_complete: candidate.end_offset.is_some(),
             ..Default::default()
         })
     }
@@ -337,11 +348,9 @@ pub(crate) fn scan_detected_lz4(path: &str, parallel_files: usize) -> io::Result
     let file_size = reader.len();
     let index = crate::formats::lz4::walk(&reader.probe_reader(), 0, file_size);
     if index.complete && index.end == file_size {
-        let mut item = candidate("lz4", 0, Some(file_size), "lz4_frame_structure");
-        item.lz4_index = Some(Box::new(index));
         return Ok(NativeScanResult {
             file_size,
-            candidates: vec![item],
+            candidates: vec![candidate("lz4", 0, Some(file_size), CandidateKind::Archive)],
             ..NativeScanResult::default()
         });
     }
@@ -554,7 +563,7 @@ fn scan_embedded_archives_native_with_iocp(
     }) {
         let exact: Vec<_> = candidates
             .iter()
-            .filter(|c| c.boundary_kind == "exact" && c.volume_anchor.is_none())
+            .filter(|c| c.end_offset.is_some() && c.volume_anchor.is_none())
             .map(|c| c.offset)
             .collect();
         candidates.retain(|c| {
@@ -654,7 +663,6 @@ fn validate_raw_hits(
     // before invoking any potentially size-proportional parser.
     let mut seeded_ranges = candidates
         .iter()
-        .filter(|candidate| candidate.boundary_kind == "exact")
         .filter_map(|candidate| candidate.end_offset.map(|end| (candidate.offset, end)))
         .collect::<Vec<_>>();
     seeded_ranges.sort_unstable();
@@ -705,9 +713,7 @@ fn validate_raw_hits(
             continue;
         };
         if let Some(end) = candidate.end_offset {
-            if candidate.boundary_kind == "exact" {
-                covered_until = covered_until.max(end);
-            }
+            covered_until = covered_until.max(end);
         }
         if candidate.format == "xz" {
             if let Some(previous) = previous_xz {
@@ -744,9 +750,9 @@ fn xz_stream_padding(reader: &ManagedReader, mut start: u64, end: u64) -> io::Re
 }
 
 fn candidate_rank(candidate: &EmbeddedCandidate) -> u8 {
-    match (candidate.candidate_kind, candidate.boundary_kind) {
-        ("logical_archive", "exact") => 3,
-        ("logical_archive", _) => 2,
+    match (candidate.is_logical_archive(), candidate.end_offset.is_some()) {
+        (true, true) => 3,
+        (true, false) => 2,
         _ => 1,
     }
 }
@@ -755,7 +761,7 @@ fn resolve_logical_candidates(candidates: &mut Vec<EmbeddedCandidate>) {
     retain_outer_ranges(candidates, |item| {
         (
             item.offset,
-            if item.candidate_kind == "logical_archive" {
+            if item.is_logical_archive() {
                 item.end_offset.unwrap_or(item.offset)
             } else {
                 item.offset
@@ -1207,14 +1213,12 @@ fn validate_candidate(
             if index.frames == 0 {
                 return Ok(None);
             }
-            let mut item = logical_candidate(
+            Ok(Some(candidate(
                 "lz4",
                 offset,
                 index.complete.then_some(index.end),
-                "lz4_frame_structure",
-            );
-            item.lz4_index = Some(Box::new(index));
-            Ok(Some(item))
+                CandidateKind::Archive,
+            )))
         }
         _ => Ok(None),
     }
@@ -1407,16 +1411,7 @@ fn validate_zip_eocd(
     )? {
         return Ok(None);
     }
-    let mut resolved = candidate(
-        "zip",
-        archive_offset,
-        Some(end),
-        if needs_zip64 {
-            "zip64_eocd_geometry_and_first_local_link"
-        } else {
-            "eocd_geometry_and_first_local_link"
-        },
-    );
+    let mut resolved = candidate("zip", archive_offset, Some(end), CandidateKind::Archive);
     resolved.zip_eocd_offset = Some(eocd_offset);
     Ok(Some(resolved))
 }
@@ -1584,7 +1579,6 @@ fn validate_zip(
         return Ok(None);
     }
     let mut compressed_size = compressed_32 as u64;
-    let mut validation = "local_header_and_data_range";
     if compressed_32 == u32::MAX || uncompressed_32 == u32::MAX {
         let extra_start = offset + 30 + name_len;
         let extra = read_at(file, extra_start, extra_len as usize)?;
@@ -1619,7 +1613,6 @@ fn validate_zip(
             compressed_size =
                 u64::from_le_bytes(zip64[value_cursor..value_cursor + 8].try_into().unwrap());
         }
-        validation = "zip64_local_header_and_data_range";
     }
     let Some(_data_end) = header_end.checked_add(compressed_size) else {
         return Ok(None);
@@ -1631,9 +1624,9 @@ fn validate_zip(
         root,
         None,
         if split {
-            "zip_split_local_header"
+            CandidateKind::SplitZipLocal
         } else {
-            validation
+            CandidateKind::Anchor
         },
     )))
 }
@@ -1675,12 +1668,7 @@ fn validate_seven_zip(
         }
     }
     if next_size > 0 {
-        let mut item = logical_candidate(
-            "7z",
-            offset,
-            None,
-            "start_header_crc_truncated_declared_range",
-        );
+        let mut item = candidate("7z", offset, None, CandidateKind::Archive);
         let next = crate::formats::seven_zip::RelationNextHeader::parse(&header).unwrap();
         item.volume_anchor = Some(Box::new(VolumeAnchor {
             size,
@@ -1734,7 +1722,7 @@ fn validate_seven_zip_next(
         "7z",
         offset,
         Some(end),
-        "start_and_next_header_crc_and_declared_end",
+        CandidateKind::Archive,
     )))
 }
 
@@ -1758,22 +1746,16 @@ fn validate_rar(
     if !anchor.error.is_empty() {
         return Ok(None);
     }
-    let validation = if anchor.needs_password {
-        if anchor.has_any(RAR_VERSION_5) {
-            "rar5_encryption_header_crc"
-        } else {
-            "rar4_header_encrypted_main_header_crc"
-        }
-    } else if anchor.has_any(RAR_VERSION_5) {
-        "rar5_complete_block_walk"
+    let kind = if anchor.needs_password {
+        CandidateKind::EncryptedRar
     } else {
-        "rar4_complete_block_walk"
+        CandidateKind::Archive
     };
     let end = anchor.expected_logical_size;
     if end.is_none() && !anchor.multivolume && !anchor.needs_password {
         return Ok(None);
     }
-    let mut item = logical_candidate("rar", offset, end, validation);
+    let mut item = candidate("rar", offset, end, kind);
     if anchor.multivolume || (anchor.needs_password && !anchor.standalone) {
         item.volume_anchor = Some(Box::new(anchor));
     }
@@ -1847,11 +1829,7 @@ fn validate_gzip(
         "gzip",
         offset,
         Some(structure.end_offset),
-        if structure.stream_count > 1 {
-            "rfc1952_concatenated_members_complete_deflate_walk"
-        } else {
-            "rfc1952_complete_deflate_walk"
-        },
+        CandidateKind::Archive,
     )))
 }
 
@@ -1871,11 +1849,7 @@ fn validate_bzip2(
         "bzip2",
         offset,
         Some(structure.end_offset),
-        if structure.stream_count > 1 {
-            "bzip2_concatenated_streams_complete_huffman_walk"
-        } else {
-            "bzip2_complete_huffman_walk_and_crc_chain"
-        },
+        CandidateKind::Archive,
     )))
 }
 
@@ -1926,7 +1900,7 @@ fn validate_xz(
                 "xz",
                 offset,
                 Some(end),
-                "xz_header_index_footer_boundary",
+                CandidateKind::Archive,
             )));
         }
         let Some(hit) = footers.ends.get(footers.next_unchecked) else {
@@ -1967,7 +1941,7 @@ fn validate_zstd(
         "zstd",
         offset,
         Some(structure.end_offset),
-        "rfc8878_complete_frame_block_walk",
+        CandidateKind::Archive,
     )))
 }
 
@@ -2104,7 +2078,7 @@ fn walk_tar_candidate(
                 "tar",
                 offset,
                 Some(tar_padding_end(file, cursor + 1024, size)?),
-                "member_walk_checksums_and_end_blocks",
+                CandidateKind::Archive,
             ));
         }
         cursor = match state.advance(&current, cursor, size, &mut |start, size| {
@@ -2112,11 +2086,11 @@ fn walk_tar_candidate(
         }) {
             Ok(next) => next,
             Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
-                return Ok(logical_candidate(
+                return Ok(candidate(
                     "tar",
                     offset,
                     None,
-                    "tar_analysis_resource_limit",
+                    CandidateKind::Archive,
                 ));
             }
             Err(error) => {
@@ -2150,32 +2124,16 @@ fn candidate(
     format: &'static str,
     offset: u64,
     end: Option<u64>,
-    validation: &'static str,
+    kind: CandidateKind,
 ) -> EmbeddedCandidate {
-    let exact = end.is_some();
     EmbeddedCandidate {
         format,
         offset,
         end_offset: end,
-        validation,
-        candidate_kind: if exact { "logical_archive" } else { "anchor" },
-        boundary_kind: if exact { "exact" } else { "unresolved" },
-        extractable: exact,
-        lz4_index: None,
         zip_eocd_offset: None,
         volume_anchor: None,
+        kind,
     }
-}
-
-fn logical_candidate(
-    format: &'static str,
-    offset: u64,
-    end: Option<u64>,
-    validation: &'static str,
-) -> EmbeddedCandidate {
-    let mut item = candidate(format, offset, end, validation);
-    item.candidate_kind = "logical_archive";
-    item
 }
 
 #[cfg(test)]
@@ -2295,7 +2253,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
-        assert!(candidates.iter().all(|item| item.boundary_kind == "exact"));
+        assert!(candidates.iter().all(|item| item.end_offset.is_some()));
 
         let mut data = stream.clone();
         data.extend_from_slice(b"unrelated tail");
@@ -2445,20 +2403,21 @@ mod tests {
                 .map(|i| {
                     let offset = i / 3;
                     let end = (i % 7 != 0).then_some(offset + (i * 17 + shift) % 21);
-                    let mut item = candidate("zip", offset, end, "matrix");
-                    if i % 5 == 0 {
-                        item.candidate_kind = "anchor";
-                    }
-                    item
+                    let kind = if i % 5 == 0 || end.is_none() {
+                        CandidateKind::Anchor
+                    } else {
+                        CandidateKind::Archive
+                    };
+                    candidate("zip", offset, end, kind)
                 })
                 .collect::<Vec<_>>();
             let project =
-                |item: &EmbeddedCandidate| (item.offset, item.end_offset, item.candidate_kind);
+                |item: &EmbeddedCandidate| (item.offset, item.end_offset, item.kind);
             let expected = inputs
                 .iter()
                 .filter(|item| {
                     !inputs.iter().any(|owner| {
-                        owner.candidate_kind == "logical_archive"
+                        owner.is_logical_archive()
                             && owner
                                 .end_offset
                                 .is_some_and(|end| owner.offset < item.offset && item.offset < end)
@@ -2811,13 +2770,8 @@ mod tests {
 
         assert_eq!(seven.offset, start);
         assert_eq!(seven.end_offset, None);
-        assert_eq!(seven.candidate_kind, "logical_archive");
-        assert_eq!(seven.boundary_kind, "unresolved");
-        assert!(!seven.extractable);
-        assert_eq!(
-            seven.validation,
-            "start_header_crc_truncated_declared_range"
-        );
+        assert!(seven.is_logical_archive());
+        assert!(seven.volume_anchor.as_ref().is_some_and(|anchor| anchor.is_volume_entry()));
         let _ = fs::remove_file(path);
     }
 
@@ -2848,7 +2802,7 @@ mod tests {
         let logical = result
             .candidates
             .iter()
-            .filter(|candidate| candidate.candidate_kind == "logical_archive")
+            .filter(|candidate| candidate.is_logical_archive())
             .collect::<Vec<_>>();
 
         assert_eq!(logical.len(), 1);
@@ -2877,7 +2831,7 @@ mod tests {
 
         assert_eq!(zip.offset, start);
         assert_eq!(zip.end_offset, Some(end));
-        assert_eq!(zip.validation, "zip64_eocd_geometry_and_first_local_link");
+        assert_eq!(zip.zip_eocd_offset, Some(end - 22));
         let _ = fs::remove_file(path);
     }
 
@@ -2927,10 +2881,6 @@ mod tests {
         assert_eq!(bzip2.len(), 1);
         assert_eq!(bzip2[0].offset, start);
         assert_eq!(bzip2[0].end_offset, Some(end));
-        assert_eq!(
-            bzip2[0].validation,
-            "bzip2_concatenated_streams_complete_huffman_walk"
-        );
         let _ = fs::remove_file(path);
     }
 
@@ -3145,7 +3095,7 @@ mod tests {
         let candidate = validate_zstd(&reader, data.len() as u64, 0, &mut Default::default())
             .unwrap()
             .expect("the full 14-byte RFC frame header must be accepted");
-        assert_eq!(candidate.validation, "rfc8878_complete_frame_block_walk");
+        assert_eq!(candidate.end_offset, Some(data.len() as u64));
         let _ = fs::remove_file(path);
     }
 

@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1731,6 +1732,7 @@ namespace sunpack::sevenzip
                 file->handle = INVALID_HANDLE_VALUE;
             }
             ArchiveMetadataErrors metadata_errors;
+            std::optional<UInt64> mtime_ns;
             if (handle != INVALID_HANDLE_VALUE)
             {
                 // All data writes have drained. Stream release can precede
@@ -1749,9 +1751,7 @@ namespace sunpack::sevenzip
                     if (ticks.QuadPart >= unix_epoch_100ns &&
                         ticks.QuadPart - unix_epoch_100ns <= (std::numeric_limits<UInt64>::max)() / 100ULL)
                     {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        file->mtime_ns = (ticks.QuadPart - unix_epoch_100ns) * 100ULL;
-                        file->has_mtime_ns = true;
+                        mtime_ns = (ticks.QuadPart - unix_epoch_100ns) * 100ULL;
                     }
                 }
 
@@ -1766,6 +1766,11 @@ namespace sunpack::sevenzip
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 file->metadata_errors = metadata_errors;
+                if (mtime_ns)
+                {
+                    file->mtime_ns = *mtime_ns;
+                    file->has_mtime_ns = true;
+                }
                 file->closed = true;
 #ifdef SUP7Z_TEST_IO_FAULTS
                 if (!file->failed)

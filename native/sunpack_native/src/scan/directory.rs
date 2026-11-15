@@ -1714,40 +1714,55 @@ impl NativeWatchCatalog {
         })()
     }
 
-    pub(crate) fn forget_observation(&self, path: &str, recursive: bool, missing_only: bool) {
+    pub(crate) fn forget_missing_observation(&self, path: &str, recursive: bool) {
         let mut key = crate::path_keys::path_key(path);
         key.truncate(key.trim_end_matches('\\').len());
-        (|| {
-            let mut tables = self.catalogs.lock().unwrap();
-            for table in tables.edit().values_mut() {
-                let keys: Vec<_> = table
-                    .rows
-                    .range::<str, _>((
-                        std::ops::Bound::Included(key.as_str()),
+        let prefix = recursive.then(|| format!("{key}\\"));
+        let mut observed: Vec<_> = {
+            let tables = self.catalogs.lock().unwrap();
+            tables.scopes.iter().filter_map(|(scope, table)| {
+                let children = prefix.iter().flat_map(|prefix| {
+                    table.rows.range::<str, _>((
+                        std::ops::Bound::Included(prefix.as_str()),
                         std::ops::Bound::Unbounded,
                     ))
-                    .take_while(|(candidate, _)| candidate.starts_with(&key))
-                    .filter(|(candidate, row)| {
-                        row.observation.is_some()
-                            && (candidate.as_ref() == key
-                                || (recursive && candidate[key.len()..].starts_with('\\')))
-                            && (!missing_only
-                                || match fs::metadata(row.path()) {
-                                    Ok(metadata) => !metadata.is_file(),
-                                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-                                })
+                    .take_while(move |(child, _)| child.starts_with(prefix))
+                });
+                let rows: Vec<_> = table.rows.get_key_value(key.as_str()).into_iter()
+                    .chain(children)
+                    .filter_map(|(key, row)| {
+                        let before = row.observation.as_deref()?;
+                        Some((Arc::clone(key), row.path(), before.clone()))
                     })
-                    .map(|(key, _)| Arc::clone(key))
                     .collect();
-                for key in keys {
-                    if table.rows[key.as_ref()].persistent() {
-                        table.rows.get_mut(key.as_ref()).unwrap().observation = None;
-                    } else {
-                        table.remove(&key);
-                    }
+                (!rows.is_empty()).then(|| (scope.clone(), rows))
+            }).collect()
+        };
+        for (_, rows) in &mut observed {
+            rows.retain(|(_, path, _)| crate::watch_store::recorded_file_is_absent(path));
+        }
+        if observed.iter().all(|(_, rows)| rows.is_empty()) {
+            return;
+        }
+        let mut tables = self.catalogs.lock().unwrap();
+        let scopes = tables.edit();
+        for (scope, rows) in observed {
+            let Some(table) = scopes.get_mut(&scope) else { continue; };
+            let mut removed = Vec::new();
+            for (key, path, before) in rows {
+                let Some(row) = table.rows.get_mut(key.as_ref()) else { continue; };
+                // A newer observation may have arrived during the metadata read.
+                if row.observation.as_deref() != Some(&before) || !row.matches_path(&path) {
+                    continue;
+                }
+                if row.persistent() {
+                    row.observation = None;
+                } else {
+                    removed.push(key);
                 }
             }
-        })();
+            table.remove_many(removed.iter().map(AsRef::as_ref));
+        }
     }
 
     pub(crate) fn cursor(
@@ -1774,24 +1789,18 @@ impl NativeWatchCatalog {
             .and_then(|table| table.buckets.get(catalog_stem(seed).as_str())).map_or(0, |bucket| bucket.revision)
     }
 
-    pub(crate) fn bucket_paths(
+    pub(crate) fn bucket_keys(
         &self,
         scope: &crate::scan::scope::NativeDiscoveryScope,
-        seed: &str,
-    ) -> Vec<String> {
+        stem: &str,
+    ) -> Vec<Arc<str>> {
         let tables = self.catalogs.lock().unwrap();
-        tables.scopes
+        tables
+            .scopes
             .get(&crate::path_keys::path_key(&scope.root))
+            .and_then(|table| table.buckets.get(stem))
             .into_iter()
-            .flat_map(|table| {
-                table
-                    .buckets
-                    .get(catalog_stem(seed).as_str())
-                    .into_iter()
-                    .flat_map(|bucket| bucket.iter())
-                    .filter_map(|key| table.rows.get(key))
-            })
-            .map(|row| row.path())
+            .flat_map(|bucket| bucket.iter().cloned())
             .collect()
     }
 

@@ -42,10 +42,7 @@ impl<K, V> Default for CacheOrder<K, V> {
 }
 
 impl<K: Eq + Hash + Clone, V> CacheOrder<K, V> {
-    fn touch(&mut self, index: usize) {
-        if self.newest == Some(index) {
-            return;
-        }
+    fn unlink(&mut self, index: usize) {
         let previous = self.slots[index].previous;
         let next = self.slots[index].next;
         if let Some(previous) = previous {
@@ -55,7 +52,16 @@ impl<K: Eq + Hash + Clone, V> CacheOrder<K, V> {
         }
         if let Some(next) = next {
             self.slots[next].previous = previous;
+        } else {
+            self.newest = previous;
         }
+    }
+
+    fn touch(&mut self, index: usize) {
+        if self.newest == Some(index) {
+            return;
+        }
+        self.unlink(index);
         if let Some(newest) = self.newest {
             self.slots[newest].next = Some(index);
         }
@@ -83,6 +89,38 @@ impl<K: Eq + Hash + Clone, V> CacheOrder<K, V> {
     {
         let index = *self.entries.get(key)?;
         Some(&mut self.slots[index].value)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.slots.iter().map(|entry| (&entry.key, &entry.value))
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+        let index = self.entries.remove(key)?;
+        self.unlink(index);
+        let removed = self.slots.swap_remove(index);
+        // Repair references to the last slot if swap_remove moved it.
+        if let Some(moved) = self.slots.get(index) {
+            let (previous, next) = (moved.previous, moved.next);
+            *self.entries.get_mut(&moved.key).unwrap() = index;
+            if let Some(previous) = previous {
+                self.slots[previous].next = Some(index);
+            } else {
+                self.oldest = Some(index);
+            }
+            if let Some(next) = next {
+                self.slots[next].previous = Some(index);
+            } else {
+                self.newest = Some(index);
+            }
+        }
+        trim_map(&mut self.entries);
+        if self.slots.is_empty() {
+            self.slots = Vec::new();
+        } else if self.slots.capacity() > 256.max(self.slots.len().saturating_mul(4)) {
+            self.slots.shrink_to(self.slots.len().saturating_mul(2));
+        }
+        Some(removed.value)
     }
 
     #[cfg(test)]
@@ -144,7 +182,9 @@ mod tests {
                 let key = (step * 7 + step / 3) % (limit * 2 + 1);
                 let previous = expected.iter().position(|(old, _)| *old == key)
                     .and_then(|index| expected.remove(index));
-                if step % 3 == 0 {
+                if step % 11 == 0 {
+                    assert_eq!(cache.remove(&key), previous.map(|(_, value)| value));
+                } else if step % 3 == 0 {
                     assert_eq!(cache.get(&key).copied(), previous.map(|(_, value)| value));
                     if let Some(previous) = previous {
                         expected.push_back(previous);

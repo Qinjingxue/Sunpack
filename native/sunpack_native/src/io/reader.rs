@@ -506,7 +506,13 @@ impl ManagedReader {
             return Ok(count);
         }
 
-        let slices = self.read_slices_at(offset, read_len)?;
+        if let Some(cache) = self.cache.as_deref().filter(|cache| read_len <= cache.capacity) {
+            let data = self.read_request_cached_slice_at(cache, offset, read_len)?;
+            buffer[..data.len()].copy_from_slice(&data);
+            return Ok(data.len());
+        }
+
+        let slices = self.read_source_slices_at(offset, read_len)?;
         let mut written = 0usize;
         for slice in slices {
             let remaining = read_len.saturating_sub(written);
@@ -558,7 +564,7 @@ impl ManagedReader {
             ));
         }
 
-        let mut slices = self.read_slices_at(offset, read_len)?;
+        let mut slices = self.read_source_slices_at(offset, read_len)?;
         if slices.len() == 1 {
             return Ok(CachedBytes::Slice(slices.remove(0)));
         }
@@ -706,13 +712,15 @@ fn coalesce_cached_slices(mut slices: Vec<CachedSlice>) -> io::Result<CachedSlic
 impl ReaderInner {
     fn store_cache_entry(&mut self, key: (u64, usize), data: CachedSlice, capacity: usize) {
         let retained = data.retained_bytes();
-        if capacity == 0 || retained > capacity {
+        if data.is_empty() || retained > capacity {
             return;
         }
-        if let Some(old) = self.cache.insert(key, data) {
-            self.cache_size = self.cache_size.saturating_sub(old.retained_bytes());
-            self.order.retain(|existing| *existing != key);
-        }
+        // A concurrent miss may already have populated this immutable range.
+        // Keep its FIFO position and reuse the existing entry for later reads.
+        let std::collections::hash_map::Entry::Vacant(entry) = self.cache.entry(key) else {
+            return;
+        };
+        entry.insert(data);
         self.cache_size += retained;
         self.order.push_back(key);
         while self.cache_size > capacity {

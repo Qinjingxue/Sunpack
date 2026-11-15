@@ -180,8 +180,9 @@ impl PendingRecord {
             } => {
                 self.active_outputs.remove(task, output);
                 let removed = if *keep {
+                    let remaining = self.active_outputs.0.get(task);
                     if path_key(task) != path_key(&self.path)
-                        && !self.active_outputs.keys().any(|active| active == task)
+                        && remaining.is_none()
                     {
                         self.completed_sources.insert(task.clone());
                     }
@@ -190,8 +191,8 @@ impl PendingRecord {
                     // Once a segment commits, its enclosing active carrier is
                     // no longer disposable. Unfinished siblings remain active
                     // and can still be removed individually on recovery.
-                    for (source, parent) in self.active_outputs.iter() {
-                        if source == task && is_path_under(&output_key, &path_key(parent)) {
+                    for parent in remaining.into_iter().flatten() {
+                        if is_path_under(&output_key, &path_key(parent)) {
                             removed.extend(self.committed_roots.retain_root(parent));
                         }
                     }
@@ -480,6 +481,10 @@ pub(crate) struct StateData {
 }
 
 impl StateData {
+    pub(crate) fn has_missing_volume(&self, path: &str) -> bool {
+        self.entries.get(path).is_some_and(|entry| entry.status == "suspended_missing_volume")
+    }
+
     fn apply(&mut self, operation: &Operation) {
         match operation {
             Operation::Output(key, change) => {
@@ -1149,6 +1154,10 @@ impl NativeWatchState {
 
     pub(crate) fn entry_by_key(&self, key: &str) -> Option<Arc<EntryRecord>> {
         self.lock().entries.get(key).cloned()
+    }
+
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.lock().entries.is_empty()
     }
 
     pub(crate) fn pending_items(&self) -> Vec<Arc<PendingRecord>> {

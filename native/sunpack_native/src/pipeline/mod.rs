@@ -771,6 +771,8 @@ pub enum Event {
 /// Publication callbacks form the durable boundary for Watch. A failed callback
 /// stops the corresponding filesystem operation and propagates to the request.
 pub(crate) trait Observer: Send + Sync {
+    const PUBLISHES_ROOTS: bool = false;
+
     fn notify(&self, event: Event);
 
     fn worker_updates(&self) -> WorkerUpdates {
@@ -783,8 +785,7 @@ pub(crate) trait Observer: Send + Sync {
 
     fn coalesced(&self) {}
 
-    // The default keeps the caller's aggregate result. Watch transfers a
-    // settled root to its ordinary completion queue without cloning receipts.
+    // Opt-in observers transfer a settled root before request completion.
     fn root_finished(
         &self, _id: TaskId, _path: &Path, outcome: Outcome, _request: u64,
     ) -> impl std::future::Future<Output = io::Result<Outcome>> + Send {

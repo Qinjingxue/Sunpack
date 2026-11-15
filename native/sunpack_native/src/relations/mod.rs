@@ -43,24 +43,23 @@ pub(crate) struct RelationInput {
 
 #[derive(Debug)]
 struct RelationProposal {
-    format: String,
+    format: &'static str,
     logical_name: String,
-    style: String,
+    style: &'static str,
     width: usize,
-    // Zero retains an encrypted candidate whose physical role is still hidden.
-    // Such proposals are password-blocked and never reach worker execution.
+    // Positive slots are in ascending order. A password-blocked proposal
+    // whose physical roles are still hidden has only zero slots.
     volumes: Vec<(String, u32)>,
     companions: Vec<String>,
 }
 
 impl RelationProposal {
     fn entry_path(&self) -> &str {
-        &self
-            .volumes
-            .iter()
-            .find(|(_, number)| *number == 1)
-            .unwrap_or(&self.volumes[0])
-            .0
+        &self.volumes[0].0
+    }
+
+    fn head_path(&self) -> Option<&str> {
+        (self.volumes[0].1 == 1).then(|| self.entry_path())
     }
 }
 
@@ -124,8 +123,6 @@ pub(crate) struct RelationCandidateData<'a> {
     parsed: Option<ParsedVolume>,
     pub(crate) entry_path: &'a str,
     pub(crate) format_hint: &'a str,
-    pub(crate) companions: &'a [String],
-    pub(crate) carrier_path: &'a str,
     pub(crate) is_split: bool,
     pub(crate) needs_password: bool,
     pub(crate) multivolume: bool,
@@ -134,18 +131,6 @@ pub(crate) struct RelationCandidateData<'a> {
 }
 
 impl<'a> RelationCandidateData<'a> {
-    pub(crate) fn parts(&self) -> impl Iterator<Item = &'a str> {
-        let (ordinary, proposal) = match self.group {
-            NativeRelationGroup::Ordinary(row, _) => (Some(row.path.as_str()), None),
-            NativeRelationGroup::Proposal(validation) => (None, Some(validation)),
-        };
-        ordinary.into_iter().chain(
-            proposal
-                .into_iter()
-                .flat_map(ProposalValidation::part_paths),
-        )
-    }
-
     pub(crate) fn parts_len(&self) -> usize {
         match self.group {
             NativeRelationGroup::Ordinary(..) => 1,
@@ -178,13 +163,13 @@ impl<'a> RelationCandidateData<'a> {
                     } else {
                         self.format_hint
                     };
-                    Cow::Owned(split_family_for_proposal(format, parsed.style))
+                    split_family_for_proposal(format, parsed.style)
                 })
                 .unwrap_or(Cow::Borrowed("")),
-            NativeRelationGroup::Proposal(validation) => Cow::Owned(proposal_split_family(
+            NativeRelationGroup::Proposal(validation) => proposal_split_family(
                 &validation.proposal,
                 &validation.facts.anchors,
-            )),
+            ),
         }
     }
 
@@ -224,6 +209,43 @@ impl NativeRelationGroup {
         match self {
             Self::Ordinary(row, _) => &row.path,
             Self::Proposal(validation) => validation.proposal.entry_path(),
+        }
+    }
+
+    pub(crate) fn part_paths(&self) -> impl Iterator<Item = &str> {
+        let (ordinary, proposal) = match self {
+            Self::Ordinary(row, _) => (Some(row.path.as_str()), None),
+            Self::Proposal(validation) => (None, Some(validation)),
+        };
+        ordinary.into_iter().chain(
+            proposal.into_iter().flat_map(ProposalValidation::part_paths),
+        )
+    }
+
+    pub(crate) fn owned_paths(&self) -> impl Iterator<Item = &str> {
+        let companions = match self {
+            Self::Ordinary(..) => &[][..],
+            Self::Proposal(validation) => &validation.proposal.companions,
+        };
+        self.part_paths().chain(companions.iter().map(String::as_str))
+    }
+
+    pub(crate) fn related_paths(&self) -> impl Iterator<Item = &str> {
+        // Fixed proposals include the entry among their volumes. An attempt
+        // plan supplies the physical members through its base source list.
+        let entry = match self {
+            Self::Proposal(validation) if validation.attempts.is_some() => {
+                Some(validation.proposal.entry_path())
+            }
+            _ => None,
+        };
+        self.owned_paths().chain(entry).filter(|path| !path.is_empty())
+    }
+
+    pub(crate) fn relation_confirmed(&self) -> bool {
+        match self {
+            Self::Ordinary(_, confirmed) => *confirmed,
+            Self::Proposal(validation) => validation_relation_confirmed(validation),
         }
     }
 
@@ -288,11 +310,7 @@ impl NativeRelationGroup {
             input,
             standalone: matches!(self, Self::Ordinary(..))
                 && anchor.is_some_and(|anchor| anchor.standalone),
-            owned_paths: data
-                .parts()
-                .chain(data.companions.iter().map(String::as_str))
-                .map(str::to_owned)
-                .collect(),
+            owned_paths: self.owned_paths().map(str::to_owned).collect(),
             failure_reason,
         }
     }
@@ -366,8 +384,6 @@ impl NativeRelationGroup {
                     parsed,
                     entry_path: &row.path,
                     format_hint: anchor.map(|a| a.format).unwrap_or(""),
-                    companions: &[],
-                    carrier_path: &row.path,
                     needs_password: anchor.is_some_and(|a| a.needs_password),
                     multivolume: anchor.is_some_and(|a| a.multivolume),
                     relation_confirmed: *confirmed,
@@ -385,13 +401,7 @@ impl NativeRelationGroup {
                     group: self,
                     parsed: None,
                     entry_path,
-                    format_hint: &proposal.format,
-                    companions: &proposal.companions,
-                    carrier_path: proposal
-                        .companions
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or(entry_path),
+                    format_hint: proposal.format,
                     is_split: true,
                     needs_password: validation.status == ProposalStatus::NeedsPassword,
                     multivolume: true,
@@ -439,11 +449,7 @@ pub(crate) fn build_native_candidate_groups_from_snapshot(
     if filtered_keys.is_empty() {
         return Vec::new();
     }
-    build_candidate_groups_from_source(
-        RelationSource::Snapshot(raw_snapshot, cached),
-        &filtered_keys,
-        cached,
-    )
+    build_candidate_groups(raw_snapshot, &filtered_keys, cached, None)
 }
 
 pub(crate) fn collect_relation_cache<'a>(
@@ -517,11 +523,11 @@ pub(crate) fn resolve_embedded_volumes(
         if keys.is_empty() {
             continue;
         }
-        let view = snapshot.without_path_keys(excluded);
-        output.extend(build_candidate_groups_from_source(
-            RelationSource::Snapshot(&view, Some(&cache)),
+        output.extend(build_candidate_groups(
+            snapshot,
             &keys,
             Some(&cache),
+            Some(excluded),
         ));
     }
     output
@@ -553,10 +559,9 @@ fn resolve_shared_carrier_volumes(
     let mut proposals = Vec::new();
     let mut mappings = HashSet::new();
     for snapshot in snapshots {
-        let view = snapshot.without_path_keys(excluded);
-        let source = RelationSource::Snapshot(&view, Some(&cache));
+        let source = RelationSource::Snapshot(snapshot, Some(&cache));
         let mut buckets: HashMap<String, Vec<RelationInput>> = HashMap::new();
-        for index in RelationScopeIndex::build(&source, &selected).rows {
+        for index in RelationScopeIndex::build(&source, &selected, Some(excluded)).rows {
             let row = source.materialize(index);
             buckets.entry(case_key(first_dot_stem(&row.name))).or_default().push(row);
         }
@@ -606,7 +611,7 @@ fn resolve_shared_carrier_volumes(
                     (key, part.1, anchor.and_then(|a| a.structure_offset),
                         anchor.and_then(|a| a.payload_end))
                 }).collect();
-                if mappings.insert((validation.proposal.format.clone(), mapping)) {
+                if mappings.insert((validation.proposal.format, mapping)) {
                     proposals.push(validation);
                 }
             }
@@ -665,9 +670,9 @@ fn resolve_shared_carrier_volumes(
                 ProposalStatus::Inconclusive
             },
             proposal: RelationProposal {
-                format: format.into(),
+                format,
                 logical_name,
-                style: style.into(),
+                style,
                 width: 3,
                 volumes: vec![(path.clone(), number)],
                 companions: Vec::new(),
@@ -701,12 +706,14 @@ fn resolve_candidate_validations(
     validations
 }
 
-fn build_candidate_groups_from_source(
-    source: RelationSource<'_>,
+fn build_candidate_groups(
+    snapshot: &NativeDirectorySnapshot,
     filtered_keys: &HashSet<String>,
     cached: Option<&RelationCache>,
+    excluded: Option<&HashSet<String>>,
 ) -> Vec<NativeRelationGroup> {
-    let scope = RelationScopeIndex::build(&source, filtered_keys);
+    let source = RelationSource::Snapshot(snapshot, cached);
+    let scope = RelationScopeIndex::build(&source, filtered_keys, excluded);
     let mut output = Vec::new();
     let mut directory_rows: Vec<_> = scope
         .rows
@@ -971,7 +978,7 @@ fn project_proposal(
     let anchors = &validation.facts.anchors;
     let style = proposal_split_family(proposal, anchors);
     input.analysis.zip_spanned = style == "zip_spanned";
-    input.mode = if matches!(style.as_str(), "rar_sfx_part" | "sfx_numeric_suffix") {
+    input.mode = if style == "rar_sfx_part" {
         OpenMode::SfxWithVolumes
     } else {
         OpenMode::NativeVolumes
@@ -1011,8 +1018,7 @@ fn project_proposal(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    input.volume_style = style;
-    input.parts.sort_unstable_by_key(|part| part.volume_number);
+    input.volume_style = style.into_owned();
     if proposal.format == "zip" && input.volume_attempts.is_none() {
         let mut logical_start = 0u64;
         for (path, _) in &proposal.volumes {
@@ -1078,9 +1084,6 @@ fn canonical_volume_name(
         "rar_oldstyle" => format!("{base}.r{:02}", number - 2),
         "zip_spanned" if terminal => format!("{base}.zip"),
         "zip_spanned" => format!("{base}.z{number:02}"),
-        "zip_zero_numbered" => format!("{base}.{:04}", number - 1),
-        "sfx_numeric_suffix" if number == 1 => format!("{}.exe", split_ext(base).0),
-        "sfx_numeric_suffix" => format!("{base}.{:0width$}", number - 1),
         _ => format!("{base}.{number:03}"),
     }
 }
@@ -1104,37 +1107,32 @@ fn proposal_logical_size(
 fn proposal_split_family(
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
-) -> String {
-    let style = proposal.style.as_str();
+) -> Cow<'static, str> {
+    let style = proposal.style;
     if proposal.format == "rar" && style != "rar_sfx_part" {
         let head = proposal
-            .volumes
-            .iter()
-            .find(|(_, number)| *number == 1)
-            .and_then(|(path, _)| anchors.get(&path_key(path)));
+            .head_path()
+            .and_then(|path| anchors.get(&path_key(path)));
         let old_naming = head.is_some_and(|anchor| anchor.has_any(RAR_OLD_NUMBERING));
         let new_naming = head.is_some_and(|anchor| anchor.has_any(RAR_PART_NUMBERING));
         if old_naming && style != "rar_oldstyle" {
-            return "rar_oldstyle".to_string();
+            return Cow::Borrowed("rar_oldstyle");
         }
         if new_naming && style == "rar_oldstyle" {
-            return "rar_part".to_string();
+            return Cow::Borrowed("rar_part");
         }
     }
-    split_family_for_proposal(&proposal.format, style)
+    split_family_for_proposal(proposal.format, style)
 }
 
-fn split_family_for_proposal(format: &str, style: &str) -> String {
-    if style == "zip_spanned" {
-        return "zip_spanned".to_string();
+fn split_family_for_proposal<'a>(format: &str, style: &'a str) -> Cow<'a, str> {
+    match (format, style) {
+        (_, "zip_spanned" | "rar_part" | "rar_sfx_part" | "rar_oldstyle") => Cow::Borrowed(style),
+        (_, "part_numbered") => Cow::Owned(format!("{format}_part")),
+        ("7z", _) => Cow::Borrowed("7z_numbered"),
+        ("zip", _) => Cow::Borrowed("zip_numbered"),
+        _ => Cow::Owned(format!("{format}_numbered")),
     }
-    if matches!(style, "rar_part" | "rar_sfx_part" | "rar_oldstyle") {
-        return style.to_string();
-    }
-    if style == "part_numbered" {
-        return format!("{format}_part");
-    }
-    format!("{format}_numbered")
 }
 
 fn get_logical_name(filename: &str, is_archive: bool) -> String {
@@ -1911,9 +1909,9 @@ mod tests {
             reason: None,
             unresolved: Vec::new(),
             proposal: RelationProposal {
-                format: "rar".to_string(),
+                format: "rar",
                 logical_name: "test".to_string(),
-                style: "rar_part".to_string(),
+                style: "rar_part",
                 width: 2,
                 volumes: paths
                     .iter()

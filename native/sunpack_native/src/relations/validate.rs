@@ -27,11 +27,11 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         return;
     }
     let proposal = &validation.proposal;
-    let unresolved_head = proposal.volumes.iter().find(|(_, slot)| *slot == 1)
-        .and_then(|(path, _)| validation.facts.anchors.get(&path_key(path)))
+    let unresolved_head = proposal.head_path()
+        .and_then(|path| validation.facts.anchors.get(&path_key(path)))
         .is_some_and(VolumeAnchor::has_unresolved_carrier_extent);
     if let Some((key, end)) = mapped_carrier_end(
-        &proposal.format,
+        proposal.format,
         proposal.style == "zip_spanned",
         proposal
             .volumes
@@ -67,7 +67,7 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         return;
     }
     validation.status = assignment_status(
-        &proposal.format,
+        proposal.format,
         proposal.style == "zip_spanned",
         proposal.volumes.iter().map(|p| (p.1, get(&p.0))),
     );

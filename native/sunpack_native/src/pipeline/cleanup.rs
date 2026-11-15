@@ -1,7 +1,7 @@
 use std::{io, path::Path};
 
 #[cfg(windows)]
-pub(super) fn recycle<'a>(paths: impl Iterator<Item = &'a Path>) -> io::Result<()> {
+pub(super) fn recycle(path: &Path) -> io::Result<()> {
     use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr::null_mut};
     use windows_sys::core::GUID;
 
@@ -88,10 +88,6 @@ pub(super) fn recycle<'a>(paths: impl Iterator<Item = &'a Path>) -> io::Result<(
         }
     }
 
-    let mut paths = paths.peekable();
-    if paths.peek().is_none() {
-        return Ok(());
-    }
     unsafe {
         check(CoInitializeEx(null_mut(), 2))?; // COINIT_APARTMENTTHREADED
         let _apartment = Apartment;
@@ -111,7 +107,7 @@ pub(super) fn recycle<'a>(paths: impl Iterator<Item = &'a Path>) -> io::Result<(
             | NO_CONFIRMATION
             | NO_ERROR_UI;
         check((methods.set_operation_flags)(operation.0, flags))?;
-        for path in paths {
+        {
             let path: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
             let mut item = ComObject(null_mut());
             check(SHCreateItemFromParsingName(
@@ -133,7 +129,7 @@ pub(super) fn recycle<'a>(paths: impl Iterator<Item = &'a Path>) -> io::Result<(
 }
 
 #[cfg(not(windows))]
-pub(super) fn recycle<'a>(_: impl Iterator<Item = &'a Path>) -> io::Result<()> {
+pub(super) fn recycle(_: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "recycling requires Windows",

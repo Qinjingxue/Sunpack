@@ -129,8 +129,8 @@ impl FileTargets {
         for row in rows.iter() {
             let mut matches = |path: &str| {
                 let key = path_key(path);
-                if self.names_by_path.contains_key(&key) {
-                    physical_matches.insert(key);
+                if let Some((key, _)) = self.names_by_path.get_key_value(&key) {
+                    physical_matches.insert(key.as_str());
                     true
                 } else {
                     false
@@ -139,21 +139,24 @@ impl FileTargets {
             let contains = match row {
                 Candidate::File(table, index) => matches(&table.paths[*index]),
                 Candidate::Relation(group) => {
-                    let data = group.candidate_data();
-                    data.parts()
-                        .chain(data.companions.iter().map(String::as_str))
-                        .chain([data.carrier_path, data.entry_path])
-                        .filter(|path| matches(path))
-                        .count()
-                        > 0
+                    let mut contains = false;
+                    for path in group.related_paths() {
+                        contains |= matches(path);
+                    }
+                    contains
                 }
             };
             matched.push(contains);
         }
+        if physical_matches.len() == self.names_by_path.len() {
+            let mut selected = matched.into_iter();
+            rows.retain(|_| selected.next().unwrap());
+            return;
+        }
         let expected: HashSet<&str> = self
             .names_by_path
             .iter()
-            .filter(|(path, _)| !physical_matches.contains(*path))
+            .filter(|(path, _)| !physical_matches.contains(path.as_str()))
             .map(|(_, name)| name.as_str())
             .collect();
         let mut selected = matched.into_iter();
@@ -848,7 +851,7 @@ impl NativeEmbeddedBatch {
             ))
         };
         let speculative = |group: &NativeRelationGroup| {
-            !group.candidate_data().relation_confirmed
+            !group.relation_confirmed()
                 && group
                     .entry_anchor()
                     .is_some_and(|a| a.has_any(SEVEN_ZIP_CARRIER_INTERRUPTED))
@@ -893,9 +896,7 @@ impl NativeEmbeddedBatch {
             let mut keep = vec![false; groups.len()];
             let mut work = Vec::new();
             for (index, group) in groups.iter().enumerate() {
-                let data = group.candidate_data();
-                for path in std::iter::once(data.entry_path).chain(data.parts())
-                    .chain(data.companions.iter().map(String::as_str)) {
+                for path in group.related_paths() {
                     let key = path_key(path);
                     if requested.contains(&key) && !keep[index] {
                         keep[index] = true;
@@ -906,9 +907,7 @@ impl NativeEmbeddedBatch {
             }
             let mut owned = HashSet::new();
             while let Some(index) = work.pop() {
-                let data = groups[index].candidate_data();
-                for path in std::iter::once(data.entry_path).chain(data.parts())
-                    .chain(data.companions.iter().map(String::as_str)) {
+                for path in groups[index].related_paths() {
                     let key = path_key(path);
                     if let Some(peers) = by_path.remove(&key) {
                         owned.insert(key);
@@ -1105,8 +1104,7 @@ impl NativeCandidateTable {
                 Some(&cached),
             );
             for group in &groups {
-                let data = group.candidate_data();
-                for path in data.parts().chain([data.entry_path]) {
+                for path in group.part_paths().chain([group.entry_path()]) {
                     previous.remove(&path_key(path));
                 }
             }
@@ -1237,17 +1235,8 @@ impl NativeCandidateTable {
             .ok_or_else(|| std::io::Error::other(index.to_string()))?;
         Ok(match row {
             Candidate::File(table, index) => vec![path_key(&table.paths[*index])],
-            Candidate::Relation(group) => {
-                let data = group.candidate_data();
-                relation_path_keys(
-                    data.parts(),
-                    data.companions,
-                    data.carrier_path,
-                    data.entry_path,
-                )
-                .into_iter()
-                .collect()
-            }
+            Candidate::Relation(group) => group.related_paths().map(path_key)
+                .collect::<HashSet<_>>().into_iter().collect(),
         })
     }
 
@@ -1269,19 +1258,10 @@ impl NativeCandidateTable {
                 && (data.needs_password
                     || (data.multivolume && (data.is_split || data.structural_non_head)))
             {
-                blocked.extend(relation_path_keys(
-                    data.parts(),
-                    data.companions,
-                    data.carrier_path,
-                    data.entry_path,
-                ));
+                blocked.extend(group.related_paths().map(path_key));
                 routes.relation_events.push((index, 2));
             } else if data.relation_confirmed && matches!(data.format_hint, "rar" | "7z" | "zip") {
-                claimed.extend(
-                    data.parts()
-                        .chain(data.companions.iter().map(String::as_str))
-                        .map(|path| path_key(path)),
-                );
+                claimed.extend(group.owned_paths().map(path_key));
                 speculative.extend(
                     group
                         .speculative_paths()
@@ -1400,16 +1380,9 @@ impl NativeCandidateTable {
         }
         for index in relation_residual {
             if let Candidate::Relation(group) = &self.rows[index] {
-                let data = group.candidate_data();
-                let keys = relation_path_keys(
-                    data.parts(),
-                    data.companions,
-                    data.carrier_path,
-                    data.entry_path,
-                );
-                if keys
-                    .iter()
-                    .all(|key| !claimed.contains(key) && !blocked.contains(key))
+                if (claimed.is_empty() && blocked.is_empty())
+                    || group.related_paths().map(path_key)
+                        .all(|key| !claimed.contains(&key) && !blocked.contains(&key))
                 {
                     routes.embedded.push(index);
                 }
@@ -1620,31 +1593,18 @@ fn candidate_rank(row: &Candidate) -> (u8, usize, usize) {
         Candidate::File(..) => (1, 0, 1),
         Candidate::Relation(group) => {
             let data = group.candidate_data();
+            let count = data.parts_len();
             (
                 if data.is_split && !data.needs_password {
                     2
                 } else {
                     1
                 },
-                if data.is_split { data.parts_len() } else { 0 },
-                data.parts_len(),
+                if data.is_split { count } else { 0 },
+                count,
             )
         }
     }
-}
-
-fn relation_path_keys<'a>(
-    parts: impl Iterator<Item = &'a str>,
-    companions: &'a [String],
-    carrier: &'a str,
-    entry: &'a str,
-) -> HashSet<String> {
-    parts
-        .chain(companions.iter().map(String::as_str))
-        .chain([carrier, entry])
-        .filter(|path| !path.is_empty())
-        .map(path_key)
-        .collect()
 }
 
 #[cfg(test)]

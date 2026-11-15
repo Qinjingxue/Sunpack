@@ -20,9 +20,16 @@ use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 
 pub(super) struct Process {
-    owner: Option<JoinHandle<()>>,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<ChildState>>,
     shared: Arc<Shared>,
+}
+
+#[derive(Default)]
+enum ChildState {
+    #[default]
+    Starting,
+    Running(Child),
+    Exited(Option<std::process::ExitStatus>),
 }
 
 #[derive(Default)]
@@ -101,6 +108,7 @@ fn pump_stderr(mut pipe: impl Read, shared: &Shared) {
 #[derive(Default)]
 struct State {
     pid: u32,
+    owner: Option<JoinHandle<()>>,
     jobs: HashMap<String, Job>,
     parked: VecDeque<(String, Arc<Mailbox>)>,
     ready: bool,
@@ -360,19 +368,21 @@ impl Process {
         mode: ProcessMode,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared::default());
-        shared.state.lock().unwrap().startup_mode = Some(mode);
-        let child = Arc::new(Mutex::new(None));
+        let child = Arc::new(Mutex::new(ChildState::Starting));
         let owner = Arc::clone(&shared);
         let owner_child = Arc::clone(&child);
         // Process creation and the handshake belong to this existing IO owner,
         // not to a request poll. All borrowers await the same retained result.
-        let owner = thread::Builder::new()
+        let mut state = shared.state.lock().unwrap();
+        state.startup_mode = Some(mode);
+        state.owner = Some(thread::Builder::new()
             .name("sunpack-worker-stdout".into())
             .spawn(move || run_process(spawn, &owner_child, &owner))
             .map_err(|error| io::Error::new(error.kind(), CommunicationError {
                 kind: "process_start", message: error.to_string(),
-            }))?;
-        Ok(Self { owner: Some(owner), child, shared })
+            }))?);
+        drop(state);
+        Ok(Self { child, shared })
     }
 
     pub(super) fn pid(&self) -> u32 { self.shared.state.lock().unwrap().pid }
@@ -598,7 +608,7 @@ impl Process {
     }
 
     fn abort(&self, message: String) {
-        stop_child(&self.child);
+        let _ = reap_child(&self.child, true);
         self.shared.fail(message, io::ErrorKind::BrokenPipe);
     }
 }
@@ -627,13 +637,14 @@ impl Drop for Process {
             self.shared.changed.notify_all();
             return;
         }
+        let owner = state.owner.take();
         drop(state);
         self.shared.shutting_down.store(true, Ordering::Release);
         if let Ok(frame) = encode_worker_frame(&json!({"worker_command":"shutdown"})) {
             let _ = self.send(Arc::new(frame)).wait_blocking();
         }
         self.shared.close_input();
-        if let Some(owner) = self.owner.take() {
+        if let Some(owner) = owner {
             let _ = owner.join();
         }
     }
@@ -670,7 +681,7 @@ impl Drop for ReadyWaiter<'_> {
 
 fn run_process(
     spawn: impl FnOnce() -> io::Result<Child>,
-    child: &Arc<Mutex<Option<Child>>>,
+    child: &Arc<Mutex<ChildState>>,
     shared: &Arc<Shared>,
 ) {
     let mut spawned = match spawn() {
@@ -686,10 +697,10 @@ fn run_process(
     let input = spawned.stdin.take().expect("worker stdin is piped");
     let output = spawned.stdout.take().expect("worker stdout is piped");
     let stderr = spawned.stderr.take();
-    *child.lock().unwrap() = Some(spawned);
+    *child.lock().unwrap() = ChildState::Running(spawned);
     let abandoned = shared.state.lock().unwrap().abort_startup.clone();
     if let Some(reason) = abandoned {
-        stop_child(child);
+        let _ = reap_child(child, true);
         shared.fail(reason.message, reason.kind);
         return;
     }
@@ -700,7 +711,7 @@ fn run_process(
                 .spawn(move || pump_stderr(pipe, &owner)) {
                 Ok(owner) => Some(owner),
                 Err(error) => {
-                    stop_child(child);
+                    let _ = reap_child(child, true);
                     shared.fail(error.to_string(), error.kind());
                     return;
                 }
@@ -719,7 +730,7 @@ fn run_process(
         }) {
         Ok(writer) => writer,
         Err(error) => {
-            stop_child(child);
+            let _ = reap_child(child, true);
             if let Some(owner) = stderr_owner { let _ = owner.join(); }
             shared.fail(error.to_string(), error.kind());
             return;
@@ -728,23 +739,14 @@ fn run_process(
     let result = dispatch_stdout(output, shared);
     // EOF or invalid protocol ends every affected attempt. Reap before any
     // result/failure wake can release leases or start a replacement process.
-    let mut child_guard = child.lock().unwrap();
-    let child = child_guard.as_mut().expect("spawned worker");
-    let exited = child.try_wait().ok().flatten();
-    if exited.is_none() && (result.is_err() || !shared.shutting_down.load(Ordering::Acquire)) {
-        let _ = child.kill();
-    }
-    let status = exited.map_or_else(|| child.wait(), Ok);
-    let out_of_memory = status.ok().and_then(|status| status.code())
-        .is_some_and(|code| matches!(code as u32, 0xc0000017 | 0xc000012d));
-    // Release the child lock before publication; a failed write may be reaping too.
-    drop(child_guard);
+    let terminate = result.is_err() || !shared.shutting_down.load(Ordering::Acquire);
+    let status = reap_child(child, terminate);
     shared.fail_classified(
         result.as_ref().err().map_or_else(
             || "sevenzip_worker exited before job completion".to_owned(),
             |error| format!("sevenzip_worker transport failed: {error}"),
         ),
-        if out_of_memory { io::ErrorKind::OutOfMemory } else { io::ErrorKind::BrokenPipe },
+        worker_exit_kind(status),
         // Main publishes process-level transport failure after wait(): the
         // worker is gone. Job-local protocol errors remain process_io.
         "worker_lost",
@@ -966,28 +968,43 @@ impl Shared {
     }
 
     fn fail_classified(&self, message: String, kind: io::ErrorKind, failure_kind: &'static str) {
-        let mut state = self.state.lock().unwrap();
-        if state.closed.is_some() {
-            return;
-        }
-        let exit = state.abort_startup.take().unwrap_or(WorkerExit { message, kind, failure_kind });
-        for (_, job) in state.jobs.drain() {
-            job.mailbox
-                .update(|updates| updates.result = Some(Err(exit.error())));
-        }
-        for (_, mailbox) in state.parked.drain(..) {
-            mailbox.update(|updates| updates.result = Some(Err(exit.error())));
-        }
-        for write in state.writes.drain(..) {
-            write.completion.finish(Err(exit.error()));
-        }
-        state.input_closed = true;
-        state.closed = Some(exit);
-        let mut wakes: Vec<_> = state.ready_waiters.values_mut().filter_map(Option::take).collect();
-        wakes.extend(state.mode_waiter.take());
-        drop(state);
+        let (jobs, parked, writes, ready, mode) = {
+            let mut state = self.state.lock().unwrap();
+            if state.closed.is_some() {
+                return;
+            }
+            let exit = state.abort_startup.take().unwrap_or(WorkerExit { message, kind, failure_kind });
+            let jobs = std::mem::take(&mut state.jobs);
+            let parked = std::mem::take(&mut state.parked);
+            let writes = std::mem::take(&mut state.writes);
+            // Publish mailbox failures before a competing pipe can observe
+            // the closed state and complete its in-flight send.
+            for job in jobs.values() {
+                job.mailbox.update(|updates| updates.result = Some(Err(exit.error())));
+            }
+            for (_, mailbox) in &parked {
+                mailbox.update(|updates| updates.result = Some(Err(exit.error())));
+            }
+            for write in &writes {
+                write.completion.finish(Err(exit.error()));
+            }
+            state.input_closed = true;
+            state.closed = Some(exit);
+            state.pid = 0;
+            // A live Process::drop takes this handle to join graceful
+            // shutdown. A failed generation does not keep the dead thread.
+            drop(state.owner.take());
+            (
+                jobs,
+                parked,
+                writes,
+                std::mem::take(&mut state.ready_waiters),
+                state.mode_waiter.take(),
+            )
+        };
+        drop((jobs, parked, writes));
         self.changed.notify_all();
-        for wake in wakes {
+        for wake in ready.into_values().flatten().chain(mode) {
             wake.wake();
         }
     }
@@ -1044,18 +1061,43 @@ impl State {
     }
 }
 
-fn stop_child(child: &Mutex<Option<Child>>) {
-    if let Some(child) = child.lock().unwrap().as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
+fn reap_child(child: &Mutex<ChildState>, terminate: bool) -> Option<std::process::ExitStatus> {
+    // Keep the mutex through reaping so the other pipe cannot publish a
+    // failure while the process still owns output handles.
+    let mut state = child.lock().unwrap();
+    let status = match &mut *state {
+        ChildState::Starting => return None,
+        ChildState::Exited(status) => return *status,
+        ChildState::Running(child) => match child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            _ => {
+                if terminate {
+                    let _ = child.kill();
+                }
+                child.wait().ok()
+            }
+        },
+    };
+    // Drop the process handle now and let either pipe classify its exit.
+    *state = ChildState::Exited(status);
+    status
+}
+
+fn worker_exit_kind(status: Option<std::process::ExitStatus>) -> io::ErrorKind {
+    if status.and_then(|status| status.code())
+        .is_some_and(|code| matches!(code as u32, 0xc0000017 | 0xc000012d))
+    {
+        io::ErrorKind::OutOfMemory
+    } else {
+        io::ErrorKind::BrokenPipe
     }
 }
 
-fn fail_stdin(child: &Mutex<Option<Child>>, shared: &Shared, error: &io::Error) {
+fn fail_stdin(child: &Mutex<ChildState>, shared: &Shared, error: &io::Error) {
     // Reap before releasing admitted jobs, and preserve the same classification
     // whichever pipe observes the dead worker first (main's abort/on_error).
-    stop_child(child);
-    shared.fail_classified(error.to_string(), io::ErrorKind::BrokenPipe, "worker_lost");
+    let status = reap_child(child, true);
+    shared.fail_classified(error.to_string(), worker_exit_kind(status), "worker_lost");
 }
 
 fn dispatch_stdin(mut input: impl Write, shared: &Shared, failed: impl FnOnce(&io::Error)) {
@@ -1158,7 +1200,7 @@ impl Process {
             .spawn()
             .unwrap();
         child.wait().unwrap();
-        let child = Arc::new(Mutex::new(Some(child)));
+        let child = Arc::new(Mutex::new(ChildState::Running(child)));
         let owner = Arc::clone(&shared);
         let owner_child = Arc::clone(&child);
         let writer = thread::spawn(move || {
@@ -1166,12 +1208,11 @@ impl Process {
                 fail_stdin(&owner_child, &owner, error);
             });
         });
-        shared.state.lock().unwrap().ready = true;
-        Arc::new(Self {
-            owner: Some(writer),
-            child,
-            shared,
-        })
+        let mut state = shared.state.lock().unwrap();
+        state.ready = true;
+        state.owner = Some(writer);
+        drop(state);
+        Arc::new(Self { child, shared })
     }
 
     pub(super) fn test_event(&self, summary: Value) {
@@ -1504,8 +1545,9 @@ mod tests {
             state.closed.is_none()
         }).unwrap();
         assert!(!timed_out.timed_out());
+        assert!(state.owner.is_none(), "failed startup retained its thread handle");
         drop(state);
-        assert!(child.lock().unwrap().as_mut().unwrap().try_wait().unwrap().is_some());
+        assert!(matches!(*child.lock().unwrap(), ChildState::Exited(_)), "reaped startup retained its process handle");
         let Poll::Ready(result) = borrower.as_mut().poll(&mut cx) else {
             panic!("reaped startup did not finish cancellation");
         };
@@ -1548,7 +1590,8 @@ mod tests {
         assert_eq!(error.get_ref().unwrap().downcast_ref::<CommunicationError>().unwrap().kind, "worker_lost");
         let error = mailbox.updates.lock().unwrap().result.take().unwrap().err().unwrap();
         assert_eq!(error.get_ref().unwrap().downcast_ref::<CommunicationError>().unwrap().kind, "worker_lost");
-        assert!(process.child.lock().unwrap().as_mut().unwrap().try_wait().unwrap().is_some());
+        assert!(matches!(*process.child.lock().unwrap(), ChildState::Exited(Some(_))),
+            "failed stdin retained the process handle or lost its exit status for stdout");
     }
 
     #[test]
@@ -1748,7 +1791,11 @@ mod tests {
             mailbox.updates.lock().unwrap().result.take().unwrap().err().unwrap().kind(),
             io::ErrorKind::BrokenPipe,
         );
-        assert!(shared.state.lock().unwrap().writes.is_empty());
+        {
+            let state = shared.state.lock().unwrap();
+            assert_eq!(state.writes.capacity(), 0);
+            assert_eq!(state.jobs.capacity(), 0);
+        }
 
         let idle = Arc::new(Shared::default());
         let owner = Arc::clone(&idle);

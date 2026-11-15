@@ -969,19 +969,21 @@ namespace sunpack::sevenzip
                 return S_OK;
             }
 
-            // Collect settled files in batches without waiting for the writer.
-            // The trace already carries the completed output's replay receipt.
-            constexpr std::size_t snapshot_batch = 64;
-            if (!async_files_.empty() && async_files_.size() % snapshot_batch == 0)
+            // Harvest settled files without waiting for the writer. Keep the
+            // others in archive order for final error reporting and replay.
+            if (async_files_.size() >= next_snapshot_sweep_)
             {
-                while (!async_files_.empty())
-                {
-                    const auto &front = async_files_.front();
-                    auto snapshot = async_writer_->take_file_snapshot(front, true);
-                    if (!snapshot.closed) break;
-                    apply_file_snapshot(front->trace_index, std::move(snapshot));
-                    async_files_.pop_front();
-                }
+                async_files_.erase(std::remove_if(async_files_.begin(), async_files_.end(),
+                    [this](const AsyncFileWriter::FileStatePtr &file) {
+                        auto snapshot = async_writer_->take_file_snapshot(file, true);
+                        if (!snapshot.closed) return false;
+                        apply_file_snapshot(file->trace_index, std::move(snapshot));
+                        return true;
+                    }), async_files_.end());
+                // Space out scans when pending files accumulate, so an archive
+                // full of failures or replay receipts still takes linear work.
+                const auto pending = async_files_.size();
+                next_snapshot_sweep_ = pending + (std::max)(kSnapshotBatch, pending / 2);
             }
 
             PROPVARIANT value{};
@@ -1738,6 +1740,8 @@ namespace sunpack::sevenzip
         mutable std::recursive_mutex state_mutex_;
 
         std::deque<AsyncFileWriter::FileStatePtr> async_files_;
+        static constexpr std::size_t kSnapshotBatch = 64;
+        std::size_t next_snapshot_sweep_ = kSnapshotBatch;
 
         AsyncFileWriter::FileStatePtr current_async_file_;
 
