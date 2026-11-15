@@ -4,6 +4,31 @@
 
 覆盖包括常规、伪装和 SFX 归档，多种压缩方法及加密方式，错误密码，缺卷，错名和候选分卷，带有前后杂项字节的载体，以及连续 Watch 的下载、重启与重试。多层用例同时验证健康分支、阻塞分支、输出目录和源文件清理。
 
+## 疑难黑盒回归
+
+这些用例使用真实 CLI、Watch Broker 和原生解压 worker。在 `93fa21a6` 的 Windows x64 `ci` 构建中，以下失败通过普通断言保留。
+
+| 场景 | 独立覆盖 | 实测结果 |
+| --- | --- | --- |
+| [嵌套 RAR5 SFX 与尾部独立加密 7z](test_adversarial_carriers.py) | SFX 本身是 RAR 数据头卷，其他 RAR 卷位于伪装载体内。外部 7-Zip 对同一 SFX 分别验证 RAR5 和 7z，SunPack 必须解出两份且完整后才能清理源输入。 | CLI 和 Watch 均解出 RAR、漏掉 7z，仍报告完成并清理源载体。 |
+| [两组 RAR5 共享全部三个卷载体](test_adversarial_carriers.py) | 中间载体上的区段顺序反转，使用不同密码校验同格式卷组能按区段正确配对，不串卷或重复输出。 | CLI 和 Watch 均通过。 |
+| [同名伪装加密卷组的失败分类](test_adversarial_split_classification.py) | 同一递归扫描里，完整组只缺密码，另一组有正确密码但缺中间卷。缺卷允许没有识别结果。 | 7z 和 RAR5 SFX 的 CLI、Watch 四个用例均通过。 |
+| [外来 RAR5 第二卷顶替缺卷](test_adversarial_split_classification.py) | 用同名、同尺寸、同卷号但来自另一归档的真实第二卷填入缺口。提交的头卷有正确密码，外来卷组的头未提交。 | CLI 把外来第二卷报成 `wrong_password`，Watch 将其记为 `failed_password`。真正的 SFX 头卷均报告缺卷，源文件保留。 |
+| [进程树提交内存上限](test_archive_job_memory_pressure.py) | 各入口一次提交三个使用 32 MiB LZMA2 字典的 7z，验证运行时与 worker 均在同一个 72 MiB Windows Job 中，三个 40 MiB 输出都必须完整。 | CLI 和 Watch 均通过。校准运行中两个入口各收到一次系统内存限额通知，解包仍完成。 |
+| [CLI 和 Watch 的并发时序](../blackbox/test_watch_migration.py) | 用暂停真实 worker 和观察输出预留固定时序。覆盖 Watch 取消与同名 CLI 解压重叠、取消时源文件已经原地更新、CLI 输出预留后 Watch 停止并重启。 | 三个用例均通过。 |
+
+### 归档内部结构与 Watch 事件顺序
+
+| 场景 | 独立覆盖 | 实测结果 |
+| --- | --- | --- |
+| [ZIP 成员记录与名称](test_adversarial_archive_structures.py) | 中央目录逆序引用本地记录，空成员使用 ZIP64 数据描述符。另一个样本让两个成员的 Unicode 路径扩展指向同一名称，其中一个扩展的 CRC 因改名失效。 | 两个 CLI 用例均完整输出各自成员。 |
+| [GNU TAR 多块稀疏映射](test_adversarial_archive_structures.py) | 26 个数据区段跨越两个映射扩展块，文件首尾和区段间有空洞，其后紧跟普通成员。 | Watch 输出与 Python `tarfile` 逐字节一致。 |
+| [RAR5 硬链接和部分恢复](test_rar5_hardlink_members.py) | 以外部工具确认归档包含真实硬链接。验证 solid 归档里有内容和空文件的链接组，以及指向 CRC 失败成员的链接不会作为完整输出发布。 | 两个 CLI 用例均通过。同内容的独立文件保持独立文件身份。CRC 损坏时保留源归档和完整的普通成员。 |
+| [持写句柄的归档跨 Watch 根移动](test_adversarial_watch_sequences.py) | 观察到 `candidate_busy` 后移动旧归档，立即在原路径放入同尺寸、同修改时间的新归档。 | 两个文件分别进入正确的输出根，各自完成后清理对应源文件。 |
+| [Watch 停机时替换父目录](test_adversarial_watch_sequences.py) | 只移动已准备好的目录，比较路径、长度和修改时间相同且文件 ID 已变的子归档，与长度变化的子归档和直接改名移入的归档。 | 后两种在重启后解出。仅文件 ID 和内容变化的子归档被遗漏，失败保留为普通断言。 |
+
+## 现有真实归档覆盖
+
 `test_split_carrier_delivery.py` 补充了分卷内容、到达方式和源清理之间的交叉覆盖。输入由现有工具按需生成；结果比对原始文件的路径、大小和 CRC32。
 
 | 入口与场景 | 独立验证 |

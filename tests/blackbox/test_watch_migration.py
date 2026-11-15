@@ -4,6 +4,7 @@ import random
 import subprocess
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import psutil
@@ -38,6 +39,127 @@ def _staged_worker(package, tmp_path):
         process for process in psutil.process_iter(["exe"])
         if process.info["exe"] and Path(process.info["exe"]) == worker_path
     )
+
+
+def test_live_watch_cancel_preserves_concurrent_cli_output_with_same_name(package, tmp_path):
+    """Overlapping output claims and rollback must stay scoped to each request."""
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    output = tmp_path / "output"
+    existing = output / "same"
+    existing.mkdir(parents=True)
+    (existing / "member.txt").write_bytes(b"user data")
+
+    incoming = tmp_path / "staged.zip"
+    source = watched / "same.zip"
+    foreground = tmp_path / "same.zip"
+    _zip(incoming, "member.txt", b"cancelled Watch archive")
+    _zip(foreground, "member.txt", b"successful CLI archive")
+    package.configure(post_extract={"archive_cleanup_mode": "d"})
+    package.json("watch", "add", watched, "-o", output)
+    with package.watch_session(), ThreadPoolExecutor(max_workers=1) as executor:
+        worker = _staged_worker(package, tmp_path)
+        worker.suspend()
+        try:
+            incoming.replace(source)
+            started = package.await_watch_event("pipeline_request_started", root=watched)
+            watch_output = output / "same(1)"
+            _wait_for(watch_output.is_dir, "Watch did not reserve its collision output")
+            cli = executor.submit(package.json, "extract", "-c", "d", "-o", output, foreground)
+            cli_output = output / "same(2)"
+            _wait_for(cli_output.is_dir, "CLI did not reserve a distinct output during the Watch batch")
+            assert not cli.done() and not (watch_output / "member.txt").exists()
+            cancelled = package.run("--cancel-watch-batch", started["owner"])
+            assert cancelled.returncode == 0, (cancelled.stdout, cancelled.stderr)
+        finally:
+            worker.resume()
+
+        assert cli.result()["summary"]["success_count"] == 1
+        package.await_watch_event("pipeline_request_interrupted", path=source.name, root=watched)
+
+    assert {path.name for path in output.iterdir()} == {existing.name, cli_output.name}
+    assert (existing / "member.txt").read_bytes() == b"user data"
+    assert (cli_output / "member.txt").read_bytes() == b"successful CLI archive"
+    assert source.is_file()
+    assert not foreground.exists()
+
+
+def test_live_watch_cancel_replays_the_new_generation_of_the_same_file(package, tmp_path):
+    """Cancellation of an admitted generation must leave an in-place update eligible."""
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    output = tmp_path / "output"
+    incoming = tmp_path / "staged.zip"
+    replacement = tmp_path / "updated.zip"
+    source = watched / "source.zip"
+    _zip(incoming, "member.txt", b"cancelled generation")
+    _zip(replacement, "member.txt", b"rewritten generation")
+    updated = replacement.read_bytes()
+    assert len(updated) == incoming.stat().st_size
+
+    package.json("watch", "add", watched, "-o", output)
+    with package.watch_session():
+        worker = _staged_worker(package, tmp_path)
+        worker.suspend()
+        try:
+            incoming.replace(source)
+            started = package.await_watch_event("pipeline_request_started", root=watched)
+            _wait_for((output / "source").is_dir, "Watch did not admit the original generation")
+            # Rewrite the mapped source in place while its old request still owns the output.
+            with source.open("r+b") as writer:
+                assert writer.write(updated) == len(updated)
+            cancelled = package.run("--cancel-watch-batch", started["owner"])
+            assert cancelled.returncode == 0, (cancelled.stdout, cancelled.stderr)
+        finally:
+            worker.resume()
+
+        done = package.await_watch_event("done", path=source.name, root=watched)
+        assert done["owner"] != started["owner"]
+
+    assert [path.read_bytes() for path in output.rglob("member.txt")] == [b"rewritten generation"]
+    assert source.read_bytes() == updated
+
+
+def test_foreground_nested_output_survives_watch_restart_during_extraction(package, tmp_path):
+    """A new Watch session must recognize a CLI output reserved by the old session."""
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    watch_output = tmp_path / "watch-output"
+    inner = tmp_path / "inner.zip"
+    _zip(inner, "generated.txt", b"keep this archive for the user")
+    outer = tmp_path / "outer.zip"
+    inner_bytes = inner.read_bytes()
+    _zip(outer, inner.name, inner_bytes)
+    incoming = tmp_path / "live.zip"
+    _zip(incoming, "live.txt", b"independent Watch work")
+
+    package.json("watch", "add", "-R", watched, "-o", watch_output)
+    package.json("watch", "start", "--no-tray")
+    produced = watched / "outer" / inner.name
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            worker = _staged_worker(package, tmp_path)
+            owner = worker.parent()
+            worker.suspend()
+            try:
+                cli = executor.submit(package.json, "extract", "-r", "1", "-F", "-o", watched, outer)
+                _wait_for(produced.parent.is_dir, "CLI did not reserve output before the Watch restart")
+                assert package.json("watch", "stop")["summary"]["stopped"]
+                package.json("watch", "start", "--no-tray")
+                assert owner.is_running() and not cli.done() and not produced.exists()
+            finally:
+                worker.resume()
+            assert cli.result()["summary"]["success_count"] == 1
+
+        incoming.replace(watched / incoming.name)
+        package.await_watch_event("done", path=incoming.name, root=watched)
+    finally:
+        assert package.json("watch", "stop")["summary"]["stopped"]
+
+    assert produced.read_bytes() == inner_bytes
+    assert [path.read_bytes() for path in watch_output.rglob("*") if path.is_file()] == [
+        b"independent Watch work",
+    ]
 
 
 def test_watch_catalog_loss_rebuilds_baseline_without_replaying_existing_sources(package, tmp_path):
