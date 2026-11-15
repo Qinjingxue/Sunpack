@@ -33,7 +33,7 @@ def test_plan7_disguised_encrypted_split_nested_carrier(package, tmp_path, outer
     download(watch, case.parts[-1])
     blocker = watch.await_event("failed_password", path=case.blocked_name)
     retry = Path(blocker["path"])
-    assert retry.parent == watch.root and retry.is_file()
+    assert retry.is_relative_to(watch.output) and retry.is_file()
     assert_nested_outputs(watch.output, case, leaf_success=False)
     if restart:
         watch.restart()
