@@ -92,4 +92,34 @@ configure_file("${quickjs_SOURCE_DIR}/LICENSE" licenses/quickjs.txt COPYONLY)
 configure_file("${core_ui_SOURCE_DIR}/third_party/lunasvg/LICENSE" licenses/lunasvg.txt COPYONLY)
 configure_file("${core_ui_SOURCE_DIR}/third_party/lunasvg/plutovg/LICENSE" licenses/plutovg.txt COPYONLY)
 configure_file("${core_ui_SOURCE_DIR}/third_party/lunasvg/plutovg/source/FTL.TXT" licenses/freetype.txt COPYONLY)
-configure_file("${core_ui_SOURCE_DIR}/third_party/lunasvg/plutovg/LICENSE" licenses/plutovg.txt COPYONLY)
+# PlutoVG embeds stb and FreeType code under their own licenses.
+# Keep the full dual-license grant, not the implementation or a license summary.
+set(plutovg_source_dir "${core_ui_SOURCE_DIR}/third_party/lunasvg/plutovg/source")
+set(stb_license "")
+foreach(stb_component image image-write truetype)
+  set(stb_header "${plutovg_source_dir}/plutovg-stb-${stb_component}.h")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${stb_header}")
+  file(READ "${stb_header}" stb_source)
+  string(FIND "${stb_source}" "This software is available under 2 licenses" stb_license_start)
+  if(stb_license_start EQUAL -1)
+    message(FATAL_ERROR "Missing embedded stb license: ${stb_header}")
+  endif()
+  string(SUBSTRING "${stb_source}" ${stb_license_start} -1 stb_component_license)
+  if(NOT stb_component_license MATCHES "\\*/[ \t\r\n]*$")
+    message(FATAL_ERROR "Unexpected embedded stb license ending: ${stb_header}")
+  endif()
+  string(REGEX REPLACE "\\*/[ \t\r\n]*$" "" stb_component_license "${stb_component_license}")
+  if(NOT stb_license STREQUAL "" AND NOT stb_license STREQUAL stb_component_license)
+    message(FATAL_ERROR "Embedded stb licenses differ; stage each license separately")
+  endif()
+  set(stb_license "${stb_component_license}")
+endforeach()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/licenses/stb.txt"
+  "stb_image, stb_image_write and stb_truetype, embedded by PlutoVG.\n"
+  "Source: https://github.com/nothings/stb\n\n${stb_license}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/licenses/freetype-attribution.txt"
+  "PlutoVG incorporates FreeType math, raster and stroker code.\n"
+  "Portions of this software are copyright (c) 1996-2014 The FreeType Project\n"
+  "(https://www.freetype.org). All rights reserved.\n"
+  "Authors: David Turner, Robert Wilhelm, and Werner Lemberg.\n"
+  "The accompanying FreeType Project License applies to these portions.\n")

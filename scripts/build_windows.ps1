@@ -625,19 +625,6 @@ $toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Jo
 $sevenZipWorkerPath = Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"
 $toastHostPath = Join-Path $toolsRoot "sunpack_toast.dll"
 $launcherBuildPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_launcher.exe"
-$mitLicensePath = Join-Path $repoRoot "LICENSE"
-$sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
-$sevenZipSourceLicensePath = Join-Path $repoRoot "licenses\7zip-source-license.txt"
-$lgplLicensePath = Join-Path $repoRoot "licenses\LGPL-2.1.txt"
-$zlibNgLicensePath = Join-Path $repoRoot "licenses\zlib-ng-license.txt"
-$lz4LicensePath = Join-Path $repoRoot "licenses\lz4-license.txt"
-$twofishLicensePath = Join-Path $repoRoot "licenses\twofish-license.txt"
-$serpentLicensePath = Join-Path $repoRoot "licenses\serpent-license.txt"
-$threefishLicensePath = Join-Path $repoRoot "licenses\threefish-license.txt"
-$magmaLicensePath = Join-Path $repoRoot "licenses\magma-license.txt"
-$blowfishLicensePath = Join-Path $repoRoot "licenses\blowfish-license.txt"
-$rc6LicensePath = Join-Path $repoRoot "licenses\rc6-license.txt"
-$thirdPartyNoticesPath = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 $distRoot = Join-Path $repoRoot "dist"
 $buildRoot = Join-Path $repoRoot "build"
 $releaseRoot = Join-Path $repoRoot "release"
@@ -650,8 +637,7 @@ $distRuntimeExePath = Join-Path $distAppRoot $runtimeExeName
 $distToolsRoot = Join-Path $distAppRoot "tools"
 $distServiceRoot = Join-Path $distAppRoot "service"
 $distWatchBrokerPath = Join-Path $distServiceRoot "sunpack-watch-broker.exe"
-$distLicensesRoot = Join-Path $distAppRoot "licenses"
-$distThirdPartyNoticesPath = Join-Path $distAppRoot "THIRD_PARTY_NOTICES.md"
+$distLicenseBundlePath = Join-Path $distAppRoot "THIRD_PARTY_LICENSES.txt"
 $versionValue = Get-ReleaseVersion -ExplicitVersion $Version -RepoRoot $repoRoot
 $releaseInstallerName = "sunpack-windows-{0}-{1}-setup.exe" -f $buildArch, $versionValue
 $releaseInstallerPath = Join-Path $releaseRoot $releaseInstallerName
@@ -671,19 +657,6 @@ Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust wo
 Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
 Assert-PathExists -LiteralPath (Join-Path $sevenZipWrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
 Assert-PathExists -LiteralPath (Join-Path $toastHostRoot "CMakeLists.txt") -Description "toast CMake project"
-Assert-PathExists -LiteralPath $mitLicensePath -Description "SunPack MIT license file"
-Assert-PathExists -LiteralPath $sevenZipLicensePath -Description "7-Zip binary license file"
-Assert-PathExists -LiteralPath $sevenZipSourceLicensePath -Description "7-Zip source license file"
-Assert-PathExists -LiteralPath $lgplLicensePath -Description "GNU LGPL 2.1 license file"
-Assert-PathExists -LiteralPath $zlibNgLicensePath -Description "zlib-ng license file"
-Assert-PathExists -LiteralPath $lz4LicensePath -Description "LZ4 license file"
-Assert-PathExists -LiteralPath $twofishLicensePath -Description "RustCrypto Twofish license file"
-Assert-PathExists -LiteralPath $serpentLicensePath -Description "RustCrypto Serpent license file"
-Assert-PathExists -LiteralPath $threefishLicensePath -Description "RustCrypto Threefish license file"
-Assert-PathExists -LiteralPath $magmaLicensePath -Description "RustCrypto Magma/GOST license file"
-Assert-PathExists -LiteralPath $blowfishLicensePath -Description "RustCrypto Blowfish license file"
-Assert-PathExists -LiteralPath $rc6LicensePath -Description "RustCrypto RC6 license file"
-Assert-PathExists -LiteralPath $thirdPartyNoticesPath -Description "Third-party notices file"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 
 if ($Clean) {
@@ -784,21 +757,8 @@ Copy-Item -LiteralPath $iconPath -Destination $distIconPath -Force
 Copy-IfExists -Source (Join-Path $repoRoot "sunpack_advanced_config.json") -Destination $distAdvancedConfigPath
 Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot
 
-New-Item -ItemType Directory -Path $distLicensesRoot -Force | Out-Null
-Copy-Item -Path (Join-Path $guiBuildDir "licenses\*.txt") -Destination $distLicensesRoot -Force
-Copy-Item -LiteralPath $mitLicensePath -Destination (Join-Path $distLicensesRoot "SunPack-MIT.txt") -Force
-Copy-Item -LiteralPath $sevenZipLicensePath -Destination (Join-Path $distLicensesRoot "7zip-license.txt") -Force
-Copy-Item -LiteralPath $sevenZipSourceLicensePath -Destination (Join-Path $distLicensesRoot "7zip-source-license.txt") -Force
-Copy-Item -LiteralPath $lgplLicensePath -Destination (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Force
-Copy-Item -LiteralPath $zlibNgLicensePath -Destination (Join-Path $distLicensesRoot "zlib-ng-license.txt") -Force
-Copy-Item -LiteralPath $lz4LicensePath -Destination (Join-Path $distLicensesRoot "lz4-license.txt") -Force
-Copy-Item -LiteralPath $twofishLicensePath -Destination (Join-Path $distLicensesRoot "twofish-license.txt") -Force
-Copy-Item -LiteralPath $serpentLicensePath -Destination (Join-Path $distLicensesRoot "serpent-license.txt") -Force
-Copy-Item -LiteralPath $threefishLicensePath -Destination (Join-Path $distLicensesRoot "threefish-license.txt") -Force
-Copy-Item -LiteralPath $magmaLicensePath -Destination (Join-Path $distLicensesRoot "magma-license.txt") -Force
-Copy-Item -LiteralPath $blowfishLicensePath -Destination (Join-Path $distLicensesRoot "blowfish-license.txt") -Force
-Copy-Item -LiteralPath $rc6LicensePath -Destination (Join-Path $distLicensesRoot "rc6-license.txt") -Force
-Copy-Item -LiteralPath $thirdPartyNoticesPath -Destination $distThirdPartyNoticesPath -Force
+& (Join-Path $repoRoot "scripts\generate_license_bundle.ps1") -RepoRoot $repoRoot `
+    -GuiLicenseRoot (Join-Path $guiBuildDir "licenses") -OutputPath $distLicenseBundlePath -Target $rustTarget
 
 $distScriptsRoot = Join-Path $distAppRoot "scripts"
 New-Item -ItemType Directory -Path $distScriptsRoot -Force | Out-Null
@@ -813,19 +773,7 @@ Assert-PathExists -LiteralPath $distPasswordPath -Description "External password
 Assert-PathExists -LiteralPath $distConfigPath -Description "External config file"
 Assert-PathExists -LiteralPath $distIconPath -Description "External icon file"
 Assert-PackagedRuntimeTools -PackageRoot $distAppRoot
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "SunPack-MIT.txt") -Description "Packaged SunPack MIT license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-license.txt") -Description "Packaged 7-Zip binary license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-source-license.txt") -Description "Packaged 7-Zip source license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Description "Packaged GNU LGPL 2.1 license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "zlib-ng-license.txt") -Description "Packaged zlib-ng license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "lz4-license.txt") -Description "Packaged LZ4 license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "twofish-license.txt") -Description "Packaged RustCrypto Twofish license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "serpent-license.txt") -Description "Packaged RustCrypto Serpent license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "threefish-license.txt") -Description "Packaged RustCrypto Threefish license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "magma-license.txt") -Description "Packaged RustCrypto Magma/GOST license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "blowfish-license.txt") -Description "Packaged RustCrypto Blowfish license file"
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "rc6-license.txt") -Description "Packaged RustCrypto RC6 license file"
-Assert-PathExists -LiteralPath $distThirdPartyNoticesPath -Description "Packaged third-party notices file"
+Assert-PathExists -LiteralPath $distLicenseBundlePath -Description "Consolidated license and third-party notices"
 Assert-PathMissing -LiteralPath (Join-Path $distToolsRoot "7z.dll") -Description "Legacy standalone tools/7z.dll (the 7-Zip backend is embedded)"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip_worker.exe") -BuildArch $buildArch -Description "Packaged tools/sunpack_sevenzip_worker.exe"
 

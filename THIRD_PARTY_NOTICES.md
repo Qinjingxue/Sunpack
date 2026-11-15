@@ -1,5 +1,9 @@
 # Third-Party Notices
 
+Release packages contain one `THIRD_PARTY_LICENSES.txt` with this overview,
+SunPack's MIT terms, and full collected dependency notices. Paths below identify
+the original files in the source repository, not separate installed files.
+
 ## SunPack GUI
 
 The standalone GUI statically links [Core UI](https://github.com/ghboke/core-ui)
@@ -7,7 +11,8 @@ at commit `126330eefdefe724ec96eb543681f715bd6be252` (MIT),
 [nlohmann/json](https://github.com/nlohmann/json) at commit
 `65ee68451d8eb2b5f3a30b410476ab83deb3289b` (MIT), and Core UI's
 QuickJS-NG, LunaSVG and PlutoVG dependencies. Their full license texts are
-copied into the package's `licenses` directory by the GUI build. The GUI also
+staged by the GUI build and consolidated into `THIRD_PARTY_LICENSES.txt`
+in release packages, together with the bundled FreeType and stb notices. The GUI also
 reuses the repository's bundled xxHash implementation and its BSD notice.
 
 SunPack-original source code is licensed under the MIT License. Third-party
