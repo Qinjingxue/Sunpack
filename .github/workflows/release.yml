@@ -199,7 +199,7 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           profile: release
-          source-key: ${{ hashFiles('sunpack/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest', 'sunpack.ico', 'sunpack_advanced_config.json') }}
+          source-key: ${{ hashFiles('sunpack/**', '.cargo/config.toml', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest', 'sunpack.ico', 'sunpack_advanced_config.json') }}
 
       - name: Prepare CMake and test dependencies
         shell: pwsh
@@ -218,7 +218,7 @@ jobs:
         uses: ./.github/actions/gui-cache
         with:
           arch: ${{ matrix.arch }}
-          source-key: ${{ hashFiles('gui/**', 'tests/gui/**', 'scripts/build_gui.ps1', 'scripts/restore_native_cache_times.ps1', 'sunpack.manifest', 'sunpack_advanced_config.json', 'sunpack/third_party/lz4/**') }}
+          source-key: ${{ hashFiles('gui/**', 'scripts/build_gui.ps1', 'scripts/build_native.ps1', 'scripts/restore_native_cache_times.ps1', 'sunpack.manifest', 'sunpack_advanced_config.json', 'sunpack/third_party/lz4/**') }}
 
       - name: Show toolchain architecture
         shell: pwsh
@@ -288,10 +288,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            .cache/rust-target/${{ matrix.arch }}
+            .cache/rust-target
             .cache/native-source-times-${{ matrix.arch }}-release.json
-            sunpack/sevenzip_bridge/build-${{ matrix.arch }}
-            sunpack/toast_host/build-${{ matrix.arch }}
+            .cache/native/${{ matrix.arch }}/release/sevenzip_bridge
+            .cache/native/${{ matrix.arch }}/release/toast_host
           key: ${{ steps.native-cache.outputs.cache-key }}
 
       - name: Compile GUI test binaries without reconfiguring the packaged app

@@ -108,10 +108,12 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 ''')
-    env = environment()
+    env = {**environment(), "CARGO_ENCODED_RUSTFLAGS": ""}
+    target = "x86_64-pc-windows-msvc"
     command(["cargo", "build", "--release", "--offline", "--manifest-path", dest / "Cargo.toml",
+             "--target", target, "--target-dir", dest / "target",
              *(["--features", "allocation-meter"] if meter else [])], env=env)
-    return dest / "target/release/sunpack_hit_index_probe.dll"
+    return dest / "target" / target / "release/sunpack_hit_index_probe.dll"
 
 
 def backends(*, fetch: bool) -> tuple[Path, dict]:

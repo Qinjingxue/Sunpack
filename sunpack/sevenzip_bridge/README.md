@@ -25,9 +25,9 @@ execution result without rereading source archives or output files.
 ## Build
 
 ```powershell
-cmake -S sunpack\sevenzip_bridge -B sunpack\sevenzip_bridge\build-x64 -A x64
-cmake --build sunpack\sevenzip_bridge\build-x64 --config Release
-ctest --test-dir sunpack\sevenzip_bridge\build-x64 -C Release --output-on-failure
+.\.venv\Scripts\cmake.exe -S sunpack\sevenzip_bridge -B .cache\native\x64\release\sevenzip_bridge -A x64
+.\.venv\Scripts\cmake.exe --build .cache\native\x64\release\sevenzip_bridge --config Release
+.\.venv\Scripts\ctest.exe --test-dir .cache\native\x64\release\sevenzip_bridge -C Release --output-on-failure
 ```
 
 On x64 the build assembles the upstream 7-Zip hot paths
@@ -48,7 +48,7 @@ before launching that worker to collect timing. `setup_windows_dev.ps1 -BuildPro
 Release runtime output:
 
 ```text
-sunpack\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe
+.cache\native\x64\release\sevenzip_bridge\Release\sunpack_sevenzip_worker.exe
 ```
 
 Development and release scripts copy it to:

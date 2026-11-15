@@ -50,7 +50,7 @@ target_link_libraries(SunPackGUI PRIVATE sunpack_gui_app sunpack_gui_data core-u
 target_link_options(SunPackGUI PRIVATE /OPT:REF /OPT:ICF
   "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../sunpack.manifest")
 enable_testing()
-add_executable(sunpack_gui_tests ../tests/gui/manager.cpp ../tests/gui/service_monitor.cpp)
+add_executable(sunpack_gui_tests tests/manager.cpp tests/service_monitor.cpp)
 ui_core_embed_text(sunpack_gui_tests FILE ../sunpack_advanced_config.json OUT defaults_json.h VAR kDefaultsJson)
 target_link_libraries(sunpack_gui_tests PRIVATE sunpack_gui_data)
 target_compile_options(sunpack_gui_tests PRIVATE /UNDEBUG)
@@ -58,8 +58,8 @@ target_compile_options(sunpack_gui_tests PRIVATE /UNDEBUG)
 # letting LINK restart automatically after encountering the static library.
 target_link_options(sunpack_gui_tests PRIVATE "$<$<CONFIG:Release>:/LTCG>")
 add_test(NAME gui_file_contracts COMMAND sunpack_gui_tests)
-add_executable(sunpack_gui_ui_tests ../tests/gui/interface.cpp ../tests/gui/rendering.cpp ../tests/gui/theme.cpp
-  ../tests/gui/startup_failure.cpp resources/app.rc)
+add_executable(sunpack_gui_ui_tests tests/interface.cpp tests/rendering.cpp tests/theme.cpp
+  tests/startup_failure.cpp resources/app.rc)
 target_include_directories(sunpack_gui_ui_tests PRIVATE "${core_ui_SOURCE_DIR}/src")
 ui_core_embed_text(sunpack_gui_ui_tests FILE ../sunpack_advanced_config.json OUT ui_defaults_json.h VAR kUiDefaultsJson)
 target_link_libraries(sunpack_gui_ui_tests PRIVATE sunpack_gui_app sunpack_gui_data core-ui comctl32)
@@ -71,8 +71,8 @@ add_test(NAME gui_theme_preferences COMMAND sunpack_gui_ui_tests --theme)
 add_test(NAME gui_startup_failure COMMAND sunpack_gui_ui_tests --startup-failure)
 add_test(NAME gui_script_errors COMMAND sunpack_gui_ui_tests --script-errors)
 if(SUNPACK_GUI_ASAN)
-  target_sources(sunpack_gui_tests PRIVATE ../tests/gui/asan_options.cpp)
-  target_sources(sunpack_gui_ui_tests PRIVATE ../tests/gui/asan_options.cpp)
+  target_sources(sunpack_gui_tests PRIVATE tests/asan_options.cpp)
+  target_sources(sunpack_gui_ui_tests PRIVATE tests/asan_options.cpp)
 endif()
 set_tests_properties(gui_file_contracts gui_interface gui_history_window gui_theme_preferences gui_startup_failure gui_script_errors PROPERTIES TIMEOUT 60)
 

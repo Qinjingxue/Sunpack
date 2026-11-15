@@ -562,8 +562,7 @@ try {
     # and its fixtures below are tested from the release build.
     Invoke-TestStep -Label "Rust correctness tests" -Command @(
         "cargo", "test", "--quiet", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
-        "--workspace", "--profile", "ci", "--target", $target,
-        "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
+        "--workspace", "--profile", "ci", "--target", $target
     )
     Invoke-TestStep -Label "CLI and Watch acceptance tests" -Command @(
         $python, "-m", "pytest", "-q", "-rs", "-n", [string]$ParallelWorkers,

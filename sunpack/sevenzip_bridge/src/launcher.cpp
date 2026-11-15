@@ -112,17 +112,19 @@ InstallContext install_context(const std::wstring& executable) {
     // Official source builds keep the launcher and Rust artifacts in their
     // native build directories. Do not stage a fake package beside the runtime.
     if (!file_exists(runtime.wstring()) && fs::path(executable).stem() == L"sunpack_launcher") {
-        const auto build = directory.parent_path();
-        const auto root = build.parent_path().parent_path().parent_path();
-        const auto name = build.filename().wstring();
-        const bool ci = name.size() >= 3 && name.compare(name.size() - 3, 3, L"-ci") == 0;
-        const auto arch = ci ? name.substr(0, name.size() - 3) : name;
-        if ((arch == L"build-x64" || arch == L"build-arm64") &&
+        const auto component = directory.parent_path();
+        const auto profile = component.parent_path();
+        const auto arch = profile.parent_path();
+        const auto cache = arch.parent_path().parent_path();
+        const auto root = cache.parent_path();
+        if (component.filename() == L"sevenzip_bridge" && cache.filename() == L".cache" &&
+            arch.parent_path().filename() == L"native" &&
+            (profile.filename() == L"ci" || profile.filename() == L"release") &&
+            (arch.filename() == L"x64" || arch.filename() == L"arm64") &&
             file_exists((root / L"sunpack" / L"Cargo.toml").wstring())) {
-            const auto target = arch == L"build-arm64"
+            const auto target = arch.filename() == L"arm64"
                 ? L"aarch64-pc-windows-msvc" : L"x86_64-pc-windows-msvc";
-            const auto platform = arch == L"build-arm64" ? L"arm64" : L"x64";
-            runtime = root / L".cache" / L"rust-target" / platform / target / (ci ? L"ci" : L"release") / L"sunpack-runtime.exe";
+            runtime = cache / L"rust-target" / target / profile.filename() / L"sunpack-runtime.exe";
             directory = root;
             data_dir = root;
         }

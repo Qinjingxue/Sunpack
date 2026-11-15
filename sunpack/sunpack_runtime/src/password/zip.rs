@@ -920,37 +920,8 @@ fn winzip_aes_verifier_matches(
 }
 
 #[cfg(test)]
-mod aes_verifier_tests {
-    use super::*;
-
-    // Independent coverage: every AES strength's non-first PBKDF2 block and
-    // long/UTF-8 HMAC keys against full PBKDF2, beyond archive success checks.
-    // This small oracle matrix catches block/offset errors without archive IO.
-    #[test]
-    fn selective_verifier_matches_full_pbkdf2_for_all_strengths() {
-        for password in ["", "password", "⑨密码", &"long-key".repeat(16)] {
-            for (key_len, salt_len) in [(16, 8), (24, 12), (32, 16)] {
-                let salt = vec![0xa5; salt_len];
-                let mut full = vec![0u8; key_len * 2 + 2];
-                pbkdf2::pbkdf2_hmac::<Sha1>(password.as_bytes(), &salt, 1000, &mut full);
-                let verifier = &full[key_len * 2..];
-                assert!(winzip_aes_verifier_matches(
-                    password.as_bytes(),
-                    &salt,
-                    verifier,
-                    key_len
-                ));
-                let rejected = [verifier[0] ^ 1, verifier[1]];
-                assert!(!winzip_aes_verifier_matches(
-                    password.as_bytes(),
-                    &salt,
-                    &rejected,
-                    key_len
-                ));
-            }
-        }
-    }
-}
+#[path = "../../tests/unit/password/zip/aes_verifier_tests.rs"]
+mod aes_verifier_tests;
 
 fn zipcrypto_header_matches(password: &[u8], encrypted_header: &[u8; 12], expected: u8) -> bool {
     let mut state = ZipCryptoState::new();
@@ -1034,88 +1005,9 @@ fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod password_encoding_tests {
-    use super::*;
-
-    #[test]
-    fn ascii_password_bytes_are_borrowed_unchanged() {
-        let encoded = zip_password_bytes("secret-123");
-        assert!(matches!(encoded, Cow::Borrowed(_)));
-        assert_eq!(&*encoded, b"secret-123");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn non_ascii_password_uses_the_ansi_codepage_like_7zip() {
-        extern "system" {
-            fn GetACP() -> u32;
-        }
-        let encoded = zip_password_bytes("密码");
-        match unsafe { GetACP() } {
-            936 => assert_eq!(&*encoded, &[0xC3, 0xDC, 0xC2, 0xEB]),
-            65001 => assert_eq!(&*encoded, "密码".as_bytes()),
-            _ => assert_ne!(&*encoded, "密码".as_bytes()),
-        }
-    }
-}
+#[path = "../../tests/unit/password/zip/password_encoding_tests.rs"]
+mod password_encoding_tests;
 
 #[cfg(test)]
-mod zip64_bounded_probe_tests {
-    use super::*;
-
-    fn stored_zip_with_eocd_offset(central_offset: u32) -> Vec<u8> {
-        let name = b"a.txt";
-        let payload = b"hello";
-        let mut data = Vec::new();
-        data.extend_from_slice(ZIP_LOCAL);
-        data.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        data.extend_from_slice(&0u16.to_le_bytes());
-        data.extend_from_slice(name);
-        data.extend_from_slice(payload);
-        let central_start = data.len() as u32;
-        data.extend_from_slice(ZIP_CENTRAL);
-        data.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        data.extend_from_slice(&[0; 12]);
-        data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(name);
-        let central_size = data.len() as u32 - central_start;
-        data.extend_from_slice(ZIP_EOCD);
-        data.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
-        data.extend_from_slice(&central_size.to_le_bytes());
-        data.extend_from_slice(&central_offset.to_le_bytes());
-        data.extend_from_slice(&0u16.to_le_bytes());
-        data
-    }
-
-    fn status_of(result: Result<ZipPasswordContext, PreparedStatus>) -> &'static str {
-        match result {
-            Err(PreparedStatus::Status(status, _)) => status,
-            Err(PreparedStatus::ReadFault(_)) => "read_fault",
-            Ok(_) => "prepared",
-        }
-    }
-
-    #[test]
-    fn zip64_directory_location_defers_instead_of_reporting_missing_volume() {
-        let data = stored_zip_with_eocd_offset(u32::MAX);
-        let len = data.len() as u64;
-        let result = prepare_zip_stream(&mut std::io::Cursor::new(data), len, None);
-        assert_eq!(status_of(result), "unknown_needs_final_verifier");
-    }
-
-    #[test]
-    fn ordinary_unencrypted_zip_is_still_not_required() {
-        let data = stored_zip_with_eocd_offset(40);
-        let len = data.len() as u64;
-        let result = prepare_zip_stream(&mut std::io::Cursor::new(data), len, None);
-        assert_eq!(status_of(result), "not_required");
-    }
-}
+#[path = "../../tests/unit/password/zip/zip64_bounded_probe_tests.rs"]
+mod zip64_bounded_probe_tests;

@@ -407,48 +407,5 @@ impl Drop for Promotion {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // File-only guards do not cover shared batch lifetime or redirected opens.
-    // One scope checks close ordering and the existing per-file fallback.
-    #[test]
-    fn scoped_readers_keep_promotion_protection_until_handles_close() {
-        let root = crate::test_support::temp_file("read_scope_İ_Σ_测试", b"");
-        std::fs::remove_file(&root).unwrap();
-        std::fs::create_dir(&root).unwrap();
-        let path = root.join("inside.fake");
-        std::fs::write(&path, b"inside").unwrap();
-        // A same-prefix sibling exercises the component boundary as well as
-        // the non-ASCII root's shared filesystem case mapping.
-        let outside = root.with_extension("sibling");
-        std::fs::write(&outside, b"outside").unwrap();
-        let scope = NativeReadScope::new(&root).unwrap();
-        let id = scope.guard.id;
-        let mut inside = scope.open_reader(path.to_str().unwrap()).unwrap();
-        let mut fallback = scope.open_reader(outside.to_str().unwrap()).unwrap();
-        assert!(matches!(inside._resource, FileResource::Shared { .. }));
-        assert!(matches!(fallback._resource, FileResource::Owned { .. }));
-        drop(scope);
-        assert!(registry()
-            .registry
-            .lock()
-            .unwrap()
-            .resources
-            .contains_key(&id));
-        let mut data = String::new();
-        inside.read_to_string(&mut data).unwrap();
-        fallback.read_to_string(&mut data).unwrap();
-        assert_eq!(data, "insideoutside");
-        drop((inside, fallback));
-        assert!(!registry()
-            .registry
-            .lock()
-            .unwrap()
-            .resources
-            .contains_key(&id));
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(root).unwrap();
-        std::fs::remove_file(outside).unwrap();
-    }
-}
+#[path = "../../tests/unit/io/resource_lifecycle/tests.rs"]
+mod tests;

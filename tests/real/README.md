@@ -71,4 +71,4 @@ The live Watch wrapped-RAR tail-first regression requires successful extraction 
 
 语料覆盖 USTAR、PAX Unicode 长路径、GNU longname、重复 TAR/ZIP 成员、空 ZIP、CP437 ZIP 和 solid RAR5 等结构。样本可用原名、伪装名和带前后杂项字节的载体三种方式运行。期望输出的路径、大小和 CRC32 来源于原始文件。
 
-脚本使用 bsdtar、WinRAR 和 `tools/real_fixture.exe`（ARM64 对应 `tools-arm64`）等独立工具。开发脚本预先构建 `real_fixture.exe`。测试用它组装载体、生成 LZ4 帧并清点文件。预生成语料可保存到 `tests/real/corpus/structure/`。pytest 在隔离目录生成所需样本。
+脚本使用 bsdtar、WinRAR 和 `real_fixture.exe`等独立工具。开发脚本预先构建 `real_fixture.exe`。测试用它组装载体、生成 LZ4 帧并清点文件。预生成语料可保存到 `tests/real/corpus/structure/`。pytest 在隔离目录生成所需样本。

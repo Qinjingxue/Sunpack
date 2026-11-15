@@ -309,15 +309,17 @@ if(WIN32)
         set(SUP_ENC_RUST_TARGET x86_64-pc-windows-msvc)
     endif()
     set(SUP_ENC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../sunpack_enc")
-    set(SUP_ENC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/enc-rust")
+    get_filename_component(SUP_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(SUP_ENC_TARGET_DIR "${SUP_REPO_ROOT}/.cache/rust-target")
     set(SUP_ENC_LIBRARY "${SUP_ENC_TARGET_DIR}/${SUP_ENC_RUST_TARGET}/${SUP_ENC_PROFILE}/sunpack_enc.lib")
     file(GLOB SUP_ENC_SOURCES CONFIGURE_DEPENDS "${SUP_ENC_ROOT}/src/*.rs")
     add_custom_command(OUTPUT "${SUP_ENC_LIBRARY}"
-        COMMAND "${CMAKE_COMMAND}" -E env "RUSTFLAGS=-Ctarget-feature=+crt-static"
-            "${SUP_ENC_CARGO}" build --profile "${SUP_ENC_PROFILE}" --locked --package sunpack-enc
+        COMMAND "${SUP_ENC_CARGO}" build --profile "${SUP_ENC_PROFILE}" --locked --package sunpack-enc
             --manifest-path "${SUP_ENC_ROOT}/Cargo.toml"
-            --target "${SUP_ENC_RUST_TARGET}" --target-dir "${SUP_ENC_TARGET_DIR}"
+            --target "${SUP_ENC_RUST_TARGET}"
+        WORKING_DIRECTORY "${SUP_REPO_ROOT}"
         DEPENDS ${SUP_ENC_SOURCES} "${SUP_ENC_ROOT}/Cargo.toml"
+            "${SUP_REPO_ROOT}/.cargo/config.toml"
             "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml" "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.lock"
         VERBATIM)
     add_custom_target(sunpack_enc_rust DEPENDS "${SUP_ENC_LIBRARY}")

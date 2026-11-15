@@ -21,11 +21,10 @@ void development_entrypoint_contract() {
     std::ofstream(root / L"sunpack_advanced_config.json") << "{}";
     for (const auto* arch : {L"x64", L"arm64"}) {
         for (const auto* profile : {L"ci", L"release"}) {
-            const auto build = std::wstring(L"build-") + arch + (std::wstring(profile) == L"ci" ? L"-ci" : L"");
-            const auto executable = root / L"sunpack" / L"sevenzip_bridge" / build / L"Release" / L"sunpack_launcher.exe";
+            const auto executable = root / L".cache" / L"native" / arch / profile / L"sevenzip_bridge" / L"Release" / L"sunpack_launcher.exe";
             const auto context = install_context(executable.wstring());
             const auto target = std::wstring(arch) == L"arm64" ? L"aarch64-pc-windows-msvc" : L"x86_64-pc-windows-msvc";
-            const auto expected = root / L".cache" / L"rust-target" / arch / target / profile / L"sunpack-runtime.exe";
+            const auto expected = root / L".cache" / L"rust-target" / target / profile / L"sunpack-runtime.exe";
             require(context.directory == root.wstring() && context.runtime == expected.wstring() &&
                     context.data_dir == root.wstring(), "native source layout");
             require(state_path(context) == (root / (L"runtime-" + wide_utf8(context.runtime_id) + L".state")).wstring(),

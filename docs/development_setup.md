@@ -23,9 +23,14 @@ sunpack/sunpack_usn_core/     Shared NTFS/USN Rust core
 sunpack/sunpack_watch_broker/ Windows Watch Broker service
 sunpack/sevenzip_bridge/      Windows 7z.dll bridge and worker
 sunpack/toast_host/           Windows toast DLL
-tools/                        x64 external tools and native build outputs
-tools-arm64/                  ARM64 external tools and native build outputs
+tools/                        Shared external fixture tools
+tools/arm64/                  ARM64 archive fixture tools
+.cache/rust-target/            Shared Cargo build tree
+.cache/native/                 CMake trees for the launcher, worker and toast
+.cache/gui-x64/                x64 GUI CMake tree
 ```
+
+The development, release and CI scripts share these build locations. Cargo separates its artifacts by target triple and profile. The native CMake trees use `.cache/native/<arch>/<profile>/<component>/` so the diagnostic `ci` build and the LTO `release` build can coexist. Source launchers and tests use the selected build tree directly.
 
 ## Python dependencies
 
@@ -71,7 +76,7 @@ Options:
 .\scripts\setup_windows_dev.ps1 -SkipAcceptanceTestTools
 ```
 
-On x64, setup also prepares the acceptance fixture generators under `.sunpack_test_tools/`: WinRAR 6.22, zstd 1.5.7, and [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4). The LZ4 writer is installed at `7zip-zstd/7z.exe` with its companion `7z.dll`; setup checks that it runs and exposes the LZ4 encoder. These tools are excluded from release packages. `-SkipAcceptanceTestTools` skips their preparation.
+On x64, setup also prepares the acceptance fixture generators under `tools/`: WinRAR 6.22, zstd 1.5.7, and [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4). The LZ4 writer is installed at `tools/7zip-zstd/7z.exe` with its companion `7z.dll`; setup checks that it runs and exposes the LZ4 encoder. These tools are excluded from release packages. `-SkipAcceptanceTestTools` skips their preparation.
 
 ## USN Watch Broker
 
@@ -110,13 +115,13 @@ Before a watch root starts, the path is verified to be on an NTFS volume with a 
 x64:
 
 ```powershell
-cargo build --locked --manifest-path sunpack\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
+cargo build --locked --manifest-path sunpack\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc
 ```
 
-For ARM64, replace the target triple and target directory with `aarch64-pc-windows-msvc` and `.cache\rust-target\arm64`. The output file is:
+For ARM64, use the target triple `aarch64-pc-windows-msvc`. The x64 output is:
 
 ```text
-.cache\rust-target\x64\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe
+.cache\rust-target\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe
 ```
 
 A development test service must use the test identity prefixes:
@@ -132,7 +137,7 @@ Repository scripts can install or uninstall a temporary service; the scripts rej
 .\scripts\manage_test_watch_service.ps1 -Action Install `
   -ServiceName SunPackWatchBrokerTest_dev `
   -PipeName '\\.\pipe\SunPack.WatchBroker.Test.dev' `
-  -BrokerPath '.cache\rust-target\x64\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe'
+  -BrokerPath '.cache\rust-target\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe'
 
 .\scripts\manage_test_watch_service.ps1 -Action Uninstall `
   -ServiceName SunPackWatchBrokerTest_dev `
@@ -144,16 +149,15 @@ Repository scripts can install or uninstall a temporary service; the scripts rej
 ### Rust runtime
 
 ```powershell
-cargo build --locked --manifest-path sunpack\Cargo.toml -p sunpack-runtime --bin sunpack-runtime --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
+cargo build --locked --manifest-path sunpack\Cargo.toml -p sunpack-runtime --bin sunpack-runtime --release --target x86_64-pc-windows-msvc
 ```
 
 ### C++ embedded 7-Zip worker
 
 ```powershell
-cmake -S sunpack\sevenzip_bridge -B sunpack\sevenzip_bridge\build-x64 -A x64
-cmake --build sunpack\sevenzip_bridge\build-x64 --config Release
-ctest --test-dir sunpack\sevenzip_bridge\build-x64 -C Release --output-on-failure
-Copy-Item sunpack\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe tools\sunpack_sevenzip_worker.exe -Force
+.\.venv\Scripts\cmake.exe -S sunpack\sevenzip_bridge -B .cache\native\x64\release\sevenzip_bridge -A x64
+.\.venv\Scripts\cmake.exe --build .cache\native\x64\release\sevenzip_bridge --config Release
+.\.venv\Scripts\ctest.exe --test-dir .cache\native\x64\release\sevenzip_bridge -C Release --output-on-failure
 ```
 
 The product worker embeds the retained 7-Zip sources and does not load `7z.dll` at run time.
@@ -161,10 +165,9 @@ The product worker embeds the retained 7-Zip sources and does not load `7z.dll` 
 ### Windows toast
 
 ```powershell
-cmake -S sunpack\toast_host -B sunpack\toast_host\build-x64 -A x64
-cmake --build sunpack\toast_host\build-x64 --config Release
-ctest --test-dir sunpack\toast_host\build-x64 -C Release --output-on-failure
-Copy-Item sunpack\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_toast.dll -Force
+.\.venv\Scripts\cmake.exe -S sunpack\toast_host -B .cache\native\x64\release\toast_host -A x64
+.\.venv\Scripts\cmake.exe --build .cache\native\x64\release\toast_host --config Release
+.\.venv\Scripts\ctest.exe --test-dir .cache\native\x64\release\toast_host -C Release --output-on-failure
 ```
 
 A continuously running watch creates Windows notification capability according to `watch.toast_enabled` and sends progress, completion, and failure notifications as configured. Notification failure reports are written to `.sunpack_watch/failures` under the writable data directory.

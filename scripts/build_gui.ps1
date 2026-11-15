@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',
-    [string]$CMakeCommand = 'cmake',
+    [string]$CMakeCommand,
     [string]$BuildDir,
     [int]$Jobs = [Environment]::ProcessorCount,
     [switch]$SkipTests,
@@ -13,6 +13,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'build_native.ps1')
+if (-not $CMakeCommand) {
+    $CMakeCommand = Get-CMakeCommand -VenvScripts (Join-Path $repoRoot '.venv\Scripts')
+}
 if (-not $BuildDir) { $BuildDir = Join-Path $repoRoot ".cache\gui-$Arch" }
 $platform = if ($Arch -eq 'arm64') { 'ARM64' } else { 'x64' }
 if ($TestsOnly -and ($ApplicationOnly -or $SkipTests -or $SkipConfigure)) {

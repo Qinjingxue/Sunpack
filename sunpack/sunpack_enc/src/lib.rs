@@ -482,4 +482,5 @@ fn payload_end<R: Read + Seek>(input: &mut R, length: u64) -> Result<u64> {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/lib/tests.rs"]
 mod tests;

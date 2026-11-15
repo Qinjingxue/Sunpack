@@ -1,6 +1,6 @@
 # 测试结构
 
-应用计算、协议和状态机的测试随 Rust/C++ 源码运行。这里的 Python 只负责通过真实进程、文件和安装脚本验证公开行为；测试不导入 SunPack 主程序或原生扩展。
+Rust 和 C++ 内部测试放在各组件的 `tests/` 里。Rust 私有模块测试经由 `#[cfg(test)]` 声明接入原模块，GUI C++ 测试在 `gui/tests/`。这里的 Python 只负责通过真实进程、文件和安装脚本验证公开行为；测试不导入 SunPack 主程序或原生扩展。
 
 - `blackbox/`：从隔离的安装目录启动真实 `sunpack.exe`、Rust 运行时和解压 worker。输入、输出、配置和状态使用各测试的临时目录。
 - `integration/`：安装语言、用户数据权限和跨版本配置迁移。直接运行相应安装或 PowerShell 路径。
@@ -18,10 +18,10 @@
 | 进程与数据一致性 | 并发启动器请求使用不同输出目录；常驻运行时看到配置与 GUI 密码写入；Watch 硬终止后清理未提交输出并重试，已取消代不能复活，恢复完成后再次重启不能重复执行；前台扫描结束后空闲 Watch 释放归档读取句柄。 |
 | 安装与系统集成 | 升级保留用户数据与语言；安装修复已有和新建目录的权限，并允许真实 GUI 编辑；右键菜单传递 Unicode 路径和参数。 |
 
-先使用现有开发环境构建对应 Windows 架构的原生产物。直接运行 pytest 默认使用 x64 的 `ci` 产物；其他架构或发布产物用 `SUNPACK_TEST_ARCH` 和 `SUNPACK_TEST_BUILD_PROFILE` 选择。需要 GUI 测试二进制时运行 `scripts/build_gui.ps1`。安装器用例需要 Inno Setup。
+先使用现有开发环境构建对应 Windows 架构的原生产物。直接运行 pytest 默认使用 Python 所在架构的 `ci` 产物；其他架构或发布产物用 `SUNPACK_TEST_ARCH` 和 `SUNPACK_TEST_BUILD_PROFILE` 选择。需要 GUI 测试二进制时运行 `scripts/build_gui.ps1`。安装器用例需要 Inno Setup。
 
 ```powershell
-uv sync --locked --extra test
+uv sync --locked --extra dev
 .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci
 .\.venv\Scripts\python.exe -m pytest tests -m "not requires_watch_broker"
 cargo test --manifest-path sunpack/Cargo.toml --locked --workspace --profile ci

@@ -56,15 +56,18 @@ pub(crate) fn launcher_path(cwd: &Path) -> io::Result<PathBuf> {
 }
 
 fn development_launcher(root: &Path, exe: &Path) -> io::Result<PathBuf> {
+    development_artifact(root, exe, "sevenzip_bridge", "sunpack_launcher.exe")
+}
+
+fn development_artifact(root: &Path, exe: &Path, component: &str, name: &str) -> io::Result<PathBuf> {
     let profile = exe.parent().and_then(Path::file_name).and_then(|name| name.to_str());
-    let suffix = match profile {
-        Some("ci") => "-ci",
-        Some("release") => "",
+    let profile = match profile {
+        Some(profile @ ("ci" | "release")) => profile,
         _ => return Err(io::Error::new(io::ErrorKind::NotFound,
-            "Build the native launcher and runtime with setup_windows_dev.ps1 (ci or release)")),
+            "Build the native tools and runtime with setup_windows_dev.ps1 (ci or release)")),
     };
     let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
-    Ok(root.join(format!("sunpack/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")))
+    Ok(root.join(format!(".cache/native/{arch}/{profile}/{component}/Release/{name}")))
 }
 
 pub(crate) fn resource_roots(cwd: &Path) -> Vec<PathBuf> {
@@ -85,55 +88,29 @@ pub fn writable_data_dir(cwd: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn tool_dirs() -> [&'static str; 2] {
-    if cfg!(target_arch = "aarch64") {
-        ["tools-arm64", "tools"]
+fn tool_path(cwd: &Path, component: &str, name: &str) -> io::Result<PathBuf> {
+    let path = if let Some(root) = package_root() {
+        root.join("tools").join(name)
     } else {
-        ["tools", "tools-x64"]
-    }
-}
-
-fn tool_path(cwd: &Path, name: &str) -> io::Result<PathBuf> {
-    for root in resource_roots(cwd) {
-        for dir in tool_dirs() {
-            let path = root.join(dir).join(name);
-            if path.is_file() {
-                return Ok(path);
-            }
-        }
+        let root = development_root(cwd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SunPack application root was not found"))?;
+        development_artifact(&root, &env::current_exe()?, component, name)?
+    };
+    if path.is_file() {
+        return Ok(path);
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        format!("Required {name} was not staged under tools."),
+        format!("Required SunPack tool was not found: {}", path.display()),
     ))
 }
 
 pub fn worker_path(cwd: &Path) -> io::Result<PathBuf> {
-    tool_path(cwd, "sunpack_sevenzip_worker.exe")
+    tool_path(cwd, "sevenzip_bridge", "sunpack_sevenzip_worker.exe")
 }
 
 pub fn toast_library_path(cwd: &Path) -> io::Result<PathBuf> {
-    find_toast_library(resource_roots(cwd)).ok_or_else(|| io::Error::new(
-        io::ErrorKind::NotFound,
-        r"Optional sunpack_toast.dll was not found under tools\ or sunpack\toast_host\build.",
-    ))
-}
-
-fn find_toast_library(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    const DLL: &str = "sunpack_toast.dll";
-    let build = if cfg!(target_arch = "aarch64") {
-        "sunpack/toast_host/build-arm64/Release"
-    } else {
-        "sunpack/toast_host/build-x64/Release"
-    };
-    let dirs = [build, "sunpack/toast_host/build/Release", "sunpack/toast_host/build/Debug"];
-    for root in roots {
-        if let Some(path) = dirs.into_iter().chain(tool_dirs()).chain([""])
-            .map(|dir| root.join(dir).join(DLL)).find(|path| path.is_file()) {
-            return Some(path);
-        }
-    }
-    None
+    tool_path(cwd, "toast_host", "sunpack_toast.dll")
 }
 
 pub(crate) struct FileMutex(*mut std::ffi::c_void);
@@ -187,46 +164,5 @@ impl Drop for FileMutex {
 }
 
 #[cfg(test)]
-mod entrypoint_tests {
-    use super::*;
-
-    #[test]
-    fn source_layout_finds_its_own_checkout_from_the_runtime_executable() {
-        let temp = env::temp_dir().join(format!("sunpack-resource-roots-{}", std::process::id()));
-        let application = temp.join("application");
-        std::fs::create_dir_all(application.join("sunpack")).unwrap();
-        std::fs::write(application.join("sunpack/Cargo.toml"), "[workspace]").unwrap();
-        let exe = application.join(".cache/rust-target/x64/target/ci/sunpack-runtime.exe");
-        assert_eq!(checkout_root(&exe), Some(application));
-        std::fs::remove_dir_all(temp).unwrap();
-    }
-
-    #[test]
-    fn source_launcher_uses_the_runtime_build_profile_without_package_staging() {
-        let root = Path::new("checkout");
-        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
-        for (profile, suffix) in [("ci", "-ci"), ("release", "")] {
-            let exe = root.join(".cache/rust-target").join(arch).join("target").join(profile).join("sunpack-runtime.exe");
-            assert_eq!(development_launcher(root, &exe).unwrap(), root.join(format!("sunpack/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")));
-        }
-        assert!(development_launcher(root, &root.join("debug/sunpack-runtime.exe")).is_err());
-    }
-
-    #[test]
-    fn toast_lookup_prefers_the_current_architecture_in_the_running_checkout() {
-        let marker = crate::test_support::temp_file("toast_lookup", b"");
-        let root = marker.with_extension("checkout");
-        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
-        let current = root.join(format!("sunpack/toast_host/build-{arch}/Release/sunpack_toast.dll"));
-        let staged = root.join("tools/sunpack_toast.dll");
-        for file in [&current, &staged] {
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(file, b"").unwrap();
-        }
-        assert_eq!(find_toast_library([root.clone()]), Some(current.clone()));
-        std::fs::remove_file(current).unwrap();
-        assert_eq!(find_toast_library([root.clone()]), Some(staged));
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_file(marker).unwrap();
-    }
-}
+#[path = "../../tests/unit/core/resources/entrypoint_tests.rs"]
+mod entrypoint_tests;

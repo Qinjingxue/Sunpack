@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sysconfig
 from functools import lru_cache
 from pathlib import Path
+
+from tests.helpers.native_build import ROOT, rust_build_dir, selected_build
 
 
 @lru_cache(maxsize=1)
 def _fixture_tool() -> Path:
-    root = Path(__file__).resolve().parents[2]
-    tools = "tools-arm64" if sysconfig.get_platform() == "win-arm64" else "tools"
-    tool = root / tools / "real_fixture.exe"
+    tool = rust_build_dir(ROOT, *selected_build()) / "examples" / "real_fixture.exe"
     if not tool.is_file():
         raise FileNotFoundError(
             f"Native test fixture tool is missing: {tool}. "

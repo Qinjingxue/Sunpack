@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any, Callable
 ROOT = Path(__file__).resolve().parents[2]
 SEVEN_ZIP = ROOT / "tools/7z.exe"
-RAR = ROOT / "tools/Rar.exe"
-ZSTD = ROOT / "tools/zstd.exe"
+RAR = ROOT / "tools/winrar/Rar.exe"
+ZSTD = ROOT / "tools/zstd/zstd.exe"
 SUPPORTED = ("zip", "7z", "rar", "gz", "bz2", "xz", "zst", "tar", "tgz", "tbz2", "txz", "tzst")
 GENERATED_FORMATS = (*SUPPORTED, "7z-split", "rar-split")
 DEFAULT_CACHE_ROOT = ROOT / "benchmarks/.cache/extraction-native"

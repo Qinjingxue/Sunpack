@@ -272,7 +272,7 @@ def main(argv=None):
                 payload = workspace.work / "password-payload.txt"
                 payload.write_bytes(b"scoped password benchmark\n" * 4096)
                 archive = selected / "encrypted.opaque"
-                tool = Path(__file__).resolve().parents[2] / ("tools" if args.arch == "x64" else "tools-arm64") / "7z.exe"
+                tool = Path(__file__).resolve().parents[2] / ("tools" if args.arch == "x64" else "tools/arm64") / "7z.exe"
                 subprocess.run([str(tool), "a", "-t7z", "-mhe=on", "-pbenchmark-key", str(archive), str(payload)], check=True, stdout=subprocess.DEVNULL)
                 entries = [
                     {"value": f"candidate-{i}", "scopes": [str(workspace.corpus / f"unrelated-{i}")]}

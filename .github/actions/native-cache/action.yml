@@ -63,14 +63,14 @@ runs:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-          .cache/rust-target/${{ inputs.arch }}
+          .cache/rust-target
           .cache/native-source-times-${{ inputs.arch }}-${{ inputs.profile }}.json
-          sunpack/sevenzip_bridge/build-${{ inputs.arch }}${{ inputs.profile == 'ci' && '-ci' || '' }}
-          sunpack/toast_host/build-${{ inputs.arch }}${{ inputs.profile == 'ci' && '-ci' || '' }}
-        key: native-v2-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('sunpack/Cargo.lock') }}-${{ inputs.source-key }}
+          .cache/native/${{ inputs.arch }}/${{ inputs.profile }}/sevenzip_bridge
+          .cache/native/${{ inputs.arch }}/${{ inputs.profile }}/toast_host
+        key: native-v3-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('sunpack/Cargo.lock') }}-${{ inputs.source-key }}
         restore-keys: |
-          native-v2-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('sunpack/Cargo.lock') }}-
-          native-v2-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ steps.toolchain.outputs.id }}-
+          native-v3-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('sunpack/Cargo.lock') }}-
+          native-v3-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-${{ steps.toolchain.outputs.id }}-
     - name: Restore unchanged source timestamps
       shell: pwsh
       env:

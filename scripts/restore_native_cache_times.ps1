@@ -20,11 +20,11 @@ if (Test-Path -LiteralPath $statePath) {
 # Git blob IDs let an unchanged source retain its timestamp even if another
 # input changed (fallback cache); modified working-tree files never do.
 $inputs = if ($Scope -eq "gui") {
-    @("gui", "tests/gui", "scripts/build_gui.ps1",
+    @("gui", "scripts/build_gui.ps1", "scripts/build_native.ps1",
       "scripts/restore_native_cache_times.ps1", "sunpack.manifest",
       "sunpack_advanced_config.json", "sunpack/third_party/lz4")
 } else {
-    @("sunpack", "scripts", ":(exclude)scripts/build_gui.ps1", "sunpack.manifest",
+    @("sunpack", ".cargo/config.toml", "scripts", ":(exclude)scripts/build_gui.ps1", "sunpack.manifest",
       "sunpack.ico", "sunpack_advanced_config.json")
 }
 $tracked = @(& git -C $repoRoot -c core.quotepath=false ls-files --stage -- $inputs)

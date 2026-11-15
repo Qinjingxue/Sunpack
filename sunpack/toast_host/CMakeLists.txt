@@ -43,7 +43,8 @@ target_link_libraries(sunpack_toast PRIVATE
 )
 
 enable_testing()
-add_executable(sunpack_toast_self_test src/self_test.cpp)
+add_executable(sunpack_toast_self_test tests/self_test.cpp)
+target_include_directories(sunpack_toast_self_test PRIVATE src)
 target_link_libraries(sunpack_toast_self_test PRIVATE sunpack_toast)
 add_test(NAME sunpack_toast_self_test COMMAND sunpack_toast_self_test)
 

@@ -50,3 +50,7 @@ windows-sys = { version = "0.61.2", features = [
 
 [build-dependencies]
 cc = "1"
+
+[[example]]
+name = "real_fixture"
+path = "tests/fixtures/real_fixture.rs"

@@ -10,7 +10,7 @@ toast通知组件代码在：sunpack\toast_host
 
 scripts下是构建脚本，开发环境安装脚本，注册右键菜单脚本
 
-项目正确性测试在tests文件夹下，性能测试在benchmarks文件夹下
+Python 黑盒测试在 tests 下，各组件的内部测试在组件自己的 tests 下，性能测试在 benchmarks 下。共用外部工具放在根目录的 tools 下，构建产物留在 .cache 中。
 
 Python 仅用于黑盒测试、基准和辅助脚本。主程序的底层、IO 和计算由 Rust 负责
 

@@ -16,8 +16,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-. (Join-Path $PSScriptRoot "sevenzip_asm_check.ps1")
-. (Join-Path $PSScriptRoot "test_environment.ps1")
+. (Join-Path $PSScriptRoot "build_native.ps1")
 
 function Write-Step {
     param([string]$Message)
@@ -45,50 +44,6 @@ function Remove-IfExists {
     param([string]$LiteralPath)
     if (Test-Path -LiteralPath $LiteralPath) {
         Remove-Item -LiteralPath $LiteralPath -Recurse -Force
-    }
-}
-
-function ConvertTo-NormalizedFullPath {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    return ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') -replace '/', '\').ToLowerInvariant()
-}
-
-function Reset-StaleCMakeBuildDir {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SourceDir,
-        [Parameter(Mandatory = $true)]
-        [string]$BuildDir,
-        [Parameter(Mandatory = $true)]
-        [string]$CMakePlatform
-    )
-
-    $cachePath = Join-Path $BuildDir "CMakeCache.txt"
-    if (-not (Test-Path -LiteralPath $cachePath)) {
-        return
-    }
-
-    $expectedSource = ConvertTo-NormalizedFullPath -Path $SourceDir
-    $actualSource = ""
-    $actualPlatform = ""
-    foreach ($line in Get-Content -LiteralPath $cachePath) {
-        if ($line -like "CMAKE_HOME_DIRECTORY:INTERNAL=*") {
-            $actualSource = ConvertTo-NormalizedFullPath -Path ($line.Substring("CMAKE_HOME_DIRECTORY:INTERNAL=".Length))
-        } elseif ($line -like "CMAKE_GENERATOR_PLATFORM:INTERNAL=*") {
-            $actualPlatform = $line.Substring("CMAKE_GENERATOR_PLATFORM:INTERNAL=".Length)
-        }
-    }
-
-    if ($actualSource -and $actualSource -ne $expectedSource) {
-        Write-Host "CMake build cache points at a different source tree; recreating $BuildDir" -ForegroundColor Yellow
-        Remove-IfExists -LiteralPath $BuildDir
-        return
-    }
-
-    if ($actualPlatform -ne $CMakePlatform) {
-        Write-Host "CMake build cache uses platform '$actualPlatform' instead of '$CMakePlatform'; resetting CMake metadata in $BuildDir" -ForegroundColor Yellow
-        Remove-IfExists -LiteralPath $cachePath
-        Remove-IfExists -LiteralPath (Join-Path $BuildDir "CMakeFiles")
     }
 }
 
@@ -348,14 +303,10 @@ function Invoke-VerifiedFileDownload {
 function Ensure-AcceptanceTestTools {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RepoRoot,
-        [Parameter(Mandatory = $true)]
         [string]$ToolsRoot
     )
 
-    # Keep these generator binaries outside tools/. build_windows.ps1 copies
-    # tools/ into release packages, while these are test-only dependencies.
-    $testToolsRoot = Join-Path $RepoRoot ".sunpack_test_tools"
+    $testToolsRoot = $ToolsRoot
     $rarRoot = Join-Path $testToolsRoot "winrar"
     $rarPath = Join-Path $rarRoot "Rar.exe"
     $rarSfxPath = Join-Path $rarRoot "Default.SFX"
@@ -484,8 +435,13 @@ function Ensure-AcceptanceTestTools {
             if (-not (Test-SevenZipZstdGenerator -FilePath (Join-Path $sevenZipZstdExtractRoot "7z.exe"))) {
                 throw "Downloaded 7-Zip-Zstandard installer does not contain a working LZ4 fixture writer."
             }
+            $sevenZipZstdInstallRoot = Join-Path $tempRoot "7zip-zstd-tools"
+            New-Item -ItemType Directory -Path $sevenZipZstdInstallRoot | Out-Null
+            foreach ($name in @("7z.exe", "7z.dll", "License.txt")) {
+                Move-Item -LiteralPath (Join-Path $sevenZipZstdExtractRoot $name) -Destination $sevenZipZstdInstallRoot
+            }
             Remove-IfExists -LiteralPath $sevenZipZstdRoot
-            Move-Item -LiteralPath $sevenZipZstdExtractRoot -Destination $sevenZipZstdRoot
+            Move-Item -LiteralPath $sevenZipZstdInstallRoot -Destination $sevenZipZstdRoot
         }
     } finally {
         Remove-IfExists -LiteralPath $tempRoot
@@ -506,24 +462,6 @@ function Invoke-Native {
     if ($LASTEXITCODE -ne 0) {
         $joined = ($Arguments | ForEach-Object { $_ }) -join " "
         throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $joined"
-    }
-}
-
-function Test-CommandRuns {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
-        [string[]]$Arguments = @("--version")
-    )
-
-    if (-not (Test-Path -LiteralPath $FilePath) -and -not (Get-Command $FilePath -ErrorAction SilentlyContinue)) {
-        return $false
-    }
-    try {
-        & $FilePath @Arguments *> $null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
     }
 }
 
@@ -563,116 +501,6 @@ function Test-RarGeneratorVersion {
     }
 }
 
-function Get-CMakeCommand {
-    param([string]$VenvScripts)
-
-    $venvCMake = Join-Path $VenvScripts "cmake.exe"
-    if ((Test-Path -LiteralPath $venvCMake) -and (Test-CommandRuns -FilePath $venvCMake)) {
-        return $venvCMake
-    } elseif (Test-Path -LiteralPath $venvCMake) {
-        Write-Host "Ignoring unusable venv CMake executable: $venvCMake" -ForegroundColor Yellow
-    }
-
-    foreach ($globalCMake in @(Get-Command "cmake" -All -ErrorAction SilentlyContinue)) {
-        if ($globalCMake.Source -and (Test-CommandRuns -FilePath $globalCMake.Source)) {
-            return $globalCMake.Source
-        }
-    }
-
-    throw "cmake executable not found. Install CMake or make it available in PATH."
-}
-
-function Get-CTestCommand {
-    param([string]$VenvScripts)
-
-    $venvCTest = Join-Path $VenvScripts "ctest.exe"
-    if ((Test-Path -LiteralPath $venvCTest) -and (Test-CommandRuns -FilePath $venvCTest)) {
-        return $venvCTest
-    } elseif (Test-Path -LiteralPath $venvCTest) {
-        Write-Host "Ignoring unusable venv CTest executable: $venvCTest" -ForegroundColor Yellow
-    }
-
-    foreach ($globalCTest in @(Get-Command "ctest" -All -ErrorAction SilentlyContinue)) {
-        if ($globalCTest.Source -and (Test-CommandRuns -FilePath $globalCTest.Source)) {
-            return $globalCTest.Source
-        }
-    }
-
-    throw "ctest executable not found. Install CMake or make CTest available in PATH."
-}
-
-function Build-SevenZipWorker {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$CMakeCommand,
-        [Parameter(Mandatory = $true)]
-        [string]$CTestCommand,
-        [Parameter(Mandatory = $true)]
-        [string]$WrapperRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$BuildDir,
-        [Parameter(Mandatory = $true)]
-        [string]$ToolsRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$BuildArch
-    )
-
-    Write-Step "Building embedded 7-Zip worker"
-    $buildStartedUtc = [datetime]::UtcNow
-    Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
-    $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
-    Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    $workerDebug = if ($BuildProfile -eq "ci") { "ON" } else { "OFF" }
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DSUP7Z_DEBUG=$workerDebug", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
-    Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
-    if ((Get-ProcessBuildArch) -eq $BuildArch) {
-        Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
-    } else {
-        Write-Host "Skipping C++ smoke test because $BuildArch binaries cannot run in the current process architecture" -ForegroundColor Yellow
-    }
-
-    $workerExe = Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe"
-    $launcherExe = Join-Path $BuildDir "Release\sunpack_launcher.exe"
-    Assert-PathExists -LiteralPath $workerExe -Description "Built 7z worker executable"
-    Assert-PathExists -LiteralPath $launcherExe -Description "Built SunPack launcher executable"
-    Copy-Item -LiteralPath $workerExe -Destination (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -Force
-
-    Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch -ArtifactPaths @(
-        (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe")
-    )
-    Set-DevelopmentArtifactBuildTime -Path $launcherExe -BuildStartedUtc $buildStartedUtc
-    Set-DevelopmentArtifactBuildTime -Path $workerExe -BuildStartedUtc $buildStartedUtc
-    Set-DevelopmentArtifactBuildTime -Path (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -BuildStartedUtc $buildStartedUtc
-}
-
-function Build-ToastLibrary {
-    param(
-        [Parameter(Mandatory = $true)][string]$CMakeCommand,
-        [Parameter(Mandatory = $true)][string]$CTestCommand,
-        [Parameter(Mandatory = $true)][string]$SourceRoot,
-        [Parameter(Mandatory = $true)][string]$BuildDir,
-        [Parameter(Mandatory = $true)][string]$ToolsRoot,
-        [Parameter(Mandatory = $true)][string]$BuildArch
-    )
-
-    Write-Step "Building in-process Windows toast library"
-    $buildStartedUtc = [datetime]::UtcNow
-    Assert-PathExists -LiteralPath (Join-Path $SourceRoot "CMakeLists.txt") -Description "toast CMake project"
-    $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
-    Reset-StaleCMakeBuildDir -SourceDir $SourceRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $SourceRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUNPACK_TOAST_ENABLE_LTO=$lto", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
-    if ((Get-ProcessBuildArch) -eq $BuildArch) {
-        Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
-    }
-    $toastDll = Join-Path $BuildDir "Release\sunpack_toast.dll"
-    Assert-PathExists -LiteralPath $toastDll -Description "Built toast DLL"
-    Copy-Item -LiteralPath $toastDll -Destination (Join-Path $ToolsRoot "sunpack_toast.dll") -Force
-    Set-DevelopmentArtifactBuildTime -Path (Join-Path $ToolsRoot "sunpack_toast.dll") -BuildStartedUtc $buildStartedUtc
-}
-
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
@@ -691,27 +519,23 @@ $projectPath = Join-Path $repoRoot "pyproject.toml"
 $nativeCrateRoot = Join-Path $repoRoot "sunpack\sunpack_runtime"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "sunpack\Cargo.lock"
-$watchBrokerCargoToml = Join-Path $repoRoot "sunpack\sunpack_watch_broker\Cargo.toml"
-$rustTargetDir = Join-Path $repoRoot (".cache\rust-target\" + $buildArch)
 $watchBrokerBuildPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
 $sevenZipWrapperRoot = Join-Path $repoRoot "sunpack\sevenzip_bridge"
-$buildSuffix = if ($BuildProfile -eq "ci") { "-ci" } else { "" }
-$lto = if ($BuildProfile -eq "ci") { "OFF" } else { "ON" }
-$sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch + $buildSuffix)
+$sevenZipWrapperBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile -Component sevenzip_bridge
 $toastHostRoot = Join-Path $repoRoot "sunpack\toast_host"
-$toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch + $buildSuffix)
-$toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
+$toastHostBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile -Component toast_host
+$toolsRoot = Join-Path $repoRoot $(if ($buildArch -eq "arm64") { "tools\arm64" } else { "tools" })
 $sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
 
 Assert-PathExists -LiteralPath $projectPath -Description "pyproject.toml"
 Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_runtime Cargo manifest"
 Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust workspace lockfile"
-Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 Assert-CommandExists -Command "uv" -Description "uv dependency manager"
 if ($Clean -and -not $AcceptanceTestDependenciesOnly) {
     Write-Step "Cleaning native build outputs"
-    foreach ($output in @($rustTargetDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
+    $rustBuildDir = Get-RustBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
+    foreach ($output in @($rustBuildDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
         $fullOutput = [IO.Path]::GetFullPath($output)
         if (-not $fullOutput.StartsWith(([IO.Path]::GetFullPath($repoRoot) + "\"), [StringComparison]::OrdinalIgnoreCase)) {
             throw "Build output is outside the repository: $output"
@@ -746,45 +570,31 @@ if ($BootstrapOnly) {
 }
 Ensure-Bundled7ZipAssets -ToolsRoot $toolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
 if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
-    Ensure-AcceptanceTestTools -RepoRoot $repoRoot -ToolsRoot $toolsRoot
+    Ensure-AcceptanceTestTools -ToolsRoot $toolsRoot
 }
 if ($AcceptanceTestDependenciesOnly) {
     return
 }
 
-Write-Step "Building Rust runtime and native fixture tool"
+Write-Step "Building Rust runtime, Watch Broker and native fixture tool"
 $nativeBuildStartedUtc = [datetime]::UtcNow
 Invoke-Native -FilePath "cargo" -Arguments @(
-    "build", "--locked", "--manifest-path", $nativeCargoToml, "--profile", $BuildProfile,
-    "--target", $rustTarget, "--target-dir", $rustTargetDir, "--jobs", [string]$BuildJobs,
-    "--bin", "sunpack-runtime", "--example", "real_fixture"
+    "build", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
+    "--profile", $BuildProfile, "--target", $rustTarget, "--jobs", [string]$BuildJobs,
+    "-p", "sunpack-runtime", "-p", "sunpack-watch-broker",
+    "--bin", "sunpack-runtime", "--bin", "sunpack-watch-broker", "--example", "real_fixture"
 )
 $runtimePath = Get-SunPackRuntimeBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
-Set-DevelopmentArtifactBuildTime -Path $runtimePath -BuildStartedUtc $nativeBuildStartedUtc
-$fixtureBuildPath = Join-Path $rustTargetDir "$rustTarget\$BuildProfile\examples\real_fixture.exe"
-Assert-PathExists -LiteralPath $fixtureBuildPath -Description "Native test fixture executable"
-New-Item -ItemType Directory -Path $toolsRoot -Force | Out-Null
-$fixtureToolPath = Join-Path $toolsRoot "real_fixture.exe"
-Copy-Item -LiteralPath $fixtureBuildPath -Destination $fixtureToolPath -Force
-Set-DevelopmentArtifactBuildTime -Path $fixtureToolPath -BuildStartedUtc $nativeBuildStartedUtc
-
-Write-Step "Building minimal Windows Watch Broker service"
-$brokerBuildStartedUtc = [datetime]::UtcNow
-Invoke-Native -FilePath "cargo" -Arguments @(
-    "build",
-    "--locked",
-    "--manifest-path", $watchBrokerCargoToml,
-    "--profile", $BuildProfile,
-    "--target", $rustTarget,
-    "--target-dir", $rustTargetDir
-)
-Assert-PathExists -LiteralPath $watchBrokerBuildPath -Description "SunPack Watch Broker executable"
-Set-DevelopmentArtifactBuildTime -Path $watchBrokerBuildPath -BuildStartedUtc $brokerBuildStartedUtc
+$fixtureBuildPath = Get-ArchiveFixtureBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
+foreach ($artifact in @($runtimePath, $watchBrokerBuildPath, $fixtureBuildPath)) {
+    Assert-PathExists -LiteralPath $artifact -Description "Rust build artifact"
+    Set-DevelopmentArtifactBuildTime -Path $artifact -BuildStartedUtc $nativeBuildStartedUtc
+}
 
 $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts
 $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
-Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
-Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
+Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -BuildArch $buildArch -BuildProfile $BuildProfile
+Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -BuildArch $buildArch -BuildProfile $BuildProfile
 Write-Host ""
 Write-Host "Local development environment is ready" -ForegroundColor Green
 Write-Host "Runtime: $runtimePath"

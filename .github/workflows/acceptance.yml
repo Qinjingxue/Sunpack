@@ -50,13 +50,22 @@ jobs:
         with:
           arch: x64
           profile: ci
-          source-key: ${{ hashFiles('sunpack/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest', 'sunpack.ico', 'sunpack_advanced_config.json') }}
+          source-key: ${{ hashFiles('sunpack/**', '.cargo/config.toml', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest', 'sunpack.ico', 'sunpack_advanced_config.json') }}
 
       - name: Cache real archive generators
         uses: actions/cache@v4
         with:
-          path: .sunpack_test_tools
-          key: acceptance-tools-v1-${{ runner.os }}-x64-${{ hashFiles('scripts/setup_windows_dev.ps1') }}
+          path: |
+            tools/7z.exe
+            tools/7z.dll
+            tools/7z.sfx
+            tools/7zCon.sfx
+            tools/7-zip.dll
+            tools/7-zip32.dll
+            tools/7zip-zstd
+            tools/winrar
+            tools/zstd
+          key: acceptance-tools-v2-${{ runner.os }}-x64-${{ hashFiles('scripts/setup_windows_dev.ps1') }}
 
       - name: Prepare acceptance environment
         shell: pwsh
@@ -64,14 +73,15 @@ jobs:
           .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4
 
       - name: Build real writer test executable for GUI contracts
+        id: writer
         shell: pwsh
         run: |
-          $artifacts = & cargo test --locked --manifest-path sunpack/Cargo.toml -p sunpack-runtime --lib --no-run --profile ci --target x86_64-pc-windows-msvc --target-dir .cache/rust-target/x64 --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
+          $artifacts = & cargo test --locked --manifest-path sunpack/Cargo.toml --workspace --no-run --profile ci --target x86_64-pc-windows-msvc --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
           if ($LASTEXITCODE -ne 0) { throw 'Rust GUI writer test build failed' }
-          $writer = @($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sunpack_runtime' -and $_.executable })
+          $writer = @($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sunpack_runtime' -and $_.profile.test -and $_.executable })
           if ($writer.Count -ne 1) { throw 'Expected exactly one Rust lib test executable' }
-          New-Item -ItemType Directory -Path tools -Force | Out-Null
-          Copy-Item -LiteralPath $writer[0].executable -Destination tools/gui_projection_writer.exe -Force
+          $relative = [IO.Path]::GetRelativePath($PWD.Path, $writer[0].executable).Replace('\', '/')
+          "artifact=$relative" >> $env:GITHUB_OUTPUT
 
       - name: Save native build cache after successful compilation
         if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
@@ -80,10 +90,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            .cache/rust-target/x64
+            .cache/rust-target
             .cache/native-source-times-x64-ci.json
-            sunpack/sevenzip_bridge/build-x64-ci
-            sunpack/toast_host/build-x64-ci
+            .cache/native/x64/ci/sevenzip_bridge
+            .cache/native/x64/ci/toast_host
           key: ${{ steps.native-cache.outputs.cache-key }}
 
       - name: Upload native runtime for GUI contracts
@@ -92,10 +102,10 @@ jobs:
           name: sunpack-runtime-ci-x64
           include-hidden-files: true
           path: |
-            .cache/rust-target/x64/x86_64-pc-windows-msvc/ci/sunpack-runtime.exe
-            tools/gui_projection_writer.exe
-            sunpack/sevenzip_bridge/build-x64-ci/Release/sunpack_launcher.exe
-            sunpack/sevenzip_bridge/build-x64-ci/Release/sunpack_sevenzip_worker.exe
+            .cache/rust-target/x86_64-pc-windows-msvc/ci/sunpack-runtime.exe
+            ${{ steps.writer.outputs.artifact }}
+            .cache/native/x64/ci/sevenzip_bridge/Release/sunpack_launcher.exe
+            .cache/native/x64/ci/sevenzip_bridge/Release/sunpack_sevenzip_worker.exe
           if-no-files-found: error
           retention-days: 1
 
@@ -154,7 +164,7 @@ jobs:
         uses: ./.github/actions/gui-cache
         with:
           arch: x64
-          source-key: ${{ hashFiles('gui/**', 'tests/gui/**', 'scripts/build_gui.ps1', 'scripts/restore_native_cache_times.ps1', 'sunpack.manifest', 'sunpack_advanced_config.json', 'sunpack/third_party/lz4/**') }}
+          source-key: ${{ hashFiles('gui/**', 'scripts/build_gui.ps1', 'scripts/build_native.ps1', 'scripts/restore_native_cache_times.ps1', 'sunpack.manifest', 'sunpack_advanced_config.json', 'sunpack/third_party/lz4/**') }}
 
       - name: Compile GUI and native tests
         shell: pwsh
@@ -213,7 +223,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: sunpack-runtime-ci-x64
-          path: .
+          path: .cache
 
       - name: Download GUI native test binary
         uses: actions/download-artifact@v8
@@ -225,6 +235,8 @@ jobs:
         shell: pwsh
         run: |
           $env:SUNPACK_GUI_TEST_BINARY = (Resolve-Path .cache/gui-x64/Release/sunpack_gui_tests.exe).Path
-          $env:SUNPACK_GUI_WRITER_TEST_BINARY = (Resolve-Path tools/gui_projection_writer.exe).Path
+          $writers = @(Get-ChildItem .cache/rust-target/x86_64-pc-windows-msvc/ci/deps/sunpack_runtime-*.exe)
+          if ($writers.Count -ne 1) { throw 'Expected exactly one uploaded Rust lib test executable' }
+          $env:SUNPACK_GUI_WRITER_TEST_BINARY = $writers[0].FullName
           & .\.venv\Scripts\python.exe -m pytest -q tests/blackbox/test_runtime_commands.py::test_gui_password_edits_are_visible_to_running_runtime tests/gui/test_integration.py
           if ($LASTEXITCODE -ne 0) { throw 'GUI and runtime boundary tests failed' }

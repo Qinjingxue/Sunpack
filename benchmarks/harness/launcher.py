@@ -10,6 +10,8 @@ from pathlib import Path
 
 import psutil
 
+from tests.helpers.native_build import native_build_dir, rust_build_dir
+
 from ..watch_broker import SERVICE_ENV, isolated_broker_environment
 from .memory import ProcessSampler
 from .workspace import REPO_ROOT
@@ -23,14 +25,13 @@ class NativePackage:
         self.sample_seconds = sample_ms / 1000
         self.install.mkdir(parents=True)
         self.data.mkdir(parents=True)
-        target = {"x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}[arch]
-        wrapper = REPO_ROOT / "sunpack/sevenzip_bridge" / f"build-{arch}{'-ci' if profile == 'ci' else ''}" / "Release"
+        wrapper = native_build_dir(REPO_ROOT, arch, profile, "sevenzip_bridge")
         package = launcher.resolve().parent if launcher else None
         if package is not None and package.name.lower() == "bin":
             package = package.parent
         sources = {
             "sunpack.exe": launcher or wrapper / "sunpack_launcher.exe",
-            "sunpack-runtime.exe": package / "sunpack-runtime.exe" if package else REPO_ROOT / ".cache/rust-target" / arch / target / profile / "sunpack-runtime.exe",
+            "sunpack-runtime.exe": package / "sunpack-runtime.exe" if package else rust_build_dir(REPO_ROOT, arch, profile) / "sunpack-runtime.exe",
             "tools/sunpack_sevenzip_worker.exe": package / "tools/sunpack_sevenzip_worker.exe" if package else wrapper / "sunpack_sevenzip_worker.exe",
             "sunpack_advanced_config.json": (package or REPO_ROOT) / "sunpack_advanced_config.json",
         }

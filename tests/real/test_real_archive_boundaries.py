@@ -79,7 +79,8 @@ def test_real_damage_patterns(package, tmp_path, case_id, damage, expected_succe
 @pytest.mark.parametrize("tool_name", ["7z.exe", "sunpack_sevenzip_worker.exe"])
 def test_real_executables_are_not_archive_candidates(package, tmp_path, tool_name):
     executable = tmp_path / tool_name
-    shutil.copyfile(package.tools / tool_name, executable)
+    source = package.tools if tool_name == "7z.exe" else package.launcher.parent.parent / "tools"
+    shutil.copyfile(source / tool_name, executable)
     report = package.json("scan", executable)
     assert report["summary"]["archive_count"] == 0
     assert not report["items"]

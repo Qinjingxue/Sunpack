@@ -5,6 +5,8 @@ import subprocess
 import shutil
 from pathlib import Path
 
+from tests.helpers.native_build import selected_build
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -30,16 +32,9 @@ def _resolve_configured_tool(
     config: dict[str, str],
     config_key: str,
     default: str | None,
-    legacy: str | None,
     repo_root: Path,
 ) -> Path | None:
-    explicit = os.environ.get(env_name)
-    value = explicit or config.get(config_key) or default
-    resolved = _resolve_tool(value, repo_root)
-    if explicit or (resolved and resolved.is_file()) or not legacy:
-        return resolved
-    legacy_path = _resolve_tool(legacy, repo_root)
-    return legacy_path if legacy_path and legacy_path.is_file() else resolved
+    return _resolve_tool(os.environ.get(env_name) or config.get(config_key) or default, repo_root)
 
 
 def get_test_tools() -> dict[str, Path | None]:
@@ -49,48 +44,45 @@ def get_test_tools() -> dict[str, Path | None]:
     if path.exists():
         config = json.loads(path.read_text(encoding="utf-8"))
 
+    arch, _ = selected_build()
+    seven_zip_root = "tools/arm64" if arch == "arm64" else "tools"
     seven_zip = _resolve_configured_tool(
         env_name="sunpack_TEST_7Z",
         config=config,
         config_key="seven_zip",
-        default="tools/7z.exe",
-        legacy=None,
+        default=f"{seven_zip_root}/7z.exe",
         repo_root=repo_root,
     )
     seven_zip_sfx = _resolve_configured_tool(
         env_name="sunpack_TEST_7Z_SFX",
         config=config,
         config_key="seven_zip_sfx",
-        default="tools/7zCon.sfx",
-        legacy=None,
+        default=f"{seven_zip_root}/7zCon.sfx",
         repo_root=repo_root,
     )
     seven_zip_zstd = _resolve_configured_tool(
         env_name="sunpack_TEST_7Z_ZSTD", config=config, config_key="seven_zip_zstd",
-        default=".sunpack_test_tools/7zip-zstd/7z.exe", legacy=None, repo_root=repo_root,
+        default="tools/7zip-zstd/7z.exe", repo_root=repo_root,
     )
     zstd_exe = _resolve_configured_tool(
         env_name="sunpack_TEST_ZSTD",
         config=config,
         config_key="zstd_exe",
-        default=".sunpack_test_tools/zstd/zstd.exe",
-        legacy="tools/zstd.exe",
+        default="tools/zstd/zstd.exe",
         repo_root=repo_root,
     )
     rar_exe = _resolve_configured_tool(
         env_name="sunpack_TEST_RAR",
         config=config,
         config_key="rar_exe",
-        default=".sunpack_test_tools/winrar/Rar.exe",
-        legacy="tools/Rar.exe",
+        default="tools/winrar/Rar.exe",
         repo_root=repo_root,
     )
     winrar_exe = _resolve_configured_tool(
         env_name="sunpack_TEST_WINRAR",
         config=config,
         config_key="winrar_exe",
-        default=".sunpack_test_tools/winrar/WinRAR.exe",
-        legacy="tools/WinRAR.exe",
+        default="tools/winrar/WinRAR.exe",
         repo_root=repo_root,
     )
     if not winrar_exe or not winrar_exe.is_file():

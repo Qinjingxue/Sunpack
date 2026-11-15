@@ -11,6 +11,7 @@ import pytest
 import psutil
 
 
+from tests.helpers.native_build import native_build_dir, rust_build_dir, selected_build
 from tests.helpers.native_fixture import native_fixture
 
 
@@ -105,13 +106,12 @@ class Package:
 
 @pytest.fixture
 def package(tmp_path, repo_root):
-    arch = os.environ.get("SUNPACK_TEST_ARCH", "x64")
-    profile = os.environ.get("SUNPACK_TEST_BUILD_PROFILE", "ci")
-    target = {"x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}[arch]
-    suffix = "-ci" if profile == "ci" else ""
-    built = repo_root / ".cache" / "rust-target" / arch / target / profile
-    wrapper = repo_root / "sunpack" / "sevenzip_bridge" / f"build-{arch}{suffix}" / "Release"
-    tool_root = repo_root / ("tools" if arch == "x64" else "tools-arm64")
+    arch, profile = selected_build()
+    built = rust_build_dir(repo_root, arch, profile)
+    wrapper = native_build_dir(repo_root, arch, profile, "sevenzip_bridge")
+    tool_root = repo_root / "tools"
+    if arch == "arm64":
+        tool_root /= "arm64"
     sources = {
         "bin/sunpack.exe": wrapper / "sunpack_launcher.exe",
         "sunpack-runtime.exe": built / "sunpack-runtime.exe",

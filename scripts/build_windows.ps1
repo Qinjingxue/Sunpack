@@ -44,11 +44,6 @@ function Remove-IfExists {
     }
 }
 
-function ConvertTo-NormalizedFullPath {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    return ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') -replace '/', '\').ToLowerInvariant()
-}
-
 function Wait-ExecutableExit {
     param(
         [Parameter(Mandatory = $true)][string]$ExecutablePath,
@@ -104,45 +99,6 @@ function Wait-FileReadyForPromotion {
     } while ((Get-Date) -lt $deadline)
 
     throw "Compiled installer remained locked for $TimeoutSeconds seconds: $LiteralPath"
-}
-
-function Reset-StaleCMakeBuildDir {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SourceDir,
-        [Parameter(Mandatory = $true)]
-        [string]$BuildDir,
-        [Parameter(Mandatory = $true)]
-        [string]$CMakePlatform
-    )
-
-    $cachePath = Join-Path $BuildDir "CMakeCache.txt"
-    if (-not (Test-Path -LiteralPath $cachePath)) {
-        return
-    }
-
-    $expectedSource = ConvertTo-NormalizedFullPath -Path $SourceDir
-    $actualSource = ""
-    $actualPlatform = ""
-    foreach ($line in Get-Content -LiteralPath $cachePath) {
-        if ($line -like "CMAKE_HOME_DIRECTORY:INTERNAL=*") {
-            $actualSource = ConvertTo-NormalizedFullPath -Path ($line.Substring("CMAKE_HOME_DIRECTORY:INTERNAL=".Length))
-        } elseif ($line -like "CMAKE_GENERATOR_PLATFORM:INTERNAL=*") {
-            $actualPlatform = $line.Substring("CMAKE_GENERATOR_PLATFORM:INTERNAL=".Length)
-        }
-    }
-
-    if ($actualSource -and $actualSource -ne $expectedSource) {
-        Write-Host "CMake build cache points at a different source tree; recreating $BuildDir" -ForegroundColor Yellow
-        Remove-IfExists -LiteralPath $BuildDir
-        return
-    }
-
-    if ($actualPlatform -ne $CMakePlatform) {
-        Write-Host "CMake build cache uses platform '$actualPlatform' instead of '$CMakePlatform'; resetting CMake metadata in $BuildDir" -ForegroundColor Yellow
-        Remove-IfExists -LiteralPath $cachePath
-        Remove-IfExists -LiteralPath (Join-Path $BuildDir "CMakeFiles")
-    }
 }
 
 function Assert-PathExists {
@@ -283,62 +239,6 @@ function Invoke-Native {
     }
 }
 
-function Test-CommandRuns {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
-        [string[]]$Arguments = @("--version")
-    )
-
-    if (-not (Test-Path -LiteralPath $FilePath) -and -not (Get-Command $FilePath -ErrorAction SilentlyContinue)) {
-        return $false
-    }
-    try {
-        & $FilePath @Arguments *> $null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
-}
-
-function Get-CMakeCommand {
-    param([string]$VenvScripts)
-
-    $venvCMake = Join-Path $VenvScripts "cmake.exe"
-    if ((Test-Path -LiteralPath $venvCMake) -and (Test-CommandRuns -FilePath $venvCMake)) {
-        return $venvCMake
-    } elseif (Test-Path -LiteralPath $venvCMake) {
-        Write-Host "Ignoring unusable venv CMake executable: $venvCMake" -ForegroundColor Yellow
-    }
-
-    foreach ($globalCMake in @(Get-Command "cmake" -All -ErrorAction SilentlyContinue)) {
-        if ($globalCMake.Source -and (Test-CommandRuns -FilePath $globalCMake.Source)) {
-            return $globalCMake.Source
-        }
-    }
-
-    throw "cmake executable not found. Install the project build extra or make CMake available in PATH."
-}
-
-function Get-CTestCommand {
-    param([string]$VenvScripts)
-
-    $venvCTest = Join-Path $VenvScripts "ctest.exe"
-    if ((Test-Path -LiteralPath $venvCTest) -and (Test-CommandRuns -FilePath $venvCTest)) {
-        return $venvCTest
-    } elseif (Test-Path -LiteralPath $venvCTest) {
-        Write-Host "Ignoring unusable venv CTest executable: $venvCTest" -ForegroundColor Yellow
-    }
-
-    foreach ($globalCTest in @(Get-Command "ctest" -All -ErrorAction SilentlyContinue)) {
-        if ($globalCTest.Source -and (Test-CommandRuns -FilePath $globalCTest.Source)) {
-            return $globalCTest.Source
-        }
-    }
-
-    throw "ctest executable not found. Install CMake or make CTest available in PATH."
-}
-
 function Get-PeSubsystem {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
@@ -396,78 +296,6 @@ function Get-InnoSetupCompiler {
     throw "Inno Setup 6 compiler (ISCC.exe) was not found. Install JRSoftware.InnoSetup or pass -InnoCompilerPath."
 }
 
-
-function Build-SevenZipWorker {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$CMakeCommand,
-        [Parameter(Mandatory = $true)]
-        [string]$CTestCommand,
-        [Parameter(Mandatory = $true)]
-        [string]$WrapperRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$BuildDir,
-        [Parameter(Mandatory = $true)]
-        [string]$ToolsRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$BuildArch
-    )
-
-    Write-Step "Building embedded 7-Zip worker"
-    Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
-    $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
-    Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DSUP7Z_DEBUG=OFF", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
-    # The old in-process wrapper DLL target is gone. Remove stale incremental-build artifacts
-    # so a previous sunpack_sevenzip.dll cannot be mistaken for a current output.
-    Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
-    if ((Get-ProcessBuildArch) -eq $BuildArch) {
-        Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
-    } else {
-        Write-Host "Skipping C++ smoke test because $BuildArch binaries cannot run in the current process architecture" -ForegroundColor Yellow
-    }
-    $workerExe = Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe"
-    $launcherExe = Join-Path $BuildDir "Release\sunpack_launcher.exe"
-    Assert-PathExists -LiteralPath $workerExe -Description "Built 7z worker executable"
-    Assert-PathExists -LiteralPath $launcherExe -Description "Built SunPack launcher executable"
-    Assert-PeMachine -LiteralPath $workerExe -BuildArch $BuildArch -Description "Built 7z worker executable"
-    Assert-PeMachine -LiteralPath $launcherExe -BuildArch $BuildArch -Description "Built SunPack launcher executable"
-    Copy-Item -LiteralPath $workerExe -Destination (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -Force
-
-    Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch -ArtifactPaths @(
-        (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe")
-    )
-}
-
-function Build-ToastLibrary {
-    param(
-        [Parameter(Mandatory = $true)][string]$CMakeCommand,
-        [Parameter(Mandatory = $true)][string]$CTestCommand,
-        [Parameter(Mandatory = $true)][string]$SourceRoot,
-        [Parameter(Mandatory = $true)][string]$BuildDir,
-        [Parameter(Mandatory = $true)][string]$ToolsRoot,
-        [Parameter(Mandatory = $true)][string]$BuildArch
-    )
-
-    Write-Step "Building in-process Windows toast library"
-    Assert-PathExists -LiteralPath (Join-Path $SourceRoot "CMakeLists.txt") -Description "toast CMake project"
-    $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
-    Reset-StaleCMakeBuildDir -SourceDir $SourceRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $SourceRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUNPACK_TOAST_ENABLE_LTO=ON", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
-    if ((Get-ProcessBuildArch) -eq $BuildArch) {
-        Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
-    } else {
-        Write-Host "Skipping toast library self-test because $BuildArch binaries cannot run in the current process architecture" -ForegroundColor Yellow
-    }
-
-    $toastDll = Join-Path $BuildDir "Release\sunpack_toast.dll"
-    Assert-PathExists -LiteralPath $toastDll -Description "Built toast DLL"
-    Assert-PeMachine -LiteralPath $toastDll -BuildArch $BuildArch -Description "Built toast DLL"
-    Copy-Item -LiteralPath $toastDll -Destination (Join-Path $ToolsRoot "sunpack_toast.dll") -Force
-}
 
 function Invoke-WithRetry {
     param(
@@ -562,20 +390,6 @@ function Get-PackagedRuntimeToolNames {
     )
 }
 
-function Copy-PackagedRuntimeTools {
-    param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-
-    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-    foreach ($name in @(Get-PackagedRuntimeToolNames)) {
-        $sourcePath = Join-Path $Source $name
-        Assert-PathExists -LiteralPath $sourcePath -Description "Runtime tool source"
-        Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $Destination $name) -Force
-    }
-}
-
 function Assert-PackagedRuntimeTools {
     param([Parameter(Mandatory = $true)][string]$PackageRoot)
 
@@ -593,7 +407,7 @@ function Assert-PackagedRuntimeTools {
 }
 
 try {
-. (Join-Path $PSScriptRoot "sevenzip_asm_check.ps1")
+. (Join-Path $PSScriptRoot "build_native.ps1")
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
@@ -615,15 +429,13 @@ $nativeCrateRoot = Join-Path $repoRoot "sunpack\sunpack_runtime"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "sunpack\Cargo.lock"
 $watchBrokerCargoToml = Join-Path $repoRoot "sunpack\sunpack_watch_broker\Cargo.toml"
-$rustTargetDir = Join-Path $repoRoot (".cache\rust-target\" + $buildArch)
-$watchBrokerBuildPath = Join-Path $rustTargetDir ("$rustTarget\release\sunpack-watch-broker.exe")
+$watchBrokerBuildPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
 $sevenZipWrapperRoot = Join-Path $repoRoot "sunpack\sevenzip_bridge"
-$sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch)
+$sevenZipWrapperBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release -Component sevenzip_bridge
 $toastHostRoot = Join-Path $repoRoot "sunpack\toast_host"
-$toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch)
-$toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
-$sevenZipWorkerPath = Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"
-$toastHostPath = Join-Path $toolsRoot "sunpack_toast.dll"
+$toastHostBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release -Component toast_host
+$sevenZipWorkerPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_sevenzip_worker.exe"
+$toastHostPath = Join-Path $toastHostBuildDir "Release\sunpack_toast.dll"
 $launcherBuildPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_launcher.exe"
 $distRoot = Join-Path $repoRoot "dist"
 $buildRoot = Join-Path $repoRoot "build"
@@ -661,7 +473,8 @@ Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 
 if ($Clean) {
     Write-Step "Cleaning native build outputs"
-    foreach ($output in @($rustTargetDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
+    $rustBuildDir = Get-RustBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
+    foreach ($output in @($rustBuildDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
         $fullOutput = [IO.Path]::GetFullPath($output)
         if (-not $fullOutput.StartsWith(([IO.Path]::GetFullPath($repoRoot) + "\"), [StringComparison]::OrdinalIgnoreCase)) {
             throw "Build output is outside the repository: $output"
@@ -684,11 +497,9 @@ New-Item -ItemType Directory -Path $distAppRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 
 Write-Step "Building Rust runtime and Windows Watch Broker"
-$rustFlags = 'target.' + $rustTarget + '.rustflags=[''-C'', ''target-feature=+crt-static'']'
 $cargoArgs = @(
     "build", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
-    "--release", "--target", $rustTarget, "--target-dir", $rustTargetDir,
-    "--jobs", [string]$BuildJobs, "--config", $rustFlags,
+    "--release", "--target", $rustTarget, "--jobs", [string]$BuildJobs,
     "-p", "sunpack-runtime", "-p", "sunpack-watch-broker",
     "--bin", "sunpack-runtime", "--bin", "sunpack-watch-broker"
 )
@@ -699,12 +510,12 @@ if ($FastBuild) {
     $cargoArgs += @("--config", "profile.release.lto=false", "--config", "profile.release.codegen-units=16")
 }
 Invoke-Native -FilePath "cargo" -Arguments $cargoArgs
-$runtimeBuildPath = Join-Path $rustTargetDir "$rustTarget\release\sunpack-runtime.exe"
+$runtimeBuildPath = Get-SunPackRuntimeBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
 Assert-PathExists -LiteralPath $runtimeBuildPath -Description "SunPack runtime executable"
 Assert-PathExists -LiteralPath $watchBrokerBuildPath -Description "SunPack Watch Broker executable"
 Assert-PeMachine -LiteralPath $watchBrokerBuildPath -BuildArch $buildArch -Description "SunPack Watch Broker executable"
 
-Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
+Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -BuildArch $buildArch -BuildProfile release
 $nativeLinkerEntry = @(Get-Content -LiteralPath (Join-Path $sevenZipWrapperBuildDir "CMakeCache.txt") |
     Where-Object { $_ -like "CMAKE_LINKER:FILEPATH=*" })
 if ($nativeLinkerEntry.Count -ne 1) {
@@ -717,9 +528,11 @@ foreach ($executable in @($runtimeBuildPath, $watchBrokerBuildPath)) {
         "-P", (Join-Path $sevenZipWrapperRoot "tests\static_runtime.cmake")
     )
 }
-Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
+Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -BuildArch $buildArch -BuildProfile release
 Assert-PathExists -LiteralPath $sevenZipWorkerPath -Description "Bundled 7z worker executable"
-Assert-PathExists -LiteralPath $toastHostPath -Description "Bundled toast DLL"
+Assert-PeMachine -LiteralPath $sevenZipWorkerPath -BuildArch $buildArch -Description "Built 7z worker executable"
+Assert-PeMachine -LiteralPath $launcherBuildPath -BuildArch $buildArch -Description "Built SunPack launcher executable"
+Assert-PeMachine -LiteralPath $toastHostPath -BuildArch $buildArch -Description "Built toast DLL"
 Write-Step "Building Core UI management panel"
 $guiBuildDir = Join-Path $repoRoot (".cache\gui-" + $buildArch)
 & (Join-Path $repoRoot "scripts\build_gui.ps1") -Arch $buildArch -CMakeCommand $cmakeCommand -BuildDir $guiBuildDir -Jobs $BuildJobs -SkipTests:$SkipTests -ApplicationOnly:$SkipTests
@@ -755,7 +568,8 @@ Copy-Item -LiteralPath (Join-Path $repoRoot "sunpack_config.json") -Destination 
 Copy-IfExists -Source (Join-Path $repoRoot "sunpack_watch_roots.txt") -Destination $distWatchRootsPath
 Copy-Item -LiteralPath $iconPath -Destination $distIconPath -Force
 Copy-IfExists -Source (Join-Path $repoRoot "sunpack_advanced_config.json") -Destination $distAdvancedConfigPath
-Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot
+New-Item -ItemType Directory -Path $distToolsRoot | Out-Null
+Copy-Item -LiteralPath $sevenZipWorkerPath, $toastHostPath -Destination $distToolsRoot -Force
 
 & (Join-Path $repoRoot "scripts\generate_license_bundle.ps1") -RepoRoot $repoRoot `
     -GuiLicenseRoot (Join-Path $guiBuildDir "licenses") -OutputPath $distLicenseBundlePath -Target $rustTarget
@@ -845,9 +659,8 @@ if ($runAcceptanceTests) {
         "-File", (Join-Path $PSScriptRoot "setup_windows_dev.ps1"),
         "-Arch", $buildArch, "-AcceptanceTestDependenciesOnly"
     )
-    $fixtureBuildPath = Join-Path $rustTargetDir "$rustTarget\release\examples\real_fixture.exe"
+    $fixtureBuildPath = Get-ArchiveFixtureBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
     Assert-PathExists -LiteralPath $fixtureBuildPath -Description "Native test fixture executable"
-    Copy-Item -LiteralPath $fixtureBuildPath -Destination (Join-Path $toolsRoot "real_fixture.exe") -Force
 
     Write-Step "Running acceptance tests"
     Invoke-Native -FilePath "powershell" -Arguments @(

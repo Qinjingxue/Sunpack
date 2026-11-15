@@ -105,8 +105,7 @@ try {
     Write-Host "Native test build: $Arch/$BuildProfile"
     Invoke-TestStep -Label "Rust correctness tests" -Command @(
         "cargo", "test", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
-        "--workspace", "--profile", $BuildProfile, "--target", $target,
-        "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
+        "--workspace", "--profile", $BuildProfile, "--target", $target
     )
     Invoke-TestStep -Label "CLI and script boundary tests" -Command @(
         $python, "-m", "pytest", "-q", "-n", [string]$ParallelWorkers,

@@ -218,10 +218,11 @@ def test_rust_writer_cpp_query_contract(repo_root, contract):
     # The existing Rust decoder cannot detect C++ query/index/filter mistakes.
     # This prebuilt test drives the real writer and invokes --project itself;
     # no Python pipeline, copied store decoder, or build-on-test fallback.
-    binary = Path(os.environ.get("SUNPACK_GUI_WRITER_TEST_BINARY", repo_root / "tools" / "gui_projection_writer.exe"))
-    if not binary.is_file() and "SUNPACK_GUI_WRITER_TEST_BINARY" not in os.environ:
+    writer = os.environ.get("SUNPACK_GUI_WRITER_TEST_BINARY")
+    if not writer:
         pytest.skip("Set SUNPACK_GUI_WRITER_TEST_BINARY to the prebuilt Rust lib test executable")
-    assert binary.is_file(), "Build/copy the Rust lib test executable and set SUNPACK_GUI_WRITER_TEST_BINARY"
+    binary = Path(writer)
+    assert binary.is_file(), "Set SUNPACK_GUI_WRITER_TEST_BINARY to the Rust lib test executable in the Cargo cache"
     arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
     gui = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"))
     assert gui.is_file(), "Build the actual C++ GUI reader with scripts/build_gui.ps1"
