@@ -21,3 +21,15 @@ _ROWS = [
     ("watch", "live-arrival", "Continuous Watch arrival latency and runtime plus Broker memory.", ("--mode", "watch", "--live-arrival", "--formats", "zip", "--small-files", "64", "--large-files", "0")),
 ]
 SCENARIOS = {(group, name): Scenario(group, name, description, arguments) for group, name, description, arguments in _ROWS}
+for scenario in (
+    Scenario("password", "probe-matrix", "Cold password candidate probing by encrypted format.", (), "benchmarks.scenarios.password_probe"),
+    Scenario("worker", "format-matrix", "Direct worker 300 MiB reproducible format matrix.", (), "benchmarks.scenarios.worker_300m"),
+    Scenario("scan", "embedded", "Large carrier embedded archive scanning.", (), "benchmarks.scenarios.embedded_scan"),
+    Scenario("scan", "hit-index", "Production hit-index build, traversal and memory.", (), "benchmarks.scenarios.hit_index_native"),
+    Scenario("extraction", "e2e-300m", "CLI 300 MiB format matrix.", ("--mode", "cli"), "benchmarks.scenarios.e2e_300m"),
+    Scenario("watch", "e2e-300m", "Watch 300 MiB format matrix.", ("--mode", "watch"), "benchmarks.scenarios.e2e_300m"),
+    Scenario("scan", "game-tree", "Recursive authorization on a game tree archive.", (), "benchmarks.scenarios.game_tree"),
+    Scenario("watch", "quiet-trace", "Native quiet policy simulated timing trajectories.", (), "benchmarks.scenarios.quiet_trace"),
+    Scenario("watch", "quiet-corpus", "Historical complex writer corpus and quiet-policy assessment.", (), "benchmarks.scenarios.quiet_corpus"),
+):
+    SCENARIOS[(scenario.group, scenario.name)] = scenario

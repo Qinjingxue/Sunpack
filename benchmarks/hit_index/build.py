@@ -83,9 +83,9 @@ def bridge(*, source_root: Path = ROOT, meter: bool = False, destination: Path |
     original_types = embedded[begin:end].removesuffix("#[derive(Default)]\n")
     patterns = embedded[embedded.index("const PATTERNS:"):embedded.index("#[cfg(target_arch", embedded.index("const PATTERNS:"))]
     names = re.findall(r'\([^,\n]+,\s*"([^"]+)",\s*"([^"]+)"\)', patterns)
-    if len(names) != 13:
+    if len(names) != 14:
         raise RuntimeError("Signature schema changed; update protocol/adapter explicitly")
-    declarations = 'const PATTERNS:[(&[u8],&str,&str);13]=[' + ','.join('(b"",'+json.dumps(name)+','+json.dumps(kind)+')' for name,kind in names) + '];\n'
+    declarations = f'const PATTERNS:[(&[u8],&str,&str);{len(names)}]=[' + ','.join('(b"",'+json.dumps(name)+','+json.dumps(kind)+')' for name,kind in names) + '];\n'
     root = root.replace("// BENCHMARK_PRODUCTION_TYPES", declarations + original_types)
     for key, path in [("COLLECTIONS", native / "collections.rs"), ("PATH_KEYS", native / "path_keys.rs"), ("FAST_HASH_CORE", native / "fast_hash_core.rs"), ("RESOURCE_LIFECYCLE", native / "io/resource_lifecycle.rs"), ("SCRATCH", native / "io/scratch.rs")]:
         root = root.replace(key, path.as_posix())

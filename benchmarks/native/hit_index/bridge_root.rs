@@ -43,6 +43,11 @@ mod fast_hash {
     pub(crate) use crate::fast_hash_core::xxh64;
 }
 mod io {
+    // The isolated index probe does not open archive readers. Promotion can
+    // therefore only evict the scratch resources registered by this process.
+    mod reader {
+        pub(crate) fn release_reader_resources_under_resolved_roots(_: &[std::path::PathBuf]) -> std::io::Result<()> { Ok(()) }
+    }
     #[path = "RESOURCE_LIFECYCLE"]
     pub(crate) mod resource_lifecycle;
     #[path = "SCRATCH"]

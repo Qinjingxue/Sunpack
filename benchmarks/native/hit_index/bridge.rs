@@ -183,8 +183,8 @@ pub unsafe extern "C" fn sp_stats(p: *mut std::ffi::c_void, out: *mut ProbeStats
     std::ptr::copy_nonoverlapping(&x.stats, out, 1);
 }
 fn joined_dump(store: &HitStorage) -> Vec<RawHit> {
-    let a: Vec<_> = store.view(0).iter().collect();
-    let b: Vec<_> = store.view(1).iter().collect();
+    let a: Vec<_> = store.view(0).iter_mask(u16::MAX).collect();
+    let b: Vec<_> = store.view(1).iter_mask(u16::MAX).collect();
     for items in [&a, &b] {
         assert!(
             items
