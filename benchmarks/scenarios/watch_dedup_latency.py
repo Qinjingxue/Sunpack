@@ -59,4 +59,3 @@ for scale in [0,512]:
      try:next(gen)
      except StopIteration:pass
 save()
-
