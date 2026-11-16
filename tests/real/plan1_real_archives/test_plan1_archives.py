@@ -137,6 +137,7 @@ CODEC_CASES = [
             ("LZMA", 5, True, "LZMA"), ("PPMd", 5, True, "PPMd"), ("BZip2", 5, True, "BZip2"),
             ("Deflate", 5, True, "Deflate"), ("LZ4", 1, True, "04F71104"),
             ("LZ4", 1, False, "04F71104"),
+            ("ZSTD", 3, False, "04F71101"),
         ]
     ],
     *[
@@ -149,7 +150,7 @@ CODEC_CASES = [
 
 @pytest.mark.parametrize(("archive_format", "method", "level", "solid", "rar4", "listed"), CODEC_CASES)
 def test_container_codecs(package, tmp_path, archive_format, method, level, solid, rar4, listed):
-    require_generator(archive_format, seven_zip_lz4=method == "LZ4")
+    require_generator(archive_format, seven_zip_lz4=method in {"LZ4", "ZSTD"})
     options = dict(payload_size=256, payload_profile="structured", compression_level=level, solid=solid)
     case = (
         create_rar4_archive(tmp_path, "codec", **options) if rar4

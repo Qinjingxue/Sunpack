@@ -4,6 +4,18 @@
 #include "sevenzip_bridge/enc.h"
 #include "sevenzip_paths.hpp"
 
+#ifdef _WIN32
+#include "7zip/Common/RegisterCodec.h"
+#include "7zip/Compress/ZstdDecoder.h"
+
+namespace {
+    // The standalone Zstandard and ZIP handlers already use this decoder.
+    // 7-Zip-Zstandard archives refer to it by their own 7z method ID.
+    REGISTER_CODEC_CREATE(CreateSevenZipZstdDecoder, NCompress::NZstd::CDecoder)
+    REGISTER_CODEC_2(SunpackSevenZipZstd, CreateSevenZipZstdDecoder, nullptr, 0x04F71101, "ZSTD")
+}
+#endif
+
 namespace sunpack::sevenzip
 {
 

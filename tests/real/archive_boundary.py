@@ -73,9 +73,10 @@ def assert_extracted(case, output, *, exact=False):
         ), (case.case_id, name, expected, actual)
 
 
-def scan_case(package, case, *, passwords=()):
+def scan_case(package, case, *, passwords=(), deep=True):
     password_args = [f"--password={password}" for password in passwords]
-    report = package.json("scan", "-d", "--no-bpw", *password_args, case.archive_dir)
+    scan_flags = ["-d"] if deep else []
+    report = package.json("scan", *scan_flags, "--no-bpw", *password_args, case.archive_dir)
     assert report["summary"]["archive_count"] == 1, report
     assert report["summary"]["failed_count"] == 0, report
     item, = report["items"]
@@ -98,9 +99,9 @@ def assert_scan_parts(case, item):
     }, item
 
 
-def assert_archive_round_trip(package, case, output, *, passwords=()):
-    item = scan_case(package, case, passwords=passwords)
-    report = extract_report(package, case.archive_dir, output, passwords=passwords)
+def assert_archive_round_trip(package, case, output, *, passwords=(), deep=True):
+    item = scan_case(package, case, passwords=passwords, deep=deep)
+    report = extract_report(package, case.archive_dir, output, passwords=passwords, deep=deep)
     assert report["summary"]["success_count"] >= 1, report
     assert report["summary"]["failed_count"] == 0, report
     assert_extracted(case, output, exact=True)

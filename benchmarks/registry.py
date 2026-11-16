@@ -28,9 +28,7 @@ for scenario in (
     Scenario("scan", "hit-index", "Production hit-index build, traversal and memory.", (), "benchmarks.scenarios.hit_index_native"),
     Scenario("extraction", "e2e-300m", "CLI 300 MiB format matrix.", ("--mode", "cli"), "benchmarks.scenarios.e2e_300m"),
     Scenario("watch", "e2e-300m", "Watch 300 MiB format matrix.", ("--mode", "watch"), "benchmarks.scenarios.e2e_300m"),
-    Scenario("scan", "game-tree", "Recursive authorization on a game tree archive.", (), "benchmarks.scenarios.game_tree"),
-    Scenario("watch", "quiet-trace", "Native quiet policy simulated timing trajectories.", (), "benchmarks.scenarios.quiet_trace"),
-    Scenario("watch", "quiet-corpus", "Historical complex writer corpus and quiet-policy assessment.", (), "benchmarks.scenarios.quiet_corpus"),
-    Scenario("watch", "quiet-scheduler", "Historical writer corpus through native Watch admission.", ("--scheduler",), "benchmarks.scenarios.quiet_corpus"),
+    Scenario("scan", "game-tree", "Direct recursive directory scan and authorization.", (), "benchmarks.scenarios.game_tree"),
+    Scenario("watch", "quiet-corpus", "Replay the full writer corpus through native Watch admission.", (), "benchmarks.scenarios.quiet_corpus"),
 ):
     SCENARIOS[(scenario.group, scenario.name)] = scenario

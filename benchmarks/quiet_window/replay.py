@@ -1,55 +1,10 @@
 from __future__ import annotations
 
 import bisect
-import heapq
-import math
-import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
-from typing import Callable, Protocol
+from dataclasses import dataclass, field
 
-from .corpus import Observation, Trace
-
-
-class Estimator(Protocol):
-    def observe(self, event: Observation) -> float: ...
-
-
-class FixedEstimator:
-    def __init__(self, seconds: float):
-        self.seconds = seconds
-
-    def observe(self, event: Observation) -> float:
-        return self.seconds
-
-
-class EwmaEstimator:
-    """RFC 6298-inspired SRTT+4*RTTVAR control, NOT a TCP implementation.
-
-    Uses content intervals, zero initial wait, no TCP floor/backoff, no upper cap.
-    """
-    def __init__(self):
-        self.last = None
-        self.mean = None
-        self.variation = 0.0
-
-    def observe(self, event: Observation) -> float:
-        if event.content_changed:
-            if self.last is not None and event.learn_interval and event.at > self.last:
-                interval = event.at - self.last
-                if self.mean is None:
-                    self.mean, self.variation = interval, interval / 2
-                else:
-                    self.variation = 0.75 * self.variation + 0.25 * abs(self.mean - interval)
-                    self.mean = 0.875 * self.mean + 0.125 * interval
-            self.last = event.at
-        return 0.0 if self.mean is None else self.mean + 4 * self.variation
-
-
-def estimators(adaptive_factory: Callable[[], Estimator]) -> dict[str, Callable[[], Estimator]]:
-    return {"adaptive": adaptive_factory, "ewma": EwmaEstimator,
-            **{f"fixed-{seconds:g}s": lambda value=seconds: FixedEstimator(value)
-               for seconds in (0.0, 0.05, 0.5, 2.0, 10.0, 180.0)}}
+from .corpus import Trace
 
 
 @dataclass(slots=True)
@@ -170,58 +125,3 @@ def input_results(trace, files):
             ready_to_valid_proposal_seconds=None if first is None else first - ready,
         ))
     return inputs
-
-
-def replay(trace: Trace, factory: Callable[[], Estimator], *, tie_order: str = "observation_first") -> dict:
-    """One proposal per observed content generation, rearmed by new content.
-
-    The estimator sees only Observation; truth is read exclusively by scoring.
-    This evaluates the quiet estimator, not WatchScheduler or archive analysis.
-    """
-    started = time.process_time_ns()
-    truth = {file.key: file for file in trace.files}
-    results = {file.key: FileResult(file.key, file.shape, file.complete_at is not None) for file in trace.files}
-    models: dict[str, Estimator] = {}
-    generations: dict[str, int] = {}
-    pending: set[str] = set()
-    heap = []
-    serial = 0
-    observation_priority = 0 if tie_order == "observation_first" else 1
-    for event in trace.observations:
-        heap.append((event.at, observation_priority, serial, event.key, event))
-        serial += 1
-    heapq.heapify(heap)
-    peak_models = 0
-    deadline_count = 0
-    # Missing members are evaluated as a separate archive-group fact. They do
-    # not turn a correctly stable individual volume into a false file decision.
-    group_ready, boundaries = proposal_boundaries(trace)
-    while heap:
-        at, _, _, key, payload = heapq.heappop(heap)
-        if at > trace.horizon:
-            break
-        if isinstance(payload, Observation):
-            model = models.get(key)
-            if model is None:
-                model = models[key] = factory()
-                peak_models = max(peak_models, len(models))
-            seconds = model.observe(payload)
-            if math.isnan(seconds) or seconds < 0:
-                raise ValueError("estimator returned a negative or NaN deadline")
-            if payload.content_changed:
-                generation = generations[key] = generations.get(key, 0) + 1
-                pending.add(key)
-                heapq.heappush(heap, (at + seconds, 1 - observation_priority, serial, key, generation))
-                serial += 1
-                deadline_count += 1
-            continue
-        if generations.get(key) != payload or key not in pending:
-            continue
-        pending.remove(key)
-        result, file = results[key], truth[key]
-        record_proposal(result, file, at, group_ready, trace.horizon)
-    files = [asdict(result) for result in results.values()]
-    add_valid_proposal_latency(files, boundaries)
-    return {"files": files,
-            "delivered_observations": len(trace.observations), "scheduled_deadlines": deadline_count,
-            "peak_live_estimators": peak_models, "replay_cpu_ns": time.process_time_ns() - started}

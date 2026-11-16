@@ -40,14 +40,17 @@ def test_plan7_container_and_encryption_variants(package, tmp_path, family):
                 password=PASSWORD if archive_format in {"7z", "zip", "rar"} else None,
             ))
     else:
-        for archive_format in ("7z", "zip", "rar", "lz4"):
+        for archive_format, method in (("7z", None), ("zip", None), ("rar", None),
+                                       ("lz4", None), ("7z", "ZSTD")):
             if archive_format == "rar" and not get_optional_rar():
                 continue
+            label = f"{archive_format}-{method.lower()}" if method else archive_format
             case = FACTORY.create(
-                fixtures, f"embedded-{archive_format}", archive_format, payload_size=64 * 1024,
-                password=PASSWORD if archive_format != "lz4" else None,
+                fixtures, f"embedded-{label}", archive_format, payload_size=64 * 1024,
+                password=PASSWORD if archive_format != "lz4" and method is None else None,
+                compression_method=method, compression_level=3 if method else None,
             )
-            wrapped = case.archive_dir / f"embedded-{archive_format}.bin"
+            wrapped = case.archive_dir / f"embedded-{label}.bin"
             assemble_carrier(wrapped, [case.entry_path], seed=0x7004, decoys=True)
             case.entry_path.unlink()
             case.entry_path = wrapped

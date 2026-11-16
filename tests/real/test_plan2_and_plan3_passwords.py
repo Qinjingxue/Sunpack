@@ -20,11 +20,11 @@ PASSWORD = "real-archive-password"
 WRONG = [f"wrong-password-{index:03d}" for index in range(100)]
 
 
-def assert_password_outcomes(package, case, tmp_path, *, wrong=WRONG, candidates=None):
+def assert_password_outcomes(package, case, tmp_path, *, wrong=WRONG, candidates=None, deep=True):
     original_parts = {path.name for path in case.archive_dir.iterdir() if path.is_file()}
     rejected_output = tmp_path / "rejected"
     rejected = extract_report(
-        package, case.archive_dir, rejected_output, passwords=wrong, cleanup="d", code=1,
+        package, case.archive_dir, rejected_output, passwords=wrong, cleanup="d", code=1, deep=deep,
     )
     assert rejected["summary"]["success_count"] == 0, rejected
     assert rejected["summary"]["partial_success_count"] == 0, rejected
@@ -34,7 +34,7 @@ def assert_password_outcomes(package, case, tmp_path, *, wrong=WRONG, candidates
 
     if candidates is None:
         candidates = [*WRONG[:63], case.password, *WRONG[63:-1]]
-    item = assert_archive_round_trip(package, case, tmp_path / "recovered", passwords=candidates)
+    item = assert_archive_round_trip(package, case, tmp_path / "recovered", passwords=candidates, deep=deep)
     assert item["password_used"] == case.password, item
     if case.split and not case.sfx:
         assert_scan_parts(case, item)
@@ -75,7 +75,7 @@ def test_encrypted_disguised_volume_candidates(package, tmp_path, naming):
 def test_official_enc_vector_candidates(package, tmp_path):
     case = create_enc_case(tmp_path, "official-vector", input_suffix=".mov")
     assert_password_outcomes(
-        package, case, tmp_path, wrong=[WRONG[0]], candidates=[WRONG[0], case.password, WRONG[1]],
+        package, case, tmp_path, wrong=[WRONG[0]], candidates=[WRONG[0], case.password, WRONG[1]], deep=False,
     )
 
 

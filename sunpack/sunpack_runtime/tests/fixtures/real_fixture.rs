@@ -53,6 +53,8 @@ enum Request {
     ZipMethod {
         output: PathBuf,
         method: u16,
+        #[serde(default)]
+        paths: Vec<PathBuf>,
     },
     Flip {
         path: PathBuf,
@@ -67,55 +69,98 @@ enum Request {
 // Independent APPNOTE fixture for methods the archive generator cannot encode.
 // Unsupported methods deliberately contain opaque bytes: the decoder must
 // report unsupported_method before interpreting those bytes.
-fn zip_method(output: &Path, method: u16) -> io::Result<Value> {
-    let name = b"payload.txt";
-    let payload = b"ZIPX method fixture payload";
-    let compressed = if method == 93 {
-        zstd::stream::encode_all(payload.as_slice(), 1)?
-    } else {
-        payload.to_vec()
-    };
-    let crc = crc32fast::hash(payload);
-    let mut local = b"PK\x03\x04".to_vec();
-    for value in [63u16, 0, method, 0, 0] {
-        local.extend_from_slice(&value.to_le_bytes());
+fn zip_method(output: &Path, method: u16, paths: &[PathBuf]) -> io::Result<Value> {
+    fn offset(writer: &mut (impl Seek + Write)) -> io::Result<u32> {
+        u32::try_from(writer.stream_position()?).map_err(io::Error::other)
     }
-    for value in [crc, compressed.len() as u32, payload.len() as u32] {
-        local.extend_from_slice(&value.to_le_bytes());
-    }
-    for value in [name.len() as u16, 0] {
-        local.extend_from_slice(&value.to_le_bytes());
-    }
-    local.extend_from_slice(name);
-    local.extend_from_slice(&compressed);
-    let mut central = b"PK\x01\x02".to_vec();
-    for value in [63u16, 63, 0, method, 0, 0] {
-        central.extend_from_slice(&value.to_le_bytes());
-    }
-    for value in [crc, compressed.len() as u32, payload.len() as u32] {
-        central.extend_from_slice(&value.to_le_bytes());
-    }
-    for value in [name.len() as u16, 0, 0, 0, 0] {
-        central.extend_from_slice(&value.to_le_bytes());
-    }
-    for value in [0u32, 0] {
-        central.extend_from_slice(&value.to_le_bytes());
-    }
-    central.extend_from_slice(name);
-    let mut eocd = b"PK\x05\x06".to_vec();
-    for value in [0u16, 0, 1, 1] {
-        eocd.extend_from_slice(&value.to_le_bytes());
-    }
-    for value in [central.len() as u32, local.len() as u32] {
-        eocd.extend_from_slice(&value.to_le_bytes());
-    }
-    eocd.extend_from_slice(&0u16.to_le_bytes());
+
     let mut writer = BufWriter::new(File::create(output)?);
-    writer.write_all(&local)?;
+    let count = u16::try_from(paths.len().max(1)).map_err(io::Error::other)?;
+    let mut central = Vec::new();
+    let mut expected = serde_json::Map::new();
+    for index in 0..count as usize {
+        let (name, mut source): (&str, Box<dyn Read>) = if let Some(path) = paths.get(index) {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| io::Error::other("ZIP fixture needs a UTF-8 filename"))?;
+            (name, Box::new(File::open(path)?))
+        } else {
+            ("payload.txt", Box::new(&b"ZIPX method fixture payload"[..]))
+        };
+        let name = name.as_bytes();
+        let name_len = u16::try_from(name.len()).map_err(io::Error::other)?;
+        let local = offset(&mut writer)?;
+        writer.write_all(b"PK\x03\x04")?;
+        for value in [63u16, 1 << 11, method, 0, 0] {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        writer.write_all(&[0; 12])?;
+        writer.write_all(&name_len.to_le_bytes())?;
+        writer.write_all(&0u16.to_le_bytes())?;
+        writer.write_all(name)?;
+        let data = offset(&mut writer)?;
+        let mut crc = crc32fast::Hasher::new();
+        let mut size = 0_u64;
+        let mut copy = |target: &mut dyn Write| -> io::Result<()> {
+            let mut buffer = [0; 64 * 1024];
+            loop {
+                let n = source.read(&mut buffer)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                crc.update(&buffer[..n]);
+                size += n as u64;
+                target.write_all(&buffer[..n])?;
+            }
+        };
+        if method == 93 {
+            let mut encoder = zstd::stream::write::Encoder::new(&mut writer, 1)?;
+            copy(&mut encoder)?;
+            encoder.finish()?;
+        } else {
+            copy(&mut writer)?;
+        }
+        let end = offset(&mut writer)?;
+        let crc = crc.finalize();
+        let size = u32::try_from(size).map_err(io::Error::other)?;
+        let values = [crc, end - data, size];
+        writer.seek(SeekFrom::Start(u64::from(local) + 14))?;
+        for value in values {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        writer.seek(SeekFrom::Start(u64::from(end)))?;
+
+        central.extend_from_slice(b"PK\x01\x02");
+        for value in [63u16, 63, 1 << 11, method, 0, 0] {
+            central.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in values {
+            central.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [name_len, 0, 0, 0, 0] {
+            central.extend_from_slice(&value.to_le_bytes());
+        }
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&local.to_le_bytes());
+        central.extend_from_slice(name);
+        expected.insert(
+            String::from_utf8_lossy(name).into_owned(),
+            json!({"size": size, "crc32": crc}),
+        );
+    }
+    let end = offset(&mut writer)?;
     writer.write_all(&central)?;
-    writer.write_all(&eocd)?;
+    writer.write_all(b"PK\x05\x06")?;
+    for value in [0_u16, 0, count, count] {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    for value in [u32::try_from(central.len()).map_err(io::Error::other)?, end] {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    writer.write_all(&0u16.to_le_bytes())?;
     writer.flush()?;
-    Ok(json!({"expected_files": {"payload.txt": {"size": payload.len(), "crc32": crc}}}))
+    Ok(json!({"expected_files": expected}))
 }
 
 fn seven_zip_uint(value: u64, output: &mut Vec<u8>) {
@@ -406,7 +451,11 @@ fn run(request: Request) -> io::Result<Value> {
             locale,
         } => libarchive_writer::write(&root, &output, &paths, format, locale.as_deref()),
         Request::Copy { source, output } => Ok(json!({"bytes": fs::copy(source, output)?})),
-        Request::ZipMethod { output, method } => zip_method(&output, method),
+        Request::ZipMethod {
+            output,
+            method,
+            paths,
+        } => zip_method(&output, method, &paths),
         Request::SevenZipLz4Header { source, output } => seven_zip_lz4_header(&source, &output),
         Request::Flip { path, offset } => {
             let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;

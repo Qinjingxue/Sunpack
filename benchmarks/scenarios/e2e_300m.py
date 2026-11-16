@@ -2,70 +2,18 @@
 from __future__ import annotations
 
 import argparse
-import os
 import platform
 import shutil
 import statistics
-import subprocess
 import time
 from pathlib import Path
 
-from benchmarks.harness.corpus import DEFAULT_CACHE_ROOT, GENERATED_FORMATS, _cached_corpus
+from benchmarks.harness.corpus import DEFAULT_CACHE_ROOT, _cached_corpus
+from benchmarks.harness.corpus_300m import FORMATS_300M, special_cases
 from benchmarks.harness.launcher import NativePackage
-from benchmarks.harness.workspace import BenchmarkWorkspace, REPO_ROOT
+from benchmarks.harness.workspace import BenchmarkWorkspace
 from benchmarks.scenarios.native_boundary import _configure_watch, _copy_case, _directory_changes, output_summary
 from benchmarks.watch_broker import SERVICE_ENV, isolated_broker_environment
-
-
-def _special_cases(root, requested, payload_mib, skipped):
-    """Generate formats absent from the shared corpus using existing fixture tools."""
-    cases = {}
-    payload = root / "payloads" / "few-large"
-    staging = root / "special"
-    staging.mkdir()
-    expected = 2 * payload_mib * 1024 * 1024
-    for name in sorted(requested & {"zipx", "lz4", "enc", "rar4", "rar4-split"}):
-        try:
-            if name.startswith("rar4"):
-                archive = staging / f"payload-{name}.rar"
-                command = [str(REPO_ROOT / "tools/winrar/Rar.exe"), "a", "-idq", "-r", "-ep1", "-ma4", "-y"]
-                if name == "rar4-split":
-                    volume_bytes = min(16 * 1024 * 1024, max(65536, payload_mib * 1024 * 1024 // 4))
-                    command.append(f"-v{volume_bytes}b")
-                subprocess.run([*command, str(archive), str(payload)],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                if name == "rar4-split":
-                    volumes = sorted(staging.glob("payload-rar4-split.part*.rar"))
-                    if len(volumes) < 2:
-                        raise RuntimeError("RAR4 fixture did not produce multiple volumes")
-                    archive = volumes[0]
-            elif name == "zipx":
-                archive = staging / "payload.zipx"
-                subprocess.run([str(REPO_ROOT / "tools/7z.exe"), "a", "-tzip", "-mm=LZMA", str(archive), str(payload)],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            elif name == "lz4":
-                from tests.helpers.native_fixture import create_lz4_frames
-                archive = staging / "payload.lz4"
-                create_lz4_frames(archive, sorted(payload.glob("*.bin")))
-            else:
-                java, javac = shutil.which("java"), shutil.which("javac")
-                jar = REPO_ROOT / "reference/implementations/SSEFilePC/S.S.E. File Encryptor for PC/ssefenc.jar"
-                if not java or not javac or not jar.is_file():
-                    raise FileNotFoundError("ENC fixture requires Java, javac and reference ssefenc.jar")
-                classes = staging / "classes"
-                classes.mkdir()
-                source = REPO_ROOT / "tests/helpers/EncV4Fixtures.java"
-                subprocess.run([javac, "--release", "17", "-cp", str(jar), "-d", str(classes), str(source)],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                subprocess.run([java, "-Xmx2g", "-cp", os.pathsep.join((str(classes), str(jar))),
-                                "EncV4Fixtures", str(staging / "enc"), "0", str(2 * payload_mib)],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                archive = staging / "enc/large.enc"
-            cases[f"few_large:{name}"] = {"path": archive, "format": name, "split": name.endswith("-split"),
-                                          "expected_payload_bytes": expected}
-        except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
-            skipped[name] = f"fixture generator unavailable: {error}"
-    return cases
 
 
 def main(argv=None):
@@ -76,7 +24,7 @@ def main(argv=None):
     parser.add_argument("--arch", choices=("x64", "arm64"), default="x64")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--sample-ms", type=float, default=50)
-    parser.add_argument("--formats", default=",".join((*GENERATED_FORMATS, "rar4", "rar4-split", "zipx", "lz4", "enc")))
+    parser.add_argument("--formats", default=",".join(FORMATS_300M))
     parser.add_argument("--large-file-mib", type=int, default=150, help="Each of the two payload files (default 150 MiB; lower for smoke runs).")
     parser.add_argument("--sample", action="append", default=[], metavar="FORMAT=PATH", help="Additional archive, e.g. zipx, lz4 or enc; provide sibling volumes and --password as needed.")
     parser.add_argument("--password", action="append", default=[])
@@ -92,6 +40,8 @@ def main(argv=None):
     if args.mode == "watch" and not isolated_broker_environment():
         parser.error("Run Watch through `python -m benchmarks watch` for an isolated broker")
     selected = set(filter(None, args.formats.split(",")))
+    if not selected or selected.difference(FORMATS_300M):
+        parser.error("--formats must select supported 300 MiB cases")
     extras = {}
     for value in args.sample:
         name, separator, path = value.partition("=")
@@ -106,51 +56,67 @@ def main(argv=None):
             large_file_mib=args.large_file_mib, rebuild=args.rebuild_corpus,
         )
         cases = {key: {**item, "split": item["format"].endswith("-split")}
-                 for key, item in corpus.items() if item["workload"] == "few_large" and item["format"] in selected}
-        cases.update(_special_cases(workspace.corpus, selected - set(extras), args.large_file_mib, skipped))
-        if "few_large:enc" in cases and "sunpack-test" not in args.password:
-            args.password.append("sunpack-test")
+                 for key, item in corpus.items() if item["workload"] == "few_large" and item["format"] in selected - extras.keys()}
+        generation = selected - extras.keys()
+        if args.shape == "carrier":
+            generation -= {"enc"}
+        cases.update(special_cases(workspace.corpus, corpus, generation, skipped,
+                                   large_files=2, large_file_mib=args.large_file_mib))
+        for item in cases.values():
+            password = item.get("password")
+            if password and password not in args.password:
+                args.password.append(password)
         for name, path in extras.items():
             cases[f"external:{name}"] = {"path": path, "format": name, "split": name.endswith("-split"), "expected_payload_bytes": None}
         missing = selected - {item["format"] for item in cases.values()}
         skipped = {name: reason for name, reason in skipped.items() if name in selected or name.startswith("few_large:")}
         for name in missing:
             skipped.setdefault(name, "corpus generator unavailable or did not produce this format; supply --sample")
-        if not cases:
-            raise ValueError("No requested archive formats available")
         if args.shape == "carrier":
+            if "enc" in selected or "enc" in extras:
+                skipped["enc"] = "ENC v4 is handled only as a standalone input"
             for key in list(cases):
-                if cases[key]["split"]:
+                if cases[key]["format"] == "enc":
+                    del cases[key]
+                elif cases[key]["split"]:
                     skipped[key] = "carrier shape excludes multi-file volume sets"
                     del cases[key]
         if not cases:
-            raise ValueError("No requested formats support this shape")
+            selected_skips = {name: reason for name, reason in skipped.items()
+                              if name in selected or name in extras}
+            raise ValueError(f"No requested archive formats available for {args.shape}: {selected_skips}")
 
         rows = []
         with NativePackage(workspace.work, launcher=args.launcher, profile=args.profile,
                            arch=args.arch, sample_ms=args.sample_ms, watch=args.mode == "watch") as app:
             if args.mode == "watch":
-                inputs = workspace.work / "arrivals"
-                inputs.mkdir()
+                watch_roots = {}
+                for deep in {item["format"] != "enc" for item in cases.values()}:
+                    inputs = workspace.work / ("arrivals-deep" if deep else "arrivals")
+                    inputs.mkdir()
+                    _configure_watch(app, args, inputs, workspace.outputs, live=True, deep=deep)
+                    watch_roots[deep] = inputs
                 staging = workspace.work / "staging"
                 staging.mkdir()
-                _configure_watch(app, args, inputs, workspace.outputs, live=True)
                 app.run("watch", "start", "--no-tray", require_broker=True)
             try:
                 for key, item in cases.items():
+                    deep = item["format"] != "enc"
                     for run in range(args.runs):
                         name = f"{key.replace(':', '-')}-{run}"
                         if args.mode == "cli":
                             entry = _copy_case(item, workspace.work / "inputs" / name, args.shape)
                             output = workspace.outputs / name
                             passwords = [part for password in args.password for part in ("-p", password)]
-                            result = app.run("extract", "--direct-file", "-d", "-r", args.recursive,
+                            scan_flags = ("-d",) if deep else ()
+                            result = app.run("extract", *scan_flags, "-r", args.recursive,
                                              "-c", "k", "--no-flatten", "--no-pause", "-o", output, entry, *passwords)
                             if not result["response"]["summary"]["processed_count"]:
                                 raise RuntimeError(f"No archive processed for {key}")
                             output_info = output_summary(output)
                             shutil.rmtree(output, ignore_errors=True)
                         else:
+                            inputs = watch_roots[deep]
                             folder = staging / name
                             entry = _copy_case(item, folder, args.shape)
                             members = list(folder.iterdir())

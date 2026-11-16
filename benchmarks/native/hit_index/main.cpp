@@ -128,7 +128,7 @@ static Data read_trace(const std::string &path) {
   uint64_t header[4];
   f.read(magic, 8);
   f.read(reinterpret_cast<char *>(header), 32);
-  require(bool(f) && std::memcmp(magic, "SPHITS\0\0", 8) == 0, "trace header");
+  require(bool(f) && std::memcmp(magic, "SPHITS\0\x01", 8) == 0, "trace header");
   Data d;
   d.logical_size = header[0];
   d.chunk = header[3];
@@ -152,7 +152,7 @@ static Data read_trace(const std::string &path) {
 }
 static void write_trace(const std::string &path, const Data &d) {
   std::ofstream f(std::filesystem::u8path(path), std::ios::binary);
-  f.write("SPHITS\0\0", 8);
+  f.write("SPHITS\0\x01", 8);
   uint64_t header[4] = {d.logical_size, d.hits.size(), 0, d.chunk};
   f.write(reinterpret_cast<const char *>(header), 32);
   for (const auto &h : d.hits) {

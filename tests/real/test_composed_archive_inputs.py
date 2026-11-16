@@ -132,10 +132,10 @@ def test_compressed_tar_recovers_pkzip_disks_and_an_enc_inside_lz4(package, tmp_
     passwords = ["wrong", zip_case.password, ENC_PASSWORD]
     output = tmp_path / "out"
     if entry_mode == "cli":
-        report = extract_report(package, source, output, passwords=passwords, cleanup="d")
+        report = extract_report(package, source, output, passwords=passwords, cleanup="d", deep=False)
         assert report["summary"]["failed_count"] == 0, report
     else:
-        watch = watch_setup(package, tmp_path, passwords=passwords, cleanup="d")
+        watch = watch_setup(package, tmp_path, passwords=passwords, cleanup="d", deep=False)
         source = download(watch, source, mode="direct")
         watch.await_archive(zip_case)
         watch.await_archive(enc)

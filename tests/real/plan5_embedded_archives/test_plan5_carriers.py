@@ -107,7 +107,12 @@ def test_plan5_mixed_carrier_preserves_recoverable_segments(package, tmp_path, c
 
 def test_plan5_large_file_extracts_128_real_embedded_archives(package, tmp_path):
     case = build_large_embedded_case(tmp_path, count=LARGE_SEGMENT_COUNT)
-    assert len(case.segments) == 128
+    expected = {(segment.archive_format, segment.offset, segment.offset + segment.length)
+                for segment in case.segments}
+    assert len(expected) == LARGE_SEGMENT_COUNT
+    items = _scan(package, case.file_path)
+    assert {_extent(item) for item in items} == expected
+    assert len(items) == len(expected)
     output = tmp_path / "out"
     report = extract_report(package, case.file_path, output, passwords=[case.password])
     assert report["summary"]["success_count"] >= 1

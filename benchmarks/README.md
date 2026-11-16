@@ -28,78 +28,79 @@ uv run --locked --extra test python -m benchmarks watch state-persistence --copi
 uv run --locked --extra test python -m benchmarks --timeout 900 watch live-arrival --runs 120 --arrival-interval-ms 1000
 uv run --locked --extra test python -m benchmarks password probe-matrix --candidates 1000
 uv run --locked --extra test python -m benchmarks scan embedded --size-mib 1024 --segments 128
-uv run --locked --extra test python -m benchmarks scan hit-index --hits 1000000
+uv run --locked --extra test python -m benchmarks scan hit-index
 uv run --locked --extra test python -m benchmarks extraction e2e-300m
 uv run --locked --extra test python -m benchmarks watch e2e-300m
 uv run --locked --extra test python -m benchmarks worker format-matrix
-uv run --locked --extra test python -m benchmarks scan game-tree --game-tree D:\game
-uv run --locked --extra test python -m benchmarks watch quiet-trace --intervals 0.1,0.1,0.1,1,1,1
+uv run --locked --extra test python -m benchmarks scan game-tree --directory D:\game
 uv run --locked --extra test python -m benchmarks watch quiet-corpus --seeds 2 --splits development --channels immediate --widths 1,4
-uv run --locked --extra test python -m benchmarks watch quiet-scheduler --seeds 2 --splits development --channels immediate --widths 1,4
 ```
 
 `password probe-matrix` puts the matching password after the requested number
-of wrong candidates and restarts the runtime before each scan. The matrix
-includes encrypted 7z, ZIP and RAR variants; unavailable generators are
-reported. `scan embedded` defaults to a generated 1 GiB carrier containing
-ZIP segments; `--file` selects an existing input. `scan hit-index` separately
-times production index construction and iteration on synthetic equally spaced
-hits, with a separate allocator-instrumented pass for peak allocation. These
-are index measurements, not whole-scanner or real-input results.
+of wrong candidates and measures the Rust verifier on a reused reader with
+1 MiB stored payloads. It reports the first round, warm median and Windows
+peak memory for encrypted 7z, ZIP, RAR and standalone ENC v4. The ENC run
+uses the published test vector. CLI scan is measured
+separately and can be skipped with `--skip-cli`.
 
-The CLI and Watch 300 MiB matrices use two reproducible 150 MiB payload files
-per case. Set `--large-file-mib 1 --runs 1` for a smoke run. ZIPX, LZ4 and ENC
-generation uses existing fixture tools; ENC additionally needs Java and the
-reference JAR. Missing optional generators are reported as skipped, and
+`scan embedded` measures the Rust scanner directly and reports CLI discovery
+separately. It defaults to a generated 1 GiB ZIP carrier. Use `--mixed` for the
+historical Plan 5 mixed-format carrier, including ZIPX, 7z-Zstandard, 7z-LZ4
+and LZ4 frames. Use `--stored-zip` for a large stored ZIP
+(including ZIP64 when needed), or `--file` for an existing input.
+`scan hit-index` defaults to real matcher hits captured from a mixed carrier.
+It times index construction, iteration and seeks, with a separate allocation
+pass. Use `--file` to capture a different input, `--trace` to replay a saved
+`hits.bin`, or `--hits` for the synthetic equal-gap workload. Capture I/O and
+report serialization are outside the index measurements.
+
+The Worker, CLI and Watch 300 MiB matrices share one format list. Cases use
+two reproducible 150 MiB payload files by default, or one stream of the same
+total size. They include ZIPX (LZMA and Zstandard), split ZIP, 7z-Zstandard,
+7z-LZ4, independent compression streams, compressed TAR variants and ENC.
+ENC v4 uses standalone discovery in the CLI and Watch matrices. Carrier runs
+exclude ENC because its header does not publish the archive length.
+Set `--large-file-mib 1 --runs 1` for a smoke run. ENC generation needs
+Java and the reference JAR. Missing optional generators are reported as skipped, and
 `--sample FORMAT=PATH` accepts external formats. Watch requires permission to
 create its isolated temporary Broker service. The direct worker matrix measures
-the persistent worker separately; compressed TAR cases measure only its first
-decompression layer. Process memory peaks are sampled lower bounds.
+the persistent worker separately, with explicit solid and non-solid 7z, RAR5
+and RAR4 variants. Use `--compare-7z` to run stock 7z.exe on supported cases.
+ENC and formats whose handler or codec is missing in stock 7z are skipped.
+Compressed TAR cases measure the first decompression layer. Process memory
+peaks are sampled lower bounds.
 
-`scan game-tree` packages the supplied directory before timing, then measures
-CLI extraction, recursive discovery and default authorization together; use
-`--archive` to supply an existing archive. It does not isolate authorization
-CPU time. `watch quiet-trace` compiles the actual Rust quiet-policy code into
-an independent probe and replays simulated timestamps without waiting. Its
-trace shows predicted quiet windows and policy CPU time, not real Watch
-end-to-end latency or a Broker trace. Change `--intervals` for other trajectories.
+`scan game-tree --directory` scans immediate child directories as separate
+recursive output scopes. Add `--single-root` to scan the supplied directory as
+one scope, including files directly in it. The benchmark reads the directory
+tree in place and uses the checkout's configuration, ignoring
+`SUNPACK_CONFIG_OVERRIDES`. Each run records directory preparation time,
+discovery and authorization time together, Windows peak working set and commit,
+and the allowed paths. Runs use fresh processes and retain the filesystem cache.
+Use `--archive` for the separate CLI extraction measurement on an existing archive.
 
-`watch quiet-corpus` restores the historical 28 synthetic writer families,
-three seed splits, four notification channels, concurrency widths and both
-timer/observation tie orders. Its default design generates 7,296 traces with
-76,224 physical files; a trace contains multiple writes, not just one interval.
-It compiles the current Rust `Quiet` implementation in a benchmark-only DLL and
-replays the original estimator-only lifecycle, alongside fixed and EWMA controls.
-The report retains per-seed, family/channel/width/tie strata, confidence
-intervals, valid-proposal latency, censored outcomes and invalid-proposal burst
-metrics. Traces, proposal timelines and executed generator/scoring source are
-saved beside the report. The estimator retains trackers until the end of each
-trace and emits at most one proposal per observed content generation. Its CPU
-figure includes Python replay and FFI overhead.
+`watch quiet-corpus` replays the historical 28 writer families through the
+Rust Watch scheduler. The default design covers three seed splits, four
+notification channels, concurrency widths and both timer/observation tie
+orders, for 7,296 traces and 76,224 physical files. It keeps per-seed and
+family/channel/width/tie summaries, confidence intervals, completion-to-proposal
+latency for logical inputs, censored inputs and invalid proposal bursts.
 
-`watch quiet-scheduler` drives the current Rust Watch capture, queue, deadline,
-readiness and tracker retirement paths with the same corpus. Cargo builds and
-runs an ignored unit-test entry point. The virtual clock, file snapshots and
-replay output are compiled only with `cfg(test)`. The replay substitutes
-virtual metadata and handle readability for file probes and assumes instant
-processing at admission. It scores one logical input per split set, including
-completion-to-proposal latency, censored inputs and invalid proposal bursts.
-Replay elapsed time and scheduler-thread CPU time exclude corpus generation,
-process startup and report writing. Busy retry loops under an unchanged snapshot are coalesced, so probe
-counts describe the simulator. Actual Broker, pipeline and OS timings belong
-to the Watch end-to-end benchmarks.
+The test build substitutes virtual metadata, handle readability and a virtual
+clock, with immediate retirement at admission. Replay elapsed time and
+scheduler-thread CPU time exclude corpus generation, process startup and
+report writing. Busy retries under unchanged snapshots are coalesced. Use
+the Watch end-to-end benchmarks for actual Broker, pipeline and OS timing.
 
-Both commands save the exact corpus and evaluator source. Use `--corpus` to
-reuse the saved traces and `--compare` to report paired deltas by seed. Comparison
-requires the same replay mode, evaluator, algorithm selection, tie orders and
-corpus. The scheduler uses the Rust code in the current checkout, and the
-estimator accepts `--policy-source PATH` for an alternate Rust `quiet.rs`.
+The command saves the exact corpus, proposal timelines and evaluator source.
+Use `--corpus` to replay saved traces and `--compare` to report paired seed
+deltas with the same evaluator, trace corpus and tie orders.
 
 ```powershell
 # Freeze one report before changing the Rust policy.
-uv run --locked --extra test python -m benchmarks watch quiet-scheduler --pin-report .cache/quiet-before.json
+uv run --locked --extra test python -m benchmarks watch quiet-corpus --pin-report .cache/quiet-before.json
 # Replay the saved traces with the changed implementation and the same evaluator.
-uv run --locked --extra test python -m benchmarks watch quiet-scheduler --corpus PATH/TO/traces.jsonl.gz --compare .cache/quiet-before.json
+uv run --locked --extra test python -m benchmarks watch quiet-corpus --corpus PATH/TO/traces.jsonl.gz --compare .cache/quiet-before.json
 ```
 
 Generated fixtures reuse the deterministic many-small-file and few-large-file

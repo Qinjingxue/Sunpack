@@ -39,7 +39,7 @@ const XZ_FOOTER_MAGIC: &[u8] = b"YZ";
 
 type PatternSpec = (&'static [u8], &'static str, &'static str);
 
-const PATTERNS: [PatternSpec; 14] = [
+const PATTERNS: [PatternSpec; 13] = [
     (ZIP_LOCAL, "zip_local", "zip"),
     (ZIP_EOCD, "zip_eocd", "zip_eocd"),
     (SEVEN_ZIP, "7z", "7z"),
@@ -53,7 +53,6 @@ const PATTERNS: [PatternSpec; 14] = [
     (crate::formats::lz4::MAGIC, "lz4", "lz4"),
     (b"\x2a\x4d\x18", "lz4_skippable", "lz4_skippable"),
     (b"PK\x06\x06", "zip64_eocd", "zip64_eocd"),
-    (sunpack_enc::MAGIC, "enc", "enc"),
 ];
 
 #[cfg(target_arch = "x86_64")]
@@ -294,7 +293,7 @@ impl NativeScanResult {
     pub(crate) fn has_independent_archive(&self) -> bool {
         self.candidates
             .iter()
-            .any(|c| c.volume_anchor.is_none() && (c.end_offset.is_some() || c.format == "enc"))
+            .any(|c| c.volume_anchor.is_none() && c.end_offset.is_some())
     }
 
     pub(crate) fn is_primary_lz4(&self) -> bool {
@@ -441,6 +440,8 @@ fn scan_embedded_archives_native_with_iocp(
     } else {
         iocp_buffers.clamp(2, 64) + iocp_workers.clamp(1, 8)
     };
+    #[cfg(all(test, windows))]
+    let capture = benchmark_capture::Capture::open(file_size, chunk_bytes, matching_window)?;
     let mut builder = HitBuilder::new(file_size, chunk_bytes, matching_window)?;
     #[cfg(test)]
     let mut raw_hit_count = 0;
@@ -457,6 +458,10 @@ fn scan_embedded_archives_native_with_iocp(
     let saw_zip_eocd = std::sync::atomic::AtomicBool::new(false);
     let scan = |sample: &[u8], carry: usize, base: u64| {
         let batch = scan_sample_batch(sample, carry, base);
+        #[cfg(all(test, windows))]
+        if let Some(capture) = &capture {
+            capture.record(&batch.results, base + carry as u64);
+        }
         if batch.results.saw_zip_eocd {
             saw_zip_eocd.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -530,6 +535,10 @@ fn scan_embedded_archives_native_with_iocp(
             ));
         }
     };
+    #[cfg(all(test, windows))]
+    if let Some(capture) = capture {
+        capture.finish()?;
+    }
     let storage = builder.finish()?;
     cancellation.check_io()?;
     let raw_hits = storage.view(0);
@@ -589,6 +598,10 @@ fn scan_embedded_archives_native_with_iocp(
         zip_eocd_absent: !saw_zip_eocd.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
+
+#[cfg(all(test, windows))]
+#[path = "../../../../benchmarks/native/hit_index/capture.rs"]
+mod benchmark_capture;
 
 fn embedded_overlap() -> usize {
     PATTERNS
@@ -1028,7 +1041,6 @@ fn scan_sample_candidate(
         b'u' => check!(9),
         4 => check!(10),
         0x2a => check!(11),
-        b'S' => check!(13),
         _ => {}
     }
 }
@@ -1177,13 +1189,6 @@ fn validate_candidate(
     suffixes: &mut FailedSuffixEvidence,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
     match kind {
-        "enc" => {
-            let prefix = read_at(file, offset, 40)?;
-            Ok(sunpack_enc::Header::parse(&prefix, file_size - offset).ok()
-                // ENC has no public length field. EOF is an input limit, not
-                // ownership evidence that can hide another embedded archive.
-                .map(|_| candidate("enc", offset, None, CandidateKind::Archive)))
-        }
         "zip" => validate_zip(file, file_size, offset),
         "7z" => validate_seven_zip(file, file_size, offset),
         "rar4" | "rar5" => validate_rar(file, file_size, offset),

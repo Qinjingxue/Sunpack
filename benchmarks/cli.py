@@ -138,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         _parser().error(f"unknown {args.group} scenario {args.scenario!r}; choose one of: {names}")
     if args.timeout is not None and args.timeout <= 0:
         _parser().error("--timeout must be positive")
-    if args.group == "watch" and args.scenario not in {"quiet-trace", "quiet-corpus", "quiet-scheduler"}:
+    if args.group == "watch" and args.scenario != "quiet-corpus":
         from .watch_broker import temporary_watch_broker_service
 
         with temporary_watch_broker_service():

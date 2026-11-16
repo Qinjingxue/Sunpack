@@ -13,10 +13,9 @@ import zipfile
 import psutil
 import pytest
 
-
-def test_deep_rejects_unproven_streams_and_keeps_enc(package, tmp_path, repo_root):
+def test_deep_rejects_unproven_streams(package, tmp_path):
     # Offset-zero prefix facts and partial walks must not become tasks. Check
-    # both plain inputs and embedded offsets in one scan, alongside real ENC.
+    # both plain inputs and embedded offsets in one scan.
     inputs = tmp_path / "inputs"
     inputs.mkdir()
     header = tarfile.TarInfo("member").tobuf(format=tarfile.USTAR_FORMAT)
@@ -40,12 +39,9 @@ def test_deep_rejects_unproven_streams_and_keeps_enc(package, tmp_path, repo_roo
     ]:
         for prefix in (b"", b"opaque carrier\0"):
             (inputs / f"{name}-{len(prefix)}.bin").write_bytes(prefix + data)
-    encrypted = inputs / "cipher.bin"
-    encrypted.write_bytes((repo_root / "tests/data/enc_parallel/algorithm_0.enc").read_bytes())
-    report = package.json("scan", "-d", "--no-bpw", "--password=sunpack-test", inputs)
-    assert report["summary"]["archive_count"] == 1, report
+    report = package.json("scan", "-d", inputs)
+    assert report["summary"]["archive_count"] == 0, report
     assert report["summary"]["failed_count"] == 0, report
-    assert report["items"][0]["format"] == "enc", report
 
 
 def test_direct_read_failure_is_reported_once_without_fallback(package, tmp_path):

@@ -319,7 +319,7 @@ fn replay(base: &Path, input: Replay) -> Value {
 }
 
 #[test]
-#[ignore = "driven by python -m benchmarks watch quiet-scheduler"]
+#[ignore = "driven by python -m benchmarks watch quiet-corpus"]
 fn replay_corpus() {
     let base = PathBuf::from(std::env::var_os("SUNPACK_QUIET_REPLAY_WORK").unwrap());
     fs::create_dir_all(base.join("input")).unwrap();

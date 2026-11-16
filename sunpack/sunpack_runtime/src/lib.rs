@@ -23,3 +23,11 @@ pub mod runtime;
 #[cfg(test)]
 #[path = "../tests/unit/lib/test_support.rs"]
 mod test_support;
+
+#[cfg(all(test, windows))]
+#[path = "../../../benchmarks/native/process_memory.rs"]
+mod benchmark_process_memory;
+
+#[cfg(all(test, windows))]
+#[path = "../../../benchmarks/native/reader/probe.rs"]
+mod benchmark_reader;

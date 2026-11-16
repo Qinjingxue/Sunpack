@@ -81,7 +81,7 @@ def _case_rows(args, workspace):
     return cases, skipped, cache
 
 
-def _configure_watch(app, args, inputs, outputs, *, live=False):
+def _configure_watch(app, args, inputs, outputs, *, live=False, deep=True):
     path = app.data / "sunpack_config.json"
     config = json.loads(path.read_text(encoding="utf-8"))
     config["recursive_extract"] = args.recursive
@@ -93,7 +93,8 @@ def _configure_watch(app, args, inputs, outputs, *, live=False):
     (app.data / "builtin_passwords.json").write_text(
         json.dumps({"passwords": [{"value": value} for value in args.password]}), encoding="utf-8",
     )
-    app.run("watch", "add", "-R", "-d", "-o", outputs, inputs)
+    scan_flags = ("-d",) if deep else ()
+    app.run("watch", "add", "-R", *scan_flags, "-o", outputs, inputs)
 
 
 @contextmanager

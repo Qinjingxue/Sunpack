@@ -323,7 +323,7 @@ def create_7z_archive(
     solid: bool | None = None,
 ):
     tools = get_test_tools()
-    seven_zip = require_7z_zstd() if str(compression_method).upper() == "LZ4" else require_7z()
+    seven_zip = require_7z_zstd() if str(compression_method).upper() in {"LZ4", "ZSTD"} else require_7z()
     level = 0 if compression_level is None else int(compression_level)
     if not 0 <= level <= 9:
         raise ValueError("7z compression level must be between 0 and 9")

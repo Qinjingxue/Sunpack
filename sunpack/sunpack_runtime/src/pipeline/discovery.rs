@@ -1134,11 +1134,9 @@ fn project_segments(
         let resolved_end = resolution.as_ref().and_then(|result| result.end_offset);
         let end = resolved_end.or(item.end_offset);
         let failure = resolution.as_ref().and_then(|result| result.failure_reason);
-        // ENC has a validated public header but no public archive length.
-        // Every other standalone input requires a verified boundary.
         let confirmed = item.is_logical_archive()
             && (resolved_end.is_some() || (item.volume_anchor.is_none()
-                && (item.end_offset.is_some() || item.format == "enc")));
+                && item.end_offset.is_some()));
         if !confirmed && failure.is_none() {
             continue;
         }
@@ -1323,3 +1321,7 @@ fn root(parents: &mut [usize], mut index: usize) -> usize {
 #[cfg(test)]
 #[path = "../../tests/unit/pipeline/discovery/tests.rs"]
 mod tests;
+
+#[cfg(all(test, windows))]
+#[path = "../../../../benchmarks/native/game_tree/probe.rs"]
+mod game_tree_bench;

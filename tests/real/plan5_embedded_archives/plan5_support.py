@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tests.helpers.native_fixture import assemble_carrier
+from tests.helpers.native_fixture import assemble_carrier, native_fixture
 from tests.helpers.real_archives import (
     ArchiveFixtureFactory,
     create_encrypted_7z_archive,
@@ -76,6 +76,8 @@ LARGE_SEGMENT_MATRIX: tuple[dict[str, Any], ...] = (
     {"format": "zip", "variant": "zip-bzip2", "creator": "factory", "params": {"compression_method": "BZip2", "compression_level": 1}},
     {"format": "zip", "variant": "zip-lzma", "creator": "factory", "params": {"compression_method": "LZMA", "compression_level": 5}},
     {"format": "zip", "variant": "zip-ppmd", "creator": "factory", "params": {"compression_method": "PPMd", "compression_level": 9}},
+    {"format": "zip", "variant": "zipx-lzma", "creator": "factory", "suffix": ".zipx", "params": {"compression_method": "LZMA", "compression_level": 5}},
+    {"format": "zip", "variant": "zipx-zstd", "creator": "zipx-zstd", "params": {}},
     {"format": "7z", "variant": "7z-copy-nonsolid", "creator": "factory", "params": {"compression_method": "Copy", "compression_level": 0, "solid": False}},
     {"format": "7z", "variant": "7z-lzma2-solid", "creator": "factory", "params": {"compression_method": "LZMA2", "compression_level": 5, "solid": True}},
     {"format": "7z", "variant": "7z-lzma2-nonsolid", "creator": "factory", "params": {"compression_method": "LZMA2", "compression_level": 1, "solid": False}},
@@ -83,6 +85,8 @@ LARGE_SEGMENT_MATRIX: tuple[dict[str, Any], ...] = (
     {"format": "7z", "variant": "7z-ppmd-solid", "creator": "factory", "params": {"compression_method": "PPMd", "compression_level": 5, "solid": True}},
     {"format": "7z", "variant": "7z-bzip2-solid", "creator": "factory", "params": {"compression_method": "BZip2", "compression_level": 1, "solid": True}},
     {"format": "7z", "variant": "7z-deflate-solid", "creator": "factory", "params": {"compression_method": "Deflate", "compression_level": 9, "solid": True}},
+    {"format": "7z", "variant": "7z-zstd", "creator": "factory", "params": {"compression_method": "ZSTD", "compression_level": 3, "solid": False}},
+    {"format": "7z", "variant": "7z-lz4", "creator": "factory", "params": {"compression_method": "LZ4", "compression_level": 3, "solid": False}},
     {"format": "rar", "variant": "rar5-store-nonsolid", "creator": "factory", "params": {"compression_level": 0, "solid": False}},
     {"format": "rar", "variant": "rar5-fast-nonsolid", "creator": "factory", "params": {"compression_level": 1, "solid": False}},
     {"format": "rar", "variant": "rar5-normal-solid", "creator": "factory", "params": {"compression_level": 3, "solid": True}},
@@ -104,6 +108,8 @@ LARGE_SEGMENT_MATRIX: tuple[dict[str, Any], ...] = (
     {"format": "xz", "variant": "xz-c", "creator": "factory", "params": {}},
     {"format": "zstd", "variant": "zstd-a", "creator": "factory", "params": {}},
     {"format": "zstd", "variant": "zstd-b", "creator": "factory", "params": {}},
+    {"format": "lz4", "variant": "lz4-frame", "creator": "factory", "params": {}},
+    {"format": "lz4", "source_format": "tar.lz4", "variant": "tar-lz4", "creator": "factory", "params": {}},
 )
 
 
@@ -128,6 +134,14 @@ def _create_segment_archive(
 ) -> tuple[Path, str]:
     case_id = f"p5_{spec['variant']}"
     creator = spec["creator"]
+    if creator == "zipx-zstd":
+        scratch.mkdir(parents=True, exist_ok=True)
+        payload = scratch / f"{case_id}.marker.txt"
+        marker = f"edge::{case_id}"
+        payload.write_text(marker, encoding="utf-8")
+        archive = scratch / f"{case_id}.zipx"
+        native_fixture("zip_method", output=str(archive), method=93, paths=[str(payload)])
+        return archive, marker
     if creator == "factory":
         factory_kwargs = {
             "payload_size": payload_size,
@@ -140,7 +154,10 @@ def _create_segment_archive(
             str(spec.get("source_format", spec["format"])),
             **factory_kwargs,
         )
-        return case.entry_path, case.marker_text
+        entry = case.entry_path
+        if suffix := spec.get("suffix"):
+            entry = entry.rename(entry.with_suffix(suffix))
+        return entry, case.marker_text
     if creator == "zip":
         case = create_encrypted_zip_archive(
             scratch,

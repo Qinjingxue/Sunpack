@@ -87,7 +87,7 @@ def test_extracts_disguised_enc_and_compressed_tar_in_one_request(package, tmp_p
         archive.addfile(entry, io.BytesIO(content))
 
     output = tmp_path / "output"
-    report = package.json("extract", "-d", "-r", "*", "-c", "k", "-p", "sunpack-test",
+    report = package.json("extract", "-r", "*", "-c", "k", "-p", "sunpack-test",
                           "-o", output, inputs)
     assert report["summary"]["failed_count"] == 0, report
     assert "sunpack-test" in report["items"][0]["recent_passwords"]
