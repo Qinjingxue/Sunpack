@@ -739,10 +739,21 @@ fn each_completion_grants_one_retry_and_cancellation_passes_its_slot() {
 fn rejection_retries_immediately_when_no_other_job_can_finish() {
     let shared = Shared::default();
     let mailbox = register(&shared, "retry");
+    let bytes = Arc::new(vec![1; 1024]);
+    let payload_lifetime = Arc::downgrade(&bytes);
+    mailbox.updates.lock().unwrap().retry_payload = Some(InputPayload::Frame(bytes));
     finish(&shared, "retry", true);
     take_rejection(&mailbox);
     assert!(mailbox.updates.lock().unwrap().retry_granted);
     take_retry(&shared, "retry", &mailbox, &Cancellation::new()).unwrap();
+    assert!(payload_lifetime.upgrade().is_some());
+
+    dispatch(&shared, json!({
+        "type": "native_event", "event": "job_accepted", "job_id": "retry",
+    }));
+    assert!(payload_lifetime.upgrade().is_none());
+    assert!(mailbox.updates.lock().unwrap().result.is_none());
+
     finish(&shared, "retry", false);
     assert!(mailbox
         .updates

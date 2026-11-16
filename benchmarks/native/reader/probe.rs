@@ -59,10 +59,12 @@ fn password() -> Result<(), Box<dyn std::error::Error>> {
     let args = request()?;
     let session = NativeArchiveSession::new(args.path.clone())?;
     let input = ArchiveInput::file(args.path, args.format, String::new());
+    let mut preparation = crate::password::context::Preparation::default();
     measure(
         || {
             let started = Instant::now();
             let found = crate::password::verify(
+                &mut preparation,
                 &input,
                 &args.passwords,
                 std::slice::from_ref(&session),

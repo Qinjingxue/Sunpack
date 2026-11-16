@@ -31,7 +31,7 @@ fn embedded_pages_cross_scope_boundaries_without_losing_ownership() {
     let candidates = CandidateSet::new(
         Arc::from([]),
         None,
-        &super::super::passwords::AttemptCache::default(),
+        &super::super::passwords::RecentPasswords::default(),
         None,
     );
     let mut request = Request::new(inputs, super::super::Mode::Scan);
@@ -94,7 +94,7 @@ fn measure_many_small_output_scopes() {
     let candidates = CandidateSet::new(
         Arc::from([]),
         None,
-        &super::super::passwords::AttemptCache::default(),
+        &super::super::passwords::RecentPasswords::default(),
         None,
     );
     let mut request = Request::new(inputs, super::super::Mode::Scan);
@@ -148,7 +148,7 @@ fn covered_explicit_targets_keep_their_retry_boundary() {
     let candidates = CandidateSet::new(
         Arc::from([]),
         None,
-        &super::super::passwords::AttemptCache::default(),
+        &super::super::passwords::RecentPasswords::default(),
         None,
     );
     for target in [&child, &archive] {

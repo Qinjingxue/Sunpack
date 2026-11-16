@@ -96,9 +96,9 @@ def test_watch_recovers_same_size_and_mtime_child_after_offline_directory_replac
     with package.watch_session():
         for source in watch_sources:
             _await_done(package, source)
-    state, = package.data.glob("runtime-*.state")
-    owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
-    assert package.run("--persistent-shutdown").returncode == 0
+        # daemon stop removes the published endpoint while shutting down.
+        state, = package.data.glob("runtime-*.state")
+        owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
     owner.wait(timeout=30)
 
     # During downtime only the parent directories move. No file-level write or

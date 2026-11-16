@@ -216,10 +216,9 @@ pub fn broker_for_each_directory_change(
     let mut request = Request::simple(Opcode::ReadDirectoriesChanges, 0);
     request.volume_guid = volume;
     request.current_usn = end;
-    let mut query = Vec::with_capacity(8 + directories.len().min(batch_ids) * FILE_ID_BYTES);
     let mut payload = Vec::new();
     for (batch, ids) in directories.chunks(batch_ids).enumerate() {
-        query.clear();
+        let mut query = Vec::with_capacity(8 + ids.len() * FILE_ID_BYTES);
         query.extend_from_slice(&journal.to_le_bytes());
         query.extend_from_slice(ids.as_flattened());
         let mut cursor = start;
@@ -236,6 +235,11 @@ pub fn broker_for_each_directory_change(
                     io::ErrorKind::InvalidData,
                     "invalid directory recovery cursor",
                 ));
+            }
+            if response.next_usn == end {
+                // The observer can reenter the broker. The finished batch
+                // must release its request before running that callback.
+                drop(std::mem::take(&mut query));
             }
             let mut input = payload.as_slice();
             let mut count = 0usize;

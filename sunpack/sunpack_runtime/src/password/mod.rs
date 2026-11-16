@@ -1,3 +1,4 @@
+pub(crate) mod attempts;
 pub(crate) mod context;
 pub(crate) mod enc;
 pub(crate) mod input;
@@ -10,6 +11,8 @@ use crate::io::archive_state::{ArchiveInput, OpenMode};
 use crate::io::read_fault::ReadFault;
 use crate::io::reader::{ManagedReader, NativeArchiveSession};
 use std::{io, sync::Arc};
+
+pub(crate) const VERIFICATION_BATCH_SIZE: usize = 256;
 
 #[derive(Debug)]
 pub(crate) struct PasswordVerification {
@@ -51,6 +54,7 @@ fn password_read_fault_status(fault: &ReadFault) -> PasswordVerification {
 }
 
 pub(crate) fn verify(
+    preparation: &mut context::Preparation,
     input: &ArchiveInput,
     passwords: &[Arc<str>],
     sessions: &[NativeArchiveSession],
@@ -60,10 +64,11 @@ pub(crate) fn verify(
     let eocd_offset = eocd_offset.or(input.analysis.zip_eocd_offset);
     if input.mode.structured() {
         if format == "rar" {
-            return rar::rar_fast_verify_passwords_from_volumes(&input.parts, passwords, sessions);
+            return rar::rar_fast_verify_passwords_from_volumes(preparation, &input.parts, passwords, sessions);
         }
         if format == "zip" && input.analysis.zip_spanned {
             return zip::zip_fast_verify_passwords_from_volumes(
+                preparation,
                 &input.parts,
                 passwords,
                 eocd_offset,
@@ -90,12 +95,14 @@ pub(crate) fn verify(
             Some(ranges[0].path.as_str())
         } else if !ranges.is_empty() {
             return match format {
-                "enc" => enc::enc_fast_verify_passwords_from_ranges(&ranges, passwords, sessions),
-                "rar" => rar::rar_fast_verify_passwords_from_ranges(&ranges, passwords, sessions),
+                "enc" => enc::enc_fast_verify_passwords_from_ranges(preparation, &ranges, passwords, sessions),
+                "rar" => rar::rar_fast_verify_passwords_from_ranges(preparation, &ranges, passwords, sessions),
                 "7z" => seven_zip::seven_zip_fast_verify_passwords_from_ranges(
+                    preparation,
                     &ranges, passwords, sessions,
                 ),
                 "zip" => zip::zip_fast_verify_passwords_from_ranges(
+                    preparation,
                     &ranges,
                     passwords,
                     eocd_offset,
@@ -116,10 +123,10 @@ pub(crate) fn verify(
         })
         .map_or_else(|| ManagedReader::open(path), Ok)?;
     match format {
-        "enc" => enc::enc_fast_verify_passwords_with_reader(&reader, passwords),
-        "rar" => rar::rar_fast_verify_passwords_with_reader(&reader, passwords),
-        "7z" => seven_zip::seven_zip_fast_verify_passwords_with_reader(&reader, passwords),
-        "zip" => zip::zip_fast_verify_passwords_with_reader(&reader, passwords, eocd_offset),
+        "enc" => enc::enc_fast_verify_passwords_with_reader(preparation, &reader, passwords),
+        "rar" => rar::rar_fast_verify_passwords_with_reader(preparation, &reader, passwords),
+        "7z" => seven_zip::seven_zip_fast_verify_passwords_with_reader(preparation, &reader, passwords),
+        "zip" => zip::zip_fast_verify_passwords_with_reader(preparation, &reader, passwords, eocd_offset),
         _ => Ok(unsupported()),
     }
 }

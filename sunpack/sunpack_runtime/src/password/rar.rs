@@ -6,7 +6,7 @@ use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
 use crate::io::scratch::{Blob, Spool};
-use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
+use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
 use crate::password::input::{
     parse_ranges, parse_volumes, ranges_key, read_ranges_at_field, VolumeSet,
 };
@@ -95,10 +95,11 @@ where
 }
 
 pub(crate) fn rar_fast_verify_passwords_with_reader(
+    preparation: &mut Preparation,
     reader: &ManagedReader,
     candidates: &[Arc<str>],
 ) -> std::io::Result<PasswordVerification> {
-    verify_prepared(InputKey::file("rar", reader)?, candidates, || {
+    preparation.verify(InputKey::file("rar", reader)?, candidates, || {
         prepare_rar(|offset, len, field| {
             reader.read_at(offset, len).map_err(|error| {
                 ReadFault::from_io(error, "read_at", offset, len, 0, reader.len())
@@ -110,24 +111,26 @@ pub(crate) fn rar_fast_verify_passwords_with_reader(
 }
 
 pub(crate) fn rar_fast_verify_passwords_from_ranges(
+    preparation: &mut Preparation,
     ranges: &[&InputExtent],
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
-    verify_prepared(ranges_key("rar", &parsed)?, candidates, || {
+    preparation.verify(ranges_key("rar", &parsed)?, candidates, || {
         prepare_rar(|offset, len, field| read_ranges_at_field(&parsed, offset, len, field))
             .map(PasswordContext::Rar)
     })
 }
 
 pub(crate) fn rar_fast_verify_passwords_from_volumes(
+    preparation: &mut Preparation,
     parts: &[InputPart],
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let volumes = VolumeSet::new(parse_volumes(parts, sessions)?);
-    verify_prepared(volumes.key("rar")?, candidates, || {
+    preparation.verify(volumes.key("rar")?, candidates, || {
         volumes.require_contiguous()?;
         prepare_rar(|offset, len, field| volumes.first_volume_read_at_field(offset, len, field))
             .map(PasswordContext::Rar)
@@ -458,14 +461,6 @@ enum RarPasswordMaterial {
 }
 
 impl RarPasswordContext {
-    pub(crate) fn retained_bytes(&self) -> usize {
-        match &self.material {
-            RarPasswordMaterial::Rar5(_) => std::mem::size_of::<Rar5EncryptionHeader>(),
-            RarPasswordMaterial::Stored { encrypted, .. } => encrypted.len(),
-            RarPasswordMaterial::Header(encrypted) => encrypted.capacity(),
-        }
-    }
-
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         match &self.material {
             RarPasswordMaterial::Rar5(header) => verify_rar5_material(header, candidates),

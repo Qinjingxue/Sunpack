@@ -1,7 +1,7 @@
-use crate::collections::CacheOrder;
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::ReadFault;
 use crate::io::resource_lifecycle::TrackedFile;
+use crate::password::attempts::AttemptCache;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -9,7 +9,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::SystemTime;
 
 #[cfg(test)]
@@ -23,7 +23,6 @@ const DEFAULT_SHARED_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const CACHE_SHARDS: usize = u64::BITS as usize;
 const HOT_CACHE_FRACTION: usize = 4;
 const HOT_EDGE_BYTES: u64 = 4 * 1024 * 1024;
-const DEFAULT_HANDLE_CAPACITY: usize = 256;
 const MAX_CACHEABLE_READ_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_ORDER_COMPACT_STALE_MIN: usize = 64;
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -144,6 +143,9 @@ pub(crate) trait ByteSource: Send + Sync {
         Ok(())
     }
     fn file_identity(&self) -> Option<FileIdentity> {
+        None
+    }
+    fn attempt_cache(&self) -> Option<&AttemptCache> {
         None
     }
     /// Reads at most `len` bytes. A range crossing EOF is shortened.
@@ -666,6 +668,16 @@ impl NativeArchiveSession {
         (&self.path, self.reader.clone())
     }
 
+    pub(crate) fn path(&self) -> &str { &self.path }
+
+    pub(crate) fn shares_source(&self) -> bool {
+        Arc::strong_count(&self.reader.source) > 1
+    }
+
+    pub(crate) fn attempt_cache(&self) -> &AttemptCache {
+        self.reader.source.attempt_cache().expect("archive session has a physical source")
+    }
+
     pub(crate) fn generation(&self) -> io::Result<(&str, u64)> {
         Ok((&self.path, self.reader.file_identity()?.source_id))
     }
@@ -889,17 +901,28 @@ struct FileSource {
     file: RwLock<Option<TrackedFile>>,
     closed: AtomicBool,
     block_loads: Mutex<HashMap<u64, Arc<BlockLoad>>>,
+    attempts: OnceLock<Box<AttemptCache>>,
 }
 
 impl Drop for FileSource {
     fn drop(&mut self) {
+        let manager = manager();
+        if let Ok(mut handles) = manager.handles.lock() {
+            let path = self.identity.path.as_ref();
+            if handles.get(path).is_some_and(|source| std::ptr::eq(source.as_ptr(), self)) {
+                handles.remove(path);
+                if handles.capacity() > 256 {
+                    crate::collections::trim_map(&mut handles);
+                }
+            }
+        }
         // Blocks are keyed by this source's generation, so no future reader
-        // can reuse them once the last handle or in-flight reader is gone.
+        // can reuse them once the last in-flight reader is gone.
         let mut shards = *self.cached_shards.get_mut();
         while shards != 0 {
             let index = shards.trailing_zeros() as usize;
             shards &= shards - 1;
-            if let Ok(mut shard) = manager().cache_shards[index].lock() {
+            if let Ok(mut shard) = manager.cache_shards[index].lock() {
                 if shard.remove_source(self.identity.source_id) {
                     shard.compact_stale_orders();
                 }
@@ -1014,6 +1037,10 @@ impl FileSource {
 }
 
 impl ByteSource for FileSource {
+    fn attempt_cache(&self) -> Option<&AttemptCache> {
+        Some(self.attempts.get_or_init(Box::default))
+    }
+
     fn validate_cached_range(&self, _offset: u64, _len: usize) -> io::Result<()> {
         self.ensure_open()
     }
@@ -1186,7 +1213,9 @@ struct CachedSource {
 }
 
 struct ReaderManager {
-    handles: Mutex<CacheOrder<Arc<Path>, Arc<FileSource>>>,
+    // Only active borrowers own a handle. The table allows concurrent readers
+    // to share one source without extending the life of a completed probe.
+    handles: Mutex<HashMap<Arc<Path>, Weak<FileSource>>>,
     cache_shards: Box<[Mutex<CacheShard>]>,
 }
 
@@ -1303,30 +1332,6 @@ impl CacheShard {
 }
 
 impl ReaderManager {
-    fn clear_resources(&self) -> io::Result<()> {
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        let retired = std::mem::take(&mut *handles);
-        drop(handles);
-        for (_, source) in retired.iter() {
-            source.close()?;
-        }
-        // A retired handle cannot publish a block after its close. Keep the
-        // sources alive until their cache shards have been cleared.
-        for shard in &self.cache_shards {
-            let mut shard = shard
-                .lock()
-                .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-            let empty = CacheShard::new(shard.hot.capacity, shard.general.capacity);
-            let retired = std::mem::replace(&mut *shard, empty);
-            drop(shard);
-            drop(retired);
-        }
-        Ok(())
-    }
-
     fn release_resources_under_roots(
         &self,
         roots: &[PathBuf],
@@ -1342,7 +1347,7 @@ impl ReaderManager {
             .filter(|(path, _)| path_is_under_roots(path, roots))
             .map(|(path, _)| Arc::clone(path))
             .collect();
-        let sources: Vec<_> = matching.iter().filter_map(|path| handles.remove(path)).collect();
+        let sources: Vec<_> = matching.iter().filter_map(|path| handles.remove(path)?.upgrade()).collect();
         drop(handles);
         for source in &sources {
             source.close()?;
@@ -1378,9 +1383,11 @@ impl ReaderManager {
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        let existing = handles.get_mut(canonical.as_path());
-        if let Some(existing) = existing.as_ref().filter(|source| source.physical == physical) {
-            return Ok(Arc::clone(existing));
+        let existing = handles.get(canonical.as_path()).and_then(Weak::upgrade);
+        if let Some(existing) = &existing {
+            if existing.physical == physical {
+                return Ok(Arc::clone(existing));
+            }
         }
         let source = Arc::new(FileSource {
             identity: FileIdentity {
@@ -1392,17 +1399,13 @@ impl ReaderManager {
             file: RwLock::new(Some(file)),
             closed: AtomicBool::new(false),
             block_loads: Mutex::new(HashMap::new()),
+            attempts: OnceLock::new(),
         });
-        // Active readers can keep the old generation. Drop retired sources
-        // outside the handle lock, as their destruction also takes shard locks.
-        let retired = if let Some(existing) = existing {
-            Some(std::mem::replace(existing, Arc::clone(&source)))
-        } else {
-            handles.insert(Arc::clone(&source.identity.path), Arc::clone(&source), DEFAULT_HANDLE_CAPACITY)
-                .map(|(_, source)| source)
-        };
+        handles.insert(Arc::clone(&source.identity.path), Arc::downgrade(&source));
         drop(handles);
-        drop(retired);
+        // The overlapping generation may have ended while we opened this
+        // file. Drop the borrowed reference after unlocking the table.
+        drop(existing);
 
         Ok(source)
     }
@@ -1549,16 +1552,6 @@ fn cache_tier(source: &FileSource, index: u64) -> CacheTier {
     } else {
         CacheTier::General
     }
-}
-
-pub(crate) fn clear_reader_resources() -> io::Result<()> {
-    crate::relations::clear_regex_caches();
-    crate::password::context::clear();
-    crate::formats::seven_zip::clear_seven_zip_kdf_cache();
-    if let Some(manager) = MANAGER.get() {
-        manager.clear_resources()?;
-    }
-    Ok(())
 }
 
 pub(crate) fn release_reader_resources_under_resolved_roots(roots: &[PathBuf]) -> io::Result<()> {

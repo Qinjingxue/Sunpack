@@ -460,15 +460,19 @@ namespace sunpack::sevenzip
             return bytes;
         }
 
-        // The registry aggregates small pools before requesting coarse reclaim.
-        // Only free buffers are touched; IOCP keeps ownership of in-flight data.
+        void trim_completed_batch() noexcept {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // A lease can be acquired again before the registry calls us.
+            if (!active_jobs_.empty() || !active_files_.empty() || free_buffers_.size() != buffers_.size()) return;
+            // Keep one file's write window hot. Deeper windows serve
+            // concurrent writers and are funded again as demand returns.
+            trim_free_payloads_locked(kDefaultFileInFlightBytes);
+        }
+
+        // Memory pressure can reclaim free buffers even during a batch.
         void reclaim_idle_memory() noexcept {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (auto *buffer : free_buffers_)
-            {
-                buffer->data.reset();
-                buffer->capacity = 0;
-            }
+            trim_free_payloads_locked(0);
         }
 
         HRESULT write(
@@ -506,7 +510,7 @@ namespace sunpack::sevenzip
                 bool newly_acquired_staging = false;
                 UInt32 previous_size = 0;
                 UInt32 chunk = 0;
-                HRESULT setup_error = S_OK;
+                Buffer *buffer = nullptr;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
 
@@ -542,7 +546,7 @@ namespace sunpack::sevenzip
                         }
                     }
 
-                    Buffer *buffer = file->staging_buffer;
+                    buffer = file->staging_buffer;
                     if (!buffer && free_buffers_.empty()) continue;
                     previous_size = buffer ? buffer->size : 0;
                     const std::size_t job_available = job->max_inflight_bytes -
@@ -558,57 +562,42 @@ namespace sunpack::sevenzip
                     if (chunk_size == 0) continue;
 
                     if (!buffer) buffer = free_buffers_.back();
-                    try
+                    if (!file->staging_buffer)
                     {
-                        if (buffer->capacity < previous_size + chunk_size)
-                        {
-                            buffer->reserve_payload(previous_size + chunk_size);
-                        }
-                        if (!file->staging_buffer)
-                        {
-                            free_buffers_.pop_back();
-                            buffer->file = file;
-                            buffer->size = 0;
-                            file->staging_buffer = buffer;
-                            newly_acquired_staging = true;
-                        }
-                        chunk = static_cast<UInt32>(chunk_size);
-                        job->inflight_bytes += chunk_size;
-                        file->inflight_bytes += chunk_size;
+                        free_buffers_.pop_back();
+                        buffer->file = file;
+                        buffer->size = 0;
+                        file->staging_buffer = buffer;
+                        newly_acquired_staging = true;
                     }
-                    catch (...)
-                    {
-                        mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
-                        set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
-                        setup_error = E_OUTOFMEMORY;
-                    }
+                    chunk = static_cast<UInt32>(chunk_size);
+                    job->inflight_bytes += chunk_size;
+                    file->inflight_bytes += chunk_size;
                 }
 
-                if (setup_error != S_OK)
-                {
-                    producer_cv_.notify_all();
-                    if (processed_size)
-                    {
-                        *processed_size = consumed;
-                    }
-                    return setup_error;
+                bool allocation_failed = false;
+                // The producer mutex owns this staging buffer until enqueue.
+                // Growing it cannot block completions or other producers.
+                if (buffer->capacity < previous_size + chunk) {
+                    try { buffer->reserve_payload(previous_size + chunk); }
+                    catch (...) { allocation_failed = true; }
                 }
-
-                std::memcpy(
-                    file->staging_buffer->data.get() + previous_size,
-                    source + consumed,
-                    chunk);
+                if (!allocation_failed)
+                    std::memcpy(buffer->data.get() + previous_size, source + consumed, chunk);
 
                 HRESULT enqueue_result = S_OK;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
+                    if (allocation_failed) {
+                        mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                        set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                    }
                     const HRESULT error = terminal_result_locked(job);
-                    Buffer *buffer = file->staging_buffer;
-                    if (error != S_OK || file->close_requested || !buffer)
+                    if (error != S_OK || file->close_requested)
                     {
                         job->inflight_bytes -= chunk;
                         file->inflight_bytes -= chunk;
-                        if (newly_acquired_staging && buffer && buffer->size == previous_size)
+                        if (newly_acquired_staging)
                         {
                             file->staging_buffer = nullptr;
                             buffer->file.reset();
@@ -915,7 +904,7 @@ namespace sunpack::sevenzip
                 producer_cv_.wait(lock, [this] { return work_queue_.empty() && active_files_.empty(); });
             }
             // No packet can reference a recycled buffer or a closed file now.
-            space_wake_->disable();
+            disable_space_wake();
             for (std::size_t i = 0; i < workers_.size(); ++i)
                 PostQueuedCompletionStatus(completion_port_, 0, kStopPacket, nullptr);
             for (auto &worker : workers_) if (worker.joinable()) worker.join();
@@ -924,6 +913,23 @@ namespace sunpack::sevenzip
         }
 
     private:
+        void trim_free_payloads_locked(std::size_t remaining) noexcept
+        {
+            // Producers take from the back. Preserve their nearest buffers
+            // first, including those already sized for a full write.
+            for (auto it = free_buffers_.rbegin(); it != free_buffers_.rend(); ++it)
+            {
+                auto *buffer = *it;
+                if (buffer->capacity <= remaining)
+                {
+                    remaining -= buffer->capacity;
+                    continue;
+                }
+                buffer->data.reset();
+                buffer->capacity = 0;
+            }
+        }
+
         void unregister_file_locked(const FileStatePtr &file) noexcept
         {
             // The registry owns each file only while I/O is in progress.
@@ -976,11 +982,18 @@ namespace sunpack::sevenzip
                         worker.join();
                     }
                 }
-                if (space_wake_) space_wake_->disable();
+                disable_space_wake();
                 CloseHandle(completion_port_);
                 completion_port_ = nullptr;
                 throw;
             }
+        }
+
+        void disable_space_wake() noexcept
+        {
+            if (!space_wake_) return;
+            space_wake_->disable();
+            if (state_->space_gate) state_->space_gate->unsubscribe(space_wake_);
         }
 
         bool write_through() const noexcept { return config_.write_through; }

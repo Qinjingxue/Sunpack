@@ -173,16 +173,19 @@ void CBase::PrepareKey()
 {
   // BCJ2 threads use same password. So we use long lock.
   MT_LOCK
-  
+
+  // Keep the process cache small even when a password comes from a file or
+  // pipe. Oversized keys still benefit from the decoder-local cache.
+  const bool cacheGlobally = _key.Password.Size() <= (4U << 10);
   bool finded = false;
   if (!_cachedKeys.GetKey(_key))
   {
-    finded = g_GlobalKeyCache.GetKey(_key);
+    finded = cacheGlobally && g_GlobalKeyCache.GetKey(_key);
     if (!finded)
       _key.CalcKey();
     _cachedKeys.Add(_key);
   }
-  if (!finded)
+  if (cacheGlobally && !finded)
     g_GlobalKeyCache.FindAndAdd(_key);
 }
 

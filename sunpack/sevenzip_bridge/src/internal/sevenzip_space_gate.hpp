@@ -322,6 +322,15 @@ namespace sunpack::sevenzip
             wake_targets_.push_back(target);
         }
 
+        void unsubscribe(const std::shared_ptr<SpaceWakeTarget> &target) noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            wake_targets_.erase(std::remove_if(wake_targets_.begin(), wake_targets_.end(),
+                [&target](const auto &value) {
+                    return !value.owner_before(target) && !target.owner_before(value);
+                }), wake_targets_.end());
+        }
+
         // 全项目唯一的卷空间查询入口，只允许 monitor 调用：writer / probe owner 线程从不
         // 查询磁盘空间，GetDiskFreeSpaceExW 因此不会阻塞写路径。
         // query_root_ 未解析（synthetic 卷首次失败前）时返回 false。

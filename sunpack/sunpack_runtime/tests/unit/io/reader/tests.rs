@@ -539,6 +539,28 @@ fn shared_request_data_survives_file_resource_release() {
 }
 
 #[test]
+fn final_reader_releases_source_and_blocks_without_a_cleanup_event() {
+    let path = temp_file("managed_reader_final_borrow", b"payload");
+    let first = ManagedReader::open(&path).unwrap();
+    let second = ManagedReader::open(&path).unwrap();
+    assert!(Arc::ptr_eq(&first.source, &second.source));
+    let identity = first.file_identity().unwrap();
+    let data = first.read_cached_at(0, 7).unwrap();
+
+    drop(first);
+    assert!(cached_source_has_blocks(identity.source_id));
+    drop(second);
+
+    assert!(!manager().handles.lock().unwrap().contains_key(&identity.path));
+    assert!(!cached_source_has_blocks(identity.source_id));
+    assert_eq!(&*data, b"payload");
+    let reopened = ManagedReader::open(&path).unwrap();
+    assert_ne!(identity, reopened.file_identity().unwrap());
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn tiny_and_empty_blocks_charge_cache_budget() {
     // Large-payload eviction tests cannot expose unlimited empty cache
     // entries. Mix a tiny payload with an empty block at each tier's budget.
@@ -785,30 +807,6 @@ fn readers_share_file_handle_and_block_cache() {
     assert!(Arc::ptr_eq(&first, &second));
     assert_eq!(second.read_at(2, 4).unwrap(), b"cdef");
     let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn handle_pool_keeps_recent_file_source_alive_between_readers() {
-    let path = temp_file("managed_reader_handle_pool", b"abcdefgh");
-    let first = manager().open_file(&path).unwrap();
-    let first_ptr = Arc::as_ptr(&first);
-    drop(first);
-    let second = manager().open_file(&path).unwrap();
-    assert_eq!(first_ptr, Arc::as_ptr(&second));
-    // Use a local pool so concurrent readers cannot change the LRU order.
-    let other = temp_file("managed_reader_other_handle", b"second");
-    let third = manager().open_file(&other).unwrap();
-    let newest = temp_file("managed_reader_newest_handle", b"third");
-    let fourth = manager().open_file(&newest).unwrap();
-    let mut pool = CacheOrder::default();
-    pool.insert(Arc::clone(&second.identity.path), Arc::clone(&second), 2);
-    pool.insert(Arc::clone(&third.identity.path), Arc::clone(&third), 2);
-    assert_eq!(Arc::as_ptr(pool.get_mut(second.identity.path.as_ref()).unwrap()), first_ptr);
-    let (_, retired) = pool.insert(Arc::clone(&fourth.identity.path), fourth, 2).unwrap();
-    assert!(Arc::ptr_eq(&third, &retired));
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(other);
-    let _ = std::fs::remove_file(newest);
 }
 
 #[test]

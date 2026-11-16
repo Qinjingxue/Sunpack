@@ -141,18 +141,22 @@ class RequestReader {
 public:
     explicit RequestReader(std::istream& input) : input_(input) {}
     bool start() {
-        // Keep the ordinary request buffer warm without pinning large
-        // allocations across an idle wait for the next request.
-        constexpr std::size_t retained_bytes = 32 * 1024;
-        data_ = {};
-        if (buffer_.capacity() > retained_bytes) std::string().swap(buffer_);
-        if (split_.capacity() > retained_bytes) std::string().swap(split_);
         const auto size = read_size(input_);
         if (size) load(*size);
         return size.has_value();
     }
-    void finish() const {
+    void finish() {
         if (!data_.empty() || more_) throw std::runtime_error("trailing worker request data");
+        retire_request();
+    }
+    void retire_request() noexcept {
+        // The job owns its parsed fields. Only the ordinary fragment
+        // buffer is worth keeping warm for unrelated requests.
+        constexpr std::size_t retained_bytes = 32 * 1024;
+        data_ = {};
+        more_ = false;
+        if (buffer_.capacity() > retained_bytes) std::string().swap(buffer_);
+        std::string().swap(split_);
     }
     std::string_view text() {
         expect(kText);

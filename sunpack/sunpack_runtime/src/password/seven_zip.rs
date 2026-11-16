@@ -8,7 +8,7 @@ use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
-use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
+use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
 use crate::password::input::{parse_ranges, ranges_key, VirtualRangeReader};
 use rayon::prelude::*;
 use sevenz_rust2::{Archive, EncoderMethod, Error as SevenZipError, Password};
@@ -38,21 +38,23 @@ fn seven_zip_password_pool() -> Option<&'static rayon::ThreadPool> {
 }
 
 pub(crate) fn seven_zip_fast_verify_passwords_with_reader(
+    preparation: &mut Preparation,
     reader: &ManagedReader,
     candidates: &[Arc<str>],
 ) -> std::io::Result<PasswordVerification> {
-    verify_prepared(InputKey::file("7z", reader)?, candidates, || {
+    preparation.verify(InputKey::file("7z", reader)?, candidates, || {
         prepare_seven_zip(reader.cursor(), reader.len()).map(PasswordContext::SevenZip)
     })
 }
 
 pub(crate) fn seven_zip_fast_verify_passwords_from_ranges(
+    preparation: &mut Preparation,
     ranges: &[&InputExtent],
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
-    verify_prepared(ranges_key("7z", &parsed)?, candidates, || {
+    preparation.verify(ranges_key("7z", &parsed)?, candidates, || {
         let reader = VirtualRangeReader::new(&parsed);
         let total_len = reader.len();
         prepare_seven_zip(reader, total_len).map(PasswordContext::SevenZip)
@@ -64,10 +66,6 @@ pub(crate) struct SevenZipPasswordContext {
 }
 
 impl SevenZipPasswordContext {
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.probe.retained_bytes()
-    }
-
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         if let Some((index, outcome)) =
             find_first_conclusive_header_with_probe(candidates, &self.probe)

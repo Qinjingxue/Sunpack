@@ -218,10 +218,11 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
     let mut cursor = 0;
     let mut actual = BTreeSet::new();
     let mut pages = 0;
+    let parents = HashMap::from([(11u128.to_le_bytes(), 0), (22u128.to_le_bytes(), 1)]);
     while cursor < end_usn {
         let page = scan_directories_page(
             42,
-            &[11u128.to_le_bytes(), 22u128.to_le_bytes()],
+            &parents,
             cursor,
             end_usn,
             |start, output| {

@@ -576,7 +576,6 @@ bool registry_creation_failure_does_not_retain_entries() {
         if (!failed) {
             if (!lease.valid()) return false;
             lease.reset();
-            registry.reap_idle();
             return registry.volume_count() == 0;
         }
         if (registry.volume_count() != 0 || registry.next_reap_deadline()) {
@@ -671,8 +670,10 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
     VolumeWriterRegistry registry(config);
 
     // A synthetic key is reclaimed immediately after its lease drops.
+    std::weak_ptr<AsyncFileWriter> synthetic_writer;
     {
         auto lease = registry.acquire("job:probe-1");
+        synthetic_writer = lease.writer_pointer();
         if (!lease.valid() || lease.writer().volume_state()->persistent) {
             std::cerr << "synthetic key was not marked non-persistent\n";
             return false;
@@ -688,14 +689,8 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
             return false;
         }
     }
-    // The deadline is already in the past for a synthetic volume.
-    if (!registry.next_reap_deadline()) {
-        std::cerr << "synthetic volume armed no reclaim deadline\n";
-        return false;
-    }
-    registry.reap_idle();
-    if (registry.volume_count() != 0) {
-        std::cerr << "synthetic entry survived reclamation\n";
+    if (registry.volume_count() != 0 || registry.next_reap_deadline() || !synthetic_writer.expired()) {
+        std::cerr << "synthetic writer survived its last lease\n";
         return false;
     }
 
@@ -762,13 +757,42 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         auto lease = immediate.acquire("volume-immediate");
         persistent_writer = lease.writer_pointer();
     }
-    const bool armed = immediate.next_reap_deadline().has_value();
-    immediate.reap_idle();
-    if (!armed || immediate.volume_count() != 1 || !persistent_writer.expired()) {
+    if (immediate.next_reap_deadline() || immediate.volume_count() != 1 || !persistent_writer.expired()) {
         std::cerr << "zero idle timeout retained a physical writer facility\n";
         return false;
     }
     return true;
+}
+
+// Keep multiple partial buffers outstanding so a fast disk cannot avoid the
+// high-water allocation. The final lease trims surplus without expiring the writer.
+bool registry_trims_payloads_at_completion(const std::filesystem::path& directory) {
+    AsyncWriterConfig config;
+    config.buffer_count = 16;
+    VolumeWriterRegistry registry(config);
+    auto lease = registry.acquire("batch-volume");
+    auto overlapping = registry.acquire("batch-volume");
+    auto writer = lease.writer_pointer();
+    const auto job = writer->make_job();
+    const std::vector<unsigned char> payload(64U << 10, 0x51);
+    std::vector<AsyncFileWriter::FileStatePtr> files;
+    for (unsigned i = 0; i < 12; ++i) {
+        auto file = writer->make_file(job, (directory / (L"batch-" + std::to_wstring(i))).wstring(), i, i);
+        UInt32 processed = 0;
+        if (writer->write(file, payload.data(), static_cast<UInt32>(payload.size()), &processed) != S_OK ||
+            processed != payload.size()) return false;
+        files.push_back(std::move(file));
+    }
+    for (const auto& file : files) {
+        writer->record_operation_result(file, 0);
+        writer->close_file(file, {});
+    }
+    if (writer->finish_job(job) != S_OK || writer->idle_memory_bytes() != (12U << 20)) return false;
+    lease.reset();
+    if (writer->idle_memory_bytes() != (12U << 20)) return false;
+    overlapping.reset();
+    auto reused = registry.acquire("batch-volume");
+    return &reused.writer() == writer.get() && writer->idle_memory_bytes() == AsyncFileWriter::kDefaultFileInFlightBytes;
 }
 
 }  // namespace
@@ -791,6 +815,7 @@ int main() {
         registry_creation_allows_other_volumes() &&
         registry_routes_by_volume_and_releases_leases(directory) &&
         registry_reclaims_aggregate_small_pools(directory) &&
+        registry_trims_payloads_at_completion(directory) &&
         registry_reclaims_idle_facilities(directory);
     std::error_code error;
     std::filesystem::remove_all(directory, error);

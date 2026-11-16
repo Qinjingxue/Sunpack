@@ -5,7 +5,7 @@ use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
-use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
+use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
 use crate::password::input::{
     parse_ranges, parse_volumes, ranges_key, VirtualRangeReader, VolumeSet,
 };
@@ -24,18 +24,20 @@ const AES_PARALLEL_PASSWORD_THRESHOLD: usize = 4;
 const ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD: usize = 256;
 
 pub(crate) fn zip_fast_verify_passwords_with_reader(
+    preparation: &mut Preparation,
     reader: &ManagedReader,
     candidates: &[Arc<str>],
     eocd_offset: Option<u64>,
 ) -> std::io::Result<PasswordVerification> {
     let key = InputKey::file("zip", reader)?;
-    verify_prepared(key, candidates, || {
+    preparation.verify(key, candidates, || {
         prepare_zip_stream(&mut reader.cursor(), reader.len(), eocd_offset)
             .map(PasswordContext::Zip)
     })
 }
 
 pub(crate) fn zip_fast_verify_passwords_from_ranges(
+    preparation: &mut Preparation,
     ranges: &[&InputExtent],
     candidates: &[Arc<str>],
     eocd_offset: Option<u64>,
@@ -43,7 +45,7 @@ pub(crate) fn zip_fast_verify_passwords_from_ranges(
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
     let key = ranges_key("zip", &parsed)?;
-    verify_prepared(key, candidates, || {
+    preparation.verify(key, candidates, || {
         let mut reader = VirtualRangeReader::new(&parsed);
         let total_len = reader.len();
         prepare_zip_stream(&mut reader, total_len, eocd_offset).map(PasswordContext::Zip)
@@ -51,13 +53,14 @@ pub(crate) fn zip_fast_verify_passwords_from_ranges(
 }
 
 pub(crate) fn zip_fast_verify_passwords_from_volumes(
+    preparation: &mut Preparation,
     parts: &[InputPart],
     candidates: &[Arc<str>],
     eocd_offset: Option<u64>,
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let volumes = VolumeSet::new(parse_volumes(parts, sessions)?);
-    verify_prepared(volumes.key("zip")?, candidates, || {
+    preparation.verify(volumes.key("zip")?, candidates, || {
         prepare_zip_volumes(&volumes, eocd_offset).map(PasswordContext::Zip)
     })
 }
@@ -514,13 +517,6 @@ impl ZipPasswordContext {
             salt: material[..salt_len].to_vec(),
             verifier: material[salt_len..].try_into().unwrap(),
         })
-    }
-
-    pub(crate) fn retained_bytes(&self) -> usize {
-        match self {
-            Self::Aes { salt, .. } => salt.len() + 2,
-            Self::ZipCrypto { .. } => 12,
-        }
     }
 
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {

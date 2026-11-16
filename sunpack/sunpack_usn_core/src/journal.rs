@@ -91,6 +91,14 @@ impl JournalReader {
         })
     }
 
+    pub fn volume_guid(&self) -> &Arc<str> {
+        &self.volume_guid
+    }
+
+    pub fn has_open_volume(&self) -> bool {
+        self.handle.is_some()
+    }
+
     pub fn probe_volume(&mut self) -> io::Result<(u64, i64)> {
         self.with_volume(|volume, volume_guid| {
             let (journal_id, next_usn) =
@@ -134,11 +142,11 @@ impl JournalReader {
     pub fn read_directories_changes(
         &mut self,
         expected_journal: u64,
-        directories: &[[u8; FILE_ID_BYTES]],
+        parents: &HashMap<[u8; FILE_ID_BYTES], u32>,
         start_usn: i64,
         end_usn: i64,
     ) -> io::Result<DirectoryChangesPage> {
-        if start_usn < 0 || end_usn <= start_usn || directories.is_empty() {
+        if start_usn < 0 || end_usn <= start_usn || parents.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid directory recovery query",
@@ -155,7 +163,7 @@ impl JournalReader {
                     "recovery end USN is beyond journal head",
                 ));
             }
-            scan_directories_page(journal_id, directories, start_usn, end_usn, |cursor, output| {
+            scan_directories_page(journal_id, parents, start_usn, end_usn, |cursor, output| {
                 read_journal_page(volume, journal_id, cursor, output)
             })
         })
@@ -345,16 +353,11 @@ fn next_journal_record<'a>(records: &mut &'a [u8]) -> io::Result<&'a [u8]> {
 // A record may yield both a directory change and a child name; keep it atomic.
 fn scan_directories_page(
     journal_id: u64,
-    directories: &[[u8; FILE_ID_BYTES]],
+    parents: &HashMap<[u8; FILE_ID_BYTES], u32>,
     start_usn: i64,
     end_usn: i64,
     mut read: impl FnMut(i64, &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<DirectoryChangesPage> {
-    let parents: HashMap<_, _> = directories
-        .iter()
-        .enumerate()
-        .map(|(index, id)| (*id, index as u32))
-        .collect();
     let mut cursor = start_usn;
     let mut payload_bytes = 0usize;
     let mut changed = BTreeSet::new();
@@ -367,7 +370,7 @@ fn scan_directories_page(
             let record = next_journal_record(&mut records)?;
             let record = record_directory_changes(
                 record,
-                &parents,
+                parents,
                 cursor,
                 end_usn,
                 &mut scratch,

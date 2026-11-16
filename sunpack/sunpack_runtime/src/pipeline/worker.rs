@@ -330,6 +330,7 @@ impl Mailbox {
 
 #[derive(Default)]
 struct Updates {
+    retry_payload: Option<InputPayload>,
     started: bool,
     progress: Option<Progress>,
     resources: Option<ResourceWait>,
@@ -534,7 +535,10 @@ impl Process {
         cancellation.check_io()?;
         let job_id = request.job_id.clone();
         let payload = match small_request(&request)? {
-            Some(bytes) => InputPayload::Frame(Arc::new(bytes)),
+            Some(bytes) => {
+                drop(request);
+                InputPayload::Frame(Arc::new(bytes))
+            }
             None => InputPayload::Request(Arc::new(request), cancellation.clone()),
         };
         self.submit_payload(&job_id, payload, cancellation, interest, on_update).await
@@ -550,7 +554,10 @@ impl Process {
     ) -> io::Result<WorkerFrame> {
         let mailbox = Arc::new(Mailbox {
             interest,
-            ..Mailbox::default()
+            updates: Mutex::new(Updates {
+                retry_payload: Some(payload),
+                ..Updates::default()
+            }),
         });
         let wake_mailbox = Arc::clone(&mailbox);
         let _subscription = cancellation.subscribe(move || wake_mailbox.update(|_| {}));
@@ -561,7 +568,15 @@ impl Process {
         let result = async {
             let mut retry = false;
             loop {
-                if let Err(error) = self.shared.send_payload(payload.clone()).wait().await {
+                let payload = mailbox.updates.lock().unwrap().retry_payload.clone();
+                let sent = match payload {
+                    Some(payload) => self.shared.send_payload(payload).wait().await,
+                    None => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "worker rejected an accepted job",
+                    )),
+                };
+                if let Err(error) = sent {
                     let mut state = self.shared.state.lock().unwrap();
                     if state.jobs.remove(job_id).is_some() && retry {
                         state.grant_retry();
@@ -962,10 +977,18 @@ impl Shared {
         let Some(job) = state.jobs.get_mut(job_id) else {
             return;
         };
+        let event = string(&frame.summary, "event");
+        if kind == "native_event" && event == "job_accepted" {
+            // The queued pipe write holds its own reference until it finishes.
+            // Acknowledgment only retires the copy reserved for a retry.
+            let retired = job.mailbox.updates.lock().unwrap().retry_payload.take();
+            drop(state);
+            drop(retired);
+            return;
+        }
         if job.result.is_some() {
             return;
         }
-        let event = string(&frame.summary, "event");
         if matches!(kind, "progress" | "native_memory")
             && (job.mailbox.interest == WorkerUpdates::None || job.resource_event(event, &frame.summary)) {
             return;

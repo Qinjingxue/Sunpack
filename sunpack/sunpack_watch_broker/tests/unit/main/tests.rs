@@ -242,24 +242,17 @@ fn journal_read_requires_a_bounded_usn_interval_and_file_identity() {
 #[test]
 fn dispatcher_reuses_volume_contexts_and_allows_overlapping_reads() {
     let dispatcher = JournalDispatcher::new().unwrap();
-    let deadline = Instant::now() + VOLUME_CONTEXT_IDLE_TTL;
+    let now = Instant::now();
     let first = dispatcher
-        .reader_for(
-            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}",
-            deadline,
-        )
+        .reader_for(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}")
         .unwrap();
+    let key = Arc::clone(first.lock().unwrap().volume_guid());
+    dispatcher.update_cache(&key, &first, true, now).unwrap();
     let same = dispatcher
-        .reader_for(
-            r"\\?\VOLUME{01234567-89AB-CDEF-0123-456789ABCDEF}",
-            deadline,
-        )
+        .reader_for(r"\\?\VOLUME{01234567-89AB-CDEF-0123-456789ABCDEF}")
         .unwrap();
     let other = dispatcher
-        .reader_for(
-            r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}",
-            deadline,
-        )
+        .reader_for(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}")
         .unwrap();
     assert!(Arc::ptr_eq(&first, &same));
     assert!(!Arc::ptr_eq(&first, &other));
@@ -287,15 +280,58 @@ fn dispatcher_schedules_expiry_and_preserves_in_use_readers() {
     let now = Instant::now();
     let deadline = now + VOLUME_CONTEXT_IDLE_TTL;
     let reader = dispatcher
-        .reader_for(
-            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}",
-            deadline,
-        )
+        .reader_for(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}")
         .unwrap();
+    let key = Arc::clone(reader.lock().unwrap().volume_guid());
+    assert!(dispatcher.entries.lock().unwrap().is_empty());
+    dispatcher.update_cache(&key, &reader, false, now).unwrap();
+    assert!(dispatcher.entries.lock().unwrap().is_empty());
+    dispatcher.update_cache(&key, &reader, true, now).unwrap();
     assert_eq!(dispatcher.reap_idle(now).unwrap(), Some(deadline));
     assert_eq!(dispatcher.reap_idle(deadline).unwrap(), None);
-    assert_eq!(dispatcher.entries.lock().unwrap().len(), 1);
-    drop(reader);
-    assert_eq!(dispatcher.reap_idle(deadline).unwrap(), None);
-    assert!(dispatcher.entries.lock().unwrap().is_empty());
+    assert_eq!(dispatcher.entries.lock().unwrap().capacity(), 0);
+    assert_eq!(Arc::strong_count(&reader), 1);
+    dispatcher.update_cache(&key, &reader, true, deadline).unwrap();
+    assert_eq!(dispatcher.reap_idle(deadline).unwrap(), Some(deadline + VOLUME_CONTEXT_IDLE_TTL));
+    dispatcher.update_cache(&key, &reader, false, deadline).unwrap();
+    assert_eq!(dispatcher.entries.lock().unwrap().capacity(), 0);
+}
+
+#[test]
+fn directory_query_is_one_message_and_keeps_wire_indices() {
+    // A body crossing a pipe fragment must preserve the full IDs and the
+    // last occurrence's index. A split or oversized message must be rejected.
+    let ids = (0..2049).map(|index| {
+        let id = if index == 2048 { 42 } else { index };
+        (u128::MAX - id).to_le_bytes()
+    });
+    let body: Vec<u8> = 17u64.to_le_bytes().into_iter()
+        .chain(ids.flatten())
+        .collect();
+    let announced = (body.len() as u32).to_le_bytes();
+    let mut oversized = body.clone();
+    oversized.push(0);
+    for body in [&body[..], &body[..body.len() - FILE_ID_BYTES], &oversized[..]] {
+        let mut messages = [announced.as_slice(), body].into_iter();
+        let mut message = messages.next().unwrap();
+        let result = read_directory_query(|buffer| {
+            let size = buffer.len().min(message.len());
+            buffer[..size].copy_from_slice(&message[..size]);
+            message = &message[size..];
+            if message.is_empty() {
+                message = messages.next().unwrap_or_default();
+                return Ok(IoResult::Completed(size));
+            }
+            Ok(IoResult::MoreData)
+        }).unwrap();
+        if body.len() == u32::from_le_bytes(announced) as usize {
+            let query = result.unwrap();
+            assert_eq!(query.journal, 17);
+            assert_eq!(query.parents.len(), 2048);
+            assert_eq!(query.parents[&(u128::MAX - 42).to_le_bytes()], 2048);
+            assert_eq!(query.parents[&(u128::MAX - 1024).to_le_bytes()], 1024);
+        } else {
+            assert!(result.is_none());
+        }
+    }
 }

@@ -1169,8 +1169,7 @@ public:
     NativeJobExecutor& operator=(const NativeJobExecutor&) = delete;
 
     void submit(WorkerRequest request) {
-        auto cancel_token = std::make_shared<std::atomic<bool>>(false);
-        const std::string& job_id = request.job_id;
+        const std::string job_id = request.job_id;
         bool rejected_for_capacity = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1181,6 +1180,7 @@ public:
                 any_job_failed_ = true;
                 rejected_for_capacity = true;
             } else {
+                auto cancel_token = std::make_shared<std::atomic<bool>>(false);
                 if (!job_id.empty()) {
                     std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
                     cancel_tokens_.insert_or_assign(
@@ -1200,6 +1200,7 @@ public:
         }
 
         if (rejected_for_capacity) {
+            request = {};
             print_frame(
                 (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                 (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("backpressure") + wire::key("retryable") + wire::boolean(true) + wire::key("failure_stage") + wire::text("native_admission") + wire::key("failure_kind") + wire::text("queue_capacity") + wire::key("message") + wire::text("native job queue is full") + wire::end()));
@@ -1208,6 +1209,9 @@ public:
         }
 
         condition_.notify_one();
+        // Native now owns the request. Send outside the scheduler lock, even
+        // if a worker has already begun or completed this accepted job.
+        print_job_event(job_id, "job_accepted");
     }
 
     bool cancel(const std::string& job_id) noexcept {
@@ -1675,6 +1679,8 @@ private:
                 std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
                 cancel_tokens_.erase(job_id);
             }
+            const auto finished_job_id = std::move(job.request.job_id);
+            job = {};
 
             // cpu_budget_.release(1) wakes at most one queued admission waiter.
             // Drain waiters use a separate condition variable, while the
@@ -1682,7 +1688,7 @@ private:
             if (drained) {
                 drain_condition_.notify_all();
             }
-            print_job_event(job_id, "job_finished");
+            print_job_event(finished_job_id, "job_finished");
         }
     }
 
@@ -1779,6 +1785,7 @@ int main() {
             try {
                 request = parse_worker_request(reader);
             } catch (const wire::AbandonedRequest&) {
+                reader.retire_request();
                 continue;
             }
             const bool shutdown = request.worker_command == "shutdown";

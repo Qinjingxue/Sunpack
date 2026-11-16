@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 use sunpack_usn_core::protocol::{
-    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES, REQUEST_BYTES,
-    RESPONSE_BYTES,
+    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES,
+    MAX_VOLUME_GUID_BYTES, REQUEST_BYTES, RESPONSE_BYTES,
 };
 use sunpack_usn_core::{JournalReader, PIPE_NAME, SERVICE_NAME};
 use windows_service::{
@@ -45,6 +45,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 const PIPE_BUFFER_BYTES: u32 = 4096;
+const DIRECTORY_QUERY_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_CONNECTED_CLIENTS: u32 = 64;
 const MAX_VOLUME_CONTEXTS: usize = 64;
 const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(60);
@@ -232,7 +233,7 @@ fn serve_client(
         // pipes still end the pending overlapped read.
         let request =
             match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut request_bytes)? {
-                IoResult::Stopped | IoResult::Disconnected => break,
+                IoResult::Stopped | IoResult::Disconnected | IoResult::MoreData => break,
                 IoResult::Completed(size) if size == REQUEST_BYTES => {
                     Request::decode(&request_bytes).ok()
                 }
@@ -260,36 +261,28 @@ fn serve_client(
                     ever_had_lease.store(true, Ordering::Release);
                     leased = true;
                 }
-                let mut query = Vec::new();
-                if request.opcode == Opcode::ReadDirectoriesChanges {
-                    let mut length = [0u8; 4];
-                    match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut length)? {
-                        IoResult::Completed(4) => {}
-                        _ => break,
-                    }
-                    let length = u32::from_le_bytes(length) as usize;
-                    if !(8 + FILE_ID_BYTES..=MAX_DIRECTORY_QUERY_BYTES).contains(&length)
-                        || (length - 8) % FILE_ID_BYTES != 0
-                    {
+                let query = if request.opcode == Opcode::ReadDirectoriesChanges {
+                    let Some(query) = read_directory_query(|buffer| {
+                        read_overlapped(pipe.raw(), stop_event, io_event.raw(), buffer)
+                    })?
+                    else {
                         break;
-                    }
-                    query.resize(length, 0);
-                    match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut query)? {
-                        IoResult::Completed(size) if size == length => {}
-                        _ => break,
-                    }
-                }
-                handle_request(journals, request, &query)
+                    };
+                    Some(query)
+                } else {
+                    None
+                };
+                handle_request(journals, request, query)
             };
         let (response, payload) = response;
         match write_overlapped(pipe.raw(), stop_event, io_event.raw(), &response.encode())? {
             IoResult::Completed(size) if size == RESPONSE_BYTES => {}
-            IoResult::Completed(_) | IoResult::Disconnected | IoResult::Stopped => break,
+            _ => break,
         }
         if !payload.is_empty() {
             match write_overlapped(pipe.raw(), stop_event, io_event.raw(), &payload)? {
                 IoResult::Completed(size) if size == payload.len() => {}
-                IoResult::Completed(_) | IoResult::Disconnected | IoResult::Stopped => break,
+                _ => break,
             }
         }
     }
@@ -297,6 +290,63 @@ fn serve_client(
         DisconnectNamedPipe(pipe.raw());
     }
     Ok(())
+}
+
+struct DirectoryQuery {
+    journal: u64,
+    parents: HashMap<[u8; FILE_ID_BYTES], u32>,
+}
+
+fn read_directory_query(
+    mut read: impl FnMut(&mut [u8]) -> io::Result<IoResult>,
+) -> io::Result<Option<DirectoryQuery>> {
+    let mut length = [0u8; 4];
+    if !matches!(read(&mut length)?, IoResult::Completed(4)) {
+        return Ok(None);
+    }
+    let length = u32::from_le_bytes(length) as usize;
+    if !(8 + FILE_ID_BYTES..=MAX_DIRECTORY_QUERY_BYTES).contains(&length)
+        || (length - 8) % FILE_ID_BYTES != 0
+    {
+        return Ok(None);
+    }
+
+    // Read the body of the single pipe message in ID-aligned fragments. In
+    // message mode MORE_DATA fills the buffer and leaves the same message
+    // pending. No large heap allocation is needed while waiting for its body.
+    let mut buffer = [0u8; DIRECTORY_QUERY_CHUNK_BYTES + 8];
+    let first = length.min(buffer.len());
+    if !receive_query_fragment(read(&mut buffer[..first])?, first, length) {
+        return Ok(None);
+    }
+    let journal = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+    let mut parents = HashMap::with_capacity((length - 8) / FILE_ID_BYTES);
+    let mut next_index = 0;
+    let mut insert = |bytes: &[u8]| {
+        for id in bytes.as_chunks::<FILE_ID_BYTES>().0 {
+            parents.insert(*id, next_index);
+            next_index += 1;
+        }
+    };
+    insert(&buffer[8..first]);
+    let mut remaining = length - first;
+    while remaining != 0 {
+        let size = remaining.min(buffer.len() - 8);
+        if !receive_query_fragment(read(&mut buffer[..size])?, size, remaining) {
+            return Ok(None);
+        }
+        insert(&buffer[..size]);
+        remaining -= size;
+    }
+    Ok(Some(DirectoryQuery { journal, parents }))
+}
+
+fn receive_query_fragment(result: IoResult, size: usize, remaining: usize) -> bool {
+    match result {
+        IoResult::Completed(received) => size == remaining && received == size,
+        IoResult::MoreData => size < remaining,
+        IoResult::Disconnected | IoResult::Stopped => false,
+    }
 }
 
 fn request_shape_is_valid(request: &Request<'_>) -> bool {
@@ -350,54 +400,84 @@ impl JournalDispatcher {
             .lock()
             .map_err(|_| io::Error::other("volume table poisoned"))?;
         let mut next_deadline: Option<Instant> = None;
-        entries.retain(|_, (reader, deadline)| {
+        entries.retain(|_, (_, deadline)| {
             if *deadline <= now {
-                return Arc::strong_count(reader) > 1;
+                // An active borrower owns its reader independently. A valid
+                // handle can be admitted again when that operation finishes.
+                return false;
             }
             next_deadline = Some(next_deadline.map_or(*deadline, |next| next.min(*deadline)));
             true
         });
+        trim_volume_table(&mut entries);
         Ok(next_deadline)
     }
 
-    fn reader_for(
-        &self,
-        volume_guid: &str,
-        deadline: Instant,
-    ) -> io::Result<SharedJournalReader> {
-        let normalized;
-        let volume_guid = if volume_guid.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            normalized = volume_guid.to_ascii_lowercase();
-            &normalized
+    fn reader_for(&self, volume_guid: &str) -> io::Result<SharedJournalReader> {
+        let mut normalized = [0; MAX_VOLUME_GUID_BYTES];
+        let volume_guid = if let Some(bytes) = normalized.get_mut(..volume_guid.len()) {
+            bytes.copy_from_slice(volume_guid.as_bytes());
+            bytes.make_ascii_lowercase();
+            std::str::from_utf8(bytes).expect("ASCII folding preserves UTF-8")
         } else {
             volume_guid
         };
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| io::Error::other("volume table poisoned"))?;
+        if let Some((reader, _)) = entries.get(volume_guid) {
+            return Ok(Arc::clone(reader));
+        }
+        drop(entries);
+        Ok(Arc::new(Mutex::new(JournalReader::new(volume_guid.into())?)))
+    }
+
+    fn update_cache(
+        &self,
+        key: &Arc<str>,
+        reader: &SharedJournalReader,
+        has_volume: bool,
+        now: Instant,
+    ) -> io::Result<()> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| io::Error::other("volume table poisoned"))?;
-        if let Some((reader, previous_deadline)) = entries.get_mut(volume_guid) {
-            *previous_deadline = (*previous_deadline).max(deadline);
-            return Ok(Arc::clone(reader));
-        }
-        let key: Arc<str> = volume_guid.into();
-        let reader = Arc::new(Mutex::new(JournalReader::new(Arc::clone(&key))?));
-        if entries.len() >= MAX_VOLUME_CONTEXTS {
-            let lru = entries
-                .iter()
-                .filter(|(_, (reader, _))| Arc::strong_count(reader) == 1)
-                .min_by_key(|(_, (_, deadline))| *deadline)
-                .map(|(key, _)| Arc::clone(key));
-            if let Some(lru) = lru {
-                entries.remove(&lru);
-            } else {
-                return Ok(reader);
+        let deadline = now + VOLUME_CONTEXT_IDLE_TTL;
+        if let Some((cached, previous_deadline)) = entries.get_mut(key) {
+            // A concurrent first touch may have already admitted its reader.
+            if !Arc::ptr_eq(cached, reader) {
+                return Ok(());
             }
+            if has_volume {
+                let expired = *previous_deadline <= now;
+                *previous_deadline = deadline;
+                if !expired {
+                    return Ok(());
+                }
+            } else {
+                entries.remove(key);
+                trim_volume_table(&mut entries);
+            }
+        } else if has_volume {
+            if entries.len() >= MAX_VOLUME_CONTEXTS {
+                let lru = entries
+                    .iter()
+                    .filter(|(_, (cached, _))| Arc::strong_count(cached) == 1)
+                    .min_by_key(|(_, (_, deadline))| *deadline)
+                    .map(|(key, _)| Arc::clone(key));
+                let Some(lru) = lru else { return Ok(()) };
+                entries.remove(&lru);
+            }
+            // Only a successfully opened volume can consume cache capacity.
+            entries.insert(Arc::clone(key), (Arc::clone(reader), deadline));
+        } else {
+            return Ok(());
         }
-        entries.insert(key, (Arc::clone(&reader), deadline));
         drop(entries);
         self.state_changed.signal();
-        Ok(reader)
+        Ok(())
     }
 
     fn with_reader<T>(
@@ -405,30 +485,38 @@ impl JournalDispatcher {
         volume_guid: &str,
         operation: impl FnOnce(&mut JournalReader) -> io::Result<T>,
     ) -> io::Result<T> {
-        let deadline = Instant::now() + VOLUME_CONTEXT_IDLE_TTL;
-        let reader = self.reader_for(volume_guid, deadline)?;
+        let reader = self.reader_for(volume_guid)?;
         let result = match reader.try_lock() {
-            Ok(mut cached) => operation(&mut cached),
+            Ok(mut cached) => {
+                let result = operation(&mut cached);
+                // Read and publish handle state under the reader lock, so a
+                // reopen on another request cannot race empty-entry removal.
+                let has_volume = cached.has_open_volume();
+                if result.is_ok() || !has_volume {
+                    self.update_cache(cached.volume_guid(), &reader, has_volume, Instant::now())?;
+                }
+                result
+            }
             // Synchronous operations on one volume handle serialize in
             // Windows. Use a separate handle for overlapping requests.
             Err(TryLockError::WouldBlock) => JournalReader::new(volume_guid.into())
                 .and_then(|mut reader| operation(&mut reader)),
             Err(TryLockError::Poisoned(_)) => Err(io::Error::other("journal state poisoned")),
         };
-        drop(reader);
-        // An expired entry can stay pinned by a slow journal operation. Wake
-        // the accept loop after releasing the pin so it can reap without polling.
-        if Instant::now() >= deadline {
-            self.state_changed.signal();
-        }
         result
+    }
+}
+
+fn trim_volume_table(entries: &mut VolumeTable) {
+    if entries.is_empty() || entries.capacity() / 4 > entries.len() {
+        entries.shrink_to_fit();
     }
 }
 
 fn handle_request(
     journals: &JournalDispatcher,
     request: Request<'_>,
-    query: &[u8],
+    query: Option<DirectoryQuery>,
 ) -> (Response, Vec<u8>) {
     let mut response = Response::ok(request.request_id);
     let mut payload = Vec::new();
@@ -448,14 +536,12 @@ fn handle_request(
             })
             .map(|(journal_id, reasons)| (journal_id, 0, reasons)),
         Opcode::ReadDirectoriesChanges => {
-            // serve_client validates the query frame before reading these bytes.
-            let expected = u64::from_le_bytes(query[..8].try_into().unwrap());
-            let (ids, _) = query[8..].as_chunks::<FILE_ID_BYTES>();
+            let DirectoryQuery { journal, parents } = query.expect("validated directory query");
             journals
-                .with_reader(request.volume_guid, |journal| {
-                    journal.read_directories_changes(
-                        expected,
-                        ids,
+                .with_reader(request.volume_guid, move |reader| {
+                    reader.read_directories_changes(
+                        journal,
+                        &parents,
                         request.previous_usn,
                         request.current_usn,
                     )
@@ -544,6 +630,7 @@ fn create_pipe(first_instance: bool) -> io::Result<OwnedHandle> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IoResult {
     Completed(usize),
+    MoreData,
     Stopped,
     Disconnected,
 }
@@ -712,10 +799,7 @@ fn wait_io(pipe: HANDLE, stop_event: HANDLE, overlapped: &mut OVERLAPPED) -> io:
 fn pipe_io_error(error: u32) -> io::Result<IoResult> {
     match error {
         ERROR_BROKEN_PIPE | ERROR_NO_DATA => Ok(IoResult::Disconnected),
-        ERROR_MORE_DATA => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "broker pipe message exceeds frame size",
-        )),
+        ERROR_MORE_DATA => Ok(IoResult::MoreData),
         _ => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }

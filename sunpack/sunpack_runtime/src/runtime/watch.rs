@@ -3336,19 +3336,15 @@ impl Scheduler {
                 if self.active.is_empty() && self.pending.is_empty() {
                     let engine = Arc::clone(&self.engine);
                     windows::maintain_when_foreground_idle(&engine, || {
-                        let _ = crate::io::reader::clear_reader_resources();
-                        engine.clear_idle_passwords();
+                        crate::relations::clear_regex_caches();
+                        crate::formats::seven_zip::clear_seven_zip_kdf_cache();
+                        engine.clear_idle_output_history();
                     }, || {
                         self.checkpoint(&HashMap::new(), true, false)?;
                         engine.run_stage("catalog_maintenance", Origin::Watch, || {
                             self.commit_idle_catalog();
                             self.hub.clear_idle_completed_families();
                             self.journal.state().trim_idle_storage();
-                            self.pending.shrink_to_fit();
-                            self.unpublished.shrink_to_fit();
-                            crate::collections::trim_map(&mut self.volume_checks);
-                            self.active.shrink_to_fit();
-                            self.active_paths.shrink_to_fit();
                         })
                     })?;
                 }
@@ -6136,6 +6132,23 @@ impl Scheduler {
     }
 
     fn arm_idle_cleanup(&mut self) {
+        // Admission/completion owns the transient tables. Keep a small
+        // reusable allocation and discard batch high water as it drains.
+        if self.pending.capacity() > 256 {
+            crate::collections::trim_map(&mut self.pending);
+        }
+        if self.unpublished.capacity() > 256.max(self.unpublished.len().saturating_mul(4)) {
+            self.unpublished.shrink_to(self.unpublished.len().saturating_mul(2));
+        }
+        if self.volume_checks.capacity() > 256 {
+            crate::collections::trim_map(&mut self.volume_checks);
+        }
+        if self.active.capacity() > 256 {
+            crate::collections::trim_map(&mut self.active);
+        }
+        if self.active_paths.capacity() > 256 {
+            crate::collections::trim_map(&mut self.active_paths);
+        }
         if self.active.is_empty() && self.pending.is_empty() && !windows::foreground_active() {
             let idle = self.settings.watch.runtime_cache_cleanup_idle_seconds;
             // main's +infinity deadline never expires. Do not pass it to

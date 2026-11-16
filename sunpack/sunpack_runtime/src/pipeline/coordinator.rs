@@ -1,7 +1,7 @@
 use super::results::RunOutcome as Outcome;
 use super::checkpoint::{CheckpointKey, InputCheckpoint, InputRecovery, GeneratedSource, ReportState};
 use super::discovery::{self, Discovered, LogicalInput, Task};
-use super::passwords::{AttemptCache, CandidateSet};
+use super::passwords::{CandidateSet, RecentPasswords};
 use super::scheduling::{stage, Scheduler, Spawner};
 use super::shell_updates::{ShellNotifier, ShellUpdates};
 use super::worker::{self, Process};
@@ -58,7 +58,7 @@ pub struct EngineState {
     worker: Mutex<WorkerOwner>,
     mode_changes: super::AsyncGate,
     leases: Arc<Leases>,
-    password_attempts: AttemptCache,
+    recent_passwords: RecentPasswords,
     scheduler: OnceLock<Arc<Scheduler>>,
     shell: ShellNotifier,
     output_names: Arc<Mutex<OutputNames>>,
@@ -79,7 +79,7 @@ impl Engine {
             }),
             mode_changes: super::AsyncGate::default(),
             leases: Arc::new(Leases::default()),
-            password_attempts: AttemptCache::default(),
+            recent_passwords: RecentPasswords::default(),
             scheduler: OnceLock::new(),
             shell: ShellNotifier::default(),
             output_names: Arc::default(),
@@ -206,7 +206,7 @@ impl Engine {
         let candidates = CandidateSet::new(
             std::mem::take(&mut request.passwords),
             request.password_snapshot.clone(),
-            &self.password_attempts,
+            &self.recent_passwords,
             request.password_scope.as_deref(),
         );
         let unfiltered = || {
@@ -275,7 +275,7 @@ impl Engine {
                 let result = async {
                     stage("discovery", &request.cancel).await?;
                     let candidates = CandidateSet::new(Arc::clone(&request.passwords),
-                        request.password_snapshot.clone(), &engine.password_attempts,
+                        request.password_snapshot.clone(), &engine.recent_passwords,
                         request.password_scope.as_deref());
                     let options = if request.deep {
                         NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
@@ -311,7 +311,7 @@ impl Engine {
 
     pub(crate) fn find_watch_volume(&self, request: &Request, options: &NativeDirectoryScanOptions, retry_incomplete: bool) -> io::Result<Option<Arc<super::PreparedVolume>>> {
         let candidates = CandidateSet::new(Arc::clone(&request.passwords), request.password_snapshot.clone(),
-            &self.password_attempts, request.password_scope.as_deref());
+            &self.recent_passwords, request.password_scope.as_deref());
         discovery::find_watch_volume(request, options, &candidates, retry_incomplete)
     }
 
@@ -383,13 +383,12 @@ impl Engine {
         }
     }
 
-    pub(crate) fn clear_idle_passwords(&self) {
-        self.password_attempts.clear();
+    pub(crate) fn clear_idle_output_history(&self) {
         self.output_names.lock().unwrap().clear_history();
     }
 
     pub(crate) fn recent_passwords(&self) -> Vec<Arc<str>> {
-        self.password_attempts.recent()
+        self.recent_passwords.recent()
     }
 }
 
@@ -3015,7 +3014,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         || flag(value, "password_verified");
                     if result.encrypted == Some(true) && password_verified {
                         result.password = plan
-                            .remember_confirmation(matched_index, &self.engine.password_attempts)
+                            .remember_confirmation(matched_index, &self.engine.recent_passwords)
                             .map(str::to_owned);
                     }
                     if let Some(output) = &output {
@@ -3036,14 +3035,8 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     if failure.kind == FailureKind::Damaged && worker::number(value, "password_crc_proven_items") != 0 {
                         result.password = plan
-                            .remember_confirmation(matched_index, &self.engine.password_attempts)
+                            .remember_confirmation(matched_index, &self.engine.recent_passwords)
                             .map(str::to_owned);
-                    } else if matches!(
-                        failure.kind,
-                        FailureKind::WrongPassword | FailureKind::PasswordRequired
-                    ) && flag(value, "password_candidates_all_rejected")
-                    {
-                        plan.remember_rejections(&self.engine.password_attempts);
                     }
                     if let Some((output, verified_files)) = output.as_ref().zip(
                         (failure.kind != FailureKind::PasswordInconclusive)

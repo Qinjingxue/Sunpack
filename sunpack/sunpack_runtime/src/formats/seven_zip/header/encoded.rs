@@ -20,10 +20,6 @@ pub(crate) struct SevenZipPasswordProbe {
 }
 
 impl SevenZipPasswordProbe {
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.packed_data.iter().map(|data| data.len()).sum()
-    }
-
     pub(crate) fn from_header<R: Read + Seek>(
         reader: &mut R,
         reader_len: u64,

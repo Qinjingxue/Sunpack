@@ -178,6 +178,7 @@ pub(crate) fn watch_directories_changes_cached_impl(
                 Err(error) => return Err(error),
             }
         }
+        drop(previous_roots);
         let mut retained = std::collections::BTreeMap::new();
         let mut retained_bytes = 0;
         let mut live = Vec::with_capacity(directories.len());
@@ -209,6 +210,7 @@ pub(crate) fn watch_directories_changes_cached_impl(
                 Err(error) => return Err(error),
             }
         }
+        drop(previous);
         if start_usn < end_usn && !ids.is_empty() {
             sunpack_usn_core::broker_for_each_directory_change(
                 volume,
@@ -229,6 +231,8 @@ pub(crate) fn watch_directories_changes_cached_impl(
                 },
             )?;
         }
+        drop(ids);
+        drop(live);
         for path in &paths {
             let key = crate::path_keys::path_key(path);
             retained.remove(&key);

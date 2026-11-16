@@ -93,18 +93,29 @@ namespace sunpack::sevenzip
 
     void VolumeWriterRegistry::release(const std::string &key) noexcept
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = entries_.find(key);
-        if (found == entries_.end())
+        std::shared_ptr<AsyncFileWriter> writer;
         {
-            return;
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = entries_.find(key);
+            if (found == entries_.end()) return;
+            Entry &entry = found->second;
+            if (entry.leases == 0 || --entry.leases != 0) return;
+            if (!entry.state->persistent)
+            {
+                // The caller still owns the writer until Lease::reset returns.
+                entries_.erase(found);
+                return;
+            }
+            if (config_.idle_timeout == std::chrono::milliseconds::zero())
+            {
+                // Keep the physical volume's gate history with no warm writer.
+                entry.writer.reset();
+                return;
+            }
+            entry.reap_deadline = std::chrono::steady_clock::now() + config_.idle_timeout;
+            writer = entry.writer;
         }
-        Entry &entry = found->second;
-        if (entry.leases != 0 && --entry.leases == 0)
-        {
-            const auto idle_timeout = entry.state->persistent ? config_.idle_timeout : std::chrono::milliseconds::zero();
-            entry.reap_deadline = std::chrono::steady_clock::now() + idle_timeout;
-        }
+        writer->trim_completed_batch();
     }
 
     void VolumeWriterRegistry::reap_idle()
@@ -134,16 +145,9 @@ namespace sunpack::sevenzip
                     continue;
                 }
                 retired.push_back(std::move(entry.writer));
-                if (entry.state && entry.state->persistent)
-                {
-                    entry.reap_deadline = std::chrono::steady_clock::time_point{};
-                    ++retained_states;
-                    ++it;
-                }
-                else
-                {
-                    it = entries_.erase(it);
-                }
+                entry.reap_deadline = {};
+                ++retained_states;
+                ++it;
             }
 
             if (retained_states > kMaxRetainedVolumeStates)

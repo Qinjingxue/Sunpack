@@ -1316,6 +1316,11 @@ void g34_iocp_admission_and_weak_wake_lifetime() {
     check(gate->try_wait(live).kind == Kind::Ready, "G-34: real completion resumes queued requests");
     check(gate->try_wait([] { return true; }).kind == Kind::Terminal,
           "G-34: cancellation takes precedence over Ready");
+    const auto calls = target->calls;
+    gate->unsubscribe(target);
+    gate->wake_waiters();
+    check(target->calls == calls, "G-34: a detached wake target must not receive later notifications");
+    gate->subscribe(target);
     target.reset();
     check(weak.expired(), "G-34: the volume must not retain a retired facility's wake target");
     gate->wake_waiters(); // expired subscriber is pruned without accessing a retired port

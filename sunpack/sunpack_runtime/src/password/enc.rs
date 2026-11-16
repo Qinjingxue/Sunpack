@@ -1,6 +1,6 @@
 //! ENC's quick block is a strong, bounded password proof. Authentication belongs
-//! to extraction. Reuse the existing generation-aware prepared-context cache.
-use super::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
+//! to extraction. Share generation-bound preparation across batches in the current plan.
+use super::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
 use super::input::{parse_ranges, ranges_key, VirtualRangeReader};
 use super::PasswordVerification;
 use crate::io::archive_state::InputExtent;
@@ -32,21 +32,23 @@ impl Drop for ActiveBatch {
 }
 
 pub(crate) fn enc_fast_verify_passwords_with_reader(
+    preparation: &mut Preparation,
     reader: &ManagedReader,
     candidates: &[Arc<str>],
 ) -> std::io::Result<PasswordVerification> {
-    verify_prepared(InputKey::file("enc", reader)?, candidates, || {
+    preparation.verify(InputKey::file("enc", reader)?, candidates, || {
         prepare(reader.cursor(), reader.len()).map(PasswordContext::Enc)
     })
 }
 
 pub(crate) fn enc_fast_verify_passwords_from_ranges(
+    preparation: &mut Preparation,
     ranges: &[&InputExtent],
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
-    verify_prepared(ranges_key("enc", &parsed)?, candidates, || {
+    preparation.verify(ranges_key("enc", &parsed)?, candidates, || {
         let reader = VirtualRangeReader::new(&parsed);
         let length = reader.len();
         prepare(reader, length).map(PasswordContext::Enc)
@@ -73,9 +75,6 @@ fn prepare<R: Read + Seek>(
         .map_err(|e| PreparedStatus::new("damaged", format!("ENC v4 password material: {e:?}")))
 }
 impl EncPasswordContext {
-    pub(crate) fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-    }
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         let found = self.find_first(candidates);
         let (index, attempts) = match found {

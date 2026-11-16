@@ -2,7 +2,7 @@
 use super::{scan_options, CandidateSet, OutputDiscovery, Request};
 use crate::benchmark_process_memory::process_memory;
 use crate::core::config;
-use crate::pipeline::{passwords::AttemptCache, Mode};
+use crate::pipeline::{passwords::RecentPasswords, Mode};
 use crate::scan::directory::scan_output_inventory_impl;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ fn scan() -> Result<(), Box<dyn std::error::Error>> {
     let before = process_memory()?;
     let start = Instant::now();
     let options = scan_options(&request.config)?;
-    let candidates = CandidateSet::new(Arc::from([]), None, &AttemptCache::default(), None);
+    let candidates = CandidateSet::new(Arc::from([]), None, &RecentPasswords::default(), None);
     let mut file_count = 0;
     let mut file_bytes = 0;
     let mut directory_errors = Vec::new();

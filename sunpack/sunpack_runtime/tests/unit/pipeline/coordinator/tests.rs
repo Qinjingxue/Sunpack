@@ -582,7 +582,7 @@ fn worker_failure_preserves_only_noncontradicted_strong_password() {
         let observer = |_: Event| {};
         let mut run = test_run(&engine, &request, &observer);
         Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(
-            Arc::from([Arc::from("secret")]), None, &engine.password_attempts, None,
+            Arc::from([Arc::from("secret")]), None, &engine.recent_passwords, None,
         );
         let (sent, received) = mpsc::channel();
         let process = Process::with_test_input(Input(sent));
@@ -770,7 +770,7 @@ fn test_run<'a, O: Observer>(
         engine: engine.clone(),
         request: Arc::new(request.clone()),
         resolve_aliases: false,
-        candidates: CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None),
+        candidates: CandidateSet::new(Arc::from([]), None, &engine.recent_passwords, None),
         options: OnceLock::new(),
         deep_options: None,
         observer: ObserverRef::Borrowed(observer),
@@ -1618,7 +1618,7 @@ fn recursive_many_outputs_preserve_parent_index_and_prompt_boundary() {
         let observer = |_: Event| {};
         let mut run = test_run(&engine, &request, &observer);
         Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(
-            Arc::from([Arc::from("secret")]), None, &engine.password_attempts, None);
+            Arc::from([Arc::from("secret")]), None, &engine.recent_passwords, None);
         let mut inventories = Vec::new();
         let mut manifests = Vec::new();
         for index in [3, 7, 15] {
@@ -1678,7 +1678,7 @@ fn recursive_discovery_waits_for_consent_and_releases_the_manifest() {
         let observer = |_: Event| {};
         let mut run = test_run(&engine, &request, &observer);
         Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(
-            Arc::from([Arc::from("secret")]), None, &engine.password_attempts, None,
+            Arc::from([Arc::from("secret")]), None, &engine.recent_passwords, None,
         );
         let manifest = output_manifest(&[("encrypted.bin", &rar), ("carrier.bin", &carrier)]);
         let retained = Arc::downgrade(manifest.records());
@@ -1990,7 +1990,7 @@ fn watch_volume_retry_waits_for_a_late_writer_to_close() {
     let mut request = Request::new(vec![first.clone()], Mode::Extract);
     request.origin = Origin::Watch;
     let engine = Engine::new(PathBuf::from("unused-worker"));
-    let candidates = CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None);
+    let candidates = CandidateSet::new(Arc::from([]), None, &engine.recent_passwords, None);
     let options = discovery::scan_options(&request.config).unwrap();
     let discovered = discovery::discover(&request, &options, &candidates).unwrap();
     let [task] = discovered.tasks.as_slice() else {
@@ -2583,7 +2583,7 @@ fn retained_carrier_recomputes_content_policy_without_reexecuting_inputs() {
                 }
                 let mut checkpoint = InputCheckpoint::create(&source, Arc::new((input).clone()), &result, &generations, Some(&container)).unwrap();
                 checkpoint.set_password_signature(|| CandidateSet::new(
-                    Arc::from([]), None, &AttemptCache::default(), None,
+                    Arc::from([]), None, &RecentPasswords::default(), None,
                 ).signature(&input.entry_path));
                 request.checkpoints.push(checkpoint);
             }

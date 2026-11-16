@@ -187,10 +187,6 @@ impl<T> CancellableOnce<T> {
             })
             .as_ref()
     }
-
-    pub(crate) fn get(&self) -> Option<&T> {
-        self.0.get().and_then(Option::as_ref)
-    }
 }
 
 struct Scope;

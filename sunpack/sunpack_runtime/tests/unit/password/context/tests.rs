@@ -9,7 +9,7 @@ fn replaced_password_snapshot_returns_typed_retirement() {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let borrower = std::thread::spawn(move || {
-        verify_prepared(old, &[], move || {
+        Preparation::default().verify(old, &[], move || {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Err(PreparedStatus::new("damaged", "obsolete verdict"))
@@ -19,7 +19,7 @@ fn replaced_password_snapshot_returns_typed_retirement() {
     std::fs::write(&path, b"new physical generation").unwrap();
     let current = ManagedReader::open(&path).unwrap();
     let key = InputKey::file("rar", &current).unwrap();
-    let new = verify_prepared(key, &[], || {
+    let new = Preparation::default().verify(key, &[], || {
         Err(PreparedStatus::new("not_required", "current verdict"))
     });
     release_tx.send(()).unwrap();
@@ -48,7 +48,7 @@ fn cancelled_initializer_does_not_publish_damage_to_shared_password_input() {
     let (release_tx, release_rx) = mpsc::channel();
     let owner = std::thread::spawn(move || {
         owner_signal.run(|| {
-            verify_prepared(owner_key, &[], move || {
+            Preparation::default().verify(owner_key, &[], move || {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Err(PreparedStatus::new("damaged", "abandoned initializer"))
@@ -61,31 +61,21 @@ fn cancelled_initializer_does_not_publish_damage_to_shared_password_input() {
     // Acquire the owner's exact slot before revoking it. A waiter on
     // this generation must see an abandoned initialization even if
     // the slot is already removed from the map when it resumes.
-    let borrowed = {
-        let entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-        Arc::clone(&entries.iter().find(|(entry, _)| *entry == key).unwrap().1)
-    };
+    let mut borrowed = Preparation(Some(borrow(&key)));
     let borrower = std::thread::spawn(move || {
-        assert!(borrowed
-            .value
-            .get_or_init(&Cancellation::default(), || {
-                panic!("the owner must settle its slot")
-            })
-            .is_none());
-        verify_prepared(borrower_key, &[], || {
+        let result = borrowed.verify(borrower_key.clone(), &[], || {
             Err(PreparedStatus::new("not_required", "surviving initializer"))
-        })
-        .unwrap()
-        .status
+        }).unwrap();
+        assert_eq!(borrowed.verify(borrower_key, &[], || {
+            panic!("successful preparation must be reused across batches")
+        }).unwrap().status, "not_required");
+        result.status
     });
     signal.cancel();
     release_tx.send(()).unwrap();
     assert_eq!(owner.join().unwrap(), "native operation cancelled");
     assert_eq!(borrower.join().unwrap(), "not_required");
-    let reused =
-        verify_prepared(key, &[], || panic!("successful facts must be reused")).unwrap();
-    assert_eq!(reused.status, "not_required");
-    release_under_roots(std::slice::from_ref(&path));
+    assert!(ACTIVE.lock().unwrap().iter().all(|slot| slot.key != key));
     drop(reader);
     std::fs::remove_file(path).unwrap();
 }
@@ -122,37 +112,28 @@ fn concurrent_volume_snapshots_preserve_independent_password_facts() {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let owner = std::thread::spawn(move || {
-        verify_prepared(owner_key, &[], move || {
+        let mut plan = Preparation::default();
+        let first = plan.verify(owner_key.clone(), &[], move || {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Err(PreparedStatus::new("missing_volume", "partial snapshot"))
-        })
-        .map(|value| value.status)
+        }).unwrap();
+        assert_eq!(plan.verify(owner_key, &[], || panic!("preparation lost")).unwrap().status, first.status);
+        first.status
     });
     entered_rx.recv().unwrap();
-    let newer = verify_prepared(complete.clone(), &[], || {
+    let mut new_plan = Preparation::default();
+    let newer = new_plan.verify(complete.clone(), &[], || {
         Err(PreparedStatus::new("not_required", "complete snapshot"))
-    })
-    .map(|value| value.status);
+    }).unwrap();
     release_tx.send(()).unwrap();
     let older = owner.join().unwrap();
-    let reused = [partial, complete].map(|key| {
-        verify_prepared(key, &[], || {
-            Err(PreparedStatus::new(
-                "damaged",
-                "unexpected reinitialization",
-            ))
-        })
-        .map(|value| value.status)
-    });
-    release_under_roots(std::slice::from_ref(&root));
+    assert_eq!(new_plan.verify(complete.clone(), &[], || panic!("preparation lost")).unwrap().status, newer.status);
+    drop(new_plan);
+    assert!(ACTIVE.lock().unwrap().iter().all(|slot| slot.key != partial && slot.key != complete));
     drop(readers);
     std::fs::remove_dir_all(root).unwrap();
 
-    assert_eq!(older.unwrap(), "missing_volume");
-    assert_eq!(newer.unwrap(), "not_required");
-    assert_eq!(
-        reused.map(Result::unwrap),
-        ["missing_volume", "not_required"]
-    );
+    assert_eq!(older, "missing_volume");
+    assert_eq!(newer.status, "not_required");
 }
