@@ -1,8 +1,23 @@
 // Exercise the actual packaged launcher control path, not a Python stand-in.
 // The private console and local pipe require no resident runtime or fixtures.
+#include <windows.h>
+
+namespace {
+// Change the reported dimensions only while the console listener is stopped.
+SMALL_RECT test_viewport{0, 0, 79, 24};
+
+BOOL read_test_viewport(HANDLE output, CONSOLE_SCREEN_BUFFER_INFO* screen) {
+    if (!GetConsoleScreenBufferInfo(output, screen)) return FALSE;
+    screen->srWindow = test_viewport;
+    return TRUE;
+}
+}
+
+#define GetConsoleScreenBufferInfo read_test_viewport
 #define wmain sunpack_launcher_main
 #include "../src/launcher.cpp"
 #undef wmain
+#undef GetConsoleScreenBufferInfo
 
 #include <stdexcept>
 
@@ -62,6 +77,10 @@ void expect_empty(HANDLE pipe) {
 
 void expect_resize(HANDLE pipe, SHORT columns, SHORT rows) {
     std::array<char, 12> frame{};
+    // The launcher checks dimensions synchronously on construction and resume.
+    DWORD available = 0;
+    require(PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr) &&
+            available >= frame.size(), "missing resize frame");
     require(read_all(pipe, frame.data(), frame.size()), "read resize");
     require(read_u32(frame.data()) == kResizeControl &&
             read_u32(frame.data() + 4) == static_cast<std::uint32_t>(columns) &&
@@ -115,9 +134,6 @@ int main() {
         DWORD mode = 0;
         require(GetConsoleMode(input, &mode) && SetConsoleMode(input, mode & ~ENABLE_WINDOW_INPUT), "initial input mode");
         mode &= ~ENABLE_WINDOW_INPUT;
-        CONSOLE_SCREEN_BUFFER_INFO screen{};
-        require(GetConsoleScreenBufferInfo(output, &screen), "initial viewport");
-
         const std::wstring name = L"\\\\.\\pipe\\SunPack-launcher-console-test-" + std::to_wstring(GetCurrentProcessId());
         const HANDLE server = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr);
@@ -134,11 +150,9 @@ int main() {
             ConsoleCancellation controls(client, supports_cancellation({L"scan"}), true);
             DWORD active_mode = 0;
             require(GetConsoleMode(input, &active_mode) && (active_mode & ENABLE_WINDOW_INPUT), "resize input enabled");
-            expect_resize(server, screen.srWindow.Right - screen.srWindow.Left + 1,
-                          screen.srWindow.Bottom - screen.srWindow.Top + 1);
+            expect_resize(server, 80, 25);
             controls.pause();
-            SMALL_RECT window{0, 0, 39, 9};
-            require(SetConsoleWindowInfo(output, TRUE, &window) != 0, "shrink viewport");
+            test_viewport = {0, 0, 39, 9};
             for (wchar_t value : std::wstring(L"quietQpassword\r")) key(input, value);
             require(read_input_line().find("quietQpassword") != std::string::npos, "prompt owns Q keys");
             // The first ReadConsoleW returns the high unit at its exact buffer

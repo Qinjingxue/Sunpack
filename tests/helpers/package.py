@@ -11,6 +11,7 @@ import pytest
 import psutil
 
 
+from tests.helpers.marker_utils import replace_shared_file
 from tests.helpers.native_build import native_build_dir, rust_build_dir, selected_build
 from tests.helpers.native_fixture import native_fixture
 
@@ -99,7 +100,7 @@ class Package:
         if live:
             pending = path.with_suffix(".tmp")
             pending.write_text(text, encoding="utf-8")
-            pending.replace(path)
+            replace_shared_file(pending, path)
         else:
             path.write_text(text, encoding="utf-8")
 

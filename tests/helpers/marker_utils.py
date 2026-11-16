@@ -15,6 +15,23 @@ _kernel32.CreateFileW.argtypes = (
 _kernel32.CreateFileW.restype = wintypes.HANDLE
 _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
 _kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.ReplaceFileW.argtypes = (
+    wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+    wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID,
+)
+_kernel32.ReplaceFileW.restype = wintypes.BOOL
+
+
+def replace_shared_file(source: Path, target: Path):
+    # Match the runtime's single-attempt atomic replacement: unlike MoveFileEx,
+    # ReplaceFile permits a FILE_SHARE_DELETE reader to retain the old file.
+    if _kernel32.ReplaceFileW(str(target), str(source), None, 0, None, None):
+        return
+    error = ctypes.get_last_error()
+    if error in (2, 1175):  # Missing target or Modify-only directory ACL.
+        source.replace(target)
+    else:
+        raise ctypes.WinError(error)
 
 
 def open_shared_file(path: Path, mode="r", *, share=0x1 | 0x2 | 0x4, **kwargs):

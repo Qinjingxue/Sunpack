@@ -102,19 +102,19 @@ enum Delta<'a> {
 
 /// Hashing is deliberately outside Index's lock and the scheduler thread.
 struct Prepared {
-    epoch: u64, record: Record, representative: Option<Record>, hash: bool, baseline: bool,
+    epoch: u64, record: Record, representative: Option<Record>, baseline: bool,
 }
 impl Prepared {
-    fn needs_hash(&self) -> bool {
-        (self.hash && self.record.digest.is_none())
-            || self.representative.as_ref().is_some_and(|record| record.digest.is_none())
-    }
-
     fn hash(&mut self) -> io::Result<()> {
-        if self.hash && self.record.digest.is_none() { self.record.hash()?; }
+        if self.record.digest.is_none() { self.record.hash()?; }
         if let Some(record) = &mut self.representative { if record.digest.is_none() { record.hash()?; } }
         Ok(())
     }
+}
+
+enum Admission {
+    Hash(Prepared),
+    Finished(bool),
 }
 
 pub(super) fn consider(
@@ -132,18 +132,18 @@ pub(super) fn consider(
     // do that under its existing Watch work budget while other jobs commit.
     let Some(record) = describe(owner, scope, inputs)? else { return Ok(false); };
     let mut locked = index.lock().unwrap();
-    let Some(mut prepared) = locked.prepare(epoch, record, generation.is_some()) else {
+    let Some(prepared) = locked.prepare(epoch, record, generation.is_some()) else {
         return Ok(false);
     };
-    if !prepared.needs_hash() {
-        return locked.commit(prepared);
-    }
+    let mut admission = locked.advance(prepared)?;
     drop(locked);
     loop {
+        let mut prepared = match admission {
+            Admission::Hash(prepared) => prepared,
+            Admission::Finished(duplicate) => return Ok(duplicate),
+        };
         prepared.hash()?;
-        let mut locked = index.lock().unwrap();
-        if locked.refresh(&mut prepared)? { continue; }
-        return locked.commit(prepared);
+        admission = index.lock().unwrap().advance(prepared)?;
     }
 }
 
@@ -311,27 +311,10 @@ impl Index {
             record.digest = saved.digest;
         }
         if self.mode == WatchDeduplication::Hash && record.digest.is_none() {
-            record.digest = self.cached_digest(&record);
+            record.digest = self.cached_digest(&record, |other| record.same_source_versions(other));
         }
         record.id = self.next_id; self.next_id += 1;
-        // Rebuild only records confirmed byte streams. A matching size does not
-        // authorize baseline IO; normal arrivals resolve the lazy bucket later.
-        let hash = !baseline && self.mode == WatchDeduplication::Hash
-            && self.other_sized(&record) && self.identity_match(&record).is_none();
-        let representative = if hash && !self.digest_match(&record) {
-            self.unhashed_representative(&record)
-        } else { None };
-        Some(Prepared { epoch, record, representative, hash, baseline })
-    }
-    fn identity_match(&self, record: &Record) -> Option<&Record> {
-        self.objects.get(&(self.signature(record), Arc::clone(&record.identities)))?
-            .iter().filter_map(|id| self.records.get(&id))
-            .find(|other| other.owner != record.owner && other.current())
-    }
-    fn digest_match(&self, record: &Record) -> bool {
-        record.digest.and_then(|digest| self.hashes.get(&(self.signature(record), digest)))
-            .is_some_and(|ids| ids.iter().filter_map(|id| self.records.get(&id))
-                .any(|other| other.owner != record.owner && other.current()))
+        Some(Prepared { epoch, record, representative: None, baseline })
     }
     fn other_sized(&self, record: &Record) -> bool {
         self.sizes.get(&self.signature(record)).is_some_and(|bucket| {
@@ -340,16 +323,18 @@ impl Index {
             bucket.count > usize::from(own)
         })
     }
-    fn cached_digest(&self, record: &Record) -> Option<[u8; 16]> {
+    fn cached_digest(&self, record: &Record, valid: impl Fn(&Record) -> bool) -> Option<[u8; 16]> {
         self.objects.get(&(self.signature(record), Arc::clone(&record.identities)))?
             .iter().filter_map(|id| self.records.get(&id))
-            .find(|other| other.digest.is_some() && (record.same_source_versions(other) || other.current()))
+            .find(|other| other.digest.is_some() && valid(other))
             .and_then(|other| other.digest)
     }
     fn unhashed_representative(&self, record: &Record) -> Option<Record> {
         let mut representative = self.sizes.get(&self.signature(record))?.pending()
             .filter_map(|id| self.records.get(&id)).find(|other| other.owner != record.owner)?.clone();
-        representative.digest = self.cached_digest(&representative);
+        representative.digest = self.cached_digest(&representative, |other| {
+            representative.same_source_versions(other) || other.current()
+        });
         Some(representative)
     }
     fn publish_representative(&mut self, prepared: &mut Prepared) -> io::Result<()> {
@@ -371,54 +356,68 @@ impl Index {
         let Some(epoch) = self.admission_epoch(scope, None) else { return Ok(None); };
         Ok(describe(owner, scope, inputs)?.and_then(|record| self.prepare(epoch, record, baseline)))
     }
-    /// Repeat only work newly made necessary by a concurrent admission. The caller
-    /// holds the same lock from a false return through commit.
-    fn refresh(&mut self, prepared: &mut Prepared) -> io::Result<bool> {
-        if prepared.baseline || self.mode != WatchDeduplication::Hash
-            || self.admission_epoch(&prepared.record.scope, None) != Some(prepared.epoch) {
-            return Ok(false);
+    /// Advance from one locked decision to the next. A live match is checked
+    /// after the candidate and used immediately, without a second probe.
+    fn advance(&mut self, mut prepared: Prepared) -> io::Result<Admission> {
+        let record = &mut prepared.record;
+        if self.admission_epoch(&record.scope, None) != Some(prepared.epoch) {
+            return Ok(Admission::Finished(false));
         }
-        // Publish each useful digest immediately. A lazy baseline can contain
-        // many unrelated same-size objects; inspect until a match or exhaustion,
-        // never repeatedly read an earlier representative or retain a work list.
-        loop {
-            self.publish_representative(prepared)?;
-            if self.identity_match(&prepared.record).is_some() || self.digest_match(&prepared.record)
-                || !self.other_sized(&prepared.record) { return Ok(false); }
-            prepared.hash = true;
-            prepared.representative = self.unhashed_representative(&prepared.record);
-            // Other baseline aliases can reuse the just-published physical digest.
-            // Publish those cache hits without dispatching another IO operation.
-            if prepared.representative.as_ref().is_some_and(|r| r.digest.is_some()) { continue; }
-            return Ok(prepared.needs_hash());
-        }
-    }
-    fn commit(&mut self, mut prepared: Prepared) -> io::Result<bool> {
-        if self.admission_epoch(&prepared.record.scope, None) != Some(prepared.epoch)
-            || !prepared.record.current()
-        {
-            return Ok(false);
-        }
-        self.publish_representative(&mut prepared)?;
-        let mut record = prepared.record;
         // A retry by its original owner is never suppressed by an alias that arrived later.
         let replaced = self.owners.get(&record.owner).copied();
         let own = replaced.and_then(|id| self.records.get(&id)).is_some_and(|r| {
             r.admitted && r.scope == record.scope && r.bytes == record.bytes && r.identities == record.identities
-                && (r.same_source_paths_and_versions(&record) || r.current())
+                && (r.same_source_paths_and_versions(record) || r.current())
         });
-        if own { return Ok(false); }
-        let mut stale = Vec::new();
-        let mut live = |ids: Option<&RecordIds>| ids.is_some_and(|ids| ids.iter().any(|id| {
-            let Some(other) = self.records.get(&id) else { return false; };
-            if other.owner == record.owner { return false; }
-            if other.current() { true } else { stale.push(id); false }
-        }));
-        let signature = self.signature(&record);
-        let duplicate = live(self.objects.get(&(signature, Arc::clone(&record.identities))))
-            || (self.mode == WatchDeduplication::Hash
-                && live(record.digest.and_then(|digest| self.hashes.get(&(signature, digest)))));
-        self.remove_ids(stale)?;
+        self.publish_representative(&mut prepared)?;
+        if own { return Ok(Admission::Finished(false)); }
+        loop {
+            let record = &mut prepared.record;
+            let signature = self.signature(record);
+            let objects = self.objects.get(&(signature, Arc::clone(&record.identities)));
+            let hashes = if self.mode == WatchDeduplication::Hash {
+                record.digest.and_then(|digest| self.hashes.get(&(signature, digest)))
+            } else {
+                None
+            };
+            let checked = objects.is_some() || hashes.is_some();
+            if checked && !record.current() {
+                return Ok(Admission::Finished(false));
+            }
+            let mut stale = Vec::new();
+            let mut live = |ids: Option<&RecordIds>, digest_only| ids.and_then(|ids| {
+                ids.iter().filter_map(|id| self.records.get(&id)).find(|other| {
+                    if other.owner == record.owner || (digest_only && other.identities == record.identities) {
+                        return false;
+                    }
+                    if other.current() { true } else { stale.push(other.id); false }
+                })
+            });
+            let matching = live(objects, false).or_else(|| live(hashes, true));
+            let duplicate = matching.is_some();
+            record.digest = record.digest.or_else(|| matching.and_then(|other| other.digest));
+            self.remove_ids(stale)?;
+
+            // A rebuild records byte streams without reading their content.
+            if !duplicate && !prepared.baseline && self.mode == WatchDeduplication::Hash
+                && self.other_sized(record)
+            {
+                prepared.representative = self.unhashed_representative(record);
+                if record.digest.is_none() || prepared.representative.as_ref().is_some_and(|r| r.digest.is_none()) {
+                    return Ok(Admission::Hash(prepared));
+                }
+                if prepared.representative.is_some() {
+                    self.publish_representative(&mut prepared)?;
+                    continue;
+                }
+            }
+            if !checked && !record.current() {
+                return Ok(Admission::Finished(false));
+            }
+            return self.commit(prepared.record, replaced, duplicate);
+        }
+    }
+    fn commit(&mut self, mut record: Record, replaced: Option<u64>, duplicate: bool) -> io::Result<Admission> {
         record.admitted = !duplicate;
         // Superseded owner layouts must not retain an obsolete signature indefinitely.
         if let Some(id) = replaced.filter(|id| self.records.contains_key(id)) {
@@ -426,7 +425,7 @@ impl Index {
         }
         self.append(&Delta::Put(Cow::Borrowed(&record)))?; self.insert(record);
         self.compact()?;
-        Ok(duplicate)
+        Ok(Admission::Finished(duplicate))
     }
     pub(super) fn invalidate(&mut self, paths: &[String]) -> io::Result<()> {
         let ids = paths.iter()
