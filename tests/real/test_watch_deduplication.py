@@ -266,3 +266,71 @@ def test_watch_hash_scope_lifecycle_and_nested_root_ownership(package, tmp_path)
     assert len(list(watch.output.rglob("scope-a-marker.txt"))) == 2
     assert len(list(watch.output.rglob("scope-b-marker.txt"))) == 2
     watch.assert_no_terminal_failures()
+
+
+def test_watch_hash_matches_whole_carrier_and_differently_split_byte_streams(package, tmp_path):
+    # Unlike the carrier-vs-carrier regression, these paths previously had
+    # different open modes and per-volume size signatures despite equal bytes.
+    case = FACTORY.create(tmp_path / "fixtures", "byte-stream", "7z", payload_size=104 * 1024)
+    raw = case.entry_path.read_bytes()
+    assert len(raw) > 1024
+    package.configure(watch={"deduplication": "hash"})
+    watch = watch_setup(package, tmp_path, passwords=[], recursive=True)
+    whole = _copy(case.entry_path, watch.root / "whole.7z")
+    watch.await_event("done", path=whole.name)
+    watch.await_archive(case)
+    # A metadata-only timestamp change must retain the lazy representative,
+    # while refreshing its IO generation before the first required hash.
+    stat = whole.stat()
+    os.utime(whole, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    carrier = tmp_path / "carrier.bin"
+    assemble_carrier(carrier, [case.entry_path], seed=201, prefix_lengths=[517])
+    _duplicate(watch, _copy(carrier, watch.root / carrier.name))
+    link = watch.root / "whole-link.7z"
+    os.link(whole, link)
+    _duplicate(watch, link)
+    for label, width in (("split-three", (len(raw) + 2) // 3), ("split-five", (len(raw) + 4) // 5)):
+        staging = tmp_path / label
+        staging.mkdir()
+        for number, start in enumerate(range(0, len(raw), width), 1):
+            (staging / f"{label}.7z.{number:03}").write_bytes(raw[start:start + width])
+        target = staging.rename(watch.root / label)
+        package.await_watch_event("watch_deduplicated", path=f"{label}.7z.001", root=target)
+    # Persisted hashes still bridge shapes after a clean process restart.
+    watch.restart()
+    after = tmp_path / "after-restart.bin"
+    assemble_carrier(after, [case.entry_path], seed=202, prefix_lengths=[4099])
+    _duplicate(watch, _copy(after, watch.root / after.name))
+    watch.stop()
+    assert len(list(watch.output.rglob(case.marker_name))) == 1
+    watch.assert_no_terminal_failures()
+
+
+def test_watch_hash_same_size_write_invalidates_digest_even_with_restored_mtime(package, tmp_path):
+    sources = []
+    for label, payload in (("a", b"AAAA"), ("b", b"BBBB")):
+        source = tmp_path / f"{label}.zip"
+        with ZipFile(source, "w") as archive:
+            archive.writestr("same-marker.txt", payload)
+        sources.append(source)
+    assert sources[0].stat().st_size == sources[1].stat().st_size
+    package.configure(watch={"deduplication": "hash"})
+    watch = watch_setup(package, tmp_path)
+    owner = _copy(sources[0], watch.root / "owner.zip")
+    watch.await_event("done", path=owner.name)
+    peer = _copy(sources[0], watch.root / "peer.zip")
+    _duplicate(watch, peer)
+    peer.unlink()
+    old = owner.stat()
+    changed = time.time()
+    owner.write_bytes(sources[1].read_bytes())
+    os.utime(owner, ns=(old.st_atime_ns, old.st_mtime_ns))
+    package.await_watch_event("done", path=owner.name, after=changed)
+    watch.restart()
+    # No live old-content representative remains, including in the WAL.
+    fresh = _copy(sources[0], watch.root / "old-content-again.zip")
+    watch.await_event("done", path=fresh.name)
+    assert watch.event("watch_deduplicated", path=fresh.name) is None
+    _duplicate(watch, _copy(sources[1], watch.root / "new-content-copy.zip"))
+    watch.stop()
+    watch.assert_no_terminal_failures()

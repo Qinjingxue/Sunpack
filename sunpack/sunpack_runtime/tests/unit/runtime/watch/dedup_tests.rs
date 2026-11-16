@@ -13,7 +13,7 @@ impl Sandbox {
 impl Drop for Sandbox { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
 fn admit(index: &mut Index, input: &ArchiveInput, baseline: bool) -> bool {
     let Some(mut p) = index.prepare_path(&input.entry_path, "scope", &[input], baseline).unwrap() else { return false; };
-    loop { p.hash().unwrap(); if !index.refresh(&mut p) { return index.commit(p).unwrap(); } }
+    loop { p.hash().unwrap(); if !index.refresh(&mut p).unwrap() { return index.commit(p).unwrap(); } }
 }
 #[test]
 fn live_identity_alias_lifetime_and_mode_reset() {
@@ -46,7 +46,7 @@ fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     let mut a = index.prepare_path(&first.entry_path, "scope", &[&first], false).unwrap().unwrap();
     let mut b = index.prepare_path(&copy.entry_path, "scope", &[&copy], false).unwrap().unwrap();
     assert!(!a.hash && !b.hash); a.hash().unwrap(); assert!(!index.commit(a).unwrap());
-    assert!(index.refresh(&mut b)); b.hash().unwrap(); assert!(!index.refresh(&mut b)); assert!(index.commit(b).unwrap());
+    assert!(index.refresh(&mut b).unwrap()); b.hash().unwrap(); assert!(!index.refresh(&mut b).unwrap()); assert!(index.commit(b).unwrap());
     let linked = ArchiveInput::file(alias.to_string_lossy().into_owned(), "zip".into(), "hardlink.zip".into());
     let cached = index.prepare_path(&linked.entry_path, "scope", &[&linked], true).unwrap().unwrap();
     assert!(cached.record.digest.is_some(), "same physical generation reuses the hash without reading");
@@ -85,7 +85,7 @@ fn hash_admission_rechecks_the_path_after_reading() {
     assert!(pending.hash().is_err(), "the read handle must exclude an active writer");
     drop(writer);
     pending.hash().unwrap();
-    assert!(!index.refresh(&mut pending));
+    assert!(!index.refresh(&mut pending).unwrap());
     fs::rename(&copy.entry_path, dir.0.join("old-copy.zip")).unwrap();
     fs::write(&copy.entry_path, b"different archive bytes").unwrap();
     assert!(!index.commit(pending).unwrap());
@@ -113,7 +113,7 @@ fn scope_retirement_discards_an_admission_already_in_flight() {
     // sampled this scope at different points in admission.
     index.reconcile_scopes(&[other]).unwrap();
     assert!(index.prepare(epoch, record, true).is_none());
-    assert!(!index.refresh(&mut prepared));
+    assert!(!index.refresh(&mut prepared).unwrap());
     assert!(!index.commit(prepared).unwrap());
     assert!(index.records.is_empty());
 }
@@ -168,7 +168,7 @@ fn process_exit_recovers_ready_index_but_rebuilds_unpublished_baseline() {
             let copy = input(&dir.0, "copy.zip");
             let mut prepared = index.prepare_path(&copy.entry_path, "scope", &[&copy], false).unwrap().unwrap();
             assert!(prepared.record.digest.is_some());
-            assert!(!index.refresh(&mut prepared));
+            assert!(!index.refresh(&mut prepared).unwrap());
             // Intentionally no Prepared::hash: persisted content evidence is reusable.
             assert!(index.commit(prepared).unwrap());
         } else {
@@ -193,8 +193,8 @@ fn root_and_global_domains_follow_live_scope_ownership() {
     let other_scope = NativeDiscoveryScope::new(other.to_string_lossy().into_owned(), None, vec![]);
     let stamps = [&parent_scope, &nested_scope, &other_scope].map(|scope| (scope.key().to_owned(), "test-volume".to_owned(), 1));
     let admit_scope = |index: &mut Index, input: &ArchiveInput, scope: &str| {
-        let Some(mut p) = index.prepare_path(&input.entry_path, scope, &[input], true).unwrap() else { return false; };
-        loop { p.hash().unwrap(); if !index.refresh(&mut p) { break index.commit(p).unwrap(); } }
+        let Some(mut p) = index.prepare_path(&input.entry_path, scope, &[input], false).unwrap() else { return false; };
+        loop { p.hash().unwrap(); if !index.refresh(&mut p).unwrap() { break index.commit(p).unwrap(); } }
     };
     for mode in [WatchDeduplication::FileId, WatchDeduplication::Hash] {
         let folder = dir.0.join(if mode == WatchDeduplication::Hash { "hash-index" } else { "id-index" });
@@ -235,4 +235,134 @@ fn root_and_global_domains_follow_live_scope_ownership() {
         let generation = index.generation(); index.reset(mode, WatchDeduplicationScope::Root).unwrap();
         assert!(index.generation() != generation && index.records.is_empty() && index.needs_rebuild());
     }
+}
+
+#[test]
+fn lazy_baseline_exhausts_same_size_candidates_and_hardlinks_need_no_hash() {
+    use super::super::dedup_hash::metrics;
+    let dir = Sandbox::new();
+    let folder = dir.0.join("index");
+    let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    let before = metrics::snapshot();
+    let inputs: Vec<_> = [b"aaaaaa", b"bbbbbb", b"cccccc"].iter().enumerate()
+        .map(|(i, bytes)| dir.file(&format!("base-{i}.zip"), *bytes)).collect();
+    let alias_path = dir.0.join("alias.zip");
+    fs::hard_link(&inputs[0].entry_path, &alias_path).unwrap();
+    for input in &inputs { assert!(!admit(&mut index, input, true)); }
+    assert_eq!(metrics::snapshot(), before, "baseline never reads content, even equal sizes");
+    index.finish_rebuild().unwrap(); drop(index);
+    let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    assert!(!index.needs_rebuild());
+    assert!(index.records.values().all(|r| r.digest.is_none()));
+    assert_eq!(metrics::snapshot(), before, "restart keeps lazy records without hashing");
+    let copy = dir.file("copy-last.zip", b"cccccc");
+    assert!(admit(&mut index, &copy, false), "must reach the third pending representative");
+    assert_eq!(metrics::snapshot(), (before.0 + 4, before.1 + 24));
+    index.invalidate(&[inputs[0].entry_path.clone()]).unwrap();
+    assert_eq!(index.records.len(), 4, "unchanged source evidence remains indexed");
+    let alias = ArchiveInput::file(alias_path.to_string_lossy().into_owned(), "zip".into(), "alias.zip".into());
+    let before_link = metrics::snapshot();
+    assert!(admit(&mut index, &alias, false));
+    assert_eq!(metrics::snapshot(), before_link);
+    // A new, still-unhashed object must also bypass hash through its File ID.
+    let lazy = dir.file("lazy.zip", b"unique-size");
+    let path = dir.0.join("lazy-link.zip"); fs::hard_link(&lazy.entry_path, &path).unwrap();
+    assert!(!admit(&mut index, &lazy, false));
+    let link = ArchiveInput::file(path.to_string_lossy().into_owned(), "zip".into(), "lazy-link.zip".into());
+    assert!(admit(&mut index, &link, false));
+    assert_eq!(metrics::snapshot(), before_link, "identity equality does not manufacture a digest");
+    assert!(index.records.values().filter(|r| r.bytes == 11).all(|r| r.digest.is_none()));
+}
+
+#[test]
+fn byte_stream_identity_ignores_carrier_and_split_boundaries_but_tracks_every_source() {
+    use crate::io::archive_state::{InputExtent, InputPart};
+    let dir = Sandbox::new();
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    let whole = dir.file("whole.zip", b"ABCDEF");
+    assert!(!admit(&mut index, &whole, true));
+    let mut carrier = dir.file("carrier.bin", b"junkABCDEFtail");
+    carrier.mode = OpenMode::FileRange;
+    carrier.parts = vec![InputPart::range(InputExtent { path: carrier.entry_path.clone(), start: 4, end: Some(10) })].into();
+    assert!(admit(&mut index, &carrier, false));
+    let left = dir.file("part-1", b"ABC"); let right = dir.file("part-2", b"DEF");
+    let mut split = left.clone(); split.mode = OpenMode::NativeVolumes;
+    split.parts = [left.entry_path.clone(), right.entry_path.clone()].into_iter()
+        .map(|path| InputPart::range(InputExtent { path, start: 0, end: None })).collect::<Vec<_>>().into();
+    assert!(admit(&mut index, &split, false));
+    let one = dir.file("other-1", b"A"); let two = dir.file("other-2", b"BCDEF");
+    let mut other = one.clone(); other.mode = OpenMode::ConcatRanges;
+    other.ranges = vec![InputExtent { path: one.entry_path.clone(), start: 0, end: Some(1) },
+        InputExtent { path: two.entry_path.clone(), start: 0, end: Some(5) }].into();
+    assert!(admit(&mut index, &other, false));
+    let mut reversed = right.clone(); reversed.mode = OpenMode::ConcatRanges;
+    reversed.ranges = vec![InputExtent { path: right.entry_path.clone(), start: 0, end: Some(3) },
+        InputExtent { path: left.entry_path.clone(), start: 0, end: Some(3) }].into();
+    assert!(!admit(&mut index, &reversed, false));
+    // Two independent logical inputs are still compared as the requested ordered stream.
+    let multi_owner = dir.0.join("group").to_string_lossy().into_owned();
+    let mut p = index.prepare_path(&multi_owner, "scope", &[&one, &two], false).unwrap().unwrap();
+    loop { p.hash().unwrap(); if !index.refresh(&mut p).unwrap() { break; } }
+    assert!(index.commit(p).unwrap());
+    fs::write(&right.entry_path, b"XYZ").unwrap();
+    index.invalidate(&[right.entry_path.clone()]).unwrap();
+    assert!(!index.owners.contains_key(path_key(&split.entry_path).as_str()));
+    assert!(!index.owners.contains_key(path_key(&reversed.entry_path).as_str()));
+    assert!(index.owners.contains_key(path_key(&whole.entry_path).as_str()));
+    fs::remove_file(&two.entry_path).unwrap(); index.invalidate(&[two.entry_path]).unwrap();
+    assert!(!index.owners.contains_key(path_key(&other.entry_path).as_str()));
+    assert!(!index.owners.contains_key(path_key(&multi_owner).as_str()));
+    fs::remove_file(&carrier.entry_path).unwrap(); index.invalidate(&[carrier.entry_path.clone()]).unwrap();
+    assert!(!index.owners.contains_key(path_key(&carrier.entry_path).as_str()));
+    assert_eq!(index.records.len(), 1);
+}
+#[test]
+fn recursion_scope_removes_whole_cross_level_input_and_persists_removal() {
+    use crate::io::archive_state::InputExtent;
+    for scope_mode in [WatchDeduplicationScope::Root, WatchDeduplicationScope::Global] {
+        let dir = Sandbox::new(); fs::create_dir_all(dir.0.join("child")).unwrap();
+        let head = dir.file("head", b"ABC"); let tail = dir.file("child/tail", b"DEF");
+        let mut input = head.clone(); input.mode = OpenMode::ConcatRanges;
+        input.ranges = vec![InputExtent { path: head.entry_path.clone(), start: 0, end: Some(3) }, InputExtent { path: tail.entry_path.clone(), start: 0, end: Some(3) }].into();
+        let recursive = NativeDiscoveryScope::new(dir.0.to_string_lossy().into_owned(), None, vec![]);
+        let flat = NativeDiscoveryScope::new(dir.0.to_string_lossy().into_owned(), Some(0), vec![]);
+        let folder = dir.0.join("index");
+        let mut index = Index::open(&folder, WatchDeduplication::Hash, scope_mode).unwrap();
+        index.reconcile_journals(&[(recursive.key().into(), "test-volume".into(), 1)]).unwrap();
+        let p = index.prepare_path(&input.entry_path, recursive.key(), &[&input], true).unwrap().unwrap();
+        assert!(!index.commit(p).unwrap()); index.finish_rebuild().unwrap();
+        index.reconcile_scopes(&[flat]).unwrap();
+        assert!(index.records.is_empty()); assert!(index.paths.is_empty()); drop(index);
+        let mut index = Index::open(&folder, WatchDeduplication::Hash, scope_mode).unwrap();
+        assert!(!index.needs_rebuild()); assert!(index.records.is_empty());
+        index.reconcile_scopes(&[recursive.clone()]).unwrap();
+        let p = index.prepare_path(&input.entry_path, recursive.key(), &[&input], true).unwrap().unwrap();
+        assert!(!index.commit(p).unwrap()); assert_eq!(index.records.len(), 1);
+        index.finish_rebuild().unwrap(); drop(index);
+        let index = Index::open(&folder, WatchDeduplication::Hash, scope_mode).unwrap();
+        assert_eq!(index.records.len(), 1); assert!(index.records.values().all(|r| r.digest.is_none()));
+    }
+}
+
+#[test]
+fn lazy_baseline_aliases_share_one_physical_hash() {
+    use super::super::dedup_hash::metrics;
+    let dir = Sandbox::new(); let source = dir.file("source", b"AAAAAA");
+    let mut aliases = Vec::new();
+    for number in 0..8 {
+        let path = dir.0.join(format!("alias-{number}")); fs::hard_link(&source.entry_path, &path).unwrap();
+        aliases.push(ArchiveInput::file(path.to_string_lossy().into_owned(), "zip".into(), "alias".into()));
+    }
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    let before = metrics::snapshot();
+    assert!(!admit(&mut index, &source, true));
+    for alias in &aliases { assert!(admit(&mut index, alias, true)); }
+    assert_eq!(metrics::snapshot(), before);
+    let different = dir.file("different", b"BBBBBB");
+    assert!(!admit(&mut index, &different, false));
+    let after = metrics::snapshot(); assert_eq!((after.0-before.0, after.1-before.1), (2, 12));
+    assert!(index.records.values().all(|r| r.digest.is_some()));
 }

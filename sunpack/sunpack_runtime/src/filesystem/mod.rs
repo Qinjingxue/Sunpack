@@ -12,7 +12,7 @@ pub(crate) struct WatchFileObservation {
 mod windows;
 
 #[cfg(windows)]
-pub(crate) use windows::watch_ready_file_snapshot;
+pub(crate) use windows::{watch_ready_file_snapshot, WatchFileSnapshot};
 
 #[cfg(not(windows))]
 pub(crate) fn watch_file_observation(

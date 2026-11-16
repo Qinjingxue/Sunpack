@@ -110,6 +110,8 @@ fn measure_watch_dedup_index() {
     println!(
         "SUNPACK_DEDUP_BENCH {}",
         serde_json::json!({
+            "hash_calls": super::super::dedup_hash::metrics::CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            "hash_bytes": super::super::dedup_hash::metrics::BYTES.load(std::sync::atomic::Ordering::Relaxed),
             "count":count, "mode":mode_name, "baseline":baseline, "duplicates":duplicates,
             "records":record_count, "hashed_records":hashed,
             "admission_ns":admit_ns, "durable_finish_ns":flush_ns,

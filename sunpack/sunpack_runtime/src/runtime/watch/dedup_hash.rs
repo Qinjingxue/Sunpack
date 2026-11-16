@@ -16,6 +16,8 @@ pub(super) struct HashRange<'a> {
 /// bounded independently of source size. The caller must run under the shared
 /// Watch work budget and revalidate its discovery/USN generation before admission.
 pub(super) fn hash_ranges<'a>(ranges: impl IntoIterator<Item = HashRange<'a>>) -> io::Result<[u8; 16]> {
+    #[cfg(test)]
+    metrics::call();
     let mut state = Xxh3::new();
     for range in ranges {
         crate::io::iocp::read_range_ordered(
@@ -24,6 +26,8 @@ pub(super) fn hash_ranges<'a>(ranges: impl IntoIterator<Item = HashRange<'a>>) -
             range.offset,
             range.len,
             |bytes| {
+                #[cfg(test)]
+                metrics::consume(bytes.len());
                 state.update(bytes);
                 Ok(())
             },
@@ -35,3 +39,7 @@ pub(super) fn hash_ranges<'a>(ranges: impl IntoIterator<Item = HashRange<'a>>) -
 #[cfg(test)]
 #[path = "../../../tests/unit/runtime/watch/dedup_hash_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/runtime/watch/dedup_hash_metrics.rs"]
+pub(super) mod metrics;
