@@ -142,3 +142,23 @@ fn completed_families_leave_no_resident_history_or_aliases() {
     projection.expire_live(vec![id.into()], 2_000_000);
     assert!(projection.tasks.is_empty() && projection.aliases.is_empty());
 }
+
+#[test]
+fn deduplicated_proposal_retires_live_owner_and_preserves_named_history() {
+    let mut projection = Projection::default();
+    let source = "C:/watch/copy.zip";
+    projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"dedup-run",
+        "groups":[{"path":source,"members":[source]}]}));
+    projection.apply(&mut json!({"event":"processing_started","owner":"dedup-run","path":source,"ts":1}));
+    let mut terminal = json!({"event":"watch_deduplicated","owner":"dedup-run","path":source,
+        "ts":2,"retire_group":true,"output_dirs":[]});
+    assert!(state_event("watch_deduplicated"));
+    assert!(projection.apply(&mut terminal), "deduplicated must enter ordinary history");
+    assert!(projection.tasks.is_empty(), "duplicate must not remain processing");
+    assert_eq!(terminal["event"], "watch_deduplicated");
+    assert!(terminal["task_id"].is_string());
+    assert!(terminal.get("succeeded").is_none());
+    assert_eq!(terminal["output_dirs"], json!([]));
+    projection.apply(&mut json!({"event":"pipeline_sources_released","owner":"dedup-run"}));
+    assert!(projection.retiring.is_empty());
+}

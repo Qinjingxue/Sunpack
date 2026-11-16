@@ -16,6 +16,7 @@ pub(crate) enum Kind {
     CatalogWal = 2,
     TaskSnapshot = 3,
     CatalogSnapshot = 4,
+    DedupWal = 5,
 }
 
 pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {

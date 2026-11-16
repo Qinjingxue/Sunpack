@@ -226,6 +226,8 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
     } else if(event=="failed_password" || event=="suspended_missing_volume") {
         status="taskWaiting"; tone="waiting";
         label=event=="failed_password"?"taskWaitingPassword":"taskWaitingVolumes";
+    } else if(event=="watch_deduplicated") {
+        status="taskSucceeded"; label="taskDeduplicated"; tone="success";
     } else if(event=="done") {
         label=status="taskSucceeded"; tone="success";
     } else if(event=="failed_terminal" || event=="partial_rejected") {

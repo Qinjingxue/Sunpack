@@ -3522,3 +3522,71 @@ fn completed_extract_compacts_segments_but_keeps_nested_summary_and_retry_receip
     }
     fs::remove_file(source).unwrap();
 }
+
+#[test]
+fn declined_watch_input_retires_without_worker_success_or_cleanup() {
+    struct Decline(Mutex<Vec<Event>>);
+    impl Observer for Decline {
+        fn input_admission_enabled(&self) -> bool { true }
+        fn notify(&self, event: Event) { self.0.lock().unwrap().push(event); }
+        fn admit_inputs(&self, owner: &Path, inputs: &[&ArchiveInput], members: &[String], depth: usize) -> io::Result<bool> {
+            assert!(super::super::scheduling::in_stage());
+            assert_eq!(depth, 1);
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(owner, Path::new(&inputs[0].entry_path));
+            assert_eq!(members, &[inputs[0].entry_path.clone()]);
+            Ok(false)
+        }
+        fn register_output(&self, _: &ArchiveResult, _: &Path) -> io::Result<()> {
+            panic!("declined input cannot reserve output")
+        }
+    }
+    let source = crate::test_support::temp_file("declined_watch_input", b"unchanged source");
+    let engine = Engine::new(PathBuf::from("must-not-start-worker.exe"));
+    let mut request = Request::new(vec![source.clone()], Mode::Extract);
+    request.origin = Origin::Watch;
+    let observer = Decline(Mutex::default());
+    let run = test_run(&engine, &request, &observer);
+    let task = Task {
+        primary: None, owned_paths: vec![source.to_string_lossy().into_owned()],
+        inputs: vec![LogicalInput {
+            input: ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
+            password: None, failure: None,
+        }], source: DiscoverySource::Detection, context: None,
+    };
+    let result = Scheduler::new().run(1, Origin::Watch, &request.cancel, |spawner| {
+        run.execute_task(run.register_task(task), 1, 1, None, spawner)
+    }).unwrap();
+    assert!(result.archives.is_empty() && result.errors.is_empty() && result.cleanup_results.is_empty());
+    assert!(result.checkpoints.is_empty());
+    assert!(run.created_outputs.lock().unwrap().0.is_empty());
+    assert!(run.cleanup_refs.lock().unwrap().paths.is_empty());
+    assert!(matches!(observer.0.lock().unwrap().as_slice(), [Event::Skipped { id: 1 }]));
+    assert_eq!(fs::read(&source).unwrap(), b"unchanged source");
+    fs::remove_file(source).unwrap();
+}
+
+#[test]
+fn discovery_baseline_visits_archive_without_starting_worker() {
+    let source = crate::test_support::temp_file("discovery_baseline", b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00");
+    let engine = Engine::new(PathBuf::from("must-not-start-worker.exe"));
+    let mut request = Request::new(vec![source.clone()], Mode::Extract);
+    request.origin = Origin::Watch;
+    request.deep = true;
+    let visited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&visited);
+    let expected_source = source.clone();
+    let job = engine.submit_discovery(request, move |owner, inputs| {
+        assert!(super::super::scheduling::in_stage());
+        assert_eq!(owner, expected_source);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].format_hint, "zip");
+        count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }, |result| result);
+    super::super::scheduling::block_on(job.wait()).unwrap();
+    assert_eq!(visited.load(Ordering::Relaxed), 1);
+    assert!(engine.worker.lock().unwrap().process.is_none());
+    assert!(source.is_file());
+    fs::remove_file(source).unwrap();
+}

@@ -24,6 +24,8 @@ sunpack.exe config show
 | `post_extract.archive_cleanup_mode` | 完整成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。 |
 | `post_extract.flatten_single_directory` | `true` 时提升唯一顶层输出目录中的内容。 |
 | `passwords.clipboard_passwords_enabled` | 默认 `true`，CLI 将当前剪贴板文本作为密码候选。 |
+| `watch.deduplication` | 普通配置默认 `"file_id"` 硬链接去重；高级配置默认 `"none"` 不去重；`"hash"` 识别内容相同的逻辑归档输入。 |
+| `watch.deduplication_scope` | 默认 `"root"` 仅比较当前监控目录；`"global"` 比较全部监控目录。 |
 | `watch.clipboard_monitor_enabled` | 默认 `true`，运行中的 Watch 保存剪贴板密码历史。 |
 | `watch.clipboard_builtin_max_entries` | 默认保留最新 30 条剪贴板历史，最小 1。 |
 | `watch.toast_report_retention_days` | 默认保留失败报告 30 天，最小 1。 |
@@ -145,3 +147,15 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
   "clipboard_history": []
 }
 ```
+
+
+## 监控去重
+
+在配置或 GUI 中将 `watch.deduplication` 设为 `none`、`file_id` 或 `hash`。随程序提供的普通配置默认启用硬链接去重，高级配置和未配置时的后备默认值仍为 `none`，普通配置优先于高级配置。仅已确认是归档且逻辑布局确定的输入进入索引，普通文件和不确定的分卷组合不参与。逻辑输入包含有序分卷成员和载体区间，不比较解压后的内容，也不影响 CLI 解压。
+
+`file_id` 比较底层文件身份；`hash` 先筛选大小，再以流式 XXH3-128 比较内容。Hash 相等是概率性判断，不是密码学保证。即使原输入挂起或失败，新重复输入也会跳过，但不会记为解压成功或清理源文件，原输入仍可正常重试。GUI 将跳过记录归入成功分类，以绿色“去重跳过”标识展示，不代表解压成功。索引仅在输入文件仍存在于监控范围内时有效。
+
+每次切换模式都会清除旧内存索引及持久化去重索引。`none` 到此结束；`file_id` 扫描已确认输入并重建，`hash` 还会读取其内容计算摘要。重建不执行解压或源清理。未切换模式的进程重启会校验并复用独立持久化索引，不重新计算全部 Hash。
+
+
+`watch.deduplication_scope` 在普通和高级配置中均默认为 `root`。设为 `global` 后可跨监控目录比较：Hash 去重可识别跨目录、跨卷的相同逻辑输入内容；硬链接去重比较卷标识和 File ID，不会将不同卷上的相同 File ID 当成同一个文件。嵌套监控根覆盖的同一路径仍是一个输入，不会与自身重复。切换范围和切换模式一样，清除并重建去重索引；未启用去重时不建立索引。

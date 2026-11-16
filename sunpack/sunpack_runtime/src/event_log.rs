@@ -50,6 +50,7 @@ fn state_event(event: &str) -> bool {
             | "failed_password"
             | "suspended_missing_volume"
             | "done"
+            | "watch_deduplicated"
             | "failed_terminal"
             | "partial_rejected"
             | "task_retired"
@@ -432,13 +433,14 @@ impl Projection {
                     | "failed_password"
                     | "suspended_missing_volume"
                     | "done"
+                    | "watch_deduplicated"
                     | "failed_terminal"
                     | "partial_rejected"
             )
         {
             let terminal = matches!(
                 event,
-                "done" | "failed_terminal" | "partial_rejected"
+                "done" | "watch_deduplicated" | "failed_terminal" | "partial_rejected"
             );
             let owner = field(value, "owner");
             if terminal

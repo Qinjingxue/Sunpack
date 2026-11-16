@@ -881,6 +881,7 @@ dependencies = [
  "sunpack-usn-core",
  "unicode-normalization",
  "windows-sys",
+ "xxhash-rust",
  "xz2",
  "zstd",
 ]
@@ -1059,6 +1060,12 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "xz2"

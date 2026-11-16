@@ -24,6 +24,8 @@ pub(super) fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
     settings.post_extract.archive_cleanup_mode = crate::core::config::CleanupMode::Keep;
     let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
     Scheduler {
+        dedup_rebuild: None, dedup_job_id: 0,
+        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
         cwd: base.into(), root_file: base.join(ROOTS_FILE),
@@ -329,6 +331,8 @@ fn checkpoint_submits_the_first_ready_generation() {
             let settings = Arc::new(Config::default());
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let mut scheduler = Scheduler {
+                dedup_rebuild: None, dedup_job_id: 0,
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 candidate_diagnostics: CandidateDiagnostics::default(),
                 admission_checkpoint: None,
@@ -486,6 +490,8 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
     let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
     options.catalog_refresh(&catalog, &scope, None).unwrap();
     let mut scheduler = Scheduler {
+        dedup_rebuild: None, dedup_job_id: 0,
+        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(),
         admission_checkpoint: None,
@@ -555,6 +561,8 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
             let settings = Arc::new(Config::default());
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let mut scheduler = Scheduler {
+                dedup_rebuild: None, dedup_job_id: 0,
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
@@ -650,6 +658,8 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let lease = BrokerLease::acquire().unwrap();
             let mut scheduler = Scheduler {
+                dedup_rebuild: None, dedup_job_id: 0,
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
@@ -779,6 +789,8 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         let settings = Arc::new(Config::default());
         let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
         let mut scheduler = Scheduler {
+            dedup_rebuild: None, dedup_job_id: 0,
+            dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
             resuming: false, baseline_roots: HashSet::new(),
             candidate_diagnostics: CandidateDiagnostics::default(),
             admission_checkpoint: None,
@@ -911,6 +923,8 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         let settings = Arc::new(Config::default());
         let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
         let mut scheduler = Scheduler {
+            dedup_rebuild: None, dedup_job_id: 0,
+            dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
             resuming: false, baseline_roots: HashSet::new(),
             candidate_diagnostics: CandidateDiagnostics::default(),
             admission_checkpoint: None,

@@ -484,6 +484,17 @@ void config_edits(Application& app,const fs::path& dir) {
     finish_input(app);
     assert(read_json(config_path)["runtime"]["process_mode"]=="high");
 
+    const std::string deduplication="/watch/deduplication";
+    search_setting(app,deduplication);
+    select_option(app,"select-"+deduplication,2);
+    finish_input(app);
+    assert(read_json(config_path)["watch"]["deduplication"]=="hash");
+    const std::string deduplication_scope="/watch/deduplication_scope";
+    search_setting(app,deduplication_scope);
+    select_option(app,"select-"+deduplication_scope,1);
+    finish_input(app);
+    assert(read_json(config_path)["watch"]["deduplication_scope"]=="global");
+
     search_setting(app,"/watch/toast_enabled");
     click(app,"toggle-/watch/toast_enabled");
     finish_input(app);

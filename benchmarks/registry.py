@@ -22,6 +22,7 @@ _ROWS = [
 ]
 SCENARIOS = {(group, name): Scenario(group, name, description, arguments) for group, name, description, arguments in _ROWS}
 for scenario in (
+    Scenario("watch", "dedup-index", "Watch logical-input dedup admission, WAL and memory scaling.", (), "benchmarks.scenarios.watch_dedup_index"),
     Scenario("password", "probe-matrix", "Cold password candidate probing by encrypted format.", (), "benchmarks.scenarios.password_probe"),
     Scenario("worker", "format-matrix", "Direct worker 300 MiB reproducible format matrix.", (), "benchmarks.scenarios.worker_300m"),
     Scenario("scan", "embedded", "Large carrier embedded archive scanning.", (), "benchmarks.scenarios.embedded_scan"),

@@ -337,6 +337,96 @@ impl Drop for PendingReads<'_> {
     }
 }
 
+// Completion order is not byte order. At most the two read-ahead slots can
+// wait here, and recycling happens only after the next logical chunk is consumed.
+struct OrderedReads {
+    next_offset: u64,
+    ready: Vec<Box<IocpSlot>>,
+}
+impl OrderedReads {
+    fn new(offset: u64) -> Self {
+        Self { next_offset: offset, ready: Vec::with_capacity(2) }
+    }
+    fn completed(&mut self, slot: Box<IocpSlot>) { self.ready.push(slot); }
+    fn next(&mut self) -> Option<Box<IocpSlot>> {
+        let index = self.ready.iter().position(|slot| slot.read_start == self.next_offset)?;
+        let slot = self.ready.swap_remove(index);
+        self.next_offset += slot.bytes_read as u64;
+        Some(slot)
+    }
+}
+
+/// Stream one exact range in offset order with a two-buffer read-ahead window.
+/// The callback runs on the caller's admitted worker; no per-file thread or
+/// unbounded completion queue is created. PendingReads also drains on unwind.
+pub(crate) fn read_range_ordered(
+    path: &Path,
+    offset: u64,
+    len: u64,
+    mut consume: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::windows::io::FromRawHandle;
+    const CHUNK: usize = 256 * 1024;
+    let end = offset.checked_add(len).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "IOCP range overflows")
+    })?;
+    let cancellation = Cancellation::current();
+    cancellation.check_io()?;
+    let handles = Arc::new(open_handles(path)?);
+    // Borrow the very same handle used by overlapped reads, without closing it.
+    let file = std::mem::ManuallyDrop::new(unsafe {
+        std::fs::File::from_raw_handle(handles.file)
+    });
+    let before = super::reader::physical_file_generation(&file)?;
+    if end > file.metadata()?.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "IOCP range exceeds file"));
+    }
+    let wake_handles = Arc::clone(&handles);
+    let _subscription = cancellation.subscribe(move || unsafe {
+        CancelIoEx(wake_handles.file, null_mut());
+        PostQueuedCompletionStatus(wake_handles.port, 0, WORKER_COMPLETION_KEY, null_mut());
+    });
+    let mut pending = PendingReads { handles: &handles, slots: HashMap::with_capacity(2) };
+    let mut next_read = offset;
+    for _ in 0..len.div_ceil(CHUNK as u64).min(2) {
+        submit_next_slot(&mut pending, &mut next_read, end, CHUNK, 0,
+            Box::new(IocpSlot::new(CHUNK.min(len as usize))))?;
+    }
+    let mut ordered = OrderedReads::new(offset);
+    while ordered.next_offset < end {
+        cancellation.check_io()?;
+        let mut bytes = 0;
+        let mut key = 0;
+        let mut overlapped = null_mut();
+        let ok = unsafe { GetQueuedCompletionStatus(handles.port, &mut bytes,
+            &mut key, &mut overlapped, INFINITE) };
+        if overlapped.is_null() {
+            cancellation.check_io()?;
+            if ok == 0 { return Err(last_error()); }
+            continue;
+        }
+        let mut slot = pending.slots.remove(&(overlapped as usize))
+            .ok_or_else(|| io::Error::other("unexpected IOCP range completion"))?;
+        if ok == 0 { return Err(last_error()); }
+        cancellation.check_io()?;
+        if bytes as usize != slot.buffer.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short IOCP range read"));
+        }
+        slot.bytes_read = bytes as usize;
+        ordered.completed(slot);
+        while let Some(slot) = ordered.next() {
+            consume(&slot.buffer[..slot.bytes_read])?;
+            cancellation.check_io()?;
+            submit_next_slot(&mut pending, &mut next_read, end, CHUNK, 0, slot)?;
+        }
+    }
+    let after = super::reader::physical_file_generation(&file)?;
+    if before != after || after != super::reader::capture_file_generation(path)? {
+        return Err(io::Error::other("file changed while streaming range"));
+    }
+    Ok(())
+}
+
 /// Run a bounded overlapped sequential scan, handing each completed batch to
 /// the caller before recycling its buffer. Result storage belongs to the sink.
 ///

@@ -256,6 +256,59 @@ impl Engine {
         }))
     }
 
+    /// Discover without extraction, then visit plans through the same bounded
+    /// consumer pool as extraction. IO/hash work never blocks the Watch driver.
+    pub(crate) fn submit_discovery<T: Send + 'static>(
+        &self, request: Request,
+        visit: impl Fn(&Path, &[&ArchiveInput]) -> io::Result<()> + Send + Sync + 'static,
+        complete: impl FnOnce(io::Result<()>) -> T + Send + 'static,
+    ) -> super::scheduling::Join<T> {
+        let id = self.next_id();
+        let scheduler = self.scheduler.get_or_init(Scheduler::new);
+        let prepared = match scheduler.prepare_submit() {
+            Ok(prepared) => prepared,
+            Err(error) => return super::scheduling::Join::ready(complete(Err(error))),
+        };
+        let engine = self.clone();
+        prepared.submit(id, request.origin, &request.cancel.clone(), move |spawner| {
+            Box::pin(async move {
+                let result = async {
+                    stage("discovery", &request.cancel).await?;
+                    let candidates = CandidateSet::new(Arc::clone(&request.passwords),
+                        request.password_snapshot.clone(), &engine.password_attempts,
+                        request.password_scope.as_deref());
+                    let options = if request.deep {
+                        NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
+                    } else { discovery::scan_options(&request.config)? };
+                    let discovered = discovery::discover(&request, &options, &candidates)?;
+                    drop(candidates);
+                    let tasks: Vec<_> = discovered.tasks.into_iter().filter(|task|
+                        !task.inputs.is_empty() && task.inputs.iter().all(|input| input.failure.is_none())).collect();
+                    let expected = tasks.len();
+                    let cancel = request.cancel.clone();
+                    let visit = Arc::new(visit);
+                    let results = spawner.bounded_map(tasks, move |task| {
+                        let cancel = cancel.clone();
+                        let visit = Arc::clone(&visit);
+                        Box::pin(async move {
+                            stage("watch_dedup", &cancel).await?;
+                            let inputs: Vec<_> = task.inputs.iter().map(|input| &input.input).collect();
+                            visit(Path::new(&task.entry().entry_path), &inputs)
+                        })
+                    }).await;
+                    request.cancel.check_io()?;
+                    debug_assert_eq!(expected, results.len());
+                    for result in results { result?; }
+                    if let Some((operation, path, detail)) = discovered.scan_errors.into_messages().into_iter().next() {
+                        return Err(io::Error::other(format!("{operation}: {path}: {detail}")));
+                    }
+                    Ok(())
+                }.await;
+                complete(result)
+            })
+        })
+    }
+
     pub(crate) fn find_watch_volume(&self, request: &Request, options: &NativeDirectoryScanOptions, retry_incomplete: bool) -> io::Result<Option<Arc<super::PreparedVolume>>> {
         let candidates = CandidateSet::new(Arc::clone(&request.passwords), request.password_snapshot.clone(),
             &self.password_attempts, request.password_scope.as_deref());
@@ -1582,6 +1635,17 @@ impl<'run, O: Observer> Run<'run, O> {
                     return Ok(outcome);
                 }
             };
+            if watch_root && this.observer.input_admission_enabled() && !task.inputs.is_empty()
+                && task.inputs.iter().all(|input| input.failure.is_none())
+            {
+                let inputs: Vec<_> = task.inputs.iter().map(|input| &input.input).collect();
+                if !this.observer.admit_inputs(Path::new(&task.entry().entry_path),
+                    &inputs, &task.owned_paths, depth)?
+                {
+                    this.notify(|| Event::Skipped { id: task_id });
+                    return Ok(outcome);
+                }
+            }
             this.notify(|| Event::Started { id: task_id });
             let preflight_failures = if task.inputs.len() > 1
                 && !missing.is_empty() {

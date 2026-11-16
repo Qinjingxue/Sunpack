@@ -160,3 +160,24 @@ scenario uses the current worker protocol. Historical
 index experiment material remains in `hit_index/`; its independent C ABI probe
 and native algorithm comparison build tools require no Python extension. The
 [GUI benchmark](gui/README.md) remains a native executable.
+
+
+`watch dedup-index` measures only the newly added native Watch dedup admission
+index, using an explicitly ignored test-build entry (no release executable hooks).
+It generates valid stored ZIP files and supplies their already-confirmed input
+models, excluding discovery, extraction and the GUI. Defaults compare 512/2048/8192
+inputs in none/file-ID/hash modes, both online admission and eager initialization,
+with equal-size equal-content copies, equal-size distinct content, distinct sizes,
+and hard links (at most 512 links per file object). Each row uses a fresh process
+and WAL. It records throughput, median/p95/p99 admission latency, process private
+memory/working-set increments, peak working set and WAL bytes; durable finish is
+timed separately. Fixture generation and OS filesystem caches are retained, so
+these numbers are **not cold-disk bandwidth** or end-to-end Watch latency. Use
+`--runs 3` for repeated trials or `--payload-bytes 1048576` for a read-heavy matrix.
+This index-only workload uses local file observations; it does not start a Watch
+Broker, GUI or installed runtime. Journal-incarnation stamps are synthetic and
+fixed, so these runs do not measure USN replay or journal recovery.
+
+```powershell
+uv run --locked --extra test python -m benchmarks watch dedup-index --profile ci
+```

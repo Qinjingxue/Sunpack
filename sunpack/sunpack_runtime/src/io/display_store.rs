@@ -300,7 +300,7 @@ fn kind(value: &Value) -> u32 {
         "processing_started" => 1,
         "failed_password" => 2,
         "suspended_missing_volume" => 3,
-        "done" => 4,
+        "done" | "watch_deduplicated" => 4,
         "failed_terminal" | "partial_rejected" => 5,
         _ => 0,
     }

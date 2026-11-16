@@ -56,8 +56,25 @@ pub struct RuntimeConfig {
     pub process_mode: ProcessMode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchDeduplication {
+    None,
+    FileId,
+    Hash,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchDeduplicationScope {
+    Root,
+    Global,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub struct WatchConfig {
+    pub deduplication: WatchDeduplication,
+    pub deduplication_scope: WatchDeduplicationScope,
     pub boundary_confirmation_seconds: f64,
     pub runtime_cache_cleanup_idle_seconds: f64,
     pub clipboard_monitor_enabled: bool,
@@ -779,6 +796,12 @@ impl Config {
             check_section(value, section, true)?;
         }
         let watch = WatchConfig {
+            deduplication: WatchDeduplication::parse(selection_field(
+                value, &["watch", "deduplication"], "none",
+            ))?,
+            deduplication_scope: WatchDeduplicationScope::parse(selection_field(
+                value, &["watch", "deduplication_scope"], "root",
+            ))?,
             boundary_confirmation_seconds: number_field(
                 value,
                 &["watch", "boundary_confirmation_seconds"],
@@ -1006,6 +1029,27 @@ pub(crate) fn decimal_digit(character: char) -> Option<u32> {
     let code = character as u32;
     let &(start, _) = ranges.iter().find(|&&(start, end)| start <= code && code <= end)?;
     Some((code - start) % 10)
+}
+
+impl WatchDeduplicationScope {
+    pub fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            value if value.eq_ignore_ascii_case("root") => Ok(Self::Root),
+            value if value.eq_ignore_ascii_case("global") => Ok(Self::Global),
+            _ => Err(invalid("watch.deduplication_scope must be root or global")),
+        }
+    }
+}
+
+impl WatchDeduplication {
+    pub fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            value if value.eq_ignore_ascii_case("none") => Ok(Self::None),
+            value if value.eq_ignore_ascii_case("file_id") => Ok(Self::FileId),
+            value if value.eq_ignore_ascii_case("hash") => Ok(Self::Hash),
+            _ => Err(invalid("watch.deduplication must be none, file_id, or hash")),
+        }
+    }
 }
 
 impl ProcessMode {

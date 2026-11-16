@@ -39,7 +39,7 @@ inline void publish_events(const spg::fs::path& path,const std::string& events,c
         auto size=LZ4_compress_default(reinterpret_cast<const char*>(raw.data()),compressed.data(),int(raw.size()),int(compressed.size()));
         std::array<char,64> entry{}; auto time=int64_t(timestamp(row)*1000000); auto offset=uint64_t(data.tellp());
         auto length=uint32_t(size), raw_size=uint32_t(raw.size()); uint32_t kind=1;
-        auto event=row["event"].get<std::string>(); if(event=="done") kind=4; else if(event=="failed_terminal" || event=="partial_rejected") kind=5;
+        auto event=row["event"].get<std::string>(); if(event=="done" || event=="watch_deduplicated") kind=4; else if(event=="failed_terminal" || event=="partial_rejected") kind=5;
         else if(event=="failed_password") kind=2; else if(event=="suspended_missing_volume") kind=3;
         memcpy(entry.data(),&time,8); memcpy(entry.data()+8,&offset,8); memcpy(entry.data()+16,&length,4);
         auto ordinal=uint32_t(uint64_t(index.tellp())/64);

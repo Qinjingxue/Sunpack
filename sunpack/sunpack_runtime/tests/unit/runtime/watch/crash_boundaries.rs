@@ -141,6 +141,8 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
         let settings = Arc::new(Config::default());
             let mut scheduler = Scheduler {
+                dedup_rebuild: None, dedup_job_id: 0,
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 candidate_diagnostics: CandidateDiagnostics::default(),
                 admission_checkpoint: None,
@@ -203,6 +205,9 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
             let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
                 (key(path), capture_file_generation(path).unwrap())).collect();
             let observer = WatchObserver {
+                dedup_enabled: false,
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+                dedup_scope: NativeDiscoveryScope::new(base.join("state").to_string_lossy().into_owned(), None, Vec::new()),
                 catalog: Arc::clone(&scheduler.catalog),
                 deep: false, journal: Arc::clone(&scheduler.journal),
                 owners: HashMap::new(),

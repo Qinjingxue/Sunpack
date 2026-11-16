@@ -226,6 +226,8 @@
     "process_mode": "normal"
   },
   "watch": {
+    "deduplication": "none",
+    "deduplication_scope": "root",
     "boundary_confirmation_seconds": 0.5,
     "runtime_cache_cleanup_idle_seconds": 10,
     "clipboard_monitor_enabled": true,

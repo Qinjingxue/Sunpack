@@ -36,6 +36,7 @@ xz2 = "0.1"
 zstd = "0.13"
 unicode-normalization = "0.1"
 rmp-serde = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

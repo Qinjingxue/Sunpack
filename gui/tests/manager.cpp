@@ -133,6 +133,17 @@ void projection(Fixture& f) {
     publish(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",0}});
     assert(log.query({},{}).at("rows").at(0).at("time")=="1970-01-01 08:00:00");
     _putenv_s("TZ",old_zone.c_str()); _tzset();
+    // Deduplication belongs to the successful GUI filter, but is visibly
+    // distinct from extraction success and carries no invented output.
+    publish(Json{{"event","watch_deduplicated"},{"path",utf8(source.wstring())},{"ts",1}});
+    View dedup_view; dedup_view.task_status="taskSucceeded";
+    auto dedup_row=log.query({},dedup_view,"zh").at("rows").at(0);
+    assert(dedup_row["status"]=="taskSucceeded" && dedup_row["statusTone"]=="success");
+    assert(dedup_row["statusText"]=="去重跳过" && dedup_row["outputs"].empty());
+    assert(log.query({},dedup_view,"en").at("rows").at(0).at("statusText")=="Duplicate skipped");
+    dedup_view.task_status="taskFailed";
+    assert(log.query({},dedup_view).at("rows").empty());
+
 
     // Resolve navigation from the same projected row at activation, including
     // deleted input archives and outputs moved after the page was displayed.
@@ -236,6 +247,10 @@ void editing(Fixture& f) {
     assert(conf["filters"][0]["rules"]==Json::array({"*","r",3}));
     fails([&]{save_config_field(c,"/watch/out_dir","\".\"","string","stale",false);});
     fails([&]{validate_setting("/runtime/process_mode",Json("typo"));});
+    for(auto mode:{"none","file_id","hash"}) validate_setting("/watch/deduplication",Json(mode));
+    fails([&]{validate_setting("/watch/deduplication",Json("sha256"));});
+    for(auto scope:{"root","global"}) validate_setting("/watch/deduplication_scope",Json(scope));
+    fails([&]{validate_setting("/watch/deduplication_scope",Json("volume"));});
     fails([&]{validate_setting("/watch/clipboard_builtin_max_entries",Json(0));});
     for(auto bounds:{std::make_tuple("/performance/worker/space_poll_interval_ms",50,60000),
                      std::make_tuple("/performance/worker/space_status_report_interval_ms",1000,600000)}) {

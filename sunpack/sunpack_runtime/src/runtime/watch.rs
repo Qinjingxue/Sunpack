@@ -30,6 +30,8 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+mod dedup;
+mod dedup_hash;
 mod journal;
 mod quiet;
 #[cfg(test)]
@@ -970,6 +972,8 @@ struct Signals {
     cancel: Vec<(String, CommandReply<bool>)>,
     roots: Vec<RootCompleted>,
     completed: Vec<String>,
+    dedup_completed: Vec<(u64, io::Result<()>)>,
+    dedup_rebuild: bool,
     claimed: HashSet<String>,
 }
 
@@ -1268,6 +1272,8 @@ impl Hub {
                 && value.cancel.is_empty()
                 && value.claimed.is_empty()
                 && value.completed.is_empty()
+                && value.dedup_completed.is_empty()
+                && !value.dedup_rebuild
                 && value.roots.is_empty()
         };
         let mut guard = if let Some(deadline) = deadline {
@@ -1970,6 +1976,7 @@ fn scope_record(scope: &NativeDiscoveryScope) -> serde_json::Map<String, Value> 
 struct ClaimedSources {
     cancelled: bool,
     coalesced: bool,
+    deduplicated: HashSet<String>,
     candidates: HashMap<String, Option<WatchCandidateRow>>,
     finished: HashSet<String>,
 }
@@ -2181,6 +2188,23 @@ impl SourceGroups {
     }
 }
 
+struct DedupRebuild {
+    id: u64,
+    generation: u64,
+    cancel: Cancellation,
+    handle: Option<crate::pipeline::scheduling::Join<()>>,
+    roots: VecDeque<(Root, NativeDiscoveryScope)>,
+}
+impl Drop for DedupRebuild {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        // Cancellation interrupts pending IOCP reads and queued stages. Join
+        // before releasing/reopening the journal: a cancelled callback must
+        // not retain the old service WAL lock across daemon restart.
+        if let Some(handle) = self.handle.take() { let _ = handle.join(); }
+    }
+}
+
 struct Scheduler {
     resuming: bool,
     baseline_roots: HashSet<String>,
@@ -2196,6 +2220,9 @@ struct Scheduler {
     engine: Arc<Engine>,
     journal: Arc<journal::Journal>,
     catalog: Arc<NativeWatchCatalog>,
+    dedup: Arc<Mutex<dedup::Index>>,
+    dedup_rebuild: Option<DedupRebuild>,
+    dedup_job_id: u64,
     recovery_ids: HashMap<String, filesystem::DirectoryRecoveryCache>,
     options: Option<NativeDirectoryScanOptions>,
     deep_options: NativeDirectoryScanOptions,
@@ -2223,6 +2250,78 @@ struct Scheduler {
 
 impl Scheduler {
     fn enabled(&self) -> bool { self.hub.enabled.load(Ordering::Acquire) }
+
+    /// A mode/scope rebuild uses the ordinary executor, not the service thread.
+    /// Pending proposals keep collecting USN/quiet evidence until this baseline
+    /// has been indexed, and control/configuration commands remain responsive.
+    fn rebuild_dedup(&mut self, scopes_changed: bool) -> io::Result<()> {
+        if self.settings.watch.deduplication == config::WatchDeduplication::None { return Ok(()); }
+        // Query each volume once at startup/configuration changes. Routine
+        // checkpoints below reuse their already-read journal boundaries.
+        self.engine.run_stage("watch_dedup_journal", Origin::Watch, || {
+            let mut volumes = HashMap::new();
+            let stamps = self.roots.values().map(|(_, scope)| {
+                let stamp = filesystem::watch_volume_device(&scope.root).ok().and_then(|volume| {
+                    let cursor = volumes.entry(volume.clone()).or_insert_with(|| filesystem::watch_volume_cursor(&volume).ok());
+                    cursor.map(|(journal, _)| (volume, journal))
+                }).unwrap_or_default();
+                (scope.key().to_owned(), stamp.0, stamp.1)
+            }).collect::<Vec<_>>();
+            self.dedup.lock().unwrap().reconcile_journals(&stamps)
+        })??;
+        if !scopes_changed && !self.dedup.lock().unwrap().needs_rebuild() { return Ok(()); }
+        self.dedup_rebuild.take();
+        self.dedup.lock().unwrap().begin_rebuild()?;
+        self.dedup_job_id += 1;
+        self.dedup_rebuild = Some(DedupRebuild {
+            id: self.dedup_job_id,
+            generation: self.dedup.lock().unwrap().generation(),
+            cancel: Cancellation::new(), handle: None,
+            roots: self.roots.values().cloned().collect(),
+        });
+        self.advance_dedup_rebuild()
+    }
+
+    fn advance_dedup_rebuild(&mut self) -> io::Result<()> {
+        let Some(job) = &mut self.dedup_rebuild else { return Ok(()); };
+        job.handle.take();
+        let Some((root, scope)) = job.roots.pop_front() else {
+            let generation = job.generation;
+            self.dedup_rebuild.take();
+            match self.dedup.lock().unwrap().finish_rebuild_if(generation) {
+                Ok(true) => self.journal.log(json!({"event":"watch_dedup_rebuilt","mode":self.settings.watch.deduplication,"scope":self.settings.watch.deduplication_scope,"roots":self.roots.len()})),
+                Ok(false) => (),
+                Err(error) => self.journal.log(json!({"event":"watch_dedup_rebuild_failed","error":error.to_string()})),
+            }
+            return Ok(());
+        };
+        let mut request = Request::with_config(vec![root.path.clone()], Mode::Scan, Arc::clone(&self.settings));
+        request.origin = Origin::Watch;
+        request.cancel = job.cancel.clone();
+        request.recursive = root.recursive;
+        request.deep = root.deep;
+        request.passwords = Arc::clone(&self.settings.user_passwords);
+        request.password_snapshot = Some(self.passwords.snapshot());
+        request.password_scope = Some(root.path.clone());
+        request.discovery_scope = Some(scope.clone());
+        request.watch_catalog = Some(Arc::clone(&self.catalog));
+        let index = Arc::clone(&self.dedup);
+        let journal = Arc::clone(&self.journal);
+        let generation = job.generation;
+        let id = job.id;
+        let hub = Arc::clone(&self.hub);
+        job.handle = Some(self.engine.submit_discovery(request, move |owner, inputs| {
+            if inputs.iter().flat_map(|input| input.physical_paths()).any(|path| !scope.contains(path)) { return Ok(()); }
+            let result = consider_dedup(&index, &owner.to_string_lossy(), scope.key(), inputs, Some(generation));
+            if let Err(error) = result {
+                journal.log(json!({"event":"watch_dedup_unavailable","path":owner,"error":error.to_string()}));
+            }
+            Ok(())
+        }, move |result| {
+            hub.update(|signals| signals.dedup_completed.push((id, result)));
+        }));
+        Ok(())
+    }
 
     fn persist_enabled(&self, enabled: bool) -> io::Result<()> {
         self.journal.resume()?;
@@ -2360,6 +2459,7 @@ impl Scheduler {
             journal.flush()?;
         }
         hub.enabled.store(enabled, Ordering::Release);
+        let dedup = Arc::new(Mutex::new(dedup::Index::open(&dir, snapshot.config.watch.deduplication, snapshot.config.watch.deduplication_scope)?));
         let mut scheduler = Self {
             resuming: false,
             baseline_roots,
@@ -2374,6 +2474,9 @@ impl Scheduler {
             engine,
             journal,
             catalog,
+            dedup,
+            dedup_rebuild: None,
+            dedup_job_id: 0,
             recovery_ids: HashMap::new(),
             options: None,
             deep_options,
@@ -2402,6 +2505,7 @@ impl Scheduler {
         scheduler.reconcile_roots(false)?;
         scheduler.activate_scan_options()?;
         scheduler.retire_missing_entries(None, true)?;
+        scheduler.rebuild_dedup(false)?;
         scheduler.reconcile_shell();
         if enabled {
             scheduler.recover_pending(None)?;
@@ -2678,6 +2782,7 @@ impl Scheduler {
         // Validate the latest root file before stopping the running scheduler.
         // Draining async requests must never hold a blocking-stage permit.
         if restart_scheduler || policy_changed {
+            self.dedup_rebuild.take();
             self.drain_active(&mut Ok(()))?;
             // Main builds its new scheduler from the durable work. In-memory
             // candidates produced by the stop checkpoint must not mask pending
@@ -2694,6 +2799,9 @@ impl Scheduler {
         self.available_roots.retain(|id| next.contains_key(id));
         self.baseline_roots.retain(|id| next.contains_key(id));
         self.roots = next;
+        if self.settings.watch.deduplication != config::WatchDeduplication::None {
+            self.dedup.lock().unwrap().reconcile_scopes(&self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>())?;
+        }
         if let Some(lease) = lease {
             self.broker_lease = Some(lease);
         }
@@ -2803,6 +2911,8 @@ impl Scheduler {
         let tray_changed = self.settings.watch.tray_enabled != snapshot.config.watch.tray_enabled
             || self.settings.cli.language != snapshot.config.cli.language;
         let process_mode_changed = self.settings.runtime.process_mode != snapshot.config.runtime.process_mode;
+        let dedup_changed = self.settings.watch.deduplication != snapshot.config.watch.deduplication
+            || self.settings.watch.deduplication_scope != snapshot.config.watch.deduplication_scope;
         let mut observed_paths = config::watch_paths(&self.cwd, &snapshot.sources);
         observed_paths.push(self.root_file.clone());
         let observers_changed = !observes_files(&observed_paths, self.passwords.path(), &self.config_observers);
@@ -2835,6 +2945,11 @@ impl Scheduler {
             if config_changed {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days);
             }
+            if dedup_changed {
+                self.dedup_rebuild.take();
+                self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope)?;
+            }
+            self.rebuild_dedup(roots_changed)?;
             if !self.enabled() { return Ok(()); }
             if scheduler_changed { self.recover_pending(None)?; }
             self.checkpoint_reload(scheduler_changed || roots_changed)?;
@@ -2856,6 +2971,11 @@ impl Scheduler {
             // ordinary settings against the latest root file, like main.
             let rollback: io::Result<()> = (|| {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days);
+                if dedup_changed {
+                    self.dedup_rebuild.take();
+                    self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope)?;
+                    self.rebuild_dedup(false)?;
+                }
                 let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots(false)?;
                 self.activate_scan_options()?;
                 if !self.enabled() { return Ok(()); }
@@ -3046,6 +3166,7 @@ impl Scheduler {
     fn run(&mut self) -> io::Result<()> {
         let mut result = self.run_inner();
         if result.is_ok() { self.hub.stop(); }
+        self.dedup_rebuild.take();
         let _ = self.drain_active(&mut result);
         let signals = if self.hub.stopped.load(Ordering::Acquire) {
             self.hub.wait(None)
@@ -3071,7 +3192,7 @@ impl Scheduler {
 
     fn run_inner(&mut self) -> io::Result<()> {
         while !self.hub.stopped.load(Ordering::Acquire) {
-            if self.enabled() { self.dispatch_ready()?; }
+            if self.enabled() && self.dedup_rebuild.is_none() { self.dispatch_ready()?; }
             self.hub
                 .pending_count
                 .store(self.pending.len(), Ordering::Relaxed);
@@ -3082,7 +3203,7 @@ impl Scheduler {
                     self.journal.compact()
                 })??;
             }
-            let due = self.next_admission();
+            let due = if self.dedup_rebuild.is_none() { self.next_admission() } else { None };
             let deadline = match (due, self.cache_deadline) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -3090,6 +3211,17 @@ impl Scheduler {
             let deadline = if self.enabled() { deadline.into_iter().chain(self.candidate_diagnostics.deadline()).min() } else { None };
             let mut signals = self.hub.wait(deadline);
             self.candidate_diagnostics.clear_expired(Instant::now());
+            if signals.dedup_rebuild { self.rebuild_dedup(false)?; }
+            for (id, result) in signals.dedup_completed.drain(..) {
+                if !self.dedup_rebuild.as_ref().is_some_and(|job| job.id == id) { continue; }
+                match result {
+                    Ok(()) => self.advance_dedup_rebuild()?,
+                    Err(error) => {
+                        self.dedup_rebuild.take();
+                        self.journal.log(json!({"event":"watch_dedup_rebuild_failed","error":error.to_string()}));
+                    }
+                }
+            }
             for (batch, waiter) in signals.cancel {
                 waiter.send(self.cancel_display_batch(&batch));
             }
@@ -3351,6 +3483,15 @@ impl Scheduler {
             let Some((root, scope)) = self.roots.get(id) else { continue };
             let deep = root.deep;
             let scope = scope.clone();
+            if self.settings.watch.deduplication != config::WatchDeduplication::None {
+                // This fast path does not pass through the USN checkpoint's
+                // invalidation. Departures already retire their exact inverse
+                // index entries below; check only the remaining named changes.
+                let changed: Vec<_> = paths.iter().filter(|path| !departed.contains(*path))
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .filter(|path| scope.contains(path) && !self.catalog.is_owned(path)).collect();
+                self.dedup.lock().unwrap().invalidate(&changed)?;
+            }
             let mut stems = HashSet::new();
             for path in paths {
                 let source = path.to_string_lossy();
@@ -3381,6 +3522,12 @@ impl Scheduler {
     }
 
     fn observe_root_changes(&mut self, changes: &mut RootChanges) -> io::Result<()> {
+        if self.settings.watch.deduplication != config::WatchDeduplication::None {
+            let mut index = self.dedup.lock().unwrap();
+            for root in &changes.topology_roots {
+                if let Some((root, _)) = self.roots.get(root) { index.invalidate_tree(&root.path.to_string_lossy())?; }
+            }
+        }
         if !self.baseline_roots.is_empty() {
             let baseline: HashMap<_, _> = changes.changed_roots.iter()
                 .filter(|(root, _)| self.baseline_roots.contains(*root))
@@ -3452,6 +3599,9 @@ impl Scheduler {
         {
             if !root.path.is_dir() {
                 self.available_roots.remove(id);
+                if self.settings.watch.deduplication != config::WatchDeduplication::None {
+                    self.dedup.lock().unwrap().invalidate_tree(&scope.root)?;
+                }
                 continue;
             }
             if self.available_roots.insert(id.clone()) && !startup {
@@ -3469,6 +3619,17 @@ impl Scheduler {
         let volume_cursors: HashMap<_, _> = volumes.into_par_iter()
             .map(|volume| (volume.to_owned(), filesystem::watch_volume_cursor(volume).map_err(Arc::new)))
             .collect();
+        if self.settings.watch.deduplication != config::WatchDeduplication::None {
+            let stamps = probes.iter().map(|(_, _, scope, _, volume)| {
+                let stamp = volume.as_ref().ok().and_then(|volume|
+                    volume_cursors.get(volume).and_then(|cursor| cursor.as_ref().ok()).map(|(journal, _)| (volume.clone(), *journal)))
+                    .unwrap_or_default();
+                (scope.key().to_owned(), stamp.0, stamp.1)
+            }).collect::<Vec<_>>();
+            if self.dedup.lock().unwrap().reconcile_journals(&stamps)? {
+                self.hub.update(|signals| signals.dedup_rebuild = true);
+            }
+        }
         if !self.recovery_ids.is_empty() {
             let mounted_roots: HashMap<_, _> = probes.iter().filter_map(|(_, _, scope, _, volume)| {
                 Some((crate::path_keys::path_key(&scope.root), volume.as_deref().ok()?))
@@ -3671,6 +3832,16 @@ impl Scheduler {
                     }
                 }
             }
+            if self.settings.watch.deduplication != config::WatchDeduplication::None {
+                if baseline {
+                    // Resume deliberately absorbs offline changes rather than
+                    // returning arrivals. Retire stale indexed inputs once at
+                    // that same scope boundary, without rehashing live ones.
+                    self.dedup.lock().unwrap().invalidate_tree(&scope.root)?;
+                } else {
+                    self.dedup.lock().unwrap().invalidate(&paths)?;
+                }
+            }
             let recovered_paths = paths.len();
             if !root.scanned {
                 paths.extend(self.catalog.candidate_paths(&scope, None));
@@ -3855,6 +4026,10 @@ impl Scheduler {
     }
 
     fn departed(&mut self, path: &str, recursive: bool) -> io::Result<()> {
+        if self.settings.watch.deduplication != config::WatchDeduplication::None {
+            if recursive { self.dedup.lock().unwrap().invalidate_tree(path)?; }
+            else { self.dedup.lock().unwrap().invalidate(&[path.to_owned()])?; }
+        }
         let path_key = watch_path_key(path);
         self.volume_checks.remove(&path_key);
         if recursive {
@@ -5110,6 +5285,9 @@ impl Scheduler {
             "path":candidates.first().map(|entry| &entry.path),"count":candidates.len()}));
         let observer = Arc::new(WatchObserver {
             deep: root.deep,
+            dedup: Arc::clone(&self.dedup),
+            dedup_enabled: self.settings.watch.deduplication != config::WatchDeduplication::None,
+            dedup_scope: scope.clone(),
             catalog: Arc::clone(&self.catalog),
             journal,
             owners,
@@ -5856,6 +6034,8 @@ impl Scheduler {
                 "failed_terminal"
             } else if archives.is_some() {
                 "done"
+            } else if active.claimed.lock().unwrap().deduplicated.contains(&canonical_id) {
+                "watch_deduplicated"
             } else {
                 "no_tasks_found"
             };
@@ -6336,8 +6516,31 @@ impl ObservedOutputs {
     }
 }
 
+fn consider_dedup(
+    index: &Mutex<dedup::Index>, owner: &str, scope: &str,
+    inputs: &[&crate::io::archive_state::ArchiveInput], generation: Option<u64>,
+) -> io::Result<bool> {
+    let prepared = {
+        let mut index = index.lock().unwrap();
+        match generation {
+            Some(generation) => index.prepare_at(generation, owner, scope, inputs, true)?,
+            None => index.prepare(owner, scope, inputs, false)?,
+        }
+    };
+    let Some(mut prepared) = prepared else { return Ok(false); };
+    loop {
+        prepared.hash()?;
+        let mut index = index.lock().unwrap();
+        if index.refresh(&mut prepared) { continue; }
+        return index.commit(prepared);
+    }
+}
+
 struct WatchObserver {
     deep: bool,
+    dedup_enabled: bool,
+    dedup: Arc<Mutex<dedup::Index>>,
+    dedup_scope: NativeDiscoveryScope,
     catalog: Arc<NativeWatchCatalog>,
     journal: Arc<journal::Journal>,
     owners: HashMap<String, String>,
@@ -6383,6 +6586,38 @@ impl WatchObserver {
 
 impl Observer for WatchObserver {
     const PUBLISHES_ROOTS: bool = true;
+
+    fn input_admission_enabled(&self) -> bool { self.dedup_enabled }
+
+    fn admit_inputs(&self, owner: &Path, inputs: &[&crate::io::archive_state::ArchiveInput], members: &[String], depth: usize) -> io::Result<bool> {
+        if depth != 1 || inputs.iter().flat_map(|input| input.physical_paths()).any(|path| !self.dedup_scope.contains(path)) {
+            return Ok(true);
+        }
+        // Rebuilding a disposable index must not revoke already-durable
+        // password/output recovery. A merely incomplete new family has no
+        // retained work and may still deduplicate once its layout becomes fixed.
+        let owner_path = owner.to_string_lossy();
+        if self.journal.state().entry(&owner_path).is_some_and(|entry| entry.status == "failed_password")
+            || self.journal.state().pending(&owner_path).is_some_and(|pending| pending.has_output_work()) {
+            return Ok(true);
+        }
+        let duplicate = match consider_dedup(&self.dedup, &owner_path, self.dedup_scope.key(), inputs, None) {
+            Ok(duplicate) => duplicate,
+            Err(error) => {
+                self.journal.log(json!({"event":"watch_dedup_unavailable","path":owner,"error":error.to_string()}));
+                false
+            }
+        };
+        if duplicate {
+            // Claim the physical proposal exactly as an ordinary root does so
+            // root_finished retires every pending member. No successful archive
+            // result is manufactured and no extraction/cleanup is entered.
+            self.claim_sources(owner, members, depth)?;
+            self.claimed.lock().unwrap().deduplicated.insert(key(owner));
+        }
+        Ok(!duplicate)
+    }
+
 
     fn coalesced(&self) {
         self.claimed.lock().unwrap().coalesced = true;

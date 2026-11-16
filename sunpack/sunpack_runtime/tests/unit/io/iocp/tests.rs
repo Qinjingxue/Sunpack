@@ -190,3 +190,38 @@ fn short_job_sets_drain_with_overlap_and_no_spare_tail_buffers() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[test]
+fn reversed_completions_are_hashed_in_range_order_without_unbounded_reordering() {
+    use xxhash_rust::xxh3::{xxh3_128, Xxh3};
+    let bytes: Vec<u8> = (0..600_037).map(|i| (i * 19 + i / 61) as u8).collect();
+    let start = (4u64 << 30) + 37;
+    let mut ordered = OrderedReads::new(start);
+    let mut hash = Xxh3::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let mut slots = Vec::new();
+        for _ in 0..2 {
+            if offset == bytes.len() { break; }
+            let end = (offset + 131_071).min(bytes.len());
+            let mut slot = Box::new(IocpSlot::new(end - offset));
+            slot.buffer.copy_from_slice(&bytes[offset..end]);
+            slot.read_start = start + offset as u64;
+            slot.bytes_read = end - offset;
+            slots.push(slot);
+            offset = end;
+        }
+        if slots.len() == 2 {
+            ordered.completed(slots.pop().unwrap());
+            assert!(ordered.next().is_none(), "later completion must not reach hash first");
+        }
+        ordered.completed(slots.pop().unwrap());
+        assert!(ordered.ready.len() <= 2);
+        while let Some(slot) = ordered.next() {
+            hash.update(&slot.buffer[..slot.bytes_read]);
+        }
+    }
+    assert_eq!(ordered.next_offset, start + bytes.len() as u64);
+    assert!(ordered.ready.is_empty());
+    assert_eq!(hash.digest128(), xxh3_128(&bytes));
+}

@@ -753,6 +753,18 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
+    fn input_admission_enabled(&self) -> bool { false }
+
+    /// Admission after canonical discovery and physical-generation validation.
+    /// Returning false retires the proposal without success, recursion or cleanup.
+    /// The callback runs inside the shared blocking stage, not the control driver.
+    fn admit_inputs(
+        &self, _owner: &Path, _inputs: &[&crate::io::archive_state::ArchiveInput],
+        _members: &[String], _depth: usize,
+    ) -> io::Result<bool> {
+        Ok(true)
+    }
+
     fn completed_sources(
         &self,
         _generations: &HashMap<String, PhysicalFileGeneration>,

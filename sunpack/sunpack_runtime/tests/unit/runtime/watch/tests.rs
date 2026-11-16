@@ -1377,6 +1377,8 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
     let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
     let settings = Arc::new(Config::default());
     let mut scheduler = Scheduler {
+        dedup_rebuild: None, dedup_job_id: 0,
+        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
         cwd: base.clone(), root_file: base.join(ROOTS_FILE),
@@ -1573,6 +1575,9 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
         members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
     let hub = Arc::new(Hub::new());
     let mut observer = WatchObserver {
+        dedup_enabled: false,
+        dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+        dedup_scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
         deep: false,
         catalog: Arc::new(NativeWatchCatalog::new(&crate::watch_store::NativeWatchState::new(), None)),
         journal: Arc::new(journal::Journal::open(&directory, 7).unwrap()),
@@ -1772,6 +1777,9 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
         let checkpoints = restore_checkpoints(journal.state(), owner, &mut outputs).unwrap();
         assert_eq!(checkpoints.len(), 1);
         let observer = WatchObserver {
+            dedup_enabled: false,
+            dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+            dedup_scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
             deep: false,
             catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)),
             journal: Arc::clone(&journal),
@@ -1941,4 +1949,31 @@ fn flatten_keeps_physical_work_when_its_literal_junction_disappears() {
     drop(journal);
     fs::remove_dir_all(base).unwrap();
     fs::remove_file(marker).unwrap();
+}
+
+#[test]
+fn dedup_completion_and_rebuild_wake_an_idle_watch_without_other_events() {
+    // Completion is often the only event after a scope rebuild. Omitting it
+    // from Hub's predicate strands both the rebuild and queued real arrivals.
+    for completion in [true, false] {
+        let hub = Arc::new(Hub::new());
+        let waiter = Arc::clone(&hub);
+        let (send, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let signals = waiter.wait(None);
+            send.send((signals.dedup_completed.len(), signals.dedup_rebuild)).unwrap();
+        });
+        hub.update(|signals| {
+            if completion { signals.dedup_completed.push((1, Ok(()))); }
+            else { signals.dedup_rebuild = true; }
+        });
+        let received = receive.recv_timeout(std::time::Duration::from_secs(2));
+        // Failure cleanup must not leave a stuck test thread behind.
+        if received.is_err() {
+            hub.stopped.store(true, Ordering::Release);
+            hub.wake.notify_all();
+        }
+        thread.join().unwrap();
+        assert_eq!(received.unwrap(), if completion { (1, false) } else { (0, true) });
+    }
 }

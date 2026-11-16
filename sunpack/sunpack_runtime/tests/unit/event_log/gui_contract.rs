@@ -227,3 +227,29 @@ fn rust_writer_cpp_query_lifecycle() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     for (file, modified) in files { assert_eq!(std::fs::metadata(file).unwrap().modified().unwrap(), modified); }
 }
+
+#[test]
+#[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
+fn rust_writer_cpp_query_deduplicated_is_green_named_success_without_outputs() {
+    let binary = gui_binary();
+    let root = Directory::new("gui_deduplicated");
+    let path = root.0.join("events.json");
+    let log = NativeEventLog::new(path.clone(), 7, true).unwrap();
+    let source = root.0.join("copy.zip");
+    let ts = utc_us() as f64 / 1_000_000.0;
+    log.write(json!({"event":"pipeline_sources_claimed","owner":"dedup-run",
+        "groups":[{"path":source,"members":[source]}],"ts":ts})).unwrap();
+    log.write(json!({"event":"watch_deduplicated","owner":"dedup-run","path":source,
+        "output_dirs":[],"retire_group":true,"ts":ts})).unwrap();
+    log.write(json!({"event":"pipeline_sources_released","owner":"dedup-run","ts":ts})).unwrap();
+    log.flush().unwrap();
+    let result = project(&binary, &path, "copy.zip", "", "", "");
+    assert_eq!(result["total"], 1);
+    let row = &result["rows"][0];
+    assert_eq!(row["status"], "taskSucceeded");
+    assert_eq!(row["statusText"], "去重跳过");
+    assert_eq!(row["statusTone"], "success");
+    assert!(row["outputs"].as_array().unwrap().is_empty());
+    let filtered = project(&binary, &path, "copy.zip", "", "", "taskSucceeded");
+    assert_eq!(filtered["total"], 1);
+}
