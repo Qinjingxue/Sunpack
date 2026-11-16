@@ -19,6 +19,7 @@ fn finish(index: &mut Index, mut prepared: Prepared) -> bool {
     loop {
         match index.advance(prepared).unwrap() {
             Admission::Finished(duplicate) => return duplicate,
+            Admission::Rescan(pending) => prepared = pending,
             Admission::Hash(mut pending) => {
                 pending.hash().unwrap();
                 prepared = pending;
@@ -147,6 +148,35 @@ fn lazy_admission_continues_when_a_hashed_representative_disappears() {
     fs::remove_file(&first.entry_path).unwrap();
     assert!(finish(&mut index, pending), "the second source still provides a live match");
     assert_eq!(index.records.len(), 2);
+}
+
+#[test]
+fn stale_bucket_resumes_without_using_an_observation_from_before_unlock() {
+    let dir = Sandbox::new();
+    let bytes = b"duplicate bytes";
+    let arrival = dir.file("arrival.zip", bytes);
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    for n in 0..2 * STALE_BATCH + 1 {
+        let peer = dir.file(&format!("peer-{n}.zip"), bytes);
+        assert_eq!(admit(&mut index, &peer, false), n != 0);
+    }
+    for n in 0..2 * STALE_BATCH + 1 {
+        if n != STALE_BATCH + 1 {
+            fs::remove_file(dir.0.join(format!("peer-{n}.zip"))).unwrap();
+        }
+    }
+    let prepared = index.prepare_path(&arrival.entry_path, "scope", &[&arrival], false).unwrap().unwrap();
+    let Admission::Hash(mut pending) = index.advance(prepared).unwrap() else { panic!("must read the candidate"); };
+    pending.hash().unwrap();
+    let Admission::Rescan(pending) = index.advance(pending).unwrap() else { panic!("the stale bucket needs another pass"); };
+    fs::remove_file(&arrival.entry_path).unwrap();
+    fs::write(&arrival.entry_path, b"modified bytes!").unwrap();
+    assert!(!finish(&mut index, pending));
+    assert!(!index.owners.contains_key(path_key(&arrival.entry_path).as_str()));
+
+    let copy = dir.file("copy.zip", bytes);
+    assert!(admit(&mut index, &copy, false), "the surviving representative must still be found");
 }
 
 /// Abrupt process exit must not rely on Index/File destructors to publish a

@@ -23,6 +23,16 @@ namespace ui {
 
 namespace {
 
+double WheelScrollStep(float delta, double viewportHeight) {
+    UINT lines = 3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+    // At the default three lines, a notch covers at most a quarter of the viewport.
+    const double lineStep = std::min(32.0, viewportHeight / 12.0);
+    const double notchStep = lines == WHEEL_PAGESCROLL ? viewportHeight
+        : std::min(viewportHeight, lines * lineStep);
+    return -double(delta) / WHEEL_DELTA * notchStep;
+}
+
 ImageSampling SamplingForBitmap(bool useHQ, D2D1_BITMAP_INTERPOLATION_MODE interp) {
     if (useHQ) return ImageSampling::HighQualityCubic;
     return interp == D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
@@ -1862,8 +1872,10 @@ bool TextAreaWidget::OnMouseWheel(const MouseEvent& e) {
         ResetWheelBoundary();
         return false;
     }
+    const auto step = WheelScrollStep(e.delta, VisibleHeight());
+    if (step == 0) return true;
     const float previous = scrollY_;
-    scrollY_ -= e.delta * 0.5f;
+    scrollY_ += static_cast<float>(step);
     ClampScroll();
     if (scrollY_ != previous) ResetWheelBoundary();
     return scrollY_ != previous;
@@ -2842,14 +2854,12 @@ bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
         return false;
     }
     if (draggingThumb_) return true;
-    UINT lines = 3;
-    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
-    const double step = -double(e.delta) / WHEEL_DELTA *
-        (lines == WHEEL_PAGESCROLL ? VisibleHeight() : lines * 16.0);
+    const float viewportHeight = VisibleHeight();
+    const double step = WheelScrollStep(e.delta, viewportHeight);
     if (step == 0) return true;
     const auto now = AnimationTimeMs();
     AdvanceScrollMotion(now);
-    const double limit = std::max(0.0f, contentHeight_ - VisibleHeight());
+    const double limit = std::max(0.0f, contentHeight_ - viewportHeight);
     // Keep ownership until the presented view reaches the physical edge.
     // A pending destination at the edge does not mean the inner view is done.
     // An unpresented inward motion must also get its reversal here first.

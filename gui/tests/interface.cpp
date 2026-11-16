@@ -25,6 +25,10 @@ namespace {
 // partially consumed packet across several ancestors. This in-memory route
 // also catches stale/owning gate entries without another rendered UI fixture.
 void wheel_chain_contracts() {
+    UINT lines=3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,0,&lines,0);
+    if(lines==0) return; // Windows has disabled wheel scrolling.
+
     struct ObservedArea : ui::TextAreaWidget {
         int calls=0;
         float received=0;
@@ -71,6 +75,19 @@ void wheel_chain_contracts() {
     const int afterSwitch=outer->calls;
     wheel(120); wheel(120); wheel(120); assert(outer->calls==afterSwitch);
     wheel(1); assert(outer->calls==afterSwitch+1 && outer->received==1);
+
+    // Shrinking a viewport at the bottom leaves a known distance to scroll.
+    // At 96 DIP, two notches should cover a gap of one and a half steps.
+    const float step=lines==WHEEL_PAGESCROLL ? 96.0f : 8.0f*std::min(lines,12u);
+    ui::TextAreaWidget area;
+    area.rect={0,0,200,96.0f+1.5f*step};
+    area.SetText(longText);
+    assert(area.OnMouseWheel({20,20,-12000}));
+    area.rect.bottom=96;
+    const ui::MouseEvent down{20,20,-WHEEL_DELTA};
+    assert(area.OnMouseWheel(down));
+    assert(area.OnMouseWheel(down));
+    assert(!area.OnMouseWheel(down));
 }
 
 Json state(UiPage page,const char* key) {

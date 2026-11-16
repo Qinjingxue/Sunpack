@@ -114,6 +114,7 @@ impl Prepared {
 
 enum Admission {
     Hash(Prepared),
+    Rescan(Prepared),
     Finished(bool),
 }
 
@@ -138,16 +139,20 @@ pub(super) fn consider(
     let mut admission = locked.advance(prepared)?;
     drop(locked);
     loop {
-        let mut prepared = match admission {
-            Admission::Hash(prepared) => prepared,
+        let prepared = match admission {
+            Admission::Hash(mut prepared) => {
+                prepared.hash()?;
+                prepared
+            }
+            Admission::Rescan(prepared) => prepared,
             Admission::Finished(duplicate) => return Ok(duplicate),
         };
-        prepared.hash()?;
         admission = index.lock().unwrap().advance(prepared)?;
     }
 }
 
 type Signature = (u64, u64);
+const STALE_BATCH: usize = 16;
 
 // Most reverse-index keys name a single record. Allocate a tree only when
 // distinct owners actually share a source, physical identity or digest.
@@ -181,7 +186,7 @@ impl RecordIds {
         }
     }
 
-    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+    fn iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
         let (one, many): (_, Option<btree_set::Iter<'_, u64>>) = match self {
             Self::One(id) => (Some(*id), None),
             Self::Many(ids) => (None, Some(ids.iter())),
@@ -324,6 +329,7 @@ impl Index {
         })
     }
     fn cached_digest(&self, record: &Record, valid: impl Fn(&Record) -> bool) -> Option<[u8; 16]> {
+        if self.hashes.is_empty() { return None; }
         self.objects.get(&(self.signature(record), Arc::clone(&record.identities)))?
             .iter().filter_map(|id| self.records.get(&id))
             .find(|other| other.digest.is_some() && valid(other))
@@ -385,18 +391,41 @@ impl Index {
                 return Ok(Admission::Finished(false));
             }
             let mut stale = Vec::new();
-            let mut live = |ids: Option<&RecordIds>, digest_only| ids.and_then(|ids| {
-                ids.iter().filter_map(|id| self.records.get(&id)).find(|other| {
-                    if other.owner == record.owner || (digest_only && other.identities == record.identities) {
-                        return false;
+            let mut matching = None;
+            'buckets: for (ids, digest_only) in [(objects, false), (hashes, true)] {
+                let Some(ids) = ids else { continue };
+                let mut ids = ids.iter().filter_map(|id| self.records.get(&id)).filter(|other| {
+                    other.owner != record.owner && (!digest_only || other.identities != record.identities)
+                });
+                // Prefer the original representative, then try the newest
+                // arrival once before continuing in the original order.
+                for probe in 0.. {
+                    let other = if probe == 1 { ids.next_back() } else { ids.next() };
+                    let Some(other) = other else { break };
+                    // After a miss, cheaply reject absent paths before the
+                    // tracked open and USN query. A hit still needs full proof.
+                    let missing = !stale.is_empty() && other.sources.iter().any(|source| {
+                        matches!(Path::new(&source.path).try_exists(), Ok(false))
+                    });
+                    if !missing && other.current() {
+                        matching = Some(other);
+                        break 'buckets;
                     }
-                    if other.current() { true } else { stale.push(other.id); false }
-                })
-            });
-            let matching = live(objects, false).or_else(|| live(hashes, true));
+                    stale.push(other.id);
+                    if stale.len() == STALE_BATCH {
+                        break 'buckets;
+                    }
+                }
+            }
             let duplicate = matching.is_some();
             record.digest = record.digest.or_else(|| matching.and_then(|other| other.digest));
+            let rescan = stale.len() == STALE_BATCH;
             self.remove_ids(stale)?;
+            if rescan {
+                // Let other Watch work acquire the lock before the next
+                // batch, which checks the candidate again.
+                return Ok(Admission::Rescan(prepared));
+            }
 
             // A rebuild records byte streams without reading their content.
             if !duplicate && !prepared.baseline && self.mode == WatchDeduplication::Hash
