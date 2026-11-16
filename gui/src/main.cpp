@@ -11,6 +11,18 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
         if(!argv) spg::win_error("opCommandLine");
         std::vector<std::wstring> args(argv+1,argv+count); LocalFree(argv);
         auto options=spg::parse_options(args); data_dir=options.data_dir;
+        // Shell actions are one-shot clients, independent of the manager window.
+        // Dispatch before the GUI singleton so an open manager cannot swallow them.
+        if(!options.shell_watch.empty()) {
+            if(!options.allow_cli) throw std::runtime_error("cliMissing");
+            options.cli.cwd=options.cli.app_root;
+            spg::Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+            if(!stop.value) spg::win_error("opLaunchCli");
+            auto command=spg::run_cli(options.cli,options.shell_watch,stop);
+            if(command.code && !command.output.empty()) throw std::runtime_error(command.output);
+            if(SUCCEEDED(com)) CoUninitialize();
+            return int(command.code);
+        }
         auto name=spg::mutex_name(options.data_dir,L"SunPack.GUI");
         spg::Handle instance(CreateMutexW(nullptr,FALSE,name.c_str()));
         if(!instance.value) spg::win_error("opGuiInstance");

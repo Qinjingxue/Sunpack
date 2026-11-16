@@ -15,6 +15,7 @@ struct Options {
     fs::path data_dir;
     CliCommand cli;
     bool allow_cli = true;
+    std::vector<std::wstring> shell_watch;
 };
 class Application {
     Options options_;

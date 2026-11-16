@@ -120,6 +120,14 @@ Options parse_options(const std::vector<std::wstring>& args) {
         else if(args[i]==L"--cli" && i+1<args.size()) result.cli.executable=resolve_path(args[++i]);
         else if(args[i]==L"--cli-prefix" && i+1<args.size()) result.cli.prefix.push_back(args[++i]);
         else if(args[i]==L"--app-root" && i+1<args.size()) result.cli.app_root=resolve_path(args[++i]);
+        else if(args[i]==L"--shell-watch" && i+2<args.size() && result.shell_watch.empty()) {
+            auto action=args[++i];
+            if(action!=L"add" && action!=L"remove") throw std::runtime_error("guiArguments");
+            result.shell_watch={L"watch",action,args[++i]};
+            if(action==L"add") result.shell_watch.push_back(L"--start");
+        }
+        else if(args[i]==L"--recursive" && result.shell_watch.size()==4)
+            result.shell_watch.push_back(L"--recursive");
         else throw std::runtime_error("guiArguments");
     }
     if(result.data_dir.empty()) {

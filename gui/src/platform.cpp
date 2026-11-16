@@ -246,6 +246,8 @@ void set_context_menu_enabled(const CliCommand& cli, bool enabled, HANDLE stop) 
     if (enabled) {
         args.push_back(L"-AppPath");
         args.push_back(cli.executable.wstring());
+        args.push_back(L"-GuiPath");
+        args.push_back(executable_path().wstring());
     }
     auto result = run_cli({powershell, app, {}}, args, stop);
     if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return;

@@ -7,7 +7,6 @@ import subprocess
 from ctypes import wintypes
 from pathlib import Path
 
-import pytest
 
 
 def test_context_menu_dry_run_preserves_unicode_with_ascii_json():
@@ -27,6 +26,8 @@ def test_context_menu_dry_run_preserves_unicode_with_ascii_json():
             os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
             "-MenuText",
             menu_text,
+            "-GuiPath",
+            os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
             "-DryRun",
         ],
         check=True,
@@ -55,6 +56,8 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
             str(script),
             "-AppPath",
             str(executable),
+            "-GuiPath",
+            os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
             "-DryRun",
         ],
         check=True,
@@ -162,12 +165,11 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
     for key in ("folder_watch", "background_watch", "folder_recursive_watch", "background_recursive_watch"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
         argv = _windows_argv(expanded)
-        assert ntpath.basename(argv[0]).lower() == "powershell.exe"
-        assert "-WindowStyle" in argv and "Hidden" in argv
-        assert ntpath.basename(argv[argv.index("-File") + 1]) == "context_menu_watch.ps1"
-        assert argv[argv.index("-WatchAction") + 1] == "add"
-        assert ntpath.normpath(argv[argv.index("-TargetPath") + 1]) == "D:\\"
-        assert ("-Recursive" in argv) == ("recursive_watch" in key)
+        assert ntpath.basename(argv[0]).lower() == "cmd.exe"  # Explicit GUI fixture path
+        assert "powershell" not in commands[key].lower()
+        assert argv[argv.index("--shell-watch") + 1] == "add"
+        assert ntpath.normpath(argv[argv.index("--shell-watch") + 2]) == "D:\\"
+        assert ("--recursive" in argv) == ("recursive_watch" in key)
         assert "-ScriptPath" not in argv
         assert "--pause" not in argv
         assert "--deep-detect" not in argv
@@ -175,11 +177,10 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
     for key in ("folder_unwatch", "background_unwatch"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
         argv = _windows_argv(expanded)
-        assert ntpath.basename(argv[0]).lower() == "powershell.exe"
-        assert ntpath.basename(argv[argv.index("-File") + 1]) == "context_menu_watch.ps1"
-        assert argv[argv.index("-WatchAction") + 1] == "remove"
-        assert ntpath.normpath(argv[argv.index("-TargetPath") + 1]) == "D:\\"
-        assert "-Recursive" not in argv
+        assert ntpath.basename(argv[0]).lower() == "cmd.exe"  # Explicit GUI fixture path
+        assert argv[argv.index("--shell-watch") + 1] == "remove"
+        assert ntpath.normpath(argv[argv.index("--shell-watch") + 2]) == "D:\\"
+        assert "--recursive" not in argv
 
 
 def test_context_menu_registration_survives_rebuild_and_uninstalls(tmp_path):
@@ -206,7 +207,7 @@ try {
     $null = New-PSDrive -Name HKLM -PSProvider Registry -Root "HKEY_CURRENT_USER\Software\$testRootName\Machine"
     $legacyKey = "HKLM:\Software\Classes\Directory\shell\SunPack"
     $null = New-Item -Path $legacyKey -Force
-    $registrationArgs = @{ AppPath = $env:COMSPEC }
+    $registrationArgs = @{ AppPath = $env:COMSPEC; GuiPath = $env:COMSPEC }
     $snapshots = @()
     foreach ($pass in 1..2) {
         $null = New-Item -Path "HKCU:\Software\Classes\SunPack.BackgroundContextMenu\shell\Obsolete" -Force
@@ -274,10 +275,10 @@ try {
         assert "--recursive" in argv
         watch = entries["WatchFolderRecursive"]["command"]
         watch_argv = _windows_argv(watch)
-        assert watch_argv[watch_argv.index("-WatchAction") + 1] == "add"
-        assert watch_argv[watch_argv.index("-TargetPath") + 1] == token + r"\."
-        assert "-Recursive" in watch_argv
-        assert "-WindowStyle Hidden" in watch
+        assert watch_argv[watch_argv.index("--shell-watch") + 1] == "add"
+        assert watch_argv[watch_argv.index("--shell-watch") + 2] == token + r"\."
+        assert "--recursive" in watch_argv
+        assert "powershell" not in watch.lower()
         assert "--recursive" not in entries["DirectExtract"]["command"]
         assert "--recursive" not in entries["WatchFolder"]["command"]
     assert {entry["name"] for entry in result["snapshots"][0]["File"]} == {"DirectExtract", "PromptPassword"}
@@ -291,60 +292,7 @@ def test_context_menu_directory_token_is_stable_for_normal_paths():
     assert ntpath.normpath(argv[4]) == r"D:\Archives"
     assert argv[5:] == ["--ask-pw", "--pause"]
 
-    watch_command = (
-        '"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
-        '-File "C:\\Program Files\\SunPack\\scripts\\context_menu_watch.ps1" '
-        '-AppPath "C:\\Program Files\\SunPack\\bin\\sunpack.exe" '
-        '-WatchAction add -TargetPath "%V\\."'
-    )
-    watch_argv = _windows_argv(watch_command.replace("%V", r"D:\Archives"))
-    assert watch_argv[watch_argv.index("-WatchAction") + 1] == "add"
-    assert ntpath.normpath(watch_argv[watch_argv.index("-TargetPath") + 1]) == r"D:\Archives"
 
-
-@pytest.mark.parametrize(
-    ("menu_key", "expected_args"),
-    [
-        ("folder_watch", ["watch", "add", "--start"]),
-        ("background_watch", ["watch", "add", "--start"]),
-        ("folder_recursive_watch", ["watch", "add", "--start", "--recursive"]),
-        ("background_recursive_watch", ["watch", "add", "--start", "--recursive"]),
-        ("folder_unwatch", ["watch", "remove"]),
-        ("background_unwatch", ["watch", "remove"]),
-    ],
-)
-def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu_key, expected_args, native_argument_recorder):
-    # Exercise the real PowerShell -File -> native argv boundary, not merely
-    # the registry command text. No admin rights or live Watch service needed.
-    scripts_dir = tmp_path / "menu scripts"
-    scripts_dir.mkdir()
-    for name in ("register_context_menu.ps1", "context_menu_watch.ps1"):
-        shutil.copyfile(Path(__file__).resolve().parents[2] / "scripts" / name, scripts_dir / name)
-    arch = "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x64"
-    target = {"arm64": "aarch64-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc"}[arch]
-    stub = tmp_path / ".cache" / "native" / arch / "ci" / "sevenzip_bridge" / "Release" / "sunpack_launcher.exe"
-    stub.parent.mkdir(parents=True)
-    shutil.copyfile(native_argument_recorder, stub)
-    runtime = tmp_path / ".cache" / "rust-target" / target / "ci" / "sunpack-runtime.exe"
-    runtime.parent.mkdir(parents=True)
-    runtime.touch()
-    folder = tmp_path / "WeChat's 中文 Files & (2026)"
-    folder.mkdir()
-    completed = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-File", str(scripts_dir / "register_context_menu.ps1"), "-DryRun"],
-        check=True, capture_output=True, text=True, encoding="utf-8-sig", timeout=30,
-    )
-    commands = json.loads(completed.stdout.strip().splitlines()[-1])
-    command = commands[menu_key].replace("%1", str(folder)).replace("%V", str(folder))
-    launched = subprocess.run(
-        _windows_argv(command), capture_output=True, text=True, timeout=30,
-    )
-    assert launched.returncode == 0, launched.stderr
-    actual = stub.with_suffix(".args").read_text(encoding="utf-8-sig").splitlines()
-    assert actual[:2] == expected_args[:2]
-    assert ntpath.normpath(actual[2]) == ntpath.normpath(str(folder))
-    assert actual[3:] == expected_args[2:]
 
 
 def _windows_argv(command: str) -> list[str]:
@@ -357,34 +305,3 @@ def _windows_argv(command: str) -> list[str]:
         return [argv[index] for index in range(argc.value)]
     finally:
         ctypes.windll.kernel32.LocalFree(argv)
-
-
-@pytest.fixture(scope="session")
-def native_argument_recorder(tmp_path_factory):
-    workspace = tmp_path_factory.mktemp("native-arguments")
-    framework = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET"
-    compiler = next((path for path in (
-        framework / "Framework64/v4.0.30319/csc.exe",
-        framework / "Framework/v4.0.30319/csc.exe",
-    ) if path.is_file()), None)
-    if compiler is None:
-        pytest.skip("Windows .NET Framework C# compiler is required for the native argv fixture")
-    source = workspace / "Arguments.cs"
-    source.write_text("""
-using System.IO;
-using System.Reflection;
-using System.Text;
-class Arguments {
-    static void Main(string[] args) {
-        string path = Path.ChangeExtension(Assembly.GetExecutingAssembly().Location, "args");
-        File.WriteAllLines(path, args, new UTF8Encoding(false));
-    }
-}
-""", encoding="ascii")
-    executable = workspace / "Arguments.exe"
-    completed = subprocess.run(
-        [str(compiler), "/nologo", "/target:exe", "/out:" + str(executable), str(source)],
-        capture_output=True, text=True, timeout=30,
-    )
-    assert completed.returncode == 0, (completed.stdout, completed.stderr)
-    return executable

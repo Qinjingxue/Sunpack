@@ -1,5 +1,6 @@
 param(
     [string]$AppPath,
+    [string]$GuiPath,
     [string]$MenuText,
     [string]$IconPath,
     [switch]$DryRun
@@ -124,7 +125,7 @@ function New-WatchCommandString {
         [switch]$Recursive
     )
 
-    return New-HiddenStartProcessCommand -Launcher $Launcher -WatchAction "add" -TargetToken $TargetToken -Recursive:$Recursive
+    return New-GuiWatchCommand -Launcher $Launcher -WatchAction "add" -TargetToken $TargetToken -Recursive:$Recursive
 }
 
 function New-WatchRemoveCommandString {
@@ -133,10 +134,10 @@ function New-WatchRemoveCommandString {
         [string]$TargetToken
     )
 
-    return New-HiddenStartProcessCommand -Launcher $Launcher -WatchAction "remove" -TargetToken $TargetToken
+    return New-GuiWatchCommand -Launcher $Launcher -WatchAction "remove" -TargetToken $TargetToken
 }
 
-function New-HiddenStartProcessCommand {
+function New-GuiWatchCommand {
     param(
         [hashtable]$Launcher,
         [ValidateSet("add", "remove")][string]$WatchAction,
@@ -144,15 +145,8 @@ function New-HiddenStartProcessCommand {
         [switch]$Recursive
     )
 
-    # Explorer expands %1/%V only when invoking the menu. Pass the resulting
-    # path as a native argument, not as source text in a PowerShell -Command.
-    # Start-Process -ArgumentList would also flatten an array into an unquoted
-    # command line, splitting folder names that contain spaces.
-    $helperPath = Join-Path $PSScriptRoot "context_menu_watch.ps1"
-    $command = ('"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AppPath "{1}" -WatchAction {2} -TargetPath "{3}"' -f $helperPath, $Launcher.AppPath, $WatchAction, $TargetToken)
-    if ($Recursive) {
-        $command += " -Recursive"
-    }
+    $command = ('"{0}" --cli "{1}" --app-root "{2}" --shell-watch {3} "{4}"' -f $resolvedGuiPath, $Launcher.AppPath, $repoRoot, $WatchAction, $TargetToken)
+    if ($Recursive) { $command += " --recursive" }
     return $command
 }
 
@@ -279,6 +273,18 @@ function Get-SubMenuTexts {
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptDir
 $launcher = Resolve-Launcher -RepoRoot $repoRoot -PreferredAppPath $AppPath
+# Installed GUI lives at the application root; development builds stay in .cache.
+$resolvedGuiPath = if ($GuiPath) { (Resolve-Path -LiteralPath $GuiPath).Path } else {
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    $candidates = @(
+        (Join-Path $repoRoot "SunPackGUI.exe"),
+        (Join-Path (Split-Path -Parent $launcher.AppPath) "SunPackGUI.exe"),
+        (Join-Path $repoRoot ".cache\gui-$arch\Release\SunPackGUI.exe")
+    )
+    $found = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $found) { throw "SunPackGUI.exe was not found. Build the GUI or pass -GuiPath." }
+    (Resolve-Path -LiteralPath $found).Path
+}
 $resolvedIconPath = if ($IconPath) { (Resolve-Path -LiteralPath $IconPath).Path } else { $launcher.IconPath }
 $menuLanguage = Get-MenuLanguage -RepoRoot $repoRoot
 $resolvedMenuText = if ($MenuText) { $MenuText } else { "sunpack" }

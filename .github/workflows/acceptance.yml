@@ -184,7 +184,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: sunpack-gui-test-ci-x64
-          path: .cache/gui-x64/Release/sunpack_gui_tests.exe
+          path: |
+            .cache/gui-x64/Release/sunpack_gui_tests.exe
+            .cache/gui-x64/Release/SunPackGUI.exe
           if-no-files-found: error
           retention-days: 1
 

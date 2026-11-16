@@ -1,5 +1,9 @@
 """Shipped GUI text and real installer-to-GUI permission contracts."""
 import base64
+import ctypes
+import ntpath
+import shutil
+from ctypes import wintypes
 import json
 import os
 import platform
@@ -10,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tests.helpers.installer import inno_compiler
+from tests.unit.test_context_menu_registration import _windows_argv
 
 
 def test_gui_template_texts_exist_in_both_languages():
@@ -233,3 +238,105 @@ def test_rust_writer_cpp_query_contract(repo_root, contract):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout, "the real writer/GUI boundary test was not selected"
+
+
+@pytest.mark.parametrize(
+    ("menu_key", "expected_args"),
+    [
+        ("folder_watch", ["watch", "add", "--start"]),
+        ("background_watch", ["watch", "add", "--start"]),
+        ("folder_recursive_watch", ["watch", "add", "--start", "--recursive"]),
+        ("background_recursive_watch", ["watch", "add", "--start", "--recursive"]),
+        ("folder_unwatch", ["watch", "remove"]),
+        ("background_unwatch", ["watch", "remove"]),
+    ],
+)
+def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu_key, expected_args, native_argument_recorder):
+    # Exercise Explorer command -> actual GUI -> hidden native CLI, not merely
+    # registry text. No admin rights or live Watch service needed.
+    scripts_dir = tmp_path / "menu scripts"
+    scripts_dir.mkdir()
+    for name in ("register_context_menu.ps1",):
+        shutil.copyfile(Path(__file__).resolve().parents[2] / "scripts" / name, scripts_dir / name)
+    arch = "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x64"
+    target = {"arm64": "aarch64-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc"}[arch]
+    stub = tmp_path / ".cache" / "native" / arch / "ci" / "sevenzip_bridge" / "Release" / "sunpack_launcher.exe"
+    stub.parent.mkdir(parents=True)
+    shutil.copyfile(native_argument_recorder, stub)
+    runtime = tmp_path / ".cache" / "rust-target" / target / "ci" / "sunpack-runtime.exe"
+    runtime.parent.mkdir(parents=True)
+    runtime.touch()
+    gui = Path(__file__).resolve().parents[2] / ".cache" / f"gui-{arch}" / "Release" / "SunPackGUI.exe"
+    assert gui.is_file(), "Build scripts/build_gui.ps1 before running GUI shell integration"
+    shutil.copyfile(gui, tmp_path / "SunPackGUI.exe")
+    folder = tmp_path / "WeChat's 中文 Files & (2026)"
+    folder.mkdir()
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", str(scripts_dir / "register_context_menu.ps1"), "-DryRun"],
+        check=True, capture_output=True, text=True, encoding="utf-8-sig", timeout=30,
+    )
+    commands = json.loads(completed.stdout.strip().splitlines()[-1])
+    command = commands[menu_key].replace("%1", str(folder)).replace("%V", str(folder))
+    # Hold the real manager's singleton name on one route. Shell actions must
+    # still run rather than activating the existing window and dropping work.
+    mutex = None
+    kernel = ctypes.windll.kernel32
+    if menu_key == "folder_recursive_watch":
+        probe = gui.with_name("sunpack_gui_tests.exe")
+        names = subprocess.check_output([str(probe), "--mutex", str(tmp_path)], text=True)
+        name = names.splitlines()[0].replace("SunPack.EditableFile", "SunPack.GUI")
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        mutex = kernel.CreateMutexW(None, False, name)
+        assert mutex
+        command += ' --data-dir "' + str(tmp_path) + '"'
+    try:
+        launched = subprocess.run(
+            _windows_argv(command), capture_output=True, text=True, timeout=30,
+        )
+    finally:
+        if mutex:
+            kernel.CloseHandle(mutex)
+    assert launched.returncode == 0, launched.stderr
+    actual = stub.with_suffix(".args").read_text(encoding="utf-8-sig").splitlines()
+    assert actual[:2] == expected_args[:2]
+    assert ntpath.normpath(actual[2]) == ntpath.normpath(str(folder))
+    assert actual[3:] == expected_args[2:]
+    assert stub.with_suffix(".console").read_text() == "False"
+
+
+@pytest.fixture(scope="session")
+def native_argument_recorder(tmp_path_factory):
+    workspace = tmp_path_factory.mktemp("native-arguments")
+    framework = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET"
+    compiler = next((path for path in (
+        framework / "Framework64/v4.0.30319/csc.exe",
+        framework / "Framework/v4.0.30319/csc.exe",
+    ) if path.is_file()), None)
+    if compiler is None:
+        pytest.skip("Windows .NET Framework C# compiler is required for the native argv fixture")
+    source = workspace / "Arguments.cs"
+    source.write_text("""
+using System.IO;
+using System.Reflection;
+using System.Text;
+using System;
+using System.Runtime.InteropServices;
+class Arguments {
+    [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+    static void Main(string[] args) {
+        string path = Path.ChangeExtension(Assembly.GetExecutingAssembly().Location, "args");
+        File.WriteAllLines(path, args, new UTF8Encoding(false));
+        File.WriteAllText(Path.ChangeExtension(path, "console"), (GetConsoleWindow() != IntPtr.Zero).ToString());
+    }
+}
+""", encoding="ascii")
+    executable = workspace / "Arguments.exe"
+    completed = subprocess.run(
+        [str(compiler), "/nologo", "/target:exe", "/out:" + str(executable), str(source)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    return executable
