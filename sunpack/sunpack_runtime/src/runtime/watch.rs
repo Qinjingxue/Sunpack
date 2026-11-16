@@ -65,6 +65,20 @@ fn admission_readable(path: &str) -> io::Result<bool> {
     filesystem::watch_file_is_ready(path)
 }
 
+// Seal the admitted observation while the existing readability handle excludes
+// writers and renames. A probe made before the last writer closes can carry an
+// older USN even when its size/mtime already describe the final contents.
+fn admission_candidate(mut candidate: WatchCandidateRow, since_usn: i64) -> io::Result<(WatchCandidateRow, bool)> {
+    #[cfg(test)]
+    if let Some(readable) = quiet_replay::readable(&candidate.path) { return Ok((candidate, readable)); }
+    let Some(snapshot) = filesystem::watch_ready_file_snapshot(
+        Path::new(&candidate.path), Some(since_usn))? else { return Ok((candidate, false)); };
+    candidate.size = snapshot.metadata.len();
+    candidate.mtime = crate::postprocess::mtime_seconds(&snapshot.metadata);
+    candidate.observation = snapshot.observation;
+    Ok((candidate, true))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Root {
     path: PathBuf,
@@ -4970,6 +4984,20 @@ impl Scheduler {
                     continue;
                 }
             };
+            #[cfg(test)]
+            admission_tests::before_readiness(&pending.candidate.path);
+            let (current, readable) = match admission_candidate(current, previous_usn) {
+                Ok(value) => value,
+                Err(error) if missing_path(&error) => {
+                    self.retire_admission(&id, &pending)?;
+                    continue;
+                }
+                Err(error) => {
+                    self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, Some(&error));
+                    self.delay(id, pending, admission_now());
+                    continue;
+                }
+            };
             // A callback can arrive while the filesystem readiness probe runs.
             // Read its generation and deadline atomically, not as independent
             // matches/deadline checks that could accept a just-written file.
@@ -5024,24 +5052,10 @@ impl Scheduler {
                 self.unpublished.insert(id.clone());
             }
             pending.candidate = current;
-            #[cfg(test)]
-            admission_tests::before_readiness(&pending.candidate.path);
-            match admission_readable(&pending.candidate.path) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, None);
-                    self.delay(id, pending, admission_now());
-                    continue;
-                }
-                Err(error) if missing_path(&error) => {
-                    self.retire_admission(&id, &pending)?;
-                    continue;
-                }
-                Err(error) => {
-                    self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, admission_now());
-                    continue;
-                }
+            if !readable {
+                self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, None);
+                self.delay(id, pending, admission_now());
+                continue;
             }
             if let Err(deadline) = pending.quiet.admit(observed_now, admission_now()) {
                 pending.due = deadline;

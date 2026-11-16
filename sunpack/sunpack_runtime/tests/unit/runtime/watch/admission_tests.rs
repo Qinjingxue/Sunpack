@@ -1225,3 +1225,82 @@ fn monitor_disable_preserves_accepted_intent_without_accepting_offline_files() {
     assert!(journal.state().pending(source.to_str().unwrap()).is_some());
     assert!(journal.state().pending(offline.to_str().unwrap()).is_none());
 }
+
+
+#[test]
+fn readiness_seals_post_close_usn_before_discovery_without_reauthorizing_recovery() {
+    const CHILD: &str = "SUNPACK_READINESS_SEALED_USN_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("readiness_seals_post_close_usn_before_discovery_without_reauthorizing_recovery", CHILD);
+        return;
+    };
+    use std::io::Write;
+    let base = PathBuf::from(base);
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    let root = key(&base.join("input"));
+    let source = base.join("input/archive.001");
+    let partial = source.with_extension("downloading");
+    let mut writer = fs::OpenOptions::new().create(true).truncate(true).write(true)
+        .share_mode(7).open(&partial).unwrap();
+    writer.write_all(b"complete bytes").unwrap(); writer.sync_all().unwrap();
+    fs::rename(&partial, &source).unwrap();
+    scheduler.enqueue(&root, source.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
+    let id = key(&source);
+    let before = scheduler.pending[&id].candidate.observation.change_usn;
+    *READINESS_HOOK.lock().unwrap() = Some((scheduler.pending[&id].candidate.path.clone(), Box::new(move || drop(writer))));
+    let mut ready = scheduler.prepare_ready_blocking(scheduler.pending[&id].quiet.deadline().unwrap_or(scheduler.pending[&id].due).max(scheduler.pending[&id].due), 1).unwrap();
+    assert!(READINESS_HOOK.lock().unwrap().is_none());
+    if ready.is_empty() {
+        ready = scheduler.prepare_ready_blocking(scheduler.pending[&id].quiet.deadline().unwrap_or(scheduler.pending[&id].due).max(scheduler.pending[&id].due), 1).unwrap();
+    }
+    assert_eq!(ready.len(), 1);
+    let current = watch_candidate_for_path(&source, None).unwrap().unwrap();
+    assert_ne!(before, current.observation.change_usn, "fixture must advance the close/rename USN");
+    let admitted = &ready[0].1.candidate;
+    assert_eq!(admitted.observation.change_usn, current.observation.change_usn);
+    assert_eq!((admitted.size, admitted.mtime), (current.size, current.mtime));
+    let entry = observed_entry(admitted, "suspended_missing_volume", None);
+    assert!(!crate::postprocess::watch_source_changed(entry.size as u64, entry.mtime,
+        &entry.file_id, entry.change_usn, &current));
+
+    // A genuine same-size overwrite with restored mtime during the identical
+    // boundary must invalidate old recovery, not be blessed as a close event.
+    scheduler.journal.commit(false, |_| {
+        let mut operations = crate::watch_store::NativeWatchOperations::empty();
+        operations.put_entry(Arc::new(entry)); Ok(operations)
+    }).unwrap();
+    scheduler.enqueue(&root, source.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
+    scheduler.pending.get_mut(&id).unwrap().recovery = Some(Arc::new(Recovery {
+        max_depth: None, scope: scheduler.roots[&root].1.clone(), password_scope: base.join("input"),
+    }));
+    let rewritten = source.clone(); let mtime = fs::metadata(&source).unwrap().modified().unwrap();
+    *READINESS_HOOK.lock().unwrap() = Some((scheduler.pending[&id].candidate.path.clone(), Box::new(move || {
+        fs::write(&rewritten, b"rewritten data").unwrap();
+        fs::File::options().write(true).open(&rewritten).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime)).unwrap();
+    })));
+    assert!(scheduler.prepare_ready_blocking(scheduler.pending[&id].quiet.deadline().unwrap_or(scheduler.pending[&id].due).max(scheduler.pending[&id].due), 1).unwrap().is_empty());
+    assert!(READINESS_HOOK.lock().unwrap().is_none());
+    assert!(scheduler.journal.state().entry(source.to_str().unwrap()).is_none());
+}
+
+#[test]
+#[ignore = "explicit benchmark: compare boolean readiness and same-handle observation"]
+fn measure_readiness_snapshot_cost() {
+    let source = crate::test_support::temp_file("readiness_snapshot_bench", b"ready bytes");
+    let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
+    let mut before = Vec::new(); let mut after = Vec::new(); let mut delta = Vec::new();
+    for i in 0..5000 {
+        let row = candidate.clone();
+        let old = || { let at = Instant::now(); assert!(admission_readable(&candidate.path).unwrap()); at.elapsed().as_nanos() as i64 };
+        let new = || { let at = Instant::now(); assert!(admission_candidate(row, candidate.observation.change_usn).unwrap().1); at.elapsed().as_nanos() as i64 };
+        let (a,b) = if i % 2 == 0 { let a=old(); (a,new()) } else { let b=new(); (old(),b) };
+        before.push(a); after.push(b); delta.push(b-a);
+    }
+    before.sort_unstable(); after.sort_unstable(); delta.sort_unstable();
+    println!("SUNPACK_ADMISSION_SNAPSHOT_BENCH {}", json!({"count":5000,
+        "old_p50_ns":before[2500],"old_p95_ns":before[4750],
+        "new_p50_ns":after[2500],"new_p95_ns":after[4750],
+        "paired_delta_p50_ns":delta[2500],"paired_delta_p95_ns":delta[4750]}));
+    fs::remove_file(source).unwrap();
+}
