@@ -934,15 +934,12 @@ impl Discovered {
                 ));
             }
         }
-        for &(index, status) in &routes.detection_events {
-            if status == 1 {
-                let mut task =
-                    project_task(table.project(index)?, DiscoverySource::Detection, verified);
-                if let Some(analysis) = routes.primary_analysis(index) {
-                    task.inputs[0].input.analysis = analysis;
-                }
-                self.tasks.push(task);
-            }
+        for &index in &routes.detected {
+            self.tasks.push(project_task(
+                table.project(index)?,
+                DiscoverySource::Detection,
+                verified,
+            ));
         }
         let embedded = request.config.embedded_scan;
         Ok(table.prepare_embedded(

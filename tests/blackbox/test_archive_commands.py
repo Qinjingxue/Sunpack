@@ -7,6 +7,8 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from tests.helpers.native_fixture import create_lz4_frames
+
 
 def _zip(entries):
     stream = io.BytesIO()
@@ -43,6 +45,26 @@ def test_scan_and_extract_nested_carrier_through_launcher(package, tmp_path):
     assert next(output.rglob("中文.txt")).read_bytes() == b"nested payload"
     assert next(output.rglob("ordinary.txt")).read_bytes() == b"ordinary payload"
     assert {path: path.read_bytes() for path in input_dir.iterdir()} == before
+
+
+def test_lz4_carrier_boundaries_are_discovered_in_deep_mode(package, tmp_path):
+    payload = tmp_path / "frame-content.txt"
+    payload.write_bytes(b"lz4 content" * 128)
+    carrier = tmp_path / "leading.lz4"
+    create_lz4_frames(carrier, [payload])
+    lz4_end = carrier.stat().st_size
+    gap = b"carrier gap"
+    with carrier.open("ab") as stream:
+        stream.write(gap + _zip({"peer.txt": b"zip content"}))
+
+    ordinary = package.json("scan", carrier)
+    assert [item["format"] for item in ordinary["items"]] == ["lz4"]
+
+    deep = package.json("scan", "-d", carrier)
+    assert [(item["format"], item["offset"], item["end_offset"]) for item in deep["items"]] == [
+        ("lz4", 0, lz4_end),
+        ("zip", lz4_end + len(gap), carrier.stat().st_size),
+    ]
 
 
 def test_password_candidates_apply_only_to_their_directory(package, tmp_path):

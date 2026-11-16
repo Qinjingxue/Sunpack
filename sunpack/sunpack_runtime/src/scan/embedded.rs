@@ -109,6 +109,7 @@ const fn simd_prefix_tables() -> [[u8; 32]; 6] {
 static EMBEDDED_MATCHER: OnceLock<AhoCorasick> = OnceLock::new();
 static EMBEDDED_PACKED_MATCHER: OnceLock<Option<packed::Searcher>> = OnceLock::new();
 
+#[cfg(test)]
 const DEFAULT_IOCP_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 // Discovery shares one byte budget over all file producers, independent of
 // root count. Account for both read slots and outstanding matching jobs.
@@ -296,26 +297,6 @@ impl NativeScanResult {
             .any(|c| c.volume_anchor.is_none() && c.end_offset.is_some())
     }
 
-    pub(crate) fn is_primary_lz4(&self) -> bool {
-        !self
-            .candidates
-            .iter()
-            .any(EmbeddedCandidate::is_logical_archive)
-            || (self.candidates.len() == 1
-                && self.candidates[0].format == "lz4"
-                && self.candidates[0].offset == 0
-                && (self.candidates[0].end_offset == Some(self.file_size)
-                    || self.candidates[0].end_offset.is_none()))
-    }
-
-    pub(crate) fn primary_analysis(&self) -> Option<crate::io::archive_state::AnalysisFacts> {
-        let candidate = self.candidates.first().filter(|item| item.format == "lz4")?;
-        Some(crate::io::archive_state::AnalysisFacts {
-            structure_complete: candidate.end_offset.is_some(),
-            ..Default::default()
-        })
-    }
-
     pub(crate) fn candidates(&self) -> &[EmbeddedCandidate] {
         &self.candidates
     }
@@ -341,25 +322,6 @@ pub(crate) fn scan_embedded_path(
         DISCOVERY_IOCP_BYTE_BUDGET / (parallel_files * slots)
     };
     scan_embedded_archives_native_with_iocp(reader, chunk_bytes, DEFAULT_IOCP_BUFFERS, workers)
-}
-
-pub(crate) fn scan_detected_lz4(path: &str, parallel_files: usize) -> io::Result<NativeScanResult> {
-    let reader = ManagedReader::open(path)?;
-    let file_size = reader.len();
-    let index = crate::formats::lz4::walk(&reader.probe_reader(), 0, file_size);
-    if index.complete && index.end == file_size {
-        return Ok(NativeScanResult {
-            file_size,
-            candidates: vec![candidate("lz4", 0, Some(file_size), CandidateKind::Archive)],
-            ..NativeScanResult::default()
-        });
-    }
-    scan_embedded_archives_native_with_iocp(
-        reader,
-        DEFAULT_IOCP_CHUNK_SIZE / parallel_files.max(1),
-        DEFAULT_IOCP_BUFFERS,
-        DEFAULT_IOCP_WORKERS,
-    )
 }
 
 /// Scan one physical byte stream once for every supported embedded format.

@@ -1,7 +1,6 @@
 use crate::analysis_native::volume_anchor::{
     CheapAnchor, EMBEDDED_VOLUME, RAR_PASSWORD_MATCHED_INCOMPLETE, SEVEN_ZIP_CARRIER_INTERRUPTED,
 };
-use crate::io::archive_state::AnalysisFacts;
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
     build_native_candidate_groups_from_snapshot, collect_relation_cache, resolve_embedded_volumes,
@@ -13,7 +12,7 @@ use crate::scan::directory::{
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
 };
 use crate::scan::embedded::{
-    scan_detected_lz4, scan_embedded_path, NativeScanResult, RarInputResolution,
+    scan_embedded_path, NativeScanResult, RarInputResolution,
     ResolvedEmbeddedScan,
 };
 use crate::scan::pe_overlay::{inspect_pe_image_native, PeProbe, PeState};
@@ -270,9 +269,8 @@ impl NativeCandidateTable {
 
 #[derive(Default)]
 pub(crate) struct NativeDiscoveryRoutes {
-    scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<io::Error>>>,
     pub(crate) relation_events: Vec<(usize, u8)>,
-    pub(crate) detection_events: Vec<(usize, u8)>,
+    pub(crate) detected: Vec<usize>,
     embedded: Vec<usize>,
 }
 
@@ -293,7 +291,6 @@ enum EmbeddedOutcome {
 #[derive(Default)]
 pub(crate) struct NativeEmbeddedBatch {
     relation_cache: RelationCache,
-    scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<io::Error>>>,
     ids: Vec<usize>,
     cursor: usize,
     nominated: usize,
@@ -396,9 +393,7 @@ fn scan_embedded_jobs(
             .filter(|&&(group, index)| {
                 let (table, batch) = groups[group];
                 let (path, pe) = table.rows[index].embedded_source();
-                !batch.scans.contains_key(&index)
-                    && !path.is_empty()
-                    && (batch.force_scan || pe != Some(PeState::Confirmed))
+                !path.is_empty() && (batch.force_scan || pe != Some(PeState::Confirmed))
             })
             .count()
             .min(parallel_jobs)
@@ -419,15 +414,8 @@ fn scan_embedded_jobs(
                         };
                         let (table, batch) = groups[group];
                         let (path, pe) = table.rows[index].embedded_source();
-                        let outcome = match batch.scans.get(&index) {
-                            Some(Ok(scan)) => EmbeddedOutcome::Scan(Arc::clone(scan)),
-                            Some(Err(error)) => {
-                                EmbeddedOutcome::read_error(path, Arc::clone(error))
-                            }
-                            None => {
-                                scan_embedded_candidate(path, batch.force_scan, pe, parallel_files)
-                            }
-                        };
+                        let outcome =
+                            scan_embedded_candidate(path, batch.force_scan, pe, parallel_files);
                         if !matches!(outcome, EmbeddedOutcome::Residual) {
                             completed.push((position, group, index, outcome));
                         }
@@ -468,18 +456,12 @@ impl EmbeddedOutcome {
     }
 }
 
-impl NativeDiscoveryRoutes {
-    pub(crate) fn primary_analysis(&self, index: usize) -> Option<AnalysisFacts> {
-        self.scans.get(&index)?.as_ref().ok()?.primary_analysis()
-    }
-}
-
 impl NativeEmbeddedBatch {
     pub(crate) fn len(&self) -> usize {
         self.ids.len() - self.cursor
     }
 
-    /// Process selected jobs across roots and consume their cached scan evidence.
+    /// Process selected jobs across roots.
     /// Root-local policy, relation ownership and password evidence stay in each batch.
     pub(crate) fn scan_pages(
         mut groups: Vec<(&mut NativeCandidateTable, &mut NativeEmbeddedBatch)>,
@@ -496,9 +478,6 @@ impl NativeEmbeddedBatch {
         }
         let borrowed: Vec<_> = groups.iter().map(|(table, batch)| (&**table, &**batch)).collect();
         let outcomes = scan_embedded_jobs(&borrowed, &jobs)?;
-        for (group, index) in jobs {
-            groups[group].1.scans.remove(&index);
-        }
         // Results follow job order, where each group's rows are contiguous.
         let mut outcomes = outcomes.into_iter().peekable();
         let mut projected = Vec::new();
@@ -521,9 +500,6 @@ impl NativeEmbeddedBatch {
                 batch.cursor = 0;
                 batch.peer_rows = None;
                 batch.seen_paths = HashSet::new();
-            }
-            if batch.scans.is_empty() {
-                batch.scans = HashMap::new();
             }
         }
         debug_assert!(outcomes.next().is_none());
@@ -1291,86 +1267,30 @@ impl NativeCandidateTable {
                 relation_residual.push(index);
             }
         }
-        let detection_indices = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| match row {
-                Candidate::File(table, file_index)
-                    if table.file_route(*file_index) == FILE_ROUTE_DETECTION =>
-                {
-                    Some(index)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        (|| {
-            for batch in detection_indices.chunks(1024) {
-                if cancellation.cancelled() {
-                    break;
-                }
-                let parallel_files = batch.len().min(rayon::current_num_threads()).clamp(1, 8);
-                let decisions = batch
-                    .par_iter()
-                    .with_min_len(batch.len().div_ceil(parallel_files))
-                    .map(|&index| {
-                        cancellation.run(|| {
-                            if cancellation.cancelled() {
-                                return None;
-                            }
-                            let Candidate::File(table, file_index) = &self.rows[index] else {
-                                return None;
-                            };
-                            let path = &table.paths[*file_index];
-                            let key = path_key(path);
-                            if claimed.contains(&key) || blocked.contains(&key) {
-                                return None;
-                            }
-                            let anchor = table.relation_anchors[*file_index]
-                                .as_ref()
-                                .and_then(CheapAnchor::anchor);
-                            let format = anchor.map(|anchor| anchor.format).unwrap_or("");
-                            let accepted = matches!(
-                                format,
-                                "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
-                            ) && anchor.is_some_and(|anchor| anchor.standalone);
-                            // The confirmed leading structure admits the whole
-                            // file. LZ4 additionally projects its frame plan.
-                            let scan = if accepted && format == "lz4" {
-                                Some(
-                                    scan_detected_lz4(path, parallel_files)
-                                        .map(Arc::new)
-                                        .map_err(Arc::new),
-                                )
-                            } else {
-                                None
-                            };
-                            let accepted = accepted
-                                && (format != "lz4"
-                                    || scan
-                                        .as_ref()
-                                        .and_then(|scan| scan.as_ref().ok())
-                                        .is_some_and(|scan| scan.is_primary_lz4()));
-                            Some((index, key, accepted, scan))
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                for (index, key, accepted, scan) in decisions.into_iter().flatten() {
-                    if claimed.contains(&key) {
-                        continue;
-                    }
-                    if let Some(scan) = scan {
-                        routes.scans.insert(index, scan);
-                    }
-                    if accepted {
-                        claimed.insert(key);
-                        routes.detection_events.push((index, 1));
-                    } else {
-                        detection_residual.push(index);
-                    }
-                }
+        // Ordinary detection uses only the leading structure already read by
+        // the filesystem probe. Embedded discovery owns carrier boundaries.
+        for (index, row) in self.rows.iter().enumerate() {
+            let Candidate::File(table, file_index) = row else { continue; };
+            if table.file_route(*file_index) != FILE_ROUTE_DETECTION {
+                continue;
             }
-        })();
+            cancellation.check()?;
+            let accepted = table.relation_anchors[*file_index]
+                .as_ref()
+                .and_then(CheapAnchor::anchor)
+                .is_some_and(|anchor| {
+                    anchor.standalone
+                        && matches!(anchor.format, "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc")
+                });
+            if accepted {
+                let key = path_key(&table.paths[*file_index]);
+                if !blocked.contains(&key) && claimed.insert(key) {
+                    routes.detected.push(index);
+                }
+            } else {
+                detection_residual.push(index);
+            }
+        }
         cancellation.check()?;
         // Preserve the former stage order: filesystem residuals, Relations
         // residuals, then Detection residuals.
@@ -1466,24 +1386,21 @@ impl NativeCandidateTable {
                 threshold = total * ratio;
             }
             // Sizes follow the candidate order, so selection needs no hash set.
-            // Keep observed errors even when policy disables new I/O.
             let mut sizes = sizes.into_iter();
-            ids.retain(|index| {
+            ids.retain(|_| {
                 let size = sizes.next().unwrap_or(0);
-                (size > 0 && size as f64 >= threshold)
-                    || matches!(routes.scans.get(index), Some(Err(_)))
+                size > 0 && size as f64 >= threshold
             });
         }
         if ids.is_empty() && self.volume_seeds.is_empty() {
-            // This root has no remaining I/O or cached errors. Its primary
+            // This root has no remaining I/O. Its primary
             // decisions are already owned by the caller; no recovery can use it.
             *self = Self::default();
-            routes.scans = HashMap::new();
             return NativeEmbeddedBatch::default();
         }
         let mut excluded: HashSet<_> = routes.resolved_relations().filter(|&index| {
             !matches!(&self.rows[index], Candidate::Relation(group) if group.is_incomplete())
-        }).chain(routes.detection_events.iter().map(|&(index, _)| index))
+        }).chain(routes.detected.iter().copied())
             .flat_map(|index| self.path_keys(index).unwrap_or_default()).collect();
         // Keep only the evidence used by volume recovery, not resolved groups
         // and their execution metadata from every root. Raw snapshots still
@@ -1523,13 +1440,7 @@ impl NativeCandidateTable {
                 true
             });
         }
-        let mut prepass = std::mem::take(&mut routes.scans);
-        let scans = if ids.len() == self.rows.len() {
-            // All rows are selected; do not duplicate their
-            // candidate storage or prepass map merely to reproduce the same indices.
-            prepass
-        } else {
-            let mut scans = HashMap::new();
+        if ids.len() != self.rows.len() {
             let positions: HashMap<_, _> = ids
                 .iter()
                 .enumerate()
@@ -1540,15 +1451,11 @@ impl NativeCandidateTable {
                 if let Some(&position) = positions.get(&index) {
                     let remapped = rows.len();
                     ids[position] = remapped;
-                    if let Some(scan) = prepass.remove(&index) {
-                        scans.insert(remapped, scan);
-                    }
                     rows.push(row);
                 }
             }
             self.rows = rows;
-            scans
-        };
+        }
         let mut pending_volumes = Vec::with_capacity(self.volume_seeds.len());
         for (facts, row, anchor) in std::mem::take(&mut self.volume_seeds) {
             let index = self.rows.len();
@@ -1561,7 +1468,6 @@ impl NativeCandidateTable {
             excluded,
             claimed_ranges,
             supplemental: HashSet::new(),
-            scans,
             ids,
             cursor: 0,
             nominated: 0,

@@ -1,6 +1,6 @@
 //! One structural LZ4 parser shared by routing, reports and embedded scanning.
 //! Walk block lengths; do not decode or hash payload during archive analysis.
-use crate::io::reader::{CachedBytes, ManagedReader};
+use crate::io::reader::ManagedReader;
 use std::ffi::c_void;
 use std::io::Read;
 
@@ -122,7 +122,7 @@ struct StructureReader<'a> {
     limit: u64,
     window_bytes: usize,
     start: u64,
-    window: CachedBytes,
+    window: Vec<u8>,
 }
 
 impl<'a> StructureReader<'a> {
@@ -132,7 +132,7 @@ impl<'a> StructureReader<'a> {
             limit,
             window_bytes,
             start: 0,
-            window: CachedBytes::default(),
+            window: Vec::new(),
         }
     }
 
@@ -142,24 +142,35 @@ impl<'a> StructureReader<'a> {
             return Err("lz4_stream_truncated");
         }
         if cursor < self.start || end > self.start + self.window.len() as u64 {
-            // Grow only when consuming the preceding window. Length jumps
-            // over payload begin with a small probe again.
+            // Nearby headers can land just past the window after a short
+            // compressed block. Grow for those too, while long payload
+            // jumps still start with a small probe.
+            let previous = self.window.len();
             let window_bytes = if !self.window.is_empty()
                 && cursor >= self.start
-                && cursor <= self.start + self.window.len() as u64
+                && cursor - self.start <= (previous + previous.min(256)) as u64
             {
-                self.window.len().saturating_mul(4).min(self.window_bytes)
+                (previous * 4).min(self.window_bytes)
             } else {
                 self.window_bytes.min(256)
             };
             self.start = cursor;
-            self.window = self
-                .reader
-                .read_cached_at(
-                    cursor,
-                    (self.limit - cursor).min(window_bytes as u64) as usize,
-                )
+            let wanted = (self.limit - cursor).min(window_bytes as u64) as usize;
+            self.window
+                .try_reserve_exact(wanted.saturating_sub(previous))
                 .map_err(|_| "os_error")?;
+            self.window.resize(wanted, 0);
+            let mut read = 0;
+            while read < wanted {
+                let count = self.reader
+                    .read_into_at(cursor + read as u64, &mut self.window[read..])
+                    .map_err(|_| "os_error")?;
+                if count == 0 {
+                    break;
+                }
+                read += count;
+            }
+            self.window.truncate(read);
         }
         let from = (cursor - self.start) as usize;
         self.window
@@ -180,7 +191,8 @@ fn advance(cursor: &mut u64, n: u64, limit: u64) -> Result<(), &'static str> {
     }
     Ok(())
 }
-pub(crate) fn walk(reader: &ManagedReader, offset: u64, limit: u64) -> Index {
+#[cfg(test)]
+fn walk(reader: &ManagedReader, offset: u64, limit: u64) -> Index {
     walk_observed(reader, offset, limit, &mut |_| Ok(()))
 }
 
