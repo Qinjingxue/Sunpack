@@ -79,11 +79,16 @@ def load_trace(path):
     header = struct.Struct('<8sQQQQ')
     with path.open('rb') as stream:
         magic, size, count, window, chunk = header.unpack(stream.read(header.size))
-        if magic != b'SPHITS\0\x01' or not chunk or path.stat().st_size != header.size + count * ctypes.sizeof(Hit):
+        if magic not in (b'SPHITS\0\x01', b'SPHITS\0\x02') or not chunk or path.stat().st_size != header.size + count * ctypes.sizeof(Hit):
             raise ValueError(f'Invalid or obsolete native hit trace: {path}; capture the source again')
         hits = (Hit * count)()
         if stream.readinto(hits) != ctypes.sizeof(hits):
             raise ValueError(f'Truncated native hit trace: {path}')
+    if magic == b'SPHITS\0\x01':
+        # v1 used tag 13 for the XZ footer. v2 assigns tag 13 to ENC.
+        for hit in hits:
+            if hit.pattern == 13:
+                hit.pattern = 14
     # IOCP matcher workers may finish out of order. The Builder replays
     # complete owner batches, while the codec receives absolute offset order.
     ordered = sorted(hits, key=lambda hit: (hit.owner, hit.offset, hit.pattern))
@@ -118,9 +123,9 @@ def main(argv=None):
             builder_hits = codec_hits = (Hit * args.hits)()
             for i, hit in enumerate(builder_hits):
                 hit.offset = i * args.gap
-                hit.pattern = i % 14
+                hit.pattern = i % 15
                 hit.owner = hit.offset // chunk
-            distribution = 'deterministic equal gap, cycling 14 production hit types'
+            distribution = 'deterministic equal gap, cycling 15 production hit types'
         else:
             trace = args.trace or ws.result_dir / 'hits.bin'
             if not args.trace:

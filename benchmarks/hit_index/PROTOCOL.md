@@ -232,6 +232,7 @@ uv run --no-sync python -m benchmarks.hit_index.build --bridge `
 结果位于 `benchmarks/results/scan.hit-index/<run>/`：`report.json`、`report.md`、`raw.jsonl`、`validation.json`、`lifecycle.json`、`lifetime.json`、`full-scan.json`、`corpus.json`、`protocol.json`、`sources.lock.json`、源码身份/差异和 probe 构建输入。
 冻结 corpus 内的真实输入及 `.hits` 路径为绝对路径；迁移机器时需要整体复制并显式重定位，重新校验 XXH128。
 `.hits` 为 8 字节 magic `SPHITS\0\x01`、四个 LE u64（文件大小、条数、匹配窗口、chunk），之后每条 16 字节：偏移 u64、类型 u8、零 padding 3 字节、job u32。
+当前 `scan hit-index` 的 Rust 捕获使用 `SPHITS\0\x02`，其中 ENC 为类型 13，XZ footer 为类型 14。该入口重放 v1 时会换算原 XZ footer 类型。历史 C++ 对照使用原 14 类 v1 契约。
 评估过程不安装 probe/capture 到 `.venv`，不修改生产扫描逻辑。
 
 分片完成后合并（显式列出全部 `report.json`；并发度、参数、源码、工具、语料或重复单元格不一致会拒绝）：

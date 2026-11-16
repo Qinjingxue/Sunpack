@@ -11,6 +11,7 @@ from benchmarks.harness.embedded_corpus import _write_repeated, mixed_carrier
 from benchmarks.harness.launcher import NativePackage
 from benchmarks.harness.native_probe import build_runtime_probe, run_runtime_probe
 from benchmarks.harness.workspace import BenchmarkWorkspace
+from tests.real.enc_support import ENC_PASSWORD
 
 
 def make_carrier(path: Path, size: int, segments: int):
@@ -88,12 +89,13 @@ def main(argv=None):
         native['median_seconds'] = statistics.median(row['seconds'] for row in native['rows'])
         rows = []
         if not args.skip_cli:
+            passwords = ("-p", ENC_PASSWORD) if args.mixed else ()
             with NativePackage(ws.work, launcher=args.launcher, profile=args.profile, arch=args.arch,
                                sample_ms=args.sample_ms) as app:
                 for run in range(args.runs):
                     if args.cold:
                         app.shutdown()
-                    result = app.run('scan', path)
+                    result = app.run('scan', *passwords, path)
                     summary = result['response']['summary']
                     if summary['scan_error_count'] or summary['input_error_count'] or summary['failed_count']:
                         raise RuntimeError(f"scan reported errors: {summary}")

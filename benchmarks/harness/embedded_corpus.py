@@ -11,10 +11,12 @@ def _write_repeated(stream, remaining, block):
 
 
 def mixed_carrier(root: Path, path: Path, size: int, segments: int = 128):
+    from tests.real.enc_support import ENC_VECTOR
     from tests.real.plan5_embedded_archives.plan5_support import build_large_embedded_case
 
     case = build_large_embedded_case(root / "plan5", count=segments)
-    padding = size - case.file_path.stat().st_size
+    enc_size = ENC_VECTOR.stat().st_size
+    padding = size - case.file_path.stat().st_size - enc_size
     if padding < 0:
         raise ValueError("The requested carrier size cannot hold the mixed archives")
     prefix = padding // 2
@@ -23,4 +25,8 @@ def mixed_carrier(root: Path, path: Path, size: int, segments: int = 128):
         _write_repeated(output, prefix, block)
         shutil.copyfileobj(source, output, len(block))
         _write_repeated(output, padding - prefix, block)
-    return {(segment.archive_format, prefix + segment.offset) for segment in case.segments}
+        with ENC_VECTOR.open("rb") as enc:
+            shutil.copyfileobj(enc, output, len(block))
+    return {(segment.archive_format, prefix + segment.offset) for segment in case.segments} | {
+        ("enc", size - enc_size),
+    }

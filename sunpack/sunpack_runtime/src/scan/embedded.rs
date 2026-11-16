@@ -39,7 +39,7 @@ const XZ_FOOTER_MAGIC: &[u8] = b"YZ";
 
 type PatternSpec = (&'static [u8], &'static str, &'static str);
 
-const PATTERNS: [PatternSpec; 13] = [
+const PATTERNS: [PatternSpec; 14] = [
     (ZIP_LOCAL, "zip_local", "zip"),
     (ZIP_EOCD, "zip_eocd", "zip_eocd"),
     (SEVEN_ZIP, "7z", "7z"),
@@ -53,6 +53,7 @@ const PATTERNS: [PatternSpec; 13] = [
     (crate::formats::lz4::MAGIC, "lz4", "lz4"),
     (b"\x2a\x4d\x18", "lz4_skippable", "lz4_skippable"),
     (b"PK\x06\x06", "zip64_eocd", "zip64_eocd"),
+    (sunpack_enc::MAGIC, "enc", "enc"),
 ];
 
 #[cfg(target_arch = "x86_64")]
@@ -294,7 +295,7 @@ impl NativeScanResult {
     pub(crate) fn has_independent_archive(&self) -> bool {
         self.candidates
             .iter()
-            .any(|c| c.volume_anchor.is_none() && c.end_offset.is_some())
+            .any(|c| c.volume_anchor.is_none() && (c.end_offset.is_some() || c.format == "enc"))
     }
 
     pub(crate) fn candidates(&self) -> &[EmbeddedCandidate] {
@@ -1008,6 +1009,7 @@ fn scan_sample_candidate(
         b'u' => check!(9),
         4 => check!(10),
         0x2a => check!(11),
+        b'S' => check!(13),
         _ => {}
     }
 }
@@ -1156,6 +1158,14 @@ fn validate_candidate(
     suffixes: &mut FailedSuffixEvidence,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
     match kind {
+        "enc" => {
+            let prefix = read_at(file, offset, 40)?;
+            Ok(sunpack_enc::Header::parse(&prefix, file_size - offset)
+                .ok()
+                // ENC has no public length. Leave the end unknown so this
+                // candidate cannot claim other hits; decryption uses EOF.
+                .map(|_| candidate("enc", offset, None, CandidateKind::Archive)))
+        }
         "zip" => validate_zip(file, file_size, offset),
         "7z" => validate_seven_zip(file, file_size, offset),
         "rar4" | "rar5" => validate_rar(file, file_size, offset),

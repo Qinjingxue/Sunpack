@@ -59,8 +59,6 @@ def main(argv=None):
         cases = {key: {**item, "split": item["format"].endswith("-split")}
                  for key, item in corpus.items() if item["workload"] == "few_large" and item["format"] in selected - extras.keys()}
         generation = selected - extras.keys()
-        if args.shape == "carrier":
-            generation -= {"enc"}
         cases.update(special_cases(workspace.corpus, corpus, generation, skipped,
                                    large_files=2, large_file_mib=args.large_file_mib))
         for item in cases.values():
@@ -74,12 +72,8 @@ def main(argv=None):
         for name in missing:
             skipped.setdefault(name, "corpus generator unavailable or did not produce this format; supply --sample")
         if args.shape == "carrier":
-            if "enc" in selected or "enc" in extras:
-                skipped["enc"] = "ENC v4 is handled only as a standalone input"
             for key in list(cases):
-                if cases[key]["format"] == "enc":
-                    del cases[key]
-                elif cases[key]["split"]:
+                if cases[key]["split"]:
                     skipped[key] = "carrier shape excludes multi-file volume sets"
                     del cases[key]
         if not cases:
@@ -97,7 +91,7 @@ def main(argv=None):
                 _configure_watch(app, args, inputs, workspace.outputs, live=True, deep=deep)
                 staging = workspace.work / "staging"
                 staging.mkdir()
-                app.run("watch", "start", "--no-tray", require_broker=True)
+                app.run("daemon", "start", "--no-tray", require_broker=True)
             try:
                 for key, item in cases.items():
                     for run in range(args.runs):
@@ -144,7 +138,7 @@ def main(argv=None):
                         print(f"{args.mode} {key} {run + 1}/{args.runs}: {result['seconds']:.3f}s", flush=True)
             finally:
                 if args.mode == "watch":
-                    app.run("watch", "stop")
+                    app.run("daemon", "stop")
             report = {
                 "schema_version": 2, "mode": args.mode, "platform": platform.platform(),
                 "forced_deep_scan": deep,

@@ -54,7 +54,8 @@ def _copy_case(item, destination: Path, shape: str):
         with carrier.open("wb") as output, result.open("rb") as archive:
             output.write(b"unrelated carrier prefix\0" * 257)
             shutil.copyfileobj(archive, output, 1024 * 1024)
-            output.write(b"unrelated trailer\0" * 19)
+            if item["format"] != "enc":
+                output.write(b"unrelated trailer\0" * 19)
         result.unlink()
         result = carrier
     return result

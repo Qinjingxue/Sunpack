@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tests.helpers.native_fixture import create_lz4_frames
+from tests.real.archive_boundary import extract_report, failure_kinds
+from tests.real.enc_support import create_enc_case
 
 
 def _zip(entries):
@@ -117,6 +119,28 @@ def test_extracts_disguised_enc_and_compressed_tar_in_one_request(package, tmp_p
     expected = (vectors / "large.expected").read_bytes()
     assert any(path.read_bytes() == expected for path in output.rglob("*")
                if path.is_file() and path.stat().st_size == len(expected))
+
+
+def test_extracts_embedded_enc_at_eof_with_password(package, tmp_path):
+    case = create_enc_case(tmp_path / "inputs", "embedded-enc", input_suffix=".opaque")
+    carrier = case.entry_path
+    prefix = b"unrelated prefix\0" * 31
+    carrier.write_bytes(prefix + carrier.read_bytes())
+
+    scan = package.json("scan", "-d", "-p", case.password, carrier)
+    item, = scan["items"]
+    assert (item["format"], item["offset"]) == ("enc", len(prefix))
+    assert item["end_offset"] is None
+
+    output = tmp_path / "output"
+    rejected = extract_report(package, carrier, output, passwords=["wrong"], code=1)
+    assert failure_kinds(rejected) == {"wrong_password"}
+    assert not any(path.is_file() for path in output.rglob("*"))
+
+    accepted = extract_report(package, carrier, output, passwords=[case.password])
+    assert accepted["summary"]["failed_count"] == 0, accepted
+    payload, = output.rglob(case.marker_name)
+    assert payload.read_bytes() == case.marker_text.encode("utf-8")
 
 
 def test_mixed_archive_batch_recovers_complete_inputs_and_preserves_missing_volumes(package, tmp_path):

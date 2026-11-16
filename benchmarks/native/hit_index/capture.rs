@@ -16,7 +16,7 @@ impl Capture {
         };
         let chunk = chunk as u64;
         let mut file = BufWriter::new(File::create(path)?);
-        file.write_all(b"SPHITS\0\x01")?;
+        file.write_all(b"SPHITS\0\x02")?;
         for value in [size, 0, window as u64, chunk] {
             file.write_all(&value.to_le_bytes())?;
         }

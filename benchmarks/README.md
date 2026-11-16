@@ -46,7 +46,7 @@ separately and can be skipped with `--skip-cli`.
 `scan embedded` measures the Rust scanner directly and reports CLI discovery
 separately. It defaults to a generated 1 GiB ZIP carrier. Use `--mixed` for the
 historical Plan 5 mixed-format carrier, including ZIPX, 7z-Zstandard, 7z-LZ4
-and LZ4 frames. Use `--stored-zip` for a large stored ZIP
+and LZ4 frames, with an ENC v4 archive at EOF. Use `--stored-zip` for a large stored ZIP
 (including ZIP64 when needed), or `--file` for an existing input.
 `scan hit-index` defaults to real matcher hits captured from a mixed carrier.
 It times index construction, iteration and seeks, with a separate allocation
@@ -59,8 +59,8 @@ two reproducible 150 MiB payload files by default, or one stream of the same
 total size. They include ZIPX (LZMA and Zstandard), split ZIP, 7z-Zstandard,
 7z-LZ4, independent compression streams, compressed TAR variants and ENC.
 The CLI and Watch matrices use normal discovery for ordinary and disguised
-archives. `--shape carrier` forces deep scanning and excludes ENC v4 because
-its header does not publish the archive length.
+archives. `--shape carrier` forces deep scanning. ENC v4 carriers place the
+encrypted archive at EOF because its header does not publish the archive length.
 Set `--large-file-mib 1 --runs 1` for a smoke run. ENC generation needs
 Java and the reference JAR. Missing optional generators are reported as skipped, and
 `--sample FORMAT=PATH` accepts external formats. Watch requires permission to
