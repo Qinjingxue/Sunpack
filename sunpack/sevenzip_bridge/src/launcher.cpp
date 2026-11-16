@@ -317,6 +317,22 @@ struct RuntimeStartup {
     }
 };
 
+// A listener can already be closed while its owner is still flushing state.
+// Reuse the runtime's ownership ranges instead of trusting a persisted PID.
+bool stopped_runtime(const InstallContext& context, bool wait_for_drain) {
+    const HANDLE raw = CreateFileW((state_path(context) + L".lock").c_str(),
+        GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (raw == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+    const std::unique_ptr<void, decltype(&CloseHandle)> lock(raw, CloseHandle);
+    OVERLAPPED listener{};
+    if (!LockFileEx(raw, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &listener)) return false;
+    OVERLAPPED lifetime{};
+    lifetime.Offset = 1;
+    return LockFileEx(raw, LOCKFILE_EXCLUSIVE_LOCK | (wait_for_drain ? 0 : LOCKFILE_FAIL_IMMEDIATELY),
+        0, 1, 0, &lifetime) != FALSE;
+}
+
 bool parse_state(const InstallContext& context, std::wstring& pipe_name,
                  std::array<unsigned char, 32>& token, std::string& runtime_build_id) {
     std::ifstream stream(state_path(context));
@@ -568,14 +584,33 @@ public:
 
 RequestOutcome request(const InstallContext& context, const std::vector<std::wstring>& arguments, bool shutdown,
                        int& exit_code, const std::wstring& request_cwd,
-                       RuntimeStartup* startup = nullptr) {
+                       RuntimeStartup* startup = nullptr, bool wait_for_shutdown = false) {
     std::wstring pipe_name;
     std::array<unsigned char, 32> token{};
     std::string runtime_build_id;
     if (!parse_state(context, pipe_name, token, runtime_build_id)) return RequestOutcome::NotDelivered;
     const HANDLE pipe = connect_pipe(pipe_name);
     if (pipe == INVALID_HANDLE_VALUE) return RequestOutcome::NotDelivered;
-    const std::unique_ptr<void, decltype(&CloseHandle)> pipe_owner(pipe, CloseHandle);
+    std::unique_ptr<void, decltype(&CloseHandle)> pipe_owner(pipe, CloseHandle);
+    // Hold the connected server's process, not a possibly stale PID from the
+    // state file. A shutdown acknowledgement precedes its final task drain.
+    std::unique_ptr<void, decltype(&CloseHandle)> server_process(nullptr, CloseHandle);
+    if (wait_for_shutdown) {
+        ULONG server_pid = 0;
+        if (GetNamedPipeServerProcessId(pipe, &server_pid)) {
+            server_process.reset(OpenProcess(SYNCHRONIZE, FALSE, server_pid));
+        }
+        if (!server_process) {
+            exit_code = 3;
+            const DWORD error = GetLastError();
+            write_stream(STD_ERROR_HANDLE,
+                (cli_language_from_config(context) == "zh"
+                    ? "无法等待 SunPack 后台进程退出，Win32 错误 "
+                    : "Cannot wait for SunPack runtime shutdown, Win32 error ") +
+                std::to_string(error) + "\n");
+            return RequestOutcome::Completed;
+        }
+    }
     if (startup) startup->release();
 
     const std::string cwd = utf8(request_cwd);
@@ -638,6 +673,13 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         if (kind == 0) {
             if (size != 4) break;
             exit_code = static_cast<std::int32_t>(read_u32(payload.data()));
+            if (wait_for_shutdown && exit_code == 0) {
+                controls.close();
+                pipe_owner.reset();
+                if (WaitForSingleObject(server_process.get(), INFINITE) != WAIT_OBJECT_0) {
+                    exit_code = 3;
+                }
+            }
             return RequestOutcome::Completed;
         }
         if (kind == 1) write_stream(STD_OUTPUT_HANDLE, payload);
@@ -809,14 +851,31 @@ int wmain(int argc, wchar_t** argv) {
         if (!spawn_runtime(context, {L"--toast-activated"}, false, &exit_code)) return 1;
         return static_cast<int>(exit_code);
     }
+    bool daemon_stop = false;
+    bool daemon_stop_json = false;
+    if (argc >= 3 && (wcscmp(argv[1], L"daemon") == 0 || wcscmp(argv[1], L"d") == 0)) {
+        bool valid = true;
+        for (int index = 2; index < argc; ++index) {
+            if (wcscmp(argv[index], L"stop") == 0 && !daemon_stop) daemon_stop = true;
+            else if (wcscmp(argv[index], L"--json") == 0 || wcscmp(argv[index], L"-j") == 0) daemon_stop_json = true;
+            else valid = false; // Help and invalid options belong to the CLI parser.
+        }
+        daemon_stop = daemon_stop && valid;
+    }
+    const bool status_follow = argc == 2 && wcscmp(argv[1], L"--watch-status-follow") == 0;
     const bool shutdown_request = argc >= 2 && wcscmp(argv[1], L"--persistent-shutdown") == 0;
-    const bool shutdown = shutdown_request;
-    const int first_request_argument = shutdown ? 2 : 1;
+    const bool shutdown = shutdown_request || daemon_stop;
+    const int first_request_argument = daemon_stop ? argc : (shutdown ? 2 : 1);
     std::vector<std::wstring> request_arguments(argv + first_request_argument, argv + argc);
+    std::unique_ptr<RuntimeStartup> stopping;
+    if (daemon_stop) {
+        stopping = std::make_unique<RuntimeStartup>(context);
+        if (!stopping->held) return 1;
+    }
     int code = 1;
     const bool pause = consume_pause(request_arguments);
-    RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd);
-    if (outcome == RequestOutcome::NotDelivered && !shutdown) {
+    RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd, nullptr, daemon_stop);
+    if (outcome == RequestOutcome::NotDelivered && !shutdown && !status_follow) {
         RuntimeStartup startup(context);
         if (startup.held) {
             // Another launcher may have completed startup while we waited.
@@ -863,15 +922,28 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
     const bool ok = outcome == RequestOutcome::Completed;
-    if (!ok) code = shutdown ? 0 : 1;
+    if (!ok) code = shutdown && outcome == RequestOutcome::NotDelivered ? 0 : 1;
+    if (daemon_stop && outcome == RequestOutcome::NotDelivered && !stopped_runtime(context, true)) {
+        code = 1;
+        write_stream(STD_ERROR_HANDLE, localized(cli_language_from_config(context), kPersistentUnavailableEn, kPersistentUnavailableZh) + "\n");
+    }
+    if (status_follow && outcome == RequestOutcome::NotDelivered && stopped_runtime(context, false)) {
+        write_stream(STD_OUTPUT_HANDLE, "{\"running\":false,\"enabled\":false,\"phase\":\"stopped\"}\n");
+        code = 0;
+    }
     std::string language;
-    if (pause || (!ok && !shutdown)) {
+    if (pause || (!ok && (!shutdown || outcome == RequestOutcome::DeliveryUncertain))) {
         language = cli_language_from_config(context);
     }
-    if (outcome == RequestOutcome::NotDelivered && !shutdown) {
+    if (outcome == RequestOutcome::NotDelivered && !shutdown && !status_follow) {
         write_stream(STD_ERROR_HANDLE, localized(language, kPersistentUnavailableEn, kPersistentUnavailableZh) + "\n");
-    } else if (outcome == RequestOutcome::DeliveryUncertain && !shutdown) {
+    } else if (outcome == RequestOutcome::DeliveryUncertain) {
         write_stream(STD_ERROR_HANDLE, localized(language, kDeliveryUncertainEn, kDeliveryUncertainZh) + "\n");
+    }
+    if (daemon_stop && daemon_stop_json && code == 0) {
+        write_stream(STD_OUTPUT_HANDLE,
+            "{\"command\":\"daemon\",\"inputs\":{\"action\":\"stop\"},"
+            "\"summary\":{\"running\":false},\"errors\":[],\"items\":[],\"tasks\":[],\"logs\":[]}\n");
     }
     pause_on_exit(pause, language);
     return code;

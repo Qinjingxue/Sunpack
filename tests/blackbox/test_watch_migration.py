@@ -120,8 +120,8 @@ def test_live_watch_cancel_replays_the_new_generation_of_the_same_file(package, 
     assert source.read_bytes() == updated
 
 
-def test_foreground_nested_output_survives_watch_restart_during_extraction(package, tmp_path):
-    """A new Watch session must recognize a CLI output reserved by the old session."""
+def test_foreground_nested_output_survives_watch_pause_during_extraction(package, tmp_path):
+    """Pausing Watch must preserve suppression of a CLI output still being produced."""
     watched = tmp_path / "watched"
     watched.mkdir()
     watch_output = tmp_path / "watch-output"
@@ -134,7 +134,7 @@ def test_foreground_nested_output_survives_watch_restart_during_extraction(packa
     _zip(incoming, "live.txt", b"independent Watch work")
 
     package.json("watch", "add", "-R", watched, "-o", watch_output)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     produced = watched / "outer" / inner.name
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -143,9 +143,9 @@ def test_foreground_nested_output_survives_watch_restart_during_extraction(packa
             worker.suspend()
             try:
                 cli = executor.submit(package.json, "extract", "-r", "1", "-F", "-o", watched, outer)
-                _wait_for(produced.parent.is_dir, "CLI did not reserve output before the Watch restart")
-                assert package.json("watch", "stop")["summary"]["stopped"]
-                package.json("watch", "start", "--no-tray")
+                _wait_for(produced.parent.is_dir, "CLI did not reserve output before the Watch resume")
+                assert package.json("watch", "disable")["summary"]["enabled"] is False
+                package.json("watch", "enable")
                 assert owner.is_running() and not cli.done() and not produced.exists()
             finally:
                 worker.resume()
@@ -154,7 +154,7 @@ def test_foreground_nested_output_survives_watch_restart_during_extraction(packa
         incoming.replace(watched / incoming.name)
         package.await_watch_event("done", path=incoming.name, root=watched)
     finally:
-        assert package.json("watch", "stop")["summary"]["stopped"]
+        assert package.json("watch", "disable")["summary"]["enabled"] is False
 
     assert produced.read_bytes() == inner_bytes
     assert [path.read_bytes() for path in watch_output.rglob("*") if path.is_file()] == [
@@ -227,14 +227,14 @@ def test_watch_catalog_loss_rebuilds_baseline_without_replaying_existing_sources
     assert package.run("--persistent-shutdown").returncode == 0
     for path in state.glob("catalog.*.bin"):
         path.unlink()
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     # A new arrival after the baseline is established must still be processed.
     # Stage it outside the root so Watch sees the completed input move into place.
     incoming = tmp_path / "live.zip"
     _zip(incoming, "live.txt", b"arrived while watching")
     incoming.replace(watched / incoming.name)
     _wait_for(lambda: bool(list(output.rglob("live.txt"))), "Watch ignored an arrival after catalog rebuild")
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     assert [path.read_bytes() for path in output.rglob("live.txt")] == [b"arrived while watching"]
     assert sorted(
         path.relative_to(output) for path in output.rglob("*")
@@ -255,7 +255,7 @@ def test_watch_replays_changed_source_without_cancelling_its_batch_siblings(pack
     # Start the root observer on the existing parent. Moving the prepared
     # directory into place admits both inputs in the same checkpoint.
     package.json("watch", "add", watched, "-o", output)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     worker = _staged_worker(package, tmp_path)
     owner = worker.parent()
     worker.suspend()
@@ -281,18 +281,18 @@ def test_watch_replays_changed_source_without_cancelling_its_batch_siblings(pack
     # admitted batch. It therefore captures the overwrite even if its ordinary
     # notification has not arrived yet. Keep the root absent during restart so
     # the durable deferred source can only be resumed when the root returns.
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     assert package.run("--persistent-shutdown").returncode == 0
     owner.wait(timeout=30)
     worker.wait(timeout=30)
     watched.replace(staging)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     staging.replace(watched)
     _wait_for(
         lambda: b"fresh generation" in [path.read_bytes() for path in output.rglob("source.txt")],
         "Watch did not recover the durable source when the root returned",
     )
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     assert [path.read_bytes() for path in output.rglob("other.txt")] == [b"unrelated batch member"]
     assert b"fresh generation" in [path.read_bytes() for path in output.rglob("source.txt")]
 
@@ -335,7 +335,7 @@ def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(packa
         )
         package.configure(recursive_extract="*")
     package.json("watch", "add", watched, "-o", output, "--deep-detect")
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     worker = _staged_worker(package, tmp_path)
     owner = worker.parent()
     events = package.data / ".sunpack_watch" / "events.json"
@@ -435,7 +435,7 @@ def test_invalid_password_edit_keeps_watch_running_with_last_valid_passwords(pac
     table.write_text(json.dumps({"passwords": [{"value": password}]}), encoding="utf-8")
     assert package.json("passwords")["items"][0]["builtin_passwords"] == [password]
     package.json("watch", "add", watched, "-o", output)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
 
     malformed = table.with_suffix(".tmp")
     malformed.write_text('{"passwords":[', encoding="utf-8")
@@ -450,7 +450,7 @@ def test_watch_reload_noop_and_invalid_configuration_keep_main_contract(package,
     watched = tmp_path / "watched"
     watched.mkdir()
     package.json("watch", "add", watched)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     assert not package.json("watch", "reload")["summary"]["reloaded"]
     config = package.data / "sunpack_config.json"
     raw = json.loads(config.read_text(encoding="utf-8"))
@@ -480,7 +480,7 @@ def test_watch_configured_user_passwords_decrypt_and_retry_after_reload(package,
         )
     package.configure(user_passwords=["configured-only", "configured-only"])
     package.json("watch", "add", watched, "-o", output)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     _wait_for(lambda: any(output.rglob("first.txt")), "Configured Watch password was not used")
     events = package.data / ".sunpack_watch" / "events.json"
     def blocked():

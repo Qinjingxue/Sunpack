@@ -201,7 +201,6 @@ struct Options {
     prompt_passwords: bool,
     no_builtins: bool,
     no_tray: bool,
-    start: bool,
     rule_stdin: bool,
 }
 
@@ -211,7 +210,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("scan", "s"),
     ("passwords", "pw"),
     ("config", "cfg"),
-    ("doctor", "d"),
+    ("daemon", "d"),
+    ("doctor", "doc"),
     ("version", "ver"),
 ];
 
@@ -220,13 +220,13 @@ const COMMANDS: &[(&str, &str)] = &[
 enum OptionId {
     Help, Json, Verbose, NoPause, Pause, Recursive, Deep, Password, PasswordFile,
     AskPassword, NoBuiltins, Recur, Cleanup, Output, Flatten, NoFlatten,
-    NoTray, Start, RuleStdin,
+    NoTray, RuleStdin,
 }
 
 #[derive(Clone, Copy)]
 enum OptionScope {
     Any, Json, Common, ArchiveOrAdd, Passwords, Extract, ExtractOrAdd,
-    WatchStart, WatchAdd, Validate,
+    DaemonStart, Validate,
 }
 
 impl OptionScope {
@@ -236,13 +236,12 @@ impl OptionScope {
         match self {
             Self::Any => true,
             Self::Json => !command.is_empty() && command != "version",
-            Self::Common => archives || command == "watch",
+            Self::Common => archives || command == "watch" || (command == "daemon" && matches!(action, "start" | "startup")),
             Self::ArchiveOrAdd => archives || add,
             Self::Passwords => archives || command == "passwords",
             Self::Extract => command == "extract",
             Self::ExtractOrAdd => command == "extract" || add,
-            Self::WatchStart => command == "watch" && action == "start",
-            Self::WatchAdd => add,
+            Self::DaemonStart => command == "daemon" && action == "start",
             Self::Validate => command == "config" && action == "validate",
         }
     }
@@ -280,8 +279,7 @@ const OPTION_SPECS: &[OptionSpec] = &[
     OptionSpec { id: OptionId::Output, names: "-o/--out-dir", metavar: "OUTPUT_DIR", scope: OptionScope::ExtractOrAdd, help: "cli.output_dir", watch_help: "cli.watch.output_dir", watch_order: 6 },
     OptionSpec { id: OptionId::Flatten, names: "-f/--flatten", metavar: "", scope: OptionScope::Extract, help: "cli.flatten", watch_help: "cli.flatten", watch_order: 14 },
     OptionSpec { id: OptionId::NoFlatten, names: "-F/--no-flatten", metavar: "", scope: OptionScope::Extract, help: "cli.no_flatten", watch_help: "cli.no_flatten", watch_order: 15 },
-    OptionSpec { id: OptionId::NoTray, names: "--no-tray", metavar: "", scope: OptionScope::WatchStart, help: "cli.watch.no_tray", watch_help: "cli.watch.no_tray", watch_order: 18 },
-    OptionSpec { id: OptionId::Start, names: "-s/--start", metavar: "", scope: OptionScope::WatchAdd, help: "cli.watch.start_after_add", watch_help: "cli.watch.start_after_add", watch_order: 7 },
+    OptionSpec { id: OptionId::NoTray, names: "--no-tray", metavar: "", scope: OptionScope::DaemonStart, help: "cli.daemon.no_tray", watch_help: "cli.daemon.no_tray", watch_order: 18 },
     OptionSpec { id: OptionId::RuleStdin, names: "--scan-rule-stdin", metavar: "", scope: OptionScope::Validate, help: "", watch_help: "", watch_order: 20 },
 ];
 
@@ -324,7 +322,7 @@ impl Options {
             .iter()
             .find(|(name, alias)| command.as_ref() == *name || command.as_ref() == *alias)
             .map(|(name, _)| *name)
-            .ok_or_else(|| invalid_choice("", "", "command", &command, "extract, e, watch, w, scan, s, passwords, pw, config, cfg, doctor, d, version, ver"))?;
+            .ok_or_else(|| invalid_choice("", "", "command", &command, "extract, e, watch, w, scan, s, passwords, pw, config, cfg, daemon, d, doctor, doc, version, ver"))?;
         let mut options = Self {
             command,
             ..Self::default()
@@ -343,10 +341,10 @@ impl Options {
             if arg == "--" && !positional {
                 // Only a command with positional operands consumes the
                 // separator. A subcommand selector instead sees it as a value.
-                let action_missing = matches!(command, "watch" | "config") && options.action.is_empty();
+                let action_missing = matches!(command, "watch" | "daemon" | "config") && options.action.is_empty();
                 let has_operands = match (command, options.action.as_str()) {
                     ("extract" | "scan", _) | ("watch", "add" | "remove") => true,
-                    ("watch", "startup") => options.paths.is_empty() || args.is_empty(),
+                    ("daemon", "startup") => options.paths.is_empty() || args.is_empty(),
                     _ => false,
                 };
                 positional = true;
@@ -356,7 +354,7 @@ impl Options {
                 }
             }
             if positional || !looks_like_option(&arg) {
-                if matches!(command, "watch" | "config") && options.action.is_empty() {
+                if matches!(command, "watch" | "daemon" | "config") && options.action.is_empty() {
                     // The action has its own common options. Explicit parent
                     // flags are restored after parsing the action.
                     options.json = false;
@@ -371,10 +369,11 @@ impl Options {
                         _ => arg.into_owned(),
                     };
                     if !matches!((command, action.as_str()),
-                        ("watch", "add" | "remove" | "startup" | "start" | "status" | "stop" | "reload" | "list" | "rebuild-log")
+                        ("watch", "add" | "remove" | "enable" | "disable" | "status" | "reload" | "list" | "rebuild-log")
+                        | ("daemon", "start" | "stop" | "startup")
                         | ("config", "show" | "validate"))
                     {
-                        return Err(invalid_choice(command, "", &format!("{command}_action"), &action, if command == "watch" { "start, add, remove, rm, list, ls, reload, rebuild-log, stop, status, st, startup" } else { "show, validate" }));
+                        return Err(invalid_choice(command, "", &format!("{command}_action"), &action, match command { "watch" => "enable, disable, add, remove, rm, list, ls, reload, rebuild-log, status, st", "daemon" => "start, stop, startup", _ => "show, validate" }));
                     }
                     options.action = action;
                 } else {
@@ -384,12 +383,12 @@ impl Options {
                     }
                     after_action = true;
                     if !matches!(command, "extract" | "scan")
-                        && !(command == "watch" && matches!(options.action.as_str(), "add" | "remove" | "startup"))
+                        && !matches!((command, options.action.as_str()), ("watch", "add" | "remove") | ("daemon", "startup"))
                     {
                         unrecognized.push(arg.into_owned());
                         continue;
                     }
-                    if command == "watch" && options.action == "startup" {
+                    if command == "daemon" && options.action == "startup" {
                         if options.paths.is_empty() && !matches!(arg.as_ref(), "enable" | "disable" | "status") {
                             return Err(invalid_choice(command, &options.action, "action", &arg, "enable, disable, status"));
                         }
@@ -404,7 +403,7 @@ impl Options {
             }
             paths_closed |= !options.paths.is_empty();
             validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), command, &options.action)?;
-            if !from_cluster && matches!(command, "watch" | "config") && options.action.is_empty() {
+            if !from_cluster && matches!(command, "watch" | "daemon" | "config") && options.action.is_empty() {
                 match arg.as_ref() {
                     "-j" | "--json" => parent_flags.0 = true,
                     "-v" | "--verbose" => parent_flags.1 = true,
@@ -498,7 +497,6 @@ impl Options {
                 Some(OptionId::AskPassword) => options.prompt_passwords = true,
                 Some(OptionId::NoBuiltins) => options.no_builtins = true,
                 Some(OptionId::NoTray) => options.no_tray = true,
-                Some(OptionId::Start) => options.start = true,
                 Some(OptionId::RuleStdin) => {
                     options.rule_stdin = true
                 }
@@ -510,8 +508,9 @@ impl Options {
         }
         let wants_paths = match (command, options.action.as_str()) {
             ("extract" | "scan", "") => true,
-            ("watch", "add" | "remove" | "startup") => true,
-            ("watch", "start" | "status" | "stop" | "reload" | "list" | "rebuild-log" | "")
+            ("watch", "add" | "remove") | ("daemon", "startup") => true,
+            ("watch", "enable" | "disable" | "status" | "reload" | "list" | "rebuild-log" | "")
+            | ("daemon", "start" | "stop" | "")
             | ("config", "show" | "validate" | "")
             | ("passwords" | "doctor" | "version", "") => false,
             _ => return Err(invalid(format!("invalid action: {}", options.action))),
@@ -520,13 +519,13 @@ impl Options {
             return Ok(options);
         }
         if wants_paths && options.paths.is_empty() {
-            if !supplied || (command == "watch" && !after_action) {
+            if !supplied || (matches!(command, "watch" | "daemon") && !after_action) {
                 options.help = true;
             } else {
                 return Err(parser_error(command, &options.action, if options.action == "startup" { "the following arguments are required: action" } else { "the following arguments are required: paths" }));
             }
         }
-        if matches!(command, "watch" | "config") && options.action.is_empty() {
+        if matches!(command, "watch" | "daemon" | "config") && options.action.is_empty() {
             if supplied {
                 return Err(parser_error(command, "", format!("the following arguments are required: {command}_action")));
             }
@@ -654,15 +653,23 @@ fn help(options: &Options, language: Language, session: &dyn Session) -> io::Res
         "watch" => match options.action.as_str() {
             "" => {
                 for (action, label) in [
-                    ("start", "start"), ("add", "add"), ("remove", "remove (rm)"),
+                    ("enable", "enable"), ("disable", "disable"), ("add", "add"), ("remove", "remove (rm)"),
                     ("list", "list (ls)"), ("reload", "reload"), ("rebuild-log", "rebuild-log"),
-                    ("stop", "stop"), ("status", "status (st)"), ("startup", "startup"),
+                    ("status", "status (st)"),
                 ] {
                     positional.push((label.into(), format!("cli.watch.{}", action.replace('-', "_"))));
                 }
             }
             "add" | "remove" => positional.push(("paths".into(), "cli.watch.paths".into())),
-            "startup" => positional.push(("action".into(), "cli.watch.startup_action".into())),
+            _ => {}
+        },
+        "daemon" => match options.action.as_str() {
+            "" => {
+                for action in ["start", "stop", "startup"] {
+                    positional.push((action.into(), format!("cli.daemon.{action}")));
+                }
+            }
+            "startup" => positional.push(("action".into(), "cli.daemon.startup_action".into())),
             _ => {}
         },
         "config" if options.action.is_empty() => positional.extend([
@@ -824,6 +831,7 @@ pub(super) async fn run(
         "doctor" => doctor(cwd, generation.unwrap().into_inspection().map(|(path, _, settings)| (path, settings)),
             session, options.json, language),
         "watch" => watch_command(host, cwd, &options, session, language).await,
+        "daemon" => daemon_command(host, cwd, &options, session, language).await,
         _ => unreachable!(),
     };
     crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
@@ -839,7 +847,7 @@ pub(super) async fn run(
             }
             let (code, message) = match options.command {
                 "version" | "scan" | "extract" => (3, "cli.runtime_failure"),
-                "watch" => (1, "cli.operation_failed"),
+                "watch" | "daemon" => (1, "cli.operation_failed"),
                 _ => (2, "cli.operation_failed"),
             };
             result
@@ -2562,6 +2570,44 @@ fn doctor(
     Ok((i32::from(failed != 0), result))
 }
 
+async fn daemon_command(
+    host: &Host,
+    cwd: &Path,
+    options: &Options,
+    session: &dyn Session,
+    language: Language,
+) -> io::Result<(i32, CommandResult)> {
+    let mut result = CommandResult::new("daemon");
+    result.inputs = json!({"action": options.action});
+    match options.action.as_str() {
+        "start" => result.summary = host.watch.start_async(cwd, host.engine(cwd)?, !options.no_tray).await?,
+        // The launcher/pipe handles shutdown before dispatching CLI requests.
+        "stop" => return Err(invalid("daemon stop requires the persistent control channel")),
+        "startup" => {
+            let action = &options.paths[0];
+            result.inputs["startup_action"] = json!(action);
+            result.summary = match action.as_str() {
+                "enable" => json!({"enabled":true,"command":windows::startup_enable()?}),
+                "disable" => json!({"enabled":false,"changed":windows::startup_disable()?}),
+                _ => {
+                    let value = windows::startup_status()?;
+                    if !options.json {
+                        let message = if value.is_some() {
+                            "cli.daemon.startup_enabled"
+                        } else {
+                            "cli.daemon.startup_disabled"
+                        };
+                        line(session, Stream::Out, language.text(message))?;
+                    }
+                    json!({"enabled":value.is_some(),"command":value.unwrap_or_default()})
+                }
+            };
+        }
+        _ => unreachable!(),
+    }
+    Ok((0, result))
+}
+
 async fn watch_command(
     host: &Host,
     cwd: &Path,
@@ -2573,8 +2619,7 @@ async fn watch_command(
     result.inputs = json!({"action": options.action});
     let mut code = 0;
     match options.action.as_str() {
-        "start" => result.summary = host.watch.start_async(cwd, host.engine(cwd)?, !options.no_tray).await?,
-        "stop" => result.summary = host.watch.stop_async().await?,
+        "enable" | "disable" => result.summary = host.watch.set_enabled_async(cwd, host.engine(cwd)?, options.action == "enable").await?,
         "reload" => result.summary = host.watch.reload_async().await?,
         "add" => {
             let requested = watch_targets(cwd, options);
@@ -2591,32 +2636,6 @@ async fn watch_command(
             result.summary =
                 host.watch
                     .add_async(cwd, &paths, output, options.deep, options.recursive).await?;
-            result.summary["start_requested"] = Value::Bool(options.start);
-            if options.start && !host.watch.is_running() {
-                result.summary["start"] = host.watch.start_async(cwd, host.engine(cwd)?, true).await?;
-                if result.summary["start"]["running"] == Value::Bool(true) {
-                    crate::pipeline::stage("cli", &Cancellation::new()).await?;
-                    let (_, effective) = host.watch.roots(cwd)?;
-                    let effective: HashSet<_> = effective.iter().map(|path| path_key(path)).collect();
-                    let mut rejected = Vec::new();
-                    for name in ["added", "updated"] {
-                        if let Some(paths) = result.summary[name].as_array_mut() {
-                            paths.retain(|path| {
-                                let present = path.as_str().is_some_and(|value| {
-                                    effective.contains(&path_key(Path::new(value)))
-                                });
-                                if !present {
-                                    rejected.push(path.clone());
-                                }
-                                present
-                            });
-                        }
-                    }
-                    if let Some(previous) = result.summary["rejected"].as_array_mut() {
-                        previous.extend(rejected);
-                    }
-                }
-            }
             result.items = result.summary["added"]
                 .as_array()
                 .cloned()
@@ -2660,7 +2679,7 @@ async fn watch_command(
                 let mut status = host.watch.status(cwd)?;
                 status["count"] = json!(result.items.len());
                 if !options.json {
-                    let message = if status["running"] == true {
+                    let message = if status["enabled"] == true {
                         "cli.watch.running"
                     } else {
                         "cli.watch.stopped"
@@ -2668,26 +2687,6 @@ async fn watch_command(
                     line(session, Stream::Out, language.text(message))?;
                 }
                 status
-            };
-        }
-        "startup" => {
-            let action = &options.paths[0];
-            result.inputs["startup_action"] = json!(action);
-            result.summary = match action.as_str() {
-                "enable" => json!({"enabled":true,"command":windows::startup_enable()?}),
-                "disable" => json!({"enabled":false,"changed":windows::startup_disable()?}),
-                _ => {
-                    let value = windows::startup_status()?;
-                    if !options.json {
-                        let message = if value.is_some() {
-                            "cli.watch.startup_enabled"
-                        } else {
-                            "cli.watch.startup_disabled"
-                        };
-                        line(session, Stream::Out, language.text(message))?;
-                    }
-                    json!({"enabled":value.is_some(),"command":value.unwrap_or_default()})
-                }
             };
         }
         "rebuild-log" => {

@@ -45,7 +45,7 @@ fn competing_runtime_does_not_wait_for_a_live_owner_with_missing_endpoint() {
 
 fn server() -> Arc<Server> {
     Arc::new(Server {
-        host: Host::new(), activity: Mutex::new(Activity { last_completed: None, active: 0, shutting_down: false }),
+        host: Host::new(), activity: Mutex::new(Activity { last_completed: None, active: 0, observers: 0, shutting_down: false }),
         drained: Condvar::new(), wake: Arc::new(Event::new(false).unwrap()),
         shutdown: Cancellation::new(), io: transport::Reactor::new().unwrap(), token: [0; 32], build_id: [0; 16],
     })
@@ -337,4 +337,38 @@ fn async_prompt_is_first_wins_and_old_waiter_cannot_remove_new_prompt() {
     drop(next);
     assert!(slot.lock().unwrap().is_none());
     assert!(PromptReply::new(&slot, &next_cancel).unwrap().is_none());
+}
+
+#[test]
+fn status_stream_is_passive_and_disconnect_releases_subscription() {
+    let server = server();
+    let (mut client, request) = connect(&server);
+    client.write_all(&command_request(&server, 0, &["--watch-status-follow"])).unwrap();
+    let mut handshake = [0; 20];
+    client.read_exact(&mut handshake).unwrap();
+    assert_eq!(&handshake[..4], b"SPS2");
+    let mut kind = [0];
+    client.read_exact(&mut kind).unwrap();
+    assert_eq!(kind, [Stream::Out as u8]);
+    let length = read_u32(&mut client).unwrap() as usize;
+    let bytes = read_field(&mut client, length).unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(status["running"].is_boolean());
+    assert!(status["enabled"].is_boolean());
+    assert!(status["phase"].is_string());
+    {
+        let activity = server.activity.lock().unwrap();
+        assert_eq!(activity.active, 1);
+        assert_eq!(activity.observers, 1);
+    }
+    let (done, finished) = mpsc::channel();
+    let waiter = std::thread::spawn(move || { let _ = request.join(); let _ = done.send(()); });
+    drop(client);
+    finished.recv_timeout(Duration::from_secs(5)).expect("status subscriber retained after disconnect");
+    waiter.join().unwrap();
+    let (activity, _) = server.drained.wait_timeout_while(
+        server.activity.lock().unwrap(), Duration::from_secs(5), |state| state.active != 0,
+    ).unwrap();
+    assert_eq!(activity.active, 0);
+    assert_eq!(activity.observers, 0);
 }

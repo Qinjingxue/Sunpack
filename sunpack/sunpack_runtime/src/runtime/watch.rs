@@ -322,8 +322,29 @@ impl Drop for FinishRun {
     }
 }
 
+#[derive(Default)]
+struct WatchStatus {
+    revision: AtomicU64,
+    next: AtomicU64,
+    waiters: Mutex<HashMap<u64, Waker>>,
+    phase: Mutex<&'static str>,
+    shutdown: AtomicBool,
+}
+impl WatchStatus {
+    fn notify(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
+        for wake in waiters.into_values() { wake.wake(); }
+    }
+}
+struct StatusWait<'a> { status: &'a WatchStatus, id: u64 }
+impl Drop for StatusWait<'_> {
+    fn drop(&mut self) { self.status.waiters.lock().unwrap().remove(&self.id); }
+}
+
 pub(super) struct Watch {
     lifecycle: AsyncGate,
+    status: Arc<WatchStatus>,
     running: Mutex<Option<Running>>,
     wake_host: Arc<dyn Fn() + Send + Sync>,
     external: Arc<OutputPublications>,
@@ -357,6 +378,7 @@ impl Watch {
     pub(super) fn new(wake_host: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             lifecycle: AsyncGate::new(),
+            status: Arc::default(),
             running: Mutex::default(),
             wake_host,
             external: Arc::default(),
@@ -371,6 +393,25 @@ impl Watch {
             .unwrap()
             .as_ref()
             .is_some_and(|run| !run.thread.is_finished())
+    }
+
+    pub(super) fn status_revision(&self) -> u64 { self.status.revision.load(Ordering::Acquire) }
+    pub(super) fn shutdown_requested(&self) -> bool { self.status.shutdown.load(Ordering::Acquire) }
+    pub(super) async fn wait_status_change(&self, revision: u64, cancel: &Cancellation) -> io::Result<()> {
+        let guard = StatusWait { status: &self.status, id: self.status.next.fetch_add(1, Ordering::Relaxed) };
+        let wake = Arc::new(Mutex::new(None::<Waker>));
+        let cancelled_wake = Arc::clone(&wake);
+        let _subscription = cancel.subscribe(move || {
+            if let Some(waker) = cancelled_wake.lock().unwrap().as_ref() { waker.wake_by_ref(); }
+        });
+        poll_fn(|cx| {
+            *wake.lock().unwrap() = Some(cx.waker().clone());
+            if let Err(error) = cancel.check() { return Poll::Ready(Err(error)); }
+            let mut waiters = self.status.waiters.lock().unwrap();
+            if self.status_revision() != revision { return Poll::Ready(Ok(())); }
+            waiters.insert(guard.id, cx.waker().clone());
+            Poll::Pending
+        }).await
     }
 
     pub(super) fn foreground_finished(&self, when_unwatched: impl FnOnce()) {
@@ -394,7 +435,8 @@ impl Watch {
         let slot = self.running.lock().unwrap();
         let run = slot.as_ref().filter(|run| !run.thread.is_finished());
         Ok(json!({
-            "running": run.is_some(), "generation": self.generation.load(Ordering::Relaxed),
+            "running": run.is_some(), "enabled": run.is_some_and(|run| run.hub.enabled.load(Ordering::Acquire)),
+            "phase": if run.is_some() { *self.status.phase.lock().unwrap() } else { "stopped" }, "generation": self.generation.load(Ordering::Relaxed),
             "pending": run.map_or(0, |run| run.hub.pending_count.load(Ordering::Relaxed)),
             "last_error": self.last_error.lock().unwrap().as_deref().unwrap_or(""),
             "state_dir": state_dir,
@@ -402,6 +444,10 @@ impl Watch {
     }
 
     pub(super) async fn start_async(&self, cwd: &Path, engine: Arc<Engine>, tray: bool) -> io::Result<Value> {
+        self.start_with_intent(cwd, engine, tray, None).await
+    }
+
+    async fn start_with_intent(&self, cwd: &Path, engine: Arc<Engine>, tray: bool, intent: Option<bool>) -> io::Result<Value> {
         let lifecycle = self.lifecycle.lock().await;
         let previous = {
             let mut slot = self.running.lock().unwrap();
@@ -412,7 +458,7 @@ impl Watch {
             slot.take()
         };
         if let Some(previous) = previous { let _ = Self::join_run(previous).await; }
-        let (running, ready) = self.spawn_run(cwd, engine, tray).await?;
+        let (running, ready) = self.spawn_run(cwd, engine, tray, intent).await?;
         let hub = Arc::clone(&running.hub);
         *self.running.lock().unwrap() = Some(running);
         let generation = self.generation.load(Ordering::Relaxed);
@@ -434,7 +480,7 @@ impl Watch {
         Ok(json!({"running":true,"started":true,"generation":generation}))
     }
 
-    async fn spawn_run(&self, cwd: &Path, engine: Arc<Engine>, tray: bool) -> io::Result<(Running, Arc<Reply<()>>)> {
+    async fn spawn_run(&self, cwd: &Path, engine: Arc<Engine>, tray: bool, intent: Option<bool>) -> io::Result<(Running, Arc<Reply<()>>)> {
         let cancel = Cancellation::new();
         stage("watch_config", &cancel).await?;
         let snapshot = config::load_snapshot(cwd)?;
@@ -445,13 +491,19 @@ impl Watch {
         windows::configure_priority_async(&engine, snapshot.config.runtime.process_mode).await;
         engine.worker_ready(&snapshot.config.performance.worker, &cancel).await?;
         let cwd = cwd.to_path_buf();
-        let hub = Arc::new(Hub::new());
+        let mut hub = Hub::new();
+        hub.status = Arc::clone(&self.status);
+        hub.wake_host = Some(Arc::clone(&self.wake_host));
+        *hub.initial_enabled.lock().unwrap() = intent;
+        hub.set_phase("starting");
+        let hub = Arc::new(hub);
         let worker_hub = Arc::clone(&hub);
         let wake = Arc::clone(&self.wake_host);
         let external = Arc::clone(&self.external);
         let last_error = Arc::clone(&self.last_error);
         let (ready, wait) = command_reply();
         let completion = Arc::new(RunCompletion::default());
+        let status = Arc::clone(&self.status);
         let finished = FinishRun(Arc::clone(&completion));
         stage("watch_start", &cancel).await?;
         self.generation.fetch_add(1, Ordering::Relaxed);
@@ -471,6 +523,7 @@ impl Watch {
                 super::diagnostics::event("watch_failed", || json!({"error":error.to_string()}));
             }
             finished.0.complete(&result);
+            status.notify();
             wake();
             result
         })?;
@@ -496,6 +549,7 @@ impl Watch {
             return Ok(json!({"running":false,"stopped":false,"generation":generation}));
         };
         super::diagnostics::event("watch_stopping", || json!({}));
+        hub.set_phase("stopping");
         hub.stop();
         // Keep the old service published while it drains, as main does.
         // Concurrent start sees that service; concurrent stop joins the same
@@ -508,6 +562,7 @@ impl Watch {
             if slot.as_ref().is_some_and(|run| Arc::ptr_eq(&run.hub, &hub)) { slot.take() } else { None }
         };
         let joined = if let Some(running) = running { Self::join_run(running).await } else { Ok(()) };
+        self.status.notify();
         (self.wake_host)();
         if stopped {
             result?;
@@ -515,6 +570,16 @@ impl Watch {
         }
         super::diagnostics::event("watch_stopped", || json!({}));
         Ok(json!({"running":false,"stopped":stopped,"generation":self.generation.load(Ordering::Relaxed)}))
+    }
+
+    pub(super) async fn set_enabled_async(&self, cwd: &Path, engine: Arc<Engine>, enabled: bool) -> io::Result<Value> {
+        self.start_with_intent(cwd, engine, true, Some(enabled)).await?;
+        let hub = self.running.lock().unwrap().as_ref().map(|run| Arc::clone(&run.hub))
+            .ok_or_else(|| io::Error::other("Daemon stopped"))?;
+        let (reply, wait) = command_reply();
+        hub.update(|signals| signals.monitor_commands.push((enabled, reply)));
+        wait.wait().await?;
+        self.status(cwd)
     }
 
     pub(super) async fn reload_async(&self) -> io::Result<Value> {
@@ -617,7 +682,7 @@ impl Watch {
         }
         Ok(json!({
             "roots_path":path,"added":added,"updated":updated,"rejected":rejected,
-            "apply":apply,"start":null,
+            "apply":apply,
         }))
     }
 
@@ -895,6 +960,7 @@ struct Signals {
     changes: RootChanges,
     reload: bool,
     reload_waiters: Vec<CommandReply<bool>>,
+    monitor_commands: Vec<(bool, CommandReply<bool>)>,
     password_changed: bool,
     foreground_finished: bool,
     published_outputs: Vec<(String, String)>,
@@ -969,6 +1035,10 @@ impl RootChanges {
 }
 
 struct Hub {
+    enabled: AtomicBool,
+    initial_enabled: Mutex<Option<bool>>,
+    status: Arc<WatchStatus>,
+    wake_host: Option<Arc<dyn Fn() + Send + Sync>>,
     stopped: AtomicBool,
     signals: Mutex<Signals>,
     wake: std::sync::Condvar,
@@ -1101,6 +1171,10 @@ impl CompletedFamilies {
 impl Hub {
     fn new() -> Self {
         Self {
+            enabled: AtomicBool::new(true),
+            initial_enabled: Mutex::new(None),
+            wake_host: None,
+            status: Arc::default(),
             stopped: AtomicBool::new(false),
             signals: Mutex::default(),
             wake: std::sync::Condvar::new(),
@@ -1109,6 +1183,12 @@ impl Hub {
             activities: Arc::default(),
             pending_count: AtomicUsize::new(0),
         }
+    }
+
+    fn publish_status(&self) { self.status.notify(); }
+    fn set_phase(&self, phase: &'static str) {
+        *self.status.phase.lock().unwrap() = phase;
+        self.publish_status();
     }
 
     fn stop(&self) {
@@ -1183,6 +1263,7 @@ impl Hub {
                 && !value.foreground_finished
                 && value.published_outputs.is_empty()
                 && value.volumes.is_empty()
+                && value.monitor_commands.is_empty()
                 && value.rebuild.is_empty()
                 && value.cancel.is_empty()
                 && value.claimed.is_empty()
@@ -2101,6 +2182,8 @@ impl SourceGroups {
 }
 
 struct Scheduler {
+    resuming: bool,
+    baseline_roots: HashSet<String>,
     #[cfg(test)]
     admission_checkpoint: Option<Box<dyn FnOnce(&mut Self) -> io::Result<()> + Send>>,
     candidate_diagnostics: CandidateDiagnostics,
@@ -2139,6 +2222,80 @@ struct Scheduler {
 }
 
 impl Scheduler {
+    fn enabled(&self) -> bool { self.hub.enabled.load(Ordering::Acquire) }
+
+    fn persist_enabled(&self, enabled: bool) -> io::Result<()> {
+        self.journal.resume()?;
+        self.journal.commit(true, |_| {
+            let mut operations = crate::watch_store::NativeWatchOperations::empty();
+            operations.set_runtime("watch_control".into(), Some(json!({"enabled":enabled, "baseline_roots":self.baseline_roots})));
+            Ok(operations)
+        })?;
+        // The command acknowledgement is the durable intent boundary, including
+        // when the append was issued from a shared blocking-stage scope.
+        self.journal.flush()
+    }
+
+    fn set_enabled(&mut self, enabled: bool) -> io::Result<bool> {
+        if self.enabled() == enabled { return Ok(false); }
+        self.hub.set_phase(if enabled { "enabling" } else { "disabling" });
+        let result = if enabled {
+            self.resuming = true;
+            self.baseline_roots.extend(self.roots.keys().cloned());
+            let result: io::Result<()> = (|| {
+                if self.journal.resume()? {
+                    self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(),
+                        Some(state_dir(&self.cwd)?.to_string_lossy().into_owned())));
+                }
+                self.activate_scan_options()?;
+                // Subscribe before taking the baseline boundary. Events beyond
+                // that boundary remain queued for ordinary enabled admission.
+                self.rearm_root_observers(None)?;
+                self.checkpoint(&HashMap::new(), true, false)?;
+                self.root_progress.checkpoint = false;
+                self.recover_pending(None)?;
+                self.password_update(true)?;
+                self.retry_missing_volumes(None)?;
+                self.root_progress.recovery = false;
+                self.persist_enabled(true)?;
+                self.hub.enabled.store(true, Ordering::Release);
+                Ok(())
+            })();
+            self.resuming = false;
+            if result.is_err() {
+                self.root_observers.clear();
+                self.parent_observers.clear();
+                self.dependency_observers.clear();
+                self.pending.clear();
+                self.due.clear();
+                self.unpublished.clear();
+            }
+            result
+        } else {
+            (|| {
+                // Accepted work survives a pause; new arrivals after this
+                // explicit command are not turned into recovery intent.
+                self.persist_candidates(BTreeMap::new(), true)?;
+                self.persist_enabled(false)?;
+                self.hub.enabled.store(false, Ordering::Release);
+                self.drain_active(&mut Ok(()))?;
+                self.persist_candidates(BTreeMap::new(), true)?;
+                self.pending.clear();
+                self.due.clear();
+                self.unpublished.clear();
+                self.cache_deadline = None;
+                self.volume_checks.clear();
+                Ok(())
+            })()
+        };
+        self.reconcile_shell();
+        self.hub.set_phase(if self.enabled() { "running" } else { "disabled" });
+        result?;
+        self.journal.log(json!({"event":if enabled { "watch_enabled" } else { "watch_disabled" }}));
+        self.suspend_empty_scheduler()?;
+        Ok(true)
+    }
+
     fn open(
         cwd: PathBuf, engine: Arc<Engine>, hub: Arc<Hub>,
         tray_enabled: bool, external: Arc<OutputPublications>, snapshot: Snapshot,
@@ -2185,7 +2342,27 @@ impl Scheduler {
             NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?;
         let passwords = BuiltinStore::shared(&cwd)?;
         let config_observers = Self::observe_config(&cwd, &snapshot, &root_file, passwords.path(), &hub)?;
+        let baseline_roots = journal.state().runtime_record("watch_control")
+            .and_then(|record| record.get("baseline_roots").and_then(Value::as_array).cloned())
+            .unwrap_or_default().into_iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+        let saved_enabled = journal.state().runtime_record("watch_control")
+            .and_then(|record| record.get("enabled").and_then(Value::as_bool)).unwrap_or(true);
+        let requested = hub.initial_enabled.lock().unwrap().take();
+        // A cold enable still has to cross the paused baseline barrier below
+        // via its queued command; a cold disable must suppress startup recovery.
+        let enabled = saved_enabled && requested != Some(false);
+        if requested.is_some() && enabled != saved_enabled {
+            journal.commit(true, |_| {
+                let mut operations = crate::watch_store::NativeWatchOperations::empty();
+                operations.set_runtime("watch_control".into(), Some(json!({"enabled":enabled})));
+                Ok(operations)
+            })?;
+            journal.flush()?;
+        }
+        hub.enabled.store(enabled, Ordering::Release);
         let mut scheduler = Self {
+            resuming: false,
+            baseline_roots,
             #[cfg(test)]
             admission_checkpoint: None,
             cwd,
@@ -2226,12 +2403,15 @@ impl Scheduler {
         scheduler.activate_scan_options()?;
         scheduler.retire_missing_entries(None, true)?;
         scheduler.reconcile_shell();
-        scheduler.recover_pending(None)?;
-        scheduler.password_update(true)?;
-        scheduler.checkpoint(&HashMap::new(), true, true)?;
-        scheduler.root_progress.checkpoint = false;
-        scheduler.retry_missing_volumes(None)?;
-        scheduler.root_progress.recovery = false;
+        if enabled {
+            scheduler.recover_pending(None)?;
+            scheduler.password_update(true)?;
+            scheduler.checkpoint(&HashMap::new(), true, true)?;
+            scheduler.root_progress.checkpoint = false;
+            scheduler.retry_missing_volumes(None)?;
+            scheduler.root_progress.recovery = false;
+        }
+        scheduler.hub.set_phase(if enabled { "running" } else { "disabled" });
         scheduler
             .hub
             .pending_count
@@ -2308,7 +2488,15 @@ impl Scheduler {
             match super::tray::Tray::start(cwd, settings.cli.language, move |action| {
                 match action {
                     super::tray::Action::Reload => hub.queue_reload(None),
-                    super::tray::Action::Stop => hub.stop(),
+                    super::tray::Action::Monitor(enabled) => {
+                        let (reply, _) = command_reply();
+                        hub.update(|signals| signals.monitor_commands.push((enabled, reply)));
+                    },
+                    super::tray::Action::Stop => {
+                        hub.status.shutdown.store(true, Ordering::Release);
+                        hub.publish_status();
+                        if let Some(wake) = &hub.wake_host { wake(); }
+                    },
                 }
             }, move |message, error| {
                 if let Some(log) = diagnostic.upgrade() {
@@ -2324,6 +2512,7 @@ impl Scheduler {
         } else if let Some(tray) = tray {
             tray.set_language(settings.cli.language);
         }
+        if let Some(tray) = tray { tray.set_enabled(hub.enabled.load(Ordering::Acquire)); }
     }
 
     fn reconcile_shell(&mut self) {
@@ -2356,7 +2545,7 @@ impl Scheduler {
         } else {
             self.toast.take();
         }
-        if self.roots.is_empty() || self.options.is_none() {
+        if !self.enabled() || self.roots.is_empty() || self.options.is_none() {
             self.monitor.take();
             return;
         }
@@ -2503,6 +2692,7 @@ impl Scheduler {
         engine.run_stage("watch_directory", Origin::Watch, || {
         let refresh_catalog = self.root_progress.observe(policy_changed, self.roots.is_empty());
         self.available_roots.retain(|id| next.contains_key(id));
+        self.baseline_roots.retain(|id| next.contains_key(id));
         self.roots = next;
         if let Some(lease) = lease {
             self.broker_lease = Some(lease);
@@ -2553,6 +2743,7 @@ impl Scheduler {
     }
 
     fn rearm_root_observers_blocking(&mut self, changed: Option<&HashSet<String>>) {
+        if !self.enabled() && !self.resuming { return; }
         // Ordinary content notifications never invalidate these subscriptions.
         // Resolve only topology-invalidated roots; preserve other memberships.
         let desired = parent_memberships(self.roots.iter()
@@ -2644,6 +2835,7 @@ impl Scheduler {
             if config_changed {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days);
             }
+            if !self.enabled() { return Ok(()); }
             if scheduler_changed { self.recover_pending(None)?; }
             self.checkpoint_reload(scheduler_changed || roots_changed)?;
             if scheduler_changed {
@@ -2666,6 +2858,7 @@ impl Scheduler {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days);
                 let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots(false)?;
                 self.activate_scan_options()?;
+                if !self.enabled() { return Ok(()); }
                 let restart = scheduler_changed || latest_policy_changed;
                 if restart {
                     self.recover_pending(None)?;
@@ -2770,6 +2963,7 @@ impl Scheduler {
             if result.is_ok() || self.hub.stopped.load(Ordering::Acquire) { return result; }
             let error = result.unwrap_err();
             *last_error.lock().unwrap() = Some(error.to_string());
+            self.hub.set_phase("error");
             self.journal.log(json!({"event":"scheduler_error","error":error.to_string()}));
             let cwd = self.cwd.clone();
             let engine = Arc::clone(&self.engine);
@@ -2799,6 +2993,9 @@ impl Scheduler {
                     for waiter in signals.rebuild { waiter.send(Ok(rebuilt)); }
                 }
                 for root in signals.roots { root.reply.complete(Err(io::Error::other(error.to_string()))); }
+                for (_, waiter) in signals.monitor_commands {
+                    waiter.send(Err(io::Error::other(error.to_string())));
+                }
                 if !signals.reload { continue; }
                 let reload = (|| {
                     let snapshot = config::reload_snapshot(&cwd)?;
@@ -2874,7 +3071,7 @@ impl Scheduler {
 
     fn run_inner(&mut self) -> io::Result<()> {
         while !self.hub.stopped.load(Ordering::Acquire) {
-            self.dispatch_ready()?;
+            if self.enabled() { self.dispatch_ready()?; }
             self.hub
                 .pending_count
                 .store(self.pending.len(), Ordering::Relaxed);
@@ -2890,7 +3087,7 @@ impl Scheduler {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            let deadline = deadline.into_iter().chain(self.candidate_diagnostics.deadline()).min();
+            let deadline = if self.enabled() { deadline.into_iter().chain(self.candidate_diagnostics.deadline()).min() } else { None };
             let mut signals = self.hub.wait(deadline);
             self.candidate_diagnostics.clear_expired(Instant::now());
             for (batch, waiter) in signals.cancel {
@@ -2913,7 +3110,16 @@ impl Scheduler {
             if let Some(error) = completion_error {
                 return Err(error);
             }
-            if !signals.published_outputs.is_empty() && self.journal.state().has_entries() {
+            for (enabled, waiter) in std::mem::take(&mut signals.monitor_commands) {
+                let result = self.set_enabled(enabled);
+                let failure = result.as_ref().err().filter(|_| self.options.is_none())
+                    .map(|error| io::Error::new(error.kind(), error.to_string()));
+                waiter.send(result);
+                // Failed completion/drain invalidates the scheduler projection.
+                // Reuse service repair rather than advertising an inactive model.
+                if let Some(error) = failure { return Err(error); }
+            }
+            if self.enabled() && !signals.published_outputs.is_empty() && self.journal.state().has_entries() {
                 let buckets: HashSet<_> = signals.published_outputs.into_iter().map(|(root, output)|
                     (watch_path_key(&root), crate::scan::catalog::catalog_stem(&output))).collect();
                 let mut retried = HashSet::new();
@@ -2927,7 +3133,7 @@ impl Scheduler {
                 let result = self.engine.run_stage("catalog_maintenance", Origin::Watch, || self.journal.rebuild_log()).and_then(|result| result);
                 waiter.send(result);
             }
-            if signals.password_changed || !signals.reload_waiters.is_empty() {
+            if self.enabled() && (signals.password_changed || !signals.reload_waiters.is_empty()) {
                 self.password_update(false)?;
             }
             if signals.foreground_finished {
@@ -2955,6 +3161,7 @@ impl Scheduler {
                     );
                 }
             }
+            if !self.enabled() { continue; }
             if !signals.volumes.is_empty() {
                 for (id, (root, _)) in &self.roots {
                     let observed = self.root_observers.get(id).is_some_and(|observers| observers.root.is_some());
@@ -3062,6 +3269,7 @@ impl Scheduler {
     }
 
     fn ensure_dependency_observers(&mut self, root_id: &str, directories: impl Iterator<Item = PathBuf>) -> io::Result<()> {
+        if !self.enabled() && !self.resuming { return Ok(()); }
         let Some((root, scope)) = self.roots.get(root_id) else { return Ok(()); };
         let mut directories_seen = HashSet::new();
         let mut bases_seen = HashSet::new();
@@ -3173,6 +3381,18 @@ impl Scheduler {
     }
 
     fn observe_root_changes(&mut self, changes: &mut RootChanges) -> io::Result<()> {
+        if !self.baseline_roots.is_empty() {
+            let baseline: HashMap<_, _> = changes.changed_roots.iter()
+                .filter(|(root, _)| self.baseline_roots.contains(*root))
+                .map(|(root, paths)| (root.clone(), paths.clone())).collect();
+            if !baseline.is_empty() {
+                self.checkpoint(&baseline, false, false)?;
+                changes.changed_roots.retain(|root, _| !baseline.contains_key(root));
+                changes.topology_roots.retain(|root| !baseline.contains_key(root));
+                changes.paths.retain(|path, _| changes.changed_roots.values().any(|paths| paths.contains(path)));
+                if changes.changed_roots.is_empty() { return Ok(()); }
+            }
+        }
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_directory", Origin::Watch, || {
             for (id, paths) in &changes.changed_roots {
@@ -3218,8 +3438,10 @@ impl Scheduler {
         startup: bool,
         path_changes: &HashMap<PathBuf, PathChange>,
     ) -> io::Result<()> {
-        if self.options.is_none() { return Ok(()); }
+        if self.options.is_none() || (!self.enabled() && !self.resuming) { return Ok(()); }
         use rayon::prelude::*;
+        let baseline = self.resuming;
+        let mut baselined = HashSet::new();
 
         let mut groups: HashMap<String, (u64, i64, i64, Vec<NativeDiscoveryScope>)> =
             HashMap::new();
@@ -3282,7 +3504,7 @@ impl Scheduler {
             }
             (id, root, scope, identity, current, cached)
         }).collect::<Vec<_>>();
-        if !reopened.is_empty() {
+        if !baseline && !reopened.is_empty() {
             // Old snapshots can have only an outside literal name while its
             // physical watched volume is offline. Resolve those legacy names
             // once when a root returns, before catalog recovery or admission.
@@ -3324,6 +3546,7 @@ impl Scheduler {
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
         for (id, root, scope, identity, current, cached) in probes {
+            let baseline = baseline || self.baseline_roots.contains(&id);
             let range = match (&current, &cached) {
                 (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end)))
                     if volume == old_volume
@@ -3342,7 +3565,9 @@ impl Scheduler {
                 // a conservative baseline. During a running session the in-memory
                 // inventory must publish arrivals even if persistence has failed.
                 let options = self.scan_options(root.deep)?;
-                let scan = if !startup || cached.is_some() {
+                let scan = if baseline {
+                    options.catalog_baseline(&self.catalog, &scope, None).map(|errors| (errors, Vec::new()))
+                } else if !startup || cached.is_some() {
                     options.catalog_refresh(&self.catalog, &scope, None)
                 } else {
                     options.catalog_update(&self.catalog, &scope, None)
@@ -3411,12 +3636,17 @@ impl Scheduler {
                     if !full_refresh && !crate::path_keys::path_ancestors(path_id.as_ref())
                         .skip(1).any(|parent| covered.contains(parent)) {
                         let options = self.scan_options(root.deep)?;
-                        let refresh = options.catalog_refresh(&self.catalog, &scope, Some(path));
+                        let refresh = if baseline {
+                            options.catalog_baseline(&self.catalog, &scope, Some(path)).map(|errors| (errors, Vec::new()))
+                        } else { options.catalog_refresh(&self.catalog, &scope, Some(path)) };
                         match collect_catalog_arrivals(refresh, &mut paths) {
                             Ok(()) => {}
                             Err(reason) => {
                                 full_refresh = true;
-                                match options.catalog_refresh(&self.catalog, &scope, None) {
+                                let refresh = if baseline {
+                                    options.catalog_baseline(&self.catalog, &scope, None).map(|errors| (errors, Vec::new()))
+                                } else { options.catalog_refresh(&self.catalog, &scope, None) };
+                                match refresh {
                                     Ok((failed, mut arrivals)) => {
                                         errors = failed;
                                         paths.append(&mut arrivals);
@@ -3451,6 +3681,7 @@ impl Scheduler {
                     marks.insert(id.clone());
                 }
             }
+            if baseline { paths.clear(); }
             let mut stems = HashSet::new();
             for (index, path) in paths.into_iter().enumerate() {
                 // Initial inventory is not an explicit retry. Only paths
@@ -3486,11 +3717,18 @@ impl Scheduler {
                     let changed = cached.as_ref().is_none_or(|(old_volume, old_journal, old_end)| {
                         (old_volume, *old_journal, *old_end) != (&volume, journal, end)
                     });
+                    if baseline { baselined.insert(id); }
                     cursors.push((changed.then_some((scope, identity)), volume, journal, end));
                 }
                 (Ok((volume, _, _)), _) => { failures.insert(volume); }
-                (Err(error), _) => self.journal.log(json!({"event":"usn_cursor_unavailable","root":root.path,"error":error.to_string()})),
+                (Err(error), _) => {
+                    if baseline { return Err(io::Error::new(error.kind(), error.to_string())); }
+                    self.journal.log(json!({"event":"usn_cursor_unavailable","root":root.path,"error":error.to_string()}));
+                },
             }
+        }
+        if baseline && !failures.is_empty() {
+            return Err(io::Error::other("Cannot establish the resumed Watch baseline"));
         }
         let mut operations = BTreeMap::new();
         for (_, volume, journal, end) in &cursors {
@@ -3560,8 +3798,16 @@ impl Scheduler {
                 "changed":admitted.len(),"queued":self.pending.len()}),
             );
         }
+        if !baselined.is_empty() {
+            self.catalog.flush()?;
+            self.baseline_roots.retain(|root| !baselined.contains(root));
+            // Only an already-enabled scheduler publishes partial root recovery.
+            // Explicit resume publishes intent once its complete barrier finishes.
+            if self.enabled() { self.persist_enabled(true)?; }
+        }
         self.catalog.commit(false);
         if let Some(error) = self.catalog.error() {
+            if baseline { return Err(io::Error::other(error)); }
             self.journal.log(json!({"event":"catalog_persistence_failed","error":error}));
         }
         Ok(())

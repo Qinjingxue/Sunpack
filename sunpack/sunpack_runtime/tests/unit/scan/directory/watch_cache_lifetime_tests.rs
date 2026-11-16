@@ -40,3 +40,39 @@ fn refresh_rescans_when_output_is_published_after_enumeration() {
     fs::remove_dir(&output).unwrap();
     fs::remove_dir(&root).unwrap();
 }
+
+#[test]
+fn paused_catalog_baseline_adopts_content_without_claiming_generated_output() {
+    use super::*;
+    use crate::scan::scope::NativeDiscoveryScope;
+
+    let root = crate::test_support::temp_file("catalog_paused_baseline", b"");
+    fs::remove_file(&root).unwrap();
+    fs::create_dir(&root).unwrap();
+    let file = root.join("kept.zip");
+    fs::write(&file, b"completed original").unwrap();
+    let scope = NativeDiscoveryScope::new(root.to_str().unwrap().to_owned(), None, Vec::new());
+    let state = crate::watch_store::NativeWatchState::new();
+    let catalog = NativeWatchCatalog::new(&state, None);
+    let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+    options.catalog_baseline(&catalog, &scope, None).unwrap();
+    let original = catalog.observation(file.to_str().unwrap()).unwrap();
+    fs::write(&file, b"changed while explicitly paused").unwrap();
+    options.catalog_baseline(&catalog, &scope, file.to_str()).unwrap();
+    let adopted = catalog.observation(file.to_str().unwrap()).unwrap();
+    assert_ne!(adopted.size, original.size);
+    let current = crate::postprocess::watch_candidate_for_path(&file, Some(adopted.change_usn)).unwrap().unwrap();
+    assert!(!crate::postprocess::watch_content_changed(adopted.size, adopted.mtime,
+        &adopted.file_id(), adopted.change_usn, &current));
+    assert!(!catalog.is_owned(file.to_str().unwrap()));
+    assert!(catalog.generated_observation(file.to_str().unwrap()).is_none());
+    fs::write(&file, b"a later active edit remains eligible").unwrap();
+    let (errors, arrivals) = options.catalog_refresh(&catalog, &scope, file.to_str()).unwrap();
+    assert!(errors.is_empty());
+    assert_eq!(arrivals, vec![file.to_str().unwrap().to_owned()]);
+    let current = crate::postprocess::watch_candidate_for_path(&file, Some(adopted.change_usn)).unwrap().unwrap();
+    assert!(crate::postprocess::watch_content_changed(adopted.size, adopted.mtime,
+        &adopted.file_id(), adopted.change_usn, &current));
+    fs::remove_file(&file).unwrap();
+    fs::remove_dir(&root).unwrap();
+}

@@ -38,7 +38,7 @@ class Application {
     void schedule_task_range();
     unsigned dirty_ = 15;
     std::atomic<uint64_t> task_query_generation_{0};
-    std::thread worker_, registry_;
+    std::thread worker_, registry_, runtime_;
     struct ControlBinding { Application* owner; Json field; };
     std::map<std::string,std::unique_ptr<ControlBinding>> controls_;
     UiWidget theme_widget_ = 0;

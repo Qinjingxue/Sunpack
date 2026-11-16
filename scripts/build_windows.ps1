@@ -637,7 +637,7 @@ if ($processArch -eq $buildArch) {
         } finally {
             # Every launcher request may start the packaged persistent runtime.
             # Shut it down while PROGRAMDATA still points at the smoke sandbox.
-            Invoke-Native -FilePath $distExePath -Arguments @("--persistent-shutdown")
+            Invoke-Native -FilePath $distExePath -Arguments @("daemon", "stop")
             Wait-ExecutableExit -ExecutablePath $distRuntimeExePath
         }
     } finally {

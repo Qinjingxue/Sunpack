@@ -225,7 +225,7 @@ def test_cli_output_does_not_require_usn(package, tmp_path, filesystem, watching
             watched = tmp_path / "unrelated"
             watched.mkdir()
             package.json("watch", "add", watched, "-R")
-            package.json("watch", "start", "--no-tray")
+            package.json("daemon", "start", "--no-tray")
         # Both output creation and flatten's identity receipts used to query
         # USN. Exercise each through the launcher, with Watch off/unrelated.
         try:
@@ -238,7 +238,7 @@ def test_cli_output_does_not_require_usn(package, tmp_path, filesystem, watching
                 assert (extracted / ("payload.txt" if flatten else "wrapper/payload.txt")).is_file()
         finally:
             if watching:
-                package.json("watch", "stop")
+                package.json("daemon", "stop")
 
 
 @pytest.mark.parametrize("stop", ["launcher-disconnect", "runtime-shutdown"])

@@ -141,6 +141,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
         let settings = Arc::new(Config::default());
             let mut scheduler = Scheduler {
+                resuming: false, baseline_roots: HashSet::new(),
                 candidate_diagnostics: CandidateDiagnostics::default(),
                 admission_checkpoint: None,
                 cwd: base.clone(), root_file: base.join(ROOTS_FILE),

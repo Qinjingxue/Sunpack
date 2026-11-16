@@ -6,6 +6,7 @@ fn invalid_window_reports_filter_and_icon_failures_without_stopping_tray() {
     let errors = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&errors);
     let context = Context {
+        enabled: Arc::new(AtomicBool::new(true)),
         cwd: PathBuf::new(), chinese: Arc::new(AtomicBool::new(false)),
         notify: Box::new(|_| {}),
         report_error: Box::new(move |message, _| recorded.lock().unwrap().push(message)),

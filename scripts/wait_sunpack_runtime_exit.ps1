@@ -1,4 +1,4 @@
-# Final uninstall barrier: explicit --persistent-shutdown is issued before this
+# Final uninstall barrier: explicit daemon stop is issued before this
 # script runs. This only waits for the already-requested runtime teardown.
 param(
     [Parameter(Mandatory = $true)]

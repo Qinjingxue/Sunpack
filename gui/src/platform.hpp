@@ -65,24 +65,6 @@ void set_context_menu_enabled(const CliCommand& cli, bool enabled, HANDLE stop);
 struct CliResult { DWORD code; std::string output; };
 CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop,const std::string* input=nullptr);
 fs::path executable_path();
-// Owned and destroyed on the thread that performs the alertable SCM wait.
-class ServiceMonitor {
-    struct Subscription {
-        SC_HANDLE handle = nullptr;
-        SERVICE_NOTIFYW notification{};
-        bool pending = false, changed = false;
-        static void CALLBACK notified(void* parameter);
-        void arm(DWORD mask);
-        void close();
-        ~Subscription() { close(); }
-    } database_, service_;
-    std::wstring name_;
-    bool running_ = false;
-public:
-    explicit ServiceMonitor(const wchar_t* name = L"SunPackWatchBroker") : name_(name) {}
-    ServiceMonitor(const ServiceMonitor&) = delete;
-    ServiceMonitor& operator=(const ServiceMonitor&) = delete;
-    bool changed() const { return database_.changed || service_.changed; }
-    bool running();
-};
+// Blocks on streamed runtime state; stop cancels I/O and joins the hidden client.
+DWORD follow_watch_status(const CliCommand& cli,HANDLE stop,const std::function<void(const std::string&)>& received);
 }

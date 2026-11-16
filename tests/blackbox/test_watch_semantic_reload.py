@@ -52,7 +52,7 @@ def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_p
     output = tmp_path / "out"
     package.configure(extraction={"content_requirement": "complete"})
     package.json("watch", "add", watched, "-o", output)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     events = package.data / ".sunpack_watch" / "events.json"
     completion = _wait_for_blocker(events, parts[0])
     if policy == "config":
@@ -67,7 +67,7 @@ def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_p
         pending.replace(roots)
     package.json("watch", "reload")
     _wait_for_blocker(events, parts[0], completion)
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     assert before == [(path.name, path.stat().st_size, path.stat().st_mtime_ns)
                       for path in watched.iterdir()]
     assert not list(output.rglob("payload.txt"))
@@ -97,7 +97,7 @@ def test_watch_restart_keeps_carrier_outputs_and_retries_retained_child(package,
     package.configure(recursive_extract="*", recursive_authorization={"enabled": False},
                       post_extract={"flatten_single_directory": True})
     package.json("watch", "add", watched, "--deep-detect", "-o", output)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     events = package.data / ".sunpack_watch" / "events.json"
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -113,7 +113,7 @@ def test_watch_restart_keeps_carrier_outputs_and_retries_retained_child(package,
         time.sleep(0.05)
     else:
         pytest.fail("Carrier did not finish flattening beside its retained password blocker")
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     identity = (ordinary.stat().st_ino, ordinary.stat().st_mtime_ns)
     assert ordinary.read_bytes() == b"retained ordinary"
     assert package.run("--persistent-shutdown").returncode == 0

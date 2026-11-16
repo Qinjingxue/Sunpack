@@ -51,11 +51,11 @@ class Package:
 
     @contextmanager
     def watch_session(self, *, cwd=None):
-        self.json("watch", "start", "--no-tray", cwd=cwd)
+        self.json("daemon", "start", "--no-tray", cwd=cwd)
         try:
             yield
         finally:
-            assert self.json("watch", "stop", cwd=cwd)["summary"]["stopped"]
+            assert self.json("daemon", "stop", cwd=cwd)["summary"]["running"] is False
 
     def await_watch_admission(self):
         # Start publishes the recovered pending count. Once the scheduler has

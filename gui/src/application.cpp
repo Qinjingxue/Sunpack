@@ -124,9 +124,8 @@ Options parse_options(const std::vector<std::wstring>& args) {
             auto action=args[++i];
             if(action!=L"add" && action!=L"remove") throw std::runtime_error("guiArguments");
             result.shell_watch={L"watch",action,args[++i]};
-            if(action==L"add") result.shell_watch.push_back(L"--start");
         }
-        else if(args[i]==L"--recursive" && result.shell_watch.size()==4)
+        else if(args[i]==L"--recursive" && result.shell_watch.size()==3 && result.shell_watch[1]==L"add")
             result.shell_watch.push_back(L"--recursive");
         else throw std::runtime_error("guiArguments");
     }
@@ -982,30 +981,35 @@ void Application::open() {
         RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,KEY_NOTIFY,&key);
         Handle event(CreateEventW(nullptr,TRUE,FALSE,nullptr));
         bool watching=key && RegNotifyChangeKeyValue(key,FALSE,REG_NOTIFY_CHANGE_LAST_SET,event,TRUE)==ERROR_SUCCESS;
-        ServiceMonitor broker;
-        Json previous;
-        bool refresh=true;
-        for(;;) {
-            if(refresh || broker.changed()) {
-                Json status;
-                try { status={{"known",true},{"running",broker.running()}}; }
-                catch(...) { status={{"known",false},{"running",false}}; }
-                if(status!=previous) { publish({{"runtime",status}}); previous=std::move(status); }
-                refresh=false;
-            }
-            // SCM RPC may already have delivered an APC while subscribing.
-            if(broker.changed()) continue;
-            HANDLE waits[]={stop_,service_refresh_,event};
-            auto signal=WaitForMultipleObjectsEx(watching?3:2,waits,FALSE,INFINITE,TRUE);
-            if(signal==WAIT_OBJECT_0 || signal==WAIT_FAILED) break;
-            if(signal==WAIT_IO_COMPLETION) continue;
-            if(signal==WAIT_OBJECT_0+1) refresh=true;
-            if(watching && signal==WAIT_OBJECT_0+2) {
-                ResetEvent(event); changed(Startup);
-                watching=RegNotifyChangeKeyValue(key,FALSE,REG_NOTIFY_CHANGE_LAST_SET,event,TRUE)==ERROR_SUCCESS;
-            }
+        HANDLE waits[]={stop_,event};
+        while(watching && WaitForMultipleObjects(2,waits,FALSE,INFINITE)==WAIT_OBJECT_0+1) {
+            ResetEvent(event); changed(Startup);
+            watching=RegNotifyChangeKeyValue(key,FALSE,REG_NOTIFY_CHANGE_LAST_SET,event,TRUE)==ERROR_SUCCESS;
         }
         if(key) RegCloseKey(key);
+    });
+    if(options_.allow_cli) runtime_=std::thread([this]{
+        Json latest={{"known",false},{"running",false},{"enabled",false},{"syncError",false}};
+        do {
+            bool received=false;
+            DWORD exit_code=1;
+            try {
+                exit_code=follow_watch_status(options_.cli,stop_,[this,&latest,&received](const std::string& line){
+                    auto status=parse_json(line);
+                    if(!status.is_object() || !status.contains("enabled") || !status.contains("running"))
+                        throw std::runtime_error("runtimeSyncError");
+                    status["known"]=true; status["syncError"]=false;
+                    received=true; latest=std::move(status);
+                    publish({{"runtime",latest}});
+                });
+            } catch(...) {}
+            if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0) break;
+            latest["known"]=exit_code==0 && received && !latest.value("running",false);
+            latest["syncError"]=!latest["known"].get<bool>();
+            publish({{"runtime",latest}});
+            HANDLE waits[]={stop_,service_refresh_};
+            if(WaitForMultipleObjects(2,waits,FALSE,INFINITE)!=WAIT_OBJECT_0+1) break;
+        } while(true);
     });
     } catch(const std::exception& e) { throw std::runtime_error(error_text("startupFailure",{{"stage",{{"source",stage}}},{"detail",{{"source",e.what()}}}})); }
 }
@@ -1023,6 +1027,7 @@ Application::~Application() {
     SetEvent(stop_); cv_.notify_all();
     if(worker_.joinable()) worker_.join();
     if(registry_.joinable()) registry_.join();
+    if(runtime_.joinable()) runtime_.join();
     if(hwnd_ && IsWindow(hwnd_)) { RemoveWindowSubclass(hwnd_,subclass,1); ui_window_destroy(window_); }
     if(large_icon_) DestroyIcon(large_icon_);
     if(small_icon_) DestroyIcon(small_icon_);
@@ -1045,13 +1050,15 @@ void Application::work() {
         auto on_data=[this,dir_key,config_key=path_key(dir/"sunpack_config.json"),
             passwords_key=path_key(dir/"builtin_passwords.json"),roots_key=path_key(dir/"sunpack_watch_roots.txt")](const fs::path& path){
             if(path.empty()) {
-                changed(Config|Passwords|Roots); return;
+                SetEvent(service_refresh_); changed(Config|Passwords|Roots); return;
             }
             const auto key=path_key(path);
             // An ancestor notification can make the whole data directory appear.
             if(is_under(dir_key,key)) {
-                changed(Config|Passwords|Roots); return;
+                SetEvent(service_refresh_); changed(Config|Passwords|Roots); return;
             }
+            const auto name=path.filename().wstring();
+            if(name.rfind(L"runtime-",0)==0 && path.extension()==L".state") SetEvent(service_refresh_);
             if(key==config_key) changed(Config);
             else if(key==passwords_key) changed(Passwords);
             else if(key==roots_key) changed(Roots);
@@ -1100,6 +1107,7 @@ void Application::work() {
             if(!data_watcher || !data_watcher->alive() || (!data_watcher->direct() && fs::is_directory(dir))) {
                 try {
                     data_watcher=std::make_unique<DirectoryWatcher>(dir,on_data); errors.erase("fileObserver");
+                    SetEvent(service_refresh_); // Close the initial subscribe/connect race.
                 }
                 catch(const std::exception& e) { errors["fileObserver"]=e.what(); }
             }
@@ -1206,8 +1214,8 @@ void Application::work() {
                         if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
                         auto action=p.value("action",std::string());
                         std::vector<std::wstring> args={L"watch"};
-                        if(action=="start" || action=="stop") args.push_back(wide(action));
-                        else if(action=="startupEnable" || action=="startupDisable") { args.push_back(L"startup"); args.push_back(action=="startupEnable"?L"enable":L"disable"); }
+                        if(action=="enable" || action=="disable") args.push_back(wide(action));
+                        else if(action=="startupEnable" || action=="startupDisable") { args={L"daemon",L"startup"}; args.push_back(action=="startupEnable"?L"enable":L"disable"); }
                         else throw std::runtime_error("cliOperationUnknown");
                         auto result=run_cli(options_.cli,args,stop_);
                         SetEvent(service_refresh_);

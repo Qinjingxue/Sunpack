@@ -42,7 +42,7 @@ def test_runtime_rebuild_keeps_arrivals_after_catalog_persistence_fails(package,
     # Real snapshot creation failure, not a product test hook. The initial
     # inventory remains resident while the disposable persistent store closes.
     (state / "catalog.snapshot.bin.tmp").mkdir()
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     events = state / "events.json"
     _wait(
         lambda: any(row.get("event") == "catalog_persistence_failed"
@@ -57,7 +57,7 @@ def test_runtime_rebuild_keeps_arrivals_after_catalog_persistence_fails(package,
     arrival.rename(watched / "arrived")
     _wait(lambda: any(p.read_bytes() == b"runtime arrival" for p in output.rglob("new.txt")),
           "runtime rebuild swallowed the directory arrival")
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     assert not list(output.rglob("baseline.txt"))
     assert len(list(output.rglob("new.txt"))) == 1
 

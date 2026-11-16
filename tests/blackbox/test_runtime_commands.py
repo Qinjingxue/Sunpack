@@ -345,7 +345,8 @@ def test_text_extract_keeps_nested_archive_under_its_carrier_segment(package, tm
 def test_watch_action_help_lists_available_options(package):
     help_text = package.run("watch", "add", "--help")
     assert help_text.returncode == 0
-    assert all(option in help_text.stdout for option in ("paths", "--out-dir", "--start", "--deep-detect"))
+    assert all(option in help_text.stdout for option in ("paths", "--out-dir", "--deep-detect"))
+    assert "--start" not in help_text.stdout
 
 
 @pytest.mark.requires_watch_broker
@@ -360,6 +361,7 @@ def test_watch_persists_completion_across_restart(package, tmp_path):
         archive.writestr("received.txt", b"watch payload")
     package.json("watch", "add", watched, "-o", output)
     assert package.json("watch", "list")["summary"]["count"] == 1
+    assert package.json("watch", "status")["summary"]["running"] is False
     with package.watch_session():
         package.await_watch_event("done", path=source.name)
     assert next(output.rglob("received.txt")).read_bytes() == b"watch payload"
@@ -404,7 +406,7 @@ def test_continuous_watch_retries_retained_nested_input_after_password_edit(pack
     settings["recursive_extract"] = "*"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     package.json("watch", "add", watched, "-o", output, "--deep-detect")
-    started = package.json("watch", "start", "--no-tray")["summary"]
+    started = package.json("daemon", "start", "--no-tray")["summary"]
     assert started["started"] and started["running"]
     # Main reports false when reload has no semantic configuration change.
     assert package.json("watch", "reload")["summary"]["reloaded"] is False
@@ -432,7 +434,7 @@ def test_continuous_watch_retries_retained_nested_input_after_password_edit(pack
     )
     status = package.json("watch", "status")["summary"]
     assert status["running"] and status["generation"] == started["generation"]
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     extracted = list(output.rglob(marker.name))
     assert len(extracted) == 1
     assert extracted[0].read_bytes() == marker.read_bytes()
@@ -450,7 +452,7 @@ def test_idle_watch_releases_reader_handles_after_foreground_scan(package, tmp_p
         with zipfile.ZipFile(inputs / f"archive-{number}.zip", "w") as archive:
             archive.writestr("payload.txt", str(number))
 
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     runtime = package.launcher.parent.parent / "sunpack-runtime.exe"
     owner = next(
         process for process in psutil.process_iter(["exe"])

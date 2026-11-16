@@ -15,7 +15,8 @@ Top-level commands:
 | `scan`, `s` | Read-only archive discovery and password confirmation. |
 | `passwords`, `pw` | Show a summary of the password sources available to the current command. |
 | `config`, `cfg` | Show or validate the merged effective configuration. |
-| `doctor`, `d` | Read-only check of configuration and runtime environment. |
+| `daemon`, `d` | Control the daemon and logon startup. |
+| `doctor`, `doc` | Read-only check of configuration and runtime environment. |
 | `version`, `ver` | Print the installed SunPack version. |
 
 Full names and the listed aliases are both supported syntax. Arbitrary long-option prefixes are rejected. JSON `command` fields always use the full command name. `-p` supplies a password; `-P` supplies a password file. `-f` enables flattening; `-F` disables it. Separate options from their values, for example `-r 3` and `-c r`.
@@ -137,7 +138,7 @@ sunpack.exe scan D:\Downloads -v
 Usage:
 
 ```powershell
-sunpack.exe watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]
+sunpack.exe watch <add|remove|list|enable|disable|reload|rebuild-log|status> [options]
 ```
 
 Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect | initial_scanned | recursive`; the last four columns are optional:
@@ -159,30 +160,40 @@ Subcommands and options:
 
 | Subcommand | Option | Description |
 | --- | --- | --- |
-| `start` | `--no-tray` | Disable the tray entry point while running continuously. |
+| `enable` | — | Enable monitoring without changing the daemon lifecycle. |
 | `add PATH...` | `-o/--out-dir DIR` | Add a monitored root; only one path may be added at a time. |
-| `add PATH...` | `-s`, `--start` | Start continuous monitoring after adding. |
 | `add PATH...` | `-R/--recursive` | Enable recursive discovery for the monitored root. |
 | `add PATH...` | `-d`, `--deep-detect` | Persist `deep_detect=true` for each input root; update already registered roots too. |
 | `remove PATH...`, `rm PATH...` | — | Remove a monitored root by input directory. |
 | `list`, `ls` | — | List the persisted input directories. |
 | `reload` | — | Re-read the configuration and monitored roots. |
 | `rebuild-log` | — | Clear display logs and rebuild from the watch snapshot/WAL. Completed history is discarded. Reports success or failure (exit code 1); automatic recovery still ignores failures and retries on later log operations. |
-| `stop` | — | Stop continuous monitoring. |
+| `disable` | — | Persistently pause monitoring; keep the daemon and tray running. |
 | `status`, `st` | — | Show whether the watch service is running. JSON also includes pending counts, the last error, and root directories. |
-| `startup enable\|disable\|status` | — | Manage the current user's logon startup entry. |
 
-`start` keeps running until a stop request arrives. Writing, moving, or modifying a file triggers an active cycle. New candidates have no initial delay; subsequent content changes adapt the quiet window to observed write intervals, without a fixed minimum or maximum wait. Ready files are submitted for processing. The arrival of a new volume or a change in password sources reactivates the affected tasks.
+`enable` resumes monitoring. `disable` persists across process restarts; resuming skips new changes made while paused. Restarting a daemon while monitoring is enabled still recovers offline changes. Writing, moving, or modifying a file triggers an active cycle. New candidates have no initial delay; subsequent content changes adapt the quiet window to observed write intervals, without a fixed minimum or maximum wait. Ready files are submitted for processing. The arrival of a new volume or a change in password sources reactivates the affected tasks.
 
 `add`'s `-o/--out-dir` can only be used together with a single input directory. Adding the same input directory again does not change the existing output mapping; you must `remove` and then `add` to update the mapping. The output roots of different monitored roots must not be strict ancestors or descendants of one another; the same output root may be shared.
 
 Adding a new root without `--deep-detect` leaves deep mode disabled. Re-adding an existing root without the flag preserves its mode; set the third column to `false` or leave it empty to disable deep mode.
 
 ```powershell
-sunpack.exe watch add D:\Downloads --deep-detect --start
+sunpack.exe watch add D:\Downloads --deep-detect
+sunpack.exe daemon start
 ```
 
 The directory and directory-background context menus contain four entries: "Extract files in this folder", "Enter password to extract files in this folder", "Watch this folder", and "Stop watching this folder". These entries do not add `--deep-detect`. The two file extraction entries enable `--deep-detect` by default. Re-run `scripts/register_context_menu.ps1` to rebuild the menus and remove obsolete entries.
+
+## daemon (alias d)
+
+```powershell
+sunpack.exe daemon <start|stop|startup>
+sunpack.exe daemon startup <enable|disable|status>
+```
+
+`start` starts the daemon and restores the saved monitoring state. `stop` waits for daemon shutdown without changing that state. `start --no-tray` suppresses the tray for this daemon session. `startup` manages the current user's logon startup entry. `stop` accepts `--json` and `--help`.
+
+“Watch this folder” runs `watch add` followed by `daemon start`; it does not override a saved pause.
 
 ## passwords
 

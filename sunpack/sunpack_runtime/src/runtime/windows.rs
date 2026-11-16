@@ -527,7 +527,7 @@ pub(super) fn startup_command() -> io::Result<String> {
         .map(String::as_str)
         .unwrap_or("v2-0000000000000000");
     Ok(format!(
-        "\"{}\" --_sunpack-runtime-id={identity} watch start",
+        "\"{}\" --_sunpack-runtime-id={identity} daemon start",
         exe.display()
     ))
 }

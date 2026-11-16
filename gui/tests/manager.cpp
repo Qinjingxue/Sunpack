@@ -10,7 +10,6 @@
 #include <tuple>
 
 using namespace spg;
-void service_notifications();
 namespace {
 void fails(const std::function<void()>& action) { bool failed=false; try { action(); } catch(const std::exception&) { failed=true; } assert(failed); }
 struct Fixture {
@@ -23,7 +22,7 @@ void native_context_menu_entrypoint(Fixture& fixture) {
     fs::create_directories(app / "scripts");
     // Intercept only this test's script dispatch, never touch shell registration.
     atomic_write(app / "scripts" / "register_context_menu.ps1",
-        "param([Parameter(Mandatory=$true)][string]$AppPath)\nSet-Content -LiteralPath (Join-Path $PSScriptRoot 'enabled.txt') -Value $AppPath -Encoding UTF8");
+        "param([Parameter(Mandatory=$true)][string]$AppPath,[string]$GuiPath)\nSet-Content -LiteralPath (Join-Path $PSScriptRoot 'enabled.txt') -Value $AppPath -Encoding UTF8");
     atomic_write(app / "scripts" / "unregister_context_menu.ps1",
         "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'disabled.txt') -Value 'ok' -Encoding UTF8");
     CliCommand cli{app / "sunpack" / "sunpack_launcher.exe", fixture.dir, {}, app};
@@ -500,6 +499,14 @@ int wmain(int argc,wchar_t** argv) {
             std::cout<<Json{{"tasks",log.query(roots,view)}}.dump(); return 0;
         } catch(const WinError& error) { std::cerr<<error.what()<<"\n"; return int(error.code); }
     }
+    if(argc==2 && std::wstring(argv[1])==L"--watch-status-follow") {
+        assert(GetConsoleWindow()==nullptr);
+        std::cout<<R"({"running":true,"enabled":true,"phase":"running"})"<<std::endl;
+        std::cout<<R"({"running":true,"enabled":false,"phase":"disabled"})"<<std::endl;
+        Handle wait(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+        WaitForSingleObject(wait,INFINITE);
+        return 0;
+    }
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
     if(argc==4 && std::wstring(argv[1])==L"--password-add") { save_password_edit(argv[2],{{"operation","add"},{"value",utf8(argv[3])}}); return 0; }
@@ -511,11 +518,20 @@ int wmain(int argc,wchar_t** argv) {
         time["lower"]="2024-02-29 12:34";time["upper"]="2027-01-01 00:00";
         std::cout<<Json{{"size",range_configuration(size,false)},{"time",range_configuration(time,true,&east)}}.dump(); return 0;
     }
-    try { Fixture f; native_context_menu_entrypoint(f); projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
+    try { Fixture f; native_context_menu_entrypoint(f); projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));
-    auto output=run_cli(cli,{L"watch",L"start",L"中文 空格",L"quote\"tail\\"},stop);
-    assert(output.code==7 && parse_json(output.output)==Json::array({"watch","start","中文 空格","quote\"tail\\"}));
+    auto output=run_cli(cli,{L"watch",L"enable",L"中文 空格",L"quote\"tail\\"},stop);
+    assert(output.code==7 && parse_json(output.output)==Json::array({"watch","enable","中文 空格","quote\"tail\\"}));
+    cli.prefix.clear();
+    unsigned updates=0;
+    follow_watch_status(cli,stop,[&](const std::string& line){
+        const auto value=parse_json(line);
+        assert(value["running"]==true);
+        assert(value["enabled"]==(updates==0));
+        if(++updates==2) SetEvent(stop);
+    });
+    assert(updates==2);
     CoUninitialize(); return 0;
 }

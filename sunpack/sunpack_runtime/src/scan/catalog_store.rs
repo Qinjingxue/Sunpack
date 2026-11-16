@@ -253,6 +253,11 @@ impl CatalogStore {
         self.pending_deltas = 0;
         Ok(())
     }
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.commit()?;
+        if let Some(handle) = &self.handle { handle.request_flush(self.seq)?.wait()?; }
+        Ok(())
+    }
     pub fn checkpoint(&mut self, catalogs: &HashMap<String, ScopeCatalog>) -> io::Result<()> {
         if self.edits == 0 {
             return Ok(());

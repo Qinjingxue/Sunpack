@@ -451,7 +451,7 @@ impl<'de> Deserialize<'de> for Operation {
                     5 => Operation::SetCursors(field(&mut seq)?),
                     6 => {
                         let key: String = field(&mut seq)?;
-                        if !key.starts_with("flatten|")
+                        if key != "watch_control" && !key.starts_with("flatten|")
                         {
                             return Err(A::Error::custom("unknown runtime record"));
                         }

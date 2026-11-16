@@ -24,6 +24,7 @@ pub(super) fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
     settings.post_extract.archive_cleanup_mode = crate::core::config::CleanupMode::Keep;
     let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
     Scheduler {
+        resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
         cwd: base.into(), root_file: base.join(ROOTS_FILE),
         roots: BTreeMap::from([(root.clone(), (Root { path: watched, output: Some(base.join("output")),
@@ -328,6 +329,7 @@ fn checkpoint_submits_the_first_ready_generation() {
             let settings = Arc::new(Config::default());
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let mut scheduler = Scheduler {
+                resuming: false, baseline_roots: HashSet::new(),
                 candidate_diagnostics: CandidateDiagnostics::default(),
                 admission_checkpoint: None,
                 cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
@@ -484,6 +486,7 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
     let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
     options.catalog_refresh(&catalog, &scope, None).unwrap();
     let mut scheduler = Scheduler {
+        resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(),
         admission_checkpoint: None,
         cwd: base.clone(), root_file: base.join(ROOTS_FILE),
@@ -552,6 +555,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
             let settings = Arc::new(Config::default());
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let mut scheduler = Scheduler {
+                resuming: false, baseline_roots: HashSet::new(),
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
                 cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
@@ -646,6 +650,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let lease = BrokerLease::acquire().unwrap();
             let mut scheduler = Scheduler {
+                resuming: false, baseline_roots: HashSet::new(),
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
                 cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
@@ -774,6 +779,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         let settings = Arc::new(Config::default());
         let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
         let mut scheduler = Scheduler {
+            resuming: false, baseline_roots: HashSet::new(),
             candidate_diagnostics: CandidateDiagnostics::default(),
             admission_checkpoint: None,
             cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
@@ -905,6 +911,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         let settings = Arc::new(Config::default());
         let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
         let mut scheduler = Scheduler {
+            resuming: false, baseline_roots: HashSet::new(),
             candidate_diagnostics: CandidateDiagnostics::default(),
             admission_checkpoint: None,
             cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
@@ -1172,4 +1179,35 @@ fn coalesced_watch_completion_keeps_the_leaders_blocker() {
         return;
     }
     run_isolated("coalesced_watch_completion_keeps_the_leaders_blocker", CHILD);
+}
+
+#[test]
+fn monitor_disable_preserves_accepted_intent_without_accepting_offline_files() {
+    const CHILD: &str = "SUNPACK_DISABLE_INTENT_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("monitor_disable_preserves_accepted_intent_without_accepting_offline_files", CHILD);
+        return;
+    };
+    let base = PathBuf::from(base);
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    Arc::make_mut(&mut scheduler.settings).watch.toast_enabled = false;
+    let source = base.join("input/accepted.zip");
+    fs::write(&source, b"accepted before disable").unwrap();
+    let root = key(&base.join("input"));
+    scheduler.enqueue(&root, source.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
+    assert!(scheduler.set_enabled(false).unwrap());
+    assert!(!scheduler.enabled());
+    assert!(scheduler.pending.is_empty());
+    assert!(scheduler.journal.state().pending(source.to_str().unwrap()).is_some());
+    let offline = base.join("input/offline.zip");
+    fs::write(&offline, b"arrived while explicitly disabled").unwrap();
+    scheduler.checkpoint(&HashMap::new(), true, false).unwrap();
+    assert!(scheduler.pending.is_empty());
+    assert!(scheduler.journal.state().pending(offline.to_str().unwrap()).is_none());
+    assert!(!scheduler.set_enabled(false).unwrap());
+    drop(scheduler);
+    let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
+    assert_eq!(journal.state().runtime_record("watch_control").unwrap()["enabled"], false);
+    assert!(journal.state().pending(source.to_str().unwrap()).is_some());
+    assert!(journal.state().pending(offline.to_str().unwrap()).is_none());
 }

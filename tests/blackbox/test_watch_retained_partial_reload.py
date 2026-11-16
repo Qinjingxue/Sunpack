@@ -97,7 +97,7 @@ def test_policy_reload_accepts_retained_missing_volume_members(package, tmp_path
                       recursive_authorization={"enabled": False},
                       post_extract={"flatten_single_directory": False})
     package.json("watch", "add", watched, "--deep-detect", "-o", output)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     events = package.data / ".sunpack_watch" / "events.json"
 
     owner = _wait_display(events, lambda display: _retained_blocker(display, head))
@@ -112,7 +112,7 @@ def test_policy_reload_accepts_retained_missing_volume_members(package, tmp_path
     package.json("watch", "reload")
 
     _wait_display(events, lambda display: _accepted(display, head, owner))
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     # Main re-evaluates retained members against the new content policy without
     # recursively scanning those unchanged outputs again.
     assert [p.read_bytes() for p in output.rglob("a.zip")] == [first]
@@ -134,7 +134,7 @@ def test_changed_middle_volume_reuses_only_its_retained_segment_slot(package, tm
                       extraction={"content_requirement": "complete"},
                       post_extract={"archive_cleanup_mode": "k", "flatten_single_directory": False})
     package.json("watch", "add", watched, "--deep-detect", "-o", output)
-    package.json("watch", "start", "--no-tray")
+    package.json("daemon", "start", "--no-tray")
     events = package.data / ".sunpack_watch" / "events.json"
     owner = _wait_display(events, lambda display: _retained_blocker(display, head))
     retained, = output.rglob("a.zip")
@@ -184,7 +184,7 @@ def test_changed_middle_volume_reuses_only_its_retained_segment_slot(package, tm
     finally:
         if handle is not None:
             assert kernel.CloseHandle(handle), ctypes.get_last_error()
-    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert package.json("daemon", "stop")["summary"]["running"] is False
     if cleanup_locked:
         # Cleanup may remove other old files before hitting the locked one.
         # The locked bytes and owning slot must survive; do not manufacture a

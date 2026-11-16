@@ -33,6 +33,7 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
     // Completion does not need a broker or an SCM service. Keep the real
     // scheduler completion/WAL/log path without installing a system service.
     let mut scheduler = Scheduler {
+        resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
         cwd: base.clone(), root_file: base.join(ROOTS_FILE),
         roots: BTreeMap::new(), available_roots: HashSet::new(),

@@ -209,12 +209,12 @@
       "en": "All settings"
     },
     "startWatch": {
-      "zh": "启动监控",
-      "en": "Start Watch"
+      "zh": "启用监控",
+      "en": "Enable Watch"
     },
     "stopWatch": {
-      "zh": "停止监控",
-      "en": "Stop Watch"
+      "zh": "禁用监控",
+      "en": "Disable Watch"
     },
     "taskSearch": {
       "zh": "搜索任务",
@@ -468,18 +468,10 @@
       "zh": "日志观察器",
       "en": "Log observer"
     },
-    "runtimeRunning": {
-      "zh": "运行中",
-      "en": "Running"
-    },
-    "runtimeStopped": {
-      "zh": "未运行",
-      "en": "Stopped"
-    },
-    "runtimeUnknown": {
-      "zh": "状态未知",
-      "en": "Status unavailable"
-    },
+    "runtimeRunning": {"zh":"正在监控","en":"Monitoring"},
+    "runtimeStopped": {"zh":"未运行","en":"Not running"},
+    "runtimeDisabled": {"zh":"未启用监控","en":"Monitoring disabled"},
+    "runtimeSyncError": {"zh":"无法同步监控状态。","en":"Unable to synchronize monitoring status."},
     "rootConflict": {
       "zh": "此监控目录已被其他程序修改，请放弃更改后重新编辑。",
       "en": "This monitored folder changed in another program. Discard changes and edit it again."

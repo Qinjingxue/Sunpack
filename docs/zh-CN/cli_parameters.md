@@ -15,7 +15,8 @@ sunpack.exe <command> [options] [paths...]
 | `scan`, `s` | 只读扫描归档并确认密码。 |
 | `passwords`, `pw` | 查看当前命令可用的密码来源汇总。 |
 | `config`, `cfg` | 查看或校验合并后的有效配置。 |
-| `doctor`, `d` | 只读检查配置和运行环境。 |
+| `daemon`, `d` | 启停后台进程及管理登录启动项。 |
+| `doctor`, `doc` | 只读检查配置和运行环境。 |
 | `version`, `ver` | 输出当前安装的 SunPack 版本号。 |
 
 完整名称和简写都是正式语法；只接受明确列出的简写，不接受任意截断长参数。简写输出的 JSON `command` 仍使用完整命令名。`-p` 是密码，`-P` 是密码文件；`-f` 启用扁平化，`-F` 关闭扁平化。带值参数推荐分开写，例如 `-r 3`、`-c r`。
@@ -137,7 +138,7 @@ sunpack.exe scan D:\Downloads -v
 用法：
 
 ```powershell
-sunpack.exe watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]
+sunpack.exe watch <add|remove|list|enable|disable|reload|rebuild-log|status> [options]
 ```
 
 监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned | recursive`，后四列可省略：
@@ -159,30 +160,40 @@ G:\Incoming | | true
 
 | 子命令 | 参数 | 说明 |
 | --- | --- | --- |
-| `start` | `--no-tray` | 持续运行时关闭托盘入口。 |
+| `enable` | — | 启用监控，保留后台进程。 |
 | `add PATH...` | `-o/--out-dir DIR` | 添加监控根；只能同时添加一个路径。 |
-| `add PATH...` | `-s`, `--start` | 添加后启动持续监控。 |
 | `add PATH...` | `-R/--recursive` | 为该监控根启用递归发现。 |
 | `add PATH...` | `-d`, `--deep-detect` | 将各输入目录的 `deep_detect` 写为 `true`；已登记目录也会更新。 |
 | `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根。 |
 | `list`, `ls` | — | 列出持久化的输入目录。 |
 | `reload` | — | 重新读取配置和监控根。 |
 | `rebuild-log` | — | 清空显示日志，从监控快照/WAL重建。已完成的历史记录会丢弃。显示重建成败，失败退出码为 1；自动恢复仍忽略失败，后续日志操作再尝试。 |
-| `stop` | — | 停止持续监控。 |
+| `disable` | — | 暂停监控并保存状态，不退出后台进程或托盘。 |
 | `status`, `st` | — | 显示监控服务是否运行。JSON 还包含待处理数量、最后一次错误和根目录。 |
-| `startup enable\|disable\|status` | — | 管理当前用户登录启动项。 |
 
-`start` 会持续运行直到收到停止请求。文件写入、移动或修改会触发活跃周期。新候选没有首次处理延迟；后续内容变化按观测到的写入间隔自适应调整静默窗口，不设固定最短或最长等待时间。文件准备好后提交处理。新分卷到达或密码来源变化会重新激活受影响任务。
+`enable` 恢复监控；`disable` 的暂停状态跨进程重启保存，恢复时不提交暂停期间的新变化。启用状态下的进程重启仍恢复离线变化。文件写入、移动或修改会触发活跃周期。新候选没有首次处理延迟；后续内容变化按观测到的写入间隔自适应调整静默窗口，不设固定最短或最长等待时间。文件准备好后提交处理。新分卷到达或密码来源变化会重新激活受影响任务。
 
 `add` 的 `-o/--out-dir` 只能和一个输入目录一起使用。重复添加同一输入目录不会改变已有输出映射；先 `remove` 再 `add` 才能更新映射。不同监控根的输出根不能互为严格的祖先和子目录，相同输出根可以共享。
 
 新增目录时不传 `--deep-detect`，默认不启用 deep。重复添加已登记目录时，不传该参数会保留已有模式；关闭 deep 可将第三列改为 `false` 或留空。
 
 ```powershell
-sunpack.exe watch add D:\Downloads --deep-detect --start
+sunpack.exe watch add D:\Downloads --deep-detect
+sunpack.exe daemon start
 ```
 
 目录对象的解压菜单为“解压该目录下文件”“输入密码解压该目录下文件”；目录空白处的解压菜单为“解压目录下文件”“输入密码解压目录下文件”。两种目录菜单还提供“监控此目录”“取消监控此目录”，这些入口不附加 `--deep-detect`。文件对象的两个解压入口默认启用 `--deep-detect`。重新运行 `scripts/register_context_menu.ps1` 会重建菜单并移除过时入口。
+
+## daemon（简写 d）
+
+```powershell
+sunpack.exe daemon <start|stop|startup>
+sunpack.exe daemon startup <enable|disable|status>
+```
+
+`start` 启动后台进程并恢复保存的监控启停状态；`stop` 等待后台退出，不改变监控启停状态。`start --no-tray` 禁用本次后台启动的托盘。`startup` 管理当前用户的登录启动项。`stop` 支持 `--json` 和 `--help`。
+
+“监控此目录”依次执行 `watch add` 和 `daemon start`，不会覆盖已保存的暂停状态。
 
 ## passwords
 

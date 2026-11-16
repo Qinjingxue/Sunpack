@@ -52,7 +52,7 @@ pub fn main() -> i32 {
         Some("--persistent-server") => pipe::serve(&cwd, runtime_id).map(|()| 0),
         Some("--persistent-shutdown") => pipe::shutdown(&cwd, runtime_id).map(|()| 0),
         Some("--toast-activated") => windows::activate_toast(&cwd, runtime_id),
-        Some("watch" | "w")
+        Some("watch" | "w" | "daemon" | "d" | "--watch-status-follow")
             if !args
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "-h" | "--help")) =>

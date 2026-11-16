@@ -649,6 +649,7 @@ impl Drop for CloseConnection { fn drop(&mut self) { self.0.close(); } }
 struct Activity {
     last_completed: Option<Instant>,
     active: usize,
+    observers: usize,
     shutting_down: bool,
 }
 
@@ -682,6 +683,23 @@ impl Drop for ActiveRequest {
             self.0.drained.notify_all();
         }
         drop(activity);
+        self.0.wake.signal();
+    }
+}
+
+// Status streams participate in shutdown draining, but are not foreground work
+// and must not keep an otherwise idle runtime alive.
+struct StatusObserver(Arc<Server>);
+impl StatusObserver {
+    fn new(server: &Arc<Server>) -> Self {
+        server.activity.lock().unwrap().observers += 1;
+        server.wake.signal();
+        Self(Arc::clone(server))
+    }
+}
+impl Drop for StatusObserver {
+    fn drop(&mut self) {
+        self.0.activity.lock().unwrap().observers -= 1;
         self.0.wake.signal();
     }
 }
@@ -738,6 +756,19 @@ impl Server {
                 self.shutdown.cancel();
                 self.wake.signal();
                 return Ok(());
+            }
+            if header.argv.as_slice() == ["--watch-status-follow"] {
+                let _observer = StatusObserver::new(self);
+                loop {
+                    cancel.check()?;
+                    crate::pipeline::stage("cli", &cancel).await?;
+                    let revision = self.host.watch.status_revision();
+                    let status = self.host.watch.status(&header.cwd)?;
+                    let mut line = serde_json::to_vec(&status).map_err(io::Error::other)?;
+                    line.push(b'\n');
+                    connection.awrite(Stream::Out, &line).await?;
+                    self.host.watch.wait_status_change(revision, &cancel).await?;
+                }
             }
             let started = Instant::now();
             let foreground = header.argv.first().is_none_or(|command| command != "--cancel-watch-batch");
@@ -808,6 +839,7 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
         activity: Mutex::new(Activity {
             last_completed: None,
             active: 0,
+            observers: 0,
             shutting_down: false,
         }),
         drained: Condvar::new(),
@@ -835,13 +867,13 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
         loop {
             let (wait, shutting_down) = {
                 let state = server.activity.lock().unwrap();
-                let timeout = if state.active == 0 && !server.host.watch.is_running() {
+                let timeout = if state.active == state.observers && !server.host.watch.is_running() {
                     state.last_completed.zip(server.host.idle_after())
                         .map_or(INFINITE, |(completed, idle)| idle_wait(completed, idle))
                 } else {
                     INFINITE
                 };
-                (timeout, state.shutting_down)
+                (timeout, state.shutting_down || server.host.watch.shutdown_requested())
             };
             if shutting_down {
                 break;
@@ -872,7 +904,7 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
     }
     let exit_reason = if result.is_err() {
         "error"
-    } else if server.activity.lock().unwrap().shutting_down {
+    } else if server.activity.lock().unwrap().shutting_down || server.host.watch.shutdown_requested() {
         "cli_shutdown"
     } else {
         "idle_timeout"

@@ -7,7 +7,7 @@ const passwordIndexes=new WeakMap();
 export default {
   data() { return {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
-    actionError:'',errors:{},cliAllowed:false,runtime:{known:false,running:false},
+    actionError:'',errors:{},cliAllowed:false,runtime:{known:false,running:false,enabled:false,syncError:false},
     taskCursors:[],taskPages:[],taskPending:null,taskRevision:0,tasks:{rows:[],total:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
     startupEnabled:false,contextMenuEnabled:false,directoryQuery:'',directorySelection:'',
     taskQuery:'',taskDirectoryDirty:false,taskStatus:0,
@@ -875,11 +875,11 @@ export default {
         <div id="identity" class="identity">
           <img id="appIcon" class="app-icon" src="sunpack.png" width="40" height="40" object-fit="contain"/>
           <div id="brand" class="column fill" style="gap:3px"><label class="brand">SunPack</label><label class="muted">{{ texts.manager }}</label></div>
-          <div id="runtimeStatus" class="runtime-badge"><div :class="runtime.known &amp;&amp; runtime.running?'runtime-dot running':'runtime-dot'"/><label class="muted">{{ !runtime.known?texts.runtimeUnknown:runtime.running?texts.runtimeRunning:texts.runtimeStopped }}</label></div>
+          <div id="runtimeStatus" class="runtime-badge"><div id="runtimeDot" :class="runtime.known &amp;&amp; runtime.running &amp;&amp; runtime.enabled &amp;&amp; runtime.phase==='running'?'runtime-dot running':'runtime-dot'"/><label id="runtimeState" class="muted" v-show="runtime.known &amp;&amp; (runtime.phase==='stopped'||runtime.phase==='running'||runtime.phase==='disabled')">{{ !runtime.running?texts.runtimeStopped:!runtime.enabled?texts.runtimeDisabled:texts.runtimeRunning }}</label></div>
         </div>
         <div id="monitorControls" class="monitor-controls">
-          <div class="row monitor-actions"><button id="watchStart" :enabled="cliAllowed" @click="send('cli',{action:'start'})">{{ texts.startWatch }}</button><button id="watchStop" :enabled="cliAllowed" @click="send('cli',{action:'stop'})">{{ texts.stopWatch }}</button></div>
-          <label v-show="actionError" class="error">{{ errorText(actionError) }}</label>
+          <div class="row monitor-actions"><button id="watchStart" :enabled="cliAllowed" @click="send('cli',{action:'enable'})">{{ texts.startWatch }}</button><button id="watchStop" :enabled="cliAllowed" @click="send('cli',{action:'disable'})">{{ texts.stopWatch }}</button></div>
+          <label id="runtimeActionError" v-show="actionError||runtime.syncError||runtime.phase==='error'" class="error">{{ actionError?errorText(actionError):texts.runtimeSyncError }}</label>
         </div>
       <div id="navItems" class="nav-items">
         <button id="tabTasks" :class="tab==='tasks'?'nav-item on':'nav-item'" @click="go('tasks')">

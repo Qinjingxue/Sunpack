@@ -78,7 +78,8 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 | `scan`      | `s`   | 只读扫描压缩包并确认密码         |
 | `passwords` | `pw`  | 查看本次会参与尝试的密码列表。               |
 | `config`    | `cfg` | 查看或校验当前有效配置                       |
-| `doctor`    | `d`   | 非破坏性检查安装状态和运行环境               |
+| `daemon`    | `d`   | 启停后台进程及管理登录启动项                 |
+| `doctor`    | `doc`   | 非破坏性检查安装状态和运行环境               |
 | `version`   | `ver` | 输出当前安装的 SunPack 版本号                |
 
 > 详细参数见 [CLI 参数说明](docs/zh-CN/cli_parameters.md)。

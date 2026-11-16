@@ -564,11 +564,11 @@ void watch_commands(Application& app,const fs::path& dir) {
         },std::string("Run ")+button);
         assert(state(app.page(),"actionError")=="");
     };
-    command("watchStart",Json::array({"watch","start"}));
-    command("watchStop",Json::array({"watch","stop"}));
+    command("watchStart",Json::array({"watch","enable"}));
+    command("watchStop",Json::array({"watch","disable"}));
     navigate(app,"tabConfig","config");
     auto enabled=state(app.page(),"startupEnabled").get<bool>();
-    command("startupToggle",Json::array({"watch","startup",enabled?"disable":"enable"}));
+    command("startupToggle",Json::array({"daemon","startup",enabled?"disable":"enable"}));
 }
 
 void recover_task_log(Application& app,const fs::path& dir) {
@@ -789,6 +789,92 @@ void task_history(Application& app,const fs::path& dir) {
 }
 
 
+void runtime_badge(Application& app,bool known,bool running,bool enabled,bool stable=true) {
+    pump([&]{
+        const auto value=state(app.page(),"runtime");
+        return value.value("known",false)==known && (!known ||
+            (value.value("running",false)==running && value.value("enabled",false)==enabled));
+    },"Synchronize runtime badge");
+    const auto texts=state(app.page(),"texts");
+    const auto expected=(!known || !stable)?std::wstring():wide(texts[!running?"runtimeStopped":!enabled?"runtimeDisabled":"runtimeRunning"].get<std::string>());
+    const auto expected_color=D2D1::ColorF(known && stable && running && enabled?0x6ccb5f:0x8a8a8a);
+    pump([&]{
+        ui_window_relayout(app.window());
+        auto* root=window(app).Root().get();
+        auto* label=dynamic_cast<ui::LabelWidget*>(root->FindById("runtimeState"));
+        auto* dot=root->FindById("runtimeDot");
+        if(!label || !dot || label->visible!=(known && stable) || (known && stable && label->Text()!=expected)) return false;
+        const auto color=dot->bgColorFn?dot->bgColorFn():dot->bgColor;
+        return std::abs(color.r-expected_color.r)<0.001f && std::abs(color.g-expected_color.g)<0.001f && std::abs(color.b-expected_color.b)<0.001f;
+    },"Render runtime label and color "+state(app.page(),"runtime").dump()+" expected="+utf8(expected));
+}
+
+int runtime_status_contract(const fs::path& directory,const fs::path& launcher) {
+    CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    int result=0;
+    try {
+        Options options; options.data_dir=directory; options.allow_cli=true;
+        options.cli={launcher,directory,{},launcher.parent_path().parent_path()};
+        Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+        auto command=[&](std::initializer_list<std::wstring> args){
+            auto reply=run_cli(options.cli,std::vector<std::wstring>(args),stop);
+            if(reply.code) throw std::runtime_error(reply.output);
+        };
+        command({L"daemon",L"stop"});
+        {
+            Application app(options); app.open();
+            pump([&]{return state(app.page(),"ready")==true;});
+            runtime_badge(app,true,false,false);
+            command({L"config",L"show"});
+            runtime_badge(app,true,false,false);
+            command({L"daemon",L"start",L"--no-tray"});
+            runtime_badge(app,true,true,true);
+            command({L"watch",L"disable"});
+            runtime_badge(app,true,true,false);
+        }
+        {
+            // Closing/reopening must fetch persisted disabled intent, not SCM state.
+            Application app(options); app.open();
+            pump([&]{return state(app.page(),"ready")==true;});
+            runtime_badge(app,true,true,false);
+            command({L"daemon",L"stop"});
+            runtime_badge(app,true,false,false);
+            command({L"daemon",L"start",L"--no-tray"});
+            runtime_badge(app,true,true,false);
+            command({L"watch",L"enable"});
+            runtime_badge(app,true,true,true);
+
+        }
+        {
+            Application app(options); app.open();
+            pump([&]{return state(app.page(),"ready")==true;});
+            runtime_badge(app,true,true,true);
+        }
+        command({L"daemon",L"stop"});
+        {
+            options.allow_cli=false;
+            Application app(options); app.open();
+            pump([&]{return state(app.page(),"ready")==true;});
+            runtime_badge(app,false,false,false);
+            Json snapshot={{"known",true},{"running",true},{"enabled",true},{"phase","running"},{"syncError",false}};
+            ui_page_set_json(app.page(),"runtime",snapshot.dump().c_str());
+            runtime_badge(app,true,true,true);
+            // A stale connected snapshot must never remain a green status.
+            for(auto phase:{"starting","enabling","disabling","stopping","error"}) {
+                auto transition=snapshot; transition["phase"]=phase;
+                ui_page_set_json(app.page(),"runtime",transition.dump().c_str());
+                runtime_badge(app,true,true,true,false);
+            }
+            auto stale=snapshot; stale["known"]=false; stale["syncError"]=true;
+            ui_page_set_json(app.page(),"runtime",stale.dump().c_str());
+            runtime_badge(app,false,true,true);
+            ui_page_set_json(app.page(),"runtime",snapshot.dump().c_str());
+            runtime_badge(app,true,true,true);
+        }
+    } catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; result=1; }
+    CoUninitialize(); return result;
+}
+
 void acceptance_contracts(Application& app,const fs::path& dir) {
     assert(state(app.page(),"tasks")["rows"][0]["name"]=="carrier.001");
     screenshot(app.window(),L"startup.png");
@@ -809,6 +895,10 @@ int fake_cli(int argc,wchar_t** argv) {
     Json args=Json::array();
     for(int i=2;i<argc;++i) args.push_back(utf8(argv[i]));
     const auto dir=fs::current_path();
+    if(args==Json::array({"--watch-status-follow"})) {
+        std::cout<<R"({"running":false,"enabled":true,"phase":"disabled"})"<<std::endl;
+        return 0;
+    }
     atomic_write(dir/"cli-arguments.json",args.dump());
     if(args==Json::array({"config","validate","--scan-rule-stdin","--json"})) {
         std::string input((std::istreambuf_iterator<char>(std::cin)),{});
@@ -843,6 +933,7 @@ int wmain(int argc,wchar_t** argv) {
     if(mode==L"--startup-failure") return startup_failure_contract();
     if(mode==L"--theme" || mode==L"--theme-session") return theme_contracts(argc,argv);
     if(mode==L"--fake-cli") return fake_cli(argc,argv);
+    if(mode==L"--runtime-status" && argc==4) return runtime_status_contract(argv[2],argv[3]);
 
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     RegistryFixture registry;

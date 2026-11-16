@@ -148,7 +148,7 @@ Name: "{autoprograms}\SunPack\Uninstall SunPack"; Filename: "{uninstallexe}"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\integration.ps1"" -Action DisableStartup"; RunOnceId: "SunPackStartup"; Flags: runhidden waituntilterminated
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\integration.ps1"" -Action DisableContextMenu"; RunOnceId: "SunPackContextMenu"; Flags: runhidden waituntilterminated
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\integration.ps1"" -Action UninstallToast"; RunOnceId: "SunPackToast"; Flags: runhidden waituntilterminated
-Filename: "{app}\bin\sunpack.exe"; Parameters: "--persistent-shutdown"; RunOnceId: "SunPackFinalRuntimeShutdown"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{app}\bin\sunpack.exe"; Parameters: "daemon stop"; RunOnceId: "SunPackFinalRuntimeShutdown"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\wait_sunpack_runtime_exit.ps1"" -CliAppPath ""{app}\bin\sunpack.exe"" -RuntimeAppPath ""{app}\sunpack-runtime.exe"" -TimeoutSeconds 20"; RunOnceId: "SunPackFinalRuntimeWait"; Flags: runhidden waituntilterminated
 
 [Code]
@@ -556,10 +556,7 @@ begin
   ExistingApp := ExistingLauncherPath;
   if not FileExists(ExistingApp) then
     Exit;
-  if not Exec(ExistingApp, 'watch stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    Log('Failed to start existing SunPack watch stop command: ' + ExistingApp)
-  else if ResultCode <> 0 then
-    Log(Format('Existing SunPack watch stop command exited with code %d', [ResultCode]));
+  // This internal command also works with the version being upgraded.
   if not Exec(ExistingApp, '--persistent-shutdown', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     Log('Failed to stop existing SunPack persistent process: ' + ExistingApp)
   else if ResultCode <> 0 then
@@ -669,7 +666,7 @@ begin
   if not RestartWatchAfterUpgrade then
     Exit;
 
-  if not RunInstallerIntegration('StartWatch', ResultCode) then
+  if not RunInstallerIntegration('StartDaemon', ResultCode) then
     Log('Failed to run the unelevated SunPack Watch restore helper after upgrade.')
   else if ResultCode <> 0 then
     Log(Format('SunPack Watch restore helper exited with code %d.', [ResultCode]))

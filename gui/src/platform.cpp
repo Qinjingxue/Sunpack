@@ -194,7 +194,8 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
                 CharLowerBuffW(name.data(),DWORD(name.size()));
                 // Missing target directories are observed through their existing ancestor.
                 if (subtree || name == L"sunpack_config.json" || name == L"builtin_passwords.json" ||
-                    name == L"sunpack_watch_roots.txt" || name == L"events.json") changed(path);
+                    name == L"sunpack_watch_roots.txt" || name == L"events.json" ||
+                    (name.rfind(L"runtime-",0)==0 && path.extension()==L".state")) changed(path);
                 if (!item->NextEntryOffset) break;
                 offset += item->NextEntryOffset;
             }
@@ -286,79 +287,28 @@ std::wstring quote_arg(const std::wstring& arg) {
     out.append(slash * 2, L'\\'); out += L'"'; return out;
 }
 fs::path executable_path() { std::wstring s(32768, 0); auto n = GetModuleFileNameW(nullptr, s.data(), DWORD(s.size())); s.resize(n); return s; }
-void CALLBACK ServiceMonitor::Subscription::notified(void* parameter) {
-    auto* notification=static_cast<SERVICE_NOTIFYW*>(parameter);
-    auto* self=static_cast<Subscription*>(notification->pContext);
-    self->pending=false;
-    self->changed=true;
-    // SCM calls may themselves perform alertable RPC waits. Never query,
-    // close or rearm here; the waiting thread consumes the result afterwards.
-    if(notification->pszServiceNames) {
-        LocalFree(notification->pszServiceNames); notification->pszServiceNames=nullptr;
+namespace {
+HANDLE launch_cli(const CliCommand& cli,std::wstring command,HANDLE writer,HANDLE reader) {
+    STARTUPINFOEXW si{}; si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.StartupInfo.wShowWindow = SW_HIDE;
+    si.StartupInfo.hStdOutput = writer; si.StartupInfo.hStdError = writer; si.StartupInfo.hStdInput = reader;
+    SIZE_T bytes = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+    std::vector<unsigned char> attributes(bytes);
+    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+    if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &bytes)) win_error("opCliAttributes");
+    HANDLE inherited[] = {writer, reader};
+    if (!UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr)) {
+        DeleteProcThreadAttributeList(si.lpAttributeList); win_error("opCliHandles");
     }
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(cli.executable.c_str(), command.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, cli.cwd.c_str(), &si.StartupInfo, &pi);
+    auto error = GetLastError(); DeleteProcThreadAttributeList(si.lpAttributeList);
+    if (!ok) { SetLastError(error); win_error("opLaunchCli"); }
+    CloseHandle(pi.hThread);
+    return pi.hProcess;
 }
-void ServiceMonitor::Subscription::arm(DWORD mask) {
-    notification={};
-    notification.dwVersion=SERVICE_NOTIFY_STATUS_CHANGE;
-    notification.pfnNotifyCallback=notified; notification.pContext=this;
-    changed=false; pending=true; // A callback can run inside the RPC below.
-    auto error=NotifyServiceStatusChangeW(handle,mask,&notification);
-    if(error!=ERROR_SUCCESS) { pending=false; SetLastError(error); win_error("opSubscribeService"); }
-}
-void ServiceMonitor::Subscription::close() {
-    if(handle) {
-        CloseServiceHandle(handle); handle=nullptr;
-        // Cancellation prevents new APCs. Drain already queued callbacks while
-        // their buffer/context is still alive, before reusing or destroying it.
-        while(SleepEx(0,TRUE)==WAIT_IO_COMPLETION) {}
-    }
-    pending=changed=false; notification={};
-}
-bool ServiceMonitor::running() {
-    if(service_.pending) return running_;
-    for(unsigned attempt=0;;++attempt) {
-        try {
-            auto error=service_.changed?service_.notification.dwNotificationStatus:
-                database_.changed?database_.notification.dwNotificationStatus:ERROR_SUCCESS;
-            if(error==ERROR_SERVICE_NOTIFY_CLIENT_LAGGING) {
-                service_.close(); database_.close();
-            } else if(error==ERROR_SERVICE_MARKED_FOR_DELETE ||
-                (service_.changed && (service_.notification.dwNotificationTriggered&SERVICE_NOTIFY_DELETE_PENDING))) {
-                service_.close();
-            } else if(error!=ERROR_SUCCESS) { SetLastError(error); win_error("opServiceNotification"); }
-            if(!service_.handle) {
-                if(!database_.handle) {
-                    database_.handle=OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT|SC_MANAGER_ENUMERATE_SERVICE);
-                    if(!database_.handle) win_error("opOpenServiceManager");
-                }
-                // Arm before opening: installation/removal in this gap cannot
-                // be lost, even when the service is not installed at GUI start.
-                if(!database_.pending) database_.arm(SERVICE_NOTIFY_CREATED|SERVICE_NOTIFY_DELETED);
-                service_.handle=OpenServiceW(database_.handle,name_.c_str(),SERVICE_QUERY_STATUS);
-                if(!service_.handle) {
-                    error=GetLastError();
-                    if(error==ERROR_SERVICE_DOES_NOT_EXIST || error==ERROR_SERVICE_MARKED_FOR_DELETE) return running_=false;
-                    win_error("opOpenWatchService");
-                }
-                database_.close();
-            }
-            SERVICE_STATUS_PROCESS status{}; DWORD bytes=0;
-            if(!QueryServiceStatusEx(service_.handle,SC_STATUS_PROCESS_INFO,reinterpret_cast<BYTE*>(&status),sizeof(status),&bytes))
-                win_error("opQueryWatchStatus");
-            constexpr DWORD states=SERVICE_NOTIFY_STOPPED|SERVICE_NOTIFY_START_PENDING|SERVICE_NOTIFY_STOP_PENDING|
-                SERVICE_NOTIFY_RUNNING|SERVICE_NOTIFY_CONTINUE_PENDING|SERVICE_NOTIFY_PAUSE_PENDING|SERVICE_NOTIFY_PAUSED;
-            // Excluding the queried state also covers a transition between the
-            // query and subscription: SCM queues an APC for the new state.
-            service_.arm((states&~(1u<<(status.dwCurrentState-1)))|SERVICE_NOTIFY_DELETE_PENDING);
-            return running_=status.dwCurrentState==SERVICE_RUNNING;
-        } catch(const WinError& error) {
-            service_.close(); database_.close();
-            // One immediate reconnect after an observed lag, never idle retries.
-            if(attempt==0 && (error.code==ERROR_SERVICE_NOTIFY_CLIENT_LAGGING ||
-                error.code==ERROR_SERVICE_MARKED_FOR_DELETE || error.code==ERROR_SERVICE_DOES_NOT_EXIST)) continue;
-            throw;
-        }
-    }
 }
 CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop,const std::string* input) {
     if (!fs::is_regular_file(cli.executable)) throw std::runtime_error("cliMissing");
@@ -383,24 +333,7 @@ CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, 
         if(!WriteFile(reader,input->data(),DWORD(input->size()),&written,nullptr) || written!=input->size()) win_error("opCaptureCli");
         LARGE_INTEGER start{}; if(!SetFilePointerEx(reader,start,nullptr,FILE_BEGIN)) win_error("opCaptureCli");
     }
-    STARTUPINFOEXW si{}; si.StartupInfo.cb = sizeof(si);
-    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.StartupInfo.wShowWindow = SW_HIDE;
-    si.StartupInfo.hStdOutput = writer; si.StartupInfo.hStdError = writer; si.StartupInfo.hStdInput = reader;
-    SIZE_T bytes = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
-    std::vector<unsigned char> attributes(bytes);
-    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
-    if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &bytes)) win_error("opCliAttributes");
-    HANDLE inherited[] = {writer, reader};
-    if (!UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr)) {
-        DeleteProcThreadAttributeList(si.lpAttributeList); win_error("opCliHandles");
-    }
-    PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(cli.executable.c_str(), command.data(), nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, cli.cwd.c_str(), &si.StartupInfo, &pi);
-    auto error = GetLastError(); DeleteProcThreadAttributeList(si.lpAttributeList);
-    if (!ok) { SetLastError(error); win_error("opLaunchCli"); }
-    Handle process(pi.hProcess), processThread(pi.hThread);
+    Handle process(launch_cli(cli,std::move(command),writer,reader));
     HANDLE waits[] = {stop, process};
     auto signal = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
     DWORD code = 0; GetExitCodeProcess(process, &code);
@@ -414,4 +347,62 @@ CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, 
 
     return {code, output};
 }
+DWORD follow_watch_status(const CliCommand& cli,HANDLE stop,const std::function<void(const std::string&)>& received) {
+    if(!fs::is_regular_file(cli.executable)) throw std::runtime_error("cliMissing");
+    GUID id{}; CoCreateGuid(&id); wchar_t token[40]; StringFromGUID2(id,token,40);
+    const auto name=std::wstring(L"\\\\.\\pipe\\SunPack-GUI-status-")+token;
+    Handle reader(CreateNamedPipeW(name.c_str(),PIPE_ACCESS_INBOUND|FILE_FLAG_OVERLAPPED|FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,0,4096,0,nullptr));
+    if(reader.value==INVALID_HANDLE_VALUE) win_error("opCaptureCli");
+    SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};
+    Handle writer(CreateFileW(name.c_str(),GENERIC_WRITE,0,&sa,OPEN_EXISTING,0,nullptr));
+    if(writer.value==INVALID_HANDLE_VALUE) win_error("opCaptureCli");
+    Handle input(CreateFileW(L"NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,&sa,OPEN_EXISTING,0,nullptr));
+    if(input.value==INVALID_HANDLE_VALUE) win_error("opCaptureCli");
+    std::wstring command=quote_arg(cli.executable.wstring());
+    for(const auto& arg:cli.prefix) command+=L" "+quote_arg(arg);
+    command+=L" --watch-status-follow";
+    Handle ready(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+    if(!ready.value) win_error("opCaptureCli");
+    Handle process(launch_cli(cli,std::move(command),writer,input));
+    CloseHandle(writer.value); writer.value=INVALID_HANDLE_VALUE;
+    std::string pending;
+    try {
+        for(;;) {
+            char buffer[4096]; DWORD size=0;
+            OVERLAPPED operation{}; operation.hEvent=ready;
+            ResetEvent(ready);
+            if(!ReadFile(reader,buffer,sizeof(buffer),&size,&operation)) {
+                auto error=GetLastError();
+                if(error==ERROR_BROKEN_PIPE) break;
+                if(error!=ERROR_IO_PENDING) win_error("opReadCliOutput");
+                HANDLE waits[]={stop,ready};
+                if(WaitForMultipleObjects(2,waits,FALSE,INFINITE)!=WAIT_OBJECT_0+1) {
+                    CancelIoEx(reader,&operation);
+                    GetOverlappedResult(reader,&operation,&size,TRUE);
+                    break;
+                }
+                if(!GetOverlappedResult(reader,&operation,&size,FALSE)) {
+                    if(GetLastError()==ERROR_BROKEN_PIPE) break;
+                    win_error("opReadCliOutput");
+                }
+            }
+            if(!size) break;
+            pending.append(buffer,size);
+            size_t consumed=0;
+            for(size_t end;(end=pending.find('\n',consumed))!=std::string::npos;consumed=end+1)
+                received(pending.substr(consumed,end-consumed));
+            pending.erase(0,consumed);
+        }
+    } catch(...) {
+        TerminateProcess(process,1); WaitForSingleObject(process,INFINITE); throw;
+    }
+    // This is only our disposable launcher, never the runtime or an extraction worker.
+    HANDLE waits[]={stop,process};
+    if(WaitForMultipleObjects(2,waits,FALSE,INFINITE)==WAIT_OBJECT_0) TerminateProcess(process,ERROR_CANCELLED);
+    WaitForSingleObject(process,INFINITE);
+    DWORD code=0; GetExitCodeProcess(process,&code);
+    return code;
+}
+
 }

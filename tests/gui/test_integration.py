@@ -243,10 +243,10 @@ def test_rust_writer_cpp_query_contract(repo_root, contract):
 @pytest.mark.parametrize(
     ("menu_key", "expected_args"),
     [
-        ("folder_watch", ["watch", "add", "--start"]),
-        ("background_watch", ["watch", "add", "--start"]),
-        ("folder_recursive_watch", ["watch", "add", "--start", "--recursive"]),
-        ("background_recursive_watch", ["watch", "add", "--start", "--recursive"]),
+        ("folder_watch", ["watch", "add"]),
+        ("background_watch", ["watch", "add"]),
+        ("folder_recursive_watch", ["watch", "add", "--recursive"]),
+        ("background_recursive_watch", ["watch", "add", "--recursive"]),
         ("folder_unwatch", ["watch", "remove"]),
         ("background_unwatch", ["watch", "remove"]),
     ],
@@ -300,7 +300,11 @@ def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu
         if mutex:
             kernel.CloseHandle(mutex)
     assert launched.returncode == 0, launched.stderr
-    actual = stub.with_suffix(".args").read_text(encoding="utf-8-sig").splitlines()
+    calls = stub.with_suffix(".args").read_text(encoding="utf-8-sig").strip().split("\n\n")
+    assert len(calls) == (2 if expected_args[1] == "add" else 1)
+    if len(calls) == 2:
+        assert calls[1].splitlines() == ["daemon", "start"]
+    actual = calls[0].splitlines()
     assert actual[:2] == expected_args[:2]
     assert ntpath.normpath(actual[2]) == ntpath.normpath(str(folder))
     assert actual[3:] == expected_args[2:]
@@ -328,7 +332,7 @@ class Arguments {
     [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
     static void Main(string[] args) {
         string path = Path.ChangeExtension(Assembly.GetExecutingAssembly().Location, "args");
-        File.WriteAllLines(path, args, new UTF8Encoding(false));
+        File.AppendAllText(path, String.Join("\\n", args) + "\\n\\n", new UTF8Encoding(false));
         File.WriteAllText(Path.ChangeExtension(path, "console"), (GetConsoleWindow() != IntPtr.Zero).ToString());
     }
 }
@@ -340,3 +344,14 @@ class Arguments {
     )
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
     return executable
+
+
+def test_gui_runtime_status_reopens_and_tracks_daemon_lifecycle(package, repo_root):
+    arch = os.environ.get("SUNPACK_TEST_ARCH", "x64")
+    harness = repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_ui_tests.exe"
+    assert harness.is_file(), "Build the GUI acceptance harness first"
+    result = subprocess.run(
+        [str(harness), "--runtime-status", str(package.data), str(package.launcher)],
+        env=package.env, capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

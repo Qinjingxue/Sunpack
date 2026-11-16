@@ -36,10 +36,10 @@ class Watch:
         return self.package.data / ".sunpack_watch" / "events.json"
 
     def start(self):
-        return self.package.json("watch", "start", "--no-tray")["summary"]
+        return self.package.json("daemon", "start", "--no-tray")["summary"]
 
     def stop(self):
-        assert self.package.json("watch", "stop")["summary"]["stopped"]
+        assert self.package.json("daemon", "stop")["summary"]["running"] is False
 
     def restart(self):
         self.stop()

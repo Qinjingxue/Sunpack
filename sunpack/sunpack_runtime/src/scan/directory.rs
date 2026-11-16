@@ -471,7 +471,7 @@ impl NativeDirectoryScanOptions {
         scope: &crate::scan::scope::NativeDiscoveryScope,
         changed: Option<&str>,
     ) -> std::io::Result<Vec<DirectoryReadError>> {
-        Ok(update_catalog(self, state, scope, changed, false)?.0)
+        Ok(update_catalog(self, state, scope, changed, false, false)?.0)
     }
 
     pub(crate) fn catalog_refresh(
@@ -481,7 +481,16 @@ impl NativeDirectoryScanOptions {
         scope: &crate::scan::scope::NativeDiscoveryScope,
         changed: Option<&str>,
     ) -> std::io::Result<(Vec<DirectoryReadError>, Vec<String>)> {
-        update_catalog(self, state, scope, changed, true)
+        update_catalog(self, state, scope, changed, true, false)
+    }
+
+    // Adopt the observed content generation without publishing new candidates.
+    // Unlike output publication this keeps ordinary scope/ownership filtering.
+    pub(crate) fn catalog_baseline(
+        &self, state: &NativeWatchCatalog,
+        scope: &crate::scan::scope::NativeDiscoveryScope, changed: Option<&str>,
+    ) -> std::io::Result<Vec<DirectoryReadError>> {
+        Ok(update_catalog(self, state, scope, changed, false, true)?.0)
     }
 
     pub(crate) fn catalog_snapshot(
@@ -1491,7 +1500,7 @@ impl NativeWatchCatalog {
                 }
                 if covered.iter().any(|root| crate::watch_store::is_path_under(target, root) || target == root) { continue; }
                 let prepared = scan_catalog(options, self, scope, target, true)?;
-                let (errors, _) = apply_catalog_scan(self, scope, Some(target), false, true, prepared, catalogs)?;
+                let (errors, _) = apply_catalog_scan(self, scope, Some(target), false, true, false, prepared, catalogs)?;
                 if !errors.is_empty() { return Err(std::io::Error::other(format!("output inventory publication failed: {errors:?}"))); }
                 covered.push(target.to_owned());
                 let mut buckets = HashSet::new();
@@ -1989,6 +1998,12 @@ impl NativeWatchCatalog {
             }
         })();
     }
+    pub(crate) fn flush(&self) -> std::io::Result<()> {
+        self.commit(false);
+        if let Some(error) = self.error() { return Err(std::io::Error::other(error)); }
+        if let Some(store) = self.store.lock().unwrap().as_mut() { store.flush()?; }
+        Ok(())
+    }
     pub(crate) fn close(&self) {
         (|| {
             let tables = self.catalogs.lock().unwrap();
@@ -2077,6 +2092,7 @@ fn update_catalog(
     scope: &crate::scan::scope::NativeDiscoveryScope,
     changed: Option<&str>,
     report_changes: bool,
+    adopt_observations: bool,
 ) -> std::io::Result<(Vec<DirectoryReadError>, Vec<String>)> {
     let target = changed.unwrap_or(&scope.root);
     let scan = || scan_catalog(options, state, scope, target, false);
@@ -2095,7 +2111,7 @@ fn update_catalog(
         drop(prepared);
         scan()?
     };
-    apply_catalog_scan(state, scope, changed, report_changes, false, prepared, tables.edit())
+    apply_catalog_scan(state, scope, changed, report_changes, false, adopt_observations, prepared, tables.edit())
 }
 
 struct CatalogScan {
@@ -2190,6 +2206,7 @@ fn apply_catalog_scan(
     changed: Option<&str>,
     report_changes: bool,
     baseline: bool,
+    adopt_observations: bool,
     prepared: Option<CatalogScan>,
     catalogs: &mut HashMap<String, ScopeCatalog>,
 ) -> std::io::Result<(Vec<DirectoryReadError>, Vec<String>)> {
@@ -2226,7 +2243,7 @@ fn apply_catalog_scan(
         {
             changed_paths.push(record.path.clone());
         }
-        let observation = if baseline && !record.is_dir && record.size.is_some_and(|size| size > 0) {
+        let observation = if (baseline || adopt_observations) && !record.is_dir && record.size.is_some_and(|size| size > 0) {
             // Enumeration already supplies size and mtime. Only read the
             // identity/USN once; do not stat every settled output again.
             match crate::filesystem::watch_file_observation_known_kind(Path::new(&record.path), None, false) {
@@ -2243,7 +2260,7 @@ fn apply_catalog_scan(
             catalog.insert_key(Arc::clone(&key), record);
             if let Some((size, mtime, observed)) = observation {
                 let row = catalog.rows.get_mut(key.as_ref()).unwrap();
-                row.remember_generated(size, mtime, &observed.file_id, observed.change_usn);
+                if baseline { row.remember_generated(size, mtime, &observed.file_id, observed.change_usn); }
                 if scope.contains(&row.path()) {
                     row.remember_observation(size, mtime, &observed.file_id, observed.change_usn, true);
                 }

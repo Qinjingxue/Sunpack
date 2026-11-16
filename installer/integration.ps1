@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('RegisterToast', 'EnableContextMenu', 'DisableContextMenu', 'EnableStartup',
-        'DisableStartup', 'StartWatch', 'UninstallToast', 'RemoveGuiPreferences')]
+        'DisableStartup', 'StartDaemon', 'UninstallToast', 'RemoveGuiPreferences')]
     [string]$Action,
     [switch]$ShellUser
 )
@@ -18,9 +18,9 @@ function Remove-Registration([string]$Path) {
     if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }
 }
 
-function Invoke-Watch([string[]]$Arguments) {
-    & $launcher watch @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "SunPack Watch exited with code $LASTEXITCODE" }
+function Invoke-Daemon([string[]]$Arguments) {
+    & $launcher daemon @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "SunPack daemon exited with code $LASTEXITCODE" }
 }
 
 function Invoke-AsShellUser([string]$UserAction) {
@@ -153,9 +153,9 @@ if (-not $ShellUser) {
 switch ($Action) {
     'EnableContextMenu' { & (Join-Path $PSScriptRoot 'register_context_menu.ps1') }
     'DisableContextMenu' { & (Join-Path $PSScriptRoot 'unregister_context_menu.ps1') }
-    'EnableStartup' { Invoke-Watch @('startup', 'enable') }
-    'DisableStartup' { Invoke-Watch @('startup', 'disable') }
-    'StartWatch' { Invoke-Watch @('start') }
+    'EnableStartup' { Invoke-Daemon @('startup', 'enable') }
+    'DisableStartup' { Invoke-Daemon @('startup', 'disable') }
+    'StartDaemon' { Invoke-Daemon @('start') }
     'UninstallToast' { Remove-Registration $toastAppId }
     'RemoveGuiPreferences' { Remove-Registration 'HKCU:\Software\SunPack\GUI' }
     default { throw "Invalid shell-user action: $Action" }

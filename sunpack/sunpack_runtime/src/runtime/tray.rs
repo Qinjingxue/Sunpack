@@ -41,15 +41,18 @@ const OPEN: i32 = 1001;
 const RELOAD: i32 = 1003;
 const STOP: i32 = 1004;
 const STARTUP: i32 = 1005;
+const MONITOR: i32 = 1006;
 
 pub(super) enum Action {
     Reload,
+    Monitor(bool),
     Stop,
 }
 
 pub(super) struct Tray {
     stop: Arc<windows::Event>,
     chinese: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
     window: usize,
     thread: Option<JoinHandle<io::Result<()>>>,
 }
@@ -65,13 +68,15 @@ impl Tray {
         let event = stop.clone();
         let chinese = Arc::new(AtomicBool::new(language == Language::Zh));
         let language = chinese.clone();
+        let enabled = Arc::new(AtomicBool::new(true));
+        let monitor = Arc::clone(&enabled);
         let cwd = cwd.to_owned();
         let (ready, receive) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("sunpack-tray".into())
             .spawn(move || {
                 let mut ready = Some(ready);
-                let result = run_tray(cwd, language, Box::new(notify), Box::new(report_error), &event, &mut ready);
+                let result = run_tray(cwd, language, monitor, Box::new(notify), Box::new(report_error), &event, &mut ready);
                 if let Some(ready) = ready {
                     let error = result.as_ref().err().map_or_else(
                         || io::Error::other("Tray exited before startup"),
@@ -85,6 +90,7 @@ impl Tray {
             Ok(Ok(window)) => Ok(Self {
                 stop,
                 chinese,
+                enabled,
                 window,
                 thread: Some(thread),
             }),
@@ -97,6 +103,8 @@ impl Tray {
             }
         }
     }
+
+    pub(super) fn set_enabled(&self, enabled: bool) { self.enabled.store(enabled, Ordering::Release); }
 
     pub(super) fn set_language(&self, language: Language) {
         self.chinese
@@ -122,6 +130,7 @@ impl Drop for Tray {
 struct Context {
     cwd: PathBuf,
     chinese: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
     notify: Box<dyn Fn(Action) + Send>,
     report_error: Box<dyn Fn(Option<u32>, &io::Error) + Send>,
     taskbar_created: u32,
@@ -131,6 +140,7 @@ struct Context {
 fn run_tray(
     cwd: PathBuf,
     chinese: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
     notify: Box<dyn Fn(Action) + Send>,
     report_error: Box<dyn Fn(Option<u32>, &io::Error) + Send>,
     stop: &windows::Event,
@@ -147,6 +157,7 @@ fn run_tray(
     let mut context = Context {
         cwd,
         chinese,
+        enabled,
         notify,
         report_error,
         taskbar_created,
@@ -315,6 +326,10 @@ impl Context {
                 (self.notify)(Action::Reload);
                 Ok(())
             }
+            MONITOR => {
+                (self.notify)(Action::Monitor(!self.enabled.load(Ordering::Acquire)));
+                Ok(())
+            }
             STOP => {
                 (self.notify)(Action::Stop);
                 Ok(())
@@ -337,6 +352,7 @@ impl Context {
             for (id, key) in [
                 (OPEN, "tray.open_manager"),
                 (STARTUP, startup_label),
+                (MONITOR, if self.enabled.load(Ordering::Acquire) { "tray.disable_watch" } else { "tray.enable_watch" }),
                 (RELOAD, "tray.reload"),
                 (STOP, "tray.exit"),
             ] {

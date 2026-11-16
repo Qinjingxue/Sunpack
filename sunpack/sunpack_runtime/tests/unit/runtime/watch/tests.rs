@@ -1377,6 +1377,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
     let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
     let settings = Arc::new(Config::default());
     let mut scheduler = Scheduler {
+        resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
         cwd: base.clone(), root_file: base.join(ROOTS_FILE),
         roots: BTreeMap::new(), available_roots: HashSet::new(),

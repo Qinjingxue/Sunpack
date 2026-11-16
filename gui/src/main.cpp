@@ -19,6 +19,8 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
             spg::Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));
             if(!stop.value) spg::win_error("opLaunchCli");
             auto command=spg::run_cli(options.cli,options.shell_watch,stop);
+            if(command.code==0 && options.shell_watch[1]==L"add")
+                command=spg::run_cli(options.cli,{L"daemon",L"start"},stop);
             if(command.code && !command.output.empty()) throw std::runtime_error(command.output);
             if(SUCCEEDED(com)) CoUninitialize();
             return int(command.code);
