@@ -87,17 +87,21 @@ impl NativeReadScope {
 
 #[cfg(windows)]
 fn handle_path_is_under(file: &File, root: &[u16]) -> io::Result<bool> {
-    with_handle_path(file, |path| handle_path_has_root(path, root))
+    with_handle_path(file, 0, |path| handle_path_has_root(path, root))
 }
 
 #[cfg(windows)]
 pub(crate) fn resolved_reader_path(file: &File) -> io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
-    with_handle_path(file, |path| PathBuf::from(std::ffi::OsString::from_wide(path)))
+    with_handle_path(file, 0, |path| PathBuf::from(std::ffi::OsString::from_wide(path)))
 }
 
 #[cfg(windows)]
-fn with_handle_path<T>(file: &File, visit: impl FnOnce(&[u16]) -> T) -> io::Result<T> {
+pub(crate) fn with_handle_path<T>(
+    file: &File,
+    flags: u32,
+    visit: impl FnOnce(&[u16]) -> T,
+) -> io::Result<T> {
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     extern "system" {
@@ -114,7 +118,7 @@ fn with_handle_path<T>(file: &File, visit: impl FnOnce(&[u16]) -> T) -> io::Resu
             file.as_raw_handle(),
             stack.as_mut_ptr(),
             stack.len() as u32,
-            0,
+            flags,
         )
     };
     if len == 0 {
@@ -128,7 +132,7 @@ fn with_handle_path<T>(file: &File, visit: impl FnOnce(&[u16]) -> T) -> io::Resu
                 file.as_raw_handle(),
                 data.as_mut_ptr(),
                 data.len() as u32,
-                0,
+                flags,
             )
         };
         if actual == 0 || actual as usize >= data.len() {

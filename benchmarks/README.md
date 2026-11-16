@@ -58,8 +58,9 @@ The Worker, CLI and Watch 300 MiB matrices share one format list. Cases use
 two reproducible 150 MiB payload files by default, or one stream of the same
 total size. They include ZIPX (LZMA and Zstandard), split ZIP, 7z-Zstandard,
 7z-LZ4, independent compression streams, compressed TAR variants and ENC.
-ENC v4 uses standalone discovery in the CLI and Watch matrices. Carrier runs
-exclude ENC because its header does not publish the archive length.
+The CLI and Watch matrices use normal discovery for ordinary and disguised
+archives. `--shape carrier` forces deep scanning and excludes ENC v4 because
+its header does not publish the archive length.
 Set `--large-file-mib 1 --runs 1` for a smoke run. ENC generation needs
 Java and the reference JAR. Missing optional generators are reported as skipped, and
 `--sample FORMAT=PATH` accepts external formats. Watch requires permission to

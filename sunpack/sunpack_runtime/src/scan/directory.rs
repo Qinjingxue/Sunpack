@@ -90,7 +90,7 @@ impl NativeDirectorySnapshot {
 
     pub(super) fn from_views(
         filtered_rows: Vec<usize>,
-        raw: Vec<DirectoryEntryRecord>,
+        raw: impl IntoIterator<Item = DirectoryEntryRecord>,
         errors: DirectoryReadErrors,
         cells: Vec<Option<CheapAnchorCell>>,
     ) -> (Self, Self) {
@@ -112,15 +112,19 @@ impl NativeDirectorySnapshot {
         )
     }
 
-    pub(crate) fn build_table(records: Vec<DirectoryEntryRecord>) -> DirectorySnapshotTable {
+    pub(crate) fn build_table(
+        records: impl IntoIterator<Item = DirectoryEntryRecord>,
+    ) -> DirectorySnapshotTable {
+        let records = records.into_iter();
+        let capacity = records.size_hint().0;
         let mut table = DirectorySnapshotTable {
             scan_errors: Vec::new(),
-            paths: Vec::with_capacity(records.len()),
-            sizes: Vec::with_capacity(records.len()),
-            mtimes_ns: Vec::with_capacity(records.len()),
-            relation_anchors: Vec::with_capacity(records.len()),
+            paths: Vec::with_capacity(capacity),
+            sizes: Vec::with_capacity(capacity),
+            mtimes_ns: Vec::with_capacity(capacity),
+            relation_anchors: Vec::with_capacity(capacity),
             relation_anchor_cells: Vec::new(),
-            routes: Vec::with_capacity(records.len()),
+            routes: Vec::with_capacity(capacity),
         };
         for record in records {
             let route = filesystem_file_route(record.is_dir, record.relation_anchor.as_ref());
@@ -302,7 +306,7 @@ impl NativeOutputInventory {
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let root = lexical_normalize_path(Path::new(&self.root));
         let manifest;
-        let (files, directory_ends, manifest_rows) = match self.files {
+        let (mut files, directory_ends, manifest_rows) = match self.files {
             OutputInventoryFiles::Disk { files, directory_ends } => {
                 (files, Some(directory_ends), None)
             }
@@ -320,19 +324,22 @@ impl NativeOutputInventory {
                 (records, None, Some((manifest.as_slice(), item_indices)))
             }
         };
-        let mut records = build_inventory_snapshot_views(
+        let (directories, filtered) = build_inventory_snapshot_views(
             &root,
-            files,
+            &mut files,
             directory_ends,
             manifest_rows,
             &options.options,
         );
-        records.errors.extend(self.scan_errors);
-        populate_relation_anchors_cached(&mut records.raw, &[], Some(&self.root));
+        populate_relation_anchors_cached(&mut files, &[], Some(&self.root));
+        let mut errors = DirectoryReadErrors::default();
+        errors.extend(self.scan_errors);
         Ok(NativeDirectorySnapshot::from_views(
-            records.filtered,
-            records.raw,
-            records.errors,
+            filtered,
+            // Directory rows precede files in both views. Consume the two
+            // buffers directly instead of copying every file into one Vec.
+            directories.into_iter().chain(files),
+            errors,
             Vec::new(),
         ))
     }
@@ -677,11 +684,11 @@ pub(crate) fn classify_scan_targets(paths: &[String]) -> (Vec<u8>, DirectoryRead
 
 fn build_inventory_snapshot_views(
     root: &Path,
-    mut raw_files: Vec<DirectoryEntryRecord>,
+    raw_files: &mut [DirectoryEntryRecord],
     directory_ends: Option<Vec<usize>>,
     manifest_rows: Option<(&[OutputFileRecord], Vec<usize>)>,
     options: &DirectoryScanOptions,
-) -> DirectoryScanRecords {
+) -> (Vec<DirectoryEntryRecord>, Vec<usize>) {
     let mut pre_mtime_accepted = vec![false; raw_files.len()];
     let mut size_accepted_split_families = HashSet::new();
     let mut size_deferred = Vec::new();
@@ -751,7 +758,7 @@ fn build_inventory_snapshot_views(
 
     // Keep parents of files accepted before the final mtime filter, even
     // when that final filter removes every file in a directory.
-    let (mut raw, mut filtered) = if let Some(directory_ends) = directory_ends {
+    let (directories, mut filtered) = if let Some(directory_ends) = directory_ends {
         let mut start = 0;
         ancestor_directory_records(
             root,
@@ -768,7 +775,7 @@ fn build_inventory_snapshot_views(
             raw_files.iter().zip(pre_mtime_accepted.iter().copied()),
         )
     };
-    let file_start = raw.len();
+    let file_start = directories.len();
     // Unlike directory enumeration, a worker manifest may name the same output
     // more than once. Preserve its existing last-record projection for aliases.
     let file_rows: HashMap<&str, usize> = raw_files
@@ -786,12 +793,7 @@ fn build_inventory_snapshot_views(
     } else {
         filtered.extend(accepted.map(|(_, record)| file_rows[record.path.as_str()]));
     }
-    raw.extend(raw_files);
-    DirectoryScanRecords {
-        filtered,
-        raw,
-        errors: DirectoryReadErrors::default(),
-    }
+    (directories, filtered)
 }
 
 fn output_file_record(path: String, size: u64, mtime_ns: Option<u64>) -> DirectoryEntryRecord {

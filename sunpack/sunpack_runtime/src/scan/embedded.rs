@@ -482,13 +482,11 @@ fn scan_embedded_archives_native_with_iocp(
                     "IOCP embedded scanning requires a single regular file",
                 )
             })?;
-            // Small streams fit one reader window. Reuse the pooled native
-            // handle and matcher rather than opening a completion port for it.
-            let output = if file_size <= 64 * 1024 {
-                let data = reader
-                    .probe_reader()
-                    .read_cached_at(0, file_size as usize)?;
-                let hits = scan(data.as_slice(), 0, 0);
+            // A single read cannot overlap other reads. Use the open reader
+            // and skip the second file handle, completion port and job queue.
+            let output = if file_size <= chunk_bytes as u64 {
+                let data = reader.read_direct_at(0, file_size as usize)?;
+                let hits = scan(&data, 0, 0);
                 collect(hits.results)?;
                 iocp::IocpScanOutput {
                     #[cfg(test)]
@@ -652,23 +650,30 @@ fn validate_raw_hits(
             }
         }
     }
-    let mut candidates = raw_hits
-        .par_iter_mask(1 << 1)
-        .map_init(DirectoryEvidence::default, |directories, hit| {
-            cancellation.run(|| {
-                validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, directories)
+    let mut eocds = raw_hits.iter_mask(1 << 1);
+    let mut candidates = match (eocds.next(), eocds.next()) {
+        (None, _) => Vec::new(),
+        (Some(hit), None) => validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, None)?
+            .into_iter()
+            .collect(),
+        _ => raw_hits
+            .par_iter_mask(1 << 1)
+            .map_init(Vec::new, |suffixes, hit| {
+                cancellation.run(|| {
+                    validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, Some(suffixes))
+                })
             })
-        })
-        .try_fold(Vec::new, |mut candidates, candidate| -> io::Result<_> {
-            if let Some(candidate) = candidate? {
-                candidates.push(candidate);
-            }
-            Ok(candidates)
-        })
-        .try_reduce(Vec::new, |mut left, mut right| {
-            left.append(&mut right);
-            Ok(left)
-        })?;
+            .try_fold(Vec::new, |mut candidates, candidate| -> io::Result<_> {
+                if let Some(candidate) = candidate? {
+                    candidates.push(candidate);
+                }
+                Ok(candidates)
+            })
+            .try_reduce(Vec::new, |mut left, mut right| {
+                left.append(&mut right);
+                Ok(left)
+            })?,
+    };
 
     // ZIP EOCD geometry can prove a logical root before its local-header hit is
     // visited. Seed exact ownership with those ranges, then process every other
@@ -1241,95 +1246,94 @@ struct DirectorySuffix {
     entries: usize,
 }
 
-#[derive(Default)]
-struct DirectoryEvidence {
-    // Only directories requested by an EOCD receive an index. Per-Rayon-task
-    // suffixes reuse overlapping proposals without a shared lock or a
-    // signature object for every possible directory marker in the payload.
-    suffixes: Vec<DirectorySuffix>,
+fn find_directory_suffix(suffixes: &[DirectorySuffix], start: u64) -> Option<DirectorySuffix> {
+    suffixes
+        .binary_search_by_key(&start, |item| item.start)
+        .ok()
+        .map(|index| suffixes[index])
 }
 
-impl DirectoryEvidence {
-    fn find(&self, start: u64) -> Option<DirectorySuffix> {
-        self.suffixes
-            .binary_search_by_key(&start, |item| item.start)
-            .ok()
-            .map(|index| self.suffixes[index])
-    }
+fn directory_matches(
+    file: &ManagedReader,
+    start: u64,
+    first_fixed: &[u8],
+    end: u64,
+    entries: usize,
+    mut suffixes: Option<&mut Vec<DirectorySuffix>>,
+) -> io::Result<bool> {
+    use crate::formats::zip::{central_directory_complete, central_directory_record_len};
 
-    fn matches(
-        &mut self,
-        file: &ManagedReader,
-        start: u64,
-        end: u64,
-        entries: usize,
-    ) -> io::Result<bool> {
-        let observed = if let Some(cached) = self.find(start) {
-            cached
-        } else {
-            let mut source = BufReader::with_capacity(64 * 1024, file.stream_cursor());
-            source.seek(SeekFrom::Start(start))?;
-            let mut cursor = start;
-            let mut path = Vec::new();
-            let mut suffix = loop {
-                if let Some(cached) = self.find(cursor) {
-                    break cached;
-                }
-                let mut fixed = [0u8; 46];
-                let length = if cursor.saturating_add(46) <= file.len() {
-                    source.read_exact(&mut fixed)?;
-                    crate::formats::zip::central_directory_record_len(&fixed)
-                } else {
-                    None
-                };
-                let Some(next) = length
-                    .and_then(|length| cursor.checked_add(length as u64))
-                    .filter(|next| *next <= file.len())
-                else {
-                    break DirectorySuffix {
-                        start: cursor,
-                        end: cursor,
-                        entries: 0,
-                    };
-                };
-                path.try_reserve(1)
-                    .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
-                path.push(cursor);
-                source.seek_relative((next - cursor - 46) as i64)?;
-                cursor = next;
-            };
-            let first_new = self.suffixes.len();
-            self.suffixes
-                .try_reserve(path.len())
-                .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
-            for start in path.into_iter().rev() {
-                suffix = DirectorySuffix {
-                    start,
-                    end: suffix.end,
-                    entries: suffix.entries + 1,
-                };
-                self.suffixes.push(suffix);
-            }
-            // A walk appends nodes in reverse physical order. Existing nodes
-            // are disjoint from the newly visited path. Consecutive ZIPs in a
-            // carrier usually append after the preceding directories.
-            self.suffixes[first_new..].reverse();
-            if first_new != 0
-                && self.suffixes.get(first_new).is_some_and(|first| {
-                    first.start < self.suffixes[first_new - 1].start
-                })
-            {
-                self.suffixes.sort_unstable_by_key(|item| item.start);
-            }
-            suffix
-        };
-        if observed.entries != entries || observed.end > end {
-            return Ok(false);
+    // Only competing EOCDs can reuse directory evidence. Each Rayon task
+    // indexes its own walks, so overlapping proposals do not require a lock.
+    let first_new = suffixes.as_ref().map_or(0, |items| items.len());
+    let mut cursor = start;
+    let mut source: Option<BufReader<_>> = None;
+    let mut skip = 0;
+    let mut visited = 0;
+    let (observed_end, mut observed_entries) = loop {
+        if let Some(suffix) = suffixes
+            .as_ref()
+            .and_then(|items| find_directory_suffix(&items[..first_new], cursor))
+        {
+            break (suffix.end, suffix.entries);
         }
-        crate::formats::zip::central_directory_complete(observed.end, end, |offset, length| {
-            read_at(file, offset, length)
-        })
+        if (suffixes.is_none() && visited == entries) || file.len().saturating_sub(cursor) < 46 {
+            break (cursor, 0);
+        }
+        let mut fixed = [0; 46];
+        let header = if visited == 0 {
+            first_fixed
+        } else {
+            if let Some(source) = &mut source {
+                source.seek_relative(skip)?;
+                source.read_exact(&mut fixed)?;
+            } else {
+                let mut stream = BufReader::with_capacity(64 * 1024, file.stream_cursor());
+                stream.seek(SeekFrom::Start(cursor))?;
+                stream.read_exact(&mut fixed)?;
+                source = Some(stream);
+            }
+            &fixed
+        };
+        let Some(next) = central_directory_record_len(header)
+            .and_then(|n| cursor.checked_add(n as u64))
+            .filter(|next| *next <= file.len())
+        else {
+            break (cursor, 0);
+        };
+        if let Some(items) = &mut suffixes {
+            items.try_reserve(1)
+                .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+            items.push(DirectorySuffix {
+                start: cursor,
+                end: 0,
+                entries: 0,
+            });
+        }
+        visited += 1;
+        skip = (next - cursor - 46) as i64;
+        cursor = next;
+    };
+    if let Some(items) = suffixes {
+        // The newly appended records are ordered already; fill their suffix
+        // facts in place, then merge their order with earlier walks if needed.
+        for item in items[first_new..].iter_mut().rev() {
+            observed_entries += 1;
+            item.end = observed_end;
+            item.entries = observed_entries;
+        }
+        if first_new != 0
+            && items.get(first_new).is_some_and(|first| first.start < items[first_new - 1].start)
+        {
+            items.sort_unstable_by_key(|item| item.start);
+        }
+    } else {
+        observed_entries += visited;
     }
+    if observed_entries != entries || observed_end > end {
+        return Ok(false);
+    }
+    central_directory_complete(observed_end, end, |offset, length| read_at(file, offset, length))
 }
 
 fn validate_zip_eocd(
@@ -1337,7 +1341,7 @@ fn validate_zip_eocd(
     size: u64,
     eocd_offset: u64,
     zip64_records: &BTreeMap<u64, Vec<(u64, crate::formats::zip::zip64::EndRecord)>>,
-    directories: &mut DirectoryEvidence,
+    suffixes: Option<&mut Vec<DirectorySuffix>>,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
     let header = read_at(file, eocd_offset, 22)?;
     if header.len() < 22 || &header[..4] != ZIP_EOCD {
@@ -1412,17 +1416,13 @@ fn validate_zip_eocd(
     if locator_archive_offset.is_some_and(|offset| offset != archive_offset) {
         return Ok(None);
     }
-    let cd_magic = read_at(file, actual_cd_start, 4)?;
-    if cd_size > 0 && cd_magic.as_slice() != b"PK\x01\x02" {
-        return Ok(None);
-    }
     if !validate_zip_boundary_evidence(
         file,
         actual_cd_start,
         directory_end,
         archive_offset,
         entries_total as usize,
-        directories,
+        suffixes,
     )? {
         return Ok(None);
     }
@@ -1494,13 +1494,10 @@ fn validate_zip_boundary_evidence(
     end: u64,
     archive_offset: u64,
     entries: usize,
-    directories: &mut DirectoryEvidence,
+    suffixes: Option<&mut Vec<DirectorySuffix>>,
 ) -> io::Result<bool> {
     if entries == 0 {
         return Ok(start == end);
-    }
-    if !directories.matches(file, start, end, entries)? {
-        return Ok(false);
     }
     let fixed = read_at(file, start, 46)?;
     if fixed.len() != 46 || &fixed[..4] != b"PK\x01\x02" {
@@ -1533,7 +1530,10 @@ fn validate_zip_boundary_evidence(
     let Some(absolute_local) = archive_offset.checked_add(local_offset) else {
         return Ok(false);
     };
-    Ok(absolute_local < start && read_at(file, absolute_local, 4)?.as_slice() == ZIP_LOCAL)
+    if absolute_local >= start || read_at(file, absolute_local, 4)?.as_slice() != ZIP_LOCAL {
+        return Ok(false);
+    }
+    directory_matches(file, start, &fixed, end, entries, suffixes)
 }
 
 fn zip64_central_local_offset(

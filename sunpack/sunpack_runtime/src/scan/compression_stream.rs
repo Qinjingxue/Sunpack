@@ -294,6 +294,8 @@ impl<'a, 'b> MsbBits<'a, 'b> {
 }
 
 const HUFFMAN_LOOKUP_BITS: u8 = 9;
+const HUFFMAN_LENGTH_BITS: u8 = 5;
+const HUFFMAN_LENGTH_MASK: u16 = (1 << HUFFMAN_LENGTH_BITS) - 1;
 
 #[derive(Clone, Copy)]
 enum BitOrder {
@@ -301,14 +303,14 @@ enum BitOrder {
     Msb,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Huffman {
     counts: [u16; 24],
     first_code: [u32; 24],
     first_symbol: [usize; 24],
     symbols: Vec<u16>,
     max_len: usize,
-    lookup: Box<[u32]>,
+    lookup: Vec<u16>,
     lookup_bits: u8,
 }
 
@@ -319,12 +321,24 @@ struct LsbHuffman<'a> {
     first_symbol: &'a [usize; 24],
     symbols: &'a [u16],
     max_len: usize,
-    lookup: &'a [u32],
+    lookup: &'a [u16],
     lookup_bits: u8,
 }
 
 impl Huffman {
     fn new(lengths: &[u8], max_allowed: usize, order: BitOrder) -> ValidationResult<Self> {
+        let mut table = Self::default();
+        table.rebuild(lengths, max_allowed, order)?;
+        Ok(table)
+    }
+
+    fn rebuild(
+        &mut self,
+        lengths: &[u8],
+        max_allowed: usize,
+        order: BitOrder,
+    ) -> ValidationResult<()> {
+        debug_assert!(lengths.len() <= 1 << (u16::BITS - u32::from(HUFFMAN_LENGTH_BITS)));
         let mut counts = [0u16; 24];
         let mut max_len = 0usize;
         for &length in lengths {
@@ -357,44 +371,56 @@ impl Huffman {
             first_symbol[length] = symbol_index;
             symbol_index += usize::from(counts[length]);
         }
-        let mut symbols = Vec::with_capacity(symbol_index);
-        for length in 1..=max_len {
-            for (symbol, &candidate) in lengths.iter().enumerate() {
-                if usize::from(candidate) == length {
-                    symbols.push(symbol as u16);
-                }
+        // Place each symbol at the next position for its length in one pass.
+        self.symbols.clear();
+        self.symbols.resize(symbol_index, 0);
+        let mut next_symbol = first_symbol;
+        for (symbol, &length) in lengths.iter().enumerate() {
+            if length != 0 {
+                let slot = &mut next_symbol[usize::from(length)];
+                self.symbols[*slot] = symbol as u16;
+                *slot += 1;
             }
         }
-        // Bounded, block-local decode table; no retained input or shared cache.
-        let lookup_bits = HUFFMAN_LOOKUP_BITS.min(max_len as u8);
-        let mut lookup = vec![0u32; 1usize << lookup_bits].into_boxed_slice();
+        // BZip2's fixed prefix removes a variable shift from each symbol.
+        // Each entry stores the full symbol and its code length in 16 bits.
+        let lookup_bits = match order {
+            BitOrder::Msb => HUFFMAN_LOOKUP_BITS,
+            BitOrder::Lsb => HUFFMAN_LOOKUP_BITS.min(max_len as u8),
+        };
+        self.lookup.clear();
+        self.lookup.resize(1usize << lookup_bits, 0);
         for length in 1..=usize::from(lookup_bits) {
             for index in 0..usize::from(counts[length]) {
                 let code = first_code[length] + index as u32;
-                let symbol = symbols[first_symbol[length] + index];
-                let entry = ((length as u32) << 16) | u32::from(symbol);
+                let symbol = self.symbols[first_symbol[length] + index];
+                let entry = (symbol << HUFFMAN_LENGTH_BITS) | length as u16;
                 let suffix_bits = usize::from(lookup_bits) - length;
-                for suffix in 0..1usize << suffix_bits {
-                    let canonical = ((code as usize) << suffix_bits) | suffix;
-                    let slot = match order {
-                        BitOrder::Msb => canonical,
-                        BitOrder::Lsb => {
-                            canonical.reverse_bits() >> (usize::BITS - u32::from(lookup_bits))
+                match order {
+                    BitOrder::Msb => {
+                        let first = (code as usize) << suffix_bits;
+                        self.lookup[first..first + (1 << suffix_bits)].fill(entry);
+                    }
+                    BitOrder::Lsb => {
+                        let first = code.reverse_bits() >> (u32::BITS - length as u32);
+                        for slot in self
+                            .lookup
+                            .iter_mut()
+                            .skip(first as usize)
+                            .step_by(1 << length)
+                        {
+                            *slot = entry;
                         }
-                    };
-                    lookup[slot] = entry;
+                    }
                 }
             }
         }
-        Ok(Self {
-            counts,
-            first_code,
-            first_symbol,
-            symbols,
-            max_len,
-            lookup,
-            lookup_bits,
-        })
+        self.counts = counts;
+        self.first_code = first_code;
+        self.first_symbol = first_symbol;
+        self.max_len = max_len;
+        self.lookup_bits = lookup_bits;
+        Ok(())
     }
 
     fn lsb(&self) -> LsbHuffman<'_> {
@@ -415,21 +441,22 @@ impl Huffman {
 
     #[inline(always)]
     fn decode_msb(&self, bits: &mut MsbBits<'_, '_>) -> ValidationResult<u16> {
-        bits.fill_available(self.lookup_bits)?;
-        let mut code = 0;
-        let mut matched_bits = 0;
-        if bits.count >= self.lookup_bits {
-            code = bits.peek(self.lookup_bits);
-            let entry = self.lookup[code as usize];
-            if entry != 0 {
-                bits.consume((entry >> 16) as u8);
-                return Ok(entry as u16);
+        const LOOKUP_BITS: u8 = HUFFMAN_LOOKUP_BITS;
+        if bits.count < LOOKUP_BITS {
+            bits.fill_available(LOOKUP_BITS)?;
+            if bits.count < LOOKUP_BITS {
+                return self.decode_msb_long(bits, 0, 0);
             }
-            // An empty lookup slot rules out every shorter canonical code.
-            bits.consume(self.lookup_bits);
-            matched_bits = usize::from(self.lookup_bits);
         }
-        self.decode_msb_long(bits, code, matched_bits)
+        let code = bits.peek(LOOKUP_BITS);
+        let entry = self.lookup[code as usize];
+        if entry != 0 {
+            bits.consume((entry & HUFFMAN_LENGTH_MASK) as u8);
+            return Ok(entry >> HUFFMAN_LENGTH_BITS);
+        }
+        // An empty lookup slot rules out every shorter canonical code.
+        bits.consume(LOOKUP_BITS);
+        self.decode_msb_long(bits, code, usize::from(LOOKUP_BITS))
     }
 
     #[cold]
@@ -457,10 +484,10 @@ impl LsbHuffman<'_> {
         if bits.count >= self.lookup_bits {
             let entry = self.lookup[(bits.bits & ((1u64 << self.lookup_bits) - 1)) as usize];
             if entry != 0 {
-                let length = (entry >> 16) as u8;
+                let length = (entry & HUFFMAN_LENGTH_MASK) as u8;
                 bits.bits >>= length;
                 bits.count -= length;
-                return Ok(entry as u16);
+                return Ok(entry >> HUFFMAN_LENGTH_BITS);
             }
         }
         let mut code = 0u32;
@@ -497,7 +524,7 @@ const fn fixed_literal_symbols() -> [u16; 288] {
     symbols
 }
 
-const fn fixed_lookup<const N: usize>(distance: bool) -> [u32; N] {
+const fn fixed_lookup<const N: usize>(distance: bool) -> [u16; N] {
     let mut entries = [0; N];
     let mut i = 0;
     while i < N {
@@ -515,15 +542,15 @@ const fn fixed_lookup<const N: usize>(distance: bool) -> [u32; N] {
                 (9, 144 + code - 400)
             }
         };
-        entries[i] = (length << 16) | symbol;
+        entries[i] = ((symbol as u16) << HUFFMAN_LENGTH_BITS) | length as u16;
         i += 1;
     }
     entries
 }
 
 const FIXED_LITERAL_SYMBOLS: [u16; 288] = fixed_literal_symbols();
-const FIXED_LITERAL_LOOKUP: [u32; 512] = fixed_lookup::<512>(false);
-const FIXED_DISTANCE_LOOKUP: [u32; 32] = fixed_lookup::<32>(true);
+const FIXED_LITERAL_LOOKUP: [u16; 512] = fixed_lookup::<512>(false);
+const FIXED_DISTANCE_LOOKUP: [u16; 32] = fixed_lookup::<32>(true);
 const FIXED_LITERAL_TREE: LsbHuffman<'static> = LsbHuffman {
     counts: &[
         0, 0, 0, 0, 0, 0, 0, 24, 152, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -918,6 +945,9 @@ pub(crate) fn validate_bzip2_structure(
 ) -> ValidationResult<u64> {
     let mut read = |offset, count| reader.read_cached_at(offset, count);
     let mut cursor = ByteCursor::new(&mut read, offset, limit, CachedBytes::default());
+    let mut selectors = Vec::new();
+    let mut tables: [Huffman; 6] = std::array::from_fn(|_| Huffman::default());
+    let mut lengths = [0u8; 258];
     loop {
         visit(cursor.position())?;
         let header = cursor.read_array::<4>()?;
@@ -943,7 +973,8 @@ pub(crate) fn validate_bzip2_structure(
             // by lbzip2. At most 18,002 can be used by a 900 KB block.
             let retained = selector_count.min(18_002);
             let mut mtf_groups = [0u8, 1, 2, 3, 4, 5];
-            let mut selectors = Vec::with_capacity(retained);
+            selectors.clear();
+            selectors.reserve_exact(retained);
             for slot in 0..selector_count {
                 let mut index = 0usize;
                 while bits.read(1)? != 0 {
@@ -959,11 +990,10 @@ pub(crate) fn validate_bzip2_structure(
                     selectors.push(value);
                 }
             }
-            let mut tables = Vec::with_capacity(group_count);
-            for _ in 0..group_count {
+            for table in &mut tables[..group_count] {
                 let mut current = bits.read(5)? as i32;
-                let mut lengths = Vec::with_capacity(alpha_size);
-                for _ in 0..alpha_size {
+                let lengths = &mut lengths[..alpha_size];
+                for length in &mut *lengths {
                     while bits.read(1)? != 0 {
                         if bits.read(1)? == 0 {
                             current += 1;
@@ -974,46 +1004,32 @@ pub(crate) fn validate_bzip2_structure(
                             return invalid("bzip2_code_length_invalid");
                         }
                     }
-                    lengths.push(current as u8);
+                    *length = current as u8;
                 }
-                tables.push(Huffman::new(&lengths, 20, BitOrder::Msb)?);
+                table.rebuild(lengths, 20, BitOrder::Msb)?;
             }
 
             let eob = (n_in_use + 1) as u16;
             let mut nblock = 0usize;
-            let mut run = 0usize;
             let mut weight = 1usize;
             'symbols: {
                 // One selector owns up to 50 symbols. A run may continue
                 // across selectors, so keep its state outside the group.
-                for selector in selectors {
+                for &selector in &selectors {
                     let table = &tables[usize::from(selector)];
                     for _ in 0..50 {
                         let symbol = table.decode_msb(&mut bits)?;
                         if symbol <= 1 {
-                            let next_weight = weight
-                                .checked_mul(2)
-                                .ok_or(ValidationError::Invalid("bzip2_run_overflow"))?;
-                            run = run
-                                .checked_add(if symbol == 0 { weight } else { next_weight })
-                                .ok_or(ValidationError::Invalid("bzip2_run_overflow"))?;
-                            weight = next_weight;
-                            continue;
-                        }
-                        if run != 0 {
-                            nblock = nblock
-                                .checked_add(run)
-                                .ok_or(ValidationError::Invalid("bzip2_block_size_overflow"))?;
-                            if nblock > block_limit {
-                                return invalid("bzip2_block_size_exceeded");
-                            }
-                            run = 0;
-                            weight = 1;
-                        }
-                        if symbol == eob {
+                            // Charge each run symbol immediately. Prior symbols
+                            // bounded nblock, and weight never exceeds nblock + 1.
+                            nblock += weight << symbol;
+                            weight <<= 1;
+                        } else if symbol == eob {
                             break 'symbols;
+                        } else {
+                            weight = 1;
+                            nblock += 1;
                         }
-                        nblock += 1;
                         if nblock > block_limit {
                             return invalid("bzip2_block_size_exceeded");
                         }

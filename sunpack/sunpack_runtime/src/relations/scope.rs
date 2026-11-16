@@ -160,12 +160,18 @@ impl RelationScopeIndex {
         let stem = |row| CaseKey::new(first_dot_stem(source.name(row)));
         let stems: HashSet<_> = rows.iter().copied().map(stem).collect();
         let mut active = HashSet::new();
-        // Inspect anchors and normalize ownership keys only within nominated
-        // stems. Stop looking for seeds once every stem is represented.
+        // Snapshot facts without overrides can cheaply rule out seeds before
+        // parsing filenames. With overrides, first narrow the scope by name
+        // to avoid a path-key lookup for unrelated rows.
+        let direct_anchors = !matches!(source, RelationSource::Snapshot(_, Some(_)));
+        let has_seed = |row| source.anchor(row).is_some_and(BucketIndex::has_seed);
         for row in source.indices() {
+            if direct_anchors && !has_seed(row) {
+                continue;
+            }
             let key = stem(row);
             if stems.contains(&key) && !active.contains(&key)
-                && admitted(row) && source.anchor(row).is_some_and(BucketIndex::has_seed)
+                && admitted(row) && (direct_anchors || has_seed(row))
             {
                 active.insert(key);
                 if active.len() == stems.len() {

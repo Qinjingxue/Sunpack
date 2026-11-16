@@ -28,7 +28,8 @@ def main(argv=None):
     parser.add_argument("--large-file-mib", type=int, default=150, help="Each of the two payload files (default 150 MiB; lower for smoke runs).")
     parser.add_argument("--sample", action="append", default=[], metavar="FORMAT=PATH", help="Additional archive, e.g. zipx, lz4 or enc; provide sibling volumes and --password as needed.")
     parser.add_argument("--password", action="append", default=[])
-    parser.add_argument("--shape", choices=("ordinary", "disguised", "carrier"), default="ordinary")
+    parser.add_argument("--shape", choices=("ordinary", "disguised", "carrier"), default="ordinary",
+                        help="Use normal discovery for ordinary or renamed archives and force deep scans for carriers.")
     parser.add_argument("--recursive", default="*")
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--rebuild-corpus", action="store_true")
@@ -86,22 +87,19 @@ def main(argv=None):
                               if name in selected or name in extras}
             raise ValueError(f"No requested archive formats available for {args.shape}: {selected_skips}")
 
+        deep = args.shape == "carrier"
         rows = []
         with NativePackage(workspace.work, launcher=args.launcher, profile=args.profile,
                            arch=args.arch, sample_ms=args.sample_ms, watch=args.mode == "watch") as app:
             if args.mode == "watch":
-                watch_roots = {}
-                for deep in {item["format"] != "enc" for item in cases.values()}:
-                    inputs = workspace.work / ("arrivals-deep" if deep else "arrivals")
-                    inputs.mkdir()
-                    _configure_watch(app, args, inputs, workspace.outputs, live=True, deep=deep)
-                    watch_roots[deep] = inputs
+                inputs = workspace.work / "arrivals"
+                inputs.mkdir()
+                _configure_watch(app, args, inputs, workspace.outputs, live=True, deep=deep)
                 staging = workspace.work / "staging"
                 staging.mkdir()
                 app.run("watch", "start", "--no-tray", require_broker=True)
             try:
                 for key, item in cases.items():
-                    deep = item["format"] != "enc"
                     for run in range(args.runs):
                         name = f"{key.replace(':', '-')}-{run}"
                         if args.mode == "cli":
@@ -116,7 +114,6 @@ def main(argv=None):
                             output_info = output_summary(output)
                             shutil.rmtree(output, ignore_errors=True)
                         else:
-                            inputs = watch_roots[deep]
                             folder = staging / name
                             entry = _copy_case(item, folder, args.shape)
                             members = list(folder.iterdir())
@@ -149,7 +146,8 @@ def main(argv=None):
                 if args.mode == "watch":
                     app.run("watch", "stop")
             report = {
-                "schema_version": 1, "mode": args.mode, "platform": platform.platform(),
+                "schema_version": 2, "mode": args.mode, "platform": platform.platform(),
+                "forced_deep_scan": deep,
                 "parameters": {**vars(args), "password": None, "password_candidate_count": len(args.password)},
                 "corpus_cache": cache, "skipped": skipped, "rows": rows,
                 "broker_service": app.env[SERVICE_ENV] if args.mode == "watch" else None,

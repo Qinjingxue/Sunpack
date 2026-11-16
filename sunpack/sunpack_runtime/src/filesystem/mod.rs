@@ -263,7 +263,7 @@ pub(crate) fn watch_directories_changes_cached_impl(
 pub(crate) fn watch_volume_device(path: &str) -> std::io::Result<String> {
     #[cfg(windows)]
     {
-        return windows::volume_device(Path::new(path));
+        return windows::watch_volume_device(Path::new(path));
     }
     #[cfg(not(windows))]
     {

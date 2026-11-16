@@ -1,20 +1,21 @@
 use super::WatchFileObservation;
 use std::ffi::{c_void, OsStr};
+use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
+use windows_sys::Win32::Storage::FileSystem::{FILE_NAME_OPENED, VOLUME_NAME_GUID};
 
 type Handle = *mut c_void;
 
-const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 const GENERIC_READ: u32 = 0x8000_0000;
 const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-const OPEN_EXISTING: u32 = 3;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FSCTL_READ_FILE_USN_DATA: u32 = 0x0009_00eb;
 const ERROR_SHARING_VIOLATION: i32 = 32;
@@ -28,15 +29,6 @@ struct ReadFileUsnData {
 
 #[link(name = "Kernel32")]
 extern "system" {
-    fn CreateFileW(
-        file_name: *const u16,
-        desired_access: u32,
-        share_mode: u32,
-        security_attributes: *const c_void,
-        creation_disposition: u32,
-        flags_and_attributes: u32,
-        template_file: Handle,
-    ) -> Handle;
     fn DeviceIoControl(
         device: Handle,
         control_code: u32,
@@ -47,7 +39,6 @@ extern "system" {
         bytes_returned: *mut u32,
         overlapped: *mut c_void,
     ) -> i32;
-    fn CloseHandle(object: Handle) -> i32;
     fn GetVolumePathNameW(file_name: *const u16, volume_path: *mut u16, buffer_length: u32) -> i32;
     fn GetVolumeNameForVolumeMountPointW(
         volume_mount_point: *const u16,
@@ -67,22 +58,8 @@ extern "system" {
 }
 
 struct OwnedHandle {
-    raw: isize,
+    file: File,
     _resource: crate::io::resource_lifecycle::NativeResourceGuard,
-}
-
-impl OwnedHandle {
-    fn raw(&self) -> Handle {
-        self.raw as Handle
-    }
-}
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.raw());
-        }
-    }
 }
 
 pub(super) fn filesystem_type(path: &Path) -> io::Result<String> {
@@ -119,50 +96,59 @@ pub(super) fn watch_file_observation_known_kind(
     since_usn: Option<i64>,
     is_directory: bool,
 ) -> io::Result<WatchFileObservation> {
-    let file = {
-        let handle = open_path(
-            path,
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            is_directory,
-        )?;
-        read_file_usn(handle.raw())?
+    let (file, volume) = {
+        let handle = open_path(path, FILE_READ_ATTRIBUTES, SHARE_ALL, is_directory)?;
+        let file = read_file_usn(handle.file.as_raw_handle())?;
+        let volume = since_usn
+            .filter(|previous| *previous > 0 && *previous < file.usn)
+            .and_then(|_| watch_volume_for_handle(&handle.file, path).ok());
+        (file, volume)
     };
     let change_reasons = since_usn.filter(|value| *value > 0).and_then(|previous| {
         if file.usn == previous {
             Some(sunpack_usn_core::ChangeReasons::default())
-        } else if file.usn > previous {
-            volume_device(path).and_then(|volume| {
-                sunpack_usn_core::broker_read_change_reasons(
-                    &volume, file.id, file.id_len, previous, file.usn,
-                )
-            }).ok()
         } else {
-            None
+            sunpack_usn_core::broker_read_change_reasons(
+                volume.as_deref()?, file.id, file.id_len, previous, file.usn,
+            )
+            .ok()
         }
     });
     Ok(WatchFileObservation { file_id: file.id_text(), change_usn: file.usn, change_reasons })
 }
 
 pub(super) fn directory_file_id(path: &Path, volume: &str) -> io::Result<[u8; 16]> {
-    let observation = watch_path_usn(path)?;
-    if !volume_device(path)?.eq_ignore_ascii_case(volume) {
+    // Share deletion so promotion can query identity within its publication gate.
+    let file = open_watch_path(path, FILE_READ_ATTRIBUTES, SHARE_ALL, true)?;
+    let observation = read_file_usn(file.as_raw_handle())?;
+    if !watch_volume_for_handle(&file, path)?.eq_ignore_ascii_case(volume) {
         return Err(io::Error::other("directory changed volume"));
     }
     Ok(observation.id)
 }
 
-fn watch_path_usn(path: &Path) -> io::Result<FileUsn> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+pub(super) fn watch_volume_device(path: &Path) -> io::Result<String> {
+    match open_watch_path(path, 0, SHARE_ALL, true) {
+        Ok(file) => watch_volume_for_handle(&file, path),
+        Err(_) => volume_device(path),
+    }
+}
 
-    // Backup semantics permits both files and directories. The handle shares
-    // deletion so promotion can query identity within its own publication gate.
-    let file = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-    read_file_usn(file.as_raw_handle())
+fn watch_volume_for_handle(file: &File, path: &Path) -> io::Result<String> {
+    // VOLUME_NAME_GUID returns \\?\Volume{GUID}\, including through a mount
+    // point. The opened name can skip normalization because only the prefix matters.
+    crate::io::resource_lifecycle::with_handle_path(
+        file,
+        VOLUME_NAME_GUID | FILE_NAME_OPENED,
+        |wide| {
+            let suffix = wide.get(4..)?;
+            let separator = suffix.iter().position(|unit| *unit == u16::from(b'\\'))?;
+            Some(volume_key_from(&wide[..4 + separator]))
+        },
+    )
+    .ok()
+    .flatten()
+    .map_or_else(|| volume_device(path), Ok)
 }
 
 pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {
@@ -191,30 +177,19 @@ fn open_path(
     let resource = crate::io::resource_lifecycle::NativeResourceGuard::register(
         [path.to_path_buf()],
     )?;
-    let path = canonical_wide(path)?;
-    let flags = if is_directory {
-        FILE_FLAG_BACKUP_SEMANTICS
-    } else {
-        FILE_ATTRIBUTE_NORMAL
-    };
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            desired_access,
-            share_mode,
-            null(),
-            OPEN_EXISTING,
-            flags,
-            null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
+    let file = open_watch_path(path, desired_access, share_mode, is_directory)?;
     Ok(OwnedHandle {
-        raw: handle as isize,
+        file,
         _resource: resource,
     })
+}
+
+fn open_watch_path(path: &Path, access: u32, share: u32, is_directory: bool) -> io::Result<File> {
+    File::options()
+        .access_mode(access)
+        .share_mode(share)
+        .custom_flags(if is_directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 })
+        .open(path)
 }
 
 struct FileUsn {
