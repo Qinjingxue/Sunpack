@@ -3104,7 +3104,7 @@ impl<'run, O: Observer> Run<'run, O> {
         }
     }
 
-    async fn discover_children_many<T>(
+    async fn discover_children_many<T: Send>(
         &self,
         inventories: impl ExactSizeIterator<Item = (T, NativeOutputInventory)>,
         depth: usize,
@@ -3117,15 +3117,16 @@ impl<'run, O: Observer> Run<'run, O> {
         let options = self.filtered_options()?;
         let mut results = Vec::with_capacity(inventories.len());
         let mut outputs = Vec::new();
-        for (parent, inventory) in inventories {
-            self.request.cancel.check_io()?;
-            let output = discovery::OutputDiscovery::prepare(inventory, options)?;
-            let mut nested = Discovered::default();
-            nested.scan_errors.extend(output.scan_errors());
-            let has_files = output.has_files();
-            results.push((parent, nested, has_files));
-            if has_files { outputs.push(output); }
-        }
+        discovery::OutputDiscovery::prepare_many(
+            inventories, options, &self.request.cancel, |item| item,
+            |parent, output| {
+                let mut nested = Discovered::default();
+                nested.scan_errors.extend(output.scan_errors());
+                let has_files = output.has_files();
+                results.push((parent, nested, has_files));
+                if has_files { outputs.push(output); }
+            },
+        )?;
         // Main asks once for this round when any filtered output contains
         // files. Archive detection and password probing start after consent.
         if outputs.is_empty() || !self.allow_recursive(depth + 1, 1).await {

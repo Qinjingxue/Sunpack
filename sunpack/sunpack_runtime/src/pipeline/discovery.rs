@@ -516,13 +516,48 @@ pub(super) struct OutputDiscovery {
 }
 
 impl OutputDiscovery {
+    pub(super) fn prepare_many<T: Send, U: Send>(
+        mut inputs: impl Iterator<Item = T>,
+        options: &NativeDirectoryScanOptions,
+        cancel: &crate::io::cancellation::Cancellation,
+        inventory: impl Fn(T) -> (U, NativeOutputInventory) + Sync,
+        mut emit: impl FnMut(U, Self),
+    ) -> io::Result<()> {
+        let prepare = |input| {
+            cancel.run(|| {
+                cancel.check_io()?;
+                let (key, inventory) = inventory(input);
+                let output = Self::prepare(inventory, options)?;
+                cancel.check_io()?;
+                Ok::<_, io::Error>((key, output))
+            })
+        };
+        while let Some(first) = inputs.next() {
+            let Some(second) = inputs.next() else {
+                let (key, output) = prepare(first)?;
+                emit(key, output);
+                break;
+            };
+            // Overlap filesystem walks and snapshot construction without
+            // creating a second pool of file-head readers.
+            let (first, second) = crate::analysis_native::volume_anchor::cheap_fast_probe_pool()
+                .install(|| rayon::join(|| prepare(first), || prepare(second)));
+            let (key, output) = first?;
+            emit(key, output);
+            let (key, output) = second?;
+            emit(key, output);
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare(
         inventory: NativeOutputInventory,
         options: &NativeDirectoryScanOptions,
     ) -> io::Result<Self> {
+        let root = inventory.root().to_owned();
         let (filtered, raw) = inventory.build_directory_snapshots(options)?;
         Ok(Self {
-            root: inventory.root().to_owned(),
+            root,
             filtered,
             raw,
         })

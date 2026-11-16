@@ -30,16 +30,23 @@ fn scan() -> Result<(), Box<dyn std::error::Error>> {
     let mut file_bytes = 0;
     let mut directory_errors = Vec::new();
     let mut outputs = Vec::new();
-    for path in &request.inputs {
-        let inventory = scan_output_inventory_impl(&path.to_string_lossy());
-        file_count += inventory.file_count();
-        file_bytes += inventory.total_size();
-        let output = OutputDiscovery::prepare(inventory, &options)?;
-        directory_errors.extend(output.scan_errors());
-        if output.has_files() {
-            outputs.push(output);
-        }
-    }
+    OutputDiscovery::prepare_many(
+        request.inputs.iter(),
+        &options,
+        &request.cancel,
+        |path| {
+            let inventory = scan_output_inventory_impl(&path.to_string_lossy());
+            ((inventory.file_count(), inventory.total_size()), inventory)
+        },
+        |(count, bytes), output| {
+            file_count += count;
+            file_bytes += bytes;
+            directory_errors.extend(output.scan_errors());
+            if output.has_files() {
+                outputs.push(output);
+            }
+        },
+    )?;
     let active_roots = outputs.len();
     let preparation = start.elapsed();
     let results = OutputDiscovery::discover_many(outputs, &candidates, &request)?;

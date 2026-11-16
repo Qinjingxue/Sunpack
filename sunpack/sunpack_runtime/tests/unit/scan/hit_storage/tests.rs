@@ -182,7 +182,8 @@ fn reordered_read_windows_reconcile_boundaries_and_spill() {
             let offset = start + (random as u64 % chunk as u64);
             let pattern = (i % (PATTERNS.len() + 1)) as u8;
             source_hits.push(RawHit::new(offset, pattern));
-            expected[usize::from(pattern as usize == PATTERNS.len())].push(RawHit::new(offset, pattern));
+            expected[usize::from(pattern as usize == PATTERNS.len())]
+                .push(RawHit::new(offset, pattern));
         }
         if ordinal != 0 {
             for (distance, pattern) in [(1, 9), (11, PATTERNS.len() as u8), (257, 9), (268, 9)] {

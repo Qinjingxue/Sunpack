@@ -17,8 +17,18 @@ public final class EncV4Fixtures {
         }
         return out.toByteArray();
     }
-    @SuppressWarnings("unchecked")
     static byte[] enc(byte[] payload, int code, byte params, String password) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        enc(payload, code, params, password, out);
+        return out.toByteArray();
+    }
+    static void writeEnc(Path path, byte[] payload, int code) throws Exception {
+        try (OutputStream out = Files.newOutputStream(path)) {
+            enc(payload, code, (byte)0, "sunpack-test", out);
+        }
+    }
+    @SuppressWarnings("unchecked")
+    static void enc(byte[] payload, int code, byte params, String password, OutputStream out) throws Exception {
         int[] keySizes = {32,32,32,32,32,32,56,128,64,256};
         int[] nonceSizes = {16,16,16,8,16,8,8,128,32,192};
         Encryptor e = new Encryptor(password.toCharArray(), code, Encryptor.PURPOSE_FILE_ENCRYPTION, true);
@@ -42,13 +52,12 @@ public final class EncV4Fixtures {
             }
         }
         cipher.shutDownThreadExecutor();
-        encrypted = Arrays.copyOf(encrypted, plaintextLength);
         Blake3Digest mac = new Blake3Digest(); mac.init(Blake3Parameters.key(auth));
-        for (byte[] b : new byte[][]{nonce,header,salt,encrypted}) mac.update(b,0,b.length);
+        for (byte[] b : new byte[][]{nonce,header,salt}) mac.update(b,0,b.length);
+        mac.update(encrypted, 0, plaintextLength);
         byte[] tag = new byte[32]; mac.doFinal(tag,0);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        for (byte[] b : new byte[][]{header,salt,encrypted,tag}) out.write(b);
-        e.wipeMasterKeys(); return out.toByteArray();
+        out.write(header); out.write(salt); out.write(encrypted, 0, plaintextLength); out.write(tag);
+        e.wipeMasterKeys();
     }
     public static void main(String[] args) throws Exception {
         Path root = Paths.get(args[0]); Files.createDirectories(root);
@@ -57,7 +66,7 @@ public final class EncV4Fixtures {
             byte[] large = new byte[largeMiB*1024*1024]; new Random(42).nextBytes(large);
             Files.write(root.resolve("large.expected"), large);
             for (int code=0;code<10;code++) {
-                Files.write(root.resolve("algorithm_"+code+".enc"), enc(large,code,(byte)0,"sunpack-test"));
+                writeEnc(root.resolve("algorithm_"+code+".enc"), large, code);
             }
             return;
         }
@@ -80,7 +89,7 @@ public final class EncV4Fixtures {
         int largeCode = args.length > 1 ? Integer.parseInt(args[1]) : 0;
         int largeMiB = args.length > 2 ? Integer.parseInt(args[2]) : 32;
         byte[] large = new byte[largeMiB*1024*1024]; new Random(42).nextBytes(large);
-        Files.write(root.resolve("large.enc"),enc(large,largeCode,(byte)0,"sunpack-test"));
+        writeEnc(root.resolve("large.enc"), large, largeCode);
         Files.write(root.resolve("large.expected"),large);
         byte[] invalid = new byte[512]; System.arraycopy(new byte[]{'S','S','E','F','E',4,99,0},0,invalid,0,8);
         Files.write(root.resolve("invalid_algorithm.enc"),invalid);

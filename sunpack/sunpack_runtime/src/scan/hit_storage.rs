@@ -1926,9 +1926,117 @@ pub(super) fn prepare(batch: HitBuffer, last: bool) -> Prepared {
     }
 }
 
+// Large carriers can have hits in only a few read chunks. Keep occupied
+// rows in order and promote to the shared bounded table when dense.
+const SLOTS_PER_CHUNK: usize = 6;
+type SlotRow = [u64; SLOTS_PER_CHUNK];
+type SparseRow = (usize, SlotRow);
+
+enum ChunkSlots {
+    Sparse(Vec<SparseRow>),
+    Dense(Slots),
+}
+impl ChunkSlots {
+    fn memory_bytes(&self) -> usize {
+        match self {
+            Self::Sparse(rows) => rows.capacity() * std::mem::size_of::<SparseRow>(),
+            Self::Dense(Slots::Memory(values)) => values.len() * 8,
+            Self::Dense(Slots::Disk(_)) => 0,
+        }
+    }
+
+    fn memory_charge(&self, chunks: usize) -> usize {
+        let mut charge = self.memory_bytes();
+        if let Self::Sparse(rows) = self {
+            // A batch can occupy its own row and the preceding boundary row.
+            // Account for both allocations during a possible resize or promotion.
+            let limit = Self::sparse_limit(chunks);
+            let needed = rows.len() + 2;
+            if needed.min(limit) > rows.capacity() {
+                charge +=
+                    Self::next_capacity(rows.capacity(), limit) * std::mem::size_of::<SparseRow>();
+            }
+            let dense = chunks.saturating_mul(std::mem::size_of::<SlotRow>());
+            if needed > limit && dense <= MEMORY_BYTES {
+                charge += dense;
+            }
+        }
+        charge
+    }
+
+    fn sparse_limit(chunks: usize) -> usize {
+        // A small dense table costs less than sparse row management.
+        if chunks < 512 {
+            return 0;
+        }
+        (chunks / 8).min(256)
+    }
+
+    fn next_capacity(capacity: usize, limit: usize) -> usize {
+        (2 * capacity).max(4).min(limit)
+    }
+
+    #[inline]
+    fn set(&mut self, ordinal: usize, slot: usize, value: u64, chunks: usize) -> io::Result<()> {
+        if let Self::Dense(dense) = self {
+            dense.set(ordinal * SLOTS_PER_CHUNK + slot, value);
+        } else {
+            self.set_sparse(ordinal, slot, value, chunks)?;
+        }
+        Ok(())
+    }
+
+    #[cold]
+    fn set_sparse(
+        &mut self,
+        ordinal: usize,
+        slot: usize,
+        value: u64,
+        chunks: usize,
+    ) -> io::Result<()> {
+        let Self::Sparse(rows) = self else {
+            unreachable!()
+        };
+        // Cap insertions as well as bytes. Promotion remains bounded even
+        // if matching jobs complete in reverse physical order.
+        let sparse_limit = Self::sparse_limit(chunks);
+        match rows.binary_search_by_key(&ordinal, |&(ordinal, _)| ordinal) {
+            Ok(index) => rows[index].1[slot] = value,
+            Err(_) if value == 0 => {}
+            Err(index) if rows.len() < sparse_limit => {
+                if rows.len() == rows.capacity() {
+                    rows.reserve_exact(
+                        Self::next_capacity(rows.capacity(), sparse_limit) - rows.len(),
+                    );
+                }
+                let mut row = [0; SLOTS_PER_CHUNK];
+                row[slot] = value;
+                rows.insert(index, (ordinal, row));
+            }
+            Err(_) => {
+                let mut dense = Slots::new(
+                    chunks
+                        .checked_mul(SLOTS_PER_CHUNK)
+                        .ok_or_else(|| io::Error::other("hit directory overflow"))?,
+                )?;
+                for (ordinal, row) in rows.drain(..) {
+                    for (slot, value) in row.into_iter().enumerate() {
+                        if value != 0 {
+                            dense.set(ordinal * SLOTS_PER_CHUNK + slot, value);
+                        }
+                    }
+                }
+                dense.set(ordinal * SLOTS_PER_CHUNK + slot, value);
+                *self = Self::Dense(dense);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct Builder {
     arena: Spool,
-    slots: Option<Slots>,
+    slots: ChunkSlots,
     chunks: usize,
     chunk: u64,
     window: usize,
@@ -1939,7 +2047,7 @@ impl Builder {
         let chunks = usize::try_from(size.div_ceil(chunk as u64)).map_err(io::Error::other)?;
         Ok(Self {
             arena: Spool::default(),
-            slots: None,
+            slots: ChunkSlots::Sparse(Vec::new()),
             chunks,
             chunk: chunk as u64,
             window,
@@ -1997,10 +2105,7 @@ impl Builder {
         // Compression shrinks completed jobs, but concurrent encoders still
         // need the original allocation. Spill storage, never throttle workers.
         let working = batch.working_bytes.saturating_mul(self.window);
-        let slots = match &self.slots {
-            Some(Slots::Memory(values)) => values.len() * 8,
-            _ => 0,
-        };
+        let slots = self.slots.memory_charge(self.chunks);
         if !self.arena.is_spilled()
             && self
                 .arena
@@ -2016,25 +2121,19 @@ impl Builder {
             if part.interior.is_none() && part.head.is_empty() && part.tail.is_empty() {
                 continue;
             }
-            if self.slots.is_none() {
-                self.slots =
-                    Some(Slots::new(self.chunks.checked_mul(6).ok_or_else(
-                        || io::Error::other("hit directory overflow"),
-                    )?)?);
-            }
-            let row = ordinal * 6 + stream * 3;
+            let row = stream * 3;
             if let Some(encoded) = part.interior {
                 let segment = self.write_segment(batch.base, encoded)?;
                 let pos = self.arena.seek(SeekFrom::End(0))?;
                 self.arena.write_all(&segment.bytes())?;
-                self.slots.as_mut().unwrap().set(row, pos + 1);
+                self.slots.set(ordinal, row, pos + 1, self.chunks)?;
             }
             let tail = self.write_part(batch.base, &part.tail)?;
-            self.slots.as_mut().unwrap().set(row + 1, tail);
+            self.slots.set(ordinal, row + 1, tail, self.chunks)?;
             if !part.head.is_empty() {
                 debug_assert!(ordinal != 0);
                 let head = self.write_part(batch.base, &part.head)?;
-                self.slots.as_mut().unwrap().set(row - 6 + 2, head);
+                self.slots.set(ordinal - 1, row + 2, head, self.chunks)?;
             }
         }
         Ok(())
@@ -2065,53 +2164,64 @@ impl Builder {
         let mut dirs = [Spool::default(), Spool::default()];
         let mut counts = [0; 2];
         let mut boundary = Vec::new();
-        if let Some(slots) = self.slots.take() {
-            let slot_bytes = match &slots {
-                Slots::Memory(values) => values.len() * 8,
-                Slots::Disk(_) => 0,
-            };
-            for ordinal in 0..self.chunks {
-                for stream in 0..2 {
-                    let row = ordinal * 6 + stream * 3;
-                    let pointer = slots.get(row);
-                    if pointer != 0 {
-                        self.arena.seek(SeekFrom::Start(pointer - 1))?;
-                        let mut bytes = [0; SEG_BYTES];
-                        self.arena.read_exact(&mut bytes)?;
-                        let mut segment = Segment::read(&bytes);
+        let slot_bytes = self.slots.memory_bytes();
+        let slots = std::mem::replace(&mut self.slots, ChunkSlots::Sparse(Vec::new()));
+        let chunks = self.chunks;
+        let mut visit = |ordinal, slots: SlotRow| -> io::Result<()> {
+            for stream in 0..2 {
+                let row = stream * 3;
+                let pointer = slots[row];
+                if pointer != 0 {
+                    self.arena.seek(SeekFrom::Start(pointer - 1))?;
+                    let mut bytes = [0; SEG_BYTES];
+                    self.arena.read_exact(&mut bytes)?;
+                    let mut segment = Segment::read(&bytes);
+                    counts[stream] += segment.count;
+                    segment.end = counts[stream];
+                    dirs[stream].write_all(&segment.bytes())?;
+                }
+                boundary.clear();
+                let base = ordinal as u64 * self.chunk;
+                self.read_part(slots[row + 1], base, &mut boundary)?;
+                self.read_part(slots[row + 2], base, &mut boundary)?;
+                if !boundary.is_empty() {
+                    if !ordered(&boundary) {
+                        boundary.sort_unstable_by_key(|hit| hit.key());
+                    }
+                    if let Some(encoded) = encode(std::mem::take(&mut boundary)) {
+                        let mut segment = self.write_segment(base, encoded)?;
                         counts[stream] += segment.count;
                         segment.end = counts[stream];
                         dirs[stream].write_all(&segment.bytes())?;
                     }
-                    boundary.clear();
-                    let base = ordinal as u64 * self.chunk;
-                    self.read_part(slots.get(row + 1), base, &mut boundary)?;
-                    self.read_part(slots.get(row + 2), base, &mut boundary)?;
-                    if !boundary.is_empty() {
-                        if !ordered(&boundary) {
-                            boundary.sort_unstable_by_key(|hit| hit.key());
-                        }
-                        if let Some(encoded) = encode(std::mem::take(&mut boundary)) {
-                            let mut segment = self.write_segment(base, encoded)?;
-                            counts[stream] += segment.count;
-                            segment.end = counts[stream];
-                            dirs[stream].write_all(&segment.bytes())?;
-                        }
+                }
+            }
+            let directory_bytes = dirs[0].memory_bytes() + dirs[1].memory_bytes();
+            if !self.arena.is_spilled()
+                && self.arena.memory_bytes() + directory_bytes + slot_bytes > MEMORY_BYTES
+            {
+                self.arena.spill()?;
+            }
+            if directory_bytes + slot_bytes + self.arena.memory_bytes() > MEMORY_BYTES {
+                for dir in &mut dirs {
+                    // A never-used stream stays empty and has no mapping.
+                    if dir.len()? != 0 {
+                        dir.spill()?;
                     }
                 }
-                let directory_bytes = dirs[0].memory_bytes() + dirs[1].memory_bytes();
-                if !self.arena.is_spilled()
-                    && self.arena.memory_bytes() + directory_bytes + slot_bytes > MEMORY_BYTES
-                {
-                    self.arena.spill()?;
+            }
+            Ok(())
+        };
+        match slots {
+            ChunkSlots::Sparse(rows) => {
+                for (ordinal, row) in rows {
+                    visit(ordinal, row)?;
                 }
-                if directory_bytes + slot_bytes + self.arena.memory_bytes() > MEMORY_BYTES {
-                    for dir in &mut dirs {
-                        // A never-used stream stays empty and has no mapping.
-                        if dir.len()? != 0 {
-                            dir.spill()?;
-                        }
-                    }
+            }
+            ChunkSlots::Dense(slots) => {
+                for ordinal in 0..chunks {
+                    let row = std::array::from_fn(|i| slots.get(ordinal * SLOTS_PER_CHUNK + i));
+                    visit(ordinal, row)?;
                 }
             }
         }

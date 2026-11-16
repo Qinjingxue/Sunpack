@@ -5,7 +5,7 @@ import random
 import statistics
 
 
-EVALUATION_CONTRACT = "sunpack.quiet-window/7"
+EVALUATION_CONTRACT = "sunpack.quiet-window/8"
 
 # Fixed-duration, arbitrarily positioned half-open windows [start, start+span).
 # Integer nanoseconds share the latency SLO's timestamp resolution. Every

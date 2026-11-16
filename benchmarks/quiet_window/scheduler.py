@@ -57,8 +57,8 @@ def replay(trace, tie_order, process):
     else:
         raise RuntimeError("Rust scheduler test exited without returning a replay")
 
-    # Rust Instant uses integer nanoseconds. Apply the same resolution to
-    # truth so a proposal exactly at release is not scored as premature.
+    # Canonicalize both sides of the comparison to Instant's nanosecond ticks.
+    # Rust's as_secs_f64 and Python's division can round the same tick differently.
     ns = lambda at: round(at * 1_000_000_000) / 1_000_000_000
     trace = replace(trace, horizon=ns(trace.horizon), files=tuple(
         replace(file, visible_at=ns(file.visible_at),
@@ -72,7 +72,7 @@ def replay(trace, tie_order, process):
     for source, proposals in zip(trace.files, response["proposals"], strict=True):
         result = FileResult(source.key, source.shape, source.complete_at is not None)
         for at in proposals:
-            record_proposal(result, source, at, group_ready, trace.horizon)
+            record_proposal(result, source, ns(at), group_ready, trace.horizon)
         files.append(asdict(result))
     add_valid_proposal_latency(files, boundaries)
     inputs = input_results(trace, files)
@@ -83,7 +83,7 @@ def replay(trace, tie_order, process):
             item["missing_reason"] = None
         else:
             deadlines = [response["pending_deadlines"][indices[member]] for member in item["members"]]
-            pending = [deadline for deadline in deadlines if deadline is not None]
+            pending = [ns(deadline) for deadline in deadlines if deadline is not None]
             item["pending_deadlines"] = pending
             if not pending:
                 item["missing_reason"] = "no_pending_after_earlier_admission"

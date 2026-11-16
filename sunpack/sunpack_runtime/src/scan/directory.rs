@@ -261,18 +261,25 @@ impl NativeWorkerManifest {
         NativeOutputInventory {
             root,
             total_size: self.total_size,
-            scan_errors: None,
-            files: Arc::clone(&self.files),
+            scan_errors: Vec::new(),
+            files: OutputInventoryFiles::Manifest(Arc::clone(&self.files)),
         }
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct NativeOutputInventory {
     root: String,
     total_size: u64,
-    scan_errors: Option<Arc<Vec<DirectoryReadError>>>,
-    files: Arc<Vec<OutputFileRecord>>,
+    scan_errors: Vec<DirectoryReadError>,
+    files: OutputInventoryFiles,
+}
+
+enum OutputInventoryFiles {
+    Disk {
+        files: Vec<DirectoryEntryRecord>,
+        directory_ends: Vec<usize>,
+    },
+    Manifest(Arc<Vec<OutputFileRecord>>),
 }
 
 impl NativeOutputInventory {
@@ -280,33 +287,54 @@ impl NativeOutputInventory {
         &self.root
     }
     pub(crate) fn file_count(&self) -> usize {
-        self.files.len()
+        match &self.files {
+            OutputInventoryFiles::Disk { files, .. } => files.len(),
+            OutputInventoryFiles::Manifest(files) => files.len(),
+        }
     }
     pub(crate) fn total_size(&self) -> u64 {
         self.total_size
     }
 
     pub(crate) fn build_directory_snapshots(
-        &self,
-
+        self,
         options: &NativeDirectoryScanOptions,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
-        let options = &options.options;
-        let (filtered, raw) = (|| {
-            let mut records =
-                build_inventory_snapshot_views(&self.root, self.files.as_ref(), options);
-            if let Some(errors) = &self.scan_errors {
-                records.errors.extend(errors.as_ref().clone());
+        let root = lexical_normalize_path(Path::new(&self.root));
+        let manifest;
+        let (files, directory_ends, manifest_rows) = match self.files {
+            OutputInventoryFiles::Disk { files, directory_ends } => {
+                (files, Some(directory_ends), None)
             }
-            populate_relation_anchors(&mut records.raw);
-            NativeDirectorySnapshot::from_views(
-                records.filtered,
-                records.raw,
-                records.errors,
-                Vec::new(),
-            )
-        })();
-        Ok((filtered, raw))
+            OutputInventoryFiles::Manifest(files) => {
+                manifest = files;
+                let mut records = Vec::with_capacity(manifest.len());
+                let mut item_indices = Vec::with_capacity(manifest.len());
+                for (index, item) in manifest.iter().enumerate() {
+                    let Some(path) = inventory_file_path(&root, item) else {
+                        continue;
+                    };
+                    records.push(output_file_record(path_to_string(&path), item.size, item.mtime_ns));
+                    item_indices.push(index);
+                }
+                (records, None, Some((manifest.as_slice(), item_indices)))
+            }
+        };
+        let mut records = build_inventory_snapshot_views(
+            &root,
+            files,
+            directory_ends,
+            manifest_rows,
+            &options.options,
+        );
+        records.errors.extend(self.scan_errors);
+        populate_relation_anchors_cached(&mut records.raw, &[], Some(&self.root));
+        Ok(NativeDirectorySnapshot::from_views(
+            records.filtered,
+            records.raw,
+            records.errors,
+            Vec::new(),
+        ))
     }
 }
 
@@ -367,6 +395,13 @@ impl NativeNumericRange {
 }
 
 impl DirectoryScanOptions {
+    fn has_directory_rules(&self) -> bool {
+        self.blacklist_rules
+            .iter()
+            .chain(&self.whitelist_rules)
+            .any(|rule| rule.has_directory_rules())
+    }
+
     fn new(
         blacklist_rules: Vec<NativePathRule>,
         size_ranges: Vec<NumericRangeTuple>,
@@ -403,13 +438,7 @@ pub(crate) struct NativeDirectoryScanOptions {
 
 impl NativeDirectoryScanOptions {
     pub(crate) fn can_share_recursive_context(&self) -> bool {
-        self.options.size_ranges.is_empty()
-            && self
-                .options
-                .blacklist_rules
-                .iter()
-                .chain(&self.options.whitelist_rules)
-                .all(|rule| !rule.has_directory_rules())
+        self.options.size_ranges.is_empty() && !self.options.has_directory_rules()
     }
 
     pub(crate) fn new(
@@ -647,56 +676,40 @@ pub(crate) fn classify_scan_targets(paths: &[String]) -> (Vec<u8>, DirectoryRead
 }
 
 fn build_inventory_snapshot_views(
-    root_path: &str,
-    files: &[OutputFileRecord],
+    root: &Path,
+    mut raw_files: Vec<DirectoryEntryRecord>,
+    directory_ends: Option<Vec<usize>>,
+    manifest_rows: Option<(&[OutputFileRecord], Vec<usize>)>,
     options: &DirectoryScanOptions,
 ) -> DirectoryScanRecords {
-    let root = lexical_normalize_path(Path::new(root_path));
-    let mut raw_files = Vec::with_capacity(files.len());
-    let mut raw_file_item_indices = Vec::with_capacity(files.len());
-    let mut pre_mtime_accepted = Vec::with_capacity(files.len());
+    let mut pre_mtime_accepted = vec![false; raw_files.len()];
     let mut size_accepted_split_families = HashSet::new();
     let mut size_deferred = Vec::new();
     let mut filter_scratch = PathFilterScratch::new(&options);
     let mut directory_rejections = HashMap::new();
+    let check_directories = options.has_directory_rules();
 
-    for (item_index, item) in files.iter().enumerate() {
-        let Some(path) = inventory_file_path(&root, item) else {
-            continue;
-        };
-        let record = DirectoryEntryRecord {
-            path: path_to_string(&path),
-            is_dir: false,
-            size: Some(item.size),
-            mtime_ns: item.mtime_ns,
-            relation_member_eligible: true,
-            relation_anchor: None,
-        };
-        let index = raw_files.len();
-        raw_files.push(record);
-        raw_file_item_indices.push(item_index);
-        pre_mtime_accepted.push(false);
-
-        if file_rejected_by_path(&path, &root, options, &mut filter_scratch)
-            || file_under_rejected_directory(
-                &path,
-                &root,
-                options,
-                &mut filter_scratch,
-                &mut directory_rejections,
-            )
+    for (index, record) in raw_files.iter_mut().enumerate() {
+        let path = Path::new(&record.path);
+        if file_rejected_by_path(path, root, options, &mut filter_scratch)
+            || (check_directories
+                && file_under_rejected_directory(
+                    path,
+                    root,
+                    options,
+                    &mut filter_scratch,
+                    &mut directory_rejections,
+                ))
         {
-            raw_files[index].relation_member_eligible = false;
+            record.relation_member_eligible = false;
             continue;
         }
         let family_keys = if options.size_ranges.is_empty() {
             Vec::new()
         } else {
-            crate::relations::relations_size_filter_split_family_keys(
-                path.to_string_lossy().as_ref(),
-            )
+            crate::relations::relations_size_filter_split_family_keys(&record.path)
         };
-        if numeric_ranges_allow(&options.size_ranges, Some(item.size)) {
+        if numeric_ranges_allow(&options.size_ranges, record.size) {
             pre_mtime_accepted[index] = true;
             size_accepted_split_families.extend(family_keys);
         } else if !family_keys.is_empty() {
@@ -715,28 +728,46 @@ fn build_inventory_snapshot_views(
         {
             record.relation_member_eligible = false;
         }
+        if record.relation_member_eligible && record.size == Some(0) {
+            record.relation_anchor = Some(probe_volume_anchor_from_head(&record.path, 0, &[]));
+        }
     }
 
-    for (record, &item_index) in raw_files.iter_mut().zip(&raw_file_item_indices) {
-        if !record.relation_member_eligible {
-            continue;
-        }
-        let item = &files[item_index];
-        if item.magic.len() >= item.size.min(512) as usize {
-            record.relation_anchor = Some(probe_volume_anchor_from_head(
-                &record.path,
-                item.size,
-                &item.magic,
-            ));
+    if let Some((manifest, indices)) = manifest_rows {
+        for (record, index) in raw_files.iter_mut().zip(indices) {
+            let item = &manifest[index];
+            if record.relation_member_eligible
+                && record.relation_anchor.is_none()
+                && item.magic.len() >= item.size.min(512) as usize
+            {
+                record.relation_anchor = Some(probe_volume_anchor_from_head(
+                    &record.path,
+                    item.size,
+                    &item.magic,
+                ));
+            }
         }
     }
 
     // Keep parents of files accepted before the final mtime filter, even
     // when that final filter removes every file in a directory.
-    let (mut raw, mut filtered) = ancestor_directory_records(
-        &root,
-        raw_files.iter().zip(pre_mtime_accepted.iter().copied()),
-    );
+    let (mut raw, mut filtered) = if let Some(directory_ends) = directory_ends {
+        let mut start = 0;
+        ancestor_directory_records(
+            root,
+            directory_ends.into_iter().map(|end| {
+                let accepted = pre_mtime_accepted[start..end].contains(&true);
+                let file = &raw_files[start];
+                start = end;
+                (file, accepted)
+            }),
+        )
+    } else {
+        ancestor_directory_records(
+            root,
+            raw_files.iter().zip(pre_mtime_accepted.iter().copied()),
+        )
+    };
     let file_start = raw.len();
     // Unlike directory enumeration, a worker manifest may name the same output
     // more than once. Preserve its existing last-record projection for aliases.
@@ -745,11 +776,16 @@ fn build_inventory_snapshot_views(
         .enumerate()
         .map(|(index, record)| (record.path.as_str(), file_start + index))
         .collect();
-    filtered.extend(raw_files.iter().enumerate().filter_map(|(index, record)| {
-        (pre_mtime_accepted[index] && record.relation_member_eligible)
-            .then(|| file_rows[record.path.as_str()])
-    }));
-    drop(file_rows);
+    let accepted = raw_files
+        .iter()
+        .enumerate()
+        .filter(|(index, record)| pre_mtime_accepted[*index] && record.relation_member_eligible);
+    if file_rows.len() == raw_files.len() {
+        drop(file_rows);
+        filtered.extend(accepted.map(|(index, _)| file_start + index));
+    } else {
+        filtered.extend(accepted.map(|(_, record)| file_rows[record.path.as_str()]));
+    }
     raw.extend(raw_files);
     DirectoryScanRecords {
         filtered,
@@ -758,14 +794,24 @@ fn build_inventory_snapshot_views(
     }
 }
 
+fn output_file_record(path: String, size: u64, mtime_ns: Option<u64>) -> DirectoryEntryRecord {
+    DirectoryEntryRecord {
+        path,
+        is_dir: false,
+        size: Some(size),
+        mtime_ns,
+        relation_member_eligible: true,
+        relation_anchor: None,
+    }
+}
+
 fn inventory_file_path(root: &Path, item: &OutputFileRecord) -> Option<PathBuf> {
     let path = Path::new(&item.path);
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
+    let normalized = if path.is_absolute() {
+        lexical_normalize_path(path)
     } else {
-        root.join(path)
+        lexical_normalize_path(&root.join(path))
     };
-    let normalized = lexical_normalize_path(&joined);
     (normalized != root && path_is_within_root(&normalized, root)).then_some(normalized)
 }
 
@@ -787,6 +833,9 @@ fn lexical_normalize_path(path: &Path) -> PathBuf {
 
 #[cfg(windows)]
 fn path_is_within_root(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
     let mut path_components = path.components();
     root.components().all(|root_component| {
         path_components.next().is_some_and(|path_component| {
@@ -808,11 +857,14 @@ fn ancestor_directory_records<'a>(
     let mut directories = HashMap::new();
     for (file, accepted) in files {
         for directory in Path::new(&file.path).ancestors().skip(1) {
-            if directory == root || !path_is_within_root(directory, root) {
+            if directory == root {
                 break;
             }
             match directories.entry(directory) {
                 Entry::Vacant(entry) => {
+                    if !path_is_within_root(directory, root) {
+                        break;
+                    }
                     entry.insert(accepted);
                 }
                 Entry::Occupied(mut entry) if accepted && !*entry.get() => {
@@ -856,8 +908,11 @@ pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInvent
     NativeOutputInventory {
         root: path_to_string(&root),
         total_size: stats.total_size,
-        scan_errors: (!stats.errors.is_empty()).then(|| Arc::new(stats.errors.into_messages())),
-        files: Arc::new(stats.files),
+        scan_errors: stats.errors.into_messages(),
+        files: OutputInventoryFiles::Disk {
+            files: stats.files,
+            directory_ends: stats.directory_ends,
+        },
     }
 }
 
@@ -865,10 +920,12 @@ pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInvent
 struct OutputTreeStats {
     total_size: u64,
     errors: DirectoryReadErrors,
-    files: Vec<OutputFileRecord>,
+    files: Vec<DirectoryEntryRecord>,
+    directory_ends: Vec<usize>,
 }
 
 fn walk_output_tree(root: &Path, stats: &mut OutputTreeStats) {
+    let normalized_root = lexical_normalize_path(root);
     let mut pending = vec![root.to_path_buf()];
     while let Some(current) = pending.pop() {
         let entries = match fs::read_dir(&current) {
@@ -878,6 +935,13 @@ fn walk_output_tree(root: &Path, stats: &mut OutputTreeStats) {
                 continue;
             }
         };
+        let normalized_dir = current
+            .strip_prefix(root)
+            .map(|path| lexical_normalize_path(&normalized_root.join(path)))
+            .unwrap_or_else(|_| normalized_root.clone());
+        // Let Path supply the correct separator once for this directory.
+        let prefix = path_to_string(&normalized_dir.join(""));
+        let first_file = stats.files.len();
         for item in entries {
             let entry = match item {
                 Ok(entry) => entry,
@@ -904,20 +968,23 @@ fn walk_output_tree(root: &Path, stats: &mut OutputTreeStats) {
             if !metadata.is_file() {
                 continue;
             }
-            let path = entry.path();
-            let relative = path
-                .strip_prefix(root)
-                .map(path_to_string)
-                .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned());
             let size = metadata.len();
             stats.total_size = stats.total_size.saturating_add(size);
-            stats.files.push(OutputFileRecord {
-                path: normalize_path_separator(relative),
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let mut path = String::with_capacity(prefix.len() + name.len());
+            path.push_str(&prefix);
+            path.push_str(&name);
+            stats.files.push(output_file_record(
+                path,
                 size,
-                status: 0,
-                mtime_ns: metadata_mtime_ns(&metadata),
-                magic: Box::default(),
-            });
+                metadata_mtime_ns(&metadata),
+            ));
+        }
+        if stats.files.len() != first_file {
+            // Direct children are contiguous; ancestor projection visits a
+            // directory once even if it contains many accepted files.
+            stats.directory_ends.push(stats.files.len());
         }
     }
 }
@@ -961,13 +1028,16 @@ fn populate_relation_anchors_cached(
     }
     // A conflicting promotion retains the original per-file error/retry path.
     let scope = root.and_then(|root| NativeReadScope::new(Path::new(root)).ok());
+    let cancellation = crate::io::cancellation::Cancellation::current();
     cheap_fast_probe_pool().install(|| {
         records
             .par_iter_mut()
             .enumerate()
             .filter(|(_, record)| needs_anchor(record))
             .for_each(|(index, record)| {
-                let anchor = match record.size {
+                // A worker may steal another root's probe while it prepares
+                // its own root. Use the cancellation scope of this probe.
+                let anchor = cancellation.run(|| match record.size {
                     Some(size) => probe_volume_anchor_record_cheap(
                         &record.path,
                         size,
@@ -976,7 +1046,7 @@ fn populate_relation_anchors_cached(
                     ),
                     // Without a size column the full anchor owns the probed size.
                     None => CheapAnchor::Full(Arc::new(probe_volume_anchor_path_cheap(&record.path))),
-                };
+                });
                 record.relation_anchor = Some(anchor);
             });
     });
@@ -1296,14 +1366,17 @@ fn directory_rejected_cached(
     scratch: &mut PathFilterScratch,
     cache: &mut HashMap<PathBuf, bool>,
 ) -> bool {
-    if crate::path_keys::path_key(&directory.to_string_lossy()) == crate::path_keys::path_key(&root.to_string_lossy()) {
+    if let Some(rejected) = cache.get(directory) {
+        return *rejected;
+    }
+    if directory == root
+        || crate::path_keys::path_key(&directory.to_string_lossy())
+            == crate::path_keys::path_key(&root.to_string_lossy())
+    {
         return false;
     }
     if !path_is_within_root(directory, root) {
         return true;
-    }
-    if let Some(rejected) = cache.get(directory) {
-        return *rejected;
     }
     let rejected = directory
         .parent()
@@ -1319,10 +1392,6 @@ fn numeric_ranges_allow(ranges: &[NativeNumericRange], value: Option<u64>) -> bo
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
-}
-
-fn normalize_path_separator(path: String) -> String {
-    path.replace('\\', "/")
 }
 
 fn metadata_mtime_ns(metadata: &fs::Metadata) -> Option<u64> {
