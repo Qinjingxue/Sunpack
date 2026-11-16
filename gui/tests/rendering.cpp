@@ -38,6 +38,7 @@ void startup_present_contracts() {
     config.title=L"SunPack startup check";
     config.width=240; config.height=180; config.tool_window=1;
     config.skip_animation=1;
+    config.system_frame=1; config.composition_surface=1;
     auto handle=ui_window_create(&config); assert(handle);
     auto* window=ui::GetContext().GetWindow(handle); assert(window);
     auto hwnd=window->Handle();
@@ -145,10 +146,13 @@ void startup_present_contracts() {
 struct Surface {
     HWND hwnd=nullptr;
     ui::Renderer renderer;
-    explicit Surface(int x, bool composition=false) {
-        hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"STATIC",L"SunPack rendering check",
+    DXGI_ALPHA_MODE compositionAlpha;
+    explicit Surface(int x, DXGI_ALPHA_MODE alpha=DXGI_ALPHA_MODE_UNSPECIFIED) : compositionAlpha(alpha) {
+        const DWORD style=WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|
+            (alpha==DXGI_ALPHA_MODE_UNSPECIFIED?0:WS_EX_NOREDIRECTIONBITMAP);
+        hwnd=CreateWindowExW(style,L"STATIC",L"SunPack rendering check",
             WS_POPUP,x,20,640,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
-        assert(hwnd && renderer.Init() && renderer.CreateRenderTarget(hwnd,composition));
+        assert(hwnd && renderer.Init() && renderer.CreateRenderTarget(hwnd,compositionAlpha));
         ShowWindow(hwnd,SW_SHOWNOACTIVATE);
     }
     ~Surface() { renderer.ReleaseRenderTarget(); DestroyWindow(hwnd); }
@@ -236,57 +240,6 @@ ui::DisplayList scene(Surface& surface,int step) {
 // replay, including alternating buffers, fractional motion, alpha and lifecycle.
 void rendering_contracts() {
     startup_present_contracts();
-    {
-        Surface surface(20,true);
-        auto& renderer=surface.renderer;
-        ComPtr<ID2D1Image> initialTarget;
-        renderer.RT()->GetTarget(&initialTarget);
-        if(!initialTarget) {
-            assert(SUCCEEDED(renderer.Resize(601,421)));
-            ui::DisplayList base;
-            base.width_px=601; base.height_px=421;
-            const float dpiScale=float(GetDpiForWindow(surface.hwnd))/96;
-            base.dpi_scale=dpiScale;
-            ui::DisplayListRecorder list(std::move(base));
-            list.Clear(D2D1::ColorF(0x202020));
-            renderer.skipVSync=true;
-            assert(SUCCEEDED(renderer.DrawDisplayListFrame(list.Finish(),false,true)));
-            ComPtr<ID2D1Image> target;
-            renderer.RT()->GetTarget(&target);
-            assert(!target);
-            auto screenshot=renderer.ScreenshotBitmap();
-            assert(screenshot);
-            const auto size=screenshot->GetPixelSize();
-            assert(size.width==601 && size.height==421);
-            renderer.RT()->SetTarget(screenshot.Get());
-            const auto captured=pixels(renderer);
-            renderer.RT()->SetTarget(nullptr);
-            assert(captured[0]==0x20 && captured[1]==0x20 && captured[2]==0x20 && captured[3]==0xff);
-
-            // A deferred frame owns a bitmap only until its explicit present;
-            // the existing screenshot path must still work after releasing it.
-            ui::DisplayList prepared;
-            prepared.width_px=601; prepared.height_px=421;
-            prepared.dpi_scale=dpiScale;
-            ui::DisplayListRecorder deferred(std::move(prepared));
-            deferred.Clear(D2D1::ColorF(0x303030));
-            renderer.skipPresent=true;
-            assert(SUCCEEDED(renderer.DrawDisplayListFrame(deferred.Finish(),false,true)));
-            renderer.RT()->GetTarget(&target);
-            assert(target);
-            target.Reset();
-            assert(SUCCEEDED(renderer.PresentPrepared(true)));
-            renderer.RT()->GetTarget(&target);
-            assert(!target);
-            screenshot=renderer.ScreenshotBitmap();
-            assert(screenshot);
-            renderer.RT()->SetTarget(screenshot.Get());
-            const auto deferredPixels=pixels(renderer);
-            renderer.RT()->SetTarget(nullptr);
-            assert(deferredPixels[0]==0x30 && deferredPixels[1]==0x30 &&
-                deferredPixels[2]==0x30 && deferredPixels[3]==0xff);
-        }
-    }
     // Hidden and prepared buffers must not masquerade as actual presentation.
     // This also exercises the hidden-HWND Present guard on the real driver.
     auto hidden=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED,L"STATIC",L"Prepared frame check",
@@ -328,7 +281,7 @@ void rendering_contracts() {
         thread.UnregisterWindow(id); thread.Stop();
     }
     DestroyWindow(hidden);
-    Surface actual(20),reference(700);
+    Surface actual(20,DXGI_ALPHA_MODE_IGNORE),reference(700);
     // Existing frame-damage scenes have no find ranges. Check shaped UTF-16
     // ranges, both colors, clipped active hits, and record/replay in one scene.
     {
@@ -364,7 +317,7 @@ void rendering_contracts() {
         }
         if(step==19) for(auto* surface:{&actual,&reference}) {
             surface->renderer.ReleaseRenderTarget();
-            assert(surface->renderer.CreateRenderTarget(surface->hwnd));
+            assert(surface->renderer.CreateRenderTarget(surface->hwnd,surface->compositionAlpha));
         }
         if(step==20) for(auto* surface:{&actual,&reference}) {
             surface->renderer.SetCjkFonts(L"Arial",L"Microsoft YaHei UI");

@@ -137,7 +137,7 @@ typedef struct UiWindowConfig {
      * x/y/width/height 在 start_maximized=1 时仍要填 — 那是用户双击 titlebar
      * 还原后的位置/尺寸, lib 不会丢弃. */
     int start_maximized;
-    int composition_surface; /* Opt in for an opaque system-frame window. */
+    int composition_surface; /* Opt in to an opaque DirectComposition swap chain. */
 } UiWindowConfig;
 
 /* ------------------------------------------------------------------ */
@@ -188,8 +188,7 @@ typedef struct UiTraceEvent {
 
 typedef void (*UiTraceSink)(const UiTraceEvent* event, void* userdata);
 
-/* Registers a process-wide trace sink. core-ui never owns output policy:
- * callers decide enablement, filtering, persistence, and analysis. */
+/* Registers a process-wide diagnostic sink in Debug builds. */
 UI_API void ui_trace_set_sink(UiTraceSink sink, void* userdata);
 
 /* ------------------------------------------------------------------ */

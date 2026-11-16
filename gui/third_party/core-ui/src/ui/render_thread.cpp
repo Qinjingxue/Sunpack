@@ -231,7 +231,7 @@ void RenderThread::HandleDeviceLostLocked(
     latestJobs_.clear();
 
     const uint64_t deviceGeneration = resources_.DeviceGeneration();
-    TraceEvent("render_thread", "device_lost",
+    UI_TRACE_EVENT("render_thread", "device_lost",
                {TraceU64("failed_window_id", failedWindow.window_id),
                 TraceU64("failed_hwnd_generation", failedWindow.hwnd_generation),
                 TraceU64("failed_frame_generation", failedGeneration),
@@ -424,7 +424,7 @@ void RenderThread::ThreadMain() {
                              static_cast<LPARAM>(job->window.hwnd_generation));
             }
             // Only a visible presented frame drives the next animation frame.
-            // Present(1) supplies VSync pacing without a competing WM_TIMER.
+            // Present1(1) supplies VSync pacing without a competing WM_TIMER.
             // Prepared frames resume when committed by the UI; hidden/skipped
             // frames resume on show/restore, never in an idle render loop.
             // Validate the window identity again on the UI thread.
@@ -434,7 +434,7 @@ void RenderThread::ThreadMain() {
                              static_cast<LPARAM>(job->window.hwnd_generation));
             if (renderResult == RenderFrameResult::Presented && resources_.DeviceLost()) {
                 resources_.MarkDeviceRecovered();
-                TraceEvent("render_thread", "device_recovered",
+                UI_TRACE_EVENT("render_thread", "device_recovered",
                            {TraceU64("window_id", job->window.window_id),
                             TraceU64("frame_generation", job->generation),
                             TraceU64("device_generation", resources_.DeviceGeneration())});

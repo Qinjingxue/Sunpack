@@ -6,12 +6,13 @@
 
 #include "ui_core.h"
 
-#ifndef UI_CORE_ENABLE_TIMING_TRACE
-#define UI_CORE_ENABLE_TIMING_TRACE 0
+#ifndef UI_CORE_ENABLE_TRACE
+#define UI_CORE_ENABLE_TRACE 0
 #endif
 
 namespace ui {
 
+#if UI_CORE_ENABLE_TRACE
 void EmitTrace(const char* source,
                const char* category,
                const char* name,
@@ -35,10 +36,6 @@ inline UiTraceField TraceBool(const char* key, bool value) {
     return UiTraceField{key, UI_TRACE_FIELD_BOOL, 0, 0, 0.0, value ? 1 : 0, nullptr};
 }
 
-inline UiTraceField TraceStr(const char* key, const char* value) {
-    return UiTraceField{key, UI_TRACE_FIELD_STR, 0, 0, 0.0, 0, value ? value : ""};
-}
-
 inline const char* TraceCategoryForSource(const char* source) {
     if (source && std::strcmp(source, "core_window") == 0) return "window";
     if (source && std::strcmp(source, "core_renderer") == 0) return "render";
@@ -59,10 +56,13 @@ inline void TraceEvent(const char* source,
               fields.begin(),
               static_cast<uint32_t>(fields.size()));
 }
+#else
+constexpr bool IsTraceEnabled() { return false; }
+#endif
 
 class TraceScope {
 public:
-#if UI_CORE_ENABLE_TIMING_TRACE
+#if UI_CORE_ENABLE_TRACE
     TraceScope(const char* source, const char* name)
         : source_(source), name_(name), enabled_(IsTraceEnabled()) {
         if (enabled_) QueryPerformanceCounter(&start_);
@@ -93,3 +93,10 @@ private:
 };
 
 }  // namespace ui
+
+// A no-op function would still evaluate the field expressions at the call site.
+#if UI_CORE_ENABLE_TRACE
+#define UI_TRACE_EVENT(...) do { if (::ui::IsTraceEnabled()) ::ui::TraceEvent(__VA_ARGS__); } while (false)
+#else
+#define UI_TRACE_EVENT(...) ((void)0)
+#endif

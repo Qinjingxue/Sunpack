@@ -163,8 +163,6 @@ private:
     void CommitDeferredVisualWindowRect();
     bool PresentPreparedVisualWindowFrame(uint64_t generation);
     void BeginAnimationFrame();
-    void StartAnimationFrames();
-    void StopAnimationFrames();
     bool HasAnimationFrameWork() const;
     void PaintAndValidate(bool trimOnly = false);
     void OnResize(UINT width, UINT height);
@@ -252,7 +250,6 @@ private:
     bool        customWindowAlpha_ = false;
     BYTE        windowAlpha_ = 255;
     bool        caretBlinkTimerRunning_ = false;
-    bool        animationFramesActive_ = false;
     bool        renderFramePosted_ = false;
     // Scroll packets update a pending view while one VSync frame is in flight.
     // The renderer's completion message releases the next frame, without
@@ -263,7 +260,6 @@ private:
     void QueueScrollFrame();
     AnimationHost animationHost_;
     AnimationManager propertyAnimations_;
-    uint64_t    lastAnimationFrameTick_ = 0;
 
     // Drag & drop (HTML5-style; see Widget draggable/onDrop* hooks)
     Widget*     dragSource_ = nullptr;      // draggable widget under the press

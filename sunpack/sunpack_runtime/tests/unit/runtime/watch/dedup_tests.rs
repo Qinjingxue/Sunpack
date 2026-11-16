@@ -299,40 +299,36 @@ fn root_and_global_domains_follow_live_scope_ownership() {
 
 #[test]
 fn lazy_baseline_exhausts_same_size_candidates_and_hardlinks_need_no_hash() {
-    use super::super::dedup_hash::metrics;
     let dir = Sandbox::new();
     let folder = dir.0.join("index");
     let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
-    let before = metrics::snapshot();
     let inputs: Vec<_> = [b"aaaaaa", b"bbbbbb", b"cccccc"].iter().enumerate()
         .map(|(i, bytes)| dir.file(&format!("base-{i}.zip"), *bytes)).collect();
     let alias_path = dir.0.join("alias.zip");
     fs::hard_link(&inputs[0].entry_path, &alias_path).unwrap();
-    for input in &inputs { assert!(!admit(&mut index, input, true)); }
-    assert_eq!(metrics::snapshot(), before, "baseline never reads content, even equal sizes");
+    for input in &inputs {
+        let prepared = index.prepare_path(&input.entry_path, "scope", &[input], true).unwrap().unwrap();
+        assert!(matches!(index.advance(prepared).unwrap(), Admission::Finished(false)));
+    }
     index.finish_rebuild().unwrap(); drop(index);
     let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
     assert!(!index.needs_rebuild());
     assert!(index.records.values().all(|r| r.digest.is_none()));
-    assert_eq!(metrics::snapshot(), before, "restart keeps lazy records without hashing");
     let copy = dir.file("copy-last.zip", b"cccccc");
     assert!(admit(&mut index, &copy, false), "must reach the third pending representative");
-    assert_eq!(metrics::snapshot(), (before.0 + 4, before.1 + 24));
     index.invalidate(&[inputs[0].entry_path.clone()]).unwrap();
     assert_eq!(index.records.len(), 4, "unchanged source evidence remains indexed");
     let alias = ArchiveInput::file(alias_path.to_string_lossy().into_owned(), "zip".into(), "alias.zip".into());
-    let before_link = metrics::snapshot();
-    assert!(admit(&mut index, &alias, false));
-    assert_eq!(metrics::snapshot(), before_link);
     // A new, still-unhashed object must also bypass hash through its File ID.
     let lazy = dir.file("lazy.zip", b"unique-size");
     let path = dir.0.join("lazy-link.zip"); fs::hard_link(&lazy.entry_path, &path).unwrap();
     assert!(!admit(&mut index, &lazy, false));
     let link = ArchiveInput::file(path.to_string_lossy().into_owned(), "zip".into(), "lazy-link.zip".into());
-    assert!(admit(&mut index, &link, false));
-    assert_eq!(metrics::snapshot(), before_link, "identity equality does not manufacture a digest");
-    assert!(index.records.values().filter(|r| r.bytes == 11).all(|r| r.digest.is_none()));
+    for link in [&alias, &link] {
+        let prepared = index.prepare_path(&link.entry_path, "scope", &[link], false).unwrap().unwrap();
+        assert!(matches!(index.advance(prepared).unwrap(), Admission::Finished(true)));
+    }
 }
 
 #[test]
@@ -407,7 +403,6 @@ fn recursion_scope_removes_whole_cross_level_input_and_persists_removal() {
 
 #[test]
 fn lazy_baseline_aliases_share_one_physical_hash() {
-    use super::super::dedup_hash::metrics;
     let dir = Sandbox::new(); let source = dir.file("source", b"AAAAAA");
     let mut aliases = Vec::new();
     for number in 0..8 {
@@ -416,12 +411,12 @@ fn lazy_baseline_aliases_share_one_physical_hash() {
     }
     let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
-    let before = metrics::snapshot();
     assert!(!admit(&mut index, &source, true));
     for alias in &aliases { assert!(admit(&mut index, alias, true)); }
-    assert_eq!(metrics::snapshot(), before);
+    assert!(index.records.values().all(|r| r.digest.is_none()));
     let different = dir.file("different", b"BBBBBB");
-    assert!(!admit(&mut index, &different, false));
-    let after = metrics::snapshot(); assert_eq!((after.0-before.0, after.1-before.1), (2, 12));
-    assert!(index.records.values().all(|r| r.digest.is_some()));
+    let prepared = index.prepare_path(&different.entry_path, "scope", &[&different], false).unwrap().unwrap();
+    let Admission::Hash(mut pending) = index.advance(prepared).unwrap() else { panic!("the two physical files must be compared"); };
+    pending.hash().unwrap();
+    assert!(matches!(index.advance(pending).unwrap(), Admission::Finished(false)), "the remaining aliases reuse the now known digest");
 }

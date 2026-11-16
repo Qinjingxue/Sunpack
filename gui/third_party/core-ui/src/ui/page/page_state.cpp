@@ -630,18 +630,6 @@ void PageState::RefreshThemeStyles() {
 
 void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const ui::expr::Value& v) {
     if (!w) return;
-    TraceScope bindingScope("page_state", "apply_binding_duration");
-    if (IsTraceEnabled()) {
-        TraceEvent("page_state", "apply_binding",
-                   {TraceStr("prop", prop.c_str()),
-                    TraceStr("widget_type", w->cssTag.c_str()),
-                    TraceStr("widget_id", w->id.c_str())});
-    }
-    auto traceBindingNoop = [&]() {
-        if (IsTraceEnabled()) {
-            TraceEvent("page_state", "binding_noop", {TraceStr("prop", prop.c_str())});
-        }
-    };
     bool shouldInvalidate = true;
 
     // Tail-call invalidator: every binding application needs to repaint
@@ -684,10 +672,10 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     if (prop == "text") {
         auto text = ToWide(v.ToString());
         if (auto* lbl = dynamic_cast<LabelWidget*>(w)) {
-            if (lbl->Text() == text) { shouldInvalidate = false; traceBindingNoop(); return; }
+            if (lbl->Text() == text) { shouldInvalidate = false; return; }
             lbl->SetText(text);
         } else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) {
-            if (btn->Text() == text) { shouldInvalidate = false; traceBindingNoop(); return; }
+            if (btn->Text() == text) { shouldInvalidate = false; return; }
             btn->SetText(text);
         }
         return;
@@ -712,11 +700,11 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
          * eval 时设 w->id, 紧接着 DispatchMountHooks 走 tree 命中 hook. id
          * 之后变化只更新值, 不联动 unmount/mount lifecycle — caller 别依赖. */
         auto id = v.ToString();
-        if (w->id == id) { shouldInvalidate = false; traceBindingNoop(); return; }
+        if (w->id == id) { shouldInvalidate = false; return; }
         w->id = std::move(id);
         // ID selectors (including descendant selectors) must be refreshed
         // here; an unchanged class binding no longer performs that work.
-        refreshStyle(refreshStyle, w);
+        if (styleUsesIds_) refreshStyle(refreshStyle, w);
         return;
     }
     if (prop == "class") {
@@ -732,7 +720,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         // Keyed row replacements re-evaluate bindings even when only status
         // or time changed. Reapplying the same class cascades CSS over the
         // whole card and can dominate the cost of a streaming task delta.
-        if (w->dynamicClasses == tokens) { shouldInvalidate = false; traceBindingNoop(); return; }
+        if (w->dynamicClasses == tokens) { shouldInvalidate = false; return; }
         w->dynamicClasses = std::move(tokens);
         refreshStyle(refreshStyle, w);
         return;
@@ -757,7 +745,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     }
     if (prop == "visible") {
         bool nv = v.ToBool();
-        if (w->visible == nv) { shouldInvalidate = false; traceBindingNoop(); return; }
+        if (w->visible == nv) { shouldInvalidate = false; return; }
         if (w->visible != nv) {
             w->visible = nv;
             if (!nv) {
@@ -791,7 +779,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     }
     if (prop == "enabled") {
         bool nv = v.ToBool();
-        if (w->enabled == nv) { shouldInvalidate = false; traceBindingNoop(); return; }
+        if (w->enabled == nv) { shouldInvalidate = false; return; }
         if (w->enabled != nv) {
             w->enabled = nv;
             // Re-cascade so any `:disabled` selector flips its match. Without
@@ -854,21 +842,18 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         const bool painted = w->PaintedOnce();
         if (auto* rb = dynamic_cast<RadioButtonWidget*>(w)) {
             if (rb->Selected() == b) {
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
             painted ? rb->SetSelected(b) : rb->SetSelectedImmediate(b);
         } else if (auto* cb = dynamic_cast<CheckBoxWidget*>(w)) {
             if (cb->Checked() == b) {
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
             painted ? cb->SetChecked(b)  : cb->SetCheckedImmediate(b);
         } else if (auto* tg = dynamic_cast<ToggleWidget*>(w)) {
             if (tg->On() == b) {
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
@@ -881,7 +866,6 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         if (auto* ti = dynamic_cast<TextInputWidget*>(w)) {
             auto text = ToWide(v.ToString());
             if (ti->Text() == text) {
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
@@ -889,7 +873,6 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         } else if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
             auto text = ToWide(v.ToString());
             if (ta->Text() == text) {
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
@@ -897,7 +880,6 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         } else if (auto* ci = dynamic_cast<ChipsInputWidget*>(w)) {
             std::wstring nv = ToWide(v.ToString());
             if (ci->Value() == nv) {  // avoid clobbering caret on echo
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
@@ -912,7 +894,6 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         } else if (auto* cb = dynamic_cast<CheckBoxWidget*>(w)) {
             bool b = v.ToBool();
             if (cb->Checked() == b) {
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
@@ -920,7 +901,6 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         } else if (auto* tg = dynamic_cast<ToggleWidget*>(w)) {
             bool b = v.ToBool();
             if (tg->On() == b) {
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
@@ -928,7 +908,6 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         } else if (auto* rb = dynamic_cast<RadioButtonWidget*>(w)) {
             bool b = v.ToBool();
             if (rb->Selected() == b) {
-                traceBindingNoop();
                 shouldInvalidate = false;
                 return;
             }
@@ -1593,6 +1572,14 @@ bool PageState::Attach(CompiledPage page, std::string& error) {
     DetachQuickJS();
     InvalidateMenuHandles();
     page_ = std::move(page);
+    styleUsesIds_ = false;
+    if (page_.ownedStylesheet) {
+        for (const auto& rule : page_.ownedStylesheet->rules)
+            for (const auto& selector : rule.selectors)
+                for (const auto& compound : selector.compounds)
+                    for (const auto& part : compound.parts)
+                        styleUsesIds_ |= part.kind == ui::css::SimpleKind::Id;
+    }
     errors_.clear();
     if (AttachQuickJS(error)) return true;
     DetachQuickJS(false);

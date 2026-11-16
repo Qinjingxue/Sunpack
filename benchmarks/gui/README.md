@@ -2,8 +2,8 @@
 
 `benchmarks/gui/performance.cpp` (CMake target `sunpack_gui_performance`) seeds a temporary
 data directory, opens the real `Application` in-process, drives it through the Core UI debug
-API and reports wall time and process CPU cycles per action plus the Core UI trace durations
-attributed to the action that caused them.
+API and reports wall time, CPU usage and selected GPU usage per action, plus memory
+and live widget counts.
 
 The five GUI rendering/input optimizations and their repeat-run measurements are
 documented in [optimization-2026-10-21.md](optimization-2026-10-21.md).
@@ -40,13 +40,6 @@ password file with `passwords` saved records plus `history` clipboard entries, a
   draining messages once after the burst (otherwise the physical cursor outside
   the test window generates a spurious leave after every packet). It is a synthetic event-pressure scenario; the
   native acceptance test separately checks unchanged hover causes no invalidation.
-* `phase_counts.<action>::area_fraction|text_layouts|text_utf16|brushes|svg_documents|retained_ranges`
-  reports damage area and retained cache sizes. `core_ui_trace.<action>::present_interval_ms`
-  records completion-to-completion intervals using QPC. Gaps at page transitions
-  can include idle time, so inspect continuous animation phases separately.
-* `core_ui_trace.all::<event>` – duration distributions of every Core UI trace event over
-  the whole run; `core_ui_trace.<action>::<event>` restricts them to the window of one
-  measured action.
 * `app_open_ms`, `open_to_ready_ms`, `initial_data_load` – startup split into
   construct/open, first data applied, and the wait between them.
 * `memory_mib_after_open|after_data|after_nav|after_ui`, `widgets_after_load|after_nav|after_ui`
@@ -62,10 +55,6 @@ password file with `passwords` saved records plus `history` clipboard entries, a
   separate filtered selection/root lookup, sort, and JSON row construction costs.
   The warm run reuses lazy task path/time metadata; unchanged selection skips
   JSON projection entirely (when the worker knows the source has not changed).
-* `phase_counts.page_switch*::dispatch_{paints,layouts,draws}` – full window
-  paints, root layouts and draw-tree operations inside each synchronous tab
-  dispatch. Compare against `core_ui_trace.page_switch*::*duration` to identify
-  whether the first-frame cost is an unnecessary synchronous layout or drawing.
 * `password_state_query` – harness cost of serializing the 3000-row password state, next to
   the password save measurements.
 * `page_switch_baseline_*` / `page_switch_end_*` – the same tab interaction measured at the
@@ -75,16 +64,11 @@ password file with `passwords` saved records plus `history` clipboard entries, a
 
 Configuration diagnostics also traverse all blocks twice in 96-DIP increments
 (`config_traverse_cold`/`config_traverse_warm`), resize the configuration page in
-8-DIP steps (`config_resize`), and feed wheel input after each recorded paint
+8-DIP steps (`config_resize`), and feed wheel input after each scroll offset update
 until the last block (`config_wheel_traverse`). This includes buffer refills and
-large cards that alternating at the tail misses. The wheel scenario uses frame
-events, without a pacing sleep. Recording and presentation counts can differ;
-compare per-present work as well as total traversal cost when the frame scheduler
-changes. Short `scroll_*` actions measure dispatch rather than the full animation.
-`virtual_refill_duration`,
-`virtual_list_layout_duration` and `scroll_layout_duration` separate template
-mounting from measurement; the traversal action includes all synchronous work
-and message processing, even when layout happens before paint recording.
+large cards that alternating at the tail misses. The traversal measures the full
+operation, including message processing. Short `scroll_*` actions measure dispatch
+rather than the full animation. The idle sample reports wall time and process CPU usage.
 
 2026-10-21 local comparison, Release, 100 tasks/passwords/history, 10 roots and
 5 rounds, with the same complete configuration and 106 samples per traversal:
@@ -105,12 +89,11 @@ or a guarantee for other displays and system loads.
   message (caret blink, paint), which reported phantom 0.9–14 s waits.
 * Waits query cheap state first (`ready`, `passwordCell`, `recordSaving`) and serialize
   the large arrays only on the poll that can finish.
-* `wait_settled` fails after 5 s and prints the widget that keeps the settle predicate
-  false, with a frame counter. Do not raise that timeout to hide a stall.
+* `wait_settled` checks visible widget positions, opacity and pending paints.
 
 ## Pre-optimization baseline (2026-10-20, before commit 1657ef06)
 
-Historical numbers. The benchmark and its workload are unchanged, so they are directly
+Historical numbers from the earlier instrumented benchmark. Its original runs are directly
 comparable with the post-optimization table below.
 
 Windows 11 26200, i9-13980HX, 2560x1600 at 240 Hz and 150% DPI (surface 1680x1080), Release.

@@ -1868,7 +1868,7 @@ void GhImgViewWidget::EndViewUpdate() {
     const bool notify = pendingViewportNotify_;
     const bool invalidate = pendingInvalidate_;
     {
-        TraceEvent("gh_img_view", "end_view_update",
+        UI_TRACE_EVENT("gh_img_view", "end_view_update",
                    {TraceBool("notify", notify),
                     TraceBool("invalidate", invalidate),
                     TraceF64("zoom", zoom_),
@@ -1885,10 +1885,10 @@ void GhImgViewWidget::RequestViewportCommit() {
     if (viewUpdateDepth_ > 0) {
         pendingViewportNotify_ = true;
         pendingInvalidate_ = true;
-        TraceEvent("gh_img_view", "request_viewport_deferred");
+        UI_TRACE_EVENT("gh_img_view", "request_viewport_deferred");
         return;
     }
-    TraceEvent("gh_img_view", "request_viewport_immediate");
+    UI_TRACE_EVENT("gh_img_view", "request_viewport_immediate");
     NotifyViewport();
     InvalidateAllWindows();
 }
@@ -2423,7 +2423,7 @@ void GhImgViewWidget::SetZoom(float z) {
     z = std::clamp(z, minZoom_, maxZoom_);
     if (zoom_ == z) return;
     {
-        TraceEvent("gh_img_view", "set_zoom",
+        UI_TRACE_EVENT("gh_img_view", "set_zoom",
                    {TraceF64("old", zoom_),
                     TraceF64("new", z),
                     TraceI64("depth", viewUpdateDepth_)});
@@ -2448,7 +2448,7 @@ void GhImgViewWidget::SetZoom(float z) {
 void GhImgViewWidget::SetPan(float x, float y) {
     if (panX_ == x && panY_ == y) return;
     {
-        TraceEvent("gh_img_view", "set_pan",
+        UI_TRACE_EVENT("gh_img_view", "set_pan",
                    {TraceF64("old_x", panX_),
                     TraceF64("old_y", panY_),
                     TraceF64("new_x", x),
@@ -2544,7 +2544,7 @@ void GhImgViewWidget::Reset() {
 
 void GhImgViewWidget::OnDraw(Renderer& r) {
     {
-        TraceEvent("gh_img_view", "on_draw",
+        UI_TRACE_EVENT("gh_img_view", "on_draw",
                    {TraceF64("l", rect.left),
                     TraceF64("t", rect.top),
                     TraceF64("r", rect.right),
@@ -2568,7 +2568,7 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
         rect.bottom != lastNotifiedRect_.bottom) {
         if (viewUpdateDepth_ > 0) {
             pendingViewportNotify_ = true;
-            TraceEvent("gh_img_view", "draw_viewport_deferred");
+            UI_TRACE_EVENT("gh_img_view", "draw_viewport_deferred");
         } else {
             NotifyViewport();   // 内部 set lastNotifiedRect_ = rect 防重 fire
         }
@@ -3233,7 +3233,7 @@ void GhImgViewWidget::NotifyViewport() {
     if (!onViewportChanged) return;
     if (info_.fullWidth == 0 || info_.fullHeight == 0) return;
     {
-        TraceEvent("gh_img_view", "notify_viewport",
+        UI_TRACE_EVENT("gh_img_view", "notify_viewport",
                    {TraceF64("zoom", zoom_),
                     TraceF64("pan_x", panX_),
                     TraceF64("pan_y", panY_),

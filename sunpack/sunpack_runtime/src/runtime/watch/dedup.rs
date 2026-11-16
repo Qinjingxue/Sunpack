@@ -225,6 +225,12 @@ impl SizeBucket {
     fn pending(&self) -> impl Iterator<Item = u64> + '_ {
         self.unhashed.iter().flat_map(RecordIds::iter)
     }
+
+    fn remove_pending(&mut self, id: u64) {
+        if self.unhashed.as_mut().is_some_and(|ids| ids.remove(id)) {
+            self.unhashed = None;
+        }
+    }
 }
 
 pub(super) struct Index {
@@ -367,16 +373,21 @@ impl Index {
         Some(representative)
     }
     fn publish_representative(&mut self, prepared: &mut Prepared) -> io::Result<()> {
-        if let Some(rep) = prepared.representative.take() {
-            // IDs are never reused: replacing a source retires the old record.
-            // Metadata-only generation refresh is allowed on this same ID.
-            if rep.digest.is_some() && self.records.get(&rep.id).is_some_and(|old| old.digest.is_none()) {
-                if rep.current() {
-                    self.append(&Delta::Put(Cow::Borrowed(&rep)))?;
-                    self.insert(rep);
-                } else { self.remove_ids(vec![rep.id])?; }
-            }
+        let Some(rep) = prepared.representative.take() else { return Ok(()); };
+        let Some(digest) = rep.digest else { return Ok(()); };
+        // Within this epoch a live ID still has the same paths, scope and
+        // physical ranges. Hashing can only refresh its source versions.
+        if !self.records.get(&rep.id).is_some_and(|old| old.digest.is_none()) {
+            return Ok(());
         }
+        if !rep.current() {
+            return self.remove_ids(vec![rep.id]);
+        }
+        let signature = self.signature(&rep);
+        self.append(&Delta::Put(Cow::Borrowed(&rep)))?;
+        self.sizes.get_mut(&signature).expect("indexed size bucket").remove_pending(rep.id);
+        self.hashes.entry((signature, digest)).or_insert(RecordIds::One(rep.id)).insert(rep.id);
+        self.records.insert(rep.id, rep);
         Ok(())
     }
 
@@ -627,9 +638,7 @@ impl Index {
         }
         if let Some(bucket) = self.sizes.get_mut(&signature) {
             bucket.count -= 1;
-            if r.digest.is_none() && bucket.unhashed.as_mut().is_some_and(|ids| ids.remove(id)) {
-                bucket.unhashed = None;
-            }
+            if r.digest.is_none() { bucket.remove_pending(id); }
             if bucket.count == 0 { self.sizes.remove(&signature); }
         }
         remove_bucket(&mut self.objects, &(signature, r.identities), id);

@@ -1,5 +1,6 @@
 #include "debug_trace.h"
 
+#if UI_CORE_ENABLE_TRACE
 #include <atomic>
 
 namespace {
@@ -37,3 +38,6 @@ void EmitTrace(const char* source,
 }
 
 }  // namespace ui
+#else
+extern "C" UI_API void ui_trace_set_sink(UiTraceSink, void*) {}
+#endif

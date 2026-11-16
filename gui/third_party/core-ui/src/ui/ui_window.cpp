@@ -181,7 +181,6 @@ static void ForEachWidget(Widget* w, const std::function<void(Widget*)>& fn) {
 UiWindowImpl::UiWindowImpl() = default;
 UiWindowImpl::~UiWindowImpl() {
     RetainWheelBoundaries();
-    StopAnimationFrames();
     /* toast 叠加窗 owner = hwnd_, DestroyWindow(hwnd_) 会连带销毁它, 但仍要
      * 显式 KillTimer + timeEndPeriod 配对 (DestroyToast 负责), 防泄漏时钟精度. */
     DestroyToast();
@@ -310,7 +309,7 @@ void UiWindowImpl::RegisterRenderWindow(uint64_t id) {
     renderThreadPresentActive_ = false;
     RenderThread::Instance().Start();
     RenderThread::Instance().RegisterWindow(renderWindowId_, hwnd_, useCompositionSurface_
-        ? RenderSurfaceKind::OpaqueCompositionSurface : RenderSurfaceKind::HwndSwapChain);
+        ? RenderSurfaceKind::OpaqueComposition : RenderSurfaceKind::HwndSwapChain);
 }
 
 void UiWindowImpl::UnregisterRenderWindow() {
@@ -569,7 +568,6 @@ void UiWindowImpl::ShowImmediate(bool activate) {
 void UiWindowImpl::Hide() {
     startupRevealPending_ = false;
     HideTooltip(true);
-    StopAnimationFrames();
     ShowWindow(hwnd_, SW_HIDE);
 }
 
@@ -586,7 +584,6 @@ void UiWindowImpl::ShowTooltip(Widget* owner) {
         tooltipProgress_.Retarget(1.0f, {150.0f, EasingFunction::MaterialEnter});
     else
         tooltipProgress_.SetImmediate(1.0f);
-    StartAnimationFrames();
     Invalidate();
 }
 
@@ -603,7 +600,6 @@ void UiWindowImpl::HideTooltip(bool immediate) {
     else tooltipProgress_.Retarget(0.0f, {150.0f, EasingFunction::MaterialExit});
     // Exit uses a value snapshot, so it never retains an unmounted row.
     if (!tooltipProgress_.Active()) std::wstring{}.swap(tooltipText_);
-    StartAnimationFrames();
     Invalidate();
 }
 
@@ -653,7 +649,7 @@ void UiWindowImpl::Invalidate() {
     }
     if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
         if (IsTraceEnabled()) {
-            TraceEvent("core_window", "invalidate_skipped_hidden",
+            UI_TRACE_EVENT("core_window", "invalidate_skipped_hidden",
                        {TraceU64("hwnd", static_cast<uint64_t>(
                                       reinterpret_cast<uintptr_t>(hwnd_))),
                         TraceBool("iconic", IsIconic(hwnd_) != FALSE)});
@@ -719,7 +715,6 @@ void UiWindowImpl::SubmitFrameJob(const FrameRequest& frame, DisplayList display
     job.height_px = static_cast<int>(clientHeightPx_);
     job.dpi_scale = dpiScale_;
     job.policy = frame.policy;
-    job.live_resize = isMoving_ && isResizing_;
     job.priority = static_cast<int>(frame.policy);
     job.render_thread_present = renderThreadPresentActive_;
     job.defer_present = deferNextFramePresent_ && FrameRequiresPresentBarrier(frame);
@@ -729,7 +724,7 @@ void UiWindowImpl::SubmitFrameJob(const FrameRequest& frame, DisplayList display
         IsWindowVisible(hwnd_) && !IsIconic(hwnd_)) scrollFrameGeneration_ = frame.generation;
     scrollFrameRecorded_ = false;
     job.display_list = std::move(displayList);
-    TraceEvent("core_window", "frame_job_submitted",
+    UI_TRACE_EVENT("core_window", "frame_job_submitted",
                {TraceU64("frame_generation", frame.generation),
                 TraceI64("policy", static_cast<int64_t>(frame.policy)),
                 TraceI64("width_px", job.width_px),
@@ -744,7 +739,7 @@ void UiWindowImpl::ActivateRenderThreadPresent() {
     if (renderThreadPresentActive_ || !renderWindowId_.IsValid()) return;
     renderer_.ReleaseRenderTarget();
     renderThreadPresentActive_ = true;
-    TraceEvent("core_window", "render_thread_present_activated",
+    UI_TRACE_EVENT("core_window", "render_thread_present_activated",
                {TraceU64("window_id", renderWindowId_.window_id),
                 TraceU64("hwnd_generation", renderWindowId_.hwnd_generation)});
 }
@@ -755,7 +750,7 @@ bool UiWindowImpl::WaitForRenderGeneration(const FrameRequest& frame, bool force
     if (!force && !FrameRequiresPresentBarrier(frame)) return false;
     const bool completed = RenderThread::Instance().WaitForGeneration(
         renderWindowId_.window_id, frame.generation, 1000);
-    TraceEvent("core_window",
+    UI_TRACE_EVENT("core_window",
                completed ? (prepared ? "render_generation_prepared"
                                      : "render_generation_completed")
                          : "render_generation_wait_incomplete",
@@ -775,7 +770,7 @@ void UiWindowImpl::SubmitRenderThreadFrameNow(FrameReason reason, PresentPolicy 
     DisplayList displayList = OnPaint(frame.generation);
     SubmitFrameJob(frame, std::move(displayList));
     frameScheduler_.CompleteFrame(frame.generation);
-    TraceEvent("core_window", "frame_scheduler_complete",
+    UI_TRACE_EVENT("core_window", "frame_scheduler_complete",
                {TraceU64("frame_generation", frame.generation)});
     WaitForRenderGeneration(frame, true);
 }
@@ -828,12 +823,12 @@ void UiWindowImpl::PrepareDeferredVisualWindowRect(int xScreen, int yScreen,
         preparedVisualResizeNotified_ = true;
         preparedVisualResizeWPx_ = targetClientW;
         preparedVisualResizeHPx_ = targetClientH;
-        TraceEvent("core_window", "prepared_visual_resize_callback",
+        UI_TRACE_EVENT("core_window", "prepared_visual_resize_callback",
                    {TraceU64("client_w_px", targetClientW),
                     TraceU64("client_h_px", targetClientH)});
         NotifyResizeCallback(targetClientW, targetClientH);
     }
-    TraceEvent("core_window", "set_window_rect_deferred",
+    UI_TRACE_EVENT("core_window", "set_window_rect_deferred",
                {TraceI64("x", xScreen),
                 TraceI64("y", yScreen),
                 TraceI64("w_dip", wDip),
@@ -853,7 +848,7 @@ bool UiWindowImpl::WaitForVisualTransactionDwmBarrier(uint64_t generation) {
         TraceScope scope("core_window", "visual_transaction_dwm_flush_duration");
         hr = DwmFlush();
     }
-    TraceEvent("core_window", "visual_transaction_dwm_flush",
+    UI_TRACE_EVENT("core_window", "visual_transaction_dwm_flush",
                {TraceU64("frame_generation", generation),
                 TraceI64("hr", static_cast<int64_t>(hr)),
                 TraceBool("ok", SUCCEEDED(hr))});
@@ -870,7 +865,7 @@ void UiWindowImpl::CommitDeferredVisualWindowRect() {
     const int hPx = deferredVisualWindowHPx_;
     deferredVisualWindowRectPending_ = false;
 
-    TraceEvent("core_window", "set_window_rect_commit_after_prepare",
+    UI_TRACE_EVENT("core_window", "set_window_rect_commit_after_prepare",
                {TraceI64("x", x),
                 TraceI64("y", y),
                 TraceI64("w_dip", wDip),
@@ -894,7 +889,7 @@ bool UiWindowImpl::PresentPreparedVisualWindowFrame(uint64_t generation) {
         scrollFrameGeneration_ = 0;
         if (HasAnimationFrameWork() || scrollPaintPending_) Invalidate();
     }
-    TraceEvent("core_window",
+    UI_TRACE_EVENT("core_window",
                presented ? "visual_transaction_prepared_presented"
                          : "visual_transaction_prepared_present_failed",
                {TraceU64("frame_generation", generation),
@@ -904,7 +899,7 @@ bool UiWindowImpl::PresentPreparedVisualWindowFrame(uint64_t generation) {
 
 void UiWindowImpl::BeginCanvasVisualTransaction() {
     ++visualUpdateDepth_;
-    TraceEvent("core_window", "begin_canvas_visual_transaction");
+    UI_TRACE_EVENT("core_window", "begin_canvas_visual_transaction");
 }
 
 void UiWindowImpl::EndCanvasVisualTransaction() {
@@ -915,7 +910,7 @@ void UiWindowImpl::EndCanvasVisualTransaction() {
     const bool needPaint = visualPaintDirty_ || visualResizeDirty_;
     const bool paintDirty = visualPaintDirty_;
     const bool resizeDirty = visualResizeDirty_;
-    TraceEvent("core_window", "end_canvas_visual_transaction",
+    UI_TRACE_EVENT("core_window", "end_canvas_visual_transaction",
                {TraceBool("need_paint", needPaint),
                 TraceBool("resize_dirty", resizeDirty)});
     visualPaintDirty_ = false;
@@ -936,7 +931,7 @@ void UiWindowImpl::EndCanvasVisualTransaction() {
                                        PresentPolicy::Immediate);
         }
     } else if (deferPresent) {
-        TraceEvent("core_window", "visual_transaction_prepare_fallback",
+        UI_TRACE_EVENT("core_window", "visual_transaction_prepare_fallback",
                    {TraceU64("frame_generation", preparedGeneration),
                     TraceBool("prepared", prepared)});
         SubmitRenderThreadFrameNow(FrameReason::Resize | FrameReason::Paint,
@@ -951,7 +946,7 @@ void UiWindowImpl::SetWindowRect(int xScreen, int yScreen, int wDip, int hDip) {
     int pw = MulDiv(wDip, dpi_, 96);
     int ph = MulDiv(hDip, dpi_, 96);
     {
-        TraceEvent("core_window", "set_window_rect_before",
+        UI_TRACE_EVENT("core_window", "set_window_rect_before",
                    {TraceI64("x", xScreen),
                     TraceI64("y", yScreen),
                     TraceI64("w_dip", wDip),
@@ -1224,21 +1219,6 @@ bool UiWindowImpl::HasAnimationFrameWork() const {
     return !animationHost_.Empty() || propertyAnimations_.HasActive() || tooltipProgress_.Active();
 }
 
-void UiWindowImpl::StartAnimationFrames() {
-    if (!hwnd_ || animationFramesActive_ || !HasAnimationFrameWork()) return;
-    if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return;
-    // The caller requests the first paint. Subsequent visible frames are
-    // requested after VSync presentation, at the display's actual refresh rate.
-    // Prepared frames resume on commit, hidden/skipped frames on show/restore.
-    animationFramesActive_ = true;
-    TraceEvent("core_window", "motion_started");
-}
-
-void UiWindowImpl::StopAnimationFrames() {
-    if (animationFramesActive_) TraceEvent("core_window", "motion_stopped");
-    animationFramesActive_ = false;
-}
-
 void UiWindowImpl::UpdateToggleAnimTimer() {
     if (!hwnd_) return;
 
@@ -1298,20 +1278,13 @@ void UiWindowImpl::UpdateToggleAnimTimer() {
         });
     }
 
-    bool needsTimer = HasAnimationFrameWork();
-    if (needsTimer) {
-        StartAnimationFrames();
-        Invalidate();
-    } else {
-        StopAnimationFrames();
-    }
+    if (HasAnimationFrameWork()) Invalidate();
 }
 
 void UiWindowImpl::RegisterAnimatingWidget(Widget* w, AnimationInvalidation invalidation) {
     if (!hwnd_ || !w) return;
 
     animationHost_.RegisterWidget(w, invalidation);
-    StartAnimationFrames();
     if (dynamic_cast<ScrollViewWidget*>(w)) QueueScrollFrame();
     else Invalidate();
 }
@@ -1320,7 +1293,6 @@ void UiWindowImpl::AnimateProperty(Widget* target, AnimProperty prop, float from
                                    float durationMs, EasingFunction easing,
                                    std::function<void()> onComplete) {
     propertyAnimations_.Animate(target, prop, from, to, durationMs, easing, std::move(onComplete));
-    StartAnimationFrames();
     Invalidate();
 }
 
@@ -1367,7 +1339,7 @@ void UiWindowImpl::LayoutRoot() {
     TraceScope scope("core_window", "layout_root_duration");
     D2D1_SIZE_F size = CachedClientSizeDip();
     if (size.width <= 0.0f || size.height <= 0.0f) return;
-    TraceEvent("core_window", "layout_root_begin",
+    UI_TRACE_EVENT("core_window", "layout_root_begin",
                {TraceF64("client_w", size.width),
                 TraceF64("client_h", size.height)});
     root_->rect = {0, 0, size.width, size.height};
@@ -1499,7 +1471,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         isMoving_ = false;
         isResizing_ = false;
         if (wasResizing && renderThreadPresentActive_) {
-            TraceEvent("core_window", "wm_exitsizemove_final_resize_frame");
+            UI_TRACE_EVENT("core_window", "wm_exitsizemove_final_resize_frame");
             RequestRenderFrame(FrameReason::Resize | FrameReason::Final, PresentPolicy::Final);
             ValidateRect(hwnd_, nullptr);
             return 0;
@@ -1522,15 +1494,15 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             startupRevealPending_ = false;
             KillTimer(hwnd_, kWindowOpenAnimTimerId);
             if (!windowClosing_) windowAnimating_ = false;
-            HideTooltip(true); scrollFrameGeneration_ = 0; StopAnimationFrames();
+            HideTooltip(true); scrollFrameGeneration_ = 0;
         }
         break;
     case WM_SIZE: {
-        if (wParam == SIZE_MINIMIZED) { HideTooltip(true); scrollFrameGeneration_ = 0; StopAnimationFrames(); }
+        if (wParam == SIZE_MINIMIZED) { HideTooltip(true); scrollFrameGeneration_ = 0; }
         else UpdateToggleAnimTimer();
         TraceScope wmSizeScope("core_window", "wm_size_duration");
         {
-            TraceEvent("core_window", "wm_size",
+            UI_TRACE_EVENT("core_window", "wm_size",
                        {TraceU64("w_px", (unsigned)LOWORD(lParam)),
                         TraceU64("h_px", (unsigned)HIWORD(lParam)),
                         TraceI64("depth", visualUpdateDepth_),
@@ -1564,7 +1536,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             : PresentPolicy::Final;
         FrameReason resizeReason = FrameReason::Resize;
         if (resizePolicy == PresentPolicy::Final) resizeReason |= FrameReason::Final;
-        TraceEvent("core_window", "wm_size_request_resize_frame",
+        UI_TRACE_EVENT("core_window", "wm_size_request_resize_frame",
                    {TraceBool("interactive", interactiveResize),
                     TraceI64("policy", static_cast<int64_t>(resizePolicy))});
         RequestRenderFrame(resizeReason, resizePolicy);
@@ -2082,7 +2054,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         lastDeviceRecoveryGeneration_ = deviceGeneration;
         scrollFrameGeneration_ = 0;
-        TraceEvent("core_window", "render_device_lost_recovery_requested",
+        UI_TRACE_EVENT("core_window", "render_device_lost_recovery_requested",
                    {TraceU64("window_id", renderWindowId_.window_id),
                     TraceU64("hwnd_generation", renderWindowId_.hwnd_generation),
                     TraceU64("device_generation", deviceGeneration),
@@ -2104,7 +2076,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (!startupRevealPending_ ||
             static_cast<uint64_t>(wParam) != startupRevealToken_ ||
             static_cast<uint64_t>(lParam) != renderWindowId_.hwnd_generation) return 0;
-        TraceEvent("core_window", "startup_frame_failed",
+        UI_TRACE_EVENT("core_window", "startup_frame_failed",
                    {TraceU64("show_token", startupRevealToken_)});
         // Reuse the application's existing close callback and cleanup. No blank
         // fallback, no timeout that guesses whether the driver will recover.
@@ -2122,7 +2094,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             static_cast<uint64_t>(lParam) != renderWindowId_.hwnd_generation ||
             !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return 0;
         startupRevealPending_ = false;
-        TraceEvent("core_window", "startup_frame_revealed",
+        UI_TRACE_EVENT("core_window", "startup_frame_revealed",
                    {TraceU64("show_token", startupRevealToken_)});
         if (startupRevealAnimate_) {
             StartWindowOpenAnimation();
@@ -2145,7 +2117,6 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_DESTROY: {
-        StopAnimationFrames();
         if (caretBlinkTimerRunning_) {
             KillTimer(hwnd_, kCaretBlinkTimerId);
             caretBlinkTimerRunning_ = false;
@@ -2254,17 +2225,8 @@ void UiWindowImpl::BeginAnimationFrame() {
     // Wheel motion can mount/measure virtual rows on an animation frame.
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
 
-    uint64_t frameTick = AnimationClockMs();
-    double frameIntervalMs = lastAnimationFrameTick_ != 0
-        ? static_cast<double>(frameTick - lastAnimationFrameTick_)
-        : 0.0;
-    lastAnimationFrameTick_ = frameTick;
-
     TraceScope frameScope("core_window", "animation_frame_duration");
-    bool anyAnimating = false;
     bool needsLayout = false;
-    int inputWidgets = (int)animationHost_.Size();
-    int tickedWidgets = 0;
     // Scrolling can release animated controls in virtual rows during this loop.
     // Weak frame-local references never retain those rows after unmounting.
     std::vector<std::pair<AnimationInvalidation, std::weak_ptr<Widget>>> activeTargets;
@@ -2279,44 +2241,37 @@ void UiWindowImpl::BeginAnimationFrame() {
         Widget* w = alive.get();
         if (!w) continue;
         bool keep = false;
-        bool ticked = false;
 
         auto* tw = dynamic_cast<ToggleWidget*>(w);
         if (tw && tw->animating_) {
             tw->UpdateAnimation();
-            ticked = true;
         }
         if (tw && tw->animating_) keep = true;
 
         auto* cb = dynamic_cast<CheckBoxWidget*>(w);
         if (cb && cb->animating_) {
             cb->UpdateAnimation();
-            ticked = true;
             if (cb->animating_) keep = true;
         }
         auto* combo = dynamic_cast<ComboBoxWidget*>(w);
         if (combo && combo->PopupAnimating()) {
             combo->UpdateAnimation();
-            ticked = true;
             if (combo->PopupAnimating()) keep = true;
         }
         auto* scroll = dynamic_cast<ScrollViewWidget*>(w);
         if (scroll && scroll->ScrollAnimating()) {
             scrollFrameRecorded_ = true;
             scroll->UpdateScrollAnimation();
-            ticked = true;
             if (scroll->ScrollAnimating()) keep = true;
         }
         auto* rb = dynamic_cast<RadioButtonWidget*>(w);
         if (rb && rb->animating_) {
             rb->UpdateAnimation();
-            ticked = true;
             if (rb->animating_) keep = true;
         }
         auto* pb = dynamic_cast<ProgressBarWidget*>(w);
         if (pb && pb->animating_) {
             pb->UpdateAnimation();
-            ticked = true;
             if (pb->animating_) keep = true;
         }
         if (pb && pb->IsIndeterminate()) {
@@ -2325,19 +2280,16 @@ void UiWindowImpl::BeginAnimationFrame() {
         auto* sl = dynamic_cast<SliderWidget*>(w);
         if (sl) {
             sl->UpdateThumbAnimation();
-            ticked = true;
             if (sl->ThumbAnimating()) keep = true;
         }
         auto* sv = dynamic_cast<SplitViewWidget*>(w);
         if (sv && sv->animating_) {
             sv->UpdateAnimation();
-            ticked = true;
             if (sv->animating_) keep = true;
         }
         auto* ex = dynamic_cast<ExpanderWidget*>(w);
         if (ex && ex->animating_) {
             ex->UpdateAnimation();
-            ticked = true;
             if (ex->animating_) keep = true;
         }
         auto* iv = dynamic_cast<ImageViewWidget*>(w);
@@ -2350,13 +2302,11 @@ void UiWindowImpl::BeginAnimationFrame() {
         }
 
         if (keep) {
-            anyAnimating = true;
             activeTargets[remaining++] = target;
             if (HasAnimationInvalidation(target.first, AnimationInvalidation::Layout)) {
                 needsLayout = true;
             }
         }
-        if (ticked) ++tickedWidgets;
     }
 
     std::vector<AnimationTarget> nextTargets;
@@ -2364,28 +2314,11 @@ void UiWindowImpl::BeginAnimationFrame() {
     for (size_t i = 0; i < remaining; ++i)
         if (auto alive = activeTargets[i].second.lock()) nextTargets.push_back({alive.get(), activeTargets[i].first});
     animationHost_.ReplaceTargets(std::move(nextTargets));
-    anyAnimating = !animationHost_.Empty();
 
     if (needsLayout) {
         LayoutRoot();
     }
 
-    if (IsTraceEnabled()) {
-        TraceEvent("core_window", "animation_frame",
-                   {TraceI64("input_count", inputWidgets),
-                    TraceI64("ticked_count", tickedWidgets),
-                    TraceI64("remaining_count", (int64_t)animationHost_.Size()),
-                    TraceBool("any_animating", anyAnimating),
-                    TraceBool("needs_layout", needsLayout),
-                    TraceF64("frame_interval_ms", frameIntervalMs),
-                    TraceBool("dropped_frame_estimate", frameIntervalMs > 25.0)});
-    }
-
-    if (!anyAnimating) {
-        animationHost_.Clear();
-        lastAnimationFrameTick_ = 0;
-        if (!HasAnimationFrameWork()) StopAnimationFrames();
-    }
 }
 
 void UiWindowImpl::PaintAndValidate(bool trimOnly) {
@@ -2399,14 +2332,14 @@ void UiWindowImpl::PaintAndValidate(bool trimOnly) {
         return;
     }
     auto frame = frameScheduler_.BeginFrame();
-    TraceEvent("core_window", "paint_and_validate",
+    UI_TRACE_EVENT("core_window", "paint_and_validate",
                {TraceI64("frame_reasons", static_cast<int64_t>(frame.reasons)),
                 TraceI64("present_policy", static_cast<int64_t>(frame.policy)),
                 TraceU64("frame_generation", frame.generation)});
     auto completeFrame = [&]() {
         if (frame.generation == 0) return;
         frameScheduler_.CompleteFrame(frame.generation);
-        TraceEvent("core_window", "frame_scheduler_complete",
+        UI_TRACE_EVENT("core_window", "frame_scheduler_complete",
                    {TraceU64("frame_generation", frame.generation)});
     };
     if (frame.generation == 0) {
@@ -2433,7 +2366,7 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
     TraceScope paintScope("core_window", "on_paint_duration");
     if (IsTraceEnabled()) {
         D2D1_SIZE_F size = CachedClientSizeDip();
-        TraceEvent("core_window", "on_paint_begin",
+        UI_TRACE_EVENT("core_window", "on_paint_begin",
                    {TraceF64("client_w", size.width),
                     TraceF64("client_h", size.height),
                     TraceI64("depth", visualUpdateDepth_),
@@ -2462,20 +2395,12 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
     // 移动期间正常渲染（不跳过）
 
     // Tick property animations
-    size_t propertyAnimInput = propertyAnimations_.Count();
-    bool animsRunning = propertyAnimations_.Tick();
-    if (IsTraceEnabled() && propertyAnimInput > 0) {
-        TraceEvent("core_window", "property_animation_frame",
-                   {TraceI64("input_count", (int64_t)propertyAnimInput),
-                    TraceI64("remaining_count", (int64_t)propertyAnimations_.Count()),
-                    TraceBool("any_animating", animsRunning)});
-    }
+    propertyAnimations_.Tick();
     if (ui::LayoutDirtyFlag()) {
         TraceScope scope("core_window", "paint_post_animation_layout_duration");
         ui::LayoutDirtyFlag() = false;
         LayoutRoot();
     }
-    if (HasAnimationFrameWork()) StartAnimationFrames(); else StopAnimationFrames();
 
     const bool recordDisplayList = canRecordDisplayList;
     DisplayListRecorder recorder;
@@ -2681,7 +2606,7 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         }
     }
 
-    TraceEvent("core_window", "on_paint_end");
+    UI_TRACE_EVENT("core_window", "on_paint_end");
     if (recordDisplayList) {
         return recorder.Finish();
     }
@@ -2701,7 +2626,7 @@ void UiWindowImpl::OnResize(UINT width, UINT height) {
     }
     UpdateClientSizeCache(width, height);
     {
-        TraceEvent("core_window", "on_resize",
+        UI_TRACE_EVENT("core_window", "on_resize",
                    {TraceU64("w_px", width),
                     TraceU64("h_px", height),
                     TraceBool("skip_prepared_callback", skipPreparedCallback),
@@ -2715,7 +2640,7 @@ void UiWindowImpl::OnResize(UINT width, UINT height) {
         TraceScope scope("core_window", "on_resize_callback_duration");
         NotifyResizeCallback(width, height);
     } else {
-        TraceEvent("core_window", "on_resize_callback_skipped_prepared",
+        UI_TRACE_EVENT("core_window", "on_resize_callback_skipped_prepared",
                    {TraceU64("w_px", width),
                     TraceU64("h_px", height)});
     }

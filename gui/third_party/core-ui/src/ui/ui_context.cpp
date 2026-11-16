@@ -164,22 +164,14 @@ void Context::RemoveWindow(uint64_t id) {
 }
 
 void Context::InvalidateAllWindows() {
-    int invalidated = 0;
-    int skippedHidden = 0;
+    UI_TRACE_EVENT("core_context", "invalidate_all_windows");
     for (auto& [id, win] : windows_) {
         if (!win) continue;
         HWND hwnd = win->Handle();
         if (hwnd && (!IsWindowVisible(hwnd) || IsIconic(hwnd))) {
-            ++skippedHidden;
             continue;
         }
         win->Invalidate();
-        ++invalidated;
-    }
-    if (IsTraceEnabled()) {
-        TraceEvent("core_context", "invalidate_all_windows",
-                   {TraceI64("invalidated", invalidated),
-                    TraceI64("skipped_hidden", skippedHidden)});
     }
 }
 

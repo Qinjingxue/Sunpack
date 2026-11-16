@@ -66,17 +66,12 @@ public:
     // Use externally-owned factories (DLL shared mode)
     bool Init(ID2D1Factory1* factory, IDWriteFactory* dwFactory, IWICImagingFactory* wicFactory);
 
-    bool CreateRenderTarget(HWND hwnd, bool compositionSurface = false);
-    // Composition-mode RT for transparent/layered windows (popup menus,
-    // tooltips). Builds a SwapChainForComposition with premultiplied alpha
-    // and binds it via DirectComposition so per-pixel alpha is honored on
-    // the desktop without WS_EX_LAYERED's GDI bottleneck. Anti-aliased
-    // round corners come from D2D's normal FillRoundedRectangle path.
-    bool CreateRenderTargetForLayered(HWND hwnd);
+    // An explicit alpha mode binds the flip swap chain through DirectComposition.
+    bool CreateRenderTarget(HWND hwnd, DXGI_ALPHA_MODE compositionAlpha = DXGI_ALPHA_MODE_UNSPECIFIED);
     void ReleaseRenderTarget();
     HRESULT Resize(UINT width, UINT height);
     void BeginDraw();
-    HRESULT EndDraw(bool trimCompositionSurface = false);
+    HRESULT EndDraw();
     HRESULT PresentPrepared(bool skipVSync);
     HRESULT SetSwapChainBackgroundColor(const D2D1_COLOR_F& color);
     void FlushAndTrimGpu();
@@ -264,7 +259,7 @@ public:
     void ReplayDisplayList(const DisplayList& list);
     void PrepareDisplayList(const DisplayList& list);
     void RenderDisplayList(DisplayList list, bool incremental);
-    HRESULT DrawDisplayListFrame(DisplayList list, bool incremental, bool trimCompositionSurface);
+    HRESULT DrawDisplayListFrame(DisplayList list, bool incremental);
     ComPtr<ID2D1Bitmap1> ScreenshotBitmap();
 
     // SVG icon support
@@ -336,16 +331,8 @@ public:
 
 private:
 
-    struct CompositionFrame;
-    HRESULT CreateCompositionFrame(UINT width, UINT height, float dpi);
-    HRESULT CreateCompositionBitmap(ComPtr<ID2D1Bitmap1>& bitmap);
-    HRESULT EnsureCompositionSurface(bool trim);
-    HRESULT BeginCompositionUpdate(const RECT& region, POINT& offset, ComPtr<ID2D1Bitmap1>& bitmap);
-    HRESULT CommitCompositionFrame(bool skipVsync);
     void UpdateDisplayListDamage(const DisplayList& list, bool incremental);
     void ReplayDisplayListFrame(DisplayList list, bool clip);
-    HRESULT PresentCompositionFrame(bool skipVSync, bool trim);
-    std::unique_ptr<CompositionFrame> compositionFrame_;
     /* 视口剔除矩形栈 (build 285). 嵌套 ScrollView 时取交集 —— 内层只可能比
      * 外层更小, 存交集省得判定时反复回溯整个栈。 */
     std::vector<D2D1_RECT_F> cullStack_;
@@ -438,7 +425,7 @@ private:
     DWORD                      targetThreadId_ = 0;
     std::vector<D2D1_MATRIX_3X2_F> transformStack_;
     // DirectComposition objects — only populated for layered/composition
-    // mode (CreateRenderTargetForLayered). Held alive so the visual tree
+    // mode. Held alive so the visual tree
     // stays bound to the hwnd; destruction order is automatic via ComPtr.
     ComPtr<IUnknown>           dcompDevice_;
     ComPtr<IUnknown>           dcompTarget_;

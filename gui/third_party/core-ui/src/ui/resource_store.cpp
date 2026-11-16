@@ -64,7 +64,7 @@ ResourceKey ResourceStore::AddImage(ResourceKind kind,
         totalBytes_ += resource->byte_size;
         resources_[resource->key] = resource;
 
-        TraceEvent("resource_store", "resource_store_add",
+        UI_TRACE_EVENT("resource_store", "resource_store_add",
                    {TraceU64("generation", resource->key.image_generation),
                     TraceU64("resource_id", resource->key.resource_id),
                     TraceI64("kind", static_cast<int64_t>(resource->key.kind)),
@@ -115,7 +115,7 @@ bool ResourceStore::UpdateImage(const ResourceKey& key,
     totalBytes_ -= std::min(totalBytes_, oldBytes);
     totalBytes_ += resource->byte_size;
 
-    TraceEvent("resource_store", "resource_store_update",
+    UI_TRACE_EVENT("resource_store", "resource_store_update",
                {TraceU64("generation", key.image_generation),
                 TraceU64("resource_id", key.resource_id),
                 TraceI64("kind", static_cast<int64_t>(key.kind)),
@@ -132,7 +132,7 @@ std::shared_ptr<const CpuImageResource> ResourceStore::Acquire(const ResourceKey
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = resources_.find(key);
     if (it == resources_.end()) {
-        TraceEvent("resource_store", "resource_store_acquire_miss",
+        UI_TRACE_EVENT("resource_store", "resource_store_acquire_miss",
                    {TraceU64("generation", key.image_generation),
                     TraceU64("resource_id", key.resource_id),
                     TraceI64("kind", static_cast<int64_t>(key.kind))});
@@ -147,7 +147,7 @@ void ResourceStore::SetPinnedVisible(const ResourceKey& key, bool pinned) {
     auto it = resources_.find(key);
     if (it != resources_.end()) {
         it->second->pinned_visible = pinned;
-        TraceEvent("resource_store", "resource_store_pin",
+        UI_TRACE_EVENT("resource_store", "resource_store_pin",
                    {TraceU64("generation", key.image_generation),
                     TraceU64("resource_id", key.resource_id),
                     TraceI64("kind", static_cast<int64_t>(key.kind)),
@@ -165,7 +165,7 @@ void ResourceStore::Remove(const ResourceKey& key) {
     const size_t bytes = it->second->byte_size;
     totalBytes_ -= std::min(totalBytes_, bytes);
     resources_.erase(it);
-    TraceEvent("resource_store", "resource_store_evict",
+    UI_TRACE_EVENT("resource_store", "resource_store_evict",
                {TraceU64("generation", key.image_generation),
                 TraceU64("resource_id", key.resource_id),
                 TraceI64("kind", static_cast<int64_t>(key.kind)),
@@ -195,7 +195,7 @@ void ResourceStore::PurgeGeneration(uint64_t imageGeneration) {
             ++it;
         }
     }
-    TraceEvent("resource_store", "resource_store_generation_purged",
+    UI_TRACE_EVENT("resource_store", "resource_store_generation_purged",
                {TraceU64("generation", imageGeneration),
                 TraceI64("bytes", static_cast<int64_t>(removed)),
                 TraceI64("total_bytes", static_cast<int64_t>(totalBytes_))});
@@ -210,7 +210,7 @@ void ResourceStore::Clear() {
 void ResourceStore::SetByteBudget(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     byteBudget_ = bytes;
-    TraceEvent("resource_store", "resource_store_budget",
+    UI_TRACE_EVENT("resource_store", "resource_store_budget",
                {TraceI64("budget_bytes", static_cast<int64_t>(byteBudget_)),
                 TraceI64("total_bytes", static_cast<int64_t>(totalBytes_))});
     EvictOverBudgetLocked();
@@ -235,7 +235,7 @@ void ResourceStore::EvictOverBudgetLocked() {
             const ResourceKey key = it->first;
             totalBytes_ -= std::min(totalBytes_, bytes);
             it = resources_.erase(it);
-            TraceEvent("resource_store", "resource_store_evict",
+            UI_TRACE_EVENT("resource_store", "resource_store_evict",
                        {TraceU64("generation", key.image_generation),
                         TraceU64("resource_id", key.resource_id),
                         TraceI64("kind", static_cast<int64_t>(key.kind)),

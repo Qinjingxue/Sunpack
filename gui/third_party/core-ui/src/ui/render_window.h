@@ -25,7 +25,7 @@ struct RenderWindowId {
 enum class RenderSurfaceKind : uint8_t {
     HwndSwapChain,
     LayeredComposition,
-    OpaqueCompositionSurface,
+    OpaqueComposition,
 };
 
 enum class RenderFrameResult : uint8_t {

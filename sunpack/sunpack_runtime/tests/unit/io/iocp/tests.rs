@@ -216,12 +216,11 @@ fn reversed_completions_are_hashed_in_range_order_without_unbounded_reordering()
             assert!(ordered.next().is_none(), "later completion must not reach hash first");
         }
         ordered.completed(slots.pop().unwrap());
-        assert!(ordered.ready.len() <= 2);
         while let Some(slot) = ordered.next() {
             hash.update(&slot.buffer[..slot.bytes_read]);
         }
     }
     assert_eq!(ordered.next_offset, start + bytes.len() as u64);
-    assert!(ordered.ready.is_empty());
+    assert!(ordered.ready.iter().all(Option::is_none));
     assert_eq!(hash.digest128(), xxh3_128(&bytes));
 }

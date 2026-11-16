@@ -163,10 +163,9 @@ set(UI_CORE_WIN_VERSION_DEFS
     NTDDI_VERSION=0x0A000004
 )
 
-# Timing scopes are diagnostics only. Keep them in Debug builds so Release
-# rendering and layout paths contain no QPC/trace-scope instrumentation.
+# Keep diagnostic fields and timing out of shipping rendering and layout paths.
 set(UI_CORE_TRACE_DEFINITIONS
-    UI_CORE_ENABLE_TIMING_TRACE=$<CONFIG:Debug>
+    UI_CORE_ENABLE_TRACE=$<CONFIG:Debug>
 )
 
 if(UI_CORE_STATIC)

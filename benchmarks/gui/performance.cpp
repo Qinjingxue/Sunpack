@@ -6,7 +6,6 @@
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
 #include <ui/controls.h>
-#include <ui/debug_trace.h>
 #include <psapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -14,7 +13,6 @@
 #pragma comment(lib, "pdh.lib")
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -22,7 +20,6 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <thread>
@@ -30,7 +27,6 @@
 
 using namespace spg;
 namespace {
-using Clock=std::chrono::steady_clock;
 struct CpuTime { uint64_t ticks=0; };
 struct Samples { std::vector<double> wall,cpu_ms,cpu_mcycles,gpu_ms,ui_mcycles; };
 // Scheduler-accounted process engine time, not Present/VSync wait. Engines
@@ -62,17 +58,7 @@ public:
 };
 GpuTime& gpu_time() { static GpuTime value; return value; }
 std::map<std::string,Samples> samples;
-std::map<std::string,std::vector<double>> trace_samples;
-std::mutex trace_mutex;
-std::string trace_phase;
 std::string active_action;
-double last_present_ms=0;
-std::string last_present_phase;
-thread_local uint64_t present_cycles=0;
-std::atomic<uint64_t> motion_stop_count{0}, paint_count{0}, animation_frame_count{0}, property_frame_count{0};
-std::atomic<bool> motion_active{false};
-std::atomic<uint64_t> layout_count{0}, draw_count{0};
-std::map<std::string,std::vector<double>> phase_counts;
 LARGE_INTEGER qpc_frequency{};
 
 double now_ms() { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return 1000.0*v.QuadPart/qpc_frequency.QuadPart; }
@@ -94,85 +80,14 @@ uint64_t working_set() {
     return GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&m),sizeof(m))
         ? m.WorkingSetSize : 0;
 }
-void trace_sink(const UiTraceEvent* e,void*) {
-    if(!e) return;
-    if(e->name && !std::strcmp(e->name,"present_begin")) {
-        ULONG64 cycles=0; QueryThreadCycleTime(GetCurrentThread(),&cycles); present_cycles=cycles;
-    }
-    if(e->name && !std::strcmp(e->name,"frame_damage")) {
-        std::lock_guard<std::mutex> lock(trace_mutex);
-        if(!trace_phase.empty()) for(uint32_t i=0;i<e->field_count;++i) {
-            const auto& f=e->fields[i];
-            if(!f.key) continue;
-            if(f.type==UI_TRACE_FIELD_F64) phase_counts[trace_phase+"::"+f.key].push_back(f.f64);
-            else if(f.type==UI_TRACE_FIELD_I64) phase_counts[trace_phase+"::"+f.key].push_back(double(f.i64));
-        }
-    }
-    if(e->name && (!std::strcmp(e->name,"apply_binding") || !std::strcmp(e->name,"binding_noop"))) {
-        std::lock_guard<std::mutex> lock(trace_mutex);
-        if(!trace_phase.empty()) for(uint32_t i=0;i<e->field_count;++i) {
-            const auto& field=e->fields[i];
-            if(field.key && !std::strcmp(field.key,"prop") && field.str)
-                phase_counts[trace_phase+"::"+e->name+"_"+field.str].push_back(1);
-        }
-    }
-    if(e->name && !std::strcmp(e->name,"motion_started")) motion_active.store(true,std::memory_order_relaxed);
-    if(e->name && !std::strcmp(e->name,"motion_stopped")) {
-        motion_active.store(false,std::memory_order_relaxed);
-        motion_stop_count.fetch_add(1,std::memory_order_relaxed);
-    }
-    if(e->name && !std::strcmp(e->name,"paint_and_validate")) paint_count.fetch_add(1,std::memory_order_relaxed);
-    if(e->name && !std::strcmp(e->name,"layout_root_duration")) layout_count.fetch_add(1,std::memory_order_relaxed);
-    if(e->name && !std::strcmp(e->name,"draw_tree_duration")) draw_count.fetch_add(1,std::memory_order_relaxed);
-    if(e->name && !std::strcmp(e->name,"animation_frame")) animation_frame_count.fetch_add(1,std::memory_order_relaxed);
-    if(e->name && !std::strcmp(e->name,"property_animation_frame")) property_frame_count.fetch_add(1,std::memory_order_relaxed);
-    bool has_duration=false,has_frame_interval=false;
-    double duration=0,frame_interval=0;
-    int64_t frame_reasons=0; bool has_frame_reasons=false;
-    for(uint32_t i=0;i<e->field_count;++i) {
-        const auto& f=e->fields[i];
-        if(f.key && !std::strcmp(f.key,"duration_ms") && f.type==UI_TRACE_FIELD_F64) {
-            duration=f.f64; has_duration=true;
-        } else if(f.key && !std::strcmp(f.key,"frame_interval_ms") && f.type==UI_TRACE_FIELD_F64) {
-            frame_interval=f.f64; has_frame_interval=true;
-        } else if(f.key && !std::strcmp(f.key,"frame_reasons") && f.type==UI_TRACE_FIELD_I64) {
-            frame_reasons=f.i64; has_frame_reasons=true;
-        }
-    }
-    if(!has_duration&&!has_frame_interval&&!has_frame_reasons) return;
-    std::lock_guard<std::mutex> lock(trace_mutex);
-    const std::string name=e->name?e->name:"";
-    if(name=="present_duration") {
-        ULONG64 cycles=0; QueryThreadCycleTime(GetCurrentThread(),&cycles);
-        if(present_cycles && !trace_phase.empty())
-            trace_samples[trace_phase+"::present_thread_million_cycles"].push_back(double(cycles-present_cycles)/1000000.0);
-        const double tick=now_ms();
-        if(last_present_phase==trace_phase && last_present_ms>0 && !trace_phase.empty())
-            trace_samples[trace_phase+"::present_interval_ms"].push_back(tick-last_present_ms);
-        last_present_ms=tick; last_present_phase=trace_phase;
-    }
-    if(has_duration) {
-        trace_samples["all::"+name].push_back(duration);
-        if(!trace_phase.empty()) trace_samples[trace_phase+"::"+name].push_back(duration);
-    }
-    if(has_frame_interval) {
-        trace_samples["all::animation_frame_interval_ms"].push_back(frame_interval);
-        if(!trace_phase.empty()) trace_samples[trace_phase+"::animation_frame_interval_ms"].push_back(frame_interval);
-    }
-    // Which frame reasons produce paints inside a measured action (idle must not paint at all).
-    if(has_frame_reasons && !trace_phase.empty())
-        phase_counts[trace_phase+"::paint_reason_"+std::to_string(frame_reasons)].push_back(1.0);
-}
 template<class F> void measure(const std::string& name,F&& fn) {
     // Avoid adding counter collection to short dispatch/layout samples.
     const bool gpu_sample=name.find("settled")!=std::string::npos || name=="config_wheel_traverse" || name=="pointer_same_target";
     const auto gpu_before=gpu_sample?gpu_time().read():std::nullopt;
-    { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase=name; }
     active_action=name;
     const double wall=now_ms(); const auto cycles=process_cycles(); const auto cpu=process_cpu(); const auto ui=ui_cycles();
     fn();
     const auto cpu_after=process_cpu(); const auto cycles_after=process_cycles(); const double elapsed=now_ms()-wall;
-    { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase.clear(); }
     active_action.clear();
     auto& out=samples[name]; out.wall.push_back(elapsed);
     out.cpu_ms.push_back(double(cpu_after.ticks-cpu.ticks)/10000.0);
@@ -198,16 +113,7 @@ Json summarize() {
         actions[name]["ui_thread_million_cycles"]=distribution(s.ui_mcycles);
         if(!s.gpu_ms.empty()) actions[name]["gpu_engine_busy_ms"]=distribution(s.gpu_ms);
     }
-    Json traces=Json::object(), counts=Json::object();
-    for(auto& [name,values]:phase_counts) counts[name]=distribution(values);
-    std::lock_guard<std::mutex> lock(trace_mutex);
-    for(auto& [name,values]:trace_samples) traces[name]=distribution(values);
-    if(trace_samples.find("all::animation_frame_interval_ms")!=trace_samples.end()) {
-        const auto& frames=trace_samples.at("all::animation_frame_interval_ms");
-        traces["animation_frame_interval_ms"]["over_16_7ms"] = std::count_if(frames.begin(),frames.end(),[](double x){return x>16.7;});
-        traces["animation_frame_interval_ms"]["over_33_3ms"] = std::count_if(frames.begin(),frames.end(),[](double x){return x>33.3;});
-    }
-    return {{"actions",actions},{"core_ui_trace",traces},{"phase_counts",counts}};
+    return {{"actions",actions}};
 }
 Json page_state(UiPage page,const char* key) {
     char* raw=ui_page_get_json(page,key);
@@ -303,65 +209,27 @@ void click(Application& app,const char* id) {
     if(ui_debug_click_at(app.window(),(r.left+r.right)/2,(r.top+r.bottom)/2)!=0)
         throw std::runtime_error(std::string("Click failed: ")+id);
 }
-bool settled(ui::Widget* w,Application& app,ui::Widget* root) {
-    if(!w->visible) return true;
-    if(w->opacity<.999f || std::abs(w->animationX)>.02f) return false;
-    if(w->id=="navIndicator") {
-        auto tab=page_state(app.page(),"tab").get<std::string>();
-        auto* target=root->FindById(tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":"tabPasswords");
-        if(target && std::abs(w->rect.top+w->animationY+(w->rect.bottom-w->rect.top)/2-
-            (target->rect.top+target->rect.bottom)/2)>.02f) return false;
-    } else if(std::abs(w->animationY)>.02f) return false;
-    for(auto& c:w->Children()) if(!settled(c.get(),app,root)) return false;
+bool settled(const ui::Widget& widget,const ui::Widget* indicator,const ui::Widget* selected) {
+    if(!widget.visible) return true;
+    if(widget.opacity<.999f || std::abs(widget.animationX)>.02f) return false;
+    float offset=widget.animationY;
+    if(&widget==indicator && selected)
+        offset+=(widget.rect.top+widget.rect.bottom-selected->rect.top-selected->rect.bottom)/2;
+    if(std::abs(offset)>.02f) return false;
+    for(const auto& child:widget.Children()) if(!settled(*child,indicator,selected)) return false;
     return true;
 }
-// First widget that keeps the settle predicate false, for diagnosing stalls.
-void describe_unsettled(ui::Widget* w,Application& app,ui::Widget* root,std::string& out) {
-    if(!out.empty() || !w->visible) return;
-    bool bad=w->opacity<.999f || std::abs(w->animationX)>.02f || std::abs(w->animationY)>.02f;
-    if(w->id=="navIndicator") {
-        auto tab=page_state(app.page(),"tab").get<std::string>();
-        auto* target=root->FindById(tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":"tabPasswords");
-        if(target && std::abs(w->rect.top+w->animationY+(w->rect.bottom-w->rect.top)/2-
-            (target->rect.top+target->rect.bottom)/2)>.02f) bad=true;
-    }
-    if(bad) {
-        std::ostringstream text;
-        text<<"id="<<(w->id.empty()?"<none>":w->id)<<" opacity="<<w->opacity
-            <<" x="<<w->animationX<<" y="<<w->animationY;
-        if(w->id=="navIndicator") {
-            auto tab=page_state(app.page(),"tab").get<std::string>();
-            auto* target=root->FindById(tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":"tabPasswords");
-            text<<" tab="<<tab<<" center="<<(w->rect.top+w->animationY+(w->rect.bottom-w->rect.top)/2)
-                <<" target="<<(target?(target->rect.top+target->rect.bottom)/2:-1);
-        }
-        out=text.str();
-        return;
-    }
-    for(auto& c:w->Children()) describe_unsettled(c.get(),app,root,out);
-}
+
 void wait_settled(Application& app) {
-    auto root=ui::GetContext().GetWindow(app.window())->Root();
-    const ULONGLONG start=GetTickCount64();
-    ULONGLONG next_report=1000;
-    uint64_t last_paint=paint_count.load(), last_anim=animation_frame_count.load(), last_prop=property_frame_count.load();
-    wait_for([&]{
-        // Visual epsilon alone can declare an easing curve settled before
-        // its actual final frames, incorrectly charging those frames to idle.
-        if(!motion_active.load(std::memory_order_relaxed) && settled(root.get(),app,root.get())) return true;
-        const auto elapsed=GetTickCount64()-start;
-        if(elapsed>=next_report) {
-            next_report=elapsed+1000;
-            std::string detail; describe_unsettled(root.get(),app,root.get(),detail);
-            const uint64_t paints=paint_count.load(), anims=animation_frame_count.load(), props=property_frame_count.load();
-            std::cerr<<"slow settle ("<<elapsed<<" ms): "<<detail
-                     <<" paints=+"<<(paints-last_paint)<<" anim_frames=+"<<(anims-last_anim)
-                     <<" prop_frames=+"<<(props-last_prop)<<'\n';
-            last_paint=paints; last_anim=anims; last_prop=props;
-        }
-        return false;
-    },"motion settle",5000,100);
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto root=window->Root();
+    auto tab=page_state(app.page(),"tab").get<std::string>();
+    auto* indicator=root->FindById("navIndicator");
+    auto* selected=root->FindById(tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":"tabPasswords");
+    wait_for([&]{return settled(*root,indicator,selected) && !GetUpdateRect(window->Handle(),nullptr,FALSE);},
+             "motion settle",5000);
 }
+
 void pump_for(DWORD duration_ms) {
     const auto end=GetTickCount64()+duration_ms;
     do {
@@ -479,7 +347,6 @@ int wmain(int argc,wchar_t** argv) {
         PROCESS_MEMORY_COUNTERS_EX memory{}; memory.cb=sizeof(memory);
         GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),sizeof(memory));
         report["memory_mib_before_ui"] = double(memory.WorkingSetSize)/1048576.0;
-        ui_trace_set_sink(trace_sink,nullptr);
         {
             spg::Options app_options; app_options.data_dir=dir; app_options.allow_cli=false;
             Application app(app_options);
@@ -534,14 +401,10 @@ int wmain(int argc,wchar_t** argv) {
             measure("json_dump_tasks",[&]{ensure(!tasks_document.dump().empty(),"task dump");});
 
             auto nav=[&](const char* button,const char* page,const char* tag="page_switch") {
-                const uint64_t paints=paint_count.load(), layouts=layout_count.load(), draws=draw_count.load();
                 measure(std::string(tag)+"_dispatch",[&]{
                     click(app,button);
                     wait_for([&]{return page_state(app.page(),"tab")==page;},"page switch");
                 });
-                phase_counts[std::string(tag)+"::dispatch_paints"].push_back(double(paint_count.load()-paints));
-                phase_counts[std::string(tag)+"::dispatch_layouts"].push_back(double(layout_count.load()-layouts));
-                phase_counts[std::string(tag)+"::dispatch_draws"].push_back(double(draw_count.load()-draws));
                 measure(std::string(tag)+"_settled",[&]{wait_settled(app);});
             };
             scroll_list(app,"taskListScroll","taskItems",options.rounds,report);
@@ -581,11 +444,10 @@ int wmain(int argc,wchar_t** argv) {
             const auto config_block_count=page_state(app.page(),"matchingBlocks").size();
             measure("config_wheel_traverse",[&]{
                 for(int step=0;step<1500;++step) {
-                    const auto paints=paint_count.load();
                     const float old_scroll=allScroll->ScrollY();
                     auto bounds=allScroll->rect;
                     ensure(ui_debug_wheel_at(app.window(),bounds.left+20,bounds.top+20,-120)==0,"configuration wheel failed");
-                    wait_for([&]{return paint_count.load()>paints || !allScroll->ScrollAnimating();},"configuration wheel frame");
+                    wait_for([&]{return allScroll->ScrollY()!=old_scroll || !allScroll->ScrollAnimating();},"configuration wheel frame");
                     // Read the static list count once, outside timing. Padding
                     // can put the last row beyond bounds.bottom at the clamped
                     // end; stop when motion is exhausted and offset is stable.
@@ -634,7 +496,6 @@ int wmain(int argc,wchar_t** argv) {
             }
             report["popup_open_completed_within_220ms"]=popup_open_completed;
             report["popup_scroll_close_completed_within_120ms"]=popup_scroll_close_completed;
-            report["motion_stopped_events"]=motion_stop_count.load(std::memory_order_relaxed);
             ui_widget_destroy(combo_handle);
 
             nav("tabPasswords","passwords");
@@ -786,18 +647,7 @@ int wmain(int argc,wchar_t** argv) {
             wait_settled(app);
             report["widgets_after_ui"]=widget_count(app);
             for(size_t i=0;i<5;i++) { nav("tabConfig","config","page_switch_end"); nav("tabTasks","tasks","page_switch_end"); }
-            const uint64_t idle_paint_start=paint_count.load(), idle_anim_start=animation_frame_count.load(),
-                idle_prop_start=property_frame_count.load();
-            { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase="idle"; }
             idle_sample(5000);
-            { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase.clear(); }
-            // Idle must stay quiet: a lingering animation timer shows up here as
-            // one paint/animation frame per timer tick, and core_ui_trace.idle::*
-            // names the event that kept firing.
-            report["idle_paints"]=paint_count.load()-idle_paint_start;
-            report["idle_animation_frames"]=animation_frame_count.load()-idle_anim_start;
-            report["idle_property_frames"]=property_frame_count.load()-idle_prop_start;
-            ui_trace_set_sink(nullptr,nullptr);
             report["memory_mib_after_ui"] = double(working_set())/1048576.0;
         }
         auto password_document=read_json(dir/"builtin_passwords.json");
@@ -843,7 +693,6 @@ int wmain(int argc,wchar_t** argv) {
         CoUninitialize();
         return 0;
     } catch(const std::exception& e) {
-        ui_trace_set_sink(nullptr,nullptr);
         if(!dir.empty() && dir.parent_path()==fs::temp_directory_path() && dir.filename().wstring().find(L"sunpack-gui-perf-")==0) {
             std::error_code ec; fs::remove_all(dir,ec);
         }

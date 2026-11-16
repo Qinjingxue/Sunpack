@@ -201,21 +201,11 @@ fn open_handles(path: &Path, share_mode: u32) -> io::Result<IocpHandles> {
         return Err(last_error());
     }
 
-    let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 0) };
+    let port = unsafe { CreateIoCompletionPort(file, null_mut(), 0, 0) };
     if port.is_null() || port == INVALID_HANDLE_VALUE {
         let error = last_error();
         unsafe {
             let _ = CloseHandle(file);
-        }
-        return Err(error);
-    }
-
-    let associated = unsafe { CreateIoCompletionPort(file, port, 0, 0) };
-    if associated.is_null() || associated == INVALID_HANDLE_VALUE {
-        let error = last_error();
-        unsafe {
-            let _ = CloseHandle(file);
-            let _ = CloseHandle(port);
         }
         return Err(error);
     }
@@ -341,20 +331,26 @@ impl Drop for PendingReads<'_> {
     }
 }
 
-// Completion order is not byte order. At most the two read-ahead slots can
-// wait here, and recycling happens only after the next logical chunk is consumed.
+// Read-ahead has two slots. Hold completed buffers inline until the
+// next logical chunk can be consumed and its slot recycled.
 struct OrderedReads {
     next_offset: u64,
-    ready: Vec<Box<IocpSlot>>,
+    ready: [Option<Box<IocpSlot>>; 2],
 }
 impl OrderedReads {
     fn new(offset: u64) -> Self {
-        Self { next_offset: offset, ready: Vec::with_capacity(2) }
+        Self { next_offset: offset, ready: [None, None] }
     }
-    fn completed(&mut self, slot: Box<IocpSlot>) { self.ready.push(slot); }
+    fn completed(&mut self, slot: Box<IocpSlot>) {
+        let vacant = self.ready.iter_mut().find(|ready| ready.is_none())
+            .expect("ordered read has at most two completed slots");
+        *vacant = Some(slot);
+    }
     fn next(&mut self) -> Option<Box<IocpSlot>> {
-        let index = self.ready.iter().position(|slot| slot.read_start == self.next_offset)?;
-        let slot = self.ready.swap_remove(index);
+        let offset = self.next_offset;
+        let slot = self.ready.iter_mut()
+            .find(|ready| ready.as_ref().is_some_and(|slot| slot.read_start == offset))?
+            .take()?;
         self.next_offset += slot.bytes_read as u64;
         Some(slot)
     }

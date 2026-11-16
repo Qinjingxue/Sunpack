@@ -104,6 +104,7 @@ private:
     friend struct CondInIter;
 
     CompiledPage page_;
+    bool styleUsesIds_ = false;
     std::vector<std::string> errors_;
     std::string  currentLocale_;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> i18nTables_;

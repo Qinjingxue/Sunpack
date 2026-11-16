@@ -57,7 +57,7 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
     if (job.width_px <= 0 || job.height_px <= 0 || job.display_list.Empty()) {
         // The minimized window queues an empty job on its render thread.
         if (renderer_ && !trimmedWhileMinimized_ &&
-            surfaceKind_ == RenderSurfaceKind::OpaqueCompositionSurface && IsIconic(hwnd_)) {
+            surfaceKind_ == RenderSurfaceKind::OpaqueComposition && IsIconic(hwnd_)) {
             renderer_->FlushAndTrimGpu();
             trimmedWhileMinimized_ = true;
         }
@@ -81,10 +81,11 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
         rendererReady_ = true;
     }
     if (!targetReady_ || !renderer_->RT()) {
-        const bool created = surfaceKind_ == RenderSurfaceKind::LayeredComposition
-            ? renderer_->CreateRenderTargetForLayered(hwnd_)
-            : renderer_->CreateRenderTarget(hwnd_, surfaceKind_ == RenderSurfaceKind::OpaqueCompositionSurface);
-        if (!created) {
+        const auto alpha = surfaceKind_ == RenderSurfaceKind::OpaqueComposition ? DXGI_ALPHA_MODE_IGNORE
+            : surfaceKind_ == RenderSurfaceKind::LayeredComposition ? DXGI_ALPHA_MODE_PREMULTIPLIED
+            : DXGI_ALPHA_MODE_UNSPECIFIED;
+        if (!renderer_->CreateRenderTarget(hwnd_, alpha) &&
+            (surfaceKind_ != RenderSurfaceKind::OpaqueComposition || !renderer_->CreateRenderTarget(hwnd_))) {
             ReleaseResources();
             return RenderFrameResult::DeviceFailure;
         }
@@ -120,7 +121,7 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
                            job.policy != PresentPolicy::Screenshot;
     const bool incremental = !resize && !job.defer_present && !job.startup_reveal &&
         visible && surfaceKind_ != RenderSurfaceKind::LayeredComposition && job.policy != PresentPolicy::Screenshot;
-    const HRESULT hr = renderer_->DrawDisplayListFrame(std::move(job.display_list), incremental, !job.live_resize);
+    const HRESULT hr = renderer_->DrawDisplayListFrame(std::move(job.display_list), incremental);
     if (hr == D2DERR_RECREATE_TARGET) {
         ReleaseResources();
         return RenderFrameResult::RecreateTarget;
