@@ -2312,7 +2312,7 @@ impl Scheduler {
         let hub = Arc::clone(&self.hub);
         job.handle = Some(self.engine.submit_discovery(request, move |owner, inputs| {
             if inputs.iter().flat_map(|input| input.physical_paths()).any(|path| !scope.contains(path)) { return Ok(()); }
-            let result = consider_dedup(&index, &owner.to_string_lossy(), scope.key(), inputs, Some(generation));
+            let result = dedup::consider(&index, &owner.to_string_lossy(), scope.key(), inputs, Some(generation));
             if let Err(error) = result {
                 journal.log(json!({"event":"watch_dedup_unavailable","path":owner,"error":error.to_string()}));
             }
@@ -6516,26 +6516,6 @@ impl ObservedOutputs {
     }
 }
 
-fn consider_dedup(
-    index: &Mutex<dedup::Index>, owner: &str, scope: &str,
-    inputs: &[&crate::io::archive_state::ArchiveInput], generation: Option<u64>,
-) -> io::Result<bool> {
-    let prepared = {
-        let mut index = index.lock().unwrap();
-        match generation {
-            Some(generation) => index.prepare_at(generation, owner, scope, inputs, true)?,
-            None => index.prepare(owner, scope, inputs, false)?,
-        }
-    };
-    let Some(mut prepared) = prepared else { return Ok(false); };
-    loop {
-        prepared.hash()?;
-        let mut index = index.lock().unwrap();
-        if index.refresh(&mut prepared) { continue; }
-        return index.commit(prepared);
-    }
-}
-
 struct WatchObserver {
     deep: bool,
     dedup_enabled: bool,
@@ -6601,7 +6581,7 @@ impl Observer for WatchObserver {
             || self.journal.state().pending(&owner_path).is_some_and(|pending| pending.has_output_work()) {
             return Ok(true);
         }
-        let duplicate = match consider_dedup(&self.dedup, &owner_path, self.dedup_scope.key(), inputs, None) {
+        let duplicate = match dedup::consider(&self.dedup, &owner_path, self.dedup_scope.key(), inputs, None) {
             Ok(duplicate) => duplicate,
             Err(error) => {
                 self.journal.log(json!({"event":"watch_dedup_unavailable","path":owner,"error":error.to_string()}));

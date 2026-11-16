@@ -1,4 +1,5 @@
 use super::*;
+use crate::io::reader::capture_file_generation;
 
 #[test]
 fn ordered_ranges_match_xxh3_across_read_ahead_and_files() {
@@ -16,14 +17,18 @@ fn ordered_ranges_match_xxh3_across_read_ahead_and_files() {
     let data: Vec<u8> = (0..1_400_019).map(|i| (i * 73 + i / 251) as u8).collect();
     std::fs::write(&a, &data).unwrap();
     std::fs::write(&b, &data[..70_003]).unwrap();
+    let a_generation = capture_file_generation(&a).unwrap();
+    let b_generation = capture_file_generation(&b).unwrap();
     let ranges = [
         HashRange {
             path: &a,
+            generation: &a_generation,
             offset: 37,
             len: 1_100_013,
         },
         HashRange {
             path: &b,
+            generation: &b_generation,
             offset: 19,
             len: 65_537,
         },
@@ -31,23 +36,24 @@ fn ordered_ranges_match_xxh3_across_read_ahead_and_files() {
     let mut expected = data[37..37 + 1_100_013].to_vec();
     expected.extend_from_slice(&data[19..19 + 65_537]);
     assert_eq!(
-        hash_ranges(&ranges).unwrap(),
+        hash_ranges(ranges).unwrap(),
         xxhash_rust::xxh3::xxh3_128(&expected).to_le_bytes()
     );
-    assert!(hash_ranges(&[HashRange {
+    assert!(hash_ranges([HashRange {
         path: &b,
+        generation: &b_generation,
         offset: 70_000,
         len: 4
     }])
     .is_err());
     assert_eq!(
-        hash_ranges(&[]).unwrap(),
+        hash_ranges([]).unwrap(),
         xxhash_rust::xxh3::xxh3_128(&[]).to_le_bytes()
     );
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
-fn ordered_read_drains_on_cancel_error_and_unwind_and_detects_replacement() {
+fn ordered_read_drains_on_cancel_error_and_unwind_and_checks_generation() {
     use std::os::windows::fs::OpenOptionsExt;
     let root = std::env::temp_dir().join(format!(
         "sunpack-dedup-drain-{}-{}",
@@ -61,11 +67,12 @@ fn ordered_read_drains_on_cancel_error_and_unwind_and_detects_replacement() {
     let path = root.join("source");
     let data = vec![42u8; 2 * 1024 * 1024];
     std::fs::write(&path, &data).unwrap();
+    let generation = capture_file_generation(&path).unwrap();
     for mode in 0..3 {
         let cancellation = crate::io::cancellation::Cancellation::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             cancellation.run(|| {
-                crate::io::iocp::read_range_ordered(&path, 0, data.len() as u64, |_| match mode {
+                crate::io::iocp::read_range_ordered(&path, &generation, 0, data.len() as u64, |_| match mode {
                     0 => {
                         cancellation.cancel();
                         Ok(())
@@ -89,7 +96,7 @@ fn ordered_read_drains_on_cancel_error_and_unwind_and_detects_replacement() {
         );
     }
     let mut truncated = false;
-    let short = crate::io::iocp::read_range_ordered(&path, 0, data.len() as u64, |_| {
+    let short = crate::io::iocp::read_range_ordered(&path, &generation, 0, data.len() as u64, |_| {
         if !truncated {
             truncated = true;
             // The following read-ahead submission is now beyond EOF, even if
@@ -105,19 +112,14 @@ fn ordered_read_drains_on_cancel_error_and_unwind_and_detects_replacement() {
         short.is_err(),
         "a truncated stream must never publish a partial digest"
     );
+    std::fs::rename(&path, root.join("old")).unwrap();
     std::fs::write(&path, &data).unwrap();
-    let mut replaced = false;
-    let result = crate::io::iocp::read_range_ordered(&path, 0, data.len() as u64, |_| {
-        if !replaced {
-            replaced = true;
-            std::fs::rename(&path, root.join("old"))?;
-            std::fs::write(&path, &data)?;
-        }
-        Ok(())
+    let result = crate::io::iocp::read_range_ordered(&path, &generation, 0, data.len() as u64, |_| {
+        panic!("the read must check the generation before consuming bytes")
     });
     assert!(
         result.is_err(),
-        "replacement must not publish the old object's digest"
+        "a replacement must not be read as the originally observed file"
     );
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -13,7 +13,7 @@ use std::collections::{btree_set, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Layout { format: String, mode: u8, parts: Box<[(u8, Option<u32>, u64)]> }
@@ -48,11 +48,39 @@ impl Record {
         })
     }
     fn hash(&mut self) -> io::Result<()> {
-        if self.sources.iter().any(|s| !crate::filesystem::watch_file_is_ready(&s.path).unwrap_or(false)) { return Err(io::Error::new(io::ErrorKind::WouldBlock, "deduplication input is being written")); }
-        let ranges: Vec<_> = self.range_sources.iter().zip(self.identities.iter()).map(|(&source, extent)| HashRange { path: Path::new(&self.sources[source as usize].path), offset: extent.start, len: extent.len }).collect();
-        self.digest = Some(hash_ranges(&ranges)?);
-        if !self.current() { return Err(io::Error::other("deduplication input changed while reading")); }
+        if self.identities.iter().any(|range| range.len > crate::io::iocp::ORDERED_READ_CHUNK as u64)
+            && self.sources.iter().any(|s| !crate::filesystem::watch_file_is_ready(&s.path).unwrap_or(false))
+        {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "deduplication input is being written"));
+        }
+        let ranges = self.range_sources.iter().zip(self.identities.iter()).map(|(&source, extent)| {
+            let source = &self.sources[source as usize];
+            HashRange {
+                path: Path::new(&source.path),
+                generation: &source.generation,
+                offset: extent.start,
+                len: extent.len,
+            }
+        });
+        self.digest = Some(hash_ranges(ranges)?);
         Ok(())
+    }
+
+    // The physical index has already matched the ordered extents. Compare
+    // their sampled versions before reusing a digest through another name.
+    fn same_source_versions(&self, other: &Self) -> bool {
+        self.range_sources.iter().zip(other.range_sources.iter()).all(|(&left, &right)| {
+            let left = &self.sources[left as usize];
+            let right = &other.sources[right as usize];
+            left.usn == right.usn && left.generation == right.generation
+        })
+    }
+
+    fn same_source_paths_and_versions(&self, other: &Self) -> bool {
+        self.sources.len() == other.sources.len()
+            && self.sources.iter().zip(other.sources.iter()).all(|(left, right)| {
+                left.path == right.path && left.usn == right.usn && left.generation == right.generation
+            })
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -66,14 +94,49 @@ enum Delta<'a> {
 }
 
 /// Hashing is deliberately outside Index's lock and the scheduler thread.
-pub(super) struct Prepared {
+struct Prepared {
     epoch: u64, record: Record, representative: Option<Record>, hash: bool,
 }
 impl Prepared {
-    pub(super) fn hash(&mut self) -> io::Result<()> {
+    fn needs_hash(&self) -> bool {
+        (self.hash && self.record.digest.is_none())
+            || self.representative.as_ref().is_some_and(|record| record.digest.is_none())
+    }
+
+    fn hash(&mut self) -> io::Result<()> {
         if self.hash && self.record.digest.is_none() { self.record.hash()?; }
         if let Some(record) = &mut self.representative { if record.digest.is_none() { record.hash()?; } }
         Ok(())
+    }
+}
+
+pub(super) fn consider(
+    index: &Mutex<Index>,
+    owner: &str,
+    scope: &str,
+    inputs: &[&ArchiveInput],
+    generation: Option<u64>,
+) -> io::Result<bool> {
+    if inputs.is_empty() { return Ok(false); }
+    let Some(epoch) = index.lock().unwrap().admission_epoch(scope, generation) else {
+        return Ok(false);
+    };
+    // Describing the sources opens files and queries NTFS/ReFS. Each job can
+    // do that under its existing Watch work budget while other jobs commit.
+    let Some(record) = describe(owner, scope, inputs)? else { return Ok(false); };
+    let mut locked = index.lock().unwrap();
+    let Some(mut prepared) = locked.prepare(epoch, record, generation.is_some()) else {
+        return Ok(false);
+    };
+    if !prepared.needs_hash() {
+        return locked.commit(prepared);
+    }
+    drop(locked);
+    loop {
+        prepared.hash()?;
+        let mut locked = index.lock().unwrap();
+        if locked.refresh(&mut prepared) { continue; }
+        return locked.commit(prepared);
     }
 }
 
@@ -193,9 +256,11 @@ impl Index {
         if self.generation != generation { return Ok(false); }
         self.finish_rebuild()?; Ok(true)
     }
-    pub(super) fn prepare_at(&mut self, generation: u64, owner: &str, scope: &str, inputs: &[&ArchiveInput], baseline: bool) -> io::Result<Option<Prepared>> {
-        if self.generation != generation { return Ok(None); }
-        self.prepare(owner, scope, inputs, baseline)
+    fn admission_epoch(&self, scope: &str, generation: Option<u64>) -> Option<u64> {
+        (self.mode != WatchDeduplication::None
+            && generation.is_none_or(|generation| generation == self.generation)
+            && self.journals.get(scope).is_some_and(|stamp| !stamp.0.is_empty()))
+            .then_some(self.epoch)
     }
     pub(super) fn needs_rebuild(&self) -> bool { self.mode != WatchDeduplication::None && !self.ready }
     pub(super) fn finish_rebuild(&mut self) -> io::Result<()> {
@@ -227,17 +292,23 @@ impl Index {
         file.write_all(&wal::file_header(Kind::DedupWal))?; self.file = Some(file);
         self.append(&Delta::Begin(mode_tag(self.mode), scope_tag(self.scope)))
     }
-    pub(super) fn prepare(&mut self, owner: &str, scope: &str, inputs: &[&ArchiveInput], baseline: bool) -> io::Result<Option<Prepared>> {
-        if self.mode == WatchDeduplication::None || inputs.is_empty() || self.journals.get(scope).is_none_or(|stamp| stamp.0.is_empty()) { return Ok(None); }
-        let Some(mut record) = describe(owner, scope, inputs)? else { return Ok(None); };
+    fn prepare(&mut self, epoch: u64, mut record: Record, baseline: bool) -> Option<Prepared> {
+        // Removing a scope with no resident entries can retire its journal
+        // without bumping the epoch.
+        if self.admission_epoch(&record.scope, None) != Some(epoch) { return None; }
         let signature = self.signature(&record);
-        if let Some(saved) = self.owners.get(&record.owner).and_then(|id| self.records.get(id)).filter(|r| r.layout == record.layout && r.identities == record.identities && r.current()) {
-            if saved.admitted && saved.scope == record.scope { return Ok(None); }
+        if let Some(saved) = self.owners.get(&record.owner).and_then(|id| self.records.get(id)).filter(|r| {
+            r.layout == record.layout && r.identities == record.identities
+                && (r.same_source_paths_and_versions(&record) || r.current())
+        }) {
+            if saved.admitted && saved.scope == record.scope { return None; }
             record.digest = saved.digest;
         }
         if self.mode == WatchDeduplication::Hash && record.digest.is_none() {
             record.digest = self.objects.get(&(signature.clone(), Arc::clone(&record.identities))).and_then(|ids|
-                ids.iter().filter_map(|id| self.records.get(&id)).find(|r| r.current()).and_then(|r| r.digest));
+                ids.iter().filter_map(|id| self.records.get(&id))
+                    .find(|r| record.same_source_versions(r) || r.current())
+                    .and_then(|r| r.digest));
         }
         record.id = self.next_id; self.next_id += 1;
         let matching = self.sizes.get(&signature);
@@ -245,12 +316,22 @@ impl Index {
             matching.and_then(|bucket| bucket.pending().filter_map(|id| self.records.get(&id)).find(|r| r.owner != record.owner)).cloned()
         } else { None };
         let hash = self.mode == WatchDeduplication::Hash && (baseline || matching.is_some());
-        Ok(Some(Prepared { epoch: self.epoch, record, representative, hash }))
+        Some(Prepared { epoch, record, representative, hash })
+    }
+
+    #[cfg(test)]
+    fn prepare_path(&mut self, owner: &str, scope: &str, inputs: &[&ArchiveInput], baseline: bool) -> io::Result<Option<Prepared>> {
+        let Some(epoch) = self.admission_epoch(scope, None) else { return Ok(None); };
+        Ok(describe(owner, scope, inputs)?.and_then(|record| self.prepare(epoch, record, baseline)))
     }
     /// Repeat only work newly made necessary by a concurrent admission. The caller
     /// holds the same lock from a false return through commit.
-    pub(super) fn refresh(&self, prepared: &mut Prepared) -> bool {
-        if self.mode != WatchDeduplication::Hash || prepared.epoch != self.epoch { return false; }
+    fn refresh(&self, prepared: &mut Prepared) -> bool {
+        if self.mode != WatchDeduplication::Hash
+            || self.admission_epoch(&prepared.record.scope, None) != Some(prepared.epoch)
+        {
+            return false;
+        }
         let Some(bucket) = self.sizes.get(&self.signature(&prepared.record)) else { return false; };
         let mut changed = false;
         if prepared.record.digest.is_none() { prepared.hash = true; changed = true; }
@@ -261,8 +342,12 @@ impl Index {
         }
         changed
     }
-    pub(super) fn commit(&mut self, mut prepared: Prepared) -> io::Result<bool> {
-        if prepared.epoch != self.epoch || !prepared.record.current() { return Ok(false); }
+    fn commit(&mut self, mut prepared: Prepared) -> io::Result<bool> {
+        if self.admission_epoch(&prepared.record.scope, None) != Some(prepared.epoch)
+            || !prepared.record.current()
+        {
+            return Ok(false);
+        }
         if let Some(rep) = prepared.representative.take() {
             if self.records.get(&rep.id).is_some_and(|old| old.digest.is_none() && old.sources.iter().map(|s| &s.generation).eq(rep.sources.iter().map(|s| &s.generation))) && rep.current() {
                 self.append(&Delta::Put(Cow::Borrowed(&rep)))?;
@@ -272,7 +357,11 @@ impl Index {
         let mut record = prepared.record;
         // A retry by its original owner is never suppressed by an alias that arrived later.
         let replaced = self.owners.get(&record.owner).copied();
-        let own = replaced.and_then(|id| self.records.get(&id)).is_some_and(|r| r.admitted && r.scope == record.scope && r.layout == record.layout && r.identities == record.identities && r.current());
+        let own = replaced.and_then(|id| self.records.get(&id)).is_some_and(|r| {
+            r.admitted && r.scope == record.scope && r.layout == record.layout && r.identities == record.identities
+                && (r.same_source_paths_and_versions(&record) || r.current())
+        });
+        if own { return Ok(false); }
         let matches = if self.mode == WatchDeduplication::FileId {
             self.objects.get(&(self.signature(&record), Arc::clone(&record.identities)))
         } else { record.digest.and_then(|d| self.hashes.get(&(self.signature(&record), d))) };
@@ -281,10 +370,9 @@ impl Index {
             let r = self.records.get(&id)?;
             if r.current() { Some(r.owner.as_ref()) } else { stale.push(id); None }
         }));
-        let duplicate = !own && representative.is_some_and(|owner| owner != record.owner.as_ref());
+        let duplicate = representative.is_some_and(|owner| owner != record.owner.as_ref());
         self.remove_ids(stale)?;
         record.admitted = !duplicate;
-        if own { return Ok(false); }
         // Superseded owner layouts must not retain an obsolete signature indefinitely.
         if let Some(id) = replaced.filter(|id| self.records.contains_key(id)) {
             self.remove_ids(vec![id])?;
@@ -512,8 +600,19 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
             _ => input.parts.len(),
         });
         let mut push = |path: &str, start: u64, end: Option<u64>, role: u8, number: Option<u32>, whole: bool| -> io::Result<bool> {
-            let path_id = path_key(path);
-            let source = if let Some(&id) = physical.get(&path_id) { id } else {
+            // Whole files and carriers with one spelling need no lookup table.
+            let (existing, path_id) = match sources.first() {
+                None => (None, None),
+                Some(first) if first.path == path => (Some(0), None),
+                Some(first) => {
+                    if physical.is_empty() {
+                        physical.insert(path_key(&first.path), 0);
+                    }
+                    let path_id = path_key(path);
+                    (physical.get(&path_id).copied(), Some(path_id))
+                }
+            };
+            let source = if let Some(id) = existing { id } else {
                 let Some(snapshot) = crate::filesystem::watch_ready_file_snapshot(Path::new(path), None)? else { return Ok(false); };
                 let id = sources.len() as u32;
                 sources.push(Source {
@@ -524,7 +623,9 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
                     file_id: snapshot.observation.file_id,
                     usn: snapshot.observation.change_usn,
                 });
-                physical.insert(path_id, id);
+                if let Some(path_id) = path_id {
+                    physical.insert(path_id, id);
+                }
                 id
             };
             let observed = &sources[source as usize];

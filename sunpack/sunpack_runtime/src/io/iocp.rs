@@ -7,6 +7,9 @@
 //! separate pooled buffer.
 
 use super::cancellation::Cancellation;
+use super::reader::{
+    physical_file_generation, physical_file_generation_from_metadata, PhysicalFileGeneration,
+};
 use super::ScanBatch;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -27,6 +30,7 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const OPEN_EXISTING: u32 = 3;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
@@ -176,7 +180,7 @@ fn last_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
 }
 
-fn open_handles(path: &Path) -> io::Result<IocpHandles> {
+fn open_handles(path: &Path, share_mode: u32) -> io::Result<IocpHandles> {
     let resource = crate::io::resource_lifecycle::NativeResourceGuard::register(
         [path.to_path_buf()],
     )?;
@@ -186,7 +190,7 @@ fn open_handles(path: &Path) -> io::Result<IocpHandles> {
         CreateFileW(
             wide.as_ptr(),
             GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share_mode,
             null_mut(),
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
@@ -356,29 +360,44 @@ impl OrderedReads {
     }
 }
 
-/// Stream one exact range in offset order with a two-buffer read-ahead window.
+pub(crate) const ORDERED_READ_CHUNK: usize = 256 * 1024;
+
+/// Stream one exact range of the observed file in offset order.
 /// The callback runs on the caller's admitted worker; no per-file thread or
-/// unbounded completion queue is created. PendingReads also drains on unwind.
+/// unbounded completion queue is created. The caller revalidates the path and
+/// its USN before publishing any result derived from this handle.
 pub(crate) fn read_range_ordered(
     path: &Path,
+    expected: &PhysicalFileGeneration,
     offset: u64,
     len: u64,
     mut consume: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::windows::io::FromRawHandle;
-    const CHUNK: usize = 256 * 1024;
+    const CHUNK: usize = ORDERED_READ_CHUNK;
     let end = offset.checked_add(len).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "IOCP range overflows")
     })?;
     let cancellation = Cancellation::current();
     cancellation.check_io()?;
-    let handles = Arc::new(open_handles(path)?);
+    // For a single buffer, confirm readiness with the read handle itself.
+    // Keep sharing enabled during long reads so writers and renames can proceed.
+    let share_mode = if len <= CHUNK as u64 {
+        FILE_SHARE_READ
+    } else {
+        SHARE_ALL
+    };
+    let handles = Arc::new(open_handles(path, share_mode)?);
     // Borrow the very same handle used by overlapped reads, without closing it.
     let file = std::mem::ManuallyDrop::new(unsafe {
         std::fs::File::from_raw_handle(handles.file)
     });
-    let before = super::reader::physical_file_generation(&file)?;
-    if end > file.metadata()?.len() {
+    let metadata = file.metadata()?;
+    let before = physical_file_generation_from_metadata(&file, &metadata)?;
+    if !before.matches_input(expected) {
+        return Err(io::Error::other("file changed before streaming range"));
+    }
+    if end > metadata.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "IOCP range exceeds file"));
     }
     let wake_handles = Arc::clone(&handles);
@@ -420,8 +439,7 @@ pub(crate) fn read_range_ordered(
             submit_next_slot(&mut pending, &mut next_read, end, CHUNK, 0, slot)?;
         }
     }
-    let after = super::reader::physical_file_generation(&file)?;
-    if before != after || after != super::reader::capture_file_generation(path)? {
+    if before != physical_file_generation(&file)? {
         return Err(io::Error::other("file changed while streaming range"));
     }
     Ok(())
@@ -464,7 +482,7 @@ where
         .clamp(1, 8)
         .min(rayon::current_num_threads().clamp(1, 8));
     let expected_read_operations = file_size.div_ceil(chunk_bytes as u64);
-    let handles = Arc::new(open_handles(path)?);
+    let handles = Arc::new(open_handles(path, SHARE_ALL)?);
     let wake_handles = Arc::clone(&handles);
     let _subscription = cancellation.subscribe(move || unsafe {
         CancelIoEx(wake_handles.file, null_mut());

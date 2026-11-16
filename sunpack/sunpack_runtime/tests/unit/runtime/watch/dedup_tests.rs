@@ -12,7 +12,7 @@ impl Sandbox {
 }
 impl Drop for Sandbox { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
 fn admit(index: &mut Index, input: &ArchiveInput, baseline: bool) -> bool {
-    let Some(mut p) = index.prepare(&input.entry_path, "scope", &[input], baseline).unwrap() else { return false; };
+    let Some(mut p) = index.prepare_path(&input.entry_path, "scope", &[input], baseline).unwrap() else { return false; };
     loop { p.hash().unwrap(); if !index.refresh(&mut p) { return index.commit(p).unwrap(); } }
 }
 #[test]
@@ -23,7 +23,7 @@ fn live_identity_alias_lifetime_and_mode_reset() {
     let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::FileId, WatchDeduplicationScope::Root).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     let writer = OpenOptions::new().write(true).open(&first.entry_path).unwrap();
-    assert!(index.prepare(&first.entry_path, "scope", &[&first], true).unwrap().is_none());
+    assert!(index.prepare_path(&first.entry_path, "scope", &[&first], true).unwrap().is_none());
     drop(writer);
     assert!(!admit(&mut index, &first, true)); assert!(admit(&mut index, &alias, true));
     index.finish_rebuild().unwrap();
@@ -43,12 +43,12 @@ fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     let alias = dir.0.join("hardlink.zip"); fs::hard_link(&first.entry_path, &alias).unwrap();
     let folder = dir.0.join("index"); let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
-    let mut a = index.prepare(&first.entry_path, "scope", &[&first], false).unwrap().unwrap();
-    let mut b = index.prepare(&copy.entry_path, "scope", &[&copy], false).unwrap().unwrap();
+    let mut a = index.prepare_path(&first.entry_path, "scope", &[&first], false).unwrap().unwrap();
+    let mut b = index.prepare_path(&copy.entry_path, "scope", &[&copy], false).unwrap().unwrap();
     assert!(!a.hash && !b.hash); a.hash().unwrap(); assert!(!index.commit(a).unwrap());
     assert!(index.refresh(&mut b)); b.hash().unwrap(); assert!(!index.refresh(&mut b)); assert!(index.commit(b).unwrap());
     let linked = ArchiveInput::file(alias.to_string_lossy().into_owned(), "zip".into(), "hardlink.zip".into());
-    let cached = index.prepare(&linked.entry_path, "scope", &[&linked], true).unwrap().unwrap();
+    let cached = index.prepare_path(&linked.entry_path, "scope", &[&linked], true).unwrap().unwrap();
     assert!(cached.record.digest.is_some(), "same physical generation reuses the hash without reading");
     index.finish_rebuild().unwrap(); drop(index);
     let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap(); assert!(!index.needs_rebuild());
@@ -56,7 +56,7 @@ fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     index.reconcile_journals(&[("other-scope".into(), "test-volume".into(), 1)]).unwrap();
     // A separately monitored root on the same volume may not be included in
     // the next checkpoint's probe list. Its old journal must still be retired.
-    let mut in_other_scope = index.prepare(&linked.entry_path, "other-scope", &[&linked], true).unwrap().unwrap();
+    let mut in_other_scope = index.prepare_path(&linked.entry_path, "other-scope", &[&linked], true).unwrap().unwrap();
     in_other_scope.hash().unwrap(); assert!(!index.commit(in_other_scope).unwrap());
     index.finish_rebuild().unwrap();
     let generation = index.generation();
@@ -64,11 +64,58 @@ fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     assert!(index.reconcile_journals(&[("scope".into(), "test-volume".into(), 2)]).unwrap());
     assert!(index.records.is_empty() && index.needs_rebuild());
     assert_eq!(index.journals["other-scope"].1, 2);
-    assert!(index.prepare_at(generation, &first.entry_path, "scope", &[&first], true).unwrap().is_none());
+    assert!(index.admission_epoch("scope", Some(generation)).is_none());
     assert!(!admit(&mut index, &first, true));
     index.finish_rebuild().unwrap();
     drop(index); OpenOptions::new().append(true).open(folder.join("dedup.wal.bin")).unwrap().write_all(&[1, 2, 3]).unwrap();
     let index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap(); assert!(index.needs_rebuild()); assert!(index.records.is_empty());
+}
+
+#[test]
+fn hash_admission_rechecks_the_path_after_reading() {
+    let dir = Sandbox::new();
+    let first = dir.file("first.zip", b"identical archive bytes");
+    let copy = dir.file("copy.zip", b"identical archive bytes");
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    assert!(!admit(&mut index, &first, true));
+
+    let mut pending = index.prepare_path(&copy.entry_path, "scope", &[&copy], false).unwrap().unwrap();
+    let writer = OpenOptions::new().write(true).open(&copy.entry_path).unwrap();
+    assert!(pending.hash().is_err(), "the read handle must exclude an active writer");
+    drop(writer);
+    pending.hash().unwrap();
+    assert!(!index.refresh(&mut pending));
+    fs::rename(&copy.entry_path, dir.0.join("old-copy.zip")).unwrap();
+    fs::write(&copy.entry_path, b"different archive bytes").unwrap();
+    assert!(!index.commit(pending).unwrap());
+    assert_eq!(index.records.len(), 1);
+}
+
+#[test]
+fn scope_retirement_discards_an_admission_already_in_flight() {
+    let dir = Sandbox::new();
+    let source = dir.file("input.zip", b"confirmed archive bytes");
+    let other = NativeDiscoveryScope::new(
+        dir.0.join("other").to_string_lossy().into_owned(), None, vec![],
+    );
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    index.reconcile_journals(&[
+        ("scope".into(), "test-volume".into(), 1),
+        (other.key().into(), "test-volume".into(), 1),
+    ]).unwrap();
+    let epoch = index.admission_epoch("scope", None).unwrap();
+    let record = describe(&source.entry_path, "scope", &[&source]).unwrap().unwrap();
+    let mut prepared = index.prepare(epoch, record.clone(), true).unwrap();
+    prepared.hash().unwrap();
+
+    // There are no resident records to invalidate, but two jobs have already
+    // sampled this scope at different points in admission.
+    index.reconcile_scopes(&[other]).unwrap();
+    assert!(index.prepare(epoch, record, true).is_none());
+    assert!(!index.refresh(&mut prepared));
+    assert!(!index.commit(prepared).unwrap());
+    assert!(index.records.is_empty());
 }
 
 /// Abrupt process exit must not rely on Index/File destructors to publish a
@@ -117,9 +164,9 @@ fn process_exit_recovers_ready_index_but_rebuilds_unpublished_baseline() {
             assert_eq!(index.records.len(), 2);
             assert!(index.records.values().all(|record| record.digest.is_some()));
             let first = input(&dir.0, "first.zip");
-            assert!(index.prepare(&first.entry_path, "scope", &[&first], false).unwrap().is_none());
+            assert!(index.prepare_path(&first.entry_path, "scope", &[&first], false).unwrap().is_none());
             let copy = input(&dir.0, "copy.zip");
-            let mut prepared = index.prepare(&copy.entry_path, "scope", &[&copy], false).unwrap().unwrap();
+            let mut prepared = index.prepare_path(&copy.entry_path, "scope", &[&copy], false).unwrap().unwrap();
             assert!(prepared.record.digest.is_some());
             assert!(!index.refresh(&mut prepared));
             // Intentionally no Prepared::hash: persisted content evidence is reusable.
@@ -146,7 +193,7 @@ fn root_and_global_domains_follow_live_scope_ownership() {
     let other_scope = NativeDiscoveryScope::new(other.to_string_lossy().into_owned(), None, vec![]);
     let stamps = [&parent_scope, &nested_scope, &other_scope].map(|scope| (scope.key().to_owned(), "test-volume".to_owned(), 1));
     let admit_scope = |index: &mut Index, input: &ArchiveInput, scope: &str| {
-        let Some(mut p) = index.prepare(&input.entry_path, scope, &[input], true).unwrap() else { return false; };
+        let Some(mut p) = index.prepare_path(&input.entry_path, scope, &[input], true).unwrap() else { return false; };
         loop { p.hash().unwrap(); if !index.refresh(&mut p) { break index.commit(p).unwrap(); } }
     };
     for mode in [WatchDeduplication::FileId, WatchDeduplication::Hash] {
@@ -175,7 +222,7 @@ fn root_and_global_domains_follow_live_scope_ownership() {
         assert_eq!(index.records.len(), before);
         assert!(index.records.values().filter(|r| r.owner.as_ref() == path_key(&alias.entry_path)).all(|r| r.scope.as_ref() == parent_scope.key()));
         if mode == WatchDeduplication::Hash {
-            let prepared = index.prepare(&alias.entry_path, parent_scope.key(), &[&alias], true).unwrap().unwrap();
+            let prepared = index.prepare_path(&alias.entry_path, parent_scope.key(), &[&alias], true).unwrap().unwrap();
             assert!(prepared.record.digest.is_some(), "scope ownership rebinding retains the valid content hash");
         }
         assert!(admit_scope(&mut index, &alias, parent_scope.key()));

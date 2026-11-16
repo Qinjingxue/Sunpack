@@ -61,6 +61,8 @@ fn measure_watch_dedup_index() {
     index
         .reconcile_journals(&[("benchmark-scope".into(), "benchmark-volume".into(), 1)])
         .unwrap();
+    let generation = baseline.then(|| index.generation());
+    let index = Mutex::new(index);
     let mut times = Vec::with_capacity(count);
     let before = memory();
     let start = Instant::now();
@@ -73,21 +75,13 @@ fn measure_watch_dedup_index() {
             format!("{i:05}.zip"),
         );
         let start = Instant::now();
-        if let Some(mut prepared) = index
-            .prepare(&input.entry_path, "benchmark-scope", &[&input], baseline)
-            .unwrap()
-        {
-            loop {
-                prepared.hash().unwrap();
-                if !index.refresh(&mut prepared) {
-                    duplicates += usize::from(index.commit(prepared).unwrap());
-                    break;
-                }
-            }
-        }
+        duplicates += usize::from(
+            consider(&index, &input.entry_path, "benchmark-scope", &[&input], generation).unwrap(),
+        );
         times.push(start.elapsed().as_nanos() as u64);
     }
     let admit_ns = start.elapsed().as_nanos() as u64;
+    let mut index = index.into_inner().unwrap();
     let flush = Instant::now();
     index.finish_rebuild().unwrap();
     let flush_ns = flush.elapsed().as_nanos() as u64;
