@@ -5,35 +5,41 @@ use std::io;
 use std::path::Path;
 use xxhash_rust::xxh3::Xxh3;
 
-pub(super) struct HashRange<'a> {
-    pub(super) path: &'a Path,
-    pub(super) generation: &'a PhysicalFileGeneration,
-    pub(super) offset: u64,
-    pub(super) len: u64,
-}
+/// Hash an ordered logical byte stream under the shared Watch work budget.
+/// The caller revalidates the path and USN before publishing the digest.
+pub(super) struct StreamHash(Xxh3);
 
-/// Hash the exact logical byte stream in caller-specified order. Read-ahead is
-/// bounded independently of source size. The caller must run under the shared
-/// Watch work budget and revalidate its discovery/USN generation before admission.
-pub(super) fn hash_ranges<'a>(ranges: impl IntoIterator<Item = HashRange<'a>>) -> io::Result<[u8; 16]> {
-    #[cfg(test)]
-    metrics::call();
-    let mut state = Xxh3::new();
-    for range in ranges {
+impl StreamHash {
+    pub(super) fn new() -> Self {
+        #[cfg(test)]
+        metrics::call();
+        Self(Xxh3::new())
+    }
+
+    pub(super) fn read(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+        validate_generation: impl FnOnce(&PhysicalFileGeneration) -> io::Result<()>,
+    ) -> io::Result<()> {
         crate::io::iocp::read_range_ordered(
-            range.path,
-            range.generation,
-            range.offset,
-            range.len,
+            path,
+            offset,
+            len,
+            validate_generation,
             |bytes| {
                 #[cfg(test)]
                 metrics::consume(bytes.len());
-                state.update(bytes);
+                self.0.update(bytes);
                 Ok(())
             },
-        )?;
+        )
     }
-    Ok(state.digest128().to_le_bytes())
+
+    pub(super) fn finish(self) -> [u8; 16] {
+        self.0.digest128().to_le_bytes()
+    }
 }
 
 #[cfg(test)]

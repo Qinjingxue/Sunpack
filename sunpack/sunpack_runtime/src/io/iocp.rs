@@ -368,9 +368,9 @@ pub(crate) const ORDERED_READ_CHUNK: usize = 256 * 1024;
 /// its USN before publishing any result derived from this handle.
 pub(crate) fn read_range_ordered(
     path: &Path,
-    expected: &PhysicalFileGeneration,
     offset: u64,
     len: u64,
+    validate_generation: impl FnOnce(&PhysicalFileGeneration) -> io::Result<()>,
     mut consume: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::windows::io::FromRawHandle;
@@ -394,9 +394,7 @@ pub(crate) fn read_range_ordered(
     });
     let metadata = file.metadata()?;
     let before = physical_file_generation_from_metadata(&file, &metadata)?;
-    if !before.matches_input(expected) {
-        return Err(io::Error::other("file changed before streaming range"));
-    }
+    validate_generation(&before)?;
     if end > metadata.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "IOCP range exceeds file"));
     }

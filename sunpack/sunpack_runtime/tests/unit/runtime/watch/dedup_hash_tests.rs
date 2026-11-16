@@ -1,6 +1,18 @@
 use super::*;
 use crate::io::reader::capture_file_generation;
 
+fn check_generation(
+    expected: &PhysicalFileGeneration,
+) -> impl FnOnce(&PhysicalFileGeneration) -> io::Result<()> + '_ {
+    |opened| {
+        if opened.matches_input(expected) {
+            Ok(())
+        } else {
+            Err(io::Error::other("file changed before streaming range"))
+        }
+    }
+}
+
 #[test]
 fn ordered_ranges_match_xxh3_across_read_ahead_and_files() {
     let root = std::env::temp_dir().join(format!(
@@ -19,35 +31,18 @@ fn ordered_ranges_match_xxh3_across_read_ahead_and_files() {
     std::fs::write(&b, &data[..70_003]).unwrap();
     let a_generation = capture_file_generation(&a).unwrap();
     let b_generation = capture_file_generation(&b).unwrap();
-    let ranges = [
-        HashRange {
-            path: &a,
-            generation: &a_generation,
-            offset: 37,
-            len: 1_100_013,
-        },
-        HashRange {
-            path: &b,
-            generation: &b_generation,
-            offset: 19,
-            len: 65_537,
-        },
-    ];
+    let mut hash = StreamHash::new();
+    hash.read(&a, 37, 1_100_013, check_generation(&a_generation)).unwrap();
+    hash.read(&b, 19, 65_537, check_generation(&b_generation)).unwrap();
     let mut expected = data[37..37 + 1_100_013].to_vec();
     expected.extend_from_slice(&data[19..19 + 65_537]);
     assert_eq!(
-        hash_ranges(ranges).unwrap(),
+        hash.finish(),
         xxhash_rust::xxh3::xxh3_128(&expected).to_le_bytes()
     );
-    assert!(hash_ranges([HashRange {
-        path: &b,
-        generation: &b_generation,
-        offset: 70_000,
-        len: 4
-    }])
-    .is_err());
+    assert!(StreamHash::new().read(&b, 70_000, 4, check_generation(&b_generation)).is_err());
     assert_eq!(
-        hash_ranges([]).unwrap(),
+        StreamHash::new().finish(),
         xxhash_rust::xxh3::xxh3_128(&[]).to_le_bytes()
     );
     std::fs::remove_dir_all(root).unwrap();
@@ -72,7 +67,7 @@ fn ordered_read_drains_on_cancel_error_and_unwind_and_checks_generation() {
         let cancellation = crate::io::cancellation::Cancellation::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             cancellation.run(|| {
-                crate::io::iocp::read_range_ordered(&path, &generation, 0, data.len() as u64, |_| match mode {
+                crate::io::iocp::read_range_ordered(&path, 0, data.len() as u64, check_generation(&generation), |_| match mode {
                     0 => {
                         cancellation.cancel();
                         Ok(())
@@ -96,7 +91,7 @@ fn ordered_read_drains_on_cancel_error_and_unwind_and_checks_generation() {
         );
     }
     let mut truncated = false;
-    let short = crate::io::iocp::read_range_ordered(&path, &generation, 0, data.len() as u64, |_| {
+    let short = crate::io::iocp::read_range_ordered(&path, 0, data.len() as u64, check_generation(&generation), |_| {
         if !truncated {
             truncated = true;
             // The following read-ahead submission is now beyond EOF, even if
@@ -114,7 +109,7 @@ fn ordered_read_drains_on_cancel_error_and_unwind_and_checks_generation() {
     );
     std::fs::rename(&path, root.join("old")).unwrap();
     std::fs::write(&path, &data).unwrap();
-    let result = crate::io::iocp::read_range_ordered(&path, &generation, 0, data.len() as u64, |_| {
+    let result = crate::io::iocp::read_range_ordered(&path, 0, data.len() as u64, check_generation(&generation), |_| {
         panic!("the read must check the generation before consuming bytes")
     });
     assert!(

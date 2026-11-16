@@ -1,5 +1,5 @@
 //! Watch-only live logical-input index. It is a disposable cache, never a success receipt.
-use super::dedup_hash::{hash_ranges, HashRange};
+use super::dedup_hash::StreamHash;
 use crate::core::config::{WatchDeduplication, WatchDeduplicationScope};
 use crate::io::archive_state::{ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection};
 use crate::io::reader::PhysicalFileGeneration;
@@ -31,6 +31,18 @@ impl Source {
                     )
             })
     }
+
+    fn hash_snapshot(&self) -> io::Result<crate::filesystem::WatchFileSnapshot> {
+        self.current_snapshot().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "deduplication input changed or is being written")
+        })
+    }
+
+    fn update_snapshot(&mut self, snapshot: crate::filesystem::WatchFileSnapshot) {
+        self.generation = snapshot.generation;
+        self.mtime = mtime_seconds(&snapshot.metadata);
+        self.usn = snapshot.observation.change_usn;
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {
@@ -49,27 +61,38 @@ impl Record {
         self.sources.iter().all(|s| s.current_snapshot().is_some())
     }
     fn hash(&mut self) -> io::Result<()> {
-        // USN metadata changes preserve content, but an IOCP read must use the
-        // current physical generation (which includes LastWriteTime). Refresh
-        // that evidence only when actual hashing is needed, not on each event.
-        for source in &mut self.sources {
-            let Some(snapshot) = source.current_snapshot() else {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "deduplication input changed or is being written"));
-            };
-            source.generation = snapshot.generation;
-            source.mtime = mtime_seconds(&snapshot.metadata);
-            source.usn = snapshot.observation.change_usn;
-        }
-        let ranges = self.range_sources.iter().zip(self.identities.iter()).map(|(&source, extent)| {
-            let source = &self.sources[source as usize];
-            HashRange {
-                path: Path::new(&source.path),
-                generation: &source.generation,
-                offset: extent.start,
-                len: extent.len,
+        let short = self.identities.iter().all(|extent| extent.len <= crate::io::iocp::ORDERED_READ_CHUNK as u64);
+        if !short {
+            // Long IOCP reads share writes and renames. Confirm readiness
+            // once per source before opening those streams.
+            for source in &mut self.sources {
+                source.update_snapshot(source.hash_snapshot()?);
             }
-        });
-        self.digest = Some(hash_ranges(ranges)?);
+        }
+        let mut hash = StreamHash::new();
+        for (&source, extent) in self.range_sources.iter().zip(self.identities.iter()) {
+            let source = &mut self.sources[source as usize];
+            let mut refreshed = None;
+            hash.read(Path::new(&source.path), extent.start, extent.len, |opened| {
+                if short {
+                    // The short read handle itself excludes writers and
+                    // renames. Consult the USN journal only on a changed generation.
+                    if opened == &source.generation { return Ok(()); }
+                    let snapshot = source.hash_snapshot()?;
+                    if opened == &snapshot.generation {
+                        refreshed = Some(snapshot);
+                        return Ok(());
+                    }
+                } else if opened.matches_input(&source.generation) {
+                    return Ok(());
+                }
+                Err(io::Error::other("file changed before streaming range"))
+            })?;
+            if let Some(snapshot) = refreshed {
+                source.update_snapshot(snapshot);
+            }
+        }
+        self.digest = Some(hash.finish());
         Ok(())
     }
 
