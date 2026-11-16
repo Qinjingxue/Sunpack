@@ -98,23 +98,76 @@ pub(super) fn watch_file_observation_known_kind(
 ) -> io::Result<WatchFileObservation> {
     let (file, volume) = {
         let handle = open_path(path, FILE_READ_ATTRIBUTES, SHARE_ALL, is_directory)?;
-        let file = read_file_usn(handle.file.as_raw_handle())?;
-        let volume = since_usn
-            .filter(|previous| *previous > 0 && *previous < file.usn)
-            .and_then(|_| watch_volume_for_handle(&handle.file, path).ok());
-        (file, volume)
+        read_watch_observation(&handle.file, path, since_usn)?
     };
+    Ok(finish_watch_observation(file, volume.as_deref(), since_usn))
+}
+
+pub(crate) struct WatchFileSnapshot {
+    pub(crate) metadata: std::fs::Metadata,
+    pub(crate) generation: crate::io::reader::PhysicalFileGeneration,
+    pub(crate) observation: WatchFileObservation,
+}
+
+/// Sample one file object while its sharing mode excludes writers and renames.
+pub(crate) fn watch_ready_file_snapshot(
+    path: &Path,
+    since_usn: Option<i64>,
+) -> io::Result<Option<WatchFileSnapshot>> {
+    let (metadata, generation, file, volume) = {
+        let handle = match open_path(path, GENERIC_READ, FILE_SHARE_READ, false) {
+            Ok(handle) => handle,
+            Err(error) if matches!(
+                error.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+            ) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let metadata = handle.file.metadata()?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Ok(None);
+        }
+        let generation = crate::io::reader::physical_file_generation_from_metadata(
+            &handle.file, &metadata,
+        )?;
+        let (file, volume) = read_watch_observation(&handle.file, path, since_usn)?;
+        (metadata, generation, file, volume)
+    };
+    Ok(Some(WatchFileSnapshot {
+        metadata,
+        generation,
+        observation: finish_watch_observation(file, volume.as_deref(), since_usn),
+    }))
+}
+
+fn read_watch_observation(
+    handle: &File,
+    path: &Path,
+    since_usn: Option<i64>,
+) -> io::Result<(FileUsn, Option<String>)> {
+    let file = read_file_usn(handle.as_raw_handle())?;
+    let volume = since_usn
+        .filter(|previous| *previous > 0 && *previous < file.usn)
+        .and_then(|_| watch_volume_for_handle(handle, path).ok());
+    Ok((file, volume))
+}
+
+fn finish_watch_observation(
+    file: FileUsn,
+    volume: Option<&str>,
+    since_usn: Option<i64>,
+) -> WatchFileObservation {
     let change_reasons = since_usn.filter(|value| *value > 0).and_then(|previous| {
         if file.usn == previous {
             Some(sunpack_usn_core::ChangeReasons::default())
         } else {
             sunpack_usn_core::broker_read_change_reasons(
-                volume.as_deref()?, file.id, file.id_len, previous, file.usn,
+                volume?, file.id, file.id_len, previous, file.usn,
             )
             .ok()
         }
     });
-    Ok(WatchFileObservation { file_id: file.id_text(), change_usn: file.usn, change_reasons })
+    WatchFileObservation { file_id: file.id_text(), change_usn: file.usn, change_reasons }
 }
 
 pub(super) fn directory_file_id(path: &Path, volume: &str) -> io::Result<[u8; 16]> {

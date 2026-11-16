@@ -173,17 +173,17 @@ fn root_and_global_domains_follow_live_scope_ownership() {
         let before = index.records.len();
         index.reconcile_scopes(&[parent_scope.clone(), other_scope.clone()]).unwrap();
         assert_eq!(index.records.len(), before);
-        assert!(index.records.values().filter(|r| r.owner == path_key(&alias.entry_path)).all(|r| r.scope == parent_scope.key()));
+        assert!(index.records.values().filter(|r| r.owner.as_ref() == path_key(&alias.entry_path)).all(|r| r.scope.as_ref() == parent_scope.key()));
         if mode == WatchDeduplication::Hash {
             let prepared = index.prepare(&alias.entry_path, parent_scope.key(), &[&alias], true).unwrap().unwrap();
             assert!(prepared.record.digest.is_some(), "scope ownership rebinding retains the valid content hash");
         }
         assert!(admit_scope(&mut index, &alias, parent_scope.key()));
         if mode == WatchDeduplication::Hash {
-            fs::remove_file(&alias_path).unwrap();
+            fs::rename(&nested, dir.0.join("moved-out")).unwrap();
             index.invalidate_tree(nested.to_str().unwrap()).unwrap();
-            assert!(!index.owners.contains_key(&path_key(&alias.entry_path)));
-            assert!(index.owners.contains_key(&path_key(&copy.entry_path)));
+            assert!(!index.owners.contains_key(path_key(&alias.entry_path).as_str()));
+            assert!(index.owners.contains_key(path_key(&copy.entry_path).as_str()));
         }
         let generation = index.generation(); index.reset(mode, WatchDeduplicationScope::Root).unwrap();
         assert!(index.generation() != generation && index.records.is_empty() && index.needs_rebuild());

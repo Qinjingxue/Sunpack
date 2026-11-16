@@ -1609,7 +1609,13 @@ pub(crate) fn capture_file_generation(path: &Path) -> io::Result<PhysicalFileGen
 }
 
 pub(crate) fn physical_file_generation(file: &File) -> io::Result<PhysicalFileGeneration> {
-    let metadata = file.metadata()?;
+    physical_file_generation_from_metadata(file, &file.metadata()?)
+}
+
+pub(crate) fn physical_file_generation_from_metadata(
+    file: &File,
+    metadata: &std::fs::Metadata,
+) -> io::Result<PhysicalFileGeneration> {
     Ok(PhysicalFileGeneration {
         len: metadata.len(),
         #[cfg(not(windows))]

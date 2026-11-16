@@ -273,7 +273,7 @@ fn normalize_path(path: &Path) -> String {
     crate::path_keys::normalize_windows_extended_prefix(text)
 }
 
-fn mtime_seconds(metadata: &fs::Metadata) -> f64 {
+pub(crate) fn mtime_seconds(metadata: &fs::Metadata) -> f64 {
     metadata
         .modified()
         .ok()
@@ -293,16 +293,28 @@ pub(crate) fn watch_content_changed(
     usn: i64,
     current: &WatchCandidateRow,
 ) -> bool {
-    if id != current.observation.file_id || size != current.size {
+    watch_observed_content_changed(size, mtime, id, usn, current.size, current.mtime, &current.observation)
+}
+
+pub(crate) fn watch_observed_content_changed(
+    size: u64,
+    mtime: f64,
+    id: &str,
+    usn: i64,
+    current_size: u64,
+    current_mtime: f64,
+    observation: &WatchFileObservation,
+) -> bool {
+    if id != observation.file_id || size != current_size {
         return true;
     }
-    if usn == current.observation.change_usn {
+    if usn == observation.change_usn {
         return false;
     }
-    if let Some(reasons) = current.observation.change_reasons {
+    if let Some(reasons) = observation.change_reasons {
         return reasons.without_close & 7 != 0;
     }
-    current.mtime >= mtime - 2.0
+    current_mtime >= mtime - 2.0
 }
 
 /// Recovery permissions belong to the original location as well as its bytes.

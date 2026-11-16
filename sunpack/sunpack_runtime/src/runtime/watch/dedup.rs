@@ -2,47 +2,68 @@
 use super::dedup_hash::{hash_ranges, HashRange};
 use crate::core::config::{WatchDeduplication, WatchDeduplicationScope};
 use crate::io::archive_state::{ArchiveInput, InputRole, OpenMode, VolumeCompleteness, VolumeSelection};
-use crate::io::reader::{capture_file_generation, PhysicalFileGeneration};
+use crate::io::reader::PhysicalFileGeneration;
 use crate::path_keys::path_key;
-use crate::postprocess::{watch_candidate_for_path, watch_content_changed};
+use crate::postprocess::{mtime_seconds, watch_observed_content_changed};
 use crate::scan::scope::NativeDiscoveryScope;
 use crate::wal::{self, Kind};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{btree_set, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct Layout { format: String, mode: u8, parts: Vec<(u8, Option<u32>, u64)> }
+struct Layout { format: String, mode: u8, parts: Box<[(u8, Option<u32>, u64)]> }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Identity { volume: u64, file: [u8; 16], start: u64, len: u64 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Source { path: String, generation: PhysicalFileGeneration, size: u64, mtime: f64, file_id: String, usn: i64 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {
-    id: u64, owner: String, scope: String, layout: Vec<Layout>,
-    admitted: bool, sources: Vec<Source>, range_sources: Vec<u32>, identities: Vec<Identity>, digest: Option<[u8; 16]>,
+    id: u64,
+    owner: Arc<str>,
+    scope: Arc<str>,
+    layout: Arc<[Layout]>,
+    admitted: bool,
+    sources: Box<[Source]>,
+    range_sources: Box<[u32]>,
+    identities: Arc<[Identity]>,
+    digest: Option<[u8; 16]>,
 }
 impl Record {
     fn current(&self) -> bool {
         self.sources.iter().all(|s| {
-            crate::filesystem::watch_file_is_ready(&s.path).unwrap_or(false)
-                && capture_file_generation(Path::new(&s.path)).is_ok_and(|g| g.matches_input(&s.generation))
-                && watch_candidate_for_path(Path::new(&s.path), Some(s.usn)).ok().flatten().is_some_and(|row|
-                    row.observation.change_usn >= s.usn && !watch_content_changed(s.size, s.mtime, &s.file_id, s.usn, &row))
+            crate::filesystem::watch_ready_file_snapshot(Path::new(&s.path), Some(s.usn))
+                .ok().flatten().is_some_and(|snapshot| {
+                    snapshot.generation.matches_input(&s.generation)
+                        && snapshot.observation.change_usn >= s.usn
+                        && !watch_observed_content_changed(
+                            s.size, s.mtime, &s.file_id, s.usn, snapshot.metadata.len(),
+                            mtime_seconds(&snapshot.metadata), &snapshot.observation,
+                        )
+                })
         })
     }
     fn hash(&mut self) -> io::Result<()> {
         if self.sources.iter().any(|s| !crate::filesystem::watch_file_is_ready(&s.path).unwrap_or(false)) { return Err(io::Error::new(io::ErrorKind::WouldBlock, "deduplication input is being written")); }
-        let ranges: Vec<_> = self.range_sources.iter().zip(&self.identities).map(|(&source, extent)| HashRange { path: Path::new(&self.sources[source as usize].path), offset: extent.start, len: extent.len }).collect();
+        let ranges: Vec<_> = self.range_sources.iter().zip(self.identities.iter()).map(|(&source, extent)| HashRange { path: Path::new(&self.sources[source as usize].path), offset: extent.start, len: extent.len }).collect();
         self.digest = Some(hash_ranges(&ranges)?);
         if !self.current() { return Err(io::Error::other("deduplication input changed while reading")); }
         Ok(())
     }
 }
 #[derive(Serialize, Deserialize)]
-enum Delta { Begin(u8, u8), Put(Record), Remove(Vec<u64>), Journals(Vec<(String, String, u64)>), Ready, Pending }
+enum Delta<'a> {
+    Begin(u8, u8),
+    Put(Cow<'a, Record>),
+    Remove(Vec<u64>),
+    Journals(Vec<(String, String, u64)>),
+    Ready,
+    Pending,
+}
 
 /// Hashing is deliberately outside Index's lock and the scheduler thread.
 pub(super) struct Prepared {
@@ -56,18 +77,70 @@ impl Prepared {
     }
 }
 
-type Signature = (u64, Vec<Layout>);
+type Signature = (u64, Arc<[Layout]>);
+
+// Most reverse-index keys name a single record. Allocate a tree only when
+// distinct owners actually share a source, physical identity or digest.
+enum RecordIds {
+    One(u64),
+    Many(Box<BTreeSet<u64>>),
+}
+
+impl RecordIds {
+    fn insert(&mut self, id: u64) {
+        match self {
+            Self::One(first) if *first != id => {
+                *self = Self::Many(Box::new(BTreeSet::from([*first, id])));
+            }
+            Self::One(_) => (),
+            Self::Many(ids) => { ids.insert(id); }
+        }
+    }
+
+    /// Returns true when the enclosing map entry can be removed.
+    fn remove(&mut self, id: u64) -> bool {
+        match self {
+            Self::One(first) => *first == id,
+            Self::Many(ids) => {
+                ids.remove(&id);
+                if ids.len() == 1 {
+                    *self = Self::One(*ids.first().unwrap());
+                }
+                false
+            }
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        let (one, many): (_, Option<btree_set::Iter<'_, u64>>) = match self {
+            Self::One(id) => (Some(*id), None),
+            Self::Many(ids) => (None, Some(ids.iter())),
+        };
+        one.into_iter().chain(many.into_iter().flatten().copied())
+    }
+}
 
 #[derive(Default)]
-struct SizeBucket { count: usize, unhashed: BTreeSet<u64> }
+struct SizeBucket { count: usize, unhashed: Option<RecordIds> }
+
+impl SizeBucket {
+    fn pending(&self) -> impl Iterator<Item = u64> + '_ {
+        self.unhashed.iter().flat_map(RecordIds::iter)
+    }
+}
 
 pub(super) struct Index {
     path: PathBuf, mode: WatchDeduplication, scope: WatchDeduplicationScope, file: Option<File>, seq: u64,
     epoch: u64, generation: u64, next_id: u64, ready: bool, edits: usize,
-    domains: HashMap<String, u64>, next_domain: u64, journals: HashMap<String, (String, u64)>, records: HashMap<u64, Record>, owners: HashMap<String, BTreeSet<u64>>,
-    paths: BTreeMap<String, BTreeSet<u64>>, sizes: HashMap<Signature, SizeBucket>,
-    hashes: HashMap<(Signature, [u8; 16]), BTreeSet<u64>>,
-    objects: HashMap<(Signature, Vec<Identity>), BTreeSet<u64>>, buffer: Vec<u8>,
+    domains: HashMap<Arc<str>, u64>,
+    next_domain: u64,
+    journals: HashMap<String, (String, u64)>,
+    records: HashMap<u64, Record>,
+    // Commit removes a superseded record before writing a replacement owner.
+    owners: HashMap<Arc<str>, u64>,
+    paths: BTreeMap<Arc<str>, RecordIds>, sizes: HashMap<Signature, SizeBucket>,
+    hashes: HashMap<(Signature, [u8; 16]), RecordIds>,
+    objects: HashMap<(Signature, Arc<[Identity]>), RecordIds>, buffer: Vec<u8>,
 }
 impl Index {
     pub(super) fn open(folder: &Path, mode: WatchDeduplication, scope: WatchDeduplicationScope) -> io::Result<Self> {
@@ -85,7 +158,7 @@ impl Index {
                 let delta: Delta = wal::decode(&reader.payload)?;
                 match delta {
                     Delta::Begin(saved, saved_scope) if !begun && saved == mode_tag(mode) && saved_scope == scope_tag(scope) => begun = true,
-                    Delta::Put(record) if begun => { index.insert(record); },
+                    Delta::Put(record) if begun => { index.insert(record.into_owned()); },
                     Delta::Remove(ids) if begun => { for id in ids { index.remove(id); } },
                     Delta::Journals(stamps) if begun => { index.apply_journals(&stamps); },
                     Delta::Ready if begun => index.ready = true,
@@ -157,18 +230,19 @@ impl Index {
     pub(super) fn prepare(&mut self, owner: &str, scope: &str, inputs: &[&ArchiveInput], baseline: bool) -> io::Result<Option<Prepared>> {
         if self.mode == WatchDeduplication::None || inputs.is_empty() || self.journals.get(scope).is_none_or(|stamp| stamp.0.is_empty()) { return Ok(None); }
         let Some(mut record) = describe(owner, scope, inputs)? else { return Ok(None); };
-        if let Some(saved) = self.owners.get(&record.owner).and_then(|ids| ids.iter().filter_map(|id| self.records.get(id)).find(|r| r.layout == record.layout && r.identities == record.identities && r.current())) {
+        let signature = self.signature(&record);
+        if let Some(saved) = self.owners.get(&record.owner).and_then(|id| self.records.get(id)).filter(|r| r.layout == record.layout && r.identities == record.identities && r.current()) {
             if saved.admitted && saved.scope == record.scope { return Ok(None); }
             record.digest = saved.digest;
         }
         if self.mode == WatchDeduplication::Hash && record.digest.is_none() {
-            record.digest = self.objects.get(&(self.signature(&record), record.identities.clone())).and_then(|ids|
-                ids.iter().filter_map(|id| self.records.get(id)).find(|r| r.digest.is_some() && r.current()).and_then(|r| r.digest));
+            record.digest = self.objects.get(&(signature.clone(), Arc::clone(&record.identities))).and_then(|ids|
+                ids.iter().filter_map(|id| self.records.get(&id)).find(|r| r.current()).and_then(|r| r.digest));
         }
         record.id = self.next_id; self.next_id += 1;
-        let matching = self.sizes.get(&self.signature(&record));
+        let matching = self.sizes.get(&signature);
         let representative = if self.mode == WatchDeduplication::Hash {
-            matching.and_then(|bucket| bucket.unhashed.iter().filter_map(|id| self.records.get(id)).find(|r| r.digest.is_none() && r.owner != record.owner)).cloned()
+            matching.and_then(|bucket| bucket.pending().filter_map(|id| self.records.get(&id)).find(|r| r.owner != record.owner)).cloned()
         } else { None };
         let hash = self.mode == WatchDeduplication::Hash && (baseline || matching.is_some());
         Ok(Some(Prepared { epoch: self.epoch, record, representative, hash }))
@@ -180,7 +254,7 @@ impl Index {
         let Some(bucket) = self.sizes.get(&self.signature(&prepared.record)) else { return false; };
         let mut changed = false;
         if prepared.record.digest.is_none() { prepared.hash = true; changed = true; }
-        if let Some(rep) = bucket.unhashed.iter().filter_map(|id| self.records.get(id)).find(|r| r.digest.is_none() && r.owner != prepared.record.owner) {
+        if let Some(rep) = bucket.pending().filter_map(|id| self.records.get(&id)).find(|r| r.owner != prepared.record.owner) {
             if prepared.representative.as_ref().is_none_or(|r| r.id != rep.id) {
                 prepared.representative = Some(rep.clone()); changed = true;
             }
@@ -190,35 +264,41 @@ impl Index {
     pub(super) fn commit(&mut self, mut prepared: Prepared) -> io::Result<bool> {
         if prepared.epoch != self.epoch || !prepared.record.current() { return Ok(false); }
         if let Some(rep) = prepared.representative.take() {
-            if self.records.get(&rep.id).is_some_and(|old| old.sources.iter().map(|s| &s.generation).eq(rep.sources.iter().map(|s| &s.generation))) && rep.current() {
-                self.append(&Delta::Put(rep.clone()))?; self.insert(rep);
+            if self.records.get(&rep.id).is_some_and(|old| old.digest.is_none() && old.sources.iter().map(|s| &s.generation).eq(rep.sources.iter().map(|s| &s.generation))) && rep.current() {
+                self.append(&Delta::Put(Cow::Borrowed(&rep)))?;
+                self.insert(rep);
             }
         }
         let mut record = prepared.record;
         // A retry by its original owner is never suppressed by an alias that arrived later.
-        let own = self.owners.get(&record.owner).is_some_and(|ids| ids.iter().filter_map(|id| self.records.get(id)).any(|r| r.admitted && r.scope == record.scope && r.layout == record.layout && r.identities == record.identities && r.current()));
+        let replaced = self.owners.get(&record.owner).copied();
+        let own = replaced.and_then(|id| self.records.get(&id)).is_some_and(|r| r.admitted && r.scope == record.scope && r.layout == record.layout && r.identities == record.identities && r.current());
         let matches = if self.mode == WatchDeduplication::FileId {
-            self.objects.get(&(self.signature(&record), record.identities.clone()))
+            self.objects.get(&(self.signature(&record), Arc::clone(&record.identities)))
         } else { record.digest.and_then(|d| self.hashes.get(&(self.signature(&record), d))) };
         let mut stale = Vec::new();
         let representative = matches.and_then(|ids| ids.iter().find_map(|id| {
-            let r = self.records.get(id)?;
-            if r.current() { Some(r.owner.as_str()) } else { stale.push(*id); None }
+            let r = self.records.get(&id)?;
+            if r.current() { Some(r.owner.as_ref()) } else { stale.push(id); None }
         }));
-        let duplicate = !own && representative.is_some_and(|owner| owner != record.owner);
+        let duplicate = !own && representative.is_some_and(|owner| owner != record.owner.as_ref());
         self.remove_ids(stale)?;
         record.admitted = !duplicate;
         if own { return Ok(false); }
         // Superseded owner layouts must not retain an obsolete signature indefinitely.
-        let replaced = self.owners.get(&record.owner).map(|ids| ids.iter().copied().collect()).unwrap_or_default();
-        self.remove_ids(replaced)?;
-        self.append(&Delta::Put(record.clone()))?; self.insert(record);
+        if let Some(id) = replaced.filter(|id| self.records.contains_key(id)) {
+            self.remove_ids(vec![id])?;
+        }
+        self.append(&Delta::Put(Cow::Borrowed(&record)))?; self.insert(record);
         self.compact()?;
         Ok(duplicate)
     }
     pub(super) fn invalidate(&mut self, paths: &[String]) -> io::Result<()> {
-        let ids: HashSet<_> = paths.iter().filter_map(|p| self.paths.get(&path_key(p))).flat_map(|ids| ids.iter().copied()).filter(|id| self.records.get(id).is_some_and(|r| !r.current())).collect();
-        self.remove_ids(ids.into_iter().collect())
+        let ids = paths.iter()
+            .filter_map(|path| self.paths.get(path_key(path).as_str()))
+            .flat_map(RecordIds::iter)
+            .collect();
+        self.invalidate_ids(ids, None)
     }
     /// The scheduler supplies its already queried per-volume cursors. USNs are
     /// comparable only within the same journal incarnation.
@@ -240,9 +320,9 @@ impl Index {
             }
         }
         if changed.is_empty() { return false; }
-        let ids: Vec<_> = self.records.values().filter(|r| changed.contains(&r.scope)).map(|r| r.id).collect();
+        let ids: Vec<_> = self.records.values().filter(|r| changed.contains(r.scope.as_ref())).map(|r| r.id).collect();
         for id in ids { self.remove(id); }
-        for (scope, volume, journal) in stamps { self.ensure_domain(scope); self.journals.insert(scope.clone(), (volume.clone(), *journal)); }
+        for (scope, volume, journal) in stamps { self.domain(scope); self.journals.insert(scope.clone(), (volume.clone(), *journal)); }
         self.ready = false; self.epoch += 1; self.generation += 1;
         true
     }
@@ -261,22 +341,51 @@ impl Index {
             // input into a second candidate or discard a still-monitored alias.
             let target = scopes.iter().filter(|scope| r.sources.iter().all(|s| scope.contains(&s.path))).max_by_key(|scope| scope.key().len());
             match target {
-                Some(scope) if scope.key() != r.scope => { let mut updated = r.clone(); updated.scope = scope.key().to_owned(); rebound.push(updated); },
+                Some(scope) if scope.key() != r.scope.as_ref() => rebound.push((r.id, scope.key())),
                 Some(_) => (),
                 None => removed.push(r.id),
             }
         }
         if !removed.is_empty() || !rebound.is_empty() { self.epoch += 1; }
         self.remove_ids(removed)?;
-        for record in rebound { self.append(&Delta::Put(record.clone()))?; self.insert(record); }
-        self.domains.retain(|key, _| scopes.iter().any(|scope| scope.key() == key));
+        for (id, scope) in rebound {
+            let mut record = self.records[&id].clone();
+            record.scope = self.domain(scope);
+            self.append(&Delta::Put(Cow::Borrowed(&record)))?;
+            self.insert(record);
+        }
+        self.domains.retain(|key, _| scopes.iter().any(|scope| scope.key() == key.as_ref()));
         Ok(())
     }
     pub(super) fn invalidate_tree(&mut self, path: &str) -> io::Result<()> {
         let key = path_key(path);
         let prefix = format!("{}\\", key.trim_end_matches('\\'));
-        let ids: BTreeSet<_> = self.paths.get(&key).into_iter().chain(self.paths.range(prefix.clone()..).take_while(|(path, _)| path.starts_with(&prefix)).map(|(_, ids)| ids)).flat_map(|ids| ids.iter().copied()).collect();
-        let stale = ids.into_iter().filter(|id| self.records.get(id).is_some_and(|r| !r.current())).collect();
+        let descendants = self.paths.range(Arc::from(prefix.as_str())..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .map(|(_, ids)| ids);
+        let ids: HashSet<_> = self.paths.get(key.as_str()).into_iter()
+            .chain(descendants)
+            .flat_map(RecordIds::iter)
+            .collect();
+        if ids.is_empty() { return Ok(()); }
+        // An absent directory proves its lexical children are absent too.
+        // The index folds case, so still validate paths with a different spelling.
+        let subtree = Path::new(path);
+        let missing = matches!(subtree.try_exists(), Ok(false)).then_some(subtree);
+        self.invalidate_ids(ids, missing)
+    }
+    fn invalidate_ids(&mut self, ids: HashSet<u64>, missing_subtree: Option<&Path>) -> io::Result<()> {
+        let stale = ids.into_iter()
+            .filter(|id| self.records.get(id).is_some_and(|record| {
+                missing_subtree.is_some_and(|path| {
+                    record.sources.iter().any(|source| {
+                        Path::new(&source.path).strip_prefix(path).is_ok_and(|tail| {
+                            tail.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+                        })
+                    })
+                }) || !record.current()
+            }))
+            .collect();
         self.remove_ids(stale)
     }
     fn remove_ids(&mut self, ids: Vec<u64>) -> io::Result<()> {
@@ -288,36 +397,67 @@ impl Index {
         shrink(&mut self.sizes); shrink(&mut self.hashes); shrink(&mut self.objects);
         self.compact()
     }
-    fn ensure_domain(&mut self, scope: &str) {
-        self.domains.entry(scope.to_owned()).or_insert_with(|| { let id = self.next_domain; self.next_domain += 1; id });
+    fn domain(&mut self, scope: &str) -> Arc<str> {
+        if let Some((scope, _)) = self.domains.get_key_value(scope) { return Arc::clone(scope); }
+        let scope: Arc<str> = Arc::from(scope);
+        self.domains.insert(Arc::clone(&scope), self.next_domain);
+        self.next_domain += 1;
+        scope
     }
     fn signature(&self, r: &Record) -> Signature {
-        (match self.scope { WatchDeduplicationScope::Root => self.domains[&r.scope], WatchDeduplicationScope::Global => 0 }, r.layout.clone())
+        (match self.scope { WatchDeduplicationScope::Root => self.domains[&r.scope], WatchDeduplicationScope::Global => 0 }, Arc::clone(&r.layout))
     }
-    fn insert(&mut self, r: Record) {
-        self.ensure_domain(&r.scope);
-        let signature = self.signature(&r);
+    fn insert(&mut self, mut r: Record) {
+        r.scope = self.domain(&r.scope);
+        let mut signature = self.signature(&r);
         self.remove(r.id); self.next_id = self.next_id.max(r.id + 1);
-        self.owners.entry(r.owner.clone()).or_default().insert(r.id);
-        for s in &r.sources { self.paths.entry(path_key(&s.path)).or_default().insert(r.id); }
-        let bucket = self.sizes.entry(signature.clone()).or_default(); bucket.count += 1; if r.digest.is_none() { bucket.unhashed.insert(r.id); }
-        self.objects.entry((signature.clone(), r.identities.clone())).or_default().insert(r.id);
-        if let Some(d) = r.digest { self.hashes.entry((signature, d)).or_default().insert(r.id); }
+        self.owners.insert(Arc::clone(&r.owner), r.id);
+        for s in r.sources.iter() {
+            let path = path_key(&s.path);
+            let path = if path == r.owner.as_ref() { Arc::clone(&r.owner) } else { Arc::from(path) };
+            self.paths.entry(path).or_insert(RecordIds::One(r.id)).insert(r.id);
+        }
+        if self.mode == WatchDeduplication::Hash {
+            if let Some((saved, _)) = self.sizes.get_key_value(&signature) {
+                r.layout = Arc::clone(&saved.1);
+                signature.1 = Arc::clone(&saved.1);
+            }
+            let bucket = self.sizes.entry(signature.clone()).or_default();
+            bucket.count += 1;
+            if let Some(digest) = r.digest {
+                self.hashes.entry((signature.clone(), digest)).or_insert(RecordIds::One(r.id)).insert(r.id);
+            } else {
+                bucket.unhashed.get_or_insert(RecordIds::One(r.id)).insert(r.id);
+            }
+        }
+        if self.mode == WatchDeduplication::FileId || r.digest.is_some() {
+            self.objects.entry((signature, Arc::clone(&r.identities))).or_insert(RecordIds::One(r.id)).insert(r.id);
+        }
         self.records.insert(r.id, r);
     }
     fn remove(&mut self, id: u64) {
         let Some(r) = self.records.remove(&id) else { return; };
         let signature = self.signature(&r);
-        remove_bucket(&mut self.owners, &r.owner, id);
-        for s in &r.sources {
+        self.owners.remove(&r.owner);
+        for s in r.sources.iter() {
             let key = path_key(&s.path);
-            if let Some(ids) = self.paths.get_mut(&key) { ids.remove(&id); if ids.is_empty() { self.paths.remove(&key); } }
+            if self.paths.get_mut(key.as_str()).is_some_and(|ids| ids.remove(id)) {
+                self.paths.remove(key.as_str());
+            }
         }
-        if let Some(bucket) = self.sizes.get_mut(&signature) { bucket.count -= 1; bucket.unhashed.remove(&id); if bucket.count == 0 { self.sizes.remove(&signature); } }
-        remove_bucket(&mut self.objects, &(signature.clone(), r.identities), id);
+        if let Some(bucket) = self.sizes.get_mut(&signature) {
+            bucket.count -= 1;
+            if r.digest.is_none() && bucket.unhashed.as_mut().is_some_and(|ids| ids.remove(id)) {
+                bucket.unhashed = None;
+            }
+            if bucket.count == 0 { self.sizes.remove(&signature); }
+        }
+        if self.mode == WatchDeduplication::FileId || r.digest.is_some() {
+            remove_bucket(&mut self.objects, &(signature.clone(), r.identities), id);
+        }
         if let Some(d) = r.digest { remove_bucket(&mut self.hashes, &(signature, d), id); }
     }
-    fn append(&mut self, delta: &Delta) -> io::Result<()> {
+    fn append(&mut self, delta: &Delta<'_>) -> io::Result<()> {
         let Some(file) = &mut self.file else {
             return if self.mode == WatchDeduplication::None { Ok(()) }
                 else { Err(io::Error::other("deduplication index is not writable")) };
@@ -331,21 +471,24 @@ impl Index {
         let temp = self.path.with_extension("tmp");
         let mut file = File::create(&temp)?; file.write_all(&wal::file_header(Kind::DedupWal))?;
         let mut seq = 0;
-        let mut write = |d: &Delta| -> io::Result<()> { seq += 1; wal::append_frame(&mut file, &mut self.buffer, seq, |out| rmp_serde::encode::write(out, d).map_err(wal::invalid)) };
+        let mut write = |d: &Delta<'_>| -> io::Result<()> { seq += 1; wal::append_frame(&mut file, &mut self.buffer, seq, |out| rmp_serde::encode::write(out, d).map_err(wal::invalid)) };
         write(&Delta::Begin(mode_tag(self.mode), scope_tag(self.scope)))?;
         write(&Delta::Journals(self.journals.iter().map(|(scope, (volume, id))| (scope.clone(), volume.clone(), *id)).collect()))?;
-        for r in self.records.values() { write(&Delta::Put(r.clone()))?; }
+        for r in self.records.values() { write(&Delta::Put(Cow::Borrowed(r)))?; }
         if self.ready { write(&Delta::Ready)?; }
         file.sync_all()?; drop(file); self.file = None;
         crate::io::atomic_file::replace(&temp, &self.path)?;
         self.file = Some(OpenOptions::new().append(true).open(&self.path)?); self.seq = seq; self.edits = 0; Ok(())
     }
 }
-fn remove_bucket<K: std::hash::Hash + Eq>(map: &mut HashMap<K, BTreeSet<u64>>, key: &K, id: u64) {
-    if let Some(ids) = map.get_mut(key) { ids.remove(&id); if ids.is_empty() { map.remove(key); } }
+fn remove_bucket<K: std::hash::Hash + Eq>(map: &mut HashMap<K, RecordIds>, key: &K, id: u64) {
+    if map.get_mut(key).is_some_and(|ids| ids.remove(id)) { map.remove(key); }
 }
 fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Option<Record>> {
-    let mut record = Record { id: 0, owner: path_key(owner), scope: scope.into(), layout: Vec::new(), admitted: false, sources: Vec::new(), range_sources: Vec::new(), identities: Vec::new(), digest: None };
+    let mut layouts = Vec::with_capacity(inputs.len());
+    let mut identities = Vec::new();
+    let mut sources: Vec<Source> = Vec::new();
+    let mut range_sources = Vec::new();
     let mut physical = HashMap::<String, u32>::new();
     for original in inputs {
         if original.analysis.missing_volume_evidence.is_some() { return Ok(None); }
@@ -363,26 +506,36 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
         } else { *original };
         if input.format_hint.is_empty() || input.volume_attempts.is_some() || matches!(input.analysis.volume_completeness, Some(VolumeCompleteness::Missing | VolumeCompleteness::Unknown)) { return Ok(None); }
         let mode = match input.mode { OpenMode::File => 0, OpenMode::FileRange => 1, OpenMode::ConcatRanges => 2, OpenMode::NativeVolumes => 3, OpenMode::SfxWithVolumes => 4 };
-        let mut layout = Layout { format: input.format_hint.clone(), mode, parts: Vec::new() };
+        let mut parts = Vec::with_capacity(match input.mode {
+            OpenMode::File => 1,
+            OpenMode::ConcatRanges => input.ranges.len(),
+            _ => input.parts.len(),
+        });
         let mut push = |path: &str, start: u64, end: Option<u64>, role: u8, number: Option<u32>, whole: bool| -> io::Result<bool> {
             let path_id = path_key(path);
-            let observed = if let Some(&id) = physical.get(&path_id) { record.sources[id as usize].clone() } else {
-                if !crate::filesystem::watch_file_is_ready(path)? { return Ok(false); }
-                let generation = capture_file_generation(Path::new(path))?;
-                let Some(row) = watch_candidate_for_path(Path::new(path), None)? else { return Ok(false); };
-                Source { path: path.into(), generation, size: row.size, mtime: row.mtime, file_id: row.observation.file_id, usn: row.observation.change_usn }
+            let source = if let Some(&id) = physical.get(&path_id) { id } else {
+                let Some(snapshot) = crate::filesystem::watch_ready_file_snapshot(Path::new(path), None)? else { return Ok(false); };
+                let id = sources.len() as u32;
+                sources.push(Source {
+                    path: path.into(),
+                    generation: snapshot.generation,
+                    size: snapshot.metadata.len(),
+                    mtime: mtime_seconds(&snapshot.metadata),
+                    file_id: snapshot.observation.file_id,
+                    usn: snapshot.observation.change_usn,
+                });
+                physical.insert(path_id, id);
+                id
             };
+            let observed = &sources[source as usize];
             let Some((volume, file)) = observed.generation.object_id() else { return Ok(false); };
             let end = match end { Some(end) => end, None if whole => observed.size, None => return Ok(false) };
             let Some(len) = end.checked_sub(start) else { return Ok(false); };
             if len == 0 || end > observed.size { return Ok(false); }
-            layout.parts.push((role, number, len)); record.identities.push(Identity { volume, file, start, len });
-            let source = *physical.entry(path_id).or_insert_with(|| {
-                let index = record.sources.len() as u32;
-                record.sources.push(observed);
-                index
-            });
-            record.range_sources.push(source); Ok(true)
+            parts.push((role, number, len));
+            identities.push(Identity { volume, file, start, len });
+            range_sources.push(source);
+            Ok(true)
         };
         if input.mode == OpenMode::File {
             if !push(&input.entry_path, 0, None, 0, None, true)? { return Ok(None); }
@@ -396,9 +549,19 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
                 if !push(&p.extent.path, p.extent.start, p.extent.end, role, p.volume_number, input.mode.structured())? { return Ok(None); }
             }
         }
-        record.layout.push(layout);
+        layouts.push(Layout { format: input.format_hint.clone(), mode, parts: parts.into_boxed_slice() });
     }
-    Ok(Some(record))
+    Ok(Some(Record {
+        id: 0,
+        owner: Arc::from(path_key(owner)),
+        scope: Arc::from(scope),
+        layout: layouts.into(),
+        admitted: false,
+        sources: sources.into_boxed_slice(),
+        range_sources: range_sources.into_boxed_slice(),
+        identities: identities.into(),
+        digest: None,
+    }))
 }
 
 fn mode_tag(mode: WatchDeduplication) -> u8 { match mode { WatchDeduplication::None => 0, WatchDeduplication::FileId => 1, WatchDeduplication::Hash => 2 } }
