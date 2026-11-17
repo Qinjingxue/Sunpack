@@ -496,7 +496,7 @@ begin
   Command :=
     '$ErrorActionPreference = ''Stop''; ' +
     'try { ' +
-    '  $json = (& ' + PowerShellSingleQuotedString(ExistingApp) + ' watch status --json 2>$null | Out-String); ' +
+    '  $json = (& ' + PowerShellSingleQuotedString(ExistingApp) + ' watch status -j 2>$null | Out-String); ' +
     '  if ($LASTEXITCODE -ne 0) { exit 2 }; ' +
     '  $status = $json | ConvertFrom-Json; ' +
     '  if ($status.summary.running -isnot [bool]) { exit 2 }; ' +
@@ -809,6 +809,9 @@ begin
       Result := CustomMessage('PrepareDataUpgradeFailed');
       Exit;
     end;
+    { A full-reset upgrade is a fresh language initialization too. }
+    InitializeLanguageOnInstall := InitializeLanguageOnInstall or
+      not FileExists(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
     UpgradePrepared := True;
   end;
   if not RemoveMachinePath(ExistingApplicationDirectory) then

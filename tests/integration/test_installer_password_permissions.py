@@ -9,7 +9,7 @@ import winreg
 from tests.helpers.installer import inno_compiler
 
 
-def test_installer_applies_pre_140_policy_before_replacing_application(tmp_path, repo_root):
+def test_installer_applies_upgrade_policy_before_replacing_application(tmp_path, repo_root):
     # Runtime/ACL tests cannot catch version gating, selective cleanup or install
     # order. Without this harness those failures go undetected; one small build
     # covers that independent boundary, including use of advanced settings before old app deletion.
@@ -118,9 +118,9 @@ end;
     assert result.returncode == 0, log.read_text(encoding="utf-8-sig", errors="replace")
     assert (fresh / "completed").read_text() == "initialize language"
 
-    cases = [("v1.2.9", True, False), ("v1.3.0", True, False),
-             ("v1.3.5-2-gabcdef0", True, False), ("1.4.0", False, False),
-             ("1.10.0", False, False), (None, False, False), ("f0df1e68", False, False),
+    cases = [("v1.2.5", False, False), ("v1.2.6", True, False),
+             ("v1.3.5-2-gabcdef0", True, False), ("1.4.0", True, False),
+             ("1.10.0", True, False), (None, False, True), ("f0df1e68", False, True),
              ("1.3.5", True, True)]
     try:
         for index, (version, migrate, failure) in enumerate(cases):
@@ -173,7 +173,7 @@ end;
                     assert (fixture / name).read_bytes() == content
             else:
                 assert result.returncode == 0, log.read_text(encoding="utf-8-sig", errors="replace")
-                assert (fixture / "completed").read_text() == "ok"
+                assert (fixture / "completed").read_text() == ("ok" if migrate else "initialize language")
                 assert not installed.exists()
                 assert not (app / "unrelated.txt").exists()
                 assert (app / "sunpack_advanced_config.json").read_bytes() == (
@@ -184,15 +184,20 @@ end;
                     assert updated["watch"]["tray_enabled"] is False
                     # This value comes from the OLD install, proving the script
                     # completed before that application's directory was deleted.
-                    assert updated["watch"]["toast_enabled"] is False
+                    if index in (1, 2):
+                        assert updated["watch"]["toast_enabled"] is False
+                    assert (data / "sunpack_watch_roots.txt").read_bytes() == originals["data\\sunpack_watch_roots.txt"]
+                    assert (data / "builtin_passwords.json").read_bytes() == originals["data\\builtin_passwords.json"]
                     assert {p.name for p in data.iterdir()} == {
                         "sunpack_config.json", "builtin_passwords.json", "sunpack_watch_roots.txt"}
                     assert not (custom / "state.snapshot").exists()
                     assert (custom / "unrelated.txt").read_bytes() == b"user owned"
                 else:
-                    for name, content in originals.items():
-                        if name.split("\\", 1)[0].split("/", 1)[0] == "data" or name.startswith("custom "):
-                            assert (fixture / name).read_bytes() == content
+                    assert {p.name for p in data.iterdir()} == {"sunpack_config.json", "builtin_passwords.json"}
+                    for name in ("sunpack_config.json", "builtin_passwords.json"):
+                        assert (data / name).read_bytes() == (repo_root / name).read_bytes()
+                    assert not (custom / "state.snapshot").exists()
+                    assert (custom / "unrelated.txt").read_bytes() == b"user owned"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, registry_key + r"\environment") as key:
                 expected = initial_path if failure else f"C:\\unrelated;{app / 'bin'}"
                 assert winreg.QueryValueEx(key, "Path")[0] == expected

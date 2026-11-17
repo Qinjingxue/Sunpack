@@ -41,7 +41,9 @@ function Assert-PrivateDirectory([string]$Directory) {
     }
 }
 
-# This script owns config migration and the pre-1.4 runtime-data reset.
+# Installation owns compatibility: v1.2.6 introduced the retained input formats.
+# All other managed state is rebuilt; roots (including initial_scanned) and
+# passwords are left in place, byte for byte, for compatible installations.
 $dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
 Assert-PlainPath $dataDirectory
 Assert-PrivateDirectory $dataDirectory
@@ -51,32 +53,13 @@ if ($versionText -match '^v?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)(?=$|[-+_~\s]|\
     [void][Version]::TryParse($Matches[1], [ref]$version)
 }
 if ($null -eq $version) {
-    # Untagged builds can have a commit hash, timestamp or custom label.
-    # Only a known version can select a data migration.
-    exit 0
-}
-if ($version -ge [Version]'1.4.0') {
-    # Retire extraction verification settings at the upgrade boundary only.
-    $retiredSettings = [Collections.Generic.List[object]]::new()
-    foreach ($configPath in @($UserConfig, $AdvancedConfig)) {
-        if (-not $configPath -or -not (Test-Path -LiteralPath $configPath -PathType Leaf)) { continue }
-        $config = Read-Config $configPath
-        if (-not $config.PSObject.Properties['verification']) { continue }
-        $config.PSObject.Properties.Remove('verification')
-        $retiredSettings.Add(@{ Path = $configPath; Text = ($config | ConvertTo-Json -Depth 100) + [Environment]::NewLine })
-    }
-    foreach ($setting in $retiredSettings) {
-        $configPath = $setting.Path
-        $temporary = $configPath + '.upgrade-' + [Guid]::NewGuid().ToString('N')
-        try {
-            [IO.File]::WriteAllText($temporary, $setting.Text, [Text.UTF8Encoding]::new($false))
-            [IO.File]::Replace($temporary, $configPath, [System.Management.Automation.Language.NullString]::Value, $false)
-        } finally {
-            if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-        }
+    if ((Test-Path -LiteralPath $dataDirectory) -and
+        @(Get-ChildItem -LiteralPath $dataDirectory -Force).Count -gt 0) {
+        throw "Unknown installed version '$PreviousVersion'; refusing to change existing SunPack data."
     }
     exit 0
 }
+$retainInputs = $version -ge [Version]'1.2.6'
 
 Assert-PlainTree $dataDirectory
 $template = Read-Config $TemplateConfig
@@ -87,6 +70,7 @@ if ($AdvancedConfig -and (Test-Path -LiteralPath $AdvancedConfig -PathType Leaf)
     $advanced = Read-Config $AdvancedConfig
 }
 
+if ($retainInputs -and $version -lt [Version]'1.4.0') {
 function Escape-RuleLiteral([string]$Value) {
     $builder = [Text.StringBuilder]::new()
     foreach ($c in $Value.ToCharArray()) {
@@ -157,7 +141,7 @@ foreach ($filter in $filters) {
         $pruned.Add([pscustomobject]@{ name = 'blacklist'; enabled = $enabled; paths = @(Unique-Rules $paths); full_names = @(); files = @(); extensions = @() })
         continue
     }
-    # v1.3.0-v1.3.4 share the legacy schema; v1.3.5 already uses current rules.
+    # Released versions through v1.3.4 share the legacy schema; v1.3.5 already uses current rules.
     $prefix = if ($filter.name -eq 'blacklist') { 'blocked' } elseif ($filter.name -eq 'whitelist') { 'allowed' } else { '' }
     if (-not $prefix -or $filter.PSObject.Properties['paths'] -or $filter.PSObject.Properties['files'] -or
         $filter.PSObject.Properties['extensions'] -or $filter.PSObject.Properties['full_names']) {
@@ -239,6 +223,8 @@ foreach ($field in @(
     }
 }
 
+}
+
 # The current ordinary template is the schema: new keys get their default and
 # retired keys disappear. Test presence, never truthiness; null/false/0/""/[]
 # are explicit values. Only scan_filters is a named-record array.
@@ -262,7 +248,7 @@ function Merge-OrdinaryConfig($Defaults, $Previous, [string]$Key = '') {
     }
     return ,$Previous
 }
-$user = Merge-OrdinaryConfig $template $user
+if ($retainInputs) { $user = Merge-OrdinaryConfig $template $user }
 
 # A custom state directory is not owned by SunPack. Remove only named records,
 # never recurse through arbitrary user content or delete the directory itself.
@@ -298,57 +284,24 @@ if ($advanced.PSObject.Properties['watch'] -and $advanced.watch -is [pscustomobj
     }
 }
 
-# Prepare all retained content before changing anything. A one-byte mapping
-# preserves the BOM and every nonblank password byte, including whitespace in
-# JSON string values. Do not deserialize/reserialize the password file.
-$byteEncoding = [Text.Encoding]::GetEncoding(28591)
-$contents = [ordered]@{}
-$text = ($user | ConvertTo-Json -Depth 100) + [Environment]::NewLine
-$null = $text | ConvertFrom-Json
-$contents['sunpack_config.json'] = [Text.UTF8Encoding]::new($false).GetBytes($text)
-$passwordFile = Join-Path $dataDirectory 'builtin_passwords.json'
-if (Test-Path -LiteralPath $passwordFile -PathType Leaf) {
-    $original = $byteEncoding.GetString([IO.File]::ReadAllBytes($passwordFile))
-    $repaired = [regex]::Replace($original, '([^\r\n]*)(\r+\n|\r|\n|\z)', {
-        param($match)
-        $line = $match.Groups[1].Value
-        if ([string]::IsNullOrWhiteSpace($line)) { return '' }
-        $ending = $match.Groups[2].Value
-        if ($ending.StartsWith("`r`r")) { $ending = "`r`n" }
-        return $line + $ending
-    })
-    $contents['builtin_passwords.json'] = $byteEncoding.GetBytes($repaired)
-}
-$rootsFile = Join-Path $dataDirectory 'sunpack_watch_roots.txt'
-if (Test-Path -LiteralPath $rootsFile -PathType Leaf) {
-    $roots = $byteEncoding.GetString([IO.File]::ReadAllBytes($rootsFile))
-    # Only the fourth column is persisted scan state. Preserve comments, paths,
-    # output mappings, deep_detect and recursive flags byte for byte.
-    $roots = [regex]::Replace($roots, '(?:(?<=\r)|(?<=\n)|\A)(?![ \t]*(?:\xEF\xBB\xBF)?[ \t]*#)([^|\r\n]+\|[^|\r\n]*\|[^|\r\n]*\|)([ \t]*)(?:true|false)?([ \t]*)(?=\||\r|\n|\z)', '${1}${2}false${3}', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    $contents['sunpack_watch_roots.txt'] = $byteEncoding.GetBytes($roots)
-}
-
-$null = [IO.Directory]::CreateDirectory($dataDirectory)
-$staging = Join-Path $dataDirectory ('.sunpack-upgrade-' + [Guid]::NewGuid().ToString('N'))
-$null = [IO.Directory]::CreateDirectory($staging)
-try {
-    foreach ($name in $contents.Keys) {
-        $path = Join-Path $staging $name
-        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $stream.Write($contents[$name], 0, $contents[$name].Length); $stream.Flush($true) }
+# Only ordinary configuration needs rewriting. Publish it before any cleanup;
+# a failed replace leaves roots, passwords and old runtime state untouched.
+if ($retainInputs) {
+    $text = ($user | ConvertTo-Json -Depth 100) + [Environment]::NewLine
+    $null = $text | ConvertFrom-Json
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    $null = [IO.Directory]::CreateDirectory($dataDirectory)
+    $temporary = $UserConfig + '.upgrade-' + [Guid]::NewGuid().ToString('N')
+    try {
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
         finally { $stream.Dispose() }
+        if ([IO.File]::Exists($UserConfig)) {
+            [IO.File]::Replace($temporary, $UserConfig, [System.Management.Automation.Language.NullString]::Value, $false)
+        } else { [IO.File]::Move($temporary, $UserConfig) }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
     }
-    # Commit retained files before clearing anything else. If a commit fails,
-    # old state is intact and the same idempotent conversion can be retried.
-    foreach ($name in $contents.Keys) {
-        $path = Join-Path $dataDirectory $name
-        Assert-PlainPath $path
-        if ([IO.File]::Exists($path)) {
-            [IO.File]::Replace((Join-Path $staging $name), $path, [System.Management.Automation.Language.NullString]::Value, $false)
-        } else { [IO.File]::Move((Join-Path $staging $name), $path) }
-    }
-} finally {
-    if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
 }
 foreach ($record in $customRecords) {
     if (Test-Path -LiteralPath $record.FullName) {
@@ -356,8 +309,8 @@ foreach ($record in $customRecords) {
         Remove-Item -LiteralPath $record.FullName -Recurse -Force
     }
 }
-foreach ($record in Get-ChildItem -LiteralPath $dataDirectory -Force) {
-    if (-not $record.PSIsContainer -and $record.Name -in @('sunpack_config.json', 'sunpack_watch_roots.txt', 'builtin_passwords.json')) { continue }
+foreach ($record in @(if (Test-Path -LiteralPath $dataDirectory) { Get-ChildItem -LiteralPath $dataDirectory -Force })) {
+    if ($retainInputs -and -not $record.PSIsContainer -and $record.Name -in @('sunpack_config.json', 'sunpack_watch_roots.txt', 'builtin_passwords.json')) { continue }
     Assert-PlainTree $record.FullName
     Remove-Item -LiteralPath $record.FullName -Recurse -Force
 }

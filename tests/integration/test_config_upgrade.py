@@ -18,9 +18,9 @@ def _snapshot(directory):
             for p in directory.rglob("*") if p.is_file()}
 
 
-def test_pre_140_upgrade_retains_user_inputs_and_retires_state(tmp_path, repo_root):
+def test_compatible_upgrade_retains_inputs_and_retires_state(tmp_path, repo_root):
     # Only this real script transaction covers template projection, advanced
-    # promotion, byte-safe input repairs and selective state deletion together.
+    # promotion, byte-exact retained inputs and selective state deletion together.
     # Removing it loses the on-disk contract; one process plus retry is cheap.
     data, custom = tmp_path / "data ' [old]", tmp_path / "custom ' [watch]"
     data.mkdir()
@@ -56,6 +56,7 @@ def test_pre_140_upgrade_retains_user_inputs_and_retires_state(tmp_path, repo_ro
         (directory / "catalog.wal.bin").write_bytes(b"old catalog")
         (directory / "unrelated.txt").write_bytes(b"user owned")
     advanced_before = advanced.read_bytes()
+    inputs_before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)}
     result = _upgrade(repo_root, user, "v1.3.5-2-gabcdef0", advanced)
     assert result.returncode == 0, result.stdout + result.stderr
     migrated = json.loads(user.read_text(encoding="utf-8-sig"))
@@ -71,13 +72,7 @@ def test_pre_140_upgrade_retains_user_inputs_and_retires_state(tmp_path, repo_ro
     expected["filesystem"]["scan_filters"] = []
     assert migrated == expected
     assert {p.name for p in data.iterdir()} == {user.name, roots.name, passwords.name}
-    assert roots.read_text(encoding="utf-8-sig").splitlines() == [
-        "# 保留注释 | output | true | true | false",
-        "C:\\Downloads | D:\\输出 | true | false | false",
-        "C:\\Other | | false | false | true"]
-    assert [line for line in passwords.read_bytes().splitlines() if line.strip()] == good_lines
-    assert all(line.strip() for line in passwords.read_bytes().splitlines())
-    assert json.loads(passwords.read_text(encoding="utf-8-sig"))["passwords"][0]["value"] == " 密码\r\n "
+    assert {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)} == inputs_before
     assert {p.name for p in custom.iterdir()} == {"unrelated.txt"}
     assert (custom / "unrelated.txt").read_bytes() == b"user owned"
     assert advanced.read_bytes() == advanced_before
@@ -89,22 +84,20 @@ def test_pre_140_upgrade_retains_user_inputs_and_retires_state(tmp_path, repo_ro
 
 def test_version_gate_and_failed_preflight_leave_all_data_untouched(tmp_path, repo_root):
     # Exercise current repairs and failed JSON/reparse preflight on disk.
-    for index, (version, broken, success) in enumerate([
-        ("1.4.0", False, True), ("v1.4.0-2-gabcdef0", True, False),
-        ("1.10.0", False, True), ("1.4.0rc1", True, False), ("1.4.0.dev1", True, False),
-        ("20261114-020000", True, True), ("dev", True, True),
-        ("1.3.5", True, False),
+    for index, version in enumerate([
+        "1.2.5", "1.2.6", "1.4.0", "v1.4.0-2-gabcdef0", "1.10.0",
+        "1.4.0rc1", "1.4.0.dev1", "20261114-020000", "dev", "",
     ]):
         data = tmp_path / str(index)
         data.mkdir()
         user = data / "sunpack_config.json"
-        user.write_text("{invalid}" if broken else '{"cli":{"language":"en"}}', encoding="utf-8")
+        user.write_text("{invalid}", encoding="utf-8")
         (data / "builtin_passwords.json").write_bytes(b'{\r\r\n\r\n"passwords": []\r\n}')
         (data / "sunpack_watch_roots.txt").write_bytes(b"C:\\input | D:\\out | true | true | false\r\n")
         (data / "state.snapshot").write_bytes(b"keep")
         before = _snapshot(data)
         result = _upgrade(repo_root, user, version)
-        assert (result.returncode == 0) is success, result.stdout + result.stderr
+        assert result.returncode != 0, result.stdout + result.stderr
         assert _snapshot(data) == before
     fresh = tmp_path / "fresh" / "sunpack_config.json"
     assert _upgrade(repo_root, fresh, "").returncode == 0
@@ -177,7 +170,7 @@ def test_current_filters_merge_by_name_without_adding_modules(tmp_path, repo_roo
                {"name": "blacklist", "enabled": False, "extensions": [],
                 "paths": [{"value": "exact/*", "regex": True}]}]
     user.write_text(json.dumps({"filesystem": {"scan_filters": filters}}), encoding="utf-8")
-    result = _upgrade(repo_root, user, "v1.3.5")
+    result = _upgrade(repo_root, user, "1.4.1")
     assert result.returncode == 0, result.stdout + result.stderr
     template = json.loads((repo_root / user.name).read_text(encoding="utf-8"))
     defaults = {f["name"]: f for f in template["filesystem"]["scan_filters"]}
@@ -185,22 +178,50 @@ def test_current_filters_merge_by_name_without_adding_modules(tmp_path, repo_roo
     assert json.loads(user.read_text(encoding="utf-8-sig"))["filesystem"]["scan_filters"] == expected
 
 
-def test_current_upgrade_retires_verification_and_preserves_state(tmp_path, repo_root):
-    user, advanced = tmp_path / "sunpack_config.json", tmp_path / "advanced.json"
-    payload = {"extraction": {"content_requirement": "allow_partial"}, "verification": {"enabled": False}}
-    user.write_text(json.dumps(payload), encoding="utf-8")
-    advanced.write_text("{invalid}", encoding="utf-8")
+def test_upgrade_boundary_and_current_projection(tmp_path, repo_root):
+    # One matrix checks the exact retained-format boundary, modern versions,
+    # fresh missing config and whole-data resets. Legacy rule tests do not cover
+    # this branch choice or additions after 1.4; process cost is small.
+    for index, version in enumerate(("1.2.5", "v1.2.6", "1.4.0", "1.4.1", "1.5.0", "1.10.0")):
+        data = tmp_path / str(index)
+        data.mkdir()
+        user = data / "sunpack_config.json"
+        user.write_text(json.dumps({"cli": {"language": "en"}, "watch": {"tray_enabled": False},
+                                   "verification": {"enabled": False}, "obsolete": 3}), encoding="utf-8")
+        roots, passwords = data / "sunpack_watch_roots.txt", data / "builtin_passwords.json"
+        roots.write_bytes(b"C:\\input | D:\\out | true | true | false\r\n")
+        passwords.write_bytes(b'{"passwords": ["  keep  "], "clipboard_history": ["old"]}')
+        (data / "state.snapshot").write_bytes(b"discard")
+        before_inputs = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)}
+        result = _upgrade(repo_root, user, version)
+        assert result.returncode == 0, result.stdout + result.stderr
+        if version == "1.2.5":
+            assert list(data.iterdir()) == []
+        else:
+            expected = json.loads((repo_root / user.name).read_text(encoding="utf-8"))
+            expected["cli"]["language"] = "en"
+            expected["watch"]["tray_enabled"] = False
+            assert json.loads(user.read_text(encoding="utf-8")) == expected
+            assert {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)} == before_inputs
+            assert {p.name for p in data.iterdir()} == {user.name, roots.name, passwords.name}
+    missing = tmp_path / "missing" / "sunpack_config.json"
+    assert _upgrade(repo_root, missing, "1.2.6").returncode == 0
+    assert json.loads(missing.read_text(encoding="utf-8")) == json.loads((repo_root / missing.name).read_text(encoding="utf-8"))
+
+
+def test_failed_config_commit_does_not_clear_inputs_or_state(tmp_path, repo_root):
+    # A readable config can still fail atomic publication. Lock its deletion
+    # rather than its read to exercise commit, not the parse preflight above.
+    from tests.helpers.marker_utils import open_shared_file
+
+    user = tmp_path / "sunpack_config.json"
+    user.write_text('{"cli":{"language":"en"}}', encoding="utf-8")
+    (tmp_path / "builtin_passwords.json").write_bytes(b'{"passwords": []}')
+    (tmp_path / "sunpack_watch_roots.txt").write_bytes(b'C:/input | | false | true | true')
+    (tmp_path / "state.snapshot").write_bytes(b"keep until commit")
     before = _snapshot(tmp_path)
-    assert _upgrade(repo_root, user, "1.4.0", advanced).returncode != 0
+    with open_shared_file(user, "rb", share=0x1 | 0x2):
+        assert _upgrade(repo_root, user, "1.4.1").returncode != 0
     assert _snapshot(tmp_path) == before
-    advanced.write_text(json.dumps({"verification": {"methods": []}, "custom": "retained"}), encoding="utf-8")
-    state = tmp_path / "state.snapshot"
-    state.write_bytes(b"retained runtime state")
-    result = _upgrade(repo_root, user, "V1.4.0-rc.1+build.2", advanced)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert json.loads(user.read_text(encoding="utf-8")) == {"extraction": payload["extraction"]}
-    assert json.loads(advanced.read_text(encoding="utf-8")) == {"custom": "retained"}
-    assert state.read_bytes() == b"retained runtime state"
-    before = _snapshot(tmp_path)
-    assert _upgrade(repo_root, user, "1.4.0", advanced).returncode == 0
-    assert _snapshot(tmp_path) == before
+    assert _upgrade(repo_root, user, "1.4.1").returncode == 0
+    assert not (tmp_path / "state.snapshot").exists()
