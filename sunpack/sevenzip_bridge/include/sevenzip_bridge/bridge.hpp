@@ -160,7 +160,8 @@ ExtractArchiveResult extract_archive(
     const std::vector<std::wstring>& canonical_names = {},
     bool native_volume_input = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+    bool output_inventory = true
 );
 
 const char* status_name(PasswordTestStatus status);

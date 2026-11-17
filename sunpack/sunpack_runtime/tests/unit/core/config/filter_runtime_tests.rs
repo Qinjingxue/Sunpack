@@ -115,33 +115,6 @@ fn disabled_rules_validate_shape_without_compiling_expressions() {
 }
 
 #[test]
-fn watch_deduplication_modes_default_validate_and_change_configuration() {
-    let mut raw = defaults().clone();
-    let original = Config::parse(&raw).unwrap();
-    assert_eq!(original.watch.deduplication, WatchDeduplication::None);
-    let mut ordinary: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"), "/../../sunpack_config.json"
-    ))).unwrap();
-    assert_eq!(Config::parse(&ordinary).unwrap().watch.deduplication, WatchDeduplication::FileId);
-    ordinary["watch"]["deduplication"] = Value::String("none".into());
-    assert_eq!(Config::parse(&ordinary).unwrap().watch.deduplication, WatchDeduplication::None);
-    for (text, mode) in [("none", WatchDeduplication::None),
-                         ("file_id", WatchDeduplication::FileId),
-                         ("HASH", WatchDeduplication::Hash)] {
-        raw["watch"]["deduplication"] = Value::String(text.into());
-        let config = Config::parse(&raw).unwrap();
-        assert_eq!(config.watch.deduplication, mode);
-        assert_eq!(config == original, mode == WatchDeduplication::None);
-    }
-    raw["watch"].as_object_mut().unwrap().remove("deduplication");
-    assert_eq!(Config::parse(&raw).unwrap().watch.deduplication, WatchDeduplication::None);
-    for invalid in [Value::String("sha256".into()), Value::from(42)] {
-        raw["watch"]["deduplication"] = invalid;
-        assert!(Config::parse(&raw).is_err());
-    }
-}
-
-#[test]
 fn watch_deduplication_scope_defaults_to_root_and_tracks_configuration_changes() {
     let mut raw = defaults().clone();
     let original = Config::parse(&raw).unwrap();

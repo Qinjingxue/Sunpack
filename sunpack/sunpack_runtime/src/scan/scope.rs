@@ -1,18 +1,19 @@
 //! The filesystem boundary shared by discovery, relation recovery and Watch.
 use crate::path_keys::path_key;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeDiscoveryScope {
     pub root: String,
     pub max_depth: Option<usize>,
     key: String,
-    excluded: HashSet<String>,
+    excluded: Option<Arc<HashSet<String>>>,
 }
 
 impl NativeDiscoveryScope {
     pub(crate) fn has_exclusions(&self) -> bool {
-        !self.excluded.is_empty()
+        self.excluded.is_some()
     }
 
     pub(crate) fn key(&self) -> &str {
@@ -21,7 +22,7 @@ impl NativeDiscoveryScope {
 
     pub(crate) fn contains_key(&self, key: &str) -> bool {
         if key == self.key {
-            return !self.excluded.contains(key);
+            return !self.excluded.as_ref().is_some_and(|excluded| excluded.contains(key));
         }
         let Some(relative) = key
             .strip_prefix(&self.key)
@@ -36,12 +37,12 @@ impl NativeDiscoveryScope {
     }
 
     fn excludes_key(&self, key: &str) -> bool {
-        if self.excluded.is_empty() {
+        let Some(excluded) = &self.excluded else {
             return false;
-        }
+        };
         let mut current = key.trim_end_matches('\\');
         loop {
-            if self.excluded.contains(current) {
+            if excluded.contains(current) {
                 return true;
             }
             let Some((parent, _)) = current.rsplit_once('\\') else {
@@ -55,8 +56,11 @@ impl NativeDiscoveryScope {
     }
 
     pub(crate) fn exclude_roots(&mut self, roots: impl Iterator<Item = String>) {
-        self.excluded
-            .extend(roots.map(|p| path_key(&p).trim_end_matches('\\').to_owned()));
+        let mut roots = roots.peekable();
+        if roots.peek().is_some() {
+            let excluded = self.excluded.get_or_insert_with(Arc::default);
+            Arc::make_mut(excluded).extend(roots.map(|path| subtree_key(&path)));
+        }
     }
 
     pub(crate) fn directory_depth(&self, path: &str) -> Option<usize> {
@@ -72,20 +76,20 @@ impl NativeDiscoveryScope {
 
 impl NativeDiscoveryScope {
     pub fn new(root: String, max_depth: Option<usize>, excluded_subtrees: Vec<String>) -> Self {
-        let key = path_key(&root).trim_end_matches('\\').to_owned();
+        let key = subtree_key(&root);
+        let excluded = (!excluded_subtrees.is_empty()).then(|| {
+            Arc::new(excluded_subtrees.into_iter().map(|path| subtree_key(&path)).collect())
+        });
         Self {
             root,
             max_depth,
             key,
-            excluded: excluded_subtrees
-                .iter()
-                .map(|p| path_key(p).trim_end_matches('\\').to_owned())
-                .collect(),
+            excluded,
         }
     }
 
     pub(crate) fn excluded_subtrees(&self) -> Vec<String> {
-        self.excluded.iter().cloned().collect()
+        self.excluded.iter().flat_map(|excluded| excluded.iter().cloned()).collect()
     }
 
     pub fn contains(&self, path: &str) -> bool {
@@ -104,6 +108,12 @@ impl NativeDiscoveryScope {
     pub fn excludes(&self, path: &str) -> bool {
         self.has_exclusions() && self.excludes_key(&path_key(path))
     }
+}
+
+fn subtree_key(path: &str) -> String {
+    let mut key = path_key(path);
+    key.truncate(key.trim_end_matches('\\').len());
+    key
 }
 
 pub(crate) fn create_output_root_exclusive(path: &std::path::Path) -> std::io::Result<()> {

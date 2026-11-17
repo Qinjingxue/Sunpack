@@ -1635,8 +1635,8 @@ fn recursive_many_outputs_preserve_parent_index_and_prompt_boundary() {
             let output = root.join(index.to_string()); fs::create_dir_all(&output).unwrap();
             fs::write(output.join("encrypted.bin"), &rar).unwrap();
             let manifest = output_manifest(&[("encrypted.bin", &rar)]);
-            manifests.push(Arc::downgrade(manifest.records()));
-            inventories.push((index, manifest.to_output_inventory(output.to_string_lossy().into_owned())));
+            manifests.push(Arc::downgrade(manifest.records().unwrap()));
+            inventories.push((index, manifest.into_output_stats(&output.to_string_lossy(), true).unwrap().inventory.unwrap()));
         }
         let scheduler = Scheduler::new();
         let results = run.recursion.serve(&request.cancel, |depth, _| {
@@ -1691,9 +1691,8 @@ fn recursive_discovery_waits_for_consent_and_releases_the_manifest() {
             Arc::from([Arc::from("secret")]), None, &engine.recent_passwords, None,
         );
         let manifest = output_manifest(&[("encrypted.bin", &rar), ("carrier.bin", &carrier)]);
-        let retained = Arc::downgrade(manifest.records());
-        let inventory = manifest.to_output_inventory(root.to_string_lossy().into_owned());
-        drop(manifest);
+        let retained = Arc::downgrade(manifest.records().unwrap());
+        let inventory = manifest.into_output_stats(&root.to_string_lossy(), true).unwrap().inventory.unwrap();
         let prompted = Mutex::new(Vec::new());
         let scheduler = Scheduler::new();
         let (nested, scanned) = run.recursion.serve(&request.cancel, |depth, pending| {
@@ -1776,9 +1775,9 @@ fn recursive_prompt_uses_filtered_outputs_before_candidate_authorization() {
             _ => vec![("sub/plain.bin", &plain)],
         };
         let inventory = if case == "unreadable" {
-            scan_output_inventory_impl(&root.join("absent").to_string_lossy())
+            scan_output_stats(&root.join("absent").to_string_lossy(), true).inventory.unwrap()
         } else {
-            output_manifest(&files).to_output_inventory(root.to_string_lossy().into_owned())
+            output_manifest(&files).into_output_stats(&root.to_string_lossy(), true).unwrap().inventory.unwrap()
         };
         if case == "cancelled" {
             request.cancel.cancel();

@@ -19,7 +19,8 @@ fn replaced_password_snapshot_returns_typed_retirement() {
     std::fs::write(&path, b"new physical generation").unwrap();
     let current = ManagedReader::open(&path).unwrap();
     let key = InputKey::file("rar", &current).unwrap();
-    let new = Preparation::default().verify(key, &[], || {
+    let mut current_plan = Preparation::default();
+    let new = current_plan.verify(key, &[], || {
         Err(PreparedStatus::new("not_required", "current verdict"))
     });
     release_tx.send(()).unwrap();
@@ -30,6 +31,8 @@ fn replaced_password_snapshot_returns_typed_retirement() {
 
     let canonical = current.file_identity().unwrap().path.to_path_buf();
     release_under_roots(&[canonical]);
+    let error = current_plan.verify_prepared(&[]).unwrap_err();
+    assert!(error.get_ref().is_some_and(|error| error.is::<InputChanged>()));
     drop((reader, current));
     std::fs::remove_file(path).unwrap();
 }
@@ -63,12 +66,10 @@ fn cancelled_initializer_does_not_publish_damage_to_shared_password_input() {
     // the slot is already removed from the map when it resumes.
     let mut borrowed = Preparation { slot: Some(borrow(&key)), rar5_key: None };
     let borrower = std::thread::spawn(move || {
-        let result = borrowed.verify(borrower_key.clone(), &[], || {
+        let result = borrowed.verify(borrower_key, &[], || {
             Err(PreparedStatus::new("not_required", "surviving initializer"))
         }).unwrap();
-        assert_eq!(borrowed.verify(borrower_key, &[], || {
-            panic!("successful preparation must be reused across batches")
-        }).unwrap().status, "not_required");
+        assert_eq!(borrowed.verify_prepared(&[]).unwrap().unwrap().status, "not_required");
         result.status
     });
     signal.cancel();

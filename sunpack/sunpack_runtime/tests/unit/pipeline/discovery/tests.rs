@@ -108,7 +108,7 @@ fn measure_many_small_output_scopes() {
     let began = std::time::Instant::now();
     for _ in 0..10 {
         let outputs = request.inputs.iter().map(|path| OutputDiscovery::prepare(
-            crate::scan::directory::scan_output_inventory_impl(&path.to_string_lossy()), &options
+            crate::scan::directory::scan_output_stats(&path.to_string_lossy(), true).inventory.unwrap(), &options
         ).unwrap()).collect::<Vec<_>>();
         let results = if separate {
             outputs.into_iter().map(|output| {

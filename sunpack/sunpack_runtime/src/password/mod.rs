@@ -60,6 +60,11 @@ pub(crate) fn verify(
     sessions: &[NativeArchiveSession],
     eocd_offset: Option<u64>,
 ) -> io::Result<PasswordVerification> {
+    // This entry point receives the same input and sessions for every batch
+    // of the plan. Even a cache hit must still check retirement and cancellation.
+    if let Some(result) = preparation.verify_prepared(passwords)? {
+        return Ok(result);
+    }
     let format = input.format_hint.as_str();
     let eocd_offset = eocd_offset.or(input.analysis.zip_eocd_offset);
     if input.mode.structured() {
@@ -104,10 +109,8 @@ pub(crate) fn verify(
     };
     let reader = sessions
         .iter()
-        .find_map(|session| {
-            let (session_path, reader) = session.borrowed_reader();
-            (session_path == path).then_some(reader)
-        })
+        .find(|session| session.path() == path)
+        .map(|session| session.borrowed_reader().1)
         .map_or_else(|| ManagedReader::open(path), Ok)?;
     match format {
         "enc" => enc::enc_fast_verify_passwords_with_reader(preparation, &reader, passwords),

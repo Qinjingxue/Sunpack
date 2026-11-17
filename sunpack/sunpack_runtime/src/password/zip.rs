@@ -29,7 +29,7 @@ pub(crate) fn zip_fast_verify_passwords_with_reader(
     candidates: &[Arc<str>],
     eocd_offset: Option<u64>,
 ) -> std::io::Result<PasswordVerification> {
-    let key = InputKey::file("zip", reader)?;
+    let key = InputKey::file("zip", reader)?.with_zip_eocd(eocd_offset);
     preparation.verify(key, candidates, || {
         prepare_zip_stream(&mut reader.cursor(), reader.len(), eocd_offset)
             .map(PasswordContext::Zip)
@@ -44,7 +44,7 @@ pub(crate) fn zip_fast_verify_passwords_from_ranges(
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
-    let key = ranges_key("zip", &parsed)?;
+    let key = ranges_key("zip", &parsed)?.with_zip_eocd(eocd_offset);
     preparation.verify(key, candidates, || {
         let mut reader = VirtualRangeReader::new(&parsed);
         let total_len = reader.len();
@@ -60,7 +60,7 @@ pub(crate) fn zip_fast_verify_passwords_from_volumes(
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
     let volumes = VolumeSet::new(parse_volumes(parts, sessions)?);
-    preparation.verify(volumes.key("zip")?, candidates, || {
+    preparation.verify(volumes.key("zip")?.with_zip_eocd(eocd_offset), candidates, || {
         prepare_zip_volumes(&volumes, eocd_offset).map(PasswordContext::Zip)
     })
 }

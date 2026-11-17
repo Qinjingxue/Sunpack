@@ -111,40 +111,8 @@ namespace sunpack::sevenzip
         {
 
             const auto part_count = part_paths.empty() ? part_ranges.size() : part_paths.size();
-            const bool canonical = !canonical_names.empty() && canonical_names.size() == part_count;
-            if (canonical)
-            {
-                auto &volume_paths = volume_paths_.emplace();
-                volume_paths.reserve(part_count);
-                for (std::size_t index = 0; index < canonical_names.size(); ++index)
-                {
-                    std::wstring alias = filename_lower(canonical_names[index]);
-                    if (!alias.empty())
-                        volume_paths[std::move(alias)] = index;
-                }
-                return;
-            }
-
-            // Single-file inputs resolve their own name directly if a handler
-            // asks for it. Most handlers never request a volume at all.
-            if (part_paths.empty()) return;
-            auto &volume_paths = volume_paths_.emplace();
-            for (std::size_t index = 0; index < part_paths.size(); ++index)
-            {
-                const auto &path = part_paths[index];
-                auto name = filename_lower(path);
-                if (!name.empty()) volume_paths[std::move(name)] = index;
-                volume_paths[lower_text(path)] = index;
-            }
-
-            if (!archive_path_.empty())
-            {
-                const auto found = std::find(part_paths.begin(), part_paths.end(), archive_path_);
-                const std::size_t index = static_cast<std::size_t>(found - part_paths.begin());
-                auto name = filename_lower(archive_path_);
-                if (!name.empty()) volume_paths[std::move(name)] = index;
-                volume_paths[lower_text(archive_path_)] = index;
-            }
+            if (!canonical_names.empty() && canonical_names.size() == part_count)
+                canonical_names_ = &canonical_names;
         }
 
 
@@ -250,8 +218,44 @@ namespace sunpack::sevenzip
 
     private:
         bool cancelled() const noexcept { return cancel_token_ && cancel_token_->load(std::memory_order_acquire); }
-        std::optional<std::size_t> volume_index(const wchar_t *name, const std::wstring &base) const
+        void build_volume_paths()
         {
+            // Publish only a complete index. An allocation failure during
+            // GetStream must leave subsequent callbacks free to retry.
+            std::unordered_map<std::wstring, std::size_t> paths;
+            if (canonical_names_)
+            {
+                paths.reserve(canonical_names_->size());
+                for (std::size_t index = 0; index < canonical_names_->size(); ++index)
+                {
+                    auto name = filename_lower((*canonical_names_)[index]);
+                    if (!name.empty()) paths[std::move(name)] = index;
+                }
+            }
+            else
+            {
+                const auto &parts = *part_paths_;
+                const auto add = [&](const std::wstring &path, std::size_t index) {
+                    auto name = filename_lower(path);
+                    if (!name.empty()) paths[std::move(name)] = index;
+                    paths[lower_text(path)] = index;
+                };
+                for (std::size_t index = 0; index < parts.size(); ++index)
+                    add(parts[index], index);
+                if (!archive_path_.empty())
+                {
+                    const auto found = std::find(parts.begin(), parts.end(), archive_path_);
+                    add(archive_path_, static_cast<std::size_t>(found - parts.begin()));
+                }
+            }
+            volume_paths_.emplace(std::move(paths));
+        }
+
+        std::optional<std::size_t> volume_index(const wchar_t *name, const std::wstring &base)
+        {
+            // Most handlers read the supplied stream and never ask for an
+            // alias. Prepare the index on the first request that needs it.
+            if (!volume_paths_ && (canonical_names_ || part_paths_)) build_volume_paths();
             if (volume_paths_)
             {
                 auto found = volume_paths_->find(base);
@@ -276,6 +280,7 @@ namespace sunpack::sevenzip
         // releases this callback, including the password batch's cache.
         const std::vector<std::wstring> *part_paths_;
         const std::vector<ExtractInputRange> *part_ranges_;
+        const std::vector<std::wstring> *canonical_names_ = nullptr;
 
         const InputPrefetchConfig volume_prefetch_config_;
         std::shared_ptr<std::atomic<bool>> cancel_token_;
@@ -360,8 +365,10 @@ namespace sunpack::sevenzip
     public:
         AsyncFileOutStream(
             std::shared_ptr<AsyncFileWriter> writer,
-            AsyncFileWriter::FileStatePtr file) : writer_(std::move(writer)),
-                                                  file_(std::move(file))
+            AsyncFileWriter::FileStatePtr file,
+            bool capture_magic = true) : writer_(std::move(writer)),
+                                         file_(std::move(file)),
+                                         prefix_limit_(capture_magic ? 512 : 0)
         {}
 
         ~AsyncFileOutStream()
@@ -385,13 +392,12 @@ namespace sunpack::sevenzip
                 }
                 return E_FAIL;
             }
-            constexpr std::size_t prefix_limit = 512;
-            const auto prefix_size = magic_.size() + std::min<std::size_t>(prefix_limit - magic_.size(), size);
+            const auto prefix_size = magic_.size() + std::min<std::size_t>(prefix_limit_ - magic_.size(), size);
             if (prefix_size > magic_.capacity())
             {
                 // Reserve before accepting output so recording the prefix
                 // cannot allocate after the writer consumes bytes.
-                try { magic_.reserve(std::min(prefix_limit, std::max(prefix_size, magic_.capacity() * 2))); }
+                try { magic_.reserve(std::min(prefix_limit_, std::max(prefix_size, magic_.capacity() * 2))); }
                 catch (const std::bad_alloc &)
                 {
                     if (processedSize) *processedSize = 0;
@@ -412,10 +418,10 @@ namespace sunpack::sevenzip
                 position_ += done;
                 if (hr != S_OK || done != amount) break;
             }
-            if (consumed != 0 && magic_.size() < prefix_limit)
+            if (consumed != 0 && magic_.size() < prefix_limit_)
             {
                 const auto *bytes = static_cast<const unsigned char *>(data);
-                const std::size_t take = std::min<std::size_t>(prefix_limit - magic_.size(), consumed);
+                const std::size_t take = std::min<std::size_t>(prefix_limit_ - magic_.size(), consumed);
                 magic_.insert(magic_.end(), bytes, bytes + take);
             }
             if (processedSize)
@@ -428,6 +434,7 @@ namespace sunpack::sevenzip
     private:
         std::shared_ptr<AsyncFileWriter> writer_;
         AsyncFileWriter::FileStatePtr file_;
+        const std::size_t prefix_limit_;
         std::vector<unsigned char> magic_;
         UInt64 position_ = 0;
         std::mutex mutex_;
@@ -681,7 +688,8 @@ namespace sunpack::sevenzip
 
             std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
 
-            std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+            std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+            bool output_inventory = true
 #ifdef SUP7Z_DEBUG
             , PipelineTiming *pipeline_timing = nullptr
 #endif
@@ -704,6 +712,7 @@ namespace sunpack::sevenzip
                 replay_(current_extraction_replay),
                 output_root_initially_empty_(
                     replay_ && replay_->initialized ? replay_->root_was_empty : directory_is_empty_or_missing(output_root_)),
+                capture_magic_(output_inventory && output_root_initially_empty_),
                 output_paths_(output_root_, replay_)
         {
             if (replay_ && !replay_->initialized)
@@ -1102,7 +1111,7 @@ namespace sunpack::sevenzip
                                                            );
             async_files_.push_back(current_async_file_);
 
-            CMyComPtr<ISequentialOutStream> stream_owner(new AsyncFileOutStream(async_writer_, current_async_file_));
+            CMyComPtr<ISequentialOutStream> stream_owner(new AsyncFileOutStream(async_writer_, current_async_file_, capture_magic_));
             *outStream = stream_owner.Detach();
 
             return S_OK;
@@ -1589,6 +1598,7 @@ namespace sunpack::sevenzip
         ExtractionReplay *replay_ = nullptr;
 
         bool output_root_initially_empty_ = false;
+        const bool capture_magic_;
 
         OutputPathAllocator output_paths_;
 

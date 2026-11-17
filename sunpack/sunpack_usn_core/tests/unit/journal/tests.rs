@@ -98,19 +98,22 @@ fn compares_v2_and_zero_extended_v3_file_ids() {
 }
 
 #[test]
-fn parses_v2_v3_and_v4_reason_layouts_with_exclusive_lower_bound() {
+fn scans_v2_v3_and_v4_reasons_between_usn_bounds() {
     for major in [2u16, 3, 4] {
         let expected = if major == 2 { 0x1234 } else { (7u128 << 64) | 0x1234 };
-        let value = record(major, expected, 101, 0x0000_0002);
-        assert_eq!(record_change_reason(&value, expected ^ (1u128 << 64), 100, 101).unwrap(), None);
-        assert_eq!(
-            record_change_reason(&value, expected, 100, 101).unwrap(),
-            Some(0x0000_0002)
-        );
-        assert_eq!(
-            record_change_reason(&value, expected, 101, 102).unwrap(),
-            None
-        );
+        let mut page = 103i64.to_le_bytes().to_vec();
+        page.extend(record(major, expected, 100, 0x01));
+        page.extend(record(major, expected ^ 1, 101, 0x08));
+        page.extend(record(major, expected, 101, 0x02));
+        page.extend(record(major, expected, 102, 0x04));
+        // The rest of a kernel page belongs to later changes.
+        page.push(0);
+        let reasons = scan_change_reasons(expected, 100, 101, |start, output| {
+            assert_eq!(start, 100);
+            output[..page.len()].copy_from_slice(&page);
+            Ok(page.len())
+        }).unwrap();
+        assert_eq!(reasons.all, 0x02);
     }
 }
 
@@ -215,6 +218,8 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
         }
     }
     let end_usn = records.len() as i64;
+    records.push(record(2, 22, end_usn, 0x1000));
+    records.push(vec![0]);
     let mut cursor = 0;
     let mut actual = BTreeSet::new();
     let mut pages = 0;

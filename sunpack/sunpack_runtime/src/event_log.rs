@@ -168,7 +168,9 @@ impl Projection {
     }
     fn remove(&mut self, id: &str) -> Option<Task> {
         let task = self.tasks.remove(id)?;
-        self.mark(id);
+        if !task.expired {
+            self.mark(id);
+        }
         self.unbind(id, &task.owners);
         for member in &task.members {
             if self

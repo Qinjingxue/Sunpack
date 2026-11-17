@@ -175,6 +175,10 @@ impl<T> Default for CancellableOnce<T> {
 }
 
 impl<T> CancellableOnce<T> {
+    pub(crate) fn get(&self) -> Option<&T> {
+        self.0.get()?.as_ref()
+    }
+
     pub(crate) fn get_or_init(
         &self,
         cancellation: &Cancellation,

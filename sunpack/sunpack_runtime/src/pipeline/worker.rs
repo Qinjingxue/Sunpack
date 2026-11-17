@@ -153,6 +153,7 @@ pub(super) struct WorkerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codepage: Option<&'static str>,
     pub report_progress: bool,
+    pub output_inventory: bool,
 }
 
 fn serialize_archive_input<S: Serializer>(input: &ArchiveInput, serializer: S) -> Result<S::Ok, S::Error> {

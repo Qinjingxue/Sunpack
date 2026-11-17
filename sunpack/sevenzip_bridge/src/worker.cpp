@@ -355,6 +355,7 @@ struct WorkerRequest {
     std::wstring password;
     std::wstring codepage;
     bool report_progress = false;
+    bool output_inventory = true;
     bool password_verified = false;
     bool scan_only = false;
     int encrypted = -1;
@@ -375,6 +376,7 @@ WorkerRequest parse_worker_request(wire::RequestReader& reader) {
         else if (key == "password") request.password = utf8_to_wide(reader.text());
         else if (key == "codepage") request.codepage = utf8_to_wide(reader.text());
         else if (key == "report_progress") request.report_progress = reader.boolean();
+        else if (key == "output_inventory") request.output_inventory = reader.boolean();
         else if (key == "password_verified") request.password_verified = reader.boolean();
         else if (key == "operation") request.scan_only = reader.text() == "scan";
         else if (key == "encrypted") request.encrypted = reader.boolean() ? 1 : 0;
@@ -491,16 +493,22 @@ std::string pipeline_timing_wire(const sunpack::sevenzip::ExtractPipelineTiming&
 }
 #endif
 
-std::string verified_manifest_wire(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result) {
-    WorkerChunks chunks(job_id, "manifest_chunk", "rows");
+std::string verified_manifest_wire(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result, bool include_rows) {
+    std::optional<WorkerChunks> chunks;
+    if (include_rows && result.output_inventory_complete) {
+        chunks.emplace(job_id, "manifest_chunk", "rows");
+    }
     unsigned int file_count = 0;
     unsigned long long total_size = 0;
+    bool complete = result.output_inventory_complete;
     std::string row;
-    row.reserve(256);
+    if (chunks) row.reserve(256);
     for (const auto& item : result.output_trace.items) {
         if (item.is_dir) continue;
         ++file_count;
         total_size += item.bytes_written;
+        complete = complete && item.done;
+        if (!chunks) continue;
         row.clear();
         row += wire::array();
         wire::append_text(row, wide_to_utf8(item.output_path));
@@ -510,15 +518,15 @@ std::string verified_manifest_wire(const std::string& job_id, const sunpack::sev
         else row.push_back(wire::kNull);
         wire::append_text(row, std::string_view(reinterpret_cast<const char*>(item.magic.data()), item.magic.size()), wire::kBytes);
         row += wire::end();
-        chunks.append(row);
+        chunks->append(row);
     }
-    const auto chunk_count = chunks.finish();
-    const bool inventory_complete = result.output_inventory_complete && file_count == result.files_written;
+    const std::string chunk_count = chunks
+        ? wire::key("chunk_count") + wire::number(chunks->finish()) : "";
     return wire::object() +
-        wire::key("complete") + wire::boolean(inventory_complete) +
+        wire::key("complete") + wire::boolean(complete && file_count == result.files_written) +
         wire::key("file_count") + wire::number(file_count) +
         wire::key("total_size") + wire::number(total_size) +
-        wire::key("chunk_count") + wire::number(chunk_count) + wire::end();
+        chunk_count + wire::end();
 }
 
 }  // namespace
@@ -807,7 +815,8 @@ RequestOutcome run_request(
         return extract_archive(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
             format_hint, selected_password, output_dir, codepage,
             request.report_progress ? ExtractProgressCallback{std::ref(attempt_progress)} : ExtractProgressCallback{},
-            archive_input.canonical_names, request.archive_input.native_volume_input, shared_writer, cancel_token);
+            archive_input.canonical_names, request.archive_input.native_volume_input, shared_writer, cancel_token,
+            request.output_inventory);
     };
 
     ExtractArchiveResult result;
@@ -1040,7 +1049,7 @@ RequestOutcome run_request(
         volume_selection += wire::end() + wire::end();
     }
     const std::string manifest_field = ok
-        ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result) : "";
+        ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result, request.output_inventory) : "";
     const auto complete_files = !ok ? std::count_if(
         result.output_trace.items.begin(), result.output_trace.items.end(),
         [](const ExtractOutputItemTrace& item) {
@@ -1351,9 +1360,16 @@ private:
             bool present = false;
         };
         JobExecution(sunpack::sevenzip::NativeMemoryManager &manager, const WorkerRequest &request) : memory(manager) {
-            std::unordered_set<std::wstring_view> seen;
+            std::wstring_view first_path;
+            std::optional<std::unordered_set<std::wstring_view>> additional_paths;
             const auto remember = [&](const std::wstring &path) {
-                if (path.empty() || !seen.insert(path).second) return;
+                if (path.empty() || path == first_path) return;
+                if (first_path.empty()) {
+                    first_path = path;
+                } else {
+                    if (!additional_paths) additional_paths.emplace();
+                    if (!additional_paths->insert(path).second) return;
+                }
                 InputStamp stamp;
                 stamp.path = sunpack::sevenzip::win32_extended_path(path);
                 stamp.present = GetFileAttributesExW(stamp.path.c_str(), GetFileExInfoStandard, &stamp.data) != FALSE;

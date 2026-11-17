@@ -220,7 +220,8 @@ namespace sunpack::sevenzip
         const std::vector<std::wstring> &canonical_names,
         bool native_volume_input,
         std::shared_ptr<AsyncFileWriter> shared_writer,
-        std::shared_ptr<std::atomic<bool>> cancel_token)
+        std::shared_ptr<std::atomic<bool>> cancel_token,
+        bool output_inventory)
     {
 #ifdef _WIN32
         ExtractArchiveResult result;
@@ -368,16 +369,15 @@ namespace sunpack::sevenzip
                 }
             }
 
-            bool stream_opened = false;
-            auto stream = [&] {
+            auto input = [&] {
 #ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::StreamOpen);
 #endif
-                return open_archive_stream(archive_path, part_paths, stream_opened, &result.input_trace,
-                    !canonical_names.empty(), prefetch_config, input_ranges);
+                return open_archive_stream(archive_path, part_paths, &result.input_trace,
+                    canonical_names, prefetch_config, input_ranges);
             }();
 
-            if (!stream_opened)
+            if (!input.opened)
             {
 
                 const HRESULT error = static_cast<HRESULT>(result.input_trace.read_hresult);
@@ -403,20 +403,18 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
 #endif
-                auto callback_path = canonical_names.empty()
-                    ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
                 return new OpenCallback(
-                    password, std::move(callback_path), part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
+                    password, std::move(input.callback_path), part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
             }();
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
 #ifdef SUP7Z_DEBUG
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveOpen);
-                hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
+                hr = archive->Open(input.stream.Interface(), search_limit, open_callback.Interface());
             }
 #else
-            hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
+            hr = archive->Open(input.stream.Interface(), search_limit, open_callback.Interface());
 #endif
             // A later fallback handler cannot erase the encrypted-header
             // evidence observed by an earlier handler for this password.
@@ -516,8 +514,8 @@ namespace sunpack::sevenzip
                 result.output_trace,
                 num_items,
                 shared_writer,
-                cancel_token
-                ,
+                cancel_token,
+                output_inventory,
                 pipeline_timing.get());
             }
 #else
@@ -529,7 +527,8 @@ namespace sunpack::sevenzip
                 result.output_trace,
                 num_items,
                 shared_writer,
-                cancel_token);
+                cancel_token,
+                output_inventory);
 #endif
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);

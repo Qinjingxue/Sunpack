@@ -145,13 +145,13 @@ pub(super) fn diagnostic_roots(cwd: &Path) -> io::Result<Vec<PathBuf>> {
 
 fn configuration_changes(
     files: &HashMap<String, (bool, bool)>,
-    names: Option<&[String]>,
+    changes: Option<&[DirectoryChange]>,
 ) -> (bool, bool) {
-    let Some(names) = names else {
+    let Some(changes) = changes else {
         // Overflow/invalidated subscriptions cannot identify a single source.
         return (true, files.values().any(|(_, passwords)| *passwords));
     };
-    names.iter().filter_map(|name| files.get(&crate::path_keys::case_key(name)))
+    changes.iter().filter_map(|change| files.get(&crate::path_keys::case_key(&change.name)))
         .fold((false, false), |(reload, passwords), (config, password)|
             (reload || *config, passwords || *password))
 }
@@ -1430,9 +1430,9 @@ impl ConfigSubscription {
             None => {
                 let listeners = Arc::new(Mutex::new(HashMap::from([(id, listener)])));
                 let events = Arc::clone(&listeners);
-                let observer = FileObserver::start(path, false, move |names| {
+                let observer = FileObserver::start(path, false, 0x01 | 0x02 | 0x08 | 0x10, 4096, move |changes| {
                     for listener in events.lock().unwrap().values() {
-                        let (config, passwords) = configuration_changes(&listener.files, names.as_deref());
+                        let (config, passwords) = configuration_changes(&listener.files, changes.as_deref());
                         if config || passwords { (listener.notify)(config, passwords); }
                     }
                 })?;
@@ -1474,17 +1474,7 @@ pub(super) struct FileObserver {
 impl FileObserver {
     pub(super) fn alive(&self) -> bool { !self.stopping.load(Ordering::Acquire) }
 
-    pub(super) fn start(
-        path: &Path,
-        recursive: bool,
-        notify: impl Fn(Option<Vec<String>>) + Send + 'static,
-    ) -> io::Result<Self> {
-        Self::start_with_filter(path, recursive, 0x01 | 0x02 | 0x08 | 0x10, 4096, move |changes| {
-            notify(changes.map(|changes| changes.into_iter().map(|change| change.name).collect()));
-        })
-    }
-
-    fn start_with_filter(
+    fn start(
         path: &Path,
         recursive: bool,
         filter: u32,
@@ -1567,7 +1557,7 @@ impl RootObserver {
         // attributes-only changes that can make an unreadable candidate usable.
         // Use watchdog 6.0.0's exact 64,000-byte business-root buffer; small
         // configuration/ancestor subscriptions keep their 4 KiB allocation.
-        let observer = FileObserver::start_with_filter(
+        let observer = FileObserver::start(
             directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, 64_000, move |names| {
             let mut password_changed = false;
             let paths = names.map(|names| {
@@ -1707,7 +1697,7 @@ impl ParentObserver {
         let watched_members = Arc::clone(&members);
         let watched_dir = directory.to_owned();
         let hub = Arc::clone(hub);
-        let observer = FileObserver::start_with_filter(directory, false, 0x01 | 0x02 | 0x08 | 0x10, 4096, move |names| {
+        let observer = FileObserver::start(directory, false, 0x01 | 0x02 | 0x08 | 0x10, 4096, move |names| {
             let changed = names.map(|names| names.into_iter()
                 .filter(|change| change.action != 3)
                 .map(|change| key(&watched_dir.join(change.name))).collect::<Vec<_>>());
@@ -3526,6 +3516,7 @@ impl Scheduler {
             operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&path, None));
             retired.push(path);
         }
+        if retired.is_empty() { return Ok(()); }
         self.journal.commit(false, |_| Ok(operations))?;
         for path in retired { self.journal.log(json!({"event":"task_retired", "path":path, "reason":"source_changed"})); }
         Ok(())
@@ -3593,14 +3584,19 @@ impl Scheduler {
             }
         }
         if !self.baseline_roots.is_empty() {
-            let baseline: HashMap<_, _> = changes.changed_roots.iter()
-                .filter(|(root, _)| self.baseline_roots.contains(*root))
-                .map(|(root, paths)| (root.clone(), paths.clone())).collect();
+            let baseline: HashMap<_, _> = changes.changed_roots
+                .extract_if(|root, _| self.baseline_roots.contains(root))
+                .collect();
             if !baseline.is_empty() {
-                self.checkpoint(&baseline, false, false)?;
-                changes.changed_roots.retain(|root, _| !baseline.contains_key(root));
                 changes.topology_roots.retain(|root| !baseline.contains_key(root));
-                changes.paths.retain(|path, _| changes.changed_roots.values().any(|paths| paths.contains(path)));
+                if changes.changed_roots.is_empty() {
+                    changes.paths.clear();
+                } else {
+                    let remaining: HashSet<&Path> = changes.changed_roots.values()
+                        .flatten().map(PathBuf::as_path).collect();
+                    changes.paths.retain(|path, _| remaining.contains(path.as_path()));
+                }
+                self.checkpoint(&baseline, false, false)?;
                 if changes.changed_roots.is_empty() { return Ok(()); }
             }
         }

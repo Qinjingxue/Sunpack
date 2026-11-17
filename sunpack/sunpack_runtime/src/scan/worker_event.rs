@@ -19,7 +19,7 @@ struct ManifestSummary {
     complete: bool,
     file_count: usize,
     total_size: u64,
-    chunk_count: usize,
+    chunk_count: Option<usize>,
 }
 
 impl WorkerFrame {
@@ -156,10 +156,15 @@ impl NativeWorkerResultAccumulator {
         }
 
         match frame.manifest_summary.take() {
-            Some(summary) if summary.chunk_count == self.manifest_seq
+            Some(summary) if summary.chunk_count == Some(self.manifest_seq)
                 && summary.file_count == self.files.len() => {
                 frame.manifest = Some(NativeWorkerManifest::from_parts(
                     std::mem::take(&mut self.files), summary.complete, summary.total_size,
+                ));
+            }
+            Some(summary) if summary.chunk_count.is_none() && self.manifest_seq == 0 => {
+                frame.manifest = Some(NativeWorkerManifest::summary(
+                    summary.file_count, summary.complete, summary.total_size,
                 ));
             }
             None if self.manifest_seq == 0 => {}

@@ -3,6 +3,7 @@ use crate::ChangeReasons;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::io;
+use std::ops::ControlFlow::{self, Break, Continue};
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{
@@ -128,12 +129,11 @@ impl JournalReader {
         }
         self.with_volume(|volume, _| {
             let (journal_id, _) = query_journal(volume)?;
-            let reasons = read_change_reasons_from_volume(
-                volume,
-                journal_id,
+            let reasons = scan_change_reasons(
                 file_id_value(&expected_file_id[..usize::from(expected_file_id_len)]),
                 previous_usn,
                 current_usn,
+                |cursor, output| read_journal_page(volume, journal_id, cursor, output),
             )?;
             Ok((journal_id, reasons))
         })
@@ -363,9 +363,15 @@ fn scan_directories_page(
     let mut changed = BTreeSet::new();
     let mut scratch = Default::default();
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
-    while cursor < end_usn {
+    'journal: while cursor < end_usn {
         let bytes_returned = read(cursor, &mut output)?;
         let (returned_next, mut records) = split_journal_reply(&output, bytes_returned)?;
+        if returned_next <= cursor {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "USN recovery made no progress; fallback scan required",
+            ));
+        }
         while !records.is_empty() {
             let record = next_journal_record(&mut records)?;
             let record = record_directory_changes(
@@ -375,6 +381,9 @@ fn scan_directories_page(
                 end_usn,
                 &mut scratch,
             )?;
+            if record.usn >= end_usn {
+                break 'journal;
+            }
             let changes = record.changes.map(|change| change.filter(|item| !changed.contains(*item)));
             let added: usize = changes.iter().flatten().map(|change| 8 + change.1.len()).sum();
             if added > MAX_DIRECTORY_RESPONSE_BYTES {
@@ -400,12 +409,6 @@ fn scan_directories_page(
             }
             payload_bytes += added;
             changed.extend(changes.into_iter().flatten().cloned());
-        }
-        if returned_next <= cursor {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "USN recovery made no progress; fallback scan required",
-            ));
         }
         cursor = returned_next;
     }
@@ -519,37 +522,32 @@ fn record_directory_changes<'a>(
     Ok(result)
 }
 
-fn read_change_reasons_from_volume(
-    volume: HANDLE,
-    journal_id: u64,
+fn scan_change_reasons(
     expected_file_id: u128,
     previous_usn: i64,
     current_usn: i64,
+    mut read: impl FnMut(i64, &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<ChangeReasons> {
     let mut next_usn = previous_usn;
     let mut reasons = ChangeReasons::default();
     let mut found = false;
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
-    while next_usn <= current_usn {
-        let bytes_returned = read_journal_page(volume, journal_id, next_usn, &mut output)?;
+    'journal: while next_usn <= current_usn {
+        let bytes_returned = read(next_usn, &mut output)?;
         let (returned_next, mut records) = split_journal_reply(&output, bytes_returned)?;
-        while !records.is_empty() {
-            let record = next_journal_record(&mut records)?;
-            if let Some(reason) = record_change_reason(
-                record,
-                expected_file_id,
-                previous_usn,
-                current_usn,
-            )? {
-                found = true;
-                reasons.observe(reason);
-            }
-        }
         if returned_next <= next_usn {
             return Err(io::Error::other("USN observation made no progress"));
         }
-        if returned_next > current_usn {
-            break;
+        while !records.is_empty() {
+            let record = next_journal_record(&mut records)?;
+            match record_change_reason(record, expected_file_id, previous_usn, current_usn)? {
+                Break(()) => break 'journal,
+                Continue(Some(reason)) => {
+                    found = true;
+                    reasons.observe(reason);
+                }
+                Continue(None) => {}
+            }
         }
         next_usn = returned_next;
     }
@@ -567,7 +565,7 @@ fn record_change_reason(
     expected_file_id: u128,
     previous_usn: i64,
     current_usn: i64,
-) -> io::Result<Option<u32>> {
+) -> io::Result<ControlFlow<(), Option<u32>>> {
     if record.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -579,7 +577,7 @@ fn record_change_reason(
         2 => (16usize, 24usize, 40usize),
         3 => (24usize, 40usize, 56usize),
         4 => (24usize, 40usize, 48usize),
-        _ => return Ok(None),
+        _ => return Ok(Continue(None)),
     };
     if record.len() < reason_offset + 4 {
         return Err(io::Error::new(
@@ -588,15 +586,16 @@ fn record_change_reason(
         ));
     }
     let usn = i64::from_le_bytes(record[usn_offset..usn_offset + 8].try_into().unwrap());
-    if usn <= previous_usn
-        || usn > current_usn
-        || file_id_value(&record[8..file_id_end]) != expected_file_id
-    {
-        return Ok(None);
+    // The kernel returns journal order. Equal USNs still belong to this query.
+    if usn > current_usn {
+        return Ok(Break(()));
     }
-    Ok(Some(u32::from_le_bytes(
+    if usn <= previous_usn || file_id_value(&record[8..file_id_end]) != expected_file_id {
+        return Ok(Continue(None));
+    }
+    Ok(Continue(Some(u32::from_le_bytes(
         record[reason_offset..reason_offset + 4].try_into().unwrap(),
-    )))
+    ))))
 }
 
 fn file_id_value(bytes: &[u8]) -> u128 {

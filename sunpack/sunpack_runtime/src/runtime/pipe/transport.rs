@@ -30,6 +30,22 @@ struct Pending {
     operations: HashMap<usize, Arc<Transfer>>,
 }
 
+impl Pending {
+    fn remove(&mut self, key: usize) -> Option<Arc<Transfer>> {
+        let operation = self.operations.remove(&key);
+        // Sequential transfers repeatedly empty this table. Keep the small
+        // allocation and release only the excess from bursts of connections.
+        if self.operations.capacity() > 256 {
+            crate::collections::trim_map(&mut self.operations);
+        }
+        operation
+    }
+
+    fn finished(&self) -> bool {
+        self.closed && self.operations.is_empty()
+    }
+}
+
 impl Reactor {
     pub(super) fn new() -> io::Result<Self> {
         let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 0) };
@@ -77,17 +93,13 @@ impl State {
             let mut overlapped = null_mut();
             let ok = unsafe { GetQueuedCompletionStatus(self.port.as_raw_handle(), &mut bytes, &mut key, &mut overlapped, INFINITE) };
             let error = (ok == 0).then(io::Error::last_os_error);
-            if !overlapped.is_null() {
-                let operation = {
-                    let mut pending = self.pending.lock().unwrap();
-                    let operation = pending.operations.remove(&(overlapped as usize));
-                    crate::collections::trim_map(&mut pending.operations);
-                    operation
-                };
-                if let Some(operation) = operation { operation.finish(bytes as usize, error); }
-            }
-            let pending = self.pending.lock().unwrap();
-            if pending.closed && pending.operations.is_empty() { return; }
+            let (operation, finished) = {
+                let mut pending = self.pending.lock().unwrap();
+                let operation = if overlapped.is_null() { None } else { pending.remove(overlapped as usize) };
+                (operation, pending.finished())
+            };
+            if let Some(operation) = operation { operation.finish(bytes as usize, error); }
+            if finished { return; }
         }
     }
 }
@@ -142,11 +154,15 @@ impl Peer {
             }
         };
         if let Some(error) = immediate_error {
-            self.state.pending.lock().unwrap().operations.remove(&key);
+            let finished = {
+                let mut pending = self.state.pending.lock().unwrap();
+                pending.remove(key);
+                pending.finished()
+            };
             operation.finish(0, Some(error));
             // A rejected submission generates no kernel packet; wake shutdown
             // if this was the final registered operation.
-            self.state.wake();
+            if finished { self.state.wake(); }
         }
         let result = operation.reply.wait().await;
         drop(guard);

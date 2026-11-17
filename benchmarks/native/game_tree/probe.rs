@@ -3,7 +3,7 @@ use super::{scan_options, CandidateSet, OutputDiscovery, Request};
 use crate::benchmark_process_memory::process_memory;
 use crate::core::config;
 use crate::pipeline::{passwords::RecentPasswords, Mode};
-use crate::scan::directory::scan_output_inventory_impl;
+use crate::scan::directory::scan_output_stats;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,8 +35,8 @@ fn scan() -> Result<(), Box<dyn std::error::Error>> {
         &options,
         &request.cancel,
         |path| {
-            let inventory = scan_output_inventory_impl(&path.to_string_lossy());
-            ((inventory.file_count(), inventory.total_size()), inventory)
+            let stats = scan_output_stats(&path.to_string_lossy(), true);
+            ((stats.file_count, stats.total_size), stats.inventory.unwrap())
         },
         |(count, bytes), output| {
             file_count += count;

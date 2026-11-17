@@ -1056,23 +1056,21 @@ impl<K: Eq + std::hash::Hash, V> ReceiptOrder<K, V> {
 
 }
 
-#[derive(Default)]
-struct ArchiveStatus {
-    round: usize,
-    failed: bool,
-}
-
-fn record_archive_status(
-    recorded: &mut HashMap<String, ArchiveStatus>,
-    round: usize,
-    current: &[ArchiveResult],
-) {
-    for archive in current {
-        let status = recorded.entry(path_key(&archive.path)).or_default();
-        if status.round != round {
-            *status = ArchiveStatus { round, failed: false };
+fn record_archive_failures(failed: &mut HashSet<String>, current: &[ArchiveResult]) {
+    let unsuccessful = |archive: &ArchiveResult| !archive.partial && archive.failure.is_some();
+    if !failed.is_empty() {
+        for archive in current.iter().filter(|archive| !unsuccessful(archive)) {
+            failed.remove(&path_key(&archive.path));
+            if failed.is_empty() {
+                break;
+            }
         }
-        status.failed |= !archive.partial && archive.failure.is_some();
+    }
+    // A carrier can have both successful and failed segments in one round.
+    // Clear old failures first so any current failure wins regardless of order.
+    failed.extend(current.iter().filter(|archive| unsuccessful(archive)).map(|archive| path_key(&archive.path)));
+    if failed.capacity() > 256.max(failed.len().saturating_mul(4)) {
+        failed.shrink_to(failed.len().saturating_mul(2));
     }
 }
 
@@ -1642,26 +1640,25 @@ async fn archives(
             line(session, Stream::Out, language.text("interrupt.hint"))?;
         }
     }
-    let progress = Arc::new(Progress {
-        session: Arc::clone(&owned_session),
-        watch: Arc::clone(&host.watch),
-        cancel: cancel.clone(),
-        language,
-        display: Mutex::default(),
-        reporting: reporting::Reports::default(),
-        prompt: settings.recursive_extract == Recursion::Prompt,
-        visible: !options.json && !scan,
-        verbose: options.verbose,
-    });
     let max_depth = depth(settings.recursive_extract);
     let settings = Arc::new(settings);
-    let mut retries = 0;
-    let mut archive_status = HashMap::new();
+    let mut failed_archives = HashSet::new();
     let mut had_input_error = false;
     let mut checkpoints = Vec::new();
     let mut generated_sources = Vec::new();
     loop {
         let began = Instant::now();
+        let progress = Arc::new(Progress {
+            session: Arc::clone(&owned_session),
+            watch: Arc::clone(&host.watch),
+            cancel: cancel.clone(),
+            language,
+            display: Mutex::default(),
+            reporting: reporting::Reports::default(),
+            prompt: settings.recursive_extract == Recursion::Prompt,
+            visible: !options.json && !scan,
+            verbose: options.verbose,
+        });
         let mut request = Request::with_config(
             std::mem::take(&mut candidate_paths),
             if scan { Mode::Scan } else { Mode::Extract },
@@ -1677,7 +1674,6 @@ async fn archives(
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
         request.generated_sources = std::mem::take(&mut generated_sources);
-        progress.reporting.reopen();
         let _report_close = ReportClose(&progress.reporting);
         let reporting = if progress.visible {
             let progress = Arc::clone(&progress);
@@ -1783,12 +1779,14 @@ async fn archives(
         // Retry inputs are physical paths. Replace every segment for a path
         // together even when a formerly nested carrier is now a root.
         candidate_paths = password_retry_paths(&current.archives);
-        record_archive_status(&mut archive_status, retries, &current.archives);
+        record_archive_failures(&mut failed_archives, &current.archives);
         had_input_error |= !current.errors.is_empty();
         drop(current.archives);
         drop(current.errors);
         drop(current.cleanup_results);
         drop(outputs);
+        drop(_report_close);
+        drop(progress);
         if candidate_paths.is_empty() {
             break;
         }
@@ -1818,11 +1816,10 @@ async fn archives(
         }
         user.extend(additional);
         dedupe(&mut user);
-        retries += 1;
     }
     // Each round has already written its report. Only the latest status per
     // carrier and any request-level input failures affect the final exit code.
-    let failed = had_input_error || archive_status.values().any(|status| status.failed);
+    let failed = had_input_error || !failed_archives.is_empty();
     Ok((i32::from(failed), CommandResult::new(options.command)))
     };
     let result = settle_unwind(execution).await;

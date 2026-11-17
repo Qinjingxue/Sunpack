@@ -85,7 +85,9 @@ impl Reports {
             state.sequence += 1;
             let sequence = state.sequence;
             state.relocations.push((sequence, event));
-            if let Some(waker) = state.waker.take() { waker.wake(); }
+            let waker = state.waker.take();
+            drop(state);
+            if let Some(waker) = waker { waker.wake(); }
             return;
         }
         let key = match &event {
@@ -119,7 +121,9 @@ impl Reports {
         state.sequence += 1;
         let sequence = state.sequence;
         state.events.insert(key, (sequence, event));
-        if let Some(waker) = state.waker.take() { waker.wake(); }
+        let waker = state.waker.take();
+        drop(state);
+        if let Some(waker) = waker { waker.wake(); }
     }
 
     pub(crate) async fn serve_async(
@@ -128,15 +132,17 @@ impl Reports {
     ) {
         let _close = Close(self);
         loop {
-            let closed = poll_fn(|cx| {
+            let (closed, pending) = poll_fn(|cx| {
                 let mut state = self.state.lock().unwrap();
-                if state.closed || !state.events.is_empty() || !state.relocations.is_empty() {
-                    Poll::Ready(state.closed)
+                let pending = !state.events.is_empty() || !state.relocations.is_empty();
+                if state.closed || pending {
+                    Poll::Ready((state.closed, pending))
                 } else {
                     state.waker = Some(cx.waker().clone());
                     Poll::Pending
                 }
             }).await;
+            if !pending { return; }
             crate::pipeline::stage("report", &crate::pipeline::Cancellation::new()).await
                 .expect("completion reporting is not cancellable");
             notify();
@@ -153,8 +159,6 @@ impl Reports {
         events.sort_unstable_by_key(|(sequence, _)| *sequence);
         events.into_iter().map(|(_, event)| event).collect()
     }
-
-    pub(crate) fn reopen(&self) { self.state.lock().unwrap().closed = false; }
 
     pub(crate) fn close(&self) {
         let waker = {

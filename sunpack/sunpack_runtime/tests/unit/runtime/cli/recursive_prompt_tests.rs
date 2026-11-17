@@ -272,14 +272,15 @@ fn retry_replaces_all_carrier_segments_when_nested_input_becomes_root() {
               scan_layout: Default::default(),
         }
     }
-    let mut all = HashMap::new();
-    record_archive_status(&mut all, 0, &[archive("C:/data/Carrier.bin", 2, 100, true),
-                               archive("C:/data/Carrier.bin", 2, 900, true),
-                               archive("C:/data/other.zip", 1, 0, false)]);
-    assert!(all[&path_key(Path::new("C:/data/Carrier.bin"))].failed);
-    record_archive_status(&mut all, 1, &[archive("c:/DATA/carrier.bin", 1, 100, false)]);
-    assert_eq!(all.len(), 2);
-    assert!(all.values().all(|status| !status.failed));
+    let mut failed = HashSet::new();
+    record_archive_failures(&mut failed, &[
+        archive("C:/data/Carrier.bin", 2, 100, true),
+        archive("C:/data/Carrier.bin", 2, 900, false),
+        archive("C:/data/other.zip", 1, 0, false),
+    ]);
+    assert_eq!(failed, HashSet::from([path_key(Path::new("C:/data/Carrier.bin"))]));
+    record_archive_failures(&mut failed, &[archive("c:/DATA/carrier.bin", 1, 100, false)]);
+    assert!(failed.is_empty());
 }
 
 #[test]

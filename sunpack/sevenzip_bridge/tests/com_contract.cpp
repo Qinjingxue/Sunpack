@@ -272,6 +272,7 @@ void check_open_callback_canonical_range()
     const std::wstring path(executable, length);
     const std::wstring name = L"archive.part2.rar";
     const std::vector<ExtractInputRange> ranges{{path, 1, 2, true}};
+    const std::vector<std::wstring> canonical_names{name};
 
     // A one-file descriptor still permits the configured entry as a volume.
     auto *single = new OpenCallback(L"", path, {}, {}, InputPrefetchConfig{false});
@@ -286,7 +287,7 @@ void check_open_callback_canonical_range()
           "single-file callback reports an unlisted volume through missing-volume evidence");
 
     auto *raw = new OpenCallback(
-        L"", L"archive.part1.rar", {}, {name}, InputPrefetchConfig{false}, {},
+        L"", L"archive.part1.rar", {}, canonical_names, InputPrefetchConfig{false}, {},
         ranges);
     CMyComPtr<IArchiveOpenCallback> callback(raw);
 
@@ -306,16 +307,28 @@ void check_open_archive_stream_ownership()
 {
     std::printf("open_archive_stream ownership\n");
 
-    bool opened = false;
-    CMyComPtr<IInStream> stream = open_archive_stream(
-        L"", std::vector<std::wstring>{}, opened);
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-sfx-stream-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(root);
+    const auto head = (root / L"payload.part1.exe").wstring();
+    const auto tail = (root / L"payload.part2.exe").wstring();
+    std::ofstream(std::filesystem::path(head)).put('a');
+    std::ofstream(std::filesystem::path(tail)).put('b');
+    {
+        auto input = open_archive_stream(tail, {tail, head});
+        IUnknown *unknown = as_unknown(input.stream.Interface());
+        const ULONG after_add_ref = unknown->AddRef();
+        const ULONG after_release = unknown->Release();
+        check(after_add_ref == 2 && after_release == 1,
+              "open_archive_stream returns exactly one owned COM reference");
 
-    IUnknown *unknown = as_unknown(stream.Interface());
-    const ULONG after_add_ref = unknown->AddRef();
-    const ULONG after_release = unknown->Release();
-
-    check(after_add_ref == 2 && after_release == 1,
-          "open_archive_stream returns exactly one owned COM reference");
+        char byte = 0;
+        UInt32 read = 0;
+        check(input.opened && input.callback_path == head &&
+              input.stream->Read(&byte, 1, &read) == S_OK && read == 1 && byte == 'a',
+              "unnamed split SFX fallback opens the same head it gives the volume callback");
+    }
+    std::filesystem::remove_all(root);
 }
 
 void check_streams()

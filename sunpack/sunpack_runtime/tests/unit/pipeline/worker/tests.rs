@@ -33,11 +33,67 @@ fn native_worker_accepts_chunked_request_then_an_ordinary_request() {
                 encrypted: None,
                 codepage: None,
                 report_progress: false,
+                output_inventory: false,
             };
             assert_eq!(small_request(&request)?.is_some(), count == 1);
             let result = process.submit(request, &cancellation, WorkerUpdates::None, |_| {}).await?;
             assert_eq!(result.summary["status"], "ok", "{}", result.summary);
             assert_eq!(result.summary["archive_type"], "gzip");
+        }
+        Ok::<_, io::Error>(())
+    });
+    drop(process);
+    std::fs::remove_file(path).unwrap();
+    result.unwrap();
+}
+
+#[test]
+fn native_extraction_requests_inventory_rows_only_for_recursion() {
+    let executable = crate::test_support::built_worker().unwrap();
+    let config = WorkerConfig { space_poll_interval_ms: None, space_status_report_interval_ms: None };
+    let process = Process::start(&executable, &config, ProcessMode::Normal).unwrap();
+    let cancellation = Cancellation::new();
+    let content = b"output inventory prefix";
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(content).unwrap();
+    let path = crate::test_support::temp_file("worker_inventory", &gzip.finish().unwrap());
+    let archive = Arc::new(ArchiveInput::file(
+        path.to_string_lossy().into_owned(), "gzip".into(), "item.gz".into(),
+    ));
+    let result = super::super::scheduling::block_on(async {
+        process.ready(&cancellation).await?;
+        for output_inventory in [false, true] {
+            let output = path.with_extension(if output_inventory { "recursive" } else { "leaf" });
+            let output_dir = output.to_string_lossy().into_owned();
+            let request = WorkerRequest {
+                job_id: output_inventory.to_string(),
+                operation: "extract",
+                origin: "foreground",
+                output_dir: output_dir.clone(),
+                output_volume_key: String::new(),
+                archive_input: Arc::clone(&archive),
+                password_candidates: Arc::default(),
+                password: None,
+                password_verified: false,
+                encrypted: None,
+                codepage: None,
+                report_progress: false,
+                output_inventory,
+            };
+            let frame = process.submit(request, &cancellation, WorkerUpdates::None, |_| {}).await?;
+            std::fs::remove_dir_all(output)?;
+            assert_eq!(frame.summary["status"], "ok", "{}", frame.summary);
+            let manifest = frame.manifest.expect("verified output");
+            assert_eq!(manifest.records().is_some(), output_inventory);
+            if output_inventory {
+                let records = manifest.records().unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].magic.as_ref(), content);
+            }
+            let stats = manifest.into_output_stats(&output_dir, output_inventory).unwrap();
+            assert_eq!(stats.file_count, 1);
+            assert_eq!(stats.total_size, content.len() as u64);
+            assert_eq!(stats.inventory.is_some(), output_inventory);
         }
         Ok::<_, io::Error>(())
     });

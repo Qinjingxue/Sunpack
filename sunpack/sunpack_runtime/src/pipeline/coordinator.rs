@@ -28,7 +28,7 @@ use crate::postprocess::{
     discover_flatten_leaf, flatten_single_branch_directories, remove_owned_file, remove_owned_tree, FlattenLeaf,
 };
 use crate::scan::directory::{
-    scan_output_inventory_impl, NativeDirectoryScanOptions, NativeOutputInventory,
+    scan_output_stats, NativeDirectoryScanOptions, NativeOutputInventory,
 };
 use crate::scan::worker_event::WorkerFrame;
 use serde::Deserialize;
@@ -2938,6 +2938,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     encrypted: plan.encrypted,
                     codepage,
                     report_progress: false,
+                    output_inventory: self.request.mode == Mode::Extract && depth <= self.request.max_depth,
                 };
                 worker
                     .submit(
@@ -2969,7 +2970,7 @@ impl<'run, O: Observer> Run<'run, O> {
         self.notify(|| Event::Finalizing { id });
         let mut inventory = None;
         match native {
-            Ok(frame) => {
+            Ok(mut frame) => {
                 let value = &frame.summary;
                 let format = worker::string(value, "archive_type");
                 if !format.is_empty()
@@ -3021,13 +3022,14 @@ impl<'run, O: Observer> Run<'run, O> {
                             .map(str::to_owned);
                     }
                     if let Some(output) = &output {
-                        let stats = inventory_for(&frame, &output_string);
-                        result.files = stats.file_count() as u64;
-                        result.bytes = stats.total_size();
+                        let collect_rows = depth <= self.request.max_depth;
+                        let stats = frame.manifest.take()
+                            .and_then(|manifest| manifest.into_output_stats(&output_string, collect_rows))
+                            .unwrap_or_else(|| scan_output_stats(&output_string, collect_rows));
+                        result.files = stats.file_count;
+                        result.bytes = stats.total_size;
                         result.output = Some(output.clone());
-                        if depth <= self.request.max_depth {
-                            inventory = Some(stats);
-                        }
+                        inventory = stats.inventory;
                     }
                 } else if result.failure.is_none() {
                     let split = input.mode.structured() || input.physical_paths().nth(1).is_some()
@@ -3045,22 +3047,22 @@ impl<'run, O: Observer> Run<'run, O> {
                         (failure.kind != FailureKind::PasswordInconclusive)
                             .then(|| recoverable_file_count(&frame)).flatten(),
                     ) {
-                        let stats = scan_output_inventory_impl(&output_string);
+                        let complete_files = recovery_complete_files(&failure, verified_files);
+                        let partial = accepts_partial_content(
+                            self.request.config.extraction.content_requirement,
+                            failure.kind, complete_files,
+                        );
+                        let stats = scan_output_stats(&output_string, partial && depth <= self.request.max_depth);
                         // Retaining damaged payload is not partial success:
                         // main keeps nonempty failed output for manual recovery,
                         // but only verified files authorize recursive processing.
-                        if verified_files > 0 || stats.file_count() > 0 {
-                            result.recovered_complete_files = recovery_complete_files(&failure, verified_files);
-                            result.partial = accepts_partial_content(
-                                self.request.config.extraction.content_requirement,
-                                failure.kind, result.recovered_complete_files,
-                            );
-                            result.files = stats.file_count() as u64;
-                            result.bytes = stats.total_size();
+                        if verified_files > 0 || stats.file_count > 0 {
+                            result.recovered_complete_files = complete_files;
+                            result.partial = partial;
+                            result.files = stats.file_count;
+                            result.bytes = stats.total_size;
                             result.output = Some(output.clone());
-                            if result.partial && depth <= self.request.max_depth {
-                                inventory = Some(stats);
-                            }
+                            inventory = stats.inventory;
                         }
                     }
                     failure.evidence = worker_evidence(value, plan.evidence);
@@ -3740,18 +3742,6 @@ fn recoverable_file_count(frame: &WorkerFrame) -> Option<u64> {
         return None;
     }
     Some(worker::number(&frame.summary, "recovered_complete_files"))
-}
-
-fn inventory_for(frame: &WorkerFrame, path: &str) -> NativeOutputInventory {
-    if let Some(manifest) = frame
-        .manifest
-        .as_ref()
-        .filter(|manifest| manifest.complete())
-    {
-        manifest.to_output_inventory(path.to_owned())
-    } else {
-        scan_output_inventory_impl(path)
-    }
 }
 
 fn output_is_gone(output: &Path, prune_empty: bool) -> bool {

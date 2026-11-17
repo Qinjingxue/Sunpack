@@ -230,9 +230,14 @@ pub(crate) struct OutputFileRecord {
 }
 
 pub(crate) struct NativeWorkerManifest {
-    files: Arc<Vec<OutputFileRecord>>,
+    files: ManifestFiles,
     complete: bool,
     total_size: u64,
+}
+
+enum ManifestFiles {
+    Summary(usize),
+    Rows(Arc<Vec<OutputFileRecord>>),
 }
 
 impl NativeWorkerManifest {
@@ -245,44 +250,59 @@ impl NativeWorkerManifest {
         // walk every row, or trust a complete summary with incomplete rows.
         let complete = complete && files.iter().all(|item| item.status == 1);
         Self {
-            files: Arc::new(files),
+            files: ManifestFiles::Rows(Arc::new(files)),
             complete,
             total_size,
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn records(&self) -> &Arc<Vec<OutputFileRecord>> {
-        &self.files
+    pub(super) fn summary(file_count: usize, complete: bool, total_size: u64) -> Self {
+        Self { files: ManifestFiles::Summary(file_count), complete, total_size }
     }
-}
 
-impl NativeWorkerManifest {
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> Option<&Arc<Vec<OutputFileRecord>>> {
+        match &self.files {
+            ManifestFiles::Summary(_) => None,
+            ManifestFiles::Rows(rows) => Some(rows),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn complete(&self) -> bool {
         self.complete
     }
-    pub(crate) fn to_output_inventory(&self, root: String) -> NativeOutputInventory {
-        NativeOutputInventory {
-            root,
-            total_size: self.total_size,
-            scan_errors: Vec::new(),
-            files: OutputInventoryFiles::Manifest(Arc::clone(&self.files)),
+
+    pub(crate) fn into_output_stats(self, root: &str, collect_rows: bool) -> Option<OutputStats> {
+        if !self.complete {
+            return None;
         }
+        let (file_count, inventory) = match self.files {
+            ManifestFiles::Summary(count) if !collect_rows => (count, None),
+            ManifestFiles::Summary(_) => return None,
+            ManifestFiles::Rows(files) => (files.len(), collect_rows.then(|| NativeOutputInventory {
+                root: root.to_owned(),
+                files: OutputInventoryFiles::Manifest(files),
+            })),
+        };
+        Some(OutputStats { file_count: file_count as u64, total_size: self.total_size, inventory })
     }
+}
+
+#[derive(Default)]
+pub(crate) struct OutputStats {
+    pub(crate) file_count: u64,
+    pub(crate) total_size: u64,
+    pub(crate) inventory: Option<NativeOutputInventory>,
 }
 
 pub(crate) struct NativeOutputInventory {
     root: String,
-    total_size: u64,
-    scan_errors: Vec<DirectoryReadError>,
     files: OutputInventoryFiles,
 }
 
 enum OutputInventoryFiles {
-    Disk {
-        files: Vec<DirectoryEntryRecord>,
-        directory_ends: Vec<usize>,
-    },
+    Disk(OutputTreeInventory),
     Manifest(Arc<Vec<OutputFileRecord>>),
 }
 
@@ -290,25 +310,15 @@ impl NativeOutputInventory {
     pub(crate) fn root(&self) -> &str {
         &self.root
     }
-    pub(crate) fn file_count(&self) -> usize {
-        match &self.files {
-            OutputInventoryFiles::Disk { files, .. } => files.len(),
-            OutputInventoryFiles::Manifest(files) => files.len(),
-        }
-    }
-    pub(crate) fn total_size(&self) -> u64 {
-        self.total_size
-    }
-
     pub(crate) fn build_directory_snapshots(
         self,
         options: &NativeDirectoryScanOptions,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let root = lexical_normalize_path(Path::new(&self.root));
         let manifest;
-        let (mut files, directory_ends, manifest_rows) = match self.files {
-            OutputInventoryFiles::Disk { files, directory_ends } => {
-                (files, Some(directory_ends), None)
+        let (mut files, directory_ends, manifest_rows, deduplicate_paths, errors) = match self.files {
+            OutputInventoryFiles::Disk(inventory) => {
+                (inventory.files, Some(inventory.directory_ends), None, inventory.lossy_paths, inventory.errors)
             }
             OutputInventoryFiles::Manifest(files) => {
                 manifest = files;
@@ -321,7 +331,7 @@ impl NativeOutputInventory {
                     records.push(output_file_record(path_to_string(&path), item.size, item.mtime_ns));
                     item_indices.push(index);
                 }
-                (records, None, Some((manifest.as_slice(), item_indices)))
+                (records, None, Some((manifest.as_slice(), item_indices)), true, DirectoryReadErrors::default())
             }
         };
         let (directories, filtered) = build_inventory_snapshot_views(
@@ -330,10 +340,9 @@ impl NativeOutputInventory {
             directory_ends,
             manifest_rows,
             &options.options,
+            deduplicate_paths,
         );
         populate_relation_anchors_cached(&mut files, &[], Some(&self.root));
-        let mut errors = DirectoryReadErrors::default();
-        errors.extend(self.scan_errors);
         Ok(NativeDirectorySnapshot::from_views(
             filtered,
             // Directory rows precede files in both views. Consume the two
@@ -697,6 +706,7 @@ fn build_inventory_snapshot_views(
     directory_ends: Option<Vec<usize>>,
     manifest_rows: Option<(&[OutputFileRecord], Vec<usize>)>,
     options: &DirectoryScanOptions,
+    deduplicate_paths: bool,
 ) -> (Vec<DirectoryEntryRecord>, Vec<usize>) {
     let mut pre_mtime_accepted = vec![false; raw_files.len()];
     let mut size_accepted_split_families = HashSet::new();
@@ -785,21 +795,20 @@ fn build_inventory_snapshot_views(
         )
     };
     let file_start = directories.len();
-    // Unlike directory enumeration, a worker manifest may name the same output
-    // more than once. Preserve its existing last-record projection for aliases.
-    let file_rows: HashMap<&str, usize> = raw_files
-        .iter()
-        .enumerate()
-        .map(|(index, record)| (record.path.as_str(), file_start + index))
-        .collect();
     let accepted = raw_files
         .iter()
         .enumerate()
         .filter(|(index, record)| pre_mtime_accepted[*index] && record.relation_member_eligible);
-    if file_rows.len() == raw_files.len() {
-        drop(file_rows);
+    if !deduplicate_paths {
         filtered.extend(accepted.map(|(index, _)| file_start + index));
     } else {
+        // Manifest entries and lossy filesystem paths can collide.
+        // Preserve the last-record projection for these aliases.
+        let file_rows: HashMap<_, _> = raw_files
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (record.path.as_str(), file_start + index))
+            .collect();
         filtered.extend(accepted.map(|(_, record)| file_rows[record.path.as_str()]));
     }
     (directories, filtered)
@@ -908,63 +917,79 @@ fn ancestor_directory_records<'a>(
     (raw, filtered)
 }
 
-pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInventory {
-    let root = PathBuf::from(output_dir);
-    let mut stats = OutputTreeStats::default();
-    match fs::metadata(&root) {
-        Ok(metadata) if metadata.is_dir() => walk_output_tree(&root, &mut stats),
-        Ok(_) => stats.errors.push(&root, "read_dir", std::io::ErrorKind::NotADirectory.into()),
-        Err(error) => stats.errors.push(&root, "metadata", error),
+pub(crate) fn scan_output_stats(output_dir: &str, collect_rows: bool) -> OutputStats {
+    let root = Path::new(output_dir);
+    let mut stats = OutputStats::default();
+    let mut inventory = collect_rows.then(OutputTreeInventory::default);
+    match fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => walk_output_tree(root, &mut stats, inventory.as_mut()),
+        Ok(_) => {
+            if let Some(inventory) = &mut inventory {
+                inventory.errors.push(root, "read_dir", std::io::ErrorKind::NotADirectory.into());
+            }
+        }
+        Err(error) => {
+            if let Some(inventory) = &mut inventory {
+                inventory.errors.push(root, "metadata", error);
+            }
+        }
     }
-    NativeOutputInventory {
-        root: path_to_string(&root),
-        total_size: stats.total_size,
-        scan_errors: stats.errors.into_messages(),
-        files: OutputInventoryFiles::Disk {
-            files: stats.files,
-            directory_ends: stats.directory_ends,
-        },
-    }
+    stats.inventory = inventory.map(|inventory| NativeOutputInventory {
+        root: output_dir.to_owned(),
+        files: OutputInventoryFiles::Disk(inventory),
+    });
+    stats
 }
 
 #[derive(Default)]
-struct OutputTreeStats {
-    total_size: u64,
+struct OutputTreeInventory {
     errors: DirectoryReadErrors,
     files: Vec<DirectoryEntryRecord>,
     directory_ends: Vec<usize>,
+    lossy_paths: bool,
 }
 
-fn walk_output_tree(root: &Path, stats: &mut OutputTreeStats) {
-    let normalized_root = lexical_normalize_path(root);
+fn walk_output_tree(root: &Path, stats: &mut OutputStats, mut inventory: Option<&mut OutputTreeInventory>) {
+    let normalized_root = inventory.as_ref().map(|_| lexical_normalize_path(root));
     let mut pending = vec![root.to_path_buf()];
     while let Some(current) = pending.pop() {
         let entries = match fs::read_dir(&current) {
             Ok(entries) => entries,
             Err(error) => {
-                stats.errors.push(&current, "read_dir", error);
+                if let Some(inventory) = &mut inventory {
+                    inventory.errors.push(&current, "read_dir", error);
+                }
                 continue;
             }
         };
-        let normalized_dir = current
-            .strip_prefix(root)
-            .map(|path| lexical_normalize_path(&normalized_root.join(path)))
-            .unwrap_or_else(|_| normalized_root.clone());
         // Let Path supply the correct separator once for this directory.
-        let prefix = path_to_string(&normalized_dir.join(""));
-        let first_file = stats.files.len();
+        let prefix = normalized_root.as_ref().map(|normalized_root| {
+            current.strip_prefix(root)
+                .map(|path| lexical_normalize_path(&normalized_root.join(path)))
+                .unwrap_or_else(|_| normalized_root.clone())
+                .join("")
+        });
+        let prefix = prefix.as_ref().map(|prefix| prefix.to_string_lossy());
+        let first_file = inventory.as_mut().zip(prefix.as_ref()).map(|(inventory, prefix)| {
+            inventory.lossy_paths |= matches!(prefix, std::borrow::Cow::Owned(_));
+            inventory.files.len()
+        });
         for item in entries {
             let entry = match item {
                 Ok(entry) => entry,
                 Err(error) => {
-                    stats.errors.push(&current, "read_dir_entry", error);
+                    if let Some(inventory) = &mut inventory {
+                        inventory.errors.push(&current, "read_dir_entry", error);
+                    }
                     continue;
                 }
             };
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    stats.errors.push(&entry.path(), "metadata", error);
+                    if let Some(inventory) = &mut inventory {
+                        inventory.errors.push(&entry.path(), "metadata", error);
+                    }
                     continue;
                 }
             };
@@ -980,22 +1005,23 @@ fn walk_output_tree(root: &Path, stats: &mut OutputTreeStats) {
                 continue;
             }
             let size = metadata.len();
+            stats.file_count += 1;
             stats.total_size = stats.total_size.saturating_add(size);
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let mut path = String::with_capacity(prefix.len() + name.len());
-            path.push_str(&prefix);
-            path.push_str(&name);
-            stats.files.push(output_file_record(
-                path,
-                size,
-                metadata_mtime_ns(&metadata),
-            ));
+            if let Some((inventory, prefix)) = inventory.as_mut().zip(prefix.as_ref()) {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                inventory.lossy_paths |= matches!(name, std::borrow::Cow::Owned(_));
+                let mut path = String::with_capacity(prefix.len() + name.len());
+                path.push_str(prefix);
+                path.push_str(&name);
+                inventory.files.push(output_file_record(path, size, metadata_mtime_ns(&metadata)));
+            }
         }
-        if stats.files.len() != first_file {
+        if let Some((inventory, _)) = inventory.as_mut().zip(first_file)
+            .filter(|(inventory, first_file)| inventory.files.len() != *first_file) {
             // Direct children are contiguous; ancestor projection visits a
             // directory once even if it contains many accepted files.
-            stats.directory_ends.push(stats.files.len());
+            inventory.directory_ends.push(inventory.files.len());
         }
     }
 }

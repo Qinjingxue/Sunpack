@@ -2,7 +2,7 @@
 //! Physical generations and logical boundaries are part of the identity; no
 //! archive detection or member discovery is performed by this cache.
 use super::PasswordVerification;
-use crate::io::cancellation::CancellableOnce;
+use crate::io::cancellation::{CancellableOnce, Cancellation};
 use crate::io::read_fault::ReadFault;
 use crate::io::reader::{FileIdentity, ManagedReader};
 use std::collections::HashMap;
@@ -39,6 +39,7 @@ pub(crate) struct InputKey {
     format: &'static str,
     mode: &'static str,
     members: Vec<InputMember>,
+    zip_eocd_offset: Option<u64>,
 }
 
 impl InputKey {
@@ -47,6 +48,7 @@ impl InputKey {
             format,
             mode,
             members,
+            zip_eocd_offset: None,
         }
     }
 
@@ -56,6 +58,11 @@ impl InputKey {
             "file",
             vec![InputMember::new(reader, 0, None, 0)?],
         ))
+    }
+
+    pub(crate) fn with_zip_eocd(mut self, offset: Option<u64>) -> Self {
+        self.zip_eocd_offset = offset;
+        self
     }
 }
 
@@ -127,13 +134,25 @@ impl<'a> Preparation<'a> {
         Self { slot: None, rar5_key: Some(key) }
     }
 
+    /// Reuse the layout for a later batch of the same plan's input and readers.
+    pub(super) fn verify_prepared(
+        &mut self,
+        candidates: &[Arc<str>],
+    ) -> std::io::Result<Option<PasswordVerification>> {
+        let Some(slot) = self.slot.as_deref() else { return Ok(None); };
+        let Some(prepared) = slot.value.get() else { return Ok(None); };
+        let cancellation = Cancellation::current();
+        Self::verify_slot(slot, prepared, candidates, self.rar5_key.as_deref_mut(), &cancellation)
+            .map(Some)
+    }
+
     pub(crate) fn verify(
         &mut self,
         key: InputKey,
         candidates: &[Arc<str>],
         prepare: impl FnOnce() -> Prepared + Send,
     ) -> std::io::Result<PasswordVerification> {
-        let cancellation = crate::io::cancellation::Cancellation::current();
+        let cancellation = Cancellation::current();
         cancellation.check()?;
         let mut prepare = Some(prepare);
         loop {
@@ -149,23 +168,38 @@ impl<'a> Preparation<'a> {
                 cancellation.check()?;
                 continue;
             };
-            if slot.retired.load(Ordering::Acquire) {
-                cancellation.check()?;
-                return Err(input_changed());
-            }
-            let result = cancellation.check().and_then(|()| match prepared {
-                Ok(context) => context.verify(candidates, self.rar5_key.as_deref_mut()),
-                Err(status) => Ok(status.verification()),
-            });
-            let retired = slot.retired.load(Ordering::Acquire);
+            let result = Self::verify_slot(
+                slot, prepared, candidates, self.rar5_key.as_deref_mut(), &cancellation,
+            );
             if matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error")
                 || matches!(prepared, Err(PreparedStatus::Status(_, message)) if message.starts_with("resource_unavailable:"))
             {
                 self.release(true);
             }
-            cancellation.check()?;
-            return if retired { Err(input_changed()) } else { result };
+            return result;
         }
+    }
+
+    fn verify_slot(
+        slot: &PreparedSlot,
+        prepared: &Prepared,
+        candidates: &[Arc<str>],
+        rar5_key: Option<&mut Option<super::rar::Rar5ProvenKey>>,
+        cancellation: &Cancellation,
+    ) -> std::io::Result<PasswordVerification> {
+        cancellation.check()?;
+        if slot.retired.load(Ordering::Acquire) {
+            return Err(input_changed());
+        }
+        let result = match prepared {
+            Ok(context) => context.verify(candidates, rar5_key),
+            Err(status) => Ok(status.verification()),
+        };
+        cancellation.check()?;
+        if slot.retired.load(Ordering::Acquire) {
+            return Err(input_changed());
+        }
+        result
     }
 
     fn release(&mut self, detach: bool) {

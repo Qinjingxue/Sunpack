@@ -953,22 +953,25 @@ namespace sunpack::sevenzip
 
     };
 
-    CMyComPtr<IInStream> open_archive_stream(
+    struct OpenedArchiveStream
+    {
+        CMyComPtr<IInStream> stream;
+        std::wstring callback_path;
+        bool opened;
+    };
+
+    OpenedArchiveStream open_archive_stream(
 
         const std::wstring &archive_path,
 
         const std::vector<std::wstring> &part_paths,
 
-        bool &opened,
-
         ExtractInputTrace *trace = nullptr,
 
-        bool structured_order = false,
+        const std::vector<std::wstring> &canonical_names = {},
 
         InputPrefetchConfig prefetch_config = input_prefetch_config(),
         const std::vector<ExtractInputRange> &input_ranges = {});
-
-    std::wstring callback_archive_path(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths);
 
 #endif
 

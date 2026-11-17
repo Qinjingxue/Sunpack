@@ -483,7 +483,7 @@ fn password_notifications_do_not_reload_unrelated_configuration() {
         // its ancestor: its appearance must rearm all affected sources.
         ("new-directory".into(), (true, true)),
     ]);
-    let names = |name: &str| vec![name.to_owned()];
+    let names = |name: &str| [DirectoryChange { name: name.to_owned(), action: 1 }];
     assert_eq!(configuration_changes(&files, Some(&names("BUILTIN_PASSWORDS.JSON"))), (false, true));
     assert_eq!(configuration_changes(&files, Some(&names("sunpack_config.json"))), (true, false));
     assert_eq!(configuration_changes(&files, Some(&names("unrelated.tmp"))), (false, false));
@@ -1740,12 +1740,12 @@ fn configuration_candidates_remain_subscribed_after_deletion() {
     // Arm before recreating: verifies actual notification delivery, with
     // a bounded receive only as a test failure guard, never idle polling.
     let (send, receive) = mpsc::channel();
-    let observer = FileObserver::start(&directory, false, move |names| {
+    let observer = FileObserver::start(&directory, false, 0x01 | 0x02 | 0x08 | 0x10, 4096, move |names| {
         let _ = send.send(names);
     }).unwrap();
     fs::write(&config, b"{}").unwrap();
     let names = receive.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
-    assert!(names.iter().any(|name| name.eq_ignore_ascii_case("sunpack_advanced_config.json")));
+    assert!(names.iter().any(|change| change.name.eq_ignore_ascii_case("sunpack_advanced_config.json")));
     drop(observer);
     fs::remove_dir_all(directory).unwrap();
     fs::remove_file(marker).unwrap();

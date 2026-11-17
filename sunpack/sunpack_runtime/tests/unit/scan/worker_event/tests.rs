@@ -57,7 +57,7 @@ fn worker_chunks_move_into_their_own_result_only() {
             .manifest
             .unwrap();
         assert!(manifest.complete());
-        let row = &manifest.records()[0];
+        let row = &manifest.records().unwrap()[0];
         assert_eq!(row.path, format!("{job}-renamed.txt"));
         assert_eq!(&*row.magic, b"abc");
         assert_eq!(row.mtime_ns, Some(123));

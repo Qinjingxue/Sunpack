@@ -260,12 +260,10 @@ namespace sunpack::sevenzip
 
             any_format_created = true;
 
-            bool stream_opened = false;
+            auto input = open_archive_stream(archive_path, part_paths,
+                nullptr, canonical_names, InputPrefetchConfig{false}, input_ranges);
 
-            CMyComPtr<IInStream> stream = open_archive_stream(archive_path, part_paths, stream_opened,
-                nullptr, !canonical_names.empty(), InputPrefetchConfig{false}, input_ranges);
-
-            if (!stream_opened)
+            if (!input.opened)
             {
 
                 const auto numbered = [](const std::wstring& path) { return parse_volume_number(path).has_value(); };
@@ -288,11 +286,11 @@ namespace sunpack::sevenzip
                 return result;
             }
 
-            const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
-            auto *raw_open_callback = new OpenCallback(password, callback_path, part_paths, canonical_names, InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges);
+            auto *raw_open_callback = new OpenCallback(password, std::move(input.callback_path), part_paths, canonical_names,
+                InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-            hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
+            hr = archive->Open(input.stream.Interface(), search_limit, open_callback.Interface());
             // A later handler/search attempt cannot erase an earlier
             // encrypted-header callback from this candidate's Open.
             last_encryption_evidence = last_encryption_evidence || raw_open_callback->password_requested();
