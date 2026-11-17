@@ -232,6 +232,12 @@ pub(crate) fn default_idle_seconds() -> f64 {
         .expect("valid built-in idle timeout")
 }
 
+pub(crate) fn default_cache_idle_seconds() -> f64 {
+    defaults()["watch"]["runtime_cache_cleanup_idle_seconds"]
+        .as_f64()
+        .expect("valid built-in cache idle timeout")
+}
+
 // Include absent candidates: a deletion must not unsubscribe its recreation,
 // and a new higher-priority config must supersede the current source.
 fn source_candidates(roots: &[PathBuf], name: &str, selected: Option<&Path>) -> Vec<PathBuf> {

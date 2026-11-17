@@ -26,9 +26,15 @@ pub(super) struct Host {
     pub(super) scheduler: Arc<crate::pipeline::Scheduler>,
     engine: OnceLock<Arc<Engine>>,
     passwords: Arc<Mutex<Option<Arc<passwords::BuiltinStore>>>>,
-    idle: Mutex<Option<Duration>>,
+    idle: Mutex<IdlePolicy>,
     pub(super) watch: Arc<watch::Watch>,
     sources: Mutex<VecDeque<Arc<SourceObservers>>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct IdlePolicy {
+    pub(super) exit: Option<Duration>,
+    pub(super) caches: Option<Duration>,
 }
 
 struct SourceObservers {
@@ -69,20 +75,31 @@ impl Host {
             scheduler: crate::pipeline::Scheduler::new(),
             engine: OnceLock::new(),
             passwords: Arc::default(),
-            idle: Mutex::new(Some(Duration::from_secs_f64(config::default_idle_seconds()))),
+            idle: Mutex::new(IdlePolicy {
+                exit: Some(Duration::from_secs_f64(config::default_idle_seconds())),
+                caches: Some(Duration::from_secs_f64(config::default_cache_idle_seconds())),
+            }),
             watch: Arc::new(watch::Watch::new(Arc::new(wake))),
             sources: Mutex::default(),
         }
     }
 
-    pub(super) fn idle_after(&self) -> Option<Duration> {
+    pub(super) fn idle_policy(&self) -> IdlePolicy {
         *self.idle.lock().unwrap()
     }
 
     pub(super) fn configure_idle(&self, settings: &Config) {
         super::diagnostics::retention(settings.watch.event_log_retention_days);
+        let mut idle = self.idle.lock().unwrap();
         if let Some(seconds) = settings.performance.persistent_server_idle_seconds {
-            *self.idle.lock().unwrap() = Duration::try_from_secs_f64(seconds).ok();
+            idle.exit = Duration::try_from_secs_f64(seconds).ok();
+        }
+        idle.caches = Duration::try_from_secs_f64(settings.watch.runtime_cache_cleanup_idle_seconds).ok();
+    }
+
+    pub(super) fn clear_idle_caches(&self) {
+        if let Some(engine) = self.engine.get() {
+            engine.clear_idle_caches();
         }
     }
 

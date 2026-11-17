@@ -192,6 +192,20 @@ static CKey g_Key;
   #define MT_LOCK
 #endif
 
+bool HasGlobalKeyCache() noexcept
+{
+  MT_LOCK
+  return !g_Key._needCalc;
+}
+
+void ClearGlobalKeyCache() noexcept
+{
+  MT_LOCK
+  g_Key.Wipe();
+  g_Key._password.Free();
+  g_Key._needCalc = true;
+}
+
 bool CDecoder::CalcKey_and_CheckPassword()
 {
   if (_needCalc)

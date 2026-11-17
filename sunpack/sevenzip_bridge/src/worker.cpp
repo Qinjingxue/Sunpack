@@ -2,6 +2,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+
+// Exported by OleAut32 but omitted from current Windows SDK headers.
+extern "C" __declspec(dllimport) void __cdecl SetOaNoCache();
 #endif
 
 #include <algorithm>
@@ -41,6 +44,7 @@
 #include "internal/native_cpu_budget.hpp"
 #include "internal/sevenzip_streams.hpp"
 #include "7zip/Crypto/7zAes.h"
+#include "7zip/Crypto/Rar5Aes.h"
 #ifdef SUP7Z_DEBUG
 #include "internal/worker_pipeline_timing.hpp"
 #endif
@@ -1204,9 +1208,9 @@ public:
                     std::move(cancel_token),
                 };
                 if (!job.request.from_watch) {
-                    foreground_queue_.push_back(std::move(job));
+                    foreground_queue_.push_back(std::move(job), warm_queue_capacity());
                 } else {
-                    background_queue_.push_back(std::move(job));
+                    background_queue_.push_back(std::move(job), warm_queue_capacity());
                 }
             }
         }
@@ -1245,26 +1249,27 @@ public:
         // Cancellation is rare: withdraw queued jobs here rather than making
         // them wait for a CPU credit just to acknowledge their terminal state.
         std::optional<Job> withdrawn;
+        std::deque<Job> retired_queue;
         bool drained = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (auto* queue : {&foreground_queue_, &background_queue_}) {
-                const auto found = std::find_if(queue->begin(), queue->end(), [&](const Job& job) {
+                auto& jobs = queue->jobs;
+                const auto found = std::find_if(jobs.begin(), jobs.end(), [&](const Job& job) {
                     return job.cancel_token == token;
                 });
-                if (found == queue->end()) continue;
+                if (found == jobs.end()) continue;
                 withdrawn.emplace(std::move(*found));
-                queue->erase(found);
+                jobs.erase(found);
+                queue->retire_if_drained(retired_queue);
                 drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
                 break;
             }
         }
+        retired_queue.clear();
         if (withdrawn) {
             if (withdrawn->execution) memory_.end(withdrawn->execution->memory);
-            {
-                std::lock_guard<std::mutex> lock(cancel_mutex_);
-                cancel_tokens_.erase(job_id);
-            }
+            erase_cancel_token(job_id);
             withdrawn.reset();
             writer_to_wake.reset();
             print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
@@ -1391,6 +1396,30 @@ private:
         std::unique_ptr<JobExecution> execution;
     };
 
+    struct JobQueue {
+        std::deque<Job> jobs;
+        bool oversized = false;
+
+        void push_back(Job&& job, std::size_t warm_capacity) {
+            jobs.push_back(std::move(job));
+            oversized |= jobs.size() > warm_capacity;
+        }
+
+        void push_front(Job&& job, std::size_t warm_capacity) {
+            jobs.push_front(std::move(job));
+            oversized |= jobs.size() > warm_capacity;
+        }
+
+        void retire_if_drained(std::deque<Job>& retired) noexcept {
+            // MSVC retains the deque's raw blocks after pop/erase. Keep one
+            // worker wave warm; detach larger drained piles before freeing.
+            if (oversized && jobs.empty()) {
+                jobs.swap(retired);
+                oversized = false;
+            }
+        }
+    };
+
     // The writer reference is deliberately weak: a strong one would keep a facility alive past its lease and could run ~AsyncFileWriter under the executor mutex.
     struct JobControl {
         explicit JobControl(std::shared_ptr<std::atomic<bool>> token)
@@ -1401,19 +1430,40 @@ private:
         std::weak_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
     };
 
+    void erase_cancel_token(const std::string& job_id) noexcept {
+        std::optional<decltype(cancel_tokens_)> retired;
+        {
+            std::lock_guard<std::mutex> lock(cancel_mutex_);
+            cancel_tokens_.erase(job_id);
+            if (cancel_tokens_.empty() && cancel_tokens_.bucket_count() > (std::max)(std::size_t{16}, worker_count_ * 4)) {
+                try {
+                    // A default map owns a small bucket array on MSVC.
+                    retired.emplace();
+                    cancel_tokens_.swap(*retired);
+                } catch (const std::bad_alloc&) {
+                    // Keep the reusable empty map if the allocator is under pressure.
+                }
+            }
+        }
+    }
+
     bool queues_empty_locked() const noexcept {
-        return foreground_queue_.empty() && background_queue_.empty();
+        return foreground_queue_.jobs.empty() && background_queue_.jobs.empty();
+    }
+
+    std::size_t warm_queue_capacity() const noexcept {
+        return (std::max)(std::size_t{8}, worker_count_);
     }
 
     std::size_t queued_job_count_locked() const noexcept {
-        return foreground_queue_.size() + background_queue_.size() + parked_jobs_;
+        return foreground_queue_.jobs.size() + background_queue_.jobs.size() + parked_jobs_;
     }
 
-    Job pop_next_job_locked() {
-        std::deque<Job>& selected =
-            foreground_queue_.empty() ? background_queue_ : foreground_queue_;
-        Job job = std::move(selected.front());
-        selected.pop_front();
+    Job pop_next_job_locked(std::deque<Job>& retired) {
+        auto& selected = foreground_queue_.jobs.empty() ? background_queue_ : foreground_queue_;
+        Job job = std::move(selected.jobs.front());
+        selected.jobs.pop_front();
+        selected.retire_if_drained(retired);
         return job;
     }
 
@@ -1523,6 +1573,7 @@ private:
                 std::lock_guard<std::mutex> jobs_lock(mutex_);
                 if (key_cache_deadline_ && now >= *key_cache_deadline_) {
                     NCrypto::N7z::ClearGlobalKeyCache();
+                    NCrypto::NRar5::ClearGlobalKeyCache();
                     key_cache_deadline_.reset();
                 }
                 if (key_cache_deadline_ && (!deadline || *key_cache_deadline_ < *deadline)) {
@@ -1546,7 +1597,7 @@ private:
     }
 
     bool finish_attempt_locked() noexcept {
-        if (--active_jobs_ == 0 && NCrypto::N7z::HasGlobalKeyCache()) {
+        if (--active_jobs_ == 0 && (NCrypto::N7z::HasGlobalKeyCache() || NCrypto::NRar5::HasGlobalKeyCache())) {
             key_cache_deadline_ = std::chrono::steady_clock::now() + writer_config_.idle_timeout;
             return true;
         }
@@ -1574,6 +1625,7 @@ private:
     }
 
     void worker_loop() noexcept {
+        std::deque<Job> retired_queue;
         for (;;) {
             Job job;
             bool wake_next_job = false;
@@ -1591,7 +1643,7 @@ private:
                     continue;
                 }
 
-                job = pop_next_job_locked();
+                job = pop_next_job_locked(retired_queue);
                 if (active_jobs_++ == 0) key_cache_deadline_.reset();
                 if (queues_empty_locked()) {
                     // On canceling shutdown the first broadcast can reach
@@ -1602,12 +1654,12 @@ private:
                     wake_next_job = cpu_budget_.can_acquire_base();
                 }
             }
-
             // Hand admission forward one worker at a time when multiple
             // credits are available, avoiding a notify-all thundering herd.
             if (wake_next_job) {
                 condition_.notify_one();
             }
+            retired_queue.clear();
 
             const bool replaying = job.execution != nullptr;
             if (!job.execution) {
@@ -1700,7 +1752,7 @@ private:
                         std::lock_guard<std::mutex> lock(mutex_);
                         --parked_jobs_;
                         auto &queue = !parked->request.from_watch ? foreground_queue_ : background_queue_;
-                        queue.push_front(std::move(*parked));
+                        queue.push_front(std::move(*parked), warm_queue_capacity());
                     }
                     condition_.notify_one();
                 }, notice);
@@ -1714,10 +1766,7 @@ private:
                 drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
                 any_job_failed_ = any_job_failed_ || outcome.code != 0;
             }
-            if (!job_id.empty()) {
-                std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
-                cancel_tokens_.erase(job_id);
-            }
+            if (!job_id.empty()) erase_cancel_token(job_id);
             const auto finished_job_id = std::move(job.request.job_id);
             job = {};
             if (monitor_recheck_needed) request_monitor_recheck();
@@ -1749,8 +1798,8 @@ private:
 
     // Scheduler hot state: foreground/background queues preserve the existing
     // foreground-first policy without an O(n) scan or middle erase.
-    std::deque<Job> foreground_queue_;
-    std::deque<Job> background_queue_;
+    JobQueue foreground_queue_;
+    JobQueue background_queue_;
     std::mutex mutex_;
     std::condition_variable condition_;
     std::condition_variable drain_condition_;
@@ -1809,6 +1858,8 @@ int run_message(
 }
 
 int main() {
+    // Return the SDK's temporary BSTR allocations to the heap on SysFreeString.
+    SetOaNoCache();
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     std::ios::sync_with_stdio(false);

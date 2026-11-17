@@ -7,11 +7,14 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
+from itertools import count
 from pathlib import Path
 from threading import Barrier
 
 import psutil
 import pytest
+
+from tests.helpers.package import wait_for
 
 
 def test_config_reload_and_literal_password_sources(package, tmp_path):
@@ -253,6 +256,39 @@ def test_existing_runtime_uses_latest_archive_request_idle_setting(package, tmp_
     assert package.json("scan", archive)["summary"]["archive_count"] == 1
     owner.wait(timeout=10)
     assert not state.exists()
+
+
+def test_resident_cli_clears_reusable_archive_state_after_idle(package, tmp_path):
+    package.configure(performance={"persistent_server_idle_seconds": "+inf"},
+                      watch={"runtime_cache_cleanup_idle_seconds": 60})
+    member = tmp_path / "member.txt"
+    member.write_bytes(b"archive cache probe")
+    encrypted = tmp_path / "encrypted.7z"
+    subprocess.run([str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on",
+                    "-pidle-test-key", str(encrypted), str(member)], check=True, capture_output=True)
+    plain = tmp_path / "plain.zip"
+    with zipfile.ZipFile(plain, "w") as payload:
+        payload.writestr(member.name, member.read_bytes())
+
+    def extract(path, destination):
+        output = tmp_path / destination
+        report = package.json("extract", "-c", "k", "--no-builtin-pw",
+                              "-p", "idle-test-key", "-o", output, path)
+        assert next(output.rglob(member.name)).read_bytes() == member.read_bytes()
+        return report["items"][0]["recent_passwords"]
+
+    assert extract(encrypted, "warm") == ["idle-test-key"]
+    assert extract(plain, "reuse") == ["idle-test-key"]
+    state, = package.data.glob("runtime-*.state")
+    owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
+
+    package.configure(watch={"runtime_cache_cleanup_idle_seconds": 0})
+    assert package.json("scan", plain)["summary"]["archive_count"] == 1
+    probes = count()
+    wait_for(lambda: extract(plain, f"idle-{next(probes)}") == [],
+             "the resident CLI releasing recent password state", timeout=5)
+    assert owner.is_running()
+    assert int(state.read_text(encoding="utf-8").splitlines()[3]) == owner.pid
 
 
 def test_launcher_restarts_while_previous_runtime_drains(package):

@@ -14,7 +14,7 @@ fn persistent_idle_can_be_disabled_and_reenabled_by_configuration() {
     ] {
         raw["performance"]["persistent_server_idle_seconds"] = setting;
         host.configure_idle(&config::Config::parse(&raw).unwrap());
-        assert_eq!(host.idle_after(), idle);
+        assert_eq!(host.idle_policy().exit, idle);
     }
 }
 
@@ -45,7 +45,7 @@ fn competing_runtime_does_not_wait_for_a_live_owner_with_missing_endpoint() {
 
 fn server() -> Arc<Server> {
     Arc::new(Server {
-        host: Host::new(), activity: Mutex::new(Activity { last_completed: None, active: 0, observers: 0, shutting_down: false }),
+        host: Host::new(), activity: Mutex::default(),
         drained: Condvar::new(), wake: Arc::new(Event::new(false).unwrap()),
         shutdown: Cancellation::new(), io: transport::Reactor::new().unwrap(), token: [0; 32], build_id: [0; 16],
     })

@@ -12,6 +12,9 @@
 namespace NCrypto {
 namespace NRar5 {
 
+bool HasGlobalKeyCache() noexcept;
+void ClearGlobalKeyCache() noexcept;
+
 const unsigned kSaltSize = 16;
 const unsigned kPswCheckSize32 = 2;
 const unsigned kAesKeySize = 32;

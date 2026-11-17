@@ -646,8 +646,10 @@ impl Drop for OutputFrame<'_> { fn drop(&mut self) { self.0.acknowledge(); } }
 struct CloseConnection(Arc<Connection>);
 impl Drop for CloseConnection { fn drop(&mut self) { self.0.close(); } }
 
+#[derive(Default)]
 struct Activity {
     last_completed: Option<Instant>,
+    last_cache_use: Option<Instant>,
     active: usize,
     observers: usize,
     shutting_down: bool,
@@ -747,7 +749,8 @@ impl Server {
                 }
             })))
         } else { None };
-        connection.finish_request(async {
+        let mut served_cli = false;
+        let result = connection.finish_request(async {
             connection.output.enqueue([b"SPS2".as_slice(), &self.build_id].concat()).await?;
             if header.flags & 1 != 0 {
                 connection.frame(0, &0_i32.to_be_bytes()).await?;
@@ -774,6 +777,7 @@ impl Server {
             let foreground = header.argv.first().is_none_or(|command| command != "--cancel-watch-batch");
             if foreground { super::diagnostics::event("foreground_request_started", || serde_json::json!({"origin":"foreground","command":header.argv.first(),"queue_ms":connected.elapsed().as_secs_f64()*1000.0})); }
             let session: Arc<dyn Session> = connection.clone();
+            served_cli = true;
             let code = match cli::run(&self.host, &header.cwd, header.argv, session, cancel).await {
                 Ok(code) => code,
                 Err(error) => {
@@ -793,9 +797,17 @@ impl Server {
             if connection.output.closed() {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
-            self.activity.lock().unwrap().last_completed = Some(Instant::now());
             Ok(())
-        }, control, output).await
+        }, control, output).await;
+        if served_cli {
+            let mut activity = self.activity.lock().unwrap();
+            let now = Instant::now();
+            activity.last_cache_use = Some(now);
+            if result.is_ok() {
+                activity.last_completed = Some(now);
+            }
+        }
+        result
     }
 }
 
@@ -836,12 +848,7 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
     let server = Arc::new(Server {
         host,
         wake,
-        activity: Mutex::new(Activity {
-            last_completed: None,
-            active: 0,
-            observers: 0,
-            shutting_down: false,
-        }),
+        activity: Mutex::default(),
         drained: Condvar::new(),
         shutdown: Cancellation::new(),
         io: transport::Reactor::new()?,
@@ -854,8 +861,8 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let ready = unsafe { OwnedHandle::from_raw_handle(ready) };
-    if let Some(settings) = settings.as_ref() {
-        server.host.configure_idle(settings);
+    if let Some(settings) = settings {
+        server.host.configure_idle(&settings);
     }
     let result = (|| {
         let mut accept = Accept::arm(&name_wide, &security, true)?;
@@ -865,21 +872,27 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         loop {
-            let (wait, shutting_down) = {
+            let (exit_wait, cache_wait, shutting_down) = {
                 let state = server.activity.lock().unwrap();
-                let timeout = if state.active == state.observers && !server.host.watch.is_running() {
-                    state.last_completed.zip(server.host.idle_after())
-                        .map_or(INFINITE, |(completed, idle)| idle_wait(completed, idle))
+                // A live Watch schedules the same engine cache cleanup.
+                let (exit, caches) = if state.active == state.observers && !server.host.watch.is_running() {
+                    let policy = server.host.idle_policy();
+                    (
+                        state.last_completed.zip(policy.exit)
+                            .map_or(INFINITE, |(completed, idle)| idle_wait(completed, idle)),
+                        state.last_cache_use.zip(policy.caches)
+                            .map_or(INFINITE, |(used, idle)| idle_wait(used, idle)),
+                    )
                 } else {
-                    INFINITE
+                    (INFINITE, INFINITE)
                 };
-                (timeout, state.shutting_down || server.host.watch.shutdown_requested())
+                (exit, caches, state.shutting_down || server.host.watch.shutdown_requested())
             };
             if shutting_down {
                 break;
             }
             let handles = [accept.event.raw(), server.wake.raw()];
-            match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, wait) } {
+            match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, exit_wait.min(cache_wait)) } {
                 WAIT_OBJECT_0 => {
                     let connected = accept.finish();
                     accept = Accept::arm(&name_wide, &security, false)?;
@@ -891,7 +904,11 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
                         Err(error) => return Err(error),
                     }
                 }
-                WAIT_TIMEOUT if wait == 0 => break,
+                WAIT_TIMEOUT if exit_wait == 0 => break,
+                WAIT_TIMEOUT if cache_wait == 0 => {
+                    server.activity.lock().unwrap().last_cache_use = None;
+                    server.host.clear_idle_caches();
+                }
                 WAIT_TIMEOUT => {}
                 value if value == WAIT_OBJECT_0 + 1 => {}
                 _ => return Err(io::Error::last_os_error()),
