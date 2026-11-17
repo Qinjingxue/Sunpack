@@ -333,7 +333,10 @@ def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(packa
         (package.data / "builtin_passwords.json").write_text(
             json.dumps({"passwords": [{"value": "crash-key"}]}), encoding="utf-8",
         )
-        package.configure(recursive_extract="*")
+        # Recovery needs the small nested volumes admitted by recursive Deep.
+        package.configure(
+            recursive_extract="*", embedded_scan={"recursive_candidate_ratio": 0.001},
+        )
     package.json("watch", "add", watched, "-o", output, "-d")
     package.json("daemon", "start", "-nt")
     worker = _staged_worker(package, tmp_path)

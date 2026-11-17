@@ -38,6 +38,8 @@ def nested_fixture(tmp_path, kind):
 
 @pytest.mark.parametrize("kind", ["password", "missing_volume"])
 def test_plan7_nested_failure_is_attributed_to_the_inner_input_in_cli(package, tmp_path, kind):
+    # Exercise inner failures, not the size-ratio exclusion of small volumes.
+    package.configure(embedded_scan={"recursive_candidate_ratio": 0.001})
     outer, inner, expected = nested_fixture(tmp_path, kind)
     output = tmp_path / "out"
     report = extract_report(package, outer, output, passwords=["wrong"], code=1)
@@ -55,6 +57,8 @@ def test_plan7_nested_failure_is_attributed_to_the_inner_input_in_cli(package, t
 @pytest.mark.requires_watch_broker
 @pytest.mark.parametrize("kind", ["password", "missing_volume"])
 def test_plan7_nested_watch_failure_is_a_retryable_inner_input(package, tmp_path, kind):
+    # Exercise inner failures, not the size-ratio exclusion of small volumes.
+    package.configure(embedded_scan={"recursive_candidate_ratio": 0.001})
     outer, inner, expected = nested_fixture(tmp_path, kind)
     watch = watch_setup(package, tmp_path, passwords=["wrong"])
     source = download(watch, outer)
