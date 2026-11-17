@@ -1155,12 +1155,13 @@ fn drain_wakes_after_stop_and_panicking_batch_completion() {
 
 #[test]
 fn empty_watch_defers_rules_until_first_root_activation() {
-    let mut raw: Value = serde_json::from_str(include_str!("../../../../../../sunpack_advanced_config.json")).unwrap();
-    raw["filesystem"]["scan_filters_enabled"] = json!(true);
-    raw["filesystem"]["scan_filters"] = json!([{
-        "name": "blacklist", "enabled": true,
-        "full_names": [{"value": "[", "regex": true}]
-    }]);
+    let mut raw = json!({"filesystem":{
+        "scan_filters_enabled":true,
+        "scan_filters":[{
+            "name":"blacklist","enabled":true,
+            "full_names":[{"value":"[","regex":true}]
+        }]
+    }});
     let config = Config::parse(&raw).unwrap();
     assert!(watch_scan_options(&config, false).unwrap().is_none());
     // Root activation compiles the same ordinary rules for normal and

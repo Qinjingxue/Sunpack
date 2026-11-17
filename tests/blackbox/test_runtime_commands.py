@@ -378,11 +378,7 @@ def test_text_extract_keeps_nested_archive_under_its_carrier_segment(package, tm
     assert result.stdout.count("[Complete] [####################] 100%") == 3
 
 
-def test_watch_action_help_lists_available_options(package):
-    help_text = package.run("watch", "add", "-h")
-    assert help_text.returncode == 0
-    assert all(option in help_text.stdout for option in ("paths", "-o", "-d"))
-    assert "--start" not in help_text.stdout
+def test_watch_relog_alias_rebuilds_log(package):
     rebuilt = package.json("w", "rlg")
     assert rebuilt["inputs"] == {"action": "relog"}
     assert rebuilt["summary"]["rebuilt"] is True

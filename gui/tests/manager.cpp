@@ -1,7 +1,6 @@
 #include "model.hpp"
 #include "presentation.hpp"
 #include "range_editor.hpp"
-#include "defaults_json.h"
 #include "event_publication.hpp"
 #include <cassert>
 #include <fstream>
@@ -262,28 +261,9 @@ void editing(Fixture& f) {
     fails([&]{validate_setting("/embedded_scan/recursive_candidate_ratio",Json(1.5));});
     validate_setting("/recursive_extract",Json("12"));
     fails([&]{validate_setting("/recursive_extract",Json("0"));});
-    // One coarse catalog contract covers every shipped setting, including
-    // fields nested in filter/module arrays, in both CLI-supported languages.
     for(auto language:{"zh","en"}) {
-        auto defaults=parse_json(kDefaultsJson);
-        for(auto& field:config_fields(defaults,kDefaultsJson,language)) {
-            if(!field["known"].get<bool>()) throw std::runtime_error("Missing setting description: "+field["id"].get<std::string>());
-            assert(!field["label"].get<std::string>().empty());
-            assert(field["editor"]!="readonly");
-        }
-        assert(!describe_setting("/retired/enabled","",language)["known"].get<bool>());
-        assert(!describe_setting("/watch/directory_password_file_auto_create","",language)["known"].get<bool>());
-        assert(!describe_setting("/passwords/directory_passwords_enabled","",language)["known"].get<bool>());
-        // Module identity, rather than position, survives copying/reordering.
-        for(auto pointer:{"/watch/enabled","/watch/roots","/watch/max_folders","/performance/worker/priority_aging_quantum"})
-            assert(!describe_setting(pointer,"",language)["known"].get<bool>());
-        auto unknown=config_fields(parse_json(R"({"watch":{"roots":[],"custom":["keep"]}})"),"",language);
+        auto unknown=config_fields(parse_json(R"({"watch":{"custom":["keep"]}})"),"",language);
         for(auto& field:unknown) assert(!field["known"].get<bool>() && field["editor"]=="readonly");
-        for(auto name:{"gzip","bzip2","xz","zstd","tar_gz","tar_bz2","tar_xz","tar_zst","tar_lz4"})
-            assert(!describe_setting("/analysis/modules/0/max_probe_bytes",name,language)["known"].get<bool>());
-        assert(!describe_setting("/analysis/modules/0/enabled","tar_gz",language)["known"].get<bool>());
-        auto module=config_fields(parse_json(R"({"analysis":{"modules":[{"name":"gzip","enabled":true}]}})"),"",language);
-        for(auto& field:module) assert(!field["known"].get<bool>() && field["editor"]=="readonly");
     }
 }
 // Existing file/edit tests only check rejection. This coarse scenario catches

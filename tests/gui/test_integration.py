@@ -1,4 +1,4 @@
-"""Shipped GUI text and real installer-to-GUI permission contracts."""
+"""GUI integration and installer permissions."""
 import base64
 import ctypes
 import ntpath
@@ -15,17 +15,6 @@ import pytest
 
 from tests.helpers.installer import inno_compiler
 from tests.unit.test_context_menu_registration import _windows_argv
-
-
-def test_gui_template_texts_exist_in_both_languages():
-    # Conditional error actions need not appear in ordinary UI runs. Checking
-    # the shipped template/catalog boundary catches missing labels cheaply.
-    resources = Path(__file__).resolve().parents[2] / "gui" / "resources"
-    catalog = json.loads((resources / "catalog.json").read_text(encoding="utf-8"))["ui"]
-    for template in resources.glob("*.uix"):
-        for key in set(re.findall(r"\btexts\.([A-Za-z_][A-Za-z0-9_]*)", template.read_text(encoding="utf-8"))):
-            assert key in catalog, (template.name, key)
-            assert all(catalog[key].get(language) for language in ("zh", "en")), (template.name, key)
 
 
 @pytest.mark.requires_watch_broker

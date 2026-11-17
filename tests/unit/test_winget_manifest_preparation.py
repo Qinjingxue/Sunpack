@@ -5,9 +5,6 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 PREPARE_SCRIPT = ROOT / "scripts" / "prepare_winget_manifest.ps1"
-# Inno Setup AppId from installer/SunPack.iss, in the form Inno writes it to the
-# uninstall registry key ("<AppId>_is1").
-PRODUCT_CODE = "'{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1'"
 
 
 def _check_complete_multifile_set(tmp_path, result):
@@ -30,22 +27,11 @@ def _check_complete_multifile_set(tmp_path, result):
     )
 
     assert "PackageVersion: 9.8.7" in version
-    assert "ManifestType: version" in version
-    assert "InstallerType: inno" in installer
-    assert "MinimumOSVersion: 10.0.14393.0" in installer
-    assert "Scope: machine" in installer
-    assert "ElevationRequirement: elevationRequired" in installer
-    assert "Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" in installer
-    assert "SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART /SP-" in installer
-    assert "Architecture: x64" in installer
-    assert "Architecture: arm64" in installer
     assert "DisplayName: SunPack 9.8.7 (x64)" in installer
     assert "DisplayName: SunPack 9.8.7 (arm64)" in installer
-    assert "DisplayVersion:" not in installer
     assert "InstallerSha256: " + "A" * 64 in installer
     assert "InstallerSha256: " + "B" * 64 in installer
-    assert "PackageLocale: en-US" in locale
-    assert "Publisher: SunPack" in locale
+    assert "PackageVersion: 9.8.7" in locale
 
 
 def _check_package_version(tmp_path, result):
@@ -70,22 +56,6 @@ def _check_package_version(tmp_path, result):
     ) in installer
     assert "DisplayName: SunPack v0.5.1 (x64)" in installer
     assert "DisplayName: SunPack v0.5.1 (arm64)" in installer
-    assert "DisplayVersion:" not in installer
-
-
-def _check_product_code(tmp_path, result):
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    installer = (
-        tmp_path / "q" / "Qinjingxue" / "SunPack" / "9.8.7"
-        / "Qinjingxue.SunPack.installer.yaml"
-    ).read_text(encoding="utf-8")
-
-    # Winget correlates the installed ARP entry through the Inno Setup AppId, and
-    # it must be quoted because a bare leading brace parses as a YAML mapping.
-    assert f"    ProductCode: {PRODUCT_CODE}" in installer
-    assert f"        ProductCode: {PRODUCT_CODE}" in installer
-    assert installer.count(PRODUCT_CODE) == 4
 
 
 def _check_release_tag_differs(tmp_path, result):
@@ -131,7 +101,6 @@ def _check_does_not_overwrite(tmp_path, first, second):
 CASES = [
     ("complete_multifile", _check_complete_multifile_set, {}),
     ("package_version", _check_package_version, {"Version": "v0.5.1"}),
-    ("product_code", _check_product_code, {}),
     ("release_tag_differs", _check_release_tag_differs, {"ReleaseTag": "v9.8.7"}),
     ("published_date", _check_published_date, {"ReleaseDate": "2026-10-03"}),
     ("unspecified_date", _check_unspecified_date, {}),

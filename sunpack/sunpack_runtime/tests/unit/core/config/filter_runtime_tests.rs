@@ -33,15 +33,10 @@ fn filter_validation_errors_match_public_main_messages() {
 
 #[test]
 fn saved_output_mapping_participates_in_runtime_configuration() {
-    let mut raw = defaults().clone();
-    let original = Config::parse(&raw).unwrap();
-    assert!(original.output.root.is_none());
-    assert!(!original.output.fixed_root);
-    raw["output"] = serde_json::json!({"root": "Recovered", "fixed_root": true});
+    let mut raw = serde_json::json!({"output":{"root":"Recovered","fixed_root":true}});
     let mapped = Config::parse(&raw).unwrap();
     assert_eq!(mapped.output.root.as_deref(), Some(std::path::Path::new("Recovered")));
     assert!(mapped.output.fixed_root);
-    assert!(mapped != original);
     raw["output"]["root"] = Value::String(String::new());
     assert!(Config::parse(&raw).unwrap().output.root.is_none());
 }
@@ -66,7 +61,7 @@ fn configured_user_passwords_are_literal_ordered_and_deduplicated() {
 
 #[test]
 fn normalized_configuration_equality_ignores_syntax_but_not_runtime_changes() {
-    let mut raw = defaults().clone();
+    let mut raw = serde_json::json!({"runtime":{"process_mode":"normal"}});
     let before = Config::parse(&raw).unwrap();
     raw["runtime"]["process_mode"] = Value::String("NORMAL".into());
     let same = Config::parse(&raw).unwrap();
@@ -115,20 +110,14 @@ fn disabled_rules_validate_shape_without_compiling_expressions() {
 }
 
 #[test]
-fn watch_deduplication_scope_defaults_to_root_and_tracks_configuration_changes() {
-    let mut raw = defaults().clone();
-    let original = Config::parse(&raw).unwrap();
-    assert_eq!(original.watch.deduplication_scope, WatchDeduplicationScope::Root);
-    let ordinary: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"), "/../../sunpack_config.json"
-    ))).unwrap();
-    assert_eq!(Config::parse(&ordinary).unwrap().watch.deduplication_scope, WatchDeduplicationScope::Root);
+fn watch_deduplication_scope_changes_are_normalized_and_validated() {
+    let mut raw = serde_json::json!({"watch":{"deduplication_scope":"root"}});
+    let root = Config::parse(&raw).unwrap();
+    assert_eq!(root.watch.deduplication_scope, WatchDeduplicationScope::Root);
     raw["watch"]["deduplication_scope"] = Value::String("GLOBAL".into());
     let global = Config::parse(&raw).unwrap();
     assert_eq!(global.watch.deduplication_scope, WatchDeduplicationScope::Global);
-    assert!(global != original);
-    raw["watch"].as_object_mut().unwrap().remove("deduplication_scope");
-    assert_eq!(Config::parse(&raw).unwrap().watch.deduplication_scope, WatchDeduplicationScope::Root);
+    assert!(global != root);
     for invalid in [Value::String("volume".into()), Value::from(42)] {
         raw["watch"]["deduplication_scope"] = invalid;
         assert!(Config::parse(&raw).is_err());

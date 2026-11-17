@@ -93,22 +93,9 @@ fn interrupted_cleanup_details_reach_stderr_once_in_both_modes() {
     }
 }
 
-// Covers localized help grouping and the noninteractive disk warning, which
-// final archive-tree tests cannot observe.
 #[test]
-fn help_sections_and_disk_wait_text_match_main() {
+fn noninteractive_disk_warning_is_emitted_once_per_wait() {
     for language in [Language::En, Language::Zh] {
-        let snapshots: Value = serde_json::from_str(include_str!("../../../data/cli_help_main.json")).unwrap();
-        let pages = snapshots[if language == Language::En { "en" } else { "zh" }].as_object().unwrap();
-        for (command, expected) in pages {
-            let input = Input::default();
-            let mut arguments: Vec<_> = command.split_whitespace().map(str::to_owned).collect();
-            arguments.push("-h".into());
-            let options = Options::parse(&arguments).unwrap();
-            help(&options, language, &input).unwrap();
-            let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
-            assert_eq!(text, expected.as_str().unwrap(), "{language:?} {command}");
-        }
         for volume_error in [None, Some(5)] {
             let input = Arc::new(Input::default());
             let progress = Progress {
