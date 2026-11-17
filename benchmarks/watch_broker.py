@@ -51,7 +51,7 @@ def _ensure_watch_broker_binary() -> Path:
     else:
         raise RuntimeError(f"unsupported Windows architecture for Watch Broker: {platform.machine()}")
 
-    target_dir = REPO_ROOT / ".cache" / "rust-target"
+    target_dir = REPO_ROOT / ".cache" / "rust-target" / "watch-broker"
     manifest = REPO_ROOT / "sunpack" / "sunpack_watch_broker" / "Cargo.toml"
     binary = target_dir / rust_target / "release" / "sunpack-watch-broker.exe"
     print("==> Building temporary Watch Broker service", flush=True)
@@ -65,6 +65,8 @@ def _ensure_watch_broker_binary() -> Path:
             "--release",
             "--target",
             rust_target,
+            "--target-dir",
+            str(target_dir),
         ],
         cwd=REPO_ROOT,
         check=True,

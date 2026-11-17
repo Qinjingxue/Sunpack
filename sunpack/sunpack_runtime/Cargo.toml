@@ -3,10 +3,6 @@ name = "sunpack-runtime"
 edition = "2021"
 license = "MIT"
 
-[lib]
-name = "sunpack_runtime"
-crate-type = ["rlib"]
-
 [dependencies]
 sunpack-enc = { path = "../sunpack_enc" }
 aho-corasick = "1.1"

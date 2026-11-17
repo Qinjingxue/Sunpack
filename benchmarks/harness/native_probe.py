@@ -13,7 +13,7 @@ def build_runtime_probe(profile: str, arch: str) -> Path:
     build = subprocess.run(
         ["cargo", "test", "--locked", "--manifest-path", str(REPO_ROOT / "sunpack/Cargo.toml"),
          "-p", "sunpack-runtime", "--target", target, "--profile", profile,
-         "--lib", "--no-run", "--message-format=json"],
+         "--bin", "sunpack-runtime", "--no-run", "--message-format=json"],
         cwd=REPO_ROOT, stdout=subprocess.PIPE, encoding="utf-8",
     )
     executable = None
@@ -21,7 +21,7 @@ def build_runtime_probe(profile: str, arch: str) -> Path:
         if not line.startswith("{"):
             continue
         event = json.loads(line)
-        if (event["reason"] == "compiler-artifact" and event["target"]["name"] == "sunpack_runtime"
+        if (event["reason"] == "compiler-artifact" and event["target"]["name"] == "sunpack-runtime"
                 and event["profile"]["test"] and event.get("executable")):
             executable = Path(event["executable"])
         elif event["reason"] == "compiler-message":

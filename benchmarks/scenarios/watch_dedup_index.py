@@ -26,13 +26,14 @@ SHAPES = ("same_size_duplicate", "same_size_distinct", "different_size_distinct"
 def build(profile):
     result = subprocess.run([
         "cargo", "test", "--locked", "--manifest-path", str(ROOT / "sunpack/Cargo.toml"),
-        "-p", "sunpack-runtime", "--lib", "--profile", profile, "--no-run", "--message-format=json",
+        "-p", "sunpack-runtime", "--bin", "sunpack-runtime", "--profile", profile, "--no-run", "--message-format=json",
     ], cwd=ROOT, text=True, encoding="utf-8", errors="replace", capture_output=True)
     if result.returncode:
         raise RuntimeError(result.stderr + result.stdout)
     for line in result.stdout.splitlines():
         row = json.loads(line)
-        if row.get("reason") == "compiler-artifact" and row.get("executable") and row["target"]["name"] == "sunpack_runtime":
+        if (row.get("reason") == "compiler-artifact" and row["profile"]["test"]
+                and row.get("executable") and row["target"]["name"] == "sunpack-runtime"):
             return Path(row["executable"])
     raise RuntimeError("Cargo did not report the runtime test executable")
 

@@ -115,13 +115,14 @@ watch 根启动前会验证路径位于 NTFS 或 ReFS 卷且 Journal 可读。Jo
 x64：
 
 ```powershell
-cargo build --locked --manifest-path sunpack\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc
+cargo build --locked --manifest-path sunpack\sunpack_watch_broker\Cargo.toml --release `
+  --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\watch-broker
 ```
 
 ARM64 使用目标三元组 `aarch64-pc-windows-msvc`。x64 输出文件如下。
 
 ```text
-.cache\rust-target\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe
+.cache\rust-target\watch-broker\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe
 ```
 
 开发测试服务必须使用测试身份前缀：
@@ -137,7 +138,7 @@ Pipe:    \\.\pipe\SunPack.WatchBroker.Test.<id>
 .\scripts\manage_test_watch_service.ps1 -Action Install `
   -ServiceName SunPackWatchBrokerTest_dev `
   -PipeName '\\.\pipe\SunPack.WatchBroker.Test.dev' `
-  -BrokerPath '.cache\rust-target\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe'
+  -BrokerPath '.cache\rust-target\watch-broker\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe'
 
 .\scripts\manage_test_watch_service.ps1 -Action Uninstall `
   -ServiceName SunPackWatchBrokerTest_dev `

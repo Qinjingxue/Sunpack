@@ -18,12 +18,6 @@ $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "build_native.ps1")
 
-function Write-Step {
-    param([string]$Message)
-    Write-Host ""
-    Write-Host "==> $Message" -ForegroundColor Cyan
-}
-
 function Get-UvBootstrapPythonCommand {
     foreach ($candidate in @("python", "py")) {
         try {
@@ -40,23 +34,6 @@ function Get-UvBootstrapPythonCommand {
     throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
 }
 
-function Remove-IfExists {
-    param([string]$LiteralPath)
-    if (Test-Path -LiteralPath $LiteralPath) {
-        Remove-Item -LiteralPath $LiteralPath -Recurse -Force
-    }
-}
-
-function Assert-PathExists {
-    param(
-        [string]$LiteralPath,
-        [string]$Description
-    )
-    if (-not (Test-Path -LiteralPath $LiteralPath)) {
-        throw "$Description not found: $LiteralPath"
-    }
-}
-
 function Assert-CommandExists {
     param(
         [string]$Command,
@@ -65,33 +42,6 @@ function Assert-CommandExists {
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
         throw "$Description not found in PATH: $Command"
     }
-}
-
-function Get-ProcessBuildArch {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
-    switch ($arch) {
-        "x64" { return "x64" }
-        "arm64" { return "arm64" }
-        default { return $arch }
-    }
-}
-
-function Get-CMakePlatform {
-    param([string]$BuildArch)
-    switch ($BuildArch) {
-        "x64" { return "x64" }
-        "arm64" { return "ARM64" }
-    }
-    throw "Unsupported build architecture: $BuildArch"
-}
-
-function Get-RustTarget {
-    param([string]$BuildArch)
-    switch ($BuildArch) {
-        "x64" { return "x86_64-pc-windows-msvc" }
-        "arm64" { return "aarch64-pc-windows-msvc" }
-    }
-    throw "Unsupported build architecture: $BuildArch"
 }
 
 function Invoke-FileDownload {
@@ -451,20 +401,6 @@ function Ensure-AcceptanceTestTools {
     Write-Host "Acceptance archive generator tools are ready" -ForegroundColor Green
 }
 
-function Invoke-Native {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
-        [string[]]$Arguments = @()
-    )
-
-    & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        $joined = ($Arguments | ForEach-Object { $_ }) -join " "
-        throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $joined"
-    }
-}
-
 function Test-SevenZipZstdGenerator {
     param([Parameter(Mandatory = $true)][string]$FilePath)
 
@@ -519,6 +455,7 @@ $projectPath = Join-Path $repoRoot "pyproject.toml"
 $nativeCrateRoot = Join-Path $repoRoot "sunpack\sunpack_runtime"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "sunpack\Cargo.lock"
+$watchBrokerTargetDir = Get-WatchBrokerTargetDirectory -RepoRoot $repoRoot
 $watchBrokerBuildPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
 $sevenZipWrapperRoot = Join-Path $repoRoot "sunpack\sevenzip_bridge"
 $sevenZipWrapperBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile -Component sevenzip_bridge
@@ -535,7 +472,7 @@ Assert-CommandExists -Command "uv" -Description "uv dependency manager"
 if ($Clean -and -not $AcceptanceTestDependenciesOnly) {
     Write-Step "Cleaning native build outputs"
     $rustBuildDir = Get-RustBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
-    foreach ($output in @($rustBuildDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
+    foreach ($output in @($rustBuildDir, (Split-Path -Parent $watchBrokerBuildPath), $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
         $fullOutput = [IO.Path]::GetFullPath($output)
         if (-not $fullOutput.StartsWith(([IO.Path]::GetFullPath($repoRoot) + "\"), [StringComparison]::OrdinalIgnoreCase)) {
             throw "Build output is outside the repository: $output"
@@ -578,12 +515,16 @@ if ($AcceptanceTestDependenciesOnly) {
 
 Write-Step "Building Rust runtime, Watch Broker and native fixture tool"
 $nativeBuildStartedUtc = [datetime]::UtcNow
-Invoke-Native -FilePath "cargo" -Arguments @(
+$cargoArgs = @(
     "build", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
-    "--profile", $BuildProfile, "--target", $rustTarget, "--jobs", [string]$BuildJobs,
-    "-p", "sunpack-runtime", "-p", "sunpack-watch-broker",
-    "--bin", "sunpack-runtime", "--bin", "sunpack-watch-broker", "--example", "real_fixture"
+    "--profile", $BuildProfile, "--target", $rustTarget, "--jobs", [string]$BuildJobs
 )
+Invoke-Native -FilePath "cargo" -Arguments ($cargoArgs + @(
+    "-p", "sunpack-runtime", "--bin", "sunpack-runtime", "--example", "real_fixture"
+))
+Invoke-Native -FilePath "cargo" -Arguments ($cargoArgs + @(
+    "-p", "sunpack-watch-broker", "--bin", "sunpack-watch-broker", "--target-dir", $watchBrokerTargetDir
+))
 $runtimePath = Get-SunPackRuntimeBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
 $fixtureBuildPath = Get-ArchiveFixtureBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
 foreach ($artifact in @($runtimePath, $watchBrokerBuildPath, $fixtureBuildPath)) {

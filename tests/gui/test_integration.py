@@ -225,9 +225,9 @@ def test_rust_writer_cpp_query_contract(repo_root, contract):
     # no Python pipeline, copied store decoder, or build-on-test fallback.
     writer = os.environ.get("SUNPACK_GUI_WRITER_TEST_BINARY")
     if not writer:
-        pytest.skip("Set SUNPACK_GUI_WRITER_TEST_BINARY to the prebuilt Rust lib test executable")
+        pytest.skip("Set SUNPACK_GUI_WRITER_TEST_BINARY to the prebuilt Rust runtime test executable")
     binary = Path(writer)
-    assert binary.is_file(), "Set SUNPACK_GUI_WRITER_TEST_BINARY to the Rust lib test executable in the Cargo cache"
+    assert binary.is_file(), "Set SUNPACK_GUI_WRITER_TEST_BINARY to the Rust runtime test executable in the Cargo cache"
     arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
     gui = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"))
     assert gui.is_file(), "Build the actual C++ GUI reader with scripts/build_gui.ps1"

@@ -115,13 +115,14 @@ Before a watch root starts, the path is verified to be on an NTFS or ReFS volume
 x64:
 
 ```powershell
-cargo build --locked --manifest-path sunpack\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc
+cargo build --locked --manifest-path sunpack\sunpack_watch_broker\Cargo.toml --release `
+  --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\watch-broker
 ```
 
 For ARM64, use the target triple `aarch64-pc-windows-msvc`. The x64 output is:
 
 ```text
-.cache\rust-target\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe
+.cache\rust-target\watch-broker\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe
 ```
 
 A development test service must use the test identity prefixes:
@@ -137,7 +138,7 @@ Repository scripts can install or uninstall a temporary service; the scripts rej
 .\scripts\manage_test_watch_service.ps1 -Action Install `
   -ServiceName SunPackWatchBrokerTest_dev `
   -PipeName '\\.\pipe\SunPack.WatchBroker.Test.dev' `
-  -BrokerPath '.cache\rust-target\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe'
+  -BrokerPath '.cache\rust-target\watch-broker\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe'
 
 .\scripts\manage_test_watch_service.ps1 -Action Uninstall `
   -ServiceName SunPackWatchBrokerTest_dev `

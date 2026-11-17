@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 mod analysis_native;
 mod collections;
 mod event_log;
@@ -18,7 +20,11 @@ mod watch_store;
 
 mod core;
 mod pipeline;
-pub mod runtime;
+mod runtime;
+
+fn main() -> std::process::ExitCode {
+    std::process::ExitCode::from(runtime::main() as u8)
+}
 
 #[cfg(test)]
 #[path = "../tests/unit/lib/test_support.rs"]

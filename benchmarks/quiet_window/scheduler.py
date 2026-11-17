@@ -15,7 +15,7 @@ from .replay import FileResult, add_valid_proposal_latency, input_results, propo
 def scheduler_replay(work):
     command = [
         "cargo", "test", "--quiet", "--locked", "--manifest-path", str(REPO_ROOT / "sunpack/Cargo.toml"),
-        "-p", "sunpack-runtime", "--profile", "ci", "--lib", "--",
+        "-p", "sunpack-runtime", "--profile", "ci", "--bin", "sunpack-runtime", "--",
         "--ignored", "--exact", "--nocapture", "runtime::watch::quiet_replay::replay_corpus",
     ]
     with subprocess.Popen(

@@ -1,6 +1,87 @@
 . (Join-Path $PSScriptRoot "sevenzip_asm_check.ps1")
 . (Join-Path $PSScriptRoot "test_environment.ps1")
 
+function Write-Step {
+    param([string]$Message)
+    Write-Host ""
+    Write-Host "==> $Message" -ForegroundColor Cyan
+}
+
+function Remove-IfExists {
+    param([string]$LiteralPath)
+    if (Test-Path -LiteralPath $LiteralPath) {
+        Remove-Item -LiteralPath $LiteralPath -Recurse -Force
+    }
+}
+
+function Assert-PathExists {
+    param(
+        [string]$LiteralPath,
+        [string]$Description
+    )
+    if (-not (Test-Path -LiteralPath $LiteralPath)) {
+        throw "$Description not found: $LiteralPath"
+    }
+}
+
+function Get-ProcessBuildArch {
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
+    switch ($arch) {
+        "x64" { return "x64" }
+        "arm64" { return "arm64" }
+        default { return $arch }
+    }
+}
+
+function Get-CMakePlatform {
+    param([string]$BuildArch)
+    switch ($BuildArch) {
+        "x64" { return "x64" }
+        "arm64" { return "ARM64" }
+    }
+    throw "Unsupported build architecture: $BuildArch"
+}
+
+function Get-RustTarget {
+    param([string]$BuildArch)
+    switch ($BuildArch) {
+        "x64" { return "x86_64-pc-windows-msvc" }
+        "arm64" { return "aarch64-pc-windows-msvc" }
+    }
+    throw "Unsupported build architecture: $BuildArch"
+}
+
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+
+    if ($PSVersionTable.PSVersion.Major -eq 5) {
+        # Windows PowerShell reports redirected stderr as PowerShell errors.
+        # Cargo writes progress there even on success.
+        $command = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop
+        $ErrorActionPreference = "Continue"
+        & $command @Arguments 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                if ($_.FullyQualifiedErrorId -notin @("NativeCommandError", "NativeCommandErrorMessage")) {
+                    throw $_
+                }
+                Write-Host $_.ToString()
+            } else {
+                $_
+            }
+        }
+    } else {
+        & $FilePath @Arguments
+    }
+    if ($LASTEXITCODE -ne 0) {
+        $joined = ($Arguments | ForEach-Object { $_ }) -join " "
+        throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $joined"
+    }
+}
+
 function ConvertTo-NormalizedFullPath {
     param([Parameter(Mandatory = $true)][string]$Path)
     return ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') -replace '/', '\').ToLowerInvariant()

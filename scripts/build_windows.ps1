@@ -18,12 +18,6 @@ $ErrorActionPreference = "Stop"
 $interactivePrompting = -not $NoPause -and -not [Console]::IsInputRedirected
 $promptForAcceptanceTests = ($PSBoundParameters.Count -eq 0) -and $interactivePrompting
 
-function Write-Step {
-    param([string]$Message)
-    Write-Host ""
-    Write-Host "==> $Message" -ForegroundColor Cyan
-}
-
 function Wait-BeforeBuildExit {
     if ($NoPause) {
         return
@@ -34,13 +28,6 @@ function Wait-BeforeBuildExit {
         $null = Read-Host
     } catch {
         # Never let the pause path hide the original build failure.
-    }
-}
-
-function Remove-IfExists {
-    param([string]$LiteralPath)
-    if (Test-Path -LiteralPath $LiteralPath) {
-        Remove-Item -LiteralPath $LiteralPath -Recurse -Force
     }
 }
 
@@ -101,16 +88,6 @@ function Wait-FileReadyForPromotion {
     throw "Compiled installer remained locked for $TimeoutSeconds seconds: $LiteralPath"
 }
 
-function Assert-PathExists {
-    param(
-        [string]$LiteralPath,
-        [string]$Description
-    )
-    if (-not (Test-Path -LiteralPath $LiteralPath)) {
-        throw "$Description not found: $LiteralPath"
-    }
-}
-
 function Assert-PathMissing {
     param(
         [string]$LiteralPath,
@@ -130,33 +107,6 @@ function Assert-CommandExists {
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
         throw "$Description not found in PATH: $Command"
     }
-}
-
-function Get-ProcessBuildArch {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
-    switch ($arch) {
-        "x64" { return "x64" }
-        "arm64" { return "arm64" }
-        default { return $arch }
-    }
-}
-
-function Get-CMakePlatform {
-    param([string]$BuildArch)
-    switch ($BuildArch) {
-        "x64" { return "x64" }
-        "arm64" { return "ARM64" }
-    }
-    throw "Unsupported build architecture: $BuildArch"
-}
-
-function Get-RustTarget {
-    param([string]$BuildArch)
-    switch ($BuildArch) {
-        "x64" { return "x86_64-pc-windows-msvc" }
-        "arm64" { return "aarch64-pc-windows-msvc" }
-    }
-    throw "Unsupported build architecture: $BuildArch"
 }
 
 function Get-ExpectedPeMachine {
@@ -223,20 +173,6 @@ function Assert-PeMachine {
         throw ("{0} architecture mismatch: expected {1}, got {2}: {3}" -f $Description, $BuildArch, (Get-PeMachineName -Machine $actual), $LiteralPath)
     }
     Write-Host ("{0} architecture: {1} ({2})" -f $Description, $BuildArch, $LiteralPath) -ForegroundColor Green
-}
-
-function Invoke-Native {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
-        [string[]]$Arguments = @()
-    )
-
-    & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        $joined = ($Arguments | ForEach-Object { $_ }) -join " "
-        throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $joined"
-    }
 }
 
 function Get-PeSubsystem {
@@ -407,7 +343,8 @@ function Assert-PackagedRuntimeTools {
 }
 
 try {
-. (Join-Path $PSScriptRoot "build_native.ps1")
+$nativeBuildScript = Join-Path $PSScriptRoot "build_native.ps1"
+. $nativeBuildScript
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
@@ -429,6 +366,7 @@ $nativeCrateRoot = Join-Path $repoRoot "sunpack\sunpack_runtime"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "sunpack\Cargo.lock"
 $watchBrokerCargoToml = Join-Path $repoRoot "sunpack\sunpack_watch_broker\Cargo.toml"
+$watchBrokerTargetDir = Get-WatchBrokerTargetDirectory -RepoRoot $repoRoot
 $watchBrokerBuildPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
 $sevenZipWrapperRoot = Join-Path $repoRoot "sunpack\sevenzip_bridge"
 $sevenZipWrapperBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release -Component sevenzip_bridge
@@ -474,7 +412,7 @@ Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 if ($Clean) {
     Write-Step "Cleaning native build outputs"
     $rustBuildDir = Get-RustBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
-    foreach ($output in @($rustBuildDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
+    foreach ($output in @($rustBuildDir, (Split-Path -Parent $watchBrokerBuildPath), $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
         $fullOutput = [IO.Path]::GetFullPath($output)
         if (-not $fullOutput.StartsWith(([IO.Path]::GetFullPath($repoRoot) + "\"), [StringComparison]::OrdinalIgnoreCase)) {
             throw "Build output is outside the repository: $output"
@@ -496,26 +434,62 @@ Remove-IfExists -LiteralPath $resolvedDistApp
 New-Item -ItemType Directory -Path $distAppRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 
-Write-Step "Building Rust runtime and Windows Watch Broker"
+Write-Step "Building SunPack Runtime, Watch Broker, GUI, and native tools in parallel"
 $cargoArgs = @(
     "build", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
-    "--release", "--target", $rustTarget, "--jobs", [string]$BuildJobs,
-    "-p", "sunpack-runtime", "-p", "sunpack-watch-broker",
-    "--bin", "sunpack-runtime", "--bin", "sunpack-watch-broker"
+    "--release", "--target", $rustTarget, "--jobs", [string]$BuildJobs
 )
-if ($runAcceptanceTests) {
-    $cargoArgs += @("--example", "real_fixture")
-}
 if ($FastBuild) {
     $cargoArgs += @("--config", "profile.release.lto=false", "--config", "profile.release.codegen-units=16")
 }
-Invoke-Native -FilePath "cargo" -Arguments $cargoArgs
+$runtimeCargoArgs = $cargoArgs + @("-p", "sunpack-runtime", "--bin", "sunpack-runtime")
+if ($runAcceptanceTests) {
+    $runtimeCargoArgs += @("--example", "real_fixture")
+}
+# Cargo locks each target directory for the full build.
+$brokerCargoArgs = $cargoArgs + @("-p", "sunpack-watch-broker", "--bin", "sunpack-watch-broker", "--target-dir", $watchBrokerTargetDir)
+$guiScript = Join-Path $PSScriptRoot "build_gui.ps1"
+$guiBuildDir = Join-Path $repoRoot (".cache\gui-" + $buildArch)
+$applicationOnly = [bool]$SkipTests
+
+$buildRust = {
+    param([string[]]$CargoArguments)
+    $ErrorActionPreference = "Stop"
+    Set-Location -LiteralPath $using:repoRoot
+    . $using:nativeBuildScript
+    Invoke-Native -FilePath "cargo" -Arguments $CargoArguments
+}
+
+$jobs = @()
+try {
+    $jobs += Start-Job -Name "Runtime" -ScriptBlock $buildRust -ArgumentList (,$runtimeCargoArgs)
+    $jobs += Start-Job -Name "Watch Broker" -ScriptBlock $buildRust -ArgumentList (,$brokerCargoArgs)
+    $jobs += Start-Job -Name "GUI" -ScriptBlock {
+        $ErrorActionPreference = "Stop"
+        & $using:guiScript -Arch $using:buildArch -CMakeCommand $using:cmakeCommand -BuildDir $using:guiBuildDir -Jobs $using:BuildJobs -SkipTests -ApplicationOnly:$using:applicationOnly
+    }
+    $jobs += Start-Job -Name "Worker and native tools" -ScriptBlock {
+        $ErrorActionPreference = "Stop"
+        $BuildJobs = $using:BuildJobs
+        . $using:nativeBuildScript
+        Build-SevenZipWorker -CMakeCommand $using:cmakeCommand -CTestCommand $using:ctestCommand -WrapperRoot $using:sevenZipWrapperRoot -BuildDir $using:sevenZipWrapperBuildDir -BuildArch $using:buildArch -BuildProfile release
+        Build-ToastLibrary -CMakeCommand $using:cmakeCommand -CTestCommand $using:ctestCommand -SourceRoot $using:toastHostRoot -BuildDir $using:toastHostBuildDir -BuildArch $using:buildArch -BuildProfile release
+    }
+
+    $jobs | Receive-Job -Wait -ErrorAction Continue
+    $failedJobs = @($jobs | Where-Object State -ne "Completed")
+    if ($failedJobs.Count -gt 0) {
+        throw "Build jobs failed: $($failedJobs.Name -join ', ')"
+    }
+} finally {
+    $jobs | Remove-Job -Force
+}
+
 $runtimeBuildPath = Get-SunPackRuntimeBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
 Assert-PathExists -LiteralPath $runtimeBuildPath -Description "SunPack runtime executable"
 Assert-PathExists -LiteralPath $watchBrokerBuildPath -Description "SunPack Watch Broker executable"
 Assert-PeMachine -LiteralPath $watchBrokerBuildPath -BuildArch $buildArch -Description "SunPack Watch Broker executable"
 
-Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -BuildArch $buildArch -BuildProfile release
 $nativeLinkerEntry = @(Get-Content -LiteralPath (Join-Path $sevenZipWrapperBuildDir "CMakeCache.txt") |
     Where-Object { $_ -like "CMAKE_LINKER:FILEPATH=*" })
 if ($nativeLinkerEntry.Count -ne 1) {
@@ -528,14 +502,14 @@ foreach ($executable in @($runtimeBuildPath, $watchBrokerBuildPath)) {
         "-P", (Join-Path $sevenZipWrapperRoot "tests\static_runtime.cmake")
     )
 }
-Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -BuildArch $buildArch -BuildProfile release
 Assert-PathExists -LiteralPath $sevenZipWorkerPath -Description "Bundled 7z worker executable"
 Assert-PeMachine -LiteralPath $sevenZipWorkerPath -BuildArch $buildArch -Description "Built 7z worker executable"
 Assert-PeMachine -LiteralPath $launcherBuildPath -BuildArch $buildArch -Description "Built SunPack launcher executable"
 Assert-PeMachine -LiteralPath $toastHostPath -BuildArch $buildArch -Description "Built toast DLL"
-Write-Step "Building Core UI management panel"
-$guiBuildDir = Join-Path $repoRoot (".cache\gui-" + $buildArch)
-& (Join-Path $repoRoot "scripts\build_gui.ps1") -Arch $buildArch -CMakeCommand $cmakeCommand -BuildDir $guiBuildDir -Jobs $BuildJobs -SkipTests:$SkipTests -ApplicationOnly:$SkipTests
+if (-not $SkipTests) {
+    Write-Step "Running GUI tests"
+    & $guiScript -Arch $buildArch -CMakeCommand $cmakeCommand -BuildDir $guiBuildDir -TestsOnly
+}
 
 Write-Step "Staging native executables"
 Copy-Item -LiteralPath $runtimeBuildPath -Destination $distRuntimeExePath -Force

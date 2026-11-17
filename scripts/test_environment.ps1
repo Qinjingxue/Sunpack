@@ -17,9 +17,10 @@ function Set-DevelopmentArtifactBuildTime {
 
 function Get-RustBuildDirectory {
     param([string]$RepoRoot, [ValidateSet("x64", "arm64")][string]$Arch,
-        [ValidateSet("release", "ci")][string]$BuildProfile = "ci")
+        [ValidateSet("release", "ci")][string]$BuildProfile = "ci",
+        [string]$TargetDirectory = (Join-Path $RepoRoot ".cache\rust-target"))
     $target = if ($Arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
-    return Join-Path $RepoRoot ".cache\rust-target\$target\$BuildProfile"
+    return Join-Path $TargetDirectory "$target\$BuildProfile"
 }
 
 function Get-NativeBuildDirectory {
@@ -29,10 +30,16 @@ function Get-NativeBuildDirectory {
     return Join-Path $RepoRoot ".cache\native\$Arch\$BuildProfile\$Component"
 }
 
+function Get-WatchBrokerTargetDirectory {
+    param([string]$RepoRoot)
+    return Join-Path $RepoRoot ".cache\rust-target\watch-broker"
+}
+
 function Get-WatchBrokerBuildPath {
     param([string]$RepoRoot, [ValidateSet("x64", "arm64")][string]$Arch,
         [ValidateSet("release", "ci")][string]$BuildProfile = "ci")
-    return Join-Path (Get-RustBuildDirectory -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile) "sunpack-watch-broker.exe"
+    $targetDirectory = Get-WatchBrokerTargetDirectory -RepoRoot $RepoRoot
+    return Join-Path (Get-RustBuildDirectory -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile -TargetDirectory $targetDirectory) "sunpack-watch-broker.exe"
 }
 
 function Get-ArchiveFixtureBuildPath {
@@ -44,7 +51,7 @@ function Get-ArchiveFixtureBuildPath {
 function Get-SunPackRuntimeBuildPath {
     param([string]$RepoRoot, [ValidateSet("x64", "arm64")][string]$Arch,
         [ValidateSet("release", "ci")][string]$BuildProfile = "ci")
-    return Join-Path (Split-Path -Parent (Get-WatchBrokerBuildPath -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile)) "sunpack-runtime.exe"
+    return Join-Path (Get-RustBuildDirectory -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile) "sunpack-runtime.exe"
 }
 
 function Get-ArchiveFixtureToolRefreshReasons {

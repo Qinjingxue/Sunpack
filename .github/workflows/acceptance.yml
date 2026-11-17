@@ -78,8 +78,8 @@ jobs:
         run: |
           $artifacts = & cargo test --locked --manifest-path sunpack/Cargo.toml --workspace --no-run --profile ci --target x86_64-pc-windows-msvc --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
           if ($LASTEXITCODE -ne 0) { throw 'Rust GUI writer test build failed' }
-          $writer = @($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sunpack_runtime' -and $_.profile.test -and $_.executable })
-          if ($writer.Count -ne 1) { throw 'Expected exactly one Rust lib test executable' }
+          $writer = @($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sunpack-runtime' -and $_.profile.test -and $_.executable })
+          if ($writer.Count -ne 1) { throw 'Expected exactly one Rust runtime test executable' }
           $relative = [IO.Path]::GetRelativePath($PWD.Path, $writer[0].executable).Replace('\', '/')
           "artifact=$relative" >> $env:GITHUB_OUTPUT
 
@@ -238,7 +238,7 @@ jobs:
         run: |
           $env:SUNPACK_GUI_TEST_BINARY = (Resolve-Path .cache/gui-x64/Release/sunpack_gui_tests.exe).Path
           $writers = @(Get-ChildItem .cache/rust-target/x86_64-pc-windows-msvc/ci/deps/sunpack_runtime-*.exe)
-          if ($writers.Count -ne 1) { throw 'Expected exactly one uploaded Rust lib test executable' }
+          if ($writers.Count -ne 1) { throw 'Expected exactly one uploaded Rust runtime test executable' }
           $env:SUNPACK_GUI_WRITER_TEST_BINARY = $writers[0].FullName
           & .\.venv\Scripts\python.exe -m pytest -q tests/blackbox/test_runtime_commands.py::test_gui_password_edits_are_visible_to_running_runtime tests/gui/test_integration.py
           if ($LASTEXITCODE -ne 0) { throw 'GUI and runtime boundary tests failed' }

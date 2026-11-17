@@ -310,13 +310,15 @@ if(WIN32)
     endif()
     set(SUP_ENC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../sunpack_enc")
     get_filename_component(SUP_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    set(SUP_ENC_TARGET_DIR "${SUP_REPO_ROOT}/.cache/rust-target")
+    # Keep the worker's Cargo build independent of the runtime's target lock.
+    set(SUP_ENC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-target")
     set(SUP_ENC_LIBRARY "${SUP_ENC_TARGET_DIR}/${SUP_ENC_RUST_TARGET}/${SUP_ENC_PROFILE}/sunpack_enc.lib")
     file(GLOB SUP_ENC_SOURCES CONFIGURE_DEPENDS "${SUP_ENC_ROOT}/src/*.rs")
     add_custom_command(OUTPUT "${SUP_ENC_LIBRARY}"
         COMMAND "${SUP_ENC_CARGO}" build --profile "${SUP_ENC_PROFILE}" --locked --package sunpack-enc
             --manifest-path "${SUP_ENC_ROOT}/Cargo.toml"
-            --target "${SUP_ENC_RUST_TARGET}"
+            --target "${SUP_ENC_RUST_TARGET}" --target-dir "${SUP_ENC_TARGET_DIR}"
+            --jobs "${SUNPACK_BUILD_JOBS}"
         WORKING_DIRECTORY "${SUP_REPO_ROOT}"
         DEPENDS ${SUP_ENC_SOURCES} "${SUP_ENC_ROOT}/Cargo.toml"
             "${SUP_REPO_ROOT}/.cargo/config.toml"
