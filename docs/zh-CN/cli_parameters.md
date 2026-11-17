@@ -19,14 +19,16 @@ sunpack.exe <command> [options] [paths...]
 | `doctor`, `doc` | 只读检查配置和运行环境。 |
 | `version`, `ver` | 输出当前安装的 SunPack 版本号。 |
 
-完整名称和简写都是正式语法；只接受明确列出的简写，不接受任意截断长参数。简写输出的 JSON `command` 仍使用完整命令名。`-p` 是密码，`-P` 是密码文件；`-f` 启用扁平化，`-F` 关闭扁平化。带值参数推荐分开写，例如 `-r 3`、`-c r`。
+命令支持完整名称和列出的别名，选项仅接受下列短写，不支持长选项。简写输出的 JSON `command` 仍使用完整命令名。`-p` 是密码，`-P` 是密码文件；`-f` 启用扁平化，`-nf` 关闭扁平化。带值参数推荐分开写，例如 `-r 3`、`-c r`。
+
+密码必须写成 `-p 密码`，中间用空格分隔，不支持紧贴或等号写法。`-p` 后的下一个参数按密码原文读取，即使以 `-` 开头。单独的 `-pa` 控制退出暂停。
 
 常用简写示例：
 
 ```powershell
-sunpack e D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt --no-pause
+sunpack e D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt -npa
 sunpack s D:\Downloads -v -d -j
-sunpack w add D:\Downloads -o E:\Output -s -R -d
+sunpack w add D:\Downloads -o E:\Output -R -d
 sunpack w ls
 sunpack w st
 ```
@@ -37,21 +39,21 @@ sunpack w st
 
 | 参数 | 说明 |
 | --- | --- |
-| `-R/--recursive` | 递归发现输入子目录；与嵌套解压的 `--recur` 独立。 |
-| `-j`, `--json` | 以 JSON 格式输出结果，适合脚本调用。 |
-| `-v`, `--verbose` | 输出更多检测和诊断细节。 |
-| `--pause` | 命令结束后等待按键退出。 |
-| `--no-pause` | 命令结束后不暂停。 |
+| `-R` | 递归发现输入子目录；与嵌套解压的 `-r` 独立。 |
+| `-j` | 以 JSON 格式输出结果，适合脚本调用。 |
+| `-v` | 输出更多检测和诊断细节。 |
+| `-pa` | 命令结束后等待按键退出。 |
+| `-npa` | 命令结束后不暂停。 |
 
 `extract` 和 `scan` 在有前台归档请求运行期间使用高进程优先级。最后一个前台请求结束后，如果 Watch 正在运行，则保留前台优先级直到 Watch 的空闲期限；没有运行 Watch 时，共享运行时和原生 worker 立即恢复配置中的 `runtime.process_mode`。Watch 缓存清理遵循 `watch.runtime_cache_cleanup_idle_seconds`。
 
-`passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
+`passwords` 只支持 `-j` 以及密码输入参数；`config` 支持 `-j`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
 
-`extract` 和 `scan` 的普通文本写入 stdout，错误写入 stderr。`[扫描错误]` 表示文件系统扫描失败，`[解压失败]` 表示归档处理失败；`[扫描不完整]` 表示部分路径无法读取，发现结果可能不完整，其余可读取的输入仍会继续处理。`--json` 输出 JSON 结果，不输出这些文本消息。
+`extract` 和 `scan` 的普通文本写入 stdout，错误写入 stderr。`[扫描错误]` 表示文件系统扫描失败，`[解压失败]` 表示归档处理失败；`[扫描不完整]` 表示部分路径无法读取，发现结果可能不完整，其余可读取的输入仍会继续处理。`-j` 输出 JSON 结果，不输出这些文本消息。
 
 JSON 的 `summary.scan_error_count` 统计文件系统扫描错误，包括省略了单独详情的错误。每份报告最多保留 100 条文件系统扫描诊断记录，另加 1 条总省略摘要；单个目录仍适用原有的 20 条详情上限。超出报告预算后只累计省略数量，不再保留每条错误的路径或身份。归档任务结果独立于这项诊断预算保留。
 
-`extract --json` 在 `tasks[].failures` 中报告归档和输入失败。`scan --json` 通过 `items[].error` 和 `items[].error_kind` 报告逻辑归档错误，不公开内部 worker 证据或恢复预览。scan 按事实稀疏输出字段：区间输入或嵌入区段显示字节范围，实际分卷布局或确认缺卷时才显示分卷字段；内部 unknown 完整度不公开，尚未解决的分卷尝试计划显示 `pending`（确认缺卷时为 `missing`）。最终保留的提取输出列于 `summary.recovered_outputs`。
+`extract -j` 在 `tasks[].failures` 中报告归档和输入失败。`scan -j` 通过 `items[].error` 和 `items[].error_kind` 报告逻辑归档错误，不公开内部 worker 证据或恢复预览。scan 按事实稀疏输出字段：区间输入或嵌入区段显示字节范围，实际分卷布局或确认缺卷时才显示分卷字段；内部 unknown 完整度不公开，尚未解决的分卷尝试计划显示 `pending`（确认缺卷时为 `missing`）。最终保留的提取输出列于 `summary.recovered_outputs`。
 
 `extract` 的 `summary.failed_count` 和各轮处理的 `failed_count` 统计归档处理失败；`input_error_count` 单独统计无效输入，例如不支持的文件系统对象，文本中显示为 `[输入错误]`。各轮处理另有 `scan_error_count` 和 `input_error_count`。受预算限制的文件系统诊断详情集中保存在 `summary.scan_failures`，各轮的 `failures` 保存归档失败和输入错误。分类依据结构化错误类别和目标结果。所有错误类别均保留在 `errors` 中，并使退出码非零，即使其他归档处理成功也是如此。
 
@@ -69,20 +71,19 @@ sunpack.exe extract [options] <paths...>
 
 | 参数 | 说明 |
 | --- | --- |
-| `-p PASSWORD`, `--password PASSWORD` | 提供一个解压密码，可重复传入。 |
-| `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
-| `-a`, `--ask-pw` | 在终端交互输入密码，空行结束。 |
-| `--no-builtin-pw`, `--no-bpw` | 禁用 JSON 持久化密码及其中的剪贴板历史。 |
-| `-d`, `--deep-detect` | 以 Embedded 为唯一归档发现入口。首轮关闭文件系统过滤并扫描全部输入；递归轮次保留文件系统过滤、`embedded_scan.recursive_candidate_ratio` 比例筛选、递归深度和授权。被选中的文件执行完整文件扫描。 |
-| `-r VALUE`, `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
-| `-c VALUE`, `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
-| `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录；相对路径按当前命令目录解析。 |
-| `-f`, `--flatten` | 解压后提升单一顶层目录的内容。 |
-| `-F`, `--no-flatten` | 保留解压目录结构。 |
+| `-p PASSWORD` | 提供一个解压密码，可重复传入。 |
+| `-P PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
+| `-a` | 在终端交互输入密码，空行结束。 |
+| `-d` | 以 Embedded 为唯一归档发现入口。首轮关闭文件系统过滤并扫描全部输入；递归轮次保留文件系统过滤、`embedded_scan.recursive_candidate_ratio` 比例筛选、递归深度和授权。被选中的文件执行完整文件扫描。 |
+| `-r VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
+| `-c VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
+| `-o OUTPUT_DIR` | 指定输出根目录；相对路径按当前命令目录解析。 |
+| `-f` | 解压后提升单一顶层目录的内容。 |
+| `-nf` | 保留解压目录结构。 |
 
-`--out-dir` 指定后，结果落在“输出根 / 输入路径相对公共根的部分 / 归档名”下；未指定时落在归档旁边。嵌套归档在输出根内生成时，子归档仍使用自身所在位置计算输出。
+`-o` 指定后，结果落在“输出根 / 输入路径相对公共根的部分 / 归档名”下；未指定时落在归档旁边。嵌套归档在输出根内生成时，子归档仍使用自身所在位置计算输出。
 
-`--recur` 的取值：
+`-r` 的取值：
 
 - `1`、`2`、`3` 等正整数：固定递归轮数。
 - `*`：只要每轮仍产生新的可处理嵌套归档，就持续递归。
@@ -93,9 +94,9 @@ sunpack.exe extract [options] <paths...>
 ```powershell
 sunpack.exe extract D:\Downloads
 sunpack.exe extract D:\A.7z -p 123456 -p secret
-sunpack.exe extract D:\Archives --pw-file .\passwords.txt --cleanup r
-sunpack.exe extract D:\Nested --recur * --no-flatten
-sunpack.exe extract --deep-detect D:\MaybeArchive.bin
+sunpack.exe extract D:\Archives -P .\passwords.txt -c r
+sunpack.exe extract D:\Nested -r * -nf
+sunpack.exe extract -d D:\MaybeArchive.bin
 sunpack.exe extract D:\Archives -o E:\Unpacked
 ```
 
@@ -121,15 +122,15 @@ sunpack.exe scan [options] <paths...>
 
 分卷歧义使用现有卷位候选和布局的紧凑表示，不展开组合，状态为“等待实际解压验证”。有限密码测试不代表整包完整或整套分卷已验证。scan 不解压、不创建输出目录、不递归进入尚未解压的内容，也不验证输出、扁平化或清理源文件。
 
-支持与 extract 相同的密码输入参数。`-v` 仅增加已有发现来源，不额外分析；`--json` 独立控制输出格式。
+支持与 extract 相同的密码输入参数。`-v` 仅增加已有发现来源，不额外分析；`-j` 独立控制输出格式。
 
-`--deep-detect` 跳过前置 Relations/Detection，仅通过完整文件 Embedded 扫描发现归档，并关闭本次请求的文件系统过滤；发现锚点后复用现有密码与分卷解析。目录范围由 `--recursive` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
+`-d` 跳过前置 Relations/Detection，仅通过完整文件 Embedded 扫描发现归档，并关闭本次请求的文件系统过滤；发现锚点后复用现有密码与分卷解析。目录范围由 `-R` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
 
 示例：
 
 ```powershell
 sunpack.exe scan D:\Downloads
-sunpack.exe scan D:\Downloads --deep-detect --json
+sunpack.exe scan D:\Downloads -d -j
 sunpack.exe scan D:\Downloads -v
 ```
 
@@ -138,7 +139,7 @@ sunpack.exe scan D:\Downloads -v
 用法：
 
 ```powershell
-sunpack.exe watch <add|remove|list|enable|disable|reload|rebuild-log|status> [options]
+sunpack.exe watch <add|remove|list|enable|disable|reload|relog|status> [options]
 ```
 
 监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned | recursive`，后四列可省略：
@@ -150,7 +151,7 @@ F:\Incoming | . | true
 G:\Incoming | | true
 ```
 
-只写输入目录时输出列保持为空，归档会解压到归档所在文件夹；使用 `--out-dir` 时，相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。每个根使用独立的 `recursive` 标志，默认 `false`；输入根需要位于 NTFS 或 ReFS 卷且有可读取的 USN Journal。
+只写输入目录时输出列保持为空，归档会解压到归档所在文件夹；使用 `-o` 时，相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。每个根使用独立的 `recursive` 标志，默认 `false`；输入根需要位于 NTFS 或 ReFS 卷且有可读取的 USN Journal。
 
 `deep_detect` 接受 `true` 或 `false`，省略或留空时默认为 `false`。模式绑定输入目录；多个输入目录可共用输出根，并分别采用不同模式。嵌套解压、密码重试和崩溃恢复均保留原始输入目录，按该目录的配置执行。启用 deep 时，该目录请求的全部 filesystem 扫描过滤模块失效。修改此列会触发配置重载，也可执行 `watch reload` 应用修改。
 
@@ -160,29 +161,29 @@ G:\Incoming | | true
 
 | 子命令 | 参数 | 说明 |
 | --- | --- | --- |
-| `enable` | — | 启用监控，保留后台进程。 |
-| `add PATH...` | `-o/--out-dir DIR` | 添加监控根；只能同时添加一个路径。 |
-| `add PATH...` | `-R/--recursive` | 为该监控根启用递归发现。 |
-| `add PATH...` | `-d`, `--deep-detect` | 将各输入目录的 `deep_detect` 写为 `true`；已登记目录也会更新。 |
+| `enable`, `ea` | — | 启用监控，保留后台进程。 |
+| `add PATH...` | `-o DIR` | 添加监控根；只能同时添加一个路径。 |
+| `add PATH...` | `-R` | 为该监控根启用递归发现。 |
+| `add PATH...` | `-d` | 将各输入目录的 `deep_detect` 写为 `true`；已登记目录也会更新。 |
 | `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根。 |
 | `list`, `ls` | — | 列出持久化的输入目录。 |
-| `reload` | — | 重新读取配置和监控根。 |
-| `rebuild-log` | — | 清空显示日志，从监控快照/WAL重建。已完成的历史记录会丢弃。显示重建成败，失败退出码为 1；自动恢复仍忽略失败，后续日志操作再尝试。 |
-| `disable` | — | 暂停监控并保存状态，不退出后台进程或托盘。 |
+| `reload`, `rl` | — | 重新读取配置和监控根。 |
+| `relog`, `rlg` | — | 重建日志。 |
+| `disable`, `da` | — | 暂停监控并保存状态，不退出后台进程或托盘。 |
 | `status`, `st` | — | 显示监控服务是否运行。JSON 还包含待处理数量、最后一次错误和根目录。 |
 
 `enable` 恢复监控；`disable` 的暂停状态跨进程重启保存，恢复时不提交暂停期间的新变化。启用状态下的进程重启仍恢复离线变化。文件写入、移动或修改会触发活跃周期。新候选没有首次处理延迟；后续内容变化按观测到的写入间隔自适应调整静默窗口，不设固定最短或最长等待时间。文件准备好后提交处理。新分卷到达或密码来源变化会重新激活受影响任务。
 
-`add` 的 `-o/--out-dir` 只能和一个输入目录一起使用。重复添加同一输入目录不会改变已有输出映射；先 `remove` 再 `add` 才能更新映射。不同监控根的输出根不能互为严格的祖先和子目录，相同输出根可以共享。
+`add` 的 `-o` 只能和一个输入目录一起使用。重复添加同一输入目录不会改变已有输出映射；先 `remove` 再 `add` 才能更新映射。不同监控根的输出根不能互为严格的祖先和子目录，相同输出根可以共享。
 
-新增目录时不传 `--deep-detect`，默认不启用 deep。重复添加已登记目录时，不传该参数会保留已有模式；关闭 deep 可将第三列改为 `false` 或留空。
+新增目录时不传 `-d`，默认不启用 deep。重复添加已登记目录时，不传该参数会保留已有模式；关闭 deep 可将第三列改为 `false` 或留空。
 
 ```powershell
-sunpack.exe watch add D:\Downloads --deep-detect
+sunpack.exe watch add D:\Downloads -d
 sunpack.exe daemon start
 ```
 
-目录对象的解压菜单为“解压该目录下文件”“输入密码解压该目录下文件”；目录空白处的解压菜单为“解压目录下文件”“输入密码解压目录下文件”。两种目录菜单还提供“监控此目录”“取消监控此目录”，这些入口不附加 `--deep-detect`。文件对象的两个解压入口默认启用 `--deep-detect`。重新运行 `scripts/register_context_menu.ps1` 会重建菜单并移除过时入口。
+目录对象的解压菜单为“解压该目录下文件”“输入密码解压该目录下文件”；目录空白处的解压菜单为“解压目录下文件”“输入密码解压目录下文件”。两种目录菜单还提供“监控此目录”“取消监控此目录”，这些入口不附加 `-d`。文件对象的两个解压入口默认启用 `-d`。重新运行 `scripts/register_context_menu.ps1` 会重建菜单并移除过时入口。
 
 ## daemon（简写 d）
 
@@ -191,7 +192,7 @@ sunpack.exe daemon <start|stop|startup>
 sunpack.exe daemon startup <enable|disable|status>
 ```
 
-`start` 启动后台进程并恢复保存的监控启停状态；`stop` 等待后台退出，不改变监控启停状态。`start --no-tray` 禁用本次后台启动的托盘。`startup` 管理当前用户的登录启动项。`stop` 支持 `--json` 和 `--help`。
+`start` 启动后台进程并恢复保存的监控启停状态；`stop` 等待后台退出，不改变监控启停状态。`start -nt` 禁用本次后台启动的托盘。`startup` 管理当前用户的登录启动项。`stop` 支持 `-j` 和 `-h`。
 
 “监控此目录”依次执行 `watch add` 和 `daemon start`，不会覆盖已保存的暂停状态。
 
@@ -207,11 +208,10 @@ sunpack.exe passwords [options]
 
 | 参数 | 说明 |
 | --- | --- |
-| `-j`, `--json` | 以 JSON 输出密码来源汇总。 |
-| `-p PASSWORD`, `--password PASSWORD` | 提供密码，可重复传入。 |
-| `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
-| `-a`, `--ask-pw` | 在终端交互输入密码。 |
-| `--no-builtin-pw`, `--no-bpw` | 不使用 JSON 持久化密码及其中的剪贴板历史。 |
+| `-j` | 以 JSON 输出密码来源汇总。 |
+| `-p PASSWORD` | 提供密码，可重复传入。 |
+| `-P PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
+| `-a` | 在终端交互输入密码。 |
 
 `passwords` 没有归档路径，因此仅汇总全局候选。归档解压时，最近成功的有效密码优先，其后依次为 JSON 中匹配作用域的密码、CLI 输入、当前剪贴板、JSON 全局密码及剪贴板历史。重复项会去重，必要时先尝试空密码。
 
@@ -219,8 +219,8 @@ sunpack.exe passwords [options]
 
 ```powershell
 sunpack.exe passwords
-sunpack.exe passwords -p 123456 --no-builtin-pw
-sunpack.exe passwords --pw-file .\passwords.txt --json
+sunpack.exe passwords -p 123456
+sunpack.exe passwords -P .\passwords.txt -j
 ```
 
 ## config
@@ -240,14 +240,14 @@ sunpack.exe config [options] <show|validate>
 
 | 参数 | 说明 |
 | --- | --- |
-| `-j`, `--json` | 以 JSON 输出结果。 |
+| `-j` | 以 JSON 输出结果。 |
 
 示例：
 
 ```powershell
 sunpack.exe config show
 sunpack.exe config validate
-sunpack.exe config validate --json
+sunpack.exe config validate -j
 ```
 
 ## doctor
@@ -255,8 +255,8 @@ sunpack.exe config validate --json
 用法：
 
 ```powershell
-sunpack.exe doctor [--json]
-sunpack.exe d [-j]
+sunpack.exe doctor [-j]
+sunpack.exe doc [-j]
 ```
 
 `doctor` 只读检查配置、原生扩展、`7z.dll`、SevenZip worker、Windows 通知能力以及已配置的监控根。不存在的监控根报告为警告；命令不会启动持续监控或真实解压，也不会修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码为 `0`。
@@ -285,10 +285,10 @@ sunpack.exe version
 文件夹对象菜单提供“解压该目录下文件”“输入密码解压该目录下文件”，目录空白处菜单提供“解压目录下文件”“输入密码解压目录下文件”；两者还提供监控和取消监控动作。任意文件的菜单提供“解压该文件”“输入密码解压该文件”，对应命令分别相当于：
 
 ```text
-extract "%1" --deep-detect --pause
-extract "%1" --ask-pw --deep-detect --pause
+extract "%1" -d -pa
+extract "%1" -a -d -pa
 ```
 
 输出默认落在归档旁边。
 
-`watch add 目录 --recursive` 启用该根的递归发现；可选列省略时使用默认值。同一范围内的分卷可分布在不同子目录，独立根之间不组合。Watch 首轮输出直接放在该根映射的输出目录下；CLI 默认放在归档旁，分卷以锚点卷位置为准。Pipeline 输出子树由 Watch 排除，用户后来放入其中的文件也会忽略。
+`watch add 目录 -R` 启用该根的递归发现；可选列省略时使用默认值。同一范围内的分卷可分布在不同子目录，独立根之间不组合。Watch 首轮输出直接放在该根映射的输出目录下；CLI 默认放在归档旁，分卷以锚点卷位置为准。Pipeline 输出子树由 Watch 排除，用户后来放入其中的文件也会忽略。

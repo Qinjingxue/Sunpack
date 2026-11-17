@@ -75,7 +75,7 @@ impl Session for Input {
 fn interrupted_cleanup_details_reach_stderr_once_in_both_modes() {
     for json in [false, true] {
         let input = Input::default();
-        let args = if json { vec!["extract".into(), "--json".into(), "input.zip".into()] }
+        let args = if json { vec!["extract".into(), "-j".into(), "input.zip".into()] }
             else { vec!["extract".into(), "input.zip".into()] };
         let options = Options::parse(&args).unwrap();
         let error = "C:\\output: access denied".to_owned();
@@ -103,7 +103,7 @@ fn help_sections_and_disk_wait_text_match_main() {
         for (command, expected) in pages {
             let input = Input::default();
             let mut arguments: Vec<_> = command.split_whitespace().map(str::to_owned).collect();
-            arguments.push("--help".into());
+            arguments.push("-h".into());
             let options = Options::parse(&arguments).unwrap();
             help(&options, language, &input).unwrap();
             let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
@@ -189,41 +189,41 @@ fn parser_errors_match_main_text_stream_and_exit_code() {
     // Captured by executing main's real parser classes, registrations and
     // value converters. Usage is suppressed; diagnostics remain on stderr.
     let cases: &[(&[&str], &str)] = &[
-        (&["extract", "x", "-p"], "sunpack extract: error: argument -p/--password: expected one argument\n"),
-        (&["e", "x", "--password"], "sunpack extract: error: argument -p/--password: expected one argument\n"),
-        (&["passwords", "--json=x"], "sunpack passwords: error: argument -j/--json: ignored explicit argument 'x'\n"),
-        (&["scan", "x", "--pause", "--no-pause"], "sunpack scan: error: argument --no-pause: not allowed with argument --pause\n"),
-        (&["extract", "x", "-F", "-f"], "sunpack extract: error: argument -f/--flatten: not allowed with argument -F/--no-flatten\n"),
+        (&["extract", "x", "-p"], "sunpack extract: error: argument -p: expected one argument\n"),
+        (&["e", "x", "-p"], "sunpack extract: error: argument -p: expected one argument\n"),
+        (&["passwords", "-j=x"], "sunpack passwords: error: argument -j: ignored explicit argument 'x'\n"),
+        (&["scan", "x", "-pa", "-npa"], "sunpack scan: error: argument -npa: not allowed with argument -pa\n"),
+        (&["extract", "x", "-nf", "-f"], "sunpack extract: error: argument -f: not allowed with argument -nf\n"),
         (&["extract", "x", "--foo", "--bar"], "sunpack: error: unrecognized arguments: --foo --bar\n"),
         (&["nonsense"], "sunpack: error: argument command: invalid choice: 'nonsense' (choose from extract, e, watch, w, scan, s, passwords, pw, config, cfg, daemon, d, doctor, doc, version, ver)\n"),
-        (&["watch", "nonsense"], "sunpack watch: error: argument watch_action: invalid choice: 'nonsense' (choose from enable, disable, add, remove, rm, list, ls, reload, rebuild-log, status, st)\n"),
+        (&["watch", "nonsense"], "sunpack watch: error: argument watch_action: invalid choice: 'nonsense' (choose from enable, ea, disable, da, add, remove, rm, list, ls, reload, rl, relog, rlg, status, st)\n"),
         (&["config", "nonsense"], "sunpack config: error: argument config_action: invalid choice: 'nonsense' (choose from show, validate)\n"),
-        (&["watch", "--json"], "sunpack watch: error: the following arguments are required: watch_action\n"),
-        (&["config", "--json"], "sunpack config: error: the following arguments are required: config_action\n"),
+        (&["watch", "-j"], "sunpack watch: error: the following arguments are required: watch_action\n"),
+        (&["config", "-j"], "sunpack config: error: the following arguments are required: config_action\n"),
         (&["config", "--"], "sunpack config: error: the following arguments are required: config_action\n"),
         (&["daemon", "startup", "nonsense"], "sunpack daemon startup: error: argument action: invalid choice: 'nonsense' (choose from enable, disable, status)\n"),
         (&["daemon", "startup", "enable", "disable"], "sunpack: error: unrecognized arguments: disable\n"),
         (&["scan", "-j"], "sunpack scan: error: the following arguments are required: paths\n"),
         (&["--foo"], "sunpack: error: the following arguments are required: command\n"),
         (&["--"], "sunpack: error: the following arguments are required: command\n"),
-        (&["version", "-h=x"], "sunpack version: error: argument -h/--help: ignored explicit argument 'x'\n"),
-        (&["extract", "x", "-h=x"], "sunpack extract: error: argument -h/--help: ignored explicit argument 'x'\n"),
-        (&["scan", "x", "-jp"], "sunpack scan: error: argument -p/--password: expected one argument\n"),
-        (&["scan", "x", "-junknown"], "sunpack scan: error: argument -j/--json: ignored explicit argument 'unknown'\n"),
-        (&["pw", "-hjunk"], "sunpack passwords: error: argument -j/--json: ignored explicit argument 'unk'\n"),
+        (&["version", "-h=x"], "sunpack version: error: argument -h: ignored explicit argument 'x'\n"),
+        (&["extract", "x", "-h=x"], "sunpack extract: error: argument -h: ignored explicit argument 'x'\n"),
+        (&["scan", "x", "-jp"], "sunpack scan: error: argument -j: ignored explicit argument 'p'\n"),
+        (&["scan", "x", "-junknown"], "sunpack scan: error: argument -j: ignored explicit argument 'unknown'\n"),
+        (&["pw", "-hjunk"], "sunpack passwords: error: argument -j: ignored explicit argument 'unk'\n"),
         (&["passwords", "--", "-j"], "sunpack: error: unrecognized arguments: -- -j\n"),
         (&["config", "validate", "--"], "sunpack: error: unrecognized arguments: --\n"),
-        (&["extract", "x", "-r", "0"], "sunpack extract: error: argument -r/--recur: recursive_extract must be \"*\", \"?\", or a positive integer\n"),
-        (&["extract", "x", "--recur=bad"], "sunpack extract: error: argument -r/--recur: recursive_extract must be \"*\", \"?\", or a positive integer\n"),
-        (&["extract", "x", "-c", "bad"], "sunpack extract: error: argument -c/--cleanup: archive_cleanup_mode must be one of: d, r, k\n"),
-        (&["scan", "x", "-j=thing"], "sunpack scan: error: argument -j/--json: ignored explicit argument 'thing'\n"),
-        (&["watch", "rm", "--pause", "--no-pause"], "sunpack watch remove: error: argument --no-pause: not allowed with argument --pause\n"),
-        (&["watch", "--foo", "nonsense"], "sunpack watch: error: argument watch_action: invalid choice: 'nonsense' (choose from enable, disable, add, remove, rm, list, ls, reload, rebuild-log, status, st)\n"),
+        (&["extract", "x", "-r", "0"], "sunpack extract: error: argument -r: recursive_extract must be \"*\", \"?\", or a positive integer\n"),
+        (&["extract", "x", "-r=bad"], "sunpack extract: error: argument -r: recursive_extract must be \"*\", \"?\", or a positive integer\n"),
+        (&["extract", "x", "-c", "bad"], "sunpack extract: error: argument -c: archive_cleanup_mode must be one of: d, r, k\n"),
+        (&["scan", "x", "-j=thing"], "sunpack scan: error: argument -j: ignored explicit argument 'thing'\n"),
+        (&["watch", "rm", "-pa", "-npa"], "sunpack watch remove: error: argument -npa: not allowed with argument -pa\n"),
+        (&["watch", "--foo", "nonsense"], "sunpack watch: error: argument watch_action: invalid choice: 'nonsense' (choose from enable, ea, disable, da, add, remove, rm, list, ls, reload, rl, relog, rlg, status, st)\n"),
         (&["extract", "--foo"], "sunpack extract: error: the following arguments are required: paths\n"),
         (&["extract", "--foo", "--bar"], "sunpack extract: error: the following arguments are required: paths\n"),
         (&["--foo", "scan", "x", "--bar"], "sunpack: error: unrecognized arguments: --foo --bar\n"),
-        (&["daemon", "startup", "--json"], "sunpack daemon startup: error: the following arguments are required: action\n"),
-        (&["daemon", "startup", "bad", "--help"], "sunpack daemon startup: error: argument action: invalid choice: 'bad' (choose from enable, disable, status)\n"),
+        (&["daemon", "startup", "-j"], "sunpack daemon startup: error: the following arguments are required: action\n"),
+        (&["daemon", "startup", "bad", "-h"], "sunpack daemon startup: error: argument action: invalid choice: 'bad' (choose from enable, disable, status)\n"),
     ];
     let host = Host::new();
     for &(args, expected) in cases {
@@ -562,7 +562,7 @@ fn final_failure_summary_uses_main_names_and_keeps_carrier_status() {
 
 #[test]
 fn scan_json_keeps_main_sparse_fields_without_internal_failure_evidence() {
-    let options = Options::parse(&["scan".into(), "--json".into(), "-v".into(), "input.bin".into()]).unwrap();
+    let options = Options::parse(&["scan".into(), "-j".into(), "-v".into(), "input.bin".into()]).unwrap();
     let mut archive = report_archive("input.bin", 0);
     archive.format.clear();
     let mut failure = crate::pipeline::Failure::new(FailureKind::Damaged, "damage");
@@ -744,7 +744,7 @@ fn cancelling_password_prompt_returns_interrupted_not_usage() {
     let cwd = std::env::current_dir().unwrap();
     let result = crate::pipeline::block_on(run(
         &host, &cwd,
-        vec!["extract".into(), "--ask-pw".into(), "--no-pause".into(), "cancelled.zip".into()],
+        vec!["extract".into(), "-a".into(), "-npa".into(), "cancelled.zip".into()],
         input.clone(), Cancellation::new(),
     ));
     assert_eq!(input.reads.load(std::sync::atomic::Ordering::Relaxed), 1);

@@ -31,7 +31,7 @@ def test_scan_and_extract_nested_carrier_through_launcher(package, tmp_path):
     archive.write_bytes(_zip({"ordinary.txt": b"ordinary payload"}))
     before = {path: path.read_bytes() for path in input_dir.iterdir()}
 
-    report = package.json("scan", "--deep-detect", str(input_dir))
+    report = package.json("scan", "-d", str(input_dir))
     assert report["command"] == "scan"
     assert report["summary"]["archive_count"] == 2, report
     items = {Path(item["main_path"]).name: item for item in report["items"]}
@@ -90,7 +90,7 @@ def test_password_candidates_apply_only_to_their_directory(package, tmp_path):
 
     report = package.json("scan", encrypted)
     assert report["items"][0]["password_used"] == "pinned secret"
-    result = package.run("scan", denied / encrypted.name, "--json", "--no-pause")
+    result = package.run("scan", denied / encrypted.name, "-j", "-npa")
     assert result.returncode != 0, result.stdout
     rejected = json.loads(result.stdout)
     assert rejected["items"][0]["password_used"] is None
@@ -260,7 +260,7 @@ def test_recursive_file_target_admits_related_volumes_in_subdirectories(package,
 
 def test_concurrent_launcher_requests_reserve_distinct_outputs(package, tmp_path):
     # Start one server before the two clients race for the same output name.
-    assert package.run("--help").returncode == 0
+    assert package.run("-h").returncode == 0
     paths = []
     for name in ("first", "second"):
         folder = tmp_path / name
@@ -271,7 +271,7 @@ def test_concurrent_launcher_requests_reserve_distinct_outputs(package, tmp_path
     output = tmp_path / "output"
 
     def extract(path):
-        return package.json("extract", "-c", "k", "-r", "1", "--flatten", "-o", output, path)
+        return package.json("extract", "-c", "k", "-r", "1", "-f", "-o", output, path)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         reports = list(executor.map(extract, paths))
@@ -324,7 +324,7 @@ def test_partial_content_policy_uses_verified_members_and_retains_source(package
     settings["extraction"]["content_requirement"] = "complete"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     rejected_output = tmp_path / "complete"
-    result = package.run("extract", "-d", "-c", "d", "-o", rejected_output, source, "--json")
+    result = package.run("extract", "-d", "-c", "d", "-o", rejected_output, source, "-j")
     assert result.returncode != 0
     assert source.is_file()
     assert not list(rejected_output.rglob("good.txt"))
@@ -338,8 +338,8 @@ def test_json_recursive_prompt_and_empty_output_keep_main_contract(package, tmp_
     for answer, name in [("yes\n", "allowed"), ("no\n", "denied")]:
         source = inputs / f"{name}.zip"
         source.write_bytes(_zip({"inner.zip": _zip({"payload.txt": b"nested"})}))
-        result = package.run("extract", source, "-F", "-c", "k", "-r", "?",
-                             "--out-dir=", "--json", input=answer, cwd=work)
+        result = package.run("extract", source, "-nf", "-c", "k", "-r", "?",
+                             "-o=", "-j", input=answer, cwd=work)
         assert result.returncode == 0, (result.stdout, result.stderr)
         report = json.loads(result.stdout)
         assert report["command"] == "extract"

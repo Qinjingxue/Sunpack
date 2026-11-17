@@ -602,12 +602,12 @@ if ($processArch -eq $buildArch) {
             $smokeOutput = Join-Path $smokeProgramDataRoot "output"
             [IO.File]::WriteAllText($smokeInput, "SunPack archive smoke test")
             Compress-Archive -LiteralPath $smokeInput -DestinationPath $smokeArchive
-            Invoke-Native -FilePath $distExePath -Arguments @("--help")
-            Invoke-Native -FilePath $distExePath -Arguments @("passwords", "--json") | Out-Null
-            Invoke-Native -FilePath $distExePath -Arguments @("scan", $smokeArchive, "--json") | Out-Null
-            Invoke-Native -FilePath $distExePath -Arguments @("extract", $smokeArchive, "--cleanup", "k", "--out-dir", $smokeOutput, "--json") | Out-Null
+            Invoke-Native -FilePath $distExePath -Arguments @("-h")
+            Invoke-Native -FilePath $distExePath -Arguments @("passwords", "-j") | Out-Null
+            Invoke-Native -FilePath $distExePath -Arguments @("scan", $smokeArchive, "-j") | Out-Null
+            Invoke-Native -FilePath $distExePath -Arguments @("extract", $smokeArchive, "-c", "k", "-o", $smokeOutput, "-j") | Out-Null
             Assert-PathExists -LiteralPath (Join-Path $smokeOutput "probe\probe.txt") -Description "Extracted smoke fixture"
-            Invoke-Native -FilePath $distExePath -Arguments @("config", "validate", "--json")
+            Invoke-Native -FilePath $distExePath -Arguments @("config", "validate", "-j")
         } finally {
             # Every launcher request may start the packaged persistent runtime.
             # Shut it down while PROGRAMDATA still points at the smoke sandbox.

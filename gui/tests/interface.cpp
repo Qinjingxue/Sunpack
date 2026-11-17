@@ -607,7 +607,7 @@ void recover_task_log(Application& app,const fs::path& dir) {
     { std::ofstream broken(log,std::ios::binary|std::ios::trunc); broken<<"{"; }
     pump([&]{
         auto rows=state(app.page(),"tasks")["rows"];
-        return fs::exists(args) && read_json(args)==Json::array({"watch","rebuild-log"}) &&
+        return fs::exists(args) && read_json(args)==Json::array({"watch","relog"}) &&
                rows.size()==1 && rows[0]["name"]=="recovered.001" &&
                state(app.page(),"errors").empty() && state(app.page(),"busy")==false;
     },"Recover corrupt task log");
@@ -855,7 +855,7 @@ int runtime_status_contract(const fs::path& directory,const fs::path& launcher) 
             runtime_badge(app,true,false,false);
             command({L"config",L"show"});
             runtime_badge(app,true,false,false);
-            command({L"daemon",L"start",L"--no-tray"});
+            command({L"daemon",L"start",L"-nt"});
             runtime_badge(app,true,true,true);
             command({L"watch",L"disable"});
             runtime_badge(app,true,true,false);
@@ -867,7 +867,7 @@ int runtime_status_contract(const fs::path& directory,const fs::path& launcher) 
             runtime_badge(app,true,true,false);
             command({L"daemon",L"stop"});
             runtime_badge(app,true,false,false);
-            command({L"daemon",L"start",L"--no-tray"});
+            command({L"daemon",L"start",L"-nt"});
             runtime_badge(app,true,true,false);
             command({L"watch",L"enable"});
             runtime_badge(app,true,true,true);
@@ -928,7 +928,7 @@ int fake_cli(int argc,wchar_t** argv) {
         return 0;
     }
     atomic_write(dir/"cli-arguments.json",args.dump());
-    if(args==Json::array({"config","validate","--scan-rule-stdin","--json"})) {
+    if(args==Json::array({"config","validate","-srs","-j"})) {
         std::string input((std::istreambuf_iterator<char>(std::cin)),{});
         auto rules=parse_json(input);
         atomic_write(dir/"cli-validation-input.json",rules.dump());
@@ -939,7 +939,7 @@ int fake_cli(int argc,wchar_t** argv) {
         std::cout<<R"({"errors":[]})";
         return 0;
     }
-    if(args==Json::array({"watch","rebuild-log"}))
+    if(args==Json::array({"watch","relog"}))
         publish_events(dir/".sunpack_watch"/"events.json",
             Json{{"event","done"},{"path",utf8((dir/"recovered.001").wstring())}}.dump()+"\n");
     std::cout<<args.dump();

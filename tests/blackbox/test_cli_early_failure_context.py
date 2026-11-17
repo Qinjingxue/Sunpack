@@ -10,7 +10,7 @@ def test_password_file_error_preserves_original_paths(package, tmp_path, command
     archive = tmp_path / "input.zip"
     with zipfile.ZipFile(archive, "w") as payload:
         payload.writestr("member.txt", "payload")
-    arguments = [command, archive.name, "--pw-file", "absent.txt", "--json"]
+    arguments = [command, archive.name, "-P", "absent.txt", "-j"]
     result = package.run(*arguments, cwd=tmp_path)
     assert result.returncode == 2, (result.stdout, result.stderr)
     receipt = json.loads(result.stdout)
@@ -23,9 +23,9 @@ def test_password_file_error_preserves_original_paths(package, tmp_path, command
 def test_cold_invalid_runtime_configuration_preserves_argv(package, command, password):
     # No earlier CLI request may prime a last-good normalized configuration.
     package.configure(runtime={"process_mode": 42})
-    arguments = [command, "input.zip", "--json"]
+    arguments = [command, "input.zip", "-j"]
     if password:
-        arguments.extend(["--password", "not-for-the-error-receipt"])
+        arguments.extend(["-p", "not-for-the-error-receipt"])
     result = package.run(*arguments)
     assert result.returncode == 3, (result.stdout, result.stderr)
     receipt = json.loads(result.stdout)

@@ -130,7 +130,7 @@ def _watch_arrivals(app, workspace, args, corpus, skipped):
     staging = workspace.work / "arrival-staging"
     staging.mkdir()
     _configure_watch(app, args, inputs, workspace.outputs, live=True)
-    app.run("watch", "start", "--no-tray", require_broker=True)
+    app.run("watch", "start", "-nt", require_broker=True)
     rows = []
     sampler = app.sampler()
     with _directory_changes(inputs) as wait, sampler:
@@ -202,7 +202,7 @@ def _watch_persistence(app):
     # drains the admitted requests and flushes the completed state for restart.
     with _directory_changes(state, 0x13) as wait, sampler:
         started = time.perf_counter()
-        start = app.run("watch", "start", "--no-tray", require_broker=True)
+        start = app.run("watch", "start", "-nt", require_broker=True)
         try:
             while True:
                 status = app.run("watch", "status")["response"]["summary"]
@@ -323,7 +323,7 @@ def main(argv=None):
                     elif args.mode in ("scan", "memory"):
                         output = workspace.outputs / f"round-{run}"
                         command = ("scan", "-R", "-d", inputs, *password_args) if args.mode == "scan" else (
-                            "extract", "-R", "-d", "-r", args.recursive, "-c", "k", "--no-flatten", "--no-pause", "-o", output, inputs, *password_args
+                            "extract", "-R", "-d", "-r", args.recursive, "-c", "k", "-nf", "-npa", "-o", output, inputs, *password_args
                         )
                         measurement = app.run(*command)
                         if args.mode == "memory" and not measurement["response"]["summary"]["processed_count"]:
@@ -334,7 +334,7 @@ def main(argv=None):
                     else:
                         for key, item, copy, name, entry in staged:
                             output = workspace.outputs / f"round-{run}-{name}"
-                            measurement = app.run("extract", "--direct-file", "-d", "-r", args.recursive, "-c", "k", "--no-flatten", "--no-pause", "-o", output, entry, *password_args)
+                            measurement = app.run("extract", "--direct-file", "-d", "-r", args.recursive, "-c", "k", "-nf", "-npa", "-o", output, entry, *password_args)
                             row = {"case": key, "format": item["format"], "run": run, "copy": copy, "output": output_summary(output), **measurement}
                             if args.compare_7z:
                                 # Compare identical unwrapped archive input; carrier

@@ -15,7 +15,7 @@ def test_doctor_validates_disabled_regex_without_disabling_runtime(package, tmp_
     rule = {"name": name, "enabled": False,
             "full_names": [{"value": "[", "regex": False}]}
     package.configure(filesystem={"scan_filters": [rule]})
-    before = json.loads(package.run("doctor", "--json").stdout)
+    before = json.loads(package.run("doctor", "-j").stdout)
     assert next(row for row in before["items"] if row["name"] == "config")["status"] == "ok"
 
     rule["full_names"][0]["regex"] = True
@@ -67,11 +67,11 @@ def test_unknown_active_scan_filter_does_not_widen_discovery(package, tmp_path):
     # main's explicit validator compiles path rules only; unknown filters fail
     # when actually selected by discovery, not during configuration inspection.
     assert package.json("config", "validate")["items"][0]["ok"]
-    result = package.run("extract", source, "--json")
+    result = package.run("extract", source, "-j")
     assert result.returncode != 0
     assert "unrecognized_filter" in result.stdout + result.stderr
     assert not (source / "input").exists()
-    assert package.json("scan", "--deep-detect", source)["summary"]["archive_count"] == 1
+    assert package.json("scan", "-d", source)["summary"]["archive_count"] == 1
 
 
 def test_unreadable_builtin_password_source_does_not_abort_request(package):
@@ -93,7 +93,7 @@ def test_unreadable_simple_config_cannot_fall_back_to_advanced_config(package):
 
 
 def test_scan_rule_validation_reads_complete_redirected_json(package):
-    command = ("config", "validate", "--scan-rule-stdin", "--json")
+    command = ("config", "validate", "-srs", "-j")
     payload = json.dumps({"files": [{"value": "sample", "regex": False}]}, indent=2)
     result = package.run(*command, input=payload)
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -106,11 +106,11 @@ def test_scan_rule_validation_reads_complete_redirected_json(package):
 def test_password_text_sources_preserve_nul_candidates(package, tmp_path):
     passwords = tmp_path / "passwords.txt"
     passwords.write_bytes(b"before\nbad\x00candidate\nafter\n")
-    result = package.json("passwords", "--no-bpw", "-p", "good", "-P", passwords)
+    result = package.json("passwords", "-p", "good", "-P", passwords)
     assert result["items"][0]["combined_passwords"] == [
         "good", "before", "bad\x00candidate", "after",
     ]
-    interactive = package.run("passwords", "--no-bpw", "-a", input="bad\x00candidate\n\n")
+    interactive = package.run("passwords", "-a", input="bad\x00candidate\n\n")
     assert interactive.returncode == 0, interactive.stderr
     assert "bad\\x00candidate" in interactive.stdout
 
@@ -126,7 +126,7 @@ def test_rejected_password_candidate_keeps_resolution_details(package, tmp_path)
         capture_output=True,
     )
 
-    result = package.json("extract", "--no-bpw", "-p", "wrong", archive, code=1)
+    result = package.json("extract", "-p", "wrong", archive, code=1)
     failure, = result["tasks"][0]["failures"]
     assert (failure["kind"], failure["stage"]) == ("wrong_password", "password_resolution")
     assert failure["details"]["diagnostic"] == ""
@@ -140,7 +140,7 @@ def test_enabled_invalid_regex_only_blocks_filtered_scans_and_reports_all_rules(
         for name, enabled in [("blacklist", True), ("whitelist", False)]
     ]})
     assert package.json("config", "show")["items"]
-    assert package.json("passwords", "--no-bpw", "-p", "good")["items"][0]["combined_passwords"] == ["good"]
+    assert package.json("passwords", "-p", "good")["items"][0]["combined_passwords"] == ["good"]
     validation = package.json("config", "validate", code=2)
     errors = validation["items"][0]["errors"]
     assert len(errors) == 2
@@ -150,7 +150,7 @@ def test_enabled_invalid_regex_only_blocks_filtered_scans_and_reports_all_rules(
     with zipfile.ZipFile(source / "input.zip", "w") as payload:
         payload.writestr("member.txt", "payload")
     assert package.json("scan", "-d", source)["summary"]["archive_count"] == 1
-    result = package.run("scan", source, "--json")
+    result = package.run("scan", source, "-j")
     assert result.returncode != 0
 
 
@@ -167,12 +167,12 @@ def test_deep_extract_defers_bad_filters_until_recursive_output_scan(package, tm
     assert not empty["errors"]
     broken = source / "broken.zip"
     broken.write_bytes(b"PK\x03\x04broken")
-    failed = package.run("extract", "-d", "-r", "1", source, "--json")
+    failed = package.run("extract", "-d", "-r", "1", source, "-j")
     assert "regex" not in failed.stdout + failed.stderr
     with zipfile.ZipFile(source / "valid.zip", "w") as payload:
         payload.writestr("member.txt", "payload")
     # Main counts the initial extraction as round 1; round 2 admits nested scans.
-    recursive = package.run("extract", "-d", "-r", "2", source, "--json")
+    recursive = package.run("extract", "-d", "-r", "2", source, "-j")
     assert recursive.returncode != 0
     assert "regex" in recursive.stdout + recursive.stderr
 
@@ -207,7 +207,7 @@ def test_archive_infrastructure_failures_keep_main_exit_classification(package, 
         args += ["-P", tmp_path / "absent-passwords.txt"]
         code = 2
     with lock:
-        result = package.run(*args, "--json")
+        result = package.run(*args, "-j")
     assert result.returncode == code, (result.stdout, result.stderr)
     assert json.loads(result.stdout)["errors"]
 
@@ -281,7 +281,7 @@ def test_explicit_config_checks_reject_bom_without_losing_last_valid_snapshot(pa
     override = tmp_path / "override.json"
     override.write_text('{"cli":{"language":"en"}}', encoding="utf-8")
     package.env["SUNPACK_CONFIG_OVERRIDES"] = str(override)
-    assert package.json("passwords", "--no-bpw", "-p", "example")["items"][0]["user_passwords"] == ["example"]
+    assert package.json("passwords", "-p", "example")["items"][0]["user_passwords"] == ["example"]
 
     override.write_text("{}", encoding="utf-8-sig")
     for action in ("show", "validate"):
@@ -291,12 +291,12 @@ def test_explicit_config_checks_reject_bom_without_losing_last_valid_snapshot(pa
     config_check = next(row for row in doctor["items"] if row["name"] == "config")
     assert config_check["status"] == "fail"
     assert "Unexpected UTF-8 BOM" in config_check["detail"]
-    assert package.json("passwords", "--no-bpw", "-p", "example")["items"][0]["user_passwords"] == ["example"]
+    assert package.json("passwords", "-p", "example")["items"][0]["user_passwords"] == ["example"]
 
 
 def test_cli_null_language_uses_english_with_explicit_cli_section(package):
     package.configure(cli={"language": None})
-    result = package.run("passwords", "--no-bpw", "-p", "example")
+    result = package.run("passwords", "-p", "example")
     assert result.returncode == 0
     assert "[CLI] Password source summary:" in result.stdout
 
@@ -311,6 +311,6 @@ def test_config_checks_report_resolved_config_path_through_junction(package, tmp
     package.env["PROGRAMDATA"] = str(alias)
     expected = str(package.data / "sunpack_config.json")
     assert package.json("config", "show")["summary"]["config_path"] == expected
-    doctor = json.loads(package.run("doctor", "--json").stdout)
+    doctor = json.loads(package.run("doctor", "-j").stdout)
     check = next(row for row in doctor["items"] if row["name"] == "config")
     assert check["detail"] == expected

@@ -77,7 +77,7 @@ def test_carrier_native_volume_and_password_matrix(package, tmp_path, kind, pass
     output = tmp_path / "out"
     args = [] if password is None else ["-p", "wrong-key", "-p", password]
     result = package.json("extract", "-d", "-r", "1", "-c", "k", "-o", output,
-                          "--no-builtin-pw", *args, parts[0])
+                          *args, parts[0])
     assert result["summary"]["failed_count"] == 0, result
     _one_marker(output, case)
     assert all(path.is_file() for path in parts)
@@ -103,12 +103,12 @@ def test_rar5_optional_common_fields_use_directory_password_plan(package, tmp_pa
     disguised = case.entry_path.with_suffix(".opaque")
     case.entry_path.unlink()
     disguised.write_bytes(changed)
-    wrong = package.json("scan", "--no-builtin-pw", "-p", "wrong", case.archive_dir, code=1)
+    wrong = package.json("scan", "-p", "wrong", case.archive_dir, code=1)
     assert wrong["items"][0]["error_kind"] == "wrong_password", wrong
-    report = package.json("scan", "--no-builtin-pw", "-p", PASSWORD, case.archive_dir)
+    report = package.json("scan", "-p", PASSWORD, case.archive_dir)
     assert len(report["items"]) == 1 and not report["items"][0].get("error_kind"), report
     output = tmp_path / "out"
-    result = package.json("extract", "--no-builtin-pw", "-p", PASSWORD,
+    result = package.json("extract", "-p", PASSWORD,
                           "-c", "k", "-o", output, case.archive_dir)
     assert result["summary"]["failed_count"] == 0, result
     marker, = output.rglob(case.marker_name)
@@ -137,19 +137,19 @@ def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package
             archive.writestr("sibling.txt", SIBLING)
         disguised[0].write_bytes(b"prefix" * 211 + disguised[0].read_bytes()
                                  + b"gap" * 37 + sibling.getvalue() + b"suffix" * 11)
-    report = package.json("scan", "-d", "--no-builtin-pw", case.archive_dir, code=1)
+    report = package.json("scan", "-d", case.archive_dir, code=1)
     blocked, = [item for item in report["items"] if item.get("error_kind") == "password_required"]
     assert len(report["items"]) == 1 + carrier, report
     assert {Path(path) for path in blocked["all_parts"]} == set(disguised)
 
     # Password-blocked candidates must survive destructive cleanup requests.
     package.json("extract", "-d", "-r", "1", "-c", "d", "-o", tmp_path / "blocked",
-                 "--no-builtin-pw", case.archive_dir, code=1)
+                 case.archive_dir, code=1)
     assert all(path.is_file() for path in disguised)
 
     # Retry uses the same relation solver with real roles, including changing
     # the representative from the alphabetically first continuation to the head.
-    report = package.json("scan", "-d", "--no-builtin-pw", "-p", PASSWORD, case.archive_dir)
+    report = package.json("scan", "-d", "-p", PASSWORD, case.archive_dir)
     item, = [item for item in report["items"] if item.get("all_parts")]
     assert {Path(path) for path in item["all_parts"]} == set(disguised)
     assert Path(item["main_path"]) == disguised[0]
@@ -162,7 +162,7 @@ def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package
 
     output = tmp_path / "out"
     report = package.json("extract", "-d", "-r", "1", "-c", "k", "-o", output,
-                          "--no-builtin-pw", "-p", PASSWORD, renamed[0])
+                          "-p", PASSWORD, renamed[0])
 
     assert report["summary"]["success_count"] == 1
     if carrier:
@@ -192,13 +192,13 @@ def test_encrypted_rar5_same_stem_keeps_independent_sets_and_singleton(package, 
             shutil.copyfile(part, target)
             paths.append(target)
         groups.append(set(paths))
-    report = package.json("scan", "-d", "--no-builtin-pw", inputs, code=1)
+    report = package.json("scan", "-d", inputs, code=1)
     assert len(report["items"]) == 3, [(Path(i["main_path"]).name, [Path(p).name for p in i.get("all_parts", [])]) for i in report["items"]]
     actual = [{Path(path) for path in item.get("all_parts", [item["main_path"]])}
               for item in report["items"]]
     assert all(group in actual for group in groups), report
     assert all(item["error_kind"] == "password_required" for item in report["items"])
-    report = package.json("scan", "-d", "--no-builtin-pw", "-p", PASSWORD, inputs)
+    report = package.json("scan", "-d", "-p", PASSWORD, inputs)
     assert len(report["items"]) == 3, [(Path(i["main_path"]).name, [Path(p).name for p in i.get("all_parts", [])]) for i in report["items"]]
     outer = tmp_path / "outer.zip"
     with zipfile.ZipFile(outer, "w") as archive:
@@ -206,7 +206,7 @@ def test_encrypted_rar5_same_stem_keeps_independent_sets_and_singleton(package, 
             archive.write(part, part.name)
     output = tmp_path / "out"
     report = package.json("extract", "-d", "-r", "*", "-c", "k", "-o", output,
-                          "--no-builtin-pw", "-p", PASSWORD, outer)
+                          "-p", PASSWORD, outer)
     assert report["summary"]["failed_count"] == 0, report
     for case in cases:
         markers = list(output.rglob(case.marker_name))

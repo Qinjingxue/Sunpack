@@ -41,7 +41,7 @@ def test_source_runtime_watch_and_native_launcher_share_checkout_root(package, r
     owner = None
     try:
         for entry in (runtime, launcher):
-            result = subprocess.run([str(entry), "watch", "list", "--json"], cwd=caller,
+            result = subprocess.run([str(entry), "watch", "list", "-j"], cwd=caller,
                                     env=package.env, capture_output=True, text=True, encoding="utf-8", timeout=30)
             assert result.returncode == 0, result.stderr
             assert json.loads(result.stdout)["summary"]["count"] == 1
@@ -49,7 +49,7 @@ def test_source_runtime_watch_and_native_launcher_share_checkout_root(package, r
         assert len(states) == 1
         first_state = states[0].read_text(encoding="utf-8")
         owner = psutil.Process(int(first_state.splitlines()[3]))
-        repeated = subprocess.run([str(launcher), "watch", "list", "--json"], cwd=caller,
+        repeated = subprocess.run([str(launcher), "watch", "list", "-j"], cwd=caller,
                                   env=package.env, capture_output=True, text=True, encoding="utf-8", timeout=30)
         assert repeated.returncode == 0, repeated.stderr
         assert json.loads(repeated.stdout)["summary"]["count"] == 1
@@ -59,8 +59,8 @@ def test_source_runtime_watch_and_native_launcher_share_checkout_root(package, r
         with zipfile.ZipFile(archive, "w") as output:
             output.writestr("probe.txt", b"source worker")
         extracted = tmp_path / "extracted"
-        result = subprocess.run([str(launcher), "extract", str(archive), "--cleanup", "k",
-                                 "--out-dir", str(extracted), "--json"], cwd=caller,
+        result = subprocess.run([str(launcher), "extract", str(archive), "-c", "k",
+                                 "-o", str(extracted), "-j"], cwd=caller,
                                 env=package.env, capture_output=True, text=True, encoding="utf-8", timeout=30)
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert (extracted / "probe" / "probe.txt").read_bytes() == b"source worker"

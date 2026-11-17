@@ -245,8 +245,8 @@ def test_rust_writer_cpp_query_contract(repo_root, contract):
     [
         ("folder_watch", ["watch", "add"]),
         ("background_watch", ["watch", "add"]),
-        ("folder_recursive_watch", ["watch", "add", "--recursive"]),
-        ("background_recursive_watch", ["watch", "add", "--recursive"]),
+        ("folder_recursive_watch", ["watch", "add", "-R"]),
+        ("background_recursive_watch", ["watch", "add", "-R"]),
         ("folder_unwatch", ["watch", "remove"]),
         ("background_unwatch", ["watch", "remove"]),
     ],

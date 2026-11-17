@@ -46,13 +46,13 @@ class Package:
         )
 
     def json(self, *arguments, cwd=None, code=0, timeout=60):
-        result = self.run(*arguments, "--json", cwd=cwd, timeout=timeout)
+        result = self.run(*arguments, "-j", cwd=cwd, timeout=timeout)
         assert result.returncode == code, (result.stdout, result.stderr)
         return json.loads(result.stdout)
 
     @contextmanager
     def watch_session(self, *, cwd=None):
-        self.json("daemon", "start", "--no-tray", cwd=cwd)
+        self.json("daemon", "start", "-nt", cwd=cwd)
         try:
             yield
         finally:

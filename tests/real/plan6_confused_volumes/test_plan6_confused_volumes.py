@@ -14,7 +14,7 @@ RAR_AVAILABLE = get_optional_rar() is not None
 
 def _assert_scan_group(package, case, parts, passwords):
     arguments = [argument for password in passwords for argument in ("-p", password)]
-    report = package.json("scan", "--no-builtin-pw", "--no-pause", *arguments, case.entry_path)
+    report = package.json("scan", "-npa", *arguments, case.entry_path)
     assert report["summary"]["archive_count"] == 1
     assert report["summary"]["failed_count"] == 0
     item, = report["items"]

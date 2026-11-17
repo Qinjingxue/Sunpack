@@ -82,7 +82,7 @@ def test_allow_partial_rejects_nonrecoverable_worker_failure_after_complete_memb
     )
     output = tmp_path / "out"
     report = package.json(
-        "extract", "-d", "--no-builtin-pw", "-p", "first-key",
+        "extract", "-d", "-p", "first-key",
         "-r", "*", "-c", "d", "-o", output, source, code=1,
     )
     assert report["summary"]["failed_count"] == 1, report
@@ -160,7 +160,7 @@ def test_completed_roots_keep_nested_results_passwords_and_failures(package, tmp
     package.configure(recursive_authorization={"enabled": False})
     output = tmp_path / "out"
     report = package.json(
-        "extract", "-d", "--no-builtin-pw", "-p", "root-key",
+        "extract", "-d", "-p", "root-key",
         "-r", "*", "-c", "k", "-o", output, inputs, code=1,
     )
     # main counts physical tasks (including the nested task), not segments.

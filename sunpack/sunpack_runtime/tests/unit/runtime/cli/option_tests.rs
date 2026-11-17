@@ -72,12 +72,12 @@ fn password_display_escapes_controls_without_changing_candidates() {
 fn option_aliases_share_values_without_leaking_action_scope() {
     let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
     for args in [
-        vec!["e", "-vRd", "-psecret", "-Ppasswords.txt", "-r1", "-ck", "-odest", "-fa", "--no-bpw", "a.zip"],
-        vec!["extract", "--verbose", "--recursive", "--deep-detect", "--password=secret", "--pw-file=passwords.txt", "--recur=1", "--cleanup=k", "--out-dir=dest", "--flatten", "--ask-pw", "--no-builtin-pw", "a.zip"],
+        vec!["e", "-vRd", "-p", "secret", "-Ppasswords.txt", "-r1", "-ck", "-odest", "-fa", "a.zip"],
+        vec!["extract", "-v", "-R", "-d", "-p", "secret", "-P=passwords.txt", "-r=1", "-c=k", "-o=dest", "-f", "-a", "a.zip"],
     ] {
         let value = parse(&args).unwrap();
         assert!(value.verbose && value.recursive && value.deep);
-        assert!(value.prompt_passwords && value.no_builtins);
+        assert!(value.prompt_passwords);
         assert_eq!(value.flatten, Some(true));
         assert_eq!(value.depth, Some((Recursion::Fixed(1), "1".into())));
         assert_eq!(value.cleanup, Some(CleanupMode::Keep));
@@ -89,15 +89,29 @@ fn option_aliases_share_values_without_leaking_action_scope() {
     let added = parse(&["w", "add", "-Rd", "-odest", "root"]).unwrap();
     assert!(added.recursive && added.deep);
     assert_eq!(added.output.as_deref(), Some("dest"));
+    let value = parse(&["e", "-nf", "-pa", "-p", "a", "a.zip"]).unwrap();
+    assert_eq!(value.flatten, Some(false));
+    assert!(value.pause && !value.no_pause);
+    assert_eq!(value.passwords[0].as_ref(), "a");
+    assert!(parse(&["e", "-npa", "a.zip"]).unwrap().no_pause);
+    for flag in ["--help", "--json", "--verbose", "--no-pause", "--pause", "--recursive",
+        "--deep-detect", "--password=x", "--pw-file=x", "--ask-pw", "--no-builtin-pw",
+        "--no-bpw", "--recur=1", "--cleanup=k", "--out-dir=x", "--flatten", "--no-flatten", "-F",
+        "-psecret", "-p=secret", "-vpsecret", "-vp"] {
+        assert!(parse(&["extract", flag, "a.zip"]).is_err(), "{flag}");
+    }
     for args in [
-        vec!["scan", "--out-dir", "dest", "a.zip"],
-        vec!["passwords", "--recursive"],
+        vec!["scan", "-o", "dest", "a.zip"],
+        vec!["passwords", "-R"],
         vec!["watch", "--start", "add", "root"],
         vec!["daemon", "start", "--start"],
         vec!["watch", "remove", "-R", "root"],
-        vec!["config", "show", "--scan-rule-stdin"],
-        vec!["doctor", "--verbose"],
-        vec!["version", "--json"],
+        vec!["config", "show", "-srs"],
+        vec!["doctor", "-v"],
+        vec!["version", "-j"],
+        vec!["passwords", "-pa"],
+        vec!["daemon", "start", "--no-tray"],
+        vec!["config", "validate", "--scan-rule-stdin"],
     ] { assert!(parse(&args).is_err(), "{args:?}"); }
 }
 
@@ -106,8 +120,7 @@ fn option_aliases_share_values_without_leaking_action_scope() {
 #[test]
 fn argparse_option_resolution_and_boundaries() {
     let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
-    let value = parse(&["extract", "--no-builtin-pw", "--password=-secret", "--out-dir=dest", "file.zip"]).unwrap();
-    assert!(value.no_builtins);
+    let value = parse(&["extract", "-p", "-secret", "-o=dest", "file.zip"]).unwrap();
     assert_eq!(value.passwords[0].as_ref(), "-secret");
     assert_eq!(value.output.as_deref(), Some("dest"));
     assert_eq!(value.paths, ["file.zip"]);
@@ -118,16 +131,15 @@ fn argparse_option_resolution_and_boundaries() {
         vec!["scan", "a.zip", "--recurs"],
         vec!["--hel"],
     ] { assert!(parse(&args).is_err(), "{args:?}"); }
-    assert!(parse(&["watch", "--json", "status"]).unwrap().json);
-    assert!(parse(&["watch", "--verbose", "status"]).unwrap().verbose);
+    assert!(parse(&["watch", "-j", "status"]).unwrap().json);
+    assert!(parse(&["watch", "-v", "status"]).unwrap().verbose);
     assert!(parse(&["config", "-j", "show"]).unwrap().json);
-    let value = parse(&["extract", "--", "--json", "--verbose", "--pause"]).unwrap();
+    let value = parse(&["extract", "--", "-j", "-v", "-pa"]).unwrap();
     assert!(!value.json && !value.verbose && !value.pause);
-    assert_eq!(value.paths, ["--json", "--verbose", "--pause"]);
-    // Attached passwords remain data even when they look like options.
-    for password in ["--json", "-j", "--verbose", "-v", "--pause"] {
-        let token = format!("--password={password}");
-        let value = parse(&["extract", &token, "a.zip"]).unwrap();
+    assert_eq!(value.paths, ["-j", "-v", "-pa"]);
+    // The token after standalone -p is always a literal password.
+    for password in ["-j", "-v", "-pa", "-npa", "--", "-p", "", "=x"] {
+        let value = parse(&["extract", "-p", password, "a.zip"]).unwrap();
         assert_eq!(value.passwords[0].as_ref(), password);
         assert!(!value.json && !value.verbose && !value.pause);
     }
@@ -137,17 +149,17 @@ fn argparse_option_resolution_and_boundaries() {
     assert!(value.json && value.verbose);
     let value = parse(&["watch", "-jv", "status", "-j"]).unwrap();
     assert!(value.json && !value.verbose);
-    let value = parse(&["watch", "--pause", "enable", "--no-pause"]).unwrap();
+    let value = parse(&["watch", "-pa", "enable", "-npa"]).unwrap();
     assert!(!value.pause && value.no_pause);
-    let value = parse(&["extract", "--pw-file=", "--out-dir=", "a.zip"]).unwrap();
+    let value = parse(&["extract", "-P=", "-o=", "a.zip"]).unwrap();
     assert!(value.password_file.is_none());
     assert!(value.output.is_none());
-    // Watch checks whether --out-dir was supplied, including an empty
+    // Watch checks whether -o was supplied, including an empty
     // value, before accepting multiple roots. Do not apply extract's
     // empty-output normalization to this command.
     for args in [
-        vec!["watch", "add", "A", "B", "--out-dir="],
-        vec!["watch", "add", "A", "B", "--out-dir", ""],
+        vec!["watch", "add", "A", "B", "-o="],
+        vec!["watch", "add", "A", "B", "-o", ""],
     ] {
         let value = parse(&args).unwrap();
         assert_eq!(value.output.as_deref(), Some(""));
@@ -160,47 +172,44 @@ fn argparse_option_resolution_and_boundaries() {
         vec!["extract", "--recu", "file.zip"],
         vec!["extract", "--no-b", "file.zip"],
         vec!["watch", "--on", "start"], // action-only flag at parent scope
-        vec!["extract", "--json=true", "file.zip"],
-        vec!["extract", "--pass", "--json", "file.zip"],
+        vec!["extract", "-j=true", "file.zip"],
+        vec!["extract", "--pass", "-j", "file.zip"],
         vec!["extract", "a.zip", "-v", "b.zip"],
         vec!["extract", "a.zip", "-v", "--", "b.zip"],
     ] { assert!(parse(&args).is_err(), "{args:?}"); }
-    let value = parse(&["extract", "-vpsecret", "-p", "-.5", "-p", "-with space", "--", "--no-b"]).unwrap();
+    let value = parse(&["extract", "-v", "-p", "secret", "-p", "-.5", "-p", "-with space", "--", "--no-b"]).unwrap();
     assert!(value.verbose);
     assert_eq!(value.passwords.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), ["secret", "-.5", "-with space"]);
     assert_eq!(value.paths, ["--no-b"]);
-    for password in ["-１２３", "-١٢٣", "-१२३", "-.１２", "-١.٢", "-1\n", "-.1\n", "-１２\n"] {
-        let value = parse(&["passwords", "--no-bpw", "--password", password, "--json"]).unwrap();
+    for password in ["-１２３", "-١٢٣", "-१२३", "-.１２", "-١.٢", "-1\n", "-.1\n", "-１２\n", "-²", "-\n", "-1\n\n", "-1\r\n"] {
+        let value = parse(&["passwords", "-p", password, "-j"]).unwrap();
         assert_eq!(value.passwords[0].as_ref(), password);
     }
-    for password in ["-²", "-\n", "-1\n\n", "-1\r\n"] {
-        assert!(parse(&["passwords", "--password", password]).is_err());
-    }
     assert_eq!(parse(&["extract", "a.zip", "--", "-b.zip"]).unwrap().paths, ["a.zip", "-b.zip"]);
-    let value = parse(&["daemon", "--json", "start", "--no-tray"]).unwrap();
+    let value = parse(&["daemon", "-j", "start", "-nt"]).unwrap();
     assert!(value.no_tray);
     assert!(value.json); // main restores explicitly supplied parent flags
-    assert!(parse(&["daemon", "start", "--json"]).unwrap().json);
-    assert!(parse(&["config", "validate", "--scan-rule-stdin"]).unwrap().rule_stdin);
+    assert!(parse(&["daemon", "start", "-j"]).unwrap().json);
+    assert!(parse(&["config", "validate", "-srs"]).unwrap().rule_stdin);
     assert!(parse(&["--", "extract", "file.zip"]).is_err());
-    assert!(parse(&["watch", "--json", "--", "start", "--no-tray"]).is_err());
+    assert!(parse(&["watch", "-j", "--", "start", "-nt"]).is_err());
     assert_eq!(parse(&["daemon", "startup", "--", "status"]).unwrap().paths, ["status"]);
     assert_eq!(parse(&["daemon", "startup", "status", "--"]).unwrap().paths, ["status"]);
-    assert_eq!(parse(&["pw", "-jp=x"]).unwrap().passwords[0].as_ref(), "=x");
+    assert_eq!(parse(&["pw", "-j", "-p", "=x"]).unwrap().passwords[0].as_ref(), "=x");
     assert!(parse(&["--he"]).is_err());
     assert!(parse(&["extract", "--he"]).is_err());
     for args in [
-        vec!["extract", "a.zip", "-v", "b.zip", "--help"],
-        vec!["extract", "--unknown", "--help"],
-        vec!["extract", "--dire", "--help"],
-        vec!["--unknown", "--help"],
-        vec!["extract", "-hp", "secret"],
-        vec!["extract", "-hvpsecret"],
-        vec!["extract", "-hFf"],
-        vec!["--unknown", "extract", "--help"],
-        vec!["daemon", "--no-tray", "start", "--help"],
-        vec!["daemon", "start", "--unknown", "--help"],
-        vec!["watch", "--help", "invalid"],
+        vec!["extract", "a.zip", "-v", "b.zip", "-h"],
+        vec!["extract", "--unknown", "-h"],
+        vec!["extract", "--dire", "-h"],
+        vec!["--unknown", "-h"],
+        vec!["extract", "-hP", "passwords.txt"],
+        vec!["extract", "-hvPpasswords.txt"],
+        vec!["extract", "-hfa"],
+        vec!["--unknown", "extract", "-h"],
+        vec!["daemon", "-nt", "start", "-h"],
+        vec!["daemon", "start", "--unknown", "-h"],
+        vec!["watch", "-h", "invalid"],
         vec!["--unknown", "extract"],
         vec!["watch", "--unknown", "add"],
         vec!["--unknown", "watch"],
@@ -208,33 +217,35 @@ fn argparse_option_resolution_and_boundaries() {
     for args in [
         vec!["-hx"],
         vec!["extract", "-hx"],
-        vec!["extract", "--password", "--help"],
-        vec!["extract", "-hp", "--help"],
-        vec!["extract", "-hvp", "--help"],
+        vec!["extract", "-p", "-h"],
+        vec!["extract", "-hp", "-h"],
+        vec!["extract", "-hvp", "-h"],
         vec!["extract", "-hj=true"],
         vec!["-h=foo"],
-        vec!["extract", "--json=true", "--help"],
-        vec!["extract", "--pause", "--no-pause", "--help"],
-        vec!["extract", "-f", "-F", "--help"],
-        vec!["watch", "invalid", "--help"],
-        vec!["config", "invalid", "--help"],
+        vec!["extract", "-j=true", "-h"],
+        vec!["extract", "-pa", "-npa", "-h"],
+        vec!["extract", "-f", "-nf", "-h"],
+        vec!["watch", "invalid", "-h"],
+        vec!["config", "invalid", "-h"],
     ] { assert!(parse(&args).is_err(), "{args:?}"); }
 }
 
 #[test]
 fn daemon_and_watch_control_have_distinct_scopes() {
     let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
-    assert_eq!(parse(&["d", "start", "--no-tray"]).unwrap().command, "daemon");
+    assert_eq!(parse(&["d", "start", "-nt"]).unwrap().command, "daemon");
     assert_eq!(parse(&["doc"]).unwrap().command, "doctor");
-    for action in ["enable", "disable"] {
-        assert_eq!(parse(&["w", action]).unwrap().action, action);
+    for (action, canonical) in [("enable", "enable"), ("disable", "disable"),
+        ("ea", "enable"), ("da", "disable"), ("rl", "reload"), ("relog", "relog"), ("rlg", "relog")] {
+        assert_eq!(parse(&["w", action]).unwrap().action, canonical);
     }
     assert_eq!(parse(&["daemon", "startup", "status"]).unwrap().paths, ["status"]);
     for args in [
         vec!["watch", "start"], vec!["watch", "stop"],
+        vec!["watch", "rebuild-log"],
         vec!["watch", "startup", "status"], vec!["watch", "add", "root", "--start"],
-        vec!["watch", "add", "-s", "root"], vec!["watch", "enable", "--no-tray"],
-        vec!["daemon", "enable"], vec!["daemon", "stop", "--pause"],
-        vec!["daemon", "--verbose", "stop"], vec!["daemon", "stop", "--no-pause"],
+        vec!["watch", "add", "-s", "root"], vec!["watch", "enable", "-nt"],
+        vec!["daemon", "enable"], vec!["daemon", "stop", "-pa"],
+        vec!["daemon", "-v", "stop"], vec!["daemon", "stop", "-npa"],
     ] { assert!(parse(&args).is_err(), "{args:?}"); }
 }

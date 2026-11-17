@@ -6,10 +6,10 @@
     "process_mode": "high"
   },
   "watch": {
-    "deduplication": "file_id",
-    "deduplication_scope": "root",
     "tray_enabled": true,
     "toast_enabled": true,
+    "deduplication": "file_id",
+    "deduplication_scope": "root",
     "event_log_retention_days": 7,
     "toast_report_retention_days": 7,
     "clipboard_monitor_enabled": true,

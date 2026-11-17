@@ -79,7 +79,7 @@ def test_extract_password_retry_resumes_one_logical_input_in_a_carrier(package, 
 
     # Both archive identities have the same physical path and format.
     result = package.run(
-        "extract", "-d", "-r", "*", "-c", "d", "-o", output, "--no-builtin-pw", "--no-pause",
+        "extract", "-d", "-r", "*", "-c", "d", "-o", output, "-npa",
         "-p", "first-key", source, input="y\nsecond-key\n\n",
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -212,7 +212,7 @@ def test_password_retry_deletes_retained_nested_archive_under_keep_mode(package,
         return False
 
     command = [str(package.launcher), "extract", "-r", "*", "-c", "k", "-o", str(output),
-               "--no-builtin-pw", "--no-pause", "-p", "wrong", str(outer), str(sibling)]
+               "-npa", "-p", "wrong", str(outer), str(sibling)]
     with ThreadPoolExecutor(max_workers=1) as executor, subprocess.Popen(
         command, cwd=package.data, env=package.env, encoding="utf-8",
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -408,7 +408,7 @@ def test_distinct_volume_requests_do_not_expand_original_busy_claim(package, tmp
         return False
 
     command = [str(package.launcher), "extract", "-c", "k", "-o", str(first_output),
-               "--no-builtin-pw", "--no-pause", "-p", "wrong", str(parts[0])]
+               "-npa", "-p", "wrong", str(parts[0])]
     with ThreadPoolExecutor(max_workers=1) as executor, subprocess.Popen(
         command, cwd=package.data, env=package.env, encoding="utf-8",
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -418,7 +418,7 @@ def test_distinct_volume_requests_do_not_expand_original_busy_claim(package, tmp
             duplicate = package.json("scan", parts[0], code=1)
             assert duplicate["summary"]["status"] == "busy"
             second = package.json("extract", "-c", "k", "-o", second_output,
-                                  "--no-builtin-pw", "-p", "fixture-key", parts[1])
+                                  "-p", "fixture-key", parts[1])
             assert second["summary"]["success_count"] == 1
             stdout, stderr = process.communicate("y\nfixture-key\n\n", timeout=60)
             assert process.returncode == 0, (stdout, stderr)

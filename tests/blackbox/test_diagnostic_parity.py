@@ -18,7 +18,7 @@ def test_text_cleanup_warning_names_the_failed_source_and_os_error(package, tmp_
     handle = kernel.CreateFileW(str(source), 0x80000000, 3, None, 3, 0x80, None)
     assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
     try:
-        result = package.run("extract", "--no-pause", "-c", "d", "-o", output, source)
+        result = package.run("extract", "-npa", "-c", "d", "-o", output, source)
     finally:
         assert kernel.CloseHandle(handle), ctypes.get_last_error()
     assert result.returncode == 0, (result.stdout, result.stderr)

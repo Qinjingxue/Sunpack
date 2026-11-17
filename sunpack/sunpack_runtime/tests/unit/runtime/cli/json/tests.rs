@@ -15,7 +15,7 @@ fn config_items_preserve_all_values_without_parallel_order_metadata() {
 #[test]
 fn cli_reports_preserve_values_and_array_order() {
     let mut result = CommandResult::new("passwords");
-    result.inputs = json!({"json":true,"use_builtin_passwords":false});
+    result.inputs = json!({"json":true});
     result.summary = json!({"user_password_count":1,"recent_password_count":2});
     let item = json!({"user_passwords":["second", "first"], "new_field":{"extra":42}});
     result.items.push(item.clone());

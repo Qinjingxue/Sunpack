@@ -21,7 +21,7 @@ def test_config_reload_and_literal_password_sources(package, tmp_path):
     password_file = tmp_path / "密码.txt"
     long = "长" * 23000  # Cross the native reader's 64 KiB buffer.
     password_file.write_bytes(f"\ufeffbom\r\n  spaces  \r#literal\n\n中文\u2028next\n{long}".encode())
-    report = package.json("passwords", "--no-builtin-pw", "-p", "  spaces  ", "--pw-file", password_file)
+    report = package.json("passwords", "-p", "  spaces  ", "-P", password_file)
     assert report["items"][0]["combined_passwords"] == ["  spaces  ", "\ufeffbom", "#literal", "中文", "next", long]
 
     before = package.json("config", "show")
@@ -81,33 +81,34 @@ def test_invalid_config_diagnostics_preserve_last_good_request_settings(package,
 
 
 def test_cli_password_values_and_noninteractive_prompt_contract(package):
-    missing = package.run("passwords", "--json", "--password", "--no-bpw")
+    missing = package.run("passwords", "-j", "-p")
     assert missing.returncode == 2 and not missing.stdout
-    assert "--password" in missing.stderr
+    assert "-p" in missing.stderr
 
-    report = package.json("passwords", "--no-bpw", "--password=--no-bpw", "-p", "-42")
-    assert report["items"][0]["user_passwords"] == ["--no-bpw", "-42"]
-    assert not report["items"][0]["use_builtin_passwords"]
+    report = package.json("passwords", "-p", "-pa", "-p", "-npa", "-p", "--", "-p", "-j", "-p", "-42")
+    assert report["items"][0]["user_passwords"] == ["-pa", "-npa", "--", "-j", "-42"]
+    for argument in ("-psecret", "-p=secret", "-vpsecret"):
+        assert package.run("passwords", argument).returncode == 2
 
     # A command-line field can span multiple pipe reads, with more arguments
     # following immediately in the same request.
     long_argument = "密" * 6000
-    report = package.json("passwords", "-p", long_argument, "-p", "last", "--no-bpw")
+    report = package.json("passwords", "-p", long_argument, "-p", "last")
     assert report["items"][0]["combined_passwords"] == [long_argument, "last"]
 
-    prompt = package.json("passwords", "--ask-pw", code=2)
-    assert prompt["inputs"]["argv"] == ["passwords", "--ask-pw", "--json"]
+    prompt = package.json("passwords", "-a", code=2)
+    assert prompt["inputs"]["argv"] == ["passwords", "-a", "-j"]
     assert prompt["errors"] == ["interactive password input is unavailable in JSON mode"]
-    arguments = ("passwords", "--json", "--ask-pw", "--password", "example-password")
+    arguments = ("passwords", "-j", "-a", "-p", "example-password")
     rejected = package.run(*arguments)
     assert rejected.returncode == 2
     assert json.loads(rejected.stdout)["inputs"]["argv"] == list(arguments)
 
-    result = package.run("passwords", "--ask-pw", "--no-bpw", input="  secret  \rquietQpassword\n\n")
+    result = package.run("passwords", "-a", input="  secret  \rquietQpassword\n\n")
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "['  secret  ', 'quietQpassword']" in result.stdout
     # Main preserves text-source candidates; NUL validation belongs to builtin JSON.
-    nul = package.run("passwords", "--ask-pw", input="truncated\x00suffix\n\n")
+    nul = package.run("passwords", "-a", input="truncated\x00suffix\n\n")
     assert nul.returncode == 0, nul.stderr
     assert "truncated\\x00suffix" in nul.stdout
 
@@ -137,13 +138,13 @@ def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):
 
 
 def test_launcher_preserves_flag_like_operands_and_validates_pause_flags(package, tmp_path):
-    archive = tmp_path / "--pause"
+    archive = tmp_path / "-pa"
     flag_like = tmp_path / "--_sunpack-terminal-size=80x24"
-    json_name = tmp_path / "--json"
+    json_name = tmp_path / "-j"
     for source in (archive, flag_like, json_name):
         with zipfile.ZipFile(source, "w") as payload:
             payload.writestr("member.txt", "payload")
-    report = package.run("scan", "--json", "--", archive.name, flag_like.name, cwd=tmp_path)
+    report = package.run("scan", "-j", "--", archive.name, flag_like.name, cwd=tmp_path)
     assert report.returncode == 0, (report.stdout, report.stderr)
     assert json.loads(report.stdout)["summary"]["archive_count"] == 2
 
@@ -151,20 +152,20 @@ def test_launcher_preserves_flag_like_operands_and_validates_pause_flags(package
     assert human.returncode == 0, human.stderr
     assert str(json_name) in human.stdout and not human.stdout.startswith("{")
 
-    invalid_pause = package.run("version", "--pause")
-    assert invalid_pause.returncode == 2 and "unrecognized arguments: --no-pause" in invalid_pause.stderr
+    invalid_pause = package.run("version", "-pa")
+    assert invalid_pause.returncode == 2 and "unrecognized arguments: -npa" in invalid_pause.stderr
 
     rejected_prompt = subprocess.run(
-        [str(package.launcher), "scan", "--json", "--pause", "--ask-pw", "--", archive.name],
+        [str(package.launcher), "scan", "-j", "-pa", "-a", "--", archive.name],
         cwd=tmp_path, env=package.env, stdin=subprocess.DEVNULL,
         capture_output=True, text=True, encoding="utf-8", timeout=60,
     )
     assert rejected_prompt.returncode == 2, rejected_prompt.stderr
     assert json.loads(rejected_prompt.stdout)["inputs"]["argv"] == [
-        "scan", "--json", "--ask-pw", "--no-pause", "--", archive.name,
+        "scan", "-j", "-npa", "-a", "--", archive.name,
     ]
 
-    for flags in [("--pause", "--no-pause"), ("--no-pause", "--pause")]:
+    for flags in [("-pa", "-npa"), ("-npa", "-pa")]:
         result = package.run("scan", archive, *flags)
         assert result.returncode == 0, (result.stdout, result.stderr)
 
@@ -217,7 +218,7 @@ def test_cold_start_releases_startup_ownership_before_prompt_completion(package)
         except (FileNotFoundError, psutil.NoSuchProcess):
             pass
     prompt = subprocess.Popen(
-        [str(package.launcher), "passwords", "--ask-pw", "--no-bpw"],
+        [str(package.launcher), "passwords", "-a"],
         cwd=package.data, env=package.env, stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
@@ -272,8 +273,7 @@ def test_resident_cli_clears_reusable_archive_state_after_idle(package, tmp_path
 
     def extract(path, destination):
         output = tmp_path / destination
-        report = package.json("extract", "-c", "k", "--no-builtin-pw",
-                              "-p", "idle-test-key", "-o", output, path)
+        report = package.json("extract", "-c", "k", "-p", "idle-test-key", "-o", output, path)
         assert next(output.rglob(member.name)).read_bytes() == member.read_bytes()
         return report["items"][0]["recent_passwords"]
 
@@ -325,7 +325,7 @@ def test_launcher_restarts_while_previous_runtime_drains(package):
             time.sleep(0.01)
         assert owner.is_running()
         replacement = subprocess.Popen(
-            [str(package.launcher), "config", "show", "--json"], cwd=package.data,
+            [str(package.launcher), "config", "show", "-j"], cwd=package.data,
             env=package.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         with pytest.raises(subprocess.TimeoutExpired):
@@ -379,10 +379,13 @@ def test_text_extract_keeps_nested_archive_under_its_carrier_segment(package, tm
 
 
 def test_watch_action_help_lists_available_options(package):
-    help_text = package.run("watch", "add", "--help")
+    help_text = package.run("watch", "add", "-h")
     assert help_text.returncode == 0
-    assert all(option in help_text.stdout for option in ("paths", "--out-dir", "--deep-detect"))
+    assert all(option in help_text.stdout for option in ("paths", "-o", "-d"))
     assert "--start" not in help_text.stdout
+    rebuilt = package.json("w", "rlg")
+    assert rebuilt["inputs"] == {"action": "relog"}
+    assert rebuilt["summary"]["rebuilt"] is True
 
 
 @pytest.mark.requires_watch_broker
@@ -441,12 +444,12 @@ def test_continuous_watch_retries_retained_nested_input_after_password_edit(pack
     settings["post_extract"]["archive_cleanup_mode"] = "d"
     settings["recursive_extract"] = "*"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
-    package.json("watch", "add", watched, "-o", output, "--deep-detect")
-    started = package.json("daemon", "start", "--no-tray")["summary"]
+    package.json("watch", "add", watched, "-o", output, "-d")
+    started = package.json("daemon", "start", "-nt")["summary"]
     assert started["started"] and started["running"]
     # Main reports false when reload has no semantic configuration change.
     assert package.json("watch", "reload")["summary"]["reloaded"] is False
-    same_root = package.json("watch", "add", watched, "--deep-detect")["summary"]
+    same_root = package.json("watch", "add", watched, "-d")["summary"]
     assert same_root["apply"]["applied"] is False
     assert same_root["apply"]["generation"] == started["generation"]
 
@@ -488,7 +491,7 @@ def test_idle_watch_releases_reader_handles_after_foreground_scan(package, tmp_p
         with zipfile.ZipFile(inputs / f"archive-{number}.zip", "w") as archive:
             archive.writestr("payload.txt", str(number))
 
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
     runtime = package.launcher.parent.parent / "sunpack-runtime.exe"
     owner = next(
         process for process in psutil.process_iter(["exe"])
@@ -520,7 +523,7 @@ def test_gui_password_edits_are_visible_to_running_runtime(package):
 
 
 def test_main_cli_contracts_preserve_parent_flags_and_reject_abbreviations(package, tmp_path):
-    for args in [("watch", "--json", "status"), ("config", "-j", "show")]:
+    for args in [("watch", "-j", "status"), ("config", "-j", "show")]:
         result = package.run(*args)
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["command"] == args[0]
@@ -532,7 +535,7 @@ def test_main_cli_contracts_preserve_parent_flags_and_reject_abbreviations(packa
     abbreviated_help = package.run("--hel")
     assert abbreviated_help.returncode == 2
     assert "the following arguments are required: command" in abbreviated_help.stderr
-    empty = package.json("passwords", "--no-bpw", "--pw-file=", "-p", "explicit")
+    empty = package.json("passwords", "-P=", "-p", "explicit")
     assert empty["items"][0]["user_passwords"] == ["explicit"]
 
 

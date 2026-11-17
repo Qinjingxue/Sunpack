@@ -39,7 +39,7 @@ def test_daemon_stop_waits_for_retiring_owner_lock(package):
     with open(str(state) + ".lock", "r+b") as lock:
         lock.seek(1)
         msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        stopping = subprocess.Popen([str(package.launcher), "daemon", "stop", "--json"],
+        stopping = subprocess.Popen([str(package.launcher), "daemon", "stop", "-j"],
                                     cwd=package.data, env=package.env,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:

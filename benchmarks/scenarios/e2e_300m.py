@@ -26,11 +26,11 @@ def main(argv=None):
     parser.add_argument("--sample-ms", type=float, default=50)
     parser.add_argument("--formats", default=",".join(FORMATS_300M))
     parser.add_argument("--large-file-mib", type=int, default=150, help="Each of the two payload files (default 150 MiB; lower for smoke runs).")
-    parser.add_argument("--sample", action="append", default=[], metavar="FORMAT=PATH", help="Additional archive, e.g. zipx, lz4 or enc; provide sibling volumes and --password as needed.")
-    parser.add_argument("--password", action="append", default=[])
+    parser.add_argument("--sample", action="append", default=[], metavar="FORMAT=PATH", help="Additional archive, e.g. zipx, lz4 or enc; provide sibling volumes and -p as needed.")
+    parser.add_argument("-p", action="append", default=[])
     parser.add_argument("--shape", choices=("ordinary", "disguised", "carrier"), default="ordinary",
                         help="Use normal discovery for ordinary or renamed archives and force deep scans for carriers.")
-    parser.add_argument("--recursive", default="*")
+    parser.add_argument("-R", default="*")
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--rebuild-corpus", action="store_true")
     parser.add_argument("--results-root", type=Path)
@@ -91,7 +91,7 @@ def main(argv=None):
                 _configure_watch(app, args, inputs, workspace.outputs, live=True, deep=deep)
                 staging = workspace.work / "staging"
                 staging.mkdir()
-                app.run("daemon", "start", "--no-tray", require_broker=True)
+                app.run("daemon", "start", "-nt", require_broker=True)
             try:
                 for key, item in cases.items():
                     for run in range(args.runs):
@@ -102,7 +102,7 @@ def main(argv=None):
                             passwords = [part for password in args.password for part in ("-p", password)]
                             scan_flags = ("-d",) if deep else ()
                             result = app.run("extract", *scan_flags, "-r", args.recursive,
-                                             "-c", "k", "--no-flatten", "--no-pause", "-o", output, entry, *passwords)
+                                             "-c", "k", "-nf", "-npa", "-o", output, entry, *passwords)
                             if not result["response"]["summary"]["processed_count"]:
                                 raise RuntimeError(f"No archive processed for {key}")
                             output_info = output_summary(output)

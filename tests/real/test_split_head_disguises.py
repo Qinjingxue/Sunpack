@@ -62,7 +62,7 @@ def _head_file(source, directory, archive_format, disguise):
 
 
 def _scan_head(package, case, head):
-    result = package.run("scan", "-d", "--json", "--no-bpw", "--no-pause", "-p", PASSWORD, head)
+    result = package.run("scan", "-d", "-j", "-npa", "-p", PASSWORD, head)
     assert result.returncode in (0, 1), (result.stdout, result.stderr)
     items = json.loads(result.stdout)["items"]
     return {
@@ -75,8 +75,7 @@ def _scan_head(package, case, head):
 
 def _cli_extract(package, source, output):
     result = package.run(
-        "extract", "-d", "-r", "*", "-F", "-c", "d", "-o", output, "--json", "--no-pause", "--no-bpw",
-        "-p", PASSWORDS[0], "-p", PASSWORDS[1], source,
+        "extract", "-d", "-r", "*", "-nf", "-c", "d", "-o", output, "-j", "-npa", "-p", PASSWORDS[0], "-p", PASSWORDS[1], source,
     )
     assert result.returncode in (0, 1), (result.stdout, result.stderr)
     return json.loads(result.stdout)

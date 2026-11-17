@@ -187,7 +187,7 @@ def test_source_cleanup_preserves_a_concurrent_parent_arrival(package, tmp_path,
     # an unrelated child while that task is awaiting its password, then let
     # the same task finish cleanup. Parent emptiness cannot be cached early.
     command = [str(package.launcher), "extract", "-c", cleanup, "-o", str(tmp_path / "out"),
-               "--no-builtin-pw", "--no-pause", "-p", "wrong", str(source)]
+               "-npa", "-p", "wrong", str(source)]
     with ThreadPoolExecutor(max_workers=1) as executor, subprocess.Popen(
         command, cwd=package.data, env=package.env, encoding="utf-8",
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

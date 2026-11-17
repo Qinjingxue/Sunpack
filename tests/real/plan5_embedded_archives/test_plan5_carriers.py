@@ -16,7 +16,7 @@ from tests.real.plan5_embedded_archives.plan5_support import (
 
 
 def _scan(package, carrier, password=None):
-    arguments = ["scan", "--deep-detect", "--no-builtin-pw", "--no-pause"]
+    arguments = ["scan", "-d", "-npa"]
     if password is not None:
         arguments.extend(("-p", password))
     report = package.json(*arguments, carrier)

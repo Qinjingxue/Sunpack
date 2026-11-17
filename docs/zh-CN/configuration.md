@@ -39,9 +39,9 @@ sunpack.exe config show
 }
 ```
 
-CLI 的 `--recur`、`--cleanup` 和 `--out-dir` 等参数可为单次命令指定解压行为，详见 [CLI 参数说明](cli_parameters.md)。
+CLI 的 `-r`、`-c` 和 `-o` 等参数可为单次命令指定解压行为，详见 [CLI 参数说明](cli_parameters.md)。
 
-目录发现默认只扫描当前层。`scan`、`extract` 使用 `--recursive` 发现子目录，嵌套解压由 `--recur` 控制。从低于 1.4.0 的已安装版本升级会重置托管运行数据，并转换旧扫描过滤字段。迁移保留的数据见下文。
+目录发现默认只扫描当前层。`scan`、`extract` 使用 `-R` 发现子目录，嵌套解压由 `-r` 控制。从低于 1.4.0 的已安装版本升级会重置托管运行数据，并转换旧扫描过滤字段。迁移保留的数据见下文。
 
 ## 解压结果与部分成功
 
@@ -118,7 +118,7 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 分析只识别当前层格式。GZIP、BZIP2、XZ、Zstandard、LZ4 先解开外层流，产出的 TAR 再由正常递归流程识别和解压；不提前识别复合格式。原 `tar_*` 分析模块及全部 `max_probe_bytes` 配置已删除。普通 TAR 分析仅从偏移 0 开始，其他位置的 TAR 候选只来自统一的 embedded 扫描器。`watch.event_log_retention_days` 控制 CLI 与监控共用的任务历史和事件保留天数。
 
-使用 `sunpack.exe watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；留空时解压到各归档所在文件夹。`watch list` 可查看目录。加 `--recursive` 可递归监控子目录，每个监控根独立保存该标志。
+使用 `sunpack.exe watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；留空时解压到各归档所在文件夹。`watch list` 可查看目录。加 `-R` 可递归监控子目录，每个监控根独立保存该标志。
 
 ## 自动运行参数
 
@@ -136,7 +136,7 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 此类升级保留普通设置、Watch 根目录和非空内置密码。根目录路径、输出目录、`deep_detect`、`recursive` 和注释保留，`initial_scanned` 重置为 `false`。升级会删除其他托管数据，包括恢复任务、目录索引、任务和事件历史、缓存及失败报告。自定义 Watch 状态目录中仅删除已知的 SunPack 记录。1.4.0 及以上版本保留现有托管数据，并移除已废弃的校验设置。已安装版本只有提交哈希、时间戳或自定义标签，或缺少版本号时，安装器会保留现有托管数据并跳过按版本执行的迁移。
 
-持久化密码只来自 `builtin_passwords.json`，包括其中的 `clipboard_history`。在 `passwords` 中填写 `value`，可用 `scopes` 指定一个或多个绝对目录，对其子目录也生效；省略 `scopes` 即全局生效。运行时来源包括显式输入（`-p`、`--pw-file` 或密码提示框）与当前剪贴板。
+持久化密码只来自 `builtin_passwords.json`，包括其中的 `clipboard_history`。在 `passwords` 中填写 `value`，可用 `scopes` 指定一个或多个绝对目录，对其子目录也生效；省略 `scopes` 即全局生效。运行时来源包括显式输入（`-p`、`-P` 或密码提示框）与当前剪贴板。
 
 ```json
 {

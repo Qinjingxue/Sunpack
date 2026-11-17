@@ -146,7 +146,7 @@ def _wait_for(predicate, message):
 def _extract(package, diagnostic_dir, *archives, output=None):
     stderr = diagnostic_dir / "extract.stderr"
     stdout = diagnostic_dir / "extract.stdout"
-    arguments = ["extract", "-d", "-c", "k", "-r", "1", "--no-flatten", "--no-pause"]
+    arguments = ["extract", "-d", "-c", "k", "-r", "1", "-nf", "-npa"]
     if output is not None:
         arguments.extend(("-o", str(output)))
     with stdout.open("wb") as out, stderr.open("wb") as err:
@@ -225,14 +225,14 @@ def test_cli_output_does_not_require_usn(package, tmp_path, filesystem, watching
             watched = tmp_path / "unrelated"
             watched.mkdir()
             package.json("watch", "add", watched, "-R")
-            package.json("daemon", "start", "--no-tray")
+            package.json("daemon", "start", "-nt")
         # Both output creation and flatten's identity receipts used to query
         # USN. Exercise each through the launcher, with Watch off/unrelated.
         try:
             for flatten in (False, True):
                 output = root / str(flatten)
                 package.json("extract", source, "-o", output, "-r", "1", "-c", "k",
-                             "--flatten" if flatten else "--no-flatten", "--no-pause")
+                             "-f" if flatten else "-nf", "-npa")
                 assert [path.read_bytes() for path in output.rglob("payload.txt")] == [payload]
                 extracted = output / "plain"
                 assert (extracted / ("payload.txt" if flatten else "wrapper/payload.txt")).is_file()

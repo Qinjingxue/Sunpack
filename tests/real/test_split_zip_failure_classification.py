@@ -60,7 +60,7 @@ def test_real_pkzip_disks_classify_wrong_password_and_missing_volumes(
         output = root.with_name(phase + "-out")
         if origin == "foreground":
             if phase == "missing_middle-correct":
-                scan = package.json("scan", "-d", "--no-bpw", "-p", password, root, code=1)
+                scan = package.json("scan", "-d", "-p", password, root, code=1)
                 item, = scan["items"]
                 assert item["error_kind"] == "missing_volume"
                 assert {Path(part).name for part in item["all_parts"]} == {

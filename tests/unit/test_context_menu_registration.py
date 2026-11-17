@@ -111,50 +111,50 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         argv = _windows_argv(expanded)
         assert argv[1] == "extract"
         assert ntpath.normpath(argv[2]) == "D:\\"
-        assert ntpath.normpath(argv[argv.index("--out-dir") + 1]) == "D:\\"
-        assert "--deep-detect" not in argv
-        assert "--ask-pw" in argv
-        assert "--pause" in argv
-        assert "--recursive" not in argv
+        assert ntpath.normpath(argv[argv.index("-o") + 1]) == "D:\\"
+        assert "-d" not in argv
+        assert "-a" in argv
+        assert "-pa" in argv
+        assert "-R" not in argv
 
     for key in ("folder_direct", "background_direct"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
         argv = _windows_argv(expanded)
         assert argv[1] == "extract"
         assert "--reuse" not in argv
-        assert "--deep-detect" not in argv
-        assert "--ask-pw" not in argv
-        assert "--pause" in argv
-        assert "--recursive" not in argv
+        assert "-d" not in argv
+        assert "-a" not in argv
+        assert "-pa" in argv
+        assert "-R" not in argv
 
     for key in ("folder_recursive_extract", "background_recursive_extract"):
         argv = _windows_argv(commands[key].replace("%1", "D:\\").replace("%V", "D:\\"))
         assert argv[1] == "extract"
         assert ntpath.normpath(argv[2]) == "D:\\"
-        assert ntpath.normpath(argv[argv.index("--out-dir") + 1]) == "D:\\"
-        assert "--recursive" in argv
-        assert "--ask-pw" not in argv
-        assert "--pause" in argv
+        assert ntpath.normpath(argv[argv.index("-o") + 1]) == "D:\\"
+        assert "-R" in argv
+        assert "-a" not in argv
+        assert "-pa" in argv
 
     for key in ("file_prompt",):
         expanded = commands[key].replace("%1", r"D:\archive.bin")
         argv = _windows_argv(expanded)
         assert argv[1] == "extract"
         assert ntpath.normpath(argv[2]) == r"D:\archive.bin"
-        assert "--out-dir" not in argv
-        assert "--deep-detect" in argv
-        assert "--ask-pw" in argv
-        assert "--pause" in argv
+        assert "-o" not in argv
+        assert "-d" in argv
+        assert "-a" in argv
+        assert "-pa" in argv
 
     for key in ("file_direct",):
         expanded = commands[key].replace("%1", r"D:\archive.bin")
         argv = _windows_argv(expanded)
         assert argv[1] == "extract"
         assert ntpath.normpath(argv[2]) == r"D:\archive.bin"
-        assert "--out-dir" not in argv
-        assert "--deep-detect" in argv
-        assert "--ask-pw" not in argv
-        assert "--pause" in argv
+        assert "-o" not in argv
+        assert "-d" in argv
+        assert "-a" not in argv
+        assert "-pa" in argv
 
     for surface in ("folder", "background"):
         assert {key for key in commands if key.startswith(surface + "_")} == {
@@ -169,10 +169,10 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert "powershell" not in commands[key].lower()
         assert argv[argv.index("--shell-watch") + 1] == "add"
         assert ntpath.normpath(argv[argv.index("--shell-watch") + 2]) == "D:\\"
-        assert ("--recursive" in argv) == ("recursive_watch" in key)
+        assert ("-R" in argv) == ("recursive_watch" in key)
         assert "-ScriptPath" not in argv
-        assert "--pause" not in argv
-        assert "--deep-detect" not in argv
+        assert "-pa" not in argv
+        assert "-d" not in argv
 
     for key in ("folder_unwatch", "background_unwatch"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
@@ -180,7 +180,7 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert ntpath.basename(argv[0]).lower() == "cmd.exe"  # Explicit GUI fixture path
         assert argv[argv.index("--shell-watch") + 1] == "remove"
         assert ntpath.normpath(argv[argv.index("--shell-watch") + 2]) == "D:\\"
-        assert "--recursive" not in argv
+        assert "-R" not in argv
 
 
 def test_context_menu_registration_survives_rebuild_and_uninstalls(tmp_path):
@@ -271,26 +271,26 @@ try {
         offset = 1
         assert argv[offset] == "extract"
         assert ntpath.normpath(argv[offset + 1]) == "D:\\"
-        assert ntpath.normpath(argv[argv.index("--out-dir") + 1]) == "D:\\"
-        assert "--recursive" in argv
+        assert ntpath.normpath(argv[argv.index("-o") + 1]) == "D:\\"
+        assert "-R" in argv
         watch = entries["WatchFolderRecursive"]["command"]
         watch_argv = _windows_argv(watch)
         assert watch_argv[watch_argv.index("--shell-watch") + 1] == "add"
         assert watch_argv[watch_argv.index("--shell-watch") + 2] == token + r"\."
-        assert "--recursive" in watch_argv
+        assert "-R" in watch_argv
         assert "powershell" not in watch.lower()
-        assert "--recursive" not in entries["DirectExtract"]["command"]
-        assert "--recursive" not in entries["WatchFolder"]["command"]
+        assert "-R" not in entries["DirectExtract"]["command"]
+        assert "-R" not in entries["WatchFolder"]["command"]
     assert {entry["name"] for entry in result["snapshots"][0]["File"]} == {"DirectExtract", "PromptPassword"}
 
 
 def test_context_menu_directory_token_is_stable_for_normal_paths():
-    command = 'sunpack.exe extract "%V\\." --out-dir "%V\\." --ask-pw --pause'
+    command = 'sunpack.exe extract "%V\\." -o "%V\\." -a -pa'
     argv = _windows_argv(command.replace("%V", r"D:\Archives"))
 
     assert ntpath.normpath(argv[2]) == r"D:\Archives"
     assert ntpath.normpath(argv[4]) == r"D:\Archives"
-    assert argv[5:] == ["--ask-pw", "--pause"]
+    assert argv[5:] == ["-a", "-pa"]
 
 
 

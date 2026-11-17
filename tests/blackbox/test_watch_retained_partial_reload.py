@@ -96,8 +96,8 @@ def test_policy_reload_accepts_retained_missing_volume_members(package, tmp_path
     package.configure(extraction={"content_requirement": "complete"},
                       recursive_authorization={"enabled": False},
                       post_extract={"flatten_single_directory": False})
-    package.json("watch", "add", watched, "--deep-detect", "-o", output)
-    package.json("daemon", "start", "--no-tray")
+    package.json("watch", "add", watched, "-d", "-o", output)
+    package.json("daemon", "start", "-nt")
     events = package.data / ".sunpack_watch" / "events.json"
 
     owner = _wait_display(events, lambda display: _retained_blocker(display, head))
@@ -133,8 +133,8 @@ def test_changed_middle_volume_reuses_only_its_retained_segment_slot(package, tm
     package.configure(recursive_extract=1,
                       extraction={"content_requirement": "complete"},
                       post_extract={"archive_cleanup_mode": "k", "flatten_single_directory": False})
-    package.json("watch", "add", watched, "--deep-detect", "-o", output)
-    package.json("daemon", "start", "--no-tray")
+    package.json("watch", "add", watched, "-d", "-o", output)
+    package.json("daemon", "start", "-nt")
     events = package.data / ".sunpack_watch" / "events.json"
     owner = _wait_display(events, lambda display: _retained_blocker(display, head))
     retained, = output.rglob("a.zip")

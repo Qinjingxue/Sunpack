@@ -55,7 +55,7 @@ pub fn main() -> i32 {
         Some("watch" | "w" | "daemon" | "d" | "--watch-status-follow")
             if !args
                 .iter()
-                .any(|arg| matches!(arg.as_str(), "-h" | "--help")) =>
+                .any(|arg| arg == "-h") =>
         {
             windows::launch_watch_request(&cwd, &args)
         }

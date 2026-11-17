@@ -216,7 +216,6 @@ struct Options {
     password_file: Option<String>,
     passwords: Vec<Arc<str>>,
     prompt_passwords: bool,
-    no_builtins: bool,
     no_tray: bool,
     rule_stdin: bool,
 }
@@ -232,11 +231,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ("version", "ver"),
 ];
 
-// One declaration drives aliases, arity, parser scope, diagnostics and help.
+// One declaration drives option names, arity, parser scope and help.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OptionId {
     Help, Json, Verbose, NoPause, Pause, Recursive, Deep, Password, PasswordFile,
-    AskPassword, NoBuiltins, Recur, Cleanup, Output, Flatten, NoFlatten,
+    AskPassword, Recur, Cleanup, Output, Flatten, NoFlatten,
     NoTray, RuleStdin,
 }
 
@@ -266,7 +265,7 @@ impl OptionScope {
 
 struct OptionSpec {
     id: OptionId,
-    names: &'static str,
+    name: &'static str,
     metavar: &'static str,
     scope: OptionScope,
     help: &'static str,
@@ -276,39 +275,39 @@ struct OptionSpec {
 
 impl OptionSpec {
     fn takes_value(&self) -> bool { !self.metavar.is_empty() }
-    fn matches(&self, flag: &str) -> bool { self.names.split('/').any(|name| name == flag) }
 }
 
 const OPTION_SPECS: &[OptionSpec] = &[
-    OptionSpec { id: OptionId::Help, names: "-h/--help", metavar: "", scope: OptionScope::Any, help: "cli.help", watch_help: "cli.help", watch_order: 0 },
-    OptionSpec { id: OptionId::Json, names: "-j/--json", metavar: "", scope: OptionScope::Json, help: "cli.json", watch_help: "cli.json", watch_order: 1 },
-    OptionSpec { id: OptionId::Verbose, names: "-v/--verbose", metavar: "", scope: OptionScope::Common, help: "cli.verbose", watch_help: "cli.verbose", watch_order: 2 },
-    OptionSpec { id: OptionId::NoPause, names: "--no-pause", metavar: "", scope: OptionScope::Common, help: "cli.no_pause", watch_help: "cli.no_pause", watch_order: 3 },
-    OptionSpec { id: OptionId::Pause, names: "--pause", metavar: "", scope: OptionScope::Common, help: "cli.pause", watch_help: "cli.pause", watch_order: 4 },
-    OptionSpec { id: OptionId::Recursive, names: "-R/--recursive", metavar: "", scope: OptionScope::ArchiveOrAdd, help: "cli.recursive_scan", watch_help: "cli.recursive_scan", watch_order: 8 },
-    OptionSpec { id: OptionId::Deep, names: "-d/--deep-detect", metavar: "", scope: OptionScope::ArchiveOrAdd, help: "cli.deep_detect", watch_help: "cli.watch.deep_detect", watch_order: 9 },
-    OptionSpec { id: OptionId::Password, names: "-p/--password", metavar: "PASSWORD", scope: OptionScope::Passwords, help: "cli.password", watch_help: "cli.password", watch_order: 7 },
-    OptionSpec { id: OptionId::PasswordFile, names: "-P/--pw-file", metavar: "PASSWORD_FILE", scope: OptionScope::Passwords, help: "cli.password_file", watch_help: "cli.password_file", watch_order: 8 },
-    OptionSpec { id: OptionId::AskPassword, names: "-a/--ask-pw", metavar: "", scope: OptionScope::Passwords, help: "cli.prompt_passwords", watch_help: "cli.prompt_passwords", watch_order: 9 },
-    OptionSpec { id: OptionId::NoBuiltins, names: "--no-builtin-pw/--no-bpw", metavar: "", scope: OptionScope::Passwords, help: "cli.no_builtin_passwords", watch_help: "cli.no_builtin_passwords", watch_order: 10 },
-    OptionSpec { id: OptionId::Recur, names: "-r/--recur", metavar: "RECURSIVE_EXTRACT", scope: OptionScope::Extract, help: "cli.recursive_extract", watch_help: "cli.recursive_extract", watch_order: 11 },
-    OptionSpec { id: OptionId::Cleanup, names: "-c/--cleanup", metavar: "ARCHIVE_CLEANUP_MODE", scope: OptionScope::Extract, help: "cli.archive_cleanup_mode", watch_help: "cli.archive_cleanup_mode", watch_order: 12 },
-    OptionSpec { id: OptionId::Output, names: "-o/--out-dir", metavar: "OUTPUT_DIR", scope: OptionScope::ExtractOrAdd, help: "cli.output_dir", watch_help: "cli.watch.output_dir", watch_order: 6 },
-    OptionSpec { id: OptionId::Flatten, names: "-f/--flatten", metavar: "", scope: OptionScope::Extract, help: "cli.flatten", watch_help: "cli.flatten", watch_order: 14 },
-    OptionSpec { id: OptionId::NoFlatten, names: "-F/--no-flatten", metavar: "", scope: OptionScope::Extract, help: "cli.no_flatten", watch_help: "cli.no_flatten", watch_order: 15 },
-    OptionSpec { id: OptionId::NoTray, names: "--no-tray", metavar: "", scope: OptionScope::DaemonStart, help: "cli.daemon.no_tray", watch_help: "cli.daemon.no_tray", watch_order: 18 },
-    OptionSpec { id: OptionId::RuleStdin, names: "--scan-rule-stdin", metavar: "", scope: OptionScope::Validate, help: "", watch_help: "", watch_order: 20 },
+    OptionSpec { id: OptionId::Help, name: "-h", metavar: "", scope: OptionScope::Any, help: "cli.help", watch_help: "cli.help", watch_order: 0 },
+    OptionSpec { id: OptionId::Json, name: "-j", metavar: "", scope: OptionScope::Json, help: "cli.json", watch_help: "cli.json", watch_order: 1 },
+    OptionSpec { id: OptionId::Verbose, name: "-v", metavar: "", scope: OptionScope::Common, help: "cli.verbose", watch_help: "cli.verbose", watch_order: 2 },
+    OptionSpec { id: OptionId::NoPause, name: "-npa", metavar: "", scope: OptionScope::Common, help: "cli.no_pause", watch_help: "cli.no_pause", watch_order: 3 },
+    OptionSpec { id: OptionId::Pause, name: "-pa", metavar: "", scope: OptionScope::Common, help: "cli.pause", watch_help: "cli.pause", watch_order: 4 },
+    OptionSpec { id: OptionId::Recursive, name: "-R", metavar: "", scope: OptionScope::ArchiveOrAdd, help: "cli.recursive_scan", watch_help: "cli.recursive_scan", watch_order: 8 },
+    OptionSpec { id: OptionId::Deep, name: "-d", metavar: "", scope: OptionScope::ArchiveOrAdd, help: "cli.deep_detect", watch_help: "cli.watch.deep_detect", watch_order: 9 },
+    OptionSpec { id: OptionId::Password, name: "-p", metavar: "PASSWORD", scope: OptionScope::Passwords, help: "cli.password", watch_help: "cli.password", watch_order: 7 },
+    OptionSpec { id: OptionId::PasswordFile, name: "-P", metavar: "PASSWORD_FILE", scope: OptionScope::Passwords, help: "cli.password_file", watch_help: "cli.password_file", watch_order: 8 },
+    OptionSpec { id: OptionId::AskPassword, name: "-a", metavar: "", scope: OptionScope::Passwords, help: "cli.prompt_passwords", watch_help: "cli.prompt_passwords", watch_order: 9 },
+    OptionSpec { id: OptionId::Recur, name: "-r", metavar: "RECURSIVE_EXTRACT", scope: OptionScope::Extract, help: "cli.recursive_extract", watch_help: "cli.recursive_extract", watch_order: 11 },
+    OptionSpec { id: OptionId::Cleanup, name: "-c", metavar: "ARCHIVE_CLEANUP_MODE", scope: OptionScope::Extract, help: "cli.archive_cleanup_mode", watch_help: "cli.archive_cleanup_mode", watch_order: 12 },
+    OptionSpec { id: OptionId::Output, name: "-o", metavar: "OUTPUT_DIR", scope: OptionScope::ExtractOrAdd, help: "cli.output_dir", watch_help: "cli.watch.output_dir", watch_order: 6 },
+    OptionSpec { id: OptionId::Flatten, name: "-f", metavar: "", scope: OptionScope::Extract, help: "cli.flatten", watch_help: "cli.flatten", watch_order: 14 },
+    OptionSpec { id: OptionId::NoFlatten, name: "-nf", metavar: "", scope: OptionScope::Extract, help: "cli.no_flatten", watch_help: "cli.no_flatten", watch_order: 15 },
+    OptionSpec { id: OptionId::NoTray, name: "-nt", metavar: "", scope: OptionScope::DaemonStart, help: "cli.daemon.no_tray", watch_help: "cli.daemon.no_tray", watch_order: 18 },
+    OptionSpec { id: OptionId::RuleStdin, name: "-srs", metavar: "", scope: OptionScope::Validate, help: "", watch_help: "", watch_order: 20 },
 ];
 
 fn option_spec(flag: &str) -> Option<&'static OptionSpec> {
-    OPTION_SPECS.iter().find(|spec| spec.matches(flag))
+    OPTION_SPECS.iter().find(|spec| spec.name == flag)
 }
 
 fn short_option(letter: u8) -> Option<&'static OptionSpec> {
-    OPTION_SPECS.iter().find(|spec| spec.names.split('/').any(|name| {
-        let bytes = name.as_bytes();
+    // Passwords require standalone -p followed by a separate literal value.
+    OPTION_SPECS.iter().find(|spec| {
+        let bytes = spec.name.as_bytes();
         bytes.len() == 2 && bytes[0] == b'-' && bytes[1] == letter
-    }))
+            && spec.id != OptionId::Password
+    })
 }
 
 impl Options {
@@ -329,7 +328,7 @@ impl Options {
                 return Ok(Self { help: true, ..Self::default() });
             }
             let (flag, inline) = arg.split_once('=').map_or((arg.as_ref(), None), |(f, v)| (f, Some(v)));
-            if flag == "-h" || flag == "--help" {
+            if flag == "-h" {
                 if let Some(value) = inline { return Err(explicit_argument("", "", flag, value)); }
                 return Ok(Self { help: true, ..Self::default() });
             }
@@ -380,17 +379,21 @@ impl Options {
                     options.no_pause = false;
                     positional = false;
                     let action = match (command, arg.as_ref()) {
+                        ("watch", "ea") => "enable".into(),
+                        ("watch", "da") => "disable".into(),
+                        ("watch", "rl") => "reload".into(),
+                        ("watch", "rlg") => "relog".into(),
                         ("watch", "rm") => "remove".into(),
                         ("watch", "ls") => "list".into(),
                         ("watch", "st") => "status".into(),
                         _ => arg.into_owned(),
                     };
                     if !matches!((command, action.as_str()),
-                        ("watch", "add" | "remove" | "enable" | "disable" | "status" | "reload" | "list" | "rebuild-log")
+                        ("watch", "add" | "remove" | "enable" | "disable" | "status" | "reload" | "list" | "relog")
                         | ("daemon", "start" | "stop" | "startup")
                         | ("config", "show" | "validate"))
                     {
-                        return Err(invalid_choice(command, "", &format!("{command}_action"), &action, match command { "watch" => "enable, disable, add, remove, rm, list, ls, reload, rebuild-log, status, st", "daemon" => "start, stop, startup", _ => "show, validate" }));
+                        return Err(invalid_choice(command, "", &format!("{command}_action"), &action, match command { "watch" => "enable, ea, disable, da, add, remove, rm, list, ls, reload, rl, relog, rlg, status, st", "daemon" => "start, stop, startup", _ => "show, validate" }));
                     }
                     options.action = action;
                 } else {
@@ -422,9 +425,9 @@ impl Options {
             validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), command, &options.action)?;
             if !from_cluster && matches!(command, "watch" | "daemon" | "config") && options.action.is_empty() {
                 match arg.as_ref() {
-                    "-j" | "--json" => parent_flags.0 = true,
-                    "-v" | "--verbose" => parent_flags.1 = true,
-                    "--pause" => parent_flags.2 = true,
+                    "-j" => parent_flags.0 = true,
+                    "-v" => parent_flags.1 = true,
+                    "-pa" => parent_flags.2 = true,
                     _ => {}
                 }
             }
@@ -449,14 +452,14 @@ impl Options {
                     .map(str::to_owned)
                     .or_else(|| {
                         args.pop_front()
-                            .filter(|value| !looks_like_option(value))
+                            .filter(|value| flag == "-p" || !looks_like_option(value))
                             .map(Cow::into_owned)
                     })
                     .ok_or_else(|| argument_error(command, &options.action, flag, "expected one argument"))
             };
             let selected = option_spec(flag).filter(|spec| spec.scope.accepts(command, &options.action));
             if let (Some(spec), Some(value)) = (selected, inline) {
-                if !spec.takes_value() {
+                if !spec.takes_value() || spec.id == OptionId::Password {
                     return Err(explicit_argument(command, &options.action, flag, value));
                 }
             }
@@ -468,21 +471,21 @@ impl Options {
                 Some(OptionId::Json) => options.json = true,
                 Some(OptionId::Verbose) => options.verbose = true,
                 Some(OptionId::Pause) => {
-                    if options.no_pause { return Err(argument_error(command, &options.action, "--pause", "not allowed with argument --no-pause")); }
+                    if options.no_pause { return Err(argument_error(command, &options.action, "-pa", "not allowed with argument -npa")); }
                     options.pause = true;
                 }
                 Some(OptionId::NoPause) => {
-                    if options.pause { return Err(argument_error(command, &options.action, "--no-pause", "not allowed with argument --pause")); }
+                    if options.pause { return Err(argument_error(command, &options.action, "-npa", "not allowed with argument -pa")); }
                     options.no_pause = true;
                 }
                 Some(OptionId::Recursive) => options.recursive = true,
                 Some(OptionId::Deep) => options.deep = true,
                 Some(OptionId::Flatten) => {
-                    if options.flatten == Some(false) { return Err(argument_error(command, &options.action, "-f", "not allowed with argument -F/--no-flatten")); }
+                    if options.flatten == Some(false) { return Err(argument_error(command, &options.action, "-f", "not allowed with argument -nf")); }
                     options.flatten = Some(true)
                 }
                 Some(OptionId::NoFlatten) => {
-                    if options.flatten == Some(true) { return Err(argument_error(command, &options.action, "-F", "not allowed with argument -f/--flatten")); }
+                    if options.flatten == Some(true) { return Err(argument_error(command, &options.action, "-nf", "not allowed with argument -f")); }
                     options.flatten = Some(false)
                 }
                 Some(OptionId::Recur) => {
@@ -512,7 +515,6 @@ impl Options {
                     continue;
                 }
                 Some(OptionId::AskPassword) => options.prompt_passwords = true,
-                Some(OptionId::NoBuiltins) => options.no_builtins = true,
                 Some(OptionId::NoTray) => options.no_tray = true,
                 Some(OptionId::RuleStdin) => {
                     options.rule_stdin = true
@@ -526,7 +528,7 @@ impl Options {
         let wants_paths = match (command, options.action.as_str()) {
             ("extract" | "scan", "") => true,
             ("watch", "add" | "remove") | ("daemon", "startup") => true,
-            ("watch", "enable" | "disable" | "status" | "reload" | "list" | "rebuild-log" | "")
+            ("watch", "enable" | "disable" | "status" | "reload" | "list" | "relog" | "")
             | ("daemon", "start" | "stop" | "")
             | ("config", "show" | "validate" | "")
             | ("passwords" | "doctor" | "version", "") => false,
@@ -618,12 +620,8 @@ fn parser_error(command: &str, action: &str, message: impl std::fmt::Display) ->
     invalid(format!("{program}: error: {message}"))
 }
 
-fn argument_name(flag: &str) -> &str {
-    option_spec(flag).map_or(flag, |spec| spec.names)
-}
-
 fn argument_error(command: &str, action: &str, flag: &str, message: &str) -> io::Error {
-    parser_error(command, action, format!("argument {}: {message}", argument_name(flag)))
+    parser_error(command, action, format!("argument {flag}: {message}"))
 }
 
 fn explicit_argument(command: &str, action: &str, flag: &str, value: &str) -> io::Error {
@@ -656,7 +654,7 @@ fn help(options: &Options, language: Language, session: &dyn Session) -> io::Res
         specs.sort_by_key(|spec| spec.watch_order);
     }
     let optional: Vec<_> = specs.into_iter().map(|spec| {
-        let label = if spec.takes_value() { format!("{} {}", spec.names, spec.metavar) } else { spec.names.to_owned() };
+        let label = if spec.takes_value() { format!("{} {}", spec.name, spec.metavar) } else { spec.name.to_owned() };
         let key = if options.command == "watch" { spec.watch_help } else { spec.help };
         (label, key.to_owned())
     }).collect();
@@ -670,8 +668,8 @@ fn help(options: &Options, language: Language, session: &dyn Session) -> io::Res
         "watch" => match options.action.as_str() {
             "" => {
                 for (action, label) in [
-                    ("enable", "enable"), ("disable", "disable"), ("add", "add"), ("remove", "remove (rm)"),
-                    ("list", "list (ls)"), ("reload", "reload"), ("rebuild-log", "rebuild-log"),
+                    ("enable", "enable (ea)"), ("disable", "disable (da)"), ("add", "add"), ("remove", "remove (rm)"),
+                    ("list", "list (ls)"), ("reload", "reload (rl)"), ("relog", "relog (rlg)"),
                     ("status", "status (st)"),
                 ] {
                     positional.push((label.into(), format!("cli.watch.{}", action.replace('-', "_"))));
@@ -1602,11 +1600,7 @@ async fn archives(
         }
     };
     crate::pipeline::stage("password_reload", cancel).await?;
-    let builtin = if options.no_builtins {
-        None
-    } else {
-        Some(host.password_snapshot(cwd)?)
-    };
+    let builtin = host.password_snapshot(cwd)?;
     let clipboard = cli_clipboard(&settings);
     if cancel.cancelled() {
         return interrupted(options, session, language, Some(&inputs), Vec::new());
@@ -1679,7 +1673,7 @@ async fn archives(
         request.recursive = options.recursive;
         request.deep = options.deep;
         request.passwords = user.iter().chain(&clipboard).cloned().collect();
-        request.password_snapshot = builtin.clone();
+        request.password_snapshot = Some(Arc::clone(&builtin));
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
         request.generated_sources = std::mem::take(&mut generated_sources);
@@ -1771,7 +1765,7 @@ async fn archives(
                 "success_count": counts.success, "failed_count": failed, "scan_error_count": scan_errors,
                 "scan_failures": filesystem_errors.map(|error| failures::Report::filesystem_scan(error, language)).collect::<Vec<_>>(),
                 "input_error_count": input_errors, "processed_count": counts.processed,
-                "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
+                "partial_success_count": counts.partial, "recovered_outputs": counts.recovered,
                 "password_retry_count": 0, "cleanup_results": cleanup.values,
             });
             result.password_sources = Some(Box::new(PasswordSources::new(
@@ -2295,7 +2289,6 @@ struct PasswordItem<'a> {
     recent_passwords: &'a [Arc<str>],
     clipboard_passwords: &'a [Arc<str>],
     builtin_passwords: &'a [Arc<str>],
-    use_builtin_passwords: bool,
     combined_passwords: &'a [Arc<str>],
 }
 
@@ -2303,16 +2296,16 @@ struct PasswordSources {
     user: Vec<Arc<str>>,
     clipboard: Vec<Arc<str>>,
     recent: Vec<Arc<str>>,
-    builtin: Option<Arc<passwords::PasswordSnapshot>>,
+    builtin: Arc<passwords::PasswordSnapshot>,
     combined: Vec<Arc<str>>,
 }
 
 impl PasswordSources {
     fn new(
         user: Vec<Arc<str>>, clipboard: Vec<Arc<str>>, recent: Vec<Arc<str>>,
-        builtin: Option<Arc<passwords::PasswordSnapshot>>,
+        builtin: Arc<passwords::PasswordSnapshot>,
     ) -> Self {
-        let global = builtin.as_deref().map_or(&[][..], passwords::PasswordSnapshot::global);
+        let global = builtin.global();
         let configured = user.iter().chain(&clipboard).chain(global);
         let mut missing_recent: HashSet<&str> = recent.iter().map(Arc::as_ref).collect();
         if !missing_recent.is_empty() {
@@ -2336,8 +2329,7 @@ impl PasswordSources {
             user_passwords: &self.user,
             recent_passwords: &self.recent,
             clipboard_passwords: &self.clipboard,
-            builtin_passwords: self.builtin.as_deref().map_or(&[][..], passwords::PasswordSnapshot::global),
-            use_builtin_passwords: self.builtin.is_some(),
+            builtin_passwords: self.builtin.global(),
             combined_passwords: &self.combined,
         }
     }
@@ -2410,16 +2402,12 @@ async fn show_passwords(
     let user = cli_passwords(cwd, options, session, language).await?;
     crate::pipeline::stage("password_reload", &Cancellation::new()).await?;
     let clipboard = cli_clipboard(&settings);
-    let snapshot = if options.no_builtins {
-        None
-    } else {
-        Some(host.password_snapshot(cwd)?)
-    };
+    let snapshot = host.password_snapshot(cwd)?;
     let sources = PasswordSources::new(user, clipboard, Vec::new(), snapshot);
     let item = sources.item();
     let mut result = CommandResult::new("passwords");
     if options.json {
-        result.inputs = json!({"json":true,"use_builtin_passwords":!options.no_builtins});
+        result.inputs = json!({"json":true});
         result.summary = json!({
             "user_password_count": item.user_passwords.len(), "recent_password_count": 0,
             "clipboard_password_count": item.clipboard_passwords.len(), "builtin_password_count": item.builtin_passwords.len(),
@@ -2706,13 +2694,13 @@ async fn watch_command(
                 status
             };
         }
-        "rebuild-log" => {
+        "relog" => {
             let rebuilt = host.watch.rebuild_log_async(cwd).await?;
             result.summary = json!({"rebuilt": rebuilt});
             let key = if rebuilt {
-                "cli.watch.rebuild_log_done"
+                "cli.watch.relog_done"
             } else {
-                "cli.watch.rebuild_log_failed"
+                "cli.watch.relog_failed"
             };
             let message = language.text(key).to_owned();
             if rebuilt {

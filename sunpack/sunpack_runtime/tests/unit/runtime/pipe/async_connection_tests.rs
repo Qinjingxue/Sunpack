@@ -63,7 +63,7 @@ fn connect(server: &Arc<Server>) -> (File, crate::pipeline::RequestHandle<io::Re
     (client, server.submit(peer))
 }
 fn help_request(server: &Server) -> Vec<u8> {
-    command_request(server, 0, &["--help"])
+    command_request(server, 0, &["-h"])
 }
 fn command_request(server: &Server, flags: u32, args: &[&str]) -> Vec<u8> {
     let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
@@ -122,11 +122,11 @@ fn internal_toast_request_waits_for_the_next_pipe_instance() {
 fn launcher_sessions_never_pause_inside_runtime() {
     let server = server();
     let cases: &[(&[&str], u32, i32)] = &[
-        (&["watch", "list", "--pause"], 4, 0),
-        (&["watch", "list", "--pause"], 0, 0),
-        (&["watch", "list", "--pause", "--json"], 4, 0),
-        (&["watch", "list", "--pause", "--help"], 4, 0),
-        (&["version", "--pause"], 4, 2),
+        (&["watch", "list", "-pa"], 4, 0),
+        (&["watch", "list", "-pa"], 0, 0),
+        (&["watch", "list", "-pa", "-j"], 4, 0),
+        (&["watch", "list", "-pa", "-h"], 4, 0),
+        (&["version", "-pa"], 4, 2),
     ];
     for &(args, flags, expected) in cases {
         let (mut client, request) = connect(&server);

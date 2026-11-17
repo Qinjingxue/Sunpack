@@ -35,8 +35,7 @@ def test_password_retry_reuses_partially_recovered_carrier_segment(package, tmp_
     output = tmp_path / "output"
 
     result = package.run(
-        "extract", "-d", "-r", "1", "-c", "d", "-o", output, "--no-builtin-pw",
-        "--no-pause", "-p", "wrong-key", source, input="y\nknown-key\n\n",
+        "extract", "-d", "-r", "1", "-c", "d", "-o", output, "-npa", "-p", "wrong-key", source, input="y\nknown-key\n\n",
     )
 
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -88,7 +87,7 @@ def test_explicit_outer_archive_keeps_nested_failure_in_its_output(package, tmp_
         filesystem={"scan_filters": [{"name": "size_range", "enabled": False}]},
     )
 
-    report = package.json("extract", "-R", "-r", "*", "--no-builtin-pw", root, outer, code=1)
+    report = package.json("extract", "-R", "-r", "*", root, outer, code=1)
 
     retained, = (path for path in (outer.parent / outer.stem).rglob(inner.name) if path.is_file())
     assert retained.read_bytes() == inner.read_bytes()
@@ -145,7 +144,7 @@ def test_damaged_zipcrypto_remembers_password_proved_by_earlier_member(package, 
     _damage_stored_member(source, "second.txt", encryption_header=12)
 
     report = package.json(
-        "extract", "-d", "--no-builtin-pw", "-p", "proof-key",
+        "extract", "-d", "-p", "proof-key",
         "-o", tmp_path / "output", source, code=1,
     )
 
@@ -176,7 +175,7 @@ def test_worker_rejection_with_no_password_candidates_keeps_wrong_password_kind(
         cwd=tmp_path, check=True, capture_output=True,
     )
 
-    report = package.json("extract", "--no-bpw", "-r", "1", archive, code=1)
+    report = package.json("extract", "-r", "1", archive, code=1)
 
     failure, = report["tasks"][0]["failures"]
     assert (failure["kind"], failure["stage"]) == ("wrong_password", "extraction")
@@ -198,8 +197,7 @@ def test_failed_first_segment_keeps_its_output_name_for_password_retry(package, 
     source.write_bytes(b"prefix" + locked.read_bytes() + b"between" + plain.read_bytes())
     output = tmp_path / "out"
     result = package.run(
-        "extract", "-d", "-r", "1", "-c", "k", "-o", output, "--no-builtin-pw",
-        "--no-pause", "-p", "wrong-key", source, input="y\nknown-key\n\n",
+        "extract", "-d", "-r", "1", "-c", "k", "-o", output, "-npa", "-p", "wrong-key", source, input="y\nknown-key\n\n",
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     secret, = output.rglob("secret.txt")
@@ -217,7 +215,7 @@ def test_unreplaced_missing_volume_preflight_has_no_extraction_receipt(package, 
         archive.writestr("payload.txt", b"payload")
     source.write_bytes(source.read_bytes()[:-12])
 
-    report = package.json("extract", "-r", "1", "--no-bpw", source, code=1)
+    report = package.json("extract", "-r", "1", source, code=1)
 
     failure, = report["tasks"][0]["failures"]
     assert (failure["kind"], failure["stage"]) == ("missing_volume", "relations")

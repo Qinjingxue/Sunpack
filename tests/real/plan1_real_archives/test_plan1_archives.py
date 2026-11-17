@@ -213,7 +213,7 @@ def test_gzip_extracts_past_long_optional_header_fields(package, tmp_path, name_
 def test_7z_lz4_interoperability(package, tmp_path, options):
     require_generator("7z", seven_zip_lz4=True)
     case = create_7z_lz4_case(tmp_path, "interop", **options)
-    password_args = ["-psecret"] if case.password else []
+    password_args = ["-p", "secret"] if case.password else []
     run_cmd([str(require_7z_zstd()), "t", "-y", *password_args, str(case.entry_path)], case.archive_dir)
     assert_archive_round_trip(package, case, tmp_path / "out", passwords=("wrong", "secret"))
 

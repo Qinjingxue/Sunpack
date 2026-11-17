@@ -102,9 +102,9 @@ function New-CommandString {
         [switch]$Recursive
     )
 
-    $extractArgs = if ($PromptPasswords) { " --ask-pw" } else { "" }
-    if ($Recursive) { $extractArgs += " --recursive" }
-    return ('"{0}" extract "{1}" --out-dir "{2}"{3} --pause' -f $Launcher.AppPath, $TargetToken, $OutDirToken, $extractArgs)
+    $extractArgs = if ($PromptPasswords) { " -a" } else { "" }
+    if ($Recursive) { $extractArgs += " -R" }
+    return ('"{0}" extract "{1}" -o "{2}"{3} -pa' -f $Launcher.AppPath, $TargetToken, $OutDirToken, $extractArgs)
 }
 
 function New-FileCommandString {
@@ -114,8 +114,8 @@ function New-FileCommandString {
         [bool]$PromptPasswords
     )
 
-    $passwordArg = if ($PromptPasswords) { " --ask-pw --deep-detect" } else { " --deep-detect" }
-    return ('"{0}" extract "{1}"{2} --pause' -f $Launcher.AppPath, $TargetToken, $passwordArg)
+    $passwordArg = if ($PromptPasswords) { " -a -d" } else { " -d" }
+    return ('"{0}" extract "{1}"{2} -pa' -f $Launcher.AppPath, $TargetToken, $passwordArg)
 }
 
 function New-WatchCommandString {
@@ -146,7 +146,7 @@ function New-GuiWatchCommand {
     )
 
     $command = ('"{0}" --cli "{1}" --app-root "{2}" --shell-watch {3} "{4}"' -f $resolvedGuiPath, $Launcher.AppPath, $repoRoot, $WatchAction, $TargetToken)
-    if ($Recursive) { $command += " --recursive" }
+    if ($Recursive) { $command += " -R" }
     return $command
 }
 

@@ -226,14 +226,14 @@
     "process_mode": "normal"
   },
   "watch": {
+    "tray_enabled": true,
+    "toast_enabled": true,
     "deduplication": "none",
     "deduplication_scope": "root",
     "boundary_confirmation_seconds": 0.5,
     "runtime_cache_cleanup_idle_seconds": 10,
     "clipboard_monitor_enabled": true,
     "clipboard_builtin_max_entries": 30,
-    "tray_enabled": true,
-    "toast_enabled": true,
     "toast_report_retention_days": 7,
     "event_log_retention_days": 7
   },

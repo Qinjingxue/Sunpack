@@ -801,26 +801,35 @@ std::string localized_value(
 }
 
 // The installed launcher owns pause, as in main. Only consume actual flags:
-// attached password values and operands following -- remain untouched.
+// Passwords following -p and operands following -- remain untouched.
 bool consume_pause(std::vector<std::wstring>& arguments) {
     bool pause = false;
     bool no_pause = false;
     bool options = true;
+    bool password_value = false;
+    size_t pause_position = 0;
     auto output = arguments.begin();
     for (auto input = arguments.begin(); input != arguments.end(); ++input) {
-        if (options && *input == L"--pause") {
-            pause = true;
-            continue;
+        if (options && !password_value) {
+            if (*input == L"-pa") {
+                if (!pause) pause_position = static_cast<size_t>(output - arguments.begin());
+                pause = true;
+                continue;
+            }
+            if (*input == L"-npa") no_pause = true;
+            if (*input == L"--") options = false;
+            password_value = *input == L"-p";
+        } else {
+            password_value = false;
         }
-        if (options && *input == L"--no-pause") no_pause = true;
-        if (*input == L"--") options = false;
         if (output != input) *output = std::move(*input);
         ++output;
     }
     arguments.erase(output, arguments.end());
     if (pause && !no_pause) {
-        const auto end_options = std::find(arguments.begin(), arguments.end(), L"--");
-        arguments.insert(end_options, L"--no-pause");
+        // Keep the replacement at the original option position so it cannot
+        // become the value of a trailing -p that is missing its password.
+        arguments.insert(arguments.begin() + pause_position, L"-npa");
     }
     return pause;
 }
@@ -857,7 +866,7 @@ int wmain(int argc, wchar_t** argv) {
         bool valid = true;
         for (int index = 2; index < argc; ++index) {
             if (wcscmp(argv[index], L"stop") == 0 && !daemon_stop) daemon_stop = true;
-            else if (wcscmp(argv[index], L"--json") == 0 || wcscmp(argv[index], L"-j") == 0) daemon_stop_json = true;
+            else if (wcscmp(argv[index], L"-j") == 0) daemon_stop_json = true;
             else valid = false; // Help and invalid options belong to the CLI parser.
         }
         daemon_stop = daemon_stop && valid;

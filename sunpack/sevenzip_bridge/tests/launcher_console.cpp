@@ -92,32 +92,40 @@ int main() {
     try {
         development_entrypoint_contract();
         for (auto arguments : std::vector<std::vector<std::wstring>>{
-                {L"extract", L"archive.zip", L"--pause"},
-                {L"extract", L"--json", L"--pause"},
-                {L"watch", L"list", L"--pause"}}) {
+                {L"extract", L"archive.zip", L"-pa"},
+                {L"extract", L"-j", L"-pa"},
+                {L"watch", L"list", L"-pa"}}) {
             require(consume_pause(arguments), "client owns pause regardless of command result");
         }
         for (auto arguments : std::vector<std::vector<std::wstring>>{
-                {L"extract", L"--", L"--pause"},
-                {L"extract", L"--password=--pause"},
-                {L"extract", L"-p--pause"},
-                {L"extract", L"-p=--pause"},
-                {L"extract", L"--no-pause"}}) {
+                {L"extract", L"--", L"-pa"},
+                {L"extract", L"-p", L"-pa"},
+                {L"extract", L"-p", L"-npa"},
+                {L"extract", L"-p", L"--", L"-p", L"-pa"},
+                {L"extract", L"-npa"}}) {
             require(!consume_pause(arguments), "do not reinterpret operands or option values");
         }
 
         for (auto arguments : std::vector<std::vector<std::wstring>>{
-                {L"scan", L"archive.zip", L"--pause", L"--no-pause"},
-                {L"scan", L"archive.zip", L"--no-pause", L"--pause"},
-                {L"scan", L"archive.zip", L"--pause"}}) {
+                {L"scan", L"archive.zip", L"-pa", L"-npa"},
+                {L"scan", L"archive.zip", L"-npa", L"-pa"},
+                {L"scan", L"archive.zip", L"-pa"}}) {
             require(consume_pause(arguments), "explicit pause belongs to launcher");
-            require(arguments == std::vector<std::wstring>{L"scan", L"archive.zip", L"--no-pause"},
+            require(arguments == std::vector<std::wstring>{L"scan", L"archive.zip", L"-npa"},
                     "both pause flag orders run without runtime conflict");
         }
-        std::vector<std::wstring> operands{L"scan", L"--pause", L"--", L"--pause", L"--no-pause"};
+        std::vector<std::wstring> operands{L"scan", L"-pa", L"--", L"-pa", L"-npa"};
         require(consume_pause(operands) && operands == std::vector<std::wstring>{
-                L"scan", L"--no-pause", L"--", L"--pause", L"--no-pause"},
+                L"scan", L"-npa", L"--", L"-pa", L"-npa"},
                 "insert runtime suppression before delimiter without consuming operands");
+        std::vector<std::wstring> password{L"scan", L"-p", L"--", L"-pa", L"--", L"-pa"};
+        require(consume_pause(password) && password == std::vector<std::wstring>{
+                L"scan", L"-p", L"--", L"-npa", L"--", L"-pa"},
+                "a password delimiter is data, not the end of options");
+        std::vector<std::wstring> missing_password{L"scan", L"-pa", L"archive.zip", L"-p"};
+        require(consume_pause(missing_password) && missing_password == std::vector<std::wstring>{
+                L"scan", L"-npa", L"archive.zip", L"-p"},
+                "pause suppression must not supply a missing password");
         require(supports_cancellation({L"scan"}) && supports_cancellation({L"s"}) &&
                 supports_cancellation({L"extract"}) && supports_cancellation({L"e"}) &&
                 !supports_cancellation({L"watch", L"status"}) && !supports_cancellation({}),

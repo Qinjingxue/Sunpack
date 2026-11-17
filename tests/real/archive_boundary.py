@@ -36,9 +36,9 @@ def extract_report(package, inputs, output, *, passwords=(), cleanup="k", recurs
     flags = ["-R"] if recursive else []
     if deep:
         flags.append("-d")
-    password_args = [f"--password={password}" for password in passwords]
+    password_args = [arg for password in passwords for arg in ("-p", password)]
     result = package.run(
-        "extract", "--json", "--no-pause", "--no-bpw", "--no-flatten",
+        "extract", "-j", "-npa", "-nf",
         "-r", recur, "-c", cleanup, "-o", output, *flags, *password_args, *paths,
     )
     expected_codes = (code,) if isinstance(code, int) else code
@@ -74,9 +74,9 @@ def assert_extracted(case, output, *, exact=False):
 
 
 def scan_case(package, case, *, passwords=(), deep=True):
-    password_args = [f"--password={password}" for password in passwords]
+    password_args = [arg for password in passwords for arg in ("-p", password)]
     scan_flags = ["-d"] if deep else []
-    report = package.json("scan", *scan_flags, "--no-bpw", *password_args, case.archive_dir)
+    report = package.json("scan", *scan_flags, *password_args, case.archive_dir)
     assert report["summary"]["archive_count"] == 1, report
     assert report["summary"]["failed_count"] == 0, report
     item, = report["items"]

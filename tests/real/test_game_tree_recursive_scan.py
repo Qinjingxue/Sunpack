@@ -18,14 +18,14 @@ def test_game_like_tree_preserves_resource_archives_at_default_authorization(pac
         archive.writestr("sound/music.bin", b"audio data" * 16_384)
 
     output = tmp_path / "protected"
-    report = package.json("extract", "-r", "*", "-F", "-o", output, source)
+    report = package.json("extract", "-r", "*", "-nf", "-o", output, source)
     assert report["summary"]["success_count"] == 1, report
     assert (output / "game/graphics/resources.zip").read_bytes() == inner.getvalue()
     assert not list(output.rglob("internal.txt"))
 
     package.configure(recursive_authorization={"enabled": False})
     output = tmp_path / "unrestricted"
-    report = package.json("extract", "-r", "*", "-F", "-o", output, source)
+    report = package.json("extract", "-r", "*", "-nf", "-o", output, source)
     assert report["summary"]["success_count"] == 2, report
     assert next(output.rglob("internal.txt")).read_text() == "resource payload"
 
@@ -47,6 +47,6 @@ def test_local_game_tree_resources_are_not_extracted_recursively(package, tmp_pa
         [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", str(source), *children],
         cwd=game_tree, capture_output=True, check=True,
     )
-    report = package.json("extract", "-r", "*", "-F", "-o", tmp_path / "out", source, timeout=None)
+    report = package.json("extract", "-r", "*", "-nf", "-o", tmp_path / "out", source, timeout=None)
     assert report["summary"]["success_count"] == 1, report
     assert report["summary"]["processed_count"] == 1, report

@@ -52,7 +52,7 @@ def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_p
     output = tmp_path / "out"
     package.configure(extraction={"content_requirement": "complete"})
     package.json("watch", "add", watched, "-o", output)
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
     events = package.data / ".sunpack_watch" / "events.json"
     completion = _wait_for_blocker(events, parts[0])
     if policy == "config":
@@ -96,8 +96,8 @@ def test_watch_restart_keeps_carrier_outputs_and_retries_retained_child(package,
     output = tmp_path / "out"
     package.configure(recursive_extract="*", recursive_authorization={"enabled": False},
                       post_extract={"flatten_single_directory": True})
-    package.json("watch", "add", watched, "--deep-detect", "-o", output)
-    package.json("daemon", "start", "--no-tray")
+    package.json("watch", "add", watched, "-d", "-o", output)
+    package.json("daemon", "start", "-nt")
     events = package.data / ".sunpack_watch" / "events.json"
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:

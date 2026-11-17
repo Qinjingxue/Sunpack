@@ -125,8 +125,8 @@ Options parse_options(const std::vector<std::wstring>& args) {
             if(action!=L"add" && action!=L"remove") throw std::runtime_error("guiArguments");
             result.shell_watch={L"watch",action,args[++i]};
         }
-        else if(args[i]==L"--recursive" && result.shell_watch.size()==3 && result.shell_watch[1]==L"add")
-            result.shell_watch.push_back(L"--recursive");
+        else if(args[i]==L"-R" && result.shell_watch.size()==3 && result.shell_watch[1]==L"add")
+            result.shell_watch.push_back(L"-R");
         else throw std::runtime_error("guiArguments");
     }
     if(result.data_dir.empty()) {
@@ -1156,7 +1156,7 @@ void Application::work() {
                             if(pointer.rfind("/filesystem/scan_filters/",0)!=0 || (field!="paths" && field!="files" && field!="extensions" && field!="full_names")) continue;
                             if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
                             auto input=Json{{field,parse_json(edit.at("text").get<std::string>())}}.dump(-1,' ',true)+"\n";
-                            auto check=run_cli(options_.cli,{L"config",L"validate",L"--scan-rule-stdin",L"--json"},stop_,&input);
+                            auto check=run_cli(options_.cli,{L"config",L"validate",L"-srs",L"-j"},stop_,&input);
                             if(check.code!=0) {
                                 auto report=Json::parse(check.output,nullptr,false);
                                 auto errors=report.is_object()?report.value("errors",Json::array()):Json::array();
@@ -1362,7 +1362,7 @@ void Application::work() {
                 task_window={""}; task_window_reset=true;
                 log.manifest=Json();
                 try {
-                    if(options_.allow_cli) run_cli(options_.cli,{L"watch",L"rebuild-log"},stop_);
+                    if(options_.allow_cli) run_cli(options_.cli,{L"watch",L"relog"},stop_);
                 } catch(...) {} // A later log operation can request recovery again.
             }
             if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {

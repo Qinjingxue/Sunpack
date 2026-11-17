@@ -145,7 +145,7 @@ def test_carrier_retains_both_branches_while_nested_password_is_missing(package,
     source.write_bytes(b"prefix" + first.getvalue() + b"between" + second.getvalue() + b"tail")
     output = tmp_path / "out"
     package.configure(post_extract={"flatten_single_directory": True}, recursive_authorization={"enabled": False})
-    report = package.json("extract", "-d", "-r", "*", "-c", "k", "--no-builtin-pw", "-o", output, source, code=1)
+    report = package.json("extract", "-d", "-r", "*", "-c", "k", "-o", output, source, code=1)
     ordinary, = output.rglob("ordinary.txt")
     assert ordinary.read_bytes() == b"ordinary"
     retained, = output.rglob("locked.zip")
@@ -242,7 +242,7 @@ def test_nested_mixed_carrier_retains_failed_input_beside_successful_segment(pac
     output = tmp_path / "out"
     package.configure(post_extract={"flatten_single_directory": True}, recursive_authorization={"enabled": False},
                       filesystem={"scan_filters_enabled": False})
-    report = package.json("extract", "-d", "-r", "*", "-c", "k", "--no-builtin-pw", "-o", output, outer, code=1)
+    report = package.json("extract", "-d", "-r", "*", "-c", "k", "-o", output, outer, code=1)
     payload, = output.rglob("hello.txt")
     assert payload.read_bytes() == b"independent success", report
     assert (output / "outer" / "keep.txt").is_file()
@@ -268,7 +268,7 @@ def test_nested_mixed_carrier_survives_cancel_during_successful_sibling_recursio
         return False
 
     command = [str(package.launcher), "extract", "-d", "-r", "?", "-c", "k",
-               "--no-builtin-pw", "--no-pause", "-o", str(output), str(outer)]
+               "-npa", "-o", str(output), str(outer)]
     with ThreadPoolExecutor(max_workers=1) as reader, subprocess.Popen(
         command, cwd=package.data, env=package.env, encoding="utf-8",
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

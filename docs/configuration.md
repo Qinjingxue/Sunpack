@@ -38,9 +38,9 @@ For example, add these fields to the main configuration to keep original archive
 }
 ```
 
-CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
+CLI options such as `-r`, `-c`, and `-o` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
 
-Directory discovery is shallow by default. Use `--recursive` with `scan` or `extract`. Use `--recur` for nested extraction. Upgrades from installed versions below 1.4.0 reset managed runtime data and convert legacy scan-filter fields. See [Automatic runtime settings](#automatic-runtime-settings) for the data retained during migration.
+Directory discovery is shallow by default. Use `-R` with `scan` or `extract`. Use `-r` for nested extraction. Upgrades from installed versions below 1.4.0 reset managed runtime data and convert legacy scan-filter fields. See [Automatic runtime settings](#automatic-runtime-settings) for the data retained during migration.
 
 ## Extraction results and partial success
 
@@ -177,7 +177,7 @@ The installer and `scripts/upgrade_config.ps1` own upgrades. For installed numer
 
 For this upgrade, SunPack retains ordinary settings, Watch roots and nonblank built-in passwords. Watch root paths, outputs, `deep_detect`, `recursive` and comments are preserved, and `initial_scanned` resets to `false`. The upgrade removes other managed data, including recovery tasks, the catalog, task and event history, caches and failure reports. In a custom Watch state directory, it removes only known SunPack records. Versions 1.4.0 and newer keep their existing managed data and remove retired verification settings. Development builds identified only by a commit hash, timestamp or custom label keep their existing managed data and skip version-specific migration. The same applies when the previous version is missing.
 
-Persistent passwords come only from `builtin_passwords.json`, including its `clipboard_history`. Add records with `value` to `passwords`; optional `scopes` lists absolute directories and applies to their descendants too. Omit `scopes` for global passwords. Runtime sources are explicit input (`-p`, `--pw-file`, or the password prompt) and the current clipboard.
+Persistent passwords come only from `builtin_passwords.json`, including its `clipboard_history`. Add records with `value` to `passwords`; optional `scopes` lists absolute directories and applies to their descendants too. Omit `scopes` for global passwords. Runtime sources are explicit input (`-p`, `-P`, or the password prompt) and the current clipboard.
 
 ```json
 {

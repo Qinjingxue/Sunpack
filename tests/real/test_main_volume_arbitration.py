@@ -155,7 +155,7 @@ def test_password_retry_does_not_authorize_cleanup_of_carrier_with_damaged_peer(
     if entry_mode == "cli":
         result = package.run(
             "extract", "-d", "-r", "1", "-c", "d", "-o", output,
-            "--no-bpw", "--no-pause", "-p", "wrong", carrier, input=f"y\n{secret}\n\n",
+            "-npa", "-p", "wrong", carrier, input=f"y\n{secret}\n\n",
         )
         assert result.returncode == 1, (result.stdout, result.stderr)
     else:

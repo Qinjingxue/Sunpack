@@ -16,7 +16,7 @@ pytestmark = pytest.mark.requires_watch_broker
 
 def test_rootless_watch_restores_foreground_process_priority(package, tmp_path):
     package.configure(runtime={"process_mode": "normal"})
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
     source = tmp_path / "archive.zip"
     _zip(source, "payload.txt", b"payload")
     assert package.json("scan", source)["summary"]["archive_count"] == 1
@@ -49,7 +49,7 @@ def test_watch_rearms_the_root_object_after_rename_and_recreation(package, tmp_p
     watched.mkdir()
     output = tmp_path / "out"
     package.json("watch", "add", watched, "-R", "-o", output)
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
     events = package.data / ".sunpack_watch" / "events.json"
 
     def wait_for_rebuild(previous):
@@ -142,13 +142,13 @@ if ($null -ne $previous) {
 try {
     [System.Windows.Forms.Clipboard]::SetText("rootless-value")
     # A rootless Watch has no clipboard monitor until its first root is added.
-    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER daemon start --no-tray --json
+    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER daemon start -nt -j
     if ($LASTEXITCODE -ne 0) { throw "rootless Watch failed to start" }
     $passwords = Get-Content -Raw $env:SUNPACK_CLIPBOARD_TEST_PASSWORDS | ConvertFrom-Json
     if (@($passwords.clipboard_history).Count -gt 0 -and $null -ne $passwords.clipboard_history) {
         throw "rootless Watch imported clipboard passwords"
     }
-    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch add $env:SUNPACK_CLIPBOARD_TEST_ROOT -o $env:SUNPACK_CLIPBOARD_TEST_OUTPUT --json
+    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch add $env:SUNPACK_CLIPBOARD_TEST_ROOT -o $env:SUNPACK_CLIPBOARD_TEST_OUTPUT -j
     if ($LASTEXITCODE -ne 0) { throw "watch add failed" }
     [System.Windows.Forms.Clipboard]::SetText(("discarded", "retained", "clipboard-only-key") -join [Environment]::NewLine)
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -157,7 +157,7 @@ try {
         Start-Sleep -Milliseconds 25
     }
 } finally {
-    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER daemon stop --json
+    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER daemon stop -j
     $result = $LASTEXITCODE
     if ($saved.GetFormats($false).Count -gt 0) {
         [System.Windows.Forms.Clipboard]::SetDataObject($saved, $true)
@@ -236,7 +236,7 @@ def test_watch_observes_edits_to_config_symlink_target(package, tmp_path):
     watched.mkdir()
     output = tmp_path / "out"
     package.json("watch", "add", watched, "-o", output)
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
 
     first = watched / "keep.zip"
     _zip(first, "kept.txt", b"keep the first source")
@@ -294,7 +294,7 @@ def test_settled_outputs_ignore_old_writes_but_admit_changes_after_restart(
     package.configure(recursive_extract=1, post_extract={"flatten_single_directory": False})
     package.json("watch", "add", watched, "-R", "-o", alias / "results")
     try:
-        package.json("daemon", "start", "--no-tray")
+        package.json("daemon", "start", "-nt")
         if origin == "foreground":
             package.json("extract", "-r", "1", "-o", alias / "results", source)
         else:
@@ -303,7 +303,7 @@ def test_settled_outputs_ignore_old_writes_but_admit_changes_after_restart(
         assert package.json("daemon", "stop")["summary"]["running"] is False
         assert not list(real.rglob("generated.txt"))
         assert package.run("--persistent-shutdown").returncode == 0
-        package.json("daemon", "start", "--no-tray")
+        package.json("daemon", "start", "-nt")
         package.await_watch_admission()
         assert not list(real.rglob("generated.txt"))
         history = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))["history"]
@@ -381,7 +381,7 @@ if ($Restore) {
     current = source
     try:
         acl(source)
-        package.json("daemon", "start", "--no-tray")
+        package.json("daemon", "start", "-nt")
         assert current.is_file() and current.stat().st_size > 0
         # Assert that this machine/token really reaches the required failure:
         # FILE_READ_ATTRIBUTES alone may remain available through parent list.
@@ -451,7 +451,7 @@ def test_password_blocked_split_group_retires_departed_non_head_member(package, 
     parts = sorted(watched.glob("locked.7z.*"))
     assert len(parts) >= 3
     package.json("watch", "add", watched, "-o", tmp_path / "out")
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
     events = package.data / ".sunpack_watch" / "events.json"
 
     def wait_members(expected):

@@ -43,7 +43,7 @@ def _output(output, name):
 def _start(package, root, output):
     root.mkdir()
     package.json("watch", "add", root, "-o", output)
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
     package.await_watch_admission()
     _status(package, True)
 
@@ -103,7 +103,7 @@ def test_disabled_intent_survives_daemon_restart_and_skips_entire_interval(packa
     _archive(root, "paused_online")
     _shutdown(package, shutdown)
     _archive(root, "paused_offline")
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
     _status(package, False)
     _archive(root, "paused_restarted")
     package.json("watch", "enable")
@@ -124,7 +124,7 @@ def test_enabled_daemon_restart_still_recovers_offline_arrivals(package, tmp_pat
     package.await_watch_event("done", path="before.zip")
     _shutdown(package, shutdown)
     _archive(root, "offline")
-    package.json("daemon", "start", "--no-tray")
+    package.json("daemon", "start", "-nt")
     _status(package, True)
     _output(output, "offline")
     _drain(package)

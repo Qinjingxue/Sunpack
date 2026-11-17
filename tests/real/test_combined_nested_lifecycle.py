@@ -22,7 +22,7 @@ def test_cli_disguised_split_carrier_multilevel_passwords(package, tmp_path, out
     passwords = ["definitely-wrong", *(case.passwords if leaf_password_known else case.passwords[:2])]
     candidates = [arg for password in passwords for arg in ("-p", password)]
     report = package.json(
-        "extract", "-c", "k", "-r", "*", "-d", "-F", "--no-bpw", "-o", output,
+        "extract", "-c", "k", "-r", "*", "-d", "-nf", "-o", output,
         *candidates, case.outer.archive_dir, code=0 if leaf_password_known else 1,
     )
     assert report["summary"]["partial_success_count"] == 0, report

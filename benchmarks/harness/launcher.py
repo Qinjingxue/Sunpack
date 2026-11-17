@@ -132,7 +132,7 @@ class NativePackage:
     def run(self, *arguments, json_output=True, accepted=(0,), require_broker=False) -> dict:
         command = [str(self.launcher), *map(str, arguments)]
         if json_output:
-            command.append("--json")
+            command.append("-j")
         started = time.perf_counter()
         process = subprocess.Popen(command, cwd=self.data, env=self.env, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)

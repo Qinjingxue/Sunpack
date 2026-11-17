@@ -1123,11 +1123,23 @@
         }
       ]
     },
+    "/watch/tray_enabled": {
+      "label": {
+        "zh": "托盘图标",
+        "en": "Tray icon"
+      }
+    },
+    "/watch/toast_enabled": {
+      "label": {
+        "zh": "Windows桌面通知",
+        "en": "Windows desktop notifications"
+      }
+    },
     "/watch/deduplication": {
       "label": { "zh": "监控去重", "en": "Watch deduplication" },
       "description": {
-        "zh": "去重相同文件，硬链接去重可避免重复处理硬链接文件，hash去重可几乎避免重复解压相同文件",
-        "en": "Deduplicate identical files. Hard-link deduplication avoids processing hard links repeatedly; hash deduplication avoids almost all repeated extraction of identical files."
+        "zh": "去重相同文件",
+        "en": "Deduplicate identical files"
       },
       "options": [
         { "value": "none", "label": { "zh": "无", "en": "None" } },
@@ -1137,10 +1149,6 @@
     },
     "/watch/deduplication_scope": {
       "label": { "zh": "去重范围", "en": "Deduplication scope" },
-      "description": {
-        "zh": "默认仅比较当前监控目录。全部监控目录可跨目录去重；切换范围会重建索引。",
-        "en": "Compare within the current monitored folder by default, or across all monitored folders. Changing the scope rebuilds the index."
-      },
       "options": [
         { "value": "root", "label": { "zh": "当前监控目录", "en": "Current monitored folder" } },
         { "value": "global", "label": { "zh": "全部监控目录", "en": "All monitored folders" } }
@@ -1192,18 +1200,6 @@
       "description": {
         "zh": "“.” 表示输入目录旁",
         "en": "“.” means beside the input"
-      }
-    },
-    "/watch/tray_enabled": {
-      "label": {
-        "zh": "托盘图标",
-        "en": "Tray icon"
-      }
-    },
-    "/watch/toast_enabled": {
-      "label": {
-        "zh": "Windows桌面通知",
-        "en": "Windows desktop notifications"
       }
     },
     "/watch/toast_report_retention_days": {
