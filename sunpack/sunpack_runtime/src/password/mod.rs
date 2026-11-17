@@ -22,6 +22,8 @@ pub(crate) struct PasswordVerification {
     pub(crate) attempts: usize,
     pub(crate) message: String,
     pub(crate) final_confirmation_required: Option<bool>,
+    // A strong prescreen may hand off now, retaining untested candidates as collision fallback.
+    pub(crate) defer_remaining: bool,
     pub(crate) match_evidence: Option<&'static str>,
     pub(crate) read_fault: Option<ReadFault>,
 }
@@ -35,6 +37,7 @@ impl PasswordVerification {
             attempts: 0,
             message: message.into(),
             final_confirmation_required: None,
+            defer_remaining: false,
             match_evidence: None,
             read_fault: None,
         }

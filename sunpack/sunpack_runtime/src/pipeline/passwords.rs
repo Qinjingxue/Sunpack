@@ -336,6 +336,12 @@ impl CandidateSet {
                         (old, next) if old == next => old,
                         _ => Some("mixed"),
                     };
+                    if result.defer_remaining {
+                        // The worker still confirms this candidate. Preserve every untested
+                        // suffix candidate in original order in case the prescreen collided.
+                        pending.extend(candidates.by_ref().cloned());
+                        break;
+                    }
                 }
                 "no_match" => {
                     password_rejected |= result.attempts != 0;

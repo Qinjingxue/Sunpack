@@ -328,7 +328,9 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE SetOperationResult(Int32 opRes) SUP7Z_NOEXCEPT override
         {
 
-            operation_result_ = opRes;
+            // Multi-item password probes must not let a later success erase
+            // an earlier failed CRC or decoding result.
+            if (operation_result_ == kOpOk) operation_result_ = opRes;
             return cancelled() ? E_ABORT : S_OK;
         }
 

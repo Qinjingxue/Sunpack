@@ -53,35 +53,7 @@ impl SevenZipPasswordProbe {
         if folder.expected_crc.is_none() || !seven_zip_probe_folder_supported(&folder) {
             return Err("7z password probe coder graph has no safe fast path".into());
         }
-        if pack.num_streams != pack.sizes.len() || pack.sizes.len() != folder.packed_streams.len() {
-            return Err("7z password probe pack stream count mismatch".into());
-        }
-        let mut stream_start = (SEVEN_Z_HEADER_SIZE as u64)
-            .checked_add(pack.pack_pos)
-            .ok_or("7z password probe stream offset overflow")?;
-        let mut packed_data = Vec::with_capacity(pack.sizes.len());
-        for size in pack.sizes {
-            let stream_end = stream_start
-                .checked_add(size)
-                .ok_or("7z password probe stream end overflow")?;
-            if stream_end > next_header_start {
-                return Err("7z password probe stream range is invalid".into());
-            }
-            let stream_size =
-                usize::try_from(size).map_err(|_| "7z password probe stream is too large")?;
-            packed_data.push(
-                read_seven_zip_probe_range(
-                    reader,
-                    reader_len,
-                    stream_start,
-                    stream_size,
-                    "7z.encoded_header.packed_stream",
-                    FieldLocation::Body,
-                )
-                .map_err(resource_error)?,
-            );
-            stream_start = stream_end;
-        }
+        let packed_data = read_seven_zip_packed_data(reader, reader_len, next_header_start, &pack, &folder)?;
         Ok(Self {
             packed_data,
             folder,
@@ -111,6 +83,45 @@ impl SevenZipPasswordProbe {
     }
 }
 
+fn read_seven_zip_packed_data<R: Read + Seek>(
+    reader: &mut R,
+    reader_len: u64,
+    before: u64,
+    pack: &SevenZipPackInfoAst,
+    folder: &SevenZipFolderAst,
+) -> Result<Vec<Blob>, std::borrow::Cow<'static, str>> {
+    if pack.num_streams != pack.sizes.len() || pack.sizes.len() != folder.packed_streams.len() {
+        return Err("7z password probe pack stream count mismatch".into());
+    }
+    let mut stream_start = (SEVEN_Z_HEADER_SIZE as u64)
+        .checked_add(pack.pack_pos)
+        .ok_or("7z password probe stream offset overflow")?;
+    let mut packed_data = Vec::with_capacity(pack.sizes.len());
+    for &size in &pack.sizes {
+        let stream_end = stream_start
+        .checked_add(size)
+        .ok_or("7z password probe stream end overflow")?;
+        if stream_end > before {
+        return Err("7z password probe stream range is invalid".into());
+        }
+        let stream_size =
+        usize::try_from(size).map_err(|_| "7z password probe stream is too large")?;
+        packed_data.push(
+        read_seven_zip_probe_range(
+            reader,
+            reader_len,
+            stream_start,
+            stream_size,
+            "7z.encoded_header.packed_stream",
+            FieldLocation::Body,
+        )
+        .map_err(resource_error)?,
+        );
+        stream_start = stream_end;
+    }
+    Ok(packed_data)
+}
+
 fn read_seven_zip_probe_range<R: Read + Seek>(
     reader: &mut R,
     source_len: u64,
@@ -132,6 +143,7 @@ fn read_seven_zip_probe_range<R: Read + Seek>(
     let mut remaining = len;
     let mut bytes = vec![0; 64 * 1024];
     while remaining > 0 {
+        crate::io::cancellation::Cancellation::check_current_io()?;
         let take = remaining.min(bytes.len());
         read_exact_field(reader, &mut bytes[..take], source_len, field, location)
             .map_err(|fault| fault.into_io_error())?;
@@ -150,6 +162,9 @@ fn parse_seven_zip_encoded_header_descriptor(
     let mut pos = 1;
     let mut streams = SevenZipStreams::default();
     parse_seven_zip_streams_info(raw, &mut pos, &mut streams, true)?;
+    if streams.folders.len() != 1 {
+        return Err("encoded_header_folder_not_unique");
+    }
     Ok((
         streams.pack.ok_or("encoded_header_pack_info_missing")?,
         streams
@@ -539,13 +554,20 @@ fn seven_zip_aes_key_iv(
     properties: &[u8],
     password: &[u8],
 ) -> Result<([u8; 32], [u8; 16]), String> {
+    seven_zip_aes_key_iv_using(properties, password, cached_seven_zip_aes_key)
+}
+
+// Payload candidates are already deduplicated by the plan. Their derived key
+// is needed only for this one bounded check, not for the process-wide header cache.
+fn seven_zip_aes_key_iv_using(
+    properties: &[u8],
+    password: &[u8],
+    derive: impl FnOnce(u32, &[u8], &[u8]) -> Result<[u8; 32], String>,
+) -> Result<([u8; 32], [u8; 16]), String> {
     let (num_cycles_power, salt, iv_bytes) = seven_zip_aes_properties(properties)
         .ok_or_else(|| "encoded_header_decoder_unsupported_method".to_string())?;
     let mut iv = [0u8; 16];
     iv[..iv_bytes.len()].copy_from_slice(iv_bytes);
-    if password.is_empty() {
-        return Err("encoded_header_decode_password_required".to_string());
-    }
     let key = if num_cycles_power == SEVEN_Z_AES_DIRECT_KEY {
         let mut key = [0u8; 32];
         let salt_size = salt.len();
@@ -555,7 +577,7 @@ fn seven_zip_aes_key_iv(
         key
     } else {
         let cycles = 1u32 << num_cycles_power;
-        cached_seven_zip_aes_key(cycles, salt, password)?
+        derive(cycles, salt, password)?
     };
     Ok((key, iv))
 }
@@ -733,3 +755,8 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
 #[cfg(test)]
 #[path = "../../../../tests/unit/formats/seven_zip/header/encoded/encoded_folder_graph_tests.rs"]
 mod encoded_folder_graph_tests;
+
+#[cfg(test)]
+pub(crate) fn seven_zip_cached_key_count() -> usize {
+    seven_zip_kdf_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
+}

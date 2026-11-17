@@ -54,12 +54,13 @@ namespace sunpack::sevenzip
         struct BoundedPasswordProbeSelection
         {
             std::optional<UInt32> index;
+            bool test_all = false;
             bool item_count_known = false;
             UInt32 item_count = 0;
             bool encrypted = false;
         };
 
-        BoundedPasswordProbeSelection bounded_password_probe_selection(IInArchive *archive, bool authenticates_empty_item)
+        BoundedPasswordProbeSelection bounded_password_probe_selection(IInArchive *archive, bool authenticates_empty_item, bool require_strong_crc)
         {
             BoundedPasswordProbeSelection selection;
             if (!archive)
@@ -77,10 +78,8 @@ namespace sunpack::sevenzip
             clear_prop(archive_value);
 
             struct Candidate { UInt32 index; UInt64 size; };
-            std::optional<Candidate> regular, encrypted;
-            auto remember = [solid](std::optional<Candidate> &current, Candidate item) {
-                if (!current || (!solid && item.size < current->size)) current = item;
-            };
+            std::optional<Candidate> regular, strong;
+            bool has_nonempty_encrypted = false;
             for (UInt32 index = 0; index < selection.item_count; ++index)
             {
                 PROPVARIANT value{};
@@ -93,20 +92,43 @@ namespace sunpack::sevenzip
                 const bool size_known = get_item_property(archive, index, kpidSize, value);
                 const UInt64 size = prop_u64(value);
                 clear_prop(value);
-                // An empty ZipCrypto item proves only the weak header byte.
-                // ENC test mode reports the password proof from Open even when
-                // damaged recovery framing prevents reporting a payload size.
+                // ENC authenticates during Open, including empty payloads.
                 if (size_known && size == 0 && !authenticates_empty_item) continue;
-                remember(regular, {index, size});
-                if (is_encrypted)
-                {
-                    remember(encrypted, {index, size});
-                    if (solid) break; // The first eligible encrypted item is final.
+                if (!regular || (!solid && size < regular->size)) regular = Candidate{index, size};
+                if (!is_encrypted) continue;
+                has_nonempty_encrypted = true;
+                if (!require_strong_crc) {
+                    // Other formats retain their existing smallest-item proof
+                    // (including MAC-based authentication without a CRC).
+                    if (!strong || (!solid && size < strong->size)) strong = Candidate{index, size};
+                    if (solid) {
+                        selection.index = index;
+                        return selection;
+                    }
+                    continue;
                 }
+                const bool crc_known = get_item_property(archive, index, kpidCRC, value);
+                clear_prop(value);
+                if (!size_known || !crc_known) continue;
+                // A single tiny CRC contains only 8 * size evidence bits.
+                // Do not add evidence across members: different folders may
+                // repeat the same encrypted bytes, IV and contents.
+                if (size < 4) continue;
+                if (solid) {
+                    selection.index = index;
+                    return selection;
+                }
+                if (!strong || size < strong->size) strong = Candidate{index, size};
             }
-            const auto &selected = selection.encrypted ? encrypted : regular;
-            if (!selected) return selection;
-            selection.index = selected->index;
+            if (!selection.encrypted) {
+                if (regular) selection.index = regular->index;
+            } else if (strong) {
+                selection.index = strong->index;
+            } else if (has_nonempty_encrypted) {
+                // No independently strong 7z CRC item: test all members
+                // rather than accepting a single tiny collision.
+                selection.test_all = true;
+            }
             return selection;
         }
 
@@ -138,7 +160,7 @@ namespace sunpack::sevenzip
         {
             auto *raw_callback = new ExtractCallback(password);
             CMyComPtr<IArchiveExtractCallback> callback(raw_callback);
-            if (!selection.index)
+            if (!selection.index && !selection.test_all)
             {
                 const auto disposition = empty_bounded_password_probe_disposition(
                     selection.item_count_known, selection.item_count, encryption_evidence);
@@ -158,7 +180,9 @@ namespace sunpack::sevenzip
             }
             else
             {
-                hr = archive->Extract(&*selection.index, 1, kTestMode, callback);
+                hr = selection.test_all
+                    ? archive->Extract(nullptr, static_cast<UInt32>(kAllItems), kTestMode, callback)
+                    : archive->Extract(&*selection.index, 1, kTestMode, callback);
             }
             operation = raw_callback->operation_result();
             encryption_evidence = encryption_evidence || raw_callback->password_requested();
@@ -321,7 +345,7 @@ namespace sunpack::sevenzip
 
             any_opened = true;
             result.archive_type = canonical_archive_type_for_guid(format);
-            auto selection = bounded_password_probe_selection(archive, result.archive_type == L"enc");
+            auto selection = bounded_password_probe_selection(archive, result.archive_type == L"enc", result.archive_type == L"7z");
             if (selection.item_count_known && rar4_rejected_empty_encrypted_headers(
                     archive.Interface(), format, selection.item_count, raw_open_callback->password_requested()))
             {
@@ -340,7 +364,7 @@ namespace sunpack::sevenzip
                 result.status = PasswordTestStatus::Ok;
                 return result;
             }
-            if (scan_only && !selection.index && selection.item_count != 0 && selection.encrypted)
+            if (scan_only && !selection.index && !selection.test_all && selection.item_count != 0 && selection.encrypted)
             {
                 archive->Close();
                 result.status = PasswordTestStatus::Error;

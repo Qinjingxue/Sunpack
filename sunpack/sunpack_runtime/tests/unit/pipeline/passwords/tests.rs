@@ -394,3 +394,22 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
     let _ = std::fs::remove_file(head);
     let _ = std::fs::remove_file(tail);
 }
+
+#[test]
+fn payload_strong_prescreen_defers_untested_suffix_without_claiming_verified() {
+    // Real 7-Zip Copy + AES, plain header, one short CRC-bearing member.
+    let source = crate::test_support::temp_file("payload_prescreen_plan", &[55, 122, 188, 175, 39, 28, 0, 4, 178, 190, 162, 6, 16, 0, 0, 0, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 137, 92, 122, 211, 37, 116, 224, 226, 140, 241, 42, 72, 179, 115, 25, 153, 186, 152, 193, 102, 1, 4, 6, 0, 1, 9, 16, 0, 7, 11, 1, 0, 2, 36, 6, 241, 7, 1, 18, 83, 15, 90, 12, 52, 178, 191, 180, 172, 56, 77, 7, 166, 158, 159, 175, 101, 31, 1, 0, 1, 0, 12, 16, 16, 0, 8, 10, 1, 53, 59, 166, 46, 0, 0, 5, 1, 25, 3, 0, 0, 0, 17, 5, 0, 120, 0, 0, 0, 20, 10, 1, 0, 100, 53, 227, 238, 121, 118, 221, 1, 21, 6, 1, 0, 32, 0, 0, 0, 0, 0]);
+    let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "archive".into());
+    let recent = RecentPasswords::default();
+    let mut values: Vec<Arc<str>> = vec![Arc::from("secret")];
+    values.extend((0..300).map(|i| Arc::from(format!("wrong-{i}"))));
+    let candidates = CandidateSet::new(values.clone().into(), None, &recent, None);
+    PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
+    let plan = candidates.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
+    let batches = PLANNED_BATCHES.with(|value| value.borrow_mut().take().unwrap());
+    assert_eq!(batches.len(), 1, "strong hit hands off without screening following batches; evidence={:?}, candidates={:?}", plan.evidence, plan.candidates);
+    assert!(plan.verified_password.is_none(), "only worker confirmation is definitive");
+    assert_eq!(*plan.candidates, values, "all untested candidates survive a possible CRC collision");
+    assert_eq!(plan.evidence, Some("7z_payload_strong_prescreen"));
+    std::fs::remove_file(source).unwrap();
+}

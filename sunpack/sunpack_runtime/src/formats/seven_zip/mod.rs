@@ -26,6 +26,8 @@ include!("constants.rs");
 include!("types.rs");
 include!("header/parse.rs");
 include!("header/encoded.rs");
+include!("header/prefix.rs");
+include!("header/payload.rs");
 /// The same checked descriptor is used to bound relation CRC reads and by
 /// the password header reader. CRC protects format metadata, never output.
 #[derive(Debug, Clone, Copy, PartialEq)]

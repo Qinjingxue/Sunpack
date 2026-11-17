@@ -18,13 +18,19 @@ fn read_sz_vint(data: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 fn parse_seven_zip_header(raw: &[u8], streams: &mut SevenZipStreams) -> Result<(), &'static str> {
+    parse_seven_zip_header_with_data(raw, streams, false)
+}
+
+fn parse_seven_zip_header_with_data(
+    raw: &[u8], streams: &mut SevenZipStreams, retain_decode_data: bool,
+) -> Result<(), &'static str> {
     let mut pos = 1;
     loop {
         let nid = *raw.get(pos).ok_or("header_tree_truncated_before_end")?;
         pos += 1;
         match nid {
             SZ_END => return Ok(()),
-            SZ_MAIN_STREAMS_INFO => parse_seven_zip_streams_info(raw, &mut pos, streams, false)?,
+            SZ_MAIN_STREAMS_INFO => parse_seven_zip_streams_info(raw, &mut pos, streams, retain_decode_data)?,
             SZ_FILES_INFO => parse_seven_zip_files_info(raw, &mut pos)?,
             _ => return Err("unsupported_header_nid"),
         }
@@ -50,6 +56,7 @@ fn parse_seven_zip_streams_info(
     // A new StreamsInfo section supersedes the previous section, including
     // when the new section ends early with only partial facts.
     streams.folders = Vec::new();
+    streams.substreams = Vec::new();
     loop {
         let nid = *data.get(*pos).ok_or("streams_info_truncated_before_end")?;
         *pos += 1;
@@ -69,7 +76,7 @@ fn parse_seven_zip_streams_info(
                 if streams.folders.is_empty() {
                     return Err("substreams_info_requires_unpack_info");
                 }
-                parse_seven_zip_substreams_info(data, pos, &streams.folders)?;
+                streams.substreams = parse_seven_zip_substreams_info(data, pos, &streams.folders, retain_decode_data)?;
             }
             _ => return Err("unsupported_streams_info_nid"),
         }
@@ -149,9 +156,6 @@ fn parse_seven_zip_unpack_info(
             .map_err(|_| "unpack_info_folder_count_too_large")?;
     if num_folders == 0 {
         return Err("unpack_info_folder_count_invalid");
-    }
-    if retain_decode_data && num_folders != 1 {
-        return Err("encoded_header_folder_not_unique");
     }
     let external = *data.get(*pos).ok_or("unpack_info_external_flag_missing")?;
     *pos += 1;
@@ -413,7 +417,8 @@ fn parse_seven_zip_substreams_info(
     data: &[u8],
     pos: &mut usize,
     folders: &[SevenZipFolderAst],
-) -> Result<(), &'static str> {
+    retain: bool,
+) -> Result<Vec<Vec<SevenZipSubstreamAst>>, &'static str> {
     let mut counts = Vec::new();
     let mut nid = *data.get(*pos).ok_or("substreams_info_truncated")?;
     if nid == SZ_NUM_UNPACK_STREAM {
@@ -423,71 +428,70 @@ fn parse_seven_zip_substreams_info(
             let count = read_sz_vint(data, pos).ok_or("substreams_info_count_truncated")?;
             counts.push(usize::try_from(count).map_err(|_| "substreams_info_count_too_large")?);
         }
-        nid = *data
-            .get(*pos)
-            .ok_or("substreams_info_truncated_after_counts")?;
+        nid = *data.get(*pos).ok_or("substreams_info_truncated_after_counts")?;
     }
-    let folder_count = folders.len();
-    let folders = folders
-        .iter()
-        .zip(counts.iter().copied().chain(std::iter::repeat(1)));
-    let (total_streams, explicit_sizes) = if counts.is_empty() {
-        (folder_count, 0)
-    } else {
-        let total = counts
-            .iter()
-            .try_fold(0usize, |sum, &count| sum.checked_add(count))
-            .ok_or("substreams_info_total_count_overflow")?;
-        (
-            total,
-            total - counts.iter().filter(|&&count| count != 0).count(),
-        )
-    };
+    let count_at = |index: usize| counts.get(index).copied().unwrap_or(1);
+    let total_streams = (0..folders.len()).try_fold(0usize, |sum, index| sum.checked_add(count_at(index)))
+        .ok_or("substreams_info_total_count_overflow")?;
+    let explicit_sizes = total_streams - (0..folders.len()).filter(|&index| count_at(index) != 0).count();
     if nid == SZ_SIZE {
         if explicit_sizes > data.len().saturating_sub(*pos + 1) {
             return Err("substreams_info_size_truncated");
         }
+        *pos += 1;
     } else if explicit_sizes != 0 {
         return Err("substreams_info_sizes_missing_for_multiple_streams");
     }
-    if nid == SZ_SIZE {
-        *pos += 1;
-        for (folder, count) in folders.clone() {
-            let mut sum = 0u64;
-            for _ in 0..count.saturating_sub(1) {
-                let span = read_sz_vint(data, pos).ok_or("substreams_info_size_truncated")?;
-                sum = sum
-                    .checked_add(span)
-                    .ok_or("substreams_info_size_sum_overflow")?;
-            }
-            if sum > folder.unpack_size(folder.main_output_stream) {
-                return Err("substreams_info_sizes_exceed_folder_unpack_size");
-            }
+    let mut retained = if retain { seven_zip_vec(folders.len())? } else { Vec::new() };
+    for (index, folder) in folders.iter().enumerate() {
+        let count = count_at(index);
+        let mut entries = if retain { seven_zip_vec(count)? } else { Vec::new() };
+        let mut sum = 0u64;
+        for _ in 0..count.saturating_sub(1) {
+            let size = read_sz_vint(data, pos).ok_or("substreams_info_size_truncated")?;
+            if retain { entries.push(SevenZipSubstreamAst { offset: sum, size, crc: None }); }
+            sum = sum.checked_add(size).ok_or("substreams_info_size_sum_overflow")?;
         }
-        nid = *data
-            .get(*pos)
-            .ok_or("substreams_info_truncated_after_sizes")?;
+        let total = folder.unpack_size(folder.main_output_stream);
+        if sum > total { return Err("substreams_info_sizes_exceed_folder_unpack_size"); }
+        if retain {
+            if count != 0 {
+                entries.push(SevenZipSubstreamAst { offset: sum, size: total - sum,
+                    crc: (count == 1).then_some(folder.expected_crc).flatten() });
+            }
+            retained.push(entries);
+        }
+    }
+    if nid == SZ_SIZE {
+        nid = *data.get(*pos).ok_or("substreams_info_truncated_after_sizes")?;
     }
     if nid == SZ_CRC {
         *pos += 1;
-        let inherited = folders
-            .filter(|(folder, count)| *count == 1 && folder.expected_crc.is_some())
-            .count();
-        skip_seven_zip_crcs(
-            data,
-            pos,
-            total_streams - inherited,
-            "substreams_info_crc_truncated",
-        )?;
-        nid = *data
-            .get(*pos)
-            .ok_or("substreams_info_truncated_after_crc")?;
+        let inherited = folders.iter().enumerate()
+            .filter(|(index, folder)| count_at(*index) == 1 && folder.expected_crc.is_some()).count();
+        let crc_count = total_streams - inherited;
+        let defined = parse_seven_zip_crc_flags(data, pos, crc_count)?;
+        if defined.defined_count(crc_count) > data.len().saturating_sub(*pos) / 4 {
+            return Err("substreams_info_crc_truncated");
+        }
+        let mut crc_index = 0;
+        for (index, folder) in folders.iter().enumerate() {
+            let count = count_at(index);
+            if count == 1 && folder.expected_crc.is_some() { continue; }
+            for sub in 0..count {
+                if defined.contains(crc_index) {
+                    let crc = u32_le(data, *pos);
+                    *pos += 4;
+                    if retain { retained[index][sub].crc = Some(crc); }
+                }
+                crc_index += 1;
+            }
+        }
+        nid = *data.get(*pos).ok_or("substreams_info_truncated_after_crc")?;
     }
-    if nid != SZ_END {
-        return Err("unsupported_substreams_info_nid");
-    }
+    if nid != SZ_END { return Err("unsupported_substreams_info_nid"); }
     *pos += 1;
-    Ok(())
+    Ok(retained)
 }
 
 enum SevenZipCrcFlags<'a> {

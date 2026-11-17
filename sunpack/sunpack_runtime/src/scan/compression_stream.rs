@@ -180,14 +180,14 @@ impl<'a, B: AsRef<[u8]>> ByteCursor<'a, B> {
     }
 }
 
-struct LsbBits<'a, 'b> {
-    cursor: &'a mut ByteCursor<'b>,
+struct LsbBits<'a, 'b, B = CachedBytes> {
+    cursor: &'a mut ByteCursor<'b, B>,
     bits: u64,
     count: u8,
 }
 
-impl<'a, 'b> LsbBits<'a, 'b> {
-    fn new(cursor: &'a mut ByteCursor<'b>) -> Self {
+impl<'a, 'b, B: AsRef<[u8]>> LsbBits<'a, 'b, B> {
+    fn new(cursor: &'a mut ByteCursor<'b, B>) -> Self {
         Self {
             cursor,
             bits: 0,
@@ -435,7 +435,7 @@ impl Huffman {
         }
     }
 
-    fn decode_lsb(&self, bits: &mut LsbBits<'_, '_>) -> ValidationResult<u16> {
+    fn decode_lsb(&self, bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>) -> ValidationResult<u16> {
         self.lsb().decode(bits)
     }
 
@@ -479,7 +479,10 @@ impl Huffman {
 }
 
 impl LsbHuffman<'_> {
-    fn decode(&self, bits: &mut LsbBits<'_, '_>) -> ValidationResult<u16> {
+    fn decode(&self, bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>) -> ValidationResult<u16> {
+        if self.max_len == 0 {
+            return invalid("empty_huffman_tree");
+        }
         bits.fill_available(self.lookup_bits)?;
         if bits.count >= self.lookup_bits {
             let entry = self.lookup[(bits.bits & ((1u64 << self.lookup_bits) - 1)) as usize];
@@ -581,11 +584,14 @@ const FIXED_DISTANCE_TREE: LsbHuffman<'static> = LsbHuffman {
     lookup_bits: 5,
 };
 
-fn dynamic_deflate_trees(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(Huffman, Huffman)> {
+fn dynamic_deflate_trees(
+    bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>,
+    deflate64: bool,
+) -> ValidationResult<(Huffman, Huffman)> {
     let literal_count = bits.read(5)? as usize + 257;
     let distance_count = bits.read(5)? as usize + 1;
     let code_count = bits.read(4)? as usize + 4;
-    if literal_count > 286 || distance_count > 32 {
+    if literal_count > (if deflate64 { 288 } else { 286 }) || distance_count > 32 {
         return invalid("invalid_deflate_dynamic_counts");
     }
     const ORDER: [usize; 19] = [
@@ -633,7 +639,13 @@ fn dynamic_deflate_trees(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(Huffma
     }
     Ok((
         Huffman::new(&lengths[..literal_count], 15, BitOrder::Lsb)?,
-        Huffman::new(&lengths[literal_count..], 15, BitOrder::Lsb)?,
+        // A literal-only block may have no distance codes. Trying to decode
+        // a match through the empty tree still fails in the shared decoder.
+        if lengths[literal_count..].iter().all(|&length| length == 0) {
+            Huffman::default()
+        } else {
+            Huffman::new(&lengths[literal_count..], 15, BitOrder::Lsb)?
+        },
     ))
 }
 
@@ -660,7 +672,14 @@ fn add_decoded_size(size: u64, count: u64) -> ValidationResult<u64> {
         .ok_or(ValidationError::Invalid("decoded_size_overflow"))
 }
 
-fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<u64> {
+fn parse_deflate(bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>) -> ValidationResult<u64> {
+    parse_deflate_mode(bits, false)
+}
+
+fn parse_deflate_mode(
+    bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>,
+    deflate64: bool,
+) -> ValidationResult<u64> {
     let mut decoded_size = 0u64;
     loop {
         let final_block = bits.read(1)? != 0;
@@ -679,7 +698,7 @@ fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<u64> {
             let (literal_tree, distance_tree) = if block_type == 1 {
                 (FIXED_LITERAL_TREE, FIXED_DISTANCE_TREE)
             } else {
-                dynamic_trees = dynamic_deflate_trees(bits)?;
+                dynamic_trees = dynamic_deflate_trees(bits, deflate64)?;
                 (dynamic_trees.0.lsb(), dynamic_trees.1.lsb())
             };
             loop {
@@ -688,15 +707,26 @@ fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<u64> {
                     256 => break,
                     symbol @ 257..=285 => {
                         let index = usize::from(symbol - 257);
-                        let length = u64::from(LENGTH_BASE[index])
-                            + u64::from(bits.read(LENGTH_EXTRA[index])?);
+                        // 7-Zip DeflateConst.h: Deflate64 replaces code 285
+                        // with base 3 + 16 bits and adds distance codes 30/31.
+                        let length = if deflate64 && symbol == 285 {
+                            3 + u64::from(bits.read(16)?)
+                        } else {
+                            u64::from(LENGTH_BASE[index])
+                                + u64::from(bits.read(LENGTH_EXTRA[index])?)
+                        };
                         let distance_symbol = distance_tree.decode(bits)? as usize;
-                        if distance_symbol >= DIST_BASE.len() {
+                        let distance = if distance_symbol < DIST_BASE.len() {
+                            u64::from(DIST_BASE[distance_symbol])
+                                + u64::from(bits.read(DIST_EXTRA[distance_symbol])?)
+                        } else if deflate64 && distance_symbol < 32 {
+                            32769 + (distance_symbol as u64 - 30) * 16384
+                                + u64::from(bits.read(14)?)
+                        } else {
                             return invalid("invalid_deflate_distance_symbol");
-                        }
-                        let distance = u64::from(DIST_BASE[distance_symbol])
-                            + u64::from(bits.read(DIST_EXTRA[distance_symbol])?);
-                        if distance > decoded_size.min(DEFLATE_WINDOW_SIZE) {
+                        };
+                        let window = if deflate64 { 65536 } else { DEFLATE_WINDOW_SIZE };
+                        if distance > decoded_size.min(window) {
                             return invalid("deflate_distance_out_of_range");
                         }
                         length
@@ -712,6 +742,26 @@ fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<u64> {
             bits.align_byte();
             return Ok(decoded_size);
         }
+    }
+}
+
+// Password prescreen over an already decrypted prefix. Reuse the structural
+// parser, including fixed lookup tables, rather than allocating a decoder or
+// dictionary. Exhausting the supplied prefix is not evidence against a key.
+// No output or iteration budget is needed: each step consumes input bits.
+pub(crate) fn deflate_prefix_is_possible(
+    prefix: &[u8],
+    deflate64: bool,
+    expected_size: u64,
+) -> bool {
+    let mut read = |_offset, _length| -> io::Result<&[u8]> { Ok(&[]) };
+    let mut cursor = ByteCursor::new(&mut read, 0, prefix.len() as u64, prefix);
+    match parse_deflate_mode(&mut LsbBits::new(&mut cursor), deflate64) {
+        // Only a complete final block gives an exact output size. A short
+        // prefix has not proved that the remaining output is absent.
+        Ok(decoded_size) => decoded_size == expected_size,
+        Err(ValidationError::Invalid("unexpected_end_of_stream")) => true,
+        Err(_) => false,
     }
 }
 

@@ -110,6 +110,7 @@ pub(crate) struct VirtualRangeReader<'a> {
     ranges: &'a [RangeSpec],
     position: u64,
     total_len: u64,
+    streaming: bool,
 }
 
 impl<'a> VirtualRangeReader<'a> {
@@ -121,7 +122,14 @@ impl<'a> VirtualRangeReader<'a> {
             ranges,
             position: 0,
             total_len,
+            streaming: false,
         }
+    }
+
+    // Material copied into a prepared descriptor already owns its lifetime.
+    // Do not also retain a potentially large CRC span in the reader caches.
+    pub(crate) fn streaming(ranges: &'a [RangeSpec]) -> Self {
+        Self { streaming: true, ..Self::new(ranges) }
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -177,9 +185,11 @@ impl Read for VirtualRangeReader<'_> {
             }
             let to_read = (range.len - local_offset).min(buf.len() as u64) as usize;
             let physical_offset = range.start + local_offset;
-            let read_now = range
-                .reader
-                .read_into_at(physical_offset, &mut buf[..to_read])?;
+            let read_now = if self.streaming {
+                range.reader.read_direct_into_at(physical_offset, &mut buf[..to_read])?
+            } else {
+                range.reader.read_into_at(physical_offset, &mut buf[..to_read])?
+            };
             if read_now == 0 {
                 break;
             }

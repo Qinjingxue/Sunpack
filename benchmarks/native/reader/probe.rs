@@ -155,6 +155,7 @@ fn password_phases() -> Result<(), Box<dyn std::error::Error>> {
             "candidates_seconds":candidates_seconds,"candidates_cpu_seconds":candidates_cpu_seconds,
             "before":before,"after_prepare":after_prepare,"after_candidates":after_candidates,
             "after_drop":after_drop,"prepare_status":prepared.status,
+            "retained_seven_zip_keys":crate::formats::seven_zip::seven_zip_cached_key_count(),
             "result":{"status":found.status,"matched_index":found.matched_index,
                 "matched_indices":found.matched_indices,"attempts":found.attempts,
                 "final_confirmation_required":found.final_confirmation_required,
