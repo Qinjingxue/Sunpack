@@ -21,7 +21,7 @@ std::string utf8(const std::wstring& s) {
     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s.data(), int(s.size()), out.data(), n, nullptr, nullptr);
     return out;
 }
-std::wstring wide(const std::string& s) {
+std::wstring wide(std::string_view s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), int(s.size()), nullptr, 0);
     if (!n) win_error("opDecodeUtf8");

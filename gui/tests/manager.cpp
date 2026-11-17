@@ -41,8 +41,8 @@ void save_config_field(const fs::path& path,const std::string& pointer,const std
     Json edit={{"pointer",pointer},{"original",original},{"type",type},{"text",text},{"boolean",boolean}};
     require_save(save_changes(path.parent_path(),Json::array({edit}),Json::array(),Json::array()));
 }
-void save_password_edit(const fs::path& path,Json edit) {
-    require_save(save_changes(path.parent_path(),Json::array(),Json::array({std::move(edit)}),Json::array()));
+void save_password_edit(const fs::path& path,Json edit,PasswordSaveSnapshot* snapshot=nullptr) {
+    require_save(save_changes(path.parent_path(),Json::array(),Json::array({std::move(edit)}),Json::array(),snapshot));
 }
 void edit_root(const fs::path& path,const std::string& op,const std::string& original,
     const std::string& input,const std::string& output,bool deep) {
@@ -150,7 +150,7 @@ void projection(Fixture& f) {
     fs::create_directories(nested); fs::create_directory(output);
     auto file=nested/L"已删除的载体.001";
     auto sibling=f.dir/"Data2";
-    WatchRoots roots; roots.entries={{f.dir,"",false},{monitor,"",false},{sibling,"",false}};
+    WatchRoots roots={{f.dir,"",false},{monitor,"",false},{sibling,"",false}};
     auto history_rows=Json{{"event","done"},{"path",utf8(file.wstring())},{"ts",4},
         {"output_dirs",{utf8((f.dir/L"missing").wstring()),utf8(output.wstring())}}}.dump()+"\n";
     // Exercise component-prefix matching through the projected rows.
@@ -202,13 +202,20 @@ void editing(Fixture& f) {
     // globals subsume scoped copies; distinct scopes share one stored record.
     Json scope_a={{"value","same"},{"scopes",{"C:/A"}}},scope_b={{"value","same"},{"scopes",{"D:/B"}}};
     Json document={{"passwords",{scope_a,scope_b}},{"clipboard_history",{"retained"}}},retained;
+    atomic_write(p,document.dump());
+    auto apply_edit=[&](Json edit) {
+        PasswordSaveSnapshot snapshot;
+        save_password_edit(p,std::move(edit),&snapshot);
+        document=std::move(snapshot.document);
+        retained=std::move(snapshot.record);
+    };
     auto apply=[&](const char* operation,const Json& old,const char* value,Json scopes) {
-        document=apply_password_changes(std::move(document),Json::array({Json{{"operation",operation},{"original",old.is_null()?"":old.dump()},{"value",value},{"values",{value}},{"scopes",scopes}}}),&retained);
+        apply_edit({{"operation",operation},{"original",old.is_null()?"":old.dump()},{"value",value},{"values",{value}},{"scopes",std::move(scopes)}});
     };
     apply("addMany",Json(),"same",{"c:\\a\\child"});
     assert(document["passwords"]==Json::array({Json{{"value","same"},{"scopes",{"C:/A","D:/B"}}}}) && retained.is_null());
     auto combined=document["passwords"][0];
-    document=apply_password_changes(std::move(document),Json::array({Json{{"operation","replace"},{"original",combined.dump()},{"scope","D:/B"},{"value","same"},{"scopes",{"C:/A"}}}}),&retained);
+    apply_edit({{"operation","replace"},{"original",combined.dump()},{"scope","D:/B"},{"value","same"},{"scopes",{"C:/A"}}});
     assert(document["passwords"]==Json::array({scope_a}) && retained.is_null());
     apply("addMany",Json(),"same",Json::array()); assert(document["passwords"]==Json::array({Json{{"value","same"}}}) && !retained.is_null());
     apply("addMany",Json(),"same",{"D:/B"}); assert(document["passwords"].size()==1 && retained.is_null());
@@ -217,17 +224,18 @@ void editing(Fixture& f) {
     assert(document["passwords"].size()==1 && retained.is_null() && document["clipboard_history"][0]=="retained");
     Json earlier={{"value","earlier"}},existing={{"value","same"}};
     document["passwords"]=Json::array({earlier,existing});
+    atomic_write(p,document.dump());
     apply("replace",earlier,"same",Json::array());
     assert(document["passwords"]==Json::array({existing}) && retained.is_null());
     // A multi-scope legacy record is edited/deleted only in the selected
     // directory; other associations survive the same atomic transaction.
     Json multi={{"value","old"},{"scopes",{"C:/A","D:/B"}}};
-    document={{"passwords",{multi}}};
-    document=apply_password_changes(std::move(document),Json::array({Json{{"operation","replace"},{"original",multi.dump()},{"scope","c:\\a"},{"value","new"},{"scopes",{"C:/A"}}}}),&retained);
+    atomic_write(p,Json{{"passwords",{multi}}}.dump());
+    apply_edit({{"operation","replace"},{"original",multi.dump()},{"scope","c:\\a"},{"value","new"},{"scopes",{"C:/A"}}});
     assert(retained==Json({{"value","new"},{"scopes",{"C:/A"}}}));
     assert(document["passwords"].size()==2 && document["passwords"][1]==Json({{"value","old"},{"scopes",{"D:/B"}}}));
     auto selected=document["passwords"][0];
-    document=apply_password_changes(std::move(document),Json::array({Json{{"operation","removeScope"},{"original",selected.dump()},{"scope","C:/A"}}}));
+    apply_edit({{"operation","removeScope"},{"original",selected.dump()},{"scope","C:/A"}});
     assert(document["passwords"]==Json::array({Json{{"value","old"},{"scopes",{"D:/B"}}}}));
     save_password_edit(p,{{"operation","add"},{"value","shared stored"},{"scopes",{"C:/A"}}});
     save_password_edit(p,{{"operation","add"},{"value","shared stored"},{"scopes",{"D:/B","c:\\a\\"}}});
@@ -349,31 +357,31 @@ void localization(Fixture& fixture) {
 void roots(Fixture& f) {
     auto p=f.dir/"sunpack_watch_roots.txt";
     atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | relative | false\n"+utf8(f.dir.wstring())+" | 末条 | TRUE\n");
-    auto roots=read_roots(p); assert(roots.entries.size()==1 && roots.entries[0].deep && roots.entries[0].output=="末条");
+    auto roots=read_roots(p); assert(roots.size()==1 && roots[0].deep && roots[0].output=="末条");
     auto nested=f.dir/"Data"; fs::create_directory(nested);
     // A runtime-only fourth column must survive GUI edits of other settings;
     // changing the input path must make the replacement eligible for scanning.
     atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | 末条 | true | true\n");
     edit_root(p,"save",utf8(f.dir.wstring()),utf8(f.dir.wstring()),"末条",true);
-    assert(read_roots(p).entries[0].initial_scanned);
+    assert(read_roots(p)[0].initial_scanned);
     edit_root(p,"save",utf8(f.dir.wstring()),utf8(nested.wstring()),"changed",false);
-    assert(!read_roots(p).entries[0].initial_scanned);
+    assert(!read_roots(p)[0].initial_scanned);
     edit_root(p,"save",utf8(nested.wstring()),utf8(f.dir.wstring()),"末条",true);
     edit_root(p,"save","",utf8(nested.wstring()),"",false);
-    auto all=read_roots(p); assert(all.entries.size()==2);
+    auto all=read_roots(p); assert(all.size()==2);
     auto duplicate_before=read_file(p);
     edit_root(p,"save","",utf8(nested.wstring()),"",false);
     assert(read_file(p)==duplicate_before);
     fails([&]{edit_root(p,"save","",utf8(nested.wstring()),"different-output",false);});
     edit_root(p,"save",utf8(nested.wstring()),utf8(f.dir.wstring()),"末条",true);
-    auto merged_root=read_roots(p); assert(merged_root.entries.size()==1 && merged_root.entries[0].deep && merged_root.entries[0].output=="末条");
+    auto merged_root=read_roots(p); assert(merged_root.size()==1 && merged_root[0].deep && merged_root[0].output=="末条");
     edit_root(p,"save","",utf8(nested.wstring()),"",false);
     edit_root(p,"delete",utf8(nested.wstring()),utf8(nested.wstring()),"",false);
     assert(read_file(p).find("# 保留注释")!=std::string::npos);
     assert(path_key(L"C:/İ/中文/../A")==path_key(L"c:\\İ\\a"));
     assert(path_key(L"C:/Data/")==path_key(L"c:\\data"));
     assert(!is_under(path_key(L"C:/Data2/a"),path_key(L"C:/Data")));
-    for(int i=0;i<501;++i) all.entries.push_back({f.dir/std::to_wstring(i),"",false});
+    for(int i=0;i<501;++i) all.push_back({f.dir/std::to_wstring(i),"",false});
     assert(directory_rows(all).size()==503);
 }
 void batch_editing(Fixture& fixture) {
@@ -426,7 +434,7 @@ void batch_editing(Fixture& fixture) {
     assert(read_json(config)["watch"]["toast_enabled"]==false);
     assert(read_json(passwords)["passwords"][0]["value"]=="fast-delta");
     assert(read_json(passwords)["clipboard_history"][0]=="latest background history");
-    assert(read_roots(roots).entries[0].deep && read_file(roots).find("# retained")!=std::string::npos);
+    assert(read_roots(roots)[0].deep && read_file(roots).find("# retained")!=std::string::npos);
     PasswordSaveSnapshot joined;
     auto previous_record=snapshot.record.dump(),joined_scope=utf8((dir.parent_path()/L"joined-scope").wstring());
     auto joined_result=save_changes(dir,Json::array(),Json::array({Json{{"operation","addMany"},{"values",{"fast-delta"}},{"scopes",{joined_scope}}}}),Json::array(),&joined,snapshot.file_text);
@@ -442,7 +450,8 @@ void batch_editing(Fixture& fixture) {
     assert(!bad["error"].get<std::string>().empty() && read_file(roots)==before);
     batch[0]["inputs"]=Json::array({utf8(first.wstring()),utf8(second.wstring()),utf8(first.wstring())});
     assert(save_changes(dir,Json::array(),Json::array(),batch)["error"]=="");
-    assert(read_roots(roots).entries.size()==3 && read_roots(roots).entries.back().deep);
+    auto saved_roots=read_roots(roots);
+    assert(saved_roots.size()==3 && saved_roots.back().deep);
     View view;
     auto saved=read_json(passwords);
     saved["passwords"].push_back({{"value","everywhere"}});
@@ -477,7 +486,7 @@ void batch_editing(Fixture& fixture) {
     cleanup["passwords"][0]["scopes"]=Json::array({utf8(second.wstring())});
     assert(removed["error"]=="" && removed["saved"]==Json::array({"passwords","roots"}));
     assert(read_json(passwords)==cleanup && cleaned.document==cleanup && cleaned.rebases.size()==2);
-    assert(read_roots(roots).entries.size()==3 && fs::is_directory(first));
+    assert(read_roots(roots).size()==3 && fs::is_directory(first));
 }
 }
 int wmain(int argc,wchar_t** argv) {
@@ -489,7 +498,7 @@ int wmain(int argc,wchar_t** argv) {
             if(argc>3) view.task_query=utf8(argv[3]);
             if(argc>4) view.task_cursor=utf8(argv[4]);
             WatchRoots roots;
-            if(argc>5 && *argv[5]) { view.task_root=utf8(argv[5]); roots.entries.push_back({fs::path(argv[5]),"",false}); }
+            if(argc>5 && *argv[5]) { view.task_root=utf8(argv[5]); roots.push_back({fs::path(argv[5]),"",false}); }
             if(argc>6) view.task_status=utf8(argv[6]);
             std::cout<<Json{{"tasks",log.query(roots,view)}}.dump(); return 0;
         } catch(const WinError& error) { std::cerr<<error.what()<<"\n"; return int(error.code); }

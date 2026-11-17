@@ -225,11 +225,9 @@ void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
 
     // R-1 空间错误不置位 failed
     const auto paused_file = writer.take_file_snapshot(file);
-    check(!paused_file.failed, "R-1: 暂停期间 file->failed 必须仍是 false");
     check(paused_file.hresult == S_OK, "R-1: 暂停期间 file->hresult 必须仍是 S_OK");
     // R-2 空间错误不置位 job error
     check(writer.current_error(job) == S_OK, "R-2: 暂停期间 job 必须没有错误");
-    check(!job->terminal_requested.load(), "R-2: 暂停期间 terminal_requested 必须仍是 false");
     // R-3 记账不变量（暂停期间）
     const auto paused = writer.snapshot_meters();
     check(paused.discarded_bytes == 0, "R-3: 暂停期间 discarded 必须为 0");
@@ -412,17 +410,13 @@ void r11a_no_volume_gate_data_failure(const std::filesystem::path &directory) {
                        &processed) == S_OK,
           "R-11a: 写入必须被接受");
 
-    check(wait_until([&] { return writer.take_file_snapshot(file).failed; }, 5s),
-          "R-11a: 无卷 gate 时空间错误必须走旧的永久失败路径");
+    check(wait_until([&] { return writer.take_file_snapshot(file).hresult != S_OK; }, 5s),
+          "R-11a: 无卷 gate 时空间错误必须成为永久失败");
 
-    // 四条旧副作用逐条断言（只断言"job 最终失败"是不够的）。
     const auto snapshot = writer.take_file_snapshot(file);
-    check(snapshot.failed, "R-11a: 副作用 1 —— file->failed 必须置位");
-    check(snapshot.win32_error == ERROR_DISK_FULL,
-          "R-11a: file 必须记录原始 Win32 错误码");
-    check(writer.current_error(job) != S_OK, "R-11a: 副作用 2 —— job->first_error 必须置位");
-    check(job->terminal_requested.load(),
-          "R-11a: 副作用 2b —— terminal_requested 必须同步置位（gate 谓词依赖它）");
+    check(snapshot.hresult == HRESULT_FROM_WIN32(ERROR_DISK_FULL),
+          "R-11a: file 必须记录磁盘空间错误");
+    check(writer.current_error(job) == snapshot.hresult, "R-11a: job 必须报告同一错误");
     const auto metrics = writer.snapshot_meters();
     check(metrics.discarded_bytes == kPayload,
           "R-11a: 副作用 3 —— discarded 必须按剩余字节增长");
@@ -665,7 +659,7 @@ void r17_concurrent_open_is_serialized(const std::filesystem::path &directory) {
           "R-17: 测试前提 —— 同一 file 的多个 Data WorkItem 必须被多个 writer 线程并发处理");
     check(open_calls.load() == 1,
           "R-17: CreateFileW 只能发生一次（第二个线程必须看到已建立的 handle）");
-    check(!snapshot.failed, "R-17: 不得出现 ERROR_FILE_EXISTS → PermanentFailure");
+    check(snapshot.hresult == S_OK, "R-17: 不得出现 ERROR_FILE_EXISTS → PermanentFailure");
     check(read_file(path) == payload, "R-17: 数据必须完整");
 }
 
@@ -696,7 +690,7 @@ void r18_permanent_failure_records_discarded(const std::filesystem::path &direct
     check(metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
           "R-18: 必须保持记账不变量");
     const auto snapshot = writer.take_file_snapshot(file);
-    check(snapshot.failed && snapshot.win32_error == ERROR_WRITE_FAULT,
+    check(snapshot.hresult == HRESULT_FROM_WIN32(ERROR_WRITE_FAULT),
           "R-18: file 必须记录永久错误");
     // 永久错误走 probe inconclusive：绝不产生 space_resumed。
     check(harness.log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
@@ -808,7 +802,7 @@ void r9_flush_space_error(const std::filesystem::path &directory) {
     check(writer.finish_job(job) == S_OK, "R-9: 恢复后 job 必须完成");
     const auto snapshot = writer.take_file_snapshot(file);
     check(snapshot.closed, "R-9: 恢复后文件必须已关闭");
-    check(!snapshot.failed, "R-9: 恢复后文件不得是失败状态");
+    check(snapshot.hresult == S_OK, "R-9: 恢复后文件不得是失败状态");
     check(open_calls.load() == 1, "R-9: flush 重试不得重新打开文件（同 handle）");
     check(writer.snapshot_meters().completed_files == 1, "R-9: 必须计入 completed_files");
     check(read_file(path) == payload, "R-9: 数据必须完整");
@@ -940,7 +934,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         check(writer.finish_job(job) != S_OK, "R-11b: open 失败必须让 job 失败");
 
         const auto snapshot = writer.take_file_snapshot(file);
-        check(snapshot.failed, "R-11b: ① open 失败必须置 file->failed");
+        check(snapshot.hresult != S_OK, "R-11b: ① 文件必须报告 open 失败");
         check(writer.current_error(job) != S_OK, "R-11b: ① open 失败必须置 job->first_error");
         check(open_calls.load() == 1,
               "R-11b: ① open 失败必须只尝试一次（open_attempted 的\"不再尝试\"语义）");
@@ -977,8 +971,8 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         check(writer.finish_job(job) != S_OK, "R-11b: ② flush 空间错误必须让 job 失败");
 
         const auto snapshot = writer.take_file_snapshot(file);
-        check(snapshot.failed && snapshot.win32_error == ERROR_DISK_FULL,
-              "R-11b: ② flush 失败必须置 file->failed 并记录原始码");
+        check(snapshot.hresult == HRESULT_FROM_WIN32(ERROR_DISK_FULL),
+              "R-11b: ② 文件必须报告 flush 的磁盘空间错误");
         check(writer.current_error(job) != S_OK, "R-11b: ② 必须置 job->first_error");
         const auto metrics = writer.snapshot_meters();
         check(metrics.discarded_bytes == 0,
@@ -1063,7 +1057,7 @@ void r21_open_space_error_is_retryable(const std::filesystem::path &directory) {
     check(wait_until([&] { return harness.gate->blocked(); }, 5s),
           "R-21: open 的空间类失败必须让卷进入暂停（而不是永久失败）");
     const auto paused = writer.take_file_snapshot(file);
-    check(!paused.failed, "R-21: 暂停期间 file 不得被标记失败");
+    check(paused.hresult == S_OK, "R-21: 暂停期间 file 不得被标记失败");
     check(writer.current_error(job) == S_OK, "R-21: 暂停期间 job 不得被标记失败");
     check(harness.log->count(VolumeSpaceTransition::Kind::Blocked) >= 1,
           "R-21: 必须开启一个 episode");

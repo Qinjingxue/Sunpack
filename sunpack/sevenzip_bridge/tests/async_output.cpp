@@ -114,7 +114,7 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     const auto metrics = writer.snapshot_meters();
     const DWORD attributes = GetFileAttributesW((directory / L"parallel.bin").c_str());
     SetFileAttributesW((directory / L"parallel.bin").c_str(), FILE_ATTRIBUTE_NORMAL);
-    if (snapshot.failed || !snapshot.closed || snapshot.accepted_bytes != expected.size() ||
+    if (snapshot.hresult != S_OK || !snapshot.closed || snapshot.accepted_bytes != expected.size() ||
         snapshot.written_bytes != expected.size() || snapshot.peak_active_data_writes < 2 ||
         metrics.accepted_bytes != expected.size() || metrics.written_bytes != expected.size() ||
         metrics.completed_files != 1 || metrics.completed_jobs != 1) {
@@ -154,7 +154,7 @@ bool write_zero_length_file(const std::filesystem::path& directory) {
     writer.record_operation_result(file, 0);
     const auto snapshot = writer.take_file_snapshot(file);
     std::error_code error;
-    return !snapshot.failed && snapshot.closed && snapshot.written_bytes == 0 &&
+    return snapshot.hresult == S_OK && snapshot.closed && snapshot.written_bytes == 0 &&
         !snapshot.metadata_errors.first_error() && !snapshot.has_mtime_ns &&
         file_times_match(directory / L"empty.bin", times) &&
         std::filesystem::file_size(directory / L"empty.bin", error) == 0 && !error;
@@ -214,7 +214,7 @@ bool timestamp_failure_does_not_fail_content(const std::filesystem::path& direct
     writer.close_file(file, {});
     if (writer.finish_job(job) != S_OK) return false;
     const auto snapshot = writer.take_file_snapshot(file);
-    if (snapshot.failed || !snapshot.closed || !snapshot.metadata_errors.first_error() ||
+    if (snapshot.hresult != S_OK || !snapshot.closed || !snapshot.metadata_errors.first_error() ||
         snapshot.written_bytes != sizeof(payload) || std::filesystem::file_size(path) != sizeof(payload))
         return false;
 
@@ -261,7 +261,7 @@ bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
     }
     std::ifstream input(path, std::ios::binary);
     std::string existing((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    return snapshot.failed && snapshot.closed && snapshot.written_bytes == 0 &&
+    return snapshot.hresult != S_OK && snapshot.closed && snapshot.written_bytes == 0 &&
         existing == "existing";
 }
 

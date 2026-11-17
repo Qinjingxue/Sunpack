@@ -3316,7 +3316,7 @@ impl Scheduler {
                 // Reuse service repair rather than advertising an inactive model.
                 if let Some(error) = failure { return Err(error); }
             }
-            if self.enabled() && !signals.published_outputs.is_empty() && self.journal.state().has_entries() {
+            if self.enabled() && !signals.published_outputs.is_empty() && self.journal.state().has_missing_volume_blockers() {
                 let buckets: HashSet<_> = signals.published_outputs.into_iter().map(|(root, output)|
                     (watch_path_key(&root), crate::scan::catalog::catalog_stem(&output))).collect();
                 let mut retried = HashSet::new();
@@ -3533,7 +3533,7 @@ impl Scheduler {
         // refreshing the durable inventory or advancing its USN stamp. The
         // captured burst is reconciled once at admission/recovery instead.
         let mut retried = HashSet::new();
-        let retry_volumes = self.journal.state().has_entries();
+        let retry_volumes = self.journal.state().has_missing_volume_blockers();
         for (id, paths) in changed {
             let Some((root, scope)) = self.roots.get(id) else { continue };
             let deep = root.deep;
@@ -3763,7 +3763,7 @@ impl Scheduler {
         let mut marks = HashSet::new();
         let mut admitted = HashSet::new();
         let mut retried = HashSet::new();
-        let retry_volumes = self.journal.state().has_entries();
+        let retry_volumes = self.journal.state().has_missing_volume_blockers();
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
         for (id, root, scope, identity, current, cached) in probes {
@@ -4577,7 +4577,7 @@ impl Scheduler {
         for id in self.catalog.bucket_keys(scope, stem) {
             if retried.contains(&id) { continue; }
             if let Some(entry) = self.journal.state().entry_by_key(&id)
-                .filter(|entry| entry.status == "suspended_missing_volume") {
+                .filter(|entry| entry.is_missing_volume()) {
                 retried.insert(id);
                 self.check_missing_volume(&entry, false)?;
             }
@@ -5656,7 +5656,7 @@ impl Scheduler {
                     let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
                     let tracker = quiet.remove(&path);
                     if let Some(entry) = self.journal.state().entry(&path)
-                        .filter(|entry| entry.status == "suspended_missing_volume") {
+                        .filter(|entry| entry.is_missing_volume()) {
                         self.check_missing_volume(&entry, false)?;
                         continue;
                     }
@@ -6155,7 +6155,7 @@ impl Scheduler {
         }
         for candidate in &active.inputs {
             if let Some(entry) = self.journal.state().entry(&candidate.path)
-                .filter(|entry| entry.status == "suspended_missing_volume") {
+                .filter(|entry| entry.is_missing_volume()) {
                 self.check_missing_volume(&entry, false)?;
             }
         }

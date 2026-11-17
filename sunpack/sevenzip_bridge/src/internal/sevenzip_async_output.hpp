@@ -140,16 +140,10 @@ namespace sunpack::sevenzip
 #endif
                   {}
 
-            // 必须是 atomic：gate 的 wait() 在 writer mutex_ 之外无锁读它。
-            // 每个令本 job 终局的地方都要同步置 true；空间错误不得置位（那是暂停语义的前提）。
-            std::atomic<bool> terminal_requested{false};
-
-            // 详细错误结果，由本 writer 的 mutex_ 保护。
-            HRESULT first_error = S_OK;
-            int first_win32_error = 0;
+            // Written under the writer mutex; the space gate reads it without that lock.
+            std::atomic<HRESULT> first_error{S_OK};
             std::size_t inflight_bytes = 0;
             std::size_t pending_jobs = 0;
-            bool cancelled = false;
             const std::size_t max_inflight_bytes;
             std::shared_ptr<std::atomic<bool>> cancel_token;
 #ifdef SUP7Z_DEBUG
@@ -172,11 +166,9 @@ namespace sunpack::sevenzip
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
             std::vector<unsigned char> magic;
-            bool failed = false;
             bool closed = false;
 #ifdef SUP7Z_DEBUG
             ArchiveMetadataErrors metadata_errors;
-            int win32_error = 0;
             UInt64 accepted_bytes = 0;
             std::size_t peak_active_data_writes = 0;
 #endif
@@ -291,14 +283,12 @@ namespace sunpack::sevenzip
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
 #ifdef SUP7Z_DEBUG
-            int win32_error = 0;
             ArchiveMetadataErrors metadata_errors;
 #endif
             bool operation_result_set = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
             std::vector<unsigned char> magic;
-            bool failed = false;
             bool closed = false;
             bool close_requested = false;
             bool close_enqueued = false;
@@ -453,7 +443,7 @@ namespace sunpack::sevenzip
             if (receipt.path.empty()) receipt.path = std::move(file->path);
             receipt.created = receipt.created || file->output_created;
             receipt.written = std::move(file->written_ranges_);
-            receipt.complete = receipt.complete || (file->closed && !file->failed && file->operation_result_set && file->operation_result == 0);
+            receipt.complete = receipt.complete || (file->closed && file->hresult == S_OK && file->operation_result_set && file->operation_result == 0);
             receipt.has_mtime = file->has_mtime_ns;
             receipt.mtime = file->mtime_ns;
         }
@@ -594,8 +584,7 @@ namespace sunpack::sevenzip
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
                     if (allocation_failed) {
-                        mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
-                        set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                        fail_file_locked(file, E_OUTOFMEMORY);
                     }
                     const HRESULT error = terminal_result_locked(job);
                     if (error != S_OK || file->close_requested)
@@ -720,7 +709,7 @@ namespace sunpack::sevenzip
             // or the caller never reached the stream's Close().
             seal_job_files(job);
             drain_cancelled_retries();
-            if (job->terminal_requested.load(std::memory_order_acquire) && state_->space_gate)
+            if (job->first_error.load(std::memory_order_acquire) != S_OK && state_->space_gate)
                 state_->space_gate->wake_waiters();
 
             std::unique_lock<std::mutex> lock(mutex_);
@@ -747,7 +736,7 @@ namespace sunpack::sevenzip
             }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                cancel_job_locked(job);
+                set_job_error_locked(job, E_ABORT);
             }
             // Release a producer's capacity wait before acquiring its file
             // mutex to seal it; the producer holds that mutex during Write().
@@ -792,17 +781,6 @@ namespace sunpack::sevenzip
             std::lock_guard<std::mutex> lock(mutex_);
             synchronize_cancellation_locked(job);
             return terminal_result_locked(job);
-        }
-
-        int current_win32_error(const JobStatePtr &job) noexcept
-        {
-            if (!job)
-            {
-                return ERROR_INVALID_STATE;
-            }
-            std::lock_guard<std::mutex> lock(mutex_);
-            synchronize_cancellation_locked(job);
-            return current_win32_error_locked(job);
         }
 
         bool is_quiescent() const noexcept
@@ -862,7 +840,7 @@ namespace sunpack::sevenzip
             {
                 // Earlier successes can be released during extraction. Keep
                 // files with old replay receipts until they are reconciled.
-                if (file->replay || !lock.try_lock() || !file->closed || file->failed ||
+                if (file->replay || !lock.try_lock() || !file->closed || file->hresult != S_OK ||
                     !file->operation_result_set || file->operation_result != 0)
                     return snapshot;
             }
@@ -877,11 +855,9 @@ namespace sunpack::sevenzip
             snapshot.has_mtime_ns = file->has_mtime_ns;
             snapshot.mtime_ns = file->mtime_ns;
             snapshot.magic = std::move(file->magic);
-            snapshot.failed = file->failed;
             snapshot.closed = file->closed;
 #ifdef SUP7Z_DEBUG
             snapshot.metadata_errors = file->metadata_errors;
-            snapshot.win32_error = file->win32_error;
             snapshot.accepted_bytes = file->accepted_bytes;
             snapshot.peak_active_data_writes = file->peak_active_data_writes;
 #endif
@@ -896,7 +872,7 @@ namespace sunpack::sevenzip
                 std::lock_guard<std::mutex> lock(mutex_);
                 stopping_.store(true, std::memory_order_release);
                 for (const auto &weak : active_jobs_)
-                    if (auto job = weak.lock()) cancel_job_locked(job);
+                    if (auto job = weak.lock()) set_job_error_locked(job, E_ABORT);
             }
             producer_cv_.notify_all();
             if (state_->space_gate) state_->space_gate->wake_waiters();
@@ -1011,32 +987,19 @@ namespace sunpack::sevenzip
         }
 #endif
 
-        void set_job_error_locked(const JobStatePtr &job, HRESULT hr, int win32_error) noexcept
+        static void set_job_error_locked(const JobStatePtr &job, HRESULT hr) noexcept
         {
-            if (job && job->first_error == S_OK)
+            if (job && job->first_error.load(std::memory_order_relaxed) == S_OK)
             {
-                job->first_error = hr;
-                job->first_win32_error = win32_error;
-                job->terminal_requested.store(true, std::memory_order_release);
+                job->first_error.store(hr, std::memory_order_release);
             }
-        }
-
-        void cancel_job_locked(const JobStatePtr &job) noexcept
-        {
-            if (!job)
-            {
-                return;
-            }
-            job->cancelled = true;
-            job->terminal_requested.store(true, std::memory_order_release);
-            set_job_error_locked(job, E_ABORT, ERROR_OPERATION_ABORTED);
         }
 
         void synchronize_cancellation_locked(const JobStatePtr &job) noexcept
         {
             if (job && job->cancel_token && job->cancel_token->load(std::memory_order_acquire))
             {
-                cancel_job_locked(job);
+                set_job_error_locked(job, E_ABORT);
             }
         }
 
@@ -1046,26 +1009,9 @@ namespace sunpack::sevenzip
             {
                 return E_FAIL;
             }
-            if (job->first_error != S_OK)
-            {
-                return job->first_error;
-            }
-            return (job->cancelled || stopping_.load(std::memory_order_acquire)) ? E_ABORT : S_OK;
-        }
-
-        int current_win32_error_locked(const JobStatePtr &job) const noexcept
-        {
-            if (!job)
-            {
-                return ERROR_INVALID_STATE;
-            }
-            if (job->first_win32_error != 0)
-            {
-                return job->first_win32_error;
-            }
-            return (job->cancelled || stopping_.load(std::memory_order_acquire))
-                       ? ERROR_OPERATION_ABORTED
-                       : 0;
+            const HRESULT hr = job->first_error.load(std::memory_order_relaxed);
+            if (hr != S_OK) return hr;
+            return stopping_.load(std::memory_order_acquire) ? E_ABORT : S_OK;
         }
 
         bool can_accept_locked(const JobStatePtr &job, const FileStatePtr &file) const noexcept
@@ -1195,8 +1141,7 @@ namespace sunpack::sevenzip
             if (output_offset > (std::numeric_limits<UInt64>::max)() - buffer->size)
             {
                 discard_staging_locked(file);
-                mark_file_failure_locked(file, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
-                set_job_error_locked(file->job, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
+                fail_file_locked(file, E_FAIL);
                 return false;
             }
             try
@@ -1207,16 +1152,14 @@ namespace sunpack::sevenzip
                 {
                     work_queue_.pop_back();
                     discard_staging_locked(file);
-                    mark_file_failure_locked(file, HRESULT_FROM_WIN32(error), error);
-                    set_job_error_locked(file->job, HRESULT_FROM_WIN32(error), error);
+                    fail_file_locked(file, HRESULT_FROM_WIN32(error));
                     return false;
                 }
             }
             catch (...)
             {
                 discard_staging_locked(file);
-                mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
-                set_job_error_locked(file->job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                fail_file_locked(file, E_OUTOFMEMORY);
                 return false;
             }
             file->staging_buffer = nullptr;
@@ -1239,8 +1182,7 @@ namespace sunpack::sevenzip
                 if (error != ERROR_SUCCESS)
                 {
                     work_queue_.pop_back();
-                    mark_file_failure_locked(file, HRESULT_FROM_WIN32(error), error);
-                    set_job_error_locked(file->job, HRESULT_FROM_WIN32(error), error);
+                    fail_file_locked(file, HRESULT_FROM_WIN32(error));
                     if (direct_close) *direct_close = true;
                     return false;
                 }
@@ -1248,8 +1190,7 @@ namespace sunpack::sevenzip
             }
             catch (...)
             {
-                mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
-                set_job_error_locked(file->job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                fail_file_locked(file, E_OUTOFMEMORY);
                 if (direct_close)
                 {
                     *direct_close = true;
@@ -1360,7 +1301,7 @@ namespace sunpack::sevenzip
                 return;
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure)
-                record_failure(file, HRESULT_FROM_WIN32(result.win32_error), result.win32_error);
+                record_failure(file, HRESULT_FROM_WIN32(result.win32_error));
 #ifdef SUP7Z_DEBUG
             if (result.kind != AttemptResult::Kind::Succeeded && buffer->size > buffer->transferred)
                 account_discarded(buffer->size - buffer->transferred);
@@ -1383,7 +1324,7 @@ namespace sunpack::sevenzip
                     result = classify_data_failure(file, error);
                 else if (bytes == 0 || bytes > buffer->size - buffer->transferred)
                 {
-                    record_failure(file, HRESULT_FROM_WIN32(ERROR_WRITE_FAULT), ERROR_WRITE_FAULT);
+                    record_failure(file, HRESULT_FROM_WIN32(ERROR_WRITE_FAULT));
                     result = {AttemptResult::Kind::PermanentFailure, ERROR_WRITE_FAULT};
                 }
                 else
@@ -1413,7 +1354,7 @@ namespace sunpack::sevenzip
             }
             catch (...)
             {
-                record_failure(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                record_failure(file, E_OUTOFMEMORY);
                 if (item.kind == WorkItem::Kind::Data)
                     finish_data_attempt(item.buffer, {AttemptResult::Kind::PermanentFailure, ERROR_OUTOFMEMORY});
                 else process_close(file);
@@ -1467,7 +1408,7 @@ namespace sunpack::sevenzip
             if (!file) return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (file->failed)
+                if (file->hresult != S_OK)
                     return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
                 if (file->handle != INVALID_HANDLE_VALUE)
                     return {AttemptResult::Kind::Succeeded, 0};
@@ -1477,7 +1418,7 @@ namespace sunpack::sevenzip
             std::lock_guard<std::mutex> open_lock(file->open_mutex);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (file->failed)
+                if (file->hresult != S_OK)
                     return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
                 if (file->handle != INVALID_HANDLE_VALUE)
                     return {AttemptResult::Kind::Succeeded, 0};
@@ -1523,10 +1464,7 @@ namespace sunpack::sevenzip
                             static_cast<unsigned long>(error)};
                 }
                 file->open_attempted = true;
-                mark_file_failure_locked(
-                    file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
-                set_job_error_locked(
-                    file->job, HRESULT_FROM_WIN32(error), static_cast<int>(error));
+                fail_file_locked(file, HRESULT_FROM_WIN32(error));
                 return {AttemptResult::Kind::PermanentFailure,
                         static_cast<unsigned long>(error)};
             }
@@ -1542,8 +1480,7 @@ namespace sunpack::sevenzip
             file->open_attempted = true;
             if (registration_error)
             {
-                mark_file_failure_locked(file, HRESULT_FROM_WIN32(registration_error), registration_error);
-                set_job_error_locked(file->job, HRESULT_FROM_WIN32(registration_error), registration_error);
+                fail_file_locked(file, HRESULT_FROM_WIN32(registration_error));
                 return {AttemptResult::Kind::PermanentFailure, registration_error};
             }
             file->handle = handle;
@@ -1556,7 +1493,7 @@ namespace sunpack::sevenzip
             return [this, job]
             {
                 return stopping_.load(std::memory_order_acquire) || !job ||
-                       job->terminal_requested.load(std::memory_order_acquire) ||
+                       job->first_error.load(std::memory_order_acquire) != S_OK ||
                        (job->cancel_token &&
                         job->cancel_token->load(std::memory_order_acquire));
             };
@@ -1565,7 +1502,7 @@ namespace sunpack::sevenzip
         bool begin_data_write(const FileStatePtr &file) noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!file || file->failed || terminal_result_locked(file->job) != S_OK)
+            if (!file || file->hresult != S_OK || terminal_result_locked(file->job) != S_OK)
             {
                 return false;
             }
@@ -1599,7 +1536,7 @@ namespace sunpack::sevenzip
                 file->written_bytes += written;
                 if (file->track_replay) {
                     try { file->written_ranges_.add(offset, offset + written); }
-                    catch (...) { set_job_error_locked(file->job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY); }
+                    catch (...) { set_job_error_locked(file->job, E_OUTOFMEMORY); }
                 }
             }
         }
@@ -1616,7 +1553,7 @@ namespace sunpack::sevenzip
             const auto global_error = current_error(job);
             if (global_error != S_OK)
             {
-                record_failure(file, global_error, current_win32_error(job));
+                record_failure(file, global_error);
                 return {AttemptResult::Kind::Terminal, 0};
             }
             const auto opened = try_open_file(file);
@@ -1671,7 +1608,7 @@ namespace sunpack::sevenzip
             {
                 return {AttemptResult::Kind::SpaceFailure, static_cast<unsigned long>(error)};
             }
-            record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
+            record_failure(file, HRESULT_FROM_WIN32(error));
             return {AttemptResult::Kind::PermanentFailure, static_cast<unsigned long>(error)};
         }
 
@@ -1695,13 +1632,13 @@ namespace sunpack::sevenzip
             const HRESULT global_error = current_error(job);
             if (global_error != S_OK)
             {
-                record_failure(file, global_error, current_win32_error(job));
+                record_failure(file, global_error);
             }
 
             bool should_open = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                should_open = !file->failed && file->handle == INVALID_HANDLE_VALUE &&
+                should_open = file->hresult == S_OK && file->handle == INVALID_HANDLE_VALUE &&
                               !file->open_attempted && !(file->replay && file->replay->complete && !file->new_writes);
             }
             AttemptResult result;
@@ -1734,11 +1671,11 @@ namespace sunpack::sevenzip
                 return;
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure || result.kind == AttemptResult::Kind::PermanentFailure)
-                record_failure(file, HRESULT_FROM_WIN32(result.win32_error), result.win32_error);
+                record_failure(file, HRESULT_FROM_WIN32(result.win32_error));
             bool restore_times = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                restore_times = !file->failed && result.kind == AttemptResult::Kind::Succeeded;
+                restore_times = file->hresult == S_OK && result.kind == AttemptResult::Kind::Succeeded;
                 file->handle = INVALID_HANDLE_VALUE;
             }
 #ifdef SUP7Z_DEBUG
@@ -1776,7 +1713,7 @@ namespace sunpack::sevenzip
                 if (!closed)
                 {
                     const DWORD error = close_error;
-                    record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
+                    record_failure(file, HRESULT_FROM_WIN32(error));
                 }
             }
             {
@@ -1791,7 +1728,7 @@ namespace sunpack::sevenzip
                 }
                 file->closed = true;
 #ifdef SUP7Z_DEBUG
-                if (!file->failed)
+                if (file->hresult == S_OK)
                 {
                     test_completed_files_.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -1849,34 +1786,21 @@ namespace sunpack::sevenzip
             producer_cv_.notify_all();
         }
 
-        void record_failure(
-            const FileStatePtr &file,
-            HRESULT hr,
-            int win32_error) noexcept
+        void record_failure(const FileStatePtr &file, HRESULT hr) noexcept
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                mark_file_failure_locked(file, hr, win32_error);
-                if (file)
-                {
-                    set_job_error_locked(file->job, hr, win32_error);
-                }
+                fail_file_locked(file, hr);
             }
             if (file && file->space_gate) file->space_gate->wake_waiters();
             producer_cv_.notify_all();
         }
 
-        static void mark_file_failure_locked(const FileStatePtr &file, HRESULT hr, [[maybe_unused]] int win32_error) noexcept
+        static void fail_file_locked(const FileStatePtr &file, HRESULT hr) noexcept
         {
-            if (!file || file->failed)
-            {
-                return;
-            }
-            file->failed = true;
-            file->hresult = hr;
-#ifdef SUP7Z_DEBUG
-            file->win32_error = win32_error;
-#endif
+            if (!file) return;
+            if (file->hresult == S_OK) file->hresult = hr;
+            set_job_error_locked(file->job, hr);
         }
 
         std::vector<std::unique_ptr<Buffer>> buffers_;

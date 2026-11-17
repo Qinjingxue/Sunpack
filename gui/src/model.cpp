@@ -2,9 +2,9 @@
 #include "range_editor.hpp"
 #include "presentation.hpp"
 #include <algorithm>
+#include <array>
 #include <set>
 #include <map>
-#include <sstream>
 #include <stdexcept>
 #include <ctime>
 #include <cmath>
@@ -33,20 +33,20 @@ std::string task_time_query(const std::wstring& query) {
     return result;
 }
 namespace {
-std::string trim(std::string s) {
+std::string_view trim(std::string_view s) {
     auto start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return {};
+    if (start == std::string_view::npos) return {};
     return s.substr(start, s.find_last_not_of(" \t\r\n") - start + 1);
 }
 bool contains_folded(const std::string& text, const std::wstring& folded_query) {
     return folded_query.empty() || fold_search(text).find(folded_query)!=std::wstring::npos;
 }
-bool absolute_windows(const std::string& value) {
-    auto p = wide(value); std::replace(p.begin(), p.end(), L'/', L'\\');
-    if (p.size() >= 3 && iswalpha(p[0]) && p[1] == L':' && p[2] == L'\\') return true;
-    if (p.rfind(L"\\\\", 0) != 0) return false;
-    auto slash = p.find(L'\\', 2);
-    return slash != std::wstring::npos && slash > 2 && slash+1 < p.size() && p[slash+1] != L'\\';
+bool absolute_windows(const std::wstring& path) {
+    const auto separator=[](wchar_t ch) { return ch==L'\\' || ch==L'/'; };
+    if (path.size() >= 3 && iswalpha(path[0]) && path[1] == L':' && separator(path[2])) return true;
+    if (path.size() < 2 || !separator(path[0]) || !separator(path[1])) return false;
+    auto slash = path.find_first_of(L"\\/", 2);
+    return slash != std::wstring::npos && slash > 2 && slash+1 < path.size() && !separator(path[slash+1]);
 }
 std::wstring scope_key(const fs::path& path) {
     auto key=path_key(path);
@@ -60,10 +60,27 @@ bool password_matches_scope_key(const Json& record,const std::wstring& selected)
         return scope_key(wide(path.get<std::string>()))==selected;
     });
 }
-void check_text(const Json& value) {
+const std::string& password_text(const Json& value) {
     if (!value.is_string() || value.get_ref<const std::string&>().find('\0') != std::string::npos)
         throw std::runtime_error("passwordUnicodeRequired");
-    wide(value.get<std::string>());
+    return value.get_ref<const std::string&>();
+}
+void validate_password_text(const Json& value) {
+    const auto& text=password_text(value);
+    if (!text.empty() && !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), int(text.size()), nullptr, 0))
+        win_error("opDecodeUtf8");
+}
+void validate_password_record(const Json& record) {
+    if (!record.is_object() || !record.contains("value")) throw std::runtime_error("passwordValueRequired");
+    validate_password_text(record["value"]);
+    for (auto it=record.begin(); it!=record.end(); ++it)
+        if (it.key() != "value" && it.key() != "scopes") throw std::runtime_error("passwordRecordUnknownField");
+    if (record.contains("scopes")) {
+        if (!record["scopes"].is_array() || record["scopes"].empty()) throw std::runtime_error("passwordScopesEmpty");
+        for (const auto& scope : record["scopes"]) {
+            if (!absolute_windows(wide(password_text(scope)))) throw std::runtime_error("passwordScopeAbsolute");
+        }
+    }
 }
 std::string pointer_escape(const std::string& key) {
     std::string out;
@@ -130,22 +147,10 @@ void validate_passwords(const Json& j) {
         throw std::runtime_error("passwordArrayRequired");
     for (auto it=j.begin(); it!=j.end(); ++it)
         if (it.key() != "passwords" && it.key() != "clipboard_history") throw std::runtime_error("passwordFileUnknownField");
-    for (auto& record : j["passwords"]) {
-        if (!record.is_object() || !record.contains("value")) throw std::runtime_error("passwordValueRequired");
-        check_text(record["value"]);
-        for (auto it=record.begin(); it!=record.end(); ++it)
-            if (it.key() != "value" && it.key() != "scopes") throw std::runtime_error("passwordRecordUnknownField");
-        if (record.contains("scopes")) {
-            if (!record["scopes"].is_array() || record["scopes"].empty()) throw std::runtime_error("passwordScopesEmpty");
-            for (auto& scope : record["scopes"]) {
-                check_text(scope);
-                if (!absolute_windows(scope.get<std::string>())) throw std::runtime_error("passwordScopeAbsolute");
-            }
-        }
-    }
+    for (const auto& record : j["passwords"]) validate_password_record(record);
     if (j.contains("clipboard_history")) {
         if (!j["clipboard_history"].is_array()) throw std::runtime_error("clipboardArrayRequired");
-        for (auto& item : j["clipboard_history"]) check_text(item);
+        for (const auto& item : j["clipboard_history"]) validate_password_text(item);
     }
 }
 namespace {
@@ -256,16 +261,25 @@ static Json deduplicate_passwords(Json& records, const std::unordered_set<std::s
     records.erase(records.begin()+out,records.end());
     return saved;
 }
-static Json patch_password(Json& j, const std::string& op, const Json& original,
-    const Json& replacement, const std::string& scope) {
-    auto& records = j["passwords"];
+static Json patch_password(Json& records, const std::string& op, const Json& original,
+    Json replacement, const std::string& scope) {
     const auto previous_count=records.size();
     size_t target=records.size();
     std::unordered_set<std::string> touched;
-    if (op == "add") { records.push_back(replacement); }
+    const auto validate_replacement=[&](const Json& record) {
+        validate_password_record(record);
+        touched.insert(record["value"].get_ref<const std::string&>());
+    };
+    if (op == "add") {
+        validate_replacement(replacement);
+        records.push_back(std::move(replacement));
+    }
     else if(op=="addMany") {
         if(!replacement.is_array() || replacement.empty()) throw std::runtime_error("batchEmpty");
-        for(auto& record:replacement) records.push_back(record);
+        for(auto& record:replacement) {
+            validate_replacement(record);
+            records.push_back(std::move(record));
+        }
     }
     else {
         auto it = std::find(records.begin(), records.end(), original);
@@ -293,21 +307,19 @@ static Json patch_password(Json& j, const std::string& op, const Json& original,
                 if(end==paths.end()) throw std::runtime_error("scopeInherited");
                 paths.erase(end,paths.end());
             }
-            *it=replacement;
+            validate_replacement(replacement);
+            *it=std::move(replacement);
             // Editing one displayed scope must preserve all other scope links.
             if(!remaining.is_null() && !remaining["scopes"].empty()) records.push_back(std::move(remaining));
         }
         else throw std::runtime_error("passwordOperationUnknown");
     }
-    validate_passwords(j);
-    if(!original.is_null()) touched.insert(original["value"].get<std::string>());
-    if(op=="addMany") for(auto& record:replacement) touched.insert(record["value"].get<std::string>());
-    else if(op=="add" || op=="replace") touched.insert(replacement["value"].get<std::string>());
+    if(!original.is_null()) touched.insert(original["value"].get_ref<const std::string&>());
     if(op!="add" && op!="addMany" && op!="replace") target=records.size();
     return deduplicate_passwords(records,touched,target,op=="addMany"?previous_count:records.size());
 }
-Json apply_password_changes(Json document,const Json& edits,Json* saved_record) {
-    validate_passwords(document);
+static Json apply_password_changes(Json& records,const Json& edits) {
+    Json saved_record;
     bool first=true;
     for(auto& edit:edits) {
         Json replacement={{"value",edit.value("value",std::string())}};
@@ -319,55 +331,66 @@ Json apply_password_changes(Json document,const Json& edits,Json* saved_record) 
             replacement=std::move(batch);
         }
         auto original=edit.value("original",std::string());
-        auto record=patch_password(document,op,original.empty()?Json():parse_json(original),replacement,edit.value("scope",std::string()));
-        if(first && saved_record) *saved_record=std::move(record);
+        auto record=patch_password(records,op,original.empty()?Json():parse_json(original),std::move(replacement),edit.value("scope",std::string()));
+        if(first) saved_record=std::move(record);
         first=false;
     }
-    return document;
+    return saved_record;
 }
-WatchRoots parse_roots(const std::string& raw, const fs::path& base) {
+WatchRoots parse_roots(std::string_view text, const fs::path& base, std::string* comments) {
     WatchRoots result; std::unordered_map<std::wstring,size_t> positions;
-    std::string text = raw;
-    if (text.rfind("\xef\xbb\xbf",0) == 0) text.erase(0,3);
-    std::istringstream in(text); std::string line;
-    while (std::getline(in, line)) {
+    if (text.rfind("\xef\xbb\xbf",0) == 0) text.remove_prefix(3);
+    auto flag=[](std::string_view value,const char* error) {
+        if(value.empty()) return false;
+        std::string lower(value);
+        std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c){return char(tolower(c));});
+        if(lower!="true" && lower!="false") throw std::runtime_error(error);
+        return lower=="true";
+    };
+    while (!text.empty()) {
+        const auto end=text.find('\n');
+        auto line=text.substr(0,end);
+        text.remove_prefix(end==std::string_view::npos?text.size():end+1);
         auto value = trim(line);
         if (value.empty()) continue;
-        if (value[0]=='#') { if (!line.empty() && line.back()=='\r') line.pop_back(); result.comments.push_back(line); continue; }
-        std::vector<std::string> parts; size_t at=0;
-        for (;;) {
-            auto sep=value.find('|',at); parts.push_back(trim(value.substr(at,sep==std::string::npos?sep:sep-at)));
-            if (sep==std::string::npos) break; at=sep+1;
+        if (value[0]=='#') {
+            if (comments) {
+                if (line.back()=='\r') line.remove_suffix(1);
+                comments->append(line);
+                comments->push_back('\n');
+            }
+            continue;
         }
-        if (parts.size()>5) throw std::runtime_error("rootsLineInvalid");
+        std::array<std::string_view,5> parts{};
+        for (size_t i=0;;++i) {
+            if(i==parts.size()) throw std::runtime_error("rootsLineInvalid");
+            const auto sep=value.find('|');
+            parts[i]=trim(value.substr(0,sep));
+            if(sep==std::string_view::npos) break;
+            value.remove_prefix(sep+1);
+        }
         if (parts[0].empty()) continue;
-        std::string deep = parts.size()>=3 ? parts[2] : "";
-        std::transform(deep.begin(),deep.end(),deep.begin(),[](unsigned char c){ return char(tolower(c)); });
-        if (!deep.empty() && deep!="true" && deep!="false") throw std::runtime_error("deepDetectInvalid");
-        std::string scanned = parts.size()>=4 ? parts[3] : "";
-        std::transform(scanned.begin(),scanned.end(),scanned.begin(),[](unsigned char c){ return char(tolower(c)); });
-        if (!scanned.empty() && scanned!="true" && scanned!="false") throw std::runtime_error("rootsLineInvalid");
-        std::string recursive=parts.size()>=5?parts[4]:"";
-        std::transform(recursive.begin(),recursive.end(),recursive.begin(),[](unsigned char c){return char(tolower(c));});
-        if(!recursive.empty() && recursive!="true" && recursive!="false") throw std::runtime_error("rootsLineInvalid");
-        WatchRoot entry{resolve_path(wide(parts[0]),base), parts.size()>=2?parts[1]:"", deep=="true", scanned=="true", recursive=="true"};
-        auto key=path_key(entry.input); auto it=positions.find(key);
-        if (it==positions.end()) { positions[key]=result.entries.size(); result.entries.push_back(entry); }
-        else { entry.input=result.entries[it->second].input; result.entries[it->second]=entry; }
+        const auto deep=flag(parts[2],"deepDetectInvalid");
+        const auto scanned=flag(parts[3],"rootsLineInvalid");
+        const auto recursive=flag(parts[4],"rootsLineInvalid");
+        WatchRoot entry{resolve_path(wide(parts[0]),base),std::string(parts[1]),deep,scanned,recursive};
+        const auto [it,inserted]=positions.try_emplace(path_key(entry.input),result.size());
+        if (inserted) result.push_back(std::move(entry));
+        else { entry.input=std::move(result[it->second].input); result[it->second]=std::move(entry); }
     }
     return result;
 }
-WatchRoots read_roots(const fs::path& p) {
+WatchRoots read_roots(const fs::path& p, std::string* comments) {
     if (!fs::exists(p)) return {};
-    return parse_roots(read_file(p),p.parent_path());
+    return parse_roots(read_file(p),p.parent_path(),comments);
 }
-static WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& edits) {
+static void apply_root_changes(WatchRoots& roots,const fs::path& base,const Json& edits) {
     // Normalize each existing key once. A multi-line paste must not rescan
     // and normalize the complete directory list for every added row.
     std::unordered_map<std::wstring,size_t> indices;
-    indices.reserve(roots.entries.size()+edits.size());
-    for(size_t i=0;i<roots.entries.size();++i) indices.emplace(path_key(roots.entries[i].input),i);
-    std::vector<bool> removed(roots.entries.size(),false);
+    indices.reserve(roots.size()+edits.size());
+    for(size_t i=0;i<roots.size();++i) indices.emplace(path_key(roots[i].input),i);
+    std::vector<bool> removed(roots.size(),false);
     bool compact=false;
     auto apply=[&](const Json& edit,const std::string& input) {
         std::string op=edit.at("operation"), original=edit.value("original",std::string()), output=edit.at("output");
@@ -381,7 +404,7 @@ static WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const
         auto index=found==indices.end()?size_t(-1):found->second;
         if (!original.empty() && index==size_t(-1)) throw std::runtime_error("rootRemoved");
         if(!original.empty() && edit.contains("expected") && !edit["expected"].is_null() &&
-            (roots.entries[index].output!=edit["expected"].value("output",std::string()) || roots.entries[index].deep!=edit["expected"].value("deep",false) || roots.entries[index].recursive!=edit["expected"].value("recursive",false)))
+            (roots[index].output!=edit["expected"].value("output",std::string()) || roots[index].deep!=edit["expected"].value("deep",false) || roots[index].recursive!=edit["expected"].value("recursive",false)))
             throw std::runtime_error("rootConflict");
         auto remove=[&] {
             if(index!=size_t(-1)) { removed[index]=true; indices.erase(previous); compact=true; }
@@ -391,19 +414,19 @@ static WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const
             auto key=path_key(path);
             auto duplicate=indices.find(key);
             if (duplicate!=indices.end() && duplicate->second!=index) {
-                const auto& record=roots.entries[duplicate->second];
+                const auto& record=roots[duplicate->second];
                 if(record.output==trim(output) && record.deep==deep && record.recursive==recursive) { remove(); return; }
                 throw std::runtime_error("rootDuplicate");
             }
-            WatchRoot replacement{path,trim(output),deep,false,recursive};
-            if(index!=size_t(-1) && path_key(roots.entries[index].input)==key)
-                replacement.initial_scanned=roots.entries[index].initial_scanned && !(recursive && !roots.entries[index].recursive);
+            WatchRoot replacement{std::move(path),std::string(trim(output)),deep,false,recursive};
+            if(index!=size_t(-1) && previous==key)
+                replacement.initial_scanned=roots[index].initial_scanned && !(recursive && !roots[index].recursive);
             if(index==size_t(-1)) {
-                indices.emplace(std::move(key),roots.entries.size());
-                roots.entries.push_back(std::move(replacement)); removed.push_back(false);
+                indices.emplace(std::move(key),roots.size());
+                roots.push_back(std::move(replacement)); removed.push_back(false);
             } else {
                 indices.erase(previous); indices[std::move(key)]=index;
-                roots.entries[index]=std::move(replacement);
+                roots[index]=std::move(replacement);
             }
         }
     };
@@ -416,20 +439,16 @@ static WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const
     }
     if(compact) {
         size_t count=0;
-        for(size_t i=0;i<roots.entries.size();++i) if(!removed[i]) {
-            if(count!=i) roots.entries[count]=std::move(roots.entries[i]);
+        for(size_t i=0;i<roots.size();++i) if(!removed[i]) {
+            if(count!=i) roots[count]=std::move(roots[i]);
             ++count;
         }
-        roots.entries.resize(count);
+        roots.resize(count);
     }
-    return roots;
 }
-static std::string roots_text(const WatchRoots& roots) {
-    std::string content;
-    for(auto& c:roots.comments) content+=c+"\n";
-    for(auto& r:roots.entries) content+=utf8(r.input.wstring())+
+static void append_roots(std::string& content,const WatchRoots& roots) {
+    for(const auto& r:roots) content+=utf8(r.input.wstring())+
         " | "+r.output+" | "+(r.deep?"true":"false")+" | "+(r.initial_scanned?"true":"false")+" | "+(r.recursive?"true":"false")+"\n";
-    return content;
 }
 Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,const Json& roots,
     PasswordSaveSnapshot* password_snapshot,std::string_view password_baseline) {
@@ -454,14 +473,18 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
         if(!fields.empty()) { section="config"; auto path=dir/"sunpack_config.json"; writes.push_back({section,path,patch_config(read_file(path),fields)}); }
         if(!roots.empty()) {
             section="roots";
-            auto updated=apply_root_changes(read_roots(dir/"sunpack_watch_roots.txt"),dir,roots);
-            std::unordered_set<std::wstring> remaining;
-            for(auto& entry:updated.entries) remaining.insert(scope_key(entry.input.wstring()));
-            for(auto& edit:roots) if(edit.at("operation")=="delete" && !edit.value("original",std::string()).empty()) {
-                auto key=scope_key(resolve_path(wide(edit.at("original").get<std::string>()),dir).wstring());
-                if(!remaining.count(key)) removed_scopes.insert(std::move(key));
+            auto updated=read_roots(dir/"sunpack_watch_roots.txt",&root_text);
+            apply_root_changes(updated,dir,roots);
+            if(deleting_roots) {
+                std::unordered_set<std::wstring> remaining;
+                remaining.reserve(updated.size());
+                for(const auto& entry:updated) remaining.insert(scope_key(entry.input));
+                for(const auto& edit:roots) if(edit.at("operation")=="delete" && !edit.value("original",std::string()).empty()) {
+                    auto key=scope_key(resolve_path(wide(edit.at("original").get<std::string>()),dir));
+                    if(!remaining.count(key)) removed_scopes.insert(std::move(key));
+                }
             }
-            root_text=roots_text(updated);
+            append_roots(root_text,updated);
         }
         if(!passwords.empty() || (!removed_scopes.empty() && fs::exists(dir/"builtin_passwords.json"))) {
             section="passwords"; auto path=dir/"builtin_passwords.json";
@@ -488,7 +511,8 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
                     }
                 }
             }
-            committed_passwords=apply_password_changes(std::move(current),passwords,&saved_record);
+            saved_record=apply_password_changes(current["passwords"],passwords);
+            committed_passwords=std::move(current);
             bool cleaned=false;
             if(!removed_scopes.empty()) {
                 auto& rows=committed_passwords["passwords"];
@@ -648,7 +672,7 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
 }
 Json directory_rows(const WatchRoots& roots) {
     Json rows=Json::array();
-    for(auto& r:roots.entries) {
+    for(auto& r:roots) {
         auto key=path_key(r.input);
         rows.push_back({{"id",utf8(key)},{"path",utf8(r.input.wstring())},{"name",utf8(r.input.filename().wstring())},
             {"output",r.output},{"deep",r.deep},{"recursive",r.recursive}});

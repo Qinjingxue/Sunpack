@@ -345,6 +345,10 @@ pub(crate) struct EntryRecord {
 }
 
 impl EntryRecord {
+    pub(crate) fn is_missing_volume(&self) -> bool {
+        self.status == "suspended_missing_volume"
+    }
+
     fn blocks(&self, blocker: &str) -> bool {
         self.failure_payload
             .get("blockers")
@@ -474,6 +478,7 @@ impl<'de> Deserialize<'de> for Operation {
 pub(crate) struct StateData {
     pending: HashMap<String, Arc<PendingRecord>>,
     entries: HashMap<String, Arc<EntryRecord>>,
+    missing_volume_count: usize,
     password_generation: i64,
     password_source_signature: String,
     cursors: BTreeMap<String, Cursor>,
@@ -487,7 +492,7 @@ impl StateData {
     }
 
     pub(crate) fn has_missing_volume(&self, path: &str) -> bool {
-        self.entries.get(path).is_some_and(|entry| entry.status == "suspended_missing_volume")
+        self.entries.get(path).is_some_and(|entry| entry.is_missing_volume())
     }
 
     fn apply(&mut self, operation: &Operation) {
@@ -535,13 +540,16 @@ impl StateData {
                 self.pending.insert(key.clone(), Arc::clone(record));
             }
             Operation::PutEntry(key, record) => {
-                self.entries.insert(key.clone(), Arc::clone(record));
+                let previous = self.entries.insert(key.clone(), Arc::clone(record));
+                self.missing_volume_count += usize::from(record.is_missing_volume());
+                self.missing_volume_count -= usize::from(previous.is_some_and(|entry| entry.is_missing_volume()));
             }
             Operation::Delete(Collection::Pending, key) => {
                 self.pending.remove(key);
             }
             Operation::Delete(Collection::Entries, key) => {
-                self.entries.remove(key);
+                let previous = self.entries.remove(key);
+                self.missing_volume_count -= usize::from(previous.is_some_and(|entry| entry.is_missing_volume()));
             }
             Operation::SetMetadata(generation, signature) => {
                 self.password_generation = *generation;
@@ -1145,8 +1153,8 @@ impl NativeWatchState {
         self.lock().entries.get(key).cloned()
     }
 
-    pub(crate) fn has_entries(&self) -> bool {
-        !self.lock().entries.is_empty()
+    pub(crate) fn has_missing_volume_blockers(&self) -> bool {
+        self.lock().missing_volume_count != 0
     }
 
     pub(crate) fn pending_items(&self) -> Vec<Arc<PendingRecord>> {
@@ -1349,6 +1357,7 @@ fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
     let data = StateData {
         runtime: snapshot.runtime,
         pending: snapshot.pending_work,
+        missing_volume_count: snapshot.entries.values().filter(|entry| entry.is_missing_volume()).count(),
         entries: snapshot.entries,
         password_generation,
         password_source_signature: snapshot.password_source_signature,

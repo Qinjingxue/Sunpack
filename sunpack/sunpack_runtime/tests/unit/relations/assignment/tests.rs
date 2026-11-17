@@ -126,6 +126,38 @@ fn competing_terminal_numbers_retain_each_structurally_legal_length() {
 }
 
 #[test]
+fn spanned_carrier_keeps_ordered_disk_sizes_and_nonuniform_fallback() {
+    let mut head = row("same.head", "zip", Some(1), false);
+    let anchor = head.anchor.as_mut().unwrap();
+    anchor.size = 200;
+    anchor.structure_offset = Some(10);
+    anchor.carrier_limit = Some(180);
+    let middle = |name, size| {
+        let mut row = row(name, "zip", Some(2), false);
+        row.size = Some(size);
+        let anchor = row.anchor.as_mut().unwrap();
+        anchor.size = size;
+        anchor.flags = MEMBER | ZIP_DIRECTORY_MEMBER;
+        row
+    };
+    let rows = [head, middle("same.short", 80), middle("same.long", 100),
+        row("same.tail", "zip", Some(3), true)];
+
+    let mut groups = resolve(&rows);
+    assert_eq!(groups.len(), 1);
+    attempts::resolve_carrier_geometry(&mut groups[0]);
+    let plan = groups[0].attempts.as_ref().unwrap();
+    let layouts: Vec<_> = plan.layouts.iter().map(|layout| {
+        let head = &plan.sources[layout.slots[0].1[0]];
+        let mut sizes: Vec<_> = layout.slots[1].1.iter()
+            .map(|&i| plan.sources[i].end - plan.sources[i].start).collect();
+        sizes.sort_unstable();
+        (head.end, sizes)
+    }).collect();
+    assert_eq!(layouts, [(90, vec![80]), (110, vec![100]), (180, vec![80, 100])]);
+}
+
+#[test]
 fn unnamed_terminal_family_stays_compact_and_keeps_numbered_tail_fixed() {
     // Many optional members must not allocate one full slot list per end.
     // A second, numbered tail must never migrate to the family's short ends.

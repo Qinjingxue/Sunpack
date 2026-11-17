@@ -120,6 +120,14 @@ pub(super) struct GeneratedBaseline {
 }
 
 impl GeneratedBaseline {
+    pub(super) fn new(size: u64, mtime: f64, id: &str, usn: i64) -> Self {
+        Self { size, mtime, file_id: FileId::new(id), usn }
+    }
+
+    pub(super) fn observation(&self) -> NativeWatchObservation {
+        NativeWatchObservation::new(self.size, self.mtime, self.file_id.clone(), self.usn)
+    }
+
     pub(super) fn source_changed(&self, current: &crate::postprocess::WatchCandidateRow) -> bool {
         crate::postprocess::watch_source_changed(
             self.size, self.mtime, &self.file_id.text(), self.usn, current,
@@ -135,17 +143,9 @@ pub(super) struct CatalogRow {
     flags: u8,
     pub cheap_anchor: Option<CheapAnchorCell>,
     pub observation: Option<Box<NativeWatchObservation>>,
-    pub generated: Option<Box<GeneratedBaseline>>,
 }
 
 impl CatalogRow {
-    pub fn remember_generated(&mut self, size: u64, mtime: f64, id: &str, usn: i64) {
-        self.generated = Some(Box::new(GeneratedBaseline { size, mtime, file_id: FileId::new(id), usn }));
-    }
-    pub fn generated_observation(&self) -> Option<NativeWatchObservation> {
-        self.generated.as_ref().map(|g| NativeWatchObservation::new(g.size, g.mtime, g.file_id.clone(), g.usn))
-    }
-
     pub fn remember_observation(
         &mut self,
         size: u64,
@@ -219,7 +219,9 @@ impl CatalogRow {
     }
 }
 
-impl Serialize for CatalogRow {
+pub(super) struct CatalogRowView<'a>(pub &'a CatalogRow, pub Option<&'a GeneratedBaseline>);
+
+impl Serialize for CatalogRowView<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Row<'a> {
@@ -230,8 +232,8 @@ impl Serialize for CatalogRow {
             #[serde(skip_serializing_if = "Option::is_none")]
             generated: Option<&'a GeneratedBaseline>,
         }
-        Row { record: self.record(), observed: self.observation.as_ref().map(|o|
-            (o.size, o.mtime, o.file_id(), o.change_usn)), generated: self.generated.as_deref() }.serialize(serializer)
+        Row { record: self.0.record(), observed: self.0.observation.as_ref().map(|o|
+            (o.size, o.mtime, o.file_id(), o.change_usn)), generated: self.1 }.serialize(serializer)
     }
 }
 
@@ -294,6 +296,7 @@ impl CatalogBucket {
 #[derive(Default)]
 pub(super) struct ScopeCatalog {
     pub rows: BTreeMap<Arc<str>, CatalogRow>,
+    pub generated: BTreeMap<Arc<str>, GeneratedBaseline>,
     pub buckets: HashMap<Box<str>, CatalogBucket>,
     parents: HashSet<Arc<str>>,
     pub persistent_len: usize,
@@ -309,6 +312,29 @@ pub(crate) fn catalog_stem(path: &str) -> String {
 }
 
 impl ScopeCatalog {
+    pub fn set_generated(&mut self, key: &str, baseline: GeneratedBaseline) {
+        let (stored_key, _) = self.rows.get_key_value(key).expect("generated catalog row");
+        self.generated.insert(Arc::clone(stored_key), baseline);
+    }
+
+    pub fn generated_keys_under(&self, mut key: String) -> impl Iterator<Item = &Arc<str>> {
+        use std::ops::Bound::{Included, Unbounded};
+        let exact = if key.ends_with('\\') {
+            None
+        } else {
+            let exact = self.generated.get_key_value(key.as_str()).map(|(key, _)| key);
+            key.push('\\');
+            exact
+        };
+        exact.into_iter().chain(self.generated.range::<str, _>((Included(key.as_str()), Unbounded))
+            .map(|(candidate, _)| candidate)
+            .take_while(move |candidate| candidate.starts_with(&key)))
+    }
+
+    pub fn row_view(&self, key: &str) -> Option<CatalogRowView<'_>> {
+        self.rows.get(key).map(|row| CatalogRowView(row, self.generated.get(key)))
+    }
+
     pub fn touch(&mut self, path: &str) {
         if let Some(bucket) = self.buckets.get_mut(catalog_stem(path).as_str()) { bucket.touch(); }
     }
@@ -360,14 +386,12 @@ impl ScopeCatalog {
                 | u8::from(record.mtime_ns.is_some()) * HAS_MTIME
                 | u8::from(transient) * TRANSIENT,
             observation: None,
-            generated: None,
             cheap_anchor: None,
         };
         let mut reuse_indexes = false;
         if let Some((old_key, mut old)) = self.rows.remove_entry(key.as_ref()) {
             key = old_key;
             row.observation = old.observation.take();
-            row.generated = old.generated.take();
             reuse_indexes = old.persistent() && row.persistent() && old.is_dir() == row.is_dir();
             if reuse_indexes {
                 self.release_parent(&old);
@@ -425,6 +449,7 @@ impl ScopeCatalog {
         let mut dirty = HashSet::new();
         for key in keys {
             if let Some(row) = self.rows.remove(key) {
+                self.generated.remove(key);
                 self.remove_indexes(key, &row, Some(&mut dirty));
             }
         }

@@ -961,7 +961,9 @@ RequestOutcome run_request(
                         result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
                     if (direct_ok || (!result.password_candidates_all_rejected && !uncertain_password) || password_candidates.size() == 1 ||
                         (cancel_token && cancel_token->load(std::memory_order_acquire))) break;
-                    result.password_candidates_all_rejected = false;
+                    // The rejected attempt has no consumers after this point.
+                    // Drop its item inventory before cleanup and the next decoder.
+                    result = ExtractArchiveResult{};
                     replay->candidate_discard_pending = true;
                 }
                 if (index == password_candidates.size()) {

@@ -650,7 +650,7 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     const auto directory="directory-"+utf8(path_key(root));
     auto disk_root=[&](const std::string& output) {
         auto roots=read_roots(root_path);
-        return std::any_of(roots.entries.begin(),roots.entries.end(),[&](const auto& entry){
+        return std::any_of(roots.begin(),roots.end(),[&](const auto& entry){
             return entry.input==root && entry.output==output;
         });
     };
@@ -712,7 +712,7 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     navigate(app,"tabRoots","roots");
     click(app,("delete-root-"+root_id).c_str());
     finish_input(app);
-    assert(read_roots(root_path).entries.size()==1);
+    assert(read_roots(root_path).size()==1);
 }
 
 ui::Widget* active_find_widget(ui::Widget* root) {

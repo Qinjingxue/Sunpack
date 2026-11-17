@@ -10,7 +10,7 @@ fn unchanged_close_still_ends_saved_phase_without_relearning_cadence() {
     let mut row = CatalogRow {
         parent: Arc::from("C:\\watch"), name: "input.zip".into(),
         size: 42, mtime_ns: 0, flags: HAS_SIZE | HAS_MTIME,
-        cheap_anchor: None, generated: None, observation: Some(Box::new(observation)),
+        cheap_anchor: None, observation: Some(Box::new(observation)),
     };
     // Main skips activity learning for unchanged forced retries, but its
     // ordinary observation publication still honors an explicit CLOSE.

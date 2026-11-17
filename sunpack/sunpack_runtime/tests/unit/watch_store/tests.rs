@@ -158,6 +158,38 @@ fn recovery_publication_orders_concurrent_blocker_changes() {
 }
 
 #[test]
+fn missing_volume_retry_gate_follows_entry_replacement_removal_and_snapshot() {
+    let state = NativeWatchState::new();
+    let path = r"C:\input\archive.bin";
+    let record = |status: &str| Arc::new(EntryRecord {
+        path: path.into(), status: status.into(), size: 1, mtime: 1.0, file_id: String::new(),
+        change_usn: 0, last_error: String::new(), attempt_count: 1, failure_kind: String::new(),
+        failure_stage: String::new(), failure_payload: Map::new(), last_attempt_at: 1.0,
+    });
+    let set = |state: &NativeWatchState, status| {
+        let mut operations = NativeWatchOperations::empty();
+        operations.put_entry(record(status));
+        state.apply(&operations);
+    };
+    set(&state, "failed_password");
+    assert!(!state.has_missing_volume_blockers());
+    set(&state, "suspended_missing_volume");
+    set(&state, "suspended_missing_volume");
+    assert!(state.has_missing_volume_blockers());
+
+    let snapshot = crate::test_support::temp_file("missing_volume_retry_gate", b"");
+    state.capture(1).write(&snapshot).unwrap();
+    let resumed = NativeWatchState::new();
+    resumed.load_snapshot(snapshot.to_string_lossy().into_owned()).unwrap();
+    assert!(resumed.has_missing_volume_blockers());
+    resumed.apply(&NativeWatchOperations::retire_entries([path_key(path)]));
+    assert!(!resumed.has_missing_volume_blockers());
+    set(&state, "failed_password");
+    assert!(!state.has_missing_volume_blockers());
+    std::fs::remove_file(snapshot).unwrap();
+}
+
+#[test]
 fn path_under_requires_a_component_boundary() {
     assert!(is_path_under("c:\\a\\b", "c:\\a"));
     assert!(is_path_under("c:\\a\\b", "c:\\a\\"));

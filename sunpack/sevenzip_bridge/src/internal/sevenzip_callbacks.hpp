@@ -800,7 +800,7 @@ namespace sunpack::sevenzip
             for (const auto &state : async_files_)
             {
                 auto snapshot = async_writer_->take_file_snapshot(state);
-                has_failed_file |= snapshot.failed;
+                has_failed_file |= snapshot.hresult != S_OK;
                 apply_file_snapshot(state->trace_index, std::move(snapshot));
             }
             if (writer_error != S_OK)
@@ -1183,7 +1183,7 @@ namespace sunpack::sevenzip
         {
             auto &item = output_trace_.items[trace_index];
             const bool decoder_ok = snapshot.operation_result_set && snapshot.operation_result == kOpOk;
-            const bool output_ok = snapshot.closed && !snapshot.failed;
+            const bool output_ok = snapshot.closed && snapshot.hresult == S_OK;
             if (decoder_ok && output_ok)
             {
                 ++files_written_;
@@ -1197,7 +1197,7 @@ namespace sunpack::sevenzip
             item.failed = item.failed || !decoder_ok || !output_ok;
             item.done = decoder_ok && output_ok;
 
-            if (snapshot.failed)
+            if (snapshot.hresult != S_OK)
             {
                 output_error_ = true;
                 output_trace_.last_hresult = static_cast<int>(snapshot.hresult);

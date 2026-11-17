@@ -21,8 +21,8 @@ namespace {
 // case-folding/UNC rules; trimming the final separator also handles C:\\ roots.
 using RootIndex=std::unordered_map<std::wstring,std::string>;
 RootIndex index_roots(const WatchRoots& roots) {
-    RootIndex index; index.reserve(roots.entries.size());
-    for(const auto& root:roots.entries) {
+    RootIndex index; index.reserve(roots.size());
+    for(const auto& root:roots) {
         auto key=path_key(root.input);
         while(!key.empty() && (key.back()==L'\\' || key.back()==L'/')) key.pop_back();
         index.emplace(std::move(key),utf8(root.input.wstring()));

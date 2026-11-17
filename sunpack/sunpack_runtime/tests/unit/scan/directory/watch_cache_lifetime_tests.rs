@@ -82,7 +82,9 @@ fn refresh_rescans_when_output_is_published_after_enumeration() {
 
     let state = crate::watch_store::NativeWatchState::new();
     state.register_output_paths(&[path.to_owned()], &[]);
-    let catalog = Arc::new(NativeWatchCatalog::new(&state, None));
+    let cache = root.with_extension("catalog");
+    let cache_path = cache.to_str().unwrap();
+    let catalog = Arc::new(NativeWatchCatalog::new(&state, Some(cache_path.to_owned())));
     let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
     let during = Arc::clone(&catalog);
     let publish_scope = scope.clone();
@@ -103,7 +105,23 @@ fn refresh_rescans_when_output_is_published_after_enumeration() {
     assert_eq!(catalog.path_is_directory(&scope, path), Some(true));
     assert!(catalog.generated_observation(file.to_str().unwrap()).is_some());
     assert!(!catalog.is_owned(path));
+
+    catalog.close();
+    assert!(catalog.error().is_none());
+    let reopened = NativeWatchCatalog::new(&state, Some(cache_path.to_owned()));
+    assert!(reopened.generated_under(&scope, &path.to_ascii_uppercase()));
+    assert!(reopened.generated_under(&scope, file.to_str().unwrap()));
+    assert!(!reopened.generated_under(&scope, root.join("out").to_str().unwrap()));
+
     fs::remove_file(&file).unwrap();
+    reopened.retire_consumed(std::iter::once(file));
+    reopened.flush().unwrap();
+    drop(reopened);
+    let reopened = NativeWatchCatalog::new(&state, Some(cache_path.to_owned()));
+    assert!(!reopened.generated_under(&scope, path));
+    assert_eq!(reopened.path_is_directory(&scope, path), Some(true));
+    drop(reopened);
+    fs::remove_dir_all(cache).unwrap();
     fs::remove_dir(&output).unwrap();
     fs::remove_dir(&root).unwrap();
 }

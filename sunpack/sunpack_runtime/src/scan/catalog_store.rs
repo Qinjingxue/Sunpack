@@ -1,5 +1,5 @@
 //! Disposable filename cache. Reuses the Watch journal writer on a separate stream.
-use super::catalog::{CatalogRow, ScopeCatalog};
+use super::catalog::{CatalogRowView, GeneratedBaseline, ScopeCatalog};
 use super::directory::DirectoryEntryRecord;
 use crate::io::scratch::Spool;
 use crate::wal::{self, Kind};
@@ -31,13 +31,17 @@ struct StoredRow {
     record: DirectoryEntryRecord,
     #[serde(default)]
     observed: Option<(u64, f64, String, i64)>,
-    generated: Option<Box<super::catalog::GeneratedBaseline>>,
+    generated: Option<Box<GeneratedBaseline>>,
 }
 impl StoredRow {
     fn insert(self, catalog: &mut ScopeCatalog) {
         let key = crate::path_keys::path_key(&self.record.path);
         catalog.insert(self.record);
-        catalog.rows.get_mut(key.as_str()).unwrap().generated = self.generated;
+        if let Some(baseline) = self.generated {
+            catalog.set_generated(&key, *baseline);
+        } else {
+            catalog.generated.remove(key.as_str());
+        }
         if let Some((size, mtime, id, usn)) = self.observed {
             let row = catalog.rows.get_mut(key.as_str()).unwrap();
             row.remember_observation(size, mtime, &id, usn, true);
@@ -48,7 +52,7 @@ impl StoredRow {
 pub(super) struct DeltaView<'a> {
     pub scope: &'a str,
     pub removed: &'a [String],
-    pub rows: Vec<&'a CatalogRow>,
+    pub rows: Vec<CatalogRowView<'a>>,
     pub stamp: Option<Stamp>,
 }
 const BATCH_BYTES: usize = 256 * 1024;
@@ -337,8 +341,13 @@ struct ScopeRows<'a>(&'a ScopeCatalog);
 impl Serialize for ScopeRows<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut rows = serializer.serialize_seq(Some(self.0.persistent_len))?;
-        for row in self.0.rows.values().filter(|row| row.persistent()) {
-            rows.serialize_element(row)?;
+        let mut generated = self.0.generated.iter().peekable();
+        for (key, row) in self.0.rows.iter().filter(|(_, row)| row.persistent()) {
+            while generated.peek().is_some_and(|(candidate, _)| *candidate < key) {
+                generated.next();
+            }
+            let baseline = generated.next_if(|(candidate, _)| *candidate == key).map(|(_, baseline)| baseline);
+            rows.serialize_element(&CatalogRowView(row, baseline))?;
         }
         rows.end()
     }

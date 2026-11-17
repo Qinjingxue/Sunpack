@@ -2,6 +2,7 @@ use crate::io::archive_state::{ArchiveInput, InputExtent};
 use crate::io::scratch::SpillSet;
 use crate::password::input::{parse_ranges, VirtualRangeReader};
 use encoding_rs::{BIG5, GBK, SHIFT_JIS};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io;
 use std::sync::OnceLock;
@@ -213,6 +214,8 @@ fn scan_zip_names(
 
 struct FilenameScoring {
     accumulators: [EncodingAccumulator; 5],
+    gbk_big5_units: HashSet<(u8, u8)>,
+    shift_jis_units: HashSet<(u8, u8)>,
     has_unflagged_ascii: bool,
 }
 
@@ -227,6 +230,8 @@ impl FilenameScoring {
                 EncodingKind::Cp932,
             ]
             .map(EncodingAccumulator::new),
+            gbk_big5_units: HashSet::new(),
+            shift_jis_units: HashSet::new(),
             has_unflagged_ascii: false,
         }
     }
@@ -249,15 +254,23 @@ impl FilenameScoring {
             for accumulator in &mut self.accumulators {
                 accumulator.observe(raw)?;
             }
+            observe_legacy_units(raw, &mut self.gbk_big5_units, |lead| (0x81..=0xfe).contains(&lead));
+            observe_legacy_units(raw, &mut self.shift_jis_units, |lead| {
+                (0x81..=0x9f).contains(&lead) || (0xe0..=0xfc).contains(&lead)
+            });
         }
         Ok(())
     }
 
     fn finish(self) -> Option<&'static str> {
-        select_scores(
-            self.accumulators
-                .map(|value| value.finish(self.has_unflagged_ascii)),
-        )
+        select_scores(self.accumulators.map(|value| {
+            let units_score = match value.kind {
+                EncodingKind::Cp936 | EncodingKind::Cp950 => legacy_units_score(&self.gbk_big5_units, value.kind),
+                EncodingKind::Cp932 => legacy_units_score(&self.shift_jis_units, value.kind),
+                _ => 0,
+            };
+            value.finish(self.has_unflagged_ascii, units_score)
+        }))
     }
 }
 
@@ -267,7 +280,6 @@ struct EncodingAccumulator {
     decoded: bool,
     failed_decode: bool,
     components: SpillSet,
-    units: HashSet<(u8, u8)>,
 }
 impl EncodingAccumulator {
     fn new(kind: EncodingKind) -> Self {
@@ -277,7 +289,6 @@ impl EncodingAccumulator {
             decoded: false,
             failed_decode: false,
             components: SpillSet::default(),
-            units: HashSet::new(),
         }
     }
     fn observe(&mut self, raw: &[u8]) -> io::Result<()> {
@@ -290,7 +301,6 @@ impl EncodingAccumulator {
             self.failed_decode = true;
             self.score = self.score.saturating_sub(12);
         }
-        observe_legacy_units(raw, self.kind, &mut self.units);
         Ok(())
     }
     fn observe_component(&mut self, part: &str, score: i64) -> io::Result<()> {
@@ -299,12 +309,12 @@ impl EncodingAccumulator {
         }
         Ok(())
     }
-    fn finish(self, has_ascii: bool) -> EncodingScore {
+    fn finish(self, has_ascii: bool, units_score: i64) -> EncodingScore {
         EncodingScore {
             kind: self.kind,
             score: self
                 .score
-                .saturating_add(legacy_units_score(self.units, self.kind))
+                .saturating_add(units_score)
                 .saturating_add(if self.failed_decode { 0 } else { 4 }),
             has_decoded_name: self.decoded || has_ascii,
         }
@@ -327,19 +337,13 @@ fn select_scores(mut scores: [EncodingScore; 5]) -> Option<&'static str> {
         .then(|| best.kind.codepage())
 }
 
-fn decode_bytes(encoding: EncodingKind, raw: &[u8]) -> Option<String> {
+fn decode_bytes(encoding: EncodingKind, raw: &[u8]) -> Option<Cow<'_, str>> {
     match encoding {
-        EncodingKind::Cp437 => Some(decode_cp437(raw)),
-        EncodingKind::Utf8 => std::str::from_utf8(raw).ok().map(str::to_owned),
-        EncodingKind::Cp936 => GBK
-            .decode_without_bom_handling_and_without_replacement(raw)
-            .map(|value| value.into_owned()),
-        EncodingKind::Cp950 => BIG5
-            .decode_without_bom_handling_and_without_replacement(raw)
-            .map(|value| value.into_owned()),
-        EncodingKind::Cp932 => SHIFT_JIS
-            .decode_without_bom_handling_and_without_replacement(raw)
-            .map(|value| value.into_owned()),
+        EncodingKind::Cp437 => Some(Cow::Owned(decode_cp437(raw))),
+        EncodingKind::Utf8 => std::str::from_utf8(raw).ok().map(Cow::Borrowed),
+        EncodingKind::Cp936 => GBK.decode_without_bom_handling_and_without_replacement(raw),
+        EncodingKind::Cp950 => BIG5.decode_without_bom_handling_and_without_replacement(raw),
+        EncodingKind::Cp932 => SHIFT_JIS.decode_without_bom_handling_and_without_replacement(raw),
     }
 }
 
@@ -356,21 +360,11 @@ fn decode_cp437(raw: &[u8]) -> String {
         .collect()
 }
 
-fn observe_legacy_units(raw_name: &[u8], encoding: EncodingKind, units: &mut HashSet<(u8, u8)>) {
-    if !matches!(
-        encoding,
-        EncodingKind::Cp932 | EncodingKind::Cp936 | EncodingKind::Cp950
-    ) {
-        return;
-    }
+fn observe_legacy_units(raw_name: &[u8], units: &mut HashSet<(u8, u8)>, is_lead: impl Fn(u8) -> bool) {
     let mut index = 0;
     while index + 1 < raw_name.len() {
         let lead = raw_name[index];
-        let is_lead = match encoding {
-            EncodingKind::Cp932 => (0x81..=0x9f).contains(&lead) || (0xe0..=0xfc).contains(&lead),
-            _ => (0x81..=0xfe).contains(&lead),
-        };
-        if is_lead {
+        if is_lead(lead) {
             units.insert((lead, raw_name[index + 1]));
             index += 2;
         } else {
@@ -378,10 +372,10 @@ fn observe_legacy_units(raw_name: &[u8], encoding: EncodingKind, units: &mut Has
         }
     }
 }
-fn legacy_units_score(units: HashSet<(u8, u8)>, encoding: EncodingKind) -> i64 {
+fn legacy_units_score(units: &HashSet<(u8, u8)>, encoding: EncodingKind) -> i64 {
     units
-        .into_iter()
-        .map(|(lead, trail)| match encoding {
+        .iter()
+        .map(|&(lead, trail)| match encoding {
             EncodingKind::Cp932 => {
                 let extension = (lead == 0x87 && (0x40..=0x9c).contains(&trail))
                     || (0xed..=0xee).contains(&lead)
@@ -432,14 +426,11 @@ fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> i64 {
         return score;
     }
 
-    score -= decoded
-        .chars()
-        .filter(|ch| ('\u{e000}'..='\u{f8ff}').contains(ch))
-        .count() as i64
-        * 8;
-
     let (mut cjk, mut kana, mut halfwidth_kana, mut latin_symbols) = (0, 0, 0, 0);
     for ch in decoded.chars() {
+        if ('\u{e000}'..='\u{f8ff}').contains(&ch) {
+            score -= 8;
+        }
         if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
             cjk += 1;
         }

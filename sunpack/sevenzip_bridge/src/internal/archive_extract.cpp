@@ -465,14 +465,12 @@ namespace sunpack::sevenzip
 
             UInt32 num_items = 0;
             bool item_count_read;
-#ifdef SUP7Z_DEBUG
             {
+#ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ItemProbe);
+#endif
                 item_count_read = archive->GetNumberOfItems(&num_items) == S_OK;
             }
-#else
-            item_count_read = archive->GetNumberOfItems(&num_items) == S_OK;
-#endif
             if (item_count_read)
             {
 
@@ -502,34 +500,26 @@ namespace sunpack::sevenzip
                 (!job_replay->initialized || job_replay->handler == handler) ? job_replay : nullptr);
             if (current_extraction_replay && !job_replay->initialized) job_replay->handler = handler;
 
-#ifdef SUP7Z_DEBUG
-            ExtractToDiskCallback *raw_extract_callback = nullptr;
+            ExtractToDiskCallback *raw_extract_callback;
             {
+#ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
-                raw_extract_callback = new ExtractToDiskCallback(
-                archive.Interface(),
-                password,
-                output_dir,
-                progress,
-                result.output_trace,
-                num_items,
-                shared_writer,
-                cancel_token,
-                output_inventory,
-                pipeline_timing.get());
-            }
-#else
-            auto *raw_extract_callback = new ExtractToDiskCallback(
-                archive.Interface(),
-                password,
-                output_dir,
-                progress,
-                result.output_trace,
-                num_items,
-                shared_writer,
-                cancel_token,
-                output_inventory);
 #endif
+                raw_extract_callback = new ExtractToDiskCallback(
+                    archive.Interface(),
+                    password,
+                    output_dir,
+                    progress,
+                    result.output_trace,
+                    num_items,
+                    shared_writer,
+                    cancel_token,
+                    output_inventory
+#ifdef SUP7Z_DEBUG
+                    , pipeline_timing.get()
+#endif
+                );
+            }
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
             raw_extract_callback->set_input_file(archive_path);
@@ -538,10 +528,10 @@ namespace sunpack::sevenzip
             if (pipeline_timing) pipeline_timing->start_pipeline();
             PipelineThreadCpuScope compute_cpu_scope(pipeline_timing.get());
             PipelineStageScope compute_scope(pipeline_timing.get(), PipelineStage::Compute);
+#endif
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
+#ifdef SUP7Z_DEBUG
             compute_scope.finish();
-#else
-            hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
 #endif
 
             // Extraction success must not be published before every queued write and close
@@ -552,24 +542,19 @@ namespace sunpack::sevenzip
             // Output callbacks have captured all item metadata. Release the
             // decoder and its cached dictionaries before draining disk output
             // or allocating a replay inventory under pressure.
-#ifdef SUP7Z_DEBUG
             {
+#ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveClose);
+#endif
                 archive->Close();
                 archive.Release();
             }
-#else
-            archive->Close();
-            archive.Release();
-#endif
-#ifdef SUP7Z_DEBUG
             {
+#ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::OutputFinalize);
+#endif
                 raw_extract_callback->finalize_output();
             }
-#else
-            raw_extract_callback->finalize_output();
-#endif
             last_hr = hr;
 
             last_op_res = raw_extract_callback->operation_result();

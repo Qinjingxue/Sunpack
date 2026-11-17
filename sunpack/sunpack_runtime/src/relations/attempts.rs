@@ -3,10 +3,12 @@
 use super::assignment::{materialize, proposal_facts, BucketView, VolumeAssignment};
 use super::filename::NameProfile;
 use super::*;
+use crate::collections::SmallOrderedSet;
 use crate::io::archive_state::{
     TailTotal, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot,
 };
 use std::collections::BTreeMap;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 #[derive(Debug)]
 pub(super) struct VolumeAttempts {
@@ -28,6 +30,41 @@ pub(super) struct AttemptLayout {
     pub minimum_slots: usize,
 }
 
+#[derive(Default)]
+struct Layouts {
+    rows: Vec<AttemptLayout>,
+    by_hash: HashMap<u64, SmallOrderedSet<usize>>,
+}
+
+impl Layouts {
+    fn push(&mut self, slots: Vec<(u32, Arc<Vec<usize>>)>, minimum_slots: usize) {
+        // Interned domain identities avoid rehashing large shared slot domains.
+        // Keep one index per layout and check equality if hashes coincide.
+        let mut hash = self.by_hash.hasher().build_hasher();
+        minimum_slots.hash(&mut hash);
+        for (number, domain) in &slots {
+            number.hash(&mut hash);
+            Arc::as_ptr(domain).hash(&mut hash);
+        }
+        let index = self.rows.len();
+        match self.by_hash.entry(hash.finish()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(SmallOrderedSet::One(index));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().iter().any(|&index| {
+                    let row = &self.rows[index];
+                    row.minimum_slots == minimum_slots && row.slots == slots
+                }) {
+                    return;
+                }
+                entry.get_mut().insert(index);
+            }
+        }
+        self.rows.push(AttemptLayout { slots, minimum_slots });
+    }
+}
+
 impl VolumeAttempts {
     pub(super) fn base_sources(&self) -> &[AttemptSource] {
         &self.sources[..self.base_source_count]
@@ -40,12 +77,23 @@ impl VolumeAttempts {
         if !head.has_unresolved_carrier_extent() {
             return self;
         }
+        let original = std::mem::take(&mut self.layouts);
         let mut domains = Domains::default();
+        // Original layouts already share interned domains. Seed the interner
+        // so trimmed layouts can reuse an original domain of equal contents.
+        let mut original_domains = HashSet::new();
+        for (_, domain) in original.iter().flat_map(|layout| &layout.slots) {
+            if original_domains.insert(Arc::as_ptr(domain)) {
+                domains.0.insert(Arc::clone(domain));
+            }
+        }
+        drop(original_domains);
+        let mut layouts = Layouts::default();
         let mut sources_by_extent = None;
         let mut variants = Vec::new();
-        let mut filtered = HashMap::new();
+        let mut disk_domains = HashMap::new();
         let distinct_base_paths = self.base_source_count == self.sources.len();
-        for AttemptLayout { slots: layout, minimum_slots } in std::mem::take(&mut self.layouts) {
+        for AttemptLayout { slots: layout, minimum_slots } in original {
             let mut interiors = HashMap::new();
             let mut sizes = None::<HashSet<u64>>;
             for (_, choices) in layout.iter().skip(1) {
@@ -120,49 +168,48 @@ impl VolumeAttempts {
                             });
                             replacements.push(index);
                         }
+                        if replacements.is_empty() {
+                            break;
+                        }
                         domains.intern(replacements)
                     } else if interiors[&Arc::as_ptr(choices)] || from_tail {
                         let interior = interiors[&Arc::as_ptr(choices)];
-                        let (_, domain) = filtered
-                            .entry((Arc::as_ptr(choices), size))
+                        let by_size = disk_domains
+                            .entry(Arc::as_ptr(choices))
                             .or_insert_with(|| {
-                                (
-                                    Arc::clone(choices),
-                                    domains.intern(
-                                        choices
-                                            .iter()
-                                            .copied()
-                                            .filter(|i| {
-                                                let source = &self.sources[*i];
-                                                if interior {
-                                                    source.end - source.start == size
-                                                } else {
-                                                    source.head_size == Some(size)
-                                                }
-                                            })
-                                            .collect(),
-                                    ),
-                                )
+                                let mut by_size = HashMap::<_, Vec<_>>::new();
+                                for &i in choices.iter() {
+                                    let source = &self.sources[i];
+                                    let size = if interior {
+                                        Some(source.end - source.start)
+                                    } else {
+                                        source.head_size
+                                    };
+                                    if let Some(size) = size {
+                                        by_size.entry(size).or_default().push(i);
+                                    }
+                                }
+                                by_size.into_iter().map(|(size, group)| {
+                                    (size, domains.intern(group))
+                                }).collect::<HashMap<_, _>>()
                             });
+                        let Some(domain) = by_size.get(&size) else { break; };
                         Arc::clone(domain)
                     } else {
                         Arc::clone(choices)
                     };
                     trimmed.push((*number, domain));
                 }
-                if trimmed.iter().all(|(_, choices)| !choices.is_empty())
-                    && !self.layouts.iter().any(|layout| layout.slots == trimmed)
-                {
-                    self.layouts.push(AttemptLayout { slots: trimmed, minimum_slots });
+                if trimmed.len() == layout.len() {
+                    layouts.push(trimmed, minimum_slots);
                 }
             }
             // Equal disk size is a geometry hypothesis, not format identity.
             // Retain the original for nonuniform disks and unpadded carriers.
-            if !self.layouts.iter().any(|existing| existing.slots == layout) {
-                self.layouts.push(AttemptLayout { slots: layout, minimum_slots });
-            }
+            layouts.push(layout, minimum_slots);
         }
         drop(sources_by_extent);
+        self.layouts = layouts.rows;
         self.sources.extend(variants);
         self
     }
@@ -288,7 +335,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
         };
         let (canonical, tokens) = local.channels(&structural, &profile);
         let channels: Vec<_> = canonical.into_iter().chain(tokens).collect();
-        let mut layouts = Vec::new();
+        let mut layouts = Layouts::default();
         let mut domains = Domains::default();
         for channel in channels.iter().map(Some).chain(std::iter::once(None)) {
             let offset = channel.map_or(0, |c| view.channel_offset(Some(head), c, &profile));
@@ -596,38 +643,27 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
                     let has_tails = !tails.is_empty();
                     // Preserve the full-length domain's priority before trying
                     // shorter prefixes with only movable, unnumbered tails.
-                    if !all_unnamed
-                        && !layouts
-                            .iter()
-                            .any(|(old, bound)| *bound == 0 && old == &layout)
-                    {
-                        layouts.push((layout.clone(), 0));
+                    if !all_unnamed {
+                        layouts.push(layout, 0);
                     }
-                    if has_tails
-                        && !layouts
-                            .iter()
-                            .any(|(old, bound)| *bound == minimum && old == &family)
-                    {
-                        layouts.push((family, minimum));
+                    if has_tails {
+                        layouts.push(family, minimum);
                     }
                     // A numbered tail only belongs at its stated position;
                     // keep its ordinary layout instead of moving it with the family.
                     continue;
                 }
-                if !layouts
-                    .iter()
-                    .any(|(old, bound)| *bound == 0 && old == &layout)
-                {
-                    layouts.push((layout, 0));
-                }
+                layouts.push(layout, 0);
             }
         }
+        let Layouts { rows: mut layouts, by_hash } = layouts;
+        drop(by_hash);
         if layouts.is_empty() {
             continue;
         }
         // Contiguous layouts get first chance; stable sort retains evidence
         // tier priority. Incomplete layouts remain useful for partial recovery.
-        layouts.sort_by_key(|(layout, _)| {
+        layouts.sort_by_key(|AttemptLayout { slots: layout, .. }| {
             (
                 !layout
                     .iter()
@@ -705,7 +741,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
                 .collect(),
             layouts: layouts
                 .into_iter()
-                .map(|(layout, minimum_slots)| AttemptLayout {
+                .map(|AttemptLayout { slots: layout, minimum_slots }| AttemptLayout {
                     minimum_slots,
                     slots: layout
                         .into_iter()

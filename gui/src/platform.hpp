@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -26,7 +27,7 @@ struct Handle {
     operator HANDLE() const { return value; }
 };
 std::string utf8(const std::wstring& value);
-std::wstring wide(const std::string& value);
+std::wstring wide(std::string_view value);
 [[noreturn]] void win_error(const char* operation);
 std::string read_file(const fs::path& path, size_t limit = 16 * 1024 * 1024);
 void atomic_write(const fs::path& path, const std::string& content);

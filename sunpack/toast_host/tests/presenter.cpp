@@ -8,6 +8,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace toast_test {
 using namespace winrt::Windows::UI::Notifications;
@@ -74,9 +75,57 @@ struct TestToastNotificationManager {
 #undef ToastNotificationManager
 #undef ToastNotifier
 
+namespace {
+void check_snapshot_and_actions() {
+    using toast_test::require;
+    const std::wstring original = L"C:\\测试\\failed & log.txt";
+    const auto decoded = hex_decode(hex_encode(original));
+    require(decoded && *decoded == original);
+    require(xml_escape(L"<&\"'>") == L"&lt;&amp;&quot;&apos;&gt;");
+    std::vector<std::uint8_t> payload(36, 0);
+    payload[0] = static_cast<std::uint8_t>(SnapshotKind::success);
+    payload[1] = static_cast<std::uint8_t>(ProgressMode::determinate);
+    const double progress = 0.25;
+    std::memcpy(payload.data() + 4, &progress, sizeof(progress));
+    require(parse_snapshot(payload).progress_value == progress);
+    for (std::size_t size = 0; size < payload.size(); ++size) {
+        require(FAILED(protect([&] { parse_snapshot(std::span<const std::uint8_t>(payload).first(size)); })));
+    }
+
+    ToastContext context;
+    require(&context_on_owner_thread(&context) == &context);
+    HRESULT wrong_thread = S_OK;
+    std::thread other([&] { wrong_thread = sunpack_toast_clear(&context); });
+    other.join();
+    require(wrong_thread == RPC_E_WRONG_THREAD);
+
+    Snapshot snapshot;
+    snapshot.actions.push_back({ActionKind::cancel_batch, L"Stop & clean", L"0123456789abcdef0123456789abcdef"});
+    XmlDocument document;
+    document.LoadXml(progress_xml(snapshot));
+    const auto actions = document.GetElementsByTagName(L"action");
+    require(actions.Length() == 1);
+    const auto action = actions.Item(0).as<winrt::Windows::Data::Xml::Dom::XmlElement>();
+    require(action.GetAttribute(L"placement").empty() && action.GetAttribute(L"content") == L"Stop & clean");
+    const auto arguments = action.GetAttribute(L"arguments");
+    require(arguments == action_arguments(snapshot.actions.front()));
+    ActivationCallback callback;
+    winrt::check_hresult(callback.Activate(kAppId, arguments.c_str(), nullptr, 0));
+    wchar_t batch[33]{};
+    winrt::check_hresult(sunpack_toast_cancel_batch(batch, 33));
+    require(std::wstring_view(batch) == snapshot.actions.front().target);
+    winrt::check_hresult(sunpack_toast_cancel_batch(batch, 33));
+    require(batch[0] == L'\0');
+    snapshot.actions.clear();
+    document.LoadXml(progress_xml(snapshot));
+    require(document.GetElementsByTagName(L"action").Length() == 0);
+}
+}
+
 int main() {
     try {
         WinrtApartmentScope apartment;
+        check_snapshot_and_actions();
         Snapshot snapshot;
         snapshot.kind = SnapshotKind::progress;
         snapshot.batch_id = L"first";

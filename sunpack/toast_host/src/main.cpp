@@ -27,7 +27,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -740,66 +739,6 @@ ToastContext& context_on_owner_thread(void* raw) {
     return context;
 }
 
-int self_test() {
-    const std::wstring original = L"C:\\测试\\failed & log.txt";
-    const auto decoded = hex_decode(hex_encode(original));
-    if (!decoded || *decoded != original) return 1;
-    if (xml_escape(L"<&\"'>") != L"&lt;&amp;&quot;&apos;&gt;") return 2;
-    std::vector<std::uint8_t> payload(36, 0);
-    payload[0] = static_cast<std::uint8_t>(SnapshotKind::success);
-    payload[1] = static_cast<std::uint8_t>(ProgressMode::determinate);
-    const double progress = 0.25;
-    std::memcpy(payload.data() + 4, &progress, sizeof(progress));
-    if (parse_snapshot(payload).progress_value != progress) return 3;
-    for (std::size_t size = 0; size < payload.size(); ++size) {
-        bool rejected = false;
-        try { parse_snapshot(std::span<const std::uint8_t>(payload).first(size)); }
-        catch (...) { rejected = true; }
-        if (!rejected) return 4;
-    }
-    {
-        CLSID test_clsid{};
-        winrt::check_hresult(CoCreateGuid(&test_clsid));
-        ToastContext context;
-        ActivationRegistration activation(test_clsid);
-        XmlDocument first;
-        first.LoadXml(L"<root><value>first</value></root>");
-        XmlDocument second;
-        second.LoadXml(L"<root><value>second</value></root>");
-        if (&context_on_owner_thread(&context) != &context) return 5;
-        HRESULT wrong_thread = S_OK;
-        std::thread other([&] {
-            wrong_thread = protect([&] { context_on_owner_thread(&context); });
-        });
-        other.join();
-        if (wrong_thread != RPC_E_WRONG_THREAD) return 6;
-        winrt::com_ptr<IClassFactory> factory;
-        winrt::check_hresult(CoGetClassObject(test_clsid, CLSCTX_LOCAL_SERVER, nullptr, IID_PPV_ARGS(factory.put())));
-        winrt::com_ptr<INotificationActivationCallback> callback;
-        winrt::check_hresult(factory->CreateInstance(nullptr, IID_PPV_ARGS(callback.put())));
-        winrt::check_hresult(callback->Activate(kAppId, L"noop", nullptr, 0));
-        Snapshot snapshot;
-        snapshot.actions.push_back({ActionKind::cancel_batch, L"Stop & clean", L"0123456789abcdef0123456789abcdef"});
-        XmlDocument document;
-        document.LoadXml(progress_xml(snapshot));
-        const auto actions = document.GetElementsByTagName(L"action");
-        if (actions.Length() != 1) return 10;
-        const auto action = actions.Item(0).as<winrt::Windows::Data::Xml::Dom::XmlElement>();
-        if (!action.GetAttribute(L"placement").empty() || action.GetAttribute(L"content") != L"Stop & clean" ||
-            action.GetAttribute(L"arguments") != action_arguments(snapshot.actions.front())) return 11;
-        winrt::check_hresult(callback->Activate(kAppId, action_arguments(snapshot.actions.front()).c_str(), nullptr, 0));
-        wchar_t batch[33]{};
-        winrt::check_hresult(sunpack_toast_cancel_batch(batch, 33));
-        if (std::wstring_view(batch) != snapshot.actions.front().target) return 13;
-        winrt::check_hresult(sunpack_toast_cancel_batch(batch, 33));
-        if (batch[0] != L'\0') return 14;
-        snapshot.actions.clear();
-        document.LoadXml(progress_xml(snapshot));
-        if (document.GetElementsByTagName(L"action").Length() != 0) return 12;
-    }
-    return 0;
-}
-
 } // namespace
 
 HRESULT sunpack_toast_create_context(const wchar_t* executable, void** output) noexcept {
@@ -857,7 +796,18 @@ HRESULT sunpack_toast_activate() noexcept {
 
 HRESULT sunpack_toast_self_test() noexcept {
     return protect([] {
-        if (self_test() != 0) winrt::throw_hresult(E_FAIL);
+        WinrtApartmentScope apartment;
+        // Probe COM activation without registering the extension's live CLSID.
+        CLSID probe_clsid{};
+        winrt::check_hresult(CoCreateGuid(&probe_clsid));
+        ActivationRegistration activation(probe_clsid);
+        winrt::com_ptr<IClassFactory> factory;
+        winrt::check_hresult(CoGetClassObject(probe_clsid, CLSCTX_LOCAL_SERVER, nullptr, IID_PPV_ARGS(factory.put())));
+        winrt::com_ptr<INotificationActivationCallback> callback;
+        winrt::check_hresult(factory->CreateInstance(nullptr, IID_PPV_ARGS(callback.put())));
+        winrt::check_hresult(callback->Activate(kAppId, L"noop", nullptr, 0));
+        XmlDocument document;
+        document.LoadXml(L"<toast/>");
     });
 }
 

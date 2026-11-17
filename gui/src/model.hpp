@@ -16,10 +16,9 @@ Json read_json(const fs::path& path);
 void validate_passwords(const Json& document);
 bool password_matches_scope(const Json& record, const std::string& scope);
 struct WatchRoot { fs::path input; std::string output; bool deep = false; bool initial_scanned = false; bool recursive = false; };
-struct WatchRoots { std::vector<WatchRoot> entries; std::vector<std::string> comments; };
-WatchRoots parse_roots(const std::string& text, const fs::path& base);
-WatchRoots read_roots(const fs::path& path);
-Json apply_password_changes(Json document, const Json& edits, Json* saved_record = nullptr);
+using WatchRoots = std::vector<WatchRoot>;
+WatchRoots parse_roots(std::string_view text, const fs::path& base, std::string* comments = nullptr);
+WatchRoots read_roots(const fs::path& path, std::string* comments = nullptr);
 // The saved document is already parsed while validating the write; return it
 // to the GUI instead of immediately re-reading and re-projecting the file.
 struct PasswordSaveSnapshot { Json document; std::string file_text; Json record, rebases; bool delta_base_matches = false; };
