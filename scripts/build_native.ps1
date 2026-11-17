@@ -58,10 +58,11 @@ function Invoke-Native {
         [string[]]$Arguments = @()
     )
 
+    # Get-Command with an explicit command type can return every PATH match.
+    $command = (Get-Command -Name $FilePath -CommandType Application -TotalCount 1 -ErrorAction Stop).Path
     if ($PSVersionTable.PSVersion.Major -eq 5) {
         # Windows PowerShell reports redirected stderr as PowerShell errors.
         # Cargo writes progress there even on success.
-        $command = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop
         $ErrorActionPreference = "Continue"
         & $command @Arguments 2>&1 | ForEach-Object {
             if ($_ -is [System.Management.Automation.ErrorRecord]) {
@@ -74,7 +75,7 @@ function Invoke-Native {
             }
         }
     } else {
-        & $FilePath @Arguments
+        & $command @Arguments
     }
     if ($LASTEXITCODE -ne 0) {
         $joined = ($Arguments | ForEach-Object { $_ }) -join " "
@@ -163,7 +164,7 @@ function Build-SevenZipWorker {
     Assert-PathExists -LiteralPath $workerExe -Description "Built 7z worker executable"
     Assert-PathExists -LiteralPath $launcherExe -Description "Built SunPack launcher executable"
 
-    Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch -ArtifactPaths @($workerExe)
+    Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch
     Set-DevelopmentArtifactBuildTime -Path $launcherExe -BuildStartedUtc $buildStartedUtc
     Set-DevelopmentArtifactBuildTime -Path $workerExe -BuildStartedUtc $buildStartedUtc
 }

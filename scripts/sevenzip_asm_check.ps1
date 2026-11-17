@@ -116,7 +116,6 @@ function Assert-SevenZipAsmSelection {
     param(
         [Parameter(Mandatory = $true)][string]$BuildDir,
         [Parameter(Mandatory = $true)][string]$BuildArch,
-        [string[]]$ArtifactPaths,
         [string]$ExpectedSymbol = "LzmaDec_DecodeReal_3"
     )
 
@@ -142,22 +141,16 @@ function Assert-SevenZipAsmSelection {
                "$ExpectedSymbol, so the assembly object cannot be the source of that symbol.")
     }
 
-    $targets = @(
-        (Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe")
-    )
-    if ($ArtifactPaths) { $targets += $ArtifactPaths }
-
-    foreach ($target in $targets) {
-        if (-not (Test-Path -LiteralPath $target)) {
-            throw "7-Zip asm check failed: expected binary $target does not exist."
-        }
-        $hits = Test-BytePatternInFile -Path $target -Pattern $symbol.Bytes
-        if ($hits -lt 1) {
-            throw ("7-Zip asm check failed: $ExpectedSymbol from $sourceName is not present " +
-                   "in $target. That binary fell back to the C LZMA decoder.")
-        }
-        Write-Host ("7-Zip asm check passed: $ExpectedSymbol present in " +
-                    "$(Split-Path $target -Leaf) ($hits match(es), " +
-                    "$($symbol.Bytes.Length) byte prologue)") -ForegroundColor Green
+    $target = Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe"
+    if (-not (Test-Path -LiteralPath $target)) {
+        throw "7-Zip asm check failed: expected binary $target does not exist."
     }
+    $hits = Test-BytePatternInFile -Path $target -Pattern $symbol.Bytes
+    if ($hits -lt 1) {
+        throw ("7-Zip asm check failed: $ExpectedSymbol from $sourceName is not present " +
+               "in $target. That binary fell back to the C LZMA decoder.")
+    }
+    Write-Host ("7-Zip asm check passed: $ExpectedSymbol present in " +
+                "$(Split-Path $target -Leaf) ($hits match(es), " +
+                "$($symbol.Bytes.Length) byte prologue)") -ForegroundColor Green
 }

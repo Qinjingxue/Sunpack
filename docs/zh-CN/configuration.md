@@ -6,7 +6,6 @@
 
 普通配置的同名值优先于高级配置；`SUNPACK_CONFIG_OVERRIDES` 仍是最后一层显式覆盖。对象按字段合并，`filesystem.scan_filters` 按 `name` 合并，其余数组整体覆盖。Watch 会自动重新加载配置变更。
 
-
 修改后校验并查看最终配置：
 
 ```powershell
@@ -16,26 +15,26 @@ sunpack.exe config show
 
 ## 常用设置
 
-| 配置项 | 如何设置 |
-| --- | --- |
-| `cli.language` | `zh` 为中文，`en` 为英文。 |
-| `recursive_extract` | `"*"` 持续处理嵌套归档；正整数指定轮数；`"?"` 每轮后询问。 |
-| `recursive_authorization.enabled` | `true` 启用嵌套归档筛选策略；`false` 跳过该策略。 |
-| `post_extract.archive_cleanup_mode` | 完整成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。 |
-| `post_extract.flatten_single_directory` | `true` 时提升唯一顶层输出目录中的内容。 |
-| `passwords.clipboard_passwords_enabled` | 默认 `true`，CLI 将当前剪贴板文本作为密码候选。 |
-| `watch.deduplication` | 普通配置默认 `"file_id"` 硬链接去重；高级配置默认 `"none"` 不去重；`"hash"` 识别内容相同的逻辑归档输入。 |
-| `watch.deduplication_scope` | 默认 `"root"` 仅比较当前监控目录；`"global"` 比较全部监控目录。 |
-| `watch.clipboard_monitor_enabled` | 默认 `true`，运行中的 Watch 保存剪贴板密码历史。 |
-| `watch.clipboard_builtin_max_entries` | 默认保留最新 30 条剪贴板历史，最小 1。 |
-| `watch.toast_report_retention_days` | 默认保留失败报告 30 天，最小 1。 |
-| `extraction.content_requirement` | `"complete"` 要求完整结果；`"allow_partial"` 接受部分恢复结果。 |
+| 配置项                                  | 如何设置                                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `cli.language`                          | `zh` 为中文，`en` 为英文。                                                                  |
+| `recursive_extract`                     | `"*"` 持续处理嵌套归档；正整数指定轮数；`"?"` 每轮后询问。                                  |
+| `recursive_authorization.enabled`       | `true` 启用嵌套归档筛选策略；`false` 跳过该策略。                                           |
+| `post_extract.archive_cleanup_mode`     | 完整成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。                                 |
+| `post_extract.flatten_single_directory` | `true` 时提升唯一顶层输出目录中的内容。                                                     |
+| `passwords.clipboard_passwords_enabled` | 默认 `true`，CLI 将当前剪贴板文本作为密码候选。                                             |
+| `watch.deduplication`                   | `"file_id"` 硬链接去重；高级配置默认 `"none"` 不去重；`"hash"` 识别内容相同的逻辑归档输入。 |
+| `watch.deduplication_scope`             | 默认 `"root"` 仅比较当前监控目录；`"global"` 比较全部监控目录。                             |
+| `watch.clipboard_monitor_enabled`       | 默认 `true`，运行中的 Watch 保存剪贴板密码历史。                                            |
+| `watch.clipboard_builtin_max_entries`   | 默认保留最新 30 条剪贴板历史，最小 1。                                                      |
+| `watch.toast_report_retention_days`     | 默认保留失败报告 30 天，最小 1。                                                            |
+| `extraction.content_requirement`        | `"complete"` 要求完整结果；`"allow_partial"` 接受部分恢复结果。                             |
 
 例如，在主配置中加入以下字段，可保留原归档并扫描子目录：
 
 ```json
 {
-  "post_extract": {"archive_cleanup_mode": "k"}
+  "post_extract": { "archive_cleanup_mode": "k" }
 }
 ```
 
@@ -60,9 +59,7 @@ verification 框架、方法配置、完整度阈值和质量评分已移除，�
 ```json
 {
   "filesystem": {
-    "scan_filters": [
-      {"name": "size_range", "enabled": false}
-    ]
+    "scan_filters": [{ "name": "size_range", "enabled": false }]
   }
 }
 ```
@@ -75,12 +72,12 @@ verification 框架、方法配置、完整度阈值和质量评分已移除，�
 {
   "name": "blacklist",
   "enabled": true,
-  "paths": [{"value": ".git", "regex": false}],
-  "files": [{"value": "报告*", "regex": false}],
-  "extensions": [{"value": "zip", "regex": false}],
+  "paths": [{ "value": ".git", "regex": false }],
+  "files": [{ "value": "报告*", "regex": false }],
+  "extensions": [{ "value": "zip", "regex": false }],
   "full_names": [
-    {"value": "报告[最终版]+.zip", "regex": false},
-    {"value": "\\.(?:tmp|log|bak)\\z", "regex": true}
+    { "value": "报告[最终版]+.zip", "regex": false },
+    { "value": "\\.(?:tmp|log|bak)\\z", "regex": true }
   ]
 }
 ```
@@ -101,8 +98,18 @@ GUI 输入框旁的“使用正则表达式”复选框设置当前记录，默�
 {
   "filesystem": {
     "scan_filters": [
-      {"name": "size_range", "enabled": true, "min_bytes": 1, "max_bytes": null},
-      {"name": "mtime_range", "enabled": true, "start_utc": "2024-01-01T00:00Z", "end_utc": "2027-01-01T00:00Z"}
+      {
+        "name": "size_range",
+        "enabled": true,
+        "min_bytes": 1,
+        "max_bytes": null
+      },
+      {
+        "name": "mtime_range",
+        "enabled": true,
+        "start_utc": "2024-01-01T00:00Z",
+        "end_utc": "2027-01-01T00:00Z"
+      }
     ]
   }
 }
@@ -141,13 +148,12 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 ```json
 {
   "passwords": [
-    {"value": "全局密码"},
-    {"value": "目录密码", "scopes": ["D:/Downloads", "E:/Archives"]}
+    { "value": "全局密码" },
+    { "value": "目录密码", "scopes": ["D:/Downloads", "E:/Archives"] }
   ],
   "clipboard_history": []
 }
 ```
-
 
 ## 监控去重
 
@@ -156,6 +162,5 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 `file_id` 比较底层文件身份；`hash` 先筛选大小，再以流式 XXH3-128 比较内容。Hash 相等是概率性判断，不是密码学保证。即使原输入挂起或失败，新重复输入也会跳过，但不会记为解压成功或清理源文件，原输入仍可正常重试。GUI 将跳过记录归入成功分类，以绿色“去重跳过”标识展示，不代表解压成功。索引仅在输入文件仍存在于监控范围内时有效。
 
 每次切换模式都会清除旧内存索引及持久化去重索引。`none` 到此结束；`file_id` 扫描已确认输入并重建，`hash` 还会读取其内容计算摘要。重建不执行解压或源清理。未切换模式的进程重启会校验并复用独立持久化索引，不重新计算全部 Hash。
-
 
 `watch.deduplication_scope` 在普通和高级配置中均默认为 `root`。设为 `global` 后可跨监控目录比较：Hash 去重可识别跨目录、跨卷的相同逻辑输入内容；硬链接去重比较卷标识和 File ID，不会将不同卷上的相同 File ID 当成同一个文件。嵌套监控根覆盖的同一路径仍是一个输入，不会与自身重复。切换范围和切换模式一样，清除并重建去重索引；未启用去重时不建立索引。

@@ -20,14 +20,14 @@ sunpack.exe config show
 | `cli.language`                          | `zh` for Chinese or `en` for English.                                                                                        |
 | `recursive_extract`                     | `"*"` to keep processing nested archives, a positive integer for a fixed number of rounds, or `"?"` to ask after each round. |
 | `recursive_authorization.enabled`       | `true` to apply the nested archive selection policy; `false` to skip this policy.                                            |
-| `post_extract.archive_cleanup_mode`     | `"r"` to recycle the original archive after complete success, `"k"` to keep it, or `"d"` to delete it.                                |
+| `post_extract.archive_cleanup_mode`     | `"r"` to recycle the original archive after complete success, `"k"` to keep it, or `"d"` to delete it.                       |
 | `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder.                                                             |
-| `passwords.clipboard_passwords_enabled` | `true` (default) reads the current clipboard for CLI password candidates. |
-| `watch.deduplication` | `"file_id"` (ordinary configuration default) for hard links, `"none"` (advanced default), or `"hash"` for identical logical archive contents. |
-| `watch.deduplication_scope` | `"root"` (default) compares within one monitored root; `"global"` compares across all monitored roots. |
-| `watch.clipboard_monitor_enabled` | `true` (default) lets a running Watch save clipboard password history. |
-| `watch.clipboard_builtin_max_entries` | Keep the newest 30 clipboard history entries by default, minimum 1. |
-| `watch.toast_report_retention_days` | Keep failure reports for 30 days by default, minimum 1. |
+| `passwords.clipboard_passwords_enabled` | `true` reads the current clipboard for CLI password candidates.                                                              |
+| `watch.deduplication`                   | `"file_id"`for hard links, `"none"` for no deduplication, or `"hash"` for identical logical archive contents.                |
+| `watch.deduplication_scope`             | `"root"` compares within one monitored root; `"global"` compares across all monitored roots.                                 |
+| `watch.clipboard_monitor_enabled`       | `true` lets a running Watch save clipboard password history.                                                                 |
+| `watch.clipboard_builtin_max_entries`   | Keep the newest 30 clipboard history entries by default, minimum 1.                                                          |
+| `watch.toast_report_retention_days`     | Keep failure reports for 30 days by default, minimum 1.                                                                      |
 | `extraction.content_requirement`        | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery.                                  |
 
 For example, add these fields to the main configuration to keep original archives:
@@ -72,12 +72,12 @@ Blacklists and whitelists use four lists of records:
 {
   "name": "blacklist",
   "enabled": true,
-  "paths": [{"value": ".git", "regex": false}],
-  "files": [{"value": "report*", "regex": false}],
-  "extensions": [{"value": "zip", "regex": false}],
+  "paths": [{ "value": ".git", "regex": false }],
+  "files": [{ "value": "report*", "regex": false }],
+  "extensions": [{ "value": "zip", "regex": false }],
   "full_names": [
-    {"value": "report[final]+.zip", "regex": false},
-    {"value": "\\.(?:tmp|log|bak)\\z", "regex": true}
+    { "value": "report[final]+.zip", "regex": false },
+    { "value": "\\.(?:tmp|log|bak)\\z", "regex": true }
   ]
 }
 ```
@@ -189,7 +189,6 @@ Persistent passwords come only from `builtin_passwords.json`, including its `cli
 }
 ```
 
-
 ## Watch deduplication
 
 Set `watch.deduplication` to `none`, `file_id`, or `hash` in configuration or the GUI. The shipped ordinary configuration enables hard-link deduplication; the advanced default and fallback remain `none`. Ordinary settings override advanced settings. Only confirmed archives with a determined logical layout enter this index; ordinary files and uncertain volume combinations do not. Ordered volume members and carrier ranges are part of the logical input. This does not compare extracted contents or affect CLI extraction.
@@ -197,6 +196,5 @@ Set `watch.deduplication` to `none`, `file_id`, or `hash` in configuration or th
 `file_id` compares underlying file identities; `hash` uses streaming XXH3-128 content digests after a size check. Hash equality is probabilistic, not a cryptographic guarantee. A duplicate is skipped even when the original is pending or failed; it is not reported as an extraction success and its source is not cleaned. The original input can still retry. The GUI lists skips in the successful category with the green “Duplicate skipped” label; this is not an extraction success. Records remain valid only while their input files exist in the monitored scope.
 
 Every mode change discards the old in-memory and persisted deduplication index. `none` stops there; `file_id` rescans confirmed inputs, and `hash` also reads their contents to build the new index. Rebuilding does not extract or clean files. Restarting without changing the mode reuses the independently persisted index after validation instead of hashing everything again.
-
 
 `watch.deduplication_scope` defaults to `root` in both configuration files. Use `global` to compare across monitored roots: hash mode can identify equal logical input contents across roots or volumes, while hard-link mode uses the volume plus file ID (matching IDs on different volumes are not the same file). A pathname shared by nested monitored roots is still one input, not its own duplicate. Changing the scope discards and rebuilds the deduplication index just like changing its mode; with deduplication disabled, no index is built.

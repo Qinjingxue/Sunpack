@@ -19,7 +19,7 @@ $interactivePrompting = -not $NoPause -and -not [Console]::IsInputRedirected
 $promptForAcceptanceTests = ($PSBoundParameters.Count -eq 0) -and $interactivePrompting
 
 function Wait-BeforeBuildExit {
-    if ($NoPause) {
+    if (-not $interactivePrompting) {
         return
     }
     Write-Host ""
@@ -296,7 +296,7 @@ function Get-GitCommit {
 
 function Confirm-AcceptanceTests {
     while ($true) {
-        $rawAnswer = Read-Host "Run acceptance tests before building? [Y/n]"
+        $rawAnswer = Read-Host "Run acceptance tests before creating the installer? [Y/n]"
         $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim() }
         if ($answer -eq "" -or $answer -match "^(?i:y|yes)$") {
             return $true
@@ -342,7 +342,10 @@ function Assert-PackagedRuntimeTools {
     }
 }
 
+$originalOutputEncoding = [Console]::OutputEncoding
 try {
+# CMake/MSBuild and the packaged CLI emit UTF-8 when PowerShell captures them.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $nativeBuildScript = Join-Path $PSScriptRoot "build_native.ps1"
 . $nativeBuildScript
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -372,6 +375,7 @@ $sevenZipWrapperRoot = Join-Path $repoRoot "sunpack\sevenzip_bridge"
 $sevenZipWrapperBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release -Component sevenzip_bridge
 $toastHostRoot = Join-Path $repoRoot "sunpack\toast_host"
 $toastHostBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release -Component toast_host
+$guiBuildDir = Join-Path $repoRoot (".cache\gui-" + $buildArch)
 $sevenZipWorkerPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_sevenzip_worker.exe"
 $toastHostPath = Join-Path $toastHostBuildDir "Release\sunpack_toast.dll"
 $launcherBuildPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_launcher.exe"
@@ -409,10 +413,21 @@ Assert-PathExists -LiteralPath (Join-Path $sevenZipWrapperRoot "CMakeLists.txt")
 Assert-PathExists -LiteralPath (Join-Path $toastHostRoot "CMakeLists.txt") -Description "toast CMake project"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 
+if ($runAcceptanceTests) {
+    # Prepare the Python environment before the GUI tests use it, and fail before
+    # compiling if the acceptance dependencies cannot be installed.
+    Write-Step "Preparing acceptance test dependencies"
+    Invoke-Native -FilePath "powershell" -Arguments @(
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $PSScriptRoot "setup_windows_dev.ps1"),
+        "-Arch", $buildArch, "-AcceptanceTestDependenciesOnly"
+    )
+}
+
 if ($Clean) {
     Write-Step "Cleaning native build outputs"
     $rustBuildDir = Get-RustBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
-    foreach ($output in @($rustBuildDir, (Split-Path -Parent $watchBrokerBuildPath), $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
+    foreach ($output in @($rustBuildDir, (Split-Path -Parent $watchBrokerBuildPath), $sevenZipWrapperBuildDir, $toastHostBuildDir, $guiBuildDir)) {
         $fullOutput = [IO.Path]::GetFullPath($output)
         if (-not $fullOutput.StartsWith(([IO.Path]::GetFullPath($repoRoot) + "\"), [StringComparison]::OrdinalIgnoreCase)) {
             throw "Build output is outside the repository: $output"
@@ -449,7 +464,6 @@ if ($runAcceptanceTests) {
 # Cargo locks each target directory for the full build.
 $brokerCargoArgs = $cargoArgs + @("-p", "sunpack-watch-broker", "--bin", "sunpack-watch-broker", "--target-dir", $watchBrokerTargetDir)
 $guiScript = Join-Path $PSScriptRoot "build_gui.ps1"
-$guiBuildDir = Join-Path $repoRoot (".cache\gui-" + $buildArch)
 $applicationOnly = [bool]$SkipTests
 
 $buildRust = {
@@ -461,14 +475,18 @@ $buildRust = {
 }
 
 $jobs = @()
+# Start-Job uses separate PowerShell processes with their own native output decoder.
+$jobOptions = @{
+    InitializationScript = { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) }
+}
 try {
-    $jobs += Start-Job -Name "Runtime" -ScriptBlock $buildRust -ArgumentList (,$runtimeCargoArgs)
-    $jobs += Start-Job -Name "Watch Broker" -ScriptBlock $buildRust -ArgumentList (,$brokerCargoArgs)
-    $jobs += Start-Job -Name "GUI" -ScriptBlock {
+    $jobs += Start-Job @jobOptions -Name "Runtime" -ScriptBlock $buildRust -ArgumentList (,$runtimeCargoArgs)
+    $jobs += Start-Job @jobOptions -Name "Watch Broker" -ScriptBlock $buildRust -ArgumentList (,$brokerCargoArgs)
+    $jobs += Start-Job @jobOptions -Name "GUI" -ScriptBlock {
         $ErrorActionPreference = "Stop"
         & $using:guiScript -Arch $using:buildArch -CMakeCommand $using:cmakeCommand -BuildDir $using:guiBuildDir -Jobs $using:BuildJobs -SkipTests -ApplicationOnly:$using:applicationOnly
     }
-    $jobs += Start-Job -Name "Worker and native tools" -ScriptBlock {
+    $jobs += Start-Job @jobOptions -Name "Worker and native tools" -ScriptBlock {
         $ErrorActionPreference = "Stop"
         $BuildJobs = $using:BuildJobs
         . $using:nativeBuildScript
@@ -626,18 +644,12 @@ if ($processArch -eq $buildArch) {
 
 if ($runAcceptanceTests) {
     # The release build already supplied the native artifacts for acceptance.
-    Write-Step "Preparing acceptance test dependencies"
-    Invoke-Native -FilePath "powershell" -Arguments @(
-        "-ExecutionPolicy", "Bypass",
-        "-File", (Join-Path $PSScriptRoot "setup_windows_dev.ps1"),
-        "-Arch", $buildArch, "-AcceptanceTestDependenciesOnly"
-    )
     $fixtureBuildPath = Get-ArchiveFixtureBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile release
     Assert-PathExists -LiteralPath $fixtureBuildPath -Description "Native test fixture executable"
 
     Write-Step "Running acceptance tests"
     Invoke-Native -FilePath "powershell" -Arguments @(
-        "-ExecutionPolicy", "Bypass",
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $repoRoot "run_acceptance_tests.ps1"),
         "-NoWait", "-Arch", $buildArch, "-BuildProfile", "release", "-SkipEnvironmentRefresh"
     )
@@ -687,6 +699,8 @@ Write-Host "Windows installer: $releaseInstallerPath"
     Write-Host ("Build failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
     Wait-BeforeBuildExit
     exit 1
+} finally {
+    [Console]::OutputEncoding = $originalOutputEncoding
 }
 
 Wait-BeforeBuildExit
