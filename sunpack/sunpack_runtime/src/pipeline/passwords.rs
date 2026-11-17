@@ -166,7 +166,7 @@ impl CandidateSet {
         input.analysis.password_required = true;
         let mut key = None;
         let plan = match self.plan_inner(&input, None, cancellation, Some(std::slice::from_ref(session)),
-            &mut password::context::Preparation::capturing_rar5_key(&mut key))? {
+            &mut password::context::Preparation::capturing_rar_key(&mut key))? {
             Ok(plan) => plan,
             Err(failure) => {
                 let mut out = anchor.clone();

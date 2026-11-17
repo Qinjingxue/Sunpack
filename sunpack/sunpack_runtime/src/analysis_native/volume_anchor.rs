@@ -932,7 +932,7 @@ pub(crate) fn resolve_encrypted_relation_anchor(
     reader: &ManagedReader,
     passwords: &[std::sync::Arc<str>],
     require_terminal: bool,
-    proven_key: Option<&crate::password::rar::Rar5ProvenKey>,
+    proven_key: Option<&crate::password::rar::RarProvenKey>,
 ) -> std::io::Result<(VolumeAnchor, Option<usize>)> {
     use crate::password::rar::{probe_header_passwords, HeaderPassword};
 

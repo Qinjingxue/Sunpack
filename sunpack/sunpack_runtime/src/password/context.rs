@@ -77,12 +77,12 @@ impl PasswordContext {
     fn verify(
         &self,
         candidates: &[Arc<str>],
-        rar5_key: Option<&mut Option<super::rar::Rar5ProvenKey>>,
+        rar_key: Option<&mut Option<super::rar::RarProvenKey>>,
     ) -> std::io::Result<PasswordVerification> {
         match self {
             Self::Enc(context) => context.verify(candidates),
             Self::Zip(context) => context.verify(candidates),
-            Self::Rar(context) => context.verify(candidates, rar5_key),
+            Self::Rar(context) => context.verify(candidates, rar_key),
             Self::SevenZip(context) => context.verify(candidates),
         }
     }
@@ -126,12 +126,12 @@ static ACTIVE: Mutex<Vec<Arc<PreparedSlot>>> = Mutex::new(Vec::new());
 #[derive(Default)]
 pub(crate) struct Preparation<'a> {
     slot: Option<Arc<PreparedSlot>>,
-    rar5_key: Option<&'a mut Option<super::rar::Rar5ProvenKey>>,
+    rar_key: Option<&'a mut Option<super::rar::RarProvenKey>>,
 }
 
 impl<'a> Preparation<'a> {
-    pub(crate) fn capturing_rar5_key(key: &'a mut Option<super::rar::Rar5ProvenKey>) -> Self {
-        Self { slot: None, rar5_key: Some(key) }
+    pub(crate) fn capturing_rar_key(key: &'a mut Option<super::rar::RarProvenKey>) -> Self {
+        Self { slot: None, rar_key: Some(key) }
     }
 
     /// Reuse the layout for a later batch of the same plan's input and readers.
@@ -142,7 +142,7 @@ impl<'a> Preparation<'a> {
         let Some(slot) = self.slot.as_deref() else { return Ok(None); };
         let Some(prepared) = slot.value.get() else { return Ok(None); };
         let cancellation = Cancellation::current();
-        Self::verify_slot(slot, prepared, candidates, self.rar5_key.as_deref_mut(), &cancellation)
+        Self::verify_slot(slot, prepared, candidates, self.rar_key.as_deref_mut(), &cancellation)
             .map(Some)
     }
 
@@ -169,7 +169,7 @@ impl<'a> Preparation<'a> {
                 continue;
             };
             let result = Self::verify_slot(
-                slot, prepared, candidates, self.rar5_key.as_deref_mut(), &cancellation,
+                slot, prepared, candidates, self.rar_key.as_deref_mut(), &cancellation,
             );
             if matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error")
                 || matches!(prepared, Err(PreparedStatus::Status(_, message)) if message.starts_with("resource_unavailable:"))
@@ -184,7 +184,7 @@ impl<'a> Preparation<'a> {
         slot: &PreparedSlot,
         prepared: &Prepared,
         candidates: &[Arc<str>],
-        rar5_key: Option<&mut Option<super::rar::Rar5ProvenKey>>,
+        rar_key: Option<&mut Option<super::rar::RarProvenKey>>,
         cancellation: &Cancellation,
     ) -> std::io::Result<PasswordVerification> {
         cancellation.check()?;
@@ -192,7 +192,7 @@ impl<'a> Preparation<'a> {
             return Err(input_changed());
         }
         let result = match prepared {
-            Ok(context) => context.verify(candidates, rar5_key),
+            Ok(context) => context.verify(candidates, rar_key),
             Err(status) => Ok(status.verification()),
         };
         cancellation.check()?;
