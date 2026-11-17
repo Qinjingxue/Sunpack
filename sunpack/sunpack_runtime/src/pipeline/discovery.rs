@@ -1225,10 +1225,7 @@ fn embedded_read_failure(path: &str, error: String) -> Failure {
 
 fn discovery_failure(reason: &str, source: DiscoverySource, path: &str) -> Option<Failure> {
     let (kind, message) = match reason {
-        "needs_password" | "embedded_password_required" => {
-            (FailureKind::PasswordRequired, "Password not found in the password list")
-        }
-        "wrong_password" | "embedded_wrong_password" => (FailureKind::WrongPassword, "Password not found in the password list"),
+        "needs_password" | "embedded_password_required" | "wrong_password" | "embedded_wrong_password" => (FailureKind::WrongPassword, "Password not found in the password list"),
         "missing_volume" | "ambiguous_volume_mapping" | "structural_conflict" => {
             (FailureKind::MissingVolume, "Missing volume")
         }

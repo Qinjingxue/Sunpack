@@ -19,6 +19,9 @@ fn relations_share_batched_password_proofs_and_skip_single_volume_directory() {
         let threads = Arc::new(Mutex::new(Vec::new()));
         RAR5_CANDIDATE_THREADS.with(|value| *value.borrow_mut() = Some(threads.clone()));
         PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
+        let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
+        let (blocked, password) = absent.resolve_relation(&anchor, &session, &cancel).unwrap();
+        assert!(blocked.needs_password && !blocked.wrong_password && password.is_none());
         let candidates = CandidateSet::new(wrong.clone().into(), None, &cache, None);
         let (blocked, password) = candidates.resolve_relation(&anchor, &session, &cancel).unwrap();
         assert!(blocked.wrong_password && password.is_none());
@@ -291,7 +294,7 @@ fn explicit_empty_enc_candidate_is_not_absent_or_implicit() {
     assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
     let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
     assert_eq!(absent.plan(&input, None, &Cancellation::new()).unwrap()
-        .err().unwrap().kind, FailureKind::PasswordRequired);
+        .err().unwrap().kind, FailureKind::WrongPassword);
     let sessions = open_sessions(&input).unwrap();
     let (key, attempts) = Key::for_input(&input, &sessions).unwrap();
     attempts.reject(key.clone(), &[Arc::from("wrong")]);

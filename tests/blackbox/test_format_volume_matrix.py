@@ -138,7 +138,7 @@ def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package
         disguised[0].write_bytes(b"prefix" * 211 + disguised[0].read_bytes()
                                  + b"gap" * 37 + sibling.getvalue() + b"suffix" * 11)
     report = package.json("scan", "-d", case.archive_dir, code=1)
-    blocked, = [item for item in report["items"] if item.get("error_kind") == "password_required"]
+    blocked, = [item for item in report["items"] if item.get("error_kind") == "wrong_password"]
     assert len(report["items"]) == 1 + carrier, report
     assert {Path(path) for path in blocked["all_parts"]} == set(disguised)
 
@@ -197,7 +197,7 @@ def test_encrypted_rar5_same_stem_keeps_independent_sets_and_singleton(package, 
     actual = [{Path(path) for path in item.get("all_parts", [item["main_path"]])}
               for item in report["items"]]
     assert all(group in actual for group in groups), report
-    assert all(item["error_kind"] == "password_required" for item in report["items"])
+    assert all(item["error_kind"] == "wrong_password" for item in report["items"])
     report = package.json("scan", "-d", "-p", PASSWORD, inputs)
     assert len(report["items"]) == 3, [(Path(i["main_path"]).name, [Path(p).name for p in i.get("all_parts", [])]) for i in report["items"]]
     outer = tmp_path / "outer.zip"

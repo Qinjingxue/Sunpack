@@ -412,10 +412,6 @@
       "zh": "无效输入",
       "en": "Invalid input"
     },
-    "taskError_password_required": {
-      "zh": "需要密码",
-      "en": "Password required"
-    },
     "taskError_wrong_password": {
       "zh": "密码错误",
       "en": "Wrong password"

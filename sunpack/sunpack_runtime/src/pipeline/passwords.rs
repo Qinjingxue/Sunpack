@@ -170,7 +170,8 @@ impl CandidateSet {
             Ok(plan) => plan,
             Err(failure) => {
                 let mut out = anchor.clone();
-                out.wrong_password = failure.kind == FailureKind::WrongPassword;
+                out.wrong_password = failure.evidence.as_deref().is_some_and(|evidence|
+                    evidence.classification_evidence.as_deref() == Some("password_candidates_all_rejected"));
                 return Ok((out, None));
             }
         };
@@ -218,7 +219,7 @@ impl CandidateSet {
         // open. With no other candidates, a Rust probe only repeats that I/O.
         if self.configured(&input.entry_path).next().is_none() {
             return Ok(if needs_password {
-                Err(Failure::password_required())
+                Err(Failure::password())
             } else {
                 Ok(PasswordPlan::empty_fallback())
             });
@@ -377,10 +378,15 @@ impl CandidateSet {
         }
         if pending.is_empty() {
             if password_rejected && has_candidates {
-                return Ok(Err(Failure::password()));
+                let mut failure = Failure::password();
+                failure.evidence = Some(Box::new(super::FailureEvidence {
+                    classification_evidence: Some("password_candidates_all_rejected".into()),
+                    ..Default::default()
+                }));
+                return Ok(Err(failure));
             }
             if password_rejected || needs_password {
-                return Ok(Err(Failure::password_required()));
+                return Ok(Err(Failure::password()));
             }
             pending.push(Arc::from(""));
         }
@@ -476,13 +482,6 @@ impl Failure {
     pub(super) fn password() -> Self {
         Self::new(
             FailureKind::WrongPassword,
-            "Password not found in the password list",
-        )
-    }
-
-    pub(super) fn password_required() -> Self {
-        Self::new(
-            FailureKind::PasswordRequired,
             "Password not found in the password list",
         )
     }

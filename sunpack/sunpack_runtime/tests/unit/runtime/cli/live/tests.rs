@@ -248,7 +248,7 @@ fn task_preflight_keeps_failed_segments_and_marks_unexecuted_rows_skipped() {
     assert!(text.starts_with("carrier  name\n"));
     assert!(text.contains("first second"));
     assert!(!text.contains('\r'));
-    let failure = Failure::new(FailureKind::PasswordRequired, "password")
+    let failure = Failure::new(FailureKind::WrongPassword, "password")
         .with_context(crate::pipeline::FailureContext::Discovery {
             discovery: crate::pipeline::DiscoverySource::Embedded,
             reason: "needs_password".into(), path: "carrier.bin".into(), error: String::new(),

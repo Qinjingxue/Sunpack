@@ -154,7 +154,6 @@ pub enum FailureKind {
     BackendUnavailable,
     Unsupported,
     MissingVolume,
-    PasswordRequired,
     WrongPassword,
     PasswordInconclusive,
     Damaged,
@@ -211,7 +210,7 @@ impl Failure {
     /// Weak ZipCrypto validation does not authorize a password retry. The
     /// classifier separately marks the password-or-volume ambiguity.
     pub(crate) fn is_password_retry(&self) -> bool {
-        matches!(self.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword)
+        self.kind == FailureKind::WrongPassword
             || (self.kind == FailureKind::PasswordInconclusive && self.password_retry)
     }
 

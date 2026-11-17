@@ -925,7 +925,7 @@ fn admitted_password_scope_survives_family_head_retry_and_retained_recovery() {
     };
     let passwords = crate::core::passwords::PasswordSnapshot::default();
     let user_signature = user_password_signature(&[]);
-    for kind in [FailureKind::PasswordRequired, FailureKind::MissingVolume] {
+    for kind in [FailureKind::WrongPassword, FailureKind::MissingVolume] {
         let mut outcome = Outcome::default();
         outcome.archives.push(completion_archive(path, 1, Some(kind)));
         let failures = outcome.input_failures();
@@ -974,7 +974,7 @@ fn retained_carrier_segments_share_blockers_without_hiding_independent_terminal_
     let mut partial = completion_archive(retained_path, 2, Some(FailureKind::MissingVolume));
     partial.partial = true;
     let terminal = completion_archive(retained_path, 2, Some(FailureKind::Damaged));
-    let blocked = completion_archive(retained_path, 2, Some(FailureKind::PasswordRequired));
+    let blocked = completion_archive(retained_path, 2, Some(FailureKind::WrongPassword));
     let mut outcome = Outcome::default();
     outcome.archives = vec![completion_archive(owner.to_str().unwrap(), 1, None), partial, terminal, blocked];
     let outputs = BTreeMap::from([
@@ -1067,7 +1067,7 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
         let mut blocker = crate::watch_store::EntryRecord {
             path: carrier_text.into(), size: 15, mtime: 1.0, file_id: String::new(),
             change_usn: 0, status: "failed_password".into(), last_error: "blocked".into(),
-            failure_kind: "password_required".into(),
+            failure_kind: "wrong_password".into(),
             failure_payload: json!({"blockers":["password"]}).as_object().unwrap().clone(),
             last_attempt_at: 1.0,
         };

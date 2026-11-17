@@ -84,7 +84,6 @@ fn kind_name(kind: FailureKind) -> &'static str {
         FailureKind::BackendUnavailable => "backend_unavailable",
         FailureKind::Unsupported => "unsupported",
         FailureKind::MissingVolume => "missing_volume",
-        FailureKind::PasswordRequired => "password_required",
         FailureKind::WrongPassword => "wrong_password",
         FailureKind::PasswordInconclusive => "password_inconclusive",
         FailureKind::Damaged => "damaged",
@@ -137,8 +136,6 @@ impl<'a> Report<'a> {
                     .filter(|e| e.stage.as_deref() == Some("password_preflight"));
                 let diagnostic = if evidence.is_some() {
                     failure.message.as_str()
-                } else if failure.kind == FailureKind::PasswordRequired {
-                    "archive requires a password but no candidates were provided"
                 } else {
                     ""
                 };
@@ -257,7 +254,7 @@ pub(in crate::runtime) fn scan_message<'a>(entries: impl Iterator<Item = &'a Arc
     let count = entries.len();
     let mut failures = entries.filter_map(|entry| entry.failure.as_ref());
     if count > 1 {
-        let key = aggregate_key(failures.all(|failure| matches!(failure.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword)));
+        let key = aggregate_key(failures.all(|failure| failure.kind == FailureKind::WrongPassword));
         return language.text(key).into();
     }
     failures.next().map_or_else(|| "".into(), |failure| super::original_message_spec(failure, language).render(language))
@@ -274,7 +271,7 @@ fn aggregate<'a>(causes: Vec<Report<'a>>, count: usize, language: Language) -> R
         };
         (child.message_key.clone(), child.message_params.clone(), rendered, child.user_action)
     } else {
-        let key = aggregate_key(causes.iter().all(|cause| matches!(cause.kind, "password_required" | "wrong_password")));
+        let key = aggregate_key(causes.iter().all(|cause| cause.kind == "wrong_password"));
         let action = if causes.iter().any(|cause| cause.user_action == "request_password") { "request_password" } else { "" };
         (key.into(), json!({}), language.text(key).to_owned(), action)
     };

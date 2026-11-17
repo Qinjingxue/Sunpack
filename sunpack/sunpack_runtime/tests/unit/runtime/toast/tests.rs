@@ -516,7 +516,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
     assert!(!directory.0.exists());
     assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
 
-    for (index, kind) in [FailureKind::PasswordRequired, FailureKind::WrongPassword,
+    for (index, kind) in [FailureKind::WrongPassword,
         FailureKind::MissingVolume].into_iter().enumerate()
     {
         let activity = publisher.register(Arc::from(format!("1{index}")), Language::En);

@@ -7,7 +7,7 @@ fn password_retry_keeps_only_failed_carrier_siblings_and_generated_anchors() {
     let checkpoint = |carrier: &str, source: &str, failed: bool| {
         let input = crate::io::archive_state::ArchiveInput::file(source.into(), "zip".into(), source.into());
         let failure = failed.then(|| json!({"partial":false,"password_signature":null,
-            "failure":crate::pipeline::Failure::new(FailureKind::PasswordRequired,"password"),"complete_files":0}));
+            "failure":crate::pipeline::Failure::new(FailureKind::WrongPassword,"password"),"complete_files":0}));
         serde_json::from_value::<crate::pipeline::InputCheckpoint>(json!({
             "schema_version":1,"carrier":carrier,"input":input,"sources":[{"path":source,"generation":generation}],
             "output":format!("{carrier}-output"),"container":null,"files":1,"bytes":1,
@@ -329,7 +329,7 @@ fn report_archive(path: &str, offset: u64) -> ArchiveResult {
 
 #[test]
 fn scan_keeps_inconclusive_errors_without_changing_retry_or_json() {
-    for kind in [FailureKind::PasswordRequired, FailureKind::WrongPassword, FailureKind::PasswordInconclusive] {
+    for kind in [FailureKind::WrongPassword, FailureKind::PasswordInconclusive] {
         for language in [Language::En, Language::Zh] {
             for json in [false, true] {
                 let mut archive = report_archive("encrypted.zip", 0);

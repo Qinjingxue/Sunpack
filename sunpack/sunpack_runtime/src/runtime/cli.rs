@@ -2104,7 +2104,7 @@ fn report_scan(
                     line(session, Stream::Out, &format!("{prefix}{text}"))?;
                 }
                 if let Some(failure) = &entry.failure {
-                    if !(matches!(failure.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword) && entry.password.is_none())
+                    if !(failure.kind == FailureKind::WrongPassword && entry.password.is_none())
                         && !(failure.kind == FailureKind::MissingVolume
                             && entry.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing))
                     {

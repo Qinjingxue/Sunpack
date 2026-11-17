@@ -144,6 +144,15 @@ void projection(Fixture& f) {
     assert(log.query({},dedup_view).at("rows").empty());
 
 
+    // Password failures retain their existing title and supplied message when
+    // projected from the unified public failure kind.
+    publish(Json{{"event","failed_terminal"},{"path",utf8(source.wstring())},{"ts",1},
+        {"error_kind","wrong_password"},{"error","密码未在密码表中"}});
+    auto password_row=log.query({},dedup_view,"zh").at("rows").at(0);
+    assert(password_row["statusTone"]=="failure");
+    assert(password_row["errorType"]=="密码错误" && password_row["error"]=="密码未在密码表中");
+    assert(log.query({},dedup_view,"en").at("rows").at(0).at("errorType")=="Wrong password");
+
     // Resolve navigation from the same projected row at activation, including
     // deleted input archives and outputs moved after the page was displayed.
     auto monitor=f.dir/L"监控", nested=monitor/L"子目录", output=f.dir/L"输出";
