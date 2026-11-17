@@ -104,3 +104,62 @@ fn embedded() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     Ok(())
 }
+
+// Opt-in phase accounting: [] constructs the same immutable context without
+// candidate KDF work; the complete list then uses the ordinary verifier.
+// Windows high-water marks are process-lifetime values, not per-phase peaks.
+#[test]
+#[ignore = "run through the password study harness"]
+fn password_phases() -> Result<(), Box<dyn std::error::Error>> {
+    fn cpu_seconds() -> io::Result<f64> {
+        use windows_sys::Win32::{Foundation::FILETIME,
+            System::Threading::{GetCurrentProcess, GetProcessTimes}};
+        let mut created: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exited = created;
+        let mut kernel = created;
+        let mut user = created;
+        if unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited,
+            &mut kernel, &mut user) } == 0 { return Err(io::Error::last_os_error()); }
+        let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+        Ok((ticks(kernel) + ticks(user)) as f64 / 10_000_000.0)
+    }
+    fn memory() -> io::Result<Value> {
+        let m = process_memory()?;
+        Ok(json!({"working_set_bytes":m.working_set,"commit_bytes":m.commit,
+            "peak_working_set_bytes":m.peak_working_set,"peak_commit_bytes":m.peak_commit}))
+    }
+    let args = request()?;
+    let session = NativeArchiveSession::new(args.path.clone())?;
+    let input = ArchiveInput::file(args.path, args.format, String::new());
+    let mut rows = Vec::new();
+    for _ in 0..args.runs {
+        let before = memory()?;
+        let mut preparation = crate::password::context::Preparation::default();
+        let cpu = cpu_seconds()?;
+        let started = Instant::now();
+        let prepared = crate::password::verify(&mut preparation, &input, &[],
+            std::slice::from_ref(&session), None)?;
+        let prepare_seconds = started.elapsed().as_secs_f64();
+        let prepare_cpu_seconds = cpu_seconds()? - cpu;
+        let after_prepare = memory()?;
+        let cpu = cpu_seconds()?;
+        let started = Instant::now();
+        let found = crate::password::verify(&mut preparation, &input, &args.passwords,
+            std::slice::from_ref(&session), None)?;
+        let candidates_seconds = started.elapsed().as_secs_f64();
+        let candidates_cpu_seconds = cpu_seconds()? - cpu;
+        let after_candidates = memory()?;
+        drop(preparation);
+        let after_drop = memory()?;
+        rows.push(json!({"prepare_seconds":prepare_seconds,"prepare_cpu_seconds":prepare_cpu_seconds,
+            "candidates_seconds":candidates_seconds,"candidates_cpu_seconds":candidates_cpu_seconds,
+            "before":before,"after_prepare":after_prepare,"after_candidates":after_candidates,
+            "after_drop":after_drop,"prepare_status":prepared.status,
+            "result":{"status":found.status,"matched_index":found.matched_index,
+                "matched_indices":found.matched_indices,"attempts":found.attempts,
+                "final_confirmation_required":found.final_confirmation_required,
+                "match_evidence":found.match_evidence}}));
+    }
+    println!("SUNPACK_BENCH {}", json!({"rows":rows}));
+    Ok(())
+}
