@@ -460,13 +460,6 @@ namespace sunpack::sevenzip
         void reserve(std::size_t count) { used_.reserve(count); }
         void preserve_replay() { if (replay_) replay_->directories = std::move(directories_); }
 
-        void clear() noexcept
-        {
-            std::unordered_set<std::wstring>{}.swap(used_);
-            std::unordered_map<std::wstring, std::size_t>{}.swap(next_numbers_);
-            std::unordered_map<std::wstring, std::filesystem::path>{}.swap(directories_);
-        }
-
         std::filesystem::path allocate(const std::filesystem::path &requested, bool initially_empty, bool is_directory = false)
         {
             if (is_directory) { return directory(requested, initially_empty); }
@@ -713,11 +706,11 @@ namespace sunpack::sevenzip
                 output_root_initially_empty_(
                     replay_ && replay_->initialized ? replay_->root_was_empty : directory_is_empty_or_missing(output_root_)),
                 capture_magic_(output_inventory && output_root_initially_empty_),
-                output_paths_(output_root_, replay_)
+                output_paths_(std::in_place, output_root_, replay_)
         {
             if (replay_ && !replay_->initialized)
                 replay_->root_was_empty = output_root_initially_empty_;
-            output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
+            output_paths_->reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
             // Query the handler's property schema once. ZIP/7z/stream hot paths
             // need neither a per-file link query nor a link index.
             UInt32 count = 0;
@@ -786,15 +779,14 @@ namespace sunpack::sevenzip
 
         void finalize_output() noexcept
         {
-            if (output_finalized_)
+            if (!created_directories_)
             {
                 return;
             }
-            output_finalized_ = true;
             archive_ = nullptr; // metadata needed below was captured during GetStream
             // Decoder callbacks are over. Directory reservations survive until
             // the final snapshot, so a late interruption can replay collisions.
-            std::unordered_set<std::wstring>{}.swap(created_directories_);
+            created_directories_.reset();
             const HRESULT writer_error = async_writer_->finish_job(async_job_);
             bool has_failed_file = false;
             for (const auto &state : async_files_)
@@ -823,7 +815,7 @@ namespace sunpack::sevenzip
             if (replay_ && (is_cancelled() || std::uncaught_exceptions() ||
                 is_memory_hresult(writer_error) || (memory && (memory->revoked.load() || memory->denied.load())))) {
                 replay_->initialized = true;
-                output_paths_.preserve_replay();
+                output_paths_->preserve_replay();
                 for (const auto &state : async_files_) async_writer_->capture_replay(state, replay_);
                 for (const auto &item : output_trace_.items)
                     if (!item.is_dir && item.done && !item.output_path.empty() && replay_->files.find(item.index) == replay_->files.end()) {
@@ -837,7 +829,7 @@ namespace sunpack::sevenzip
             }
             async_files_.clear();
             current_async_file_.reset();
-            output_paths_.clear();
+            output_paths_.reset();
         }
 
 
@@ -1042,7 +1034,7 @@ namespace sunpack::sevenzip
                 {
 
                     target = receipt && !receipt->path.empty() ? std::filesystem::path(receipt->path)
-                        : output_paths_.allocate(output_root_ / safe_path.value(), output_root_initially_empty_, true);
+                        : output_paths_->allocate(output_root_ / safe_path.value(), output_root_initially_empty_, true);
                     if (receipt) receipt->path = target.native();
 
                     directory_ready = ensure_directory(target, &directory_error);
@@ -1063,7 +1055,7 @@ namespace sunpack::sevenzip
                 {
 
                     target = receipt && !receipt->path.empty() ? std::filesystem::path(receipt->path)
-                        : output_paths_.allocate(output_root_ / safe_path.value(), output_root_initially_empty_);
+                        : output_paths_->allocate(output_root_ / safe_path.value(), output_root_initially_empty_);
                     if (receipt) receipt->path = target.native();
 
                     directory_ready = ensure_directory(target.parent_path(), &directory_error);
@@ -1457,7 +1449,7 @@ namespace sunpack::sevenzip
         }
 
         // 可暂停的目录创建，与根输出目录创建共用同一个原语。
-        // created_directories_.insert 必须在成功之后：把失败的目录记进 memo 会让它不再被创建。
+        // Cache only successful directory creation.
         // ensure_no_reparse_ancestors() 会抛 filesystem_error，必须在 noexcept 的 helper 之外 catch。
         bool ensure_directory(const std::filesystem::path &directory, std::error_code *out_error)
         {
@@ -1466,8 +1458,8 @@ namespace sunpack::sevenzip
                 out_error->clear();
             }
 
-            const auto key = normalized_output_path_key(directory);
-            if (created_directories_.find(key) != created_directories_.end())
+            auto key = normalized_output_path_key(directory);
+            if (created_directories_->find(key) != created_directories_->end())
             {
                 // Successful checks/creation belong to this extraction callback.
                 // Repeated files in the same directory reuse that result.
@@ -1510,7 +1502,7 @@ namespace sunpack::sevenzip
                 return false;
             }
 
-            created_directories_.insert(key);
+            created_directories_->insert(std::move(key));
             return true;
         }
 
@@ -1600,9 +1592,9 @@ namespace sunpack::sevenzip
         bool output_root_initially_empty_ = false;
         const bool capture_magic_;
 
-        OutputPathAllocator output_paths_;
+        std::optional<OutputPathAllocator> output_paths_;
 
-        std::unordered_set<std::wstring> created_directories_;
+        std::optional<std::unordered_set<std::wstring>> created_directories_{std::in_place};
 
         UInt64 completed_bytes_ = 0;
 
@@ -1623,7 +1615,6 @@ namespace sunpack::sevenzip
 
         bool output_error_ = false;
 
-        bool output_finalized_ = false;
         bool encrypted_ = false;
     };
 

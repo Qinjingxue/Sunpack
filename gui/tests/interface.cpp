@@ -621,7 +621,6 @@ void task_card(Application& app) {
     row["parts"]=Json::array({"disguised.001","unrelated.bin"});
     row["error"]="CRC mismatch";
     row["errorType"]="Damaged archive";
-    row["status"]="taskFailed";
     assert(ui_page_set_json(app.page(),"tasks",data.dump().c_str())==0);
     ui_window_set_size(app.window(),850,560);
     ui_window_relayout(app.window());
@@ -797,8 +796,8 @@ void task_history(Application& app,const fs::path& dir) {
     pump([&]{return highlighted->textHighlights.empty();},"Clear task search highlights");
     highlighted.reset();
     const auto head=dir/"shared.jpg", tail=dir/"shared.chunk3.opaque";
-    const std::array<std::pair<const char*,const char*>,4> phases={{{"failed_password","taskWaiting"},
-        {"suspended_missing_volume","taskWaiting"},{"processing_started","taskProcessing"},{"done","taskSucceeded"}}};
+    const std::array<std::pair<const char*,const char*>,4> phases={{{"failed_password","waiting"},
+        {"suspended_missing_volume","waiting"},{"processing_started","info"},{"done","success"}}};
     for(size_t phase=0;phase<phases.size();++phase) {
         const auto path=phase?head:tail;
         Json members={utf8(head.wstring()),utf8(tail.wstring())};
@@ -809,7 +808,7 @@ void task_history(Application& app,const fs::path& dir) {
         pump([&]{
             const auto visible=rows();
             return visible.size()==1 && visible[0]["id"]=="encrypted-group" &&
-                visible[0]["status"]==phases[phase].second && visible[0]["path"]==utf8(path.wstring()) &&
+                visible[0]["statusTone"]==phases[phase].second && visible[0]["path"]==utf8(path.wstring()) &&
                 visible[0]["parts"].size()==members.size();
         },"Refresh encrypted volume status");
         ui_window_relayout(app.window());

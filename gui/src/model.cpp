@@ -84,46 +84,84 @@ void validate_password_record(const Json& record) {
 }
 std::string pointer_escape(const std::string& key) {
     std::string out;
-    for (char c : key) out += c == '~' ? "~0" : c == '/' ? "~1" : std::string(1,c);
+    for (char c : key) {
+        if(c=='~') out+="~0";
+        else if(c=='/') out+="~1";
+        else out.push_back(c);
+    }
     return out;
 }
 // Locate original JSON tokens after syntax validation. Splicing just the edited
 // token preserves unknown fields, formatting, and numbers beyond uint64 exactly.
 struct JsonTokens {
+    struct Range { size_t start=0,length=0; bool descend=false; };
     const std::string& source;
     size_t at=0;
-    std::unordered_map<std::string,std::pair<size_t,size_t>> ranges;
+    std::unordered_map<std::string,Range> ranges;
+    explicit JsonTokens(const std::string& text):source(text) {}
+    void select(std::string path) {
+        if(!path.empty() && path.front()!='/') return;
+        ranges.try_emplace(path);
+        while(!path.empty()) {
+            path.resize(path.rfind('/'));
+            auto& ancestor=ranges[path];
+            if(ancestor.descend) break;
+            ancestor.descend=true;
+        }
+    }
+    void scan() {
+        if(ranges.empty()) return;
+        at=source.rfind("\xef\xbb\xbf",0)==0?3:0;
+        value(ranges.find(""));
+    }
     void space() { while(at<source.size() && (source[at]==' ' || source[at]=='\t' || source[at]=='\r' || source[at]=='\n')) ++at; }
     void string() {
         ++at;
         while(at<source.size()) { auto c=source[at++]; if(c=='\\') ++at; else if(c=='"') return; }
     }
-    void value(const std::string& path) {
+    void skip_value() {
+        // Unselected subtrees need no decoded keys or paths. The source has
+        // already passed JSON validation, so only strings affect nesting here.
+        size_t depth=0;
+        do {
+            const auto c=source.at(at);
+            if(c=='"') { string(); continue; }
+            if(c=='{' || c=='[') ++depth;
+            else if(c=='}' || c==']') --depth;
+            else if(!depth) {
+                while(at<source.size() && std::string_view(",]} \t\r\n").find(source[at])==std::string_view::npos) ++at;
+                return;
+            }
+            ++at;
+        } while(depth);
+    }
+    void value(decltype(ranges)::iterator selected) {
         space(); auto start=at; auto c=source.at(at);
-        if(c=='{') {
+        if(selected==ranges.end()) { skip_value(); return; }
+        const auto& path=selected->first;
+        if(selected->second.descend && c=='{') {
             ++at; space();
             while(source.at(at)!='}') {
                 auto begin=at; string();
                 auto key=parse_json(source.substr(begin,at-begin)).get<std::string>();
                 auto child=path+"/"+pointer_escape(key);
-                space(); ++at; value(child);
+                space(); ++at; value(ranges.find(child));
                 space();
                 if(source.at(at)!=',') break; ++at; space();
             }
             ++at;
-        } else if(c=='[') {
+        } else if(selected->second.descend && c=='[') {
             ++at; space(); size_t index=0;
             while(source.at(at)!=']') {
-                value(path+"/"+std::to_string(index++)); space();
+                value(ranges.find(path+"/"+std::to_string(index++))); space();
                 if(source.at(at)!=',') break; ++at; space();
             }
             ++at;
-        } else if(c=='"') string();
-        else while(at<source.size() && std::string(",]} \t\r\n").find(source[at])==std::string::npos) ++at;
-        ranges[path]={start,at-start};
+        } else skip_value();
+        selected->second.start=start;
+        selected->second.length=at-start;
     }
-    explicit JsonTokens(const std::string& text):source(text) { if(text.rfind("\xef\xbb\xbf",0)==0) at=3; value(""); }
-    std::string token(const std::string& path) const { auto r=ranges.at(path); return source.substr(r.first,r.second); }
+    std::string_view text(const Range& range) const { return std::string_view(source).substr(range.start,range.length); }
 };
 }
 bool password_matches_scope(const Json& record,const std::string& scope) {
@@ -161,6 +199,8 @@ struct ConfigEditError:std::runtime_error {
 }
 static std::string patch_config(std::string source,const Json& edits) {
     Json j=parse_json(source); JsonTokens tokens(source);
+    for(auto& edit:edits) tokens.select(edit.at("pointer").get_ref<const std::string&>());
+    tokens.scan();
     struct Change { size_t start,length; std::string value; };
     std::vector<Change> changes;
     for(auto& edit:edits) {
@@ -168,7 +208,9 @@ static std::string patch_config(std::string source,const Json& edits) {
         bool boolean=edit.at("boolean");
         try {
         Json::json_pointer target(pointer);
-        if (!j.contains(target) || tokens.token(pointer) != original) throw std::runtime_error("settingChanged");
+        if (!j.contains(target)) throw std::runtime_error("settingChanged");
+        const auto& range=tokens.ranges.at(pointer);
+        if(tokens.text(range)!=original) throw std::runtime_error("settingChanged");
         Json replacement = type == "string" ? Json(text) : type == "boolean" ? Json(boolean) : parse_json(text);
         if ((type == "number" && !replacement.is_number()) || (type == "array" && !replacement.is_array()) ||
             (type == "object" && !replacement.is_object())) throw std::runtime_error("settingTypeMismatch");
@@ -183,8 +225,7 @@ static std::string patch_config(std::string source,const Json& edits) {
         if(current.is_object() && current.contains("name") && (current["name"]=="size_range" || current["name"]=="mtime_range"))
             validate_range_module(replacement,current["name"]=="mtime_range");
         else validate_setting(pointer,replacement,module);
-        auto range=tokens.ranges.at(pointer);
-        changes.push_back({range.first,range.second,type=="string" || type=="boolean"?replacement.dump():text});
+        changes.push_back({range.start,range.length,type=="string" || type=="boolean"?replacement.dump():text});
         } catch(const std::exception& error) { throw ConfigEditError(pointer,error.what()); }
     }
     std::sort(changes.begin(),changes.end(),[](const Change& a,const Change& b){return a.start>b.start;});
@@ -589,7 +630,6 @@ bool EventLog::refresh() {
         return a.is_null() || b.is_null()?a==b:a.at("name")==b.at("name");
     };
     auto changed=manifest.is_null() || next.value("task_revision",uint64_t(0))!=manifest.value("task_revision",uint64_t(0)) ||
-        next.value("dropped",uint64_t(0))!=manifest.value("dropped",uint64_t(0)) ||
         !std::equal(next.at("runs").begin(),next.at("runs").end(),manifest.at("runs").begin(),manifest.at("runs").end(),same_run) ||
         !same_run(next.at("live"),manifest.at("live"));
     manifest=std::move(next);
@@ -630,20 +670,23 @@ Json password_rows(const Json& passwords,const View& v) {
             }
         }
     }
-    const auto total=rows.size();
-    return {{"rows",std::move(rows)},{"total",total},{"scope",v.password_scope}};
+    return {{"rows",std::move(rows)},{"scope",v.password_scope}};
 }
 Json config_fields(const Json& config,const std::string& source,const std::string& language) {
     Json rows=Json::array();
     if(config.empty()) return rows;
-    std::unique_ptr<JsonTokens> tokens;
-    if(!source.empty()) tokens=std::make_unique<JsonTokens>(source);
+    JsonTokens tokens(source);
+    auto original=[&](const std::string& pointer,const Json& item,int indent) {
+        if(source.empty()) return item.dump(indent);
+        tokens.select(pointer);
+        return std::string();
+    };
     std::function<void(const Json&,std::string,std::string)> walk;
     walk=[&](const Json& item,std::string pointer,std::string module) {
         if(item.is_object() && !item.empty()) {
             if(item.contains("name") && item["name"].is_string()) module=item["name"].get<std::string>();
             if(pointer.rfind("/filesystem/scan_filters/",0)==0 && pointer.find('/',25)==std::string::npos && (module=="size_range" || module=="mtime_range")) {
-                auto raw=tokens?tokens->token(pointer):item.dump();
+                auto raw=original(pointer,item,-1);
                 auto field=describe_setting(pointer,module,language);
                 field.update(Json{{"id",pointer},{"key",pointer+"@"+language+"@"+module},{"type","object"},
                     {"original",raw},{"text",raw},{"boolean",false},{"choice",-1},{"items",Json::array()},
@@ -653,12 +696,12 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
             for(auto it=item.begin();it!=item.end();++it) if(it.key()!="name" || module.empty()) walk(it.value(),pointer+"/"+pointer_escape(it.key()),module);
             return;
         }
-        if(item.is_array() && !item.empty() && describe_setting(pointer,module,language)["editor"]!="rule_list" && std::all_of(item.begin(),item.end(),[](const Json& i){return i.is_object();})) {
+        auto field=describe_setting(pointer,module,language);
+        if(item.is_array() && !item.empty() && field["editor"]!="rule_list" && std::all_of(item.begin(),item.end(),[](const Json& i){return i.is_object();})) {
             for(size_t i=0;i<item.size();++i) walk(item[i],pointer+"/"+std::to_string(i),module); return;
         }
         std::string type=item.is_boolean()?"boolean":item.is_string()?"string":item.is_number()?"number":item.is_array()?"array":item.is_object()?"object":"null";
-        auto raw=tokens?tokens->token(pointer):item.dump(2);
-        auto field=describe_setting(pointer,module,language);
+        auto raw=original(pointer,item,2);
         std::string editor=field["editor"], text=item.is_string()?item.get<std::string>():raw;
         if(editor.empty()) editor=!field["known"].get<bool>()?"readonly":!field["options"].empty()?"choice":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
         int choice=-1;
@@ -668,7 +711,19 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
             {"editor",editor},{"choice",choice},{"items",editor=="rule_list"?item:Json::array()}});
         rows.push_back(std::move(field));
     };
-    walk(config,"",""); return rows;
+    walk(config,"","");
+    if(!source.empty()) {
+        tokens.scan();
+        for(auto& field:rows) {
+            const auto& id=field["id"].get_ref<const std::string&>();
+            const auto& range=tokens.ranges.at(id);
+            if(!range.length) throw std::out_of_range("settingChanged");
+            const auto raw=tokens.text(range);
+            field["original"]=std::string(raw);
+            if(field["type"]!="string") field["text"]=std::string(raw);
+        }
+    }
+    return rows;
 }
 Json directory_rows(const WatchRoots& roots) {
     Json rows=Json::array();

@@ -176,7 +176,7 @@ std::wstring row_status_text(Application& app,const std::string& row_id) {
 // Fixture producer only; the shipping GUI exposes no log-writing API.
 void append_log_lines(const fs::path& path,const std::string& text) {
     auto folder=path.parent_path()/(path.filename().wstring()+L".store"); fs::create_directories(folder);
-    Json manifest=fs::exists(path)?read_json(path):Json{{"format",1},{"revision",0},{"task_revision",0},{"runs",Json::array()},{"live",nullptr},{"dropped",0}};
+    Json manifest=fs::exists(path)?read_json(path):Json{{"format",1},{"task_revision",0},{"runs",Json::array()},{"live",nullptr}};
     if(manifest["runs"].empty()) manifest["runs"].push_back({{"name","fixture-1"},{"head",0},{"count",0},{"unordered",false}});
     auto& run=manifest["runs"].back(); auto name=run["name"].get<std::string>();
     std::ofstream data(folder/(name+".data"),std::ios::binary|std::ios::app),index(folder/(name+".index"),std::ios::binary|std::ios::app);
@@ -199,7 +199,7 @@ void append_log_lines(const fs::path& path,const std::string& text) {
         run["count"]=run["count"].get<uint64_t>()+1;
     }
     data.close(); index.close();
-    manifest["revision"]=manifest["revision"].get<uint64_t>()+1; manifest["task_revision"]=manifest["revision"];
+    manifest["task_revision"]=manifest["task_revision"].get<uint64_t>()+1;
     atomic_write(path,manifest.dump());
 }
 
@@ -362,8 +362,8 @@ int wmain(int argc,wchar_t** argv) {
             });
             report["open_to_ready_ms"]=now_ms()-open_start;
             report["memory_mib_after_data"]=double(working_set())/1048576.0;
-            ensure(page_state(app.page(),"tasks").value("total",0)==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0)),"initial task count");
-            ensure(page_state(app.page(),"passwords").value("total",0)==options.passwords,"initial password count");
+            ensure(page_state(app.page(),"tasks").at("rows").size()==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0)),"initial task count");
+            ensure(page_state(app.page(),"passwords").at("rows").size()==options.passwords,"initial password count");
             report["widgets_after_load"]=widget_count(app);
             ui_window_set_size(app.window(),1120,720); ui_window_relayout(app.window());
             wait_settled(app);
@@ -391,10 +391,10 @@ int wmain(int argc,wchar_t** argv) {
                 std::string text(raw); ui_page_free(raw); return text;
             };
             auto tasks_text=state_text("tasks"), passwords_text=state_text("passwords");
-            measure("state_query_tasks",[&]{ensure(page_state(app.page(),"tasks").value("total",0)==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0)),"task state query");});
+            measure("state_query_tasks",[&]{ensure(page_state(app.page(),"tasks").at("rows").size()==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0)),"task state query");});
             measure("state_apply_tasks",[&]{ensure(ui_page_set_json(app.page(),"tasks",tasks_text.c_str())==0,"task state apply");});
             measure("state_apply_tasks_commit",[&]{pump_messages();});
-            measure("state_query_passwords",[&]{ensure(page_state(app.page(),"passwords").value("total",0)==options.passwords,"password state query");});
+            measure("state_query_passwords",[&]{ensure(page_state(app.page(),"passwords").at("rows").size()==options.passwords,"password state query");});
             measure("state_apply_passwords",[&]{ensure(ui_page_set_json(app.page(),"passwords",passwords_text.c_str())==0,"password state apply");});
             measure("state_apply_passwords_commit",[&]{pump_messages();});
             auto tasks_document=Json::parse(tasks_text);
@@ -550,7 +550,7 @@ int wmain(int argc,wchar_t** argv) {
                 measure("password_state_query",[&]{page_state(app.page(),"passwords");});
             }
             click(app,"clipboardHistory");
-            wait_for([&]{return page_state(app.page(),"passwords").value("total",0)==options.history;},"clipboard history");
+            wait_for([&]{return page_state(app.page(),"passwords").at("rows").size()==options.history;},"clipboard history");
             scroll_list(app,"passwordListScroll","passwordItems",options.rounds,report);
 
             nav("tabTasks","tasks");
@@ -640,10 +640,10 @@ int wmain(int argc,wchar_t** argv) {
                 ensure(ui_debug_type_text(app.window(),wide(query.str()).c_str())==0,"search input failed");
             });
             measure("task_search_result_wait",[&]{
-                wait_for([&]{return page_state(app.page(),"tasks").value("total",0)==1;},"task search result");
+                wait_for([&]{return page_state(app.page(),"tasks").at("rows").size()==1;},"task search result");
             });
             ui_debug_key_mod(app.window(),'A',1,0,0); ui_debug_type_char(app.window(),8);
-            wait_for([&]{return page_state(app.page(),"tasks").value("total",0)==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0));},"clear task search");
+            wait_for([&]{return page_state(app.page(),"tasks").at("rows").size()==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0));},"clear task search");
             wait_settled(app);
             report["widgets_after_ui"]=widget_count(app);
             for(size_t i=0;i<5;i++) { nav("tabConfig","config","page_switch_end"); nav("tabTasks","tasks","page_switch_end"); }
@@ -679,7 +679,7 @@ int wmain(int argc,wchar_t** argv) {
         }
         report["task_display_cache_bytes"]=0; // No resident all-history model.
         measure("model_password_rows",[&]{
-            ensure(password_rows(backend_passwords,backend_view).value("total",0)==options.passwords,"password projection count");
+            ensure(password_rows(backend_passwords,backend_view).at("rows").size()==options.passwords,"password projection count");
         });
         measure("model_config_fields",[&]{
             ensure(config_fields(backend_config,backend_config_text,"en").size()==report["config_field_count"].get<size_t>(),"config projection count");

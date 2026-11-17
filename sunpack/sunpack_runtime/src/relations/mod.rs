@@ -982,7 +982,7 @@ fn project_proposal(
     input.volume_attempts = validation
         .attempts
         .as_ref()
-        .map(|attempts| Box::new(attempts.project(proposal, &style)));
+        .map(|attempts| Arc::new(attempts.project(proposal, &style)));
     // Keep the fixed composition for the Rust password probe. Ordered attempts
     // replace it in the worker request and are materialized only on success.
     input.parts = proposal

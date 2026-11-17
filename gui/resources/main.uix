@@ -8,7 +8,7 @@ export default {
   data() { return {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
     actionError:'',errors:{},cliAllowed:false,runtime:{known:false,running:false,enabled:false,syncError:false},
-    taskCursors:[],taskPages:[],taskPending:null,taskRevision:0,tasks:{rows:[],total:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
+    taskCursors:[],taskPages:[],taskPending:null,taskRevision:0,tasks:{rows:[],hasMore:false,next:''},passwords:{rows:[]},fields:[],directories:[],
     startupEnabled:false,contextMenuEnabled:false,directoryQuery:'',directorySelection:'',
     taskQuery:'',taskDirectoryDirty:false,taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
@@ -154,13 +154,13 @@ export default {
       let replacement=patch.row;
       replacement.id=rows[i].id;
       rows[i]=replacement;
-      this.passwords={rows:rows,total:rows.length,scope:patch.scope};
+      this.passwords={rows:rows,scope:patch.scope};
     },
     applyPasswords(snapshot) {
       if(snapshot.scope!==this.passwordScope) return;
       // Own save receipts rebase drafts before snapshots arrive. Preserve the
       // mounted row/input, including focus and measured height, across renames.
-      let order=this.passwordNew.concat(this.passwords.rows),ids=new Map(),reserved=new Set();
+      let ids=new Map(),reserved=new Set();
       let remember=(original,id)=>{ let group=ids.get(original); if(!group) { group={ids:[],next:0}; ids.set(original,group); } group.ids.push(id); };
       for(let id of Object.keys(this.passwordDrafts)) { let d=this.passwordDrafts[id]; if(d.original&&d.scope===this.directorySelection) { remember(d.original,id); reserved.add(id); } }
       if(this.passwords.scope===snapshot.scope) for(let p of this.passwords.rows) if(p.original&&!reserved.has(p.id)) remember(p.original,p.id);
@@ -176,10 +176,11 @@ export default {
           let d=this.passwordDrafts[id];
           if(d.historyValue===undefined&&d.scope===this.directorySelection&&!byId.has(id)&&!d.original&&(d.pending||d.error||this.passwordCell===id)) byId.set(id,d);
         }
-        for(let previous of order) if(byId.has(previous.id)) {
-          let current=byId.get(previous.id); byId.delete(previous.id);
-          rows.push(current.original&&current.original===previous.original?previous:current);
-        }
+        for(let previousRows of [this.passwordNew,this.passwords.rows])
+          for(let previous of previousRows) if(byId.has(previous.id)) {
+            let current=byId.get(previous.id); byId.delete(previous.id);
+            rows.push(current.original&&current.original===previous.original?previous:current);
+          }
         for(let current of byId.values()) rows.push(current);
         snapshot.rows=rows;
       }
@@ -258,7 +259,7 @@ export default {
     publishTaskPages() {
       // Both arrays share row objects; evicted pages retain only disk cursors.
       let last=this.taskPages[this.taskPages.length-1],rows=this.taskPages.flatMap(page=>page.rows);
-      this.tasks={rows:rows,total:rows.length,hasMore:last.hasMore,next:last.next,dropped:last.dropped};
+      this.tasks={rows:rows,hasMore:last.hasMore,next:last.next};
       this.send('taskWindow',{window:this.taskPages.map(page=>page.cursor),revision:this.taskRevision});
     },
     filterPasswords() { this.send('filterPasswords',{query:this.passwordQuery,scope:this.passwordScope}); },
@@ -939,7 +940,6 @@ export default {
           </div>
           </VirtualList>
         </div></ScrollView>
-        <label v-show="tasks.dropped" class="error">{{ tasks.dropped }} {{ texts.droppedLogs }}</label>
       </div>
       <div id="page-config" v-show="tab==='config'" class="content">
         <div class="page-header"><label class="heading">{{ texts.config }}</label></div>

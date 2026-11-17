@@ -1498,30 +1498,32 @@ private:
     static std::string space_event_payload(
         const char* event,
         const std::string& job_id,
-        const std::string& volume_key,
         std::uint64_t episode_id,
-        unsigned long win32_error,
-        std::uint64_t free_bytes,
-        double blocked_seconds,
         bool query_ok,
         unsigned long query_error
+#ifdef SUP7Z_DEBUG
+        , const std::string& volume_key,
+        unsigned long win32_error,
+        std::uint64_t free_bytes
+#endif
     ) {
-        std::string payload =
+        return
             (wire::object() + wire::key("type") + wire::text("progress") + wire::key("job_id")) + wire::text(job_id) +
             wire::key("event") + wire::text(event) +
-            wire::key("volume_key") + wire::text(volume_key) +
             wire::key("episode_id") + wire::number(episode_id) +
-            wire::key("win32_error") + wire::number(win32_error) +
-            wire::key("free_bytes") + wire::number(free_bytes) +
-            wire::key("blocked_seconds") + wire::number(blocked_seconds) +
             wire::key("volume_query_ok") + wire::boolean(query_ok) +
-            wire::key("volume_query_error") + wire::number(query_error) + wire::end();
-        return payload;
+            wire::key("volume_query_error") + wire::number(query_error)
+#ifdef SUP7Z_DEBUG
+            + wire::key("volume_key") + wire::text(volume_key) +
+            wire::key("win32_error") + wire::number(win32_error) +
+            wire::key("free_bytes") + wire::number(free_bytes)
+#endif
+            + wire::end();
     }
 
     void print_volume_space_status(
         const sunpack::sevenzip::VolumeStatePtr& state,
-        std::uint64_t free_bytes,
+        [[maybe_unused]] std::uint64_t free_bytes,
         bool query_ok,
         unsigned long query_error
     ) noexcept {
@@ -1538,13 +1540,13 @@ private:
             print_frame(space_event_payload(
                 "space_status",
                 job_id,
-                state->key,
                 episode_id,
-                query_ok ? 0UL : query_error,
-                free_bytes,
-                0.0,
                 query_ok,
-                query_error));
+                query_error
+#ifdef SUP7Z_DEBUG
+                , state->key, query_ok ? 0UL : query_error, free_bytes
+#endif
+            ));
         }
     }
 
@@ -1561,13 +1563,13 @@ private:
             print_frame(space_event_payload(
                 blocked ? "space_blocked" : "space_resumed",
                 job_id,
-                transition.volume_key,
                 transition.episode_id,
-                transition.win32_error,
-                transition.free_bytes,
-                transition.blocked_seconds,
                 transition.query_ok,
-                transition.query_error));
+                transition.query_error
+#ifdef SUP7Z_DEBUG
+                , transition.volume_key, transition.win32_error, transition.free_bytes
+#endif
+            ));
         }
     }
 
@@ -1726,9 +1728,11 @@ private:
                     if (error.code() == std::errc::resource_unavailable_try_again) {
                         memory_.retry(memory_job);
                         outcome.code = kMemoryRetry;
+#ifdef SUP7Z_DEBUG
                         print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(job_id) +
                             (wire::key("event") + wire::text("memory_thread_resource_retry") + wire::key("error_code")) +
                             wire::number(error.code().value()) + wire::end());
+#endif
                     }
                 } catch (...) { outcome.code = -100; }
             }
@@ -1743,17 +1747,22 @@ private:
                     ++parked_jobs_;
                 }
                 if (monitor_recheck_needed) request_monitor_recheck();
+#ifdef SUP7Z_DEBUG
                 print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(job_id) +
                     (wire::key("event") + wire::text("memory_reclaimed") + wire::key("required_bytes")) + wire::number(memory_job.required) + wire::end());
+#endif
                 auto parked = std::make_shared<Job>(std::move(job));
-                const auto notice = [parked](bool blocked, std::int64_t headroom, std::uint64_t needed) {
+                const auto notice = [parked](bool blocked, [[maybe_unused]] std::int64_t headroom, [[maybe_unused]] std::uint64_t needed) {
                     auto &episode = parked->execution->memory_episode;
                     if (blocked) ++episode;
                     print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(parked->request.job_id) +
                         wire::key("event") + wire::text((blocked ? "memory_blocked" : "memory_resumed")) +
-                        wire::key("episode_id") + wire::number(episode) +
-                        wire::key("required_bytes") + wire::number(needed) +
-                        wire::key("available_bytes") + wire::number((std::max)(headroom, std::int64_t{0})) + wire::end());
+                        wire::key("episode_id") + wire::number(episode)
+#ifdef SUP7Z_DEBUG
+                        + wire::key("required_bytes") + wire::number(needed) +
+                        wire::key("available_bytes") + wire::number((std::max)(headroom, std::int64_t{0}))
+#endif
+                        + wire::end());
                 };
                 memory_.park(memory_job, *parked->cancel_token, [this, parked](bool ready) {
                     if (!ready) parked->cancel_token->store(true, std::memory_order_release);
@@ -1882,9 +1891,10 @@ int main() {
     print_frame(
         (wire::object() + wire::key("type") + wire::text("worker_ready")) +
         wire::key("thread_capacity") + wire::number(worker_count) +
+#ifdef SUP7Z_DEBUG
         (wire::key("memory_management") + wire::text("commitment_replay")) +
-        wire::key("memory_reserve_bytes") +
-            wire::number(memory_reserve_bytes) +
+        wire::key("memory_reserve_bytes") + wire::number(memory_reserve_bytes) +
+#endif
         wire::key("process_mode") + wire::text(requested_process_mode) +
         wire::key("process_mode_applied") + wire::boolean(process_mode_applied) + wire::end());
     wire::RequestReader reader(std::cin);

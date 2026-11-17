@@ -337,9 +337,7 @@ pub(crate) struct EntryRecord {
     pub(crate) change_usn: i64,
     pub(crate) status: String,
     pub(crate) last_error: String,
-    pub(crate) attempt_count: i64,
     pub(crate) failure_kind: String,
-    pub(crate) failure_stage: String,
     pub(crate) failure_payload: Map<String, Value>,
     pub(crate) last_attempt_at: f64,
 }

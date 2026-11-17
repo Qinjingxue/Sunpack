@@ -97,24 +97,41 @@ impl Root {
             && output_key(self) == output_key(other)
     }
 
-    fn scope(&self, entries: &[Self], metadata: &[String]) -> NativeDiscoveryScope {
-        let mut exclude = metadata.to_vec();
-        let own = key(&self.path);
-        exclude.extend(entries.iter().filter_map(|entry| {
-            let nested = key(&entry.path);
-            (nested != own && is_path_under(&nested, &own))
-                .then(|| entry.path.to_string_lossy().into_owned())
-        }));
+    fn scope(&self, excluded: Vec<String>) -> NativeDiscoveryScope {
         NativeDiscoveryScope::new(
             self.path.to_string_lossy().into_owned(),
             (!self.recursive).then_some(0),
-            exclude,
+            excluded,
         )
     }
 }
 
+fn root_scopes(entries: &[Root], metadata: &[String]) -> BTreeMap<String, (Root, NativeDiscoveryScope)> {
+    let roots: Vec<_> = entries.iter().map(|root| (key(&root.path), root)).collect();
+    let positions: HashMap<_, _> = roots.iter().enumerate()
+        .map(|(index, (id, _))| (id.trim_end_matches('\\'), index)).collect();
+    let mut excluded = vec![metadata.to_vec(); roots.len()];
+    for (id, root) in &roots {
+        // Excluding the nearest nested root also excludes every root below it.
+        let parent = crate::path_keys::path_ancestors(id).skip(1)
+            .find_map(|ancestor| positions.get(ancestor));
+        if let Some(&parent) = parent {
+            excluded[parent].push(root.path.to_string_lossy().into_owned());
+        }
+    }
+    roots.into_iter().zip(excluded).map(|((id, root), excluded)| {
+        (id, (root.clone(), root.scope(excluded)))
+    }).collect()
+}
+
 fn key(path: &Path) -> String {
     watch_path_key(&path.to_string_lossy())
+}
+
+fn root_key(path: &Path) -> String {
+    let mut id = key(path);
+    id.truncate(id.trim_end_matches('\\').len());
+    id
 }
 
 fn resolve_output(root: &Path, value: &str) -> io::Result<PathBuf> {
@@ -202,7 +219,7 @@ fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
                 ),
             ));
         }
-        let id = key(&input);
+        let id = root_key(&input);
         let mut root = Root {
             path: input,
             output,
@@ -645,9 +662,12 @@ impl Watch {
         {
             let _lock = FileMutex::lock(&path, ROOTS_LOCK)?;
             let mut roots = read_roots(&path)?;
+            let mut positions: HashMap<_, _> = roots.iter().enumerate()
+                .map(|(index, root)| (root_key(&root.path), index)).collect();
             for root in paths {
-                let id = key(root);
-                if let Some(existing) = roots.iter_mut().find(|entry| key(&entry.path) == id) {
+                let id = root_key(root);
+                if let Some(&index) = positions.get(&id) {
+                    let existing = &mut roots[index];
                     let changed = (recursive && !existing.recursive) || (deep && !existing.deep);
                     existing.scanned &= !recursive || existing.recursive;
                     existing.recursive |= recursive;
@@ -657,6 +677,7 @@ impl Watch {
                     }
                     continue;
                 }
+                positions.insert(id, roots.len());
                 roots.push(Root {
                     path: root.clone(),
                     output: output.map(str::trim).filter(|value| !value.is_empty())
@@ -675,10 +696,10 @@ impl Watch {
         let apply = self.root_change_status(running, changed).await?;
         if running && changed {
             stage("watch_directory", &Cancellation::new()).await?;
-            let retained: HashSet<_> = read_roots(&path)?.iter().map(|root| key(&root.path)).collect();
+            let retained: HashSet<_> = read_roots(&path)?.iter().map(|root| root_key(&root.path)).collect();
             for changes in [&mut added, &mut updated] {
                 changes.retain(|root| {
-                    let keep = retained.contains(&key(root));
+                    let keep = retained.contains(&root_key(root));
                     if !keep {
                         rejected.push(root.clone());
                     }
@@ -708,10 +729,10 @@ impl Watch {
         let mut removed = Vec::new();
         {
             let _lock = FileMutex::lock(&path, ROOTS_LOCK)?;
-            let keys: HashSet<_> = paths.iter().map(|path| key(path)).collect();
+            let keys: HashSet<_> = paths.iter().map(|path| root_key(path)).collect();
             let mut roots = read_roots(&path)?;
             roots.retain(|root| {
-                if keys.contains(&key(&root.path)) {
+                if keys.contains(&root_key(&root.path)) {
                     removed.push(root.path.clone());
                     false
                 } else {
@@ -879,21 +900,19 @@ impl Drop for Watch {
 }
 
 fn validate_outputs(roots: &[Root]) -> io::Result<()> {
-    let output: Vec<_> = roots
-        .iter()
-        .filter_map(|root| root.output.as_deref().map(|output| (&root.path, output, key(output))))
-        .collect();
-    for (index, (first_root, first_output, first_key)) in output.iter().enumerate() {
-        for (second_root, second_output, second_key) in &output[index + 1..] {
-            if first_key != second_key
-                && (is_path_under(first_key, second_key) || is_path_under(second_key, first_key))
-            {
-                return Err(io::Error::other(format!(
-                    "watch output roots must not contain one another: {} -> {}; {} -> {}",
-                    first_root.display(), first_output.display(),
-                    second_root.display(), second_output.display(),
-                )));
-            }
+    let outputs: Vec<_> = roots.iter().filter_map(|root| {
+        let output = root.output.as_deref()?;
+        Some((root_key(output), &root.path, output))
+    }).collect();
+    let positions: HashMap<_, _> = outputs.iter().map(|(id, root, output)| (id.as_str(), (root, output))).collect();
+    for (id, root, output) in &outputs {
+        if let Some((parent, parent_output)) = crate::path_keys::path_ancestors(id).skip(1)
+            .find_map(|ancestor| positions.get(ancestor))
+        {
+            return Err(io::Error::other(format!(
+                "watch output roots must not contain one another: {} -> {}; {} -> {}",
+                parent.display(), parent_output.display(), root.display(), output.display(),
+            )));
         }
     }
     Ok(())
@@ -1712,38 +1731,6 @@ impl ParentObserver {
     }
 }
 
-#[derive(Default)]
-struct RootObservers {
-    root: Option<RootObserver>,
-}
-
-impl RootObservers {
-    fn rearm(
-        &mut self,
-        root: &Root,
-        scope: &NativeDiscoveryScope,
-        passwords: &Path,
-        hub: &Arc<Hub>,
-        journal: &Arc<journal::Journal>,
-        catalog: &Arc<NativeWatchCatalog>,
-    ) -> (bool, Vec<io::Error>) {
-        let mut errors = Vec::new();
-        // A root can grant access even when its parent only permits traversal.
-        // Failure of the extra sentinel must not disable the root subscription.
-        let replaced = self.root.as_ref().is_some_and(|observer| !observer.matches(&root.path));
-        if replaced {
-            self.root.take();
-        }
-        if self.root.is_none() && root.path.is_dir() {
-            match RootObserver::start(&root.path, root, scope.clone(), passwords, hub, journal, catalog, false) {
-                Ok(observer) => self.root = Some(observer),
-                Err(error) => errors.push(error),
-            }
-        }
-        (replaced, errors)
-    }
-}
-
 // Like main's _pop_ready, bound both the readiness probes in this round and
 // the temporary key snapshot. Unselected due entries keep their old deadlines.
 fn due_admissions(
@@ -2285,7 +2272,7 @@ struct Scheduler {
     deep_options: NativeDirectoryScanOptions,
     passwords: Arc<BuiltinStore>,
     hub: Arc<Hub>,
-    root_observers: HashMap<String, RootObservers>,
+    root_observers: HashMap<String, RootObserver>,
     root_progress: RootPolicyProgress,
     parent_observers: HashMap<String, ParentObserver>,
     dependency_observers: HashMap<(String, String), RootObserver>,
@@ -2827,10 +2814,7 @@ impl Scheduler {
         let is_alias = crate::path_keys::path_key(&state) != resolved_state;
         let mut metadata = vec![state];
         if is_alias { metadata.push(resolved_state); }
-        let next = entries
-            .iter()
-            .map(|root| (key(&root.path), (root.clone(), root.scope(&entries, &metadata))))
-            .collect::<BTreeMap<_, _>>();
+        let next = root_scopes(&entries, &metadata);
         let policy_changed = self.roots.len() != next.len()
             || next.iter().any(|(id, (root, _))| {
                 self.roots.get(id).is_none_or(|(old, _)| {
@@ -2950,13 +2934,18 @@ impl Scheduler {
         for (id, (root, scope)) in self.roots.iter()
             .filter(|(id, _)| changed.is_none_or(|changed| changed.contains(*id)))
         {
-            let (replaced, errors) = self.root_observers.entry(id.clone()).or_default()
-                .rearm(root, scope, self.passwords.path(), &self.hub, &self.journal, &self.catalog);
-            if replaced {
+            // A root may grant access even if its parent sentinel failed to open.
+            if let Some(observer) = self.root_observers.get(id) {
+                if observer.matches(&root.path) { continue; }
+                self.root_observers.remove(id);
                 self.available_roots.remove(id);
             }
-            for error in errors {
-                self.journal.log(json!({"event":"watch_root_unavailable","root":root.path,"error":error.to_string()}));
+            if root.path.is_dir() {
+                match RootObserver::start(&root.path, root, scope.clone(), self.passwords.path(),
+                    &self.hub, &self.journal, &self.catalog, false) {
+                    Ok(observer) => { self.root_observers.insert(id.clone(), observer); }
+                    Err(error) => self.journal.log(json!({"event":"watch_root_unavailable","root":root.path,"error":error.to_string()})),
+                }
             }
         }
     }
@@ -3105,7 +3094,7 @@ impl Scheduler {
     fn drain_active(&mut self, result: &mut io::Result<()>) -> io::Result<()> {
         // Match main's stop boundary: checkpoint while directory observers are
         // armed, then join producers before draining submitted requests.
-        if !self.root_observers.is_empty() || !self.parent_observers.is_empty() || self.monitor.is_some() {
+        if !self.roots.is_empty() && (self.enabled() || self.resuming) {
             if result.is_ok() {
                 if let Err(error) = self.checkpoint(&HashMap::new(), true, false) { *result = Err(error); }
             }
@@ -3361,7 +3350,7 @@ impl Scheduler {
             if !self.enabled() { continue; }
             if !signals.volumes.is_empty() {
                 for (id, (root, _)) in &self.roots {
-                    let observed = self.root_observers.get(id).is_some_and(|observers| observers.root.is_some());
+                    let observed = self.root_observers.contains_key(id);
                     if signals.volumes.affects(&root.path, observed) {
                         signals.changes.topology_changed(id.clone());
                         if signals.volumes.arrives(&root.path, observed) {
@@ -3691,16 +3680,17 @@ impl Scheduler {
             }
         }
         if !self.recovery_ids.is_empty() {
-            let mounted_roots: HashMap<_, _> = probes.iter().filter_map(|(_, _, scope, _, volume)| {
-                Some((crate::path_keys::path_key(&scope.root), volume.as_deref().ok()?))
-            }).collect();
-            // A root can be remounted without a policy edit. Retire the old
-            // cache before any volume starts reusing directory identities.
+            let mounted_roots: HashMap<_, _> = probes.iter()
+                .map(|(id, _, _, _, volume)| (id.as_str(), volume.as_deref().ok())).collect();
+            // Retire cached directory IDs when a root goes offline or changes volumes.
+            // Roots outside this checkpoint keep their last observed availability.
             self.recovery_ids.retain(|volume, cache| {
-                !cache.roots.keys().any(|root| {
-                    mounted_roots.get(root).is_some_and(|current| *current != volume)
+                cache.roots.keys().all(|root| {
+                    self.available_roots.contains(root)
+                        && mounted_roots.get(root.as_str()).is_none_or(|current| *current == Some(volume.as_str()))
                 })
             });
+            crate::collections::trim_map(&mut self.recovery_ids);
         }
         let probes = probes.into_iter().map(|(id, root, scope, identity, volume)| {
             let current = volume.map_err(Arc::new).and_then(|volume| {
@@ -5490,11 +5480,7 @@ impl Scheduler {
             {
                 continue;
             }
-            interrupted.put_entry(Arc::new(observed_entry(
-                input,
-                "interrupted",
-                self.journal.state().entry(&input.path).as_deref(),
-            )));
+            interrupted.put_entry(Arc::new(observed_entry(input, "interrupted")));
             if let Some(pending) = self.pending.remove(&id) {
                 self.due.remove(&(pending.due, id.clone()));
                 self.unpublished.remove(&id);
@@ -5884,7 +5870,6 @@ impl Scheduler {
                 &candidate,
                 &super::failure::message(failure, self.settings.cli.language),
                 input_failure,
-                self.journal.state().entry(&candidate.path).as_deref(),
                 &active.passwords,
                 &self.user_password_signature,
                 Some(&group),
@@ -6060,7 +6045,6 @@ impl Scheduler {
                         &candidate,
                         record_error.as_deref().unwrap_or(error),
                         blocker,
-                        self.journal.state().entry(&candidate.path).as_deref(),
                         &active.passwords,
                         &self.user_password_signature,
                         group.map(Arc::as_ref),
@@ -6531,7 +6515,6 @@ fn make_blocker(
     candidate: &WatchCandidateRow,
     error: &str,
     failure: &InputFailure<'_>,
-    previous: Option<&crate::watch_store::EntryRecord>,
     passwords: &crate::core::passwords::PasswordSnapshot,
     user_signature: &str,
     group: Option<&SourceGroup>,
@@ -6558,12 +6541,11 @@ fn make_blocker(
     if password {
         payload.insert("password_signature".into(), json!(password_source_signature(user_signature, &passwords.scope_signature(password_scope))));
     }
-    let mut entry = observed_entry(candidate, status, previous);
+    let mut entry = observed_entry(candidate, status);
     entry.last_error = error.to_owned();
     if let Ok(Value::String(kind)) = serde_json::to_value(kind) {
         entry.failure_kind = kind;
     }
-    entry.failure_stage = "extraction".to_owned();
     entry.failure_payload = payload;
     Arc::new(entry)
 }
@@ -6571,7 +6553,6 @@ fn make_blocker(
 fn observed_entry(
     candidate: &WatchCandidateRow,
     status: &str,
-    previous: Option<&crate::watch_store::EntryRecord>,
 ) -> crate::watch_store::EntryRecord {
     crate::watch_store::EntryRecord {
         path: candidate.path.clone(),
@@ -6581,9 +6562,7 @@ fn observed_entry(
         change_usn: candidate.observation.change_usn,
         status: status.to_owned(),
         last_error: String::new(),
-        attempt_count: previous.map_or(1, |record| record.attempt_count.saturating_add(1)),
         failure_kind: String::new(),
-        failure_stage: String::new(),
         failure_payload: serde_json::Map::new(),
         last_attempt_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

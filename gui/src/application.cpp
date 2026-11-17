@@ -37,10 +37,10 @@ bool copy_text(HWND owner,const std::wstring& text) {
     if(!copied) GlobalFree(memory);
     return copied;
 }
-bool rule_editor(const Json& editor) { return editor=="rule_list"; }
-void update_tags(TagCollection& tags,const Json& field,const Json& drafts) {
-    auto id=field["id"].get<std::string>();
-    tags.SetItems((drafts.contains(id)?drafts[id]["text"]:field["text"]).get_ref<const std::string&>());
+bool rule_editor(std::string_view editor) { return editor=="rule_list"; }
+void update_tags(TagCollection& tags,const std::string& id,const std::string& text,const Json& drafts) {
+    auto draft=drafts.find(id);
+    tags.SetItems(draft==drafts.end()?text:(*draft)["text"].get_ref<const std::string&>());
 }
 // Keep host messages outside Core UI's startup/render message range.
 constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403, TaskRange = WM_APP + 0x404;
@@ -416,7 +416,8 @@ void Application::apply_pending() {
         auto text=it.value().dump();
         if(ui_page_set_json(page_,it.key().c_str(),text.c_str())!=0) throw std::runtime_error("uiBindingFailed");
     }
-    if(!task_snapshot.is_null() && task_snapshot.value("generation",uint64_t(0))==task_query_generation_.load()) {
+    const bool apply_tasks=!task_snapshot.is_null() && task_snapshot.value("generation",uint64_t(0))==task_query_generation_.load();
+    if(apply_tasks) {
         auto* window=ui::GetContext().GetWindow(window_);
         auto* list=window?dynamic_cast<ui::VirtualListWidget*>(window->Root()->FindById("taskItems")):nullptr;
         if(list && !list->Indices().empty()) task_snapshot["range"]={{"first",list->Indices().front()},{"last",list->Indices().back()+1}};
@@ -442,14 +443,15 @@ void Application::apply_pending() {
         auto drafts=page_value(page_,"drafts");
         for(auto it=controls_.begin();it!=controls_.end();) {
             if(it->second->pending_removal) {
-                auto host=(it->second->field["editor"]=="toggle"?"toggle-host-":rule_editor(it->second->field["editor"])?"tags-host-":"choice-")+it->first;
+                const auto& editor=it->second->editor;
+                auto host=(editor=="toggle"?"toggle-host-":rule_editor(editor)?"tags-host-":"choice-")+it->first;
                 ui_page_on_widget_mount(page_,host.c_str(),nullptr,nullptr);
                 ui_page_on_widget_unmount(page_,host.c_str(),nullptr,nullptr);
                 it=controls_.erase(it); continue;
             }
-            if(it->second->field["editor"]=="toggle") { ++it; continue; }
+            if(it->second->editor=="toggle") { ++it; continue; }
             auto widget=widget_handle(window_,"select-"+it->first);
-            if(widget && !drafts.contains(it->first)) ui_combobox_set_selected(widget,it->second->field["choice"].get<int>());
+            if(widget && !drafts.contains(it->first)) ui_combobox_set_selected(widget,it->second->choice);
             ++it;
         }
     }
@@ -476,7 +478,7 @@ void Application::apply_pending() {
         else {
             // Frequent task publications must not rematch the retained directory
             // pane or a configuration/password page with unchanged sources.
-            if(!task_snapshot.is_null()) find_->Refresh("task");
+            if(apply_tasks) find_->Refresh("task");
             if(!password_snapshot.is_null() || !password_delta_patch.is_null()) find_->Refresh("password");
             if(patch.contains("startupEnabled") || patch.contains("themeChoice") || patch.contains("contextMenuEnabled")) find_->Refresh("config");
         }
@@ -510,10 +512,10 @@ void Application::navigate(const std::string& tab) {
 }
 void Application::sync_toggles() {
     auto drafts=page_value(page_,"toggleDrafts");
-    for(auto& pair:controls_) if(pair.second->field["editor"]=="toggle") {
+    for(auto& pair:controls_) if(pair.second->editor=="toggle") {
         auto widget=widget_handle(window_,"toggle-"+pair.first);
         if(!widget) continue;
-        bool on=drafts.contains(pair.first)?drafts[pair.first]["boolean"].get<bool>():pair.second->field["boolean"].get<bool>();
+        bool on=drafts.contains(pair.first)?drafts[pair.first]["boolean"].get<bool>():pair.second->boolean;
         ui_toggle_set_on(widget,on);
     }
 }
@@ -521,9 +523,9 @@ void Application::sync_tags(const std::string& id) {
     auto drafts=page_value(page_,"drafts");
     auto* root=ui::GetContext().GetWindow(window_)->Root().get();
     auto sync=[&](const auto& binding) {
-        if(rule_editor(binding.second->field["editor"])) {
+        if(rule_editor(binding.second->editor)) {
             if(auto* tags=dynamic_cast<TagCollection*>(root->FindById("tags-"+binding.first)))
-                update_tags(*tags,binding.second->field,drafts);
+                update_tags(*tags,binding.first,binding.second->text,drafts);
         }
     };
     if(id.empty()) {
@@ -537,19 +539,23 @@ void Application::bind_controls(const Json& fields) {
     for(auto& field:fields) {
         auto editor=field.value("editor",std::string());
         if(editor!="choice" && editor!="recursive" && editor!="toggle" && !rule_editor(editor)) continue;
-        auto id=field["id"].get<std::string>();
-        auto& binding=controls_[id];
-        if(!binding) binding=std::make_unique<ControlBinding>(ControlBinding{this,field});
-        else {
-            binding->field=field;
-            binding->pending_removal=false;
-        }
+        auto it=controls_.try_emplace(field["id"].get_ref<const std::string&>()).first;
+        const auto& id=it->first;
+        auto& binding=it->second;
+        if(!binding) binding=std::make_unique<ControlBinding>(ControlBinding{this,id});
+        binding->pending_removal=false;
+        binding->editor=editor;
+        binding->text=field["text"].get<std::string>();
+        binding->original=rule_editor(editor)?std::string():field["original"].get<std::string>();
+        binding->options=editor=="choice" || editor=="recursive"?field["options"]:Json();
+        binding->boolean=field["boolean"].get<bool>();
+        binding->choice=field["choice"].get<int>();
         auto host=(editor=="toggle"?"toggle-host-":rule_editor(editor)?"tags-host-":"choice-")+id;
         ui_page_on_widget_mount(page_,host.c_str(),[](UiPage,UiWidget parent,void* context){
             auto* binding=static_cast<ControlBinding*>(context); auto* self=binding->owner;
-            auto id=binding->field["id"].get<std::string>();
-            bool toggle=binding->field["editor"]=="toggle";
-            if(rule_editor(binding->field["editor"])) {
+            const auto& id=binding->id;
+            bool toggle=binding->editor=="toggle";
+            if(rule_editor(binding->editor)) {
                 auto* host=ui::GetContext().handles.LookupRaw(parent);
                 if(!host || host->FindById("tags-"+id)) return;
                 auto tags=std::make_shared<TagCollection>(); tags->id="tags-"+id;
@@ -561,7 +567,7 @@ void Application::bind_controls(const Json& fields) {
                     auto payload=Json{{"id",id},{"index",index},{"value",utf8(value)},{"regex",regex}}.dump();
                     if(ui_page_call_json(self->page_,"editTag",payload.c_str())!=0) self->set_error("actionError","uiBindingFailed");
                 };
-                update_tags(*tags,binding->field,page_value(self->page_,"drafts"));
+                update_tags(*tags,id,binding->text,page_value(self->page_,"drafts"));
                 host->AddChild(tags); return;
             }
             // Nested scope mounting visits descendants again when its parent
@@ -572,42 +578,42 @@ void Application::bind_controls(const Json& fields) {
                 auto widget=ui_toggle(L""); ui_widget_set_id(widget,("toggle-"+id).c_str());
                 ui_widget_set_width(widget,44); ui_widget_set_height(widget,26);
                 auto drafts=page_value(self->page_,"toggleDrafts");
-                ui_toggle_set_on_immediate(widget,drafts.contains(id)?drafts[id]["boolean"].get<bool>():binding->field["boolean"].get<bool>());
+                ui_toggle_set_on_immediate(widget,drafts.contains(id)?drafts[id]["boolean"].get<bool>():binding->boolean);
                 ui_toggle_on_changed(widget,[](UiWidget,int value,void* context){
                     auto* binding=static_cast<ControlBinding*>(context); auto* self=binding->owner;
                     try {
-                    auto id=binding->field["id"].get<std::string>();
+                    const auto& id=binding->id;
                     // A switch owns its finite animation. Keep its draft channel
                     // separate so a click doesn't rebind every text/list control.
                     auto drafts=page_value(self->page_,"toggleDrafts");
                     if(page_value(self->page_,"saveErrors").contains(id) && !self->field_pending(id)) drafts.erase(id);
-                    Json draft=drafts.contains(id)?drafts[id]:Json{{"original",binding->field["original"]},{"text",binding->field["text"]},{"boolean",binding->field["boolean"]},{"baselineText",binding->field["text"]},{"baselineBoolean",binding->field["boolean"]}};
+                    Json draft=drafts.contains(id)?drafts[id]:Json{{"original",binding->original},{"text",binding->text},{"boolean",binding->boolean},{"baselineText",binding->text},{"baselineBoolean",binding->boolean}};
                     draft["boolean"]=value!=0;
                     if(draft["boolean"]==draft["baselineBoolean"] && !self->field_pending(id)) drafts.erase(id); else drafts[id]=std::move(draft);
                     auto encoded=drafts.dump(); ui_page_set_json(self->page_,"toggleDrafts",encoded.c_str());
                     self->save_error(id,"");
                     self->save_field(id);
-                    } catch(const std::exception& e) { self->save_error(binding->field["id"],e.what()); }
+                    } catch(const std::exception& e) { self->save_error(binding->id,e.what()); }
                 },binding);
                 ui_widget_add_child(parent,widget); ui_widget_destroy(widget); return;
             }
             std::vector<std::wstring> labels; std::vector<const wchar_t*> texts;
-            for(auto& option:binding->field["options"]) labels.push_back(wide(option["label"].get<std::string>()));
+            for(auto& option:binding->options) labels.push_back(wide(option["label"].get_ref<const std::string&>()));
             for(auto& label:labels) texts.push_back(label.c_str());
             auto combo=ui_combobox(texts.data(),int(texts.size()));
             ui_widget_set_id(combo,("select-"+id).c_str()); ui_widget_set_expand(combo,true); ui_widget_set_height(combo,32);
             auto drafts=page_value(self->page_,"drafts");
-            int selected=drafts.contains(id)?drafts[id].value("choice",binding->field["choice"].get<int>()):binding->field["choice"].get<int>();
+            int selected=drafts.contains(id)?drafts[id].value("choice",binding->choice):binding->choice;
             ui_combobox_set_selected(combo,selected);
             ui_combobox_on_changed(combo,[](UiWidget,int index,void* context){
                 auto* binding=static_cast<ControlBinding*>(context); auto* self=binding->owner;
                 try {
-                    auto id=binding->field["id"].get<std::string>();
+                    const auto& id=binding->id;
                     auto drafts=page_value(self->page_,"drafts");
                     if(page_value(self->page_,"saveErrors").contains(id) && !self->field_pending(id)) drafts.erase(id);
-                    Json draft=drafts.contains(id)?drafts[id]:Json{{"original",binding->field["original"]},{"text",binding->field["text"]},{"boolean",binding->field["boolean"]},{"choice",binding->field["choice"]},{"baselineText",binding->field["text"]},{"baselineBoolean",binding->field["boolean"]}};
-                    if(index<0 || size_t(index)>=binding->field["options"].size()) return;
-                    auto value=binding->field["options"][index]["value"].get<std::string>();
+                    if(index<0 || size_t(index)>=binding->options.size()) return;
+                    Json draft=drafts.contains(id)?drafts[id]:Json{{"original",binding->original},{"text",binding->text},{"boolean",binding->boolean},{"choice",binding->choice},{"baselineText",binding->text},{"baselineBoolean",binding->boolean}};
+                    const auto& value=binding->options[index]["value"].get_ref<const std::string&>();
                     draft["choice"]=index; draft["text"]=value=="#"?"1":value;
                     if(draft["text"]==draft["baselineText"] && !self->field_pending(id)) drafts.erase(id); else drafts[id]=std::move(draft);
                     auto encoded=drafts.dump(); ui_page_set_json(self->page_,"drafts",encoded.c_str());

@@ -98,7 +98,7 @@ fn recovery_volume_descriptor_preserves_style_roles_and_plan_order() {
     }]);
     input.analysis.origin = AnalysisOrigin::Relations;
     input.analysis.volume_completeness = Some(VolumeCompleteness::Unknown);
-    input.volume_attempts = Some(Box::new(VolumeAttemptPlan {
+    input.volume_attempts = Some(Arc::new(VolumeAttemptPlan {
         sources: Box::new([input.parts[0].extent.clone()]),
         domains: Box::new([VolumeDomain {
             choices: Arc::new(vec![0]),

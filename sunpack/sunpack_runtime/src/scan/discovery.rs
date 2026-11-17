@@ -587,7 +587,7 @@ impl NativeEmbeddedBatch {
         }
     }
 
-    pub(crate) fn encrypted_volume_paths(&self, table: &NativeCandidateTable) -> Vec<String> {
+    fn encrypted_volume_paths<'a>(&'a self, table: &'a NativeCandidateTable) -> HashSet<&'a str> {
         let mut requests: HashSet<_> = self
             .pending_volumes
             .iter()
@@ -595,7 +595,7 @@ impl NativeEmbeddedBatch {
             .map(|pending| pending.anchor.path.as_str())
             .collect();
         if requests.is_empty() {
-            return Vec::new();
+            return requests;
         }
         let selected: HashSet<_> = requests.iter().map(|path| path_key(path)).collect();
         let cache = &self.relation_cache;
@@ -615,6 +615,12 @@ impl NativeEmbeddedBatch {
                 if !snapshot.table.relation_member_eligible(row) {
                     continue;
                 }
+                let direct = snapshot.table.relation_anchors[row]
+                    .as_ref()
+                    .and_then(CheapAnchor::anchor);
+                if cache.anchors.is_empty() && !direct.is_some_and(|anchor| anchor.needs_password) {
+                    continue;
+                }
                 let path = &snapshot.table.paths[row];
                 let key = path_key(path);
                 if self.excluded.contains(&key) {
@@ -623,37 +629,30 @@ impl NativeEmbeddedBatch {
                 if !stems.contains(&catalog_stem(path)) {
                     continue;
                 }
-                let anchor = cache
-                    .anchors
-                    .get(&key)
-                    .or(snapshot.table.relation_anchors[row]
-                        .as_ref()
-                        .and_then(CheapAnchor::anchor));
+                let anchor = cache.anchors.get(&key).or(direct);
                 if anchor.is_some_and(|a| a.needs_password) {
                     requests.insert(path.as_str());
                 }
             }
         }
-        requests.into_iter().map(str::to_owned).collect()
+        requests
     }
 
     /// One directed Relations call per source scope, using native scan facts.
     /// Status 0 returns standalone/sibling scan facts to Embedded.
     pub(crate) fn resolve_volumes(
         &mut self,
-
         table: &mut NativeCandidateTable,
-        password_candidates: Option<Vec<(String, Vec<Arc<str>>)>>,
+        mut passwords: impl FnMut(&str) -> Vec<Arc<str>>,
     ) -> io::Result<Vec<EmbeddedVolumeOutcome>> {
         use crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor;
         let mut batch = std::mem::take(self);
         if batch.pending_volumes.is_empty() {
             return Ok(Vec::new());
         }
-        let candidates: HashMap<_, _> = password_candidates
-            .unwrap_or_default()
+        let candidates: HashMap<_, _> = batch.encrypted_volume_paths(table)
             .into_iter()
-            .map(|(path, values)| (path_key(&path), values))
+            .map(|path| (path_key(path), passwords(path)))
             .collect();
         let mut cache = std::mem::take(&mut batch.relation_cache);
         let mut pending = std::mem::take(&mut batch.pending_volumes);
@@ -661,22 +660,25 @@ impl NativeEmbeddedBatch {
             .iter()
             .map(|item| path_key(&item.anchor.path))
             .collect();
-        for snapshot in table
-            .relation_sources
-            .iter()
-            .filter(|_| !candidates.is_empty())
-        {
+        // Pending anchors and overrides already own their facts. Only look
+        // through raw rows for peer anchors that still need to be imported.
+        let mut external: HashSet<&str> = candidates.keys()
+            .filter(|key| !pending_keys.contains(*key) && !cache.anchors.contains_key(*key))
+            .map(String::as_str)
+            .collect();
+        'sources: for snapshot in &table.relation_sources {
+            if external.is_empty() {
+                break;
+            }
             for &row in snapshot.rows.iter() {
+                let Some(anchor) = snapshot.table.relation_anchors[row]
+                    .as_ref()
+                    .and_then(CheapAnchor::anchor) else { continue; };
                 let key = path_key(&snapshot.table.paths[row]);
-                if candidates.contains_key(&key)
-                    && !pending_keys.contains(&key)
-                    && !cache.anchors.contains_key(&key)
-                {
-                    if let Some(anchor) = snapshot.table.relation_anchors[row]
-                        .as_ref()
-                        .and_then(CheapAnchor::anchor)
-                    {
-                        cache.anchors.insert(key, anchor.clone());
+                if external.remove(key.as_str()) {
+                    cache.anchors.insert(key, anchor.clone());
+                    if external.is_empty() {
+                        break 'sources;
                     }
                 }
             }

@@ -8,7 +8,6 @@ fn replayed_entry_event_keeps_business_failure_kind_and_message() {
         failure_kind: "wrong_password".into(),
         last_error: format!("{}末尾诊断", "密码不在密码列表中".repeat(512)),
         size: 0, mtime: 0.0, file_id: String::new(), change_usn: 0,
-        attempt_count: 1, failure_stage: String::new(),
         failure_payload: Map::new(), last_attempt_at: 0.0
     };
     let event = entry_event(&entry);
@@ -111,8 +110,7 @@ fn recovery_publication_orders_concurrent_blocker_changes() {
         let record: EntryRecord = serde_json::from_value(serde_json::json!({
             "path":"c:\\input\\opaque.001", "size":1, "mtime":1.0,
             "file_id":"", "change_usn":0, "status":"failed_password",
-            "last_error":"locked", "attempt_count":1, "failure_kind":"",
-            "failure_stage":"", "failure_payload":{}, "last_attempt_at":1.0
+            "last_error":"locked", "failure_kind":"", "failure_payload":{}, "last_attempt_at":1.0
         }))
         .unwrap();
         let key = path_key(&record.path);
@@ -163,8 +161,8 @@ fn missing_volume_retry_gate_follows_entry_replacement_removal_and_snapshot() {
     let path = r"C:\input\archive.bin";
     let record = |status: &str| Arc::new(EntryRecord {
         path: path.into(), status: status.into(), size: 1, mtime: 1.0, file_id: String::new(),
-        change_usn: 0, last_error: String::new(), attempt_count: 1, failure_kind: String::new(),
-        failure_stage: String::new(), failure_payload: Map::new(), last_attempt_at: 1.0,
+        change_usn: 0, last_error: String::new(), failure_kind: String::new(),
+        failure_payload: Map::new(), last_attempt_at: 1.0,
     });
     let set = |state: &NativeWatchState, status| {
         let mut operations = NativeWatchOperations::empty();

@@ -100,7 +100,7 @@ fn startup_catalog_rebuild_observes_replacements_before_skipping_blockers() {
         if let Some(status) = status {
             scheduler.journal.commit(false, |_| {
                 let mut operations = crate::watch_store::NativeWatchOperations::empty();
-                operations.put_entry(Arc::new(observed_entry(&before, status, None)));
+                operations.put_entry(Arc::new(observed_entry(&before, status)));
                 Ok(operations)
             }).unwrap();
         }
@@ -307,6 +307,13 @@ fn stopped_watch_saves_conflicting_outputs_for_runtime_validation() {
         for (root, output) in [(&first, &output), (&second, &nested)] {
             assert!(error.contains(&format!("{} -> {}", root.display(), output.display())));
         }
+        let trailing = PathBuf::from(format!("{}\\", first.display()));
+        let paths = std::slice::from_ref(&trailing);
+        let added = block_on(watch.add_async(&base, paths, None, true, false)).unwrap();
+        assert_eq!(added["added"], json!([]));
+        assert_eq!(added["updated"], json!([first]));
+        let removed = block_on(watch.remove_async(&base, paths)).unwrap();
+        assert_eq!(removed["removed"], json!([first]));
         return;
     }
     run_isolated("stopped_watch_saves_conflicting_outputs_for_runtime_validation", CHILD);
@@ -361,7 +368,7 @@ fn checkpoint_submits_the_first_ready_generation() {
                 let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
                 scheduler.journal.commit(true, |_| {
                     let mut operations = crate::watch_store::NativeWatchOperations::empty();
-                    operations.put_entry(Arc::new(observed_entry(&candidate, "interrupted", None)));
+                    operations.put_entry(Arc::new(observed_entry(&candidate, "interrupted")));
                     Ok(operations)
                 }).unwrap();
                 scheduler.enqueue(&root_id, source_text.to_owned(), CandidateAdmission::Observe).unwrap();
@@ -719,12 +726,11 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
 
         // The live subscription must survive a root validation error during
         // an otherwise semantic reload.
-        let original = Arc::clone(&scheduler.root_observers[&root_id].root
-            .as_ref().unwrap().observer.changes);
+        let original = Arc::clone(&scheduler.root_observers[&root_id].observer.changes);
         fs::write(&scheduler.root_file, format!("{} | | invalid\n", watched.display())).unwrap();
         fs::write(&configuration, br#"{"cli":{"language":"en"}}"#).unwrap();
         assert!(scheduler.reload().is_err());
-        let observer = &scheduler.root_observers[&root_id].root.as_ref().unwrap().observer;
+        let observer = &scheduler.root_observers[&root_id].observer;
         assert!(observer.alive() && Arc::ptr_eq(&observer.changes, &original));
 
         // Removing the last root must release the data scheduler, not discard
@@ -822,7 +828,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         let failed = watch_candidate_for_path(&source, None).unwrap().unwrap();
         scheduler.journal.commit(true, |_| {
             let mut operations = crate::watch_store::NativeWatchOperations::empty();
-            operations.put_entry(Arc::new(observed_entry(&failed, "password", None)));
+            operations.put_entry(Arc::new(observed_entry(&failed, "password")));
             Ok(operations)
         }).unwrap();
         fs::write(&source, b"archive still being downloaded").unwrap();
@@ -849,7 +855,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         let candidate = scheduler.pending[&id].candidate.clone();
         scheduler.journal.commit(true, |_| {
             let mut operations = crate::watch_store::NativeWatchOperations::empty();
-            operations.put_entry(Arc::new(observed_entry(&candidate, "password", None)));
+            operations.put_entry(Arc::new(observed_entry(&candidate, "password")));
             Ok(operations)
         }).unwrap();
         let pending = scheduler.pending.remove(&id).unwrap();
@@ -871,7 +877,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         scheduler.catalog.retire_observation(path, Some(10.0), Some(2.0), 1.0, 0.0);
         assert_eq!(scheduler.catalog.observation(path).unwrap().quiet_seconds, 10.0);
         scheduler.journal.commit(true, |_| {
-            let mut entry = observed_entry(&candidate, "suspended_missing_volume", None);
+            let mut entry = observed_entry(&candidate, "suspended_missing_volume");
             entry.failure_payload.insert("blockers".into(), json!(["missing_volume"]));
             let mut operations = crate::watch_store::NativeWatchOperations::empty();
             operations.put_entry(Arc::new(entry));
@@ -1154,7 +1160,7 @@ fn coalesced_watch_completion_keeps_the_leaders_blocker() {
         fs::write(&source, b"follower generation").unwrap();
         let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
         let id = watch_path_key(&candidate.path);
-        let blocker = Arc::new(observed_entry(&candidate, "failed_password", None));
+        let blocker = Arc::new(observed_entry(&candidate, "failed_password"));
         scheduler.journal.commit(true, |state| {
             let mut operations = state.pending_operations(
                 [(PendingObservation(candidate.path.clone(), candidate.size as i64,
@@ -1268,7 +1274,7 @@ fn readiness_seals_post_close_usn_before_discovery_without_reauthorizing_recover
     let admitted = &ready[0].1.candidate;
     assert_eq!(admitted.observation.change_usn, current.observation.change_usn);
     assert_eq!((admitted.size, admitted.mtime), (current.size, current.mtime));
-    let entry = observed_entry(admitted, "suspended_missing_volume", None);
+    let entry = observed_entry(admitted, "suspended_missing_volume");
     assert!(!crate::postprocess::watch_source_changed(entry.size as u64, entry.mtime,
         &entry.file_id, entry.change_usn, &current));
 

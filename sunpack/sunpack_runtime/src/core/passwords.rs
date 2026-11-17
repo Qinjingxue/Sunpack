@@ -213,7 +213,8 @@ impl IndexBuilder {
         let mut changed = self.scoped.len() != previous.scoped.len();
         let mut bucket = |mut values: Vec<Arc<str>>, previous: Option<&Bucket>| {
             let mut seen = HashSet::with_capacity(values.len());
-            values.retain(|value| seen.insert(value.clone()));
+            // Every spelling already shares one interned allocation.
+            values.retain(|value| seen.insert(Arc::as_ptr(value)));
             if let Some(previous) = previous.filter(|old| old.values.as_ref() == values) {
                 previous.clone()
             } else {

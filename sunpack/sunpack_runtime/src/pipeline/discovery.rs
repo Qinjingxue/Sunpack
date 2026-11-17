@@ -736,9 +736,16 @@ fn resolve_volume(
     for index in table.resolve()?.resolved_relations() {
         let task = project_task(table.project(index)?, DiscoverySource::Relations, &verified);
         let input = task.entry();
-        if task.inputs[0].failure.is_none() && input.mode.structured()
-            && (format.is_empty() || input.format_hint == format)
-            && required.is_subset(&input.physical_paths().map(path_key).collect()) {
+        if task.inputs[0].failure.is_some() || !input.mode.structured()
+            || (!format.is_empty() && input.format_hint != format) {
+            continue;
+        }
+        let mut matched = HashSet::new();
+        if required.is_empty() || input.physical_paths().any(|path| {
+            required.get(&path_key(path)).is_some_and(|key| {
+                matched.insert(key) && matched.len() == required.len()
+            })
+        }) {
             return Ok(Some(task));
         }
     }
@@ -1000,15 +1007,7 @@ impl Discovered {
         candidates: &CandidateSet,
         verified: &VerifiedPasswords,
     ) -> io::Result<()> {
-        let passwords = batch
-            .encrypted_volume_paths(table)
-            .into_iter()
-            .map(|path| {
-                let values = candidates.for_embedded(&path);
-                (path, values)
-            })
-            .collect();
-        let volumes = batch.resolve_volumes(table, Some(passwords))?;
+        let volumes = batch.resolve_volumes(table, |path| candidates.for_embedded(path))?;
         let mut replaced = HashSet::new();
         let mut shared_inputs = false;
         // The volume pass can add logical inputs backed by sources that

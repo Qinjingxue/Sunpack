@@ -340,10 +340,11 @@ impl InputCheckpoint {
         drop(mapped);
         // Output flattening usually does not move the archive descriptor.
         // Do not copy a shared plan unless one of its physical paths changes.
-        if !Path::new(&self.input.entry_path).starts_with(source)
+        let moves_plan_source = self.input.volume_attempts.as_ref().is_some_and(|plan| {
+            plan.sources.iter().any(|extent| Path::new(&extent.path).starts_with(source))
+        });
+        if !moves_plan_source && !Path::new(&self.input.entry_path).starts_with(source)
             && !self.input.physical_extents().any(|extent| Path::new(&extent.path).starts_with(source))
-            && !self.input.volume_attempts.as_ref().is_some_and(|plan|
-                plan.sources.iter().any(|extent| Path::new(&extent.path).starts_with(source)))
         { return changed; }
         let input = Arc::make_mut(&mut self.input);
         if let Some(target) = relocate(Path::new(&input.entry_path)) {
@@ -360,7 +361,8 @@ impl InputCheckpoint {
                 changed = true;
             }
         }
-        if let Some(plan) = &mut input.volume_attempts {
+        if moves_plan_source {
+            let plan = Arc::make_mut(input.volume_attempts.as_mut().unwrap());
             for extent in &mut plan.sources {
                 if let Some(target) = relocate(Path::new(&extent.path)) {
                     extent.path = target.to_string_lossy().into_owned(); changed = true;

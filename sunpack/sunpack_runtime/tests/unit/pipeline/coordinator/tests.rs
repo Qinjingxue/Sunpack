@@ -987,7 +987,7 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
     // executable. Do not derive its key from the successful worker output.
     let alternative = crate::test_support::temp_file("completed_family_alternative", b"candidate");
     let mut alternative_input = task.entry().clone();
-    alternative_input.volume_attempts = Some(Box::new(crate::io::archive_state::VolumeAttemptPlan {
+    alternative_input.volume_attempts = Some(Arc::new(crate::io::archive_state::VolumeAttemptPlan {
         sources: [&head, &tail, &alternative].map(|path| crate::io::archive_state::InputExtent {
             path: path.to_string_lossy().into_owned(), start: 0, end: None,
         }).into(),
@@ -2071,7 +2071,7 @@ fn alias_dedup_covers_candidate_and_preflight_failure_plans() {
         let mut input = ArchiveInput::file(path.to_string_lossy().into_owned(),
             "7z".into(), "archive".into());
         if candidate {
-            input.volume_attempts = Some(Box::new(VolumeAttemptPlan {
+            input.volume_attempts = Some(Arc::new(VolumeAttemptPlan {
                 sources: Box::new([InputExtent {
                     path: input.entry_path.clone(), start: 0, end: None,
                 }]),

@@ -376,6 +376,26 @@ fn root_policy_normalizes_only_equivalent_nonrecursive_output_layouts() {
 }
 
 #[test]
+fn root_scopes_route_nested_descendants_and_keep_prefix_siblings() {
+    let roots: Vec<_> = [r"C:\watch", r"C:\watch\sub", r"C:\watch\sub\deep", r"C:\watch\sub-old"]
+        .into_iter().map(|path| Root {
+            path: PathBuf::from(path), output: None, recursive: true, deep: false, scanned: false,
+        }).collect();
+    let scopes = root_scopes(&roots, &[]);
+    let root = &scopes[r"c:\watch"].1;
+    let child = &scopes[r"c:\watch\sub"].1;
+    let grandchild = &scopes[r"c:\watch\sub\deep"].1;
+    assert!(root.contains(r"C:\watch\sub-backup\a.zip"));
+    assert!(!root.contains(r"C:\watch\sub-old\a.zip"));
+    assert!(child.contains(r"C:\watch\sub\a.zip"));
+    let nested_archive = r"C:\watch\sub\deep\a.zip";
+    assert!(!root.contains(nested_archive));
+    assert!(!child.contains(nested_archive));
+    assert!(grandchild.contains(nested_archive));
+    assert_eq!(root.excluded_subtrees().len(), 2);
+}
+
+#[test]
 fn partial_catalog_refresh_preserves_arrivals_before_fallback() {
     let mut paths = vec!["previous.zip".to_owned()];
     let errors = vec![("metadata".into(), "locked.zip".into(), "access denied".into())];
@@ -506,7 +526,7 @@ fn native_burst_updates_activity_before_scheduler_drains_its_coalesced_signal() 
     let hub = Arc::new(Hub::new());
     let source = watched.join("growing.zip");
     let activity = hub.activities.bind(&key(&source), quiet::Activity::default);
-    let observer = RootObserver::start(&watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]),
+    let observer = RootObserver::start(&watched, &root, root.scope(vec![state.to_string_lossy().into_owned()]),
         &watched.join("builtin_passwords.json"), &hub, &journal, &catalog, false).unwrap();
     let mut file = fs::File::create(&source).unwrap();
     // Wait for each size to reach the shared activity without draining the
@@ -552,7 +572,7 @@ fn business_root_routes_password_file_notification_only_to_password_reload() {
     let hub = Arc::new(Hub::new());
     let passwords = watched.join("builtin_passwords.json");
     let observer = RootObserver::start(
-        &watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]), &passwords, &hub, &journal, &Arc::new(NativeWatchCatalog::new(journal.state(), None)), false,
+        &watched, &root, root.scope(vec![state.to_string_lossy().into_owned()]), &passwords, &hub, &journal, &Arc::new(NativeWatchCatalog::new(journal.state(), None)), false,
     ).unwrap();
     fs::write(&passwords, b"{}").unwrap();
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -690,7 +710,7 @@ fn completion_blockers_follow_reloaded_roots_without_losing_recovery_routes() {
     };
     // Both kinds can return from a request admitted before root reload.
     for status in ["failed_password", "suspended_missing_volume"] {
-        let mut entry = observed_entry(&candidate, status, None);
+        let mut entry = observed_entry(&candidate, status);
         let roots = BTreeMap::from([(id.clone(), (root.clone(), recursive.clone()))]);
         assert!(route_blocker(&entry, &roots).is_some());
         assert!(route_blocker(&entry, &BTreeMap::new()).is_none());
@@ -735,7 +755,7 @@ fn retained_regroup_handoff_persists_the_new_current_root() {
         scope: NativeDiscoveryScope::new(r"C:\watch\old".into(), Some(0), Vec::new()),
         password_scope: r"C:\passwords".into(),
     };
-    let mut entry = Arc::new(observed_entry(&candidate, "suspended_missing_volume", None));
+    let mut entry = Arc::new(observed_entry(&candidate, "suspended_missing_volume"));
     let payload = &mut Arc::make_mut(&mut entry).failure_payload;
     payload.insert("discovery_scope".into(), Value::Object(recovery.record()));
     payload.insert("password_scope_dir".into(), json!(recovery.password_scope));
@@ -910,7 +930,7 @@ fn admitted_password_scope_survives_family_head_retry_and_retained_recovery() {
         outcome.archives.push(completion_archive(path, 1, Some(kind)));
         let failures = outcome.input_failures();
         let failure = &failures[&crate::path_keys::path_key(path)];
-        let entry = make_blocker(&candidate, "blocked", failure, None,
+        let entry = make_blocker(&candidate, "blocked", failure,
             &passwords, &user_signature, None, None, b);
         assert_eq!(entry.failure_payload["password_scope_dir"], json!(b));
         if failure.password.is_some() {
@@ -938,7 +958,7 @@ fn admitted_password_scope_survives_family_head_retry_and_retained_recovery() {
     state.apply(&operations);
     assert_eq!(candidate_password_scope(&state, pending_path, None), b);
     // An existing retry entry takes precedence over pending, as in main.
-    let mut entry = observed_entry(&candidate, "failed_password", None);
+    let mut entry = observed_entry(&candidate, "failed_password");
     entry.path = pending_path.into();
     entry.failure_payload.insert("password_scope_dir".into(), json!(a));
     let mut operations = NativeWatchOperations::empty();
@@ -973,7 +993,7 @@ fn retained_carrier_segments_share_blockers_without_hiding_independent_terminal_
         },
     };
     let passwords = crate::core::passwords::PasswordSnapshot::default();
-    let entry = make_blocker(&candidate, "carrier blocked", carrier, None,
+    let entry = make_blocker(&candidate, "carrier blocked", carrier,
         &passwords, &user_password_signature(&[]), None, None, Path::new(retained_path).parent().unwrap());
     assert_eq!(entry.status, "suspended_missing_volume");
     assert_eq!(entry.failure_payload["blockers"], json!(["missing_volume", "password"]));
@@ -1047,8 +1067,7 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
         let mut blocker = crate::watch_store::EntryRecord {
             path: carrier_text.into(), size: 15, mtime: 1.0, file_id: String::new(),
             change_usn: 0, status: "failed_password".into(), last_error: "blocked".into(),
-            attempt_count: 1, failure_kind: "password_required".into(),
-            failure_stage: "extraction".into(),
+            failure_kind: "password_required".into(),
             failure_payload: json!({"blockers":["password"]}).as_object().unwrap().clone(),
             last_attempt_at: 1.0,
         };
@@ -1777,7 +1796,7 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
             let mut operations = state.output_operation(owner, owner.to_owned(),
                 container.to_str().unwrap().to_owned(), Some(true), false)?.unwrap();
             let candidate = watch_candidate_for_path(&source, None)?.unwrap();
-            let mut blocker = observed_entry(&candidate, "failed_password", None);
+            let mut blocker = observed_entry(&candidate, "failed_password");
             blocker.failure_payload.insert("input_checkpoints".into(), json!([{
                 "schema_version":1,"carrier":source,
                 "input":crate::io::archive_state::ArchiveInput::file(

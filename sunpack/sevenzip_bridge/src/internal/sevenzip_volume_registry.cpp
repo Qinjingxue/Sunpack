@@ -123,7 +123,6 @@ namespace sunpack::sevenzip
         std::vector<std::shared_ptr<AsyncFileWriter>> retired;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            const auto previous_size = entries_.size();
             const auto now = std::chrono::steady_clock::now();
             std::size_t retained_states = 0;
             for (auto it = entries_.begin(); it != entries_.end();)
@@ -166,10 +165,19 @@ namespace sunpack::sevenzip
                     }
                 }
             }
-            if (entries_.size() < previous_size &&
-                entries_.bucket_count() > (std::max)(kMaxRetainedVolumeStates, entries_.size() * 4))
+            // Synthetic entries disappear in release(), before this pass.
+            if (entries_.bucket_count() > (std::max)(kMaxRetainedVolumeStates, entries_.size() * 4))
             {
-                entries_.rehash(0);
+                try
+                {
+                    // MSVC's rehash never shrinks. Transfer the nodes so a
+                    // provisional writer initialization keeps its Entry reference.
+                    decltype(entries_) compact;
+                    compact.reserve(entries_.size());
+                    compact.merge(entries_);
+                    entries_.swap(compact);
+                }
+                catch (const std::bad_alloc &) { /* Trimming is best effort. */ }
             }
         }
 
@@ -200,6 +208,12 @@ namespace sunpack::sevenzip
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return entries_.size();
+    }
+
+    std::size_t VolumeWriterRegistry::volume_bucket_count() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return entries_.bucket_count();
     }
 #endif
 

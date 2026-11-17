@@ -109,7 +109,7 @@ pub(crate) struct ArchiveInput {
     pub volume_style: String,
     pub mode: OpenMode,
     pub parts: Box<[InputPart]>,
-    pub volume_attempts: Option<Box<VolumeAttemptPlan>>,
+    pub volume_attempts: Option<Arc<VolumeAttemptPlan>>,
     pub analysis: AnalysisFacts,
 }
 

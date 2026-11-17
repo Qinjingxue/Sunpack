@@ -48,6 +48,7 @@ impl<'a> RelationSource<'a> {
     fn anchor(&self, row: usize) -> Option<&'a VolumeAnchor> {
         match self {
             Self::Snapshot(snapshot, cached) => cached
+                .filter(|cache| !cache.anchors.is_empty())
                 .and_then(|cache| cache.anchors.get(&path_key(self.path(row))))
                 .or(snapshot.table.relation_anchors[row]
                     .as_ref()
@@ -163,7 +164,7 @@ impl RelationScopeIndex {
         // Snapshot facts without overrides can cheaply rule out seeds before
         // parsing filenames. With overrides, first narrow the scope by name
         // to avoid a path-key lookup for unrelated rows.
-        let direct_anchors = !matches!(source, RelationSource::Snapshot(_, Some(_)));
+        let direct_anchors = !matches!(source, RelationSource::Snapshot(_, Some(cache)) if !cache.anchors.is_empty());
         let has_seed = |row| source.anchor(row).is_some_and(BucketIndex::has_seed);
         for row in source.indices() {
             if direct_anchors && !has_seed(row) {

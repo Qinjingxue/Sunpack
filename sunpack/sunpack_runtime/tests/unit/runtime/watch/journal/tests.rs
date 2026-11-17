@@ -241,9 +241,7 @@ fn cpp_query_recovers_durable_blocker_after_writer_death() {
                 change_usn: 0,
                 status: "suspended_missing_volume".into(),
                 last_error: String::new(),
-                attempt_count: 1,
                 failure_kind: String::new(),
-                failure_stage: String::new(),
                 failure_payload: Default::default(),
                 last_attempt_at: crate::io::display_store::utc_us() as f64 / 1_000_000.0,
             }));

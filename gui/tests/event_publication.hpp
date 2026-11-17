@@ -49,5 +49,5 @@ inline void publish_events(const spg::fs::path& path,const std::string& events,c
     data.close(); index.close();
     auto run=Json{{"name",name},{"head",live?1:0},{"count",rows.size()+(live?1:0)},{"unordered",live}};
     auto runs=retained_runs; if(!live) runs.push_back(run);
-    atomic_write(path,Json{{"format",1},{"revision",generation},{"task_revision",generation},{"runs",std::move(runs)},{"live",live?run:Json()},{"dropped",0}}.dump());
+    atomic_write(path,Json{{"format",1},{"task_revision",generation},{"runs",std::move(runs)},{"live",live?run:Json()}}.dump());
 }

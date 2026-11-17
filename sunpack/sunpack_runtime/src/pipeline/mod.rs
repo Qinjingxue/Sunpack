@@ -374,7 +374,7 @@ pub struct ArchiveResult {
     pub offset: u64,
     pub end_offset: Option<u64>,
     pub(crate) volume_completeness: Option<VolumeCompleteness>,
-    pub(crate) volume_attempts: Option<Box<crate::io::archive_state::VolumeAttemptPlan>>,
+    pub(crate) volume_attempts: Option<Arc<crate::io::archive_state::VolumeAttemptPlan>>,
     pub source_paths: Vec<PathBuf>,
     pub password: Option<String>,
     pub discovery_source: DiscoverySource,

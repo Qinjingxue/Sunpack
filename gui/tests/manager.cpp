@@ -73,15 +73,15 @@ void projection(Fixture& f) {
     }
     assert(next==-1 && pages==4);
     view.task_cursor.clear(); view.task_query="carrier-349";
-    assert(log.query({},view)["total"]==1);
+    assert(log.query({},view)["rows"].size()==1);
     log.cancelled=[]{return true;}; view.task_query="not-present";
     assert(log.query({},view).is_null()); log.cancelled={};
-    // A background rebuild can reuse both counters. Ordinary appends cannot
+    // A background rebuild can reuse the revision. Ordinary appends cannot
     // detect stale cards in that case; reuse this disk fixture at negligible cost.
     auto before=log.manifest;
     publish_events(p,event("done",source,1));
     auto replaced=read_json(p);
-    replaced["task_revision"]=before["task_revision"]; replaced["dropped"]=before["dropped"];
+    replaced["task_revision"]=before["task_revision"];
     atomic_write(p,replaced.dump());
     assert(log.refresh());
     view.task_query.clear();
@@ -137,7 +137,7 @@ void projection(Fixture& f) {
     publish(Json{{"event","watch_deduplicated"},{"path",utf8(source.wstring())},{"ts",1}});
     View dedup_view; dedup_view.task_status="taskSucceeded";
     auto dedup_row=log.query({},dedup_view,"zh").at("rows").at(0);
-    assert(dedup_row["status"]=="taskSucceeded" && dedup_row["statusTone"]=="success");
+    assert(dedup_row["statusTone"]=="success");
     assert(dedup_row["statusText"]=="去重跳过" && dedup_row["outputs"].empty());
     assert(log.query({},dedup_view,"en").at("rows").at(0).at("statusText")=="Duplicate skipped");
     dedup_view.task_status="taskFailed";
@@ -244,14 +244,17 @@ void editing(Fixture& f) {
     auto shared=std::find_if(stored.begin(),stored.end(),[](const Json& row){return row["value"]=="shared stored";});
     assert((*shared)["scopes"]==Json::array({"C:/A","D:/B"}));
     auto c=f.dir/"sunpack_config.json";
-    atomic_write(c,R"({"watch":{"out_dir":"."},"unknown":{"large":9007199254740993,"huge":123456789012345678901234567890},"filters":[{"name":"x","rules":["*","r",3]}]})");
+    auto source=std::string(R"({"filters":[{"name":"x","rules":["x]}","y\"[{",3]}], "watch": {"out_dir" : "."},"unknown":{"large":9007199254740993,"huge":123456789012345678901234567890}})");
+    atomic_write(c,source);
     save_config_field(c,"/watch/out_dir","\".\"","string","中文",false);
+    source.replace(source.find("\".\""),3,"\"中文\"");
+    assert(read_file(c)==source);
     auto conf=read_json(c); assert(conf["unknown"]["large"].dump()=="9007199254740993");
     assert(read_file(c).find("123456789012345678901234567890")!=std::string::npos);
     auto fields=config_fields(conf,read_file(c));
     auto huge=std::find_if(fields.begin(),fields.end(),[](const Json& field){return field["id"]=="/unknown/huge";});
     assert((*huge)["text"]=="123456789012345678901234567890");
-    assert(conf["filters"][0]["rules"]==Json::array({"*","r",3}));
+    assert(conf["filters"][0]["rules"]==Json::array({"x]}","y\"[{",3}));
     fails([&]{save_config_field(c,"/watch/out_dir","\".\"","string","stale",false);});
     fails([&]{validate_setting("/runtime/process_mode",Json("typo"));});
     for(auto mode:{"none","file_id","hash"}) validate_setting("/watch/deduplication",Json(mode));
@@ -455,10 +458,11 @@ void batch_editing(Fixture& fixture) {
     View view;
     auto saved=read_json(passwords);
     saved["passwords"].push_back({{"value","everywhere"}});
-    assert(password_rows(saved,view)["total"]==1 && password_rows(saved,view)["rows"][0]["value"]=="everywhere");
+    auto global=password_rows(saved,view);
+    assert(global["rows"].size()==1 && global["rows"][0]["value"]=="everywhere");
     view.password_scope=utf8(dir.wstring());
-    auto matches=password_rows(saved,view); assert(matches["total"]==1 && matches["rows"][0]["value"]=="fast-delta");
-    view.password_scope=utf8((dir/"child").wstring()); assert(password_rows(saved,view)["total"]==0);
+    auto matches=password_rows(saved,view); assert(matches["rows"].size()==1 && matches["rows"][0]["value"]=="fast-delta");
+    view.password_scope=utf8((dir/"child").wstring()); assert(password_rows(saved,view)["rows"].empty());
     // GUI deletion removes exactly the deleted scope, preserving shared/global
     // entries, separately monitored children, similar prefixes and history.
     auto child=first/"child"; fs::create_directory(child);

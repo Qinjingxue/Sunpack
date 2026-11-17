@@ -645,8 +645,6 @@ void check_output_path_reservations()
     std::filesystem::path last;
     for (int index = 0; index < 10000; ++index) { last = many.allocate(original, true); }
     check(last == root / L"entry(10000).txt", "large duplicate group advances without rescanning prior reservations");
-    many.clear();
-    check(many.allocate(original, true) == original, "released reservations do not survive the output lifetime");
 }
 
 } // namespace

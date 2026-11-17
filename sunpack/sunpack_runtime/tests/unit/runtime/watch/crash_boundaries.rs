@@ -167,7 +167,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
             };
 
         let mut interrupted = NativeWatchOperations::empty();
-        interrupted.put_entry(Arc::new(observed_entry(&old, "interrupted", None)));
+        interrupted.put_entry(Arc::new(observed_entry(&old, "interrupted")));
         scheduler.journal.commit(true, |_| Ok(interrupted)).unwrap();
         fs::write(&source, b"replacement generation with a different size").unwrap();
         let group = Arc::new(SourceGroup { path: source.clone(),

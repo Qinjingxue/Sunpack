@@ -78,7 +78,8 @@ void FindController::release_results(Search& s) {
     decltype(s.byId)().swap(s.byId);
 }
 void FindController::clear_matches(Search& s) {
-    s.matchIndex.clear(); s.matches.clear(); s.matchBytes=0; s.matchIndex.rehash(0);
+    decltype(s.matchIndex)().swap(s.matchIndex);
+    s.matches.clear(); s.matchBytes=0;
 }
 std::vector<ui::TextHighlight> FindController::match(Search& s,const std::string& text) {
     auto found=s.matchIndex.find(text);
@@ -137,6 +138,13 @@ void FindController::refresh(Search& s) {
     if(!s.targets.empty()) {
         if(s.pending && !at_edge(s,s.pending)) advance(s,s.pending);
         s.targets[s.current.target].ranges[s.current.range].active=true;
+        if(s.targets.capacity()/4>std::max<size_t>(64,s.targets.size())) s.targets.shrink_to_fit();
+        if(s.byId.bucket_count()/4>std::max<size_t>(64,s.byId.size())) {
+            decltype(s.byId) compact;
+            compact.reserve(s.byId.size());
+            compact.merge(s.byId);
+            s.byId.swap(compact);
+        }
     } else if(had_results) release_results(s);
     const bool locate=changed || s.pending!=0;
     s.pending=0;

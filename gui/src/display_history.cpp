@@ -185,11 +185,12 @@ struct RunReader {
         }
         if(!current.raw || !current.compressed || current.raw>uint32_t(INT_MAX) || current.compressed>uint32_t(LZ4_compressBound(int(current.raw))))
             throw std::runtime_error("logRecordTooLarge");
-        packed.resize(current.compressed); raw.resize(current.raw);
-        read_at(*data,current.offset,packed.data(),packed.size());
-        if(LZ4_decompress_safe(packed.data(),raw.data(),int(packed.size()),int(raw.size()))!=int(raw.size()))
+        if(packed.size()<current.compressed) packed.resize(current.compressed);
+        if(raw.size()<current.raw) raw.resize(current.raw);
+        read_at(*data,current.offset,packed.data(),current.compressed);
+        if(LZ4_decompress_safe(packed.data(),raw.data(),int(current.compressed),int(current.raw))!=int(current.raw))
             throw std::runtime_error("logRecordTooLarge");
-        return Json::from_msgpack(raw.begin(),raw.end());
+        return Json::from_msgpack(raw.data(),raw.data()+current.raw);
     }
 };
 bool matches(const Json& value,const std::wstring& query,const std::string& time_query) {
@@ -217,20 +218,20 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
     const auto& path=input->get_ref<const std::string&>();
     if(path.empty()) return {};
     const auto& event=event_name->get_ref<const std::string&>();
-    const char* status;
     const char* tone;
     const char* label;
+    bool failed=false;
     if(event=="processing_started") {
-        label=status="taskProcessing"; tone="info";
+        label="taskProcessing"; tone="info";
     } else if(event=="failed_password" || event=="suspended_missing_volume") {
-        status="taskWaiting"; tone="waiting";
+        tone="waiting";
         label=event=="failed_password"?"taskWaitingPassword":"taskWaitingVolumes";
     } else if(event=="watch_deduplicated") {
-        status="taskSucceeded"; label="taskDeduplicated"; tone="success";
+        label="taskDeduplicated"; tone="success";
     } else if(event=="done") {
-        label=status="taskSucceeded"; tone="success";
+        label="taskSucceeded"; tone="success";
     } else if(event=="failed_terminal" || event=="partial_rejected") {
-        label=status="taskFailed"; tone="failure";
+        label="taskFailed"; tone="failure"; failed=true;
     } else return {};
     auto id=value.value("task_id",std::string());
     if(id.empty()) id=utf8(path_key(wide(path)));
@@ -258,7 +259,7 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
     } else parts.clear();
 
     std::string error,error_type;
-    if(status==std::string_view("taskFailed")) {
+    if(failed) {
         auto text=value.find("error"), kind=value.find("error_kind");
         if(text!=value.end() && text->is_string()) error=text->get<std::string>();
         if(kind!=value.end() && kind->is_string()) error_type=kind->get<std::string>();
@@ -275,7 +276,7 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
     const auto ts=value.find("ts");
     const auto timestamp=ts!=value.end() && ts->is_number()?ts->get<double>():std::numeric_limits<double>::quiet_NaN();
     return {{{"id",std::move(id)},{"name",utf8(source.filename().wstring())},{"directory",utf8(source.parent_path().wstring())},
-        {"path",std::move(display_path)},{"root",indexed_root(path_key(source),roots)},{"status",status},
+        {"path",std::move(display_path)},{"root",indexed_root(path_key(source),roots)},
         {"statusText",translate(label)},{"time",task_time(timestamp)},{"statusTone",tone},{"parts",std::move(parts)},
         {"error",std::move(error)},{"errorType",std::move(error_type)},{"outputs",std::move(outputs)}},
         std::isfinite(timestamp)?timestamp:0.0};
@@ -283,7 +284,7 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
 
 }
 Json EventLog::query(const WatchRoots& roots,const View& view,const std::string& language) const {
-    if(manifest.is_null()) return {{"rows",Json::array()},{"total",0},{"hasMore",false},{"dropped",0},{"next",""}};
+    if(manifest.is_null()) return {{"rows",Json::array()},{"hasMore",false},{"next",""}};
     const auto root_index=index_roots(roots);
     auto folder=path().parent_path()/(path().filename().wstring()+L".store");
     std::string before_name;
@@ -411,8 +412,7 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     Json::array_t rows;
     rows.reserve(projected.size());
     for(auto& row:projected) rows.push_back(std::move(row.value));
-    const auto count=projected.size();
-    return {{"rows",std::move(rows)},{"total",count},{"hasMore",more},{"dropped",manifest.value("dropped",uint64_t(0))},
+    return {{"rows",std::move(rows)},{"hasMore",more},
         {"next",more && last?Json({std::get<0>(*last),std::get<1>(*last),std::get<2>(*last)}).dump():std::string()}};
 }
 }

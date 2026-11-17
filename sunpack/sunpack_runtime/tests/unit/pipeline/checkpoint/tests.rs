@@ -171,9 +171,10 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
     assert!(!partial.valid_for(&changed, &generations));
 
     let mut alternatives = input.clone();
-    alternatives.volume_attempts = Some(Box::new(VolumeAttemptPlan {
+    let alternative_path = source.with_extension("alternative");
+    alternatives.volume_attempts = Some(Arc::new(VolumeAttemptPlan {
         sources: vec![input.parts[0].extent.clone(), InputExtent {
-            path: source.with_extension("alternative").to_string_lossy().into_owned(),
+            path: alternative_path.to_string_lossy().into_owned(),
             start: 0, end: Some(7),
         }].into_boxed_slice(),
         layouts: vec![VolumeLayout {
@@ -186,7 +187,12 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
     }));
     assert!(complete.valid_for(&alternatives, &generations));
     assert!(!partial.valid_for(&alternatives, &generations));
-    assert!(InputCheckpoint::create(&source, Arc::new(alternatives.clone()), &result, &generations, None).is_some());
+    let mut checkpoint = InputCheckpoint::create(&source, Arc::new(alternatives.clone()), &result, &generations, None).unwrap();
+    let moved_alternative = alternative_path.with_extension("moved");
+    assert!(checkpoint.relocate(&alternative_path, &moved_alternative));
+    let source_path = |input: &ArchiveInput| input.volume_attempts.as_ref().unwrap().sources[1].path.clone();
+    assert_eq!(source_path(checkpoint.input()), moved_alternative.to_string_lossy());
+    assert_eq!(source_path(&alternatives), alternative_path.to_string_lossy());
 
     // A failed input reserves its name without advertising recoverable
     // content. Persist and relocate that namespace independently of output.

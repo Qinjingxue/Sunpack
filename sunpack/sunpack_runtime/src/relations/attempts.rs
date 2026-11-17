@@ -762,6 +762,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
 
 impl VolumeAttempts {
     pub(super) fn project(&self, proposal: &RelationProposal, style: &str) -> VolumeAttemptPlan {
+        let zip_spanned = proposal.style == "zip_spanned";
         let mut domains = Vec::new();
         let mut domain_indexes = HashMap::new();
         let layouts = self
@@ -778,7 +779,7 @@ impl VolumeAttempts {
                                 domains.push(VolumeDomain {
                                     choices: Arc::clone(choices),
                                 });
-                                (index, choices.iter().all(|&i| self.sources[i].terminal))
+                                (index, zip_spanned && choices.iter().all(|&i| self.sources[i].terminal))
                             });
                         VolumeSlot {
                             number,
@@ -787,7 +788,7 @@ impl VolumeAttempts {
                                 number,
                                 style,
                                 proposal.width,
-                                proposal.style == "zip_spanned" && terminal,
+                                terminal,
                             ),
                             domain,
                         }

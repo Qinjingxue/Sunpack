@@ -41,12 +41,10 @@ pub(crate) struct Run {
 #[derive(Default, Serialize, Deserialize)]
 pub(crate) struct Manifest {
     pub format: u32,
-    pub revision: u64,
     #[serde(default)]
     pub task_revision: u64,
     pub runs: Vec<Run>,
     pub live: Option<Run>,
-    pub dropped: u64,
 }
 struct Live {
     run: Run,
@@ -193,7 +191,9 @@ fn compress_block(raw: &[u8], compressed: &mut Vec<u8>) -> io::Result<usize> {
     if bound <= 0 {
         return Err(invalid("display block cannot be compressed"));
     }
-    compressed.resize(bound as usize, 0);
+    if compressed.len() < bound as usize {
+        compressed.resize(bound as usize, 0);
+    }
     let len = unsafe {
         LZ4_compress_default(
             raw.as_ptr(),
@@ -779,7 +779,6 @@ impl Store {
         if self.compressed.capacity() > 2 * RECORD_BLOCK_BYTES {
             self.compressed = Vec::new();
         }
-        self.manifest.revision = self.manifest.revision.wrapping_add(1);
         if let Some(live) = &mut self.live {
             live.set_revision(self.manifest.task_revision)?;
         }

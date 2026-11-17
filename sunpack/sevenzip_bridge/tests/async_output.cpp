@@ -739,6 +739,10 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         std::cerr << "persistent volume retention cap was exceeded\n";
         return false;
     }
+    if (registry.volume_bucket_count() > 256) {
+        std::cerr << "idle registry still holds peak volume buckets\n";
+        return false;
+    }
     // The facility can be rebuilt for the same volume while its persistent state is retained.
     {
         auto lease = registry.acquire("volume-p");

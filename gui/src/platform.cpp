@@ -157,6 +157,10 @@ Handle directory_watch_event() {
     if (!event) win_error("opWatchDirectory");
     return Handle(event);
 }
+bool same_filename(std::wstring_view name, std::wstring_view expected) {
+    return name.size()==expected.size() &&
+        CompareStringOrdinal(name.data(),int(name.size()),expected.data(),int(expected.size()),TRUE)==CSTR_EQUAL;
+}
 }
 DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void(const fs::path&)> changed)
     : stop_(directory_watch_event()) {
@@ -189,13 +193,12 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
             if (!count) changed({});
             for (DWORD offset = 0; count && offset < count;) {
                 auto* item = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer + offset);
-                auto path = ancestor / std::wstring(item->FileName, item->FileNameLength / sizeof(wchar_t));
-                auto name = path.filename().wstring();
-                CharLowerBuffW(name.data(),DWORD(name.size()));
+                const std::wstring_view name(item->FileName,item->FileNameLength / sizeof(wchar_t));
                 // Missing target directories are observed through their existing ancestor.
-                if (subtree || name == L"sunpack_config.json" || name == L"builtin_passwords.json" ||
-                    name == L"sunpack_watch_roots.txt" || name == L"events.json" ||
-                    (name.rfind(L"runtime-",0)==0 && path.extension()==L".state")) changed(path);
+                if (subtree || same_filename(name,L"sunpack_config.json") || same_filename(name,L"builtin_passwords.json") ||
+                    same_filename(name,L"sunpack_watch_roots.txt") || same_filename(name,L"events.json") ||
+                    (name.size()>=14 && same_filename(name.substr(0,8),L"runtime-") && name.substr(name.size()-6)==L".state"))
+                    changed(ancestor / name);
                 if (!item->NextEntryOffset) break;
                 offset += item->NextEntryOffset;
             }

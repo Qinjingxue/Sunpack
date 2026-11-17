@@ -50,8 +50,10 @@ namespace sunpack::sevenzip
 
             ~Lease() { reset(); }
 
+#ifdef SUP7Z_DEBUG
             bool valid() const noexcept { return writer_ != nullptr; }
             AsyncFileWriter &writer() const noexcept { return *writer_; }
+#endif
             std::shared_ptr<AsyncFileWriter> writer_pointer() const noexcept { return writer_; }
             const VolumeStatePtr &volume() const noexcept
             {
@@ -78,6 +80,7 @@ namespace sunpack::sevenzip
 
 #ifdef SUP7Z_DEBUG
         std::size_t volume_count() const noexcept;
+        std::size_t volume_bucket_count() const noexcept;
 #endif
 
         void reap_idle();
@@ -149,7 +152,9 @@ namespace sunpack::sevenzip
         SpaceJobRegistration(const SpaceJobRegistration &) = delete;
         SpaceJobRegistration &operator=(const SpaceJobRegistration &) = delete;
 
+#ifdef SUP7Z_DEBUG
         bool registered() const noexcept { return gate_ != nullptr; }
+#endif
 
     private:
         std::shared_ptr<VolumeSpaceGate> gate_;

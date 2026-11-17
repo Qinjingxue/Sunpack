@@ -42,11 +42,12 @@ namespace sunpack::sevenzip
         };
 
         Kind kind = Kind::Blocked;
-        std::string volume_key;
         std::uint64_t episode_id = 0;
+#ifdef SUP7Z_DEBUG
+        std::string volume_key;
         unsigned long win32_error = 0;
         std::uint64_t free_bytes = 0;
-        double blocked_seconds = 0.0;
+#endif
         bool query_ok = true;
         unsigned long query_error = 0;
         std::vector<std::string> job_ids;
@@ -265,15 +266,17 @@ namespace sunpack::sevenzip
         // volume_key：身份键（= \\?\Volume{GUID}，小写无尾反斜杠）。
         // query_root_hint：resolved 卷可省略（构造时自动补尾反斜杠）；
         //                  synthetic 卷留空，首次空间失败时用 failed_path 就地解析。
-        VolumeSpaceGate(std::string volume_key,
-                        std::string query_root_hint,
+        VolumeSpaceGate(const std::string &volume_key,
+                        const std::string &query_root_hint,
                         ChangeSink sink)
-            : volume_key_(std::move(volume_key)),
-              query_root_(widen_ascii(query_root_hint)),
+            : query_root_(widen_ascii(query_root_hint)),
+#ifdef SUP7Z_DEBUG
+              volume_key_(volume_key),
+#endif
               sink_(std::move(sink))
         {
             if (query_root_.empty())
-                query_root_ = space_query_path(widen_ascii(volume_key_));
+                query_root_ = space_query_path(widen_ascii(volume_key));
         }
 
         // 由 job 的 volume lease scope 调用（不是 make_job / finish_job）：根输出目录创建
@@ -359,17 +362,16 @@ namespace sunpack::sevenzip
         // 唤醒目录等待者并通知 IOCP 重新裁决排队请求；不改变状态。
         void wake_waiters() noexcept;
 
-        VolumeSpacePhase phase() const noexcept;
         bool blocked() const noexcept; // Blocked || Probing
         std::uint64_t episode_id() const noexcept;
         std::vector<std::string> affected_job_ids() const;
         bool has_affected_jobs() const noexcept;
 #ifdef SUP7Z_DEBUG
+        VolumeSpacePhase phase() const noexcept;
         std::size_t waiter_count() const noexcept;
         std::uint64_t wait_call_count() const noexcept;
-#endif
-        const std::string &volume_key() const noexcept { return volume_key_; }
         bool query_root_resolved() const noexcept;
+#endif
 
     private:
         friend class ProbeLease;
@@ -459,15 +461,18 @@ namespace sunpack::sevenzip
         std::uint64_t episode_id_ = 0; // 每次 Ready→Blocked 递增
         std::uint64_t probe_owner_token_ = 0;     // 0 = 许可待领取
         std::uint64_t next_token_ = 1;
+#ifdef SUP7Z_DEBUG
         unsigned long last_win32_error_ = 0;
-        std::chrono::steady_clock::time_point blocked_since_{};
+        std::uint64_t last_free_bytes_ = 0;
+#endif
         std::chrono::steady_clock::time_point last_status_at_{};
-        std::uint64_t last_free_bytes_ = 0; // 最近一次成功采样值（仅诊断与展示）
         bool last_query_ok_ = true;
         unsigned long last_query_error_ = 0;
 
-        std::string volume_key_;  // 身份键：\\?\Volume{GUID} 小写无尾反斜杠 / job:<id>
         std::wstring query_root_; // 身份键的可查询形态（补回尾反斜杠）或就地解析结果
+#ifdef SUP7Z_DEBUG
+        std::string volume_key_;
+#endif
 
         std::vector<std::string> affected_jobs_; // job：只做事件 fan-out
 
@@ -567,7 +572,7 @@ namespace sunpack::sevenzip
     }
 
     inline bool VolumeSpaceGate::report_space_failure(
-        unsigned long win32_error, std::wstring_view failed_path) noexcept
+        [[maybe_unused]] unsigned long win32_error, std::wstring_view failed_path) noexcept
     {
         std::optional<VolumeSpaceTransition> transition;
         bool opened_episode = false;
@@ -576,14 +581,15 @@ namespace sunpack::sevenzip
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
+#ifdef SUP7Z_DEBUG
             last_win32_error_ = win32_error;
+#endif
 
             if (phase_ == VolumeSpacePhase::Ready)
             {
                 ++episode_id_;
                 phase_ = VolumeSpacePhase::Blocked;
                 probe_owner_token_ = 0;
-                blocked_since_ = std::chrono::steady_clock::now();
                 last_status_at_ = {};
                 opened_episode = true;
 
@@ -681,7 +687,9 @@ namespace sunpack::sevenzip
             {
                 last_query_ok_ = true;
                 last_query_error_ = 0;
+#ifdef SUP7Z_DEBUG
                 last_free_bytes_ = local_free;
+#endif
             }
             else
             {
@@ -716,7 +724,9 @@ namespace sunpack::sevenzip
     {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+#ifdef SUP7Z_DEBUG
             last_free_bytes_ = free_bytes_now;
+#endif
             // 0 字节不可用于验证普通写入；只有 Blocked 且可用空间为正时发放许可。
             // Probing 期间无论空间读数如何，都不能并发发放第二个许可。
             if (phase_ != VolumeSpacePhase::Blocked || free_bytes_now == 0)
@@ -754,8 +764,9 @@ namespace sunpack::sevenzip
             // Probing → Ready 的唯一合法原因是一次真实成功。
             phase_ = VolumeSpacePhase::Ready;
             probe_owner_token_ = 0;
+#ifdef SUP7Z_DEBUG
             last_win32_error_ = 0;
-            blocked_since_ = std::chrono::steady_clock::time_point{};
+#endif
             if (sink_) transition.emplace(make_transition_locked(
                 VolumeSpaceTransition::Kind::Resumed));
         }
@@ -764,7 +775,7 @@ namespace sunpack::sevenzip
     }
 
     inline void VolumeSpaceGate::settle_space_failure(
-        std::uint64_t token, unsigned long win32_error, std::wstring_view failed_path) noexcept
+        std::uint64_t token, [[maybe_unused]] unsigned long win32_error, std::wstring_view failed_path) noexcept
     {
         resolve_query_root_outside_lock(std::wstring(failed_path));
 
@@ -776,7 +787,9 @@ namespace sunpack::sevenzip
             }
             phase_ = VolumeSpacePhase::Blocked;
             probe_owner_token_ = 0;
+#ifdef SUP7Z_DEBUG
             last_win32_error_ = win32_error;
+#endif
             // 不做新鲜查询或立即重试：下次成功的正数空间采样才可发放新许可。
         }
         wake_waiters();
@@ -795,12 +808,6 @@ namespace sunpack::sevenzip
         // No fresh space failure: the same sample still authorises one real
         // attempt. Keep Probing so another live request can take the permit.
         wake_waiters();
-    }
-
-    inline VolumeSpacePhase VolumeSpaceGate::phase() const noexcept
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return phase_;
     }
 
     inline bool VolumeSpaceGate::blocked() const noexcept
@@ -831,13 +838,19 @@ namespace sunpack::sevenzip
         return !affected_jobs_.empty();
     }
 
+#ifdef SUP7Z_DEBUG
+    inline VolumeSpacePhase VolumeSpaceGate::phase() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return phase_;
+    }
+
     inline bool VolumeSpaceGate::query_root_resolved() const noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return !query_root_.empty();
     }
 
-#ifdef SUP7Z_DEBUG
     inline std::size_t VolumeSpaceGate::waiter_count() const noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -856,20 +869,16 @@ namespace sunpack::sevenzip
     {
         VolumeSpaceTransition transition;
         transition.kind = kind;
-        transition.volume_key = volume_key_;
         transition.episode_id = episode_id_;
+#ifdef SUP7Z_DEBUG
+        transition.volume_key = volume_key_;
         transition.win32_error = last_win32_error_;
         transition.free_bytes = last_free_bytes_;
+#endif
         transition.query_ok = last_query_ok_;
         transition.query_error = last_query_error_;
         if (new_job) transition.job_ids.push_back(*new_job);
         else transition.job_ids = affected_jobs_;
-        if (blocked_since_ != std::chrono::steady_clock::time_point{})
-        {
-            transition.blocked_seconds =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - blocked_since_)
-                    .count();
-        }
         return transition;
     }
 

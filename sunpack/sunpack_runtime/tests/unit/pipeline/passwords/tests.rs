@@ -342,7 +342,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
         changed.parts.swap(0, 1);
         assert!(attempts.proof(&Key::for_input(&changed, &sessions).unwrap().0).is_none());
     }
-    input.volume_attempts = Some(Box::new(VolumeAttemptPlan {
+    input.volume_attempts = Some(Arc::new(VolumeAttemptPlan {
         sources: input.parts.iter().map(|part| part.extent.clone()).collect(),
         layouts: vec![VolumeLayout { slots: vec![VolumeSlot {
             number: 1, canonical_name: "a.rar".into(), domain: 0,
@@ -354,14 +354,14 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
     let (planned, attempts) = Key::for_input(&input, &sessions).unwrap();
     attempts.reject(planned.clone(), &[Arc::from("old-wrong")]);
     let mut changed = input.clone();
-    changed.volume_attempts.as_mut().unwrap().domains[0].choices = Arc::new(vec![1, 0]);
+    Arc::make_mut(changed.volume_attempts.as_mut().unwrap()).domains[0].choices = Arc::new(vec![1, 0]);
     assert!(Key::for_input(&changed, &sessions).unwrap().0 != planned);
     // Optional struct fields must retain their names: compact positional
     // serialization aliases these distinct constraints when values match.
     let mut head_constraint = input.clone();
-    head_constraint.volume_attempts.as_mut().unwrap().head_size_from_total = Some(4);
+    Arc::make_mut(head_constraint.volume_attempts.as_mut().unwrap()).head_size_from_total = Some(4);
     let mut minimum_constraint = input.clone();
-    minimum_constraint.volume_attempts.as_mut().unwrap().minimum_size = Some(4);
+    Arc::make_mut(minimum_constraint.volume_attempts.as_mut().unwrap()).minimum_size = Some(4);
     let head_key = Key::for_input(&head_constraint, &sessions).unwrap().0;
     let minimum_key = Key::for_input(&minimum_constraint, &sessions).unwrap().0;
     assert!(head_key != minimum_key);
