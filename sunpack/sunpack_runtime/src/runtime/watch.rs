@@ -1787,6 +1787,22 @@ impl CandidateDiagnostics {
         if self.paths.is_empty() && self.paths.capacity() != 0 { self.paths = HashMap::new(); }
     }
 
+    fn retire_path(&mut self, path: &str, recursive: bool) {
+        let retired = |candidate: &str| candidate == path || recursive && is_path_under(candidate, path);
+        if recursive {
+            let before = self.paths.len();
+            self.paths.retain(|candidate, _| !retired(candidate));
+            if self.paths.len() == before { return; }
+        } else if self.paths.remove(path).is_none() {
+            return;
+        }
+        for queue in [&mut self.readiness, &mut self.observations] {
+            queue.retain(|entry| !retired(&entry.path));
+            crate::collections::trim_deque(queue);
+        }
+        crate::collections::trim_map(&mut self.paths);
+    }
+
     fn deadline(&self) -> Option<Instant> {
         self.readiness.front().into_iter().chain(self.observations.front())
             .map(|entry| entry.expires).min()
@@ -3335,16 +3351,11 @@ impl Scheduler {
                 self.cache_deadline = None;
                 if self.active.is_empty() && self.pending.is_empty() {
                     let engine = Arc::clone(&self.engine);
-                    windows::maintain_when_foreground_idle(&engine, || {
-                        crate::relations::clear_regex_caches();
-                        crate::formats::seven_zip::clear_seven_zip_kdf_cache();
-                        engine.clear_idle_output_history();
-                    }, || {
+                    windows::maintain_when_foreground_idle(&engine, || engine.clear_idle_caches(), || {
                         self.checkpoint(&HashMap::new(), true, false)?;
                         engine.run_stage("catalog_maintenance", Origin::Watch, || {
                             self.commit_idle_catalog();
                             self.hub.clear_idle_completed_families();
-                            self.journal.state().trim_idle_storage();
                         })
                     })?;
                 }
@@ -4041,6 +4052,7 @@ impl Scheduler {
             else { self.dedup.lock().unwrap().invalidate(&[path.to_owned()])?; }
         }
         let path_key = watch_path_key(path);
+        self.candidate_diagnostics.retire_path(&path_key, recursive);
         self.volume_checks.remove(&path_key);
         if recursive {
             self.volume_checks.retain(|id, _| !is_path_under(id, &path_key));
@@ -4177,7 +4189,10 @@ impl Scheduler {
                     &self.journal, admission_now(), &id, &path);
                 return Ok(());
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if missing_path(&error) => {
+                self.candidate_diagnostics.retire_path(&id, false);
+                return Ok(());
+            }
             Err(error) => {
                 self.candidate_diagnostics.log_observation(
                     &self.journal, admission_now(), &id, &path, &error, event);

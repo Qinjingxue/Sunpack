@@ -20,6 +20,11 @@ impl RecentPasswords {
         self.0.lock().unwrap().iter().cloned().collect()
     }
 
+    pub(super) fn clear(&self) {
+        let recent = std::mem::take(&mut *self.0.lock().unwrap());
+        drop(recent);
+    }
+
     fn remember_recent(&self, password: Arc<str>) {
         if password.is_empty() {
             return;

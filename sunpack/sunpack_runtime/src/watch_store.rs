@@ -481,6 +481,11 @@ pub(crate) struct StateData {
 }
 
 impl StateData {
+    fn trim_retired_storage(&mut self) {
+        trim_map(&mut self.pending);
+        trim_map(&mut self.entries);
+    }
+
     pub(crate) fn has_missing_volume(&self, path: &str) -> bool {
         self.entries.get(path).is_some_and(|entry| entry.status == "suspended_missing_volume")
     }
@@ -848,6 +853,7 @@ impl NativeWatchState {
                 }
                 data.apply(operation);
             }
+            data.trim_retired_storage();
             // One WAL batch can replace a provisional member with its real
             // head. Publish the committed state, never the temporary gap
             // between Delete(old) and PutEntry(head), which clears GUI groups.
@@ -1121,13 +1127,6 @@ impl NativeWatchState {
         *self.lock() = StateData::default();
     }
 
-    /// Capacity-only maintenance: never changes records or checkpoint views.
-    pub(crate) fn trim_idle_storage(&self) {
-        let mut data = self.lock();
-        trim_map(&mut data.pending);
-        trim_map(&mut data.entries);
-    }
-
     pub(crate) fn password_generation(&self) -> i64 {
         self.lock().password_generation
     }
@@ -1309,7 +1308,10 @@ impl NativeWatchState {
         checkpoint_seq: u64,
         expected_seq: u64,
     ) -> std::io::Result<NativeWatchReplay> {
-        replay_segment_file(&mut self.lock(), &path, checkpoint_seq, expected_seq)
+        let mut data = self.lock();
+        let result = replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq);
+        data.trim_retired_storage();
+        result
     }
 }
 

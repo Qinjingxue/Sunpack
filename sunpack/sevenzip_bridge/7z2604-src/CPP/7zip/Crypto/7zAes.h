@@ -62,7 +62,12 @@ public:
   bool GetKey(CKeyInfo &key);
   void Add(const CKeyInfo &key);
   void FindAndAdd(const CKeyInfo &key);
+  bool IsEmpty() const { return Keys.IsEmpty(); }
+  void Clear() { Keys.ClearAndFree(); }
 };
+
+bool HasGlobalKeyCache() noexcept;
+void ClearGlobalKeyCache() noexcept;
 
 class CBase
 {

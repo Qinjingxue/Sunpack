@@ -102,10 +102,28 @@ pub(crate) fn watch_candidate_for_path(
     path: &Path,
     since_usn: Option<i64>,
 ) -> io::Result<Option<WatchCandidateRow>> {
+    watch_candidate(path, since_usn, false)
+}
+
+pub(crate) fn watch_candidate_for_observation(
+    path: &Path,
+    since_usn: Option<i64>,
+) -> io::Result<Option<WatchCandidateRow>> {
+    watch_candidate(path, since_usn, true)
+}
+
+fn watch_candidate(
+    path: &Path,
+    since_usn: Option<i64>,
+    report_absent: bool,
+) -> io::Result<Option<WatchCandidateRow>> {
     // An unobservable candidate ends this admission attempt, as in main.
     // USN and readiness failures remain separately classified below.
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
+        Err(error) if report_absent && matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+            return Err(error);
+        }
         Err(_) => return Ok(None),
     };
     if !metadata.is_file() {

@@ -40,6 +40,7 @@
 #include "internal/extraction_replay.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/sevenzip_streams.hpp"
+#include "7zip/Crypto/7zAes.h"
 #ifdef SUP7Z_DEBUG
 #include "internal/worker_pipeline_timing.hpp"
 #endif
@@ -529,6 +530,12 @@ std::string verified_manifest_wire(const std::string& job_id, const sunpack::sev
 
 constexpr int kMemoryRetry = -102;
 
+struct RequestOutcome {
+    int code;
+    // IPC storage has no job charge and survives destruction of JobExecution.
+    std::string response;
+};
+
 bool extraction_rejects_password(const sunpack::sevenzip::ExtractArchiveResult& result) {
     // With a complete callback inventory, rejection by every eligible encrypted
     // member also proves rejection by whichever member the fallback would test.
@@ -543,18 +550,18 @@ bool extraction_rejects_password(const sunpack::sevenzip::ExtractArchiveResult& 
     return tested;
 }
 
-int interrupted_result(const std::string& job_id) {
+RequestOutcome interrupted_result(const std::string& job_id) {
     // The attempt token also stops work for memory reclamation. Only the
     // executor's persistent user token decides whether a parked job is canceled.
     const auto* memory = sunpack::sevenzip::current_native_memory_job();
-    if (memory && memory->revoked.load(std::memory_order_acquire)) return kMemoryRetry;
-    print_frame(
+    if (memory && memory->revoked.load(std::memory_order_acquire)) return {kMemoryRetry, {}};
+    sunpack::sevenzip::NativeMemoryScope response_memory(nullptr);
+    return {-101,
         (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
-        (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("cancelled") + wire::key("failure_stage") + wire::text("native_cancel") + wire::key("failure_kind") + wire::text("cancelled") + wire::key("message") + wire::text("native job was cancelled") + wire::end()));
-    return -101;
+        (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("cancelled") + wire::key("failure_stage") + wire::text("native_cancel") + wire::key("failure_kind") + wire::text("cancelled") + wire::key("message") + wire::text("native job was cancelled") + wire::end())};
 }
 
-int scan_request(const WorkerRequest& request) {
+RequestOutcome scan_request(const WorkerRequest& request) {
     using namespace sunpack::sevenzip;
     const auto& input = request.archive_input;
     const bool ambiguous = !input.volume_attempts.layouts.empty();
@@ -597,7 +604,7 @@ int scan_request(const WorkerRequest& request) {
             if (auto* memory = current_native_memory_job()) {
                 if (memory->denied.load(std::memory_order_acquire) && !memory->revoked.load(std::memory_order_acquire))
                     memory->owner.retry(*memory);
-                if (memory->revoked.load(std::memory_order_acquire)) return kMemoryRetry;
+                if (memory->revoked.load(std::memory_order_acquire)) return {kMemoryRetry, {}};
             }
             if (native_job_cancelled()) return interrupted_result(request.job_id);
             verified = probe.status == PasswordTestStatus::Ok && probe.encrypted;
@@ -619,12 +626,12 @@ int scan_request(const WorkerRequest& request) {
     }
     if (request.encrypted >= 0 || verified || (tested && (probe.encrypted || probe.status == PasswordTestStatus::Ok)))
         fields += wire::key("encrypted") + wire::boolean(request.encrypted == 1 || verified || probe.encrypted);
-    print_frame(wire::object() + wire::key("type") + wire::text("result") +
+    NativeMemoryScope response_memory(nullptr);
+    return {ok ? 0 : 1, wire::object() + wire::key("type") + wire::text("result") +
         wire::key("job_id") + wire::text(request.job_id) + wire::key("status") + wire::text(ok ? "ok" : "failed") +
         wire::key("operation") + wire::text("scan") + wire::key("password_verified") + wire::boolean(verified) +
         wire::key("archive_type") + wire::text(wide_to_utf8(probe.archive_type.empty() ? input.format_hint : probe.archive_type)) +
-        fields + wire::end());
-    return ok ? 0 : 1;
+        fields + wire::end()};
 }
 
 // Called only for a candidate transaction whose output was initially empty.
@@ -719,17 +726,18 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
     return replay.uncertain_read.load(std::memory_order_relaxed);
 }
 
-int run_request(
+RequestOutcome run_request(
     WorkerRequest& request,
     // The registry lease in worker_loop covers the output-volume writer.
     const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
-    const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr
+    const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr,
+    const std::function<void()>& release_writer = {}
 ) {
     using namespace sunpack::sevenzip;
 
     const std::string& job_id = request.job_id;
     if (auto *memory = current_native_memory_job(); memory && memory->revoked.load(std::memory_order_acquire))
-        return kMemoryRetry;
+        return {kMemoryRetry, {}};
     if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
         return interrupted_result(job_id);
     }
@@ -741,10 +749,10 @@ int run_request(
     const std::wstring& codepage = request.codepage;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
     if (archive_path.empty() || (!request.scan_only && output_dir.empty())) {
-        print_frame(
+        NativeMemoryScope response_memory(nullptr);
+        return {2,
             (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
-            (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message") + wire::text("archive_path is required; extraction also requires output_dir") + wire::end()));
-        return 2;
+            (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message") + wire::text("archive_path is required; extraction also requires output_dir") + wire::end())};
     }
 
     const bool volume_trials = !request.archive_input.volume_attempts.layouts.empty();
@@ -766,11 +774,11 @@ int run_request(
     };
 
     if (!request.archive_input.validation_error.empty()) {
-        print_frame(
+        NativeMemoryScope response_memory(nullptr);
+        return {2,
             (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
             (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message")) +
-            wire::text(request.archive_input.validation_error) + wire::end());
-        return 2;
+            wire::text(request.archive_input.validation_error) + wire::end()};
     }
     if (request.scan_only) return scan_request(request);
     auto* volume_replay = current_extraction_replay;
@@ -781,9 +789,9 @@ int run_request(
             const auto root = std::filesystem::path(win32_extended_path(output_dir));
             const bool output_owned = directory_is_empty_or_missing(root);
             if (!output_owned) {
-                print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
-                    (wire::key("status") + wire::text("failed") + wire::key("failure_stage") + wire::text("output_prepare") + wire::key("failure_kind") + wire::text("output_filesystem") + wire::key("message") + wire::text("volume composition trials require an empty output directory") + wire::end()));
-                return 2;
+                NativeMemoryScope response_memory(nullptr);
+                return {2, (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+                    (wire::key("status") + wire::text("failed") + wire::key("failure_stage") + wire::text("output_prepare") + wire::key("failure_kind") + wire::text("output_filesystem") + wire::key("message") + wire::text("volume composition trials require an empty output directory") + wire::end())};
             }
             auto& plan = request.archive_input.volume_attempts;
             {
@@ -968,7 +976,7 @@ int run_request(
                 memory->owner.retry(*memory);
             // An interrupted attempt is internal. Never publish its provisional
             // damage/password/output errors or a final result to the caller.
-            if (memory->revoked.load(std::memory_order_acquire) && result.status != PasswordTestStatus::Ok) return kMemoryRetry;
+            if (memory->revoked.load(std::memory_order_acquire) && result.status != PasswordTestStatus::Ok) return {kMemoryRetry, {}};
         }
 
         if (cancel_token && cancel_token->load(std::memory_order_acquire)) return interrupted_result(job_id);
@@ -1025,6 +1033,9 @@ int run_request(
     }
 
     const bool ok = result.status == PasswordTestStatus::Ok;
+    // Output handles have drained. Streaming the manifest needs the result
+    // inventory and the retry state, but can block without holding the writer.
+    if (release_writer) release_writer();
     std::string volume_selection;
     if (volume_trials && ok) {
         const auto& cursor = volume_replay->volumes;
@@ -1051,7 +1062,9 @@ int run_request(
     const std::string pipeline_timing_field = pipeline_timing_enabled() ?
         wire::key("pipeline_timing") + pipeline_timing_wire(result.pipeline_timing) : "";
 #endif
-    print_frame(
+    // The serialized frame is transport-owned and outlives the managed job.
+    NativeMemoryScope response_memory(nullptr);
+    return {ok ? 0 : 1,
         (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
         wire::key("status") + wire::text(ok ? "ok" : "failed") +
         wire::key("native_status") + wire::text(status_name(result.status)) +
@@ -1077,8 +1090,7 @@ int run_request(
 #ifdef SUP7Z_DEBUG
         + pipeline_timing_field
 #endif
-        + wire::end());
-    return ok ? 0 : 1;
+        + wire::end()};
 }
 
 std::size_t native_logical_processor_count() noexcept {
@@ -1253,6 +1265,8 @@ public:
                 std::lock_guard<std::mutex> lock(cancel_mutex_);
                 cancel_tokens_.erase(job_id);
             }
+            withdrawn.reset();
+            writer_to_wake.reset();
             print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                 (wire::key("status") + wire::text("cancelled") + wire::key("native_status") + wire::text("cancelled") + wire::key("hresult") + wire::number(-2147467260) + wire::end()));
             print_job_event(job_id, "job_finished");
@@ -1505,6 +1519,16 @@ private:
             std::unique_lock<std::mutex> lock(monitor_mutex_);
             const auto now = std::chrono::steady_clock::now();
             auto deadline = writer_registry_->next_reap_deadline();
+            {
+                std::lock_guard<std::mutex> jobs_lock(mutex_);
+                if (key_cache_deadline_ && now >= *key_cache_deadline_) {
+                    NCrypto::N7z::ClearGlobalKeyCache();
+                    key_cache_deadline_.reset();
+                }
+                if (key_cache_deadline_ && (!deadline || *key_cache_deadline_ < *deadline)) {
+                    deadline = key_cache_deadline_;
+                }
+            }
             if (space_monitor_->sampling()) {
                 const auto space = now + writer_config_.space_poll_interval;
                 if (!deadline || space < *deadline) deadline = space;
@@ -1519,6 +1543,14 @@ private:
             writer_registry_->reap_idle();
             space_monitor_->tick(std::chrono::steady_clock::now());
         }
+    }
+
+    bool finish_attempt_locked() noexcept {
+        if (--active_jobs_ == 0 && NCrypto::N7z::HasGlobalKeyCache()) {
+            key_cache_deadline_ = std::chrono::steady_clock::now() + writer_config_.idle_timeout;
+            return true;
+        }
+        return false;
     }
 
     // Fallback routing key: an unknown volume gets its own isolated facility rather than sharing another volume's writer.
@@ -1560,7 +1592,7 @@ private:
                 }
 
                 job = pop_next_job_locked();
-                active_jobs_ += 1;
+                if (active_jobs_++ == 0) key_cache_deadline_.reset();
                 if (queues_empty_locked()) {
                     // On canceling shutdown the first broadcast can reach
                     // idle workers before a parked job is requeued. Removing
@@ -1582,7 +1614,8 @@ private:
                 if (job.request.report_progress) print_job_event(job.request.job_id, "job_started");
                 job.execution = std::make_unique<JobExecution>(memory_, job.request);
             }
-            int code = -100;
+            RequestOutcome outcome{-100, {}};
+            bool monitor_recheck_needed = true;
             const std::string& job_id = job.request.job_id;
             auto &memory_job = job.execution->memory;
             memory_.begin(memory_job);
@@ -1599,9 +1632,9 @@ private:
                 sunpack::sevenzip::ExtractionReplayScope replay_scope(&job.execution->replay);
                 try {
                     if (replaying && !job.cancel_token->load(std::memory_order_acquire) && !job.execution->inputs_unchanged()) {
-                        code = 1;
-                        print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
-                            (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("input_changed") + wire::key("failure_stage") + wire::text("native_replay") + wire::key("message") + wire::text("archive input changed while waiting for memory; rescan required") + wire::end()));
+                        sunpack::sevenzip::NativeMemoryScope response_memory(nullptr);
+                        outcome = {1, (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+                            (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("input_changed") + wire::key("failure_stage") + wire::text("native_replay") + wire::key("message") + wire::text("archive input changed while waiting for memory; rescan required") + wire::end())};
                     } else if (!job.request.scan_only) {
                         const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
                         auto lease = writer_registry_->acquire(key);
@@ -1609,35 +1642,46 @@ private:
                         const auto weak = std::weak_ptr<sunpack::sevenzip::AsyncFileWriter>(lease.writer_pointer());
                         memory_.set_wake(memory_job, [weak] { if (auto writer = weak.lock()) writer->wake_waiters(); });
                         if (job.cancel_token->load(std::memory_order_acquire)) memory_job.cancel->store(true, std::memory_order_release);
-                        sunpack::sevenzip::SpaceJobRegistration registration(lease, job_id);
-                        code = run_request(job.request, lease.writer_pointer(), memory_job.cancel);
-                    } else code = run_request(job.request, nullptr, memory_job.cancel);
+                        std::optional<sunpack::sevenzip::SpaceJobRegistration> registration(std::in_place, lease, job_id);
+                        auto writer = lease.writer_pointer();
+                        outcome = run_request(job.request, writer, memory_job.cancel, [&] {
+                            registration.reset();
+                            writer.reset();
+                            lease.reset();
+                            request_monitor_recheck();
+                            monitor_recheck_needed = false;
+                        });
+                    } else outcome = run_request(job.request, nullptr, memory_job.cancel);
+                    if (outcome.response.size() > UINT32_MAX) {
+                        outcome = {-100, {}};
+                    }
                 } catch (const std::bad_alloc&) {
                     memory_.retry(memory_job);
-                    code = kMemoryRetry;
+                    outcome.code = kMemoryRetry;
                 } catch (const std::system_error &error) {
                     // MSVC std::thread reports _beginthreadex exhaustion as
                     // EAGAIN, including a failed small stack/CRT allocation.
                     // Writer-facility threads do not use the SDK allocator.
                     if (error.code() == std::errc::resource_unavailable_try_again) {
                         memory_.retry(memory_job);
-                        code = kMemoryRetry;
+                        outcome.code = kMemoryRetry;
                         print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(job_id) +
                             (wire::key("event") + wire::text("memory_thread_resource_retry") + wire::key("error_code")) +
                             wire::number(error.code().value()) + wire::end());
                     }
-                } catch (...) { code = -100; }
-            }
-            if (code == -100) {
-                print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
-                    (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("native_exception") + wire::key("failure_stage") + wire::text("native_execution") + wire::key("message") + wire::text("unexpected native execution exception") + wire::end()));
+                } catch (...) { outcome.code = -100; }
             }
             // Pending output and decoder threads have drained. Parked tasks
             // retain neither dictionaries, writer leases nor execution threads.
             cpu_budget_.release(1);
             memory_.end(memory_job);
-            request_monitor_recheck();
-            if (code == kMemoryRetry) {
+            if (outcome.code == kMemoryRetry) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    monitor_recheck_needed = finish_attempt_locked() || monitor_recheck_needed;
+                    ++parked_jobs_;
+                }
+                if (monitor_recheck_needed) request_monitor_recheck();
                 print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(job_id) +
                     (wire::key("event") + wire::text("memory_reclaimed") + wire::key("required_bytes")) + wire::number(memory_job.required) + wire::end());
                 auto parked = std::make_shared<Job>(std::move(job));
@@ -1650,11 +1694,6 @@ private:
                         wire::key("required_bytes") + wire::number(needed) +
                         wire::key("available_bytes") + wire::number((std::max)(headroom, std::int64_t{0})) + wire::end());
                 };
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    --active_jobs_;
-                    ++parked_jobs_;
-                }
                 memory_.park(memory_job, *parked->cancel_token, [this, parked](bool ready) {
                     if (!ready) parked->cancel_token->store(true, std::memory_order_release);
                     {
@@ -1671,9 +1710,9 @@ private:
             bool drained = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                active_jobs_ = active_jobs_ > 0 ? active_jobs_ - 1 : 0;
+                monitor_recheck_needed = finish_attempt_locked() || monitor_recheck_needed;
                 drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
-                any_job_failed_ = any_job_failed_ || code != 0;
+                any_job_failed_ = any_job_failed_ || outcome.code != 0;
             }
             if (!job_id.empty()) {
                 std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
@@ -1681,12 +1720,20 @@ private:
             }
             const auto finished_job_id = std::move(job.request.job_id);
             job = {};
+            if (monitor_recheck_needed) request_monitor_recheck();
 
             // cpu_budget_.release(1) wakes at most one queued admission waiter.
             // Drain waiters use a separate condition variable, while the
             // low-frequency monitor is touched only on active/idle edges.
             if (drained) {
                 drain_condition_.notify_all();
+            }
+            if (outcome.code == -100) {
+                print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(finished_job_id) +
+                    (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("native_exception") + wire::key("failure_stage") + wire::text("native_execution") + wire::key("message") + wire::text("unexpected native execution exception") + wire::end()));
+            } else {
+                const auto response = std::move(outcome.response);
+                print_frame(response);
             }
             print_job_event(finished_job_id, "job_finished");
         }
@@ -1724,6 +1771,8 @@ private:
     const std::size_t queue_capacity_;
     sunpack::sevenzip::NativeCpuBudget cpu_budget_;
     std::size_t active_jobs_ = 0;
+    // Armed only when the last executing attempt leaves a populated cache.
+    std::optional<std::chrono::steady_clock::time_point> key_cache_deadline_;
     std::size_t parked_jobs_ = 0;
     bool any_job_failed_ = false;
     bool stopping_ = false;

@@ -96,9 +96,7 @@ fn lifetime_waits_for_first_lease_and_exits_on_stop_or_last_client() {
     // cannot run journal commands without a lease.
     let mut probe = Request::simple(Opcode::ProbeVolume, 2);
     probe.volume_guid = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}";
-    unleased
-        .write_all(&probe.encode().unwrap())
-        .unwrap();
+    unleased.write_all(&probe.encode().unwrap()).unwrap();
     let mut response = [0; RESPONSE_BYTES];
     unleased.read_exact(&mut response).unwrap();
     assert_eq!(
@@ -291,9 +289,16 @@ fn dispatcher_schedules_expiry_and_preserves_in_use_readers() {
     assert_eq!(dispatcher.reap_idle(deadline).unwrap(), None);
     assert_eq!(dispatcher.entries.lock().unwrap().capacity(), 0);
     assert_eq!(Arc::strong_count(&reader), 1);
-    dispatcher.update_cache(&key, &reader, true, deadline).unwrap();
-    assert_eq!(dispatcher.reap_idle(deadline).unwrap(), Some(deadline + VOLUME_CONTEXT_IDLE_TTL));
-    dispatcher.update_cache(&key, &reader, false, deadline).unwrap();
+    dispatcher
+        .update_cache(&key, &reader, true, deadline)
+        .unwrap();
+    assert_eq!(
+        dispatcher.reap_idle(deadline).unwrap(),
+        Some(deadline + VOLUME_CONTEXT_IDLE_TTL)
+    );
+    dispatcher
+        .update_cache(&key, &reader, false, deadline)
+        .unwrap();
     assert_eq!(dispatcher.entries.lock().unwrap().capacity(), 0);
 }
 
@@ -305,25 +310,38 @@ fn directory_query_is_one_message_and_keeps_wire_indices() {
         let id = if index == 2048 { 42 } else { index };
         (u128::MAX - id).to_le_bytes()
     });
-    let body: Vec<u8> = 17u64.to_le_bytes().into_iter()
+    let body: Vec<u8> = 17u64
+        .to_le_bytes()
+        .into_iter()
         .chain(ids.flatten())
         .collect();
     let announced = (body.len() as u32).to_le_bytes();
     let mut oversized = body.clone();
     oversized.push(0);
-    for body in [&body[..], &body[..body.len() - FILE_ID_BYTES], &oversized[..]] {
+    for body in [
+        &body[..],
+        &body[..body.len() - FILE_ID_BYTES],
+        &oversized[..],
+    ] {
         let mut messages = [announced.as_slice(), body].into_iter();
-        let mut message = messages.next().unwrap();
-        let result = read_directory_query(|buffer| {
-            let size = buffer.len().min(message.len());
-            buffer[..size].copy_from_slice(&message[..size]);
-            message = &message[size..];
-            if message.is_empty() {
-                message = messages.next().unwrap_or_default();
-                return Ok(IoResult::Completed(size));
-            }
-            Ok(IoResult::MoreData)
-        }).unwrap();
+        let message = std::cell::Cell::new(messages.next().unwrap());
+        let reads = std::cell::Cell::new(0);
+        let result = read_directory_query(
+            |buffer| {
+                reads.set(reads.get() + 1);
+                let current = message.get();
+                let size = buffer.len().min(current.len());
+                buffer[..size].copy_from_slice(&current[..size]);
+                if size == current.len() {
+                    message.set(messages.next().unwrap_or_default());
+                    return Ok(IoResult::Completed(size));
+                }
+                message.set(&current[size..]);
+                Ok(IoResult::MoreData)
+            },
+            || Ok(message.get().len()),
+        )
+        .unwrap();
         if body.len() == u32::from_le_bytes(announced) as usize {
             let query = result.unwrap();
             assert_eq!(query.journal, 17);
@@ -332,6 +350,11 @@ fn directory_query_is_one_message_and_keeps_wire_indices() {
             assert_eq!(query.parents[&(u128::MAX - 1024).to_le_bytes()], 1024);
         } else {
             assert!(result.is_none());
+            assert_eq!(
+                reads.get(),
+                2,
+                "reject after reading only the first fragment"
+            );
         }
     }
 }

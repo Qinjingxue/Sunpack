@@ -178,6 +178,16 @@ fn request_notifications_are_separate_from_physical_family_leases() {
 }
 
 #[test]
+fn split_failure_suffixes_preserve_disguises_and_unicode_decimal_digits() {
+    for path in [r"C:\folder.part1.rar\archive.PaRt١٢.RaR.cover", "archive.z０१", "archive.९८७.bin", "archive.001"] {
+        assert!(looks_like_split_archive_name(path), "{path}");
+    }
+    for path in [r"C:\folder.part1.rar\archive.bin", "archive.z01.bin", "archive.¹²³", "archive.001.", "archive.part1.rar.bin.txt"] {
+        assert!(!looks_like_split_archive_name(path), "{path}");
+    }
+}
+
+#[test]
 fn worker_failure_proof_survives_json_and_streamed_report() {
     let cases = [
         (json!({"failure_kind":"resource_unavailable", "hresult":-2147024882i64}), None,
@@ -1700,6 +1710,9 @@ fn recursive_discovery_waits_for_consent_and_releases_the_manifest() {
             assert_eq!(engine.recent_passwords().as_slice(), [Arc::<str>::from("secret")]);
             assert!(!nested.tasks.is_empty(), "approved archive was not discovered");
             assert!(nested.scan_errors.is_empty(), "departed carrier reported as unreadable");
+            engine.clear_idle_caches();
+            assert!(engine.recent_passwords().is_empty());
+            assert_eq!(run.candidates.for_embedded(&source.to_string_lossy()), [Arc::<str>::from("secret")]);
         } else {
             assert!(engine.recent_passwords().is_empty());
             assert!(nested.tasks.is_empty());

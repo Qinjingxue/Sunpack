@@ -225,7 +225,7 @@ fn probe_candidate(path: &std::path::Path, since_usn: Option<i64>)
     -> std::io::Result<(Option<WatchCandidateRow>, Instant, f64)> {
     #[cfg(test)]
     if let Some(result) = super::quiet_replay::probe(path, since_usn) { return Ok(result); }
-    let candidate = crate::postprocess::watch_candidate_for_path(path, since_usn)?;
+    let candidate = crate::postprocess::watch_candidate_for_observation(path, since_usn)?;
     Ok((candidate, Instant::now(), super::windows::monotonic_seconds()))
 }
 

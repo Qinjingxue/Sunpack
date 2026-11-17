@@ -161,6 +161,18 @@ static CKeyInfoCache g_GlobalKeyCache(32);
   #define MT_LOCK
 #endif
 
+bool HasGlobalKeyCache() noexcept
+{
+  MT_LOCK
+  return !g_GlobalKeyCache.IsEmpty();
+}
+
+void ClearGlobalKeyCache() noexcept
+{
+  MT_LOCK
+  g_GlobalKeyCache.Clear();
+}
+
 CBase::CBase():
   _cachedKeys(16),
   _ivSize(0)

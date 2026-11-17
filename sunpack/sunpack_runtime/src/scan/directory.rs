@@ -1037,10 +1037,11 @@ fn populate_relation_anchors_cached(
     if !records.iter().any(needs_anchor) {
         return;
     }
-    // A conflicting promotion retains the original per-file error/retry path.
-    let scope = root.and_then(|root| NativeReadScope::new(Path::new(root)).ok());
     let cancellation = crate::io::cancellation::Cancellation::current();
     cheap_fast_probe_pool().install(|| {
+        // The calling Rayon worker can run cleanup while waiting for this pool.
+        // Keep the guard on the probe worker so cleanup can wait for it safely.
+        let scope = root.and_then(|root| NativeReadScope::new(Path::new(root)).ok());
         records
             .par_iter_mut()
             .enumerate()

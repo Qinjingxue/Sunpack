@@ -36,7 +36,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
@@ -262,9 +262,10 @@ fn serve_client(
                     leased = true;
                 }
                 let query = if request.opcode == Opcode::ReadDirectoriesChanges {
-                    let Some(query) = read_directory_query(|buffer| {
-                        read_overlapped(pipe.raw(), stop_event, io_event.raw(), buffer)
-                    })?
+                    let Some(query) = read_directory_query(
+                        |buffer| read_overlapped(pipe.raw(), stop_event, io_event.raw(), buffer),
+                        || remaining_pipe_message_bytes(pipe.raw()),
+                    )?
                     else {
                         break;
                     };
@@ -299,6 +300,7 @@ struct DirectoryQuery {
 
 fn read_directory_query(
     mut read: impl FnMut(&mut [u8]) -> io::Result<IoResult>,
+    remaining_message_bytes: impl FnOnce() -> io::Result<usize>,
 ) -> io::Result<Option<DirectoryQuery>> {
     let mut length = [0u8; 4];
     if !matches!(read(&mut length)?, IoResult::Completed(4)) {
@@ -319,6 +321,12 @@ fn read_directory_query(
     if !receive_query_fragment(read(&mut buffer[..first])?, first, length) {
         return Ok(None);
     }
+    let mut remaining = length - first;
+    // MORE_DATA confirms there is a remainder of this same pipe message.
+    // Check its size before reserving the index for a large client request.
+    if remaining != 0 && remaining_message_bytes()? != remaining {
+        return Ok(None);
+    }
     let journal = u64::from_le_bytes(buffer[..8].try_into().unwrap());
     let mut parents = HashMap::with_capacity((length - 8) / FILE_ID_BYTES);
     let mut next_index = 0;
@@ -329,7 +337,6 @@ fn read_directory_query(
         }
     };
     insert(&buffer[8..first]);
-    let mut remaining = length - first;
     while remaining != 0 {
         let size = remaining.min(buffer.len() - 8);
         if !receive_query_fragment(read(&mut buffer[..size])?, size, remaining) {
@@ -339,6 +346,14 @@ fn read_directory_query(
         remaining -= size;
     }
     Ok(Some(DirectoryQuery { journal, parents }))
+}
+
+fn remaining_pipe_message_bytes(pipe: HANDLE) -> io::Result<usize> {
+    let mut remaining = 0;
+    if unsafe { PeekNamedPipe(pipe, null_mut(), 0, null_mut(), null_mut(), &mut remaining) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(remaining as usize)
 }
 
 fn receive_query_fragment(result: IoResult, size: usize, remaining: usize) -> bool {
@@ -430,7 +445,9 @@ impl JournalDispatcher {
             return Ok(Arc::clone(reader));
         }
         drop(entries);
-        Ok(Arc::new(Mutex::new(JournalReader::new(volume_guid.into())?)))
+        Ok(Arc::new(Mutex::new(JournalReader::new(
+            volume_guid.into(),
+        )?)))
     }
 
     fn update_cache(
@@ -499,8 +516,9 @@ impl JournalDispatcher {
             }
             // Synchronous operations on one volume handle serialize in
             // Windows. Use a separate handle for overlapping requests.
-            Err(TryLockError::WouldBlock) => JournalReader::new(volume_guid.into())
-                .and_then(|mut reader| operation(&mut reader)),
+            Err(TryLockError::WouldBlock) => {
+                JournalReader::new(volume_guid.into()).and_then(|mut reader| operation(&mut reader))
+            }
             Err(TryLockError::Poisoned(_)) => Err(io::Error::other("journal state poisoned")),
         };
         result

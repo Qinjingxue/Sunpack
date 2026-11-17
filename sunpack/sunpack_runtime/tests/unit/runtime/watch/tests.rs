@@ -332,6 +332,19 @@ fn candidate_wait_history_survives_pending_retirement_and_expires_with_a_bound()
     history.clear_expired(at + std::time::Duration::from_secs(30));
     assert!(history.paths.is_empty());
     assert!(history.deadline().is_none());
+    let child = r"C:\retired\pending.zip";
+    let sibling = r"C:\retired-other\pending.zip";
+    for path in [child, sibling] {
+        history.log_wait(&journal, at, path, path, None);
+        history.log_observation(&journal, at, path, path, &error, None);
+    }
+    history.retire_path(r"C:\retired", true);
+    assert!(!history.paths.contains_key(child));
+    assert_eq!(history.len(), 2);
+    assert!(history.paths.contains_key(sibling));
+    history.retire_path(sibling, false);
+    assert_eq!(history.paths.capacity(), 0);
+    assert!(history.deadline().is_none());
     drop(journal);
     fs::remove_dir_all(directory).unwrap();
     fs::remove_file(marker).unwrap();

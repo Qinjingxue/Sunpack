@@ -1,4 +1,71 @@
 #[test]
+fn queued_relation_probe_does_not_block_same_root_promotion() {
+    use super::*;
+    use crate::io::resource_lifecycle::Promotion;
+    use std::sync::{Barrier, mpsc};
+    use std::time::Duration;
+
+    let root = crate::test_support::temp_file("queued_relation_probe", b"");
+    fs::remove_file(&root).unwrap();
+    fs::create_dir(&root).unwrap();
+    let source = root.join("source.zip");
+    fs::write(&source, b"source bytes").unwrap();
+
+    let caller = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let probes = cheap_fast_probe_pool();
+    let entered = Arc::new(Barrier::new(probes.current_num_threads() + 1));
+    let resume = Arc::new(Barrier::new(probes.current_num_threads() + 1));
+    let queued = Arc::clone(&entered);
+    let blocked = Arc::clone(&resume);
+    probes.spawn_broadcast(move |_| {
+        queued.wait();
+        blocked.wait();
+    });
+    entered.wait();
+
+    let (started, starting) = mpsc::channel();
+    let (probe_done, probe_result) = mpsc::channel();
+    let root_path = root.to_str().unwrap().to_owned();
+    let source_path = source.to_str().unwrap().to_owned();
+    caller.spawn(move || {
+        let mut record = DirectoryEntryRecord {
+            path: source_path,
+            is_dir: false,
+            size: Some(12),
+            mtime_ns: None,
+            relation_member_eligible: true,
+            relation_anchor: None,
+        };
+        started.send(()).unwrap();
+        populate_relation_anchors_cached(std::slice::from_mut(&mut record), &[], Some(&root_path));
+        probe_done.send(record.relation_anchor.is_some()).unwrap();
+    });
+    starting.recv().unwrap();
+
+    // The caller pool has one worker. It can service this second job only
+    // by re-entering while the first waits for the still-blocked probe pool.
+    let (reentered, reentry) = mpsc::channel();
+    caller.spawn(move || reentered.send(()).unwrap());
+    reentry.recv().unwrap();
+
+    let (promotion_done, promotion_result) = mpsc::channel();
+    let target = source.clone();
+    let promotion = std::thread::spawn(move || {
+        let result = Promotion::begin([target]).map(drop);
+        promotion_done.send(result).unwrap();
+    });
+    let before_probe = promotion_result.recv_timeout(Duration::from_secs(5));
+    // Always release the probe workers, including when the old ownership
+    // causes the promotion to wait. The test can then fail without hanging.
+    resume.wait();
+    promotion.join().unwrap();
+    assert!(probe_result.recv().unwrap());
+    fs::remove_file(source).unwrap();
+    fs::remove_dir(root).unwrap();
+    before_probe.expect("promotion waited on a probe that had not started").unwrap();
+}
+
+#[test]
 fn refresh_rescans_when_output_is_published_after_enumeration() {
     use super::*;
     use crate::scan::scope::NativeDiscoveryScope;

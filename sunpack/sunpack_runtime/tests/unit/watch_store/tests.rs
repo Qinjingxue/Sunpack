@@ -93,6 +93,9 @@ fn carrier_outputs_survive_snapshot_and_incremental_replay() {
     assert!(pending.committed_roots.contains(&moved));
     assert_eq!(pending.output_identities[&moved], "moved-id");
     assert!(!pending.output_identities.contains_key(&second));
+    drop(pending);
+    resumed.apply(&NativeWatchOperations::finish_pending(&owner, None));
+    assert_eq!(resumed.lock().pending.capacity(), 0);
     fs::remove_file(snapshot).unwrap();
     fs::remove_file(journal).unwrap();
 }
@@ -145,6 +148,7 @@ fn recovery_publication_orders_concurrent_blocker_changes() {
         state.with_event_projection(|rows| {
             if delete {
                 assert!(rows.is_empty());
+                assert_eq!(state.lock().entries.capacity(), 0);
             } else {
                 assert_eq!(rows[0]["event"], "suspended_missing_volume");
             }

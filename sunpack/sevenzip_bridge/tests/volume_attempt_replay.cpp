@@ -147,10 +147,10 @@ void request_recovery(const std::filesystem::path& archive, const std::filesyste
     withdrawing_job = &job;
     std::ostringstream output;
     auto* previous = std::cout.rdbuf(output.rdbuf());
-    auto code = run_request(request, nullptr, job.cancel);
+    auto outcome = run_request(request, nullptr, job.cancel);
     std::cout.rdbuf(previous);
     require(injected, "did not reach cursor enumeration");
-    require(code == kMemoryRetry, "withdrawal did not request a retry");
+    require(outcome.code == kMemoryRetry && outcome.response.empty(), "withdrawal did not request a retry");
     check_final_results(output, 0);
     require(replay.volumes.attempts == (after_failure ? 1 : 0), "withdrawal counted an unfinished candidate");
     manager.end(job);
@@ -164,18 +164,19 @@ void request_recovery(const std::filesystem::path& archive, const std::filesyste
     if (user_cancel) job.cancel->store(true); // Same persistent-token projection as the executor.
     output.str("");
     previous = std::cout.rdbuf(output.rdbuf());
-    code = run_request(request, nullptr, job.cancel);
+    outcome = run_request(request, nullptr, job.cancel);
     std::cout.rdbuf(previous);
     if (user_cancel) {
-        require(code == -101, "user cancellation was mistaken for resource retry");
+        require(outcome.code == -101, "user cancellation was mistaken for resource retry");
     } else {
-        if (code != 0) std::cerr << output.str();
-        require(code == 0 && replay.volumes.selected == std::vector<std::size_t>{0, 1}, "replay lost the valid composition");
+        require(outcome.code == 0 && replay.volumes.selected == std::vector<std::size_t>{0, 1}, "replay lost the valid composition");
         require(replay.volumes.attempts == (after_failure ? 2 : 1), "replay repeated a rejected composition");
         std::ifstream member(destination / L"ok.txt", std::ios::binary);
         std::string contents((std::istreambuf_iterator<char>(member)), {});
         require(contents == "cursor replay", "replayed composition wrote incorrect output");
     }
+    check_final_results(output, 0);
+    wire::write(output, outcome.response);
     check_final_results(output, 1, user_cancel ? "cancelled" : "ok");
     manager.end(job);
 }

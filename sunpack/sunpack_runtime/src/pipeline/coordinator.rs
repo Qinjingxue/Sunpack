@@ -383,8 +383,11 @@ impl Engine {
         }
     }
 
-    pub(crate) fn clear_idle_output_history(&self) {
+    pub(crate) fn clear_idle_caches(&self) {
+        crate::relations::clear_regex_caches();
+        crate::formats::seven_zip::clear_seven_zip_kdf_cache();
         self.output_names.lock().unwrap().clear_history();
+        self.recent_passwords.clear();
     }
 
     pub(crate) fn recent_passwords(&self) -> Vec<Arc<str>> {
@@ -3587,10 +3590,30 @@ fn weak_password_failure(result: &Value, evidence: Option<&str>) -> bool {
 // main also recognizes a split-style filename for conflicting native damage
 // and password evidence, even when relation discovery proved a standalone file.
 fn looks_like_split_archive_name(path: &str) -> bool {
-    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    fn has_digits(value: &str, count: usize) -> bool {
+        let mut chars = value.chars();
+        (0..count).all(|_| chars.next().and_then(crate::core::config::decimal_digit).is_some())
+            && chars.next().is_none()
+    }
+    fn rar_part(stem: &str) -> bool {
+        let Some((_, marker)) = stem.rsplit_once('.') else { return false; };
+        let Some(prefix) = marker.get(..4) else { return false; };
+        let digits = &marker[4..];
+        prefix.eq_ignore_ascii_case("part") && !digits.is_empty()
+            && digits.chars().all(|c| crate::core::config::decimal_digit(c).is_some())
+    }
     let name = Path::new(path).file_name().unwrap_or_default().to_string_lossy();
-    PATTERN.get_or_init(|| regex::Regex::new(
-        r"(?i)(\.part\d+\.rar(?:\.[^.]+)?|\.z\d{2}|\.\d{3}(?:\.[^.]+)?)$").unwrap()).is_match(&name)
+    let Some((base, suffix)) = name.rsplit_once('.') else { return false; };
+    if has_digits(suffix, 3)
+        || (suffix.as_bytes().first().is_some_and(|b| b.eq_ignore_ascii_case(&b'z'))
+            && has_digits(&suffix[1..], 2))
+        || (suffix.eq_ignore_ascii_case("rar") && rar_part(base))
+    {
+        return true;
+    }
+    !suffix.is_empty() && base.rsplit_once('.').is_some_and(|(stem, extension)| {
+        has_digits(extension, 3) || (extension.eq_ignore_ascii_case("rar") && rar_part(stem))
+    })
 }
 
 fn classify_worker_failure(
