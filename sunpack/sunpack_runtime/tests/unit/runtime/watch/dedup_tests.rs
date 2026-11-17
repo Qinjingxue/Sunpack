@@ -75,8 +75,13 @@ fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     index.finish_rebuild().unwrap();
     let generation = index.generation();
     assert!(!index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap());
+    // Represent the space left by a large, now obsolete journal incarnation.
+    index.records.reserve(2048);
+    index.objects.reserve(2048);
     assert!(index.reconcile_journals(&[("scope".into(), "test-volume".into(), 2)]).unwrap());
     assert!(index.records.is_empty() && index.needs_rebuild());
+    assert_eq!(index.records.capacity(), 0);
+    assert_eq!(index.objects.capacity(), 0);
     assert_eq!(index.journals["other-scope"].1, 2);
     assert!(index.admission_epoch("scope", Some(generation)).is_none());
     assert!(!admit(&mut index, &first, true));
@@ -349,13 +354,13 @@ fn byte_stream_identity_ignores_carrier_and_split_boundaries_but_tracks_every_so
         .map(|path| InputPart::range(InputExtent { path, start: 0, end: None })).collect::<Vec<_>>().into();
     assert!(admit(&mut index, &split, false));
     let one = dir.file("other-1", b"A"); let two = dir.file("other-2", b"BCDEF");
-    let mut other = one.clone(); other.mode = OpenMode::ConcatRanges;
-    other.ranges = vec![InputExtent { path: one.entry_path.clone(), start: 0, end: Some(1) },
-        InputExtent { path: two.entry_path.clone(), start: 0, end: Some(5) }].into();
+    let mut other = one.clone(); other.mode = OpenMode::NativeVolumes;
+    other.parts = [InputExtent { path: one.entry_path.clone(), start: 0, end: Some(1) },
+        InputExtent { path: two.entry_path.clone(), start: 0, end: Some(5) }].into_iter().map(InputPart::range).collect();
     assert!(admit(&mut index, &other, false));
-    let mut reversed = right.clone(); reversed.mode = OpenMode::ConcatRanges;
-    reversed.ranges = vec![InputExtent { path: right.entry_path.clone(), start: 0, end: Some(3) },
-        InputExtent { path: left.entry_path.clone(), start: 0, end: Some(3) }].into();
+    let mut reversed = right.clone(); reversed.mode = OpenMode::NativeVolumes;
+    reversed.parts = [InputExtent { path: right.entry_path.clone(), start: 0, end: Some(3) },
+        InputExtent { path: left.entry_path.clone(), start: 0, end: Some(3) }].into_iter().map(InputPart::range).collect();
     assert!(!admit(&mut index, &reversed, false));
     // Two independent logical inputs are still compared as the requested ordered stream.
     let multi_owner = dir.0.join("group").to_string_lossy().into_owned();
@@ -375,12 +380,13 @@ fn byte_stream_identity_ignores_carrier_and_split_boundaries_but_tracks_every_so
 }
 #[test]
 fn recursion_scope_removes_whole_cross_level_input_and_persists_removal() {
-    use crate::io::archive_state::InputExtent;
+    use crate::io::archive_state::{InputExtent, InputPart};
     for scope_mode in [WatchDeduplicationScope::Root, WatchDeduplicationScope::Global] {
         let dir = Sandbox::new(); fs::create_dir_all(dir.0.join("child")).unwrap();
         let head = dir.file("head", b"ABC"); let tail = dir.file("child/tail", b"DEF");
-        let mut input = head.clone(); input.mode = OpenMode::ConcatRanges;
-        input.ranges = vec![InputExtent { path: head.entry_path.clone(), start: 0, end: Some(3) }, InputExtent { path: tail.entry_path.clone(), start: 0, end: Some(3) }].into();
+        let mut input = head.clone(); input.mode = OpenMode::NativeVolumes;
+        input.parts = [InputExtent { path: head.entry_path.clone(), start: 0, end: Some(3) },
+            InputExtent { path: tail.entry_path.clone(), start: 0, end: Some(3) }].into_iter().map(InputPart::range).collect();
         let recursive = NativeDiscoveryScope::new(dir.0.to_string_lossy().into_owned(), None, vec![]);
         let flat = NativeDiscoveryScope::new(dir.0.to_string_lossy().into_owned(), Some(0), vec![]);
         let folder = dir.0.join("index");

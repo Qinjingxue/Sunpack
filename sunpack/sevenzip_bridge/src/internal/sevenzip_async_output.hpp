@@ -32,12 +32,14 @@
 
 namespace sunpack::sevenzip
 {
+#ifdef SUP7Z_DEBUG
     struct ArchiveMetadataErrors
     {
         DWORD time = 0;
         DWORD attributes = 0;
         DWORD first_error() const noexcept { return time ? time : attributes; }
     };
+#endif
 
     struct ArchiveItemMetadata
     {
@@ -50,10 +52,15 @@ namespace sunpack::sevenzip
 
         bool has_times() const noexcept { return (defined & (Creation | Access | Modification)) != 0; }
 
-        ArchiveMetadataErrors restore(HANDLE handle) const noexcept
+        void restore(HANDLE handle
+#ifdef SUP7Z_DEBUG
+                     , ArchiveMetadataErrors *errors = nullptr
+#endif
+        ) const noexcept
         {
             const DWORD flags = basic_attributes();
-            if (flags && has_times())
+            const bool times = has_times();
+            if (flags && times)
             {
                 FILE_BASIC_INFO info{};
                 info.FileAttributes = flags;
@@ -62,13 +69,30 @@ namespace sunpack::sevenzip
                     copy_time(Access, access, info.LastAccessTime) &&
                     copy_time(Modification, modification, info.LastWriteTime))
                 {
-                    if (SetFileInformationByHandle(handle, FileBasicInfo, &info, sizeof(info))) return {};
+                    if (SetFileInformationByHandle(handle, FileBasicInfo, &info, sizeof(info))) return;
                 }
             }
-            // Some filesystems reject the combined update. Preserve independent
-            // restoration and error reporting for each part in that case.
-            const DWORD time_error = set_times(handle);
-            return {time_error, set_basic_attributes(handle, flags)};
+            // Some filesystems reject the combined update. Restore each part
+            // independently so a rejected time does not prevent the attributes.
+            if (times)
+            {
+                [[maybe_unused]] const BOOL ok = SetFileTime(handle,
+                    (defined & Creation) ? &creation : nullptr,
+                    (defined & Access) ? &access : nullptr,
+                    (defined & Modification) ? &modification : nullptr);
+#ifdef SUP7Z_DEBUG
+                if (errors && !ok) errors->time = GetLastError();
+#endif
+            }
+            if (flags)
+            {
+                FILE_BASIC_INFO info{};
+                info.FileAttributes = flags;
+                [[maybe_unused]] const BOOL ok = SetFileInformationByHandle(handle, FileBasicInfo, &info, sizeof(info));
+#ifdef SUP7Z_DEBUG
+                if (errors && !ok) errors->attributes = GetLastError();
+#endif
+            }
         }
 
     private:
@@ -79,16 +103,6 @@ namespace sunpack::sevenzip
             destination.HighPart = static_cast<LONG>(time.dwHighDateTime);
             destination.LowPart = time.dwLowDateTime;
             return true;
-        }
-
-        DWORD set_times(HANDLE handle) const noexcept
-        {
-            if (!has_times() || SetFileTime(handle,
-                    (defined & Creation) ? &creation : nullptr,
-                    (defined & Access) ? &access : nullptr,
-                    (defined & Modification) ? &modification : nullptr))
-                return ERROR_SUCCESS;
-            return GetLastError();
         }
 
         DWORD basic_attributes() const noexcept
@@ -105,15 +119,6 @@ namespace sunpack::sevenzip
             return value ? value : FILE_ATTRIBUTE_NORMAL;
         }
 
-        static DWORD set_basic_attributes(HANDLE handle, DWORD flags) noexcept
-        {
-            if (!flags) return ERROR_SUCCESS;
-            FILE_BASIC_INFO info{};
-            info.FileAttributes = flags;
-            if (SetFileInformationByHandle(handle, FileBasicInfo, &info, sizeof(info)))
-                return ERROR_SUCCESS;
-            return GetLastError();
-        }
     };
 
     class AsyncFileWriter final
@@ -169,7 +174,7 @@ namespace sunpack::sevenzip
             std::vector<unsigned char> magic;
             bool failed = false;
             bool closed = false;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             ArchiveMetadataErrors metadata_errors;
             int win32_error = 0;
             UInt64 accepted_bytes = 0;
@@ -177,7 +182,7 @@ namespace sunpack::sevenzip
 #endif
         };
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         struct WriterMeterSnapshot
         {
             std::uint64_t accepted_bytes;
@@ -277,7 +282,7 @@ namespace sunpack::sevenzip
             Buffer *staging_buffer = nullptr;
             std::size_t inflight_bytes = 0;
             std::size_t outstanding_data = 0;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             UInt64 accepted_bytes = 0;
             std::size_t active_data_writes = 0;
             std::size_t peak_active_data_writes = 0;
@@ -285,7 +290,7 @@ namespace sunpack::sevenzip
             UInt64 written_bytes = 0;
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             int win32_error = 0;
             ArchiveMetadataErrors metadata_errors;
 #endif
@@ -435,7 +440,7 @@ namespace sunpack::sevenzip
             if (file->staging_buffer && file->staging_buffer->size && !enqueue_staging_locked(file, true))
                 return terminal_result_locked(file->job);
             file->next_write_offset += size;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             file->accepted_bytes += size;
 #endif
             return S_OK;
@@ -619,7 +624,7 @@ namespace sunpack::sevenzip
                             ++file->outstanding_data;
                         }
                         file->new_writes = true;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
                         file->accepted_bytes += chunk;
                         test_accepted_bytes_.fetch_add(chunk, std::memory_order_relaxed);
                         test_pending_bytes_.fetch_add(chunk, std::memory_order_relaxed);
@@ -725,7 +730,7 @@ namespace sunpack::sevenzip
 
             const HRESULT result = terminal_result_locked(job);
             unregister_job_locked(job);
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             if (result == S_OK)
             {
                 test_completed_jobs_.fetch_add(1, std::memory_order_relaxed);
@@ -817,7 +822,7 @@ namespace sunpack::sevenzip
             return true;
         }
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         bool has_active_jobs() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -874,7 +879,7 @@ namespace sunpack::sevenzip
             snapshot.magic = std::move(file->magic);
             snapshot.failed = file->failed;
             snapshot.closed = file->closed;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             snapshot.metadata_errors = file->metadata_errors;
             snapshot.win32_error = file->win32_error;
             snapshot.accepted_bytes = file->accepted_bytes;
@@ -998,7 +1003,7 @@ namespace sunpack::sevenzip
 
         bool write_through() const noexcept { return config_.write_through; }
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         void account_discarded(std::size_t bytes) noexcept
         {
             test_discarded_bytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -1136,7 +1141,7 @@ namespace sunpack::sevenzip
             file->staging_buffer = nullptr;
             if (buffer->size != 0)
             {
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
                 account_discarded(buffer->size);
 #endif
                 if (file->inflight_bytes >= buffer->size)
@@ -1356,7 +1361,7 @@ namespace sunpack::sevenzip
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure)
                 record_failure(file, HRESULT_FROM_WIN32(result.win32_error), result.win32_error);
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             if (result.kind != AttemptResult::Kind::Succeeded && buffer->size > buffer->transferred)
                 account_discarded(buffer->size - buffer->transferred);
 #endif
@@ -1372,8 +1377,6 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
                 if (file && file->job->pipeline_timing)
                     file->job->pipeline_timing->end(PipelineStage::Output);
-#endif
-#ifdef SUP7Z_TEST_IO_FAULTS
                 end_data_write(file);
 #endif
                 if (error != ERROR_SUCCESS)
@@ -1487,7 +1490,7 @@ namespace sunpack::sevenzip
             {
                 creation_flags |= FILE_FLAG_WRITE_THROUGH;
             }
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             // 整个 FileState 生命周期内 CreateFileW 只应被调用一次。
             if (open_probe_)
             {
@@ -1566,14 +1569,14 @@ namespace sunpack::sevenzip
             {
                 return false;
             }
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             ++file->active_data_writes;
             file->peak_active_data_writes = (std::max)(file->peak_active_data_writes, file->active_data_writes);
 #endif
             return true;
         }
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         void end_data_write(const FileStatePtr &file) noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1586,7 +1589,7 @@ namespace sunpack::sevenzip
 
         void add_written_bytes(const FileStatePtr &file, DWORD written, UInt64 offset = 0) noexcept
         {
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             test_written_bytes_.fetch_add(written, std::memory_order_relaxed);
             test_pending_bytes_.fetch_sub(written, std::memory_order_relaxed);
 #endif
@@ -1619,7 +1622,7 @@ namespace sunpack::sevenzip
             const auto opened = try_open_file(file);
             if (opened.kind != AttemptResult::Kind::Succeeded) return opened;
             if (!begin_data_write(file)) return {AttemptResult::Kind::Terminal, 0};
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             unsigned long injected = 0;
             if (write_fault_.consume(injected))
             {
@@ -1632,11 +1635,9 @@ namespace sunpack::sevenzip
             buffer->request.overlapped.Offset = static_cast<DWORD>(offset);
             buffer->request.overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32U);
             DWORD size = buffer->size - buffer->transferred;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             const auto chunk = max_write_chunk_.load(std::memory_order_relaxed);
             if (chunk && size > chunk) size = chunk;
-#endif
-#ifdef SUP7Z_DEBUG
             if (job->pipeline_timing) job->pipeline_timing->begin(PipelineStage::Output);
 #endif
             const BOOL started = WriteFile(file->handle, buffer->data.get() + buffer->transferred,
@@ -1646,8 +1647,6 @@ namespace sunpack::sevenzip
             {
 #ifdef SUP7Z_DEBUG
                 if (job->pipeline_timing) job->pipeline_timing->end(PipelineStage::Output);
-#endif
-#ifdef SUP7Z_TEST_IO_FAULTS
                 end_data_write(file);
 #endif
                 return classify_data_failure(file, error);
@@ -1658,7 +1657,7 @@ namespace sunpack::sevenzip
 
         bool is_output_space_failure(DWORD error) const noexcept
         {
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             if (failure_classifier_) return failure_classifier_(error);
 #endif
             return is_space_exhaustion_error(error);
@@ -1678,7 +1677,7 @@ namespace sunpack::sevenzip
 
         bool flush_file(HANDLE handle, DWORD &error) noexcept
         {
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             if (flush_fault_.consume(error)) return false;
 #endif
             if (FlushFileBuffers(handle)) return true;
@@ -1742,7 +1741,7 @@ namespace sunpack::sevenzip
                 restore_times = !file->failed && result.kind == AttemptResult::Kind::Succeeded;
                 file->handle = INVALID_HANDLE_VALUE;
             }
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             ArchiveMetadataErrors metadata_errors;
 #endif
             std::optional<UInt64> mtime_ns;
@@ -1752,11 +1751,11 @@ namespace sunpack::sevenzip
                 // SetOperationResult, so timestamp restoration must not depend on it.
                 if (restore_times)
                 {
-#ifdef SUP7Z_TEST_IO_FAULTS
-                    metadata_errors = file->metadata.restore(handle);
-#else
-                    file->metadata.restore(handle);
+                    file->metadata.restore(handle
+#ifdef SUP7Z_DEBUG
+                                           , &metadata_errors
 #endif
+                    );
                 }
                 FILETIME last_write{};
                 if (GetFileTime(handle, nullptr, nullptr, &last_write))
@@ -1782,7 +1781,7 @@ namespace sunpack::sevenzip
             }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
                 file->metadata_errors = metadata_errors;
 #endif
                 if (mtime_ns)
@@ -1791,7 +1790,7 @@ namespace sunpack::sevenzip
                     file->has_mtime_ns = true;
                 }
                 file->closed = true;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
                 if (!file->failed)
                 {
                     test_completed_files_.fetch_add(1, std::memory_order_relaxed);
@@ -1875,7 +1874,7 @@ namespace sunpack::sevenzip
             }
             file->failed = true;
             file->hresult = hr;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             file->win32_error = win32_error;
 #endif
         }
@@ -1901,7 +1900,7 @@ namespace sunpack::sevenzip
         // 必须是 atomic：gate 的 terminal predicate 会无锁读它。
         std::atomic<bool> stopping_{false};
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         std::atomic<std::uint64_t> test_accepted_bytes_{0};
         std::atomic<std::uint64_t> test_written_bytes_{0};
         std::atomic<std::uint64_t> test_discarded_bytes_{0};

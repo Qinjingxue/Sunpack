@@ -613,7 +613,6 @@ fn scan_sparse_layout_is_shared_by_text_and_json() {
     for (mode, origin, start, complete, show_range, show_parts, public_complete) in [
         (OpenMode::FileRange, AnalysisOrigin::Embedded, 64, Complete, true, false, None),
         (OpenMode::FileRange, AnalysisOrigin::Embedded, 0, Complete, true, false, None),
-        (OpenMode::ConcatRanges, AnalysisOrigin::Embedded, 0, Complete, true, false, None),
         (OpenMode::NativeVolumes, AnalysisOrigin::Relations, 0, Complete, false, true, Some("complete")),
         (OpenMode::NativeVolumes, AnalysisOrigin::Relations, 0, Unknown, false, true, None),
         (OpenMode::File, AnalysisOrigin::Plain, 0, Missing, false, true, Some("missing")),

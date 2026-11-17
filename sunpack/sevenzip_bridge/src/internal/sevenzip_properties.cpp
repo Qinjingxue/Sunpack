@@ -72,53 +72,12 @@ namespace sunpack::sevenzip
         value.vt = VT_EMPTY;
     }
 
-    bool get_archive_property_bool(IInArchive *archive, UInt32 prop_id)
-    {
-        PROPVARIANT value{};
-        value.vt = VT_EMPTY;
-        if (archive->GetArchiveProperty(prop_id, &value) != S_OK)
-        {
-            return false;
-        }
-        const bool result = prop_bool(value);
-        clear_prop(value);
-        return result;
-    }
-
     bool get_item_property(IInArchive *archive, UInt32 index, UInt32 prop_id, PROPVARIANT &value)
     {
         value = PROPVARIANT{};
         value.vt = VT_EMPTY;
         return archive->GetProperty(index, prop_id, &value) == S_OK && value.vt != VT_EMPTY;
     }
-
-    bool archive_has_encrypted_items(IInArchive *archive)
-    {
-        UInt32 num_items = 0;
-        if (!archive || archive->GetNumberOfItems(&num_items) != S_OK)
-        {
-            return false;
-        }
-        for (UInt32 index = 0; index < num_items; ++index)
-        {
-            PROPVARIANT value{};
-            if (get_item_property(archive, index, kpidEncrypted, value))
-            {
-                const bool encrypted = prop_bool(value);
-                clear_prop(value);
-                if (encrypted)
-                {
-                    return true;
-                }
-            }
-            else
-            {
-                clear_prop(value);
-            }
-        }
-        return false;
-    }
-
 
 #endif
 

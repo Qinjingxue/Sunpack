@@ -413,8 +413,7 @@ impl Journal {
                 let dir = snapshot.parent().unwrap();
                 let temp = dir.join(SNAPSHOT_TEMP_NAME);
                 let publication = (|| {
-                    drop(File::create(&temp)?);
-                    checkpoint.write(temp.to_string_lossy().into_owned())?;
+                    checkpoint.write(&temp)?;
                     crate::io::atomic_file::replace_once(&temp, &snapshot)?;
                     // Publication must be durable before retiring its WAL prefix.
                     // Windows requires a writable handle for FlushFileBuffers.

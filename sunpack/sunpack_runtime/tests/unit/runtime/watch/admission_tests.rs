@@ -1209,9 +1209,11 @@ fn monitor_disable_preserves_accepted_intent_without_accepting_offline_files() {
     fs::write(&source, b"accepted before disable").unwrap();
     let root = key(&base.join("input"));
     scheduler.enqueue(&root, source.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
+    assert!(scheduler.candidate_diagnostics.admit(admission_now(), &key(&source), 0));
     assert!(scheduler.set_enabled(false).unwrap());
     assert!(!scheduler.enabled());
-    assert!(scheduler.pending.is_empty());
+    assert_eq!(scheduler.pending.capacity(), 0);
+    assert!(scheduler.candidate_diagnostics.paths.is_empty());
     assert!(scheduler.journal.state().pending(source.to_str().unwrap()).is_some());
     let offline = base.join("input/offline.zip");
     fs::write(&offline, b"arrived while explicitly disabled").unwrap();

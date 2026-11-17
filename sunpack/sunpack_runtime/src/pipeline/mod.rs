@@ -301,7 +301,6 @@ pub struct FailureRead {
     pub source_offset: u64,
     pub virtual_offset: u64,
     pub requested: u64,
-    pub returned: u64,
     pub win32_error: i64,
     pub read_error: bool,
 }
@@ -398,7 +397,7 @@ impl ScanLayout {
         let extent = input.physical_extents().next();
         Self {
             range: extent.is_some_and(|extent| extent.start != 0
-                || matches!(input.mode, OpenMode::FileRange | OpenMode::ConcatRanges)
+                || input.mode == OpenMode::FileRange
                 || extent.end.is_some() && input.analysis.origin == AnalysisOrigin::Embedded),
             volumes: !input.volume_style.is_empty() || input.mode.structured(),
         }

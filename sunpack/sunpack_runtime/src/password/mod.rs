@@ -79,21 +79,11 @@ pub(crate) fn verify(
             return Ok(unsupported());
         }
     }
-    let range = if input.mode == OpenMode::File {
-        None
-    } else {
-        let ranges = if input.ranges.is_empty() {
-            input
-                .parts
-                .iter()
-                .map(|part| &part.extent)
-                .collect::<Vec<_>>()
-        } else {
-            input.ranges.iter().collect()
-        };
-        if ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end.is_none() {
-            Some(ranges[0].path.as_str())
-        } else if !ranges.is_empty() {
+    let path = match (input.mode, input.parts.as_ref()) {
+        (OpenMode::File, _) | (_, []) => input.entry_path.as_str(),
+        (_, [part]) if part.extent.start == 0 && part.extent.end.is_none() => part.extent.path.as_str(),
+        _ => {
+            let ranges: Vec<_> = input.physical_extents().collect();
             return match format {
                 "enc" => enc::enc_fast_verify_passwords_from_ranges(preparation, &ranges, passwords, sessions),
                 "rar" => rar::rar_fast_verify_passwords_from_ranges(preparation, &ranges, passwords, sessions),
@@ -110,11 +100,8 @@ pub(crate) fn verify(
                 ),
                 _ => Ok(unsupported()),
             };
-        } else {
-            None
         }
     };
-    let path = range.unwrap_or(&input.entry_path);
     let reader = sessions
         .iter()
         .find_map(|session| {

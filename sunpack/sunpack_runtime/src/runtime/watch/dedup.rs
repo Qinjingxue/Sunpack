@@ -3,13 +3,14 @@ use super::dedup_hash::StreamHash;
 use crate::core::config::{WatchDeduplication, WatchDeduplicationScope};
 use crate::io::archive_state::{ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection};
 use crate::io::reader::PhysicalFileGeneration;
-use crate::path_keys::path_key;
+use crate::collections::{trim_map, SmallOrderedSet};
+use crate::path_keys::{path_ancestors, path_key};
 use crate::postprocess::{mtime_seconds, watch_observed_content_changed};
 use crate::scan::scope::NativeDiscoveryScope;
 use crate::wal::{self, Kind};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{btree_set, BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -177,57 +178,18 @@ pub(super) fn consider(
 type Signature = (u64, u64);
 const STALE_BATCH: usize = 16;
 
-// Most reverse-index keys name a single record. Allocate a tree only when
-// distinct owners actually share a source, physical identity or digest.
-enum RecordIds {
-    One(u64),
-    Many(Box<BTreeSet<u64>>),
-}
-
-impl RecordIds {
-    fn insert(&mut self, id: u64) {
-        match self {
-            Self::One(first) if *first != id => {
-                *self = Self::Many(Box::new(BTreeSet::from([*first, id])));
-            }
-            Self::One(_) => (),
-            Self::Many(ids) => { ids.insert(id); }
-        }
-    }
-
-    /// Returns true when the enclosing map entry can be removed.
-    fn remove(&mut self, id: u64) -> bool {
-        match self {
-            Self::One(first) => *first == id,
-            Self::Many(ids) => {
-                ids.remove(&id);
-                if ids.len() == 1 {
-                    *self = Self::One(*ids.first().unwrap());
-                }
-                false
-            }
-        }
-    }
-
-    fn iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
-        let (one, many): (_, Option<btree_set::Iter<'_, u64>>) = match self {
-            Self::One(id) => (Some(*id), None),
-            Self::Many(ids) => (None, Some(ids.iter())),
-        };
-        one.into_iter().chain(many.into_iter().flatten().copied())
-    }
-}
+type RecordIds = SmallOrderedSet<u64>;
 
 #[derive(Default)]
 struct SizeBucket { count: usize, unhashed: Option<RecordIds> }
 
 impl SizeBucket {
-    fn pending(&self) -> impl Iterator<Item = u64> + '_ {
+    fn pending(&self) -> impl Iterator<Item = &u64> + '_ {
         self.unhashed.iter().flat_map(RecordIds::iter)
     }
 
     fn remove_pending(&mut self, id: u64) {
-        if self.unhashed.as_mut().is_some_and(|ids| ids.remove(id)) {
+        if self.unhashed.as_mut().is_some_and(|ids| ids.remove(&id)) {
             self.unhashed = None;
         }
     }
@@ -360,13 +322,13 @@ impl Index {
     fn cached_digest(&self, record: &Record, valid: impl Fn(&Record) -> bool) -> Option<[u8; 16]> {
         if self.hashes.is_empty() { return None; }
         self.objects.get(&(self.signature(record), Arc::clone(&record.identities)))?
-            .iter().filter_map(|id| self.records.get(&id))
+            .iter().filter_map(|id| self.records.get(id))
             .find(|other| other.digest.is_some() && valid(other))
             .and_then(|other| other.digest)
     }
     fn unhashed_representative(&self, record: &Record) -> Option<Record> {
         let mut representative = self.sizes.get(&self.signature(record))?.pending()
-            .filter_map(|id| self.records.get(&id)).find(|other| other.owner != record.owner)?.clone();
+            .filter_map(|id| self.records.get(id)).find(|other| other.owner != record.owner)?.clone();
         representative.digest = self.cached_digest(&representative, |other| {
             representative.same_source_versions(other) || other.current()
         });
@@ -428,7 +390,7 @@ impl Index {
             let mut matching = None;
             'buckets: for (ids, digest_only) in [(objects, false), (hashes, true)] {
                 let Some(ids) = ids else { continue };
-                let mut ids = ids.iter().filter_map(|id| self.records.get(&id)).filter(|other| {
+                let mut ids = ids.iter().filter_map(|id| self.records.get(id)).filter(|other| {
                     other.owner != record.owner && (!digest_only || other.identities != record.identities)
                 });
                 // Prefer the original representative, then try the newest
@@ -494,6 +456,7 @@ impl Index {
         let ids = paths.iter()
             .filter_map(|path| self.paths.get(path_key(path).as_str()))
             .flat_map(RecordIds::iter)
+            .copied()
             .collect();
         self.invalidate_ids(ids, None)
     }
@@ -506,6 +469,7 @@ impl Index {
         Ok(changed)
     }
     fn apply_journals(&mut self, stamps: &[(String, String, u64)]) -> bool {
+        if stamps.is_empty() { return false; }
         let volumes: HashMap<_, _> = stamps.iter().filter(|(_, volume, _)| !volume.is_empty()).map(|(_, volume, journal)| (volume.as_str(), *journal)).collect();
         let mut changed: HashSet<String> = stamps.iter().filter(|(scope, volume, journal)| self.journals.get(scope).is_none_or(|old| old.0 != *volume || old.1 != *journal)).map(|(scope, _, _)| scope.clone()).collect();
         // A journal belongs to a volume, not to a monitored root. A checkpoint
@@ -519,24 +483,39 @@ impl Index {
         if changed.is_empty() { return false; }
         let ids: Vec<_> = self.records.values().filter(|r| changed.contains(r.scope.as_ref())).map(|r| r.id).collect();
         for id in ids { self.remove(id); }
+        self.trim_record_indices();
         for (scope, volume, journal) in stamps { self.domain(scope); self.journals.insert(scope.clone(), (volume.clone(), *journal)); }
         self.ready = false; self.epoch += 1; self.generation += 1;
         true
     }
-    pub(super) fn reconcile_scopes(&mut self, scopes: &[NativeDiscoveryScope]) -> io::Result<()> {
+    pub(super) fn reconcile_scopes<'a>(
+        &mut self, scopes: impl IntoIterator<Item = &'a NativeDiscoveryScope>,
+    ) -> io::Result<()> {
+        let scopes: HashMap<_, _> = scopes.into_iter().map(|scope| (scope.key(), scope)).collect();
         if scopes.is_empty() {
             if !self.journals.is_empty() || self.records.capacity() != 0 || self.needs_rebuild() {
                 self.reset(self.mode, self.scope)?; self.finish_rebuild()?;
             }
             return Ok(());
         }
-        self.journals.retain(|key, _| scopes.iter().any(|scope| scope.key() == key));
+        self.journals.retain(|key, _| scopes.contains_key(key.as_str()));
+        trim_map(&mut self.journals);
         let mut removed = Vec::new();
         let mut rebound = Vec::new();
         for r in self.records.values() {
             // A nested root changing ownership must not turn the same physical
             // input into a second candidate or discard a still-monitored alias.
-            let target = scopes.iter().filter(|scope| r.sources.iter().all(|s| scope.contains(&s.path))).max_by_key(|scope| scope.key().len());
+            let target = r.sources.split_first().and_then(|(first, remaining)| {
+                let path = path_key(&first.path);
+                let others = std::cell::OnceCell::new();
+                // Any scope covering all members must first cover this one.
+                // Ancestors already visit the most specific roots first.
+                let target = path_ancestors(&path).filter_map(|ancestor| scopes.get(ancestor).copied())
+                    .find(|scope| scope.contains_key(&path) && others
+                        .get_or_init(|| remaining.iter().map(|source| path_key(&source.path)).collect::<Vec<_>>())
+                        .iter().all(|source| scope.contains_key(source)));
+                target
+            });
             match target {
                 Some(scope) if scope.key() != r.scope.as_ref() => rebound.push((r.id, scope.key())),
                 Some(_) => (),
@@ -551,7 +530,8 @@ impl Index {
             self.append(&Delta::Put(Cow::Borrowed(&record)))?;
             self.insert(record);
         }
-        self.domains.retain(|key, _| scopes.iter().any(|scope| scope.key() == key.as_ref()));
+        self.domains.retain(|key, _| scopes.contains_key(key.as_ref()));
+        trim_map(&mut self.domains);
         Ok(())
     }
     pub(super) fn invalidate_tree(&mut self, path: &str) -> io::Result<()> {
@@ -563,6 +543,7 @@ impl Index {
         let ids: HashSet<_> = self.paths.get(key.as_str()).into_iter()
             .chain(descendants)
             .flat_map(RecordIds::iter)
+            .copied()
             .collect();
         if ids.is_empty() { return Ok(()); }
         // An absent directory proves its lexical children are absent too.
@@ -589,10 +570,22 @@ impl Index {
         if ids.is_empty() { return Ok(()); }
         // Remove memory first: failed persistence may lose suppression but cannot cause a stale skip.
         for id in &ids { self.remove(*id); }
+        self.trim_record_indices();
         self.append(&Delta::Remove(ids))?;
-        shrink(&mut self.records); shrink(&mut self.owners);
-        shrink(&mut self.sizes); shrink(&mut self.hashes); shrink(&mut self.objects);
         self.compact()
+    }
+    fn trim_record_indices(&mut self) {
+        if self.records.capacity() > 256 {
+            trim_map(&mut self.records);
+            trim_map(&mut self.owners);
+            trim_map(&mut self.sizes);
+            trim_map(&mut self.hashes);
+            trim_map(&mut self.objects);
+        }
+    }
+
+    pub(super) fn release_write_buffer(&mut self) {
+        self.buffer = Vec::new();
     }
     fn domain(&mut self, scope: &str) -> Arc<str> {
         if let Some((scope, _)) = self.domains.get_key_value(scope) { return Arc::clone(scope); }
@@ -632,7 +625,7 @@ impl Index {
         self.owners.remove(&r.owner);
         for s in r.sources.iter() {
             let key = path_key(&s.path);
-            if self.paths.get_mut(key.as_str()).is_some_and(|ids| ids.remove(id)) {
+            if self.paths.get_mut(key.as_str()).is_some_and(|ids| ids.remove(&id)) {
                 self.paths.remove(key.as_str());
             }
         }
@@ -669,7 +662,7 @@ impl Index {
     }
 }
 fn remove_bucket<K: std::hash::Hash + Eq>(map: &mut HashMap<K, RecordIds>, key: &K, id: u64) {
-    if map.get_mut(key).is_some_and(|ids| ids.remove(id)) { map.remove(key); }
+    if map.get_mut(key).is_some_and(|ids| ids.remove(&id)) { map.remove(key); }
 }
 fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Option<Record>> {
     let mut identities = Vec::new();
@@ -738,9 +731,6 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
         };
         if input.mode == OpenMode::File {
             if !push(&input.entry_path, 0, None, true)? { return Ok(None); }
-        } else if input.mode == OpenMode::ConcatRanges {
-            if input.ranges.is_empty() { return Ok(None); }
-            for p in input.ranges.iter() { if !push(&p.path, p.start, p.end, false)? { return Ok(None); } }
         } else {
             if input.parts.is_empty() { return Ok(None); }
             for p in input.parts.iter() {
@@ -769,11 +759,6 @@ fn scope_tag(scope: WatchDeduplicationScope) -> u8 { match scope { WatchDeduplic
 #[cfg(test)]
 #[path = "../../../tests/unit/runtime/watch/dedup_tests.rs"]
 mod tests;
-
-fn shrink<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>) {
-    if map.capacity() > 1024 && map.len().saturating_mul(4) < map.capacity() { map.shrink_to(map.len().saturating_mul(2)); }
-}
-
 
 #[cfg(test)]
 #[path = "../../../tests/unit/runtime/watch/dedup_bench.rs"]

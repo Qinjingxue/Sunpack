@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 use sunpack_usn_core::protocol::{
-    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES,
-    MAX_VOLUME_GUID_BYTES, REQUEST_BYTES, RESPONSE_BYTES,
+    DirectoryQueryHeader, Opcode, Request, Response, Status, DIRECTORY_QUERY_HEADER_BYTES,
+    FILE_ID_BYTES, MAX_VOLUME_GUID_BYTES, REQUEST_BYTES, RESPONSE_BYTES,
 };
 use sunpack_usn_core::{JournalReader, PIPE_NAME, SERVICE_NAME};
 use windows_service::{
@@ -40,7 +40,7 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE,
+    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, INFINITE,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -89,11 +89,10 @@ define_windows_service!(ffi_service_main, service_main);
 
 fn main() -> windows_service::Result<()> {
     let config = BrokerConfig::from_args(std::env::args().skip(1));
-    let service_name = config.service_name.clone();
     CONFIG
         .set(config)
         .expect("Watch Broker configuration was initialized twice");
-    service_dispatcher::start(service_name, ffi_service_main)
+    service_dispatcher::start(&broker_config().service_name, ffi_service_main)
 }
 
 fn service_main(_arguments: Vec<OsString>) {
@@ -113,19 +112,24 @@ fn run_service() -> windows_service::Result<()> {
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     };
-    let status_handle =
-        service_control_handler::register(&broker_config().service_name, event_handler)?;
-    status_handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
-    })?;
-
-    let result = serve_watch_lifetimes(&stop_event);
+    let config = broker_config();
+    let status_handle = service_control_handler::register(&config.service_name, event_handler)?;
+    let result = match PipeListener::new(&config.pipe_name) {
+        Ok(listener) => {
+            // A client that observes RUNNING can already connect to the first pipe.
+            status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })?;
+            serve_watch_lifetimes(&stop_event, listener)
+        }
+        Err(error) => Err(error),
+    };
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
@@ -138,38 +142,43 @@ fn run_service() -> windows_service::Result<()> {
     result.map_err(windows_service::Error::Winapi)
 }
 
-fn serve_watch_lifetimes(stop_event: &OwnedHandle) -> io::Result<()> {
+fn serve_watch_lifetimes(stop_event: &OwnedHandle, mut listener: PipeListener) -> io::Result<()> {
     let journals = &JournalDispatcher::new()?;
     let connected_clients = &AtomicUsize::new(0);
     let ever_had_lease = &AtomicBool::new(false);
     let state_changed = &journals.state_changed;
-    let mut first_instance = true;
-    let mut pending_accept: Option<PendingPipeAccept> = None;
     thread::scope(|workers| {
         let result = (|| {
             loop {
                 let clients = connected_clients.load(Ordering::Acquire);
                 let had_lease = ever_had_lease.load(Ordering::Acquire);
                 // Before the first lease, only an explicit stop proves nobody will use us.
-                if had_lease && clients == 0 {
+                let retiring = had_lease && clients == 0;
+                if retiring && !listener.is_listening() {
                     break;
                 }
 
-                if clients < MAX_CONNECTED_CLIENTS as usize && pending_accept.is_none() {
-                    pending_accept = Some(PendingPipeAccept::start(first_instance)?);
+                if clients < MAX_CONNECTED_CLIENTS as usize && !listener.is_listening() {
+                    listener.listen(false)?;
                 }
-                let timeout = journals
-                    .reap_idle(Instant::now())?
-                    .map_or(INFINITE, |deadline| {
-                        // Wait accepts whole milliseconds. Round up to avoid waking
-                        // repeatedly before the expiry can be observed.
-                        (deadline
-                            .saturating_duration_since(Instant::now())
-                            .as_millis()
-                            + 1) as u32
-                    });
-                let wait = if let Some(accept) = pending_accept.as_ref() {
-                    let handles = [stop_event.raw(), accept.event(), state_changed.raw()];
+                let timeout = if retiring {
+                    // An accepted connection may already be waiting when the
+                    // previous client closes. Give that connection precedence.
+                    0
+                } else {
+                    journals
+                        .reap_idle(Instant::now())?
+                        .map_or(INFINITE, |deadline| {
+                            // Wait accepts whole milliseconds. Round up to avoid waking
+                            // repeatedly before the expiry can be observed.
+                            (deadline
+                                .saturating_duration_since(Instant::now())
+                                .as_millis()
+                                + 1) as u32
+                        })
+                };
+                let wait = if listener.is_listening() {
+                    let handles = [stop_event.raw(), listener.event.raw(), state_changed.raw()];
                     unsafe {
                         WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout)
                     }
@@ -186,11 +195,13 @@ fn serve_watch_lifetimes(stop_event: &OwnedHandle) -> io::Result<()> {
                     return Err(io::Error::last_os_error());
                 }
                 if wait == WAIT_TIMEOUT {
+                    if retiring {
+                        break;
+                    }
                     continue;
                 }
-                if pending_accept.is_some() && wait == WAIT_OBJECT_0 + 1 {
-                    let pipe = pending_accept.take().unwrap().finish()?;
-                    first_instance = false;
+                if listener.is_listening() && wait == WAIT_OBJECT_0 + 1 {
+                    let pipe = listener.accept()?;
                     connected_clients.fetch_add(1, Ordering::AcqRel);
                     // Drop the join handle immediately. The scope still waits for
                     // clients on stop without retaining each finished OS handle.
@@ -201,7 +212,7 @@ fn serve_watch_lifetimes(stop_event: &OwnedHandle) -> io::Result<()> {
                     })?;
                     continue;
                 }
-                let state_index = if pending_accept.is_some() { 2 } else { 1 };
+                let state_index = if listener.is_listening() { 2 } else { 1 };
                 if wait != WAIT_OBJECT_0 + state_index {
                     return Err(io::Error::last_os_error());
                 }
@@ -210,7 +221,7 @@ fn serve_watch_lifetimes(stop_event: &OwnedHandle) -> io::Result<()> {
         })();
         // Errors must wake blocked clients before the scope joins them.
         stop_event.signal();
-        drop(pending_accept);
+        drop(listener);
         result
     })
 }
@@ -302,33 +313,33 @@ fn read_directory_query(
     mut read: impl FnMut(&mut [u8]) -> io::Result<IoResult>,
     remaining_message_bytes: impl FnOnce() -> io::Result<usize>,
 ) -> io::Result<Option<DirectoryQuery>> {
-    let mut length = [0u8; 4];
-    if !matches!(read(&mut length)?, IoResult::Completed(4)) {
+    let mut header = [0u8; DIRECTORY_QUERY_HEADER_BYTES];
+    if !matches!(
+        read(&mut header)?,
+        IoResult::Completed(DIRECTORY_QUERY_HEADER_BYTES)
+    ) {
         return Ok(None);
     }
-    let length = u32::from_le_bytes(length) as usize;
-    if !(8 + FILE_ID_BYTES..=MAX_DIRECTORY_QUERY_BYTES).contains(&length)
-        || (length - 8) % FILE_ID_BYTES != 0
-    {
+    let Some(DirectoryQueryHeader { id_bytes, journal }) = DirectoryQueryHeader::decode(&header)
+    else {
         return Ok(None);
-    }
+    };
 
     // Read the body of the single pipe message in ID-aligned fragments. In
     // message mode MORE_DATA fills the buffer and leaves the same message
     // pending. No large heap allocation is needed while waiting for its body.
-    let mut buffer = [0u8; DIRECTORY_QUERY_CHUNK_BYTES + 8];
-    let first = length.min(buffer.len());
-    if !receive_query_fragment(read(&mut buffer[..first])?, first, length) {
+    let mut buffer = [0u8; DIRECTORY_QUERY_CHUNK_BYTES];
+    let first = id_bytes.min(buffer.len());
+    if !receive_query_fragment(read(&mut buffer[..first])?, first, id_bytes) {
         return Ok(None);
     }
-    let mut remaining = length - first;
+    let mut remaining = id_bytes - first;
     // MORE_DATA confirms there is a remainder of this same pipe message.
     // Check its size before reserving the index for a large client request.
     if remaining != 0 && remaining_message_bytes()? != remaining {
         return Ok(None);
     }
-    let journal = u64::from_le_bytes(buffer[..8].try_into().unwrap());
-    let mut parents = HashMap::with_capacity((length - 8) / FILE_ID_BYTES);
+    let mut parents = HashMap::with_capacity(id_bytes / FILE_ID_BYTES);
     let mut next_index = 0;
     let mut insert = |bytes: &[u8]| {
         for id in bytes.as_chunks::<FILE_ID_BYTES>().0 {
@@ -336,9 +347,9 @@ fn read_directory_query(
             next_index += 1;
         }
     };
-    insert(&buffer[8..first]);
+    insert(&buffer[..first]);
     while remaining != 0 {
-        let size = remaining.min(buffer.len() - 8);
+        let size = remaining.min(buffer.len());
         if !receive_query_fragment(read(&mut buffer[..size])?, size, remaining) {
             return Ok(None);
         }
@@ -612,14 +623,16 @@ fn handle_request(
     (response, payload)
 }
 
-fn create_pipe(first_instance: bool) -> io::Result<OwnedHandle> {
-    let descriptor = SecurityDescriptor::new(PIPE_SDDL)?;
+fn create_pipe(
+    name: &[u16],
+    descriptor: &SecurityDescriptor,
+    first_instance: bool,
+) -> io::Result<OwnedHandle> {
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.raw(),
+        lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
     };
-    let name = wide(&broker_config().pipe_name);
     let open_mode = PIPE_ACCESS_DUPLEX
         | FILE_FLAG_OVERLAPPED
         | if first_instance {
@@ -653,20 +666,46 @@ enum IoResult {
     Disconnected,
 }
 
-struct PendingPipeAccept {
+struct PipeListener {
+    name: Vec<u16>,
+    descriptor: SecurityDescriptor,
     pipe: Option<OwnedHandle>,
     event: OwnedHandle,
     overlapped: Box<OVERLAPPED>,
     pending: bool,
 }
 
-impl PendingPipeAccept {
-    fn start(first_instance: bool) -> io::Result<Self> {
-        let pipe = create_pipe(first_instance)?;
+impl PipeListener {
+    fn new(name: &str) -> io::Result<Self> {
         let event = OwnedHandle::event()?;
-        let mut overlapped = Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() });
-        overlapped.hEvent = event.raw();
-        let connected = unsafe { ConnectNamedPipe(pipe.raw(), overlapped.as_mut()) };
+        let overlapped = Box::new(OVERLAPPED::default());
+        let mut listener = Self {
+            name: wide(name),
+            descriptor: SecurityDescriptor::new(PIPE_SDDL)?,
+            pipe: None,
+            event,
+            overlapped,
+            pending: false,
+        };
+        listener.listen(true)?;
+        Ok(listener)
+    }
+
+    fn is_listening(&self) -> bool {
+        self.pipe.is_some()
+    }
+
+    fn listen(&mut self, first_instance: bool) -> io::Result<()> {
+        debug_assert!(!self.is_listening());
+        let pipe = create_pipe(&self.name, &self.descriptor, first_instance)?;
+        if unsafe { ResetEvent(self.event.raw()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        *self.overlapped = OVERLAPPED {
+            hEvent: self.event.raw(),
+            ..Default::default()
+        };
+        let connected = unsafe { ConnectNamedPipe(pipe.raw(), self.overlapped.as_mut()) };
         let pending = if connected != 0 {
             false
         } else {
@@ -682,21 +721,14 @@ impl PendingPipeAccept {
         // A client may connect before ConnectNamedPipe. Route that case
         // through the same wait as async completion, preserving stop priority.
         if !pending {
-            event.signal();
+            self.event.signal();
         }
-        Ok(Self {
-            pipe: Some(pipe),
-            event,
-            overlapped,
-            pending,
-        })
+        self.pipe = Some(pipe);
+        self.pending = pending;
+        Ok(())
     }
 
-    fn event(&self) -> HANDLE {
-        self.event.raw()
-    }
-
-    fn finish(mut self) -> io::Result<OwnedHandle> {
+    fn accept(&mut self) -> io::Result<OwnedHandle> {
         if self.pending {
             let mut transferred = 0u32;
             if unsafe {
@@ -714,20 +746,14 @@ impl PendingPipeAccept {
         }
         Ok(self.pipe.take().unwrap())
     }
-
-    fn cancel(&mut self) {
-        if !self.pending {
-            return;
-        }
-        let pipe = self.pipe.as_ref().unwrap().raw();
-        cancel_io(pipe, self.overlapped.as_mut());
-        self.pending = false;
-    }
 }
 
-impl Drop for PendingPipeAccept {
+impl Drop for PipeListener {
     fn drop(&mut self) {
-        self.cancel();
+        if self.pending {
+            let pipe = self.pipe.as_ref().unwrap().raw();
+            cancel_io(pipe, self.overlapped.as_mut());
+        }
     }
 }
 
@@ -880,10 +906,6 @@ impl SecurityDescriptor {
         } else {
             Ok(Self(descriptor))
         }
-    }
-
-    fn raw(&self) -> *mut c_void {
-        self.0
     }
 }
 

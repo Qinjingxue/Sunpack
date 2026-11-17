@@ -730,35 +730,33 @@ struct SnapshotInput {
 
 impl NativeWatchSnapshot {
 
-    /// Encode, write and fsync the snapshot to an existing temporary file.
-    pub(crate) fn write(&self, path: String) -> std::io::Result<u64> {
-        (|| -> std::io::Result<u64> {
-            let document = SnapshotDocument {
-                password_generation: self.data.password_generation,
-                password_source_signature: &self.data.password_source_signature,
-                watch_cursors: &self.data.cursors,
-                pending_work: Records(&self.data.pending),
-                entries: Records(&self.data.entries),
-                runtime: &self.data.runtime,
-            };
-            let mut file = TrackedFile::open_with(&path, |options| {
-                options.write(true).truncate(true);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::OpenOptionsExt;
-                    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
-                    options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
-                }
-            })?;
-            let bytes = wal::write_snapshot(
-                &mut file,
-                Kind::TaskSnapshot,
-                self.checkpoint_seq,
-                &document,
-            )?;
-            file.sync_all()?;
-            Ok(bytes)
-        })()
+    /// Encode, write and fsync the snapshot to a temporary file.
+    pub(crate) fn write(&self, path: &Path) -> std::io::Result<u64> {
+        let document = SnapshotDocument {
+            password_generation: self.data.password_generation,
+            password_source_signature: &self.data.password_source_signature,
+            watch_cursors: &self.data.cursors,
+            pending_work: Records(&self.data.pending),
+            entries: Records(&self.data.entries),
+            runtime: &self.data.runtime,
+        };
+        let mut file = TrackedFile::open_with(path, |options| {
+            options.write(true).create(true).truncate(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+                options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+            }
+        })?;
+        let bytes = wal::write_snapshot(
+            &mut file,
+            Kind::TaskSnapshot,
+            self.checkpoint_seq,
+            &document,
+        )?;
+        file.sync_all()?;
+        Ok(bytes)
     }
 }
 
@@ -1192,8 +1190,7 @@ impl NativeWatchState {
                 .entries
                 .iter()
                 .filter(|(key, record)| {
-                    let record_key = crate::path_keys::path_key(&record.path);
-                    !scopes.iter().any(|scope| scope.contains_key(&record_key))
+                    !scopes.iter().any(|scope| scope.contains_key(key))
                         && !record
                             .failure_payload
                             .get("source_input_root")

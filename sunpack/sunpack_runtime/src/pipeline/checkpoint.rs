@@ -268,7 +268,7 @@ impl InputCheckpoint {
             && (if self.failure.is_some() {
                 self.input.entry_path == input.entry_path
                     && self.input.mode == input.mode && self.input.format_hint == input.format_hint
-                    && self.input.parts == input.parts && self.input.ranges == input.ranges
+                    && self.input.parts == input.parts
             } else { layout_matches(&self.input, input) })
             && self.sources.iter().all(|source| {
                 generations
@@ -354,7 +354,6 @@ impl InputCheckpoint {
             .parts
             .iter_mut()
             .map(|part| &mut part.extent)
-            .chain(&mut input.ranges)
         {
             if let Some(target) = relocate(Path::new(&extent.path)) {
                 extent.path = target.to_string_lossy().into_owned();
@@ -402,8 +401,7 @@ impl InputCheckpoint {
             .input
             .parts
             .first()
-            .map(|part| &part.extent)
-            .or(self.input.ranges.first());
+            .map(|part| &part.extent);
         ArchiveResult {
             path: PathBuf::from(&self.input.entry_path),
             format: self.input.format_hint.clone(),
@@ -512,7 +510,6 @@ impl CheckpointKey {
 fn layout_matches(saved: &ArchiveInput, input: &ArchiveInput) -> bool {
         if saved.mode != input.mode
             || saved.format_hint != input.format_hint
-            || saved.ranges != input.ranges
         {
             return false;
         }

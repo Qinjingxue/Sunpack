@@ -3480,10 +3480,8 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
 fn recovery_anchors(input: &ArchiveInput) -> impl Iterator<Item = (String, u64)> + '_ {
     let plan = input.volume_attempts.as_ref();
     let extents = plan.into_iter().flat_map(|plan| plan.sources.iter())
-        .chain(input.ranges.iter().filter(move |_| plan.is_none()))
-        .chain(input.parts.iter().filter(move |_| plan.is_none() && input.ranges.is_empty())
-            .map(|part| &part.extent));
-    let empty = plan.map_or(input.parts.is_empty() && input.ranges.is_empty(), |plan| plan.sources.is_empty());
+        .chain(input.physical_extents().filter(move |_| plan.is_none()));
+    let empty = plan.map_or(input.parts.is_empty(), |plan| plan.sources.is_empty());
     extents.map(|extent| (path_key(&extent.path), extent.start))
         .chain(empty.then(|| (path_key(&input.entry_path), 0)))
 }
@@ -3555,7 +3553,6 @@ fn worker_evidence(
         source_offset: worker::number(last, "source_offset"),
         virtual_offset: worker::number(last, "virtual_offset"),
         requested: worker::number(last, "requested"),
-        returned: worker::number(last, "returned"),
         win32_error: input["last_win32_error"].as_i64().unwrap_or_default(),
         read_error,
     });

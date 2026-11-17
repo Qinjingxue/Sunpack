@@ -81,11 +81,15 @@ def descriptor(item):
     result = {'entry_path': str(path), 'open_mode': 'file', 'format_hint': hint}
     if fmt in ('7z-split', 'zip-split'):
         parts = sorted(path.parent.glob(path.name.rsplit('.', 1)[0] + '.*'))
-        result.update(open_mode='concat_ranges', ranges=[{'path':str(p), 'start':0} for p in parts])
     elif fmt in ('rar-split', 'rar4-split'):
         prefix = path.name.split('.part', 1)[0]
         parts = sorted(path.parent.glob(prefix + '.part*.rar'))
-        result.update(open_mode='native_volumes', parts=[{'path':str(p), 'start':0, 'volume_number':i, 'canonical_name':p.name} for i,p in enumerate(parts, 1)])
+    else:
+        return result
+    result.update(open_mode='native_volumes', parts=[
+        {'path': str(part), 'start': 0, 'volume_number': index, 'canonical_name': part.name}
+        for index, part in enumerate(parts, 1)
+    ])
     return result
 
 

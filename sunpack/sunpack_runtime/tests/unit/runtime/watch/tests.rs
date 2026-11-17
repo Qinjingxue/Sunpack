@@ -94,10 +94,14 @@ fn completed_family_requires_full_generation_mode_and_live_output() {
     assert_eq!(cache.output(&refreshed, false), None);
     cache.remember(refreshed.clone(), false, &output);
     assert_eq!(cache.output(&refreshed, false), Some(output.clone()));
+    assert!(cache.covers(&head, false));
+    assert!(cache.covers(&tail, false));
     fs::remove_dir(&output).unwrap();
     assert_eq!(cache.output(&refreshed, false), None);
     assert!(!cache.covers(&head, false));
-    assert_eq!(cache.0.lock().unwrap().len(), 0);
+    let stored = cache.0.lock().unwrap();
+    assert_eq!(stored.receipts.len(), 0);
+    assert!(stored.members.is_empty());
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -149,7 +153,9 @@ fn idle_completed_families_release_old_output_but_live_requests_reuse_it() {
     hub.clear_idle_completed_families();
     let cache = &hub.completed_families;
     assert_eq!(cache.output(&generations, false), None);
-    assert_eq!(cache.0.lock().unwrap().len(), 0);
+    let stored = cache.0.lock().unwrap();
+    assert_eq!(stored.receipts.len(), 0);
+    assert!(stored.members.is_empty());
     fs::remove_dir(output).unwrap();
     fs::remove_file(head).unwrap();
     fs::remove_file(tail).unwrap();
@@ -169,15 +175,15 @@ fn completed_family_cache_is_bounded_and_refreshes_lru() {
     // filesystem objects; spellings of the same object now intentionally coalesce.
     for n in 1..COMPLETED_FAMILY_LIMIT {
         let family: CompletedFamilyKey = (Arc::from([CompletedMember::Path(format!("other-{n}"))]), false);
-        let generations = Arc::new(CompletedGenerations::new(vec![(format!("other-{n}"), generation.clone())]));
-        cache.0.lock().unwrap().insert(family, (generations, Arc::from(directory.as_path())), COMPLETED_FAMILY_LIMIT);
+        let generations = Arc::from([(Arc::from(format!("other-{n}")), generation.clone())]);
+        cache.0.lock().unwrap().insert(family, (generations, Arc::from(directory.as_path())));
     }
     assert!(cache.covers(&head, false));
     cache.remember(HashMap::from([(key(&head), generation)]), true, &directory);
     assert!(cache.covers(&head, false));
     let cache = cache.0.lock().unwrap();
-    assert_eq!(cache.len(), COMPLETED_FAMILY_LIMIT);
-    assert!(!cache.iter().any(|((members, _), _)| members.iter().any(|member| matches!(member, CompletedMember::Path(path) if path == "other-1"))));
+    assert_eq!(cache.receipts.len(), COMPLETED_FAMILY_LIMIT);
+    assert!(!cache.members.contains_key("other-1"));
     fs::remove_dir_all(directory).unwrap();
 }
 

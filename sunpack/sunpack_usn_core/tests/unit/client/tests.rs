@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::REQUEST_BYTES;
+use crate::protocol::{DIRECTORY_QUERY_HEADER_BYTES, REQUEST_BYTES};
 use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
 use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
 use windows_sys::Win32::System::Pipes::{
@@ -36,6 +36,17 @@ fn seed_lease(connection: BrokerConnection) {
     assert_eq!(state.leases, 0);
     state.leases = 1;
     state.idle = Some(connection);
+}
+
+fn read_directory_query(pipe: &BrokerConnection) {
+    let mut metadata = [0; DIRECTORY_QUERY_HEADER_BYTES];
+    read_exact(pipe.0, &mut metadata).unwrap();
+    let header = DirectoryQueryHeader::decode(&metadata).unwrap();
+    assert_eq!(header.journal, 42);
+    assert_eq!(header.id_bytes, FILE_ID_BYTES);
+    let mut id = [0; FILE_ID_BYTES];
+    read_exact(pipe.0, &mut id).unwrap();
+    assert_eq!(id, [1; FILE_ID_BYTES]);
 }
 
 #[test]
@@ -80,8 +91,7 @@ fn startup_follows_retiring_instances_but_propagates_real_failures() {
         ]
     );
     for error in [5, 1066] {
-        let mut states =
-            [status(SERVICE_STOPPED, 0), status(SERVICE_STOPPED, error)].into_iter();
+        let mut states = [status(SERVICE_STOPPED, 0), status(SERVICE_STOPPED, error)].into_iter();
         let failure = drive_service_start(
             || Ok(states.next().unwrap()),
             || Ok(()),
@@ -151,11 +161,7 @@ fn directory_recovery_allows_another_request_between_pages() {
                 reply.next_usn = next;
                 let mut payload = Vec::new();
                 if opcode == Opcode::ReadDirectoriesChanges {
-                    let mut length = [0; 4];
-                    let mut query = [0; 8 + FILE_ID_BYTES];
-                    read_exact(server.0, &mut length).unwrap();
-                    assert_eq!(u32::from_le_bytes(length) as usize, query.len());
-                    read_exact(server.0, &mut query).unwrap();
+                    read_directory_query(&server);
                     payload.extend_from_slice(&0u32.to_le_bytes());
                     payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
                     payload.extend_from_slice(name);
@@ -227,18 +233,16 @@ fn overlapping_request_uses_another_pipe_and_release_closes_both() {
             read_exact(slow.0, &mut bytes).unwrap();
             let request = Request::decode(&bytes).unwrap();
             assert_eq!(request.opcode, Opcode::ReadDirectoriesChanges);
-            let mut length = [0; 4];
-            let mut query = [0; 8 + FILE_ID_BYTES];
-            read_exact(slow.0, &mut length).unwrap();
-            assert_eq!(u32::from_le_bytes(length) as usize, query.len());
-            read_exact(slow.0, &mut query).unwrap();
+            read_directory_query(&slow);
             started.send(()).unwrap();
             resume.recv_timeout(guard_timeout).unwrap();
             let mut reply = Response::ok(request.request_id);
             reply.journal_id = 42;
             reply.next_usn = 2;
             write_exact(slow.0, &reply.encode()).unwrap();
-            assert!(is_transient_broker_io(&read_exact(slow.0, &mut bytes).unwrap_err()));
+            assert!(is_transient_broker_io(
+                &read_exact(slow.0, &mut bytes).unwrap_err()
+            ));
         });
         let directory = workers.spawn(|| {
             broker_for_each_directory_change("volume", 42, &[[1; FILE_ID_BYTES]], 1, 2, |_, _| {
@@ -258,7 +262,9 @@ fn overlapping_request_uses_another_pipe_and_release_closes_both() {
                 reply.next_usn = 2;
                 write_exact(fast.0, &reply.encode())?;
             }
-            assert!(is_transient_broker_io(&read_exact(fast.0, &mut bytes).unwrap_err()));
+            assert!(is_transient_broker_io(
+                &read_exact(fast.0, &mut bytes).unwrap_err()
+            ));
             Ok::<_, io::Error>(())
         });
         let probe = workers.spawn(move || {

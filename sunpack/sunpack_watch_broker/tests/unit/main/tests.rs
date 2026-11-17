@@ -12,25 +12,20 @@ fn lifetime_waits_for_first_lease_and_exits_on_stop_or_last_client() {
         r"\\.\pipe\SunPack.WatchBroker.Test.lifetime.{}",
         std::process::id()
     );
-    CONFIG
-        .set(BrokerConfig {
-            service_name: "SunPackWatchBrokerTest_lifetime".to_owned(),
-            pipe_name: name.clone(),
-        })
-        .unwrap();
-
     struct Server {
         stop: Arc<OwnedHandle>,
         thread: Option<thread::JoinHandle<io::Result<()>>>,
         done: mpsc::Receiver<()>,
     }
     impl Server {
-        fn start() -> Self {
+        fn start(name: &str) -> Self {
             let stop = Arc::new(OwnedHandle::event().unwrap());
             let worker_stop = Arc::clone(&stop);
             let (tx, done) = mpsc::channel();
+            let name = name.to_owned();
             let thread = thread::spawn(move || {
-                let result = serve_watch_lifetimes(&worker_stop);
+                let result = PipeListener::new(&name)
+                    .and_then(|listener| serve_watch_lifetimes(&worker_stop, listener));
                 let _ = tx.send(());
                 result
             });
@@ -75,7 +70,7 @@ fn lifetime_waits_for_first_lease_and_exits_on_stop_or_last_client() {
     }
 
     {
-        let server = Server::start();
+        let server = Server::start(&name);
         assert_eq!(
             server.done.recv_timeout(Duration::from_millis(5_100)),
             Err(RecvTimeoutError::Timeout)
@@ -83,7 +78,7 @@ fn lifetime_waits_for_first_lease_and_exits_on_stop_or_last_client() {
         server.stop.signal();
         server.done.recv_timeout(Duration::from_secs(3)).unwrap();
     }
-    let server = Server::start();
+    let server = Server::start(&name);
     let mut owner = connect(&name);
     request(&mut owner, Opcode::Hello);
     for _ in 0..16 {
@@ -117,7 +112,7 @@ fn lifetime_waits_for_first_lease_and_exits_on_stop_or_last_client() {
     drop(server);
 
     // Stop must drain clients blocked in a read before releasing events.
-    let server = Server::start();
+    let server = Server::start(&name);
     let mut owner = connect(&name);
     request(&mut owner, Opcode::Hello);
     server.stop.signal();
@@ -133,15 +128,18 @@ fn lifetime_waits_for_first_lease_and_exits_on_stop_or_last_client() {
     // pointing into caller-owned storage. Existing request tests only
     // cover successful IO and cannot detect this pending-operation leak.
     for failed_wait in [true, false] {
-        let accept = PendingPipeAccept::start(true).unwrap();
+        let mut listener = PipeListener::new(&name).unwrap();
         let _client = connect(&name);
         assert_eq!(
             unsafe {
-                windows_sys::Win32::System::Threading::WaitForSingleObject(accept.event(), 3000)
+                windows_sys::Win32::System::Threading::WaitForSingleObject(
+                    listener.event.raw(),
+                    3000,
+                )
             },
             WAIT_OBJECT_0
         );
-        let pipe = accept.finish().unwrap();
+        let pipe = listener.accept().unwrap();
         let stop = OwnedHandle::event().unwrap();
         stop.signal();
         let event = OwnedHandle::event().unwrap();
@@ -310,12 +308,13 @@ fn directory_query_is_one_message_and_keeps_wire_indices() {
         let id = if index == 2048 { 42 } else { index };
         (u128::MAX - id).to_le_bytes()
     });
-    let body: Vec<u8> = 17u64
-        .to_le_bytes()
-        .into_iter()
-        .chain(ids.flatten())
-        .collect();
-    let announced = (body.len() as u32).to_le_bytes();
+    let body: Vec<u8> = ids.flatten().collect();
+    let id_bytes = body.len();
+    let announced = DirectoryQueryHeader {
+        id_bytes,
+        journal: 17,
+    }
+    .encode();
     let mut oversized = body.clone();
     oversized.push(0);
     for body in [
@@ -342,7 +341,7 @@ fn directory_query_is_one_message_and_keeps_wire_indices() {
             || Ok(message.get().len()),
         )
         .unwrap();
-        if body.len() == u32::from_le_bytes(announced) as usize {
+        if body.len() == id_bytes {
             let query = result.unwrap();
             assert_eq!(query.journal, 17);
             assert_eq!(query.parents.len(), 2048);

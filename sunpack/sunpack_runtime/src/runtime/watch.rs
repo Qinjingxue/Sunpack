@@ -1085,40 +1085,77 @@ impl CompletedMember {
 }
 
 type CompletedFamilyKey = (Arc<[CompletedMember]>, bool);
-#[derive(Clone)]
-struct CompletedGenerations {
-    ordered: Vec<(Arc<str>, PhysicalFileGeneration)>,
-    by_path: HashSet<Arc<str>>,
-}
-
-impl CompletedGenerations {
-    fn new(generations: Vec<(String, PhysicalFileGeneration)>) -> Self {
-        let ordered: Vec<_> = generations.into_iter().map(|(path, generation)|
-            (Arc::<str>::from(path), generation)).collect();
-        let by_path = ordered.iter().map(|(path, _)| Arc::clone(path)).collect();
-        Self { ordered, by_path }
-    }
-}
+type CompletedGenerations = Arc<[(Arc<str>, PhysicalFileGeneration)]>;
+type CompletedReceipt = (CompletedGenerations, Arc<Path>);
 
 #[derive(Default)]
 struct CompletedFamilies(Mutex<CompletedFamilyCache>);
 
-type CompletedFamilyCache = crate::collections::CacheOrder<
-    CompletedFamilyKey,
-    (Arc<CompletedGenerations>, Arc<Path>),
->;
+#[derive(Default)]
+struct CompletedFamilyCache {
+    receipts: crate::collections::CacheOrder<CompletedFamilyKey, CompletedReceipt>,
+    members: HashMap<Arc<str>, crate::collections::SmallOrderedSet<CompletedFamilyKey>>,
+}
+
+impl CompletedFamilyCache {
+    fn index(&mut self, family: &CompletedFamilyKey, generations: &CompletedGenerations) {
+        for (path, _) in generations.iter() {
+            self.members.entry(Arc::clone(path))
+                .and_modify(|keys| keys.insert(family.clone()))
+                .or_insert_with(|| crate::collections::SmallOrderedSet::One(family.clone()));
+        }
+    }
+
+    fn unindex(&mut self, family: &CompletedFamilyKey, generations: &CompletedGenerations) {
+        for (path, _) in generations.iter() {
+            if self.members.get_mut(path).expect("indexed receipt member").remove(family) {
+                self.members.remove(path);
+            }
+        }
+    }
+
+    fn insert(&mut self, family: CompletedFamilyKey, (generations, output): CompletedReceipt) {
+        if let Some((previous, saved_output)) = self.receipts.get_mut(&family) {
+            *saved_output = output;
+            let previous = std::mem::replace(previous, Arc::clone(&generations));
+            if previous.iter().map(|(path, _)| path).ne(generations.iter().map(|(path, _)| path)) {
+                self.unindex(&family, &previous);
+                self.index(&family, &generations);
+            }
+        } else {
+            self.index(&family, &generations);
+            if let Some((evicted, (generations, _))) = self.receipts.insert(family, (generations, output), COMPLETED_FAMILY_LIMIT) {
+                self.unindex(&evicted, &generations);
+            }
+        }
+        crate::collections::trim_map(&mut self.members);
+    }
+
+    fn validate_output(&mut self, family: &CompletedFamilyKey, output: &Arc<Path>, live: bool) -> bool {
+        // An old probe cannot refresh or remove a replacement receipt.
+        if !self.receipts.peek_mut(family).is_some_and(|(_, current)| Arc::ptr_eq(output, current)) {
+            return false;
+        }
+        if !live {
+            let (generations, _) = self.receipts.remove(family).unwrap();
+            self.unindex(family, &generations);
+            crate::collections::trim_map(&mut self.members);
+        }
+        live
+    }
+}
 
 impl CompletedFamilies {
     fn remember(&self, generations: SourceGenerations, deep: bool, output: &Path) {
         if generations.is_empty() { return; }
         let mut ordered: Vec<_> = generations.into_iter().map(|(path, generation)|
-            (CompletedMember::new(&path, &generation), (path, generation))).collect();
+            (CompletedMember::new(&path, &generation), (Arc::<str>::from(path), generation))).collect();
         ordered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let (members, generations): (Vec<_>, Vec<_>) = ordered.into_iter().unzip();
         let family = (Arc::from(members), deep);
-        let generations = Arc::new(CompletedGenerations::new(generations));
+        let generations = Arc::from(generations);
         let output = Arc::from(output);
-        self.0.lock().unwrap().insert(family, (generations, output), COMPLETED_FAMILY_LIMIT);
+        self.0.lock().unwrap().insert(family, (generations, output));
     }
 
     fn output(&self, generations: &SourceGenerations, deep: bool) -> Option<PathBuf> {
@@ -1132,8 +1169,8 @@ impl CompletedFamilies {
         let family = (Arc::from(members), deep);
         let output = {
             let mut cache = self.0.lock().unwrap();
-            let (previous, output) = cache.peek_mut(&family)?;
-            if !current.iter().zip(&previous.ordered).all(|((_, current), (_, previous))|
+            let (previous, output) = cache.receipts.peek_mut(&family)?;
+            if !current.iter().zip(previous.iter()).all(|((_, current), (_, previous))|
                 current.matches_input(previous)) {
                 return None;
             }
@@ -1141,48 +1178,47 @@ impl CompletedFamilies {
         };
         let live = output.is_dir();
         let mut cache = self.0.lock().unwrap();
-        if !Self::validate_output(&mut cache, &family, &output, live) { return None; }
-        // Late completion/failure checks must use the validated live names too.
-        // Share each name with the membership index and retain unchanged names,
-        // without filesystem observations beyond admission's snapshot.
-        let (previous, _) = cache.get_mut(&family).unwrap();
-        if current.iter().zip(&previous.ordered).any(|((path, _), (stored, _))| stored.as_ref() != path.as_str()) {
-            let previous = Arc::make_mut(previous);
-            for ((path, _), (stored, _)) in current.iter().zip(&mut previous.ordered) {
-                if stored.as_ref() != path.as_str() { *stored = Arc::from(path.as_str()); }
-            }
-            previous.by_path.clear();
-            previous.by_path.extend(previous.ordered.iter().map(|(path, _)| Arc::clone(path)));
+        if !cache.validate_output(&family, &output, live) { return None; }
+        let (previous, _) = cache.receipts.peek_mut(&family).unwrap();
+        if current.iter().zip(previous.iter()).any(|((path, _), (stored, _))| stored.as_ref() != path.as_str()) {
+            // Keep the validated versions and publish the live names for late
+            // completion checks, retaining allocations for unchanged names.
+            let renamed = current.iter().zip(previous.iter()).map(|((path, _), (stored, generation))| {
+                let path = if stored.as_ref() == path.as_str() { Arc::clone(stored) } else { Arc::from(path.as_str()) };
+                (path, generation.clone())
+            }).collect::<CompletedGenerations>();
+            cache.insert(family, (renamed, Arc::clone(&output)));
+        } else {
+            cache.receipts.get(&family);
         }
         Some(output.to_path_buf())
     }
 
     fn covers(&self, path: &Path, deep: bool) -> bool {
         let path = key(path);
-        let candidates: Vec<_> = self.0.lock().unwrap().iter()
-            .filter(|(family, (generations, _))| family.1 == deep && generations.by_path.contains(path.as_str()))
-            .map(|(family, receipt)| (family.clone(), receipt.clone())).collect();
+        let candidates: Vec<_> = {
+            let mut cache = self.0.lock().unwrap();
+            let CompletedFamilyCache { receipts, members } = &mut *cache;
+            let Some(families) = members.get(path.as_str()) else { return false; };
+            families.iter().filter(|family| family.1 == deep)
+                .map(|family| (family.clone(), receipts.peek_mut(family).expect("indexed receipt").clone()))
+                .collect()
+        };
         for (family, (generations, output)) in candidates {
             // Require the entire current family, not only the old request's head.
-            if !generations.ordered.iter().all(|(member, previous)| {
+            if !generations.iter().all(|(member, previous)| {
                 crate::io::reader::capture_file_generation(Path::new(member.as_ref()))
                     .is_ok_and(|current| current.matches_input(previous))
             }) { continue; }
             let live = output.is_dir();
             let mut cache = self.0.lock().unwrap();
-            if Self::validate_output(&mut cache, &family, &output, live)
-                && cache.peek_mut(&family).is_some_and(|(current, _)| Arc::ptr_eq(current, &generations)) {
-                cache.get(&family);
+            if cache.validate_output(&family, &output, live)
+                && cache.receipts.peek_mut(&family).is_some_and(|(current, _)| Arc::ptr_eq(current, &generations)) {
+                cache.receipts.get(&family);
                 return true;
             }
         }
         false
-    }
-    fn validate_output(cache: &mut CompletedFamilyCache, family: &CompletedFamilyKey, output: &Arc<Path>, live: bool) -> bool {
-        // An old probe cannot refresh or remove a replacement receipt.
-        if !cache.peek_mut(family).is_some_and(|(_, current)| Arc::ptr_eq(output, current)) { return false; }
-        if !live { cache.remove(family); }
-        live
     }
 }
 
@@ -2395,9 +2431,7 @@ impl Scheduler {
                 self.root_observers.clear();
                 self.parent_observers.clear();
                 self.dependency_observers.clear();
-                self.pending.clear();
-                self.due.clear();
-                self.unpublished.clear();
+                self.release_admission();
             }
             result
         } else {
@@ -2409,11 +2443,7 @@ impl Scheduler {
                 self.hub.enabled.store(false, Ordering::Release);
                 self.drain_active(&mut Ok(()))?;
                 self.persist_candidates(BTreeMap::new(), true)?;
-                self.pending.clear();
-                self.due.clear();
-                self.unpublished.clear();
-                self.cache_deadline = None;
-                self.volume_checks.clear();
+                self.release_admission();
                 Ok(())
             })()
         };
@@ -2577,21 +2607,30 @@ impl Scheduler {
         self.journal.suspend()?;
         self.catalog.close();
         self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(), None));
+        self.release_admission();
+        self.active = HashMap::new();
+        self.active_paths = HashMap::new();
+        self.available_roots = HashSet::new();
+        self.hub.clear_idle_completed_families();
+        Ok(())
+    }
+
+    fn release_admission(&mut self) {
+        // While paused there is no diagnostic expiry deadline. Release that
+        // history and the transient admission tables with the paused queue.
         self.pending = HashMap::new();
         self.unpublished = HashSet::new();
         self.volume_checks = HashMap::new();
         self.due.clear();
-        self.active = HashMap::new();
-        self.active_paths = HashMap::new();
-        self.available_roots = HashSet::new();
         self.candidate_diagnostics = CandidateDiagnostics::default();
-        self.hub.clear_idle_completed_families();
         self.cache_deadline = None;
-        Ok(())
     }
 
     fn commit_idle_catalog(&mut self) {
         self.recovery_ids = HashMap::new();
+        if let Ok(mut dedup) = self.dedup.try_lock() {
+            dedup.release_write_buffer();
+        }
         self.catalog.commit(true);
     }
 
@@ -2830,7 +2869,7 @@ impl Scheduler {
         self.baseline_roots.retain(|id| next.contains_key(id));
         self.roots = next;
         if self.settings.watch.deduplication != config::WatchDeduplication::None {
-            self.dedup.lock().unwrap().reconcile_scopes(&self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>())?;
+            self.dedup.lock().unwrap().reconcile_scopes(self.roots.values().map(|(_, scope)| scope))?;
         }
         if let Some(lease) = lease {
             self.broker_lease = Some(lease);

@@ -440,8 +440,7 @@ void Application::apply_pending() {
     if(patch.contains("fields")) {
         auto drafts=page_value(page_,"drafts");
         for(auto it=controls_.begin();it!=controls_.end();) {
-            bool exists=std::any_of(patch["fields"].begin(),patch["fields"].end(),[&](const Json& f){return f["id"]==it->first;});
-            if(!exists) {
+            if(it->second->pending_removal) {
                 auto host=(it->second->field["editor"]=="toggle"?"toggle-host-":rule_editor(it->second->field["editor"])?"tags-host-":"choice-")+it->first;
                 ui_page_on_widget_mount(page_,host.c_str(),nullptr,nullptr);
                 ui_page_on_widget_unmount(page_,host.c_str(),nullptr,nullptr);
@@ -520,18 +519,30 @@ void Application::sync_toggles() {
 void Application::sync_tags(const std::string& id) {
     auto drafts=page_value(page_,"drafts");
     auto* root=ui::GetContext().GetWindow(window_)->Root().get();
-    for(auto& pair:controls_) if((id.empty() || pair.first==id) && rule_editor(pair.second->field["editor"])) {
-        if(auto* tags=dynamic_cast<TagCollection*>(root->FindById("tags-"+pair.first))) update_tags(*tags,pair.second->field,drafts);
+    auto sync=[&](const auto& binding) {
+        if(rule_editor(binding.second->field["editor"])) {
+            if(auto* tags=dynamic_cast<TagCollection*>(root->FindById("tags-"+binding.first)))
+                update_tags(*tags,binding.second->field,drafts);
+        }
+    };
+    if(id.empty()) {
+        for(const auto& binding:controls_) sync(binding);
+    } else if(auto found=controls_.find(id); found!=controls_.end()) {
+        sync(*found);
     }
 }
 void Application::bind_controls(const Json& fields) {
+    for(auto& binding:controls_) binding.second->pending_removal=true;
     for(auto& field:fields) {
         auto editor=field.value("editor",std::string());
         if(editor!="choice" && editor!="recursive" && editor!="toggle" && !rule_editor(editor)) continue;
         auto id=field["id"].get<std::string>();
         auto& binding=controls_[id];
         if(!binding) binding=std::make_unique<ControlBinding>(ControlBinding{this,field});
-        else binding->field=field;
+        else {
+            binding->field=field;
+            binding->pending_removal=false;
+        }
         auto host=(editor=="toggle"?"toggle-host-":rule_editor(editor)?"tags-host-":"choice-")+id;
         ui_page_on_widget_mount(page_,host.c_str(),[](UiPage,UiWidget parent,void* context){
             auto* binding=static_cast<ControlBinding*>(context); auto* self=binding->owner;

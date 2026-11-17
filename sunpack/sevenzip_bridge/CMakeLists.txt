@@ -14,7 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 99)
 
-option(SUP7Z_DEBUG "Build an optimized diagnostic worker without release LTO" OFF)
+option(SUP7Z_DEBUG "Build the optimized worker with diagnostics and test instrumentation" OFF)
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -356,13 +356,11 @@ function(sup7z_attach_bundled_7z target_name)
 endfunction()
 
 
-set(SUP7Z_WRITER_SOURCES
+add_library(sunpack_sevenzip_core STATIC
     src/internal/archive_extract.cpp
     src/internal/password_testing.cpp
     src/internal/sevenzip_streams.cpp
     src/internal/sevenzip_volume_registry.cpp
-)
-set(SUP7Z_COMMON_SOURCES
     src/internal/native_cpu_budget.cpp
     src/internal/native_memory.cpp
     src/internal/sevenzip_formats.cpp
@@ -375,36 +373,21 @@ set(SUP7Z_COMMON_SOURCES
     src/internal/zlib_ng_deflate_decoder.cpp
 )
 
-if(SUP7Z_DEBUG)
-    list(APPEND SUP7Z_COMMON_SOURCES
-        src/worker_pipeline_timing.cpp)
+apply_release_optimizations(sunpack_sevenzip_core)
+apply_source_charset(sunpack_sevenzip_core)
+target_include_directories(sunpack_sevenzip_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(WIN32)
+    # Attach bundled 7-Zip objects at the executable link to retain format registration.
+    target_include_directories(sunpack_sevenzip_core PRIVATE ${SUP7Z_7Z_ROOT}/CPP)
+    target_compile_definitions(sunpack_sevenzip_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(sunpack_sevenzip_core PUBLIC
+        OleAut32 Psapi sunpack_enc Userenv Ws2_32 Bcrypt Ntdll AdvApi32)
 endif()
-
-add_library(sunpack_sevenzip_common OBJECT ${SUP7Z_COMMON_SOURCES})
-add_library(sunpack_sevenzip_core STATIC
-    ${SUP7Z_WRITER_SOURCES} $<TARGET_OBJECTS:sunpack_sevenzip_common>)
-# The writer, callbacks and streams are header-defined. Compile all their users in
-# each test binary with the same layout, sharing unaffected objects.
-add_library(sunpack_sevenzip_io_test_core STATIC
-    ${SUP7Z_WRITER_SOURCES} $<TARGET_OBJECTS:sunpack_sevenzip_common>)
-target_compile_definitions(sunpack_sevenzip_io_test_core PUBLIC SUP7Z_TEST_IO_FAULTS=1)
-foreach(core IN ITEMS sunpack_sevenzip_common sunpack_sevenzip_core sunpack_sevenzip_io_test_core)
-    apply_release_optimizations(${core})
-    apply_source_charset(${core})
-    target_include_directories(${core} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    if(WIN32)
-        # Attach the bundled 7-Zip objects at the executable link so format
-        # registration objects are retained.
-        target_include_directories(${core} PRIVATE ${SUP7Z_7Z_ROOT}/CPP)
-        target_compile_definitions(${core} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-        target_link_libraries(${core} PUBLIC
-            OleAut32 Psapi sunpack_enc Userenv Ws2_32 Bcrypt Ntdll AdvApi32)
-    endif()
-    target_link_libraries(${core} PUBLIC sunpack_lz4 PRIVATE zlib-ng::zlibstatic)
-    if(SUP7Z_DEBUG)
-        target_compile_definitions(${core} PUBLIC SUP7Z_DEBUG=1)
-    endif()
-endforeach()
+target_link_libraries(sunpack_sevenzip_core PUBLIC sunpack_lz4 PRIVATE zlib-ng::zlibstatic)
+if(SUP7Z_DEBUG)
+    target_sources(sunpack_sevenzip_core PRIVATE src/worker_pipeline_timing.cpp)
+    target_compile_definitions(sunpack_sevenzip_core PUBLIC SUP7Z_DEBUG=1)
+endif()
 
 add_executable(sunpack_sevenzip_smoke
     tests/smoke.cpp
@@ -428,65 +411,6 @@ target_include_directories(sunpack_sevenzip_smoke
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-add_executable(sunpack_sevenzip_async_output
-    tests/async_output.cpp
-)
-apply_release_optimizations(sunpack_sevenzip_async_output)
-apply_source_charset(sunpack_sevenzip_async_output)
-
-target_link_libraries(sunpack_sevenzip_async_output
-    PRIVATE sunpack_sevenzip_io_test_core
-)
-
-sup7z_attach_bundled_7z(sunpack_sevenzip_async_output)
-
-target_include_directories(sunpack_sevenzip_async_output
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-add_executable(sunpack_sevenzip_space_gate
-    tests/space_gate.cpp
-)
-apply_release_optimizations(sunpack_sevenzip_space_gate)
-apply_source_charset(sunpack_sevenzip_space_gate)
-
-target_link_libraries(sunpack_sevenzip_space_gate
-    PRIVATE sunpack_sevenzip_io_test_core
-)
-
-sup7z_attach_bundled_7z(sunpack_sevenzip_space_gate)
-
-target_include_directories(sunpack_sevenzip_space_gate
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-if(WIN32)
-    target_compile_definitions(sunpack_sevenzip_space_gate PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-endif()
-
-add_executable(sunpack_sevenzip_space_retry
-    tests/space_retry.cpp
-)
-apply_release_optimizations(sunpack_sevenzip_space_retry)
-apply_source_charset(sunpack_sevenzip_space_retry)
-
-target_link_libraries(sunpack_sevenzip_space_retry
-    PRIVATE sunpack_sevenzip_io_test_core
-)
-
-sup7z_attach_bundled_7z(sunpack_sevenzip_space_retry)
-
-target_include_directories(sunpack_sevenzip_space_retry
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-if(WIN32)
-    target_compile_definitions(sunpack_sevenzip_space_retry PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-endif()
-
 add_executable(sunpack_sevenzip_worker
     src/worker.cpp
     src/worker_alloc.cpp
@@ -505,16 +429,18 @@ target_link_libraries(sunpack_sevenzip_worker
 
 sup7z_attach_bundled_7z(sunpack_sevenzip_worker)
 
-add_executable(sunpack_sevenzip_memory_worker
-    src/worker.cpp tests/memory_worker.cpp src/worker_alloc.cpp)
-apply_release_optimizations(sunpack_sevenzip_memory_worker)
-apply_source_charset(sunpack_sevenzip_memory_worker)
-target_link_libraries(sunpack_sevenzip_memory_worker PRIVATE sunpack_sevenzip_core)
-sup7z_attach_bundled_7z(sunpack_sevenzip_memory_worker)
-if(MSVC)
-    target_link_options(sunpack_sevenzip_memory_worker PRIVATE /STACK:1048576,65536)
+if(SUP7Z_DEBUG)
+    add_executable(sunpack_sevenzip_memory_worker
+        src/worker.cpp tests/memory_worker.cpp src/worker_alloc.cpp)
+    apply_release_optimizations(sunpack_sevenzip_memory_worker)
+    apply_source_charset(sunpack_sevenzip_memory_worker)
+    target_link_libraries(sunpack_sevenzip_memory_worker PRIVATE sunpack_sevenzip_core)
+    sup7z_attach_bundled_7z(sunpack_sevenzip_memory_worker)
+    if(MSVC)
+        target_link_options(sunpack_sevenzip_memory_worker PRIVATE /STACK:1048576,65536)
+    endif()
+    target_compile_definitions(sunpack_sevenzip_memory_worker PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
-target_compile_definitions(sunpack_sevenzip_memory_worker PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_worker PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -547,7 +473,7 @@ add_executable(sunpack_sevenzip_com_contract
 )
 apply_release_optimizations(sunpack_sevenzip_com_contract)
 apply_source_charset(sunpack_sevenzip_com_contract)
-target_link_libraries(sunpack_sevenzip_com_contract PRIVATE sunpack_sevenzip_io_test_core)
+target_link_libraries(sunpack_sevenzip_com_contract PRIVATE sunpack_sevenzip_core)
 sup7z_attach_bundled_7z(sunpack_sevenzip_com_contract)
 target_include_directories(sunpack_sevenzip_com_contract
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -606,17 +532,19 @@ if(WIN32)
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/toast_activation.cmake")
     set_tests_properties(sunpack_launcher_toast_activation PROPERTIES TIMEOUT 15)
 endif()
-add_executable(sunpack_sevenzip_memory_replay tests/memory_replay.cpp)
-apply_release_optimizations(sunpack_sevenzip_memory_replay)
-apply_source_charset(sunpack_sevenzip_memory_replay)
-target_link_libraries(sunpack_sevenzip_memory_replay PRIVATE sunpack_sevenzip_io_test_core)
-target_include_directories(sunpack_sevenzip_memory_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(sunpack_sevenzip_memory_replay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-sup7z_attach_bundled_7z(sunpack_sevenzip_memory_replay)
-add_test(NAME sunpack_sevenzip_memory_replay COMMAND sunpack_sevenzip_memory_replay)
+if(SUP7Z_DEBUG)
+    foreach(test_name IN ITEMS async_output space_gate space_retry memory_replay)
+        set(test_target sunpack_sevenzip_${test_name})
+        add_executable(${test_target} tests/${test_name}.cpp)
+        apply_release_optimizations(${test_target})
+        apply_source_charset(${test_target})
+        target_link_libraries(${test_target} PRIVATE sunpack_sevenzip_core)
+        target_include_directories(${test_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(${test_target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        sup7z_attach_bundled_7z(${test_target})
+        add_test(NAME ${test_target} COMMAND ${test_target})
+    endforeach()
+endif()
 add_test(NAME sunpack_sevenzip_smoke COMMAND sunpack_sevenzip_smoke)
-add_test(NAME sunpack_sevenzip_async_output COMMAND sunpack_sevenzip_async_output)
-add_test(NAME sunpack_sevenzip_space_gate COMMAND sunpack_sevenzip_space_gate)
-add_test(NAME sunpack_sevenzip_space_retry COMMAND sunpack_sevenzip_space_retry)
 add_test(NAME sunpack_sevenzip_com_contract COMMAND sunpack_sevenzip_com_contract)
 add_test(NAME sunpack_zlib_ng_deflate_contract COMMAND sunpack_zlib_ng_deflate_contract)

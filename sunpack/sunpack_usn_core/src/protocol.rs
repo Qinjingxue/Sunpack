@@ -5,10 +5,38 @@ pub const MAX_VOLUME_GUID_BYTES: usize = 64;
 pub const FILE_ID_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 112;
 pub const RESPONSE_BYTES: usize = 42;
-// A batch query is framed separately after the fixed request: journal ID + 16-byte IDs.
+// A batch has a metadata message followed by the raw IDs in one pipe message.
+pub const DIRECTORY_QUERY_HEADER_BYTES: usize = 12;
 pub const MAX_DIRECTORY_QUERY_BYTES: usize = 1024 * 1024;
 pub const MAX_DIRECTORY_RESPONSE_BYTES: usize = 64 * 1024;
 const _: () = assert!(REQUEST_BYTES <= 4096);
+
+pub struct DirectoryQueryHeader {
+    pub id_bytes: usize,
+    pub journal: u64,
+}
+
+impl DirectoryQueryHeader {
+    pub fn encode(self) -> [u8; DIRECTORY_QUERY_HEADER_BYTES] {
+        let mut bytes = [0; DIRECTORY_QUERY_HEADER_BYTES];
+        bytes[..4].copy_from_slice(&(self.id_bytes as u32).to_le_bytes());
+        bytes[4..].copy_from_slice(&self.journal.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8; DIRECTORY_QUERY_HEADER_BYTES]) -> Option<Self> {
+        let id_bytes = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        if !(FILE_ID_BYTES..=MAX_DIRECTORY_QUERY_BYTES).contains(&id_bytes)
+            || !id_bytes.is_multiple_of(FILE_ID_BYTES)
+        {
+            return None;
+        }
+        Some(Self {
+            id_bytes,
+            journal: u64::from_le_bytes(bytes[4..].try_into().unwrap()),
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]

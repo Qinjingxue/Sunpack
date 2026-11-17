@@ -41,8 +41,10 @@ impl VolumeAttempts {
             return self;
         }
         let mut domains = Domains::default();
-        let mut heads = HashMap::new();
+        let mut sources_by_extent = None;
+        let mut variants = Vec::new();
         let mut filtered = HashMap::new();
+        let distinct_base_paths = self.base_source_count == self.sources.len();
         for AttemptLayout { slots: layout, minimum_slots } in std::mem::take(&mut self.layouts) {
             let mut interiors = HashMap::new();
             let mut sizes = None::<HashSet<u64>>;
@@ -92,19 +94,29 @@ impl VolumeAttempts {
                     let domain = if *number == 1 {
                         let mut replacements = Vec::new();
                         for &i in choices.iter() {
-                            if end > self.sources[i].end {
+                            let source = &self.sources[i];
+                            if end > source.end {
                                 continue;
                             }
-                            let index = *heads.entry((i, end)).or_insert_with(|| {
-                                let mut source = self.sources[i].clone();
-                                source.end = end;
-                                if let Some(index) =
-                                    self.sources.iter().position(|old| *old == source)
-                                {
-                                    return index;
+                            if distinct_base_paths && end == source.end {
+                                replacements.push(i);
+                                continue;
+                            }
+                            // Index all source attributes so equal variants keep
+                            // the first index, including an existing base extent.
+                            let source_indexes = sources_by_extent.get_or_insert_with(|| {
+                                let mut indexes = HashMap::new();
+                                if !distinct_base_paths {
+                                    for (index, original) in self.sources.iter().enumerate() {
+                                        indexes.entry(original.key_with_end(original.end)).or_insert(index);
+                                    }
                                 }
-                                self.sources.push(source);
-                                self.sources.len() - 1
+                                indexes
+                            });
+                            let index = *source_indexes.entry(source.key_with_end(end)).or_insert_with(|| {
+                                let index = self.sources.len() + variants.len();
+                                variants.push(AttemptSource { end, ..source.clone() });
+                                index
                             });
                             replacements.push(index);
                         }
@@ -150,6 +162,8 @@ impl VolumeAttempts {
                 self.layouts.push(AttemptLayout { slots: layout, minimum_slots });
             }
         }
+        drop(sources_by_extent);
+        self.sources.extend(variants);
         self
     }
 }
@@ -178,7 +192,7 @@ impl Domains {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct AttemptSource {
     pub path: String,
     pub start: u64,
@@ -188,6 +202,10 @@ pub(super) struct AttemptSource {
     pub head_size: Option<u64>,
 }
 impl AttemptSource {
+    fn key_with_end(&self, end: u64) -> (&str, u64, u64, Option<u64>, bool, Option<u64>) {
+        (&self.path, self.start, end, self.proven_end, self.terminal, self.head_size)
+    }
+
     fn new(path: &str, anchor: &VolumeAnchor) -> Self {
         Self {
             path: path.into(),

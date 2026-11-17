@@ -273,6 +273,18 @@ void check_open_callback_canonical_range()
     const std::wstring name = L"archive.part2.rar";
     const std::vector<ExtractInputRange> ranges{{path, 1, 2, true}};
 
+    // A one-file descriptor still permits the configured entry as a volume.
+    auto *single = new OpenCallback(L"", path, {}, {}, InputPrefetchConfig{false});
+    CMyComPtr<IArchiveOpenCallback> single_callback(single);
+    CMyComPtr<IInStream> source;
+    const auto basename = std::filesystem::path(path).filename().wstring();
+    check(single->GetStream(basename.c_str(), &source) == S_OK && source,
+          "single-file callback resolves the entry basename without a parts list");
+    CMyComPtr<IInStream> missing;
+    check(single->GetStream(name.c_str(), &missing) == E_FAIL && !missing &&
+          single->missing_volume_name() == name && single->input_error() == S_OK,
+          "single-file callback reports an unlisted volume through missing-volume evidence");
+
     auto *raw = new OpenCallback(
         L"", L"archive.part1.rar", {}, {name}, InputPrefetchConfig{false}, {},
         ranges);
@@ -386,20 +398,30 @@ void check_archive_open_start_and_carrier_fallback()
             output.write(reinterpret_cast<const char *>(rar.data()), rar.size());
             output.write(tail.data(), tail.size());
         }
+#ifdef SUP7Z_DEBUG
         observed_logical_read_bytes = 0;
+#endif
         const auto result = extract_archive(path.wstring(), {path.wstring()}, {}, L"rar", L"", (root / L"output").wstring(), L"");
         check(result.status == PasswordTestStatus::Ok && result.archive_type == L"rar4",
               "RAR4 opens with a generic family hint, including carrier prefix fallback");
+#ifdef SUP7Z_DEBUG
         if (!prefix) {
             check(observed_logical_read_bytes > 0 && observed_logical_read_bytes < (512u << 10),
                   "wrong RAR handler does not consume the large carrier tail");
-        } else {
+        }
+#endif
+        if (prefix) {
             const std::vector<ExtractInputRange> ranges = {{path.wstring(), prefix, prefix + rar.size(), true}};
+#ifdef SUP7Z_DEBUG
             observed_logical_read_bytes = 0;
+#endif
             const auto carved = extract_archive(path.wstring(), {}, ranges, L"rar", L"", (root / L"carved").wstring(), L"");
-            check(carved.status == PasswordTestStatus::Ok && carved.archive_type == L"rar4" &&
-                  observed_logical_read_bytes > 0 && observed_logical_read_bytes < (512u << 10),
-                  "canonical carrier range opens without consuming the underlying prefix and tail");
+            check(carved.status == PasswordTestStatus::Ok && carved.archive_type == L"rar4",
+                  "canonical carrier range opens as RAR4");
+#ifdef SUP7Z_DEBUG
+            check(observed_logical_read_bytes > 0 && observed_logical_read_bytes < (512u << 10),
+                  "canonical carrier range reads stay within the bounded input");
+#endif
         }
     }
     _putenv_s("SUNPACK_SEVENZIP_PREFETCH", previous_prefetch.c_str());

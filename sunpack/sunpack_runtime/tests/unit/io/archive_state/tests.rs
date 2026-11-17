@@ -401,12 +401,7 @@ fn project_input_slice(
         format.to_owned(),
         source.logical_name.clone(),
     );
-    if mapped.len() == 1 {
-        input.mode = OpenMode::FileRange;
-        input.parts = Box::new([InputPart::range(mapped.pop().unwrap())]);
-    } else {
-        input.mode = OpenMode::ConcatRanges;
-        input.ranges = mapped.into_boxed_slice();
-    }
+    input.mode = OpenMode::FileRange;
+    input.parts = mapped.into_iter().map(InputPart::range).collect();
     Some(input)
 }

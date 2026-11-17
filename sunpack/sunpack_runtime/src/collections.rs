@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::Hash;
 
 pub(crate) fn trim_map<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
@@ -15,6 +15,49 @@ pub(crate) fn trim_deque<T>(queue: &mut VecDeque<T>) {
         *queue = VecDeque::new();
     } else if queue.capacity() > 256.max(queue.len().saturating_mul(4)) {
         queue.shrink_to(queue.len().saturating_mul(2));
+    }
+}
+
+// Reverse-index keys usually belong to one entry. Allocate an ordered set
+// only when the key is shared.
+pub(crate) enum SmallOrderedSet<T> {
+    One(T),
+    Many(Box<BTreeSet<T>>),
+}
+
+impl<T: Ord + Clone> SmallOrderedSet<T> {
+    pub(crate) fn insert(&mut self, value: T) {
+        match self {
+            Self::One(first) if *first != value => {
+                *self = Self::Many(Box::new(BTreeSet::from([first.clone(), value])));
+            }
+            Self::One(_) => (),
+            Self::Many(values) => {
+                values.insert(value);
+            }
+        }
+    }
+
+    /// Returns true when the enclosing map entry can be removed.
+    pub(crate) fn remove(&mut self, value: &T) -> bool {
+        match self {
+            Self::One(first) => first == value,
+            Self::Many(values) => {
+                values.remove(value);
+                if values.len() == 1 {
+                    *self = Self::One(values.pop_first().unwrap());
+                }
+                false
+            }
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
+        let (one, many) = match self {
+            Self::One(value) => (Some(value), None),
+            Self::Many(values) => (None, Some(values.iter())),
+        };
+        one.into_iter().chain(many.into_iter().flatten())
     }
 }
 
@@ -89,10 +132,6 @@ impl<K: Eq + Hash + Clone, V> CacheOrder<K, V> {
     {
         let index = *self.entries.get(key)?;
         Some(&mut self.slots[index].value)
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.slots.iter().map(|entry| (&entry.key, &entry.value))
     }
 
     pub(crate) fn remove<Q: Eq + Hash + ?Sized>(&mut self, key: &Q) -> Option<V>

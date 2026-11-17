@@ -364,7 +364,7 @@ namespace sunpack::sevenzip
         std::uint64_t episode_id() const noexcept;
         std::vector<std::string> affected_job_ids() const;
         bool has_affected_jobs() const noexcept;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         std::size_t waiter_count() const noexcept;
         std::uint64_t wait_call_count() const noexcept;
 #endif
@@ -472,7 +472,7 @@ namespace sunpack::sevenzip
         std::vector<std::string> affected_jobs_; // job：只做事件 fan-out
 
         ChangeSink sink_;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         std::size_t waiter_count_ = 0;
         std::uint64_t wait_call_count_ = 0;
 #endif
@@ -622,7 +622,7 @@ namespace sunpack::sevenzip
     {
         auto self = weak_from_this().lock();
         std::lock_guard<std::mutex> lock(mutex_);
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         ++wait_call_count_;
 #endif
         return decide_locked(self, terminal);
@@ -639,13 +639,13 @@ namespace sunpack::sevenzip
         }
 
         std::unique_lock<std::mutex> lock(mutex_);
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
         ++wait_call_count_;
 #endif
         auto decision = decide_locked(self, terminal);
         if (decision.kind == WaitResult::Kind::Pending)
         {
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             ++waiter_count_;
 #endif
             do
@@ -653,7 +653,7 @@ namespace sunpack::sevenzip
                 cv_.wait(lock);
                 decision = decide_locked(self, terminal);
             } while (decision.kind == WaitResult::Kind::Pending);
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             --waiter_count_;
 #endif
         }
@@ -837,7 +837,7 @@ namespace sunpack::sevenzip
         return !query_root_.empty();
     }
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
     inline std::size_t VolumeSpaceGate::waiter_count() const noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);

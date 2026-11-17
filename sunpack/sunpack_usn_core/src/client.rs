@@ -1,6 +1,6 @@
 use crate::protocol::{
-    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES,
-    MAX_DIRECTORY_RESPONSE_BYTES, RESPONSE_BYTES,
+    DirectoryQueryHeader, Opcode, Request, Response, Status, DIRECTORY_QUERY_HEADER_BYTES,
+    FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES, MAX_DIRECTORY_RESPONSE_BYTES, RESPONSE_BYTES,
 };
 use crate::{
     ChangeReasons, PIPE_NAME, PIPE_NAME_ENV, SERVICE_NAME, SERVICE_NAME_ENV, TEST_PIPE_NAME_PREFIX,
@@ -73,7 +73,11 @@ impl ClientState {
         Ok(self.idle.take())
     }
 
-    fn recycle(&mut self, generation: u64, connection: BrokerConnection) -> Option<BrokerConnection> {
+    fn recycle(
+        &mut self,
+        generation: u64,
+        connection: BrokerConnection,
+    ) -> Option<BrokerConnection> {
         if self.leases != 0 && self.generation == generation && self.idle.is_none() {
             self.idle = Some(connection);
             return None;
@@ -83,6 +87,12 @@ impl ClientState {
 }
 
 struct BrokerConnection(HANDLE);
+
+#[derive(Clone, Copy)]
+struct DirectoryQuery<'a> {
+    header: [u8; DIRECTORY_QUERY_HEADER_BYTES],
+    ids: &'a [u8],
+}
 
 unsafe impl Send for BrokerConnection {}
 
@@ -98,16 +108,16 @@ impl BrokerConnection {
     fn transact(
         &mut self,
         request: &Request<'_>,
-        query: &[u8],
+        query: Option<DirectoryQuery<'_>>,
         payload: &mut Vec<u8>,
     ) -> io::Result<Response> {
         let request_id = request.request_id;
         let payload_response = request.opcode == Opcode::ReadDirectoriesChanges;
         let request = request.encode()?;
         write_exact(self.0, &request)?;
-        if !query.is_empty() {
-            write_exact(self.0, &(query.len() as u32).to_le_bytes())?;
-            write_exact(self.0, query)?;
+        if let Some(query) = query {
+            write_exact(self.0, &query.header)?;
+            write_exact(self.0, query.ids)?;
         }
         let mut response_bytes = [0u8; RESPONSE_BYTES];
         read_exact(self.0, &mut response_bytes)?;
@@ -173,7 +183,7 @@ pub fn broker_release() -> io::Result<()> {
 pub fn broker_volume_cursor(volume_guid: &str) -> io::Result<(u64, i64)> {
     let mut request = Request::simple(Opcode::ProbeVolume, next_request_id());
     request.volume_guid = volume_guid;
-    let response = transact_request(&request, &[], &mut Vec::new())?;
+    let response = transact_request(&request, None, &mut Vec::new())?;
     Ok((response.journal_id, response.next_usn))
 }
 
@@ -190,7 +200,7 @@ pub fn broker_read_change_reasons(
     request.file_id_len = file_id_len;
     request.previous_usn = previous_usn;
     request.current_usn = current_usn;
-    let response = transact_request(&request, &[], &mut Vec::new())?;
+    let response = transact_request(&request, None, &mut Vec::new())?;
     Ok(ChangeReasons {
         all: response.reasons_all,
         without_close: response.reasons_without_close,
@@ -211,22 +221,28 @@ pub fn broker_for_each_directory_change(
             "invalid directory recovery query",
         ));
     }
-    let batch_ids = (MAX_DIRECTORY_QUERY_BYTES - 8) / FILE_ID_BYTES;
+    let batch_ids = MAX_DIRECTORY_QUERY_BYTES / FILE_ID_BYTES;
     // Only the ID and cursor change between pages of this logical query.
     let mut request = Request::simple(Opcode::ReadDirectoriesChanges, 0);
     request.volume_guid = volume;
     request.current_usn = end;
     let mut payload = Vec::new();
     for (batch, ids) in directories.chunks(batch_ids).enumerate() {
-        let mut query = Vec::with_capacity(8 + ids.len() * FILE_ID_BYTES);
-        query.extend_from_slice(&journal.to_le_bytes());
-        query.extend_from_slice(ids.as_flattened());
+        let encoded_ids = ids.as_flattened();
+        let query = DirectoryQuery {
+            header: DirectoryQueryHeader {
+                id_bytes: encoded_ids.len(),
+                journal,
+            }
+            .encode(),
+            ids: encoded_ids,
+        };
         let mut cursor = start;
         while cursor < end {
             request.request_id = next_request_id();
             request.previous_usn = cursor;
             // Return the pipe before running the caller's page observer.
-            let response = transact_request(&request, &query, &mut payload)?;
+            let response = transact_request(&request, Some(query), &mut payload)?;
             if response.journal_id != journal
                 || response.next_usn <= cursor
                 || response.next_usn > end
@@ -235,11 +251,6 @@ pub fn broker_for_each_directory_change(
                     io::ErrorKind::InvalidData,
                     "invalid directory recovery cursor",
                 ));
-            }
-            if response.next_usn == end {
-                // The observer can reenter the broker. The finished batch
-                // must release its request before running that callback.
-                drop(std::mem::take(&mut query));
             }
             let mut input = payload.as_slice();
             let mut count = 0usize;
@@ -270,7 +281,7 @@ pub fn broker_for_each_directory_change(
 
 fn transact_request(
     request: &Request<'_>,
-    query: &[u8],
+    query: Option<DirectoryQuery<'_>>,
     payload: &mut Vec<u8>,
 ) -> io::Result<Response> {
     // Only these read-only requests are safe to replay after the pipe dies:
@@ -351,7 +362,7 @@ fn connect_and_hello(generation: Option<u64>) -> io::Result<BrokerConnection> {
             Ok(mut connection) => {
                 match connection.transact(
                     &Request::simple(Opcode::Hello, next_request_id()),
-                    &[],
+                    None,
                     &mut Vec::new(),
                 ) {
                     Ok(response) => {

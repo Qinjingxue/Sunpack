@@ -11,7 +11,6 @@ use std::sync::Arc;
 pub(crate) enum OpenMode {
     File,
     FileRange,
-    ConcatRanges,
     NativeVolumes,
     SfxWithVolumes,
 }
@@ -110,7 +109,6 @@ pub(crate) struct ArchiveInput {
     pub volume_style: String,
     pub mode: OpenMode,
     pub parts: Box<[InputPart]>,
-    pub ranges: Box<[InputExtent]>,
     pub volume_attempts: Option<Box<VolumeAttemptPlan>>,
     pub analysis: AnalysisFacts,
 }
@@ -124,27 +122,22 @@ impl ArchiveInput {
             volume_style: String::new(),
             mode: OpenMode::File,
             parts: Box::new([]),
-            ranges: Box::new([]),
             volume_attempts: None,
             analysis: AnalysisFacts::default(),
         }
     }
 
     pub(crate) fn physical_extents(&self) -> impl Iterator<Item = &InputExtent> {
-        self.parts
-            .iter()
-            .map(|part| &part.extent)
-            .chain(self.ranges.iter())
+        self.parts.iter().map(|part| &part.extent)
     }
 
     pub(crate) fn physical_paths(&self) -> impl Iterator<Item = &str> {
         let plan = self.volume_attempts.as_deref();
-        let use_entry = self.parts.is_empty() && self.ranges.is_empty() && plan.is_none();
+        let use_entry = self.parts.is_empty() && plan.is_none();
         let fixed = if plan.is_some() { &[][..] } else { &self.parts };
         fixed
             .iter()
             .map(|part| part.extent.path.as_str())
-            .chain(self.ranges.iter().map(|range| range.path.as_str()))
             .chain(
                 plan.into_iter()
                     .flat_map(|plan| plan.sources.iter().map(|range| range.path.as_str())),
@@ -168,8 +161,7 @@ impl ArchiveInput {
             entry_path: &self.entry_path,
             open_mode: self.mode,
             format_hint: &self.format_hint,
-            parts: if attempts.is_some() || self.mode == OpenMode::ConcatRanges { &[] } else { &self.parts },
-            ranges: if attempts.is_none() && self.mode == OpenMode::ConcatRanges { &self.ranges } else { &[] },
+            parts: if attempts.is_some() { &[] } else { &self.parts },
             volume_attempts: attempts,
             analysis: self
                 .execution_evidence()
@@ -216,10 +208,9 @@ impl Serialize for ArchiveInputReport<'_> {
         if let Some(plan) = input.volume_attempts.as_deref() {
             map.serialize_entry("volume_attempts", &AttemptReport(plan))?;
         }
-        if !input.parts.is_empty() || (input.mode == OpenMode::File && input.ranges.is_empty()) {
+        if !input.parts.is_empty() || input.mode == OpenMode::File {
             map.serialize_entry("parts", &PartsReport(input))?;
         }
-        if input.mode == OpenMode::ConcatRanges { map.serialize_entry("ranges", &input.ranges)?; }
         if !input.logical_name.is_empty() { map.serialize_entry("logical_name", &input.logical_name)?; }
         if !input.volume_style.is_empty() { map.serialize_entry("volume_style", &input.volume_style)?; }
         let analysis = AnalysisReport(input);
@@ -342,8 +333,6 @@ pub(crate) struct WorkerInput<'a> {
     format_hint: &'a str,
     #[serde(skip_serializing_if = "slice_empty")]
     parts: &'a [InputPart],
-    #[serde(skip_serializing_if = "slice_empty")]
-    ranges: &'a [InputExtent],
     #[serde(skip_serializing_if = "Option::is_none")]
     volume_attempts: Option<&'a VolumeAttemptPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]

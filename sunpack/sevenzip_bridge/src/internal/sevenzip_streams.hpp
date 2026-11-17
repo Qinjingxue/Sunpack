@@ -39,7 +39,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
     inline thread_local UInt64 observed_logical_read_bytes = 0;
 #endif
 
@@ -427,7 +427,7 @@ namespace sunpack::sevenzip
                 // The decoder handle is independent of the OVERLAPPED handles.
                 // Reposition it only if a later read misses the prefetch cache.
                 file_pointer_dirty_ = true;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
                 observed_logical_read_bytes += size;
 #endif
                 prefetch_->after_read(position_);
@@ -483,7 +483,7 @@ namespace sunpack::sevenzip
                 prefetch_->after_read(position_);
             }
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             observed_logical_read_bytes += read;
 #endif
 
@@ -682,7 +682,7 @@ namespace sunpack::sevenzip
             if (prefetch_ && prefetch_->consume(position_, data, size))
             {
                 position_ += size;
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
                 observed_logical_read_bytes += size;
 #endif
                 prefetch_->after_read(position_);
@@ -781,7 +781,7 @@ namespace sunpack::sevenzip
                 cached_handle_position_ += read;
             }
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
             observed_logical_read_bytes += total_read;
 #endif
 

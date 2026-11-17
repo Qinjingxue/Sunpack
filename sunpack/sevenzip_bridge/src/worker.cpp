@@ -260,11 +260,10 @@ void read_volume_plan(wire::RequestReader& reader, WorkerArchiveInput& input) {
     })) input.validation_error = "invalid volume attempt slot";
 }
 
-enum class InputMode { File, FileRange, ConcatRanges, NativeVolumes, SfxWithVolumes };
+enum class InputMode { File, FileRange, NativeVolumes, SfxWithVolumes };
 
 InputMode read_input_mode(std::string_view mode) {
     if (mode == "file_range") return InputMode::FileRange;
-    if (mode == "concat_ranges") return InputMode::ConcatRanges;
     if (mode == "native_volumes") return InputMode::NativeVolumes;
     if (mode == "sfx_with_volumes") return InputMode::SfxWithVolumes;
     return InputMode::File;
@@ -322,14 +321,8 @@ WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
         if (key == "entry_path") input.archive_path = utf8_to_wide(reader.text());
         else if (key == "open_mode") mode = read_input_mode(reader.text());
         else if (key == "format_hint") input.format_hint = utf8_to_wide(reader.text());
-        else if (key == "parts" && mode != InputMode::ConcatRanges) read_input_parts(reader, input, mode);
-        else if (key == "ranges" && mode == InputMode::ConcatRanges) {
-            read_array(reader, [&] {
-                auto range = read_range(reader);
-                if (range.path.empty()) range.path = input.archive_path;
-                if (!range.path.empty()) input.ranges.push_back(std::move(range));
-            });
-        } else if (key == "volume_attempts") {
+        else if (key == "parts") read_input_parts(reader, input, mode);
+        else if (key == "volume_attempts") {
             attempts = true;
             read_volume_plan(reader, input);
         } else if (key == "analysis") {
@@ -344,9 +337,7 @@ WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
     });
     input.native_volume_input = mode == InputMode::NativeVolumes;
     if (!attempts && input.validation_error.empty()) {
-        if (mode == InputMode::ConcatRanges && input.ranges.empty())
-            input.validation_error = "concat_ranges descriptor requires ranges";
-        else if (mode == InputMode::FileRange && input.ranges.empty())
+        if (mode == InputMode::FileRange && input.ranges.empty())
             input.validation_error = "file_range descriptor requires canonical parts with extents";
         else if ((mode == InputMode::NativeVolumes || mode == InputMode::SfxWithVolumes) && input.canonical_names.empty())
             input.validation_error = "structured volume descriptor has no parts";
@@ -1667,7 +1658,7 @@ private:
                 job.execution = std::make_unique<JobExecution>(memory_, job.request);
             }
             RequestOutcome outcome{-100, {}};
-            bool monitor_recheck_needed = true;
+            bool monitor_recheck_needed = false;
             const std::string& job_id = job.request.job_id;
             auto &memory_job = job.execution->memory;
             memory_.begin(memory_job);
@@ -1683,13 +1674,15 @@ private:
                 sunpack::sevenzip::NativeMemoryScope memory_scope(&memory_job);
                 sunpack::sevenzip::ExtractionReplayScope replay_scope(&job.execution->replay);
                 try {
-                    if (replaying && !job.cancel_token->load(std::memory_order_acquire) && !job.execution->inputs_unchanged()) {
+                    const bool interrupted = memory_job.cancel->load(std::memory_order_acquire);
+                    if (replaying && !interrupted && !job.execution->inputs_unchanged()) {
                         sunpack::sevenzip::NativeMemoryScope response_memory(nullptr);
                         outcome = {1, (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                             (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("input_changed") + wire::key("failure_stage") + wire::text("native_replay") + wire::key("message") + wire::text("archive input changed while waiting for memory; rescan required") + wire::end())};
-                    } else if (!job.request.scan_only) {
+                    } else if (!job.request.scan_only && !interrupted) {
                         const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
                         auto lease = writer_registry_->acquire(key);
+                        monitor_recheck_needed = true;
                         register_cancel_writer(job_id, lease.writer_pointer());
                         const auto weak = std::weak_ptr<sunpack::sevenzip::AsyncFileWriter>(lease.writer_pointer());
                         memory_.set_wake(memory_job, [weak] { if (auto writer = weak.lock()) writer->wake_waiters(); });

@@ -22,6 +22,7 @@ fn carrier_outputs_survive_snapshot_and_incremental_replay() {
     use std::io::Write;
 
     let snapshot = crate::test_support::temp_file("carrier_owner_snapshot", b"");
+    fs::remove_file(&snapshot).unwrap();
     let journal = snapshot.with_extension("wal");
     let base = snapshot.with_extension("outputs");
     let owner = base.join("outer.zip").to_string_lossy().into_owned();
@@ -57,7 +58,7 @@ fn carrier_outputs_survive_snapshot_and_incremental_replay() {
     ]);
     state.replay_segment(journal.to_string_lossy().into_owned(), 1, 2).unwrap();
     assert_eq!(state.pending(&owner).unwrap().active_outputs.values().count(), 3);
-    state.capture(2).write(snapshot.to_string_lossy().into_owned()).unwrap();
+    state.capture(2).write(&snapshot).unwrap();
     let resumed = NativeWatchState::new();
     assert_eq!(resumed.load_snapshot(snapshot.to_string_lossy().into_owned()).unwrap(), 2);
     assert_eq!(resumed.pending(&owner).unwrap().active_outputs.values().count(), 3);

@@ -320,7 +320,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
         volume_number: Some(index as u32 + 1), canonical_name: format!("part{}.rar", index + 1),
     }).collect();
     let cache = RecentPasswords::default();
-    for mode in [OpenMode::NativeVolumes, OpenMode::ConcatRanges, OpenMode::SfxWithVolumes] {
+    for mode in [OpenMode::NativeVolumes, OpenMode::SfxWithVolumes] {
         input.mode = mode;
         let sessions = open_sessions(&input).unwrap();
         let (key, attempts) = Key::for_input(&input, &sessions).unwrap();

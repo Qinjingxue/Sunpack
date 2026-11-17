@@ -19,11 +19,7 @@ namespace sunpack::sevenzip
 
     void clear_prop(PROPVARIANT &value);
 
-    bool get_archive_property_bool(IInArchive *archive, UInt32 prop_id);
-
     bool get_item_property(IInArchive *archive, UInt32 index, UInt32 prop_id, PROPVARIANT &value);
-
-    bool archive_has_encrypted_items(IInArchive *archive);
 
     // RAR4 may return Open=S_OK with zero items after a wrong encrypted-header
     // password. The handler records that failed header parse in kpidErrorFlags.

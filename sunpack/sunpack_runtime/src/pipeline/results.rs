@@ -72,10 +72,20 @@ impl<T: ResultFacts> Results<T> {
         self.tail = std::mem::take(&mut other.tail);
     }
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
-        for block in &mut self.blocks { block.retain(&mut keep); }
-        self.tail.retain(keep);
-        self.len = self.blocks.iter().map(Vec::len).sum::<usize>() + self.tail.len();
-        self.refresh();
+        self.len = 0;
+        self.incomplete = 0;
+        self.cancelled = 0;
+        for block in self.blocks.iter_mut().chain(std::iter::once(&mut self.tail)) {
+            block.retain(|item| {
+                if !keep(item) { return false; }
+                self.incomplete += usize::from(item.incomplete());
+                self.cancelled += usize::from(item.cancelled());
+                true
+            });
+            self.len += block.len();
+            if block.is_empty() { *block = Vec::new(); }
+        }
+        if self.len == 0 { self.blocks.clear(); }
     }
     pub fn into_vec(mut self) -> Vec<T> {
         if self.blocks.is_empty() { return self.tail; }

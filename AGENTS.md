@@ -4,6 +4,8 @@
 
 7z.dll worker和C++ CLI启动器代码在sunpack\sevenzip_bridge
 
+worker 的调试、诊断、性能计时和测试插桩统一由 `SUP7Z_DEBUG` 控制。正式发布构建关闭此开关，CI 构建开启此开关。禁止另设功能专用构建选项或编译宏。
+
 USN和watch监控服务代码在：sunpack\sunpack_usn_core和sunpack\sunpack_watch_broker
 
 toast通知组件代码在：sunpack\toast_host

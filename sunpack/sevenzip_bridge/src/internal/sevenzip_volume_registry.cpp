@@ -195,7 +195,7 @@ namespace sunpack::sevenzip
         return earliest;
     }
 
-#ifdef SUP7Z_TEST_IO_FAULTS
+#ifdef SUP7Z_DEBUG
     std::size_t VolumeWriterRegistry::volume_count() const noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);

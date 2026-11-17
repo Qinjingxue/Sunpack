@@ -39,7 +39,7 @@ class Application {
     unsigned dirty_ = 15;
     std::atomic<uint64_t> task_query_generation_{0};
     std::thread worker_, registry_, runtime_;
-    struct ControlBinding { Application* owner; Json field; };
+    struct ControlBinding { Application* owner; Json field; bool pending_removal = false; };
     std::map<std::string,std::unique_ptr<ControlBinding>> controls_;
     UiWidget theme_widget_ = 0;
     UiWidget status_widget_ = 0;

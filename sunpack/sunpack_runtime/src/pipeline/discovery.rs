@@ -293,36 +293,37 @@ pub(super) fn discover(
     let mut verified = HashMap::new();
     let mut retry_scopes = Vec::new();
     let mut by_parent = BTreeMap::<_, (_, Vec<_>)>::new();
-    for path in &files {
-        let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(path));
-        let logical_scope = request.discovery_scope.clone().unwrap_or_else(|| {
-            NativeDiscoveryScope::new(
-                parent.to_string_lossy().into_owned(),
-                max_depth,
-                Vec::new(),
-            )
-        });
+    let requested_scope = request.discovery_scope.as_ref();
+    if let Some(scope) = requested_scope.filter(|_| !files.is_empty()) {
         logical_scopes
-            .entry(logical_scope.key().to_owned())
-            .or_insert(logical_scope);
+            .entry(scope.key().to_owned())
+            .or_insert_with(|| scope.clone());
+    }
+    for path in &files {
+        let (key, root) = if let Some(scope) = requested_scope {
+            (scope.key().to_owned(), std::borrow::Cow::Borrowed(scope.root.as_str()))
+        } else {
+            let path = Path::new(path);
+            let parent = path.parent().unwrap_or(path).to_string_lossy();
+            let mut key = path_key(&parent);
+            key.truncate(key.trim_end_matches('\\').len());
+            if !logical_scopes.contains_key(&key) {
+                let scope = NativeDiscoveryScope::new(parent.as_ref().to_owned(), max_depth, Vec::new());
+                logical_scopes.insert(key.clone(), scope);
+            }
+            (key, parent)
+        };
         if !roots.is_empty() && covering_root(&path_key(path)) {
             continue;
         }
-        let parent = request
-            .discovery_scope
-            .as_ref()
-            .map(|scope| scope.root.clone())
-            .unwrap_or_else(|| parent.to_string_lossy().into_owned());
         let bucket = if request.watch_catalog.is_some() {
             crate::scan::catalog::catalog_stem(path)
         } else {
             String::new()
         };
-        let mut key = path_key(&parent);
-        key.truncate(key.trim_end_matches('\\').len());
         by_parent
             .entry((key, bucket))
-            .or_insert_with(|| (parent, Vec::new()))
+            .or_insert_with(|| (root.into_owned(), Vec::new()))
             .1
             .push((path.clone(), filesystem_logical_name(path)));
     }
@@ -460,7 +461,7 @@ fn suppress_prepared_continuations(prepared: &[Task], tasks: &mut Vec<Task>) {
                 Some(super::FailureContext::Discovery { reason, .. }) if reason == "missing_volume"
             ))
             && input.volume_attempts.is_none()
-            && input.ranges.is_empty() && !input.parts.is_empty()
+            && !input.parts.is_empty()
             && input.parts.iter().all(|part| part.volume_number.is_some_and(|number| number > 1)))
             .then_some(input)
     }
@@ -1323,7 +1324,6 @@ fn merge_shared_inputs(tasks: &mut Vec<Task>, blocked_paths: &mut HashSet<String
                 && left.mode == right.mode
                 && left.format_hint == right.format_hint
                 && left.parts == right.parts
-                && left.ranges == right.ranges
                 && left.volume_attempts == right.volume_attempts;
             if same {
                 if previous.failure.is_some() && next.failure.is_none() {

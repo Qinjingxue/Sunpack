@@ -68,7 +68,7 @@ impl Key {
             let mut storage = [0; COMPOUND_KEY_BYTES];
             let mut remaining = storage.as_mut_slice();
             rmp_serde::encode::write_named(&mut remaining, &(
-                input.mode, &members, &input.parts, &input.ranges,
+                input.mode, &members, &input.parts,
                 &input.volume_attempts,
             )).ok()?;
             let len = COMPOUND_KEY_BYTES - remaining.len();
