@@ -338,8 +338,6 @@ def test_watch_retries_unobserved_candidate_after_acl_only_recovery(package, tmp
     output = tmp_path / "out"
     source = watched / "restricted.zip"
     _zip(source, "restored.txt", b"ACL-only arrival recovery")
-    idle_probe = tmp_path / "idle-probe.zip"
-    _zip(idle_probe, "probe.txt", b"idle reader barrier")
     acl_script = tmp_path / "candidate-acl.ps1"
     acl_script.write_text(r"""
 param([string]$Path, [string]$Saved, [switch]$Restore)
@@ -375,7 +373,6 @@ if ($Restore) {
         result = subprocess.run(command, capture_output=True, text=True, env=environment)
         assert result.returncode == 0, (result.stdout, result.stderr)
 
-    package.configure(watch={"runtime_cache_cleanup_idle_seconds": 0.25})
     package.json("watch", "add", watched, "-R", "-o", output)
     events = package.data / ".sunpack_watch" / "events.json"
     current = source
@@ -410,22 +407,9 @@ if ($Restore) {
         else:
             pytest.fail("Watch did not observe the identity denial during its initial scan")
         assert package.json("watch", "status")["summary"]["pending"] == 0
-        package.json("scan", idle_probe)
-        # Reader-cache release is an observable idle-maintenance barrier. An
-        # exclusive open cannot succeed while the runtime retains its reader.
-        deadline = time.monotonic() + 30
-        saw_cached_reader = False
-        while time.monotonic() < deadline:
-            handle = kernel.CreateFileW(str(idle_probe), 0x80000000, 0, None, 3, 0, None)
-            if handle != ctypes.c_void_p(-1).value:
-                kernel.CloseHandle(ctypes.c_void_p(handle))
-                break
-            assert ctypes.get_last_error() in (32, 33)
-            saw_cached_reader = True
-            time.sleep(0.01)
-        else:
-            pytest.fail("Watch idle maintenance did not release the foreground reader")
-        assert saw_cached_reader, "idle barrier did not observe a retained reader"
+        # The failed observation has drained from the queue. Completed readers
+        # are now released with their owners, so retaining one until idle
+        # maintenance is no longer a valid synchronization condition.
         assert not list(output.rglob("restored.txt"))
         acl(current, restore=True)
         _wait_for_output(output, "restored.txt", b"ACL-only arrival recovery")

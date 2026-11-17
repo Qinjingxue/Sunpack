@@ -49,9 +49,11 @@ def test_plan7_interrupted_download_completes_after_restart(package, tmp_path, r
         tmp_path / "fixtures", "restart-zip", "zip", password=PASSWORD, payload_size=128 * 1024,
     )
     watch = watch_setup(package, tmp_path)
-    partial = download(watch, case.entry_path, interrupt=True)
-    if not resume:
-        partial.unlink()
+    partial = download(watch, case.entry_path, interrupt=True, delete_interrupted=not resume)
+    if resume:
+        assert 0 < partial.stat().st_size < case.entry_path.stat().st_size
+    else:
+        assert not partial.exists()
     assert not list(watch.output.rglob(case.marker_name))
     watch.restart()
     download(watch, case.entry_path, resume=resume)

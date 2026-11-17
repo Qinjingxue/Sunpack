@@ -124,7 +124,8 @@ def source_directory_cleaned(directory):
         return True
 
 
-def download(watch, source, *, mode="rename", directory=None, interrupt=False, resume=False):
+def download(watch, source, *, mode="rename", directory=None, interrupt=False, resume=False,
+             delete_interrupted=False):
     directory = directory or watch.root
     directory.mkdir(parents=True, exist_ok=True)
     final = directory / source.name
@@ -137,6 +138,10 @@ def download(watch, source, *, mode="rename", directory=None, interrupt=False, r
             writer.flush()
             os.fsync(writer.fileno())
             if interrupt:
+                if delete_interrupted:
+                    # Cancel while still owning the writer, just like rename
+                    # publication below. Closing first races Watch readiness.
+                    pending.unlink()
                 return pending
             time.sleep(0.001)
         # Keep write ownership through publication. main's readiness probe
