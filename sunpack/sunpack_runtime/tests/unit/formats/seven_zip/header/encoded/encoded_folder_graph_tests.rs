@@ -168,25 +168,68 @@ fn password_probe_accepts_7z_aes_without_salt_or_iv() {
 }
 
 #[test]
-fn seven_zip_kdf_cache_is_bounded_and_preserves_keys() {
-    seven_zip_kdf_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
-    for index in 0..SEVEN_ZIP_KDF_CACHE_CAPACITY + 17 {
-        let password = format!("cache-password-{index}").into_bytes();
-        assert_eq!(
-            cached_seven_zip_aes_key(4, b"salt", &password),
-            derive_seven_zip_aes_key(4, b"salt", &password)
-        );
+fn header_prescreen_and_full_crc_share_one_candidate_scoped_key() {
+    use aes::cipher::BlockModeEncrypt;
+    for compressed in [false, true] {
+        let properties = vec![0xc1, 0x10, 9, 10, 11];
+        // LZMA2 uncompressed chunk containing the valid empty Header tree.
+        let encoded: &[u8] = if compressed {
+            &[1, 0, 1, SZ_HEADER, SZ_END, 0]
+        } else {
+            &[SZ_HEADER, SZ_END]
+        };
+        let mut encrypted = vec![0x99; 16];
+        encrypted[..encoded.len()].copy_from_slice(encoded);
+        let bytes = Password::from("secret");
+        let (key, iv) = seven_zip_aes_key_iv(&properties, bytes.as_slice()).unwrap();
+        cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
+            .encrypt_padded::<NoPadding>(&mut encrypted, 16)
+            .unwrap();
+        let mut folder = SevenZipFolderAst {
+            coders: vec![SevenZipCoderAst {
+                method_id: EncoderMethod::ID_AES256_SHA256.to_vec(),
+                properties,
+                num_in_streams: 1,
+                num_out_streams: 1,
+            }],
+            bind_pairs: Vec::new(),
+            packed_streams: vec![0],
+            main_output_stream: 0,
+            unpack_sizes: SevenZipUnpackSizes::Main(2),
+            expected_crc: Some(crc32(&[SZ_HEADER, SZ_END])),
+        };
+        if compressed {
+            folder.coders.push(SevenZipCoderAst {
+                method_id: EncoderMethod::ID_LZMA2.to_vec(),
+                properties: vec![0],
+                num_in_streams: 1,
+                num_out_streams: 1,
+            });
+            folder.bind_pairs.push((1, 0));
+            folder.main_output_stream = 1;
+            folder.unpack_sizes = SevenZipUnpackSizes::All(vec![encoded.len() as u64, 2]);
+        }
+        let stream = seven_zip_aes_stream(&folder, 0, 16).unwrap();
+        let mut probe = SevenZipPasswordProbe {
+            packed_data: vec![encrypted.into()],
+            folder,
+            aes_index: 0,
+            prefix: Some((0, stream)),
+        };
+        for password in ["wrong", "secret", "secret"] {
+            SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.set(0));
+            let result = probe.decoded_header_if_password_matches(password).unwrap();
+            assert_eq!(result.is_some(), password == "secret");
+            // The prefix survivor must not derive again in the full decoder;
+            // repeated requests have no hidden global retained-key state.
+            assert_eq!(SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.get()), 1);
+        }
+        probe.folder.expected_crc = Some(probe.folder.expected_crc.unwrap() ^ 1);
+        assert!(probe
+            .decoded_header_if_password_matches("secret")
+            .unwrap()
+            .is_none());
     }
-    assert_eq!(
-        seven_zip_kdf_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len(),
-        SEVEN_ZIP_KDF_CACHE_CAPACITY
-    );
 }
 
 #[test]

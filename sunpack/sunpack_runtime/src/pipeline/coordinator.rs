@@ -385,7 +385,6 @@ impl Engine {
 
     pub(crate) fn clear_idle_caches(&self) {
         crate::relations::clear_regex_caches();
-        crate::formats::seven_zip::clear_seven_zip_kdf_cache();
         self.output_names.lock().unwrap().clear_history();
         self.recent_passwords.clear();
     }

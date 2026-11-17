@@ -180,7 +180,11 @@ impl SevenZipPayloadProbe {
     pub(crate) fn test(&self, password: &str) -> Result<SevenZipPrefixCheck, String> {
         check_password_cancellation()?;
         let password = Password::from(password);
-        let (key, iv) = seven_zip_aes_key_iv_using(&self.properties, password.as_slice(), derive_seven_zip_aes_key)?;
+        let (key, iv) = seven_zip_aes_key_iv_using(
+            &self.properties,
+            password.as_slice(),
+            derive_seven_zip_aes_key,
+        )?;
         let mut iv = self.iv_override.unwrap_or(iv);
         match &self.kind {
             SevenZipPayloadEvidence::Prefix {
@@ -235,119 +239,72 @@ impl SevenZipPayloadProbe {
     }
 }
 
-// Follow bind pairs from the actual packed input, never coder array order.
-// Copy is transparent; filters before the compressor are not a plain prefix.
-fn seven_zip_payload_plan(
+// One shared graph walk for encrypted headers and data-only evidence. Copy
+// nodes are transparent; no filter is mistaken for a compressed-stream start.
+struct SevenZipAesStream {
+    aes_index: usize,
+    plaintext_size: u64,
+    consumer: Option<(usize, u64)>,
+}
+
+fn seven_zip_aes_stream(
     folder: &SevenZipFolderAst,
-    substreams: &[SevenZipSubstreamAst],
     packed_input: u64,
-    offset: u64,
     packed_size: u64,
-) -> Option<SevenZipPayloadPlan> {
+) -> Option<SevenZipAesStream> {
     let mut input = packed_input;
-    let mut aes: Option<&SevenZipCoderAst> = None;
-    let mut aes_size = 0;
+    let mut aes_index = None;
+    let mut plaintext_size = 0;
     for _ in 0..folder.coders.len() {
         let mut input_base = 0;
         let mut output_base = 0;
-        let (coder, output) = folder.coders.iter().find_map(|coder| {
-            let found =
-                (input == input_base && coder.num_in_streams == 1 && coder.num_out_streams == 1)
-                    .then_some((coder, output_base));
-            input_base += coder.num_in_streams;
-            output_base += coder.num_out_streams;
-            found
-        })?;
+        let (index, coder, output) =
+            folder
+                .coders
+                .iter()
+                .enumerate()
+                .find_map(|(index, coder)| {
+                    let found = (input == input_base
+                        && coder.num_in_streams == 1
+                        && coder.num_out_streams == 1)
+                        .then_some((index, coder, output_base));
+                    input_base += coder.num_in_streams;
+                    output_base += coder.num_out_streams;
+                    found
+                })?;
         if coder.method_id == EncoderMethod::ID_AES256_SHA256 {
-            if aes.is_some() {
+            if aes_index.is_some() {
                 return None;
             }
             seven_zip_aes_properties(&coder.properties)?;
-            aes = Some(coder);
-            aes_size = folder.unpack_size(output);
-            if aes_size == 0 || packed_size % 16 != 0 || aes_size > packed_size {
+            aes_index = Some(index);
+            plaintext_size = folder.unpack_size(output);
+            if plaintext_size == 0 || packed_size % 16 != 0 || plaintext_size > packed_size {
                 return None;
             }
         } else if coder.method_id == EncoderMethod::ID_COPY && coder.properties.is_empty() {
-            // Copy may expose only its declared output range.
-            if aes.is_some() {
-                aes_size = aes_size.min(folder.unpack_size(output));
-                if aes_size == 0 {
+            if aes_index.is_some() {
+                plaintext_size = plaintext_size.min(folder.unpack_size(output));
+                if plaintext_size == 0 {
                     return None;
                 }
             }
         } else {
-            let aes = aes?;
+            let aes_index = aes_index?;
             if !seven_zip_prefix_is_supported(&coder.method_id) {
                 return None;
             }
-            let strong = seven_zip_prefix_is_strong(&coder.method_id);
-            // Deflate tree descriptions can extend beyond the first two AES
-            // blocks. A slightly larger bounded prefix avoids cheap false
-            // positives without allocating a decoder dictionary.
-            let prefix_size = if matches!(coder.method_id.as_slice(), [4, 1, 8] | [4, 1, 9]) { 128 } else { 32 };
-            let plaintext_size = aes_size.min(prefix_size) as usize;
-            let size = (plaintext_size as u64).div_ceil(16) * 16;
-            let cycles = seven_zip_aes_properties(&aes.properties)?.0;
-            return Some(SevenZipPayloadPlan {
-                offset,
-                size,
-                properties: aes.properties.clone(),
-                preceding_block: false,
-                kind: SevenZipPayloadEvidence::Prefix {
-                    coder: coder.clone(),
-                    unpack_size: folder.unpack_size(output),
-                    plaintext_size,
-                },
-                cost: seven_zip_payload_cost(cycles, size, strong),
+            return Some(SevenZipAesStream {
+                aes_index,
+                plaintext_size,
+                consumer: Some((index, folder.unpack_size(output))),
             });
         }
         if output == folder.main_output_stream {
-            let aes = aes?;
-            // No decompressor/filter intervened: a substream CRC is directly
-            // on AES plaintext. CBC needs just the block before this range.
-            let smallest = substreams
-                .iter()
-                .filter_map(|stream| {
-                    stream
-                        .crc
-                        .filter(|_| stream.size != 0)
-                        .map(|crc| (stream.offset, stream.size, crc))
-                })
-                .chain(
-                    folder
-                        .expected_crc
-                        .filter(|_| aes_size != 0)
-                        .map(|crc| (0, aes_size, crc)),
-                )
-                .min_by_key(|(start, size, _)| {
-                    (start % 16 + size).div_ceil(16) + u64::from(*start >= 16)
-                })?;
-            let (start, bytes, expected) = smallest;
-            let end = start.checked_add(bytes)?;
-            if end > aes_size {
-                return None;
-            }
-            let first_block = start / 16 * 16;
-            let preceding_block = first_block != 0;
-            let read_start = first_block.saturating_sub(16);
-            let read_end = end.div_ceil(16).checked_mul(16)?;
-            if read_end > packed_size {
-                return None;
-            }
-            let size = read_end - read_start;
-            let cycles = seven_zip_aes_properties(&aes.properties)?.0;
-            return Some(SevenZipPayloadPlan {
-                offset: offset.checked_add(read_start)?,
-                size,
-                properties: aes.properties.clone(),
-                preceding_block,
-                kind: SevenZipPayloadEvidence::Crc {
-                    skip: (start - first_block) as usize,
-                    size: bytes,
-                    expected,
-                },
-                cost: seven_zip_payload_cost(cycles, size, bytes >= 4),
+            return Some(SevenZipAesStream {
+                aes_index: aes_index?,
+                plaintext_size,
+                consumer: None,
             });
         }
         input = folder
@@ -357,6 +314,94 @@ fn seven_zip_payload_plan(
             .0;
     }
     None
+}
+
+fn seven_zip_payload_plan(
+    folder: &SevenZipFolderAst,
+    substreams: &[SevenZipSubstreamAst],
+    packed_input: u64,
+    offset: u64,
+    packed_size: u64,
+) -> Option<SevenZipPayloadPlan> {
+    let stream = seven_zip_aes_stream(folder, packed_input, packed_size)?;
+    let aes = &folder.coders[stream.aes_index];
+    let aes_size = stream.plaintext_size;
+    if let Some((index, unpack_size)) = stream.consumer {
+        let coder = &folder.coders[index];
+        let strong = seven_zip_prefix_is_strong(&coder.method_id);
+        // Deflate tree descriptions can extend beyond the first two AES
+        // blocks. A slightly larger bounded prefix avoids cheap false
+        // positives without allocating a decoder dictionary.
+        let prefix_size = seven_zip_prefix_read_size(&coder.method_id);
+        let plaintext_size = aes_size.min(prefix_size) as usize;
+        let size = (plaintext_size as u64).div_ceil(16) * 16;
+        let cycles = seven_zip_aes_properties(&aes.properties)?.0;
+        return Some(SevenZipPayloadPlan {
+            offset,
+            size,
+            properties: aes.properties.clone(),
+            preceding_block: false,
+            kind: SevenZipPayloadEvidence::Prefix {
+                coder: coder.clone(),
+                unpack_size: unpack_size,
+                plaintext_size,
+            },
+            cost: seven_zip_payload_cost(cycles, size, strong),
+        });
+    }
+    // No decompressor/filter intervened: a substream CRC is directly
+    // on AES plaintext. CBC needs just the block before this range.
+    let smallest = substreams
+        .iter()
+        .filter_map(|stream| {
+            stream
+                .crc
+                .filter(|_| stream.size != 0)
+                .map(|crc| (stream.offset, stream.size, crc))
+        })
+        .chain(
+            folder
+                .expected_crc
+                .filter(|_| aes_size != 0)
+                .map(|crc| (0, aes_size, crc)),
+        )
+        .min_by_key(|(start, size, _)| {
+            (start % 16 + size).div_ceil(16) + u64::from(*start >= 16)
+        })?;
+    let (start, bytes, expected) = smallest;
+    let end = start.checked_add(bytes)?;
+    if end > aes_size {
+        return None;
+    }
+    let first_block = start / 16 * 16;
+    let preceding_block = first_block != 0;
+    let read_start = first_block.saturating_sub(16);
+    let read_end = end.div_ceil(16).checked_mul(16)?;
+    if read_end > packed_size {
+        return None;
+    }
+    let size = read_end - read_start;
+    let cycles = seven_zip_aes_properties(&aes.properties)?.0;
+    return Some(SevenZipPayloadPlan {
+        offset: offset.checked_add(read_start)?,
+        size,
+        properties: aes.properties.clone(),
+        preceding_block,
+        kind: SevenZipPayloadEvidence::Crc {
+            skip: (start - first_block) as usize,
+            size: bytes,
+            expected,
+        },
+        cost: seven_zip_payload_cost(cycles, size, bytes >= 4),
+    });
+}
+
+fn seven_zip_prefix_read_size(method: &[u8]) -> u64 {
+    if matches!(method, [4, 1, 8] | [4, 1, 9]) {
+        128
+    } else {
+        32
+    }
 }
 
 fn seven_zip_payload_cost(cycles: u8, bytes: u64, strong: bool) -> u64 {

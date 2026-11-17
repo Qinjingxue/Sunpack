@@ -22,11 +22,18 @@ fn kdf_credit_counts_preserve_official_keys() {
     ] {
         let header = Header::parse(fixture, fixture.len() as u64).unwrap();
         let serial = Workspace::with_threads(1)
-            .derive(&header, &pw("sunpack-test"))
+            .derive(&header, &pw("sunpack-test"), KeyPurpose::Extraction)
             .unwrap();
+        let proof = Workspace::with_threads(1)
+            .derive(&header, &pw("sunpack-test"), KeyPurpose::PasswordProof)
+            .unwrap();
+        assert_eq!(proof.key, serial.key);
+        assert_eq!(proof.nonce, serial.nonce);
+        assert_eq!(proof.auth, [0; 32]);
+        assert_ne!(serial.auth, [0; 32]);
         for threads in [2, 3, 4] {
             let parallel = Workspace::with_threads(threads)
-                .derive(&header, &pw("sunpack-test"))
+                .derive(&header, &pw("sunpack-test"), KeyPurpose::Extraction)
                 .unwrap();
             assert_eq!(parallel.key, serial.key);
             assert_eq!(parallel.nonce, serial.nonce);
@@ -336,7 +343,7 @@ fn ctr_arbitrary_chunking_matches_official_all_ciphers() {
     for fixture in FIXTURES {
         let header = Header::parse(fixture, fixture.len() as u64).unwrap();
         let keys = Workspace::default()
-            .derive(&header, &pw("sunpack-test"))
+            .derive(&header, &pw("sunpack-test"), KeyPurpose::Extraction)
             .unwrap();
         for chunk in [1, 7, 15, 31, 32, 127, 129] {
             let mut bytes = fixture[40..fixture.len() - 32].to_vec();
@@ -370,7 +377,7 @@ fn ctr_offsets_match_official_vectors_and_full_counter_carries() {
     for fixture in FIXTURES {
         let header = Header::parse(fixture, fixture.len() as u64).unwrap();
         let keys = Workspace::default()
-            .derive(&header, &pw("sunpack-test"))
+            .derive(&header, &pw("sunpack-test"), KeyPurpose::Extraction)
             .unwrap();
         let mut stream = cipher::Stream::new(header.bytes[6], &keys.key, &keys.nonce);
         // Absolute offsets remain valid even after the serial cursor has advanced.
@@ -426,7 +433,7 @@ fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
         let mut header = Header::parse(FIXTURES[code], FIXTURES[code].len() as u64).unwrap();
         header.bytes[7] = 0;
         let keys = Workspace::default()
-            .derive(&header, &pw("sunpack-test"))
+            .derive(&header, &pw("sunpack-test"), KeyPurpose::Extraction)
             .unwrap();
         let plaintext: Vec<u8> = (0..(if code == 9 { 2 } else { 1 }) * 1024 * 1024 + 137)
             .map(|i| (i * 13) as u8)

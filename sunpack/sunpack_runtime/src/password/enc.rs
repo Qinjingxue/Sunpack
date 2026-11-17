@@ -125,20 +125,27 @@ impl EncPasswordContext {
             // Dividing candidate count by four again serializes small batches.
             .min(candidates.len())
             .max(1);
-        let chunk_size = candidates.len().div_ceil(workers);
+        // Claim nearby candidates instead of assigning distant contiguous
+        // chunks. Once a hit is known, only already-running KDFs remain;
+        // earlier candidates have already been claimed. Each worker still owns
+        // exactly one temporary workspace and reuses it until this batch ends.
+        let next = AtomicUsize::new(0);
         let earliest = AtomicUsize::new(candidates.len());
         let cancellation = Cancellation::current();
-        let search = |(chunk_index, chunk): (usize, &[Arc<str>])| {
-            let mut workspace = Workspace::default();
+        let search = || {
+            // Multiple candidates already provide parallelism. Two lane tasks reduce
+            // nested joins while preserving all four Argon2 format lanes.
+            // A lone workspace keeps the full lane parallelism for latency.
+            let mut workspace = Workspace::with_threads(if workers > 1 { 2 } else { 4 });
             workspace.set_cancellation(cancellation.flag());
             let mut utf16 = Vec::new();
-            for (offset, password) in chunk.iter().enumerate() {
-                let index = chunk_index * chunk_size + offset;
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
                 if index >= earliest.load(Ordering::Relaxed) || cancellation.cancelled() {
                     break;
                 }
                 utf16.clear();
-                utf16.extend(password.encode_utf16());
+                utf16.extend(candidates[index].encode_utf16());
                 match self.probe.matches(&utf16, &mut workspace) {
                     Ok(false) => (),
                     outcome => {
@@ -150,14 +157,18 @@ impl EncPasswordContext {
             None
         };
         if workers == 1 {
-            search((0, candidates))
+            search()
         } else {
-            candidates
-                .par_chunks(chunk_size)
-                .enumerate()
-                .map(search)
-                .find_first(Option::is_some)
-                .flatten()
+            (0..workers)
+                .into_par_iter()
+                .filter_map(|_| search())
+                // Worker completion order is unrelated to candidate order.
+                // Earlier claims must finish even after a later match/error.
+                .min_by_key(|(index, _)| *index)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/password/enc/tests.rs"]
+mod tests;

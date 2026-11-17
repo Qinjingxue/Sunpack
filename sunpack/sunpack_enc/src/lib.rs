@@ -87,6 +87,12 @@ impl Header {
     }
 }
 
+#[derive(Clone, Copy)]
+enum KeyPurpose {
+    PasswordProof,
+    Extraction,
+}
+
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct Keys {
     key: Vec<u8>,
@@ -121,7 +127,12 @@ impl Workspace {
         workspace.kdf_threads = Some(threads.max(1));
         workspace
     }
-    fn derive(&mut self, header: &Header, password: &[u16]) -> Result<Keys> {
+    fn derive(
+        &mut self,
+        header: &Header,
+        password: &[u16],
+        purpose: KeyPurpose,
+    ) -> Result<Keys> {
         let cancellation = &self.cancellation;
         let cancelled = || {
             cancellation
@@ -201,14 +212,18 @@ impl Workspace {
                 b"nonceInfo".as_slice(),
                 keys.nonce.as_mut_slice(),
             ),
-            (
-                b"authKeySalt".as_slice(),
-                b"authKeyInfo".as_slice(),
-                keys.auth.as_mut_slice(),
-            ),
         ] {
             Hkdf::<Sha3_512>::new(Some(salt), &*derived)
                 .expand(info, output)
+                .map_err(|_| Error::Format)?;
+        }
+        // PasswordProof consumes only the quick cipher block. Deriving its
+        // unused authentication key for every rejected candidate is needless.
+        // Extraction still derives the same full key material in this call;
+        // no Argon2 result or key cache survives the operation.
+        if matches!(purpose, KeyPurpose::Extraction) {
+            Hkdf::<Sha3_512>::new(Some(b"authKeySalt"), &*derived)
+                .expand(b"authKeyInfo", &mut keys.auth)
                 .map_err(|_| Error::Format)?;
         }
         Ok(keys)
@@ -263,14 +278,19 @@ impl PasswordProbe {
         self.header.params().unwrap().memory_blocks() as usize * std::mem::size_of::<Block>()
     }
     pub fn matches(&self, password: &[u16], workspace: &mut Workspace) -> Result<bool> {
-        match self.keys(password, workspace) {
+        match self.checked_keys(password, workspace, KeyPurpose::PasswordProof) {
             Ok(_) => Ok(true),
             Err(Error::Password) => Ok(false),
             Err(e) => Err(e),
         }
     }
-    fn keys(&self, password: &[u16], workspace: &mut Workspace) -> Result<Keys> {
-        let keys = workspace.derive(&self.header, password)?;
+    fn checked_keys(
+        &self,
+        password: &[u16],
+        workspace: &mut Workspace,
+        purpose: KeyPurpose,
+    ) -> Result<Keys> {
+        let keys = workspace.derive(&self.header, password, purpose)?;
         let mut quick = self.quick;
         cipher::Stream::new(self.header.bytes[6], &keys.key, &keys.nonce).apply(&mut quick);
         if !quick
@@ -332,7 +352,7 @@ impl Decoder {
                 }
             }
             workspace.kdf_threads = Some(1 + lease.extra);
-            probe.keys(password, &mut workspace)?
+            probe.checked_keys(password, &mut workspace, KeyPurpose::Extraction)?
         };
         drop(workspace); // return large KDF memory before recovery/payload I/O
 

@@ -17,6 +17,8 @@ impl AsRef<[u8]> for CoderInput<'_> {
 pub(crate) struct SevenZipPasswordProbe {
     packed_data: Vec<Blob>,
     folder: SevenZipFolderAst,
+    aes_index: usize,
+    prefix: Option<(usize, SevenZipAesStream)>,
 }
 
 impl SevenZipPasswordProbe {
@@ -53,10 +55,26 @@ impl SevenZipPasswordProbe {
         if folder.expected_crc.is_none() || !seven_zip_probe_folder_supported(&folder) {
             return Err("7z password probe coder graph has no safe fast path".into());
         }
-        let packed_data = read_seven_zip_packed_data(reader, reader_len, next_header_start, &pack, &folder)?;
+        let packed_data =
+            read_seven_zip_packed_data(reader, reader_len, next_header_start, &pack, &folder)?;
+        let aes_index = folder
+            .coders
+            .iter()
+            .position(|coder| coder.method_id == EncoderMethod::ID_AES256_SHA256)
+            .expect("supported encrypted folder");
+        let prefix = folder
+            .packed_streams
+            .iter()
+            .enumerate()
+            .find_map(|(index, &input)| {
+                seven_zip_aes_stream(&folder, input, packed_data[index].len() as u64)
+                    .map(|stream| (index, stream))
+            });
         Ok(Self {
             packed_data,
             folder,
+            aes_index,
+            prefix,
         })
     }
 
@@ -65,10 +83,32 @@ impl SevenZipPasswordProbe {
         password: &str,
     ) -> Result<Option<Blob>, String> {
         check_password_cancellation()?;
-        let decoded = match decode_seven_zip_encoded_folder(
+        if password.is_empty() {
+            return Ok(None);
+        }
+        // Candidate-scoped material serves both the cheap rejection and the
+        // full CRC verifier. Wrong keys never enter a process-wide cache.
+        let bytes = Password::from(password);
+        let (key, iv) = seven_zip_aes_key_iv(
+            &self.folder.coders[self.aes_index].properties,
+            bytes.as_slice(),
+        )?;
+        let key = SevenZipAesKey { key, iv };
+        if let Some((packed, stream)) = &self.prefix {
+            if !seven_zip_header_prefix_matches(
+                &self.packed_data[*packed],
+                &self.folder,
+                stream,
+                &key,
+            )? {
+                return Ok(None);
+            }
+        }
+        let decoded = match decode_seven_zip_encoded_folder_with_key(
             &self.packed_data,
             &self.folder,
-            Some(password),
+            None,
+            Some((self.aes_index, &key)),
         ) {
             Ok(decoded) => decoded,
             Err(error) if error.starts_with("resource_unavailable:") => return Err(error),
@@ -81,6 +121,50 @@ impl SevenZipPasswordProbe {
                 .is_some_and(|expected| crc32(&decoded) == expected))
         .then_some(decoded))
     }
+}
+
+struct SevenZipAesKey {
+    key: [u8; 32],
+    iv: [u8; 16],
+}
+impl Drop for SevenZipAesKey {
+    fn drop(&mut self) {
+        self.key.fill(0);
+        self.iv.fill(0);
+    }
+}
+
+fn seven_zip_header_prefix_matches(
+    encrypted: &[u8],
+    folder: &SevenZipFolderAst,
+    stream: &SevenZipAesStream,
+    key: &SevenZipAesKey,
+) -> Result<bool, String> {
+    let limit = stream.consumer.map_or(16, |(index, _)| {
+        seven_zip_prefix_read_size(&folder.coders[index].method_id)
+    });
+    let len = stream.plaintext_size.min(limit) as usize;
+    let encrypted_len = len.div_ceil(16) * 16;
+    let Some(encrypted) = encrypted.get(..encrypted_len) else {
+        return Ok(true);
+    };
+    let mut prefix = [0u8; 128];
+    prefix[..encrypted_len].copy_from_slice(encrypted);
+    Aes256CbcDec::new(&key.key.into(), &key.iv.into())
+        .decrypt_padded::<NoPadding>(&mut prefix[..encrypted_len])
+        .map_err(|_| "encoded_header_payload_crc_bad:aes_block_size".to_string())?;
+    Ok(match stream.consumer {
+        Some((index, unpack_size)) => {
+            let coder = &folder.coders[index];
+            seven_zip_prefix_check(
+                &coder.method_id,
+                &coder.properties,
+                &prefix[..len],
+                unpack_size,
+            ) != SevenZipPrefixCheck::Reject
+        }
+        None => prefix.first() == Some(&SZ_HEADER),
+    })
 }
 
 fn read_seven_zip_packed_data<R: Read + Seek>(
@@ -99,23 +183,23 @@ fn read_seven_zip_packed_data<R: Read + Seek>(
     let mut packed_data = Vec::with_capacity(pack.sizes.len());
     for &size in &pack.sizes {
         let stream_end = stream_start
-        .checked_add(size)
-        .ok_or("7z password probe stream end overflow")?;
+            .checked_add(size)
+            .ok_or("7z password probe stream end overflow")?;
         if stream_end > before {
-        return Err("7z password probe stream range is invalid".into());
+            return Err("7z password probe stream range is invalid".into());
         }
         let stream_size =
-        usize::try_from(size).map_err(|_| "7z password probe stream is too large")?;
+            usize::try_from(size).map_err(|_| "7z password probe stream is too large")?;
         packed_data.push(
-        read_seven_zip_probe_range(
-            reader,
-            reader_len,
-            stream_start,
-            stream_size,
-            "7z.encoded_header.packed_stream",
-            FieldLocation::Body,
-        )
-        .map_err(resource_error)?,
+            read_seven_zip_probe_range(
+                reader,
+                reader_len,
+                stream_start,
+                stream_size,
+                "7z.encoded_header.packed_stream",
+                FieldLocation::Body,
+            )
+            .map_err(resource_error)?,
         );
         stream_start = stream_end;
     }
@@ -190,6 +274,15 @@ fn decode_seven_zip_encoded_folder(
     folder: &SevenZipFolderAst,
     password: Option<&str>,
 ) -> Result<Blob, String> {
+    decode_seven_zip_encoded_folder_with_key(packed_data, folder, password, None)
+}
+
+fn decode_seven_zip_encoded_folder_with_key(
+    packed_data: &[Blob],
+    folder: &SevenZipFolderAst,
+    password: Option<&str>,
+    key: Option<(usize, &SevenZipAesKey)>,
+) -> Result<Blob, String> {
     if folder.coders.is_empty() {
         return Err("encoded_header_decoder_unsupported_method".to_string());
     }
@@ -199,6 +292,7 @@ fn decode_seven_zip_encoded_folder(
         packed_data,
         folder,
         password,
+        key,
         &mut visiting,
     )
 }
@@ -208,6 +302,7 @@ fn decode_seven_zip_output(
     packed_data: &[Blob],
     folder: &SevenZipFolderAst,
     password: Option<&str>,
+    key: Option<(usize, &SevenZipAesKey)>,
     visiting: &mut [bool],
 ) -> Result<Blob, String> {
     let mut input_base = 0u64;
@@ -242,8 +337,15 @@ fn decode_seven_zip_output(
             .iter()
             .find(|(input, _)| *input == input_stream)
         {
-            decode_seven_zip_output(*upstream_output, packed_data, folder, password, visiting)
-                .map(CoderInput::Owned)
+            decode_seven_zip_output(
+                *upstream_output,
+                packed_data,
+                folder,
+                password,
+                key,
+                visiting,
+            )
+            .map(CoderInput::Owned)
         } else {
             let packed_index = folder
                 .packed_streams
@@ -272,6 +374,13 @@ fn decode_seven_zip_output(
     }
     let input = read_input(0)?;
     visiting[coder_index] = false;
+    if let Some((index, key)) = key.filter(|(index, _)| *index == coder_index) {
+        debug_assert_eq!(
+            folder.coders[index].method_id,
+            EncoderMethod::ID_AES256_SHA256
+        );
+        return decrypt_seven_zip_aes_with_key(input.as_ref(), key, unpack_size);
+    }
     decode_seven_zip_encoded_coder(input, coder, password, unpack_size)
 }
 
@@ -473,17 +582,27 @@ fn decrypt_seven_zip_aes256_sha256(
         return Err("encoded_header_decode_password_required".into());
     };
     let password_bytes = Password::from(password);
-    let (key, mut iv) = seven_zip_aes_key_iv(properties, password_bytes.as_slice())?;
+    let (key, iv) = seven_zip_aes_key_iv(properties, password_bytes.as_slice())?;
+    decrypt_seven_zip_aes_with_key(data, &SevenZipAesKey { key, iv }, unpack_size)
+}
+
+fn decrypt_seven_zip_aes_with_key(
+    data: &[u8],
+    key: &SevenZipAesKey,
+    unpack_size: u64,
+) -> Result<Blob, String> {
+    let mut iv = key.iv;
     if data.len() % 16 != 0 || unpack_size > data.len() as u64 {
         return Err("encoded_header_payload_crc_bad:aes_block_size".into());
     }
     let mut output = Spool::default();
     let mut remaining = unpack_size;
-    let mut buffer = vec![0; 64 * 1024];
+    let mut buffer = crate::io::resource_error::zeroed_bytes(data.len().clamp(16, 64 * 1024))
+        .map_err(resource_error)?;
     for bytes in data.chunks(buffer.len()) {
         check_password_cancellation()?;
         buffer[..bytes.len()].copy_from_slice(bytes);
-        Aes256CbcDec::new(&key.into(), &iv.into())
+        Aes256CbcDec::new(&key.key.into(), &iv.into())
             .decrypt_padded::<NoPadding>(&mut buffer[..bytes.len()])
             .map_err(|_| "encoded_header_decode_password_rejected".to_string())?;
         iv.copy_from_slice(&bytes[bytes.len() - 16..]);
@@ -554,11 +673,11 @@ fn seven_zip_aes_key_iv(
     properties: &[u8],
     password: &[u8],
 ) -> Result<([u8; 32], [u8; 16]), String> {
-    seven_zip_aes_key_iv_using(properties, password, cached_seven_zip_aes_key)
+    seven_zip_aes_key_iv_using(properties, password, derive_seven_zip_aes_key)
 }
 
-// Payload candidates are already deduplicated by the plan. Their derived key
-// is needed only for this one bounded check, not for the process-wide header cache.
+// Password keys are candidate-scoped. The caller can carry one key through
+// bounded prescreening and complete verification without a global cache.
 fn seven_zip_aes_key_iv_using(
     properties: &[u8],
     password: &[u8],
@@ -582,81 +701,6 @@ fn seven_zip_aes_key_iv_using(
     Ok((key, iv))
 }
 
-const SEVEN_ZIP_KDF_CACHE_CAPACITY: usize = 256;
-
-struct SevenZipKdfCacheEntry {
-    cycles: u32,
-    salt: Vec<u8>,
-    password: Vec<u8>,
-    key: [u8; 32],
-}
-
-impl Drop for SevenZipKdfCacheEntry {
-    fn drop(&mut self) {
-        self.password.fill(0);
-        self.salt.fill(0);
-        self.key.fill(0);
-    }
-}
-
-fn seven_zip_kdf_cache(
-) -> &'static std::sync::Mutex<std::collections::VecDeque<SevenZipKdfCacheEntry>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::VecDeque<SevenZipKdfCacheEntry>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
-}
-
-pub(crate) fn clear_seven_zip_kdf_cache() {
-    // Idle cleanup owns the same boundary as reader/password-context cleanup.
-    // Drop entries and their backing allocation outside the cache lock.
-    let entries = std::mem::take(
-        &mut *seven_zip_kdf_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    );
-    drop(entries);
-}
-
-fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
-    check_password_cancellation()?;
-    let matches = |entry: &SevenZipKdfCacheEntry| {
-        entry.cycles == cycles && entry.salt == salt && entry.password == password
-    };
-    {
-        let mut cache = seven_zip_kdf_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(index) = cache.iter().position(matches) {
-            let entry = cache.remove(index).expect("located 7z KDF cache entry");
-            let key = entry.key;
-            cache.push_front(entry);
-            return Ok(key);
-        }
-    }
-
-    let key = derive_seven_zip_aes_key(cycles, salt, password)?;
-    let mut cache = seven_zip_kdf_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(index) = cache.iter().position(matches) {
-        let entry = cache.remove(index).expect("located 7z KDF cache entry");
-        let cached_key = entry.key;
-        cache.push_front(entry);
-        return Ok(cached_key);
-    }
-    if cache.len() >= SEVEN_ZIP_KDF_CACHE_CAPACITY {
-        cache.pop_back();
-    }
-    cache.push_front(SevenZipKdfCacheEntry {
-        cycles,
-        salt: salt.to_vec(),
-        password: password.to_vec(),
-        key,
-    });
-    Ok(key)
-}
-
 fn check_password_cancellation() -> Result<(), String> {
     if crate::io::cancellation::Cancellation::current().cancelled() {
         Err("resource_unavailable:password probe cancelled".into())
@@ -665,7 +709,12 @@ fn check_password_cancellation() -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
+thread_local! { static SEVEN_ZIP_KDF_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
+    #[cfg(test)]
+    SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.set(count.get() + 1));
     let cancellation = crate::io::cancellation::Cancellation::current();
     const KDF_RECORDS_PER_UPDATE: usize = 64;
     let mut sha = sha2_11::Sha256::default();
@@ -755,8 +804,3 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
 #[cfg(test)]
 #[path = "../../../../tests/unit/formats/seven_zip/header/encoded/encoded_folder_graph_tests.rs"]
 mod encoded_folder_graph_tests;
-
-#[cfg(test)]
-pub(crate) fn seven_zip_cached_key_count() -> usize {
-    seven_zip_kdf_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
-}
