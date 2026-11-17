@@ -79,6 +79,7 @@ pub(crate) struct NativeCandidateTable {
     // Decrypted continuations may outlive their headless proposal. Transfer
     // their existing facts to the same embedded peer frontier, without I/O.
     volume_seeds: Vec<(Arc<DirectorySnapshotTable>, usize, crate::analysis_native::volume_anchor::VolumeAnchor)>,
+    volume_entry_peers: Vec<(Arc<DirectorySnapshotTable>, usize)>,
     // Shared physical facts; row indices survive only for this discovery scan.
     relation_sources: Vec<NativeDirectorySnapshot>,
 }
@@ -656,9 +657,6 @@ impl NativeEmbeddedBatch {
             .collect();
         let mut cache = std::mem::take(&mut batch.relation_cache);
         let mut pending = std::mem::take(&mut batch.pending_volumes);
-        let requested: HashSet<_> = pending.iter()
-            .filter(|item| !batch.supplemental.contains(&item.index))
-            .map(|item| path_key(&item.anchor.path)).collect();
         let pending_keys: HashSet<_> = pending
             .iter()
             .map(|item| path_key(&item.anchor.path))
@@ -864,6 +862,9 @@ impl NativeEmbeddedBatch {
             // Ownership is physical: a related carrier may also hold a second
             // split head. Keep its connected groups before cleanup can own the
             // carrier, without promoting unrelated same-stem archives.
+            let requested: HashSet<_> = table.rows.iter().enumerate()
+                .filter(|(index, _)| !batch.supplemental.contains(index))
+                .map(|(_, row)| path_key(row.path())).collect();
             let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
             let mut keep = vec![false; groups.len()];
             let mut work = Vec::new();
@@ -942,6 +943,7 @@ impl NativeCandidateTable {
         self.rows.append(&mut other.rows);
         self.relation_sources.append(&mut other.relation_sources);
         self.volume_seeds.append(&mut other.volume_seeds);
+        self.volume_entry_peers.append(&mut other.volume_entry_peers);
     }
 
     pub(crate) fn from_directory(
@@ -967,12 +969,45 @@ impl NativeCandidateTable {
             .map(|row| Candidate::File(Arc::clone(&selected.table), row)));
         if let Some(targets) = targets {
             targets.retain(&mut table.rows);
+            if deep {
+                table.find_volume_entry_peers(filtered, targets);
+            }
         }
         if !deep {
             table.append_speculative_files(raw);
         }
         table.relation_sources.push(raw.share_rows());
         table
+    }
+
+    // An explicitly selected raw continuation may have no signature. Use
+    // existing split-entry evidence to open the same Embedded peer frontier
+    // from the other end, within this target's original scope.
+    fn find_volume_entry_peers(&mut self, filtered: &NativeDirectorySnapshot, targets: &FileTargets) {
+        if self.rows.is_empty() || self.rows.len() >= filtered.rows.len() {
+            return;
+        }
+        let facts = &filtered.table;
+        let mut stems = None;
+        for &row in filtered.rows.iter() {
+            if !facts.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor)
+                .is_some_and(|anchor| anchor.multivolume && anchor.is_volume_entry())
+            {
+                continue;
+            }
+            let path = &facts.paths[row];
+            if targets.names_by_path.contains_key(&path_key(path)) {
+                continue;
+            }
+            let stems = stems.get_or_insert_with(|| self.rows.iter().filter_map(|candidate| {
+                let Candidate::File(facts, row) = candidate else { return None; };
+                facts.relation_anchors[*row].as_ref().and_then(CheapAnchor::anchor).is_none()
+                    .then(|| catalog_stem(candidate.path()))
+            }).collect::<HashSet<_>>());
+            if stems.contains(&catalog_stem(path)) {
+                self.volume_entry_peers.push((Arc::clone(facts), row));
+            }
+        }
     }
 
     /// Decrypt only nominated RAR families. Until the hidden main header is
@@ -1285,11 +1320,23 @@ impl NativeCandidateTable {
             batch.force_scan = true;
             return batch;
         }
-        NativeEmbeddedBatch {
+        let mut batch = NativeEmbeddedBatch {
             ids: (0..self.rows.len()).collect(),
             force_scan: true,
             ..NativeEmbeddedBatch::default()
+        };
+        if !self.volume_entry_peers.is_empty() {
+            let mut seen: HashSet<_> = self.rows.iter().map(|row| path_key(row.path())).collect();
+            for (facts, row) in std::mem::take(&mut self.volume_entry_peers) {
+                if seen.insert(path_key(&facts.paths[row])) {
+                    let index = self.rows.len();
+                    self.rows.push(Candidate::File(facts, row));
+                    batch.supplemental.insert(index);
+                    batch.ids.push(index);
+                }
+            }
         }
+        batch
     }
 
     /// Finish primary projection before calling: only embedded/relation rows survive.
