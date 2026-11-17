@@ -40,11 +40,10 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
     for password in ["", "secret", "密碼🔐", &"long-password".repeat(10)] {
         for lg2_count in [0, 4, 10] {
             let iterations = 1u32 << lg2_count;
-            let mut header = Rar5EncryptionHeader {
+            let mut header = Rar5EncryptionIdentity {
                 lg2_count,
                 salt: [0x73; 16],
-                has_password_check: true,
-                password_check: [0; 8],
+                password_check: None,
             };
             let mut key = [0u8; 32];
             let mut check = [0u8; 32];
@@ -60,13 +59,14 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
                 iterations + 32,
                 &mut check,
             );
-            for (index, byte) in check.iter().enumerate() {
-                header.password_check[index % 8] ^= byte;
-            }
+            let mut proof = [0; 8];
+            for (index, byte) in check.iter().enumerate() { proof[index % 8] ^= byte; }
+            header.password_check = Some(proof);
             assert_eq!(rar5_checked_aes_key(password, &header), Some(key));
-            header.password_check[0] ^= 1;
+            proof[0] ^= 1;
+            header.password_check = Some(proof);
             assert_eq!(rar5_checked_aes_key(password, &header), None);
-            header.has_password_check = false;
+            header.password_check = None;
             assert_eq!(rar5_checked_aes_key(password, &header), None);
         }
     }

@@ -67,11 +67,15 @@ pub(crate) enum PasswordContext {
 }
 
 impl PasswordContext {
-    fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
+    fn verify(
+        &self,
+        candidates: &[Arc<str>],
+        rar5_key: Option<&mut Option<super::rar::Rar5ProvenKey>>,
+    ) -> std::io::Result<PasswordVerification> {
         match self {
             Self::Enc(context) => context.verify(candidates),
             Self::Zip(context) => context.verify(candidates),
-            Self::Rar(context) => context.verify(candidates),
+            Self::Rar(context) => context.verify(candidates, rar5_key),
             Self::SevenZip(context) => context.verify(candidates),
         }
     }
@@ -113,9 +117,16 @@ static ACTIVE: Mutex<Vec<Arc<PreparedSlot>>> = Mutex::new(Vec::new());
 /// Keep one preparation across all candidate batches in a password plan.
 /// Overlapping plans share initialization, and the last plan frees its slot.
 #[derive(Default)]
-pub(crate) struct Preparation(Option<Arc<PreparedSlot>>);
+pub(crate) struct Preparation<'a> {
+    slot: Option<Arc<PreparedSlot>>,
+    rar5_key: Option<&'a mut Option<super::rar::Rar5ProvenKey>>,
+}
 
-impl Preparation {
+impl<'a> Preparation<'a> {
+    pub(crate) fn capturing_rar5_key(key: &'a mut Option<super::rar::Rar5ProvenKey>) -> Self {
+        Self { slot: None, rar5_key: Some(key) }
+    }
+
     pub(crate) fn verify(
         &mut self,
         key: InputKey,
@@ -126,11 +137,11 @@ impl Preparation {
         cancellation.check()?;
         let mut prepare = Some(prepare);
         loop {
-            if self.0.as_ref().is_none_or(|slot| slot.key != key) {
+            if self.slot.as_ref().is_none_or(|slot| slot.key != key) {
                 self.release(false);
-                self.0 = Some(borrow(&key));
+                self.slot = Some(borrow(&key));
             }
-            let slot = self.0.as_ref().unwrap();
+            let slot = self.slot.as_ref().unwrap();
             let Some(prepared) = slot.value.get_or_init(&cancellation, || prepare.take().unwrap()()) else {
                 // The initializing borrower was cancelled. Waiters can take
                 // over without retiring a still-current file generation.
@@ -143,7 +154,7 @@ impl Preparation {
                 return Err(input_changed());
             }
             let result = cancellation.check().and_then(|()| match prepared {
-                Ok(context) => context.verify(candidates),
+                Ok(context) => context.verify(candidates, self.rar5_key.as_deref_mut()),
                 Err(status) => Ok(status.verification()),
             });
             let retired = slot.retired.load(Ordering::Acquire);
@@ -158,7 +169,7 @@ impl Preparation {
     }
 
     fn release(&mut self, detach: bool) {
-        let Some(slot) = self.0.take() else { return; };
+        let Some(slot) = self.slot.take() else { return; };
         let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
         if detach || Arc::strong_count(&slot) <= 2 {
             if let Some(index) = active.iter().position(|current| Arc::ptr_eq(current, &slot)) {
@@ -177,7 +188,7 @@ impl Preparation {
     }
 }
 
-impl Drop for Preparation {
+impl Drop for Preparation<'_> {
     fn drop(&mut self) { self.release(false); }
 }
 

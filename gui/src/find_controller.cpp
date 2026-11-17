@@ -36,14 +36,17 @@ FindController::~FindController() {
 }
 void FindController::Refresh(const char* scope) {
     for(auto& s:searches_) {
+        if(scope && std::string_view(scope)!=s.scope) continue;
         if(visible(s)) {
-            if(!scope || std::string_view(scope)==s.scope) refresh(s);
+            refresh(s);
             continue;
         }
         if(!s.matches.empty()) clear_matches(s);
-        if(s.targets.capacity()) {
-            if(!s.targets.empty()) s.saved=selection(s);
+        if(!s.targets.empty()) {
+            s.saved=selection(s);
             release_results(s);
+            s.revision=++revision_;
+            decorate(s);
         }
     }
 }
@@ -109,6 +112,8 @@ void FindController::refresh(Search& s) {
     ui_page_set_json(page_,"searchSnapshot","null"); // Never retain a duplicate of the reactive rows.
     auto query=fold_search(snapshot.at("query").get_ref<const std::string&>());
     const bool changed=s.query!=query;
+    if(!changed && query.empty()) return;
+    const bool had_results=!s.targets.empty();
     auto old=changed?Selection{}:s.targets.empty()?std::move(s.saved):selection(s);
     s.saved={};
     if(changed || query.empty()) clear_matches(s);
@@ -116,7 +121,6 @@ void FindController::refresh(Search& s) {
     s.before=snapshot.value("before",false); s.after=snapshot.value("after",false);
     s.query=std::move(query); s.targets.clear(); s.byId.clear(); s.ticks.clear();
     s.current={}; s.geometry=~uint64_t(0); s.extent=-1; s.revision=++revision_;
-    if(s.query.empty()) release_results(s);
     if(!s.query.empty()) for(auto& source:snapshot.at("targets")) {
         Target target{source.at("id").get<std::string>(),source.at("row").get<int>(),source.at("tag").get<int>()};
         target.ranges=match(s,source.at("text").get_ref<const std::string&>());
@@ -133,18 +137,19 @@ void FindController::refresh(Search& s) {
     if(!s.targets.empty()) {
         if(s.pending && !at_edge(s,s.pending)) advance(s,s.pending);
         s.targets[s.current.target].ranges[s.current.range].active=true;
-    }
+    } else if(had_results) release_results(s);
     const bool locate=changed || s.pending!=0;
     s.pending=0;
-    decorate(s);
+    if(had_results || !s.targets.empty()) decorate(s);
     if(locate && !s.targets.empty()) reveal(s);
 }
-void FindController::Decorate() { for(auto& s:searches_) if(visible(s)) decorate(s); }
+void FindController::Decorate() { for(auto& s:searches_) if(!s.targets.empty() && visible(s)) decorate(s); }
 void FindController::decorate(Search& s) {
     auto* area=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll)); if(!area) return;
     auto* list=root()->FindById(s.list);
     std::function<void(ui::Widget*,ui::Widget*)> visit=[&](ui::Widget* w,ui::Widget* row) {
-        if(!w->visible) return;
+        // Clear earlier highlights on hidden editors and tabs once as well.
+        if(!w->visible && !s.targets.empty()) return;
         if(w->Parent()==list) row=w;
         auto found=s.byId.find(w->id);
         if(found!=s.byId.end()) {
@@ -162,21 +167,25 @@ void FindController::decorate(Search& s) {
             }
         }
         if(w->textHighlightRevision!=s.revision) {
-            w->textHighlightRevision=s.revision; w->textHighlights.clear();
-            std::map<size_t,std::vector<ui::TextHighlight>> tags;
-            if(found!=s.byId.end()) for(size_t index:found->second.targets) {
-                auto& t=s.targets[index];
-                if(t.tag>=0) tags[size_t(t.tag)]=t.ranges; else w->textHighlights=t.ranges;
-            }
+            w->textHighlightRevision=s.revision;
             if(auto* collection=dynamic_cast<TagCollection*>(w)) {
-                collection->SetHighlights(std::move(tags));
-                auto* parent=collection->Parent();
-                while(parent && !dynamic_cast<ui::ScrollViewWidget*>(parent)) parent=parent->Parent();
-                if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(parent)) {
-                    std::weak_ptr<TagCollection> weak=std::static_pointer_cast<TagCollection>(collection->shared_from_this());
-                    scroll->onDrawSearchMarkers=[weak,scroll](ui::Renderer& r){if(auto item=weak.lock()) item->DrawSearchMarkers(r,*scroll);};
+                std::map<size_t,std::vector<ui::TextHighlight>> tags;
+                if(found!=s.byId.end()) for(size_t index:found->second.targets) {
+                    auto& t=s.targets[index];
+                    if(t.tag>=0) tags[size_t(t.tag)]=t.ranges;
                 }
-            }
+                const bool has_tags=!tags.empty();
+                collection->SetHighlights(std::move(tags));
+                if(has_tags) {
+                    auto* parent=collection->Parent();
+                    while(parent && !dynamic_cast<ui::ScrollViewWidget*>(parent)) parent=parent->Parent();
+                    if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(parent)) {
+                        std::weak_ptr<TagCollection> weak=std::static_pointer_cast<TagCollection>(collection->shared_from_this());
+                        scroll->onDrawSearchMarkers=[weak,scroll](ui::Renderer& r){if(auto item=weak.lock()) item->DrawSearchMarkers(r,*scroll);};
+                    }
+                }
+            } else if(found!=s.byId.end()) w->textHighlights=s.targets[found->second.targets.back()].ranges;
+            else if(w->textHighlights.capacity()) decltype(w->textHighlights)().swap(w->textHighlights);
         }
         for(auto& child:w->Children()) visit(child.get(),row);
     };

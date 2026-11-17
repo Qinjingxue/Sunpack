@@ -50,7 +50,7 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     let passwords = [Arc::from("secret")];
     let reader = ManagedReader::from_bytes(data, Default::default());
     let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 37, "rar").unwrap();
-    let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true).unwrap();
+    let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true, None).unwrap();
     assert_eq!(matched, Some(0));
     assert_eq!(anchor.internal_volume_number, Some(3));
     assert_eq!(anchor.relation_has_next, Some(false));
@@ -82,14 +82,14 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     data.extend(ciphertext);
     let reader = ManagedReader::from_bytes(data.clone(), Default::default());
     let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 0, "rar").unwrap();
-    let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true).unwrap();
+    let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true, None).unwrap();
     assert_eq!(matched, Some(0));
     assert_eq!(anchor.internal_volume_number, Some(3), "{}", anchor.error);
 
     data.truncate(300);
     let reader = ManagedReader::from_bytes(data, Default::default());
     let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 0, "rar").unwrap();
-    let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true).unwrap();
+    let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true, None).unwrap();
     assert!(matched.is_none() && anchor.needs_password);
     assert!(!anchor.wrong_password);
 }

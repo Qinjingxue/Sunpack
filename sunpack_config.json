@@ -8,7 +8,7 @@
   "watch": {
     "tray_enabled": true,
     "toast_enabled": true,
-    "deduplication": "file_id",
+    "deduplication": "none",
     "deduplication_scope": "root",
     "event_log_retention_days": 7,
     "toast_report_retention_days": 7,

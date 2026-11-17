@@ -1,4 +1,3 @@
-#define NOMINMAX
 #include "sevenzip_bridge/bridge.hpp"
 #include "internal/sevenzip_paths.hpp"
 #include "internal/sevenzip_formats.hpp"

@@ -323,8 +323,8 @@ CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, 
     Handle writer(CreateFileW(output_path.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_DELETE,
         &sa,CREATE_NEW,FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr));
     if(writer.value==INVALID_HANDLE_VALUE) win_error("opCaptureCli");
-    auto input_path=output_path; input_path+=L".input";
-    Handle reader(CreateFileW(input?input_path.c_str():L"NUL",input?GENERIC_READ|GENERIC_WRITE:GENERIC_READ,
+    auto input_path=input?output_path.wstring()+L".input":L"NUL";
+    Handle reader(CreateFileW(input_path.c_str(),input?GENERIC_READ|GENERIC_WRITE:GENERIC_READ,
         FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,&sa,input?CREATE_NEW:OPEN_EXISTING,
         input?FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE:0,nullptr));
     if(reader.value==INVALID_HANDLE_VALUE) win_error("opCaptureCli");
@@ -336,16 +336,21 @@ CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, 
     Handle process(launch_cli(cli,std::move(command),writer,reader));
     HANDLE waits[] = {stop, process};
     auto signal = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-    DWORD code = 0; GetExitCodeProcess(process, &code);
+    if(signal==WAIT_FAILED) win_error("opReadCliOutput");
+    DWORD code = 0; if(!GetExitCodeProcess(process, &code)) win_error("opReadCliOutput");
     std::string output;
-    if(signal==WAIT_OBJECT_0+1) {
-        LARGE_INTEGER start{}; SetFilePointerEx(writer,start,nullptr,FILE_BEGIN);
-        output.resize(65536); DWORD count=0;
+    if(signal==WAIT_OBJECT_0+1 && code!=0) {
+        LARGE_INTEGER size{};
+        if(!GetFileSizeEx(writer,&size)) win_error("opReadCliOutput");
+        LARGE_INTEGER start{};
+        if(!SetFilePointerEx(writer,start,nullptr,FILE_BEGIN)) win_error("opReadCliOutput");
+        output.resize(size_t(std::min<LONGLONG>(size.QuadPart,65536)));
+        DWORD count=0;
         if(!ReadFile(writer,output.data(),DWORD(output.size()),&count,nullptr)) win_error("opReadCliOutput");
         output.resize(count);
     }
 
-    return {code, output};
+    return {code, std::move(output)};
 }
 DWORD follow_watch_status(const CliCommand& cli,HANDLE stop,const std::function<void(const std::string&)>& received) {
     if(!fs::is_regular_file(cli.executable)) throw std::runtime_error("cliMissing");
@@ -399,8 +404,11 @@ DWORD follow_watch_status(const CliCommand& cli,HANDLE stop,const std::function<
     }
     // This is only our disposable launcher, never the runtime or an extraction worker.
     HANDLE waits[]={stop,process};
-    if(WaitForMultipleObjects(2,waits,FALSE,INFINITE)==WAIT_OBJECT_0) TerminateProcess(process,ERROR_CANCELLED);
-    WaitForSingleObject(process,INFINITE);
+    const auto signal=WaitForMultipleObjects(2,waits,FALSE,INFINITE);
+    if(signal==WAIT_OBJECT_0) {
+        TerminateProcess(process,ERROR_CANCELLED);
+        WaitForSingleObject(process,INFINITE);
+    } else if(signal==WAIT_FAILED) win_error("opReadCliOutput");
     DWORD code=0; GetExitCodeProcess(process,&code);
     return code;
 }

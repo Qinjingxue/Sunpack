@@ -932,31 +932,21 @@ pub(crate) fn resolve_encrypted_relation_anchor(
     reader: &ManagedReader,
     passwords: &[std::sync::Arc<str>],
     require_terminal: bool,
+    proven_key: Option<&crate::password::rar::Rar5ProvenKey>,
 ) -> std::io::Result<(VolumeAnchor, Option<usize>)> {
+    use crate::password::rar::{probe_header_passwords, HeaderPassword};
+
     let rar5 = anchor.has_any(RAR_VERSION_5);
     let reader = reader.windowed_probe_reader();
-    let mut rejected = 0;
-    for (index, password) in passwords.iter().enumerate() {
-        let Some(proof) = crate::password::rar::probe_header_encrypted(
-            &reader,
-            anchor.structure_offset.unwrap_or(0),
-            password,
-            usize::try_from(reader.len() / 8).unwrap_or(usize::MAX),
-            require_terminal,
-        )?
-        else {
-            continue;
-        };
-        if !proof.password_matched {
-            rejected += usize::from(proof.password_rejected);
-            continue;
-        }
+    let mut out = anchor.clone();
+    let password = probe_header_passwords(
+        &reader, anchor.structure_offset.unwrap_or(0), passwords, require_terminal, proven_key,
+    )?;
+    if let HeaderPassword::Matched(index, proof) = password {
         if rar5 && proof.main_volume.is_none() {
-            let mut out = anchor.clone();
             out.flags |= RAR_PASSWORD_MATCHED_INCOMPLETE;
             return Ok((out, None));
         }
-        let mut out = anchor.clone();
         out.needs_password = false;
         out.wrong_password = false;
         if let Some((flags, number)) = proof.main_volume {
@@ -970,19 +960,17 @@ pub(crate) fn resolve_encrypted_relation_anchor(
         apply_rar_terminal_proof(&mut out, proof);
         return Ok((out, Some(index)));
     }
-    let mut out = anchor.clone();
-    out.wrong_password = !passwords.is_empty() && rejected == passwords.len();
+    out.wrong_password = matches!(password, HeaderPassword::Rejected);
     Ok((out, None))
 }
 
 fn apply_rar_terminal_proof(out: &mut VolumeAnchor, proof: crate::password::rar::RarTerminalProof) {
-    if proof.end_block_found {
-        let next = proof.end_block_flags & 1 != 0;
-        out.relation_has_next = Some(next);
-        out.expected_logical_size = proof.end_offset;
-        out.continuation_to_next = next;
-        merge_rar_volume(out, proof.volume_number);
-        if !next {
+    if let Some(terminal) = proof.terminal {
+        out.relation_has_next = Some(terminal.has_next);
+        out.expected_logical_size = Some(terminal.offset);
+        out.continuation_to_next = terminal.has_next;
+        merge_rar_volume(out, terminal.volume_number);
+        if !terminal.has_next {
             out.flags |= TERMINAL;
         }
         out.flags |= RAR_END_CHECKED;

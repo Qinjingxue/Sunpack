@@ -164,7 +164,9 @@ impl CandidateSet {
             })].into();
         }
         input.analysis.password_required = true;
-        let plan = match self.plan_inner(&input, None, cancellation, Some(std::slice::from_ref(session)))? {
+        let mut key = None;
+        let plan = match self.plan_inner(&input, None, cancellation, Some(std::slice::from_ref(session)),
+            &mut password::context::Preparation::capturing_rar5_key(&mut key))? {
             Ok(plan) => plan,
             Err(failure) => {
                 let mut out = anchor.clone();
@@ -176,7 +178,7 @@ impl CandidateSet {
             .unwrap_or(&plan.candidates);
         let (_, reader) = session.borrowed_reader();
         let (out, matched) = crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor(
-            anchor, &reader, passwords, offset != 0 || anchor.carrier_limit.is_some(),
+            anchor, &reader, passwords, offset != 0 || anchor.carrier_limit.is_some(), key.as_ref(),
         )?;
         Ok((out, matched.map(|index| passwords[index].clone())))
     }
@@ -187,7 +189,7 @@ impl CandidateSet {
         known: Option<Arc<str>>,
         cancellation: &Cancellation,
     ) -> io::Result<Result<PasswordPlan, Failure>> {
-        self.plan_inner(input, known, cancellation, None)
+        self.plan_inner(input, known, cancellation, None, &mut password::context::Preparation::default())
     }
 
     fn plan_inner(
@@ -196,6 +198,7 @@ impl CandidateSet {
         known: Option<Arc<str>>,
         cancellation: &Cancellation,
         sessions: Option<&[NativeArchiveSession]>,
+        preparation: &mut password::context::Preparation<'_>,
     ) -> io::Result<Result<PasswordPlan, Failure>> {
         let recent = &self.sources.recent;
         if let Some(password) = known {
@@ -252,7 +255,6 @@ impl CandidateSet {
         let candidates = self
             .for_path(&input.entry_path)
             .filter(|value| needs_password || !value.is_empty());
-        let mut preparation = password::context::Preparation::default();
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut pending = Vec::new();
         let mut evidence = None;
@@ -290,7 +292,7 @@ impl CandidateSet {
             PLANNED_BATCHES.with(|capture| {
                 if let Some(batches) = capture.borrow_mut().as_mut() { batches.push(batch.clone()); }
             });
-            let result = password::verify(&mut preparation, input, &batch, sessions, None)?;
+            let result = password::verify(preparation, input, &batch, sessions, None)?;
             match result.status {
                 "not_required" => {
                     if let Some((key, cache)) = attempts.as_ref() {

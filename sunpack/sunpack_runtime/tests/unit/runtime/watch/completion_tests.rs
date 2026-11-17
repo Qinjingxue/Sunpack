@@ -37,6 +37,7 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
         dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
+        root_scope_records: HashMap::new(),
         cwd: base.clone(), root_file: base.join(ROOTS_FILE),
         roots: BTreeMap::new(), available_roots: HashSet::new(),
         user_password_signature: user_password_signature(&settings.user_passwords),

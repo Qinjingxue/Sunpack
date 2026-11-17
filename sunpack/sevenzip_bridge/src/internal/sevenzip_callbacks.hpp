@@ -209,6 +209,7 @@ namespace sunpack::sevenzip
                 const auto *range = part_ranges_ && *index < part_ranges_->size() ? &(*part_ranges_)[*index] : nullptr;
                 const auto &path = range ? range->path : part_paths_ && *index < part_paths_->size()
                     ? (*part_paths_)[*index] : archive_path_;
+                if (!input_error_) input_error_ = std::make_shared<std::atomic<HRESULT>>(S_OK);
                 auto *stream = new VolumeInStream(path, range, volume_prefetch_config_, input_error_);
                 CMyComPtr<IInStream> stream_holder(stream);
                 if (!stream->is_open())
@@ -225,7 +226,7 @@ namespace sunpack::sevenzip
         }
 
         bool missing_volume_requested() const { return missing_volume_requested_; }
-        HRESULT input_error() const { return input_error_->load(std::memory_order_relaxed); }
+        HRESULT input_error() const { return input_error_ ? input_error_->load(std::memory_order_relaxed) : S_OK; }
         bool volume_open_failed() const { return volume_open_failed_; }
         bool password_requested() const { return password_requested_; }
         const std::wstring &missing_volume_name() const { return missing_volume_name_; }
@@ -280,7 +281,7 @@ namespace sunpack::sevenzip
         std::shared_ptr<std::atomic<bool>> cancel_token_;
 
         std::optional<std::unordered_map<std::wstring, std::size_t>> volume_paths_;
-        std::shared_ptr<std::atomic<HRESULT>> input_error_ = std::make_shared<std::atomic<HRESULT>>(S_OK);
+        std::shared_ptr<std::atomic<HRESULT>> input_error_;
         bool missing_volume_requested_ = false;
         bool volume_open_failed_ = false;
         bool password_requested_ = false;

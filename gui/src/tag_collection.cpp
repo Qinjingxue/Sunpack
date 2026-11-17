@@ -17,7 +17,7 @@ bool TagCollection::SetItems(const std::string& source) {
     std::vector<Tag> next; next.reserve(values.size());
     for(const auto& value:values) next.push_back({wide(value.at("value").get_ref<const std::string&>()),value.at("regex").get<bool>()});
     tags_=std::move(next); source_=source; width_=-1;
-    highlights_.clear(); markers_.clear(); active_tag_=-1;
+    highlights_.clear(); rebuild_markers();
     hovered_=pressed_=-1;
     ui::RequestLayout();
     return true;
@@ -83,7 +83,6 @@ void TagCollection::OnDraw(ui::Renderer& r) {
 }
 void TagCollection::SetHighlights(std::map<size_t,std::vector<ui::TextHighlight>> highlights) {
     highlights_=std::move(highlights); rebuild_markers();
-    if(highlights_.empty()) decltype(markers_)().swap(markers_);
 }
 void TagCollection::SetActiveHighlight(size_t tag,size_t range,bool active) {
     auto found=highlights_.find(tag);
@@ -93,6 +92,11 @@ void TagCollection::SetActiveHighlight(size_t tag,size_t range,bool active) {
 }
 void TagCollection::rebuild_markers() {
     markers_.clear(); tick_height_=-1; active_tag_=-1;
+    if(highlights_.empty()) {
+        decltype(markers_)().swap(markers_);
+        decltype(ticks_)().swap(ticks_);
+        return;
+    }
     for(auto& item:highlights_) if(item.first<tags_.size()) {
         const float y=tags_[item.first].bounds.top+chipHeight/2;
         if(markers_.empty() || markers_.back()!=y) markers_.push_back(y);
@@ -100,6 +104,7 @@ void TagCollection::rebuild_markers() {
     }
 }
 void TagCollection::DrawSearchMarkers(ui::Renderer& r,const ui::ScrollViewWidget& scroll) const {
+    if(markers_.empty()) return;
     const auto box=scroll.ScrollbarTrackRect();
     const float height=box.bottom-box.top;
     if(tick_height_!=height) {

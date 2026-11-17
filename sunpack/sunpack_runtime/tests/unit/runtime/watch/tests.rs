@@ -762,7 +762,7 @@ fn retained_regroup_handoff_persists_the_new_current_root() {
                 PendingObservation(candidate.path.clone(), candidate.size as i64,
                     candidate.mtime, candidate.observation.file_id.clone(),
                     candidate.observation.change_usn),
-                current.path.to_string_lossy().into_owned(), Some(recovery.record()),
+                current.path.to_string_lossy().into_owned(), Some(Arc::new(recovery.record())),
             )], pending.force, &recovery.password_scope.to_string_lossy(), true, None);
             operations.put_entry(Arc::clone(&entry));
             Ok(operations)
@@ -1007,13 +1007,15 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
     let root = owner.with_extension("state");
     let segment = root.join("retained");
     let child_output = segment.join("nested");
-    let unrelated = root.join("unrelated");
+    let unrelated = root.join("retained-sibling");
     fs::create_dir_all(&child_output).unwrap();
     fs::create_dir_all(&unrelated).unwrap();
     let carrier = root.join("carrier.bin");
     let nested = segment.join("nested.zip");
+    let sibling = unrelated.join("nested.zip");
     fs::write(&carrier, b"carrier archive").unwrap();
     fs::write(&nested, b"nested archive").unwrap();
+    fs::write(&sibling, b"unrelated nested archive").unwrap();
     let receipt = |source: &Path, output: &Path, partial: bool| {
         let input = crate::io::archive_state::ArchiveInput::file(
             source.to_string_lossy().into_owned(), "zip".into(), "nested".into(),
@@ -1030,8 +1032,8 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
                 "complete_files":1})),
         })).unwrap()
     };
-    let checkpoints = vec![receipt(&carrier, &segment, false), receipt(&nested, &child_output, true),
-        receipt(&owner, &unrelated, false)];
+    let checkpoints = vec![receipt(&nested, &child_output, true), receipt(&sibling, &unrelated, false),
+        receipt(&carrier, &segment, false)];
     let owner_text = owner.to_str().unwrap();
     let carrier_text = carrier.to_str().unwrap();
     {
@@ -1051,7 +1053,7 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
             last_attempt_at: 1.0,
         };
         blocker.failure_payload.insert("input_checkpoints".into(), serde_json::to_value(
-            recovery_checkpoints(&checkpoints, &[carrier.clone()])).unwrap());
+            RecoveryReceipts::new(&checkpoints).select([carrier.as_path()])).unwrap());
         journal.commit(true, |_| {
             let mut operations = NativeWatchOperations::empty();
             operations.put_entry(Arc::new(blocker));
@@ -1065,10 +1067,9 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
         assert!(input_checkpoints(journal.state().entry(owner_text).as_deref()).next().is_none());
         let retained = input_checkpoints(journal.state().entry(carrier_text).as_deref()).collect::<io::Result<Vec<_>>>().unwrap();
         assert_eq!(retained.len(), 2);
-        let nested_receipt = retained.iter()
-            .find(|checkpoint| checkpoint.carrier() == nested)
-            .unwrap();
-        let nested_receipt = serde_json::to_value(nested_receipt).unwrap();
+        assert_eq!(retained[0].carrier(), nested);
+        assert_eq!(retained[1].carrier(), carrier);
+        let nested_receipt = serde_json::to_value(&retained[0]).unwrap();
         assert_eq!(nested_receipt["failure"]["failure"]["kind"], "damaged");
         assert_eq!(nested_receipt["failure"]["partial"], true);
         assert_eq!(nested_receipt["failure"]["complete_files"], 1);
@@ -1400,6 +1401,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
         dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
+        root_scope_records: HashMap::new(),
         cwd: base.clone(), root_file: base.join(ROOTS_FILE),
         roots: BTreeMap::new(), available_roots: HashSet::new(),
         user_password_signature: user_password_signature(&settings.user_passwords), settings,

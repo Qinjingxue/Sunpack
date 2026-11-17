@@ -792,7 +792,10 @@ void task_history(Application& app,const fs::path& dir) {
 
     // Follow one grouped card through actual file notifications and page
     // updates. Static projection cannot catch stale virtualized member chips.
+    auto highlighted=active_find_widget(list)->shared_from_this();
     search("");
+    pump([&]{return highlighted->textHighlights.empty();},"Clear task search highlights");
+    highlighted.reset();
     const auto head=dir/"shared.jpg", tail=dir/"shared.chunk3.opaque";
     const std::array<std::pair<const char*,const char*>,4> phases={{{"failed_password","taskWaiting"},
         {"suspended_missing_volume","taskWaiting"},{"processing_started","taskProcessing"},{"done","taskSucceeded"}}};

@@ -305,7 +305,7 @@ pub(crate) struct PendingRecord {
     pub(crate) password_scope_dir: String,
     pub(crate) source_input_root: String,
     pub(crate) internal_recovery: bool,
-    pub(crate) discovery_scope: Map<String, Value>,
+    pub(crate) discovery_scope: Arc<Map<String, Value>>,
     pub(crate) durable_owner: bool,
     pub(crate) active_outputs: ActiveOutputs,
     pub(crate) committed_roots: PathSet,
@@ -362,7 +362,7 @@ pub(crate) struct Cursor {
 
 pub(crate) struct PendingObservation(pub String, pub i64, pub f64, pub String, pub i64);
 
-pub(crate) type PendingUpdate = (PendingObservation, String, Option<Map<String, Value>>);
+pub(crate) type PendingUpdate = (PendingObservation, String, Option<Arc<Map<String, Value>>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Collection {

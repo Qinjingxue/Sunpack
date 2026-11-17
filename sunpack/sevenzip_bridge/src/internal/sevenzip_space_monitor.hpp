@@ -9,7 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -18,7 +18,7 @@ namespace sunpack::sevenzip
     // 纯采样器：每次 tick 直接从 registry 拉仍有 affected job 的 blocked volumes，不维护自己的 membership，
     // 不缓存、不 re-arm；只采样可用空间，发放试探许可由 gate.poll() 决定。
     //
-    // tick() 必须由 controller_loop 在 executor mutex_ 之外调用：它会取 registry mutex_ 并
+    // tick() 由唯一的 monitor 线程在 executor mutex_ 之外调用：它会取 registry mutex_ 并
     // 可能执行一次很慢的 GetDiskFreeSpaceExW（离线 UNC / 坏盘可能卡几秒），放在 mutex_ 内
     // 会把 submit() / cancel() / admission 全部堵住。
     class VolumeSpaceMonitor final
@@ -50,23 +50,17 @@ namespace sunpack::sevenzip
             }
         }
 
-        VolumeSpaceMonitor()
-            : VolumeSpaceMonitor(Options{}, BlockedProvider{}, StatusSink{}) {}
-
         void tick(std::chrono::steady_clock::time_point now) noexcept
         {
             // Low bit: sampling active. Upper bits: blocked-event generation.
             // An empty snapshot may stop only the generation it observed; a
             // concurrent Blocked event must survive that stale snapshot.
             auto generation = sampling_generation_.load(std::memory_order_relaxed);
-            if ((generation & 1) == 0)
+            if ((generation & 1) == 0 || now < next_poll_at_)
             {
                 return;
             }
-            if (!provider_)
-            {
-                return;
-            }
+            next_poll_at_ = now + options_.poll_interval;
 
             std::vector<VolumeStatePtr> states;
             try
@@ -81,23 +75,10 @@ namespace sunpack::sevenzip
             if (states.empty())
             {
                 // 异常状态已完全消除：停止采样，下一 episode 的第一拍立即可采样。
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    next_poll_at_ = std::chrono::steady_clock::time_point{};
-                }
+                next_poll_at_ = {};
                 sampling_generation_.compare_exchange_strong(
                     generation, generation & ~std::uint64_t{1}, std::memory_order_relaxed);
                 return;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (next_poll_at_ != std::chrono::steady_clock::time_point{} &&
-                    now < next_poll_at_)
-                {
-                    return;
-                }
-                next_poll_at_ = now + options_.poll_interval;
             }
 
             for (const auto &state : states)
@@ -124,11 +105,11 @@ namespace sunpack::sevenzip
             }
         }
 
-        // 采样是否处于"活跃"状态：note_blocked() 置位，一次拉取返回空则清零。
-        // 用途只有 tick() 的常态早退与为 parked controller 提供异常路径 deadline。
-        bool sampling() const noexcept
+        // Read by the same thread that owns tick(). Producers only set the generation.
+        std::optional<std::chrono::steady_clock::time_point> next_poll_deadline() const noexcept
         {
-            return (sampling_generation_.load(std::memory_order_relaxed) & 1) != 0;
+            if ((sampling_generation_.load(std::memory_order_relaxed) & 1) == 0) return std::nullopt;
+            return next_poll_at_;
         }
 
         // 由 ChangeSink 在收到 space_blocked transition 时调用（开始采样的唯一驱动点）。
@@ -164,7 +145,6 @@ namespace sunpack::sevenzip
         Options options_;
         BlockedProvider provider_;
         StatusSink status_;
-        mutable std::mutex mutex_; // 只保护 next_poll_at_
         std::atomic<std::uint64_t> sampling_generation_{0};
         std::chrono::steady_clock::time_point next_poll_at_{};
     };

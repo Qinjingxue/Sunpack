@@ -1001,15 +1001,22 @@ fn walk_output_tree(root: &Path, stats: &mut OutputTreeStats) {
 }
 
 pub(crate) fn walk_can_reach(root: &str, target: &str) -> bool {
-    for path in Path::new(target).ancestors() {
-        if crate::path_keys::path_key(&path.to_string_lossy()).trim_end_matches('\\') == root {
-            return true;
+    walk_reachable_keys(target).any(|key| key == root)
+}
+
+pub(crate) fn walk_reachable_keys(target: &str) -> impl Iterator<Item = String> + '_ {
+    // A scan can start at a reparse point, but cannot reach it from its parent.
+    // Check the previous component only when the caller wants to walk higher.
+    Path::new(target).ancestors().scan(None::<&Path>, |previous, path| {
+        if previous.replace(path).is_some_and(|child| {
+            fs::symlink_metadata(child).map_or(true, |metadata| is_reparse_point(&metadata))
+        }) {
+            return None;
         }
-        if std::fs::symlink_metadata(path).map_or(true, |meta| is_reparse_point(&meta)) {
-            return false;
-        }
-    }
-    false
+        let mut key = crate::path_keys::path_key(&path.to_string_lossy());
+        key.truncate(key.trim_end_matches('\\').len());
+        Some(key)
+    }).fuse()
 }
 
 pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {

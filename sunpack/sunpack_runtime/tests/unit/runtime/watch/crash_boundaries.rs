@@ -145,6 +145,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 candidate_diagnostics: CandidateDiagnostics::default(),
+                root_scope_records: HashMap::new(),
                 admission_checkpoint: None,
                 cwd: base.clone(), root_file: base.join(ROOTS_FILE),
                 roots: BTreeMap::from([(key(&watched), (Root { path: watched.clone(), output: None,

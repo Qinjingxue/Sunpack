@@ -858,7 +858,7 @@ void g24_sticky_hint_survives_recovery() {
             return *states;
         },
         VolumeSpaceMonitor::StatusSink{});
-    check(!monitor.sampling(), "G-24: 初始必须不采样");
+    check(!monitor.next_poll_deadline(), "G-24: 初始必须不采样");
 
     // 常态零开销：没有任何卷 blocked 时，tick() 连 registry 都不拉。
     const auto now = std::chrono::steady_clock::now();
@@ -871,7 +871,7 @@ void g24_sticky_hint_survives_recovery() {
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     monitor.note_blocked();
     monitor.tick(now + 20ms);
-    check(monitor.sampling(), "G-24: note_blocked 之后必须开始采样");
+    check(monitor.next_poll_deadline().has_value(), "G-24: note_blocked 之后必须开始采样");
     check(provider_calls->load() >= 1, "G-24: 开始采样后必须真的拉 blocked 卷");
 
     // A 卷恢复 → 这次拉取返回空 → 采样必须停下。
@@ -883,7 +883,7 @@ void g24_sticky_hint_survives_recovery() {
     check(gate->phase() == VolumeSpacePhase::Ready, "G-24: 卷已恢复");
     states->clear(); // 恢复后不再出现在 blocked_volumes() 里
     monitor.tick(now + 100ms);
-    check(!monitor.sampling(),
+    check(!monitor.next_poll_deadline(),
           "G-24: ★ 异常状态消除后必须停止采样（不能像 sticky 历史那样永远拉 registry）");
     const int calls_after_recovery = provider_calls->load();
     monitor.tick(now + 200ms);
@@ -947,7 +947,7 @@ void g25_two_volumes_recover_independently() {
 
     // 采样清零的条件是"拉取结果为空"，不是任何 transition：A 恢复时这次拉取返回 [B]，
     // 所以采样继续、B 仍被 poll；只有 B 也恢复后才停下。
-    check(monitor.sampling(), "G-25: A 恢复后采样必须继续（B 仍然 blocked）");
+    check(monitor.next_poll_deadline().has_value(), "G-25: A 恢复后采样必须继续（B 仍然 blocked）");
     monitor.tick(now + 100ms);
     check(status_seen_b->load(), "G-25: A 恢复之后 B 必须仍被采样");
     check(status_calls->load() >= 1, "G-25: monitor 必须仍在工作");
@@ -1138,10 +1138,14 @@ void g31_monitor_drops_episode_history_after_recovery() {
     state->space_gate = gate;
 
     auto status_calls = std::make_shared<std::atomic<int>>(0);
+    int snapshots = 0;
     // 用虚拟时间检查同一 episode 的节流及新 episode 的首次诊断，无需等待 10 秒。
     VolumeSpaceMonitor monitor(
         VolumeSpaceMonitor::Options{5ms, 10s},
-        [blocked] { return *blocked; },
+        [blocked, &snapshots] {
+            ++snapshots;
+            return *blocked;
+        },
         [status_calls](const VolumeStatePtr &, std::uint64_t, bool, unsigned long) {
             status_calls->fetch_add(1);
         });
@@ -1154,7 +1158,9 @@ void g31_monitor_drops_episode_history_after_recovery() {
     monitor.note_blocked();
     monitor.tick(now);
     check(status_calls->load() >= 1, "G-31: episode 1 必须发出诊断");
-    check(monitor.sampling(), "G-31: episode 1 必须处于采样中");
+    check(monitor.next_poll_deadline() == now + 5ms, "G-31: episode 1 must schedule the next poll");
+    monitor.tick(now + 1ms);
+    check(snapshots == 1, "G-31: a wake before the deadline must not collect another snapshot");
 
     monitor.tick(now + 10ms);
     check(status_calls->load() == 1, "G-31: 同一 episode 的重复采样必须节流");
@@ -1191,7 +1197,7 @@ void g31_monitor_drops_episode_history_after_recovery() {
     recovered.lease.report_success();
     blocked->clear();
     monitor.tick(now + 150ms);
-    check(!monitor.sampling(), "G-31: 全部恢复后必须停止采样");
+    check(!monitor.next_poll_deadline(), "G-31: 全部恢复后必须停止采样");
 
     // 停止采样后再次满盘，也立即报告首次诊断。
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
@@ -1200,7 +1206,7 @@ void g31_monitor_drops_episode_history_after_recovery() {
     monitor.tick(now + 200ms);
     check(status_calls->load() == 11,
           "G-31: 新 episode 的第一拍必须立刻可诊断");
-    check(monitor.sampling(), "G-31: 再次阻塞必须重新开始采样");
+    check(monitor.next_poll_deadline().has_value(), "G-31: 再次阻塞必须重新开始采样");
 
     // Force the stale-empty/new-Blocked race even on runs without a VHD.
     VolumeSpaceMonitor *racing_ptr = nullptr;
@@ -1216,9 +1222,9 @@ void g31_monitor_drops_episode_history_after_recovery() {
     racing_ptr = &racing;
     racing.note_blocked();
     racing.tick(now);
-    check(racing.sampling(), "G-31: 旧的空快照不能覆盖新的 Blocked 事件");
+    check(racing.next_poll_deadline().has_value(), "G-31: 旧的空快照不能覆盖新的 Blocked 事件");
     racing.tick(now + 100ms);
-    check(!racing.sampling(), "G-31: 下一次空快照仍必须能停止空闲采样");
+    check(!racing.next_poll_deadline(), "G-31: 下一次空快照仍必须能停止空闲采样");
 }
 
 
@@ -1378,7 +1384,7 @@ void vhd_recovery(const std::filesystem::path &root, const std::filesystem::path
     const auto now = std::chrono::steady_clock::now();
     monitor.note_blocked();
     monitor.tick(now);
-    if (!check(monitor.sampling(), "VHD: stale empty snapshot must preserve new blocked event")) return;
+    if (!check(monitor.next_poll_deadline().has_value(), "VHD: stale empty snapshot must preserve new blocked event")) return;
 
     monitor.tick(now + 1s);
     auto initial = gate->try_wait({});
@@ -1407,7 +1413,7 @@ void vhd_recovery(const std::filesystem::path &root, const std::filesystem::path
     check(resumed == 1 && gate->phase() == VolumeSpacePhase::Ready, "VHD: only real success resumes");
     gate->unregister_job("survivor");
     monitor.tick(now + 3s);
-    check(!monitor.sampling(), "VHD: recovery stops sampling");
+    check(!monitor.next_poll_deadline(), "VHD: recovery stops sampling");
     const auto calls = provider_calls;
     monitor.tick(now + 4s);
     check(provider_calls == calls, "VHD: no idle polling");

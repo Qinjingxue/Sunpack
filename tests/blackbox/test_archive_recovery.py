@@ -115,8 +115,11 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
     passwords.write_text(json.dumps({"passwords": [{"value": "first-key"}]}), encoding="utf-8")
     package.json("watch", "add", "-d", "-o", output, watched)
 
-    with package.watch_session():
-        package.await_watch_event("failed_password", path=carrier.name)
+    package.json("daemon", "start", "-nt")
+    package.await_watch_event("failed_password", path=carrier.name)
+    # Reload acknowledges on the Watch scheduler after the completion's WAL
+    # commit. The daemon stays live so the test can terminate it below.
+    assert package.json("watch", "reload")["summary"]["running"]
     first_path = _only_output(output, "first.txt", first)
     assert not list(output.rglob("second.txt"))
     if nested:

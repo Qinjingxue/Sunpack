@@ -28,6 +28,7 @@ pub(super) fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
         dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
+        root_scope_records: HashMap::new(),
         cwd: base.into(), root_file: base.join(ROOTS_FILE),
         roots: BTreeMap::from([(root.clone(), (Root { path: watched, output: Some(base.join("output")),
             recursive: true, deep: false, scanned: true }, scope))]),
@@ -335,6 +336,7 @@ fn checkpoint_submits_the_first_ready_generation() {
                 dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 candidate_diagnostics: CandidateDiagnostics::default(),
+                root_scope_records: HashMap::new(),
                 admission_checkpoint: None,
                 cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
                 roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
@@ -494,6 +496,7 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
         dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(),
+        root_scope_records: HashMap::new(),
         admission_checkpoint: None,
         cwd: base.clone(), root_file: base.join(ROOTS_FILE),
         roots: BTreeMap::from([(root.clone(), (Root { path: watched.clone(), output: Some(output.clone()),
@@ -566,6 +569,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 resuming: false, baseline_roots: HashSet::new(),
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
+                root_scope_records: HashMap::new(),
                 cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
                 roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
                     recursive: true, deep: false, scanned: true }, scope))]),
@@ -663,6 +667,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
                 resuming: false, baseline_roots: HashSet::new(),
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
+                root_scope_records: HashMap::new(),
                 cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
                 roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
                     recursive: true, deep: false, scanned: true }, scope))]),
@@ -793,6 +798,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
             resuming: false, baseline_roots: HashSet::new(),
             candidate_diagnostics: CandidateDiagnostics::default(),
+            root_scope_records: HashMap::new(),
             admission_checkpoint: None,
             cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
             roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
@@ -827,7 +833,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         pending.due = Instant::now() + Duration::from_secs(10);
         scheduler.due.insert((pending.due, id.clone()), ());
         let before = Instant::now();
-        scheduler.retry_password_failures(&scheduler.passwords.snapshot(), None).unwrap();
+        scheduler.retry_password_failures(&scheduler.passwords.snapshot(), None, "password_retry").unwrap();
         assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9));
 
         // A new pending also must not use the old password failure shortcut
@@ -927,6 +933,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
             resuming: false, baseline_roots: HashSet::new(),
             candidate_diagnostics: CandidateDiagnostics::default(),
+            root_scope_records: HashMap::new(),
             admission_checkpoint: None,
             cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
             roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,

@@ -150,10 +150,12 @@ function Build-SevenZipWorker {
     Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DSUP7Z_DEBUG=$workerDebug", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
     Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
     Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
-    if ((Get-ProcessBuildArch) -eq $BuildArch) {
-        Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
-    } else {
-        Write-Host "Skipping C++ smoke test because $BuildArch binaries cannot run in the current process architecture" -ForegroundColor Yellow
+    if ($BuildProfile -eq "ci") {
+        if ((Get-ProcessBuildArch) -eq $BuildArch) {
+            Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
+        } else {
+            Write-Host "Skipping C++ tests because $BuildArch binaries cannot run in the current process architecture" -ForegroundColor Yellow
+        }
     }
 
     $workerExe = Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe"
@@ -183,8 +185,10 @@ function Build-ToastLibrary {
     Reset-StaleCMakeBuildDir -SourceDir $SourceRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
     $lto = if ($BuildProfile -eq "ci") { "OFF" } else { "ON" }
     Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $SourceRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUNPACK_TOAST_ENABLE_LTO=$lto", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
-    if ((Get-ProcessBuildArch) -eq $BuildArch) {
+    $toastBuildArgs = @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
+    if ($BuildProfile -eq "release") { $toastBuildArgs += @("--target", "sunpack_toast") }
+    Invoke-Native -FilePath $CMakeCommand -Arguments $toastBuildArgs
+    if ($BuildProfile -eq "ci" -and (Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
     }
     $toastDll = Join-Path $BuildDir "Release\sunpack_toast.dll"

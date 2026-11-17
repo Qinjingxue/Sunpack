@@ -6,7 +6,6 @@
 #include <cstring>
 #include <cmath>
 #include <limits>
-#include <memory>
 #include <optional>
 #include <queue>
 #include <string_view>
@@ -212,7 +211,7 @@ bool matches(const Json& value,const std::wstring& query,const std::string& time
 }
 struct TaskRow { Json value; double timestamp=0; };
 TaskRow project_task(const Json& value,const RootIndex& roots,const std::string& language,
-    std::unordered_map<std::string,std::string>& labels) {
+    std::unordered_map<std::string,std::string>& labels,std::unordered_set<std::string>& ids) {
     auto input=value.find("path"), event_name=value.find("event");
     if(input==value.end() || !input->is_string() || event_name==value.end() || !event_name->is_string()) return {};
     const auto& path=input->get_ref<const std::string&>();
@@ -233,6 +232,9 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
     } else if(event=="failed_terminal" || event=="partial_rejected") {
         label=status="taskFailed"; tone="failure";
     } else return {};
+    auto id=value.value("task_id",std::string());
+    if(id.empty()) id=utf8(path_key(wide(path)));
+    if(!ids.insert(id).second) return {};
     auto translate=[&](const std::string& key) -> const std::string& {
         auto [at,inserted]=labels.try_emplace(key);
         if(inserted) at->second=tr(key,language);
@@ -243,8 +245,6 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
     const bool grouped=group!=value.end() && group->is_object();
     auto display_path=grouped?group->value("path",path):path;
     const fs::path source=wide(display_path);
-    auto id=value.value("task_id",std::string());
-    if(id.empty()) id=utf8(path_key(wide(path)));
     auto parts=Json::array();
     if(grouped && group->contains("members") && (*group)["members"].is_array()) {
         std::unordered_set<std::wstring> seen;
@@ -293,11 +293,12 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         before_name=cursor.at(1).get<std::string>();
         before=Cursor{cursor.at(0).get<int64_t>(),before_name,cursor.at(2).get<uint64_t>()};
     }
-    std::vector<std::unique_ptr<RunReader>> runs;
     auto revision=manifest.value("task_revision",uint64_t(0));
     const auto& historical=manifest.at("runs");
+    std::vector<RunReader> runs;
+    runs.reserve(historical.size()+1);
     for(const auto& run:historical)
-        runs.push_back(std::make_unique<RunReader>(folder,run,before,revision,historical.size()==1));
+        runs.emplace_back(folder,run,before,revision,historical.size()==1);
     auto query=folded(view.task_query); auto bits=filter(query);
     // UTC microseconds are already indexed, including in old stores. Check
     // local display time before rejecting the path bloom, decode candidates
@@ -337,38 +338,37 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     };
     const bool filter_values=!query.empty() || !view.task_root.empty();
     if(manifest.contains("live") && manifest["live"].is_object()) {
-        auto live=std::make_unique<RunReader>(folder,manifest["live"],before,revision,true);
-        if(live->unordered) {
+        auto& live=runs.emplace_back(folder,manifest["live"],before,revision,true);
+        if(live.unordered) {
             // Keep at most one page of live candidates. Only filters on record
             // contents need decoding before the merge with historical runs.
             auto newer=[](const Entry& a,const Entry& b) { return std::tie(a.time,a.offset)>std::tie(b.time,b.offset); };
-            live->selected.reserve(PageRows+1);
-            while(live->position>=0) {
+            live.selected.reserve(PageRows+1);
+            while(live.position>=0) {
                 if((++scanned&63)==0 && cancelled && cancelled()) return Json();
-                auto key=live->key(); auto row=live->current;
-                if((!before || key<*before) && (live->selected.size()<PageRows+1 || newer(row,live->selected.front())) && matches_entry(row)) {
-                    if(!filter_values || matches_value(live->value(packed,raw))) {
-                        if(live->selected.size()==PageRows+1) {
-                            std::pop_heap(live->selected.begin(),live->selected.end(),newer);
-                            live->selected.pop_back();
+                auto key=live.key(); auto row=live.current;
+                if((!before || key<*before) && (live.selected.size()<PageRows+1 || newer(row,live.selected.front())) && matches_entry(row)) {
+                    if(!filter_values || matches_value(live.value(packed,raw))) {
+                        if(live.selected.size()==PageRows+1) {
+                            std::pop_heap(live.selected.begin(),live.selected.end(),newer);
+                            live.selected.pop_back();
                         }
-                        live->selected.push_back(row);
-                        std::push_heap(live->selected.begin(),live->selected.end(),newer);
+                        live.selected.push_back(row);
+                        std::push_heap(live.selected.begin(),live.selected.end(),newer);
                     }
                 }
-                live->previous();
+                live.previous();
             }
-            std::sort_heap(live->selected.begin(),live->selected.end(),newer);
-            std::reverse(live->selected.begin(),live->selected.end());
-            live->filtered=true; live->position=int64_t(live->selected.size())-1;
-            if(live->position>=0) live->current=live->selected.back();
+            std::sort_heap(live.selected.begin(),live.selected.end(),newer);
+            std::reverse(live.selected.begin(),live.selected.end());
+            live.filtered=true; live.position=int64_t(live.selected.size())-1;
+            if(live.position>=0) live.current=live.selected.back();
         }
-        runs.push_back(std::move(live));
     }
     const auto earlier=[](const RunReader* a,const RunReader* b) { return a->key()<b->key(); };
     std::vector<RunReader*> heads;
     heads.reserve(runs.size());
-    for(const auto& run:runs) if(run->position>=0) heads.push_back(run.get());
+    for(auto& run:runs) if(run.position>=0) heads.push_back(&run);
     std::priority_queue merge(earlier,std::move(heads));
     const auto advance=[&](RunReader* run) {
         run->previous();
@@ -391,8 +391,8 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
         // These are independent snapshots. Keep the first card for each ID.
         if(!check_value) value=selected->value(packed,raw);
-        auto row=project_task(value,root_index,language,labels);
-        if(!row.value.is_null() && ids.insert(row.value.at("id").get_ref<const std::string&>()).second) {
+        auto row=project_task(value,root_index,language,labels,ids);
+        if(!row.value.is_null()) {
             needs_sort|=row.timestamp>previous_timestamp;
             previous_timestamp=row.timestamp;
             projected.push_back(std::move(row));
@@ -402,7 +402,7 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     if(cancelled && cancelled()) return Json();
     // Even an empty/filtered page can have crossed a live-slot mutation.
     // Reuse the GUI's existing observed-conflict retry, retaining its last page.
-    for(const auto& run:runs) run->validate();
+    for(const auto& run:runs) run.validate();
     // The disk index already orders by microseconds. Distinct display
     // timestamps in the same index tick can still require a page-local sort.
     if(needs_sort) std::stable_sort(projected.begin(),projected.end(),[](const TaskRow& a,const TaskRow& b) {

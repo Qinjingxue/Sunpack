@@ -224,7 +224,7 @@ fn probe_encrypted_rar(prefix: &[u8], password: Option<&str>) -> VolumeAnchor {
     let reader = ManagedReader::from_bytes(prefix.to_vec(), Default::default());
     let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 0, "rar").unwrap();
     if let Some(password) = password {
-        resolve_encrypted_relation_anchor(&anchor, &reader, &[Arc::from(password)], false)
+        resolve_encrypted_relation_anchor(&anchor, &reader, &[Arc::from(password)], false, None)
             .unwrap()
             .0
     } else {

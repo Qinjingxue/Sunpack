@@ -33,12 +33,13 @@ export default {
       // Synthetic editor rows belong only to the directory where they began.
       if(this.passwords.scope!==this.passwordScope) { saved=saved.filter(p=>p.original); ids=passwordIndexes.get(saved); }
       if(!ids) { ids=new Set(saved.map(p=>p.id)); passwordIndexes.set(saved,ids); }
-      let extra=this.passwordNew.filter(p=>p.scope===this.directorySelection&&!ids.has(p.id)),rows=extra.length?extra.concat(saved):saved;
+      let extra=this.passwordNew.filter(p=>p.scope===this.directorySelection&&!ids.has(p.id));
+      let extraIds=extra.length?new Set(extra.map(p=>p.id)):null,retained=[];
       for(let id of Object.keys(this.passwordDrafts)) {
         let d=this.passwordDrafts[id];
-        if((d.original||d.historyValue===undefined)&&d.scope===this.directorySelection&&!ids.has(id)&&!extra.some(p=>p.id===id)&&(d.pending||d.error||this.passwordCell===id)) rows=rows.concat([d]);
+        if((d.original||d.historyValue===undefined)&&d.scope===this.directorySelection&&!ids.has(id)&&!(extraIds&&extraIds.has(id))&&(d.pending||d.error||this.passwordCell===id)) retained.push(d);
       }
-      return rows;
+      return extra.length||retained.length?extra.concat(saved,retained):saved;
     },
     categories() { let seen={}; return this.fields.filter(f=>{ if(seen[f.category]) return false; seen[f.category]=true; return true; }).map(f=>({id:f.category,label:f.categoryLabel})); },
     configBlocks() {

@@ -2280,6 +2280,7 @@ struct Scheduler {
     cwd: PathBuf,
     root_file: PathBuf,
     roots: BTreeMap<String, (Root, NativeDiscoveryScope)>,
+    root_scope_records: HashMap<String, Arc<serde_json::Map<String, Value>>>,
     available_roots: HashSet<String>,
     settings: Arc<Config>,
     user_password_signature: String,
@@ -2428,9 +2429,7 @@ impl Scheduler {
             })();
             self.resuming = false;
             if result.is_err() {
-                self.root_observers.clear();
-                self.parent_observers.clear();
-                self.dependency_observers.clear();
+                self.stop_watch_sources();
                 self.release_admission();
             }
             result
@@ -2528,6 +2527,7 @@ impl Scheduler {
             cwd,
             root_file,
             roots: BTreeMap::new(),
+            root_scope_records: HashMap::new(),
             available_roots: HashSet::new(),
             user_password_signature: user_password_signature(&snapshot.config.user_passwords),
             settings: Arc::new(snapshot.config),
@@ -2596,10 +2596,7 @@ impl Scheduler {
         // Reconciliation has already drained requests and retired removed scopes.
         // Keep only the configuration/tray/log shell; durable recovery belongs to
         // the next scheduler, not to an idle service with no roots.
-        self.root_observers = HashMap::new();
-        self.dependency_observers = HashMap::new();
-        self.parent_observers = HashMap::new();
-        self.monitor.take();
+        self.stop_watch_sources();
         self.toast.take();
         *self.external.current.write().unwrap() = None;
         self.broker_lease.take();
@@ -2611,8 +2608,14 @@ impl Scheduler {
         self.active = HashMap::new();
         self.active_paths = HashMap::new();
         self.available_roots = HashSet::new();
-        self.hub.clear_idle_completed_families();
         Ok(())
+    }
+
+    fn stop_watch_sources(&mut self) {
+        self.root_observers = HashMap::new();
+        self.dependency_observers = HashMap::new();
+        self.parent_observers = HashMap::new();
+        self.monitor.take();
     }
 
     fn release_admission(&mut self) {
@@ -2621,9 +2624,12 @@ impl Scheduler {
         self.pending = HashMap::new();
         self.unpublished = HashSet::new();
         self.volume_checks = HashMap::new();
+        self.root_scope_records = HashMap::new();
+        self.recovery_ids = HashMap::new();
         self.due.clear();
         self.candidate_diagnostics = CandidateDiagnostics::default();
         self.cache_deadline = None;
+        self.hub.clear_idle_completed_families();
     }
 
     fn commit_idle_catalog(&mut self) {
@@ -2857,7 +2863,9 @@ impl Scheduler {
             // candidates produced by the stop checkpoint must not mask pending
             // output cleanup or retained recovery under the new policy.
             self.persist_candidates(BTreeMap::new(), true)?;
-            self.pending.clear();
+            self.pending = HashMap::new();
+            self.unpublished = HashSet::new();
+            self.volume_checks = HashMap::new();
             self.due.clear();
             if let Some(toast) = &self.toast {
                 toast.reset_batches();
@@ -2868,7 +2876,8 @@ impl Scheduler {
         self.available_roots.retain(|id| next.contains_key(id));
         self.baseline_roots.retain(|id| next.contains_key(id));
         self.roots = next;
-        if self.settings.watch.deduplication != config::WatchDeduplication::None {
+        self.root_scope_records = HashMap::new();
+        if refresh_catalog && self.settings.watch.deduplication != config::WatchDeduplication::None {
             self.dedup.lock().unwrap().reconcile_scopes(self.roots.values().map(|(_, scope)| scope))?;
         }
         if let Some(lease) = lease {
@@ -2932,22 +2941,22 @@ impl Scheduler {
         }
         for (id, (directory, mut members)) in desired {
             if let Some(parent) = self.parent_observers.get(&id) {
+                if parent.observer.matches(&directory) {
+                    parent.members.lock().unwrap().extend(members);
+                    continue;
+                }
                 members.extend(parent.members.lock().unwrap().clone());
-            }
-            if self.parent_observers.get(&id).is_some_and(|parent| !parent.observer.matches(&directory)) {
                 self.parent_observers.remove(&id);
             }
-            if let Some(parent) = self.parent_observers.get(&id) {
-                *parent.members.lock().unwrap() = members;
-            } else {
-                match ParentObserver::start(&directory, members, &self.hub) {
-                    Ok(parent) => { self.parent_observers.insert(id, parent); }
-                    Err(error) => self.journal.log(json!({"event":"watch_parent_unavailable", "path":directory,"error":error.to_string()})),
-                }
+            match ParentObserver::start(&directory, members, &self.hub) {
+                Ok(parent) => { self.parent_observers.insert(id, parent); }
+                Err(error) => self.journal.log(json!({"event":"watch_parent_unavailable", "path":directory,"error":error.to_string()})),
             }
         }
         self.parent_observers.retain(|_, parent| !parent.members.lock().unwrap().is_empty());
         self.root_observers.retain(|id, _| self.roots.contains_key(id));
+        crate::collections::trim_map(&mut self.parent_observers);
+        crate::collections::trim_map(&mut self.root_observers);
         for (id, (root, scope)) in self.roots.iter()
             .filter(|(id, _)| changed.is_none_or(|changed| changed.contains(*id)))
         {
@@ -3007,7 +3016,7 @@ impl Scheduler {
         });
 
         let apply = (|| {
-            if scheduler_changed || roots_changed || config_changed { self.volume_checks.clear(); }
+            if roots_changed || config_changed { self.volume_checks = HashMap::new(); }
             if scheduler_changed || roots_changed {
                 self.activate_scan_options()?;
             }
@@ -3110,11 +3119,8 @@ impl Scheduler {
             if result.is_ok() {
                 if let Err(error) = self.checkpoint(&HashMap::new(), true, false) { *result = Err(error); }
             }
-            self.root_observers.clear();
-            self.dependency_observers.clear();
-            self.parent_observers.clear();
-            self.monitor.take();
         }
+        self.stop_watch_sources();
         let mut failure_observed = false;
         while !self.active.is_empty() {
             if result.is_err() && !failure_observed {
@@ -3410,10 +3416,7 @@ impl Scheduler {
         match watch_scan_options(&self.settings, !self.roots.is_empty()) {
             Ok(options) => { self.options = options; Ok(()) }
             Err(error) => {
-                self.root_observers.clear();
-                self.dependency_observers.clear();
-                self.parent_observers.clear();
-                self.monitor.take();
+                self.stop_watch_sources();
                 Err(error)
             }
         }
@@ -3491,6 +3494,7 @@ impl Scheduler {
     fn retire_dependency_observers(&mut self) {
         self.dependency_observers.retain(|(root, _), observer| self.roots.get(root).is_some_and(|(_, scope)|
             self.catalog.generated_under(scope, &observer.observer.path.to_string_lossy())));
+        crate::collections::trim_map(&mut self.dependency_observers);
     }
 
     fn invalidate_recovery(&mut self, paths: impl Iterator<Item = String>) -> io::Result<()> {
@@ -3734,7 +3738,7 @@ impl Scheduler {
             self.recover_pending(Some(&reopened))?;
             self.retry_missing_volumes(Some(&reopened))?;
             let passwords = self.passwords.snapshot();
-            self.retry_password_failures(&passwords, Some(&reopened))?;
+            self.retry_password_failures(&passwords, Some(&reopened), "password_retry")?;
         }
         let jobs: Vec<_> = groups.into_iter().map(|(volume, range)| {
             let cache = self.recovery_ids.remove(&volume).unwrap_or_default();
@@ -4431,6 +4435,7 @@ impl Scheduler {
             return Ok(());
         }
         let keys = &self.unpublished;
+        let root_scope_records = &mut self.root_scope_records;
         self.journal.commit(durable, |state| {
             use crate::watch_store::PendingObservation;
             let mut ordinary = Vec::new();
@@ -4454,7 +4459,7 @@ impl Scheduler {
                     let update = (
                         observation,
                         root.path.to_string_lossy().into_owned(),
-                        Some(recovery.record()),
+                        Some(Arc::new(recovery.record())),
                     );
                     recoveries.push((update, pending.force, &recovery.password_scope));
                 } else {
@@ -4463,7 +4468,14 @@ impl Scheduler {
                     } else {
                         &mut ordinary
                     };
-                    target.push((observation, scope.root.clone(), Some(scope_record(scope))));
+                    // All queued observations for this root share the same
+                    // immutable scope until reconciliation installs new policy.
+                    let record = root_scope_records.get(&pending.root).cloned().unwrap_or_else(|| {
+                        let record = Arc::new(scope_record(scope));
+                        root_scope_records.insert(pending.root.clone(), Arc::clone(&record));
+                        record
+                    });
+                    target.push((observation, scope.root.clone(), Some(record)));
                 }
             }
             let cursors = (!cursors.is_empty()).then_some(cursors);
@@ -4510,12 +4522,12 @@ impl Scheduler {
         let signature = password_source_signature(&self.user_password_signature, snapshot.signature());
         let state = self.journal.state();
         let changed = state.password_source_signature() != signature;
-        if changed { self.volume_checks.clear(); }
+        if changed { self.volume_checks = HashMap::new(); }
         if changed || startup {
             // A prior runtime can publish the password generation before
             // scheduling every affected blocker. Reconcile entries once when
             // taking ownership, even if the global generation is current.
-            self.retry_password_failures_with_event(&snapshot, None,
+            self.retry_password_failures(&snapshot, None,
                 if startup { "startup_password_reconcile" } else { "password_retry" })?;
             self.persist_candidates(BTreeMap::new(), !changed)?;
         }
@@ -4535,15 +4547,7 @@ impl Scheduler {
         Ok(())
     }
 
-    fn retry_password_failures(
-        &mut self,
-        snapshot: &crate::core::passwords::PasswordSnapshot,
-        roots: Option<&HashSet<String>>,
-    ) -> io::Result<()> {
-        self.retry_password_failures_with_event(snapshot, roots, "password_retry")
-    }
-
-    fn retry_password_failures_with_event(&mut self,
+    fn retry_password_failures(&mut self,
         snapshot: &crate::core::passwords::PasswordSnapshot,
         roots: Option<&HashSet<String>>, event: &'static str,
     ) -> io::Result<()> {
@@ -5826,6 +5830,8 @@ impl Scheduler {
         let mut regrouped_recoveries = Vec::new();
         let mut published = HashSet::new();
         let generated = std::cell::OnceCell::new();
+        let recovery_receipts = std::cell::OnceCell::new();
+        let recovery_receipts = || recovery_receipts.get_or_init(|| RecoveryReceipts::new(&outcome.checkpoints));
         for archive in outcome
             .archives
             .iter()
@@ -5891,7 +5897,7 @@ impl Scheduler {
             );
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
             payload.insert("input_checkpoints".into(), serde_json::to_value(
-                recovery_checkpoints(&outcome.checkpoints, &archive.source_paths))?);
+                recovery_receipts().select(archive.source_paths.iter().map(PathBuf::as_path)))?);
             let route_root = &active.root;
             let (root, scope) = &self.roots[route_root];
             payload.insert("source_input_root".into(), json!(scope.root));
@@ -5950,6 +5956,20 @@ impl Scheduler {
                     continue;
                 }
             }
+            // One logical result owns the blocker and archive evidence. For
+            // the other volumes, retire only their physical pending records.
+            if !completed.cancelled {
+                if id != canonical_id {
+                    operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
+                        &candidate.path, None,
+                    ));
+                }
+                if self.pending.contains_key(&canonical_id)
+                    || !projected_groups.insert(canonical_id.clone())
+                {
+                    continue;
+                }
+            }
             let discovery_failure = input_error.and_then(|error| error.failure.as_deref());
             let failed_archive = (input_error.is_none() || discovery_failure.is_some())
                 .then(|| archives.and_then(|items| completion_failed_archive(items, &input_failures))).flatten();
@@ -5961,40 +5981,24 @@ impl Scheduler {
                 .or_else(|| input_error.map(|error| error.message.as_str()));
             let blocker = input_failure.filter(|input| input.retryable());
             let retryable = blocker.is_some();
-            // A multipart request has one logical result and one blocker.
-            // Physical sibling generations only need their pending WAL retired.
-            let candidate = if completed.cancelled {
+            let candidate = if completed.cancelled || id == canonical_id {
                 std::borrow::Cow::Borrowed(candidate)
+            } else if let Some(&head) = canonical_inputs.get_or_init(|| {
+                active.inputs.iter().map(|candidate| (watch_path_key(&candidate.path), candidate))
+                    .collect::<HashMap<_, _>>()
+            }).get(&canonical_id) {
+                std::borrow::Cow::Borrowed(head)
+            } else if error.is_none() {
+                // Successful source cleanup may already have removed the
+                // head. No blocker observation is needed for a success.
+                let mut head = candidate.clone();
+                head.path = canonical.clone();
+                std::borrow::Cow::Owned(head)
             } else {
-                if id != canonical_id {
-                    operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                        &candidate.path, None,
-                    ));
-                }
-                if self.pending.contains_key(&canonical_id)
-                    || !projected_groups.insert(canonical_id.clone())
-                {
+                let Ok(Some(head)) = watch_candidate_for_path(Path::new(&canonical), None) else {
                     continue;
-                }
-                if id == canonical_id {
-                    std::borrow::Cow::Borrowed(candidate)
-                } else if let Some(&head) = canonical_inputs.get_or_init(|| {
-                    active.inputs.iter().map(|candidate| (watch_path_key(&candidate.path), candidate))
-                        .collect::<HashMap<_, _>>()
-                }).get(&canonical_id) {
-                    std::borrow::Cow::Borrowed(head)
-                } else if error.is_none() {
-                    // Successful source cleanup may already have removed the
-                    // head. No blocker observation is needed for a success.
-                    let mut head = candidate.clone();
-                    head.path = canonical.clone();
-                    std::borrow::Cow::Owned(head)
-                } else {
-                    let Ok(Some(head)) = watch_candidate_for_path(Path::new(&canonical), None) else {
-                        continue;
-                    };
-                    std::borrow::Cow::Owned(head)
-                }
+                };
+                std::borrow::Cow::Owned(head)
             };
             let stale = error.is_some()
                 // A retained terminal child may outlive its successfully
@@ -6068,8 +6072,8 @@ impl Scheduler {
                         &active.password_scope,
                     );
                     Arc::make_mut(&mut entry).failure_payload.insert("input_checkpoints".into(),
-                        serde_json::to_value(recovery_checkpoints(&outcome.checkpoints,
-                            &[PathBuf::from(&canonical)])).expect("serializable input checkpoints"));
+                        serde_json::to_value(recovery_receipts().select([Path::new(&canonical)]))
+                            .expect("serializable input checkpoints"));
                     if recovery.is_some() {
                         if let Some((root, _)) = self.roots.get(&active.root) {
                             Arc::make_mut(&mut entry)
@@ -6257,24 +6261,66 @@ fn output_owner<'a>(outputs: &'a BTreeMap<String, String>, path: &str) -> Option
     }
 }
 
-fn recovery_checkpoints<'a>(
-    checkpoints: &'a [crate::pipeline::InputCheckpoint], sources: &[PathBuf],
-) -> Vec<&'a crate::pipeline::InputCheckpoint> {
-    let sources = sources.iter().map(|source| key(source)).collect::<HashSet<_>>();
-    let direct = |checkpoint: &crate::pipeline::InputCheckpoint| {
-        // A provisional volume representative can own completed siblings in
-        // another physical file. Keep that task's receipts across head changes.
-        sources.contains(&key(checkpoint.carrier()))
-            || checkpoint.source_paths().any(|source| sources.contains(&key(source)))
-    };
-    let roots = checkpoints.iter().filter(|checkpoint| checkpoint.has_output() && direct(checkpoint))
-        .map(|checkpoint| (key(checkpoint.output()), String::new())).collect::<BTreeMap<_, _>>();
-    // Descendant receipts still refer to inputs inside the retained segment,
-    // not to its moved carrier. Hand off that subtree before retiring its old
-    // owner, so a retry cannot duplicate accepted nested recovery output.
-    checkpoints.iter().filter(|checkpoint| direct(checkpoint)
-        || checkpoint.source_paths().any(|source| output_owner(&roots, &key(source)).is_some()))
-        .collect()
+struct RecoveryReceipts<'a> {
+    checkpoints: &'a [crate::pipeline::InputCheckpoint],
+    // Both carrier and source keys select direct receipts. Only physical
+    // sources can attach a receipt to another receipt's retained output.
+    paths: Vec<(String, usize, bool)>,
+}
+
+impl<'a> RecoveryReceipts<'a> {
+    fn new(checkpoints: &'a [crate::pipeline::InputCheckpoint]) -> Self {
+        let mut paths = Vec::with_capacity(checkpoints.len());
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            let carrier = key(checkpoint.carrier());
+            let mut carrier_is_source = false;
+            for source in checkpoint.source_paths() {
+                let source = key(source);
+                carrier_is_source |= source == carrier;
+                paths.push((source, index, true));
+            }
+            if !carrier_is_source {
+                paths.push((carrier, index, false));
+            }
+        }
+        paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Self { checkpoints, paths }
+    }
+
+    fn starting_at(&self, key: &str) -> &[(String, usize, bool)] {
+        &self.paths[self.paths.partition_point(|(path, _, _)| path.as_str() < key)..]
+    }
+
+    fn select<'s>(&self, sources: impl IntoIterator<Item = &'s Path>) -> Vec<&'a crate::pipeline::InputCheckpoint> {
+        let mut matches = Vec::new();
+        for source in sources {
+            let source = key(source);
+            matches.extend(self.starting_at(&source).iter()
+                .take_while(|(path, _, _)| *path == source).map(|(_, index, _)| *index));
+        }
+        matches.sort_unstable();
+        matches.dedup();
+
+        // Hand off descendant receipts under the directly selected outputs,
+        // even when their carrier has moved. Keep original receipt order.
+        let mut roots = HashSet::new();
+        for slot in 0..matches.len() {
+            let checkpoint = &self.checkpoints[matches[slot]];
+            if !checkpoint.has_output() { continue; }
+            let mut root = key(checkpoint.output());
+            if !roots.insert(root.clone()) { continue; }
+            matches.extend(self.starting_at(&root).iter()
+                .take_while(|(path, _, _)| *path == root)
+                .filter_map(|(_, index, source)| source.then_some(*index)));
+            root.push('\\');
+            matches.extend(self.starting_at(&root).iter()
+                .take_while(|(path, _, _)| path.starts_with(&root))
+                .filter_map(|(_, index, source)| source.then_some(*index)));
+        }
+        matches.sort_unstable();
+        matches.dedup();
+        matches.into_iter().map(|index| &self.checkpoints[index]).collect()
+    }
 }
 
 fn nested_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailure<'_>>) -> bool {

@@ -61,7 +61,7 @@ fn cancelled_initializer_does_not_publish_damage_to_shared_password_input() {
     // Acquire the owner's exact slot before revoking it. A waiter on
     // this generation must see an abandoned initialization even if
     // the slot is already removed from the map when it resumes.
-    let mut borrowed = Preparation(Some(borrow(&key)));
+    let mut borrowed = Preparation { slot: Some(borrow(&key)), rar5_key: None };
     let borrower = std::thread::spawn(move || {
         let result = borrowed.verify(borrower_key.clone(), &[], || {
             Err(PreparedStatus::new("not_required", "surviving initializer"))

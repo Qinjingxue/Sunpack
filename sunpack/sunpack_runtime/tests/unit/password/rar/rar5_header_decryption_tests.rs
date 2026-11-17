@@ -39,6 +39,7 @@ fn embedded_boundary_reopen_failure_is_local_but_cancellation_propagates() {
 #[test]
 fn encrypted_header_walker_returns_exact_end_for_complete_fixture() {
     let original = hex_bytes(SINGLE_HP_HEX);
+    let passwords = ["wrong", "also wrong", "no", "secret", "another"].map(Arc::from);
     for flags in 0u8..4 {
         let end = 13 + original[12] as usize;
         let mut body = vec![4, flags];
@@ -49,10 +50,10 @@ fn encrypted_header_walker_returns_exact_end_for_complete_fixture() {
         data.extend(crc32(&block).to_le_bytes()); data.extend(&block);
         data.extend_from_slice(&original[end..]);
         let reader = ManagedReader::from_bytes(data.clone(), Default::default());
-        let proof = probe_header_encrypted(&reader, 0, "secret", 4096, true).unwrap().unwrap();
-        assert!(proof.password_matched && proof.end_block_found);
-        assert_eq!(proof.end_offset, Some(data.len() as u64));
-        assert!(probe_header_encrypted(&reader, 0, "wrong", 4096, true).unwrap().unwrap().password_rejected);
+        let HeaderPassword::Matched(3, proof) = probe_header_passwords(&reader, 0, &passwords, true, None).unwrap()
+        else { panic!("expected matching password and proof"); };
+        assert_eq!(proof.terminal.map(|end| end.offset), Some(data.len() as u64));
+        assert!(matches!(probe_header_passwords(&reader, 0, &passwords[..3], true, None).unwrap(), HeaderPassword::Rejected));
     }
     // Unsupported crypto version is not proof that the password is wrong.
     let mut unsupported = original;
@@ -61,18 +62,14 @@ fn encrypted_header_walker_returns_exact_end_for_complete_fixture() {
     let crc = crc32(&unsupported[12..end]);
     unsupported[8..12].copy_from_slice(&crc.to_le_bytes());
     let reader = ManagedReader::from_bytes(unsupported, Default::default());
-    let proof = probe_header_encrypted(&reader, 0, "secret", 4096, true).unwrap().unwrap();
-    assert!(!proof.password_matched && !proof.password_rejected);
+    assert!(matches!(probe_header_passwords(&reader, 0, &passwords, true, None).unwrap(), HeaderPassword::Inconclusive));
 }
 
 #[test]
 fn encrypted_header_walker_fails_open_on_incomplete_fixture() {
     let data = hex_bytes(PART2_HP_HEX);
     let reader = ManagedReader::from_bytes(data, Default::default());
-    let proof = probe_header_encrypted(&reader, 0, "secret", 4096, true)
-        .unwrap()
-        .unwrap();
-    assert!(proof.password_matched);
-    assert!(!proof.end_block_found);
-    assert_eq!(proof.end_offset, None);
+    let HeaderPassword::Matched(0, proof) = probe_header_passwords(&reader, 0, &[Arc::from("secret")], true, None).unwrap()
+    else { panic!("expected password match for incomplete volume"); };
+    assert!(proof.terminal.is_none());
 }

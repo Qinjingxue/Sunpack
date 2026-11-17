@@ -1571,10 +1571,8 @@ private:
                     deadline = key_cache_deadline_;
                 }
             }
-            if (space_monitor_->sampling()) {
-                const auto space = now + writer_config_.space_poll_interval;
-                if (!deadline || space < *deadline) deadline = space;
-            }
+            if (const auto space = space_monitor_->next_poll_deadline();
+                space && (!deadline || *space < *deadline)) deadline = space;
             if (deadline) monitor_condition_.wait_until(lock, *deadline,
                 [this] { return monitor_stopping_ || monitor_recheck_; });
             else monitor_condition_.wait(lock,

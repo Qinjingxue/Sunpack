@@ -33,7 +33,7 @@ fn relations_share_batched_password_proofs_and_skip_single_volume_directory() {
         assert_eq!(password.as_deref(), Some("secret"));
         assert!(resolved.standalone && !resolved.needs_password);
         assert!(resolved.relation_has_next.is_none(), "standalone must stop after the main header");
-        assert_eq!(threads.lock().unwrap().len(), 257);
+        assert_eq!(threads.lock().unwrap().len(), 257, "the header walk reuses the winning key");
         PLANNED_BATCHES.with(|value| {
             let value = value.borrow(); let batches = value.as_ref().unwrap();
             assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [256, 1]);

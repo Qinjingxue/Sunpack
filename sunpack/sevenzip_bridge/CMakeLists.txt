@@ -391,28 +391,6 @@ if(SUP7Z_DEBUG)
     target_compile_definitions(sunpack_sevenzip_core PUBLIC SUP7Z_DEBUG=1)
 endif()
 
-add_executable(sunpack_sevenzip_smoke
-    tests/smoke.cpp
-)
-add_executable(sunpack_sevenzip_lz4 tests/lz4.cpp)
-apply_release_optimizations(sunpack_sevenzip_lz4)
-apply_source_charset(sunpack_sevenzip_lz4)
-target_link_libraries(sunpack_sevenzip_lz4 PRIVATE sunpack_sevenzip_core)
-sup7z_attach_bundled_7z(sunpack_sevenzip_lz4)
-apply_release_optimizations(sunpack_sevenzip_smoke)
-apply_source_charset(sunpack_sevenzip_smoke)
-
-target_link_libraries(sunpack_sevenzip_smoke
-    PRIVATE sunpack_sevenzip_core
-)
-
-sup7z_attach_bundled_7z(sunpack_sevenzip_smoke)
-
-target_include_directories(sunpack_sevenzip_smoke
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
 add_executable(sunpack_sevenzip_worker
     src/worker.cpp
     src/worker_alloc.cpp
@@ -465,88 +443,53 @@ if(WIN32)
     endif()
 endif()
 
-# QueryInterface contract for the callback/stream objects handed to 7-Zip.
-# Upstream's Z7_COM_UNKNOWN_IMP_N macro emits an entry only for the IIDs it is
-# given -- it does not walk the C++ base classes -- so a parent interface such
-# as IProgress has to be listed explicitly. This test is what stops a future
-# macro edit from silently dropping it.
-add_executable(sunpack_sevenzip_com_contract
-    tests/com_contract.cpp
-)
-apply_release_optimizations(sunpack_sevenzip_com_contract)
-apply_source_charset(sunpack_sevenzip_com_contract)
-target_link_libraries(sunpack_sevenzip_com_contract PRIVATE sunpack_sevenzip_core)
-sup7z_attach_bundled_7z(sunpack_sevenzip_com_contract)
-target_include_directories(sunpack_sevenzip_com_contract
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-if(WIN32)
-    target_compile_definitions(sunpack_sevenzip_com_contract PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-endif()
-
-# Contract tests for SunPack's zlib-ng decode paths. This covers the raw
-# Deflate adapter (including Strong Encryption unused-input semantics), the
-# generic adaptive registry decoder, and the seekable gzip wrapper fast path.
-add_executable(sunpack_zlib_ng_deflate_contract
-    tests/zlib_ng_deflate_decoder.cpp
-)
-apply_release_optimizations(sunpack_zlib_ng_deflate_contract)
-apply_source_charset(sunpack_zlib_ng_deflate_contract)
-target_link_libraries(sunpack_zlib_ng_deflate_contract
-    PRIVATE sunpack_sevenzip_core)
-sup7z_attach_bundled_7z(sunpack_zlib_ng_deflate_contract)
-target_include_directories(sunpack_zlib_ng_deflate_contract
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-if(WIN32)
-    target_compile_definitions(sunpack_zlib_ng_deflate_contract PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-endif()
-
-enable_testing()
-add_executable(sunpack_sevenzip_volume_attempts tests/volume_attempts.cpp)
-apply_release_optimizations(sunpack_sevenzip_volume_attempts)
-apply_source_charset(sunpack_sevenzip_volume_attempts)
-target_include_directories(sunpack_sevenzip_volume_attempts PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
-add_test(NAME sunpack_sevenzip_volume_attempts COMMAND sunpack_sevenzip_volume_attempts)
-add_executable(sunpack_sevenzip_volume_attempt_replay tests/volume_attempt_replay.cpp)
-apply_release_optimizations(sunpack_sevenzip_volume_attempt_replay)
-apply_source_charset(sunpack_sevenzip_volume_attempt_replay)
-target_link_libraries(sunpack_sevenzip_volume_attempt_replay PRIVATE sunpack_sevenzip_core)
-target_include_directories(sunpack_sevenzip_volume_attempt_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(sunpack_sevenzip_volume_attempt_replay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-sup7z_attach_bundled_7z(sunpack_sevenzip_volume_attempt_replay)
-add_test(NAME sunpack_sevenzip_volume_attempt_replay COMMAND sunpack_sevenzip_volume_attempt_replay)
-if(WIN32)
-    add_executable(sunpack_launcher_console tests/launcher_console.cpp)
-    apply_release_optimizations(sunpack_launcher_console)
-    apply_source_charset(sunpack_launcher_console)
-    target_compile_definitions(sunpack_launcher_console PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-    target_link_libraries(sunpack_launcher_console PRIVATE Shell32 User32)
-    add_test(NAME sunpack_launcher_console COMMAND sunpack_launcher_console)
-    set_tests_properties(sunpack_launcher_console PROPERTIES TIMEOUT 15)
-
-    add_executable(sunpack_toast_activation_runtime tests/toast_activation_runtime.cpp)
-    apply_release_optimizations(sunpack_toast_activation_runtime)
-    apply_source_charset(sunpack_toast_activation_runtime)
-    add_test(NAME sunpack_launcher_toast_activation COMMAND ${CMAKE_COMMAND}
-        "-DLAUNCHER=$<TARGET_FILE:sunpack_launcher>"
-        "-DRUNTIME=$<TARGET_FILE:sunpack_toast_activation_runtime>"
-        "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/toast_activation.cmake")
-    set_tests_properties(sunpack_launcher_toast_activation PROPERTIES TIMEOUT 15)
-endif()
 if(SUP7Z_DEBUG)
-    foreach(test_name IN ITEMS async_output space_gate space_retry memory_replay)
+    enable_testing()
+
+    function(add_worker_test_target target_name source_file)
+        add_executable(${target_name} tests/${source_file})
+        apply_release_optimizations(${target_name})
+        apply_source_charset(${target_name})
+        target_link_libraries(${target_name} PRIVATE sunpack_sevenzip_core)
+        target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(${target_name} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        sup7z_attach_bundled_7z(${target_name})
+    endfunction()
+
+    foreach(test_name IN ITEMS smoke com_contract volume_attempt_replay async_output space_gate space_retry memory_replay)
         set(test_target sunpack_sevenzip_${test_name})
-        add_executable(${test_target} tests/${test_name}.cpp)
-        apply_release_optimizations(${test_target})
-        apply_source_charset(${test_target})
-        target_link_libraries(${test_target} PRIVATE sunpack_sevenzip_core)
-        target_include_directories(${test_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_compile_definitions(${test_target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-        sup7z_attach_bundled_7z(${test_target})
+        add_worker_test_target(${test_target} ${test_name}.cpp)
         add_test(NAME ${test_target} COMMAND ${test_target})
     endforeach()
+
+    add_worker_test_target(sunpack_zlib_ng_deflate_contract zlib_ng_deflate_decoder.cpp)
+    add_test(NAME sunpack_zlib_ng_deflate_contract COMMAND sunpack_zlib_ng_deflate_contract)
+    add_worker_test_target(sunpack_sevenzip_lz4 lz4.cpp)
+
+    add_executable(sunpack_sevenzip_volume_attempts tests/volume_attempts.cpp)
+    apply_release_optimizations(sunpack_sevenzip_volume_attempts)
+    apply_source_charset(sunpack_sevenzip_volume_attempts)
+    target_include_directories(sunpack_sevenzip_volume_attempts PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME sunpack_sevenzip_volume_attempts COMMAND sunpack_sevenzip_volume_attempts)
+
+    if(WIN32)
+        add_executable(sunpack_launcher_console tests/launcher_console.cpp)
+        apply_release_optimizations(sunpack_launcher_console)
+        apply_source_charset(sunpack_launcher_console)
+        target_compile_definitions(sunpack_launcher_console PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+        target_link_libraries(sunpack_launcher_console PRIVATE Shell32 User32)
+        add_test(NAME sunpack_launcher_console COMMAND sunpack_launcher_console)
+        set_tests_properties(sunpack_launcher_console PROPERTIES TIMEOUT 15)
+
+        add_executable(sunpack_toast_activation_runtime tests/toast_activation_runtime.cpp)
+        apply_release_optimizations(sunpack_toast_activation_runtime)
+        apply_source_charset(sunpack_toast_activation_runtime)
+        add_test(NAME sunpack_launcher_toast_activation COMMAND ${CMAKE_COMMAND}
+            "-DLAUNCHER=$<TARGET_FILE:sunpack_launcher>"
+            "-DRUNTIME=$<TARGET_FILE:sunpack_toast_activation_runtime>"
+            "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/toast_activation.cmake")
+        set_tests_properties(sunpack_launcher_toast_activation PROPERTIES TIMEOUT 15)
+    endif()
 endif()
-add_test(NAME sunpack_sevenzip_smoke COMMAND sunpack_sevenzip_smoke)
-add_test(NAME sunpack_sevenzip_com_contract COMMAND sunpack_sevenzip_com_contract)
-add_test(NAME sunpack_zlib_ng_deflate_contract COMMAND sunpack_zlib_ng_deflate_contract)

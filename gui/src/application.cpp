@@ -160,7 +160,8 @@ void Application::publish(Json patch) {
     if(patch.contains("tasks") && pending_.contains("tasks") &&
         patch["tasks"]["generation"]==pending_["tasks"]["generation"] && pending_["tasks"].value("reset",false))
         patch["tasks"]["reset"]=true;
-    for(auto it=patch.begin();it!=patch.end();++it) pending_[it.key()]=std::move(it.value());
+    // The incoming patch destroys replaced snapshots after the lock is released.
+    for(auto it=patch.begin();it!=patch.end();++it) pending_[it.key()].swap(it.value());
     if(!notified_) { notified_=true; PostMessageW(hwnd_,Update,0,0); }
 }
 void Application::set_error(const char* field,const std::string& message) {

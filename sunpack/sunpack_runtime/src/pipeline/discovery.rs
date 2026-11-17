@@ -9,7 +9,7 @@ use crate::io::reader::NativeArchiveSession;
 use crate::password::rar::resolve_embedded_rar_boundaries;
 use crate::path_keys::{path_ancestors, path_key};
 use crate::scan::directory::{
-    classify_scan_targets, filesystem_logical_name, walk_can_reach, NativeDirectoryScanOptions,
+    classify_scan_targets, filesystem_logical_name, walk_reachable_keys, NativeDirectoryScanOptions,
     NativeDirectorySnapshot, NativeOutputInventory,
 };
 use crate::scan::discovery::{
@@ -337,23 +337,23 @@ pub(super) fn discover(
     {
         let file_roots: HashMap<_, _> = by_parent
             .iter()
-            .map(|((key, _), (root, _))| (key.clone(), root.clone()))
+            .map(|((key, _), (root, _))| (key.as_str(), root.as_str()))
             .collect();
-        for (key, path) in file_roots
-            .iter()
-            .map(|(key, path)| (key.as_str(), path.as_str()))
-            .chain(
-                scopes
-                    .iter()
-                    .map(|scope| (scope.key(), scope.root.as_str())),
-            )
-        {
-            if let Some((_, root)) = path_ancestors(key)
-                .filter_map(|ancestor| file_roots.get_key_value(ancestor))
-                .filter(|(root, _)| walk_can_reach(root, path))
-                .last()
-            {
-                shared_roots.insert(key.to_owned(), root.clone());
+        for (key, path) in file_roots.iter().map(|(&key, &path)| (key, path)).chain(
+            scopes.iter().map(|scope| (scope.key(), scope.root.as_str())),
+        ) {
+            let ancestors = path_ancestors(key);
+            let Some(highest) = ancestors.filter(|ancestor| file_roots.contains_key(ancestor)).last()
+            else { continue; };
+            let mut shared = None;
+            for ancestor in walk_reachable_keys(path) {
+                if let Some(&root) = file_roots.get(ancestor.as_str()) {
+                    shared = Some(root);
+                }
+                if ancestor == highest { break; }
+            }
+            if let Some(root) = shared {
+                shared_roots.insert(key.to_owned(), root.to_owned());
             }
         }
     }
@@ -391,21 +391,21 @@ pub(super) fn discover(
         if !shared_roots.contains_key(scope.key()) {
             result.scan_errors.extend(filtered.scan_errors());
         }
-        let mut table = NativeCandidateTable::new();
-        table.append_directory(&raw, &filtered, Some(FileTargets::new(targets)), request.deep)?;
-        match probe_relations(&mut table, &filtered, &raw, candidates, &mut verified, request) {
+        let targets = FileTargets::new(targets);
+        let mut table = NativeCandidateTable::from_directory(&raw, &filtered, Some(&targets), request.deep);
+        match probe_relations(&mut table, &filtered, &raw, Some(&targets), candidates, &mut verified, request) {
             Ok(()) => tables.push(table),
             Err(error) if request.watch_catalog.is_some() && !crate::io::cancellation::is_cancellation(&error) => {
                 // Main evaluates each Watch selection independently. On a
                 // real probe error, reuse the bucket snapshot to preserve
                 // those exact target/alias boundaries. Healthy buckets never
                 // rebuild a table or repeat password verification.
-                let targets = table.take_file_targets();
+                drop(table);
                 if let Some(path) = targets.only_path() {
                     result.errors.push(watch_discovery_error(path.into(), error));
                     continue;
                 }
-                let mut successful = NativeCandidateTable::new();
+                let mut successful = NativeCandidateTable::default();
                 for (path, target) in targets.into_singles() {
                     request.cancel.check_io()?;
                     match directory_table(&filtered, &raw, Some(target), candidates, &mut verified, request) {
@@ -806,9 +806,8 @@ fn directory_table(
     verified: &mut VerifiedPasswords,
     request: &Request,
 ) -> io::Result<NativeCandidateTable> {
-    let mut table = NativeCandidateTable::new();
-    table.append_directory(raw, filtered, targets, request.deep)?;
-    probe_relations(&mut table, filtered, raw, candidates, verified, request)?;
+    let mut table = NativeCandidateTable::from_directory(raw, filtered, targets.as_ref(), request.deep);
+    probe_relations(&mut table, filtered, raw, targets.as_ref(), candidates, verified, request)?;
     Ok(table)
 }
 
@@ -816,6 +815,7 @@ fn probe_relations(
     table: &mut NativeCandidateTable,
     filtered: &NativeDirectorySnapshot,
     raw: &NativeDirectorySnapshot,
+    targets: Option<&FileTargets>,
     candidates: &CandidateSet,
     verified: &mut VerifiedPasswords,
     request: &Request,
@@ -844,7 +844,7 @@ fn probe_relations(
         }
         anchors.push(anchor);
     }
-    table.retry_relations(raw, filtered, anchors, Some(refresh))?;
+    table.retry_relations(raw, filtered, targets, anchors, refresh);
     Ok(())
 }
 
@@ -926,14 +926,12 @@ impl Discovered {
             return Ok(table.prepare_deep(recursive, request.config.embedded_scan.recursive_candidate_ratio));
         }
         let mut routes = table.resolve()?;
-        for &(index, status) in &routes.relation_events {
-            if matches!(status, 1 | 2) {
-                self.tasks.push(project_task(
-                    table.project(index)?,
-                    DiscoverySource::Relations,
-                    verified,
-                ));
-            }
+        for &(index, _) in &routes.relations {
+            self.tasks.push(project_task(
+                table.project(index)?,
+                DiscoverySource::Relations,
+                verified,
+            ));
         }
         for &index in &routes.detected {
             self.tasks.push(project_task(
@@ -960,36 +958,35 @@ impl Discovered {
         verified: &VerifiedPasswords,
     ) -> io::Result<()> {
         for row in rows {
-            if let Some(error) = row.error {
-                let (path, format) = table.summary(row.index)?;
-                let failure = embedded_read_failure(&path, error.to_string());
-                if format.is_empty() {
-                    self.blocked_paths.extend(table.path_keys(row.index)?);
-                    self.errors.push(InputError {
-                        path: PathBuf::from(path),
-                        message: failure.message.clone(),
-                        kind: InputErrorKind::EmbeddedDiscovery,
-                        failure: Some(Box::new(failure)),
-                        scan_operation: None,
-                    });
-                } else {
-                    let mut task = project_task(
-                        table.project(row.index)?,
-                        DiscoverySource::Embedded,
-                        verified,
-                    );
-                    task.inputs[0].failure = Some(failure);
-                    embedded_tasks.push(task);
+            let scan = match row.result {
+                Ok(scan) => scan,
+                Err(error) => {
+                    let (path, format) = table.summary(row.index);
+                    let failure = embedded_read_failure(path, error.to_string());
+                    if format.is_empty() {
+                        table.extend_path_keys(row.index, &mut self.blocked_paths);
+                        self.errors.push(InputError {
+                            path: PathBuf::from(path),
+                            message: failure.message.clone(),
+                            kind: InputErrorKind::EmbeddedDiscovery,
+                            failure: Some(Box::new(failure)),
+                            scan_operation: None,
+                        });
+                    } else {
+                        let mut task = project_task(
+                            table.project(row.index)?,
+                            DiscoverySource::Embedded,
+                            verified,
+                        );
+                        task.inputs[0].failure = Some(failure);
+                        embedded_tasks.push(task);
+                    }
+                    continue;
                 }
-            } else if let Some(scan) = row.scan {
-                let task = project_task(
-                    table.project(row.index)?,
-                    DiscoverySource::Embedded,
-                    verified,
-                );
-                if let Some(task) = project_segments(task, &scan, HashMap::new(), candidates)? {
-                    embedded_tasks.push(task);
-                }
+            };
+            let task = project_task(table.project(row.index)?, DiscoverySource::Embedded, verified);
+            if let Some(task) = project_segments(task, &scan, HashMap::new(), candidates)? {
+                embedded_tasks.push(task);
             }
         }
         Ok(())

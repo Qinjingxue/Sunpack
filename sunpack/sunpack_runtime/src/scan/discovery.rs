@@ -36,8 +36,7 @@ pub(crate) enum CandidateProjection<'a> {
 
 pub(crate) struct EmbeddedPageRow {
     pub(crate) index: usize,
-    pub(crate) scan: Option<Arc<NativeScanResult>>,
-    pub(crate) error: Option<Arc<io::Error>>,
+    pub(crate) result: Result<Arc<NativeScanResult>, Arc<io::Error>>,
 }
 
 pub(crate) struct EmbeddedVolumeOutcome {
@@ -77,7 +76,6 @@ impl Candidate {
 #[derive(Default)]
 pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
-    targets: Option<FileTargets>,
     // Decrypted continuations may outlive their headless proposal. Transfer
     // their existing facts to the same embedded peer frontier, without I/O.
     volume_seeds: Vec<(Arc<DirectorySnapshotTable>, usize, crate::analysis_native::volume_anchor::VolumeAnchor)>,
@@ -260,25 +258,20 @@ impl NativeCandidateTable {
         groups
     }
 
-    fn retain_targets(&mut self) {
-        if let Some(targets) = &self.targets {
-            targets.retain(&mut self.rows);
-        }
-    }
 }
 
 #[derive(Default)]
 pub(crate) struct NativeDiscoveryRoutes {
-    pub(crate) relation_events: Vec<(usize, u8)>,
+    pub(crate) relations: Vec<(usize, bool)>,
     pub(crate) detected: Vec<usize>,
     embedded: Vec<usize>,
 }
 
 impl NativeDiscoveryRoutes {
     pub(crate) fn resolved_relations(&self) -> impl Iterator<Item = usize> + '_ {
-        self.relation_events
+        self.relations
             .iter()
-            .filter_map(|&(index, status)| (status == 1).then_some(index))
+            .filter_map(|&(index, confirmed)| confirmed.then_some(index))
     }
 }
 
@@ -322,14 +315,14 @@ impl NativeEmbeddedBatch {
 
         table: &NativeCandidateTable,
         outcomes: impl Iterator<Item = (usize, EmbeddedOutcome)>,
-    ) -> io::Result<Vec<EmbeddedPageRow>> {
+    ) -> Vec<EmbeddedPageRow> {
         let mut projected = Vec::new();
         for (index, outcome) in outcomes {
-            let (scan, error) = match outcome {
+            let result = match outcome {
                 EmbeddedOutcome::Residual => {
                     unreachable!("residuals are filtered before projection")
                 }
-                EmbeddedOutcome::Failed(error) => (None, Some(error)),
+                EmbeddedOutcome::Failed(error) => Err(error),
                 EmbeddedOutcome::Scan(scan) => {
                     let path = table.rows[index].path();
                     let key = path_key(path);
@@ -360,21 +353,19 @@ impl NativeEmbeddedBatch {
                                 scan: retain_scan.then(|| Arc::clone(&scan)),
                             });
                         }
-                        (None, None)
-                    } else {
-                        // A complete peer archive keeps its original ownership.
-                        self.excluded.extend(table.path_keys(index)?);
-                        (Some(scan), None)
+                        continue;
                     }
+                    // A complete peer archive keeps its original ownership.
+                    table.extend_path_keys(index, &mut self.excluded);
+                    Ok(scan)
                 }
             };
-            projected.push(EmbeddedPageRow {
-                index,
-                scan,
-                error,
-            });
+            // Supplemental rows supply relation facts for the original targets.
+            if !self.supplemental.contains(&index) {
+                projected.push(EmbeddedPageRow { index, result });
+            }
         }
-        Ok(projected)
+        projected
     }
 }
 
@@ -487,11 +478,11 @@ impl NativeEmbeddedBatch {
                     outcomes.next_if(|(selected, _, _)| *selected == group)
                 })
                 .map(|(_, index, outcome)| (index, outcome));
-                let mut rows = batch.project_outcomes(table, ready)?;
-                // Supplemental rows supply relation facts, not additional targets.
-                rows.retain(|row| !batch.supplemental.contains(&row.index));
+                let rows = batch.project_outcomes(table, ready);
                 batch.enqueue_volume_peers(table);
-                projected.push((group, rows));
+                if !rows.is_empty() {
+                    projected.push((group, rows));
+                }
             }
             if batch.len() == 0 {
                 // All eligible peers have been enqueued, including any added
@@ -720,7 +711,7 @@ impl NativeEmbeddedBatch {
                         let reader =
                             crate::io::reader::ManagedReader::open(&anchor.path)?.probe_reader();
                         let (resolved, index) =
-                            resolve_encrypted_relation_anchor(anchor, &reader, values, true)?;
+                            resolve_encrypted_relation_anchor(anchor, &reader, values, true, None)?;
                         *anchor = resolved;
                         Ok(index.map(|index| {
                             (
@@ -947,70 +938,41 @@ impl NativeEmbeddedBatch {
 }
 
 impl NativeCandidateTable {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn extend(&mut self, other: &mut Self) {
         self.rows.append(&mut other.rows);
         self.relation_sources.append(&mut other.relation_sources);
         self.volume_seeds.append(&mut other.volume_seeds);
     }
 
-    pub(crate) fn append_directory(
-        &mut self,
-
-        raw_snapshot: &NativeDirectorySnapshot,
-        filtered_snapshot: &NativeDirectorySnapshot,
-        targets: Option<FileTargets>,
+    pub(crate) fn from_directory(
+        raw: &NativeDirectorySnapshot,
+        filtered: &NativeDirectorySnapshot,
+        targets: Option<&FileTargets>,
         deep: bool,
-    ) -> std::io::Result<()> {
-        debug_assert!(raw_snapshot.rows.windows(2).all(|pair| pair[0] < pair[1]));
-        (|| {
-            self.targets = targets;
-            let selected = self
-                .targets
-                .as_ref()
-                .and_then(|targets| targets.select(filtered_snapshot));
-            if deep {
-                // Embedded is the only producer in deep mode. Keep raw peers
-                // for directed volume recovery, without pre-grouping or
-                // decrypting these archives on another discovery route.
-                let selected = selected.as_ref().unwrap_or(filtered_snapshot);
-                self.rows.extend(selected.rows.iter().copied()
-                    .filter(|&row| !selected.table.is_dir(row))
-                    .map(|row| Candidate::File(Arc::clone(&selected.table), row)));
-                self.retain_targets();
-                self.relation_sources.push(raw_snapshot.share_rows());
-                return;
-            }
-            let groups = self.relation_groups(
-                raw_snapshot,
-                filtered_snapshot,
-                selected.as_ref(),
-                None,
-            );
-            let filtered_snapshot = selected.as_ref().unwrap_or(filtered_snapshot);
-            self.rows
-                .reserve(groups.len() + filtered_snapshot.rows.len());
-            self.rows.extend(
-                groups
-                    .into_iter()
-                    .map(|group| Candidate::Relation(Box::new(group))),
-            );
-            for &row in filtered_snapshot.rows.iter() {
-                if !filtered_snapshot.table.is_dir(row)
-                    && filtered_snapshot.table.file_route(row) != FILE_ROUTE_RELATIONS
-                {
-                    self.rows
-                        .push(Candidate::File(Arc::clone(&filtered_snapshot.table), row));
-                }
-            }
-            self.retain_targets();
-            self.append_speculative_files(raw_snapshot);
-            self.relation_sources.push(raw_snapshot.share_rows());
-        })();
-        Ok(())
+    ) -> Self {
+        debug_assert!(raw.rows.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut table = Self::default();
+        let selected = targets.and_then(|targets| targets.select(filtered));
+        let groups = if deep { Vec::new() } else {
+            table.relation_groups(raw, filtered, selected.as_ref(), None)
+        };
+        // Embedded is the only producer in deep mode. Keep raw peers for
+        // directed volume recovery on both discovery paths.
+        let selected = selected.as_ref().unwrap_or(filtered);
+        table.rows.reserve_exact(groups.len() + selected.rows.len());
+        table.rows.extend(groups.into_iter().map(|group| Candidate::Relation(Box::new(group))));
+        table.rows.extend(selected.rows.iter().copied()
+            .filter(|&row| !selected.table.is_dir(row)
+                && (deep || selected.table.file_route(row) != FILE_ROUTE_RELATIONS))
+            .map(|row| Candidate::File(Arc::clone(&selected.table), row)));
+        if let Some(targets) = targets {
+            targets.retain(&mut table.rows);
+        }
+        if !deep {
+            table.append_speculative_files(raw);
+        }
+        table.relation_sources.push(raw.share_rows());
+        table
     }
 
     /// Decrypt only nominated RAR families. Until the hidden main header is
@@ -1043,89 +1005,73 @@ impl NativeCandidateTable {
         anchors.into_values().collect()
     }
 
-    pub(crate) fn take_file_targets(&mut self) -> FileTargets {
-        self.targets.take().expect("file discovery table must have targets")
-    }
-
     /// Replace the relation evidence for one table after a password is found.
     pub(crate) fn retry_relations(
         &mut self,
-
         raw_snapshot: &NativeDirectorySnapshot,
         filtered_snapshot: &NativeDirectorySnapshot,
+        targets: Option<&FileTargets>,
         anchors: Vec<crate::analysis_native::volume_anchor::VolumeAnchor>,
-        refresh_paths: Option<Vec<String>>,
-    ) -> std::io::Result<()> {
-        (|| {
-            let mut cached = self.relation_cache();
-            let mut previous: HashSet<_> = cached.anchors.iter()
-                .filter(|(_, a)| a.needs_password && a.rar5_encryption.is_some())
-                .map(|(path, _)| path.clone()).collect();
-            cached.anchors.extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
-            // A short password probe may start after another request consumed its
-            // inputs. Drop only proven departures from that proposal, sharing the
-            // original snapshot and surviving anchors instead of scanning again.
-            let departed: HashSet<String> = refresh_paths
-                .filter(|paths| !paths.is_empty())
-                .map(|paths| {
-                    paths
-                        .into_iter()
-                        .filter(|path| {
-                            std::fs::metadata(path)
-                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                        })
-                        .map(|path| path_key(&path))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let current_snapshots = (!departed.is_empty()).then(|| {
-                (
-                    raw_snapshot.without_path_keys(&departed),
-                    filtered_snapshot.without_path_keys(&departed),
-                )
-            });
-            let (raw, filtered) = current_snapshots
-                .as_ref()
-                .map(|(raw, filtered)| (raw, filtered))
-                .unwrap_or((raw_snapshot, filtered_snapshot));
-            let selected = self
-                .targets
-                .as_ref()
-                .and_then(|targets| targets.select(filtered));
-            let groups = self.relation_groups(
-                raw,
-                filtered,
-                selected.as_ref(),
-                Some(&cached),
-            );
-            for group in &groups {
-                for path in group.part_paths().chain([group.entry_path()]) {
-                    previous.remove(&path_key(path));
-                }
+        refresh_paths: Vec<String>,
+    ) {
+        let mut cached = self.relation_cache();
+        let mut previous: HashSet<_> = cached.anchors.iter()
+            .filter(|(_, a)| a.needs_password && a.rar5_encryption.is_some())
+            .map(|(path, _)| path.clone()).collect();
+        cached.anchors.extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
+        // A short password probe may start after another request consumed its
+        // inputs. Drop only proven departures from that proposal, sharing the
+        // original snapshot and surviving anchors instead of scanning again.
+        let departed: HashSet<String> = refresh_paths.into_iter()
+            .filter(|path| std::fs::metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
+            .map(|path| path_key(&path))
+            .collect();
+        let current_snapshots = (!departed.is_empty()).then(|| {
+            (
+                raw_snapshot.without_path_keys(&departed),
+                filtered_snapshot.without_path_keys(&departed),
+            )
+        });
+        let (raw, filtered) = current_snapshots
+            .as_ref()
+            .map(|(raw, filtered)| (raw, filtered))
+            .unwrap_or((raw_snapshot, filtered_snapshot));
+        let selected = targets.and_then(|targets| targets.select(filtered));
+        let groups = self.relation_groups(
+            raw,
+            filtered,
+            selected.as_ref(),
+            Some(&cached),
+        );
+        for group in &groups {
+            for path in group.part_paths().chain([group.entry_path()]) {
+                previous.remove(&path_key(path));
             }
-            // A recovered continuation is not a standalone task, but still
-            // nominates same-stem opaque carriers when the head is embedded.
-            for &row in raw.rows.iter() {
-                if previous.is_empty() { break; }
-                let key = path_key(&raw.table.paths[row]);
-                if previous.remove(&key) && cached.anchors.get(&key).is_some_and(|a|
-                    a.multivolume && !a.needs_password && !a.is_volume_entry()) {
-                    self.volume_seeds.push((Arc::clone(&raw.table), row, cached.anchors.remove(&key).unwrap()));
-                }
+        }
+        // A recovered continuation is not a standalone task, but still
+        // nominates same-stem opaque carriers when the head is embedded.
+        for &row in raw.rows.iter() {
+            if previous.is_empty() { break; }
+            let key = path_key(&raw.table.paths[row]);
+            if previous.remove(&key) && cached.anchors.get(&key).is_some_and(|a|
+                a.multivolume && !a.needs_password && !a.is_volume_entry()) {
+                self.volume_seeds.push((Arc::clone(&raw.table), row, cached.anchors.remove(&key).unwrap()));
             }
-            self.rows.retain(|row| matches!(row, Candidate::File(..)));
-            let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());
-            replacement.extend(
-                groups
-                    .into_iter()
-                    .map(|group| Candidate::Relation(Box::new(group))),
-            );
-            replacement.append(&mut self.rows);
-            self.rows = replacement;
-            self.retain_targets();
-            self.append_speculative_files(raw);
-        })();
-        Ok(())
+        }
+        self.rows.retain(|row| matches!(row, Candidate::File(..)));
+        let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());
+        replacement.extend(
+            groups
+                .into_iter()
+                .map(|group| Candidate::Relation(Box::new(group))),
+        );
+        replacement.append(&mut self.rows);
+        self.rows = replacement;
+        if let Some(targets) = targets {
+            targets.retain(&mut self.rows);
+        }
+        self.append_speculative_files(raw);
     }
 
     pub(crate) fn dedupe(&mut self) {
@@ -1202,36 +1148,25 @@ impl NativeCandidateTable {
         })
     }
 
-    pub(crate) fn summary(&self, index: usize) -> std::io::Result<(String, String)> {
-        let row = self
-            .rows
-            .get(index)
-            .ok_or_else(|| std::io::Error::other(index.to_string()))?;
-        Ok(match row {
-            Candidate::File(table, index) => (
-                table.paths[*index].clone(),
-                table.relation_anchors[*index]
-                    .as_ref()
-                    .and_then(CheapAnchor::anchor)
-                    .map_or("", |anchor| anchor.format)
-                    .to_owned(),
-            ),
-            Candidate::Relation(group) => {
-                (group.entry_path().to_owned(), group.format_hint().to_owned())
-            }
-        })
+    pub(crate) fn summary(&self, index: usize) -> (&str, &str) {
+        let row = &self.rows[index];
+        let format = match row {
+            Candidate::File(table, index) => table.relation_anchors[*index]
+                .as_ref()
+                .and_then(CheapAnchor::anchor)
+                .map_or("", |anchor| anchor.format),
+            Candidate::Relation(group) => group.format_hint(),
+        };
+        (row.path(), format)
     }
 
-    pub(crate) fn path_keys(&self, index: usize) -> std::io::Result<Vec<String>> {
-        let row = self
-            .rows
-            .get(index)
-            .ok_or_else(|| std::io::Error::other(index.to_string()))?;
-        Ok(match row {
-            Candidate::File(table, index) => vec![path_key(&table.paths[*index])],
-            Candidate::Relation(group) => group.related_paths().map(path_key)
-                .collect::<HashSet<_>>().into_iter().collect(),
-        })
+    pub(crate) fn extend_path_keys(&self, index: usize, paths: &mut HashSet<String>) {
+        match &self.rows[index] {
+            Candidate::File(table, index) => {
+                paths.insert(path_key(&table.paths[*index]));
+            }
+            Candidate::Relation(group) => paths.extend(group.related_paths().map(path_key)),
+        }
     }
 
     pub(crate) fn resolve(&self) -> std::io::Result<NativeDiscoveryRoutes> {
@@ -1253,7 +1188,7 @@ impl NativeCandidateTable {
                     || (data.multivolume && (data.is_split || data.structural_non_head)))
             {
                 blocked.extend(group.related_paths().map(path_key));
-                routes.relation_events.push((index, 2));
+                routes.relations.push((index, false));
             } else if data.relation_confirmed && matches!(data.format_hint, "rar" | "7z" | "zip") {
                 claimed.extend(group.owned_paths().map(path_key));
                 speculative.extend(
@@ -1262,7 +1197,7 @@ impl NativeCandidateTable {
                         .filter(|path| *path != data.entry_path)
                         .map(path_key),
                 );
-                routes.relation_events.push((index, 1));
+                routes.relations.push((index, true));
             } else {
                 relation_residual.push(index);
             }
@@ -1398,10 +1333,12 @@ impl NativeCandidateTable {
             *self = Self::default();
             return NativeEmbeddedBatch::default();
         }
-        let mut excluded: HashSet<_> = routes.resolved_relations().filter(|&index| {
+        let mut excluded = HashSet::new();
+        for index in routes.resolved_relations().filter(|&index| {
             !matches!(&self.rows[index], Candidate::Relation(group) if group.is_incomplete())
-        }).chain(routes.detected.iter().copied())
-            .flat_map(|index| self.path_keys(index).unwrap_or_default()).collect();
+        }).chain(routes.detected.iter().copied()) {
+            self.extend_path_keys(index, &mut excluded);
+        }
         // Keep only the evidence used by volume recovery, not resolved groups
         // and their execution metadata from every root. Raw snapshots still
         // supply all eligible peers; primary decisions have been projected.
