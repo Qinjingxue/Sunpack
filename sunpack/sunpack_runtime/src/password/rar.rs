@@ -681,13 +681,15 @@ impl RarPasswordContext {
         &self, reader: &mut AttemptReader<'_>, disk: usize, start: &RarContinuationFragment,
         fragments: &Arc<[Option<RarContinuationFragment>]>,
     ) -> io::Result<Option<Self>> {
-        let prepare = |reader: &mut AttemptReader<'_>, encrypted| {
+        let prepare = |reader: &mut AttemptReader<'_>, encrypted, follow_headers| {
             let encrypted = match encrypted {
                 Some(encrypted) => Some(encrypted),
-                None => read_native_rar(reader, disk, start, fragments, start.offset, 16)?.try_into().ok(),
+                None => read_native_rar(reader, &mut NativeRarPosition::new(disk, start), start, fragments,
+                    start.offset, 16)?.try_into().ok(),
             };
             let source = RarTailSource::Native(Box::new(NativeRarTail {
                 reads: reader.deferred_reads(true), disk, start: start.clone(), fragments: Arc::clone(fragments),
+                last_ambiguous_disk: if follow_headers { reader.last_ambiguous_native_disk(disk) } else { None },
             }));
             Ok::<_, io::Error>((encrypted, source))
         };
@@ -695,7 +697,7 @@ impl RarPasswordContext {
             RarPasswordMaterial::Rar4Block(block) if block.split_after
                 && block.next.checked_sub(16) == Some(start.offset) && block.data_size == start.size =>
                 {
-                    let (encrypted, source) = prepare(reader, block.encrypted)?;
+                    let (encrypted, source) = prepare(reader, block.encrypted, false)?;
                     let Some(encrypted) = encrypted else { return Ok(None); };
                     RarPasswordMaterial::Rar4Block(Rar4BlockProbe {
                         salt: block.salt, encrypted: Some(encrypted), next: block.next,
@@ -705,7 +707,7 @@ impl RarPasswordContext {
             RarPasswordMaterial::Rar5Block { identity, block } if block.split_after
                 && block.offset == start.offset && block.packed_size == start.size =>
                 {
-                    let (encrypted, source) = prepare(reader, block.encrypted)?;
+                    let (encrypted, source) = prepare(reader, block.encrypted, true)?;
                     let Some(encrypted) = encrypted else { return Ok(None); };
                     RarPasswordMaterial::Rar5Block { identity: *identity, block: Rar5BlockProbe {
                         encrypted: Some(encrypted), offset: block.offset, packed_size: block.packed_size,
@@ -805,21 +807,37 @@ struct NativeRarTail {
     disk: usize,
     start: RarContinuationFragment,
     fragments: Arc<[Option<RarContinuationFragment>]>,
+    last_ambiguous_disk: Option<usize>,
 }
 
-fn read_native_rar(
-    reader: &mut AttemptReader<'_>, mut disk: usize, start: &RarContinuationFragment,
-    fragments: &[Option<RarContinuationFragment>], offset: u64, len: usize,
+#[derive(Clone, Copy)]
+struct NativeRarPosition<'a> {
+    disk: usize,
+    logical_start: u64,
+    fragment: &'a RarContinuationFragment,
+}
+
+impl<'a> NativeRarPosition<'a> {
+    fn new(disk: usize, fragment: &'a RarContinuationFragment) -> Self {
+        Self { disk, logical_start: fragment.offset, fragment }
+    }
+}
+
+fn read_native_rar<'a>(
+    reader: &mut AttemptReader<'_>, position: &mut NativeRarPosition<'a>, start: &'a RarContinuationFragment,
+    fragments: &'a [Option<RarContinuationFragment>], offset: u64, len: usize,
 ) -> io::Result<Vec<u8>> {
-    let mut relative = offset.checked_sub(start.offset).ok_or(io::ErrorKind::UnexpectedEof)?;
-    let mut fragment = start;
+    let mut relative = offset.checked_sub(position.logical_start).ok_or(io::ErrorKind::UnexpectedEof)?;
+    let mut current = *position;
     let mut bytes = vec![0; len];
     let mut written = 0;
     loop {
+        let fragment = current.fragment;
         if relative < fragment.size {
+            if written == 0 { *position = current; }
             let count = (fragment.size - relative).min((len - written) as u64) as usize;
             let at = fragment.offset.checked_add(relative).ok_or(io::ErrorKind::UnexpectedEof)?;
-            let actual = reader.read_native_disk(disk, at, &mut bytes[written..written + count])?;
+            let actual = reader.read_native_disk(current.disk, at, &mut bytes[written..written + count])?;
             written += actual;
             if written == len {
                 return Ok(bytes);
@@ -831,11 +849,15 @@ fn read_native_rar(
             break;
         }
         relative -= fragment.size;
-        disk = disk.checked_add(1).ok_or(io::ErrorKind::UnexpectedEof)?;
+        let disk = current.disk.checked_add(1).ok_or(io::ErrorKind::UnexpectedEof)?;
         let Some(id) = reader.native_proof(disk, |source| {
             fragments[source].as_ref().filter(|part| part.name == start.name).map(|_| source)
         })? else { break };
-        fragment = fragments[id].as_ref().unwrap();
+        current = NativeRarPosition {
+            disk,
+            logical_start: current.logical_start.checked_add(fragment.size).ok_or(io::ErrorKind::UnexpectedEof)?,
+            fragment: fragments[id].as_ref().unwrap(),
+        };
     }
     bytes.truncate(written);
     Ok(bytes)
@@ -863,26 +885,34 @@ impl RarTailSource {
         matches!(self, Self::Projected(source) if source.range_is_ambiguous(offset, size))
     }
 
-    fn verify(&self, mut check: impl FnMut(&mut RarProbeRead<'_>) -> RarProof) -> io::Result<RarCheck> {
+    fn verify(&self, mut check: impl FnMut(&mut RarProbeRead<'_>, &std::cell::Cell<bool>) -> RarProof) -> io::Result<RarCheck> {
         let mut result = RarCheck::from(RarProof::Reject);
+        let may_narrow_native = std::cell::Cell::new(false);
         let checks = match self {
             Self::Projected(source) =>
-                source.evaluate(|reader| check(&mut |offset, size| reader.read(offset, size)))?,
+                source.evaluate(|reader| check(&mut |offset, size| reader.read(offset, size), &may_narrow_native))?,
             Self::Native(source) =>
-                source.reads.evaluate(|reader| check(&mut |offset, size| {
-                    let bytes = reader.load(|reader| read_native_rar(reader, source.disk, &source.start,
-                        &source.fragments, offset, size))?;
-                    if bytes.len() == size { Ok(bytes) } else { Err(DeferredReadError::Missing) }
-                }))?,
+                source.reads.evaluate(|reader| {
+                    let start = NativeRarPosition::new(source.disk, &source.start);
+                    let mut position = start;
+                    may_narrow_native.set(source.last_ambiguous_disk.is_some());
+                    check(&mut |offset, size| {
+                        if offset < position.logical_start { position = start; }
+                        let bytes = reader.load(|reader| read_native_rar(reader, &mut position, &source.start,
+                            &source.fragments, offset, size))?;
+                        may_narrow_native.set(source.last_ambiguous_disk.is_some_and(|disk| position.disk <= disk));
+                        if bytes.len() == size { Ok(bytes) } else { Err(DeferredReadError::Missing) }
+                    }, &may_narrow_native)
+                })?,
             Self::Fixed(ranges) => {
                 let mut reader = VirtualRangeReader::streaming(ranges);
                 return Ok(check(&mut |offset, size| {
                     let bytes = reader.read_at(offset, size).map_err(DeferredReadError::Io)?;
                     if bytes.len() != size { return Err(DeferredReadError::Missing); }
                     Ok(bytes)
-                }).into());
+                }, &may_narrow_native).into());
             }
-            Self::PrefixOnly => return Ok(check(&mut |_, _| Err(DeferredReadError::Missing)).into()),
+            Self::PrefixOnly => return Ok(check(&mut |_, _| Err(DeferredReadError::Missing), &may_narrow_native).into()),
         };
         let corroborated = checks.iter().any(|(_, proof)| *proof == RarProof::Successor(true));
         for (projection, proof) in checks {
@@ -1108,7 +1138,7 @@ impl Rar4BlockProbe {
         match rar3_lz_tables(&first) {
             LevelTable::Impossible => Ok(RarProof::Reject.into()),
             LevelTable::Complete => Ok(weak.into()),
-            LevelTable::Incomplete => self.source.verify(|read| {
+            LevelTable::Incomplete => self.source.verify(|read, _| {
                 let mut plain = [0; RAR3_TABLE_WINDOW];
                 plain[..16].copy_from_slice(&first);
                 let mut previous = encrypted;
@@ -1155,7 +1185,7 @@ impl Rar4HeaderProbe {
             return Ok(RarProof::Reject.into());
         };
         let Some(rest_offset) = self.offset.checked_add(24) else { return Ok(RarProof::Reject.into()); };
-        self.source.verify(|read| {
+        self.source.verify(|read, _| {
             let header = match first.finish(&cipher, |size| read(rest_offset, size)) {
                 Ok(Some(header)) => header,
                 Ok(None) => return RarProof::Reject,
@@ -1213,7 +1243,10 @@ impl Rar5BlockProbe {
         if table == LevelTable::Complete && last {
             return Ok(if next as u64 <= self.packed_size { weak } else { self.incomplete() }.into());
         }
-        self.source.verify(|read| {
+        // Deferred reads may branch on a continuation. The headers wholly in
+        // the selected first fragment are shared by every resulting branch.
+        let mut common_successor = None;
+        self.source.verify(|read, may_narrow_native| {
             let mut prefix = Rar5BlockWindow::default();
             if table == LevelTable::Incomplete {
                 let edge = (header_len + table_bits.div_ceil(8).min(20)).next_multiple_of(16);
@@ -1225,9 +1258,9 @@ impl Rar5BlockProbe {
                     return RarProof::Reject;
                 }
             }
-            let mut next = next as u64;
-            let mut last = last;
-            let mut checked_successor = false;
+            let (mut next, mut last) = common_successor.unwrap_or((next as u64, last));
+            let mut checked_successor = common_successor.is_some();
+            let mut checked_native_boundary = false;
             loop {
                 if next > self.packed_size && !self.source.is_native() { return self.incomplete(); }
                 if last { return weak; }
@@ -1237,7 +1270,8 @@ impl Rar5BlockProbe {
                 let cbc_start = (next & !15).saturating_sub(16).max(16);
                 let crosses_fragment = next.checked_add(5).and_then(|end| end.checked_next_multiple_of(16))
                     .is_none_or(|end| end > self.packed_size);
-                if checked_successor && !(self.source.is_native() && crosses_fragment)
+                if checked_successor && !may_narrow_native.get()
+                    && !(self.source.is_native() && crosses_fragment && !checked_native_boundary)
                     && self.offset.checked_add(cbc_start).is_none_or(|offset|
                         !self.source.range_is_ambiguous(offset, self.packed_size.saturating_sub(cbc_start))) {
                     return weak;
@@ -1264,9 +1298,15 @@ impl Rar5BlockProbe {
                 };
                 let Some(end) = rar5_block_end(header) else { return RarProof::Reject; };
                 let Some(offset) = next.checked_add(end as u64) else { return RarProof::Reject; };
+                let within_first = next.checked_add(width as u64).and_then(|end| end.checked_next_multiple_of(16))
+                    .is_some_and(|end| end <= self.packed_size);
                 next = offset;
                 last = header[0] & 0x40 != 0;
                 checked_successor = true;
+                if self.source.is_native() {
+                    if within_first { common_successor = Some((next, last)); }
+                    else { checked_native_boundary = true; }
+                }
             }
         })
     }
@@ -1342,7 +1382,7 @@ impl Rar5HeaderTail {
                 Ok(RarProof::Confirmed.into())
             } else { reject() };
         }
-        self.source.verify(|read| {
+        self.source.verify(|read, _| {
             let mut previous = previous;
             let mut digest = crc32fast::Hasher::new();
             digest.update(&first[4..size.min(16)]);

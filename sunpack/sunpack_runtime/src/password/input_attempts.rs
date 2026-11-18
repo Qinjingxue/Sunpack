@@ -1092,6 +1092,11 @@ impl AttemptReader<'_> {
         self.projection.topology.range_is_ambiguous(start, size)
     }
 
+    pub(in crate::password) fn last_ambiguous_native_disk(&self, after: usize) -> Option<usize> {
+        self.projection.topology.disk_mappings().range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+            .rev().find_map(|(&disk, mapping)| mapping.different_source.then_some(disk))
+    }
+
     fn metadata_ready(&self) -> io::Result<()> {
         if self.fault.is_some() {
             return Err(io::Error::other("volume source read failed"));

@@ -263,6 +263,41 @@ void last_password_extracts_into_existing_destination(const std::filesystem::pat
         "sole-password extraction changed existing output");
 }
 
+void scan_confirms_only_unproven_password(const std::filesystem::path& archive) {
+    NativeCpuBudget budget(1);
+    NativeCpuJobContext job(budget);
+    NativeCpuContextScope cpu(&job);
+    WorkerRequest request;
+    request.job_id = "scan-sole-composition";
+    request.scan_only = true;
+    request.encrypted = 1;
+    request.password = L"fixture-known";
+    request.password_candidates = {request.password};
+    request.archive_input.archive_path = archive.wstring();
+    request.archive_input.format_hint = L"zip";
+    auto& plan = request.archive_input.volume_attempts;
+    plan.sources = {{archive.wstring(), 0, 45, true},
+                    {archive.wstring(), 45, std::filesystem::file_size(archive), true}};
+    plan.domains = {{0, 1}, {1}};
+    plan.layouts = {{{1, L"v1", 0}, {2, L"v2", 1}}};
+
+    request.password_verified = true;
+    const auto verified = run_request(request);
+    auto selected = wire::key("volume_selection");
+    append_volume_selection(selected, 0, {0, 1});
+    const auto confirmed = wire::key("password_verified") + wire::boolean(true);
+    const auto matched = wire::key("matched_index") + wire::number(0);
+    require(verified.code == 0 && verified.response.find(selected) != std::string::npos &&
+        verified.response.find(confirmed) != std::string::npos && verified.response.find(matched) == std::string::npos,
+        "Scan probed the proven password again or lost the sole composition");
+
+    request.password_verified = false;
+    const auto unverified = run_request(request);
+    require(unverified.code == 0 && unverified.response.find(confirmed) != std::string::npos &&
+        unverified.response.find(matched) != std::string::npos,
+        "Scan failed to verify its last unproven password with the member CRC");
+}
+
 void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
     WorkerRequest request;
     request.scan_only = true;
@@ -445,6 +480,7 @@ int main() {
     unavailable_member_is_not_reprobed_for_an_unread_slice(archive, root / L"unsupported-carrier.zip");
     disjoint_layouts_do_not_repeat_comparisons();
     rejected_composition_is_not_prepared(root / L"encrypted.zip", root / L"rejected");
+    scan_confirms_only_unproven_password(root / L"encrypted.zip");
     sole_injective_composition_skips_member_probe(archive, root / L"direct");
     last_password_extracts_into_existing_destination(root / L"encrypted.zip", root / L"existing");
     unsigned index = 0;

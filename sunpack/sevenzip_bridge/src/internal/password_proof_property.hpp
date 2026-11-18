@@ -15,4 +15,6 @@ inline constexpr PROPID kpidSunpackProofOffset = kpidUserDefined + 258;
 inline constexpr PROPID kpidSunpackProofPackedSize = kpidUserDefined + 259;
 inline constexpr PROPID kpidSunpackProofDisks = kpidUserDefined + 260;
 inline constexpr PROPID kpidSunpackAesCopyStart = kpidUserDefined + 261;
+// Archive-open callback property for a bounded member proof.
+inline constexpr PROPID kpidSunpackBoundedPasswordProbe = kpidUserDefined + 262;
 inline constexpr Int32 kSunpackVerifyMember = 2;

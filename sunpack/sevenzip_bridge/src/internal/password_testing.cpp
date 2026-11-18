@@ -662,7 +662,7 @@ namespace sunpack::sevenzip
             }
 
             auto *raw_open_callback = new OpenCallback(password, input.callback_path, part_paths, canonical_names,
-                InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges, volumes.observer());
+                InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges, volumes.observer(), !final_read_only);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
             hr = archive->Open(input.stream.Interface(), search_limit, open_callback.Interface());

@@ -278,10 +278,13 @@ fn double_encrypted_header_uses_both_ivs_and_checks_the_header_crc() {
     assert_eq!(SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.get()), passwords.len());
 
     let keys = [11, 12].map(|iv| SevenZipAesKey::derive(&coder(iv).properties, "secret").unwrap());
-    let structure = SevenZipPayloadEvidence::Compressed {
-        method: EncoderMethod::ID_LZMA2.to_vec(),
+    let structure = SevenZipPayloadEvidence {
         packed_size: 60,
-        unpack_size: 56,
+        unchanged_prefix: u64::MAX,
+        verifier: SevenZipPayloadVerifier::Compressed {
+            method: EncoderMethod::ID_LZMA2.to_vec(),
+            unpack_size: 56,
+        },
     };
     for next in [0, 0x7f] {
         let mut packed = [0; 64];
@@ -302,6 +305,76 @@ fn double_encrypted_header_uses_both_ivs_and_checks_the_header_crc() {
             &mut read, &SevenZipPayloadSource::Fixed(Arc::new([]))).unwrap();
         assert_eq!(result == SevenZipPrefixCheck::Reject, next != 0);
     }
+}
+
+#[test]
+fn only_the_bound_bcj2_range_input_yields_password_evidence() {
+    let mut folder = SevenZipFolderAst {
+        coders: vec![
+            SevenZipCoderAst {
+                method_id: EncoderMethod::ID_BCJ2.to_vec(),
+                properties: Vec::new(),
+                num_in_streams: 4,
+                num_out_streams: 1,
+            },
+            SevenZipCoderAst {
+                method_id: EncoderMethod::ID_AES256_SHA256.to_vec(),
+                properties: vec![0x3f],
+                num_in_streams: 1,
+                num_out_streams: 1,
+            },
+        ],
+        bind_pairs: vec![(3, 1)],
+        packed_streams: vec![0, 1, 2, 4],
+        main_output_stream: 0,
+        unpack_sizes: SevenZipUnpackSizes::All(vec![2, 5]),
+        expected_crc: None,
+    };
+    let plan = seven_zip_payload_plan(&folder, 4, 0, 16, false).unwrap();
+    let proof = plan.kind;
+    assert_eq!(proof.plaintext_prefix_size(), 5);
+    assert_eq!(proof.check_prefix(&[0, 0xff, 0xff, 0xff, 0xfe]), SevenZipPrefixCheck::Weak);
+    assert_eq!(proof.check_prefix(&[0, 0xff, 0xff, 0xff, 0xff]), SevenZipPrefixCheck::Reject);
+    assert_eq!(proof.check_prefix(&[1, 0, 0, 0, 0]), SevenZipPrefixCheck::Reject);
+    for port in 0..3 {
+        folder.bind_pairs[0].0 = port;
+        assert!(seven_zip_payload_plan(&folder, 4, 0, 16, false).is_none());
+    }
+}
+
+#[test]
+fn delta_prefix_evidence_never_reads_beyond_its_unmodified_span() {
+    use aes::cipher::BlockModeEncrypt;
+
+    let coder = |method: &[u8], properties| SevenZipCoderAst {
+        method_id: method.to_vec(), properties, num_in_streams: 1, num_out_streams: 1,
+    };
+    let folder = SevenZipFolderAst {
+        coders: vec![
+            coder(EncoderMethod::ID_AES256_SHA256, vec![0x3f]),
+            coder(EncoderMethod::ID_DELTA, vec![2]),
+            coder(EncoderMethod::ID_LZMA2, vec![0]),
+        ],
+        bind_pairs: vec![(1, 0), (2, 1)],
+        packed_streams: vec![0],
+        main_output_stream: 2,
+        unpack_sizes: SevenZipUnpackSizes::All(vec![6, 6, 2]),
+        expected_crc: Some(crc32(&[SZ_HEADER, SZ_END])),
+    };
+    let plan = seven_zip_payload_plan(&folder, 0, 0, 16, false).unwrap();
+    let key = SevenZipAesKey::derive(&plan.properties, "secret").unwrap();
+    // Distance-3 Delta encoding of [1, 0, 1, SZ_HEADER, SZ_END, 0].
+    // The last byte is not a valid LZMA2 end marker before Delta decoding.
+    let mut encrypted = [0; 16];
+    encrypted[..6].copy_from_slice(&[1, 0, 1, SZ_HEADER - 1, SZ_END, 0xff]);
+    cbc::Encryptor::<Aes256>::new(&key.key.into(), &key.iv.into())
+        .encrypt_padded::<NoPadding>(&mut encrypted, 16).unwrap();
+    assert_eq!(plan.kind.plaintext_prefix_size(), 3);
+    assert!(!plan.kind.has_successor());
+    assert_eq!(plan.kind.check_encrypted_prefix(&encrypted, &key).unwrap(), SevenZipPrefixCheck::Weak);
+    let header = SevenZipPasswordProbe::from_parts(vec![encrypted.to_vec().into()], folder, SevenZipMetadata::Header);
+    assert_eq!(header.check_header(|properties| SevenZipAesKey::derive(properties, "secret")).unwrap(),
+        SevenZipPrefixCheck::Confirmed);
 }
 
 #[test]
@@ -344,10 +417,13 @@ fn unavailable_second_aes_block_keeps_first_block_structure() {
         inner_aes: Box::default(),
         offset: 0,
         properties,
-        kind: SevenZipPayloadEvidence::Compressed {
-            method: vec![4, 2, 2],
+        kind: SevenZipPayloadEvidence {
             packed_size: 32,
-            unpack_size: 1,
+            unchanged_prefix: u64::MAX,
+            verifier: SevenZipPayloadVerifier::Compressed {
+                method: vec![4, 2, 2],
+                unpack_size: 1,
+            },
         },
         cost: 0,
     };

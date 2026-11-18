@@ -3011,8 +3011,9 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                     }
                 }
-                if success && self.request.mode == Mode::Extract && input.volume_attempts.is_some()
-                {
+                let scan_selection = self.request.mode == Mode::Scan && value.get("volume_selection").is_some();
+                if input.volume_attempts.is_some()
+                    && (scan_selection || (success && self.request.mode == Mode::Extract)) {
                     let selected = value
                         .get("volume_selection")
                         .ok_or_else(|| {
@@ -3024,11 +3025,17 @@ impl<'run, O: Observer> Run<'run, O> {
                         .and_then(|raw| {
                             VolumeSelection::deserialize(raw).map_err(io::Error::from)
                         });
+                    let completeness = input.analysis.volume_completeness;
                     match selected.and_then(|selected| Arc::make_mut(&mut input).select_volumes(&selected)) {
                         Ok(()) => {
                             result.source_paths =
                                 input.physical_paths().map(PathBuf::from).collect();
-                            result.volume_completeness = Some(VolumeCompleteness::Complete);
+                            if scan_selection {
+                                // A unique composition can still be missing archive data.
+                                Arc::make_mut(&mut input).analysis.volume_completeness = completeness;
+                            } else {
+                                result.volume_completeness = Some(VolumeCompleteness::Complete);
+                            }
                         }
                         Err(error) => {
                             result.failure =

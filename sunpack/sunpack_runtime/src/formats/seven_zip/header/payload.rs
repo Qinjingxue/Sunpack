@@ -186,44 +186,53 @@ fn seven_zip_deferred_error(error: DeferredReadError) -> String {
     format!("7z structural evidence unavailable: {reason}")
 }
 
-enum SevenZipPayloadEvidence {
-    Header { packed_size: u64 },
-    Compressed {
-        method: Vec<u8>,
-        packed_size: u64,
-        unpack_size: u64,
-    },
+struct SevenZipPayloadEvidence {
+    packed_size: u64,
+    unchanged_prefix: u64,
+    verifier: SevenZipPayloadVerifier,
+}
+
+enum SevenZipPayloadVerifier {
+    Header,
+    Compressed { method: Vec<u8>, unpack_size: u64 },
+    Bcj2Range,
 }
 
 impl SevenZipPayloadEvidence {
     fn from_stream(folder: &SevenZipFolderAst, stream: &SevenZipAesStream, header: bool) -> Option<Self> {
-        let packed_size = stream.plaintext_size;
-        match stream.consumer {
-            Some((index, unpack_size)) => Some(Self::Compressed {
-                method: folder.coders[index].method_id.clone(),
-                packed_size,
-                unpack_size,
-            }),
-            None if header => Some(Self::Header { packed_size }),
-            None => None,
-        }
+        let verifier = match stream.consumer {
+            Some(SevenZipAesConsumer::Compressed(index, unpack_size)) => {
+                let method = &folder.coders[index].method_id;
+                // A truncated identity span needs at least a complete frame
+                // magic before an LZ4/Zstd probe can reject any bytes.
+                if stream.unchanged_prefix < 4 && matches!(method.as_slice(), [0x04, 0xf7, 0x11, 0x01 | 0x04]) {
+                    return None;
+                }
+                SevenZipPayloadVerifier::Compressed { method: method.clone(), unpack_size }
+            }
+            Some(SevenZipAesConsumer::Bcj2Range) => SevenZipPayloadVerifier::Bcj2Range,
+            None if header => SevenZipPayloadVerifier::Header,
+            None => return None,
+        };
+        Some(Self { packed_size: stream.plaintext_size, unchanged_prefix: stream.unchanged_prefix, verifier })
     }
 
     fn followup_span(&self) -> u64 {
-        match self {
-            Self::Header { packed_size } => *packed_size,
-            Self::Compressed { method, packed_size, .. } if seven_zip_is_deflate(method) => {
-                (*packed_size).min(deflate_prefix::MAX_DYNAMIC_HEADER_SIZE as u64)
+        match &self.verifier {
+            SevenZipPayloadVerifier::Compressed { method, .. } if seven_zip_is_deflate(method) => {
+                self.packed_size.min(deflate_prefix::MAX_DYNAMIC_HEADER_SIZE as u64)
             }
-            Self::Compressed { packed_size, .. } => *packed_size,
+            _ => self.packed_size,
         }.next_multiple_of(16)
     }
 
     fn plaintext_prefix_size(&self) -> usize {
-        match self {
-            Self::Header { packed_size } => (*packed_size).min(16) as usize,
-            Self::Compressed { packed_size, .. } => (*packed_size).min(32) as usize,
-        }
+        let cap = match self.verifier {
+            SevenZipPayloadVerifier::Header => 16,
+            SevenZipPayloadVerifier::Bcj2Range => 5,
+            SevenZipPayloadVerifier::Compressed { .. } => 32,
+        };
+        self.packed_size.min(self.unchanged_prefix).min(cap) as usize
     }
 
     #[cfg(test)]
@@ -267,17 +276,19 @@ impl SevenZipPayloadEvidence {
     }
 
     fn check_prefix(&self, plaintext: &[u8]) -> SevenZipPrefixCheck {
-        match self {
-            Self::Header { packed_size } => seven_zip_plain_header_prefix(plaintext, *packed_size),
-            Self::Compressed { method, packed_size, unpack_size } => {
-                seven_zip_prefix_check(method, plaintext, *packed_size, *unpack_size)
+        match &self.verifier {
+            SevenZipPayloadVerifier::Header => seven_zip_plain_header_prefix(plaintext, self.packed_size),
+            SevenZipPayloadVerifier::Bcj2Range => seven_zip_bcj2_range_prefix(plaintext, self.packed_size),
+            SevenZipPayloadVerifier::Compressed { method, unpack_size } => {
+                seven_zip_prefix_check(method, plaintext, self.packed_size, *unpack_size)
             }
         }
     }
 
     fn has_successor(&self) -> bool {
-        matches!(self, Self::Compressed { method, .. }
-            if seven_zip_has_block_successor(method) || seven_zip_is_deflate(method))
+        self.unchanged_prefix >= self.packed_size &&
+            matches!(&self.verifier, SevenZipPayloadVerifier::Compressed { method, .. }
+                if seven_zip_has_block_successor(method) || seven_zip_is_deflate(method))
     }
 
     fn check_successor(
@@ -285,9 +296,13 @@ impl SevenZipPayloadEvidence {
         material: &SevenZipAesKey, inner: &[SevenZipAesKey],
         read: &mut SevenZipRead<'_>, source: &SevenZipPayloadSource,
     ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
-        let Self::Compressed { method, packed_size, unpack_size } = self else {
+        let SevenZipPayloadVerifier::Compressed { method, unpack_size } = &self.verifier else {
             return Ok(SevenZipPrefixCheck::Weak);
         };
+        let packed_size = self.packed_size;
+        if self.unchanged_prefix < packed_size {
+            return Ok(SevenZipPrefixCheck::Weak);
+        }
         let mut read_plain = |at: u64, out: &mut [u8]| {
             if let Some(bytes) = usize::try_from(at).ok()
                 .and_then(|at| at.checked_add(out.len()).and_then(|end| plaintext.get(at..end)))
@@ -333,10 +348,10 @@ impl SevenZipPayloadEvidence {
             Ok(())
         };
         if seven_zip_is_deflate(method) {
-            let bound = (*packed_size).min(deflate_prefix::MAX_DYNAMIC_HEADER_SIZE as u64) as usize;
+            let bound = packed_size.min(deflate_prefix::MAX_DYNAMIC_HEADER_SIZE as u64) as usize;
             let deflate64 = method[2] == 9;
             let check = |bytes: &[u8]| deflate_prefix::check_prefix(
-                bytes, Some(*packed_size), Some(*unpack_size), deflate64,
+                bytes, Some(packed_size), Some(*unpack_size), deflate64,
             );
             if bound <= plaintext.len() || check(plaintext).is_some() {
                 return Ok(SevenZipPrefixCheck::Weak);
@@ -358,7 +373,7 @@ impl SevenZipPayloadEvidence {
                 }
                 SevenZipPayloadSource::Fixed(_) => false,
             };
-            seven_zip_successor_prefix(method, plaintext, *packed_size, *unpack_size, read_plain, ambiguous)
+            seven_zip_successor_prefix(method, plaintext, packed_size, *unpack_size, read_plain, ambiguous)
         } else {
             Ok(SevenZipPrefixCheck::Weak)
         }
@@ -778,13 +793,20 @@ impl SevenZipPayloadProbe {
 
 }
 
-// One shared graph walk for encrypted headers and data-only evidence. Copy
-// nodes are transparent; no filter is mistaken for a compressed-stream start.
+// One graph walk for encrypted headers and data-only evidence. Only byte
+// identities justified by each input port reach a structural verifier.
 struct SevenZipAesStream {
     aes_index: usize,
     inner_aes: Vec<usize>,
     plaintext_size: u64,
-    consumer: Option<(usize, u64)>,
+    unchanged_prefix: u64,
+    consumer: Option<SevenZipAesConsumer>,
+}
+
+#[derive(Clone, Copy)]
+enum SevenZipAesConsumer {
+    Compressed(usize, u64),
+    Bcj2Range,
 }
 
 fn seven_zip_aes_stream(
@@ -796,24 +818,37 @@ fn seven_zip_aes_stream(
     let mut aes_index = None;
     let mut inner_aes = Vec::new();
     let mut plaintext_size = 0;
+    let mut unchanged_prefix = u64::MAX;
     let mut input_size = packed_size;
     for _ in 0..folder.coders.len() {
         let mut input_base = 0;
         let mut output_base = 0;
-        let (index, coder, output) =
+        let (index, coder, port, output) =
             folder
                 .coders
                 .iter()
                 .enumerate()
                 .find_map(|(index, coder)| {
-                    let found = (input == input_base
-                        && coder.num_in_streams == 1
-                        && coder.num_out_streams == 1)
-                        .then_some((index, coder, output_base));
+                    let found = input.checked_sub(input_base)
+                        .filter(|&port| port < coder.num_in_streams && coder.num_out_streams == 1)
+                        .map(|port| (index, coder, port, output_base));
                     input_base += coder.num_in_streams;
                     output_base += coder.num_out_streams;
                     found
                 })?;
+        if coder.num_in_streams != 1 {
+            if coder.method_id != EncoderMethod::ID_BCJ2 || !coder.properties.is_empty() ||
+                coder.num_in_streams != 4 || port != 3 {
+                return None;
+            }
+            return Some(SevenZipAesStream {
+                aes_index: aes_index?,
+                inner_aes,
+                plaintext_size,
+                unchanged_prefix,
+                consumer: Some(SevenZipAesConsumer::Bcj2Range),
+            });
+        }
         if coder.method_id == EncoderMethod::ID_AES256_SHA256 {
             if aes_index.is_some() {
                 inner_aes.push(index);
@@ -825,6 +860,13 @@ fn seven_zip_aes_stream(
             if plaintext_size == 0 || input_size % 16 != 0 || plaintext_size > input_size {
                 return None;
             }
+            // A later CBC layer can only consume complete unchanged blocks.
+            if unchanged_prefix != u64::MAX {
+                unchanged_prefix &= !15;
+                if unchanged_prefix == 0 {
+                    return None;
+                }
+            }
         } else if coder.method_id == EncoderMethod::ID_COPY && coder.properties.is_empty() {
             if aes_index.is_some() {
                 plaintext_size = plaintext_size.min(folder.unpack_size(output));
@@ -832,6 +874,14 @@ fn seven_zip_aes_stream(
                     return None;
                 }
             }
+        } else if coder.method_id == EncoderMethod::ID_DELTA {
+            let [distance] = coder.properties.as_slice() else { return None; };
+            if folder.unpack_size(output) != input_size {
+                return None;
+            }
+            // Delta's initial history is zero. Its first distance bytes are
+            // identical to the input, independent of all subsequent bytes.
+            unchanged_prefix = unchanged_prefix.min(u64::from(*distance) + 1);
         } else {
             let aes_index = aes_index?;
             if !seven_zip_prefix_is_supported(&coder.method_id) {
@@ -841,7 +891,8 @@ fn seven_zip_aes_stream(
                 aes_index,
                 inner_aes,
                 plaintext_size,
-                consumer: Some((index, folder.unpack_size(output))),
+                unchanged_prefix,
+                consumer: Some(SevenZipAesConsumer::Compressed(index, folder.unpack_size(output))),
             });
         }
         if output == folder.main_output_stream {
@@ -849,6 +900,7 @@ fn seven_zip_aes_stream(
                 aes_index: aes_index?,
                 inner_aes,
                 plaintext_size,
+                unchanged_prefix,
                 consumer: None,
             });
         }
@@ -873,7 +925,8 @@ fn seven_zip_payload_plan(
     let aes = &folder.coders[stream.aes_index];
     let kind = SevenZipPayloadEvidence::from_stream(folder, &stream, header)?;
     let size = kind.plaintext_prefix_size().div_ceil(16) as u64 * 16;
-    let strong = matches!(&kind, SevenZipPayloadEvidence::Compressed { method, .. } if seven_zip_prefix_is_strong(method));
+    let strong = matches!(&kind.verifier, SevenZipPayloadVerifier::Compressed { method, .. }
+        if seven_zip_prefix_is_strong(method));
     let cycles = seven_zip_aes_properties(&aes.properties)?.0;
     let mut cost = seven_zip_payload_cost(cycles, size, strong);
     let inner_aes = stream.inner_aes.iter().map(|&index| {

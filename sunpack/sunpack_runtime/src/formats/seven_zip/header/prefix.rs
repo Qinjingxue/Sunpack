@@ -404,6 +404,14 @@ fn seven_zip_range_prefix(prefix: &[u8], upper: Option<u32>) -> SevenZipPrefixCh
     SevenZipPrefixCheck::Weak
 }
 
+fn seven_zip_bcj2_range_prefix(prefix: &[u8], packed_size: u64) -> SevenZipPrefixCheck {
+    // Bcj2Dec_Decode initializes only the RC input with five bytes.
+    if packed_size < 5 {
+        return SevenZipPrefixCheck::Reject;
+    }
+    seven_zip_range_prefix(prefix, Some(u32::MAX))
+}
+
 #[cfg(test)]
 mod seven_zip_prefix_tests {
     use super::{seven_zip_plain_header_prefix, seven_zip_prefix_check, SevenZipPrefixCheck, SevenZipPrefixCheck::*};

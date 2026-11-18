@@ -840,6 +840,15 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
             }
         } else pending.push_back(i);
     }
+    if (request.scan_only && request.password_verified && next.attempts == 1 && pending.size() == 1) {
+        // Check uniqueness before the first member probe. A single-CPU wave
+        // must keep its cursor unchanged when a second composition exists.
+        if (!exhausted) {
+            auto lookahead = next;
+            exhausted = !lookahead.next(plan, cancel);
+        }
+        if (exhausted && (!cancel || !cancel->load(std::memory_order_relaxed))) return prepared_attempts;
+    }
     std::optional<std::size_t> final_choice;
     if (!request.scan_only && !pending.empty() && pending.back() + 1 == prepared_attempts.size() &&
         (!cancel || !cancel->load(std::memory_order_relaxed)) && (exhausted || !next.next(plan, cancel))) {
@@ -924,6 +933,12 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
                 const PreparedAttempt* skipped_prefix = nullptr;
                 std::size_t skipped_slots = 0;
                 for (auto& candidate : wave) {
+                    if (!candidate.probe && verified) {
+                        fields += wire::key("volume_selection");
+                        append_volume_selection(fields, candidate.layout, candidate.sources);
+                        tested = true;
+                        break;
+                    }
                     if (skipped_layout == candidate.layout) continue;
                     if (skipped_prefix && skipped_prefix->layout == candidate.layout &&
                         same_volume_prefix(skipped_prefix->sources, candidate.sources, skipped_slots)) continue;

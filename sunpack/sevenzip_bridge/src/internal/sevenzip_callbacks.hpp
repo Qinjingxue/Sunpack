@@ -99,7 +99,8 @@ namespace sunpack::sevenzip
             const std::vector<std::wstring> &canonical_names = {},
             InputPrefetchConfig volume_prefetch_config = input_prefetch_config(),
             std::shared_ptr<std::atomic<bool>> cancel_token = native_job_cancel_token(),
-            const std::vector<ExtractInputRange> &part_ranges = {}, VolumeReadUncertainty* probe_reads = nullptr)
+            const std::vector<ExtractInputRange> &part_ranges = {}, VolumeReadUncertainty* probe_reads = nullptr,
+            bool bounded_password_probe = false)
 
             : password_(std::move(password)),
 
@@ -108,7 +109,8 @@ namespace sunpack::sevenzip
               part_paths_(part_paths.empty() ? nullptr : &part_paths),
               part_ranges_(part_ranges.empty() ? nullptr : &part_ranges), probe_reads_(probe_reads),
 
-              volume_prefetch_config_(volume_prefetch_config), cancel_token_(std::move(cancel_token))
+              volume_prefetch_config_(volume_prefetch_config), cancel_token_(std::move(cancel_token)),
+              bounded_password_probe_(bounded_password_probe)
         {
 
             const auto part_count = part_paths.empty() ? part_ranges.size() : part_paths.size();
@@ -141,6 +143,10 @@ namespace sunpack::sevenzip
                 value->bstrVal = SysAllocString(archive_path_.c_str());
 
                 return value->bstrVal ? S_OK : E_OUTOFMEMORY;
+            }
+            if (propID == kpidSunpackBoundedPasswordProbe && bounded_password_probe_) {
+                value->vt = VT_BOOL;
+                value->boolVal = VARIANT_TRUE;
             }
 
             return S_OK;
@@ -306,6 +312,7 @@ namespace sunpack::sevenzip
         bool missing_volume_requested_ = false;
         bool volume_open_failed_ = false;
         bool password_requested_ = false;
+        const bool bounded_password_probe_;
         std::wstring missing_volume_name_;
         std::wstring failed_volume_name_;
     };

@@ -442,20 +442,21 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
 }
 
 #[test]
-fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
+fn rar5_successor_blocks_and_first_level_table_filter_different_sources() {
     let salt = [0x32; 16];
     let iv = [0x43; 16];
     let mut key = [0; 32];
     pbkdf2::pbkdf2_hmac::<Sha256>(b"secret", &salt, 16, &mut key);
-    let mut compressed = [0u8; 80];
+    let mut compressed = [0u8; 112];
     let mut header = |offset: usize, flags: u8, length: u8| {
         compressed[offset..offset + 3].copy_from_slice(&[flags, 0x5a ^ flags ^ length, length]);
     };
     header(0, 0x87, 29);
     header(32, 0x07, 29);
-    header(64, 0x47, 0);
+    header(64, 0x07, 29);
+    header(96, 0x47, 0);
     compressed[3] = 0x11; // Complete code-length tree with two codes of length 1.
-    let encrypt = |mut bytes: [u8; 80]| {
+    let encrypt = |mut bytes: [u8; 112]| {
         let size = bytes.len();
         cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
             .encrypt_padded::<NoPadding>(&mut bytes, size).unwrap();
@@ -465,8 +466,8 @@ fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
     let mut bad_table = compressed;
     bad_table[3] = 0; // Every length is zero despite the valid block checksum.
     let bad_table = encrypt(bad_table);
-    let mut wrong_third = good;
-    wrong_third[49] ^= 1; // CBC change to the third header's checked byte.
+    let mut wrong_last = good;
+    wrong_last[81] ^= 1; // CBC change to the fourth header's checked byte.
     let mut extra = vec![36, 1, 0, 0, 4];
     extra.extend(salt);
     extra.extend(iv);
@@ -485,7 +486,7 @@ fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
     let password = [Arc::from("secret")];
     assert_eq!(context.verify(&password, None).unwrap().status, "no_match");
 
-    for native_split in [None, Some(48usize), Some(8)] {
+    for native_split in [None, Some(48usize), Some(8), Some(80)] {
         let archives = if let Some(split) = native_split {
             file[1] |= 16;
             file[3] = split as u8;
@@ -493,13 +494,13 @@ fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
                 &rar5_block(&[5, 0, 1])].concat();
             let tail = |bytes: &[u8]| [RAR5_SIGNATURE, &rar5_block(&[1, 0, 3, 1]),
                 &rar5_block(&[2, 10, bytes.len() as u8, 0, 10, 0, 0x80, 1, 0, 1, b'x']), bytes, &end].concat();
-            [head, tail(&wrong_third[split..]), tail(&good[split..])]
+            [head, tail(&wrong_last[split..]), tail(&good[split..])]
         } else {
-            [[&prefix[..], &good[..48]].concat(), [&wrong_third[48..], &end[..]].concat(),
+            [[&prefix[..], &good[..48]].concat(), [&wrong_last[48..], &end[..]].concat(),
                 [&good[48..], &end[..]].concat()]
         };
         let paths: Vec<_> = archives.iter().enumerate().map(|(i, data)|
-            crate::test_support::temp_file(&format!("rar5_third_block_{i}"), data)).collect();
+            crate::test_support::temp_file(&format!("rar5_successor_block_{i}"), data)).collect();
         let plan = Arc::new(VolumeAttemptPlan {
             sources: paths.iter().map(|path| InputExtent {
                 path: path.to_string_lossy().into_owned(), start: 0, end: Some(path.metadata().unwrap().len()),
@@ -514,7 +515,7 @@ fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
         preparation.fix_password();
         let result = rar_fast_verify_passwords_from_attempts(&mut preparation, &plan.sources[0],
             &plan, &password, &[], native_split.is_some()).unwrap();
-        let remaining = result.volume_attempts.expect("third block prunes one tail");
+        let remaining = result.volume_attempts.expect("a successor block prunes one tail");
         assert!(!remaining.sources.contains(&plan.sources[1]));
         assert!(remaining.sources.contains(&plan.sources[2]));
         for path in paths { std::fs::remove_file(path).unwrap(); }

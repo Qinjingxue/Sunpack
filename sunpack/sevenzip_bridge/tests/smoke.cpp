@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef _WIN32
@@ -183,6 +184,46 @@ bool check_rar5_short_keyed_member_password_proof() {
         return test_password_batch(path.wstring(), {}, {}, L"rar5", keys, count, {}, true);
     };
     const auto keyed = probe(candidates, 2);
+
+    // The same member remains independently verifiable with optional RAR5
+    // metadata. Opening for extraction still exposes both service payloads.
+    constexpr char cmt_header[] = "\x47\x80\x92\xc9\x12\x03\x02\x80\x08\x04\x80\x08\x00\x7c\xed\x58\x9d\x00\x00\x03" "CMT";
+    constexpr char acl_header[] = "\xf8\x7a\xdc\x26\x12\x03\x02\x80\x08\x04\x80\x08\x00\x1a\xfb\x37\xb7\x00\x00\x03" "ACL";
+    const std::string comment(1024, 'C'), acl(1024, 'A');
+    fixture.insert(fixture.size() - 8, std::string(acl_header, sizeof(acl_header) - 1) + acl);
+    fixture.insert(16, std::string(cmt_header, sizeof(cmt_header) - 1) + comment);
+#ifdef SUP7Z_DEBUG
+    observed_logical_read_bytes = 0;
+#endif
+    const auto with_metadata = probe(candidates + 1, 1);
+#ifdef SUP7Z_DEBUG
+    const bool skipped_payloads = observed_logical_read_bytes > 0 && observed_logical_read_bytes < acl.size();
+#else
+    const bool skipped_payloads = true;
+#endif
+    const bool metadata_preserved = [&] {
+        auto input = open_archive_stream(path.wstring(), {});
+        CMyComPtr<IInArchive> handler;
+        CMyComPtr<IArchiveOpenCallback> callback(new OpenCallback(candidates[1]));
+        const auto formats = extraction_formats_for_hint(L"rar5");
+        if (!input.opened || create_in_archive(formats.handlers.front(), &handler) != S_OK ||
+            handler->Open(input.stream, nullptr, callback) != S_OK)
+            return false;
+        CMyComPtr<IArchiveGetRawProps> raw;
+        const void* acl_data = nullptr;
+        UInt32 acl_size = 0, acl_type = 0;
+        if (handler.QueryInterface(IID_IArchiveGetRawProps, &raw) != S_OK ||
+            raw->GetRawProp(0, kpidNtSecure, &acl_data, &acl_size, &acl_type) != S_OK ||
+            !acl_data || std::string_view(static_cast<const char*>(acl_data), acl_size) != acl)
+            return false;
+        PROPVARIANT property{};
+        const bool has_comment = handler->GetArchiveProperty(kpidComment, &property) == S_OK &&
+                                 prop_text(property) == std::wstring(comment.size(), L'C');
+        clear_prop(property);
+        return has_comment;
+    }();
+    fixture.assign(archive, sizeof(archive) - 1);
+
     fixture.replace(16, 4, "\xb7\x98\x2e\xc7", 4);
     fixture.replace(28, 4, "\x83\x16\xdc\x8c", 4);
     fixture[39] = 0;
@@ -196,6 +237,8 @@ bool check_rar5_short_keyed_member_password_proof() {
     std::error_code error;
     std::filesystem::remove(path, error);
     return keyed.status == PasswordTestStatus::Ok && keyed.matched_index == 1 &&
+        with_metadata.status == PasswordTestStatus::Ok && with_metadata.matched_index == 0 &&
+        skipped_payloads && metadata_preserved &&
         plain.status == PasswordTestStatus::Unsupported && plain.weak_match &&
         empty.status == PasswordTestStatus::Unsupported && empty.password_independent_failure;
 }

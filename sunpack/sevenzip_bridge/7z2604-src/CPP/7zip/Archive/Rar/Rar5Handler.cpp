@@ -2301,6 +2301,19 @@ HRESULT CHandler::Open2(IInStream *stream,
     openCallback->QueryInterface(IID_ICryptoGetTextPassword, (void **)&unpacker.getTextPassword);
   }
   // unpacker.getTextPassword = getTextPassword;
+
+  enum { kReadUnchecked, kReadMetadata, kSkipMetadata } metadataMode = kReadUnchecked;
+  const auto readMetadata = [&]() {
+    // Resolve this only for archives that contain an optional service payload.
+    if (metadataMode == kReadUnchecked)
+    {
+      NCOM::CPropVariant prop;
+      metadataMode = openVolumeCallback
+          && openVolumeCallback->GetProperty(kpidSunpackBoundedPasswordProbe, &prop) == S_OK
+          && prop.vt == VT_BOOL && prop.boolVal == VARIANT_TRUE ? kSkipMetadata : kReadMetadata;
+    }
+    return metadataMode == kReadMetadata;
+  };
   
   CInArchive arch;
   int prevSplitFile = -1;
@@ -2478,7 +2491,12 @@ HRESULT CHandler::Open2(IInStream *stream,
             && item.Get_Method() == 0
             && !item.IsSplit())
         {
-          RINOK(unpacker.DecodeToBuf(EXTERNAL_CODECS_VARS item, item.PackSize, inStream, _comment))
+          // Preserve password evidence when the comment itself is encrypted
+          // but opening the archive headers did not require a password.
+          if ((item.IsEncrypted() && !arch.m_CryptoMode) || readMetadata())
+          {
+            RINOK(unpacker.DecodeToBuf(EXTERNAL_CODECS_VARS item, item.PackSize, inStream, _comment))
+          }
           needAdd = false;
           // item.RecordType = (Byte)NHeaderType::kFile; // for debug
         }
@@ -2512,7 +2530,7 @@ HRESULT CHandler::Open2(IInStream *stream,
                   || item.Size >= (1 << 24)
                   || item.Size == 0)
                 _error_in_ACL = true;
-              if (prevMainFile >= 0 && item.Size < (1 << 24) && item.Size != 0)
+              if (prevMainFile >= 0 && item.Size < (1 << 24) && item.Size != 0 && readMetadata())
               {
                 CItem &mainItem = _items[_refs[prevMainFile].Item];
                 
