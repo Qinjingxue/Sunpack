@@ -7,6 +7,9 @@
 #include "../../../Common/ComTry.h"
 
 #include "../../Common/ProgressUtils.h"
+#include "../../Common/StreamUtils.h"
+#include "../../Crypto/7zAes.h"
+#include "internal/password_proof_property.hpp"
 
 #include "7zDecode.h"
 #include "7zHandler.h"
@@ -30,6 +33,9 @@ private:
   bool _calcCrc;
   UInt32 _crc;
   UInt64 _rem;
+  bool _checkFolderCrc;
+  UInt32 _folderCrc, _expectedFolderCrc;
+  UInt64 _folderRemaining;
 
   const UInt32 *_indexes;
   // unsigned _startIndex;
@@ -52,14 +58,14 @@ public:
       CheckCrc(true)
       {}
 
-  HRESULT Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles);
+  HRESULT Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles, CNum folder, UInt64 outputSize);
   HRESULT FlushCorrupted(Int32 callbackOperationResult);
 
   bool WasWritingFinished() const { return _numFiles == 0; }
 };
 
 
-HRESULT CFolderOutStream::Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles)
+HRESULT CFolderOutStream::Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles, CNum folder, UInt64 outputSize)
 {
   // _startIndex = startIndex;
   _fileIndex = startIndex;
@@ -68,6 +74,16 @@ HRESULT CFolderOutStream::Init(unsigned startIndex, const UInt32 *indexes, unsig
   
   _fileIsOpen = false;
   ExtraWriteWasCut = false;
+  // A single-substream folder digest is already exposed as the file CRC.
+  // Only a complete multi-substream decode can validate the folder digest.
+  _checkFolderCrc = CheckCrc && folder != kNumNoIndex && _db->NumUnpackStreamsVector[folder] > 1 &&
+      _db->FolderCRCs.ValidAndDefined(folder) && outputSize == _db->GetFolderUnpackSize(folder);
+  if (_checkFolderCrc)
+  {
+    _folderRemaining = outputSize;
+    _folderCrc = CRC_INIT_VAL;
+    _expectedFolderCrc = _db->FolderCRCs.Vals[folder];
+  }
   
   return ProcessEmptyFiles();
 }
@@ -125,7 +141,13 @@ HRESULT CFolderOutStream::CloseFile_and_SetResult(Int32 res)
 HRESULT CFolderOutStream::CloseFile()
 {
   const CFileItem &fi = _db->Files[_fileIndex];
-  return CloseFile_and_SetResult((!_calcCrc || fi.Crc == CRC_GET_DIGEST(_crc)) ?
+  bool valid = !_calcCrc || fi.Crc == CRC_GET_DIGEST(_crc);
+  if (_checkFolderCrc && _folderRemaining == 0)
+  {
+    valid = valid && _expectedFolderCrc == CRC_GET_DIGEST(_folderCrc);
+    _checkFolderCrc = false;
+  }
+  return CloseFile_and_SetResult(valid ?
       NExtract::NOperationResult::kOK :
       NExtract::NOperationResult::kCRCError);
 }
@@ -161,6 +183,11 @@ Z7_COM7F_IMF(CFolderOutStream::Write(const void *data, UInt32 size, UInt32 *proc
         result = _stream->Write(data, cur, &cur);
       if (_calcCrc)
         _crc = CrcUpdate(_crc, data, cur);
+      if (_checkFolderCrc)
+      {
+        _folderCrc = CrcUpdate(_folderCrc, data, cur);
+        _folderRemaining -= cur;
+      }
       if (processedSize)
         *processedSize += cur;
       data = (const Byte *)data + cur;
@@ -226,6 +253,69 @@ Z7_COM7F_IMF(CFolderOutStream::GetSubStreamSize(UInt64 subStream, UInt64 *value)
 */
 
 
+// CBC can enter an AES/Copy folder at any ciphertext block using the previous
+// block for chaining. A substream CRC covers just this file's plaintext.
+static HRESULT TestCopySubstream(const CDbEx &db, IInStream *stream, UInt32 index,
+    IArchiveExtractCallback *callback, bool &handled)
+{
+  const auto &file = db.Files[index];
+  const CNum folderIndex = db.FileIndexToFolderIndexMap[index];
+  if (!file.CrcDefined || !file.Size || folderIndex == kNumNoIndex ||
+      db.FolderStartFileIndex[folderIndex] == index ||
+      (db.FolderCRCs.ValidAndDefined(folderIndex) &&
+       (index + 1 == db.Files.Size() || db.FileIndexToFolderIndexMap[index + 1] != folderIndex)))
+    return S_OK;
+  CFolder folder;
+  const int coder = db.GetSeekableAesCoder(folderIndex, folder);
+  if (coder < 0) return S_OK;
+
+  UInt64 offset = 0;
+  for (auto i = db.FolderStartFileIndex[folderIndex]; i < index; ++i)
+    offset += db.Files[i].Size;
+  if (offset < 16) return S_OK;
+  const UInt64 start = (offset & ~(UInt64)15) - 16;
+  const UInt64 packSize = db.GetFolderFullPackSize(folderIndex);
+  if (offset > packSize || file.Size > packSize - offset) return S_OK;
+  handled = true;
+
+  CMyComPtr<ICryptoGetTextPassword> crypto;
+  RINOK(callback->QueryInterface(IID_ICryptoGetTextPassword, (void **)&crypto))
+  CMyComBSTR_Wipe password;
+  BSTR *passwordValue = &password;
+  RINOK(crypto->CryptoGetTextPassword(passwordValue))
+  CMyComPtr2_Create<ICompressFilter, NCrypto::N7z::CDecoder> aes;
+  const auto &props = folder.Coders[(unsigned)coder].Props;
+  RINOK(static_cast<ICompressSetDecoderProperties2 *>(aes.ClsPtr())->SetDecoderProperties2(props, (UInt32)props.Size()))
+  RINOK(static_cast<ICryptoSetPassword *>(aes.ClsPtr())->CryptoSetPassword(
+      (const Byte *)*passwordValue, SysStringByteLen(*passwordValue)))
+  RINOK(aes.Interface()->Init())
+  RINOK(InStream_SeekSet(stream, db.GetFolderStreamPos(folderIndex, 0) + start))
+  RINOK(callback->SetTotal(file.Size))
+  CMyComPtr<ISequentialOutStream> unused;
+  RINOK(callback->GetStream(index, &unused, NExtract::NAskMode::kTest))
+  RINOK(callback->PrepareOperation(NExtract::NAskMode::kTest))
+  alignas(16) Byte buffer[1 << 15];
+  UInt64 remaining = file.Size;
+  UInt32 skip = (UInt32)(offset - start), crc = CRC_INIT_VAL;
+  while (remaining)
+  {
+    const UInt32 take = (UInt32)MyMin((UInt64)sizeof(buffer) - skip, remaining);
+    const UInt32 size = (take + skip + 15) & ~(UInt32)15;
+    size_t read = size;
+    RINOK(ReadStream(stream, buffer, &read))
+    if (read != size)
+      return callback->SetOperationResult(NExtract::NOperationResult::kUnexpectedEnd);
+    if (aes.Interface()->Filter(buffer, size) != size) return E_FAIL;
+    crc = CrcUpdate(crc, buffer + skip, take);
+    skip = 0;
+    remaining -= take;
+    const UInt64 done = file.Size - remaining;
+    RINOK(callback->SetCompleted(&done))
+  }
+  return callback->SetOperationResult(CRC_GET_DIGEST(crc) == file.Crc ?
+      NExtract::NOperationResult::kOK : NExtract::NOperationResult::kCRCError);
+}
+
 Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
     Int32 testModeSpec, IArchiveExtractCallback *extractCallbackSpec))
 {
@@ -236,6 +326,12 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
   COM_TRY_BEGIN
   
   CMyComPtr<IArchiveExtractCallback> extractCallback = extractCallbackSpec;
+  if (testModeSpec == kSunpackVerifyMember && numItems == 1 && indices && _crcSize)
+  {
+    bool handled = false;
+    RINOK(TestCopySubstream(_db, _inStream, indices[0], extractCallback, handled))
+    if (handled) return S_OK;
+  }
   
   UInt64 importantTotalUnpacked = 0;
 
@@ -343,7 +439,7 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
     {
       const HRESULT result = folderOutStream->Init(fileIndex,
           allFilesMode ? NULL : indices + i,
-          numSolidFiles);
+          numSolidFiles, folderIndex, curUnpacked);
 
       i += numSolidFiles;
 

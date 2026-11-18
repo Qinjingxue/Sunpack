@@ -82,6 +82,27 @@ struct CFolders
     return CoderUnpackSizes[FoToCoderUnpackSizes[folderIndex] + FoToMainUnpackSizeIndex[folderIndex]];
   }
 
+  int GetSeekableAesCoder(CNum index, CFolder &folder) const
+  {
+    if (FoStartPackStreamIndex[index + 1] - FoStartPackStreamIndex[index] != 1 ||
+        GetNumFolderUnpackSizes(index) > 2)
+      return -1;
+    ParseFolderInfo(index, folder);
+    if (folder.PackStreams.Size() != 1)
+      return -1;
+    const unsigned aes = folder.PackStreams[0];
+    if (aes >= folder.Coders.Size() || !folder.Coders[aes].IsSimpleCoder() ||
+        folder.Coders[aes].MethodID != k_AES)
+      return -1;
+    if (folder.Coders.Size() == 1)
+      return (int)aes;
+    const unsigned copy = 1 - aes;
+    if (folder.Coders[copy].MethodID == k_Copy && folder.Coders[copy].IsSimpleCoder() &&
+        folder.Bonds.Size() == 1 && folder.Bonds[0].PackIndex == copy && folder.Bonds[0].UnpackIndex == aes)
+      return (int)aes;
+    return -1;
+  }
+
   UInt64 GetStreamPackSize(unsigned index) const
   {
     return PackPositions[index + 1] - PackPositions[index];

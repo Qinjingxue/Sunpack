@@ -41,6 +41,7 @@
 #include "../../Archive/Rar/RarVol.h"
 #include "Rar5Handler.h"
 #include "internal/decoder_cpu_budget.h"
+#include "internal/password_proof_property.hpp"
 
 using namespace NWindows;
 
@@ -1996,6 +1997,15 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
 
     case kpidSplitBefore: prop = item.IsSplitBefore(); break;
     case kpidSplitAfter: prop = lastItem.IsSplitAfter(); break;
+    case kpidSunpackProofSize:
+      if (ref.Link < 0 && (item.PackSize || item.IsSplitAfter()) &&
+          !item.IsSplitBefore() && !lastItem.IsSplitAfter() && !lastItem.Is_UnknownSize() &&
+          (lastItem.Has_CRC() || lastItem.FindExtra_Blake() >= 0))
+        prop = lastItem.Size;
+      break;
+    case kpidSunpackProofDisks:
+      prop = ((UInt64)lastItem.VolIndex << 32) | item.VolIndex;
+      break;
 
     case kpidVolumeIndex:
     {

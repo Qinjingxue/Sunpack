@@ -14,7 +14,7 @@ using Key = std::vector<std::tuple<unsigned int, std::wstring, std::size_t>>;
 
 static std::vector<Composition> reference(const VolumeAttemptPlan& plan) {
     std::vector<Composition> result;
-    std::set<Key> seen;
+    std::set<std::pair<std::size_t, Key>> seen;
     for (std::size_t layout = 0; layout < plan.layouts.size(); ++layout) {
         const auto& maximum = plan.layouts[layout];
         const auto minimum = plan.minimum_slots.empty() || !plan.minimum_slots[layout]
@@ -32,7 +32,8 @@ static std::vector<Composition> reference(const VolumeAttemptPlan& plan) {
                 Key key;
                 for (std::size_t i = 0; i < slots.size(); ++i)
                     key.emplace_back(slots[i].number, slots[i].name, selected[i]);
-                if (seen.insert(key).second) result.emplace_back(layout, selected);
+                const auto group = plan.layout_password_domains.empty() ? 0 : plan.layout_password_domains[layout];
+                if (seen.emplace(group, std::move(key)).second) result.emplace_back(layout, selected);
                 return;
             }
             for (auto source : plan.domains[slots[selected.size()].domain]) {
@@ -139,6 +140,7 @@ int main() {
                 layout.push_back(std::move(value));
             }
             plan.minimum_slots.push_back(size > 1 && random() % 2 ? 2 + random() % (size - 1) : 0);
+            if (trial % 2) plan.layout_password_domains.push_back(random() % 2);
         }
         if (!compare(plan)) { std::cerr << "plan mismatch: " << trial << '\n'; return 3; }
     }

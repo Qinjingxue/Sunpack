@@ -1,3 +1,4 @@
+use aes::cipher::{block_padding::NoPadding, KeyIvInit};
 use super::*;
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_reader_at_offset, resolve_encrypted_relation_anchor,
@@ -140,10 +141,119 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     assert_eq!(matched, Some(0));
     assert_eq!(anchor.internal_volume_number, Some(3), "{}", anchor.error);
 
+    // A large unrelated member after this encrypted header must not enter
+    // preparation or be retained for the password batch.
+    let mut large = data.clone();
+    large.resize(4 * 1024 * 1024, 0x65);
+    let bounded = ManagedReader::from_bytes(large, Default::default());
+    let context = prepare_rar_ranges(&[RangeSpec::entire(&bounded)]).unwrap_or_else(|_| panic!("no-check header proof"));
+    let match_result = context.verify(&parallel, None).unwrap();
+    assert_eq!(match_result.matched_index, Some(2));
+    assert_eq!(match_result.final_confirmation_required, Some(false));
+    assert_eq!(match_result.match_evidence, Some("rar5_header_crc32"));
+    assert!(bounded.stats().read_bytes < 4096, "{}", bounded.stats().read_bytes);
+
+    // An uncertain raw split must not project the next disk merely to
+    // prepare an encrypted header. Its first block can complete a short CRC.
+    let start = data.len() - len;
+    let projected = |archive: &[u8]| {
+        prepare_rar(|offset, size, _| {
+            let start = offset as usize;
+            assert!(start + size <= archive.len());
+            Ok(archive[start..start + size].to_vec())
+        }).unwrap_or_else(|_| panic!("encrypted header prefix"))
+            .verify(&parallel, None).unwrap()
+    };
+    let long = projected(&data[..start + 16]);
+    assert_eq!((long.matched_index, long.final_confirmation_required), (Some(2), Some(true)));
+    let mut short = rar5_block(&[1, 0, 0]);
+    short.resize(16, 0);
+    cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
+        .encrypt_padded::<NoPadding>(&mut short, 16).unwrap();
+    let mut first_disk = data[..start].to_vec();
+    first_disk.extend(short);
+    let short = projected(&first_disk);
+    assert_eq!((short.matched_index, short.final_confirmation_required), (Some(2), Some(false)));
+
+    // The normal attempt dispatcher resolves a first cipher block split
+    // between two disks, while both unrelated tail choices are absent.
+    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    let split = first_disk.len() - 5;
+    let paths = [crate::test_support::temp_file("rar5_split_head", &first_disk[..split]),
+        crate::test_support::temp_file("rar5_split_ciphertext", &first_disk[split..])];
+    let mut sources: Vec<_> = paths.iter().map(|path| InputExtent {
+        path: path.to_string_lossy().into_owned(), start: 0, end: Some(path.metadata().unwrap().len()),
+    }).collect();
+    for len in [17, 431] {
+        sources.push(InputExtent { path: paths[0].with_extension(format!("missing-{len}")).to_string_lossy().into_owned(),
+            start: 0, end: Some(len) });
+    }
+    let plan = VolumeAttemptPlan {
+        sources: sources.into_boxed_slice(),
+        layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..3).map(|i| VolumeSlot {
+            number: 1 + i as u32, canonical_name: format!("part.{i}"), domain: i,
+        }).collect() }].into_boxed_slice(),
+        domains: [vec![0], vec![1], vec![2, 3]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
+        head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
+    };
+    let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &plan.sources[0],
+        &plan, &parallel, &[], false).unwrap();
+    assert_eq!((result.matched_index, result.final_confirmation_required), (Some(2), Some(false)), "{}", result.message);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+
     data.truncate(300);
     let reader = ManagedReader::from_bytes(data, Default::default());
     let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 0, "rar").unwrap();
     let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords, true, None).unwrap();
     assert!(matched.is_none() && anchor.needs_password);
     assert!(!anchor.wrong_password);
+}
+
+// Real fixtures normally carry the optional quick check. This exercises the
+// no-check compressed stream path and the boundaries that prohibit using it.
+#[test]
+fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
+    let salt = [0x41; 16];
+    let iv = [0x62; 16];
+    let mut key = [0; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(b"secret", &salt, 16, &mut key);
+    let mut block = [0u8; 16];
+    block[1] = 0x5a; // Legal empty block, reusing solid tables.
+    cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
+        .encrypt_padded::<NoPadding>(&mut block, 16).unwrap();
+    let make = |split: bool, method: u64, version: u64| {
+        let mut encryption = vec![1, 0, 0, 4]; // extra type, version, flags, KDF log
+        encryption.extend(salt); encryption.extend(iv);
+        let mut extra = vint(encryption.len() as u64); extra.extend(encryption);
+        let mut file = vec![2, 3 | if split { 8 } else { 0 }];
+        file.extend(vint(extra.len() as u64)); file.extend(vint(16));
+        file.extend([0, 0, 0]); // file flags, unpack size, attributes
+        file.extend(vint(method << 7 | 0x40 | version)); // solid
+        file.extend([0, 1, b'x']); file.extend(extra);
+        let mut bytes = RAR5_SIGNATURE.to_vec();
+        bytes.extend(rar5_block(&[1,0,0])); bytes.extend(rar5_block(&file));
+        bytes.extend(block); bytes.extend(rar5_block(&[5,0,0])); bytes
+    };
+    let prepare = |bytes: Vec<u8>| {
+        let reader = ManagedReader::from_bytes(bytes, Default::default());
+        prepare_rar(|offset, size, _| Ok(reader.read_at(offset, size).unwrap()))
+    };
+    let context = prepare(make(false, 1, 0)).unwrap_or_else(|_| panic!("compressed first block"));
+    let candidates = [Arc::from("wrong"), Arc::from("secret"), Arc::from("secret")];
+    let result = context.verify(&candidates, None).unwrap();
+    assert_eq!(result.matched_indices, [1, 2]);
+    assert_eq!(result.final_confirmation_required, Some(true));
+    assert_eq!(result.match_evidence, Some("rar5_compressed_block"));
+    // A missing middle disk and a stored first member do not make a
+    // later independent RAR7-compatible compressed member unreadable.
+    let volumes = VolumeSet::new([make(false, 0, 0), make(false, 1, 1)].into_iter().enumerate().map(|(i, data)|
+        crate::password::input::VolumeSpec { reader: ManagedReader::from_bytes(data, Default::default()),
+            number: 1 + (2 * i) as u32, start: 0, end: None }).collect());
+    let later = prepare_rar_volumes(&volumes, true).unwrap_or_else(|_| panic!("independent later member"));
+    assert_eq!(later.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
+    let plain_first = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 1]), &rar5_block(&[5, 0, 1])].concat();
+    assert!(matches!(prepare(plain_first), Err(PreparedStatus::Status("unknown_needs_final_verifier", _))));
+    for (split, method) in [(true, 1), (false, 0)] {
+        assert!(matches!(prepare(make(split, method, 0)), Err(PreparedStatus::Status("unknown_needs_final_verifier", _))));
+    }
 }

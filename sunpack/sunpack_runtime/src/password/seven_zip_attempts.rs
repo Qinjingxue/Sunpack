@@ -1,0 +1,136 @@
+// Format metadata drives reads over shared volume evidence projections.
+pub(crate) fn seven_zip_fast_verify_passwords_from_attempts(
+    preparation: &mut Preparation,
+    head: &InputExtent,
+    plan: &VolumeAttemptPlan,
+    candidates: &[Arc<str>],
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<PasswordVerification> {
+    // A complete invariant prefix does not depend on inaccessible later parts.
+    let mut prefix = crate::password::input::prefix::common_attempt_prefix(head, plan, sessions);
+    if prefix.is_empty() && plan.head_size_from_total.is_none() && plan.tail_totals.is_empty() {
+        prefix.push(head.clone());
+    }
+    use crate::password::input::parse_range_prefix;
+    if !prefix.is_empty() {
+        let next = parse_range_prefix(prefix.iter(), sessions, Some(SEVEN_Z_HEADER_SIZE as u64))
+            .ok()
+            .and_then(|ranges| {
+                let mut start = [0; SEVEN_Z_HEADER_SIZE];
+                VirtualRangeReader::streaming(&ranges)
+                    .read_exact(&mut start)
+                    .ok()?;
+                RelationNextHeader::parse(&start)
+            });
+        if let Some(next) = next {
+            if let Ok(ranges) = parse_range_prefix(prefix.iter(), sessions, Some(next.end())) {
+                let reader = VirtualRangeReader::streaming(&ranges);
+                if reader.len() == next.end() {
+                    return preparation.verify(ranges_key("7z", &ranges)?, candidates, || {
+                        prepare_seven_zip(reader, next.end()).map(PasswordContext::SevenZip)
+                    });
+                }
+            }
+        }
+    }
+    preparation.verify_local(prepare_seven_zip_attempts(head, plan, sessions), candidates)
+}
+
+fn prepare_seven_zip_attempts(
+    head: &InputExtent,
+    plan: &VolumeAttemptPlan,
+    sessions: &[NativeArchiveSession],
+) -> Result<PasswordContext, PreparedStatus> {
+    use crate::password::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
+    let unknown = || {
+        PreparedStatus::new(
+            "unknown_needs_final_verifier",
+            "7z volume password material is unavailable",
+        )
+    };
+    let ranges = parse_ranges(std::iter::once(head), sessions).map_err(|_| unknown())?;
+    let mut reader = VirtualRangeReader::streaming(&ranges);
+    let mut start = [0; SEVEN_Z_HEADER_SIZE];
+    reader.read_exact(&mut start).map_err(|_| unknown())?;
+    if !start.starts_with(SEVEN_Z_MAGIC)
+        || crc32fast::hash(&start[12..32]) != u32::from_le_bytes(start[8..12].try_into().unwrap())
+    {
+        return Err(unknown());
+    }
+    let next = RelationNextHeader::checked_fields(&start).ok_or_else(unknown)?;
+    let geometry = if !plan.tail_totals.is_empty() {
+        AttemptGeometry::TailTotals
+    } else if let Some(total) = plan.head_size_from_total {
+        AttemptGeometry::TrimmedHead { total }
+    } else {
+        AttemptGeometry::Forward {
+            logical_limit: Some(next.end()),
+        }
+    };
+    let contexts = prepare_attempt_evidence_partial(head, plan, sessions, geometry, |reader| {
+        let length = reader.len();
+        prepare_seven_zip_descriptor(reader, length, next, start[6] == 0, &VolumeEvidence)
+            .map(Some)
+            .or_else(|status| match status {
+                PreparedStatus::Status("invalid_volume_evidence", _) => Ok(None),
+                status => Err(status),
+            })
+            .map_err(|status| match status {
+                PreparedStatus::Status(_, message) => {
+                    PreparedStatus::new("unknown_needs_final_verifier", message)
+                }
+                PreparedStatus::ReadFault(fault) => {
+                    PreparedStatus::new("unknown_needs_final_verifier", format!("{fault:?}"))
+                }
+            })
+    })?;
+    Ok(contexts.into_context(PasswordContext::SevenZip))
+}
+
+use crate::password::input::attempts::AttemptReader;
+
+struct VolumeEvidence;
+impl<'a> SevenZipEvidenceReads<AttemptReader<'a>> for VolumeEvidence {
+    fn independent<T, E>(
+        &self,
+        reader: &mut AttemptReader<'a>,
+        read: impl FnOnce(&mut AttemptReader<'a>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        reader.independent_evidence(read)
+    }
+
+    fn range_is_ambiguous(&self, reader: &AttemptReader<'a>, start: u64, size: u64) -> bool {
+        reader.range_is_ambiguous(start, size)
+    }
+
+    fn check_packed(
+        &self,
+        reader: &mut AttemptReader<'a>,
+        offset: u64,
+        size: u64,
+        expected: u32,
+    ) -> Result<(), std::borrow::Cow<'static, str>> {
+        if !reader.range_is_ambiguous(offset, size) {
+            return Ok(());
+        }
+        // An unavailable independent digest cannot block a prefix in another volume.
+        let digest = reader.independent_evidence(|reader| -> std::io::Result<u32> {
+            reader.seek(SeekFrom::Start(offset))?;
+            let mut crc = crc32fast::Hasher::new();
+            let mut remaining = size;
+            let mut buffer = [0; 64 * 1024];
+            while remaining != 0 {
+                Cancellation::check_current_io()?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                reader.read_exact(&mut buffer[..count])?;
+                crc.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            Ok(crc.finalize())
+        });
+        if digest.is_ok_and(|actual| actual != expected) {
+            return Err("7z packed stream crc mismatch".into());
+        }
+        Ok(())
+    }
+}

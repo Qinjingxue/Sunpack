@@ -22,41 +22,7 @@ pub(crate) struct SevenZipPasswordProbe {
 }
 
 impl SevenZipPasswordProbe {
-    pub(crate) fn from_header<R: Read + Seek>(
-        reader: &mut R,
-        reader_len: u64,
-        start: &[u8; SEVEN_Z_HEADER_SIZE],
-        next: RelationNextHeader,
-    ) -> Result<Self, std::borrow::Cow<'static, str>> {
-        let stored_start_crc = u32_le(start, 8);
-        if crc32(&start[12..32]) != stored_start_crc {
-            return Err("7z password probe start header crc is invalid".into());
-        }
-        let next_header_size =
-            usize::try_from(next.size).map_err(|_| "7z password probe next header is too large")?;
-        if next_header_size == 0 {
-            return Err("7z password probe next header size is unsupported".into());
-        }
-        let next_header_start = next.offset;
-        let raw = read_seven_zip_probe_range(
-            reader,
-            reader_len,
-            next_header_start,
-            next_header_size,
-            "7z.next_header",
-            FieldLocation::Tail,
-        )
-        .map_err(resource_error)?;
-        if crc32(&raw) != next.crc {
-            return Err("7z password probe next header crc is invalid".into());
-        }
-        let (pack, folder) = parse_seven_zip_encoded_header_descriptor(&raw)?;
-        drop(raw);
-        if folder.expected_crc.is_none() || !seven_zip_probe_folder_supported(&folder) {
-            return Err("7z password probe coder graph has no safe fast path".into());
-        }
-        let packed_data =
-            read_seven_zip_packed_data(reader, reader_len, next_header_start, &pack, &folder)?;
+    fn from_parts(packed_data: Vec<Blob>, folder: SevenZipFolderAst) -> Self {
         let aes_index = folder
             .coders
             .iter()
@@ -70,63 +36,65 @@ impl SevenZipPasswordProbe {
                 seven_zip_aes_stream(&folder, input, packed_data[index].len() as u64)
                     .map(|stream| (index, stream))
             });
-        Ok(Self {
+        Self {
             packed_data,
             folder,
             aes_index,
             prefix,
-        })
+        }
     }
 
-    pub(crate) fn decoded_header_if_password_matches(
-        &self,
-        password: &str,
-    ) -> Result<Option<Blob>, String> {
-        check_password_cancellation()?;
-        if password.is_empty() {
-            return Ok(None);
-        }
-        // Candidate-scoped material serves both the cheap rejection and the
-        // full CRC verifier. Wrong keys never enter a process-wide cache.
-        let bytes = Password::from(password);
-        let (key, iv) = seven_zip_aes_key_iv(
-            &self.folder.coders[self.aes_index].properties,
-            bytes.as_slice(),
-        )?;
-        let key = SevenZipAesKey { key, iv };
+    pub(crate) fn key_properties(&self) -> &[u8] {
+        &self.folder.coders[self.aes_index].properties
+    }
+
+    pub(crate) fn check_header(&self, key: &SevenZipAesKey) -> Result<bool, String> {
         if let Some((packed, stream)) = &self.prefix {
             if !seven_zip_header_prefix_matches(
                 &self.packed_data[*packed],
                 &self.folder,
                 stream,
-                &key,
+                key,
             )? {
-                return Ok(None);
+                return Ok(false);
             }
         }
         let decoded = match decode_seven_zip_encoded_folder_with_key(
             &self.packed_data,
             &self.folder,
             None,
-            Some((self.aes_index, &key)),
+            Some((self.aes_index, key)),
         ) {
             Ok(decoded) => decoded,
             Err(error) if error.starts_with("resource_unavailable:") => return Err(error),
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(false),
         };
-        Ok((decoded.first().copied() == Some(SZ_HEADER)
+        Ok(decoded.first().copied() == Some(SZ_HEADER)
             && self
                 .folder
                 .expected_crc
                 .is_some_and(|expected| crc32(&decoded) == expected))
-        .then_some(decoded))
     }
 }
 
-struct SevenZipAesKey {
+pub(crate) struct SevenZipAesKey {
     key: [u8; 32],
     iv: [u8; 16],
 }
+impl SevenZipAesKey {
+    pub(crate) fn with_iv(&self, bytes: &[u8]) -> Self {
+        let mut iv = [0; 16];
+        iv[..bytes.len()].copy_from_slice(bytes);
+        Self { key: self.key, iv }
+    }
+
+    pub(crate) fn derive(properties: &[u8], password: &str) -> Result<Self, String> {
+        let bytes = Password::from(password);
+        let (key, iv) = seven_zip_aes_key_iv(properties, bytes.as_slice())?;
+        Ok(Self { key, iv })
+    }
+}
+
 impl Drop for SevenZipAesKey {
     fn drop(&mut self) {
         self.key.fill(0);
@@ -181,7 +149,7 @@ fn read_seven_zip_packed_data<R: Read + Seek>(
         .checked_add(pack.pack_pos)
         .ok_or("7z password probe stream offset overflow")?;
     let mut packed_data = Vec::with_capacity(pack.sizes.len());
-    for &size in &pack.sizes {
+    for (index, &size) in pack.sizes.iter().enumerate() {
         let stream_end = stream_start
             .checked_add(size)
             .ok_or("7z password probe stream end overflow")?;
@@ -201,6 +169,15 @@ fn read_seven_zip_packed_data<R: Read + Seek>(
             )
             .map_err(resource_error)?,
         );
+        if pack
+            .crcs
+            .get(index)
+            .copied()
+            .flatten()
+            .is_some_and(|expected| crc32(packed_data.last().unwrap()) != expected)
+        {
+            return Err("7z packed stream crc mismatch".into());
+        }
         stream_start = stream_end;
     }
     Ok(packed_data)
@@ -650,7 +627,7 @@ fn decode_lzma(data: &[u8], coder: &SevenZipCoderAst, unpack_size: u64) -> Resul
 const SEVEN_Z_AES_MAX_CYCLES_POWER: u8 = 24;
 const SEVEN_Z_AES_DIRECT_KEY: u8 = 0x3f;
 
-fn seven_zip_aes_properties(properties: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+pub(crate) fn seven_zip_aes_properties(properties: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let Some((&b0, rest)) = properties.split_first() else {
         return Some((0, &[], &[]));
     };

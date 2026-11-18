@@ -1,7 +1,6 @@
 #include "sevenzip_bridge/bridge.hpp"
 #include "internal/sevenzip_paths.hpp"
 #include "internal/sevenzip_formats.hpp"
-#include "internal/password_probe_policy.hpp"
 #include "internal/sevenzip_status.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
@@ -94,20 +93,6 @@ bool check_password_probe_status_names() {
     return std::string(sunpack::sevenzip::status_name(
         sunpack::sevenzip::PasswordTestStatus::NeedsVolumeOrTailDamaged
     )) == "needs_volume_or_tail_damaged";
-}
-
-bool check_empty_bounded_password_probe_requires_positive_evidence() {
-    using sunpack::sevenzip::EmptyBoundedPasswordProbeDisposition;
-    using sunpack::sevenzip::empty_bounded_password_probe_disposition;
-    return
-        empty_bounded_password_probe_disposition(false, 0, false) ==
-            EmptyBoundedPasswordProbeDisposition::RejectInconclusive &&
-        empty_bounded_password_probe_disposition(true, 0, false) ==
-            EmptyBoundedPasswordProbeDisposition::RejectInconclusive &&
-        empty_bounded_password_probe_disposition(true, 0, true) ==
-            EmptyBoundedPasswordProbeDisposition::AcceptOpenProof &&
-        empty_bounded_password_probe_disposition(true, 3, false) ==
-            EmptyBoundedPasswordProbeDisposition::TestAllItems;
 }
 
 bool check_cpu_budget_accounts_base_and_decoder_credits() {
@@ -342,10 +327,7 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "password probe status name check failed\n";
         return 4;
     }
-    if (!check_empty_bounded_password_probe_requires_positive_evidence()) {
-        std::cerr << "empty bounded password probe evidence check failed\n";
-        return 15;
-    }
+
     if (!check_cpu_budget_accounts_base_and_decoder_credits()) {
         std::cerr << "CPU credit accounting check failed\n";
         return 23;

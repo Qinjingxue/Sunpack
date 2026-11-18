@@ -45,9 +45,6 @@ fn status_of(data: Vec<u8>) -> &'static str {
         Ok(data[start..(start + len).min(data.len())].to_vec())
     });
     match result {
-        Ok(RarPasswordContext {
-            material: RarPasswordMaterial::Stored { .. },
-        }) => "stored",
         Ok(_) => "other_material",
         Err(PreparedStatus::Status(status, _)) => status,
         Err(PreparedStatus::ReadFault(_)) => "read_fault",
@@ -63,7 +60,7 @@ fn encrypted_member_after_plain_member_is_found() {
         ],
         Some(0),
     );
-    assert_eq!(status_of(data), "stored");
+    assert_eq!(status_of(data), "unknown_needs_final_verifier");
 }
 
 #[test]
@@ -76,7 +73,7 @@ fn encrypted_member_beyond_prefix_is_found_by_seeking() {
         ],
         Some(0),
     );
-    assert_eq!(status_of(data), "stored");
+    assert_eq!(status_of(data), "unknown_needs_final_verifier");
 }
 
 #[test]
@@ -107,4 +104,25 @@ fn encrypted_empty_member_alone_is_undecided() {
         Some(0),
     );
     assert_eq!(status_of(data), "unknown_needs_final_verifier");
+}
+
+#[test]
+fn local_header_password_evidence_does_not_require_contiguous_volumes() {
+    use crate::password::input::VolumeSpec;
+    let mut head = RAR4_SIGNATURE.to_vec();
+    head.extend(block(0x73, RAR4_MAIN_HEADER_PASSWORD | 1, &[0; 6]));
+    head.extend([0x44; 40]);
+    // A RAR byte split inside its plaintext main header must assemble the
+    // exact contiguous prefix before parsing the first password evidence.
+    let split = VolumeSet::new([&head[..12], &head[12..]].into_iter().enumerate().map(|(i, data)| VolumeSpec {
+        reader: ManagedReader::from_bytes(data.to_vec(), Default::default()),
+        number: i as u32 + 1, start: 0, end: None,
+    }).collect());
+    assert!(matches!(prepare_rar_volumes(&split, false), Ok(RarPasswordContext { material: RarPasswordMaterial::Header(_) })));
+    let volumes = VolumeSet::new(vec![
+        VolumeSpec { reader: ManagedReader::from_bytes(head, Default::default()), number: 1, start: 0, end: None },
+        VolumeSpec { reader: ManagedReader::from_bytes(vec![], Default::default()), number: 3, start: 0, end: None },
+    ]);
+    let result = prepare_rar_volumes(&volumes, true);
+    assert!(matches!(result, Ok(RarPasswordContext { material: RarPasswordMaterial::Header(_) })));
 }

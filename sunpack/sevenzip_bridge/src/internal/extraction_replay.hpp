@@ -58,26 +58,27 @@ struct ReplayFile {
     bool created = false, complete = false, has_mtime = false;
     std::uint64_t mtime = 0;
 };
-struct ExtractionReplay {
+struct VolumeReadUncertainty {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> uncertain_ranges;
+    std::atomic<bool> uncertain_read{false};
+    void observe_logical_read(std::uint64_t offset, std::uint32_t size) {
+        if (!size || uncertain_read.load(std::memory_order_relaxed)) return;
+        const auto range = std::upper_bound(uncertain_ranges.begin(), uncertain_ranges.end(), offset,
+            [](auto value, const auto& range) { return value < range.second; });
+        if (range != uncertain_ranges.end() && (range->first <= offset || range->first - offset < size))
+            uncertain_read.store(true, std::memory_order_relaxed);
+    }
+};
+struct ExtractionReplay : VolumeReadUncertainty {
     VolumeAttemptCursor volumes;
     bool volume_password_uncertain = false;
     bool volume_password_ambiguous = false;
-    // Request-owned read receipts distinguish fixed-input damage from a
-    // composition failure; decoder threads only update the atomic flag.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> uncertain_ranges;
     std::unordered_set<std::wstring> uncertain_paths;
-    std::atomic<bool> uncertain_read{false};
     void observe_volume_read(std::uint64_t offset, std::uint32_t size, const std::wstring* physical = nullptr) {
-        if (!volumes.started || !size || uncertain_read.load(std::memory_order_relaxed)) return;
-        bool intersects = false;
-        if (physical) intersects = uncertain_paths.find(*physical) != uncertain_paths.end();
-        else {
-            const auto range = std::upper_bound(uncertain_ranges.begin(), uncertain_ranges.end(), offset,
-                [](auto value, const auto& range) { return value < range.second; });
-            intersects = range != uncertain_ranges.end() &&
-                (range->first <= offset || range->first - offset < size);
-        }
-        if (intersects) uncertain_read.store(true, std::memory_order_relaxed);
+        if (!volumes.started) return;
+        if (!physical) observe_logical_read(offset, size);
+        else if (size && !uncertain_read.load(std::memory_order_relaxed) && uncertain_paths.count(*physical))
+            uncertain_read.store(true, std::memory_order_relaxed);
     }
     // Only output identity and confirmed byte intervals survive an attempt.
     // No archive handler, dictionary, output buffer or CPU credit is retained.
@@ -88,6 +89,8 @@ struct ExtractionReplay {
     // Candidate confirmation is an extraction transaction, including across
     // memory withdrawals. Never replay one password's bytes under another.
     std::size_t candidate_index = 0;
+    int confirmed_candidate_index = -1;
+    bool volume_output_started = false;
     bool candidates_started = false, candidate_output_owned = false, candidate_discard_pending = false;
     void clear_output() {
         files.clear(); directories.clear(); handler.fill(0);

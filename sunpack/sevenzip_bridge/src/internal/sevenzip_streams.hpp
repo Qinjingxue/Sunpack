@@ -599,9 +599,9 @@ namespace sunpack::sevenzip
             const std::vector<ExtractInputRange> &ranges,
             ExtractInputTrace *trace = nullptr,
             InputPrefetchConfig prefetch_config = InputPrefetchConfig{false, 512 * 1024},
-            bool physical_volume = false)
+            bool physical_volume = false, VolumeReadUncertainty* probe_reads = nullptr)
 
-            : trace_(trace), physical_volume_(physical_volume)
+            : trace_(trace), physical_volume_(physical_volume), probe_reads_(probe_reads)
         {
 
             ranges_.reserve(ranges.size());
@@ -662,7 +662,8 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
-            if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, !physical_volume_ || ranges_.empty() ? nullptr : &ranges_.front().path);
+            if (probe_reads_) probe_reads_->observe_logical_read(position_, size);
+            else if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, !physical_volume_ || ranges_.empty() ? nullptr : &ranges_.front().path);
 
 
             if (processedSize)
@@ -861,6 +862,7 @@ namespace sunpack::sevenzip
         }
 
         ExtractionReplay* attempt_replay_ = current_extraction_replay;
+        VolumeReadUncertainty* probe_reads_ = nullptr;
         std::size_t find_range_index(UInt64 position) const
         {
             if (cached_index_ < ranges_.size())
@@ -971,7 +973,7 @@ namespace sunpack::sevenzip
         const std::vector<std::wstring> &canonical_names = {},
 
         InputPrefetchConfig prefetch_config = input_prefetch_config(),
-        const std::vector<ExtractInputRange> &input_ranges = {});
+        const std::vector<ExtractInputRange> &input_ranges = {}, VolumeReadUncertainty* probe_reads = nullptr);
 
 #endif
 

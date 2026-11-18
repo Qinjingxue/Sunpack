@@ -1,11 +1,12 @@
 // Necessary conditions at the beginning of a compressor stream, not a file or
-// arbitrary solid-stream position. Passing never proves a password: the worker
-// still confirms it. Keep weak survivors in their original candidate order.
+// arbitrary solid-stream position. Compressor prefix checks never confirm a
+// password; Confirmed is reserved for complete decoded-header/CRC evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SevenZipPrefixCheck {
     Reject,
     Weak,
     Strong,
+    Confirmed,
 }
 
 // Keep selection separate from candidate checks: unsupported methods must not
@@ -126,8 +127,14 @@ pub(crate) fn seven_zip_prefix_check(
         }
         [0x04, 0x01, 0x08] | [0x04, 0x01, 0x09] => {
             if crate::scan::compression_stream::deflate_prefix_is_possible(
-                prefix, method == [0x04, 0x01, 0x09], unpack_size,
-            ) { Weak } else { Reject }
+                prefix,
+                method == [0x04, 0x01, 0x09],
+                unpack_size,
+            ) {
+                Weak
+            } else {
+                Reject
+            }
         }
         // Copy, filters and unknown codecs have no generic plaintext magic.
         _ => Weak,
@@ -171,14 +178,21 @@ mod seven_zip_prefix_tests {
         // 7-Zip Deflate64 fixtures (fixed and dynamic), plus a fixed stream
         // checked by 7z t that emits 65545 bytes using length 285 and both
         // extended distance symbols. No output buffer is needed by the probe.
-        let fixed64 = [203, 72, 205, 201, 201, 87, 72, 73, 77, 203, 73, 44, 73,
-            53, 51, 81, 24, 241, 124, 18, 249, 0];
-        let dynamic64 = [228, 193, 129, 0, 0, 0, 0, 128, 32, 182, 253, 165,
-            6, 169, 226, 241, 120, 60, 30, 143, 199, 227, 241, 120, 60, 30,
-            143, 199, 227, 241, 120, 60];
+        let fixed64 = [
+            203, 72, 205, 201, 201, 87, 72, 73, 77, 203, 73, 44, 73, 53, 51, 81, 24, 241, 124, 18,
+            249, 0,
+        ];
+        let dynamic64 = [
+            228, 193, 129, 0, 0, 0, 0, 128, 32, 182, 253, 165, 6, 169, 226, 241, 120, 60, 30, 143,
+            199, 227, 241, 120, 60, 30, 143, 199, 227, 241, 120, 60,
+        ];
         let wide64 = [115, 28, 253, 255, 7, 192, 7, 0, 0, 255, 255, 15, 0];
-        for (stream, size) in [(&fixed64[..], 320), (&dynamic64[..], 70000),
-            (&wide64[..], 65545), (&stored[..], 1)] {
+        for (stream, size) in [
+            (&fixed64[..], 320),
+            (&dynamic64[..], 70000),
+            (&wide64[..], 65545),
+            (&stored[..], 1),
+        ] {
             for length in 0..=stream.len() {
                 assert_eq!(check(&[4, 1, 9], &[], &stream[..length], size), Weak);
             }

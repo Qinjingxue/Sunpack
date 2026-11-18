@@ -140,7 +140,7 @@ namespace sunpack::sevenzip
             return "";
         }
 
-        unsigned int password_crc_proven_items(const ExtractOutputTrace &trace, bool require_strong_crc)
+        unsigned int password_crc_proven_items(const ExtractOutputTrace &trace)
         {
             unsigned int count = 0;
             for (const auto &item : trace.items)
@@ -155,9 +155,8 @@ namespace sunpack::sevenzip
                     item.encrypted &&
                     !item.is_dir &&
                     item.done &&
-                    item.bytes_written != 0 &&
-                    (!require_strong_crc || item.bytes_written >= 4) &&
-                    item.has_source_crc32)
+                    (!item.has_expected_size || item.bytes_written == item.expected_size) &&
+                    item.strong_password_proof)
                 {
                     ++count;
                 }
@@ -590,7 +589,7 @@ namespace sunpack::sevenzip
             // CRC receipts only decide whether extraction failures can be
             // attributed to damage after a password was confirmed.
             if (result.encrypted)
-                result.password_crc_proven_items = password_crc_proven_items(result.output_trace, result.archive_type == L"7z");
+                result.password_crc_proven_items = password_crc_proven_items(result.output_trace);
             if (read_failed) return result;
 
             if (raw_extract_callback->output_error())

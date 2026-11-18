@@ -11,19 +11,7 @@ fn selective_verifier_matches_full_pbkdf2_for_all_strengths() {
             let mut full = vec![0u8; key_len * 2 + 2];
             pbkdf2::pbkdf2_hmac::<Sha1>(password.as_bytes(), &salt, 1000, &mut full);
             let verifier = &full[key_len * 2..];
-            assert!(winzip_aes_verifier_matches(
-                password.as_bytes(),
-                &salt,
-                verifier,
-                key_len
-            ));
-            let rejected = [verifier[0] ^ 1, verifier[1]];
-            assert!(!winzip_aes_verifier_matches(
-                password.as_bytes(),
-                &salt,
-                &rejected,
-                key_len
-            ));
+            assert_eq!(winzip_aes_verifier(password.as_bytes(), &salt, key_len).unwrap(), verifier);
         }
     }
 }

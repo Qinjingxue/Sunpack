@@ -1,6 +1,7 @@
 // RarHandler.cpp
 
 #include "StdAfx.h"
+#include "internal/password_proof_property.hpp"
 
 #include "../../../../C/CpuArch.h"
 
@@ -1014,6 +1015,13 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
     case kpidSolid: prop = IsSolid(index); break;
     case kpidCommented: prop = item.IsCommented(); break;
     case kpidSplitBefore: prop = item.IsSplitBefore(); break;
+    case kpidSunpackProofSize:
+      if (!item.IsSplitBefore() && !lastItem.IsSplitAfter() && lastItem.Is_Size_Defined())
+        prop = lastItem.Size;
+      break;
+    case kpidSunpackProofDisks:
+      prop = ((UInt64)(refItem.VolumeIndex + refItem.NumItems - 1) << 32) | refItem.VolumeIndex;
+      break;
     case kpidSplitAfter: prop = _items[refItem.ItemIndex + refItem.NumItems - 1].IsSplitAfter(); break;
     
     case kpidVolumeIndex:

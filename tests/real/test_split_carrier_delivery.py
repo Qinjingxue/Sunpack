@@ -307,6 +307,50 @@ def test_watch_does_not_borrow_split_members_from_another_root(package, tmp_path
     watch.assert_no_terminal_failures()
 
 
+@pytest.mark.parametrize("disable_probe", [False, True], ids=["prescreen", "worker-only"])
+def test_cli_split_carrier_retries_encrypted_header_tail(package, tmp_path, disable_probe):
+    # Open fails before an item callback when the encrypted header is damaged.
+    # That is evidence against this tail, not against the password on every
+    # possible composition. Exercise the same fallback without Rust probing.
+    if disable_probe:
+        package.env["SUNPACK_DISABLE_7Z_PASSWORD_PROBE"] = "1"
+    case = FACTORY.create(
+        tmp_path / "fixtures", "header-fallback", "7z", password="fallback-key", split=True,
+        payload_size=104 * 1024, split_volume_size=40 * 1024,
+        compression_method="Copy", solid=False,
+    )
+    head, middle, tail = sorted(case.archive_dir.iterdir())
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    wrapped = _wrap_volume(head, inputs, 0)
+    delivered_middle = inputs / middle.name
+    copyfile(middle, delivered_middle)
+    correct = inputs / f"{tail.name}.图片"
+    copyfile(tail, correct)
+    # The encoded header ciphertext precedes the plaintext NextHeader. Alter
+    # its final AES block without changing the outer descriptor or volume size.
+    next_header_offset = int.from_bytes(head.read_bytes()[12:20], "little")
+    tail_offset = 32 + next_header_offset - 16 - head.stat().st_size - middle.stat().st_size
+    damaged = bytearray(tail.read_bytes())
+    assert 0 <= tail_offset < len(damaged)
+    damaged[tail_offset] ^= 0xFF
+
+    # Prove the exact carrier/range input and password work before introducing
+    # the preferred, same-length canonical-name decoy.
+    baseline = tmp_path / "baseline"
+    report = extract_report(package, wrapped, baseline, passwords=["wrong-key", case.password])
+    assert report["summary"]["success_count"] == 1, report
+    _assert_only_payloads(baseline, [case], {})
+    decoy = inputs / tail.name
+    decoy.write_bytes(damaged)
+    output = tmp_path / "out"
+    report = extract_report(package, wrapped, output, passwords=["wrong-key", case.password], cleanup="d")
+    assert report["summary"]["success_count"] == 1, report
+    _assert_only_payloads(output, [case], {})
+    assert not any(path.exists() for path in (wrapped, delivered_middle, correct))
+    assert decoy.read_bytes() == damaged
+
+
 def test_cli_split_carrier_falls_back_to_valid_middle_volume_without_deleting_decoy(package, tmp_path):
     # Both middle candidates have the expected length and slot number. Only
     # member verification distinguishes them after volume planning succeeds.

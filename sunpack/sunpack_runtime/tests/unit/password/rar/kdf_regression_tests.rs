@@ -41,6 +41,8 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
         for lg2_count in [0, 4, 10] {
             let iterations = 1u32 << lg2_count;
             let mut header = Rar5EncryptionIdentity {
+                keyed_hash: false,
+                iv: [0; 16],
                 lg2_count,
                 salt: [0x73; 16],
                 password_check: None,
@@ -61,13 +63,17 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
             );
             let mut proof = [0; 8];
             for (index, byte) in check.iter().enumerate() { proof[index % 8] ^= byte; }
+            let password: Arc<str> = Arc::from(password);
+            let cache = RarKeyCache::default();
             header.password_check = Some(proof);
-            assert_eq!(rar5_checked_aes_key(password, &header), Some(key));
+            assert_eq!(cache.rar5(&password, &header), Some(key));
             proof[0] ^= 1;
             header.password_check = Some(proof);
-            assert_eq!(rar5_checked_aes_key(password, &header), None);
+            assert_eq!(cache.rar5(&password, &header), None);
             header.password_check = None;
-            assert_eq!(rar5_checked_aes_key(password, &header), None);
+            header.iv = [0xa5; 16];
+            assert_eq!(cache.rar5(&password, &header), Some(key));
+            assert_eq!(cache.rar5.lock().unwrap().len(), 1, "check and IV are not KDF inputs");
         }
     }
 }

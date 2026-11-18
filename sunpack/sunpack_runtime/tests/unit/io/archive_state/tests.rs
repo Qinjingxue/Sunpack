@@ -131,6 +131,33 @@ fn recovery_volume_descriptor_preserves_style_roles_and_plan_order() {
 use super::*;
 
 #[test]
+fn scan_reports_slot_survivors_and_frontier_in_original_source_order() {
+    let domains = [vec![0, 1], vec![2, 3, 4]].map(|choices| VolumeDomain { choices: Arc::new(choices) });
+    let layout = VolumeLayout { minimum_slots: 0, slots: [0,1].map(|domain| VolumeSlot {
+        number: domain as u32 + 1, canonical_name: domain.to_string(), domain,
+    }).into() };
+    let plan = VolumeAttemptPlan {
+        sources: (0..5).map(|i| InputExtent { path: i.to_string(), start: 0, end: Some(1) }).collect(),
+        layouts: vec![layout.clone(), layout].into(), domains: domains.into(),
+        tail_totals: Box::default(), minimum_size: None, head_size_from_total: None,
+    };
+    let first = VolumeSelection { layout: 0, sources: vec![0, 4] };
+    let remaining = plan.remaining_after_scan(Some(&first), vec![
+        LayoutSurvivors { layout: 0, slots: vec![vec![0,1], vec![2,4]] },
+        LayoutSurvivors { layout: 1, slots: vec![] },
+    ]).unwrap();
+    let mut paths = Vec::new();
+    for l in &remaining.layouts {
+        for &a in remaining.domains[l.slots[0].domain].choices.iter() {
+            for &b in remaining.domains[l.slots[1].domain].choices.iter() {
+                paths.push((remaining.sources[a].path.as_str(), remaining.sources[b].path.as_str()));
+            }
+        }
+    }
+    assert_eq!(paths, [("0","4"), ("1","2"), ("1","4")]);
+}
+
+#[test]
 fn trimmed_head_admission_keeps_first_sufficient_duplicate_extent() {
     // A shorter duplicate must not hide a later sufficient carrier. Keep
     // first-match order too: a later match cannot bypass source uniqueness.

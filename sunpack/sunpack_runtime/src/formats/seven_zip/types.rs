@@ -2,6 +2,7 @@ struct SevenZipPackInfoAst {
     pack_pos: u64,
     num_streams: usize,
     sizes: Vec<u64>,
+    crcs: Vec<Option<u32>>,
 }
 
 #[derive(Clone)]
@@ -39,12 +40,4 @@ impl SevenZipFolderAst {
 struct SevenZipStreams {
     pack: Option<SevenZipPackInfoAst>,
     folders: Vec<SevenZipFolderAst>,
-    substreams: Vec<Vec<SevenZipSubstreamAst>>,
-}
-
-#[derive(Debug, PartialEq)]
-struct SevenZipSubstreamAst {
-    offset: u64,
-    size: u64,
-    crc: Option<u32>,
 }

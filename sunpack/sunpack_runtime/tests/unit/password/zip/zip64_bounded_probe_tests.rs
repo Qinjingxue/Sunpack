@@ -73,12 +73,13 @@ fn zip64_password_probe_resolves_disk_relative_entry_and_end_records() {
     local[31..43].fill(0x9b);
 
     for split in [false, true] {
-        let disk_number = u32::from(split);
+        let disk_number = if split { 2u32 } else { 0 };
         let central_offset = if split { 0 } else { prefix.len() as u64 };
         let mut tail = vec![0; 46];
         tail[..4].copy_from_slice(ZIP_CENTRAL);
         tail[4..8].copy_from_slice(&[45, 0, 45, 0]);
         tail[8] = 1;
+        tail[19] = 0x5a;
         tail[28] = 1;
         tail[30] = 16;
         tail[34..36].copy_from_slice(&u16::MAX.to_le_bytes());
@@ -88,14 +89,24 @@ fn zip64_password_probe_resolves_disk_relative_entry_and_end_records() {
         tail.extend(4u64.to_le_bytes());
         tail.extend(0u32.to_le_bytes());
 
+        let entries = if split {
+            // The first directory entry belongs to the missing middle disk.
+            // The following entry points directly into the available anchor.
+            let mut missing = tail.clone();
+            let field = missing.len() - 4;
+            missing[field..].copy_from_slice(&1u32.to_le_bytes());
+            missing.extend(tail);
+            tail = missing;
+            2u64
+        } else { 1 };
         let central_size = tail.len() as u64;
         tail.extend(b"PK\x06\x06");
         tail.extend(44u64.to_le_bytes());
         tail.extend([45, 0, 45, 0]);
         tail.extend(disk_number.to_le_bytes());
         tail.extend(disk_number.to_le_bytes());
-        tail.extend(1u64.to_le_bytes());
-        tail.extend(1u64.to_le_bytes());
+        tail.extend(entries.to_le_bytes());
+        tail.extend(entries.to_le_bytes());
         tail.extend(central_size.to_le_bytes());
         tail.extend(central_offset.to_le_bytes());
         tail.extend(b"PK\x06\x07");
@@ -114,19 +125,18 @@ fn zip64_password_probe_resolves_disk_relative_entry_and_end_records() {
                     .enumerate()
                     .map(|(disk, bytes)| VolumeSpec {
                         reader: ManagedReader::from_bytes(bytes, ReaderConfig::default()),
-                        number: disk as u32 + 1,
+                        number: if disk == 0 { 1 } else { disk_number + 1 },
                         start: 0,
                         end: None,
                     })
                     .collect(),
             );
-            assert_eq!(status_of(prepare_zip_volumes(&volumes, None)), "prepared");
-            prepare_zip_volumes(&volumes, Some(eocd))
+            prepare_zip_volume_directory(&volumes, Some(eocd), None)
         } else {
             let mut archive = prefix.clone();
             archive.extend(tail);
             let len = archive.len() as u64;
-            prepare_zip_stream(&mut std::io::Cursor::new(archive), len, Some(eocd))
+            prepare_zip_directory_stream(&mut std::io::Cursor::new(archive), len, Some(eocd), None)
         };
         match prepared {
             Ok(ZipPasswordContext::ZipCrypto { header, check_byte }) => {

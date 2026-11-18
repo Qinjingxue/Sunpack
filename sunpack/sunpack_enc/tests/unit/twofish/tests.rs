@@ -18,8 +18,7 @@ fn interleaved_groups_and_tails_match_upstream() {
             let mut bytes: Vec<u8> = (0..prefix + count * 16 + 7).map(|_| next()).collect();
             let mut expected = bytes.clone();
             for block in expected[prefix..prefix + count * 16].chunks_exact_mut(16) {
-                reference
-                    .encrypt_block(cipher::Block::<::twofish::Twofish>::from_mut_slice(block));
+                reference.encrypt_block(cipher::Block::<::twofish::Twofish>::from_mut_slice(block));
             }
             cipher.encrypt(&mut bytes[prefix..prefix + count * 16]);
             assert_eq!(bytes, expected);

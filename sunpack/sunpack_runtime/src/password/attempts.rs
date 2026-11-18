@@ -22,7 +22,7 @@ pub(crate) struct Key {
     start: u64,
     end: Option<u64>,
     eocd: Option<u64>,
-    zip_spanned: bool,
+    native_disks: bool,
     compound: Option<Arc<[u8]>>,
     compound_hash: u64,
 }
@@ -34,7 +34,7 @@ impl std::hash::Hash for Key {
         // identity, so a fast-hash collision cannot reuse another proof.
         std::hash::Hash::hash(&(
             self.generation, self.format, self.start, self.end, self.eocd,
-            self.zip_spanned, self.compound.is_some(), self.compound_hash,
+            self.native_disks, self.compound.is_some(), self.compound_hash,
         ), state);
     }
 }
@@ -83,14 +83,14 @@ impl Key {
         let compound_hash = compound.as_deref().map_or(0, |bytes| crate::fast_hash_core::xxh64(bytes, 0));
         let cache = sessions.iter().find(|session| session.path() == path)?.attempt_cache();
         Some((Self { generation, format, start, end,
-            eocd: input.analysis.zip_eocd_offset, zip_spanned: input.analysis.zip_spanned,
+            eocd: input.analysis.zip_eocd_offset, native_disks: input.analysis.zip_spanned || input.analysis.rar_native_volume,
             compound, compound_hash }, cache))
     }
 
     #[cfg(test)]
     pub(crate) fn synthetic(generation: u64, compound: Option<Arc<[u8]>>) -> Self {
         Self { generation, format: "zip", start: 0, end: None, eocd: None,
-            zip_spanned: false, compound, compound_hash: 0 }
+            native_disks: false, compound, compound_hash: 0 }
     }
 }
 

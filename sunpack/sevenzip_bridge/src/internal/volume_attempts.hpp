@@ -24,6 +24,7 @@ struct VolumeAttemptPlan {
     std::vector<std::vector<std::size_t>> domains;
     std::vector<std::vector<VolumeAttemptSlot>> layouts;
     std::vector<std::size_t> minimum_slots;
+    std::vector<std::size_t> layout_password_domains;
     std::vector<VolumeSlotVariation> variation;
     std::vector<unsigned long long> domain_capacity;
     bool insufficient_sources = false;
@@ -246,6 +247,8 @@ struct VolumeAttemptCursor {
                 // Membership in an earlier layout avoids an ever-growing seen set.
                 bool duplicate = false;
                 for (std::size_t old = 0; old < layout && !duplicate; ++old) {
+                    if (!plan.layout_password_domains.empty() &&
+                        plan.layout_password_domains[old] != plan.layout_password_domains[layout]) continue;
                     const auto& previous = plan.layouts[old];
                     if (slot_count > previous.size() || slot_count < plan.minimum_slots_for(old)) continue;
                     duplicate = true;

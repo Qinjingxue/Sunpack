@@ -5,6 +5,9 @@ exercise payload prefilters, their unsupported-method fallback, and real member
 CRC confirmation. Candidate collisions/order are covered by the native units.
 """
 
+import struct
+import zlib
+
 import pytest
 
 from tests.helpers.native_fixture import assemble_carrier, file_inventory
@@ -127,7 +130,8 @@ def test_payload_tiny_crc_collision_does_not_confirm_password(package, tmp_path,
     rejected = package.json("scan", "-d", "-p", bad, archive, code=1)
     assert rejected["items"][0]["error_kind"] == "wrong_password", rejected
     scan = package.json("scan", "-d", "-p", bad, "-p", "secret", archive)
-    assert scan["items"][0]["password_used"] == "secret", scan
+    expected_password = None if max(map(len, expected.values())) < 4 else "secret"
+    assert scan["items"][0]["password_used"] == expected_password, scan
     # Fresh extraction confirms while writing; an existing output switches to
     # the read-only confirmation path and must preserve the user's sentinel.
     package.configure(post_extract={"flatten_single_directory": False})
@@ -147,3 +151,43 @@ def test_payload_tiny_crc_collision_does_not_confirm_password(package, tmp_path,
             assert [path.read_bytes() for path in output.rglob(name)] == [content]
         if existing:
             assert sentinel.read_text(encoding="utf-8") == "user content"
+
+
+def test_solid_folder_checksum_without_file_checksums(package, tmp_path):
+    # Two substreams in one AES-only folder. Both plaintexts are arbitrary
+    # bytes and neither file has a checksum. Only the full folder can prove
+    # the key, including when final extraction starts with a single candidate.
+    packed = bytes.fromhex("8081813f1e61d9e3c0ba3ad5d5f7e9cf")
+    checksum = zlib.crc32(b"AAAABBBBB")
+    for valid in (True, False):
+        header = (bytes.fromhex("0104060001091000070b0100012406f10701013f0c090a01")
+                  + struct.pack("<I", checksum if valid else checksum ^ 1)
+                  + bytes.fromhex("00080d0209040000050211090061000000620000000000"))
+        start = struct.pack("<QQI", len(packed), len(header), zlib.crc32(header))
+        archive = tmp_path / ("valid.7z" if valid else "invalid.7z")
+        archive.write_bytes(bytes.fromhex("377abcaf271c0004") +
+                            struct.pack("<I", zlib.crc32(start)) + start + packed + header)
+        if valid:
+            scan = package.json("scan", "-d", "-npa", "-p", "wrong", "-p", "secret", archive)
+            assert scan["items"][0]["password_used"] == "secret", scan
+        output = tmp_path / archive.stem
+        report = extract_report(package, archive, output, passwords=["secret"], code=0 if valid else 1)
+        assert report["summary"]["success_count"] == int(valid), report
+        if valid:
+            assert {p.name: p.read_bytes() for p in output.rglob("*") if p.is_file()} == {
+                "a": b"AAAA", "b": b"BBBBB",
+            }
+
+
+def test_solid_copy_member_starts_inside_chained_aes_block(package, tmp_path):
+    # Only b has a digest. Its four plaintext bytes start five bytes into block
+    # three, whose nonzero CBC predecessor differs from the archive's zero IV.
+    packed = bytes(16) + bytes([0x11]) * 16 + bytes.fromhex("8081813f1e61d9e3c0ba3ad5d5f7e9cf")
+    header = (bytes.fromhex("0104060001093000070b0100012406f10701013f0c2900080d0209250a0040")
+              + struct.pack("<I", zlib.crc32(b"SSSS")) + bytes.fromhex("0000050211090061000000620000000000"))
+    start = struct.pack("<QQI", len(packed), len(header), zlib.crc32(header))
+    archive = tmp_path / "seekable.7z"
+    archive.write_bytes(bytes.fromhex("377abcaf271c0004") +
+                        struct.pack("<I", zlib.crc32(start)) + start + packed + header)
+    scan = package.json("scan", "-d", "-npa", "-p", "wrong", "-p", "secret", archive)
+    assert scan["items"][0]["password_used"] == "secret", scan

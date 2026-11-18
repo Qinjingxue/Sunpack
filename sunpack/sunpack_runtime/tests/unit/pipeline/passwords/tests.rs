@@ -76,7 +76,7 @@ fn empty_and_three_configured_passwords_share_the_encrypted_header_batch() {
     let source = crate::test_support::temp_file("password_batch_7z", &bytes);
     // Relations' header geometry does not declare encryption. Exercise that
     // actual password plan, rather than manually invoking the verifier.
-    let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "archive".into());
+    let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "archive".into());
     struct Reset;
     impl Drop for Reset { fn drop(&mut self) { PLANNED_BATCHES.with(|value| *value.borrow_mut() = None); } }
     let _reset = Reset;
@@ -84,7 +84,7 @@ fn empty_and_three_configured_passwords_share_the_encrypted_header_batch() {
         let cache = RecentPasswords::default();
         let candidates = CandidateSet::new(Arc::from([Arc::from("wrong1"), Arc::from("wrong2"), Arc::from(tail)]), None, &cache, None);
         PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
-        let plan = candidates.plan(&input, None, &Cancellation::new()).unwrap();
+        let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap();
         PLANNED_BATCHES.with(|value| {
             let borrow = value.borrow(); let batches = borrow.as_ref().unwrap();
             assert_eq!(batches.len(), 1);
@@ -103,10 +103,10 @@ fn encrypted_empty_rar_crc_failure_uses_verified_direct_password_plan() {
     // Real RAR5 from Rar.exe -ma5 -pfixture-secret, empty.txt. Only the
     // file CRC is damaged; its enclosing header CRC has been recomputed.
     let source = crate::test_support::temp_file("crc_empty_rar", &[82, 97, 114, 33, 26, 7, 1, 0, 51, 146, 181, 229, 10, 1, 5, 6, 0, 5, 1, 1, 128, 128, 0, 138, 98, 34, 111, 86, 2, 3, 60, 144, 0, 4, 128, 0, 32, 243, 251, 157, 52, 128, 3, 0, 9, 101, 109, 112, 116, 121, 46, 116, 120, 116, 48, 1, 0, 3, 15, 193, 88, 249, 247, 42, 138, 96, 222, 172, 113, 197, 80, 56, 137, 60, 185, 108, 179, 130, 137, 125, 195, 143, 174, 207, 163, 1, 120, 21, 154, 87, 254, 248, 185, 39, 15, 144, 111, 233, 62, 123, 127, 192, 14, 10, 3, 2, 164, 7, 232, 133, 136, 115, 221, 1, 51, 121, 211, 16, 206, 151, 73, 238, 124, 252, 221, 165, 125, 51, 144, 88, 29, 119, 86, 81, 3, 5, 4, 0]);
-    let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "rar".into(), "archive".into());
+    let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "rar".into(), "archive".into());
     let cache = RecentPasswords::default();
     let candidates = CandidateSet::new(Arc::from([Arc::from("fixture-secret")]), None, &cache, None);
-    let plan = candidates.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
     assert_eq!(plan.verified_password.as_deref(), Some("fixture-secret"));
     assert!(plan.candidates.is_empty(), "must not use the all-rejected candidate fallback");
     std::fs::remove_file(source).unwrap();
@@ -224,10 +224,10 @@ fn preflight_read_failure_retains_machine_readable_evidence() {
     // Two passwords force the Rust probe, unlike single-candidate worker
     // confirmation. This exercises the terminal planning projection.
     let path = crate::test_support::temp_file("enc_read_fault_evidence", b"short");
-    let input = ArchiveInput::file(path.to_string_lossy().into_owned(), "enc".into(), "archive".into());
+    let mut input = ArchiveInput::file(path.to_string_lossy().into_owned(), "enc".into(), "archive".into());
     let cache = RecentPasswords::default();
     let candidates = CandidateSet::new(Arc::from(["first".into(), "second".into()]), None, &cache, None);
-    let failure = candidates.plan(&input, None, &Cancellation::new()).unwrap().err().unwrap();
+    let failure = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().err().unwrap();
     assert_eq!(failure.kind, FailureKind::Damaged);
     let json = serde_json::to_value(&failure).unwrap();
     let evidence = &json["evidence"];
@@ -243,10 +243,10 @@ fn preflight_read_failure_retains_machine_readable_evidence() {
     // confirmed missing volume. Relation discovery may confirm it.
     let mut hinted = input.clone();
     hinted.analysis.missing_volume_evidence = Some("seven_zip_start_header_length".into());
-    assert_eq!(candidates.plan(&hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
+    assert_eq!(candidates.plan(&mut hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
         FailureKind::Damaged);
     hinted.analysis.origin = crate::io::archive_state::AnalysisOrigin::Relations;
-    assert_eq!(candidates.plan(&hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
+    assert_eq!(candidates.plan(&mut hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
         FailureKind::MissingVolume);
     let _ = std::fs::remove_file(path);
 }
@@ -257,7 +257,7 @@ fn sole_enc_candidate_after_cached_rejections_uses_worker_confirmation() {
     // because the worker will confirm the sole remaining candidate.
     let path = crate::test_support::temp_file("enc_single_candidate_plan", b"short");
     let name = path.to_string_lossy().into_owned();
-    let input = ArchiveInput::file(name.clone(), "enc".into(), "archive".into());
+    let mut input = ArchiveInput::file(name.clone(), "enc".into(), "archive".into());
     let sessions = [NativeArchiveSession::new(name).unwrap()];
     let cache = RecentPasswords::default();
     let (key, attempts) = Key::for_input(&input, &sessions).unwrap();
@@ -271,7 +271,7 @@ fn sole_enc_candidate_after_cached_rejections_uses_worker_confirmation() {
         None,
     );
     let plan = candidates
-        .plan(&input, None, &Cancellation::new())
+        .plan(&mut input, None, &Cancellation::new())
         .unwrap()
         .unwrap();
     assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("confirm-in-worker")]);
@@ -287,24 +287,24 @@ fn sole_enc_candidate_after_cached_rejections_uses_worker_confirmation() {
 fn explicit_empty_enc_candidate_is_not_absent_or_implicit() {
     let path = crate::test_support::temp_file("enc_empty_candidate_plan", b"short");
     let name = path.to_string_lossy().into_owned();
-    let input = ArchiveInput::file(name, "enc".into(), "archive".into());
+    let mut input = ArchiveInput::file(name, "enc".into(), "archive".into());
     let cache = RecentPasswords::default();
     let empty = CandidateSet::new(Arc::from([Arc::from("")]), None, &cache, None);
-    let plan = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = empty.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
     assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
     let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
-    assert_eq!(absent.plan(&input, None, &Cancellation::new()).unwrap()
+    assert_eq!(absent.plan(&mut input, None, &Cancellation::new()).unwrap()
         .err().unwrap().kind, FailureKind::WrongPassword);
-    let sessions = open_sessions(&input).unwrap();
+    let sessions = member_sessions(&input, NativeArchiveSession::new(input.entry_path.clone()).unwrap());
     let (key, attempts) = Key::for_input(&input, &sessions).unwrap();
     attempts.reject(key.clone(), &[Arc::from("wrong")]);
     let mixed = CandidateSet::new(Arc::from([Arc::from("wrong"), Arc::from("")]), None, &cache, None);
-    let plan = mixed.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = mixed.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
     assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
     attempts.remember_proof(key, Some(Arc::from("")));
-    let cached = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
+    let cached = empty.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
     assert_eq!(cached.verified_password.as_deref(), Some(""));
-    let known = empty.plan(&input, Some(Arc::from("")), &Cancellation::new()).unwrap().unwrap();
+    let known = empty.plan(&mut input, Some(Arc::from("")), &Cancellation::new()).unwrap().unwrap();
     assert_eq!(known.verified_password.as_deref(), Some(""));
     drop(sessions);
     let _ = std::fs::remove_file(path);
@@ -325,7 +325,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
     let cache = RecentPasswords::default();
     for mode in [OpenMode::NativeVolumes, OpenMode::SfxWithVolumes] {
         input.mode = mode;
-        let sessions = open_sessions(&input).unwrap();
+        let sessions = member_sessions(&input, NativeArchiveSession::new(input.entry_path.clone()).unwrap());
         let (key, attempts) = Key::for_input(&input, &sessions).unwrap();
         attempts.reject(key.clone(), &[Arc::from("old-wrong")]);
         let mut candidates = vec![Arc::from("old-wrong"), Arc::from("new")];
@@ -336,7 +336,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
         // The invalid header would fail a fresh verifier call; a stored
         // proof must return before parsing/KDF for every compound layout.
         let configured = CandidateSet::new(Arc::from([Arc::from("right")]), None, &cache, None);
-        let plan = configured.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
+        let plan = configured.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
         assert_eq!(plan.verified_password.as_deref(), Some("right"));
         let mut changed = input.clone();
         changed.parts[1].extent.start = 1;
@@ -353,7 +353,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
         domains: vec![VolumeDomain { choices: Arc::new(vec![0, 1]) }].into(),
         head_size_from_total: None, minimum_size: None, tail_totals: Box::new([]),
     }));
-    let sessions = open_sessions(&input).unwrap();
+    let sessions = member_sessions(&input, NativeArchiveSession::new(input.entry_path.clone()).unwrap());
     let (planned, attempts) = Key::for_input(&input, &sessions).unwrap();
     attempts.reject(planned.clone(), &[Arc::from("old-wrong")]);
     let mut changed = input.clone();
@@ -384,7 +384,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
     assert!(attempts.proof(&volume_key).is_none());
     drop(sessions);
     crate::io::reader::invalidate_reader_path(&tail);
-    let sessions = open_sessions(&input).unwrap();
+    let sessions = member_sessions(&input, NativeArchiveSession::new(input.entry_path.clone()).unwrap());
     assert!(Key::for_input(&input, &sessions).unwrap().0 != planned);
     let (fresh_key, fresh_attempts) = Key::for_input(&input, &sessions).unwrap();
     assert!(fresh_attempts.proof(&fresh_key).is_none());
@@ -396,20 +396,19 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
 }
 
 #[test]
-fn payload_strong_prescreen_defers_untested_suffix_without_claiming_verified() {
+fn copy_payload_preserves_candidates_across_batches_for_worker() {
     // Real 7-Zip Copy + AES, plain header, one short CRC-bearing member.
     let source = crate::test_support::temp_file("payload_prescreen_plan", &[55, 122, 188, 175, 39, 28, 0, 4, 178, 190, 162, 6, 16, 0, 0, 0, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 137, 92, 122, 211, 37, 116, 224, 226, 140, 241, 42, 72, 179, 115, 25, 153, 186, 152, 193, 102, 1, 4, 6, 0, 1, 9, 16, 0, 7, 11, 1, 0, 2, 36, 6, 241, 7, 1, 18, 83, 15, 90, 12, 52, 178, 191, 180, 172, 56, 77, 7, 166, 158, 159, 175, 101, 31, 1, 0, 1, 0, 12, 16, 16, 0, 8, 10, 1, 53, 59, 166, 46, 0, 0, 5, 1, 25, 3, 0, 0, 0, 17, 5, 0, 120, 0, 0, 0, 20, 10, 1, 0, 100, 53, 227, 238, 121, 118, 221, 1, 21, 6, 1, 0, 32, 0, 0, 0, 0, 0]);
-    let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "archive".into());
+    let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "archive".into());
     let recent = RecentPasswords::default();
     let mut values: Vec<Arc<str>> = vec![Arc::from("secret")];
     values.extend((0..300).map(|i| Arc::from(format!("wrong-{i}"))));
     let candidates = CandidateSet::new(values.clone().into(), None, &recent, None);
     PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
-    let plan = candidates.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
     let batches = PLANNED_BATCHES.with(|value| value.borrow_mut().take().unwrap());
-    assert_eq!(batches.len(), 1, "strong hit hands off without screening following batches; evidence={:?}, candidates={:?}", plan.evidence, plan.candidates);
-    assert!(plan.verified_password.is_none(), "only worker confirmation is definitive");
-    assert_eq!(*plan.candidates, values, "all untested candidates survive a possible CRC collision");
-    assert_eq!(plan.evidence, Some("7z_payload_strong_prescreen"));
+    assert_eq!(batches.len(), 2);
+    assert!(plan.verified_password.is_none());
+    assert_eq!(&plan.candidates[1..], values.as_slice());
     std::fs::remove_file(source).unwrap();
 }

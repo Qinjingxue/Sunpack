@@ -108,6 +108,9 @@ pub struct Workspace {
     cancellation: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     kdf_runs: usize,
+    // Test-only wall intervals; simultaneous workers overlap.
+    #[cfg(test)]
+    study_seconds: [f64; 5],
 }
 impl Drop for Workspace {
     fn drop(&mut self) {
@@ -127,12 +130,7 @@ impl Workspace {
         workspace.kdf_threads = Some(threads.max(1));
         workspace
     }
-    fn derive(
-        &mut self,
-        header: &Header,
-        password: &[u16],
-        purpose: KeyPurpose,
-    ) -> Result<Keys> {
+    fn derive(&mut self, header: &Header, password: &[u16], purpose: KeyPurpose) -> Result<Keys> {
         let cancellation = &self.cancellation;
         let cancelled = || {
             cancellation
@@ -146,11 +144,19 @@ impl Workspace {
         if cancelled() {
             return Err(Error::Cancelled);
         }
+        #[cfg(test)]
+        let study_start = std::time::Instant::now();
         let normalized = normalize_password(password);
         let mut master = Zeroizing::new([0u8; 256]);
         MasterHkdf::new(Some(b"memorySalt"), &normalized)
             .expand(b"memoryInfo", &mut *master)
             .map_err(|_| Error::Format)?;
+        #[cfg(test)]
+        {
+            self.study_seconds[0] += study_start.elapsed().as_secs_f64();
+        }
+        #[cfg(test)]
+        let study_start = std::time::Instant::now();
         let params = header.params()?;
         let count = params.memory_blocks() as usize;
         if self.external.is_none() && count != self.memory.len() {
@@ -174,6 +180,12 @@ impl Workspace {
         } else {
             self.memory.as_mut_slice()
         };
+        #[cfg(test)]
+        {
+            self.study_seconds[1] += study_start.elapsed().as_secs_f64();
+        }
+        #[cfg(test)]
+        let study_start = std::time::Instant::now();
         let mut derived = Zeroizing::new([0u8; 256]);
         #[cfg(test)]
         {
@@ -195,6 +207,12 @@ impl Workspace {
                 Error::Format
             }
         })?;
+        #[cfg(test)]
+        {
+            self.study_seconds[2] += study_start.elapsed().as_secs_f64();
+        }
+        #[cfg(test)]
+        let study_start = std::time::Instant::now();
         let (key_size, nonce_size) = header.dimensions();
         let mut keys = Keys {
             key: vec![0; key_size],
@@ -225,6 +243,10 @@ impl Workspace {
             Hkdf::<Sha3_512>::new(Some(b"authKeySalt"), &*derived)
                 .expand(b"authKeyInfo", &mut keys.auth)
                 .map_err(|_| Error::Format)?;
+        }
+        #[cfg(test)]
+        {
+            self.study_seconds[3] += study_start.elapsed().as_secs_f64();
         }
         Ok(keys)
     }
@@ -258,6 +280,7 @@ pub struct PasswordProbe {
     header: Header,
     quick: [u8; 32],
 }
+
 impl PasswordProbe {
     fn read<R: Read + Seek>(input: &mut R, length: u64) -> Result<Self> {
         input.seek(SeekFrom::Start(0))?;
@@ -274,6 +297,13 @@ impl PasswordProbe {
             .unwrap();
         Ok(Self { header, quick })
     }
+    /// Password evidence needs only the public header and quick block, not a
+    /// complete payload or authentication trailer. Decoder::open keeps using
+    /// the length-aware parse above for extraction.
+    pub fn parse_prefix(bytes: &[u8]) -> Result<Self> {
+        Self::parse(bytes, PREFIX + CHECK + MAC)
+    }
+
     pub fn workspace_bytes(&self) -> usize {
         self.header.params().unwrap().memory_blocks() as usize * std::mem::size_of::<Block>()
     }
@@ -284,6 +314,12 @@ impl PasswordProbe {
             Err(e) => Err(e),
         }
     }
+    fn quick_matches(&self, keys: &Keys) -> bool {
+        let mut quick = self.quick;
+        cipher::Stream::new(self.header.bytes[6], &keys.key, &keys.nonce).apply(&mut quick);
+        quick.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    }
+
     fn checked_keys(
         &self,
         password: &[u16],
@@ -291,14 +327,12 @@ impl PasswordProbe {
         purpose: KeyPurpose,
     ) -> Result<Keys> {
         let keys = workspace.derive(&self.header, password, purpose)?;
-        let mut quick = self.quick;
-        cipher::Stream::new(self.header.bytes[6], &keys.key, &keys.nonce).apply(&mut quick);
-        if !quick
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        {
-            return Err(Error::Password);
-        }
+        #[cfg(test)]
+        let study_start = std::time::Instant::now();
+        let matches = self.quick_matches(&keys);
+        #[cfg(test)]
+        { workspace.study_seconds[4] += study_start.elapsed().as_secs_f64(); }
+        if !matches { return Err(Error::Password); }
         Ok(keys)
     }
 }
@@ -504,3 +538,7 @@ fn payload_end<R: Read + Seek>(input: &mut R, length: u64) -> Result<u64> {
 #[cfg(test)]
 #[path = "../tests/unit/lib/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../benchmarks/native/enc/probe.rs"]
+mod benchmark;

@@ -1,7 +1,7 @@
 //! ENC's quick block is a strong, bounded password proof. Authentication belongs
 //! to extraction. Share generation-bound preparation across batches in the current plan.
 use super::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
-use super::input::{parse_ranges, ranges_key, VirtualRangeReader};
+use super::input::{parse_range_prefix, ranges_key, VirtualRangeReader};
 use super::PasswordVerification;
 use crate::io::archive_state::InputExtent;
 use crate::io::cancellation::Cancellation;
@@ -47,9 +47,9 @@ pub(crate) fn enc_fast_verify_passwords_from_ranges(
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
+    let parsed = parse_range_prefix(ranges.iter().copied(), sessions, Some(72))?;
     preparation.verify(ranges_key("enc", &parsed)?, candidates, || {
-        let reader = VirtualRangeReader::new(&parsed);
+        let reader = VirtualRangeReader::streaming(&parsed);
         let length = reader.len();
         prepare(reader, length).map(PasswordContext::Enc)
     })
@@ -70,13 +70,14 @@ fn prepare<R: Read + Seek>(
         "enc.password_proof",
         FieldLocation::Head,
     )?;
-    PasswordProbe::parse(&bytes, length)
+    PasswordProbe::parse_prefix(&bytes)
         .map(|probe| EncPasswordContext { probe })
         .map_err(|e| PreparedStatus::new("damaged", format!("ENC v4 password material: {e:?}")))
 }
 impl EncPasswordContext {
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         let found = self.find_first(candidates);
+        Cancellation::current().check_io()?;
         let (index, attempts) = match found {
             Some((index, Ok(()))) => (index as i32, index + 1),
             Some((_, Err(Error::Memory))) => {
@@ -106,7 +107,10 @@ impl EncPasswordContext {
         })
     }
 
-    fn find_first(&self, candidates: &[Arc<str>]) -> Option<(usize, Result<(), Error>)> {
+    fn find_first(
+        &self,
+        candidates: &[Arc<str>],
+    ) -> Option<(usize, Result<(), Error>)> {
         if candidates.is_empty() {
             return None;
         }

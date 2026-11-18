@@ -2781,7 +2781,7 @@ impl<'run, O: Observer> Run<'run, O> {
         outcome: &mut Outcome,
     ) -> io::Result<Executed> {
         let LogicalInput {
-            input,
+            mut input,
             password,
             failure,
         } = logical;
@@ -2852,7 +2852,7 @@ impl<'run, O: Observer> Run<'run, O> {
         } else {
             None
         };
-        let plan = match candidates.plan(&input, password, &self.request.cancel) {
+        let mut plan = match candidates.plan(&mut input, password, &self.request.cancel) {
             Ok(Ok(plan)) => plan,
             Ok(Err(failure)) => {
                 result.failure = Some(failure.with_context(super::FailureContext::PasswordResolution));
@@ -2932,6 +2932,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     output_volume_key: volume_key,
                     archive_input: Arc::clone(&input),
                     password_candidates: Arc::clone(&plan.candidates),
+                    layout_passwords: std::mem::take(&mut plan.layout_passwords),
                     password: plan.verified_password.clone(),
                     password_verified: plan.verified_password.is_some(),
                     encrypted: plan.encrypted,
@@ -2986,6 +2987,21 @@ impl<'run, O: Observer> Run<'run, O> {
                     .and_then(Value::as_u64)
                     .and_then(|index| usize::try_from(index).ok());
                 let success = worker::string(value, "status") == "ok";
+                if self.request.mode == Mode::Scan {
+                    if flag(value, "volume_candidates_exhausted") {
+                        if let Some(plan) = &input.volume_attempts {
+                            let empty = plan.with_remaining(Vec::new(), Vec::new());
+                            Arc::make_mut(&mut input).volume_attempts = Some(Arc::new(empty));
+                        }
+                    } else if let Some(plan) = &input.volume_attempts {
+                        let first = value.get("first_remaining_volume").map(VolumeSelection::deserialize).transpose()?;
+                        let updates = value.get("volume_layout_survivors").map(Vec::deserialize).transpose()?.unwrap_or_default();
+                        if first.is_some() || !updates.is_empty() {
+                            let remaining = plan.remaining_after_scan(first.as_ref(), updates)?;
+                            Arc::make_mut(&mut input).volume_attempts = Some(Arc::new(remaining));
+                        }
+                    }
+                }
                 if success && self.request.mode == Mode::Extract && input.volume_attempts.is_some()
                 {
                     let selected = value
@@ -3037,7 +3053,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     if matches!(failure.kind, FailureKind::WrongPassword | FailureKind::PasswordInconclusive) {
                         result.password = None;
                     }
-                    if failure.kind == FailureKind::Damaged && worker::number(value, "password_crc_proven_items") != 0 {
+                    let proven_on_scan = self.request.mode == Mode::Scan && failure.kind == FailureKind::MissingVolume
+                        && flag(value, "password_verified");
+                    if proven_on_scan || (failure.kind == FailureKind::Damaged && worker::number(value, "password_crc_proven_items") != 0) {
                         result.password = plan
                             .remember_confirmation(matched_index, &self.engine.recent_passwords)
                             .map(str::to_owned);

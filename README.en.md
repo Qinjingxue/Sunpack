@@ -95,6 +95,8 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 
 Recent successes only reorder currently eligible candidates and never expand their scope. File events refresh the password snapshot when the JSON file changes.
 
+Progress stays at 0% while password and volume candidates are being verified. Large candidate lists or expensive checks can take longer; the progress notification can cancel the task.
+
 ### GUI manager
 
 Open the manager from the Watch tray or by searching for Sunpackgui in the Start menu to manage tasks, monitored folders, passwords, and settings in one place.

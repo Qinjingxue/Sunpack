@@ -1,15 +1,28 @@
-use super::context::{InputKey, InputMember, PreparedStatus};
+use super::context::{InputKey, InputMember};
 use crate::io::archive_state::{InputExtent, InputPart};
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, NativeArchiveSession};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
+#[derive(Clone)]
 pub(crate) struct RangeSpec {
     reader: ManagedReader,
     start: u64,
     len: u64,
     virtual_start: u64,
+}
+
+impl RangeSpec {
+    pub(super) fn entire(reader: &ManagedReader) -> Self {
+        Self { reader: reader.clone(), start: 0, len: reader.len(), virtual_start: 0 }
+    }
+
+    pub(super) fn covering(ranges: &[Self], offset: u64, size: u64) -> &[Self] {
+        let start = ranges.partition_point(|r| r.virtual_start + r.len <= offset);
+        let end = ranges.partition_point(|r| r.virtual_start < offset.saturating_add(size));
+        &ranges[start..end.max(start)]
+    }
 }
 
 // The caller already holds lifecycle borrows. Reuse their validated readers
@@ -44,9 +57,18 @@ pub(crate) fn parse_ranges<'a>(
     ranges: impl Iterator<Item = &'a InputExtent>,
     sessions: &'a [NativeArchiveSession],
 ) -> std::io::Result<Vec<RangeSpec>> {
+    parse_range_prefix(ranges, sessions, None)
+}
+
+/// Stop opening members once the requested logical prefix is complete.
+pub(crate) fn parse_range_prefix<'a>(
+    ranges: impl Iterator<Item = &'a InputExtent>,
+    sessions: &'a [NativeArchiveSession],
+    limit: Option<u64>,
+) -> std::io::Result<Vec<RangeSpec>> {
     let mut readers = InputReaders::new(sessions);
     let (minimum, maximum) = ranges.size_hint();
-    let mut parsed = Vec::with_capacity(minimum);
+    let mut parsed = if limit.is_some() { Vec::new() } else { Vec::with_capacity(minimum) };
     let mut cursor = 0u64;
     for range in ranges {
         let (path, start, end) = (&range.path, range.start, range.end);
@@ -59,7 +81,14 @@ pub(crate) fn parse_ranges<'a>(
         if effective_end < start {
             return Err(std::io::Error::other("range end is before start"));
         }
-        let len = effective_end - start;
+        let mut len = effective_end - start;
+        if let Some(limit) = limit {
+            let remaining = limit - cursor;
+            if len < remaining && end.is_some_and(|end| end > file_len) {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            len = len.min(remaining);
+        }
         parsed.push(RangeSpec {
             reader,
             start,
@@ -72,6 +101,9 @@ pub(crate) fn parse_ranges<'a>(
                 "logical input size overflow",
             )
         })?;
+        if Some(cursor) == limit {
+            break;
+        }
     }
     Ok(parsed)
 }
@@ -273,20 +305,18 @@ pub(crate) struct VolumeSet {
 }
 
 impl VolumeSet {
-    pub(crate) fn require_contiguous(&self) -> Result<(), PreparedStatus> {
-        if self.volumes.is_empty()
-            || self
-                .volumes
-                .iter()
-                .enumerate()
-                .any(|(index, volume)| volume.number != index as u32 + 1)
-        {
-            return Err(PreparedStatus::new(
-                "missing_volume",
-                "structured volume numbers are not contiguous from one; missing volume",
-            ));
-        }
-        Ok(())
+    /// Bytes whose disk positions are known without crossing a missing disk.
+    pub(crate) fn contiguous_prefix_len(&self) -> u64 {
+        self.volumes.iter().enumerate()
+            .take_while(|(index, volume)| volume.number == *index as u32 + 1)
+            .try_fold(0u64, |total, (index, _)| total.checked_add(self.volume_len(index)?))
+            .unwrap_or(0)
+    }
+    pub(super) fn last_number(&self) -> usize {
+        self.volumes.last().map_or(0, |v| v.number as usize)
+    }
+    pub(super) fn ordinal(&self, disk: usize) -> Option<usize> {
+        self.volumes.binary_search_by_key(&disk.checked_add(1)?, |v| v.number as usize).ok()
     }
 
     pub(crate) fn new(volumes: Vec<VolumeSpec>) -> Self {
@@ -321,17 +351,17 @@ impl VolumeSet {
     }
 
     pub(crate) fn read_disk_spanning(
-        &self,
-        mut disk: usize,
-        mut offset: u64,
-        size: usize,
+        &self, mut disk: usize, mut offset: u64, size: usize,
     ) -> std::io::Result<Vec<u8>> {
+        let first_number = self.volumes.get(disk).map(|v| v.number as usize);
+        let first_ordinal = disk;
         let mut output = vec![0u8; size];
         let mut written = 0usize;
         while written < size {
             let Some(volume) = self.volumes.get(disk) else {
                 break;
             };
+            if first_number.and_then(|n| n.checked_add(disk - first_ordinal)) != Some(volume.number as usize) { break; }
             let volume_len = self.volume_len(disk).unwrap();
             if offset >= volume_len {
                 if offset == volume_len {
@@ -343,10 +373,8 @@ impl VolumeSet {
             }
             let available = (volume_len - offset) as usize;
             let requested = available.min(size - written);
-            let read = volume.reader.read_into_at(
-                volume.start + offset,
-                &mut output[written..written + requested],
-            )?;
+            let buffer = &mut output[written..written + requested];
+            let read = volume.reader.read_into_at(volume.start + offset, buffer)?;
             if read == 0 {
                 break;
             }
@@ -419,53 +447,31 @@ impl VolumeSet {
         }
     }
 
-    pub(crate) fn read_last_tail_field(
-        &self,
-        size: usize,
-        field: &'static str,
-    ) -> Result<Vec<u8>, ReadFault> {
-        let disk = self.volumes.len().saturating_sub(1);
-        let Some(volume_len) = self.volume_len(disk) else {
-            return Err(ReadFault::short_read("read_volume_tail", 0, size, 0, 0)
-                .with_field(field, FieldLocation::Tail)
-                .with_volume(disk as u32 + 1));
-        };
-        let read_size = size.min(volume_len as usize);
-        self.read_disk_spanning_field(
-            disk,
-            volume_len - read_size as u64,
-            read_size,
-            field,
-            FieldLocation::Tail,
-        )
+    pub(super) fn contiguous_ranges(&self) -> Vec<RangeSpec> {
+        let mut position = 0u64;
+        self.volumes.iter().enumerate()
+            .take_while(|(index, volume)| volume.number as usize == *index + 1)
+            .map_while(|(disk, _)| {
+                let mut range = self.disk_range(disk)?;
+                range.virtual_start = position;
+                position = position.checked_add(range.len)?;
+                Some(range)
+            }).collect()
     }
 
-    /// Read up to `size` bytes at `offset` inside the first volume only; the
-    /// result is shorter only at the end of that volume.
-    pub(crate) fn first_volume_read_at_field(
-        &self,
-        offset: u64,
-        size: usize,
-        field: &'static str,
-    ) -> Result<Vec<u8>, ReadFault> {
-        let Some(volume_len) = self.volume_len(0) else {
-            return Err(ReadFault::short_read("read_volume", offset, size, 0, 0)
-                .with_field(field, FieldLocation::Head)
-                .with_volume(1));
-        };
-        let requested = size.min(volume_len.saturating_sub(offset) as usize);
-        if requested == 0 {
-            return Ok(Vec::new());
-        }
-        self.read_disk_spanning(0, offset, requested)
-            .map_err(|error| {
-                ReadFault::from_io(error, "read_volume", offset, requested, 0, volume_len)
-                    .with_field(field, FieldLocation::Head)
-                    .with_volume(1)
-            })
+    pub(super) fn disk_range(&self, disk: usize) -> Option<RangeSpec> {
+        let volume = self.volumes.get(disk)?;
+        Some(RangeSpec { reader: volume.reader.clone(), start: volume.start,
+            len: self.volume_len(disk)?, virtual_start: 0 })
     }
 }
 
 #[cfg(test)]
 #[path = "../../tests/unit/password/input/tests.rs"]
 mod tests;
+
+#[path = "input_attempts.rs"]
+pub(crate) mod attempts;
+
+#[path = "input_prefix.rs"]
+pub(crate) mod prefix;

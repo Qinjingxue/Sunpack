@@ -61,7 +61,7 @@ fn archive_counts_follow_header_bytes_while_folder_graphs_stay_bounded() {
     substreams.extend(vec![0; 100_000]);
     substreams.push(SZ_END);
     let mut pos = 0;
-    parse_seven_zip_substreams_info(&substreams, &mut pos, &unpack, false).unwrap();
+    parse_seven_zip_substreams_info(&substreams, &mut pos, &unpack).unwrap();
     assert_eq!(pos, substreams.len());
     let mut files = number(100_001);
     files.push(SZ_END);

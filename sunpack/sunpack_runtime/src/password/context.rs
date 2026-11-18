@@ -67,19 +67,30 @@ impl InputKey {
 }
 
 pub(crate) enum PasswordContext {
+    Evidence(super::evidence::EvidenceContext),
+    Reduced(
+        Box<PasswordContext>,
+        Arc<crate::io::archive_state::VolumeAttemptPlan>,
+    ),
     Enc(super::enc::EncPasswordContext),
     Zip(super::zip::ZipPasswordContext),
-    Rar(super::rar::RarPasswordContext),
+    Rar(Arc<super::rar::RarPasswordContext>),
     SevenZip(super::seven_zip::SevenZipPasswordContext),
 }
 
 impl PasswordContext {
-    fn verify(
+    pub(crate) fn verify(
         &self,
         candidates: &[Arc<str>],
         rar_key: Option<&mut Option<super::rar::RarProvenKey>>,
     ) -> std::io::Result<PasswordVerification> {
         match self {
+            Self::Reduced(context, plan) => {
+                let mut result = context.verify(candidates, rar_key)?;
+                result.volume_attempts = Some(plan.clone());
+                Ok(result)
+            }
+            Self::Evidence(context) => context.verify(candidates),
             Self::Enc(context) => context.verify(candidates),
             Self::Zip(context) => context.verify(candidates),
             Self::Rar(context) => context.verify(candidates, rar_key),
@@ -98,7 +109,14 @@ impl PreparedStatus {
         Self::Status(status, message.into())
     }
 
-    fn verification(&self) -> PasswordVerification {
+    fn transient(&self) -> bool {
+        match self {
+            Self::ReadFault(fault) => fault.code == "io_error",
+            Self::Status(_, message) => message.starts_with("resource_unavailable:"),
+        }
+    }
+
+    pub(super) fn verification(&self) -> PasswordVerification {
         match self {
             Self::ReadFault(fault) => super::password_read_fault_status(fault),
             Self::Status(status, message) => PasswordVerification::status(status, message.as_str()),
@@ -125,13 +143,62 @@ static ACTIVE: Mutex<Vec<Arc<PreparedSlot>>> = Mutex::new(Vec::new());
 /// Overlapping plans share initialization, and the last plan frees its slot.
 #[derive(Default)]
 pub(crate) struct Preparation<'a> {
+    pub(super) fixed_password: bool,
+    pub(crate) other_password_batches: bool,
     slot: Option<Arc<PreparedSlot>>,
+    local: Option<Box<Prepared>>,
     rar_key: Option<&'a mut Option<super::rar::RarProvenKey>>,
 }
 
 impl<'a> Preparation<'a> {
+    pub(crate) fn fix_password(&mut self) {
+        self.fixed_password = true;
+    }
+
+    /// A volume plan owns its projected evidence for all password batches.
+    /// Building a global identity would reopen unrelated sources just for the key.
+    pub(crate) fn verify_local(
+        &mut self,
+        prepared: Prepared,
+        candidates: &[Arc<str>],
+    ) -> std::io::Result<PasswordVerification> {
+        let reusable = !prepared.as_ref().is_err_and(|error| error.transient());
+        let result = Self::verify_material(
+            None,
+            &prepared,
+            candidates,
+            self.rar_key.as_deref_mut(),
+            &Cancellation::current(),
+            self.fixed_password,
+            self.other_password_batches,
+        );
+        if reusable && result.is_ok() {
+            self.local = Some(Box::new(prepared));
+        }
+        result
+    }
+
+    pub(crate) fn evidence(&self) -> Option<&super::evidence::EvidenceContext> {
+        let context = self
+            .local
+            .as_deref()
+            .or_else(|| self.slot.as_ref()?.value.get())?
+            .as_ref()
+            .ok()?;
+        match context {
+            PasswordContext::Evidence(evidence) => Some(evidence),
+            _ => None,
+        }
+    }
+
     pub(crate) fn capturing_rar_key(key: &'a mut Option<super::rar::RarProvenKey>) -> Self {
-        Self { slot: None, rar_key: Some(key) }
+        Self {
+            fixed_password: false,
+            other_password_batches: false,
+            slot: None,
+            local: None,
+            rar_key: Some(key),
+        }
     }
 
     /// Reuse the layout for a later batch of the same plan's input and readers.
@@ -139,11 +206,21 @@ impl<'a> Preparation<'a> {
         &mut self,
         candidates: &[Arc<str>],
     ) -> std::io::Result<Option<PasswordVerification>> {
-        let Some(slot) = self.slot.as_deref() else { return Ok(None); };
-        let Some(prepared) = slot.value.get() else { return Ok(None); };
+        let slot = self.slot.as_deref();
+        let Some(prepared) = self.local.as_deref().or_else(|| slot?.value.get()) else {
+            return Ok(None);
+        };
         let cancellation = Cancellation::current();
-        Self::verify_slot(slot, prepared, candidates, self.rar_key.as_deref_mut(), &cancellation)
-            .map(Some)
+        Self::verify_material(
+            slot,
+            prepared,
+            candidates,
+            self.rar_key.as_deref_mut(),
+            &cancellation,
+            self.fixed_password,
+            self.other_password_batches,
+        )
+        .map(Some)
     }
 
     pub(crate) fn verify(
@@ -161,52 +238,69 @@ impl<'a> Preparation<'a> {
                 self.slot = Some(borrow(&key));
             }
             let slot = self.slot.as_ref().unwrap();
-            let Some(prepared) = slot.value.get_or_init(&cancellation, || prepare.take().unwrap()()) else {
+            let Some(prepared) = slot
+                .value
+                .get_or_init(&cancellation, || prepare.take().unwrap()())
+            else {
                 // The initializing borrower was cancelled. Waiters can take
                 // over without retiring a still-current file generation.
                 self.release(true);
                 cancellation.check()?;
                 continue;
             };
-            let result = Self::verify_slot(
-                slot, prepared, candidates, self.rar_key.as_deref_mut(), &cancellation,
+            let result = Self::verify_material(
+                Some(slot),
+                prepared,
+                candidates,
+                self.rar_key.as_deref_mut(),
+                &cancellation,
+                self.fixed_password,
+                self.other_password_batches,
             );
-            if matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error")
-                || matches!(prepared, Err(PreparedStatus::Status(_, message)) if message.starts_with("resource_unavailable:"))
-            {
+            if prepared.as_ref().is_err_and(|error| error.transient()) {
                 self.release(true);
             }
             return result;
         }
     }
 
-    fn verify_slot(
-        slot: &PreparedSlot,
+    fn verify_material(
+        slot: Option<&PreparedSlot>,
         prepared: &Prepared,
         candidates: &[Arc<str>],
         rar_key: Option<&mut Option<super::rar::RarProvenKey>>,
         cancellation: &Cancellation,
+        fixed_password: bool,
+        other_password_batches: bool,
     ) -> std::io::Result<PasswordVerification> {
         cancellation.check()?;
-        if slot.retired.load(Ordering::Acquire) {
+        if slot.is_some_and(|slot| slot.retired.load(Ordering::Acquire)) {
             return Err(input_changed());
         }
         let result = match prepared {
+            Ok(PasswordContext::Evidence(context)) => {
+                context.verify_batch(candidates, fixed_password, !other_password_batches)
+            }
             Ok(context) => context.verify(candidates, rar_key),
             Err(status) => Ok(status.verification()),
         };
         cancellation.check()?;
-        if slot.retired.load(Ordering::Acquire) {
+        if slot.is_some_and(|slot| slot.retired.load(Ordering::Acquire)) {
             return Err(input_changed());
         }
         result
     }
 
     fn release(&mut self, detach: bool) {
-        let Some(slot) = self.slot.take() else { return; };
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
         let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
         if detach || Arc::strong_count(&slot) <= 2 {
-            if let Some(index) = active.iter().position(|current| Arc::ptr_eq(current, &slot)) {
+            if let Some(index) = active
+                .iter()
+                .position(|current| Arc::ptr_eq(current, &slot))
+            {
                 active.swap_remove(index);
             }
             if active.capacity() > 256.max(active.len().saturating_mul(4)) {
@@ -223,7 +317,9 @@ impl<'a> Preparation<'a> {
 }
 
 impl Drop for Preparation<'_> {
-    fn drop(&mut self) { self.release(false); }
+    fn drop(&mut self) {
+        self.release(false);
+    }
 }
 
 fn borrow(key: &InputKey) -> Arc<PreparedSlot> {
@@ -231,19 +327,24 @@ fn borrow(key: &InputKey) -> Arc<PreparedSlot> {
     if let Some(slot) = active.iter().find(|slot| slot.key == *key) {
         return Arc::clone(slot);
     }
-    let generations: HashMap<_, _> = key.members.iter()
+    let generations: HashMap<_, _> = key
+        .members
+        .iter()
         .map(|member| (&member.generation.path, &member.generation))
         .collect();
     let retired = retire_where(&mut active, |old| {
         // Different volume snapshots can share unchanged members. Only
         // (re)opening a changed member invalidates its existing preparations.
         old.members.iter().any(|left| {
-            generations.get(&left.generation.path)
+            generations
+                .get(&left.generation.path)
                 .is_some_and(|right| left.generation != **right)
         })
     });
     let slot = Arc::new(PreparedSlot {
-        key: key.clone(), value: CancellableOnce::default(), retired: AtomicBool::new(false),
+        key: key.clone(),
+        value: CancellableOnce::default(),
+        retired: AtomicBool::new(false),
     });
     active.push(Arc::clone(&slot));
     drop(active);
@@ -272,7 +373,9 @@ pub(crate) fn release_under_roots(roots: &[PathBuf]) {
     let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
     let retired = retire_where(&mut active, |key| {
         key.members.iter().any(|member| {
-            roots.iter().any(|root| member.generation.path.starts_with(root))
+            roots
+                .iter()
+                .any(|root| member.generation.path.starts_with(root))
         })
     });
     drop(active);

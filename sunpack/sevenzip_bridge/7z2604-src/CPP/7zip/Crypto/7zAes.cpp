@@ -9,7 +9,8 @@
 #include "../../Common/MyBuffer2.h"
 
 #ifndef Z7_ST
-#include "../../Windows/Synchronization.h"
+#include <mutex>
+#include <condition_variable>
 #endif
 
 #include "../Common/StreamUtils.h"
@@ -130,21 +131,6 @@ bool CKeyInfoCache::GetKey(CKeyInfo &key)
   return false;
 }
 
-void CKeyInfoCache::FindAndAdd(const CKeyInfo &key)
-{
-  FOR_VECTOR (i, Keys)
-  {
-    const CKeyInfo &cached = Keys[i];
-    if (key.IsEqualTo(cached))
-    {
-      if (i != 0)
-        Keys.MoveToFront(i);
-      return;
-    }
-  }
-  Add(key);
-}
-
 void CKeyInfoCache::Add(const CKeyInfo &key)
 {
   if (Keys.Size() >= Size)
@@ -155,8 +141,24 @@ void CKeyInfoCache::Add(const CKeyInfo &key)
 static CKeyInfoCache g_GlobalKeyCache(32);
 
 #ifndef Z7_ST
-  static NWindows::NSynchronization::CCriticalSection g_GlobalKeyCacheCriticalSection;
-  #define MT_LOCK NWindows::NSynchronization::CCriticalSectionLock lock(g_GlobalKeyCacheCriticalSection);
+  static std::mutex g_KeyMutex;
+  static std::condition_variable g_KeyReady;
+  struct CKeyFlight {
+    const CKeyInfo &Key;
+    CKeyFlight *Next = nullptr;
+    bool Active = false;
+    static CKeyFlight *First;
+    ~CKeyFlight() {
+      if (!Active) return;
+      std::lock_guard<std::mutex> lock(g_KeyMutex);
+      auto **link = &First;
+      while (*link != this) link = &(*link)->Next;
+      *link = Next;
+      g_KeyReady.notify_all();
+    }
+  };
+  CKeyFlight *CKeyFlight::First = nullptr;
+  #define MT_LOCK std::lock_guard<std::mutex> lock(g_KeyMutex);
 #else
   #define MT_LOCK
 #endif
@@ -183,22 +185,43 @@ CBase::CBase():
 
 void CBase::PrepareKey()
 {
-  // BCJ2 threads use same password. So we use long lock.
-  MT_LOCK
-
-  // Keep the process cache small even when a password comes from a file or
-  // pipe. Oversized keys still benefit from the decoder-local cache.
-  const bool cacheGlobally = _key.Password.Size() <= (4U << 10);
-  bool finded = false;
-  if (!_cachedKeys.GetKey(_key))
+  if (_cachedKeys.GetKey(_key)) return;
+  if (_key.Password.Size() > (4U << 10))
   {
-    finded = cacheGlobally && g_GlobalKeyCache.GetKey(_key);
-    if (!finded)
-      _key.CalcKey();
+    _key.CalcKey();
     _cachedKeys.Add(_key);
+    return;
   }
-  if (cacheGlobally && !finded)
-    g_GlobalKeyCache.FindAndAdd(_key);
+  bool found;
+#ifndef Z7_ST
+  CKeyFlight flight{_key};
+  {
+    std::unique_lock<std::mutex> lock(g_KeyMutex);
+    for (;;) {
+      found = g_GlobalKeyCache.GetKey(_key);
+      if (found) break;
+      auto *same = CKeyFlight::First;
+      while (same && !_key.IsEqualTo(same->Key)) same = same->Next;
+      if (!same) {
+        flight.Next = CKeyFlight::First;
+        CKeyFlight::First = &flight;
+        flight.Active = true;
+        break;
+      }
+      g_KeyReady.wait(lock);
+    }
+  }
+#else
+  found = g_GlobalKeyCache.GetKey(_key);
+#endif
+  if (!found) {
+    // Independent passwords run on their own decoder credits. Simultaneous
+    // consumers of the same password and salt share its published key.
+    _key.CalcKey();
+    MT_LOCK
+    g_GlobalKeyCache.Add(_key);
+  }
+  _cachedKeys.Add(_key);
 }
 
 #ifndef Z7_EXTRACT_ONLY

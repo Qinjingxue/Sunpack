@@ -15,6 +15,7 @@
 
 #include "7zHandler.h"
 #include "7zProperties.h"
+#include "internal/password_proof_property.hpp"
 
 #ifdef Z7_7Z_SET_PROPERTIES
 #ifdef Z7_EXTRACT_ONLY
@@ -619,6 +620,40 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
     case kpidMTime:  SetFileTimeProp_From_UInt64Def(value, _db.MTime, index2); break;
     case kpidAttrib:  if (_db.Attrib.ValidAndDefined(index2)) PropVarEm_Set_UInt32(value, _db.Attrib.Vals[index2]); break;
     case kpidCRC:  if (item.CrcDefined) PropVarEm_Set_UInt32(value, item.Crc); break;
+    case kpidSunpackProofSize:
+    {
+      const CNum folder = _db.FileIndexToFolderIndexMap[index];
+      if (folder != kNumNoIndex && _db.FolderCRCs.ValidAndDefined(folder) &&
+          (index + 1 == _db.Files.Size() || _db.FileIndexToFolderIndexMap[index + 1] != folder))
+        PropVarEm_Set_UInt64(value, _db.GetFolderUnpackSize(folder));
+      else if (item.CrcDefined)
+        PropVarEm_Set_UInt64(value, item.Size);
+      break;
+    }
+    case kpidSunpackProofOffset:
+    case kpidSunpackProofPackedSize:
+    {
+      const CNum folder = _db.FileIndexToFolderIndexMap[index];
+      if (folder == kNumNoIndex) break;
+      if (propID == kpidSunpackProofOffset)
+        PropVarEm_Set_UInt64(value, _db.GetFolderStreamPos(folder, 0));
+      else if (index + 1 == _db.Files.Size() || _db.FileIndexToFolderIndexMap[index + 1] != folder)
+        PropVarEm_Set_UInt64(value, _db.GetFolderFullPackSize(folder));
+      else
+        PropVarEm_Set_UInt64(value, 1); // A partial solid decode starts at the folder.
+      break;
+    }
+    case kpidSunpackAesCopyStart:
+    {
+      COM_TRY_BEGIN
+      const CNum folder = _db.FileIndexToFolderIndexMap[index];
+      CFolder graph;
+      if (folder != kNumNoIndex && _db.NumUnpackStreamsVector[folder] > 1 &&
+          _db.GetSeekableAesCoder(folder, graph) >= 0)
+        PropVarEm_Set_UInt64(value, _db.GetFolderStreamPos(folder, 0));
+      break;
+      COM_TRY_END
+    }
     case kpidEncrypted:  PropVarEm_Set_Bool(value, IsFolderEncrypted(_db.FileIndexToFolderIndexMap[index2])); break;
     case kpidIsAnti:  PropVarEm_Set_Bool(value, _db.IsItemAnti(index2)); break;
     /*

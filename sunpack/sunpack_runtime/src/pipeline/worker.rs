@@ -145,6 +145,8 @@ pub(super) struct WorkerRequest {
     #[serde(serialize_with = "serialize_archive_input")]
     pub archive_input: Arc<ArchiveInput>,
     pub password_candidates: Arc<Vec<Arc<str>>>,
+    #[serde(flatten)]
+    pub layout_passwords: crate::password::evidence::LayoutPasswords,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<Arc<str>>,
     pub password_verified: bool,

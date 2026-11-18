@@ -1,10 +1,9 @@
 use super::PasswordVerification;
 use crate::formats::seven_zip::{
-    predecoded_seven_zip_header_is_supported, RelationNextHeader, SevenZipPasswordProbe,
-    SevenZipPayloadProbe, SevenZipPrefixCheck,
-    SEVEN_Z_HEADER_SIZE, SEVEN_Z_MAGIC,
+    seven_zip_aes_properties, RelationNextHeader, SevenZipAesKey, SevenZipEvidenceReads,
+    SevenZipPrefixCheck, SEVEN_Z_HEADER_SIZE, SEVEN_Z_MAGIC,
 };
-use crate::io::archive_state::InputExtent;
+use crate::io::archive_state::{InputExtent, VolumeAttemptPlan};
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
@@ -62,57 +61,102 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_ranges(
     })
 }
 
-pub(crate) enum SevenZipPasswordContext {
-    Header(SevenZipPasswordProbe),
-    Payload(SevenZipPayloadProbe),
-}
+include!("seven_zip_attempts.rs");
+
+pub(crate) use crate::formats::seven_zip::SevenZipPasswordContext;
+
+type SevenZipKeyCache<'a> =
+    super::evidence::SharedCandidateKeys<(u8, &'a [u8]), Result<SevenZipAesKey, String>>;
 
 impl SevenZipPasswordContext {
-    pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
-        let Self::Header(probe) = self else {
-            let Self::Payload(probe) = self else { unreachable!() };
-            return verify_payload_candidates(candidates, probe);
-        };
-        if let Some((index, outcome)) =
-            find_first_conclusive_header_with_probe(candidates, probe)
-        {
-            return conclusive_status(index, outcome);
+    fn properties(&self) -> &[u8] {
+        match self {
+            Self::Header(probe) => probe.key_properties(),
+            Self::Prefix { probe, .. } => probe.key_properties(),
         }
-        status(
-            "no_match",
-            -1,
-            candidates.len() as i32,
-            "7z encrypted header did not open",
-        )
+    }
+
+    pub(super) fn kdf_parameters(&self) -> Option<(u8, &[u8])> {
+        seven_zip_aes_properties(self.properties()).map(|(cycles, salt, _)| (cycles, salt))
+    }
+
+    pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
+        self.verify_cached(candidates, None)
+    }
+
+    pub(super) fn verify_cached(
+        &self,
+        candidates: &[Arc<str>],
+        cache: Option<&SevenZipKeyCache>,
+    ) -> std::io::Result<PasswordVerification> {
+        let properties = self.properties();
+        let prefix_evidence = match self {
+            Self::Header(_) => None,
+            Self::Prefix { header, .. } => Some(if *header {
+                "7z_header_prefix"
+            } else {
+                "7z_payload_prefix"
+            }),
+        };
+        let shared = cache.and_then(|cache| {
+            let (cycles, salt, iv) = seven_zip_aes_properties(properties)?;
+            Some((cache.cells(&(cycles, salt), candidates.len())?, iv))
+        });
+        collect_candidates(candidates, prefix_evidence, |index, password| {
+            if prefix_evidence.is_none() && password.is_empty() {
+                return Ok(SevenZipPrefixCheck::Reject);
+            }
+            let key = match shared {
+                Some((cells, iv)) => cells[index]
+                    .get_or_init(|| SevenZipAesKey::derive(properties, password))
+                    .as_ref()
+                    .map_err(Clone::clone)?
+                    .with_iv(iv),
+                None => SevenZipAesKey::derive(properties, password)?,
+            };
+            match self {
+                Self::Header(probe) => probe.check_header(&key).map(|matched| {
+                    if matched {
+                        SevenZipPrefixCheck::Confirmed
+                    } else {
+                        SevenZipPrefixCheck::Reject
+                    }
+                }),
+                Self::Prefix { probe, .. } => probe.test_with_key(&key),
+            }
+        })
     }
 }
 
-fn verify_payload_candidates(
+fn collect_candidates(
     candidates: &[Arc<str>],
-    probe: &SevenZipPayloadProbe,
-) -> std::io::Result<PasswordVerification> {
-    collect_payload_candidates(candidates, probe.is_strong(), |password| probe.test(password))
-}
-
-fn collect_payload_candidates(
-    candidates: &[Arc<str>],
-    strong: bool,
-    check: impl Fn(&str) -> Result<SevenZipPrefixCheck, String> + Sync,
+    prefix_evidence: Option<&'static str>,
+    check: impl Fn(usize, &str) -> Result<SevenZipPrefixCheck, String> + Sync,
 ) -> std::io::Result<PasswordVerification> {
     let cancellation = Cancellation::current();
     cancellation.check_io()?;
+    let strong = prefix_evidence.is_none();
     let test = |(index, password): (usize, &Arc<str>)| {
-        cancellation.run(|| match check(password) {
+        cancellation.run(|| match check(index, password) {
             Ok(SevenZipPrefixCheck::Reject) => None,
             outcome => Some((index, outcome)),
         })
     };
     let search = || {
         if strong {
-            candidates.par_iter().enumerate().filter_map(test).find_first(|_| true)
-                .into_iter().collect::<Vec<_>>()
+            candidates
+                .par_iter()
+                .enumerate()
+                .filter_map(test)
+                .find_first(|_| true)
+                .into_iter()
+                .collect::<Vec<_>>()
         } else {
-            candidates.par_iter().enumerate().filter_map(test).collect::<Vec<_>>()
+            candidates
+                .par_iter()
+                .enumerate()
+                .filter_map(test)
+                .collect::<Vec<_>>()
         }
     };
     let matches = if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
@@ -121,27 +165,53 @@ fn collect_payload_candidates(
             None => search(),
         }
     } else if strong {
-        candidates.iter().enumerate().find_map(test).into_iter().collect()
+        candidates
+            .iter()
+            .enumerate()
+            .find_map(test)
+            .into_iter()
+            .collect()
     } else {
         candidates.iter().enumerate().filter_map(test).collect()
     };
     cancellation.check_io()?;
+    if let Some((index, _)) = matches
+        .iter()
+        .find(|(_, value)| matches!(value, Ok(SevenZipPrefixCheck::Confirmed)))
+    {
+        return Ok(PasswordVerification {
+            matched_index: Some(*index),
+            matched_indices: vec![*index],
+            attempts: if strong { index + 1 } else { candidates.len() },
+            final_confirmation_required: Some(false),
+            match_evidence: Some("7z_encrypted_header"),
+            ..PasswordVerification::status("match", "7z password confirmed by complete evidence")
+        });
+    }
     // An I/O/resource failure is not password evidence. Hand the entire batch
     // to the existing worker fallback rather than caching false rejections.
     if let Some(message) = matches.iter().find_map(|(_, value)| value.as_ref().err()) {
-        return status("unknown_needs_final_verifier", -1, 0, message);
+        return Ok(PasswordVerification::status(
+            "unknown_needs_final_verifier",
+            message,
+        ));
     }
     let Some((first, _)) = matches.first() else {
-        return status("no_match", -1, candidates.len() as i32, "7z payload prescreen rejected candidates");
+        return Ok(PasswordVerification {
+            attempts: candidates.len(),
+            ..PasswordVerification::status("no_match", "7z prescreen rejected candidates")
+        });
     };
     Ok(PasswordVerification {
         matched_index: Some(*first),
         matched_indices: matches.iter().map(|(index, _)| *index).collect(),
         attempts: if strong { first + 1 } else { candidates.len() },
         final_confirmation_required: Some(true),
-        defer_remaining: strong,
-        match_evidence: Some(if strong { "7z_payload_strong_prescreen" } else { "7z_payload_prefix" }),
-        ..PasswordVerification::status("match", "7z payload candidates require extraction confirmation")
+        match_evidence: prefix_evidence,
+        ..PasswordVerification::status(
+            "match",
+            "7z payload candidates require extraction confirmation",
+        )
     })
 }
 
@@ -173,39 +243,61 @@ fn prepare_seven_zip<R: Read + Seek>(
         FieldLocation::Head,
     )?;
     let next = seven_zip_tail_requirement(&start_header, total_len)?;
-    // Reuse the start header for the existing bounded descriptor. Encrypted headers
-    // need no preliminary Archive::read (which reparses the same coder graph).
-    // Keep the original parser only for plaintext and unsupported graphs.
-    let probe_error = if std::env::var_os("SUNPACK_DISABLE_7Z_PASSWORD_PROBE").is_some() {
-        "7z password probe is disabled".into()
-    } else if start_header[6] == 0 {
-        match SevenZipPasswordProbe::from_header(&mut reader, total_len, &start_header, next) {
-            Ok(probe) => return Ok(SevenZipPasswordContext::Header(probe)),
+    let enabled = start_header[6] == 0
+        && crc32fast::hash(&start_header[12..32])
+            == u32::from_le_bytes(start_header[8..12].try_into().unwrap());
+    prepare_seven_zip_descriptor(&mut reader, total_len, next, enabled, &()).map_err(|error| {
+        match error {
+            PreparedStatus::Status("invalid_volume_evidence", message) => {
+                PreparedStatus::new("damaged", message)
+            }
+            other => other,
+        }
+    })
+}
+
+fn prepare_seven_zip_descriptor<R: Read + Seek>(
+    reader: &mut R,
+    total_len: u64,
+    next: RelationNextHeader,
+    supported: bool,
+    evidence: &impl SevenZipEvidenceReads<R>,
+) -> Result<SevenZipPasswordContext, PreparedStatus> {
+    let probe_error = if supported {
+        let enabled = std::env::var_os("SUNPACK_DISABLE_7Z_PASSWORD_PROBE").is_none();
+        match SevenZipPasswordContext::from_next_header(reader, total_len, next, enabled, evidence)
+        {
+            Ok(Some(context)) => return Ok(context),
+            Ok(None) => {
+                return Err(PreparedStatus::new(
+                    "not_required",
+                    "7z header is readable without password",
+                ))
+            }
+            Err(message)
+                if matches!(
+                    message.as_ref(),
+                    "7z next header crc mismatch" | "7z packed stream crc mismatch"
+                ) =>
+            {
+                return Err(PreparedStatus::new("invalid_volume_evidence", message));
+            }
+            Err(message)
+                if message.starts_with("resource_unavailable:")
+                    || message == "7z payload has no supported prescreen evidence" =>
+            {
+                return Err(PreparedStatus::new("unknown_needs_final_verifier", message));
+            }
             Err(message) => message,
         }
     } else {
-        "7z password probe signature or version is unsupported".into()
+        "7z password probe start header is unsupported".into()
     };
-    if probe_error.starts_with("resource_unavailable:") {
-        return Err(PreparedStatus::new(
-            "unknown_needs_final_verifier",
-            probe_error,
-        ));
-    }
-    if std::env::var_os("SUNPACK_DISABLE_7Z_PASSWORD_PROBE").is_none() && start_header[6] == 0 {
-        match SevenZipPayloadProbe::from_header(&mut reader, total_len, &start_header, next) {
-            Ok(probe) => return Ok(SevenZipPasswordContext::Payload(probe)),
-            Err(message) if message.starts_with("resource_unavailable:") => {
-                return Err(PreparedStatus::new("unknown_needs_final_verifier", message));
-            }
-            Err(_) => {}
-        }
-    }
     reader.seek(SeekFrom::Start(0)).map_err(|error| {
         ReadFault::from_io(error, "seek", 0, 0, 0, total_len)
             .with_field("7z.start_header", FieldLocation::Head)
     })?;
-    match read_archive_header_from_reader(&mut reader, "") {
+    match read_archive_header_from_reader(reader, "") {
         HeaderRead::Ok {
             payload_encrypted: false,
         } => {
@@ -264,64 +356,6 @@ fn seven_zip_tail_requirement(
     Ok(next)
 }
 
-fn find_first_conclusive_header_with_probe(
-    candidates: &[Arc<str>],
-    probe: &SevenZipPasswordProbe,
-) -> Option<(usize, Result<(), String>)> {
-    let cancellation = Cancellation::current();
-    if cancellation.cancelled() {
-        return None;
-    }
-    let test = |(index, password): (usize, &Arc<str>)| {
-        cancellation.run(
-            || match probe.decoded_header_if_password_matches(password) {
-                Ok(Some(decoded)) => Some((index, Ok(decoded))),
-                Ok(None) => None,
-                Err(error) => Some((index, Err(error))),
-            },
-        )
-    };
-    let possible = if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
-        let search = || {
-            candidates
-                .par_iter()
-                .enumerate()
-                .filter_map(test)
-                .find_first(|_| true)
-        };
-        match seven_zip_password_pool() {
-            Some(pool) => pool.install(search),
-            None => search(),
-        }
-    } else {
-        candidates.iter().enumerate().find_map(test)
-    }?;
-    Some((
-        possible.0,
-        possible.1.and_then(|decoded| {
-            predecoded_seven_zip_header_is_supported(&decoded)
-                .then_some(())
-                .ok_or_else(|| "7z decoded header requires extraction confirmation".into())
-        }),
-    ))
-}
-
-fn conclusive_status(index: usize, outcome: Result<(), String>) -> std::io::Result<PasswordVerification> {
-    match outcome {
-        Ok(()) => status_with_details(
-            "match",
-            index as i32,
-            (index + 1) as i32,
-            "7z encrypted header opened",
-            Some(false),
-            Some("7z_encrypted_header"),
-        ),
-        Err(message) => {
-            status("unknown_needs_final_verifier", -1, index as i32, &message)
-        }
-    }
-}
-
 fn read_archive_header_from_reader<R: Read + Seek>(mut reader: R, password: &str) -> HeaderRead {
     match Archive::read(&mut reader, &Password::from(password)) {
         Ok(archive) => HeaderRead::Ok {
@@ -351,32 +385,6 @@ fn read_archive_header_from_reader<R: Read + Seek>(mut reader: R, password: &str
             "7z header-only verifier could not classify error: {error}"
         )),
     }
-}
-
-fn status(
-    status: &'static str,
-    matched_index: i32,
-    attempts: i32,
-    message: &str,
-) -> std::io::Result<PasswordVerification> {
-    status_with_details(status, matched_index, attempts, message, None, None)
-}
-
-fn status_with_details(
-    status: &'static str,
-    matched_index: i32,
-    attempts: i32,
-    message: &str,
-    final_confirmation_required: Option<bool>,
-    match_evidence: Option<&'static str>,
-) -> std::io::Result<PasswordVerification> {
-    Ok(PasswordVerification {
-        matched_index: usize::try_from(matched_index).ok(),
-        attempts: attempts as usize,
-        final_confirmation_required,
-        match_evidence,
-        ..PasswordVerification::status(status, message)
-    })
 }
 
 #[cfg(test)]

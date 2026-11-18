@@ -653,6 +653,7 @@ impl ManagedReader {
 
 }
 
+#[derive(Clone)]
 pub(crate) struct NativeArchiveSession {
     path: String,
     reader: ManagedReader,

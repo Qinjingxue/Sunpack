@@ -974,6 +974,9 @@ fn project_proposal(
     let anchors = &validation.facts.anchors;
     let style = proposal_split_family(proposal, anchors);
     input.analysis.zip_spanned = style == "zip_spanned";
+    input.analysis.rar_native_volume = proposal.format == "rar" && proposal.head_path()
+        .and_then(|path| anchors.get(&path_key(path)))
+        .is_some_and(|head| head.has_any(RAR_OLD_NUMBERING | RAR_PART_NUMBERING));
     input.mode = if style == "rar_sfx_part" {
         OpenMode::SfxWithVolumes
     } else {

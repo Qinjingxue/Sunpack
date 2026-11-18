@@ -11,7 +11,7 @@ namespace sunpack::sevenzip
         ExtractInputTrace *trace,
         const std::vector<std::wstring> &canonical_names,
         InputPrefetchConfig prefetch_config,
-        const std::vector<ExtractInputRange> &input_ranges)
+        const std::vector<ExtractInputRange> &input_ranges, VolumeReadUncertainty* probe_reads)
     {
         const bool multipart = !part_paths.empty() && !(part_paths.size() == 1 && part_paths.front() == archive_path);
         const bool structured_order = !canonical_names.empty();
@@ -33,7 +33,7 @@ namespace sunpack::sevenzip
         };
         if (use_ranges)
         {
-            return opened_stream(new MultiRangeInStream(input_ranges, trace, prefetch_config));
+            return opened_stream(new MultiRangeInStream(input_ranges, trace, prefetch_config, false, probe_reads));
         }
         if (sfx_first)
         {

@@ -218,17 +218,15 @@ fn header_prescreen_and_full_crc_share_one_candidate_scoped_key() {
         };
         for password in ["wrong", "secret", "secret"] {
             SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.set(0));
-            let result = probe.decoded_header_if_password_matches(password).unwrap();
-            assert_eq!(result.is_some(), password == "secret");
+            let key = SevenZipAesKey::derive(probe.key_properties(), password).unwrap();
+            assert_eq!(probe.check_header(&key).unwrap(), password == "secret");
             // The prefix survivor must not derive again in the full decoder;
             // repeated requests have no hidden global retained-key state.
             assert_eq!(SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.get()), 1);
         }
         probe.folder.expected_crc = Some(probe.folder.expected_crc.unwrap() ^ 1);
-        assert!(probe
-            .decoded_header_if_password_matches("secret")
-            .unwrap()
-            .is_none());
+        let key = SevenZipAesKey::derive(probe.key_properties(), "secret").unwrap();
+        assert!(!probe.check_header(&key).unwrap());
     }
 }
 

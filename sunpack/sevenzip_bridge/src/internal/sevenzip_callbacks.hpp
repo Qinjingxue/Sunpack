@@ -13,6 +13,7 @@
 #include <exception>
 
 #ifdef _WIN32
+#include "password_proof_property.hpp"
 
 #include <algorithm>
 #include <deque>
@@ -98,14 +99,14 @@ namespace sunpack::sevenzip
             const std::vector<std::wstring> &canonical_names = {},
             InputPrefetchConfig volume_prefetch_config = input_prefetch_config(),
             std::shared_ptr<std::atomic<bool>> cancel_token = native_job_cancel_token(),
-            const std::vector<ExtractInputRange> &part_ranges = {})
+            const std::vector<ExtractInputRange> &part_ranges = {}, VolumeReadUncertainty* probe_reads = nullptr)
 
             : password_(std::move(password)),
 
               archive_path_(std::move(archive_path)),
 
               part_paths_(part_paths.empty() ? nullptr : &part_paths),
-              part_ranges_(part_ranges.empty() ? nullptr : &part_ranges),
+              part_ranges_(part_ranges.empty() ? nullptr : &part_ranges), probe_reads_(probe_reads),
 
               volume_prefetch_config_(volume_prefetch_config), cancel_token_(std::move(cancel_token))
         {
@@ -147,6 +148,8 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE GetStream(const wchar_t *name, IInStream **inStream) SUP7Z_NOEXCEPT override
         {
+            // Named-volume existence and physical stream sizes also affect Open.
+            if (probe_reads_) probe_reads_->uncertain_read.store(true, std::memory_order_relaxed);
 
             if (!inStream)
             {
@@ -171,7 +174,9 @@ namespace sunpack::sevenzip
                 {
                     missing_volume_requested_ = true;
                     missing_volume_name_ = std::move(requested_name);
-                    return E_FAIL;
+                    // A missing continuation lets the handler finish indexing
+                    // complete members from available volumes.
+                    return S_FALSE;
                 }
 
                 const auto *range = part_ranges_ && *index < part_ranges_->size() ? &(*part_ranges_)[*index] : nullptr;
@@ -280,6 +285,7 @@ namespace sunpack::sevenzip
         // releases this callback, including the password batch's cache.
         const std::vector<std::wstring> *part_paths_;
         const std::vector<ExtractInputRange> *part_ranges_;
+        VolumeReadUncertainty* probe_reads_;
         const std::vector<std::wstring> *canonical_names_ = nullptr;
 
         const InputPrefetchConfig volume_prefetch_config_;
@@ -965,12 +971,16 @@ namespace sunpack::sevenzip
             if (is_hard_link)
                 hard_link = prop_text(value);
             clear_prop(value);
-            // CRC availability proves a password only on an encrypted
-            // payload. RAR5's payload-less link record cannot prove it.
-            bool has_source_crc32 = false;
+            // A payload checksum or MAC can confirm its password.
+            // RAR5 link records carry no encrypted payload.
+            bool strong_password_proof = false;
             if (encrypted && !is_hard_link)
             {
-                has_source_crc32 = get_item_property(archive_, index, kpidCRC, value);
+                strong_password_proof = get_item_property(archive_, index, kpidSunpackProofSize, value) &&
+                    strong_member_crc(prop_u64(value));
+                clear_prop(value);
+                if (!strong_password_proof)
+                    strong_password_proof = get_item_property(archive_, index, kpidSunpackMacPackedSize, value);
                 clear_prop(value);
             }
 
@@ -992,7 +1002,7 @@ namespace sunpack::sevenzip
             encrypted_ |= encrypted;
             item.expected_size = expected_size;
             item.has_expected_size = has_expected_size;
-            item.has_source_crc32 = has_source_crc32;
+            item.strong_password_proof = strong_password_proof;
             // Keep names only for potential hard-link targets. Positions
             // correspond to trace entries, including empty directory slots.
             if (supports_hard_links_)

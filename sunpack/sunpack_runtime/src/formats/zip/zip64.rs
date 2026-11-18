@@ -106,6 +106,15 @@ pub(crate) fn locate_end_record<B: AsRef<[u8]>>(
         Some(starts) => *starts.get(locator.record_disk as usize).ok_or(())?,
         None => 0,
     };
+    locate_record_before(locator_offset, base, locator, read).map(Some)
+}
+
+pub(crate) fn locate_record_before<B: AsRef<[u8]>>(
+    locator_offset: u64,
+    base: u64,
+    locator: Locator,
+    mut read: impl FnMut(u64, usize) -> Result<B, ()>,
+) -> Result<LocatedEndRecord, ()> {
     let declared = base.checked_add(locator.record_offset).ok_or(())?;
     let check = |offset: u64, fixed: &[u8]| -> Result<Option<LocatedEndRecord>, ()> {
         if fixed.len() < 56 || !fixed.starts_with(b"PK\x06\x06") {
@@ -135,7 +144,7 @@ pub(crate) fn locate_end_record<B: AsRef<[u8]>>(
             .is_some_and(|end| end <= locator_offset)
         {
             if let Some(found) = check(offset, read(offset, 56)?.as_ref())? {
-                return Ok(Some(found));
+                return Ok(found);
             }
         }
     }
@@ -149,7 +158,7 @@ pub(crate) fn locate_end_record<B: AsRef<[u8]>>(
         let window = window.as_ref();
         for index in memchr::memmem::rfind_iter(window, b"PK\x06\x06") {
             if let Some(found) = check(start + index as u64, &window[index..])? {
-                return Ok(Some(found));
+                return Ok(found);
             }
         }
         end = start;

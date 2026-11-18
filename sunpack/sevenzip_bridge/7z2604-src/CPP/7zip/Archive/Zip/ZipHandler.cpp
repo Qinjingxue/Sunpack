@@ -43,6 +43,7 @@
 #include "ZipHandler.h"
 
 #include "internal/zlib_ng_deflate_decoder.h"
+#include "internal/password_proof_property.hpp"
 
 using namespace NWindows;
 
@@ -511,6 +512,24 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
     }
     
     case kpidCRC:  if (item.IsThereCrc()) prop = item.Crc; break;
+    case kpidSunpackProofSize:
+      if (!item.IsBadDescriptor() && item.IsThereCrc()) prop = item.Size;
+      break;
+    case kpidSunpackMacPackedSize:
+    {
+      CWzAesExtra aes;
+      if (item.IsEncrypted() && item.Method == NFileHeader::NCompressionMethod::kWzAES &&
+          extra.GetWzAes(aes) && (aes.VendorVersion == 1 || aes.VendorVersion == 2))
+        prop = item.PackSize;
+      break;
+    }
+    case kpidSunpackProofOffset:
+      prop = m_Archive.IsMultiVol ? item.LocalHeaderPos :
+          (UInt64)((Int64)item.LocalHeaderPos + m_Archive.ArcInfo.Base);
+      break;
+    case kpidSunpackProofPackedSize:
+      prop = item.PackSize + item.LocalFullHeaderSize;
+      break;
     
     case kpidMethod:
     {
@@ -900,7 +919,7 @@ public:
     #ifndef Z7_ST
     UInt32 numThreads, UInt64 memUsage,
     #endif
-    Int32 &res);
+    bool authenticateOnly, Int32 &res);
 };
 
 
@@ -1000,7 +1019,7 @@ HRESULT CZipDecoder::Decode(
     #ifndef Z7_ST
     UInt32 numThreads, UInt64 memUsage,
     #endif
-    Int32 &res)
+    bool authenticateOnly, Int32 &res)
 {
   res = NExtract::NOperationResult::kHeadersError;
   
@@ -1025,7 +1044,7 @@ HRESULT CZipDecoder::Decode(
   {
     if (item.GetMainExtra().GetWzAes(aesField))
     {
-      if (!item.IsEncrypted())
+      if (!item.IsEncrypted() || (aesField.VendorVersion != 1 && aesField.VendorVersion != 2))
       {
         res = NExtract::NOperationResult::kUnsupportedMethod;
         return S_OK;
@@ -1164,6 +1183,39 @@ HRESULT CZipDecoder::Decode(
     }
   }
   
+  if (wzAesMode)
+  {
+    const HRESULT headerResult = _wzAesDecoder->ReadHeader(inStream);
+    if (headerResult == S_FALSE) { res = NExtract::NOperationResult::kUnexpectedEnd; return S_OK; }
+    RINOK(headerResult)
+    if (!_wzAesDecoder->Init_and_CheckPassword())
+    {
+      res = NExtract::NOperationResult::kWrongPassword;
+      return S_OK;
+    }
+    if (authenticateOnly)
+    {
+      Byte bytes[1 << 15];
+      while (inStream->GetRem())
+      {
+        UInt32 read = 0;
+        RINOK(inStream.Interface()->Read(bytes, sizeof(bytes), &read))
+        if (!read)
+        {
+          res = NExtract::NOperationResult::kUnexpectedEnd;
+          return S_OK;
+        }
+        _wzAesDecoder->Authenticate(bytes, read);
+        const UInt64 position = inStream->GetSize();
+        RINOK(compressProgress->SetRatioInfo(&position, NULL))
+      }
+      bool valid = false;
+      RINOK(_wzAesDecoder->CheckMac(packStream, valid))
+      res = valid ? NExtract::NOperationResult::kOK : NExtract::NOperationResult::kCRCError;
+      return S_OK;
+    }
+  }
+
   const bool useSunpackZlibNg = UseSunpackZlibNgDeflate(id, item);
   const unsigned methodCacheKey = useSunpackZlibNg
       ? kSunpackZlibNgDeflateCacheKey
@@ -1293,19 +1345,7 @@ HRESULT CZipDecoder::Decode(
       filterReleaser.FilterCoder = filterStream.ClsPtr();
       filterStream->Filter = cryptoFilter;
       
-      if (wzAesMode)
-      {
-        result = _wzAesDecoder->ReadHeader(inStream);
-        if (result == S_OK)
-        {
-          if (!_wzAesDecoder->Init_and_CheckPassword())
-          {
-            res = NExtract::NOperationResult::kWrongPassword;
-            return S_OK;
-          }
-        }
-      }
-      else if (pkAesMode)
+      if (pkAesMode)
       {
         isFullStreamExpected = false;
         result = _pkAesDecoder->ReadHeader(inStream, item.Crc, item.Size);
@@ -1320,7 +1360,7 @@ HRESULT CZipDecoder::Decode(
           }
         }
       }
-      else
+      else if (!wzAesMode)
       {
         result = _zipCryptoDecoder->ReadHeader(inStream);
         if (result == S_OK)
@@ -1693,7 +1733,7 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
         #ifndef Z7_ST
         _props._numThreads, _props._memUsage_Decompress,
         #endif
-        opRes);
+        testMode == kSunpackVerifyMember, opRes);
     
     RINOK(hres)
     // realOutStream.Release();

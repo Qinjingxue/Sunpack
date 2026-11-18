@@ -47,10 +47,17 @@ enum class PasswordTestStatus {
     NeedsVolumeOrTailDamaged,
 };
 
+// For shorter plaintext a CRC match carries at most eight bits per byte.
+inline constexpr bool strong_member_crc(unsigned long long bytes) { return bytes >= 4; }
+
 struct PasswordTestResult {
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
     bool encrypted = false;
     bool missing_volume = false;
+    bool weak_match = false;
+    bool password_independent_failure = false;
+    bool rejects_fixed_geometry = false;
+    std::vector<std::size_t> possible_candidates;
     int matched_index = -1;
     int operation_result = 0;
     std::wstring archive_type;
@@ -83,7 +90,7 @@ struct ExtractOutputItemTrace {
     bool is_dir = false;
     bool encrypted = false;
     bool has_expected_size = false;
-    bool has_source_crc32 = false;
+    bool strong_password_proof = false;
     bool done = false;
     bool failed = false;
     bool has_mtime_ns = false;
@@ -137,6 +144,7 @@ struct ExtractInputRange {
     bool has_end = false;
 };
 
+struct VolumeAttemptPlan;
 PasswordTestResult test_password_batch(
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
@@ -145,7 +153,9 @@ PasswordTestResult test_password_batch(
     const std::wstring* candidates,
     std::size_t candidate_count,
     const std::vector<std::wstring>& canonical_names,
-    bool scan_only = false
+    bool scan_only = false, bool final_read_only = false,
+    const std::size_t* candidate_indices = nullptr,
+    const VolumeAttemptPlan* volume_plan = nullptr
 );
 
 ExtractArchiveResult extract_archive(

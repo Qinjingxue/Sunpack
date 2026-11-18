@@ -282,7 +282,7 @@ void check_open_callback_canonical_range()
     check(single->GetStream(basename.c_str(), &source) == S_OK && source,
           "single-file callback resolves the entry basename without a parts list");
     CMyComPtr<IInStream> missing;
-    check(single->GetStream(name.c_str(), &missing) == E_FAIL && !missing &&
+    check(single->GetStream(name.c_str(), &missing) == S_FALSE && !missing &&
           single->missing_volume_name() == name && single->input_error() == S_OK,
           "single-file callback reports an unlisted volume through missing-volume evidence");
 
