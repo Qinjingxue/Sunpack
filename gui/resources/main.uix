@@ -655,6 +655,7 @@ export default {
     tagValues(f) { f=this.tagField(f); return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
     changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); if(this.configQuery) this.send('refreshSearch'); },
     saveTags(f,values) {
+      // Save writes this JSON token directly into the single-line filter module.
       f=this.tagField(f); this.changeField(f,JSON.stringify(values));
       this.send('syncTags',{id:f.id}); this.commitField(f);
     },

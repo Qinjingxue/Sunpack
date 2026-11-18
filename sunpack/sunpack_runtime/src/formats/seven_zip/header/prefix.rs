@@ -273,18 +273,17 @@ fn seven_zip_lzma2_chunk(
         Ok(Some((size, chunk_end as u64)))
 }
 
-fn seven_zip_has_block_successor(method: &[u8]) -> bool {
-    matches!(method, [0x21] | [0x04, 0xf7, 0x11, 0x04 | 0x01])
-}
-
 // Each extra read is derived from an already checked codec length. There is
 // no magic scan, decompression, or dependence on the intervening block body.
+// Keep the full packed length for structure checks when only an unchanged
+// prefix can be read before a preprocessing filter.
 pub(crate) fn seven_zip_successor_prefix<E>(
-    method: &[u8], prefix: &[u8], packed: u64, unpacked: u64,
+    method: &[u8], prefix: &[u8], packed: u64, unpacked: u64, readable: u64,
     mut read: impl FnMut(u64, &mut [u8]) -> Result<(), E>,
     mut still_ambiguous: impl FnMut(u64) -> bool,
 ) -> Result<SevenZipPrefixCheck, E> {
     use SevenZipPrefixCheck::{Reject, Strong, Weak};
+    let available_at = |at| readable.saturating_sub(at);
     if method == [0x21] {
         let mut need_init = 0xe0;
         let mut chunk = seven_zip_lzma2_chunk(prefix, packed, unpacked, &mut need_init);
@@ -306,7 +305,10 @@ pub(crate) fn seven_zip_successor_prefix<E>(
                 Err(()) => return Ok(Reject),
             }
             let mut header = [0; 11];
-            let len = (packed - next).min(header.len() as u64) as usize;
+            let len = available_at(next).min(header.len() as u64) as usize;
+            if len == 0 {
+                return Ok(Weak);
+            }
             read(next, &mut header[..len])?;
             chunk = seven_zip_lzma2_chunk(&header[..len], packed - next, unpacked, &mut need_init);
         }
@@ -314,11 +316,12 @@ pub(crate) fn seven_zip_successor_prefix<E>(
     let is_lz4 = method == [0x04, 0xf7, 0x11, 0x04];
     let mut offset = 0;
     let mut step = seven_zip_frame_step(prefix, packed, is_lz4);
-    if matches!(step, Ok(None)) && (prefix.len() as u64) < packed {
+    let header_size = readable.min(32) as usize;
+    if matches!(step, Ok(None)) && prefix.len() < header_size {
         let mut header = [0; 32];
-        let size = packed.min(header.len() as u64) as usize;
-        read(0, &mut header[..size])?;
-        step = seven_zip_frame_step(&header[..size], packed, is_lz4);
+        header[..prefix.len()].copy_from_slice(prefix);
+        read(prefix.len() as u64, &mut header[prefix.len()..header_size])?;
+        step = seven_zip_frame_step(&header[..header_size], packed, is_lz4);
     }
     let mut checked_successor = false;
     loop {
@@ -327,11 +330,11 @@ pub(crate) fn seven_zip_successor_prefix<E>(
                 packed - offset == span || !still_ambiguous(offset + span) => return Ok(Strong),
             Ok(Some(SevenZipFrameStep::Skip(span) | SevenZipFrameStep::Last(span))) => {
                 offset += span;
-                if packed - offset < 4 {
+                if available_at(offset) < 4 {
                     return Ok(Weak);
                 }
                 let mut header = [0; 32];
-                let size = (packed - offset).min(header.len() as u64) as usize;
+                let size = available_at(offset).min(header.len() as u64) as usize;
                 read(offset, &mut header[..size])?;
                 seven_zip_frame_step(&header[..size], packed - offset, is_lz4)
             }
@@ -340,6 +343,9 @@ pub(crate) fn seven_zip_successor_prefix<E>(
                     return Ok(Strong);
                 }
                 let mut header = [0; 4];
+                if available_at(offset + next) < header.len() as u64 {
+                    return Ok(Weak);
+                }
                 read(offset + next, &mut header)?;
                 checked_successor = true;
                 seven_zip_lz4_block(&frame, u32::from_le_bytes(header), packed - offset - next - 4)
@@ -353,6 +359,9 @@ pub(crate) fn seven_zip_successor_prefix<E>(
                     return Ok(Strong);
                 }
                 let mut header = [0; 3];
+                if available_at(offset + next) < header.len() as u64 {
+                    return Ok(Weak);
+                }
                 read(offset + next, &mut header)?;
                 checked_successor = true;
                 seven_zip_zstd_block(&frame, header, packed - offset - next - 3)

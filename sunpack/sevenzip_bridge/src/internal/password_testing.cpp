@@ -102,13 +102,16 @@ namespace sunpack::sevenzip
             UInt64 coverage;
             bool weak;
             bool variable;
+            bool auxiliary = false;
             bool operator<(const MemberProof& other) const {
+                // Optional metadata is only useful when ordinary members cannot be tested.
+                if (auxiliary != other.auxiliary) return !auxiliary;
                 if (weak != other.weak) return !weak;
                 // Unknown lengths can supply a strong proof after decoding.
                 // Prefer these to a checksum known to cover only a few bytes.
                 if (weak && coverage != other.coverage) return coverage > other.coverage;
-                if (cost != other.cost) return cost < other.cost;
                 if (variable != other.variable) return variable;
+                if (cost != other.cost) return cost < other.cost;
                 return index < other.index;
             }
         };
@@ -298,8 +301,11 @@ namespace sunpack::sevenzip
                         cost += (std::min)(prop_u64(value), UINT64_MAX - cost);
                     clear_prop(value);
                 }
+                const bool auxiliary = !final_read_only && rar5 && index + 1 == selection.item_count &&
+                    get_item_property(archive, index, kpidIsAux, value) && prop_bool(value);
+                clear_prop(value);
                 MemberProof member{index, cost, coverage,
-                    !authenticated && (measured || !strong_member_crc(coverage)), variable};
+                    !authenticated && (measured || !strong_member_crc(coverage)), variable, auxiliary};
                 if (!best || member < *best) best = member;
                 if (alternatives) alternatives->push_back(member);
             }
@@ -382,6 +388,31 @@ namespace sunpack::sevenzip
             return error;
         }
 
+        std::optional<UInt32> next_copy_crc(IInArchive* archive, UInt32 index, UInt32 count)
+        {
+            PROPVARIANT value{};
+            if (index + 1 >= count || !get_item_property(archive, index, kpidBlock, value)) return {};
+            const auto folder = prop_u32(value);
+            clear_prop(value);
+            if (!get_item_property(archive, index, kpidSunpackAesCopyStart, value) || value.vt != VT_UI8) {
+                clear_prop(value);
+                return {};
+            }
+            clear_prop(value);
+            // Streamless items within this folder share its block index but
+            // cannot contribute any plaintext checksum evidence.
+            for (++index; index < count; ++index) {
+                const bool same_folder = get_item_property(archive, index, kpidBlock, value) &&
+                    value.vt == VT_UI4 && prop_u32(value) == folder;
+                clear_prop(value);
+                if (!same_folder) break;
+                const auto coverage = get_item_property(archive, index, kpidSunpackProofSize, value) ? prop_u64(value) : 0;
+                clear_prop(value);
+                if (coverage && coverage <= sizeof(UInt32)) return index;
+            }
+            return {};
+        }
+
         void probe_opened_archive(
             IInArchive *archive, BoundedPasswordProbeSelection &selection,
             const std::wstring &password, bool &encryption_evidence, bool final_read_only,
@@ -404,44 +435,22 @@ namespace sunpack::sevenzip
                 hr == S_OK && raw_callback->operation_result() == kOpOk && !FAILED(probe_read_error(open, trace, hr))) {
                 // A seekable AES/Copy substream can verify another CRC with
                 // the same key without decoding the solid prefix again.
-                PROPVARIANT block{};
-                if (get_item_property(archive, *selection.index, kpidBlock, block) && block.vt == VT_UI4) {
-                    const auto folder = prop_u32(block);
-                    clear_prop(block);
-                    const auto next = *selection.index + 1;
-                    PROPVARIANT proof{};
-                    PROPVARIANT copy{};
-                    if (next < selection.item_count &&
-                        get_item_property(archive, next, kpidBlock, block) &&
-                        block.vt == VT_UI4 && prop_u32(block) == folder &&
-                        get_item_property(archive, next, kpidSunpackAesCopyStart, copy) &&
-                        copy.vt == VT_UI8 &&
-                        get_item_property(archive, next, kpidSunpackProofSize, proof) &&
-                        prop_u64(proof) != 0 &&
-                        prop_u64(proof) <= sizeof(UInt32)) {
-                        auto *second = new ExtractCallback(password);
-                        CMyComPtr<IArchiveExtractCallback> second_callback(second);
-                        const auto second_hr = archive->Extract(&next, 1, kSunpackVerifyMember, second_callback);
-                        const auto second_read = probe_read_error(open, trace, second_hr);
-                        if (FAILED(second_read)) {
-                            volumes.incomplete_read.store(true, std::memory_order_relaxed);
-                            trace.read_hresult = 0;
-                            open.clear_input_error();
-                        } else if (second_hr == S_OK && (second->operation_result() == kOpWrongPassword ||
-                                                  second->operation_result() == kOpCrcError)) {
-                            hr = second_hr;
-                            operation = second->operation_result();
-                            encryption_evidence = true;
-                            clear_prop(proof);
-                            clear_prop(copy);
-                            clear_prop(block);
-                            return;
-                        }
+                if (const auto next = next_copy_crc(archive, *selection.index, selection.item_count)) {
+                    auto *second = new ExtractCallback(password);
+                    CMyComPtr<IArchiveExtractCallback> second_callback(second);
+                    const auto second_hr = archive->Extract(&*next, 1, kSunpackVerifyMember, second_callback);
+                    if (FAILED(probe_read_error(open, trace, second_hr))) {
+                        volumes.incomplete_read.store(true, std::memory_order_relaxed);
+                        trace.read_hresult = 0;
+                        open.clear_input_error();
+                    } else if (second_hr == S_OK && (second->operation_result() == kOpWrongPassword ||
+                                              second->operation_result() == kOpCrcError)) {
+                        hr = second_hr;
+                        operation = second->operation_result();
+                        encryption_evidence = true;
+                        return;
                     }
-                    clear_prop(proof);
-                    clear_prop(copy);
                 }
-                clear_prop(block);
             }
             operation = raw_callback->operation_result();
             if (measure_item && hr == S_OK && operation == kOpOk) {

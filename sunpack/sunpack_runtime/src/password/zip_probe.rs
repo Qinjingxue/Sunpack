@@ -6,6 +6,7 @@ use crate::io::cancellation::Cancellation;
 use crate::password::evidence::VolumeProjection;
 use crate::password::input::attempts::{DeferredReadError, DeferredReads};
 use crate::password::input::{RangeSpec, VirtualRangeReader, VolumeSet};
+use crate::scan::compression_stream::{check_xz_prefix, MAX_XZ_PREFIX_SIZE};
 use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use std::io;
@@ -134,6 +135,25 @@ pub(super) enum ZipPrefixKey {
     Aes { key: [u8; 32], len: usize },
 }
 
+pub(super) struct ZipPrefixScratch {
+    small: [u8; MAX_IMPLODE_TABLES],
+    large: Vec<u8>,
+}
+
+impl ZipPrefixScratch {
+    pub(super) fn new() -> Self {
+        Self { small: [0; MAX_IMPLODE_TABLES], large: Vec::new() }
+    }
+
+    pub(super) fn bytes(&mut self, len: usize) -> &mut [u8] {
+        if let Some(bytes) = self.small.get_mut(..len) { bytes }
+        else {
+            self.large.resize(len, 0);
+            &mut self.large
+        }
+    }
+}
+
 impl ZipPrefix {
     pub(super) fn new(method: u16, flags: u16, start: u64, overhead: u64, sizes: Option<&CentralValues>) -> Option<Self> {
         matches!(method, 1 | 6 | 8 | 9 | 12 | 14 | 93 | 95 | 98 | 99).then(|| Self {
@@ -175,7 +195,8 @@ impl ZipPrefix {
             12 => 10,
             14 => 14,
             93 => 24,
-            95 | 99 => 12,
+            95 => MAX_XZ_PREFIX_SIZE,
+            99 => 12,
             98 => 6,
             _ => unreachable!(),
         }
@@ -211,7 +232,9 @@ impl ZipPrefix {
             self.sizes
         } else { None };
         let zstd_volumes = zstd_sizes.is_some_and(|(packed, _)| source.ambiguous(self.start, packed));
-        let initial = size.min(16);
+        let xz = self.method == 95;
+        let initial = size.min(if xz { 13 } else { 16 });
+        let next_size = |read: usize| if xz { size } else { (2 * read).max(5).min(size) };
         let minimum = self.minimum_prefix().min(size);
         let first = if zstd_volumes {
             // A skippable frame needs only its 8-byte header before jumping.
@@ -221,6 +244,7 @@ impl ZipPrefix {
         } else {
             initial
         };
+        let mut scratch = ZipPrefixScratch::new();
         let checks = source.evaluate(|read| {
             let mut unavailable = None;
             let mut encrypted = match read(self.start, first) {
@@ -234,20 +258,21 @@ impl ZipPrefix {
                     }
                 }
             };
+            let mut next = next_size(encrypted.len());
             let mut verdicts = if zstd_volumes && unavailable.is_none() { vec![None; keys.len()] }
-                else { keys.iter().map(|(_, key)| self.check(key, &encrypted)).collect() };
+                else { keys.iter().map(|(_, key)| self.check(key, &encrypted, &mut next, &mut scratch)).collect() };
             while !zstd_volumes && unavailable.is_none() && encrypted.len() < size
                 && verdicts.iter().any(Option::is_none) {
                 let previous = encrypted.len();
-                let next = (2 * previous).max(5).min(size);
                 let more = match read(self.start + previous as u64, next - previous) {
                     Ok(bytes) => bytes,
                     Err(error) => { unavailable = Some(error); break; }
                 };
                 encrypted.extend_from_slice(&more);
+                next = next_size(encrypted.len());
                 for ((_, key), verdict) in keys.iter().zip(&mut verdicts) {
                     if verdict.is_none() {
-                        *verdict = self.check(key, &encrypted);
+                        *verdict = self.check(key, &encrypted, &mut next, &mut scratch);
                     }
                 }
             }
@@ -303,22 +328,25 @@ impl ZipPrefix {
         Ok(())
     }
 
-    fn check(&self, key: &ZipPrefixKey, encrypted: &[u8]) -> Option<bool> {
-        let mut plain = [0; MAX_IMPLODE_TABLES];
-        let plain = &mut plain[..encrypted.len()];
-        plain.copy_from_slice(encrypted);
+    fn check(&self, key: &ZipPrefixKey, encrypted: &[u8], next: &mut usize, scratch: &mut ZipPrefixScratch) -> Option<bool> {
+        let plain = scratch.bytes(encrypted.len());
         match *key {
             ZipPrefixKey::ZipCrypto(mut state) => {
-                for byte in plain.iter_mut() {
-                    *byte = state.decrypt(*byte);
+                for (output, &byte) in plain.iter_mut().zip(encrypted) {
+                    *output = state.decrypt(byte);
                 }
             }
-            ZipPrefixKey::Aes { key, len: 16 } => winzip_aes_prefix::<Aes128>(&key[..16], plain),
-            ZipPrefixKey::Aes { key, len: 24 } => winzip_aes_prefix::<Aes192>(&key[..24], plain),
-            ZipPrefixKey::Aes { key, len: 32 } => winzip_aes_prefix::<Aes256>(&key, plain),
-            ZipPrefixKey::Aes { .. } => unreachable!(),
+            ZipPrefixKey::Aes { key, len } => {
+                plain.copy_from_slice(encrypted);
+                match len {
+                    16 => winzip_aes_prefix::<Aes128>(&key[..16], plain),
+                    24 => winzip_aes_prefix::<Aes192>(&key[..24], plain),
+                    32 => winzip_aes_prefix::<Aes256>(&key, plain),
+                    _ => unreachable!(),
+                }
+            }
         }
-        self.check_plain(plain)
+        self.check_plain(plain, next)
     }
 
     fn check_aes_zstd_successors(
@@ -334,7 +362,7 @@ impl ZipPrefix {
             let plain = &mut plain[..encrypted.len()];
             plain.copy_from_slice(encrypted);
             winzip_aes_ctr(&cipher, 0, plain);
-            seven_zip_successor_prefix(ZSTD_METHOD, plain, packed, unpacked, |offset, output| {
+            seven_zip_successor_prefix(ZSTD_METHOD, plain, packed, unpacked, packed, |offset, output| {
                 output.copy_from_slice(&read(prefix.start + offset, output.len())?);
                 winzip_aes_ctr(&cipher, offset, output);
                 Ok(())
@@ -348,15 +376,15 @@ impl ZipPrefix {
         }
     }
 
-    pub(super) fn cbc_first_block_offset(&self) -> Option<u64> {
+    pub(super) fn cbc_probe_range(&self) -> Option<(u64, u64)> {
         // The encrypted length includes PKCS7 padding. It is a safe upper
         // bound for compression framing, but cannot be used as an exact size.
-        self.sizes
-            .is_some_and(|(packed, _)| packed >= 16)
-            .then_some(self.start)
+        let (packed, _) = self.sizes?;
+        let maximum = if self.method == 95 { MAX_XZ_PREFIX_SIZE.next_multiple_of(16) } else { 16 };
+        (packed >= 16).then_some((self.start, packed.min(maximum as u64)))
     }
 
-    pub(super) fn check_plain(&self, plain: &[u8]) -> Option<bool> {
+    pub(super) fn check_plain(&self, plain: &[u8], next: &mut usize) -> Option<bool> {
         let (packed, unpacked) = self.sizes.unzip();
         let codec = match self.method {
             // Shrink starts in nine-bit mode with an empty dictionary. A
@@ -377,12 +405,11 @@ impl ZipPrefix {
                 return (range.len() >= 5).then_some(true);
             }
             93 => ZSTD_METHOD,
-            95 => {
-                if plain.get(..6)? != b"\xfd7zXZ\x00" {
-                    return Some(false);
-                }
-                return Some(crate::scan::compression_stream::validate_xz_header(plain.get(..12)?).is_ok());
-            }
+            95 => return match check_xz_prefix(plain, packed, unpacked) {
+                Ok(Some(required)) => { *next = (*next).min(required); None }
+                Ok(None) => Some(true),
+                Err(_) => Some(false),
+            },
             98 => {
                 let properties = le_u16(plain, 0)?;
                 if properties & 15 == 0 || properties >> 12 > 2 {

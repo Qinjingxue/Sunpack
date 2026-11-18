@@ -378,6 +378,52 @@ fn delta_prefix_evidence_never_reads_beyond_its_unmodified_span() {
 }
 
 #[test]
+fn delta_successor_uses_only_readable_headers_with_full_packed_bounds() {
+    use aes::cipher::BlockModeEncrypt;
+    use SevenZipPrefixCheck::{Reject, Weak};
+
+    let key = SevenZipAesKey::derive(&[0x3f], "secret").unwrap();
+    for (distance, chunk_len, expected) in [(20, 30, Weak), (22, 30, Weak), (23, 30, Reject), (23, 11, Weak)] {
+        let structure = SevenZipPayloadEvidence {
+            packed_size: 36,
+            unchanged_prefix: distance,
+            verifier: SevenZipPayloadVerifier::Compressed {
+                method: EncoderMethod::ID_LZMA2.to_vec(),
+                unpack_size: 29,
+            },
+        };
+        let mut plaintext = [0x44u8; 36];
+        plaintext[..3].copy_from_slice(&[1, 0, 16]); // 17 raw bytes.
+        plaintext[20..23].copy_from_slice(&[2, 0, chunk_len]); // 12 raw bytes when valid.
+        plaintext[35] = 0;
+        let mut ciphertext = [0; 48];
+        ciphertext[..plaintext.len()].copy_from_slice(&plaintext);
+        for at in distance as usize..plaintext.len() {
+            ciphertext[at] = plaintext[at].wrapping_sub(plaintext[at - distance as usize]);
+        }
+        cbc::Encryptor::<Aes256>::new(&key.key.into(), &key.iv.into())
+            .encrypt_padded::<NoPadding>(&mut ciphertext, 48).unwrap();
+        let first = ciphertext.first_chunk::<16>().unwrap();
+        let (prefix, len) = structure.decrypt_prefix(first, &key).unwrap();
+        assert_eq!(structure.check_prefix(&prefix[..len]), Weak);
+        let mut did_read = false;
+        let mut read = |offset, output: &mut [u8]| -> Result<(), DeferredReadError> {
+            assert!(!did_read);
+            assert_eq!((offset, output.len()), (16, 16));
+            output.copy_from_slice(&ciphertext[16..32]);
+            did_read = true;
+            Ok(())
+        };
+        assert_eq!(
+            structure.check_successor(0, first, &prefix[..len], &key, &[], &mut read,
+                &SevenZipPayloadSource::Fixed(Arc::new([]))).unwrap(),
+            expected
+        );
+        assert_eq!(did_read, distance > 20);
+    }
+}
+
+#[test]
 fn decoder_follows_bind_pairs_instead_of_coder_declaration_order() {
     let copy = || SevenZipCoderAst {
         method_id: EncoderMethod::ID_COPY.to_vec(),

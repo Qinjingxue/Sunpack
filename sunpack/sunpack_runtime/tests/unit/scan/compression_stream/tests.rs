@@ -531,3 +531,20 @@ fn xz_reverse_index_walk_locates_stream_and_checks_index_crc() {
         "xz_index_crc_bad"
     );
 }
+
+#[test]
+fn xz_prefix_bounds_declared_sizes_and_accepts_an_empty_first_stream() {
+    let empty = xz2::write::XzEncoder::new(Vec::new(), 1).finish().unwrap();
+    assert_eq!(check_xz_prefix(&empty[..13], Some(100), Some(9)).unwrap(), Some(32));
+    // A subsequent stream may account for the ZIP member's nonzero unpacked size.
+    assert_eq!(check_xz_prefix(&empty, Some(100), Some(9)).unwrap(), None);
+
+    let mut prefix = empty[..12].to_vec();
+    let block = [2, 0xc0, 4, 9, 0x21, 1, 0, 0];
+    prefix.extend(block);
+    prefix.extend(crc32(&block).to_le_bytes());
+    assert_eq!(check_xz_prefix(&prefix[..13], None, None).unwrap(), Some(24));
+    assert_eq!(check_xz_prefix(&prefix, Some(56), Some(9)).unwrap(), None);
+    assert!(check_xz_prefix(&prefix, Some(55), Some(9)).is_err());
+    assert!(check_xz_prefix(&prefix, Some(56), Some(8)).is_err());
+}

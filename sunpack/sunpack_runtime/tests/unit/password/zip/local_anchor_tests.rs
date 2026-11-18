@@ -195,20 +195,51 @@ fn zipcrypto_deflate_uses_dynamic_tables_with_unknown_descriptor_sizes() {
 
 #[test]
 fn winzip_aes_jumps_to_zstd_header_in_another_volume() {
-    use aes::{cipher::{Block, BlockCipherEncrypt, KeyInit}, Aes128};
-
     let unpacked = b"frame after skippable bytes";
     let frame = zstd::stream::encode_all(&unpacked[..], 1).unwrap();
     let mut payload = Vec::from(b"\x50\x2a\x4d\x18\x1d\0\0\0");
     payload.extend([0; 29]);
     let split = payload.len();
     payload.extend(frame);
+    let (mut local, payload) = winzip_aes_member(payload, unpacked.len(), 93);
+    local.extend(&payload[..split]);
+    let mut good = payload[split..].to_vec();
+    good.extend([0; 10]); // The Rust proof never opens the member MAC.
+    let mut bad = good.clone();
+    bad[0] ^= 1;
+    assert_aes_member_scope(&local, &bad, &good);
+}
+
+#[test]
+fn winzip_aes_screens_xz_block_after_fixed_stream_header() {
+    let input = b"XZ framing on a second volume";
+    let payload = xz_payload(input);
+    let block_end = 12 + (usize::from(payload[12]) + 1) * 4;
+    let (mut local, payload) = winzip_aes_member(payload, input.len(), 95);
+    local.extend_from_slice(&payload[..16]);
+    let mut good = payload[16..].to_vec();
+    good.extend([0; 10]);
+    let mut bad = good.clone();
+    bad[block_end - 17] ^= 1; // Stream header and size byte still agree.
+    assert_aes_member_scope(&local, &bad, &good);
+}
+
+pub(super) fn xz_payload(input: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
+    encoder.write_all(input).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn winzip_aes_member(mut payload: Vec<u8>, unpacked: usize, method: u8) -> (Vec<u8>, Vec<u8>) {
+    use aes::{cipher::{Block, BlockCipherEncrypt, KeyInit}, Aes128};
+
     let mut local = local_crypto_header()[..31].to_vec();
     local[8] = 99;
     local[18..22].copy_from_slice(&((20 + payload.len()) as u32).to_le_bytes());
-    local[22..26].copy_from_slice(&(unpacked.len() as u32).to_le_bytes());
+    local[22..26].copy_from_slice(&(unpacked as u32).to_le_bytes());
     local[28] = 11;
-    local.extend([1, 0x99, 7, 0, 2, 0, b'A', b'E', 1, 93, 0]);
+    local.extend([1, 0x99, 7, 0, 2, 0, b'A', b'E', 1, method, 0]);
     let salt = [0x83; 8];
     let mut derived = [0; 34];
     pbkdf2::pbkdf2_hmac::<Sha1>(b"secret", &salt, 1000, &mut derived);
@@ -220,19 +251,18 @@ fn winzip_aes_jumps_to_zstd_header_in_another_volume() {
         cipher.encrypt_block(&mut mask);
         for (byte, mask) in chunk.iter_mut().zip(mask) { *byte ^= mask; }
     }
-    local.extend(&payload[..split]);
-    let mut good = payload[split..].to_vec();
-    good.extend([0; 10]); // The Rust proof never opens the member MAC.
-    let mut bad = good.clone();
-    bad[0] ^= 1;
-    let (paths, sources, plan) = volume_alternatives(&local, &bad, &good);
+    (local, payload)
+}
+
+fn assert_aes_member_scope(local: &[u8], bad: &[u8], good: &[u8]) {
+    let (paths, sources, plan) = volume_alternatives(local, bad, good);
     let mut preparation = Preparation::default();
     let result = zip_fast_verify_passwords_from_attempts(&mut preparation, &sources[0], &plan,
         &[Arc::from("wrong"), Arc::from("secret")], false, Some(0), &[]).unwrap();
     assert_eq!(result.matched_indices, [1]);
     preparation.fix_password();
     let verified = preparation.verify_prepared(&[Arc::from("secret")]).unwrap().unwrap();
-    let reduced = verified.volume_attempts.expect("Zstd frame ruled out the wrong volume");
+    let reduced = verified.volume_attempts.expect("compression proof ruled out the wrong volume");
     assert_eq!(reduced.sources.len(), 2);
     assert_eq!(reduced.sources[1].path, sources[2].path);
     drop(preparation);

@@ -487,6 +487,7 @@ class CHandler Z7_final:
   bool _needChecksumCheck;
   bool _memUsage_WasSet;
   bool _comment_WasUsedInArc;
+  bool _commentProofUnavailable;
   bool _acl_Used;
   bool _error_in_ACL;
   bool _split_Error;

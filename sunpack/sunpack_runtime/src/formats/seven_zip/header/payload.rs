@@ -104,10 +104,10 @@ impl SevenZipPayloadProbes {
     pub(crate) fn has_ambiguous_followup(&self) -> bool {
         match &self.source {
             Some(SevenZipPayloadSource::Projected(reads)) => {
-                (self.first.kind.has_successor()
-                    && reads.range_is_ambiguous(self.first.offset, self.first.kind.followup_span()))
+                let span = self.first.kind.followup_span();
+                (span != 0 && reads.range_is_ambiguous(self.first.offset, span))
                 || self.rest.iter().any(|plan| reads.range_is_ambiguous(
-                    plan.offset, if plan.kind.has_successor() { plan.kind.followup_span() } else { 16 },
+                    plan.offset, plan.kind.followup_span().max(16),
                 ))
             }
             _ => false,
@@ -217,13 +217,28 @@ impl SevenZipPayloadEvidence {
         Some(Self { packed_size: stream.plaintext_size, unchanged_prefix: stream.unchanged_prefix, verifier })
     }
 
+    fn readable_size(&self) -> u64 {
+        self.packed_size.min(self.unchanged_prefix)
+    }
+
+    fn followup_plaintext_size(&self) -> u64 {
+        let SevenZipPayloadVerifier::Compressed { method, .. } = &self.verifier else {
+            return 0;
+        };
+        let readable = self.readable_size();
+        match method.as_slice() {
+            method if readable > 16 && seven_zip_is_deflate(method) =>
+                readable.min(deflate_prefix::MAX_DYNAMIC_HEADER_SIZE as u64),
+            // Prescreening already walks all LZMA2 headers in the first AES block.
+            [0x21] if readable > 16 => readable,
+            // A skippable frame and the next magic can fit in the first AES block.
+            [0x04, 0xf7, 0x11, 0x04 | 0x01] if readable >= 12 => readable,
+            _ => 0,
+        }
+    }
+
     fn followup_span(&self) -> u64 {
-        match &self.verifier {
-            SevenZipPayloadVerifier::Compressed { method, .. } if seven_zip_is_deflate(method) => {
-                self.packed_size.min(deflate_prefix::MAX_DYNAMIC_HEADER_SIZE as u64)
-            }
-            _ => self.packed_size,
-        }.next_multiple_of(16)
+        self.followup_plaintext_size().next_multiple_of(16)
     }
 
     fn plaintext_prefix_size(&self) -> usize {
@@ -232,7 +247,7 @@ impl SevenZipPayloadEvidence {
             SevenZipPayloadVerifier::Bcj2Range => 5,
             SevenZipPayloadVerifier::Compressed { .. } => 32,
         };
-        self.packed_size.min(self.unchanged_prefix).min(cap) as usize
+        self.readable_size().min(cap) as usize
     }
 
     #[cfg(test)]
@@ -286,9 +301,7 @@ impl SevenZipPayloadEvidence {
     }
 
     fn has_successor(&self) -> bool {
-        self.unchanged_prefix >= self.packed_size &&
-            matches!(&self.verifier, SevenZipPayloadVerifier::Compressed { method, .. }
-                if seven_zip_has_block_successor(method) || seven_zip_is_deflate(method))
+        self.followup_plaintext_size() != 0
     }
 
     fn check_successor(
@@ -300,10 +313,12 @@ impl SevenZipPayloadEvidence {
             return Ok(SevenZipPrefixCheck::Weak);
         };
         let packed_size = self.packed_size;
-        if self.unchanged_prefix < packed_size {
+        let readable = self.followup_plaintext_size();
+        if readable == 0 {
             return Ok(SevenZipPrefixCheck::Weak);
         }
         let mut read_plain = |at: u64, out: &mut [u8]| {
+            debug_assert!(at + out.len() as u64 <= readable);
             if let Some(bytes) = usize::try_from(at).ok()
                 .and_then(|at| at.checked_add(out.len()).and_then(|end| plaintext.get(at..end)))
             {
@@ -348,7 +363,7 @@ impl SevenZipPayloadEvidence {
             Ok(())
         };
         if seven_zip_is_deflate(method) {
-            let bound = packed_size.min(deflate_prefix::MAX_DYNAMIC_HEADER_SIZE as u64) as usize;
+            let bound = readable as usize;
             let deflate64 = method[2] == 9;
             let check = |bytes: &[u8]| deflate_prefix::check_prefix(
                 bytes, Some(packed_size), Some(*unpack_size), deflate64,
@@ -365,18 +380,20 @@ impl SevenZipPayloadEvidence {
                 SevenZipPrefixCheck::Weak
             });
         }
-        if seven_zip_has_block_successor(method) {
-            let ambiguous = |next: u64| match source {
+        let ciphertext_span = readable.next_multiple_of(16);
+        let ambiguous = |next: u64| {
+            if next >= readable {
+                return false;
+            }
+            match source {
                 SevenZipPayloadSource::Projected(reads) => {
                     let window = (next & !15u64).saturating_sub(16 * (1 + inner.len()) as u64);
-                    reads.range_is_ambiguous(offset + window, self.followup_span() - window)
+                    reads.range_is_ambiguous(offset + window, ciphertext_span - window)
                 }
                 SevenZipPayloadSource::Fixed(_) => false,
-            };
-            seven_zip_successor_prefix(method, plaintext, packed_size, *unpack_size, read_plain, ambiguous)
-        } else {
-            Ok(SevenZipPrefixCheck::Weak)
-        }
+            }
+        };
+        seven_zip_successor_prefix(method, plaintext, packed_size, *unpack_size, readable, read_plain, ambiguous)
     }
 }
 

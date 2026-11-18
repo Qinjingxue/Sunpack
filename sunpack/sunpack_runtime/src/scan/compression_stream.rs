@@ -9,6 +9,8 @@ const INITIAL_PROBE_BYTES: usize = 256;
 const GZIP_MAGIC: &[u8] = b"\x1f\x8b\x08";
 const BZIP2_MAGIC: &[u8] = b"BZh";
 const XZ_MAGIC: &[u8] = b"\xfd7zXZ\x00";
+const XZ_STREAM_HEADER_SIZE: usize = 12;
+pub(crate) const MAX_XZ_PREFIX_SIZE: usize = XZ_STREAM_HEADER_SIZE + 1024;
 
 #[derive(Debug)]
 pub(crate) enum ValidationError {
@@ -1122,6 +1124,12 @@ fn read_xz_footer(reader: &ManagedReader, end: u64) -> ValidationResult<XzFooter
 }
 
 pub(crate) fn parse_xz_footer(footer: &[u8], end: u64) -> ValidationResult<XzFooter> {
+    let footer = xz_footer_fields(footer, end)?;
+    xz_check_size(footer.flags[1] & 0x0f)?;
+    Ok(footer)
+}
+
+fn xz_footer_fields(footer: &[u8], end: u64) -> ValidationResult<XzFooter> {
     if footer.len() != 12 || &footer[10..12] != b"YZ" {
         return invalid("xz_footer_magic_invalid");
     }
@@ -1132,7 +1140,6 @@ pub(crate) fn parse_xz_footer(footer: &[u8], end: u64) -> ValidationResult<XzFoo
     if u32::from_le_bytes(footer[0..4].try_into().unwrap()) != crc32(&footer[4..10]) {
         return invalid("xz_footer_crc_bad");
     }
-    xz_check_size(flags[1] & 0x0f)?;
     Ok(XzFooter {
         end,
         flags,
@@ -1279,13 +1286,11 @@ fn parse_xz_block_header(block_header: &[u8]) -> ValidationResult<(Option<u64>, 
         let _filter_id =
             read_vli_slice(&block_header[..block_header.len() - 4], &mut field_cursor)?;
         let property_size =
-            read_vli_slice(&block_header[..block_header.len() - 4], &mut field_cursor)? as usize;
-        field_cursor = field_cursor
-            .checked_add(property_size)
-            .ok_or(ValidationError::Invalid("xz_filter_properties_overflow"))?;
-        if field_cursor > block_header.len() - 4 {
+            read_vli_slice(&block_header[..block_header.len() - 4], &mut field_cursor)?;
+        if property_size > (block_header.len() - 4 - field_cursor) as u64 {
             return invalid("xz_filter_properties_truncated");
         }
+        field_cursor += property_size as usize;
     }
     if block_header[field_cursor..block_header.len() - 4]
         .iter()
@@ -1294,6 +1299,67 @@ fn parse_xz_block_header(block_header: &[u8]) -> ValidationResult<(Option<u64>, 
         return invalid("xz_block_header_padding_invalid");
     }
     Ok((declared_compressed, declared_uncompressed))
+}
+
+fn validate_xz_empty_index(empty: &[u8], flags: &[u8]) -> ValidationResult<()> {
+    let footer = xz_footer_fields(&empty[8..], 32)?;
+    if empty[..4] != [0; 4]
+        || empty[4..8] != crc32(&empty[..4]).to_le_bytes()
+        || footer.index_size != 8
+        || flags != footer.flags
+    {
+        return invalid("xz_empty_stream_invalid");
+    }
+    Ok(())
+}
+
+// Returns the exact prefix length still needed, or None once the first
+// block header (or the entire empty stream) has been checked.
+pub(crate) fn check_xz_prefix(
+    prefix: &[u8], packed: Option<u64>, unpacked: Option<u64>,
+) -> ValidationResult<Option<usize>> {
+    let Some(magic) = prefix.get(..XZ_MAGIC.len()) else { return Ok(Some(XZ_MAGIC.len())); };
+    if magic != XZ_MAGIC {
+        return invalid("xz_header_magic_invalid");
+    }
+    if packed.is_some_and(|size| size < 32) {
+        return invalid("xz_stream_out_of_range");
+    }
+    let Some(header) = prefix.get(..XZ_STREAM_HEADER_SIZE) else {
+        return Ok(Some(XZ_STREAM_HEADER_SIZE));
+    };
+    validate_xz_header(header)?;
+    let Some(&size) = prefix.get(XZ_STREAM_HEADER_SIZE) else {
+        return Ok(Some(XZ_STREAM_HEADER_SIZE + 1));
+    };
+    if size == 0 {
+        let Some(empty) = prefix.get(XZ_STREAM_HEADER_SIZE..32) else { return Ok(Some(32)); };
+        validate_xz_empty_index(empty, &header[6..8])?;
+        // An empty stream can be followed by another XZ stream.
+        return Ok(None);
+    }
+
+    let block_end = XZ_STREAM_HEADER_SIZE + (usize::from(size) + 1) * 4;
+    // Check length is defined even for IDs without a supported checksum.
+    let check = header[7];
+    let check_size = if check == 0 { 0 } else { 4u64 << ((check - 1) / 3) };
+    let block_overhead = (block_end - XZ_STREAM_HEADER_SIZE) as u64 + check_size;
+    // The Stream Header, minimum Index and Stream Footer also occupy space.
+    let overhead = block_end as u64 + check_size + 20;
+    if packed.is_some_and(|limit| overhead + 4 > limit) {
+        return invalid("xz_block_out_of_range");
+    }
+    let Some(block) = prefix.get(XZ_STREAM_HEADER_SIZE..block_end) else {
+        return Ok(Some(block_end));
+    };
+    let (compressed, uncompressed) = parse_xz_block_header(block)?;
+    if compressed.is_some_and(|size| {
+        size == 0 || size > i64::MAX as u64 - block_overhead
+            || packed.is_some_and(|limit| size.next_multiple_of(4) > limit - overhead)
+    }) || uncompressed.zip(unpacked).is_some_and(|(size, limit)| size > limit) {
+        return invalid("xz_block_out_of_range");
+    }
+    Ok(None)
 }
 
 pub(crate) fn validate_xz_identity(
@@ -1314,14 +1380,7 @@ pub(crate) fn validate_xz_identity(
         let Some(empty) = header.get(12..32) else {
             return invalid("xz_empty_stream_truncated");
         };
-        let footer = parse_xz_footer(&empty[8..], 32)?;
-        if empty[..4] != [0; 4]
-            || empty[4..8] != crc32(&empty[..4]).to_le_bytes()
-            || footer.index_size != 8
-            || stream_header[6..8] != footer.flags
-        {
-            return invalid("xz_empty_stream_invalid");
-        }
+        validate_xz_empty_index(empty, &stream_header[6..8])?;
         return Ok(0);
     }
     let block_size = (usize::from(size_byte) + 1) * 4;

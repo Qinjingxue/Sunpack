@@ -116,6 +116,30 @@ fn pkware_strong_rejects_alternative_ciphertext_after_shared_validation() {
 }
 
 #[test]
+fn pkware_strong_screens_xz_block_beyond_the_first_cbc_block() {
+    use super::super::{local_anchor_tests::{volume_alternatives, xz_payload},
+        zip_fast_verify_passwords_from_attempts, Preparation};
+    let mut packed = xz_payload(MEMBER);
+    let (good, _, validation) = archive_member::<Aes256>(0x6610, 32, true, 95, &packed);
+    let block_end = 12 + (usize::from(packed[12]) + 1) * 4;
+    packed[block_end - 1] ^= 1;
+    let (bad, _, _) = archive_member::<Aes256>(0x6610, 32, true, 95, &packed);
+    let split = validation + 32 + 16;
+    assert_eq!(good[..split], bad[..split]);
+    let (paths, sources, plan) = volume_alternatives(&good[..split], &bad[split..], &good[split..]);
+    let mut preparation = Preparation::default();
+    let proof = zip_fast_verify_passwords_from_attempts(&mut preparation, &sources[0], &plan,
+        &[Arc::from("wrong"), Arc::from("secret")], false, None, &[]).unwrap();
+    assert_eq!(proof.matched_indices, [1]);
+    assert_eq!(proof.final_confirmation_required, Some(false));
+    let reduced = proof.volume_attempts.expect("XZ header ruled out the wrong volume");
+    assert_eq!(reduced.sources.len(), 2);
+    assert_eq!(reduced.sources[1].path, sources[2].path);
+    drop(preparation);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+}
+
+#[test]
 fn pkware_strong_structural_proof_across_disk_and_damage() {
     use super::super::{prepare_zip_stream_from, prepare_zip_volumes, RangeSpec, ZipReadInput};
     use crate::io::reader::{ManagedReader, ReaderConfig};

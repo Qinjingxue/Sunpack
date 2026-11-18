@@ -1978,6 +1978,7 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
     }
 
     case kpidIsAltStream: prop = item.Is_STM(); break;
+    case kpidIsAux: if (item.Is_CMT()) prop = true; break;
 
     case kpidSymLink: item.Link_to_Prop(NLinkType::kUnixSymLink, prop); break;
     case kpidHardLink: item.Link_to_Prop(NLinkType::kHardLink, prop); break;
@@ -1996,6 +1997,7 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
     case kpidSplitAfter: prop = lastItem.IsSplitAfter(); break;
     case kpidSunpackMacPackedSize:
       if (_needChecksumCheck && ref.Link < 0 &&
+          (!_commentProofUnavailable || !item.Is_CMT()) &&
           !item.IsSplitBefore() && !lastItem.IsSplitAfter() &&
           (lastItem.Has_CRC() || lastItem.FindExtra_Blake() >= 0) &&
           HasKeyedChecksum(lastItem) &&
@@ -2007,6 +2009,7 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
       break;
     case kpidSunpackProofSize:
       if (_needChecksumCheck && ref.Link < 0 && (item.PackSize || item.IsSplitAfter()) &&
+          (!_commentProofUnavailable || !item.Is_CMT()) &&
           !item.IsSplitBefore() && !lastItem.IsSplitAfter() &&
           (lastItem.Has_CRC() || lastItem.FindExtra_Blake() >= 0))
         prop = lastItem.Is_UnknownSize() ? kSunpackUnknownProofSize : lastItem.Size;
@@ -2318,6 +2321,7 @@ HRESULT CHandler::Open2(IInStream *stream,
   CInArchive arch;
   int prevSplitFile = -1;
   int prevMainFile = -1;
+  int commentProofItem = -1;
   UInt64 totalBytes = 0;
   UInt64 curBytes = 0;
   bool nextVol_is_Required = false;
@@ -2485,21 +2489,29 @@ HRESULT CHandler::Open2(IInStream *stream,
           && item.Is_CMT())
       {
         _comment_WasUsedInArc = true;
-        if (   item.PackSize <= kCommentSize_Max
-            && item.PackSize == item.Size
-            && item.PackSize != 0
-            && item.Get_Method() == 0
-            && !item.IsSplit())
+        if (readMetadata())
         {
-          // Preserve password evidence when the comment itself is encrypted
-          // but opening the archive headers did not require a password.
-          if ((item.IsEncrypted() && !arch.m_CryptoMode) || readMetadata())
+          if (   item.PackSize <= kCommentSize_Max
+              && item.PackSize == item.Size
+              && item.PackSize != 0
+              && item.Get_Method() == 0
+              && !item.IsSplit())
           {
             RINOK(unpacker.DecodeToBuf(EXTERNAL_CODECS_VARS item, item.PackSize, inStream, _comment))
           }
-          needAdd = false;
-          // item.RecordType = (Byte)NHeaderType::kFile; // for debug
         }
+        else if (item.IsEncrypted())
+        {
+          // Retain the encrypted service header so bounded extraction can
+          // use its checksum only when it needs a fallback member. CBC
+          // rounds up packed size, which Extract already handles for Store.
+          commentProofItem = (int)_items.Size();
+          _commentProofUnavailable = !isOk_packSize || arch.Position > endPos ||
+              item.Size == 0 || item.Size > kCommentSize_Max || item.Is_UnknownSize() ||
+              item.Get_Method() != 0 || item.IsSplit() ||
+              item.PackSize != ((item.Size + 15) & ~(UInt64)15);
+        }
+        needAdd = false;
       }
 
       CRefItem ref;
@@ -2629,6 +2641,12 @@ HRESULT CHandler::Open2(IInStream *stream,
   }
 
   FillLinks();
+  if (commentProofItem >= 0)
+  {
+    const unsigned index = (unsigned)commentProofItem;
+    const CRefItem ref = { index, index, -1, -1 };
+    _refs.Add(ref);
+  }
   return S_OK;
 }
 
@@ -2652,6 +2670,7 @@ Z7_COM7F_IMF(CHandler::Close())
   // _warningFlags = 0;
   _isArc = false;
   _comment_WasUsedInArc = false;
+  _commentProofUnavailable = false;
   _acl_Used = false;
   _error_in_ACL = false;
   _split_Error = false;

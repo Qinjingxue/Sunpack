@@ -543,7 +543,8 @@ void config_edits(Application& app,const fs::path& dir) {
 
 void tag_config(Application& app,const fs::path& dir) {
     const std::string id="/filesystem/scan_filters/0/paths", input="tag-input-"+id;
-    auto disk=[&]{return read_json(dir/"sunpack_config.json")[Json::json_pointer(id)];};
+    const auto config_path=dir/"sunpack_config.json";
+    auto disk=[&]{return read_json(config_path)[Json::json_pointer(id)];};
     search_setting(app,id);
     auto before=disk();
     click(app,input.c_str());
@@ -577,6 +578,10 @@ void tag_config(Application& app,const fs::path& dir) {
     saved=disk();
     assert((saved.back()==Json{{"value","^cache/[0-9]+$"},{"regex",true}}));
     assert(read_json(dir/"cli-validation-input.json")["paths"]==saved);
+    const auto source=read_file(config_path);
+    const auto filters=parse_json(source)["filesystem"]["scan_filters"];
+    assert(source.find(filters[0].dump())!=std::string::npos);
+    assert(source.find(filters[1].dump())!=std::string::npos);
     search_config(app,L"");
 }
 

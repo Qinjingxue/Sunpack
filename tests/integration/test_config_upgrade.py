@@ -168,14 +168,18 @@ def test_current_filters_merge_by_name_without_adding_modules(tmp_path, repo_roo
     user = tmp_path / "sunpack_config.json"
     filters = [{"name": "size_range", "enabled": False, "min_bytes": 0},
                {"name": "blacklist", "enabled": False, "extensions": [],
-                "paths": [{"value": "exact/*", "regex": True}]}]
-    user.write_text(json.dumps({"filesystem": {"scan_filters": filters}}), encoding="utf-8")
+                "paths": [{"value": r'\A"exact  [x]"\z', "regex": True}]},
+               {"name": "whitelist", "enabled": True, "extensions": [{"value": "zip", "regex": False}]}]
+    user.write_text(json.dumps({"filesystem": {"scan_filters": filters}}, indent=2), encoding="utf-8")
     result = _upgrade(repo_root, user, "1.4.1")
     assert result.returncode == 0, result.stdout + result.stderr
     template = json.loads((repo_root / user.name).read_text(encoding="utf-8"))
     defaults = {f["name"]: f for f in template["filesystem"]["scan_filters"]}
     expected = [dict(defaults[f["name"]], **f) for f in filters]
-    assert json.loads(user.read_text(encoding="utf-8-sig"))["filesystem"]["scan_filters"] == expected
+    migrated = user.read_text(encoding="utf-8-sig")
+    assert json.loads(migrated)["filesystem"]["scan_filters"] == expected
+    lines = {line.strip().removesuffix(",") for line in migrated.splitlines()}
+    assert all(json.dumps(f, separators=(",", ":")) in lines for f in expected[1:])
 
 
 def test_upgrade_boundary_and_current_projection(tmp_path, repo_root):

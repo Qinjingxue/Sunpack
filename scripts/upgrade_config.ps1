@@ -250,6 +250,35 @@ function Merge-OrdinaryConfig($Defaults, $Previous, [string]$Key = '') {
 }
 if ($retainInputs) { $user = Merge-OrdinaryConfig $template $user }
 
+function ConvertTo-OrdinaryConfigJson($Config) {
+    $filters = if ($Config.PSObject.Properties['filesystem'] -and $Config.filesystem -is [pscustomobject]) {
+        $Config.filesystem.PSObject.Properties['scan_filters']
+    }
+    if ($null -eq $filters -or $filters.Value -isnot [array]) {
+        return ConvertTo-Json -InputObject $Config -Depth 100
+    }
+
+    # ConvertTo-Json controls indentation for the whole document. Serialize
+    # only the two rule modules separately and splice them at their JSON tokens.
+    $original = $filters.Value
+    $prefix = 'SunPackFilter-' + [Guid]::NewGuid().ToString('N') + '-'
+    $compact = @{}
+    try {
+        $filters.Value = @(foreach ($filter in $original) {
+            if ($filter.name -in @('blacklist', 'whitelist')) {
+                $token = $prefix + $compact.Count
+                $compact['"' + $token + '"'] = ConvertTo-Json -InputObject $filter -Depth 100 -Compress
+                $token
+            } else { $filter }
+        })
+        $text = ConvertTo-Json -InputObject $Config -Depth 100
+    } finally { $filters.Value = $original }
+    return [regex]::Replace($text, ('"' + $prefix + '[0-9]+"'), {
+        param($match)
+        $compact[$match.Value]
+    })
+}
+
 # A custom state directory is not owned by SunPack. Remove only named records,
 # never recurse through arbitrary user content or delete the directory itself.
 $customRecords = @()
@@ -287,7 +316,7 @@ if ($advanced.PSObject.Properties['watch'] -and $advanced.watch -is [pscustomobj
 # Only ordinary configuration needs rewriting. Publish it before any cleanup;
 # a failed replace leaves roots, passwords and old runtime state untouched.
 if ($retainInputs) {
-    $text = ($user | ConvertTo-Json -Depth 100) + [Environment]::NewLine
+    $text = (ConvertTo-OrdinaryConfigJson $user) + [Environment]::NewLine
     $null = $text | ConvertFrom-Json
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
     $null = [IO.Directory]::CreateDirectory($dataDirectory)

@@ -442,6 +442,60 @@ void unavailable_member_is_not_reprobed_for_an_unread_slice(
         "the unread slice reran an unavailable method or was falsely rejected");
 }
 
+void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {
+    // ZipCrypto, key "fixture-known". The smaller entry is entirely fixed,
+    // while the second entry's CRC can distinguish the two middle slices.
+    static constexpr char zip[] =
+        "\x50\x4b\x03\x04\x14\x00\x01\x00\x00\x00\x00\x00\x21\x00\x32\xce\xc9\x9e\x11\x00\x00\x00\x05\x00\x00\x00\x01\x00\x00\x00"
+        "\x61\xc8\x0f\xe5\x81\x51\xb7\xf4\xb3\x47\x87\x4b\x13\x42\x4a\x9f\x33\xc3\x50\x4b\x03\x04\x14\x00\x01\x00\x00\x00\x00\x00"
+        "\x21\x00\x80\x5a\xa4\x17\x13\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x62\xc8\x0f\xe5\x81\x51\xb7\xf4\xb3\x47\x87\x4b"
+        "\x9a\x53\x75\x80\xab\xf6\x92\xa3\x50\x4b\x01\x02\x14\x00\x14\x00\x01\x00\x00\x00\x00\x00\x21\x00\x32\xce\xc9\x9e\x11\x00"
+        "\x00\x00\x05\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x61\x50\x4b\x01\x02\x14"
+        "\x00\x14\x00\x01\x00\x00\x00\x00\x00\x21\x00\x80\x5a\xa4\x17\x13\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        "\x00\x00\x00\x00\x00\x00\x00\x30\x00\x00\x00\x62\x50\x4b\x05\x06\x00\x00\x00\x00\x02\x00\x02\x00\x5e\x00\x00\x00\x62\x00"
+        "\x00\x00\x00\x00";
+    constexpr auto length = sizeof(zip) - 1;
+    constexpr std::size_t start = 48, end = 98;
+    std::string damaged(zip + start, zip + end);
+    damaged.back() ^= 1;
+    { std::ofstream file(carrier, std::ios::binary); file.write(zip, length); file << damaged; }
+
+    const auto path = carrier.wstring();
+    const std::vector<ExtractInputRange> ranges = {
+        {path, 0, start, true}, {path, start, end, true}, {path, end, length, true}
+    };
+    VolumeAttemptPlan plan;
+    plan.sources = ranges;
+    plan.sources.push_back({path, length, length + damaged.size(), true});
+    plan.domains = {{0}, {3, 1}, {2}};
+    plan.layouts = {{{1, L"one", 0}, {2, L"two", 1}, {3, L"three", 2}}};
+    plan.prepare();
+    const std::wstring password = L"fixture-known";
+    auto wrong = ranges;
+    wrong[1] = plan.sources.back();
+    const auto rejected = test_password_batch(path, {}, wrong, L"zip", &password, 1, {}, true, false, nullptr, &plan);
+    const auto accepted = test_password_batch(path, {}, ranges, L"zip", &password, 1, {}, true, false, nullptr, &plan);
+    require(rejected.status == PasswordTestStatus::WrongPassword && !rejected.rejects_fixed_geometry &&
+        accepted.status == PasswordTestStatus::Ok && accepted.matched_index == 0,
+        "the fixed member masked a bad volume that the second CRC can reject");
+}
+
+void short_copy_crc_skips_unverifiable_items(const std::filesystem::path& archive) {
+    // One solid AES folder: a matching byte, a directory, a stream without
+    // a CRC, and a byte whose CRC mismatches. Only the last read can reject.
+    static constexpr char seven_zip[] =
+        "\x37\x7a\xbc\xaf\x27\x1c\x00\x04\xea\x3c\x22\x5c\x20\x00\x00\x00\x00\x00\x00\x00\x31\x00\x00\x00\x00"
+        "\x00\x00\x00\xa8\x5e\x48\x9a\x2d\x79\x30\xc8\x7b\xc5\xd9\x5e\x39\x47\x26\x12\x63\xd1\x62\x76\x07\x44"
+        "\xee\xf8\x9f\x51\x81\x9b\x3c\xba\x11\x1e\x58\x81\xd5\x40\x01\x04\x06\x00\x01\x09\x20\x00\x07\x0b\x01"
+        "\x00\x01\x24\x06\xf1\x07\x01\x01\x3f\x0c\x11\x00\x08\x0d\x03\x09\x01\x0f\x0a\x00\xa0\x8b\x9e\xd9\xd3"
+        "\xa7\xff\xd7\x3d\x00\x00\x05\x04\x0e\x01\x40\x00\x00";
+    { std::ofstream file(archive, std::ios::binary); file.write(seven_zip, sizeof(seven_zip) - 1); }
+    const std::wstring password = L"fixture-known";
+    const auto result = test_password_batch(archive.wstring(), {}, {}, L"7z", &password, 1, {}, true);
+    require(result.status == PasswordTestStatus::WrongPassword,
+        "AES/Copy follow-up missed the next verifiable member past empty or unchecksummed items");
+}
+
 void disjoint_layouts_do_not_repeat_comparisons() {
     constexpr std::size_t layouts = 512;
     VolumeAttemptPlan plan;
@@ -478,6 +532,8 @@ int main() {
     warm_volume_waves_reuse_proofs(archive);
     carrier_slices_share_open_file(archive);
     unavailable_member_is_not_reprobed_for_an_unread_slice(archive, root / L"unsupported-carrier.zip");
+    member_crc_rejects_a_bad_volume(root / L"encrypted-carrier.zip");
+    short_copy_crc_skips_unverifiable_items(root / L"solid-aes-copy.7z");
     disjoint_layouts_do_not_repeat_comparisons();
     rejected_composition_is_not_prepared(root / L"encrypted.zip", root / L"rejected");
     scan_confirms_only_unproven_password(root / L"encrypted.zip");

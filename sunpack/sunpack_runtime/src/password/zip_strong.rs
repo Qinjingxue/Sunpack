@@ -3,7 +3,7 @@ use super::{
     le_u16, le_u32, zip_password_bytes, PasswordVerification, PreparedStatus, ZipKey, ZipKeyCache,
     ZipKeyMaterial,
 };
-use super::probe::{read_reason, CheckRead, ZipPrefix, ZipRead};
+use super::probe::{read_reason, CheckRead, ZipPrefix, ZipPrefixScratch, ZipRead};
 use crate::formats::zip::zip64::CentralValues;
 use crate::io::cancellation::Cancellation;
 use crate::password::input::attempts::DeferredReadError;
@@ -259,12 +259,14 @@ impl PasswordHeader {
         // Only padding survivors may load the optional VData and ERD prefix.
         let checks = if let Some(source) = &self.source {
             let body = self.prefix.as_ref().and_then(|prefix| {
-                let offset = prefix.cbc_first_block_offset()?;
-                source.ambiguous(offset, BLOCK as u64).then_some((prefix, offset))
+                let (offset, span) = prefix.cbc_probe_range()?;
+                source.ambiguous(offset, span).then_some((prefix, offset))
             });
+            let mut scratch = None;
             source.evaluate(|read| -> Result<ValidationEvidence, ValidationUnavailable> {
                 let validation = self.load_validation(read)?;
                 let mut first_body_block = None;
+                let mut body_tail: Option<(usize, Result<Vec<u8>, DeferredReadError>)> = None;
                 let matches = survivors.iter().map(|(_, cipher)| {
                     let Some(file_cipher) = self.check_validation(cipher, &validation) else {
                         return ValidationMatch::CrcMismatch;
@@ -277,8 +279,27 @@ impl PasswordHeader {
                             Ok(bytes) => {
                                 let previous = validation.bytes.last_chunk::<BLOCK>().unwrap();
                                 let plain = decrypt_block(&file_cipher, previous, bytes);
-                                if prefix.check_plain(&plain) == Some(false) {
+                                let mut next = usize::MAX;
+                                if prefix.check_plain(&plain, &mut next) == Some(false) {
                                     return ValidationMatch::BodyContradiction;
+                                }
+                                if next != usize::MAX {
+                                    let aligned = next.next_multiple_of(BLOCK);
+                                    let size = aligned - BLOCK;
+                                    if !source.ambiguous(offset, aligned as u64) {
+                                        return ValidationMatch::Proven;
+                                    }
+                                    if body_tail.as_ref().is_none_or(|(cached, result)|
+                                        *cached < size || (*cached != size && result.is_err())) {
+                                        body_tail = Some((size, read(offset + BLOCK as u64, size)));
+                                    }
+                                    match &body_tail.as_ref().unwrap().1 {
+                                        Ok(tail) if check_body_tail(prefix, &file_cipher, bytes,
+                                            &tail[..size], plain, next,
+                                            scratch.get_or_insert_with(ZipPrefixScratch::new)) => return ValidationMatch::BodyContradiction,
+                                        Err(DeferredReadError::Truncated) => return ValidationMatch::BodyContradiction,
+                                        _ => {}
+                                    }
                                 }
                             }
                             Err(DeferredReadError::Truncated) => return ValidationMatch::BodyContradiction,
@@ -289,7 +310,8 @@ impl PasswordHeader {
                 }).collect();
                 Ok(ValidationEvidence {
                     matches,
-                    body_issue: first_body_block.and_then(Result::err),
+                    body_issue: first_body_block.and_then(Result::err)
+                        .or_else(|| body_tail.and_then(|(_, result)| result.err())),
                 })
             })?
         } else { Vec::new() };
@@ -393,6 +415,20 @@ fn decrypt_block<C: BlockCipherDecrypt>(
     block.copy_from_slice(encrypted);
     cipher.decrypt_block(&mut block);
     std::array::from_fn(|i| block[i] ^ previous[i])
+}
+
+fn check_body_tail<'a, C: BlockCipherDecrypt>(
+    prefix: &ZipPrefix, cipher: &C, mut previous: &'a [u8], encrypted: &'a [u8],
+    first: [u8; BLOCK], size: usize, scratch: &mut ZipPrefixScratch,
+) -> bool {
+    let body = scratch.bytes(BLOCK + encrypted.len());
+    body[..BLOCK].copy_from_slice(&first);
+    for (output, block) in body[BLOCK..].chunks_exact_mut(BLOCK).zip(encrypted.chunks_exact(BLOCK)) {
+        output.copy_from_slice(&decrypt_block(cipher, previous, block));
+        previous = block;
+    }
+    let mut needed = size;
+    prefix.check_plain(&body[..size], &mut needed) == Some(false)
 }
 
 fn derive_key(sha: Sha1) -> [u8; 32] {

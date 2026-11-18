@@ -243,6 +243,78 @@ bool check_rar5_short_keyed_member_password_proof() {
         empty.status == PasswordTestStatus::Unsupported && empty.password_independent_failure;
 }
 
+bool check_rar5_encrypted_comment_password_fallback() {
+    using namespace sunpack::sevenzip;
+    constexpr char signature[] = "\x52\x61\x72\x21\x1a\x07\x01\x00\xc5\x1a\x33\x32\x03\x01\x00\x00";
+    constexpr char end_header[] = "\x19\xb2\x3a\x35\x03\x05\x00\x00";
+    constexpr char crypto_extra[] =
+        "\x24\x01\x00\x00\x08\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+        "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f";
+    constexpr char good_comment[] =
+        "\xa0\x4f\xfd\x37\x36\x03\x03\x25\x10\x04\x10\x00\x9f\xe6\xf6\xe0\x00\x00\x03" "CMT";
+    constexpr char padded_comment[] =
+        "\xb6\xac\x90\xf1\x36\x03\x03\x25\x10\x04\x0f\x00\x4d\xf1\x65\x2c\x00\x00\x03" "CMT";
+    constexpr char corrupt_comment[] =
+        "\x5d\x4b\x71\x77\x38\x03\x03\x25\x80\x08\x04\x80\x08\x00\x00\x00\x00\x00\x00\x00\x03" "CMT";
+    constexpr char ciphertext[] = "\x79\x2a\x0e\x2c\x6a\xf2\x37\xa7\x1f\x84\xce\xfa\x88\xae\x90\x32";
+    constexpr char file_header[] =
+        "\x82\x4f\x71\x59\x34\x02\x03\x25\x10\x04\x10\x00\x9f\xe6\xf6\xe0\x00\x00\x01x";
+    const auto path = std::filesystem::temp_directory_path() /
+        (L"sunpack-rar-encrypted-comment-" + std::to_wstring(GetCurrentProcessId()) + L".rar");
+    const std::wstring keys[]{L"wrong-password", L"evidence-key"};
+    const auto write_fixture = [&](std::string_view comment_header, std::string_view comment_data, bool add_file, bool add_end) {
+        std::ofstream file(path, std::ios::binary);
+        file.write(signature, sizeof(signature) - 1);
+        file.write(comment_header.data(), comment_header.size());
+        file.write(crypto_extra, sizeof(crypto_extra) - 1);
+        file.write(comment_data.data(), comment_data.size());
+        if (add_file) {
+            file.write(file_header, sizeof(file_header) - 1);
+            file.write(crypto_extra, sizeof(crypto_extra) - 1);
+            file.write(ciphertext, sizeof(ciphertext) - 1);
+        }
+        if (add_end) file.write(end_header, sizeof(end_header) - 1);
+    };
+    const std::string damaged(1024, '\0');
+    write_fixture({corrupt_comment, sizeof(corrupt_comment) - 1}, damaged, true, true);
+#ifdef SUP7Z_DEBUG
+    observed_logical_read_bytes = 0;
+#endif
+    const auto regular = test_password_batch(path.wstring(), {}, {}, L"rar5", keys + 1, 1, {}, true);
+#ifdef SUP7Z_DEBUG
+    const bool skipped_comment = observed_logical_read_bytes > 0 && observed_logical_read_bytes < damaged.size();
+#else
+    const bool skipped_comment = true;
+#endif
+    const std::string_view comment_header{good_comment, sizeof(good_comment) - 1};
+    write_fixture({padded_comment, sizeof(padded_comment) - 1}, {ciphertext, sizeof(ciphertext) - 1}, false, true);
+    const auto comment = test_password_batch(path.wstring(), {}, {}, L"rar5", keys, 2, {}, true);
+    write_fixture(comment_header, {ciphertext, sizeof(ciphertext) - 1}, false, true);
+    const bool comment_metadata_preserved = [&] {
+        auto input = open_archive_stream(path.wstring(), {});
+        CMyComPtr<IInArchive> handler;
+        CMyComPtr<IArchiveOpenCallback> callback(new OpenCallback(keys[1]));
+        const auto formats = extraction_formats_for_hint(L"rar5");
+        UInt32 items = 0;
+        if (!input.opened || create_in_archive(formats.handlers.front(), &handler) != S_OK ||
+            handler->Open(input.stream, nullptr, callback) != S_OK ||
+            handler->GetNumberOfItems(&items) != S_OK || items != 0)
+            return false;
+        PROPVARIANT property{};
+        const bool success = handler->GetArchiveProperty(kpidComment, &property) == S_OK &&
+            prop_text(property) == L"16 bytes of data";
+        clear_prop(property);
+        return success;
+    }();
+    write_fixture(comment_header, {ciphertext, 8}, false, false);
+    const auto truncated = test_password_batch(path.wstring(), {}, {}, L"rar5", keys + 1, 1, {}, true);
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    return regular.status == PasswordTestStatus::Ok && regular.matched_index == 0 && skipped_comment &&
+        comment.status == PasswordTestStatus::Ok && comment.matched_index == 1 && comment_metadata_preserved &&
+        truncated.status == PasswordTestStatus::Unsupported && truncated.encrypted;
+}
+
 bool check_cpu_budget_accounts_base_and_decoder_credits() {
     using namespace sunpack::sevenzip;
     NativeCpuBudget budget(8);
@@ -482,6 +554,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_rar5_short_keyed_member_password_proof()) {
         std::cerr << "RAR5 short keyed member password proof check failed\n";
         return 36;
+    }
+    if (!check_rar5_encrypted_comment_password_fallback()) {
+        std::cerr << "RAR5 encrypted comment fallback check failed\n";
+        return 37;
     }
 
     if (!check_cpu_budget_accounts_base_and_decoder_credits()) {
