@@ -85,13 +85,15 @@ namespace sunpack::sevenzip
             std::vector<UInt64> starts;
             std::vector<UInt32> variable;
             mutable std::optional<VolumeReadUncertainty> reads;
+            mutable std::atomic<bool> incomplete_read{false};
 
             ProbeVolumeRanges(const VolumeAttemptPlan* plan, const std::vector<ExtractInputRange>& ranges,
                               const std::wstring& format) {
                 if (!plan || std::none_of(plan->variation.begin(), plan->variation.end(),
                     [](const auto& slot) { return slot.variable; })) return;
-                if ((format == L"7z" || format == L"zip") && !ranges.empty() &&
-                    std::none_of(plan->variation.begin(), plan->variation.end(), [](const auto& slot) { return slot.variable_length; }))
+                if ((format == L"7z" || format == L"zip" || format == L"rar" ||
+                     format == L"rar4" || format == L"rar5") && !ranges.empty() &&
+                    std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.has_end; }))
                     reads.emplace();
                 starts.reserve(ranges.size() + 1);
                 variable.reserve(ranges.size() + 1);
@@ -102,25 +104,26 @@ namespace sunpack::sevenzip
                     starts.push_back(r.has_end && r.end - r.start <= UINT64_MAX - starts.back()
                         ? starts.back() + r.end - r.start : UINT64_MAX);
                     variable.push_back(variable.back() + plan->variation[i].variable);
-                    if (reads && plan->variation[i].variable)
+                    if (reads && plan->variation[i].variable) {
                         reads->uncertain_ranges.emplace_back(starts[i], starts[i + 1]);
+                        reads->variable_slots.push_back(i);
+                    }
                 }
                 if (reads && !reads->uncertain_ranges.empty())
                     reads->observed = std::make_unique<std::atomic<bool>[]>(reads->uncertain_ranges.size());
             }
             VolumeReadUncertainty* observer() const { return reads ? &*reads : nullptr; }
             void attach(PasswordTestResult& result) const {
-                if (!reads || reads->named_volume_requested.load(std::memory_order_relaxed) ||
-                    result.missing_volume || native_job_cancelled() ||
+                if (!reads || reads->untracked_named_volume.load(std::memory_order_relaxed) ||
+                    result.missing_volume || incomplete_read.load(std::memory_order_relaxed) || native_job_cancelled() ||
                     (result.status != PasswordTestStatus::WrongPassword &&
                      (result.status != PasswordTestStatus::Ok || !result.encrypted))) return;
                 result.rejects_fixed_geometry = result.status == PasswordTestStatus::WrongPassword &&
                     !reads->uncertain_read.load(std::memory_order_relaxed);
                 if (!reads->observed) return;
                 auto& used = result.observed_volume_slots.emplace();
-                for (std::size_t slot = 0, range = 0; slot + 1 < variable.size(); ++slot) {
-                    if (variable[slot] == variable[slot + 1]) continue;
-                    if (reads->observed[range++].load(std::memory_order_relaxed)) used.push_back(slot);
+                for (std::size_t range = 0; range < reads->variable_slots.size(); ++range) {
+                    if (reads->observed[range].load(std::memory_order_relaxed)) used.push_back(reads->variable_slots[range]);
                 }
             }
             bool contains(IInArchive* archive, UInt32 index, const std::wstring& format) const {
@@ -261,6 +264,8 @@ namespace sunpack::sevenzip
             OpenCallback *callback_state = nullptr;
             BoundedPasswordProbeSelection selection;
             PasswordTestResult evidence;
+            ExtractInputTrace input_trace;
+            std::vector<MemberProof> alternatives;
 
             void reset()
             {
@@ -268,14 +273,23 @@ namespace sunpack::sevenzip
                 archive.Release();
                 callback.Release();
                 callback_state = nullptr;
+                alternatives.clear();
             }
             ~PasswordProbeCache() { reset(); }
         };
 
+        HRESULT probe_read_error(const OpenCallback& open, const ExtractInputTrace& trace, HRESULT operation) {
+            auto error = open.input_error();
+            if (!FAILED(error)) error = static_cast<HRESULT>(trace.read_hresult);
+            if (!FAILED(error) && open.volume_open_failed()) return FAILED(operation) ? operation : E_FAIL;
+            return error;
+        }
+
         void probe_opened_archive(
             IInArchive *archive, const BoundedPasswordProbeSelection &selection,
             const std::wstring &password, bool &encryption_evidence, bool final_read_only,
-            HRESULT &hr, Int32 &operation)
+            HRESULT &hr, Int32 &operation, OpenCallback& open, ExtractInputTrace& trace,
+            const ProbeVolumeRanges& volumes)
         {
             auto *raw_callback = new ExtractCallback(password);
             CMyComPtr<IArchiveExtractCallback> callback(raw_callback);
@@ -289,7 +303,7 @@ namespace sunpack::sevenzip
                 hr = archive->Extract(&*selection.index, 1, mode, callback);
             }
             if (!final_read_only && selection.weak && selection.member_mode && selection.index &&
-                hr == S_OK && raw_callback->operation_result() == kOpOk) {
+                hr == S_OK && raw_callback->operation_result() == kOpOk && !FAILED(probe_read_error(open, trace, hr))) {
                 // A seekable AES/Copy substream can verify another CRC with
                 // the same key without decoding the solid prefix again.
                 PROPVARIANT block{};
@@ -310,7 +324,12 @@ namespace sunpack::sevenzip
                         auto *second = new ExtractCallback(password);
                         CMyComPtr<IArchiveExtractCallback> second_callback(second);
                         const auto second_hr = archive->Extract(&next, 1, kSunpackVerifyMember, second_callback);
-                        if (second_hr == S_OK && (second->operation_result() == kOpWrongPassword ||
+                        const auto second_read = probe_read_error(open, trace, second_hr);
+                        if (FAILED(second_read)) {
+                            volumes.incomplete_read.store(true, std::memory_order_relaxed);
+                            trace.read_hresult = 0;
+                            open.clear_input_error();
+                        } else if (second_hr == S_OK && (second->operation_result() == kOpWrongPassword ||
                                                   second->operation_result() == kOpCrcError)) {
                             hr = second_hr;
                             operation = second->operation_result();
@@ -328,6 +347,60 @@ namespace sunpack::sevenzip
             }
             operation = raw_callback->operation_result();
             encryption_evidence = encryption_evidence || raw_callback->password_requested();
+        }
+
+        void probe_available_member(
+            IInArchive* archive, BoundedPasswordProbeSelection& selection, OpenCallback& open,
+            PasswordProbeCache& cache, const std::wstring& format, const ProbeVolumeRanges& volumes,
+            const std::wstring& password, bool& encrypted, bool final_read_only,
+            HRESULT& hr, Int32& operation)
+        {
+            HRESULT read_error = S_OK;
+            const auto probe = [&] {
+                cache.input_trace.read_hresult = 0;
+                open.clear_input_error();
+                probe_opened_archive(archive, selection, password, encrypted, final_read_only, hr, operation,
+                    open, cache.input_trace, volumes);
+                read_error = probe_read_error(open, cache.input_trace, hr);
+                if (FAILED(read_error)) {
+                    volumes.incomplete_read.store(true, std::memory_order_relaxed);
+                    hr = read_error;
+                }
+            };
+            const auto can_try_another = [&] {
+                return !native_job_cancelled() && hr != E_ABORT && hr != E_OUTOFMEMORY &&
+                    (FAILED(read_error) || hr == E_NOTIMPL ||
+                     (hr == S_OK && (operation == kOpUnsupportedMethod ||
+                        operation == kOpUnavailable || operation == kOpUnexpectedEnd)));
+            };
+            probe();
+            if (final_read_only || !selection.index || selection.item_count <= 1 || !can_try_another()) return;
+
+            if (cache.alternatives.empty()) {
+                bounded_password_probe_selection(archive, format, open.password_requested(), volumes, &cache.alternatives);
+                std::sort(cache.alternatives.begin(), cache.alternatives.end());
+            }
+            const auto first = selection;
+            auto failure = first;
+            auto failure_hr = hr;
+            auto failure_op = operation;
+            for (const auto& member : cache.alternatives) {
+                if (member.index == *first.index) continue;
+                selection.index = member.index;
+                selection.weak = member.weak;
+                probe();
+                if (!can_try_another()) return;
+                if ((FAILED(read_error) && (failure_hr == E_NOTIMPL || !FAILED(failure_hr))) ||
+                    (hr == S_OK && operation == kOpUnexpectedEnd && (failure_hr == E_NOTIMPL ||
+                        (failure_hr == S_OK && failure_op == kOpUnsupportedMethod)))) {
+                    failure = selection;
+                    failure_hr = hr;
+                    failure_op = operation;
+                }
+            }
+            selection = failure;
+            hr = failure_hr;
+            operation = failure_op;
         }
 
     } // namespace
@@ -364,17 +437,19 @@ namespace sunpack::sevenzip
             bool encrypted = result.encrypted;
             HRESULT hr = S_OK;
             Int32 operation = kOpOk;
-            probe_opened_archive(cache.archive, cache.selection, password,
-                encrypted, final_read_only, hr, operation);
+            auto selection = cache.selection;
+            probe_available_member(cache.archive, selection, *cache.callback_state, cache, result.archive_type, volumes,
+                password, encrypted, final_read_only, hr, operation);
             result.operation_result = operation;
             if (cache.callback_state->missing_volume_requested() && (hr != S_OK || operation != kOpOk) &&
                 !((result.archive_type == L"rar4" || result.archive_type == L"rar5") &&
-                  cache.selection.index && looks_wrong_password(hr, operation, encrypted)))
+                  selection.index && looks_wrong_password(hr, operation, encrypted)))
                 return needs_volume_or_tail_damaged_result("probe_volume_callback_not_found", cache.callback_state->missing_volume_name(),
                     cache.callback_state->password_requested());
-            if (cache.callback_state->volume_open_failed() || FAILED(hr)) {
+            if (FAILED(hr) && hr != E_NOTIMPL) {
                 result.status = PasswordTestStatus::Error;
                 result.message = "password probe could not read or decode the selected member";
+                result.password_independent_failure = hr == E_ABORT || hr == E_OUTOFMEMORY;
                 cache.reset();
                 return result;
             }
@@ -384,7 +459,7 @@ namespace sunpack::sevenzip
                 {
                     result.status = PasswordTestStatus::Ok;
                     result.message = "password accepted";
-                    result.weak_match = cache.selection.weak && !final_read_only;
+                    result.weak_match = selection.weak && !final_read_only;
                     return result;
                 }
                 if (looks_wrong_password(hr, operation, encrypted))
@@ -437,8 +512,9 @@ namespace sunpack::sevenzip
 
             any_format_created = true;
 
+            cache.input_trace.read_hresult = 0;
             auto input = open_archive_stream(archive_path, part_paths,
-                nullptr, canonical_names, InputPrefetchConfig{false}, input_ranges, volumes.observer());
+                &cache.input_trace, canonical_names, InputPrefetchConfig{false}, input_ranges, volumes.observer());
 
             if (!input.opened)
             {
@@ -457,6 +533,7 @@ namespace sunpack::sevenzip
                 }
 
                 result.status = PasswordTestStatus::Error;
+                result.password_independent_failure = true;
 
                 result.message = "archive file could not be opened";
 
@@ -481,10 +558,13 @@ namespace sunpack::sevenzip
                 return missing;
             }
 
-            if (raw_open_callback->volume_open_failed())
+            if (hr != S_OK && (raw_open_callback->volume_open_failed() ||
+                FAILED(raw_open_callback->input_error()) || FAILED(static_cast<HRESULT>(cache.input_trace.read_hresult))))
             {
+                volumes.incomplete_read.store(true, std::memory_order_relaxed);
                 result.status = PasswordTestStatus::Error;
                 result.message = "archive split volume could not be opened";
+                result.password_independent_failure = !raw_open_callback->password_requested();
                 return result;
             }
 
@@ -497,6 +577,10 @@ namespace sunpack::sevenzip
             }
 
             any_opened = true;
+            if (raw_open_callback->volume_open_failed() || FAILED(raw_open_callback->input_error()) ||
+                FAILED(static_cast<HRESULT>(cache.input_trace.read_hresult)))
+                volumes.incomplete_read.store(true, std::memory_order_relaxed);
+            cache.alternatives.clear();
             result.archive_type = canonical_archive_type_for_guid(format);
             auto selection = bounded_password_probe_selection(archive, result.archive_type, raw_open_callback->password_requested(), volumes);
             if (final_read_only && !raw_open_callback->missing_volume_requested() && selection.item_count_known && rar4_rejected_empty_encrypted_headers(
@@ -530,29 +614,10 @@ namespace sunpack::sevenzip
                 result.password_independent_failure = !raw_open_callback->password_requested();
                 return result;
             }
-            probe_opened_archive(archive, selection, password,
-                last_encryption_evidence, final_read_only, hr, last_op_res);
-            const auto method_unavailable = [&] {
-                return hr == E_NOTIMPL || (hr == S_OK &&
-                    (last_op_res == kOpUnsupportedMethod || last_op_res == kOpUnavailable));
-            };
-            if (!final_read_only && method_unavailable() && selection.index && selection.item_count > 1) {
-                // Build the ordered inventory only when the cheapest member's
-                // codec or data was unavailable. Normal probes retain one index.
-                std::vector<MemberProof> alternatives;
-                bounded_password_probe_selection(archive, result.archive_type,
-                    raw_open_callback->password_requested(), volumes, &alternatives);
-                std::sort(alternatives.begin(), alternatives.end());
-                for (const auto& member : alternatives) {
-                    if (member.index == *selection.index) continue;
-                    selection.index = member.index;
-                    selection.weak = member.weak;
-                    probe_opened_archive(archive, selection, password, last_encryption_evidence,
-                        final_read_only, hr, last_op_res);
-                    if (!method_unavailable()) break;
-                }
-            }
+            probe_available_member(archive, selection, *raw_open_callback, cache, result.archive_type, volumes,
+                password, last_encryption_evidence, final_read_only, hr, last_op_res);
             result.operation_result = last_op_res;
+            result.missing_volume = raw_open_callback->missing_volume_requested();
             last_hr = hr;
             // RAR's handler may request the next volume during Open, having
             // already indexed whole earlier members. A password failure for
@@ -565,10 +630,11 @@ namespace sunpack::sevenzip
                 archive->Close();
                 return missing;
             }
-            if (raw_open_callback->volume_open_failed() || (FAILED(hr) && hr != E_NOTIMPL)) {
+            if (FAILED(hr) && hr != E_NOTIMPL) {
                 archive->Close();
                 result.status = PasswordTestStatus::Error;
                 result.message = "password probe could not read or decode the selected member";
+                result.password_independent_failure = hr == E_ABORT || hr == E_OUTOFMEMORY;
                 return result;
             }
             if (hr == E_NOTIMPL || last_op_res == kOpUnsupportedMethod) {
@@ -582,7 +648,6 @@ namespace sunpack::sevenzip
             if (!raw_open_callback->password_requested() &&
                 looks_wrong_password(hr, last_op_res, last_encryption_evidence))
             {
-                cache.reset();
                 cache.archive = archive;
                 cache.callback = open_callback;
                 cache.callback_state = raw_open_callback;
@@ -736,7 +801,7 @@ namespace sunpack::sevenzip
             }
             if (!current.password_independent_failure &&
                 (current.status == PasswordTestStatus::Unsupported || current.status == PasswordTestStatus::NeedsVolumeOrTailDamaged ||
-                 current.status == PasswordTestStatus::Damaged)) {
+                 current.status == PasswordTestStatus::Damaged || current.status == PasswordTestStatus::Error)) {
                 // Decrypting another header can expose a different usable
                 // member. Preserve this candidate and continue the method.
                 proofs[index] = CandidateProof::Unresolved;

@@ -28,10 +28,11 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_attempts(
     };
     if let Some(next) = invariant_start {
         if let Ok(ranges) = parse_range_prefix(prefix.iter(), sessions, Some(next.end())) {
-            let mut reader = VirtualRangeReader::streaming(&ranges);
-            if reader.len() == next.end() {
+            if VirtualRangeReader::streaming(&ranges).len() == next.end() {
                 return preparation.verify(ranges_key("7z", &ranges)?, candidates, || {
-                    prepare_seven_zip_descriptor(&mut reader, next.end(), next, true, &())
+                    let evidence = FixedSevenZipEvidence(ranges.into());
+                    let mut reader = VirtualRangeReader::streaming(&evidence.0);
+                    prepare_seven_zip_descriptor(&mut reader, next.end(), next, true, &evidence)
                         .map_err(seven_zip_fixed_input_status)
                         .map(PasswordContext::SevenZip)
                 });
@@ -76,14 +77,17 @@ fn prepare_seven_zip_attempts(
                     // The candidate alone does not contain this evidence.
                     return Err(unknown());
                 }
-                reader.read_exact(&mut start).map_err(|_| unknown())?;
+                read_exact_field(reader, &mut start, length, "7z.start_header", FieldLocation::Head)?;
                 if !start.starts_with(SEVEN_Z_MAGIC) {
                     return Err(unknown());
                 }
                 if !seven_zip_start_header_crc_matches(&start) {
                     return Ok(None);
                 }
-                (RelationNextHeader::checked_fields(&start).ok_or_else(unknown)?, start[6] == 0)
+                let Some(next) = RelationNextHeader::checked_fields(&start) else {
+                    return Ok(None);
+                };
+                (next, start[6] == 0)
             }
         };
         prepare_seven_zip_descriptor(reader, length, next, supported_start, &VolumeEvidence)
@@ -96,9 +100,7 @@ fn prepare_seven_zip_attempts(
                 PreparedStatus::Status(_, message) => {
                     PreparedStatus::new("unknown_needs_final_verifier", message)
                 }
-                PreparedStatus::ReadFault(fault) => {
-                    PreparedStatus::new("unknown_needs_final_verifier", format!("{fault:?}"))
-                }
+                status @ PreparedStatus::ReadFault(_) => status,
             })
     })?;
     Ok(contexts.into_context(PasswordContext::SevenZip))
@@ -118,6 +120,10 @@ impl<'a> SevenZipEvidenceReads<AttemptReader<'a>> for VolumeEvidence {
 
     fn range_is_ambiguous(&self, reader: &AttemptReader<'a>, start: u64, size: u64) -> bool {
         reader.range_is_ambiguous(start, size)
+    }
+
+    fn payload_source(&self, reader: &AttemptReader<'a>) -> Option<SevenZipPayloadSource> {
+        Some(SevenZipPayloadSource::Projected(reader.deferred_reads(false)))
     }
 
     fn check_packed(

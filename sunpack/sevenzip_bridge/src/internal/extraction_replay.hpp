@@ -63,7 +63,14 @@ struct VolumeReadUncertainty {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> uncertain_ranges;
     std::atomic<bool> uncertain_read{false};
     std::unique_ptr<std::atomic<bool>[]> observed;
-    std::atomic<bool> named_volume_requested{false};
+    std::vector<std::size_t> variable_slots;
+    std::atomic<bool> untracked_named_volume{false};
+    void observe_named_volume(std::size_t slot) {
+        const auto it = std::lower_bound(variable_slots.begin(), variable_slots.end(), slot);
+        if (it == variable_slots.end() || *it != slot) return;
+        uncertain_read.store(true, std::memory_order_relaxed);
+        if (observed) observed[it - variable_slots.begin()].store(true, std::memory_order_relaxed);
+    }
     void observe_logical_read(std::uint64_t offset, std::uint32_t size) {
         if (!size || (!observed && uncertain_read.load(std::memory_order_relaxed))) return;
         const auto range = std::upper_bound(uncertain_ranges.begin(), uncertain_ranges.end(), offset,

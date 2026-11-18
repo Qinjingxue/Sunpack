@@ -66,8 +66,78 @@ struct Topology {
     cases: usize,
     case_layouts: Vec<(usize, usize)>,
     ambiguous_ranges: std::sync::OnceLock<Vec<(u64, u64)>>,
+    disk_mappings: OnceLock<BTreeMap<usize, DiskMapping>>,
 }
+
+struct DiskMapping {
+    source: usize,
+    length: u64,
+    different_source: bool,
+    different_length: bool,
+}
+
 impl Topology {
+    // Use the full geometry so method selection stays stable when a parser
+    // replays on a narrower projection.
+    fn range_is_ambiguous(&self, start: u64, size: u64) -> bool {
+        let ranges = self.ambiguous_ranges.get_or_init(|| {
+            let mut mappings: Vec<_> = self.edges.iter()
+                .filter(|edge| !edge.unresolved && edge.start < edge.end)
+                .map(|edge| (edge.start, edge.source, edge.end))
+                .collect();
+            mappings.sort_unstable();
+            let mut overlaps: Vec<(u64, u64)> = Vec::new();
+            let mut covered_end = 0;
+            for same in mappings.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
+                let &(start, _, end) = same.last().unwrap();
+                let overlap_end = end.min(covered_end);
+                if start < overlap_end {
+                    match overlaps.last_mut() {
+                        Some((_, last)) if *last >= start => *last = (*last).max(overlap_end),
+                        _ => overlaps.push((start, overlap_end)),
+                    }
+                }
+                covered_end = covered_end.max(end);
+            }
+            overlaps
+        });
+        let index = ranges.partition_point(|&(_, end)| end <= start);
+        ranges.get(index).is_some_and(|&(from, _)| from < start.saturating_add(size))
+    }
+
+    fn disk_range_is_ambiguous(&self, mut disk: usize, mut offset: u64, mut size: u64) -> bool {
+        let mappings = self.disk_mappings.get_or_init(|| {
+            let mut mappings = BTreeMap::<_, DiskMapping>::new();
+            for edge in &self.edges {
+                let length = edge.end - edge.start;
+                mappings.entry(edge.disk).and_modify(|mapping| {
+                    mapping.different_source |= mapping.source != edge.source;
+                    mapping.different_length |= mapping.length != length;
+                }).or_insert(DiskMapping {
+                    source: edge.source, length, different_source: false, different_length: false,
+                });
+            }
+            mappings
+        });
+        while size != 0 {
+            let Some(mapping) = mappings.get(&disk) else { break; };
+            if mapping.different_length {
+                return true;
+            }
+            if offset >= mapping.length {
+                offset -= mapping.length;
+            } else {
+                if mapping.different_source {
+                    return true;
+                }
+                size = size.saturating_sub(mapping.length - offset);
+                offset = 0;
+            }
+            disk += 1;
+        }
+        false
+    }
+
     fn node(&mut self) -> usize {
         self.nodes.push(Node::default());
         self.nodes.len() - 1
@@ -289,6 +359,14 @@ fn unknown(message: impl Into<String>) -> PreparedStatus {
     PreparedStatus::new("unknown_needs_final_verifier", message)
 }
 
+fn read_unavailable(error: io::Error) -> PreparedStatus {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        PreparedStatus::new("needs_volume_or_tail_damaged", error.to_string())
+    } else {
+        unknown(format!("resource_unavailable: {error}"))
+    }
+}
+
 pub(crate) struct PreparedEvidence<T> {
     plan: Arc<VolumeAttemptPlan>,
     pub(crate) contexts: Vec<T>,
@@ -332,7 +410,7 @@ impl<T> PreparedEvidence<T> {
                     .zip(self.projections)
                     .collect(),
                 rejected: self.rejected,
-                unresolved: self.unresolved.is_some(),
+                unresolved: self.unresolved,
             },
         )
     }
@@ -727,10 +805,10 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
         for (mut reader, result) in outcomes {
             rejected.append(&mut reader.truncated_choices);
             if let Some(fault) = reader.unresolved_fault.take() {
-                unresolved.get_or_insert_with(|| unknown(format!("resource_unavailable: {fault}")));
+                unresolved.get_or_insert_with(|| read_unavailable(fault));
             }
             if let Some(fault) = reader.fault {
-                unresolved.get_or_insert_with(|| unknown(format!("resource_unavailable: {fault}")));
+                unresolved.get_or_insert_with(|| read_unavailable(fault));
                 continue;
             }
             if let Some(branches) = reader.pending {
@@ -749,9 +827,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                 }
                 result => {
                     if let Some(error) = reader.evidence_fault {
-                        unresolved.get_or_insert_with(|| {
-                            unknown(format!("resource_unavailable: {error}"))
-                        });
+                        unresolved.get_or_insert_with(|| read_unavailable(error));
                     } else if let Err(error) = result {
                         unresolved.get_or_insert(error);
                     }
@@ -785,6 +861,8 @@ pub(crate) struct AttemptReader<'a> {
     evidence_fault: Option<io::Error>,
     unresolved_fault: Option<io::Error>,
     truncated_choices: Vec<Arc<crate::password::evidence::VolumeProjection>>,
+    preserve_unreadable: bool,
+    missing: bool,
 }
 
 #[derive(Clone)]
@@ -792,30 +870,124 @@ pub(crate) struct DeferredReads {
     sources: Arc<[AttemptSource]>,
     projection: Projection,
     disk_relative: bool,
+    proof: Arc<OnceLock<Arc<crate::password::evidence::VolumeProjection>>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DeferredReadError {
+    Missing,
+    Pending,
+    Io(io::Error),
+    Truncated,
+    Cancelled,
+}
+
+pub(crate) struct DeferredReader<'a> {
+    reader: AttemptReader<'a>,
+    disk_relative: bool,
 }
 
 impl DeferredReads {
-    pub(crate) fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let mut reader = AttemptReader::new(&self.sources, self.projection.clone());
-        let bytes = if self.disk_relative {
-            let (disk, local) = reader.advance_disk_offset(0, 0, offset)?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "required volume is unavailable")
-            })?;
-            reader.read_disk_spanning(disk, local, len)?
+    pub(crate) fn range_is_ambiguous(&self, start: u64, size: u64) -> bool {
+        if self.disk_relative {
+            self.disk_range_is_ambiguous(0, start, size)
         } else {
+            self.projection.topology.range_is_ambiguous(start, size)
+        }
+    }
+
+    pub(crate) fn disk_range_is_ambiguous(&self, disk: usize, offset: u64, size: u64) -> bool {
+        self.projection.topology.disk_range_is_ambiguous(disk, offset, size)
+    }
+
+    pub(crate) fn evaluate<T>(
+        &self, mut verify: impl FnMut(&mut DeferredReader<'_>) -> T,
+    ) -> io::Result<Vec<(Arc<crate::password::evidence::VolumeProjection>, T)>> {
+        let mut pending = Vec::new();
+        let mut current = Some(self.projection.clone());
+        let mut outcomes = Vec::new();
+        let mut branched = false;
+        while let Some(projection) = current.take().or_else(|| pending.pop()) {
+            Cancellation::check_current_io()?;
+            let mut reader = AttemptReader::new(&self.sources, projection);
+            reader.preserve_unreadable = true;
+            let mut reader = DeferredReader { reader, disk_relative: self.disk_relative };
+            let value = verify(&mut reader);
+            Cancellation::check_current_io()?;
+            if let Some(branches) = reader.reader.pending {
+                branched = true;
+                pending.extend(branches.into_iter().rev());
+            } else {
+                let projection = if branched {
+                    reader.reader.projection.proof()
+                } else {
+                    self.proof.get_or_init(|| reader.reader.projection.proof()).clone()
+                };
+                outcomes.push((projection, value));
+            }
+        }
+        Ok(outcomes)
+    }
+
+}
+
+impl DeferredReader<'_> {
+    pub(crate) fn read(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, DeferredReadError> {
+        if self.disk_relative {
+            return self.read_disk_offset(0, 0, offset, len);
+        }
+        self.load(len, |reader| {
             reader.seek(SeekFrom::Start(offset))?;
             let mut bytes = crate::io::resource_error::bytes_with_capacity(len)?;
             bytes.resize(len, 0);
             reader.read_exact(&mut bytes)?;
-            bytes
-        };
-        if let Some(error) = reader.unresolved_fault.or(reader.fault) {
-            return Err(error);
+            Ok(bytes)
+        })
+    }
+
+    pub(crate) fn read_disk_offset(
+        &mut self, disk: usize, base: u64, relative: u64, len: usize,
+    ) -> Result<Vec<u8>, DeferredReadError> {
+        self.load(len, |reader| {
+            let Some((disk, offset)) = reader.advance_disk_offset(disk, base, relative)? else {
+                return Ok(Vec::new());
+            };
+            reader.read_disk_spanning(disk, offset, len)
+        })
+    }
+
+    fn load(
+        &mut self, len: usize,
+        read: impl FnOnce(&mut AttemptReader<'_>) -> io::Result<Vec<u8>>,
+    ) -> Result<Vec<u8>, DeferredReadError> {
+        if self.reader.pending.is_some() {
+            return Err(DeferredReadError::Pending);
         }
-        if !reader.truncated_choices.is_empty() || bytes.len() != len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "required volume extent is incomplete"));
+        self.reader.missing = false;
+        let result = read(&mut self.reader);
+        if self.reader.pending.is_some() {
+            return Err(DeferredReadError::Pending);
         }
-        Ok(bytes)
+        if Cancellation::current().cancelled() {
+            return Err(DeferredReadError::Cancelled);
+        }
+        let fault = self.reader.fault.take().or(self.reader.unresolved_fault.take());
+        if self.reader.missing {
+            return Err(DeferredReadError::Missing);
+        }
+        if let Some(error) = fault {
+            return Err(if error.kind() == io::ErrorKind::UnexpectedEof {
+                DeferredReadError::Truncated
+            } else {
+                DeferredReadError::Io(error)
+            });
+        }
+        match result {
+            Ok(bytes) if bytes.len() == len => Ok(bytes),
+            Ok(_) => Err(DeferredReadError::Missing),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Err(DeferredReadError::Missing),
+            Err(error) => Err(DeferredReadError::Io(error)),
+        }
     }
 }
 
@@ -830,6 +1002,8 @@ impl AttemptReader<'_> {
             evidence_fault: None,
             unresolved_fault: None,
             truncated_choices: Vec::new(),
+            preserve_unreadable: false,
+            missing: false,
         }
     }
 
@@ -838,42 +1012,12 @@ impl AttemptReader<'_> {
             sources: Arc::clone(self.sources),
             projection: self.projection.clone(),
             disk_relative,
+            proof: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Keep method selection stable when a read splits a projection and its
-    /// parser is replayed. Only overlapping *distinct physical mappings*
-    /// can yield different bytes at the same logical position.
     pub(crate) fn range_is_ambiguous(&self, start: u64, size: u64) -> bool {
-        let ranges = self.projection.topology.ambiguous_ranges.get_or_init(|| {
-            let mut mappings: Vec<_> = self
-                .projection
-                .topology
-                .edges
-                .iter()
-                .filter(|edge| !edge.unresolved && edge.start < edge.end)
-                .map(|edge| (edge.start, edge.source, edge.end))
-                .collect();
-            mappings.sort_unstable();
-            let mut overlaps: Vec<(u64, u64)> = Vec::new();
-            let mut covered_end = 0;
-            for same in mappings.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
-                let &(start, _, end) = same.last().unwrap();
-                let overlap_end = end.min(covered_end);
-                if start < overlap_end {
-                    match overlaps.last_mut() {
-                        Some((_, last)) if *last >= start => *last = (*last).max(overlap_end),
-                        _ => overlaps.push((start, overlap_end)),
-                    }
-                }
-                covered_end = covered_end.max(end);
-            }
-            overlaps
-        });
-        let index = ranges.partition_point(|&(_, end)| end <= start);
-        ranges
-            .get(index)
-            .is_some_and(|&(from, _)| from < start.saturating_add(size))
+        self.projection.topology.range_is_ambiguous(start, size)
     }
 
     fn metadata_ready(&self) -> io::Result<()> {
@@ -1184,10 +1328,14 @@ impl AttemptReader<'_> {
             {
                 branches.push(branch);
             }
+            if self.preserve_unreadable && (!branches.is_empty() || short) {
+                branches.extend(self.projection.select(&covering, &beyond_gap, false, self.position));
+            }
             if short {
                 branches.extend(self.projection.select(&covering, &[], true, self.position));
             }
             if branches.is_empty() {
+                self.missing = true;
                 self.fault = self.unresolved_fault.take();
             } else {
                 self.pending = Some(branches);
@@ -1211,6 +1359,7 @@ impl AttemptReader<'_> {
         }
         let mut reads = HashMap::<(usize, u64), Observation>::new();
         let mut truncated = Vec::new();
+        let mut unavailable = Vec::new();
         let mut bytes = vec![0; count];
         let mut comparison = Vec::new();
         for &index in &covering {
@@ -1226,6 +1375,7 @@ impl AttemptReader<'_> {
                 match read {
                     Observation::Bytes(group) => groups[group].1.push(index),
                     Observation::Truncated => truncated.push(index),
+                    Observation::Unavailable if self.preserve_unreadable => unavailable.push(index),
                     Observation::Unavailable => {}
                 }
                 continue;
@@ -1240,6 +1390,9 @@ impl AttemptReader<'_> {
                     Observation::Truncated
                 } else {
                     self.unresolved_fault.get_or_insert(fault);
+                    if self.preserve_unreadable {
+                        unavailable.push(index);
+                    }
                     Observation::Unavailable
                 };
                 reads.insert(location, observation);
@@ -1292,7 +1445,7 @@ impl AttemptReader<'_> {
             }
             return Err(io::Error::other("no readable evidence projection"));
         }
-        if !truncated.is_empty() {
+        if !truncated.is_empty() && !self.preserve_unreadable {
             // Another choice supplied this exact logical range. A source that
             // cannot fill its declared extent cannot supply the same evidence.
             let projection = if disk.is_some() {
@@ -1304,9 +1457,10 @@ impl AttemptReader<'_> {
                 self.truncated_choices.push(projection.proof());
             }
         }
-        if groups.len() > 1 || short {
+        if groups.len() > 1 || short || (self.preserve_unreadable && (!unavailable.is_empty() || !truncated.is_empty())) {
             let mut branches = Vec::new();
-            for (_, edges) in groups {
+            let failures = [unavailable, if self.preserve_unreadable { truncated } else { Vec::new() }];
+            for edges in groups.into_iter().map(|(_, edges)| edges).chain(failures).filter(|edges| !edges.is_empty()) {
                 let branch = if disk.is_some() {
                     self.projection.select_disk(&covering, &edges, &[])
                 } else {

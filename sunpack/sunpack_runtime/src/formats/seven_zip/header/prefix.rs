@@ -49,11 +49,13 @@ pub(crate) fn seven_zip_prefix_check(
         [0x04, 0x02, 0x02] => {
             // BZip2Decoder.cpp ReadStreamSignature2 / ReadBlockSignature2.
             // Both a data block and the empty stream's end marker are legal.
+            if !b"BZh".starts_with(&prefix[..prefix.len().min(3)])
+                || prefix.get(3).is_some_and(|level| !(b'1'..=b'9').contains(level))
+            {
+                return Reject;
+            }
             if prefix.len() < 10 {
                 return Weak;
-            }
-            if &prefix[..3] != b"BZh" || !(b'1'..=b'9').contains(&prefix[3]) {
-                return Reject;
             }
             match &prefix[4..10] {
                 [0x31, 0x41, 0x59, 0x26, 0x53, 0x59] | [0x17, 0x72, 0x45, 0x38, 0x50, 0x90] => {
@@ -65,20 +67,12 @@ pub(crate) fn seven_zip_prefix_check(
         [0x04, 0xf7, 0x11, 0x04] => seven_zip_frame_prefix(prefix, packed_size, true),
         [0x04, 0xf7, 0x11, 0x01] => seven_zip_frame_prefix(prefix, packed_size, false),
         [0x04, 0x01, 0x08] | [0x04, 0x01, 0x09] => {
-            // Only the common framing bits and optional uncompressed block
-            // length are used here. The worker owns Huffman/payload decoding.
-            match prefix.first().map(|first| (first >> 1) & 3) {
-                Some(3) => Reject,
-                Some(0) if prefix.len() >= 5 => {
-                    let len = u16::from_le_bytes([prefix[1], prefix[2]]);
-                    let complement = u16::from_le_bytes([prefix[3], prefix[4]]);
-                    if len != !complement || u64::from(len) > unpack_size || u64::from(len) + 5 > packed_size {
-                        Reject
-                    } else {
-                        Weak
-                    }
-                }
-                _ => Weak,
+            if crate::formats::deflate_prefix::matches_prefix(
+                prefix, Some(packed_size), Some(unpack_size), method[2] == 0x09,
+            ) {
+                Weak
+            } else {
+                Reject
             }
         }
         // Copy, filters and unknown codecs have no generic plaintext magic.
@@ -86,83 +80,107 @@ pub(crate) fn seven_zip_prefix_check(
     }
 }
 
+enum SevenZipFrameStep {
+    Skip(u64),
+    Last,
+    Lz4(crate::formats::lz4::Header, u64),
+    Zstd(crate::formats::zstd::FrameHeader, u64),
+}
+
 fn seven_zip_frame_prefix(
     mut prefix: &[u8],
     mut packed_size: u64,
     is_lz4: bool,
 ) -> SevenZipPrefixCheck {
-    use crate::formats::{lz4, zstd};
     use SevenZipPrefixCheck::{Reject, Strong, Weak};
+    loop {
+        match seven_zip_frame_step(prefix, packed_size, is_lz4) {
+            Ok(Some(SevenZipFrameStep::Skip(span))) => {
+                packed_size -= span;
+                prefix = prefix.get(usize::try_from(span).unwrap_or(usize::MAX)..).unwrap_or_default();
+            }
+            Ok(Some(_)) => return Strong,
+            Ok(None) => return Weak,
+            Err(()) => return Reject,
+        }
+    }
+}
 
-    let magic = loop {
-        let Some(magic) = prefix.first_chunk::<4>().copied().map(u32::from_le_bytes) else {
-            return Weak;
-        };
-        if !lz4::skippable(magic) {
-            break magic;
-        }
-        if packed_size < 8 {
-            return Reject;
-        }
-        let Some(size) = prefix.get(4..8) else {
-            return Weak;
-        };
-        let span = 8 + u64::from(u32::from_le_bytes(size.try_into().unwrap()));
-        if span > packed_size {
-            return Reject;
-        }
-        packed_size -= span;
-        let Ok(span) = usize::try_from(span) else {
-            return Weak;
-        };
-        prefix = prefix.get(span..).unwrap_or_default();
+fn seven_zip_frame_step(
+    prefix: &[u8], packed_size: u64, is_lz4: bool,
+) -> Result<Option<SevenZipFrameStep>, ()> {
+    use crate::formats::{lz4, zstd};
+    let Some(magic) = prefix.first_chunk::<4>().copied().map(u32::from_le_bytes) else {
+        return Ok(None);
     };
-    let needed = if is_lz4 {
+    if lz4::skippable(magic) {
+        if packed_size < 8 {
+            return Err(());
+        }
+        let Some(size) = prefix.get(4..8) else { return Ok(None) };
+        let span = 8 + u64::from(u32::from_le_bytes(size.try_into().unwrap()));
+        return (span <= packed_size).then_some(Some(SevenZipFrameStep::Skip(span))).ok_or(());
+    }
+    if is_lz4 {
         if !prefix.starts_with(lz4::MAGIC) {
-            return Reject;
+            return Err(());
         }
         let header = match lz4::parse_header(prefix) {
             Ok(header) => header,
-            Err("lz4_header_truncated") => return Weak,
-            Err(_) => return Reject,
+            Err("lz4_header_truncated") => return Ok(None),
+            Err(_) => return Err(()),
         };
         let end = header.len + 4;
         if end as u64 > packed_size {
-            return Reject;
+            return Err(());
         }
-        let Some(block) = prefix.get(header.len..end) else {
-            return Weak;
-        };
+        let Some(block) = prefix.get(header.len..end) else { return Ok(None) };
         let word = u32::from_le_bytes(block.try_into().unwrap());
-        header.block_span(word).ok().map(|span| {
-            let end_marker = if word == 0 { 0 } else { 4 + u64::from(header.content_checksum) * 4 };
-            end as u64 + span + end_marker
+        seven_zip_lz4_block(&header, word, packed_size - end as u64).map(|next| {
+            Some(match next {
+                Some(span) => SevenZipFrameStep::Lz4(header, end as u64 + span),
+                None => SevenZipFrameStep::Last,
+            })
         })
     } else if magic == zstd::MAGIC {
-        let Some(&descriptor) = prefix.get(4) else {
-            return Weak;
-        };
+        let Some(&descriptor) = prefix.get(4) else { return Ok(None) };
         if descriptor & 8 != 0 {
-            return Reject;
+            return Err(());
         }
         let offset = 4 + zstd::frame_header_size(descriptor);
         let end = offset + zstd::BLOCK_HEADER_SIZE;
         if end as u64 > packed_size {
-            return Reject;
+            return Err(());
         }
-        let Some(block) = prefix.get(offset..end) else {
-            return Weak;
-        };
-        zstd::FrameHeader::parse(&prefix[4..offset]).and_then(|frame| {
-            let block = frame.block(block.try_into().unwrap())?;
-            let next_header = if block.last { 0 } else { zstd::BLOCK_HEADER_SIZE as u64 };
-            let checksum_size = if frame.has_checksum { 4 } else { 0 };
-            Some(end as u64 + block.encoded_size + next_header + checksum_size)
+        let Some(block) = prefix.get(offset..end) else { return Ok(None) };
+        let frame = zstd::FrameHeader::parse(&prefix[4..offset]).ok_or(())?;
+        seven_zip_zstd_block(&frame, block.try_into().unwrap(), packed_size - end as u64).map(|next| {
+            Some(match next {
+                Some(span) => SevenZipFrameStep::Zstd(frame, end as u64 + span),
+                None => SevenZipFrameStep::Last,
+            })
         })
     } else {
-        None
-    };
-    if needed.is_some_and(|size| size <= packed_size) { Strong } else { Reject }
+        Err(())
+    }
+}
+
+fn seven_zip_lz4_block(
+    header: &crate::formats::lz4::Header, word: u32, remaining: u64,
+) -> Result<Option<u64>, ()> {
+    let span = header.block_span(word).map_err(|_| ())?;
+    let next_header = if word == 0 { 0 } else { 4 + u64::from(header.content_checksum) * 4 };
+    (span + next_header <= remaining).then_some((word != 0).then_some(span)).ok_or(())
+}
+
+fn seven_zip_zstd_block(
+    frame: &crate::formats::zstd::FrameHeader, header: [u8; 3], remaining: u64,
+) -> Result<Option<u64>, ()> {
+    let block = frame.block(header).ok_or(())?;
+    let next_header = if block.last { 0 } else { 3 };
+    let checksum_size = if frame.has_checksum { 4 } else { 0 };
+    (block.encoded_size + next_header + checksum_size <= remaining)
+        .then_some((!block.last).then_some(block.encoded_size)).ok_or(())
 }
 
 fn seven_zip_lzma2_prefix(
@@ -172,30 +190,45 @@ fn seven_zip_lzma2_prefix(
 ) -> SevenZipPrefixCheck {
     use SevenZipPrefixCheck::{Reject, Weak};
 
-    // Same reset states as C/Lzma2Dec.c. Only walk to a following chunk
-    // when its control byte is already in the decrypted prefix.
     let mut need_init = 0xe0;
-    while let Some(&control) = prefix.first() {
-        if control == 0 {
-            return if unpacked == 0 { Weak } else { Reject };
+    loop {
+        match seven_zip_lzma2_chunk(prefix, packed, unpacked, &mut need_init) {
+            Ok(Some((size, span))) => {
+                packed -= span;
+                unpacked -= size;
+                prefix = prefix.get(span as usize..).unwrap_or_default();
+            }
+            Ok(None) => return Weak,
+            Err(()) => return Reject,
         }
+    }
+}
+
+fn seven_zip_lzma2_chunk(
+    prefix: &[u8], packed: u64, unpacked: u64, need_init: &mut u8,
+) -> Result<Option<(u64, u64)>, ()> {
+        let Some(&control) = prefix.first() else { return Ok(None) };
+        if control == 0 {
+            return (unpacked == 0).then_some(None).ok_or(());
+        }
+        // Same reset states as C/Lzma2Dec.c.
         let header_size = match control {
             1 => {
-                need_init = 0xc0;
+                *need_init = 0xc0;
                 3
             }
-            2 if need_init != 0xe0 => 3,
-            0x80..=0xff if control >= need_init => {
-                need_init = 0;
+            2 if *need_init != 0xe0 => 3,
+            0x80..=0xff if control >= *need_init => {
+                *need_init = 0;
                 if control & 0x40 != 0 { 6 } else { 5 }
             }
-            _ => return Reject,
+            _ => return Err(()),
         };
         if unpacked == 0 || header_size as u64 >= packed {
-            return Reject;
+            return Err(());
         }
         let Some(unpack) = prefix.get(1..3) else {
-            return Weak;
+            return Ok(None);
         };
         let mut size = u64::from(u16::from_be_bytes(unpack.try_into().unwrap())) + 1;
         let chunk_packed = if header_size == 3 {
@@ -203,36 +236,119 @@ fn seven_zip_lzma2_prefix(
         } else {
             size += u64::from(control & 0x1f) << 16;
             let Some(pack) = prefix.get(3..5) else {
-                return if size <= unpacked { Weak } else { Reject };
+                return (size <= unpacked).then_some(None).ok_or(());
             };
             let pack = u64::from(u16::from_be_bytes(pack.try_into().unwrap())) + 1;
             // The range decoder needs its five initialization bytes.
             if pack < 5 {
-                return Reject;
+                return Err(());
             }
             pack
         };
         let chunk_end = header_size + chunk_packed as usize;
         if size > unpacked || chunk_end as u64 > packed {
-            return Reject;
+            return Err(());
         }
         if header_size == 6
             && prefix.get(5).is_some_and(|prop| *prop >= 225 || prop % 9 + (prop / 9) % 5 > 4)
         {
-            return Reject;
+            return Err(());
         }
         if header_size != 3 {
             // The stricter bound only applies when the dictionary resets.
             let upper = (control >= 0xe0).then_some(0xbfff_fc00);
-            if seven_zip_range_prefix(prefix.get(header_size..).unwrap_or_default(), upper) == Reject {
-                return Reject;
+            if seven_zip_range_prefix(prefix.get(header_size..).unwrap_or_default(), upper) == SevenZipPrefixCheck::Reject {
+                return Err(());
             }
         }
-        packed -= chunk_end as u64;
-        unpacked -= size;
-        prefix = prefix.get(chunk_end..).unwrap_or_default();
+        Ok(Some((size, chunk_end as u64)))
+}
+
+fn seven_zip_has_block_successor(method: &[u8]) -> bool {
+    matches!(method, [0x21] | [0x04, 0xf7, 0x11, 0x04 | 0x01])
+}
+
+// Each extra read is derived from an already checked codec length. There is
+// no magic scan, decompression, or dependence on the intervening block body.
+fn seven_zip_successor_prefix<E>(
+    method: &[u8], prefix: &[u8], packed: u64, unpacked: u64,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), E>,
+    mut still_ambiguous: impl FnMut(u64) -> bool,
+) -> Result<SevenZipPrefixCheck, E> {
+    use SevenZipPrefixCheck::{Reject, Strong, Weak};
+    if method == [0x21] {
+        let mut need_init = 0xe0;
+        let mut chunk = seven_zip_lzma2_chunk(prefix, packed, unpacked, &mut need_init);
+        let mut unpacked = unpacked;
+        let mut next = 0;
+        loop {
+            match chunk {
+                Ok(Some((size, span))) => {
+                    let first = next == 0;
+                    next += span;
+                    if next == packed || (!first && !still_ambiguous(next)) {
+                        // Do not require a separate end marker when the
+                        // known-size stream is already exhausted.
+                        return Ok(Weak);
+                    }
+                    unpacked -= size;
+                }
+                Ok(None) => return Ok(Weak),
+                Err(()) => return Ok(Reject),
+            }
+            let mut header = [0; 11];
+            let len = (packed - next).min(header.len() as u64) as usize;
+            read(next, &mut header[..len])?;
+            chunk = seven_zip_lzma2_chunk(&header[..len], packed - next, unpacked, &mut need_init);
+        }
     }
-    Weak
+    let is_lz4 = method == [0x04, 0xf7, 0x11, 0x04];
+    let mut offset = 0;
+    let mut step = seven_zip_frame_step(prefix, packed, is_lz4);
+    if matches!(step, Ok(None)) && (prefix.len() as u64) < packed {
+        let mut header = [0; 32];
+        let size = packed.min(header.len() as u64) as usize;
+        read(0, &mut header[..size])?;
+        step = seven_zip_frame_step(&header[..size], packed, is_lz4);
+    }
+    let mut checked_successor = false;
+    loop {
+        step = match step {
+            Ok(Some(SevenZipFrameStep::Skip(span))) => {
+                offset += span;
+                if packed - offset < 4 {
+                    return Ok(Weak);
+                }
+                let mut header = [0; 32];
+                let size = (packed - offset).min(header.len() as u64) as usize;
+                read(offset, &mut header[..size])?;
+                seven_zip_frame_step(&header[..size], packed - offset, is_lz4)
+            }
+            Ok(Some(SevenZipFrameStep::Last)) => return Ok(Strong),
+            Ok(Some(SevenZipFrameStep::Lz4(frame, next))) => {
+                if checked_successor && !still_ambiguous(offset + next) {
+                    return Ok(Strong);
+                }
+                let mut header = [0; 4];
+                read(offset + next, &mut header)?;
+                checked_successor = true;
+                seven_zip_lz4_block(&frame, u32::from_le_bytes(header), packed - offset - next - 4)
+                    .map(|span| Some(span.map_or(SevenZipFrameStep::Last, |span| SevenZipFrameStep::Lz4(frame, next + 4 + span))))
+            }
+            Ok(Some(SevenZipFrameStep::Zstd(frame, next))) => {
+                if checked_successor && !still_ambiguous(offset + next) {
+                    return Ok(Strong);
+                }
+                let mut header = [0; 3];
+                read(offset + next, &mut header)?;
+                checked_successor = true;
+                seven_zip_zstd_block(&frame, header, packed - offset - next - 3)
+                    .map(|span| Some(span.map_or(SevenZipFrameStep::Last, |span| SevenZipFrameStep::Zstd(frame, next + 3 + span))))
+            }
+            Ok(None) => return Ok(Weak),
+            Err(()) => return Ok(Reject),
+        };
+    }
 }
 
 fn seven_zip_plain_header_prefix(prefix: &[u8], plaintext_size: u64) -> SevenZipPrefixCheck {

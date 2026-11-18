@@ -679,6 +679,11 @@ public:
     }
 };
 
+bool fixed_volume_geometry(const sunpack::sevenzip::VolumeAttemptPlan& plan) {
+    return std::none_of(plan.variation.begin(), plan.variation.end(),
+        [](const auto& slot) { return slot.variable_length; });
+}
+
 // Keep one wave's worth of decoder results. Equal declared geometry and
 // the same sources at every observed slot imply identical decoder input.
 class VolumeProbeCache {
@@ -686,25 +691,51 @@ class VolumeProbeCache {
         std::size_t layout;
         std::vector<std::pair<std::size_t, std::size_t>> sources;
         sunpack::sevenzip::PasswordTestResult result;
+        std::vector<unsigned long long> sizes;
+        unsigned long long trim_total = 0;
     };
     std::deque<Entry> entries_;
+    bool fixed_;
+
+    static unsigned long long trim_total(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt) {
+        const auto tail_total = plan.tail_totals.empty() ? 0 : plan.tail_totals[attempt.sources.back()];
+        return tail_total ? tail_total : plan.head_size_from_total;
+    }
+    static unsigned long long size_of(const sunpack::sevenzip::VolumeAttemptPlan& plan, std::size_t source) {
+        const auto& range = plan.sources[source];
+        return range.end - range.start;
+    }
 public:
+    explicit VolumeProbeCache(const sunpack::sevenzip::VolumeAttemptPlan& plan) : fixed_(fixed_volume_geometry(plan)) {}
     CompleteVolumeGeometry geometry;
 
-    const sunpack::sevenzip::PasswordTestResult* find(const PreparedAttempt& attempt) const {
+    bool can_skip_suffix(const sunpack::sevenzip::VolumeAttemptPlan& plan, std::size_t layout) {
+        return fixed_ && geometry.known(plan, layout);
+    }
+
+    const sunpack::sevenzip::PasswordTestResult* find(
+        const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt) const {
         for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
             if (it->layout == attempt.layout && std::all_of(it->sources.begin(), it->sources.end(),
-                [&](const auto& source) { return attempt.sources[source.first] == source.second; })) return &it->result;
+                [&](const auto& source) { return attempt.sources[source.first] == source.second; }) &&
+                (fixed_ || (it->trim_total == trim_total(plan, attempt) &&
+                    std::equal(it->sizes.begin(), it->sizes.end(), attempt.sources.begin(), attempt.sources.end(),
+                        [&](auto size, auto source) { return size == size_of(plan, source); })))) return &it->result;
         return nullptr;
     }
 
     void remember(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt, std::size_t capacity) {
         const auto& observed = attempt.probe.observed_volume_slots;
-        if (!observed || !geometry.known(plan, attempt.layout) || find(attempt)) return;
+        if (!observed || !geometry.known(plan, attempt.layout) || find(plan, attempt)) return;
         if (entries_.size() == capacity) entries_.pop_front();
-        Entry entry{attempt.layout, {}, attempt.probe};
+        Entry entry{attempt.layout, {}, attempt.probe, {}, 0};
         entry.sources.reserve(observed->size());
         for (const auto slot : *observed) entry.sources.emplace_back(slot, attempt.sources[slot]);
+        if (!fixed_) {
+            entry.trim_total = trim_total(plan, attempt);
+            entry.sizes.reserve(attempt.sources.size());
+            for (const auto source : attempt.sources) entry.sizes.push_back(size_of(plan, source));
+        }
         entries_.push_back(std::move(entry));
     }
 };
@@ -761,7 +792,7 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
     parallel.run(prepared_attempts.size(), [&](std::size_t lane, std::size_t) {
         if (lane > earliest.load()) return;
         auto& prepared = prepared_attempts[lane];
-        if (const auto* cached = cache.find(prepared)) prepared.probe = *cached;
+        if (const auto* cached = cache.find(request.archive_input.volume_attempts, prepared)) prepared.probe = *cached;
         else {
             WorkerArchiveInput input;
             select_volume_attempt(request.archive_input, prepared.layout, prepared.sources, input);
@@ -825,7 +856,7 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
             std::string discarded_paths;
             std::string discarded_prefixes;
             std::string discarded_layouts;
-            VolumeProbeCache proof_cache;
+            VolumeProbeCache proof_cache(plan);
             std::optional<std::size_t> skipped_layout;
             while (!tested) {
                 auto wave = probe_volume_wave(request, cursor, cancel, proof_cache);
@@ -839,11 +870,11 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
                     probe = std::move(candidate.probe);
                     const bool rejected = probe.status == PasswordTestStatus::WrongPassword;
                     const auto prefix = rejected ? rejected_prefix_size(probe, candidate.sources.size()) : 0;
-                    if (probe.rejects_fixed_geometry && proof_cache.geometry.known(plan, candidate.layout)) {
+                    if (probe.rejects_fixed_geometry && proof_cache.can_skip_suffix(plan, candidate.layout)) {
                         skipped_layout = candidate.layout;
                         if (frontier_found) wire::append_number(discarded_layouts, candidate.layout);
                         if (cursor.layout == candidate.layout && !cursor.searching) cursor.skip_layout();
-                    } else if (prefix && proof_cache.geometry.known(plan, candidate.layout)) {
+                    } else if (prefix && proof_cache.can_skip_suffix(plan, candidate.layout)) {
                         skipped_prefix = &candidate;
                         skipped_slots = prefix;
                         if (frontier_found) append_volume_selection(discarded_prefixes, candidate.layout, candidate.sources, prefix);
@@ -1040,7 +1071,7 @@ RequestOutcome run_request(
         std::all_of(request.archive_input.volume_attempts.layouts[0].begin(), request.archive_input.volume_attempts.layouts[0].end(),
             [&](const auto& slot) { return request.archive_input.volume_attempts.domains[slot.domain].size() == 1; });
     std::optional<PasswordTestResult> selected_probe;
-    VolumeProbeCache proof_cache;
+    VolumeProbeCache proof_cache(request.archive_input.volume_attempts);
     auto extract_with_password = [&](const std::wstring& selected_password) {
         if (volume_trials) volume_replay->volume_output_started = true;
         // The callback is synchronous and its emit() serializes calls. Each
@@ -1154,7 +1185,7 @@ RequestOutcome run_request(
                 auto& cursor = volume_replay->volumes;
                 const auto& plan = request.archive_input.volume_attempts;
                 const auto prefix = rejected_prefix_size(*selected_probe, cursor.selected.size());
-                if ((selected_probe->rejects_fixed_geometry || prefix) && proof_cache.geometry.known(plan, cursor.layout)) {
+                if ((selected_probe->rejects_fixed_geometry || prefix) && proof_cache.can_skip_suffix(plan, cursor.layout)) {
                     if (selected_probe->rejects_fixed_geometry) {
                         cursor.skip_layout();
                         prepared_attempts.clear();

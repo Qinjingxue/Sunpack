@@ -59,6 +59,83 @@ fn payload_prefix_collisions_survive_until_complete_header_evidence() {
     }
 }
 
+const AES_LZMA2_FOLDER: &[u8] = &[2, 0x24, 6, 0xf1, 7, 1, 1, 0x3f, 0x21, 0x21, 1, 0, 1, 0];
+
+fn direct_key_ciphertext(plaintext: &[u8]) -> Vec<u8> {
+    use aes::cipher::{block_padding::NoPadding, BlockModeEncrypt, KeyIvInit};
+    let mut key = [0; 32];
+    key[..12].copy_from_slice(b"s\0e\0c\0r\0e\0t\0");
+    let mut encrypted = plaintext.to_vec();
+    let length = plaintext.len().next_multiple_of(16);
+    encrypted.resize(length, 0);
+    cbc::Encryptor::<aes::Aes256>::new(&key.into(), &[0; 16].into())
+        .encrypt_padded::<NoPadding>(&mut encrypted, length)
+        .unwrap();
+    encrypted
+}
+
+fn archive_with_descriptor(body: &[u8], header: &[u8]) -> Vec<u8> {
+    let mut archive = vec![0; SEVEN_Z_HEADER_SIZE];
+    archive[..SEVEN_Z_MAGIC.len()].copy_from_slice(SEVEN_Z_MAGIC);
+    archive[7] = 4;
+    archive[12..20].copy_from_slice(&(body.len() as u64).to_le_bytes());
+    archive.extend_from_slice(body);
+    archive.extend_from_slice(header);
+    update_descriptor_crc(&mut archive);
+    archive
+}
+
+#[test]
+fn projected_lzma2_successor_removes_bad_cbc_source_after_prefix_survives() {
+    // Two LZMA2 blocks have known controls and lengths, and their intervening
+    // bodies need no scan. The end marker's CBC predecessor is on the disputed
+    // volume, beyond the first successor already checked in the common head.
+    let mut stream = vec![1, 0, 44];
+    stream.extend([0xa9; 45]);
+    stream.extend([2, 0, 44]);
+    stream.extend([0x4a; 45]);
+    stream.push(0);
+    let encrypted = direct_key_ciphertext(&stream);
+    let mut header = vec![1, 4, 6, 0, 1, 9, encrypted.len() as u8, 0, 7, 11, 1, 0];
+    header.extend(AES_LZMA2_FOLDER);
+    header.extend([12, stream.len() as u8, 90, 0, 0, 0]);
+    let archive = archive_with_descriptor(&encrypted, &header);
+    let (paths, sources, plan) = uncertain_tail_fixture_at(&archive, &[], 112);
+    let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None)
+        .unwrap_or_else(|_| panic!("LZMA2 projected header"));
+    let PasswordContext::Evidence(evidence) = context else {
+        panic!("the common prefix should retain separate successor sources");
+    };
+    let proof = evidence.verify_batch(&[Arc::from("secret")], true, true).unwrap();
+    assert_eq!(proof.matched_indices, [0]);
+    assert!(!proof.volume_attempts.unwrap().sources.iter().any(|source| source.path == sources[1].path));
+    drop(evidence);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+}
+
+#[test]
+fn external_folder_metadata_locates_encrypted_payload_stream() {
+    let mut body = direct_key_ciphertext(&[1, 0, 0, 42, 0]);
+    body.extend(AES_LZMA2_FOLDER);
+    let size = AES_LZMA2_FOLDER.len() as u8;
+    let header = [
+        1, 3,                       // Header and AdditionalStreamsInfo
+        6, 16, 1, 9, size, 0,       // PackInfo for the external Copy stream
+        7, 11, 1, 0, 1, 1, 0,      // one inline Copy folder
+        12, size, 0, 0,
+        4, 6, 0, 1, 9, 16, 0,      // MainStreamsInfo and payload PackInfo
+        7, 11, 1, 1, 0,            // one external folder in AdditionalStreams stream 0
+        12, 5, 1, 0, 0, 0,
+    ];
+    let archive = archive_with_descriptor(&body, &header);
+    let context = prepare_seven_zip(std::io::Cursor::new(&archive), archive.len() as u64, &())
+        .unwrap_or_else(|_| panic!("external folder should expose its AES compressor prefix"));
+    let proof = context.verify(&[Arc::from("wrong"), Arc::from("secret")]).unwrap();
+    assert_eq!(proof.matched_indices, [1]);
+    assert_eq!(proof.match_evidence, Some("7z_payload_prefix"));
+    assert_eq!(proof.final_confirmation_required, Some(true));
+}
+
 #[test]
 fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
     let bytes: &[u8] = &[
@@ -222,17 +299,17 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
         224, 0, 0,
     ];
     // Remove the optional folder CRC from the same real encoded header.
-    // AES -> Copy exposes the Header NID but cannot confirm the password.
+    // The complete header can still reject invalid trees but cannot confirm the password.
     let mut crc_less = bytes.to_vec();
     let crc_field = crc_less.len() - 8;
     assert_eq!(&crc_less[crc_field..crc_field + 2], &[0x0a, 1]);
     crc_less.drain(crc_field..crc_field + 6);
     update_descriptor_crc(&mut crc_less);
-    let context = prepare_seven_zip(std::io::Cursor::new(&crc_less), crc_less.len() as u64)
-        .unwrap_or_else(|_| panic!("CRC-less header must use prefix evidence"));
+    let context = prepare_seven_zip(std::io::Cursor::new(&crc_less), crc_less.len() as u64, &())
+        .unwrap_or_else(|_| panic!("CRC-less header must use structural evidence"));
     let result = context.verify(&[Arc::from("wrong-first"), Arc::from("secret")]).unwrap();
     assert_eq!(result.matched_indices, [1]);
-    assert_eq!(result.match_evidence, Some("7z_header_prefix"));
+    assert_eq!(result.match_evidence, Some("7z_header_structure"));
     assert_eq!(result.final_confirmation_required, Some(true));
     // A single substream covers the whole encrypted metadata folder.
     // Move the original folder digest to SubStreamsInfo, then split the

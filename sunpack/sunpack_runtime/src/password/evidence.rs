@@ -1,6 +1,6 @@
 //! Task-local byte dependencies reduce the existing candidate plan directly.
 //! Worker layouts carry only the passwords still viable for their bytes.
-use super::{context::PasswordContext, PasswordVerification};
+use super::{context::{PasswordContext, PreparedStatus}, PasswordVerification};
 use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSelection};
 use crate::io::cancellation::Cancellation;
 use rayon::prelude::*;
@@ -19,7 +19,7 @@ pub(crate) struct EvidenceContext {
     pub alternatives: Vec<(PasswordContext, Arc<VolumeProjection>)>,
     pub rejected: Vec<Arc<VolumeProjection>>,
     pub public_plan: std::sync::OnceLock<Arc<VolumeAttemptPlan>>,
-    pub unresolved: bool,
+    pub unresolved: Option<PreparedStatus>,
     pub public_reduced: bool,
     pub rar_anchor: Option<Arc<super::rar::RarPasswordContext>>,
     pub independent_rar: Vec<Option<Arc<super::rar::RarPasswordContext>>>,
@@ -28,15 +28,18 @@ pub(crate) struct EvidenceContext {
 /// Only allocate per-path indices after a globally viable password is
 /// excluded on that path. All indices refer to the final worker list.
 #[derive(Default)]
-pub(crate) struct CandidateDomains(Vec<Option<Vec<usize>>>);
+pub(crate) struct CandidateDomains {
+    prepared: Vec<Option<Vec<usize>>>,
+    scoped: Vec<(Arc<VolumeProjection>, usize)>,
+}
 
 impl CandidateDomains {
     pub(crate) fn append(&mut self, batch: Vec<Option<Vec<usize>>>, offset: usize, count: usize) {
-        if self.0.is_empty() {
-            self.0.resize_with(batch.len(), || None);
+        if self.prepared.is_empty() {
+            self.prepared.resize_with(batch.len(), || None);
         }
         let mut next = batch.into_iter();
-        for accumulated in &mut self.0 {
+        for accumulated in &mut self.prepared {
             match next.next().flatten() {
                 Some(indices) => accumulated
                     .get_or_insert_with(|| (0..offset).collect())
@@ -50,12 +53,20 @@ impl CandidateDomains {
         }
     }
 
+    pub(crate) fn append_scoped(
+        &mut self, rejected: Vec<(Arc<VolumeProjection>, usize)>, offset: usize, surviving: &[usize],
+    ) {
+        self.scoped.extend(rejected.into_iter().filter_map(|(path, index)| {
+            surviving.binary_search(&index).ok().map(|index| (path, offset + index))
+        }));
+    }
+
     pub(crate) fn finish(
         self,
         context: &EvidenceContext,
         count: usize,
     ) -> std::io::Result<Option<(VolumeAttemptPlan, LayoutPasswords)>> {
-        if self.0.is_empty() {
+        if self.prepared.is_empty() && self.scoped.is_empty() {
             return Ok(None);
         }
         let mut groups: Vec<Arc<[usize]>> = vec![Arc::default()];
@@ -63,23 +74,63 @@ impl CandidateDomains {
         let mut rules: Vec<_> = context
             .rejected
             .iter()
-            .map(|p| (p.as_ref(), None))
+            .map(|p| (p.as_ref(), Rule::Remove))
             .collect();
-        for ((_, path), indices) in context.alternatives.iter().zip(self.0) {
+        for ((_, path), indices) in context.alternatives.iter().zip(self.prepared) {
             let Some(indices) = indices else {
                 continue;
             };
-            let group = if indices.is_empty() {
-                None
+            let rule = if indices.is_empty() {
+                Rule::Remove
             } else {
-                Some(*ids.entry(indices.into()).or_insert_with_key(|indices| {
+                Rule::Domain(*ids.entry(indices.into()).or_insert_with_key(|indices| {
                     groups.push(indices.clone());
                     groups.len() - 1
                 }))
             };
-            rules.push((path, group));
+            rules.push((path, rule));
         }
-        let (plan, mut layout_groups) = partition(&context.plan, &rules, groups.len())?;
+        rules.extend(self.scoped.iter().map(|(path, index)| (path.as_ref(), Rule::Reject(*index))));
+        let mut rejected = Vec::new();
+        let mut allowed = Vec::new();
+        let mut terminal = |state: &State, ends: &Ends| -> Option<usize> {
+            let mut group = 0;
+            rejected.clear();
+            for node in state {
+                match ends.get(node) {
+                    Some(Rule::Remove) => return None,
+                    Some(Rule::Domain(id)) => group = if group == 0 { *id } else { group.min(*id) },
+                    Some(Rule::Reject(index)) => rejected.push(*index),
+                    None => {}
+                }
+            }
+            if rejected.is_empty() {
+                return Some(group);
+            }
+            rejected.sort_unstable();
+            rejected.dedup();
+            allowed.clear();
+            let mut rejected = rejected.iter().copied().peekable();
+            let mut retain = |index| {
+                while rejected.next_if(|i| *i < index).is_some() {}
+                if rejected.next_if_eq(&index).is_none() {
+                    allowed.push(index);
+                }
+            };
+            if group == 0 {
+                (0..count).for_each(&mut retain);
+                if allowed.len() == count { return Some(0); }
+            } else {
+                groups[group].iter().copied().for_each(retain);
+                if allowed.len() == groups[group].len() { return Some(group); }
+            }
+            if allowed.is_empty() { return None; }
+            Some(*ids.entry(allowed.as_slice().into()).or_insert_with_key(|indices| {
+                groups.push(indices.clone());
+                groups.len() - 1
+            }))
+        };
+        let (plan, mut layout_groups) = partition_from(&context.plan, &rules, &[], None, &mut terminal)?;
         if layout_groups.iter().all(|&id| id == 0) {
             return Ok(Some((plan, LayoutPasswords::default())));
         }
@@ -124,20 +175,20 @@ pub(super) struct SharedCandidateKeys<K, V>(
 );
 
 impl<K: Copy + Eq + std::hash::Hash, V> SharedCandidateKeys<K, V> {
-    fn new<'a>(
+    pub(super) fn new<'a, I: IntoIterator<Item = K>>(
         alternatives: &'a [(PasswordContext, Arc<VolumeProjection>)],
-        identify: impl Fn(&'a PasswordContext) -> Option<K>,
+        identify: impl Fn(&'a PasswordContext) -> I,
     ) -> Self {
+        Self::from_parameters(alternatives.iter().flat_map(|(context, _)| identify(context)))
+    }
+
+    pub(super) fn from_parameters(parameters: impl IntoIterator<Item = K>) -> Self {
         let mut shared = HashMap::new();
-        if alternatives.len() > 1 {
-            let mut seen = std::collections::HashSet::new();
-            for key in alternatives
-                .iter()
-                .filter_map(|(context, _)| identify(context))
-            {
-                if !seen.insert(key) {
-                    shared.entry(key).or_default();
-                }
+        let mut parameters = parameters.into_iter();
+        if let (Some(first), Some(second)) = (parameters.next(), parameters.next()) {
+            let mut seen = std::collections::HashSet::from([first]);
+            for key in std::iter::once(second).chain(parameters) {
+                if !seen.insert(key) { shared.entry(key).or_default(); }
             }
         }
         Self(shared)
@@ -206,6 +257,9 @@ impl EvidenceContext {
                 for i in &mut result.matched_indices {
                     *i = indices[*i];
                 }
+                for (_, i) in &mut result.scoped_rejections {
+                    *i = indices[*i];
+                }
                 result.attempts = candidates.len();
                 return Ok(result);
             }
@@ -223,9 +277,12 @@ impl EvidenceContext {
     ) -> std::io::Result<PasswordVerification> {
         let cancellation = Cancellation::current();
         cancellation.check_io()?;
-        let keys = SharedCandidateKeys::new(&self.alternatives, |context| match context {
-            PasswordContext::SevenZip(context) => context.kdf_parameters(),
-            _ => None,
+        let keys = SharedCandidateKeys::new(&self.alternatives, |context| {
+            let context = match context {
+                PasswordContext::SevenZip(context) => Some(context),
+                _ => None,
+            };
+            context.into_iter().flat_map(|context| context.kdf_parameters())
         });
         let zip_keys = SharedCandidateKeys::new(&self.alternatives, |context| match context {
             PasswordContext::Zip(context) => context.kdf_parameters(),
@@ -237,7 +294,7 @@ impl EvidenceContext {
             .map(|(context, _)| {
                 cancellation.run(|| match context {
                     PasswordContext::SevenZip(context) => context
-                        .verify_cached(candidates, (self.alternatives.len() > 1).then_some(&keys)),
+                        .verify_cached(candidates, Some(&keys)),
                     PasswordContext::Zip(context) => context.verify_cached(
                         candidates,
                         (self.alternatives.len() > 1).then_some(&zip_keys),
@@ -279,7 +336,7 @@ impl EvidenceContext {
         // tail may be a valid archive using a different configured password.
         let confirmed = results.iter().find_map(strong).filter(|&hit| {
             fixed
-                || (!self.unresolved
+                || (self.unresolved.is_none()
                     && results.iter().all(|result| {
                         strong(result) == Some(hit)
                             || (complete
@@ -293,6 +350,10 @@ impl EvidenceContext {
             for ((_, projection), result) in self.alternatives.iter().zip(&results) {
                 if !survives(result, index) {
                     removed.push(projection);
+                } else {
+                    removed.extend(result.scoped_rejections.iter().filter_map(|(path, i)| {
+                        (*i == index).then_some(path.as_ref())
+                    }));
                 }
             }
         }
@@ -348,15 +409,14 @@ impl EvidenceContext {
             return Ok(result);
         }
         if self.alternatives.is_empty() {
-            return Ok(PasswordVerification {
-                volume_attempts,
-                ..PasswordVerification::status(
-                    "unknown_needs_final_verifier",
-                    "no usable password proof",
-                )
-            });
+            let mut result = self.unresolved.as_ref().map_or_else(
+                || PasswordVerification::status("unknown_needs_final_verifier", "no usable password proof"),
+                PreparedStatus::verification,
+            );
+            result.volume_attempts = volume_attempts;
+            return Ok(result);
         }
-        let mut possible = vec![self.unresolved; candidates.len()];
+        let mut possible = vec![self.unresolved.is_some(); candidates.len()];
         let mut method = None;
         for result in &results {
             if result.status == "match" {
@@ -395,8 +455,20 @@ impl EvidenceContext {
             }
         }
         let matched = !matches.is_empty();
+        let fallback = self.unresolved.as_ref().map(PreparedStatus::verification);
+        let message = fallback.as_ref().map(|result| result.message.as_str()).or_else(|| {
+            results.iter().find(|result| !matches!(result.status, "match" | "no_match") || result.read_fault.is_some())
+                .map(|result| result.message.as_str())
+        }).or_else(|| results.iter().find(|result| result.status == "match").map(|result| result.message.as_str()));
+        let summary = PasswordVerification::status(
+            if matched { "match" } else { "no_match" },
+            message.unwrap_or("password candidates screened against available volume evidence"),
+        );
+        let read_fault = fallback.and_then(|result| result.read_fault)
+            .or_else(|| results.iter().find_map(|result| result.read_fault.clone()));
         Ok(PasswordVerification {
             password_domains,
+            scoped_rejections: results.into_iter().flat_map(|result| result.scoped_rejections).collect(),
             matched_index: matches.first().copied(),
             matched_indices: matches,
             attempts: candidates.len(),
@@ -407,10 +479,8 @@ impl EvidenceContext {
                 method
             },
             volume_attempts,
-            ..PasswordVerification::status(
-                if matched { "match" } else { "no_match" },
-                "password candidates screened against available volume evidence",
-            )
+            read_fault,
+            ..summary
         })
     }
 }
@@ -424,9 +494,9 @@ pub(super) fn remove_paths(
 ) -> std::io::Result<VolumeAttemptPlan> {
     let rules: Vec<_> = removed
         .iter()
-        .map(|&projection| (projection, None))
+        .map(|&projection| (projection, Rule::Remove))
         .collect();
-    Ok(partition(plan, &rules, 1)?.0)
+    Ok(partition_from(plan, &rules, &[], None, &mut remove_terminal)?.0)
 }
 
 /// Worker results use the original request's source IDs. Subtract the actual
@@ -489,30 +559,36 @@ pub(crate) fn remove_scan_paths(
     }
     proof.roots.extend(roots.into_iter().map(|((layout, count), at)| [layout, count, at]));
     proof.edges.extend(edges.into_iter().map(|((from, source), to)| [from, to, source]));
-    let (plan, _) = partition_from(plan, &[(&proof, None)], 1, &dropped, first)?;
+    let (plan, _) = partition_from(plan, &[(&proof, Rule::Remove)], &dropped, first, &mut remove_terminal)?;
     Ok(plan)
 }
 
 // A terminal either removes a path or assigns its password domain. Prepared
 // alternatives partition the byte observations. Paths without readable proof
 // use domain zero, which contains every globally surviving candidate.
-fn partition(
-    plan: &VolumeAttemptPlan,
-    rules: &[(&VolumeProjection, Option<usize>)],
-    domain_count: usize,
-) -> std::io::Result<(VolumeAttemptPlan, Vec<usize>)> {
-    partition_from(plan, rules, domain_count, &[], None)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    Remove,
+    Domain(usize),
+    Reject(usize),
+}
+
+type State = Vec<(usize, usize)>;
+type Ends = HashMap<(usize, usize), Rule>;
+
+fn remove_terminal(state: &State, ends: &Ends) -> Option<usize> {
+    (!state.iter().any(|node| ends.contains_key(node))).then_some(0)
 }
 
 fn partition_from(
     plan: &VolumeAttemptPlan,
-    rules: &[(&VolumeProjection, Option<usize>)],
-    domain_count: usize,
+    rules: &[(&VolumeProjection, Rule)],
     dropped: &[bool],
     first: Option<&VolumeSelection>,
+    terminal: &mut impl FnMut(&State, &Ends) -> Option<usize>,
 ) -> std::io::Result<(VolumeAttemptPlan, Vec<usize>)> {
     if let Some(first) = first { plan.selected_parts(first)?; }
-    type State = Vec<(usize, usize)>;
+    let tracks_domains = rules.iter().any(|(_, rule)| *rule != Rule::Remove);
     let mut edges: HashMap<(usize, usize, usize), Vec<usize>> = HashMap::new();
     let mut ends = HashMap::new();
     let mut roots = HashMap::<(usize, usize), State>::new();
@@ -535,8 +611,8 @@ fn partition_from(
         choices: &[Arc<Vec<usize>>],
         root: State,
         edges: &HashMap<(usize, usize, usize), Vec<usize>>,
-        ends: &HashMap<(usize, usize), Option<usize>>,
-        domain_count: usize,
+        ends: &Ends,
+        terminal: &mut impl FnMut(&State, &Ends) -> Option<usize>,
     ) -> std::io::Result<Vec<(Vec<Arc<Vec<usize>>>, usize)>> {
         if root.is_empty() {
             return Ok(vec![(choices.to_vec(), 0)]);
@@ -573,28 +649,23 @@ fn partition_from(
             layers.push(steps);
             layer = next;
         }
-        let mut suffixes: Vec<Vec<usize>> = layer
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Suffix {
+            Group(usize),
+            Node(usize),
+        }
+        let mut suffixes: Vec<Vec<Suffix>> = layer
             .iter()
-            .map(|state| {
-                state
-                    .iter()
-                    .filter_map(|n| ends.get(n))
-                    .copied()
-                    .min()
-                    .unwrap_or(Some(0))
-                    .into_iter()
-                    .collect()
-            })
+            .map(|state| terminal(state, ends).map(Suffix::Group).into_iter().collect())
             .collect();
-        // Terminal IDs are password domains. Higher IDs refer to arena entries.
-        let mut arena: Vec<(Arc<Vec<usize>>, usize)> = Vec::new();
-        let mut unconstrained = 0;
+        let mut arena: Vec<(Arc<Vec<usize>>, Suffix)> = Vec::new();
+        let mut unconstrained = Suffix::Group(0);
         for (domain, steps) in choices.iter().zip(layers).rev() {
             cancel.check_io()?;
-            let mut intern = HashMap::<(Arc<Vec<usize>>, usize), usize>::new();
+            let mut intern = HashMap::<(Arc<Vec<usize>>, Suffix), Suffix>::new();
             let mut node = |choices: Arc<Vec<usize>>, tail| {
                 *intern.entry((choices.clone(), tail)).or_insert_with(|| {
-                    let id = domain_count + arena.len();
+                    let id = Suffix::Node(arena.len());
                     arena.push((choices, tail));
                     id
                 })
@@ -608,7 +679,7 @@ fn partition_from(
                     }
                     let mut output = Vec::new();
                     let mut group = Vec::new();
-                    let mut common = 0;
+                    let mut common = Suffix::Group(0);
                     for (&source, target) in domain.iter().zip(targets) {
                         let tails = &suffixes[target];
                         if tails.is_empty() {
@@ -645,12 +716,13 @@ fn partition_from(
             .into_iter()
             .map(|mut id| {
                 let mut path = Vec::with_capacity(choices.len());
-                while id >= domain_count {
-                    let (choices, next) = &arena[id - domain_count];
+                while let Suffix::Node(node) = id {
+                    let (choices, next) = &arena[node];
                     path.push(choices.clone());
                     id = *next;
                 }
-                (path, id)
+                let Suffix::Group(group) = id else { unreachable!() };
+                (path, group)
             })
             .collect())
     }
@@ -701,19 +773,19 @@ fn partition_from(
                     slots: slots.into(),
                     minimum_slots: if lowest == count { 0 } else { lowest },
                 });
-                if domain_count > 1 {
+                if tracks_domains {
                     layout_groups.push(group);
                 }
             };
             match frontier {
                 None => {
-                    for (remaining, group) in subtract(&choices, state, &edges, &ends, domain_count)? {
+                    for (remaining, group) in subtract(&choices, state, &edges, &ends, terminal)? {
                         keep(remaining, group);
                     }
                 }
                 Some(selection) => {
                     for suffix in ordered_suffix(&choices, &selection.sources) {
-                        for (remaining, group) in subtract(&suffix, state.clone(), &edges, &ends, domain_count)? {
+                        for (remaining, group) in subtract(&suffix, state.clone(), &edges, &ends, terminal)? {
                             keep(remaining, group);
                         }
                     }

@@ -426,27 +426,6 @@ impl VolumeSet {
         Ok(data)
     }
 
-    pub(crate) fn advance_disk_offset(
-        &self,
-        mut disk: usize,
-        mut offset: u64,
-        mut amount: u64,
-    ) -> Option<(usize, u64)> {
-        loop {
-            let volume_len = self.volume_len(disk)?;
-            if offset > volume_len {
-                return None;
-            }
-            let remaining = volume_len - offset;
-            if amount <= remaining {
-                return Some((disk, offset + amount));
-            }
-            amount -= remaining;
-            disk += 1;
-            offset = 0;
-        }
-    }
-
     pub(super) fn contiguous_ranges(&self) -> Vec<RangeSpec> {
         let mut position = 0u64;
         self.volumes.iter().enumerate()

@@ -19,10 +19,17 @@ pub(crate) struct SevenZipPasswordProbe {
     folder: SevenZipFolderAst,
     aes_index: usize,
     prefix: Option<(usize, SevenZipPayloadEvidence)>,
+    metadata: SevenZipMetadata,
+}
+
+#[derive(Clone, Copy)]
+enum SevenZipMetadata {
+    Header,
+    Folders(usize),
 }
 
 impl SevenZipPasswordProbe {
-    fn from_parts(packed_data: Vec<Blob>, folder: SevenZipFolderAst) -> Self {
+    fn from_parts(packed_data: Vec<Blob>, folder: SevenZipFolderAst, metadata: SevenZipMetadata) -> Self {
         let aes_index = folder
             .coders
             .iter()
@@ -34,7 +41,9 @@ impl SevenZipPasswordProbe {
             .enumerate()
             .find_map(|(index, &input)| {
                 seven_zip_aes_stream(&folder, input, packed_data[index].len() as u64)
-                    .and_then(|stream| SevenZipPayloadEvidence::from_stream(&folder, &stream, true))
+                    .and_then(|stream| SevenZipPayloadEvidence::from_stream(
+                        &folder, &stream, matches!(metadata, SevenZipMetadata::Header),
+                    ))
                     .map(|evidence| (index, evidence))
             });
         Self {
@@ -42,6 +51,7 @@ impl SevenZipPasswordProbe {
             folder,
             aes_index,
             prefix,
+            metadata,
         }
     }
 
@@ -49,12 +59,17 @@ impl SevenZipPasswordProbe {
         &self.folder.coders[self.aes_index].properties
     }
 
-    pub(crate) fn check_header(&self, key: &SevenZipAesKey) -> Result<bool, String> {
+    pub(crate) fn has_crc(&self) -> bool {
+        self.folder.expected_crc.is_some()
+    }
+
+    pub(crate) fn check_header(&self, key: &SevenZipAesKey) -> Result<SevenZipPrefixCheck, String> {
+        use SevenZipPrefixCheck::{Confirmed, Reject, Strong, Weak};
         if let Some((packed, prefix)) = &self.prefix {
             if prefix.check_encrypted_prefix(&self.packed_data[*packed], key)?
-                == SevenZipPrefixCheck::Reject
+                == Reject
             {
-                return Ok(false);
+                return Ok(Reject);
             }
         }
         let decoded = match decode_seven_zip_encoded_folder_with_key(
@@ -65,13 +80,30 @@ impl SevenZipPasswordProbe {
         ) {
             Ok(decoded) => decoded,
             Err(error) if error.starts_with("resource_unavailable:") => return Err(error),
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(Reject),
         };
-        Ok(decoded.first().copied() == Some(SZ_HEADER)
-            && self
-                .folder
-                .expected_crc
-                .is_some_and(|expected| crc32(&decoded) == expected))
+        if matches!(self.metadata, SevenZipMetadata::Header)
+            && decoded.first().copied() != Some(SZ_HEADER)
+        {
+            return Ok(Reject);
+        }
+        if let Some(expected) = self.folder.expected_crc {
+            return Ok(if crc32(&decoded) == expected { Confirmed } else { Reject });
+        }
+        let syntax = match self.metadata {
+            SevenZipMetadata::Header => parse_seven_zip_header_with_data(
+                &decoded, &mut SevenZipStreams::default(), false, None,
+            ),
+            SevenZipMetadata::Folders(count) => parse_seven_zip_folders(&decoded, &mut 0, count, false)
+                .map(|_| ()).map_err(std::borrow::Cow::Borrowed),
+        };
+        match syntax {
+            Ok(()) => Ok(Strong),
+            Err(error) if error.contains("unsupported") || error == "folder_coder_reserved_flags_set"
+                || error == "folder_stream_count_exceeds_limit" => Ok(Weak),
+            Err(error) if error == "7z_analysis_resource_limit" => Err(error.into_owned()),
+            Err(_) => Ok(Reject),
+        }
     }
 }
 
@@ -106,15 +138,22 @@ fn read_seven_zip_packed_data<R: Read + Seek>(
     before: u64,
     pack: &SevenZipPackInfoAst,
     folder: &SevenZipFolderAst,
+    first: usize,
 ) -> Result<Vec<Blob>, std::borrow::Cow<'static, str>> {
-    if pack.num_streams != pack.sizes.len() || pack.sizes.len() != folder.packed_streams.len() {
+    if pack.num_streams != pack.sizes.len() {
         return Err("7z password probe pack stream count mismatch".into());
     }
     let mut stream_start = (SEVEN_Z_HEADER_SIZE as u64)
         .checked_add(pack.pack_pos)
         .ok_or("7z password probe stream offset overflow")?;
-    let mut packed_data = Vec::with_capacity(pack.sizes.len());
-    for (index, &size) in pack.sizes.iter().enumerate() {
+    let sizes = pack.sizes.get(first..first + folder.packed_streams.len())
+        .ok_or("7z password probe pack stream index out of range")?;
+    for &size in &pack.sizes[..first] {
+        stream_start = stream_start.checked_add(size)
+            .ok_or("7z password probe stream offset overflow")?;
+    }
+    let mut packed_data = Vec::with_capacity(sizes.len());
+    for (index, &size) in sizes.iter().enumerate() {
         let stream_end = stream_start
             .checked_add(size)
             .ok_or("7z password probe stream end overflow")?;
@@ -136,7 +175,7 @@ fn read_seven_zip_packed_data<R: Read + Seek>(
         );
         if pack
             .crcs
-            .get(index)
+            .get(first + index)
             .copied()
             .flatten()
             .is_some_and(|expected| crc32(packed_data.last().unwrap()) != expected)
@@ -181,22 +220,23 @@ fn read_seven_zip_probe_range<R: Read + Seek>(
 
 fn parse_seven_zip_encoded_header_descriptor(
     raw: &[u8],
-) -> Result<(SevenZipPackInfoAst, SevenZipFolderAst), &'static str> {
+) -> Result<(SevenZipPackInfoAst, SevenZipFolderAst), SevenZipMetadataError> {
     if raw.first() != Some(&SZ_ENCODED_HEADER) {
-        return Err("encoded_header_nid_missing");
+        return Err("encoded_header_nid_missing".into());
     }
     let mut pos = 1;
     let mut streams = SevenZipStreams::default();
-    let substream_crc = parse_seven_zip_streams_info(raw, &mut pos, &mut streams, true)?;
+    let substream_crc = parse_seven_zip_streams_info(raw, &mut pos, &mut streams, true, &mut None)?;
     if streams.folders.len() != 1 {
-        return Err("encoded_header_folder_not_unique");
+        return Err("encoded_header_folder_not_unique".into());
     }
     let mut folder = streams.folders.pop().unwrap();
     folder.expected_crc = folder.expected_crc.or(substream_crc);
-    Ok((
-        streams.pack.ok_or("encoded_header_pack_info_missing")?,
-        folder,
-    ))
+    let pack = streams.pack.ok_or("encoded_header_pack_info_missing")?;
+    if pack.num_streams != folder.packed_streams.len() {
+        return Err("7z password probe pack stream count mismatch".into());
+    }
+    Ok((pack, folder))
 }
 
 fn lzma2_dict_size(prop: u8) -> Option<u32> {
@@ -398,6 +438,14 @@ fn decode_seven_zip_encoded_coder(
         return decode_lzma(data.as_ref(), coder, unpack_size);
     }
     let compressed = Cursor::new(data);
+    match coder.method_id.as_slice() {
+        [0x04, 0x01, 0x08] => return collect_decoded(flate2::read::DeflateDecoder::new(compressed), unpack_size),
+        [0x04, 0x02, 0x02] => return collect_decoded(bzip2::read::MultiBzDecoder::new(compressed), unpack_size),
+        [0x04, 0xf7, 0x11, 0x01] => {
+            return collect_decoded(zstd::stream::read::Decoder::new(compressed).map_err(decode_error)?, unpack_size);
+        }
+        _ => {}
+    }
     macro_rules! decode_bcj {
         ($constructor:path) => {{
             return collect_decoded(
@@ -714,6 +762,8 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
             if coder.properties.len() != 5 {
                 return false;
             }
+        } else if matches!(method, [0x04, 0x01, 0x08] | [0x04, 0x02, 0x02] | [0x04, 0xf7, 0x11, 0x01]) {
+            // Deflate, BZip2 and Zstd derive their settings from the stream.
         } else if method == EncoderMethod::ID_LZMA {
             if coder.properties.len() < 5 {
                 return false;

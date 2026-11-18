@@ -133,3 +133,58 @@ fn tail_total_table_prefers_source_then_falls_back_to_global_trim() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn delayed_read_keeps_unavailable_choices_separate_from_readable_bytes() {
+    use super::attempts::{prepare_attempt_evidence, AttemptGeometry, DeferredReadError};
+    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    use std::sync::Arc;
+
+    let paths = [
+        temp_file("deferred_head", b"H"),
+        temp_file("deferred_match", b"A"),
+        temp_file("deferred_reject", b"B"),
+        temp_file("deferred_unavailable", b""),
+        temp_file("deferred_truncated", b""),
+    ];
+    std::fs::remove_file(&paths[3]).unwrap();
+    let plan = VolumeAttemptPlan {
+        sources: paths.iter().map(|path| InputExtent {
+            path: path.to_string_lossy().into_owned(), start: 0, end: Some(1),
+        }).collect(),
+        domains: [vec![0], vec![1, 2, 3, 4]].map(|choices| VolumeDomain { choices: Arc::new(choices) }).into(),
+        layouts: vec![VolumeLayout {
+            slots: (0..2).map(|domain| VolumeSlot {
+                number: domain as u32 + 1, canonical_name: domain.to_string(), domain,
+            }).collect(),
+            minimum_slots: 0,
+        }].into(),
+        head_size_from_total: None,
+        minimum_size: None,
+        tail_totals: Box::default(),
+    };
+    let values = prepare_attempt_evidence(&plan.sources[0], &plan, &[],
+        AttemptGeometry::Forward { logical_limit: None },
+        |reader| Ok(Some(reader.deferred_reads(false))),
+    ).unwrap_or_else(|_| panic!("shared prefix geometry"));
+    assert!(!values[0].disk_range_is_ambiguous(0, 0, 1));
+    assert!(values[0].disk_range_is_ambiguous(0, 1, 1));
+    let observations = values[0].evaluate(|reader| reader.read(1, 1)).unwrap();
+    let mut count = 0;
+    for (projection, read) in observations {
+        let source = projection.edges.iter().find(|edge| edge[2] != 0).unwrap()[2];
+        count += 1;
+        match (source, read) {
+            (1, Ok(bytes)) if bytes == b"A" => {}
+            (2, Ok(bytes)) if bytes == b"B" => {}
+            (3, Err(DeferredReadError::Io(_))) => {}
+            (4, Err(DeferredReadError::Truncated)) => {}
+            (source, read) => panic!("unexpected deferred read for {source}: {read:?}"),
+        }
+    }
+    assert_eq!(count, 4);
+    drop(values);
+    for (index, path) in paths.into_iter().enumerate() {
+        if index != 3 { std::fs::remove_file(path).unwrap(); }
+    }
+}

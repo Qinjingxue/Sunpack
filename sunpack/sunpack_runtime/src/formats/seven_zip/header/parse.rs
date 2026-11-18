@@ -17,10 +17,18 @@ fn read_sz_vint(data: &[u8], pos: &mut usize) -> Option<u64> {
     Some(value)
 }
 
+type SevenZipMetadataError = std::borrow::Cow<'static, str>;
+type SevenZipExternalFolders<'a> =
+    dyn FnMut(usize, usize) -> Result<Blob, SevenZipMetadataError> + 'a;
+type SevenZipAdditionalFolders<'a> =
+    dyn FnMut(&mut SevenZipStreams, usize, usize) -> Result<Blob, SevenZipMetadataError> + 'a;
+
 fn parse_seven_zip_header_with_data(
     raw: &[u8], streams: &mut SevenZipStreams, retain_decode_data: bool,
-) -> Result<(), &'static str> {
+    mut resolve: Option<&mut SevenZipAdditionalFolders<'_>>,
+) -> Result<(), SevenZipMetadataError> {
     let mut pos = 1;
+    let mut additional = SevenZipStreams::default();
     loop {
         let nid = read_sz_vint(raw, &mut pos).ok_or("header_tree_truncated_before_end")?;
         let nid = u8::try_from(nid).map_err(|_| "unsupported_header_nid")?;
@@ -28,15 +36,19 @@ fn parse_seven_zip_header_with_data(
             SZ_END => return Ok(()),
             SZ_ARCHIVE_PROPERTIES => skip_seven_zip_properties(raw, &mut pos)?,
             SZ_ADDITIONAL_STREAMS_INFO => {
-                // The CRC-checked descriptor gives the main stream coordinates.
-                // Additional streams are needed only to resolve external metadata.
-                parse_seven_zip_streams_info(raw, &mut pos, &mut SevenZipStreams::default(), false)?;
+                let crc = parse_seven_zip_streams_info(raw, &mut pos, &mut additional, resolve.is_some(), &mut None)?;
+                if let [folder] = additional.folders.as_mut_slice() {
+                    folder.expected_crc = folder.expected_crc.or(crc);
+                }
             }
             SZ_MAIN_STREAMS_INFO => {
-                parse_seven_zip_streams_info(raw, &mut pos, streams, retain_decode_data)?;
+                let mut fetch = |index, count| {
+                    resolve.as_mut().ok_or("unpack_info_external_folders_unsupported")?(&mut additional, index, count)
+                };
+                parse_seven_zip_streams_info(raw, &mut pos, streams, retain_decode_data, &mut Some(&mut fetch))?;
             }
             SZ_FILES_INFO => parse_seven_zip_files_info(raw, &mut pos)?,
-            _ => return Err("unsupported_header_nid"),
+            _ => return Err("unsupported_header_nid".into()),
         }
     }
 }
@@ -46,9 +58,11 @@ fn parse_seven_zip_streams_info(
     pos: &mut usize,
     streams: &mut SevenZipStreams,
     retain_decode_data: bool,
-) -> Result<Option<u32>, &'static str> {
+    external: &mut Option<&mut SevenZipExternalFolders<'_>>,
+) -> Result<Option<u32>, SevenZipMetadataError> {
     // A new StreamsInfo section supersedes the previous section, including
     // when the new section ends early with only partial facts.
+    streams.pack = None;
     streams.folders = Vec::new();
     let mut header_crc = None;
     loop {
@@ -63,17 +77,17 @@ fn parse_seven_zip_streams_info(
                 }
             }
             SZ_UNPACK_INFO => {
-                let folders = parse_seven_zip_unpack_info(data, pos, retain_decode_data)?;
+                let folders = parse_seven_zip_unpack_info(data, pos, retain_decode_data, external)?;
                 streams.folders = folders;
                 header_crc = None;
             }
             SZ_SUB_STREAMS_INFO => {
                 if streams.folders.is_empty() {
-                    return Err("substreams_info_requires_unpack_info");
+                    return Err("substreams_info_requires_unpack_info".into());
                 }
                 header_crc = parse_seven_zip_substreams_info(data, pos, &streams.folders)?;
             }
-            _ => return Err("unsupported_streams_info_nid"),
+            _ => return Err("unsupported_streams_info_nid".into()),
         }
     }
 }
@@ -151,32 +165,31 @@ fn parse_seven_zip_unpack_info(
     data: &[u8],
     pos: &mut usize,
     retain_decode_data: bool,
-) -> Result<Vec<SevenZipFolderAst>, &'static str> {
+    external: &mut Option<&mut SevenZipExternalFolders<'_>>,
+) -> Result<Vec<SevenZipFolderAst>, SevenZipMetadataError> {
     if data.get(*pos).copied() != Some(SZ_FOLDER) {
-        return Err("unpack_info_folder_nid_missing");
+        return Err("unpack_info_folder_nid_missing".into());
     }
     *pos += 1;
     let num_folders =
         usize::try_from(read_sz_vint(data, pos).ok_or("unpack_info_folder_count_truncated")?)
             .map_err(|_| "unpack_info_folder_count_too_large")?;
     if num_folders == 0 {
-        return Err("unpack_info_folder_count_invalid");
+        return Err("unpack_info_folder_count_invalid".into());
     }
-    let external = *data.get(*pos).ok_or("unpack_info_external_flag_missing")?;
+    let external_flag = *data.get(*pos).ok_or("unpack_info_external_flag_missing")?;
     *pos += 1;
-    if external != 0 {
-        return Err("unpack_info_external_folders_unsupported");
-    }
-    // Each inline Folder needs at least a coder count, flags and method ID.
-    if num_folders > data.len().saturating_sub(*pos) / 3 {
-        return Err("unpack_info_folders_truncated");
-    }
-    let mut folders = seven_zip_vec(num_folders)?;
-    for _ in 0..num_folders {
-        folders.push(parse_seven_zip_folder(data, pos, retain_decode_data)?);
-    }
+    let mut folders = if external_flag == 0 {
+        parse_seven_zip_folders(data, pos, num_folders, retain_decode_data)?
+    } else {
+        let index = usize::try_from(read_sz_vint(data, pos).ok_or("unpack_info_external_index_truncated")?)
+            .map_err(|_| "unpack_info_external_index_too_large")?;
+        let fetch = external.as_mut().ok_or("unpack_info_external_folders_unsupported")?;
+        let decoded = fetch(index, num_folders)?;
+        parse_seven_zip_folders(&decoded, &mut 0, num_folders, retain_decode_data)?
+    };
     if data.get(*pos).copied() != Some(SZ_CODERS_UNPACK_SIZE) {
-        return Err("unpack_info_coders_unpack_size_nid_missing");
+        return Err("unpack_info_coders_unpack_size_nid_missing".into());
     }
     *pos += 1;
     for folder in &mut folders {
@@ -208,7 +221,7 @@ fn parse_seven_zip_unpack_info(
         for (index, folder) in folders.iter_mut().enumerate() {
             if defined.contains(index) {
                 if pos.checked_add(4).is_none_or(|end| end > data.len()) {
-                    return Err("unpack_info_folder_crc_truncated");
+                    return Err("unpack_info_folder_crc_truncated".into());
                 }
                 folder.expected_crc = Some(u32_le(data, *pos));
                 *pos += 4;
@@ -216,9 +229,23 @@ fn parse_seven_zip_unpack_info(
         }
     }
     if data.get(*pos).copied() != Some(SZ_END) {
-        return Err("unpack_info_end_nid_missing");
+        return Err("unpack_info_end_nid_missing".into());
     }
     *pos += 1;
+    Ok(folders)
+}
+
+fn parse_seven_zip_folders(
+    data: &[u8], pos: &mut usize, count: usize, retain_decode_data: bool,
+) -> Result<Vec<SevenZipFolderAst>, &'static str> {
+    // Each Folder needs at least a coder count, flags and method ID.
+    if count > data.len().saturating_sub(*pos) / 3 {
+        return Err("unpack_info_folders_truncated");
+    }
+    let mut folders = seven_zip_vec(count)?;
+    for _ in 0..count {
+        folders.push(parse_seven_zip_folder(data, pos, retain_decode_data)?);
+    }
     Ok(folders)
 }
 

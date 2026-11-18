@@ -228,7 +228,7 @@ pub(super) fn prepare(head: &InputExtent, plan: &VolumeAttemptPlan, sessions: &[
     let materials: Vec<_> = plan.sources.iter().map(|s| materials[by_extent[s]].clone()).collect();
     if plan.layouts.is_empty() || materials.iter().all(Option::is_none) {
         return Ok(Some(PasswordContext::Evidence(EvidenceContext {
-            plan, alternatives: Vec::new(), rejected: Vec::new(), public_plan: Default::default(), unresolved: false,
+            plan, alternatives: Vec::new(), rejected: Vec::new(), public_plan: Default::default(), unresolved: None,
             public_reduced: reduced, independent_rar: Vec::new(), rar_anchor: None,
         })));
     }
@@ -249,7 +249,11 @@ pub(super) fn prepare(head: &InputExtent, plan: &VolumeAttemptPlan, sessions: &[
     })?;
     let PasswordContext::Evidence(mut context) = prepared.into_context(PasswordContext::Rar) else { unreachable!() };
     context.public_reduced = reduced;
-    context.independent_rar = materials;
-    context.rar_anchor = anchor_context.filter(|c| matches!(c.material, RarPasswordMaterial::Header(_) | RarPasswordMaterial::Rar5Block { .. }));
+    // A data-only proof belongs to a member. Testing that password against
+    // unrelated files on other disks would falsely reject mixed-password data.
+    if facts[head_index].header_encrypted {
+        context.independent_rar = materials;
+        context.rar_anchor = anchor_context.filter(|c| matches!(c.material, RarPasswordMaterial::Header(_) | RarPasswordMaterial::Rar5Header { .. }));
+    }
     Ok(Some(PasswordContext::Evidence(context)))
 }

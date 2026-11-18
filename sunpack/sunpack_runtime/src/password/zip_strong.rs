@@ -3,8 +3,10 @@ use super::{
     le_u16, le_u32, zip_password_bytes, PasswordVerification, PreparedStatus, ZipKey, ZipKeyCache,
     ZipKeyMaterial,
 };
+use super::probe::{read_reason, CheckRead, ZipPrefix, ZipRead};
 use crate::formats::zip::zip64::CentralValues;
 use crate::io::cancellation::Cancellation;
+use crate::password::input::attempts::DeferredReadError;
 use aes::cipher::{Block, BlockCipherDecrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use rayon::prelude::*;
@@ -13,7 +15,6 @@ use std::sync::Arc;
 
 const BLOCK: usize = 16;
 const FIELD: &str = "zip.strong_encryption.decryption_header";
-pub(super) const VALIDATION_FIELD: &str = "zip.strong_encryption.validation";
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PasswordHeader {
@@ -22,7 +23,8 @@ pub(crate) struct PasswordHeader {
     key_len: usize,
     erd_tail: [[u8; BLOCK]; 2],
     ranges: ValidationRanges,
-    validation: Option<Validation>,
+    source: Option<ZipRead>,
+    prefix: Option<ZipPrefix>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,25 +32,45 @@ struct ValidationRanges {
     body_offset: u64,
     erd_len: usize,
     validation_len: usize,
-    validation_size_checked: bool,
 }
 
-#[derive(Clone, PartialEq, Eq)]
 struct Validation {
-    erd_prefix: Arc<[u8]>,
-    erd_has_random_data: bool,
-    bytes: Arc<[u8]>,
+    erd_prefix: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Evidence {
-    Reject,
-    Possible,
-    Match,
+enum ValidationMatch {
+    CrcMismatch,
+    BodyContradiction,
+    Proven,
+}
+
+struct ValidationEvidence {
+    matches: Vec<ValidationMatch>,
+    body_issue: Option<DeferredReadError>,
+}
+
+enum ValidationUnavailable {
+    Read(DeferredReadError),
+    Certificate,
+    InvalidSize,
+}
+
+impl ValidationUnavailable {
+    fn reason(&self) -> String {
+        match self {
+            Self::Certificate => "unsupported certificate data".into(),
+            Self::InvalidSize => "validation length disagrees with the decryption header".into(),
+            Self::Read(error) => read_reason(error),
+        }
+    }
 }
 
 impl PasswordHeader {
     pub(super) fn read(
+        method: u16,
+        flags: u16,
         sizes_and_crc: Option<(&CentralValues, u32)>,
         mut read: impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, PreparedStatus>,
     ) -> Result<Self, PreparedStatus> {
@@ -127,7 +149,8 @@ impl PasswordHeader {
             },
             tail[tail_len - BLOCK..].try_into().unwrap(),
         ];
-        let mut header = Self {
+        let body_start = body_offset + erd_len as u64 + 6 + validation_len as u64;
+        Ok(Self {
             iv,
             iv_len,
             key_len,
@@ -136,70 +159,59 @@ impl PasswordHeader {
                 body_offset,
                 erd_len,
                 validation_len,
-                validation_size_checked: false,
             },
-            validation: None,
-        };
-        header.load_validation(read)?;
-        Ok(header)
+            source: None,
+            prefix: ZipPrefix::new(method, flags, body_start, body_start, sizes_and_crc.map(|(sizes, _)| sizes)),
+        })
     }
 
-    pub(super) fn has_validation(&self) -> bool {
-        self.validation.is_some()
+    pub(super) fn bind(&mut self, source: ZipRead) {
+        self.source = Some(source);
     }
 
-    pub(super) fn load_validation(
-        &mut self,
-        mut read: impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, PreparedStatus>,
-    ) -> Result<(), PreparedStatus> {
-        // Only the ERD tail is required for the padding proof. Inspect the
-        // certificate marker and declared VSize before reading the ciphertext.
+    pub(super) fn set_sizes(&mut self, sizes: Option<&CentralValues>) {
+        self.prefix = self.prefix.take().map(|prefix| prefix.with_sizes(sizes));
+    }
+
+    pub(super) fn needs_sizes(&self) -> bool {
+        self.prefix.as_ref().is_some_and(ZipPrefix::needs_size)
+    }
+
+    fn load_validation(&self, read: &mut CheckRead<'_>) -> Result<Validation, ValidationUnavailable> {
         let ValidationRanges {
             body_offset,
             erd_len,
             validation_len,
-            validation_size_checked,
         } = self.ranges;
         let erd_prefix_len = erd_len.saturating_sub(2 * BLOCK);
         let validation_offset = body_offset + erd_len as u64;
-        if !validation_size_checked {
-            let Ok(lengths) = read(validation_offset, 6, VALIDATION_FIELD) else {
-                return Ok(());
-            };
-            if le_u32(&lengths, 0) != Some(0) {
-                return Err(PreparedStatus::new(
-                    "unsupported_method",
-                    "unsupported PKWARE Strong certificate data",
-                ));
-            }
-            if le_u16(&lengths, 4) != Some(validation_len as u16) {
-                return Err(PreparedStatus::new(
-                    "unknown_needs_final_verifier",
-                    "invalid PKWARE Strong validation size",
-                ));
-            }
-            self.ranges.validation_size_checked = true;
+        let lengths = read(validation_offset, 6).map_err(ValidationUnavailable::Read)?;
+        if le_u32(&lengths, 0) != Some(0) {
+            return Err(ValidationUnavailable::Certificate);
         }
-        self.validation = read(validation_offset + 6, validation_len, VALIDATION_FIELD)
-            .ok()
-            .and_then(|bytes| {
-                let erd_prefix = if erd_prefix_len == 0 {
-                    Arc::default()
-                } else {
-                    read(body_offset, erd_prefix_len, VALIDATION_FIELD)
-                        .ok()?
-                        .into()
-                };
-                Some(Validation {
-                    erd_prefix,
-                    erd_has_random_data: erd_len > BLOCK,
-                    bytes: bytes.into(),
-                })
-            });
-        Ok(())
+        if le_u16(&lengths, 4) != Some(validation_len as u16) {
+            return Err(ValidationUnavailable::InvalidSize);
+        }
+        let bytes = read(validation_offset + 6, validation_len).map_err(ValidationUnavailable::Read)?;
+        let erd_prefix = if erd_prefix_len == 0 { Vec::new() }
+            else { read(body_offset, erd_prefix_len).map_err(ValidationUnavailable::Read)? };
+        Ok(Validation { erd_prefix, bytes })
     }
 
     pub(super) fn verify(
+        &self,
+        candidates: &[Arc<str>],
+        cache: Option<&ZipKeyCache>,
+    ) -> std::io::Result<PasswordVerification> {
+        match self.key_len {
+            16 => self.verify_aes::<Aes128>(candidates, cache),
+            24 => self.verify_aes::<Aes192>(candidates, cache),
+            32 => self.verify_aes::<Aes256>(candidates, cache),
+            _ => unreachable!(),
+        }
+    }
+
+    fn verify_aes<C: BlockCipherDecrypt + KeyInit + Send>(
         &self,
         candidates: &[Arc<str>],
         cache: Option<&ZipKeyCache>,
@@ -215,20 +227,15 @@ impl PasswordHeader {
                     zip_password_bytes(password),
                 ))))
             };
-            let Some(ZipKey::Strong(key)) =
-                slots.map_or_else(derive, |slots| *slots[index].get_or_init(derive))
-            else {
-                return None;
-            };
-            let proof = match self.key_len {
-                16 => self.check::<Aes128>(&key),
-                24 => self.check::<Aes192>(&key),
-                32 => self.check::<Aes256>(&key),
-                _ => unreachable!(),
-            };
-            (proof != Evidence::Reject).then_some((index, proof))
+            let local;
+            let material = if let Some(slots) = slots { slots[index].get_or_init(derive) }
+                else { local = derive(); &local };
+            let Some(ZipKey::Strong(key)) = material else { return None; };
+            let cipher = C::new_from_slice(&key[..self.key_len]).unwrap();
+            (decrypt_block(&cipher, &self.erd_tail[0], &self.erd_tail[1])
+                == [BLOCK as u8; BLOCK]).then_some((index, cipher))
         };
-        let mut survivors: Vec<_> = if candidates.len() >= 32 {
+        let survivors: Vec<_> = if candidates.len() >= 32 {
             candidates
                 .par_iter()
                 .enumerate()
@@ -238,62 +245,114 @@ impl PasswordHeader {
             candidates.iter().enumerate().filter_map(check).collect()
         };
         cancellation.check_io()?;
-        if survivors.iter().any(|&(_, proof)| proof == Evidence::Match) {
-            survivors.retain(|&(_, proof)| proof == Evidence::Match);
-        }
-        let proven = survivors
-            .first()
-            .is_some_and(|&(_, evidence)| evidence == Evidence::Match);
-        let mut result = if proven {
-            PasswordVerification::status("match", "PKWARE Strong password validation CRC matched")
-        } else if !survivors.is_empty() {
-            // Exact ERD padding under this key plus a bad VCRC can mean damage
-            // to the encrypted validation bytes. Let the decoder resolve it.
-            PasswordVerification::status(
-                "match",
-                "PKWARE Strong password padding matched; validation CRC is inconclusive",
-            )
-        } else {
-            PasswordVerification::status(
-                "no_match",
-                "PKWARE Strong password validation did not match",
-            )
-        };
-        result.attempts = candidates.len();
-        result.matched_indices = survivors.iter().map(|&(index, _)| index).collect();
-        result.matched_index = result.matched_indices.first().copied();
-        if result.matched_index.is_some() {
-            let strong = proven && survivors.len() == 1;
-            result.final_confirmation_required = Some(!strong);
-            result.match_evidence = Some(if proven {
-                "zip_pkware_strong_vcrc32"
-            } else {
-                "zip_pkware_strong_padding"
+        if survivors.is_empty() {
+            return Ok(PasswordVerification {
+                attempts: candidates.len(),
+                ..PasswordVerification::status("no_match", "PKWARE Strong ERD padding did not match")
             });
         }
+        // Only padding survivors may load the optional VData and ERD prefix.
+        let checks = if let Some(source) = &self.source {
+            let body = self.prefix.as_ref().and_then(|prefix| {
+                let offset = prefix.cbc_first_block_offset()?;
+                source.ambiguous(offset, BLOCK as u64).then_some((prefix, offset))
+            });
+            source.evaluate(|read| -> Result<ValidationEvidence, ValidationUnavailable> {
+                let validation = self.load_validation(read)?;
+                let mut first_body_block = None;
+                let matches = survivors.iter().map(|(_, cipher)| {
+                    let Some(file_cipher) = self.check_validation(cipher, &validation) else {
+                        return ValidationMatch::CrcMismatch;
+                    };
+                    if let Some((prefix, offset)) = body {
+                        // VData is the first ciphertext in this CBC stream.
+                        // Its final block is already available as the chaining
+                        // value for the adjacent compression header.
+                        if let Ok(bytes) = first_body_block.get_or_insert_with(|| read(offset, BLOCK)) {
+                            let previous = validation.bytes.last_chunk::<BLOCK>().unwrap();
+                            let plain = decrypt_block(&file_cipher, previous, bytes);
+                            if prefix.check_plain(&plain) == Some(false) {
+                                return ValidationMatch::BodyContradiction;
+                            }
+                        }
+                    }
+                    ValidationMatch::Proven
+                }).collect();
+                Ok(ValidationEvidence {
+                    matches,
+                    body_issue: first_body_block.and_then(Result::err),
+                })
+            })?
+        } else { Vec::new() };
+        let unavailable = checks.iter().find_map(|(_, check)| check.as_ref().err());
+        let viable_body = checks.iter().any(|(_, check)| {
+            check.as_ref().is_ok_and(|evidence| evidence.matches.contains(&ValidationMatch::Proven))
+        });
+        let crc_matches = viable_body || checks.iter().any(|(_, check)| check.as_ref().is_ok_and(
+            |evidence| evidence.matches.contains(&ValidationMatch::BodyContradiction)));
+        let reason = if let Some(error) = unavailable {
+            error.reason()
+        } else if checks.is_empty() {
+            "validation range is unavailable".into()
+        } else if !crc_matches {
+            "validation CRC did not match".into()
+        } else {
+            "validation CRC is not unique across volume choices".into()
+        };
+        let mut result = PasswordVerification::status("match",
+            format!("PKWARE Strong password padding matched; {reason}"));
+        result.attempts = candidates.len();
+        for (position, (index, _)) in survivors.into_iter().enumerate() {
+            let compatible = |proof: ValidationMatch| {
+                proof == ValidationMatch::Proven || (!viable_body && proof == ValidationMatch::BodyContradiction)
+            };
+            let matched = checks.iter().any(|(_, check)| check.as_ref()
+                .is_ok_and(|evidence| compatible(evidence.matches[position])));
+            if matched || !crc_matches || unavailable.is_some() {
+                result.matched_indices.push(index);
+            }
+            if crc_matches {
+                for (scope, check) in &checks {
+                    if let (Some(scope), Ok(evidence)) = (scope, check) {
+                        // A valid VCRC can establish the password even when
+                        // the particular member body contradicts this layout.
+                        if evidence.matches[position] != ValidationMatch::Proven {
+                            result.scoped_rejections.push((scope.clone(), index));
+                        }
+                    }
+                }
+            }
+        }
+        result.matched_index = result.matched_indices.first().copied();
+        let strong = crc_matches && unavailable.is_none() && result.matched_indices.len() == 1;
+        result.final_confirmation_required = Some(!strong);
+        result.match_evidence = Some(if strong {
+            let body_issue = checks.iter().find_map(|(_, check)| check.as_ref().ok()?.body_issue.as_ref());
+            result.message = if let Some(error) = body_issue {
+                format!("PKWARE Strong password validation CRC matched; {}", read_reason(error))
+            } else if !viable_body {
+                "PKWARE Strong password validation CRC matched; member compression header is invalid".into()
+            } else {
+                "PKWARE Strong password validation CRC matched".into()
+            };
+            "zip_pkware_strong_vcrc32"
+        } else {
+            "zip_pkware_strong_padding"
+        });
         Ok(result)
     }
 
-    fn check<C: BlockCipherDecrypt + KeyInit>(&self, master_key: &[u8; 32]) -> Evidence {
-        let master_cipher = C::new_from_slice(&master_key[..self.key_len]).unwrap();
-        // The final CBC block is known full padding in the supported native
-        // method. Reject before walking ERD or deriving the file key.
-        if decrypt_block(&master_cipher, &self.erd_tail[0], &self.erd_tail[1])
-            != [BLOCK as u8; BLOCK]
-        {
-            return Evidence::Reject;
-        }
-        let Some(validation) = &self.validation else {
-            return Evidence::Possible;
-        };
+    fn check_validation<C: BlockCipherDecrypt + KeyInit>(
+        &self, master_cipher: &C, validation: &Validation,
+    ) -> Option<C> {
         let mut previous = &self.iv[..];
         let mut sha = Sha1::new_with_prefix(&self.iv[..self.iv_len]);
         for block in validation.erd_prefix.chunks_exact(BLOCK) {
-            sha.update(decrypt_block(&master_cipher, previous, block));
+            sha.update(decrypt_block(master_cipher, previous, block));
             previous = block;
         }
-        if validation.erd_has_random_data {
-            sha.update(decrypt_block(&master_cipher, previous, &self.erd_tail[0]));
+        if self.ranges.erd_len > BLOCK {
+            sha.update(decrypt_block(master_cipher, previous, &self.erd_tail[0]));
         }
         let file_key = derive_key(sha);
         let file_cipher = C::new_from_slice(&file_key[..self.key_len]).unwrap();
@@ -307,11 +366,7 @@ impl PasswordHeader {
         }
         let last = decrypt_block(&file_cipher, previous, last);
         crc.update(&last[..BLOCK - 4]);
-        if crc.finalize() == le_u32(&last, BLOCK - 4).unwrap() {
-            Evidence::Match
-        } else {
-            Evidence::Possible
-        }
+        (crc.finalize() == le_u32(&last, BLOCK - 4).unwrap()).then_some(file_cipher)
     }
 }
 

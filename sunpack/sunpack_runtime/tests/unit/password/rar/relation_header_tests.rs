@@ -109,7 +109,10 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     assert_eq!(verify(two_headers).final_confirmation_required, Some(true));
 
     let mut comment = rar4_block(0x75, 0, &[0, 0, 0, 0, 0, 0]);
-    let mut file_header = rar4_block(0x74, 0x8000 | RAR4_FILE_COMMENT, &[0; 25]);
+    let mut fields = vec![0; 25];
+    fields[19..21].copy_from_slice(&1u16.to_le_bytes());
+    fields.extend([b'x', 0, 0x90, 0x15]); // Name and one extended mtime digit.
+    let mut file_header = rar4_block(0x74, 0x9000 | RAR4_FILE_COMMENT, &fields);
     let header_size = (file_header.len() + comment.len()) as u16;
     file_header[5..7].copy_from_slice(&header_size.to_le_bytes());
     let header_crc = crc32(&file_header[2..]) as u16;
@@ -118,8 +121,10 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     let mut commented = data[37..offset as usize].to_vec();
     commented.extend(salt);
     commented.extend(seal(file_header, key, iv));
+    commented.extend(next_salt);
+    commented.extend(seal(rar4_block(0x7b, 0, &[]), key2, iv2));
     let result = verify(commented);
-    assert_eq!((result.matched_index, result.final_confirmation_required), (Some(0), Some(true)));
+    assert_eq!((result.matched_index, result.final_confirmation_required), (Some(0), Some(false)));
 
     // A short encrypted header at the end of the first byte-split part is
     // useful even when every undecided tail is unavailable.
@@ -271,13 +276,28 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     assert_eq!((result.matched_index, result.final_confirmation_required), (Some(2), Some(false)), "{}", result.message);
     for path in paths { std::fs::remove_file(path).unwrap(); }
 
-    // Only the active projection knows the remainder of this encrypted
-    // main header. Both possible sources share those bytes and have
-    // distinct outside padding, which must never enter the CRC proof.
+    // The two encrypted header CRCs split the active projection. Keep equal
+    // bodies with different padding and remove candidates that contradict
+    // either header, even though the first AES block selected no source.
+    let tail_iv = [0x35u8; 16];
+    let terminal = |corrupt| {
+        let mut bytes = rar5_block(&[5, 0, 0]);
+        if corrupt { bytes[0] ^= 0x01; }
+        bytes.resize(16, 0);
+        cbc::Encryptor::<Aes256>::new(&key.into(), &tail_iv.into())
+            .encrypt_padded::<NoPadding>(&mut bytes, 16).unwrap();
+        bytes
+    };
+    let body = [&data[start + 16..], &tail_iv[..], &terminal(false)].concat();
+    let mut broken = body.clone();
+    broken[0] ^= 0x80;
+    let bad_successor = [&data[start + 16..], &tail_iv[..], &terminal(true)].concat();
     let paths = [
         crate::test_support::temp_file("rar5_active_prefix", &data[..start + 16]),
-        crate::test_support::temp_file("rar5_active_body_a", &[&data[start + 16..], &[0x5a]].concat()),
-        crate::test_support::temp_file("rar5_active_body_b", &[&data[start + 16..], &[0xa5]].concat()),
+        crate::test_support::temp_file("rar5_active_bad_body", &broken),
+        crate::test_support::temp_file("rar5_active_body_a", &[body.as_slice(), &[0x5a]].concat()),
+        crate::test_support::temp_file("rar5_active_bad_successor", &bad_successor),
+        crate::test_support::temp_file("rar5_active_body_b", &[body.as_slice(), &[0xa5]].concat()),
     ];
     let sources: Vec<_> = paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
         start: 0, end: Some(path.metadata().unwrap().len()) }).collect();
@@ -286,12 +306,18 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
         layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..2).map(|i| VolumeSlot {
             number: i as u32 + 1, canonical_name: format!("part.{}", i + 1), domain: i,
         }).collect() }].into_boxed_slice(),
-        domains: [vec![0], vec![1, 2]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
+        domains: [vec![0], vec![1, 2, 3, 4]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
         head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
     };
     let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &cut.sources[0],
         &cut, &parallel, &[], false).unwrap();
     assert_eq!((result.matched_index, result.final_confirmation_required), (Some(2), Some(false)), "{}", result.message);
+    let remaining = result.volume_attempts.expect("CRC rejected the bad volume candidate");
+    let domains = remaining.layouts.iter().flat_map(|layout| {
+        remaining.domains[layout.slots[1].domain].choices.iter()
+            .map(|&index| remaining.sources[index].path.as_str())
+    }).collect::<Vec<_>>();
+    assert_eq!(domains, [cut.sources[2].path.as_str(), cut.sources[4].path.as_str()]);
     for path in paths { std::fs::remove_file(path).unwrap(); }
 
     data.truncate(300);
@@ -365,6 +391,34 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     let reader = ManagedReader::from_bytes(make(false, 1, 0, &valid), Default::default());
     let context = prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("second block"));
     assert_eq!(context.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
+
+    // A later independent member has its own password. Prefer its stronger
+    // check without intersecting the earlier weak hit with a different scope.
+    let later_salt = [0x93; 16];
+    let mut check = [0; 8];
+    let mut digest = [0; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(b"later", &later_salt, 16 + 32, &mut digest);
+    for (index, byte) in digest.into_iter().enumerate() { check[index % 8] ^= byte; }
+    let mut encryption = vec![1, 0, 1, 4];
+    encryption.extend(later_salt);
+    encryption.extend(iv);
+    encryption.extend(check);
+    encryption.extend(&Sha256::digest(check)[..4]);
+    let mut extra = vint(encryption.len() as u64);
+    extra.extend(encryption);
+    let mut file = vec![2, 3];
+    file.extend(vint(extra.len() as u64));
+    file.extend([0, 0, 0, 0, 0, 0, 1, b'y']);
+    file.extend(extra);
+    let mut mixed = make(false, 1, 0, &valid);
+    let end = rar5_block(&[5, 0, 0]);
+    mixed.truncate(mixed.len() - end.len());
+    mixed.extend(rar5_block(&file));
+    mixed.extend(end);
+    let context = prepare(mixed).unwrap_or_else(|_| panic!("later independent member"));
+    let result = context.verify(&[Arc::from("secret"), Arc::from("later")], None).unwrap();
+    assert_eq!(result.matched_index, Some(1));
+    assert_eq!(result.match_evidence, Some("rar5_password_check"));
 
     plaintext[48] ^= 1;
     encrypt(&mut plaintext);

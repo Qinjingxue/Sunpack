@@ -148,12 +148,6 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE GetStream(const wchar_t *name, IInStream **inStream) SUP7Z_NOEXCEPT override
         {
-            // Named-volume existence and physical stream sizes also affect Open.
-            if (probe_reads_) {
-                probe_reads_->uncertain_read.store(true, std::memory_order_relaxed);
-                probe_reads_->named_volume_requested.store(true, std::memory_order_relaxed);
-            }
-
             if (!inStream)
             {
 
@@ -173,6 +167,15 @@ namespace sunpack::sevenzip
             {
                 auto requested_name = std::filesystem::path(name).filename().wstring();
                 const auto index = volume_index(name, lower_text(requested_name));
+                // Canonical requests depend only on the selected slot. A
+                // handler that resolves by physical name may observe aliases.
+                if (probe_reads_) {
+                    if (index && canonical_names_ && part_ranges_ && *index < part_ranges_->size()) {
+                        probe_reads_->observe_named_volume(*index);
+                    } else {
+                        probe_reads_->untracked_named_volume.store(true, std::memory_order_relaxed);
+                    }
+                }
                 if (!index)
                 {
                     missing_volume_requested_ = true;
@@ -203,6 +206,10 @@ namespace sunpack::sevenzip
 
         bool missing_volume_requested() const { return missing_volume_requested_; }
         HRESULT input_error() const { return input_error_ ? input_error_->load(std::memory_order_relaxed) : S_OK; }
+        void clear_input_error() {
+            if (input_error_) input_error_->store(S_OK, std::memory_order_relaxed);
+            volume_open_failed_ = false;
+        }
         bool volume_open_failed() const { return volume_open_failed_; }
         bool password_requested() const { return password_requested_; }
         const std::wstring &missing_volume_name() const { return missing_volume_name_; }

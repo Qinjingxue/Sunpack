@@ -1,7 +1,7 @@
 use super::PasswordVerification;
 use crate::formats::seven_zip::{
     seven_zip_aes_properties, RelationNextHeader, SevenZipAesKey, SevenZipEvidenceReads,
-    SevenZipPrefixCheck, SEVEN_Z_HEADER_SIZE, SEVEN_Z_MAGIC,
+    SevenZipPayloadSource, SevenZipPrefixCheck, SEVEN_Z_HEADER_SIZE, SEVEN_Z_MAGIC,
 };
 use crate::io::archive_state::{InputExtent, VolumeAttemptPlan};
 use crate::io::cancellation::Cancellation;
@@ -9,7 +9,7 @@ use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
 use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
-use crate::password::input::{parse_ranges, ranges_key, VirtualRangeReader};
+use crate::password::input::{parse_ranges, ranges_key, RangeSpec, VirtualRangeReader};
 use rayon::prelude::*;
 use sevenz_rust2::{Archive, EncoderMethod, Error as SevenZipError, Password};
 use std::io::{Read, Seek, SeekFrom};
@@ -43,7 +43,9 @@ pub(crate) fn seven_zip_fast_verify_passwords_with_reader(
     candidates: &[Arc<str>],
 ) -> std::io::Result<PasswordVerification> {
     preparation.verify(InputKey::file("7z", reader)?, candidates, || {
-        prepare_seven_zip(reader.stream_cursor(), reader.len()).map(PasswordContext::SevenZip)
+        let evidence = FixedSevenZipEvidence(Arc::new([RangeSpec::entire(reader)]));
+        prepare_seven_zip(reader.stream_cursor(), reader.len(), &evidence)
+            .map(PasswordContext::SevenZip)
     })
 }
 
@@ -55,10 +57,19 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_ranges(
 ) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
     preparation.verify(ranges_key("7z", &parsed)?, candidates, || {
-        let reader = VirtualRangeReader::streaming(&parsed);
+        let evidence = FixedSevenZipEvidence(parsed.into());
+        let reader = VirtualRangeReader::streaming(&evidence.0);
         let total_len = reader.len();
-        prepare_seven_zip(reader, total_len).map(PasswordContext::SevenZip)
+        prepare_seven_zip(reader, total_len, &evidence).map(PasswordContext::SevenZip)
     })
+}
+
+struct FixedSevenZipEvidence(Arc<[RangeSpec]>);
+
+impl<R> SevenZipEvidenceReads<R> for FixedSevenZipEvidence {
+    fn payload_source(&self, _: &R) -> Option<SevenZipPayloadSource> {
+        Some(SevenZipPayloadSource::Fixed(Arc::clone(&self.0)))
+    }
 }
 
 include!("seven_zip_attempts.rs");
@@ -69,62 +80,117 @@ type SevenZipKeyCache<'a> =
     super::evidence::SharedCandidateKeys<(u8, &'a [u8]), Result<SevenZipAesKey, String>>;
 
 impl SevenZipPasswordContext {
-    fn properties(&self) -> &[u8] {
-        match self {
-            Self::Header(probe) => probe.key_properties(),
-            Self::Prefix { probe, .. } => probe.key_properties(),
-        }
-    }
-
-    pub(super) fn kdf_parameters(&self) -> Option<(u8, &[u8])> {
-        seven_zip_aes_properties(self.properties()).map(|(cycles, salt, _)| (cycles, salt))
+    pub(super) fn kdf_parameters(&self) -> impl Iterator<Item = (u8, &[u8])> + '_ {
+        let (header, payload) = match self {
+            Self::Header(probe) => (Some(probe.key_properties()), None),
+            Self::Prefix { probe, .. } => (None, Some(probe)),
+        };
+        header
+            .into_iter()
+            .chain(payload.into_iter().flat_map(|probe| probe.key_properties()))
+            .filter_map(|properties| seven_zip_aes_properties(properties))
+            .map(|(cycles, salt, _)| (cycles, salt))
     }
 
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         self.verify_cached(candidates, None)
     }
 
-    pub(super) fn verify_cached(
-        &self,
+    pub(super) fn verify_cached<'a>(
+        &'a self,
         candidates: &[Arc<str>],
-        cache: Option<&SevenZipKeyCache>,
+        cache: Option<&SevenZipKeyCache<'a>>,
     ) -> std::io::Result<PasswordVerification> {
-        let properties = self.properties();
-        let prefix_evidence = match self {
-            Self::Header(_) => None,
-            Self::Prefix { header, .. } => Some(if *header {
-                "7z_header_prefix"
-            } else {
-                "7z_payload_prefix"
-            }),
-        };
-        let shared = cache.and_then(|cache| {
-            let (cycles, salt, iv) = seven_zip_aes_properties(properties)?;
-            Some((cache.cells(&(cycles, salt), candidates.len())?, iv))
-        });
-        collect_candidates(candidates, prefix_evidence, |index, password| {
-            if prefix_evidence.is_none() && password.is_empty() {
-                return Ok(SevenZipPrefixCheck::Reject);
+        let local: SevenZipKeyCache<'a>;
+        let cache = match cache {
+            Some(cache) => cache,
+            None => {
+                local = SevenZipKeyCache::from_parameters(self.kdf_parameters());
+                &local
             }
-            let key = match shared {
-                Some((cells, iv)) => cells[index]
+        };
+        let key = |index: usize, password: &str, properties: &'a [u8]| {
+            let (cycles, salt, iv) = seven_zip_aes_properties(properties).unwrap();
+            match cache.cells(&(cycles, salt), candidates.len()) {
+                Some(cells) => cells[index]
                     .get_or_init(|| SevenZipAesKey::derive(properties, password))
                     .as_ref()
-                    .map_err(Clone::clone)?
-                    .with_iv(iv),
-                None => SevenZipAesKey::derive(properties, password)?,
-            };
-            match self {
-                Self::Header(probe) => probe.check_header(&key).map(|matched| {
-                    if matched {
-                        SevenZipPrefixCheck::Confirmed
-                    } else {
-                        SevenZipPrefixCheck::Reject
-                    }
-                }),
-                Self::Prefix { probe, .. } => probe.test_with_key(&key),
+                    .map(|key| key.with_iv(iv))
+                    .map_err(Clone::clone),
+                None => SevenZipAesKey::derive(properties, password),
             }
-        })
+        };
+        let Self::Prefix { probe, header } = self else {
+            let Self::Header(probe) = self else { unreachable!() };
+            return collect_candidates(candidates, (!probe.has_crc()).then_some("7z_header_structure"), |index, password| {
+                if password.is_empty() {
+                    return Ok(SevenZipPrefixCheck::Reject);
+                }
+                probe.check_header(&key(index, password, probe.key_properties())?)
+            });
+        };
+        let evidence = Some(if *header { "7z_header_prefix" } else { "7z_payload_prefix" });
+        let properties = probe.key_properties().next().unwrap();
+        let followup = probe.has_followup();
+        let surviving = std::sync::Mutex::new(Vec::new());
+        let mut result = collect_candidates(candidates, evidence, |index, password| {
+            let key = key(index, password, properties)?;
+            let prefix = probe.prescreen(&key)?;
+            let check = prefix.check;
+            if followup && check != SevenZipPrefixCheck::Reject {
+                surviving.lock().unwrap().push((index, key, prefix));
+            }
+            Ok(check)
+        })?;
+        let surviving = surviving.into_inner().unwrap();
+        if surviving.is_empty() || (result.matched_indices.len() == 1 && !probe.has_ambiguous_followup()) {
+            return Ok(result);
+        }
+        let cancellation = Cancellation::current();
+        let test = |(index, first_key, prefix)| {
+            cancellation.run(|| {
+                let mut rejected = Vec::new();
+                let proof = probe.verify_followup(&first_key, prefix, |properties| {
+                    key(index, &candidates[index], properties)
+                }, |projection| rejected.push((projection, index)));
+                (index, proof, rejected)
+            })
+        };
+        let mut outcomes: Vec<_> = if surviving.len() >= PARALLEL_PASSWORD_THRESHOLD {
+            surviving.into_par_iter().map(test).collect()
+        } else {
+            surviving.into_iter().map(test).collect()
+        };
+        cancellation.check_io()?;
+        outcomes.sort_unstable_by_key(|(index, _, _)| *index);
+        let mut outcomes = outcomes.into_iter().peekable();
+        let mut message = None;
+        result.matched_indices.retain(|&index| {
+            if outcomes.peek().is_none_or(|(tested, _, _)| *tested != index) {
+                return true;
+            }
+            let (_, outcome, scoped) = outcomes.next().unwrap();
+            result.scoped_rejections.extend(scoped);
+            match outcome {
+                Ok(SevenZipPrefixCheck::Reject) => false,
+                Err(error) => {
+                    message.get_or_insert(error);
+                    true
+                }
+                _ => true,
+            }
+        });
+        result.matched_index = result.matched_indices.first().copied();
+        if result.matched_index.is_none() {
+            return Ok(PasswordVerification {
+                attempts: candidates.len(),
+                ..PasswordVerification::status("no_match", "7z follow-up rejected candidates")
+            });
+        }
+        if let Some(message) = message {
+            result.message = message;
+        }
+        Ok(result)
     }
 }
 
@@ -212,6 +278,7 @@ fn collect_candidates(
 fn prepare_seven_zip<R: Read + Seek>(
     mut reader: R,
     total_len: u64,
+    evidence: &impl SevenZipEvidenceReads<R>,
 ) -> Result<SevenZipPasswordContext, PreparedStatus> {
     let mut signature = [0u8; SEVEN_Z_MAGIC.len()];
     read_exact_field(
@@ -238,7 +305,7 @@ fn prepare_seven_zip<R: Read + Seek>(
     )?;
     let next = seven_zip_tail_requirement(&start_header, total_len)?;
     let enabled = start_header[6] == 0 && seven_zip_start_header_crc_matches(&start_header);
-    prepare_seven_zip_descriptor(&mut reader, total_len, next, enabled, &())
+    prepare_seven_zip_descriptor(&mut reader, total_len, next, enabled, evidence)
         .map_err(seven_zip_fixed_input_status)
 }
 
@@ -277,6 +344,7 @@ fn prepare_seven_zip_descriptor<R: Read + Seek>(
                 if matches!(
                     message.as_ref(),
                     "7z next header crc mismatch" | "7z packed stream crc mismatch"
+                        | "7z external folder metadata crc mismatch"
                 ) =>
             {
                 return Err(PreparedStatus::new("invalid_volume_evidence", message));

@@ -19,6 +19,8 @@ pub(crate) const VERIFICATION_BATCH_SIZE: usize = 256;
 pub(crate) struct PasswordVerification {
     // Per evidence path, indices into this batch's ordered surviving passwords.
     pub(crate) password_domains: Vec<Option<Vec<usize>>>,
+    // A follow-up may disprove one password on only part of a prepared path.
+    pub(crate) scoped_rejections: Vec<(Arc<evidence::VolumeProjection>, usize)>,
     pub(crate) volume_attempts: Option<Arc<crate::io::archive_state::VolumeAttemptPlan>>,
     pub(crate) status: &'static str,
     pub(crate) matched_index: Option<usize>,
@@ -34,6 +36,7 @@ impl PasswordVerification {
     pub(crate) fn status(status: &'static str, message: impl Into<String>) -> Self {
         Self {
             password_domains: Vec::new(),
+            scoped_rejections: Vec::new(),
             volume_attempts: None,
             status,
             matched_index: None,

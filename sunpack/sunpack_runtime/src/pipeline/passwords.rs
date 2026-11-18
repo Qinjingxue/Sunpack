@@ -503,6 +503,17 @@ impl CandidateSet {
                 _ => pending.extend(batch.iter().cloned()),
             }
             domains.append(result.password_domains, offset, pending.len() - offset);
+            if !result.scoped_rejections.is_empty() {
+                let tested = result.attempts.min(batch.len());
+                let surviving: Vec<_> = (0..batch.len())
+                    .filter(|&i| i >= tested || match result.status {
+                        "match" => result.matched_index == Some(i) || result.matched_indices.binary_search(&i).is_ok(),
+                        "no_match" => false,
+                        _ => true,
+                    })
+                    .collect();
+                domains.append_scoped(result.scoped_rejections, offset, &surviving);
+            }
             batch.clear();
         }
         if pending.is_empty() {

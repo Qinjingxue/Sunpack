@@ -38,7 +38,7 @@ fn archive_counts_follow_header_bytes_while_folder_graphs_stay_bounded() {
     raw.extend(vec![0; folders as usize]);
     raw.extend([SZ_END, SZ_END]);
     let mut streams = SevenZipStreams::default();
-    parse_seven_zip_streams_info(&raw, &mut 0, &mut streams, false).unwrap();
+    parse_seven_zip_streams_info(&raw, &mut 0, &mut streams, false, &mut None).unwrap();
     assert_eq!(streams.folders.len(), folders as usize);
 
     let mut pack = vec![0];
@@ -54,7 +54,7 @@ fn archive_counts_follow_header_bytes_while_folder_graphs_stay_bounded() {
         folders as usize
     );
 
-    let unpack = parse_seven_zip_unpack_info(&one_copy_folder(0, None), &mut 0, false).unwrap();
+    let unpack = parse_seven_zip_unpack_info(&one_copy_folder(0, None), &mut 0, false, &mut None).unwrap();
     let mut substreams = vec![SZ_NUM_UNPACK_STREAM];
     substreams.extend(number(100_001));
     substreams.push(SZ_SIZE);
@@ -70,7 +70,7 @@ fn archive_counts_follow_header_bytes_while_folder_graphs_stay_bounded() {
     let mut impossible = vec![SZ_FOLDER];
     impossible.extend(number(u64::MAX));
     impossible.push(0);
-    assert!(parse_seven_zip_unpack_info(&impossible, &mut 0, false).is_err());
+    assert!(parse_seven_zip_unpack_info(&impossible, &mut 0, false, &mut None).is_err());
     assert!(parse_seven_zip_crc_flags(&[0], &mut 0, usize::MAX).is_err());
     assert_eq!(
         seven_zip_vec::<u64>(usize::MAX).unwrap_err(),
@@ -94,7 +94,7 @@ fn parses_folder_graph_and_inherited_single_substream_crc() {
     // The inherited folder CRC leaves no explicit CRC flags or values.
     raw.extend([SZ_SUB_STREAMS_INFO, SZ_CRC, SZ_END, SZ_END, SZ_END]);
     let mut streams = SevenZipStreams::default();
-    parse_seven_zip_header_with_data(&raw, &mut streams, true).unwrap();
+    parse_seven_zip_header_with_data(&raw, &mut streams, true, None).unwrap();
     assert_eq!(streams.folders.len(), 1);
     assert_eq!(streams.folders[0].unpack_size(0), 20);
     assert_eq!(streams.folders[0].coders[0].method_id, [0]);
@@ -122,12 +122,12 @@ fn parses_multiple_substream_sizes_and_crcs() {
     raw.extend([SZ_END, SZ_END]);
     let mut pos = 0;
     let mut streams = SevenZipStreams::default();
-    assert_eq!(parse_seven_zip_streams_info(&raw, &mut pos, &mut streams, false).unwrap(), None);
+    assert_eq!(parse_seven_zip_streams_info(&raw, &mut pos, &mut streams, false, &mut None).unwrap(), None);
     assert_eq!(pos, raw.len());
     raw.truncate(raw.len() - 3);
     assert_eq!(
-        parse_seven_zip_streams_info(&raw, &mut 0, &mut streams, false),
-        Err("substreams_info_crc_truncated"),
+        parse_seven_zip_streams_info(&raw, &mut 0, &mut streams, false, &mut None).unwrap_err(),
+        "substreams_info_crc_truncated",
     );
 }
 
@@ -146,8 +146,8 @@ fn preserves_folder_info_when_later_substream_graph_is_invalid() {
     let mut pos = 0;
     let mut streams = SevenZipStreams::default();
     assert_eq!(
-        parse_seven_zip_streams_info(&raw, &mut pos, &mut streams, false),
-        Err("substreams_info_sizes_exceed_folder_unpack_size")
+        parse_seven_zip_streams_info(&raw, &mut pos, &mut streams, false, &mut None).unwrap_err(),
+        "substreams_info_sizes_exceed_folder_unpack_size"
     );
     assert_eq!(streams.folders.len(), 1);
 }

@@ -160,6 +160,7 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
                     key_len: 16,
                     salt,
                     verifier: [key[32], key[33]],
+                    prefix: None,
                 }),
                 Arc::new(VolumeProjection {
                     roots: vec![[0, 2, 0]],
@@ -173,7 +174,7 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
         plan: Arc::new(plan),
         alternatives,
         rejected: vec![],
-        unresolved: true,
+        unresolved: Some(PreparedStatus::new("unknown_needs_final_verifier", "missing tail evidence")),
         public_reduced: false,
         public_plan: Default::default(),
         rar_anchor: None,
@@ -186,6 +187,16 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
         let result = context.verify(&candidates).unwrap();
         assert_eq!(result.matched_indices.len(), candidates.len());
         domains.append(result.password_domains, count, candidates.len());
+        if count == 0 {
+            // An independent, late check rejects the first password only
+            // on the otherwise unresolved tail, including across batches.
+            let scope = Arc::new(VolumeProjection {
+                roots: vec![[0, 2, 0]],
+                edges: vec![[0, 1, 0], [1, 2, 3]],
+                ends: vec![2],
+            });
+            domains.append_scoped(vec![(scope, 1)], count, &result.matched_indices);
+        }
         count += candidates.len();
     }
     let (remaining, passwords) = domains.finish(&context, count).unwrap().unwrap();
@@ -207,7 +218,7 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
         [
             ("tailA", &[1][..]),
             ("tailB", &[2][..]),
-            ("unreadable", &[0, 1, 2][..])
+            ("unreadable", &[0, 2][..])
         ]
     );
 }

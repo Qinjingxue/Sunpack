@@ -7,17 +7,20 @@ use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
 use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
 use crate::password::input::{
-    parse_ranges, parse_volumes, ranges_key, VirtualRangeReader, VolumeSet,
+    parse_ranges, parse_volumes, ranges_key, RangeSpec, VirtualRangeReader, VolumeSet,
 };
 use hmac::{Hmac, Mac};
 use rayon::prelude::*;
 use sha1::Sha1;
 use std::borrow::Cow;
 use std::io::{Read, Seek};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[path = "zip_strong.rs"]
 mod strong;
+#[path = "zip_probe.rs"]
+mod probe;
+use probe::{ZipLocation, ZipPrefix, ZipPrefixKey, ZipRead, ZipReadInput};
 
 const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_CENTRAL: &[u8] = b"PK\x01\x02";
@@ -35,7 +38,8 @@ pub(crate) fn zip_fast_verify_passwords_with_reader(
 ) -> std::io::Result<PasswordVerification> {
     let key = InputKey::file("zip", reader)?.with_zip_eocd(eocd_offset);
     preparation.verify(key, candidates, || {
-        prepare_zip_stream(&mut reader.cursor(), reader.len(), eocd_offset)
+        let input = ZipReadInput::Ranges(Arc::from([RangeSpec::entire(reader)]));
+        prepare_zip_stream_from(&mut reader.cursor(), reader.len(), eocd_offset, Some(&input))
             .map(PasswordContext::Zip)
     })
 }
@@ -47,12 +51,13 @@ pub(crate) fn zip_fast_verify_passwords_from_ranges(
     eocd_offset: Option<u64>,
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let parsed = parse_ranges(ranges.iter().copied(), sessions)?;
+    let parsed: Arc<_> = parse_ranges(ranges.iter().copied(), sessions)?.into_boxed_slice().into();
     let key = ranges_key("zip", &parsed)?.with_zip_eocd(eocd_offset);
     preparation.verify(key, candidates, || {
         let mut reader = VirtualRangeReader::new(&parsed);
         let total_len = reader.len();
-        prepare_zip_stream(&mut reader, total_len, eocd_offset).map(PasswordContext::Zip)
+        let input = ZipReadInput::Ranges(Arc::clone(&parsed));
+        prepare_zip_stream_from(&mut reader, total_len, eocd_offset, Some(&input)).map(PasswordContext::Zip)
     })
 }
 
@@ -63,7 +68,7 @@ pub(crate) fn zip_fast_verify_passwords_from_volumes(
     eocd_offset: Option<u64>,
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let volumes = VolumeSet::new(parse_volumes(parts, sessions)?);
+    let volumes = Arc::new(VolumeSet::new(parse_volumes(parts, sessions)?));
     preparation.verify(volumes.key("zip")?.with_zip_eocd(eocd_offset), candidates, || {
         prepare_zip_volumes(&volumes, eocd_offset).map(PasswordContext::Zip)
     })
@@ -121,13 +126,20 @@ fn prepare_zip_attempts(
             let volumes = CertainZipVolumes { reader: std::cell::RefCell::new(reader), count };
             prepare_zip_volume_directory(&volumes, eocd_offset, anchor.as_ref())
         } else {
-            prepare_zip_directory_stream(reader, len, eocd_offset, anchor.as_ref())
+            prepare_zip_directory_stream_from(reader, len, eocd_offset, anchor.as_ref(), |reader| {
+                Some(ZipReadInput::Projected(Arc::new(reader.deferred_reads(false))))
+            })
         });
         match directory {
             Ok(context) => Ok(Some(context)),
             Err(PreparedStatus::Status("invalid_volume_evidence", _)) => Ok(None),
-            Err(_) if anchor.as_ref().is_some_and(|anchor| !anchor.context.has_optional_validation()) =>
-                Ok(anchor.as_ref().map(|anchor| anchor.context.clone())),
+            Err(_) if anchor.is_some() => {
+                let anchor = anchor.as_ref().unwrap();
+                let input = anchor.context.needs_read().then(|| ZipReadInput::Projected(
+                    Arc::new(reader.deferred_reads(spanned))
+                ));
+                Ok(Some(anchor.context.clone().bind(input, anchor.location())))
+            }
             Err(_) => reader.independent_evidence(|reader| {
                 let context = if spanned {
                     prepare_zip_local_chain(|offset, size, field| {
@@ -142,17 +154,22 @@ fn prepare_zip_attempts(
                             if bytes.len() != size { return Err(ReadFault::short_read("read_volume", offset, size, bytes.len(), len).with_field(field, location).into()); }
                             Ok(bytes)
                         };
-                        if field == strong::VALIDATION_FIELD { reader.independent_evidence(load) } else { load(reader) }
+                        load(reader)
                     })?
                 } else {
                     prepare_zip_local_chain(|offset, size, field| {
                         let load = |reader: &mut super::input::attempts::AttemptReader<'_>| {
                             read_zip_anchor_field(reader, len, offset, size, field)
                         };
-                        if field == strong::VALIDATION_FIELD { reader.independent_evidence(load) } else { load(reader) }
+                        load(reader)
                     })?
                 };
-                context.map(|anchor| Some(anchor.context)).ok_or_else(invalid_password_directory)
+                let anchor = context.ok_or_else(invalid_password_directory)?;
+                let input = anchor.context.needs_read().then(|| ZipReadInput::Projected(
+                    Arc::new(reader.deferred_reads(spanned))
+                ));
+                let location = anchor.location();
+                Ok(Some(anchor.context.bind(input, location)))
             }),
         }
     })?;
@@ -328,6 +345,7 @@ trait ZipVolumeReader {
     fn volume_len(&self, disk: usize) -> Option<u64>;
     fn read_disk_spanning_field(&self, disk: usize, offset: u64, size: usize,
         field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault>;
+    fn deferred(&self, disk: usize, offset: u64) -> Option<ZipRead>;
     fn advance_disk_offset(&self, mut disk: usize, mut offset: u64, mut amount: u64) -> Option<(usize, u64)> {
         loop {
             let length = self.volume_len(disk)?;
@@ -345,7 +363,7 @@ trait ZipVolumeReader {
         self.read_disk_spanning_field(disk, length - size as u64, size, field, FieldLocation::Tail)
     }
 }
-impl ZipVolumeReader for VolumeSet {
+impl ZipVolumeReader for Arc<VolumeSet> {
     fn len(&self) -> usize { self.last_number() }
     fn volume_len(&self, disk: usize) -> Option<u64> {
         self.ordinal(disk).and_then(|i| VolumeSet::volume_len(self, i))
@@ -355,6 +373,9 @@ impl ZipVolumeReader for VolumeSet {
         let i = self.ordinal(disk).ok_or_else(|| ReadFault::short_read("read_volume", offset, size, 0, 0)
             .with_field(field, location).with_volume(disk as u32 + 1).with_possible_missing_volume())?;
         VolumeSet::read_disk_spanning_field(self, i, offset, size, field, location)
+    }
+    fn deferred(&self, disk: usize, offset: u64) -> Option<ZipRead> {
+        Some(ZipRead { input: ZipReadInput::Volumes(self.clone()), location: ZipLocation { disk: Some(disk), offset } })
     }
 }
 
@@ -385,12 +406,18 @@ impl ZipVolumeReader for CertainZipVolumes<'_, '_> {
             }
             Ok(bytes)
         };
-        if field == strong::VALIDATION_FIELD { reader.independent_evidence(load) } else { load(&mut reader) }
+        load(&mut reader)
+    }
+    fn deferred(&self, disk: usize, offset: u64) -> Option<ZipRead> {
+        Some(ZipRead {
+            input: ZipReadInput::Projected(Arc::new(self.reader.borrow().deferred_reads(true))),
+            location: ZipLocation { disk: Some(disk), offset },
+        })
     }
 }
 
 fn prepare_zip_volumes(
-    volumes: &VolumeSet,
+    volumes: &Arc<VolumeSet>,
     eocd_offset: Option<u64>,
 ) -> Result<ZipPasswordContext, PreparedStatus> {
     let prefix_len = volumes.contiguous_prefix_len();
@@ -400,9 +427,18 @@ fn prepare_zip_volumes(
             return Err(ReadFault::short_read("read_volume", offset, size, 0, prefix_len).with_field(field, location).into());
         }
         let (disk, local) = volumes.advance_disk_offset(0, 0, offset).ok_or_else(invalid_password_directory)?;
-        Ok(volumes.read_disk_spanning_field(disk, local, size, field, location)?)
+        Ok(VolumeSet::read_disk_spanning_field(volumes, disk, local, size, field, location)?)
     });
-    if let Ok(Some(anchor)) = context { return Ok(anchor.context); }
+    if let Ok(Some(anchor)) = context {
+        if eocd_offset.is_some() && anchor.context.needs_sizes() {
+            if let Ok(context) = prepare_zip_volume_directory(volumes, eocd_offset, Some(&anchor)) {
+                if !context.needs_sizes() { return Ok(context); }
+            }
+        }
+        let input = anchor.context.needs_read().then(|| ZipReadInput::Volumes(volumes.clone()));
+        let location = anchor.location();
+        return Ok(anchor.context.bind(input, location));
+    }
     prepare_zip_volume_directory(volumes, eocd_offset, None).or_else(|error| context.and(Err(error)))
 }
 
@@ -549,7 +585,7 @@ fn prepare_zip_volume_directory(
             if anchor.is_none() || same_anchor_position(entry) {
                 match prepare_zip_volume_entry_checked(volumes, entry.0, entry.1, Some((&fixed, &variable, values)), anchor) {
                     Ok(context) => return Ok(context),
-                    Err(error @ PreparedStatus::Status("invalid_volume_evidence", _)) => return Err(error),
+                    Err(error @ PreparedStatus::Status("invalid_volume_evidence", _)) if anchor.is_some() => return Err(error),
                     Err(error) => { unavailable.get_or_insert(error); }
                 }
             }
@@ -559,7 +595,8 @@ fn prepare_zip_volume_directory(
         };
         (disk, offset) = next;
     }
-    anchor.map(|anchor| anchor.context.clone()).ok_or_else(|| unavailable.unwrap_or_else(|| PreparedStatus::new("not_required", "zip has no encrypted entries")))
+    if anchor.is_some() { return Err(unavailable.unwrap_or_else(invalid_password_directory)); }
+    Err(unavailable.unwrap_or_else(|| PreparedStatus::new("not_required", "zip has no encrypted entries")))
 }
 
 #[cfg(test)]
@@ -618,17 +655,18 @@ fn prepare_zip_volume_entry_checked(
         Ok(data) => data,
         Err(fault) => return Err(fault.into()),
     };
+    let central_extra = central.as_ref().map(|(fixed, variable, _)| {
+        &variable[usize::from(le_u16(fixed, 28).unwrap())..]
+    });
     let sizes_and_crc = if let Some((central, central_variable, sizes)) = central {
         compare_zip_entry(central, central_variable, &sizes, &fixed, &variable)?;
         Some((sizes, le_u32(central, 16).unwrap()))
     } else {
         local_zip_sizes(&fixed, &variable[name_len as usize..]).map(|sizes| (sizes, le_u32(&fixed, 14).unwrap()))
     };
-    let partial_strong = match anchor.map(|anchor| &anchor.context) {
-        Some(ZipPasswordContext::Strong(header)) if !header.has_validation() => Some(header),
-        Some(context) => return Ok(context.clone()),
-        None => None,
-    };
+    if let Some(anchor) = anchor.filter(|anchor| !anchor.context.needs_read()) {
+        return Ok(anchor.context.clone());
+    }
     let extra = &variable[name_len as usize..];
     let data_delta = 30 + name_len + extra_len;
     let Some((data_disk, data_offset)) =
@@ -646,12 +684,17 @@ fn prepare_zip_volume_entry_checked(
         };
         Ok(volumes.read_disk_spanning_field(disk, offset, size, field, FieldLocation::Body)?)
     };
-    if let Some(header) = partial_strong {
-        let mut header = header.clone();
-        header.load_validation(read)?;
-        return Ok(ZipPasswordContext::Strong(header));
+    let mut context = if let Some(anchor) = anchor {
+        anchor.context.clone().with_sizes(sizes_and_crc.map(|(sizes, _)| sizes))
+    } else {
+        ZipEncryption::from_local(&fixed, extra, central_extra)?.prepare(sizes_and_crc, read)?
+    };
+    if context.needs_read() {
+        if let Some(source) = volumes.deferred(data_disk, data_offset) {
+            context.set_read(source);
+        }
     }
-    ZipEncryption::from_local(&fixed, extra)?.prepare(sizes_and_crc, read)
+    Ok(context)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -660,20 +703,56 @@ pub(crate) enum ZipPasswordContext {
         key_len: usize,
         salt: Vec<u8>,
         verifier: [u8; 2],
+        prefix: Option<ZipPrefix>,
     },
     ZipCrypto {
         header: [u8; ZIPCRYPTO_HEADER_LEN],
         check_byte: u8,
+        prefix: Option<ZipPrefix>,
     },
     Strong(strong::PasswordHeader),
 }
 
 impl ZipPasswordContext {
-    fn has_optional_validation(&self) -> bool {
-        matches!(self, Self::Strong(header) if !header.has_validation())
+    fn needs_read(&self) -> bool {
+        match self {
+            Self::Aes { prefix, .. } | Self::ZipCrypto { prefix, .. } => prefix.is_some(),
+            Self::Strong(_) => true,
+        }
     }
 
-    fn aes(strength: u8, material: Vec<u8>) -> Result<Self, PreparedStatus> {
+    fn set_read(&mut self, source: ZipRead) {
+        match self {
+            Self::Aes { prefix, .. } | Self::ZipCrypto { prefix, .. } => {
+                if let Some(prefix) = prefix { prefix.bind(source); }
+            }
+            Self::Strong(header) => header.bind(source),
+        }
+    }
+
+    fn bind(mut self, input: Option<ZipReadInput>, location: ZipLocation) -> Self {
+        if let Some(input) = input { self.set_read(ZipRead { input, location }); }
+        self
+    }
+
+    fn with_sizes(mut self, sizes: Option<&zip64::CentralValues>) -> Self {
+        match &mut self {
+            Self::Aes { prefix, .. } | Self::ZipCrypto { prefix, .. } => {
+                *prefix = prefix.take().map(|prefix| prefix.with_sizes(sizes));
+            }
+            Self::Strong(header) => header.set_sizes(sizes),
+        }
+        self
+    }
+
+    fn needs_sizes(&self) -> bool {
+        match self {
+            Self::Aes { prefix, .. } | Self::ZipCrypto { prefix, .. } => prefix.as_ref().is_some_and(ZipPrefix::needs_size),
+            Self::Strong(header) => header.needs_sizes(),
+        }
+    }
+
+    fn aes(strength: u8, method: u16, flags: u16, sizes: Option<&zip64::CentralValues>, material: Vec<u8>) -> Result<Self, PreparedStatus> {
         let (salt_len, key_len) = aes_lengths(strength).ok_or_else(|| {
             PreparedStatus::new("unsupported_method", "unsupported winzip AES strength")
         })?;
@@ -687,13 +766,14 @@ impl ZipPasswordContext {
             key_len,
             salt: material[..salt_len].to_vec(),
             verifier: material[salt_len..].try_into().unwrap(),
+            prefix: ZipPrefix::new(method, flags, (salt_len + 2) as u64, (salt_len + 12) as u64, sizes),
         })
     }
 
     pub(super) fn kdf_parameters(&self) -> Option<ZipKeyMaterial<'_>> {
         match self {
             Self::Aes { key_len, salt, .. } => Some(ZipKeyMaterial::Aes(*key_len, salt)),
-            Self::ZipCrypto { header, check_byte } => Some(ZipKeyMaterial::ZipCrypto(header, *check_byte)),
+            Self::ZipCrypto { header, check_byte, .. } => Some(ZipKeyMaterial::ZipCrypto(header, *check_byte)),
             Self::Strong(_) => Some(ZipKeyMaterial::Strong),
         }
     }
@@ -708,9 +788,10 @@ impl ZipPasswordContext {
                 key_len,
                 salt,
                 verifier,
-            } => verify_winzip_aes_candidates(candidates, *key_len, salt, verifier, cache),
-            Self::ZipCrypto { header, check_byte } => {
-                verify_zipcrypto_material(candidates, header, *check_byte, cache)
+                prefix,
+            } => verify_winzip_aes_candidates(candidates, *key_len, salt, verifier, prefix.as_ref(), cache),
+            Self::ZipCrypto { header, check_byte, prefix } => {
+                verify_zipcrypto_material(candidates, header, *check_byte, prefix.as_ref(), cache)
             }
             Self::Strong(header) => header.verify(candidates, cache),
         }
@@ -719,9 +800,15 @@ impl ZipPasswordContext {
 
 struct ZipAnchor {
     local_offset: u64,
+    data_offset: u64,
     context: ZipPasswordContext,
 }
 
+impl ZipAnchor {
+    fn location(&self) -> ZipLocation {
+        ZipLocation { disk: None, offset: self.data_offset }
+    }
+}
 fn local_zip_sizes(fixed: &[u8], extra: &[u8]) -> Option<zip64::CentralValues> {
     if le_u16(fixed, 6)? & 8 != 0 {
         return None;
@@ -764,12 +851,12 @@ fn prepare_zip_local_chain(
         let data_offset = offset.checked_add(length as u64).ok_or_else(invalid_password_directory)?;
         if flags & 1 != 0 {
             let sizes_and_crc = sizes.as_ref().map(|sizes| (sizes, le_u32(&bytes, 14).unwrap()));
-            let context = ZipEncryption::from_local(&bytes, extra).and_then(|encryption| encryption.prepare(sizes_and_crc, |relative, size, field| {
+            let context = ZipEncryption::from_local(&bytes, extra, None).and_then(|encryption| encryption.prepare(sizes_and_crc, |relative, size, field| {
                 let at = data_offset.checked_add(relative).ok_or_else(invalid_password_directory)?;
                 read(at, size, field)
             }));
             match context {
-                Ok(context) => return Ok(Some(ZipAnchor { local_offset: offset, context })),
+                Ok(context) => return Ok(Some(ZipAnchor { local_offset: offset, data_offset, context })),
                 Err(error @ PreparedStatus::Status("unsupported_method" | "unknown_needs_final_verifier" | "damaged", _)) => {
                     unavailable.get_or_insert(error);
                 }
@@ -784,45 +871,60 @@ fn prepare_zip_local_chain(
 }
 
 enum ZipEncryption {
-    Traditional(u8),
-    Aes(u8),
-    Strong,
+    Traditional { check_byte: u8, method: u16, flags: u16 },
+    Aes { strength: u8, method: u16, flags: u16 },
+    Strong { method: u16, flags: u16 },
 }
 
 impl ZipEncryption {
-    fn from_local(fixed: &[u8], extra: &[u8]) -> Result<Self, PreparedStatus> {
+    fn from_local(fixed: &[u8], extra: &[u8], central_extra: Option<&[u8]>) -> Result<Self, PreparedStatus> {
         let flags = le_u16(fixed, 6).unwrap();
         if flags & 0x2000 != 0 {
             return Err(PreparedStatus::new("unsupported_method", "ZIP local fields are masked"));
         }
         let method = le_u16(fixed, 8).unwrap();
-        if flags & 0x40 != 0 {
-            if method == 99 {
-                return Err(PreparedStatus::new("unsupported_method", "conflicting ZIP encryption fields"));
-            }
-            return Ok(Self::Strong);
-        }
         if method == 99 {
-            return parse_winzip_aes_strength(extra).map(Self::Aes).ok_or_else(||
-                PreparedStatus::new("unsupported_method", "winzip AES extra field not found"));
+            let local_aes = parse_winzip_aes_extra(extra)?;
+            let central_aes = central_extra.map(parse_winzip_aes_extra).transpose()?.flatten();
+            if local_aes.is_some() && central_aes.is_some() && local_aes != central_aes {
+                return Err(PreparedStatus::new("unsupported_method", "ZIP AES local and central parameters disagree"));
+            }
+            if let Some((strength, method)) = central_aes.or(local_aes) {
+                if flags & 0x40 != 0 {
+                    return Err(PreparedStatus::new("unsupported_method", "conflicting ZIP encryption fields"));
+                }
+                return Ok(Self::Aes { strength, method, flags });
+            }
+            // Method 99 is also LZFSE. The handler can select it when the
+            // directory confirms that there is no WinZip AES extra. A local
+            // header alone cannot rule out an AES extra in the directory.
+            if central_extra.is_none() {
+                return Err(PreparedStatus::new("unsupported_method", "winzip AES extra field not found"));
+            }
+        }
+        if flags & 0x40 != 0 {
+            return Ok(Self::Strong { method, flags });
         }
         let check_byte = if flags & 8 == 0 { fixed[17] } else { fixed[11] };
-        Ok(Self::Traditional(check_byte))
+        Ok(Self::Traditional { check_byte, method, flags })
     }
 
     fn prepare(self, sizes_and_crc: Option<(&zip64::CentralValues, u32)>, mut read: impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, PreparedStatus>) -> Result<ZipPasswordContext, PreparedStatus> {
         match self {
-            Self::Aes(strength) => {
+            Self::Aes { strength, method, flags } => {
                 let (salt_len, _) = aes_lengths(strength).ok_or_else(||
                     PreparedStatus::new("unsupported_method", "unsupported winzip AES strength"))?;
-                ZipPasswordContext::aes(strength, read(0, salt_len + 2, "zip.aes.salt_password_verifier")?)
+                ZipPasswordContext::aes(strength, method, flags, sizes_and_crc.map(|(sizes, _)| sizes),
+                    read(0, salt_len + 2, "zip.aes.salt_password_verifier")?)
             }
-            Self::Traditional(check_byte) => {
+            Self::Traditional { check_byte, method, flags } => {
                 let header = read(0, ZIPCRYPTO_HEADER_LEN, "zip.zipcrypto.encryption_header")?.try_into().map_err(|_|
                     PreparedStatus::new("damaged", "zipcrypto password header is incomplete"))?;
-                Ok(ZipPasswordContext::ZipCrypto { header, check_byte })
+                let size = ZIPCRYPTO_HEADER_LEN as u64;
+                let prefix = ZipPrefix::new(method, flags, size, size, sizes_and_crc.map(|(sizes, _)| sizes));
+                Ok(ZipPasswordContext::ZipCrypto { header, check_byte, prefix })
             }
-            Self::Strong => strong::PasswordHeader::read(sizes_and_crc, read).map(ZipPasswordContext::Strong),
+            Self::Strong { method, flags } => strong::PasswordHeader::read(method, flags, sizes_and_crc, read).map(ZipPasswordContext::Strong),
         }
     }
 }
@@ -842,22 +944,44 @@ fn read_zip_anchor_field<R: Read + Seek>(file: &mut R, total_len: u64, offset: u
         Ok(bytes)
 }
 
+#[cfg(test)]
 fn prepare_zip_stream<R: Read + Seek>(
     file: &mut R,
     total_len: u64,
     eocd_offset: Option<u64>,
 ) -> Result<ZipPasswordContext, PreparedStatus> {
-    let context = prepare_zip_anchor(file, total_len);
-    if let Ok(Some(anchor)) = context { return Ok(anchor.context); }
-    prepare_zip_directory_stream(file, total_len, eocd_offset, None).or_else(|error| context.and(Err(error)))
+    prepare_zip_stream_from(file, total_len, eocd_offset, None)
 }
 
-struct ZipStream<'a, R> {
+fn prepare_zip_stream_from<R: Read + Seek>(
+    file: &mut R,
+    total_len: u64,
+    eocd_offset: Option<u64>,
+    input: Option<&ZipReadInput>,
+) -> Result<ZipPasswordContext, PreparedStatus> {
+    let context = prepare_zip_anchor(file, total_len);
+    if let Ok(Some(anchor)) = context {
+        if eocd_offset.is_some() && anchor.context.needs_sizes() {
+            if let Ok(context) = prepare_zip_directory_stream_from(file, total_len, eocd_offset,
+                Some(&anchor), |_| input.cloned())
+            {
+                if !context.needs_sizes() { return Ok(context); }
+            }
+        }
+        let location = anchor.location();
+        return Ok(anchor.context.bind(input.cloned(), location));
+    }
+    prepare_zip_directory_stream_from(file, total_len, eocd_offset, None, |_| input.cloned())
+        .or_else(|error| context.and(Err(error)))
+}
+
+struct ZipStream<'a, R, F> {
     file: std::cell::RefCell<&'a mut R>,
     length: u64,
+    input: F,
 }
 
-impl<R: Read + Seek> ZipVolumeReader for ZipStream<'_, R> {
+impl<R: Read + Seek, F: Fn(&R) -> Option<ZipReadInput>> ZipVolumeReader for ZipStream<'_, R, F> {
     fn len(&self) -> usize { 1 }
 
     fn volume_len(&self, disk: usize) -> Option<u64> {
@@ -876,10 +1000,23 @@ impl<R: Read + Seek> ZipVolumeReader for ZipStream<'_, R> {
         read_exact_field(&mut **file, &mut bytes, self.length, field, location)?;
         Ok(bytes)
     }
+    fn deferred(&self, disk: usize, offset: u64) -> Option<ZipRead> {
+        if disk != 0 { return None; }
+        let file = self.file.borrow();
+        Some(ZipRead { input: (self.input)(&file)?, location: ZipLocation { disk: None, offset } })
+    }
 }
 
+#[cfg(test)]
 fn prepare_zip_directory_stream<R: Read + Seek>(file: &mut R, total_len: u64, eocd_offset: Option<u64>, anchor: Option<&ZipAnchor>) -> Result<ZipPasswordContext, PreparedStatus> {
-    let stream = ZipStream { file: std::cell::RefCell::new(file), length: total_len };
+    prepare_zip_directory_stream_from(file, total_len, eocd_offset, anchor, |_| None)
+}
+
+fn prepare_zip_directory_stream_from<R: Read + Seek>(file: &mut R, total_len: u64,
+    eocd_offset: Option<u64>, anchor: Option<&ZipAnchor>,
+    input: impl Fn(&R) -> Option<ZipReadInput>,
+) -> Result<ZipPasswordContext, PreparedStatus> {
+    let stream = ZipStream { file: std::cell::RefCell::new(file), length: total_len, input };
     prepare_zip_volume_directory(&stream, eocd_offset, anchor)
 }
 
@@ -890,10 +1027,12 @@ pub(super) enum ZipKeyMaterial<'a> {
     Strong,
 }
 
-#[derive(Clone, Copy)]
 pub(super) enum ZipKey {
-    Aes([u8; 2]),
-    ZipCrypto,
+    Aes {
+        verifier: [u8; 2],
+        encryption: OnceLock<Option<[u8; 32]>>,
+    },
+    ZipCrypto(ZipCryptoState),
     Strong([u8; 32]),
 }
 
@@ -901,15 +1040,25 @@ type ZipKeyCache<'a> = super::evidence::SharedCandidateKeys<ZipKeyMaterial<'a>, 
 
 fn verify_winzip_aes_candidates(
     candidates: &[Arc<str>], key_len: usize, salt: &[u8], verifier: &[u8; 2],
+    prefix: Option<&ZipPrefix>,
     cache: Option<&ZipKeyCache>,
 ) -> std::io::Result<PasswordVerification> {
     let attempts = candidates.len();
     let cancellation = Cancellation::current();
     let slots = cache.and_then(|cache| cache.cells(&ZipKeyMaterial::Aes(key_len, salt), attempts));
     let check = |(index, password): (usize, &Arc<str>)| {
-        let derive = || cancellation.run(|| winzip_aes_verifier(&zip_password_bytes(password), salt, key_len)).map(ZipKey::Aes);
-        let bytes = slots.map_or_else(derive, |slots| *slots[index].get_or_init(derive));
-        matches!(bytes, Some(ZipKey::Aes(bytes)) if bytes == *verifier).then_some(index)
+        let derive = || cancellation.run(|| winzip_aes_verifier(&zip_password_bytes(password), salt, key_len));
+        let bytes = if let Some(slots) = slots {
+            match slots[index].get_or_init(|| derive().map(|verifier| ZipKey::Aes {
+                verifier, encryption: OnceLock::new(),
+            })) {
+                Some(ZipKey::Aes { verifier, .. }) => Some(*verifier),
+                _ => None,
+            }
+        } else {
+            derive()
+        };
+        (bytes == Some(*verifier)).then_some(index)
     };
     let matched_indices: Vec<_> = if attempts >= AES_PARALLEL_PASSWORD_THRESHOLD {
         candidates.par_iter().enumerate().filter_map(check).collect()
@@ -917,7 +1066,7 @@ fn verify_winzip_aes_candidates(
         candidates.iter().enumerate().filter_map(check).collect()
     };
     cancellation.check_io()?;
-    let result = if let Some(first) = matched_indices.first().copied() {
+    let mut result = if let Some(first) = matched_indices.first().copied() {
         PasswordVerification {
             matched_index: Some(first),
             matched_indices,
@@ -931,6 +1080,24 @@ fn verify_winzip_aes_candidates(
             ..PasswordVerification::status("no_match", "winzip aes password verifier did not match")
         }
     };
+    if let Some(prefix) = prefix.filter(|prefix| prefix.can_screen(result.matched_indices.len(), true)) {
+        let mut keys = Vec::with_capacity(result.matched_indices.len());
+        for &index in &result.matched_indices {
+            let derive = || winzip_aes_encryption_key(&zip_password_bytes(&candidates[index]), salt, key_len);
+            let key = if let Some(ZipKey::Aes { encryption, .. }) =
+                slots.and_then(|slots| slots[index].get()).and_then(Option::as_ref)
+            {
+                *encryption.get_or_init(derive)
+            } else {
+                derive()
+            };
+            if let Some(key) = key {
+                keys.push((index, ZipPrefixKey::Aes { key, len: key_len }));
+            }
+        }
+        cancellation.check_io()?;
+        prefix.screen(&keys, &mut result)?;
+    }
     Ok(result)
 }
 
@@ -938,6 +1105,7 @@ fn verify_zipcrypto_material(
     candidates: &[Arc<str>],
     encryption_header: &[u8; ZIPCRYPTO_HEADER_LEN],
     check_byte: u8,
+    prefix: Option<&ZipPrefix>,
     cache: Option<&ZipKeyCache>,
 ) -> std::io::Result<PasswordVerification> {
     let attempts = candidates.len();
@@ -945,20 +1113,28 @@ fn verify_zipcrypto_material(
     let slots = cache.and_then(|cache| cache.cells(&ZipKeyMaterial::ZipCrypto(encryption_header, check_byte), attempts));
     let check = |(index, password): (usize, &Arc<str>)| {
         if cancellation.cancelled() { return None; }
-        let derive = || zipcrypto_header_matches(&zip_password_bytes(password), encryption_header, check_byte).then_some(ZipKey::ZipCrypto);
-        matches!(slots.map_or_else(derive, |slots| *slots[index].get_or_init(derive)), Some(ZipKey::ZipCrypto)).then_some(index)
+        let derive = || zipcrypto_header_state(&zip_password_bytes(password), encryption_header, check_byte);
+        let state = if let Some(slots) = slots {
+            match slots[index].get_or_init(|| derive().map(ZipKey::ZipCrypto)) {
+                Some(ZipKey::ZipCrypto(state)) => Some(*state),
+                _ => None,
+            }
+        } else {
+            derive()
+        };
+        state.map(|state| (index, ZipPrefixKey::ZipCrypto(state)))
     };
-    let matched_indices: Vec<_> = if attempts >= ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD {
+    let keys: Vec<_> = if attempts >= ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD {
         candidates.par_iter().enumerate().filter_map(check).collect()
     } else {
         candidates.iter().enumerate().filter_map(check).collect()
     };
     cancellation.check_io()?;
 
-    let result = if let Some(first) = matched_indices.first().copied() {
+    let mut result = if let Some(&(first, _)) = keys.first() {
         PasswordVerification {
             matched_index: Some(first),
-            matched_indices,
+            matched_indices: keys.iter().map(|&(index, _)| index).collect(),
             attempts,
             match_evidence: Some("zipcrypto_header_byte"),
             ..PasswordVerification::status("match", "zipcrypto password material matched")
@@ -969,29 +1145,28 @@ fn verify_zipcrypto_material(
             ..PasswordVerification::status("no_match", "zipcrypto password material did not match")
         }
     };
+    if let Some(prefix) = prefix.filter(|prefix| prefix.can_screen(keys.len(), false)) {
+        prefix.screen(&keys, &mut result)?;
+    }
     Ok(result)
 }
 
-fn parse_winzip_aes_strength(extra: &[u8]) -> Option<u8> {
-    let mut offset = 0usize;
-    while offset.checked_add(4)? <= extra.len() {
-        let header_id = le_u16(extra, offset)?;
-        let data_size = le_u16(extra, offset + 2)? as usize;
-        let data_offset = offset.checked_add(4)?;
-        let next = data_offset.checked_add(data_size)?;
-        if next > extra.len() {
-            return None;
-        }
-        if header_id == 0x9901 && data_size >= 7 {
-            if !matches!(le_u16(extra, data_offset)?, 1 | 2)
-                || extra.get(data_offset + 2..data_offset + 4)? != b"AE" {
-                return None;
+fn parse_winzip_aes_extra(mut extra: &[u8]) -> Result<Option<(u8, u16)>, PreparedStatus> {
+    let malformed = || PreparedStatus::new("unsupported_method", "invalid ZIP AES extra field");
+    while !extra.is_empty() {
+        let header_id = le_u16(extra, 0).ok_or_else(malformed)?;
+        let size = usize::from(le_u16(extra, 2).ok_or_else(malformed)?);
+        let (data, rest) = extra[4..].split_at_checked(size).ok_or_else(malformed)?;
+        if header_id == 0x9901 {
+            if data.len() < 7 || !matches!(le_u16(data, 0), Some(1 | 2))
+                || &data[2..4] != b"AE" {
+                return Err(malformed());
             }
-            return extra.get(data_offset + 4).copied();
+            return Ok(Some((data[4], le_u16(data, 5).unwrap())));
         }
-        offset = next;
+        extra = rest;
     }
-    None
+    Ok(None)
 }
 
 fn aes_lengths(strength: u8) -> Option<(usize, usize)> {
@@ -1091,6 +1266,21 @@ fn winzip_aes_verifier(
     let offset = key_len * 2;
     let block_index = (offset / 20 + 1) as u32;
     let template = Hmac::<Sha1>::new_from_slice(password).expect("HMAC accepts any key length");
+    let derived = winzip_aes_block(&template, salt, block_index)?;
+    Some([derived[offset % 20], derived[offset % 20 + 1]])
+}
+
+fn winzip_aes_encryption_key(password: &[u8], salt: &[u8], len: usize) -> Option<[u8; 32]> {
+    let template = Hmac::<Sha1>::new_from_slice(password).expect("HMAC accepts any key length");
+    let mut key = [0; 32];
+    for (index, block) in key[..len].chunks_mut(20).enumerate() {
+        let derived = winzip_aes_block(&template, salt, index as u32 + 1)?;
+        block.copy_from_slice(&derived[..block.len()]);
+    }
+    Some(key)
+}
+
+fn winzip_aes_block(template: &Hmac<Sha1>, salt: &[u8], block_index: u32) -> Option<[u8; 20]> {
     let mut mac = template.clone();
     mac.update(salt);
     mac.update(&block_index.to_be_bytes());
@@ -1108,24 +1298,25 @@ fn winzip_aes_verifier(
             *value ^= byte;
         }
     }
-    Some([derived[offset % 20], derived[offset % 20 + 1]])
+    Some(derived.into())
 }
 
 #[cfg(test)]
 #[path = "../../tests/unit/password/zip/aes_verifier_tests.rs"]
 mod aes_verifier_tests;
 
-fn zipcrypto_header_matches(password: &[u8], encrypted_header: &[u8; ZIPCRYPTO_HEADER_LEN], expected: u8) -> bool {
+fn zipcrypto_header_state(password: &[u8], encrypted_header: &[u8; ZIPCRYPTO_HEADER_LEN], expected: u8) -> Option<ZipCryptoState> {
     let mut state = ZipCryptoState::new();
     for &byte in password { state.update_keys(byte); }
     let mut last = 0;
     for &encrypted in encrypted_header {
         last = state.decrypt(encrypted);
     }
-    last == expected
+    (last == expected).then_some(state)
 }
 
-struct ZipCryptoState {
+#[derive(Clone, Copy)]
+pub(super) struct ZipCryptoState {
     key0: u32,
     key1: u32,
     key2: u32,

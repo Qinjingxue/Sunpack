@@ -119,7 +119,7 @@ fn zip64_password_probe_resolves_disk_relative_entry_and_end_records() {
         tail.extend(0u16.to_le_bytes());
 
         let prepared = if split {
-            let volumes = VolumeSet::new(
+            let volumes = Arc::new(VolumeSet::new(
                 [prefix.clone(), tail]
                     .into_iter()
                     .enumerate()
@@ -130,7 +130,7 @@ fn zip64_password_probe_resolves_disk_relative_entry_and_end_records() {
                         end: None,
                     })
                     .collect(),
-            );
+            ));
             prepare_zip_volume_directory(&volumes, Some(eocd), None)
         } else {
             let mut archive = prefix.clone();

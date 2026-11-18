@@ -209,18 +209,22 @@ fn header_prescreen_and_full_crc_share_one_candidate_scoped_key() {
             folder.main_output_stream = 1;
             folder.unpack_sizes = SevenZipUnpackSizes::All(vec![encoded.len() as u64, 2]);
         }
-        let mut probe = SevenZipPasswordProbe::from_parts(vec![encrypted.into()], folder);
+        let mut probe = SevenZipPasswordProbe::from_parts(vec![encrypted.into()], folder, SevenZipMetadata::Header);
         for password in ["wrong", "secret", "secret"] {
             SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.set(0));
             let key = SevenZipAesKey::derive(probe.key_properties(), password).unwrap();
-            assert_eq!(probe.check_header(&key).unwrap(), password == "secret");
+            assert_eq!(probe.check_header(&key).unwrap(), if password == "secret" {
+                SevenZipPrefixCheck::Confirmed
+            } else {
+                SevenZipPrefixCheck::Reject
+            });
             // The prefix survivor must not derive again in the full decoder;
             // repeated requests have no hidden global retained-key state.
             assert_eq!(SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.get()), 1);
         }
         probe.folder.expected_crc = Some(probe.folder.expected_crc.unwrap() ^ 1);
         let key = SevenZipAesKey::derive(probe.key_properties(), "secret").unwrap();
-        assert!(!probe.check_header(&key).unwrap());
+        assert_eq!(probe.check_header(&key).unwrap(), SevenZipPrefixCheck::Reject);
     }
 }
 
@@ -262,7 +266,6 @@ fn unavailable_second_aes_block_keeps_first_block_structure() {
     let mut reader = Cursor::new(&encrypted[..16]);
     let plan = SevenZipPayloadPlan {
         offset: 0,
-        size: 32,
         properties,
         kind: SevenZipPayloadEvidence::Compressed {
             method: vec![4, 2, 2],
@@ -272,9 +275,12 @@ fn unavailable_second_aes_block_keeps_first_block_structure() {
         cost: 0,
     };
     let probe = SevenZipPayloadProbe::load_plan(&mut reader, 32, plan, &()).unwrap();
-    assert_eq!(probe.test_with_key(&key).unwrap(), SevenZipPrefixCheck::Strong);
-    let wrong = SevenZipAesKey::derive(probe.key_properties(), "wrong").unwrap();
-    assert_eq!(probe.test_with_key(&wrong).unwrap(), SevenZipPrefixCheck::Reject);
+    let check = |key: &SevenZipAesKey| {
+        probe.kind.check_encrypted_prefix(&probe.encrypted, key).unwrap()
+    };
+    assert_eq!(check(&key), SevenZipPrefixCheck::Strong);
+    let wrong = SevenZipAesKey::derive(&probe.properties, "wrong").unwrap();
+    assert_eq!(check(&wrong), SevenZipPrefixCheck::Reject);
 }
 
 // Real password tests cover malformed plaintext, but cannot inject OOM or
