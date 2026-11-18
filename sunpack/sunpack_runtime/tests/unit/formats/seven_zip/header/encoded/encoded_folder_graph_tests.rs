@@ -14,7 +14,7 @@ fn lzma2_encoded_coder_requires_declared_size_and_end_marker() {
         num_out_streams: 1,
     };
     let decode = |data: &[u8], size| {
-        decode_seven_zip_encoded_coder(CoderInput::Borrowed(data), &coder, None, size)
+        decode_seven_zip_encoded_coder(CoderInput::Borrowed(data), &coder, size)
     };
     assert_eq!(decode(&packed, 512).unwrap(), b"test".repeat(128));
     for wrong_size in [0, 1, 511, 513] {
@@ -29,7 +29,6 @@ fn lzma2_encoded_coder_requires_declared_size_and_end_marker() {
         decode_seven_zip_encoded_coder(
             CoderInput::Borrowed(packed.as_slice()),
             &large_dictionary,
-            None,
             512
         )
         .unwrap(),
@@ -52,7 +51,7 @@ fn lz4_encoded_coder_checks_size_properties_and_checksum() {
         num_out_streams: 1,
     };
     assert_eq!(
-        decode_seven_zip_encoded_coder(CoderInput::Borrowed(bytes.as_slice()), &coder, None, 4)
+        decode_seven_zip_encoded_coder(CoderInput::Borrowed(bytes.as_slice()), &coder, 4)
             .unwrap(),
         b"test"
     );
@@ -60,7 +59,6 @@ fn lz4_encoded_coder_checks_size_properties_and_checksum() {
         assert!(decode_seven_zip_encoded_coder(
             CoderInput::Borrowed(bytes.as_slice()),
             &coder,
-            None,
             wrong_size
         )
         .is_err());
@@ -69,7 +67,6 @@ fn lz4_encoded_coder_checks_size_properties_and_checksum() {
     assert!(decode_seven_zip_encoded_coder(
         CoderInput::Borrowed(bytes.as_slice()),
         &coder,
-        None,
         4
     )
     .is_err());
@@ -77,7 +74,6 @@ fn lz4_encoded_coder_checks_size_properties_and_checksum() {
     assert!(decode_seven_zip_encoded_coder(
         CoderInput::Borrowed(bytes.as_slice()),
         &coder,
-        None,
         4
     )
     .is_err());
@@ -212,8 +208,7 @@ fn header_prescreen_and_full_crc_share_one_candidate_scoped_key() {
         let mut probe = SevenZipPasswordProbe::from_parts(vec![encrypted.into()], folder, SevenZipMetadata::Header);
         for password in ["wrong", "secret", "secret"] {
             SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.set(0));
-            let key = SevenZipAesKey::derive(probe.key_properties(), password).unwrap();
-            assert_eq!(probe.check_header(&key).unwrap(), if password == "secret" {
+            assert_eq!(probe.check_header(|properties| SevenZipAesKey::derive(properties, password)).unwrap(), if password == "secret" {
                 SevenZipPrefixCheck::Confirmed
             } else {
                 SevenZipPrefixCheck::Reject
@@ -223,8 +218,89 @@ fn header_prescreen_and_full_crc_share_one_candidate_scoped_key() {
             assert_eq!(SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.get()), 1);
         }
         probe.folder.expected_crc = Some(probe.folder.expected_crc.unwrap() ^ 1);
-        let key = SevenZipAesKey::derive(probe.key_properties(), "secret").unwrap();
-        assert_eq!(probe.check_header(&key).unwrap(), SevenZipPrefixCheck::Reject);
+        assert_eq!(probe.check_header(|properties| SevenZipAesKey::derive(properties, "secret")).unwrap(), SevenZipPrefixCheck::Reject);
+    }
+}
+
+#[test]
+fn double_encrypted_header_uses_both_ivs_and_checks_the_header_crc() {
+    use aes::cipher::BlockModeEncrypt;
+    let coder = |iv| SevenZipCoderAst {
+        method_id: EncoderMethod::ID_AES256_SHA256.to_vec(),
+        properties: vec![0x41, 0, iv],
+        num_in_streams: 1,
+        num_out_streams: 1,
+    };
+    let folder = SevenZipFolderAst {
+        coders: vec![coder(11), coder(12), SevenZipCoderAst {
+            method_id: EncoderMethod::ID_LZMA2.to_vec(),
+            properties: vec![0],
+            num_in_streams: 1,
+            num_out_streams: 1,
+        }],
+        bind_pairs: vec![(1, 0), (2, 1)],
+        packed_streams: vec![0],
+        main_output_stream: 2,
+        unpack_sizes: SevenZipUnpackSizes::All(vec![16, 6, 2]),
+        expected_crc: Some(crc32(&[SZ_HEADER, SZ_END])),
+    };
+    let mut packed = [0u8; 16];
+    packed[..6].copy_from_slice(&[1, 0, 1, SZ_HEADER, SZ_END, 0]);
+    for coder in folder.coders[..2].iter().rev() {
+        let key = SevenZipAesKey::derive(&coder.properties, "secret").unwrap();
+        cbc::Encryptor::<Aes256>::new(&key.key.into(), &key.iv.into())
+            .encrypt_padded::<NoPadding>(&mut packed, 16).unwrap();
+    }
+    assert!(seven_zip_probe_folder_supported(&folder));
+    let plan = seven_zip_payload_plan(&folder, 0, 0, 16, false).expect("stacked AES compressed prefix");
+    let prefix = SevenZipPasswordContext::Prefix {
+        probe: SevenZipPayloadProbes {
+            first: SevenZipPayloadProbe {
+                offset: 0,
+                properties: plan.properties,
+                inner_aes: plan.inner_aes,
+                encrypted: packed,
+                kind: plan.kind,
+            },
+            rest: Vec::new(),
+            source: None,
+        },
+        header: false,
+    };
+    let passwords = [Arc::from("wrong"), Arc::from("secret")];
+    assert_eq!(prefix.verify(&passwords).unwrap().matched_indices, [1]);
+    let probe = SevenZipPasswordProbe::from_parts(vec![packed.to_vec().into()], folder, SevenZipMetadata::Header);
+    let context = SevenZipPasswordContext::Header(probe);
+    SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.set(0));
+    let result = context.verify(&passwords).unwrap();
+    assert_eq!(result.matched_indices, [1]);
+    assert_eq!(result.final_confirmation_required, Some(false));
+    assert_eq!(SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.get()), passwords.len());
+
+    let keys = [11, 12].map(|iv| SevenZipAesKey::derive(&coder(iv).properties, "secret").unwrap());
+    let structure = SevenZipPayloadEvidence::Compressed {
+        method: EncoderMethod::ID_LZMA2.to_vec(),
+        packed_size: 60,
+        unpack_size: 56,
+    };
+    for next in [0, 0x7f] {
+        let mut packed = [0; 64];
+        packed[..3].copy_from_slice(&[1, 0, 55]); // Raw chunk with 56 data bytes, then a marker.
+        packed[59] = next;
+        for key in keys.iter().rev() {
+            cbc::Encryptor::<Aes256>::new(&key.key.into(), &key.iv.into())
+                .encrypt_padded::<NoPadding>(&mut packed, 64).unwrap();
+        }
+        let first: &[u8; 16] = packed[..16].try_into().unwrap();
+        let (prefix, len) = structure.decrypt_prefix_with_inner(first, &keys[0], &keys[1..]).unwrap();
+        let mut read = |at: u64, output: &mut [u8]| -> Result<(), DeferredReadError> {
+            let start = at as usize;
+            output.copy_from_slice(&packed[start..start + output.len()]);
+            Ok(())
+        };
+        let result = structure.check_successor(0, first, &prefix[..len], &keys[0], &keys[1..],
+            &mut read, &SevenZipPayloadSource::Fixed(Arc::new([]))).unwrap();
+        assert_eq!(result == SevenZipPrefixCheck::Reject, next != 0);
     }
 }
 
@@ -247,7 +323,7 @@ fn decoder_follows_bind_pairs_instead_of_coder_declaration_order() {
         expected_crc: None,
     };
     let decoded =
-        decode_seven_zip_encoded_folder(&[b"test".to_vec().into()], &folder, None).unwrap();
+        decode_seven_zip_encoded_folder(&[b"test".to_vec().into()], &folder).unwrap();
     assert_eq!(decoded, b"test");
 }
 
@@ -265,6 +341,7 @@ fn unavailable_second_aes_block_keeps_first_block_structure() {
         .unwrap();
     let mut reader = Cursor::new(&encrypted[..16]);
     let plan = SevenZipPayloadPlan {
+        inner_aes: Box::default(),
         offset: 0,
         properties,
         kind: SevenZipPayloadEvidence::Compressed {
@@ -325,6 +402,6 @@ fn decoder_rejects_bind_pair_cycles() {
         unpack_sizes: SevenZipUnpackSizes::Main(1),
         expected_crc: None,
     };
-    let error = decode_seven_zip_encoded_folder(&[], &folder, None).unwrap_err();
+    let error = decode_seven_zip_encoded_folder(&[], &folder).unwrap_err();
     assert_eq!(error, "encoded_header_bind_pair_cycle");
 }

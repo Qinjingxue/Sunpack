@@ -22,8 +22,8 @@ pub(super) struct VolumeFacts {
     pub(super) number: Option<u32>,
     pub(super) has_next: Option<bool>,
     packed: Option<Vec<(u64, u64, PackedDigest)>>,
-    first: Option<Option<Vec<u8>>>,
-    last: Option<Option<Vec<u8>>>,
+    first: Option<Option<RarContinuationFragment>>,
+    last: Option<Option<RarContinuationFragment>>,
 }
 
 impl VolumeFacts {
@@ -31,9 +31,12 @@ impl VolumeFacts {
         self.packed.is_some()
     }
 
-    pub(super) fn file(&mut self, before: bool, after: bool, name: &[u8]) {
-        self.first.get_or_insert_with(|| before.then(|| name.to_vec()));
-        self.last = Some(after.then(|| name.to_vec()));
+    pub(super) fn file(&mut self, before: bool, after: bool, name: &[u8], offset: u64, size: u64) {
+        let fragment = || RarContinuationFragment {
+            name: name.into(), offset, size, split_after: after,
+        };
+        self.first.get_or_insert_with(|| before.then(fragment));
+        self.last = Some(after.then(fragment));
     }
 
     pub(super) fn packed(&mut self, offset: u64, length: u64, digest: PackedDigest) {
@@ -153,10 +156,12 @@ fn rejections(plan: &VolumeAttemptPlan, facts: &[VolumeFacts], anchor: Option<&V
                                 let wrong_header = anchor.is_some_and(|a| a.version.is_some() && f.version.is_some() &&
                                     (a.version != f.version || a.header_encrypted != f.header_encrypted));
                                 let wrong_pair = matches!(state, State::Clean(Some(previous)) if adjacent &&
-                                    f.first.as_ref().is_some_and(|first| first.as_deref() != previous));
+                                    f.first.as_ref().is_some_and(|first| first.as_ref().map(|f| f.name.as_ref()) != previous));
                                 if f.invalid || wrong_header || f.number.is_some_and(|n| n != slot.number)
                                     || (f.has_next == Some(false) && ordinal + 1 < count) || wrong_pair { State::Bad }
-                                else { State::Clean(if f.has_next.is_some() { f.last.as_ref().map(|x| x.as_deref()) } else { None }) }
+                                else { State::Clean(if f.has_next.is_some() {
+                                    f.last.as_ref().map(|last| last.as_ref().map(|f| f.name.as_ref()))
+                                } else { None }) }
                             } else { State::Clean(None) };
                         }
                         let to = *next.entry(state).or_insert_with(|| { let n = nodes; nodes += 1; n });
@@ -178,6 +183,51 @@ pub(in crate::password) fn rejected_sources(plan: &VolumeAttemptPlan, bad: &[boo
     rejections(plan, &[], None, bad)
 }
 
+fn variable_sources(plan: &VolumeAttemptPlan) -> Vec<bool> {
+    let mut variable = vec![false; plan.sources.len()];
+    // The same disk can receive different sources through separate singleton
+    // layouts. Classify domains before touching each domain's source list.
+    let mut first = HashMap::new();
+    let visit = |observe: &mut dyn FnMut(u32, usize, Option<usize>, bool)| {
+        for layout in &plan.layouts {
+            let max = layout.slots.len();
+            let min = if layout.minimum_slots == 0 { max } else { layout.minimum_slots };
+            let Some(last) = layout.slots.last() else { continue };
+            for (index, slot) in layout.slots.iter().enumerate() {
+                let terminal = (index + 1 >= min && index + 1 < max && slot.domain != last.domain)
+                    .then_some(last.domain);
+                observe(slot.number, slot.domain, terminal, index + 1 > min);
+            }
+        }
+    };
+    let singleton = |id: usize| match plan.domains[id].choices.as_slice() {
+        [source] => Some(*source),
+        _ => None,
+    };
+    visit(&mut |number, domain, terminal, optional| {
+        let current = singleton(domain).filter(|source| {
+            !optional && terminal.is_none_or(|end| singleton(end) == Some(*source))
+        });
+        let (record, occurrences) = first.entry(number).or_insert((current, 0));
+        if *record != current { *record = None; }
+        *occurrences += 1;
+    });
+    let mut domains = vec![false; plan.domains.len()];
+    visit(&mut |number, domain, terminal, _| {
+        let (source, occurrences) = first[&number];
+        if source.is_none() || occurrences != plan.layouts.len() {
+            domains[domain] = true;
+            if let Some(terminal) = terminal { domains[terminal] = true; }
+        }
+    });
+    for (domain, variable_domain) in plan.domains.iter().zip(domains) {
+        if variable_domain {
+            for &source in domain.choices.iter() { variable[source] = true; }
+        }
+    }
+    variable
+}
+
 pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, sessions: &[NativeArchiveSession], native_volume: bool)
     -> Result<Option<PasswordContext>, PreparedStatus> {
     let cancel = Cancellation::current();
@@ -193,17 +243,12 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
         let context = prepare_rar_volume(|offset, size, field| {
             reader.read_at(offset, size).map_err(|err|
                 ReadFault::from_io(err, "read_volume", offset, size, 0, len).with_field(field, FieldLocation::Head))
-        }, Some(&mut facts), RarRanges::Fixed(ranges)).ok().map(Arc::new);
+        }, Some(&mut facts), RarRanges::Fixed(ranges, native_volume)).ok().map(Arc::new);
         Some((facts, context))
     };
     let Some((anchor, context)) = inspect(&plan.sources[head_index], false) else { return Ok(None); };
     if !native_volume && !anchor.native { return Ok(None); }
-    let mut variable = vec![false; plan.sources.len()];
-    for domain in &plan.domains {
-        if domain.choices.len() > 1 {
-            for &id in domain.choices.iter() { variable[id] = true; }
-        }
-    }
+    let variable = variable_sources(plan);
     let mut members: Vec<_> = plan.sources.par_iter().enumerate().map(|(i, s)|
         if i == head_index { Default::default() } else { cancel.run(|| inspect(s, variable[i])).unwrap_or_default() }
     ).collect();
@@ -217,14 +262,21 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
     } else { Arc::clone(plan) };
     let anchor_context = materials[head_index].clone();
     let by_extent: HashMap<_, _> = plan.sources.iter().enumerate().map(|(i,s)| (s,i)).collect();
-    let bad: Vec<_> = remaining.sources.par_iter().map(|s| {
-        facts[by_extent[s]].packed.as_deref().is_some_and(|spans| packed_mismatch(spans, s, &readers, &cancel))
-    }).collect();
-    cancel.check_io().map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
-    if bad.iter().any(|&value| value) {
-        let rejected = rejected_sources(&remaining, &bad);
-        remaining = Arc::new(remove_paths(&remaining, &[&rejected]).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?);
-        reduced = true;
+    if facts.iter().any(|f| f.packed.as_ref().is_some_and(|spans| !spans.is_empty())) {
+        let narrowed;
+        let variable = if reduced {
+            narrowed = variable_sources(&remaining);
+            &narrowed
+        } else { &variable };
+        let bad: Vec<_> = remaining.sources.par_iter().enumerate().map(|(i, s)| {
+            variable[i] && facts[by_extent[s]].packed.as_deref().is_some_and(|spans| packed_mismatch(spans, s, &readers, &cancel))
+        }).collect();
+        cancel.check_io().map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
+        if bad.iter().any(|&value| value) {
+            let rejected = rejected_sources(&remaining, &bad);
+            remaining = Arc::new(remove_paths(&remaining, &[&rejected]).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?);
+            reduced = true;
+        }
     }
     let plan = remaining;
     let materials: Vec<_> = plan.sources.iter().map(|s| materials[by_extent[s]].clone()).collect();
@@ -237,6 +289,9 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
     // Native disk methods use their own offset zero and ignore all earlier
     // disk lengths. Read each source once, then branch only on usable proofs.
     let disks: BTreeSet<_> = plan.layouts.iter().flat_map(|l| l.slots.iter().map(|s| (s.number - 1) as usize)).collect();
+    let fragments: Option<Arc<[_]>> = materials.iter().flatten().any(|c| c.can_follow_native()).then(|| {
+        plan.sources.iter().map(|s| facts[by_extent[s]].first.as_ref().and_then(Clone::clone)).collect()
+    });
     let prepared = prepare_attempt_evidence_partial(head, &plan, sessions, AttemptGeometry::DiskRelative, |reader| {
         for strong in [true, false] {
             for &disk in &disks {
@@ -245,7 +300,20 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
                         || matches!(ctx.material, RarPasswordMaterial::Rar5Header { .. });
                     (strong == is_strong).then_some(source)
                 })).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
-                if let Some(source) = source { return Ok(materials[source].clone()); }
+                if let Some(source) = source {
+                    let material = materials[source].as_ref().unwrap();
+                    if material.can_follow_native() && disks.contains(&(disk + 1)) {
+                        let facts = &facts[by_extent[&plan.sources[source]]];
+                        if let (Some(fragments), Some(Some(outgoing))) = (&fragments, &facts.last) {
+                            if let Some(material) = material.with_native_tail(
+                                reader, disk, outgoing, fragments,
+                            ).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))? {
+                                return Ok(Some(Arc::new(material)));
+                            }
+                        }
+                    }
+                    return Ok(Some(material.clone()));
+                }
             }
         }
         Err(PreparedStatus::new("unknown_needs_final_verifier", "native RAR requires member verification"))

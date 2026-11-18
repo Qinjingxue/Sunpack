@@ -1254,8 +1254,8 @@
         "en": "Nested candidate ratio"
       },
       "description": {
-        "zh": "控制内嵌压缩包的递归筛选",
-        "en": "Controls recursive filtering of embedded archives"
+        "zh": "递归只深度扫描满足对应大小比例的文件，0表示完全扫描，1表示完全不扫描",
+        "en": "During recursion, deep-scan only files that meet the size ratio. Use 0 to scan all candidates and 1 to scan none."
       },
       "min": 0,
       "max": 1

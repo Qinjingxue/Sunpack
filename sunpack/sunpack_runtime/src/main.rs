@@ -1,5 +1,8 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+#[cfg(not(panic = "unwind"))]
+compile_error!("SunPack Runtime requires panic unwinding for task and request cleanup");
+
 mod analysis_native;
 mod collections;
 mod event_log;

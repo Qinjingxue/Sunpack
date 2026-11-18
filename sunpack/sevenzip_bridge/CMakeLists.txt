@@ -124,11 +124,10 @@ file(GLOB_RECURSE SUP7Z_BUNDLED_7Z_SOURCES CONFIGURE_DEPENDS
 )
 
 list(LENGTH SUP7Z_BUNDLED_7Z_SOURCES SUP7Z_BUNDLED_7Z_SOURCE_COUNT)
-if(NOT SUP7Z_BUNDLED_7Z_SOURCE_COUNT EQUAL 228)
+if(NOT SUP7Z_BUNDLED_7Z_SOURCE_COUNT EQUAL 225)
     message(FATAL_ERROR
-        "Trimmed 7-Zip tree must contribute exactly 228 translation units, found "
-        "${SUP7Z_BUNDLED_7Z_SOURCE_COUNT}. Re-derive the keep set (regenerate "
-        "docs/zh-CN/sevenzip_retained_sources.txt) or fix the tree.")
+        "Trimmed 7-Zip tree must contribute exactly 225 translation units, found "
+        "${SUP7Z_BUNDLED_7Z_SOURCE_COUNT}. Re-derive the keep set or fix the tree.")
 endif()
 
 
@@ -150,7 +149,7 @@ if(SUP7Z_X64_ASM_ENABLED)
         SUP7Z_BUNDLED_7Z_SOURCE_COUNT_WITHOUT_ASM_TWINS)
     math(EXPR SUP7Z_BUNDLED_7Z_ASM_SWAP_REMOVED
         "${SUP7Z_BUNDLED_7Z_SOURCE_COUNT} - ${SUP7Z_BUNDLED_7Z_SOURCE_COUNT_WITHOUT_ASM_TWINS}")
-    if(NOT SUP7Z_BUNDLED_7Z_SOURCE_COUNT_WITHOUT_ASM_TWINS EQUAL 223)
+    if(NOT SUP7Z_BUNDLED_7Z_ASM_SWAP_REMOVED EQUAL 5)
         message(FATAL_ERROR
             "x64 assembly swap must remove exactly 5 C fallbacks "
             "(7zCrcOpt.c, XzCrc64Opt.c, AesOpt.c, Sha1Opt.c, Sha256Opt.c), but "

@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, OnceLock};
 
+#[path = "../relations/packed_crc.rs"]
+mod packed_crc;
+pub(crate) use packed_crc::PackedCrcs;
+
 #[cfg(test)]
 thread_local! {
     static EDGE_READS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -110,33 +114,39 @@ struct DiskMapping {
     different_length: bool,
 }
 
+fn ambiguous_logical_ranges<'a>(edges: impl Iterator<Item = &'a Edge>) -> Vec<(u64, u64)> {
+    let mut mappings: Vec<_> = edges
+        .filter(|edge| !edge.unresolved && edge.start < edge.end)
+        .map(|edge| (edge.start, edge.source, edge.end))
+        .collect();
+    mappings.sort_unstable();
+    let mut overlaps: Vec<(u64, u64)> = Vec::new();
+    let mut covered_end = 0;
+    for same in mappings.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
+        let &(start, _, end) = same.last().unwrap();
+        let overlap_end = end.min(covered_end);
+        if start < overlap_end {
+            match overlaps.last_mut() {
+                Some((_, last)) if *last >= start => *last = (*last).max(overlap_end),
+                _ => overlaps.push((start, overlap_end)),
+            }
+        }
+        covered_end = covered_end.max(end);
+    }
+    overlaps
+}
+
+fn overlaps_range(ranges: &[(u64, u64)], start: u64, size: u64) -> bool {
+    let index = ranges.partition_point(|&(_, end)| end <= start);
+    size != 0 && ranges.get(index).is_some_and(|&(from, _)| from < start.saturating_add(size))
+}
+
 impl Topology {
     // Use the full geometry so method selection stays stable when a parser
     // replays on a narrower projection.
     fn range_is_ambiguous(&self, start: u64, size: u64) -> bool {
-        let ranges = self.ambiguous_ranges.get_or_init(|| {
-            let mut mappings: Vec<_> = self.edges.iter()
-                .filter(|edge| !edge.unresolved && edge.start < edge.end)
-                .map(|edge| (edge.start, edge.source, edge.end))
-                .collect();
-            mappings.sort_unstable();
-            let mut overlaps: Vec<(u64, u64)> = Vec::new();
-            let mut covered_end = 0;
-            for same in mappings.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
-                let &(start, _, end) = same.last().unwrap();
-                let overlap_end = end.min(covered_end);
-                if start < overlap_end {
-                    match overlaps.last_mut() {
-                        Some((_, last)) if *last >= start => *last = (*last).max(overlap_end),
-                        _ => overlaps.push((start, overlap_end)),
-                    }
-                }
-                covered_end = covered_end.max(end);
-            }
-            overlaps
-        });
-        let index = ranges.partition_point(|&(_, end)| end <= start);
-        ranges.get(index).is_some_and(|&(from, _)| from < start.saturating_add(size))
+        let ranges = self.ambiguous_ranges.get_or_init(|| ambiguous_logical_ranges(self.edges.iter()));
+        overlaps_range(ranges, start, size)
     }
 
     fn disk_mappings(&self) -> &BTreeMap<usize, DiskMapping> {
@@ -948,10 +958,6 @@ impl DeferredReads {
         Arc::ptr_eq(&self.projection, &reader.reader.projection)
     }
 
-    pub(crate) fn scope(&self) -> Arc<crate::password::evidence::VolumeProjection> {
-        self.proof.get_or_init(|| self.projection.proof()).clone()
-    }
-
     pub(crate) fn range_is_ambiguous(&self, start: u64, size: u64) -> bool {
         if self.disk_relative {
             self.disk_range_is_ambiguous(0, start, size)
@@ -967,36 +973,6 @@ impl DeferredReads {
     pub(crate) fn evaluate<T>(
         &self, mut verify: impl FnMut(&mut DeferredReader<'_>) -> T,
     ) -> io::Result<Vec<(Arc<crate::password::evidence::VolumeProjection>, T)>> {
-        self.evaluate_with(&mut verify, |projection, branched| {
-            if branched { projection.proof() }
-            else { self.proof.get_or_init(|| projection.proof()).clone() }
-        })
-    }
-
-    pub(crate) fn partition(
-        &self, mut rejects: impl FnMut(&mut DeferredReader<'_>) -> bool,
-    ) -> io::Result<(Vec<Self>, Vec<Arc<crate::password::evidence::VolumeProjection>>)> {
-        let mut retained = Vec::new();
-        let mut rejected = Vec::new();
-        for (projection, reject) in self.evaluate_with(&mut rejects, |projection, _| projection)? {
-            if reject {
-                rejected.push(projection.proof());
-            } else {
-                retained.push(Self {
-                    sources: Arc::clone(&self.sources),
-                    projection,
-                    disk_relative: self.disk_relative,
-                    proof: Default::default(),
-                });
-            }
-        }
-        Ok((retained, rejected))
-    }
-
-    fn evaluate_with<T, P>(
-        &self, verify: &mut impl FnMut(&mut DeferredReader<'_>) -> T,
-        mut project: impl FnMut(Arc<Projection>, bool) -> P,
-    ) -> io::Result<Vec<(P, T)>> {
         let mut pending = Vec::new();
         let mut current = Some(Arc::clone(&self.projection));
         let mut outcomes = Vec::new();
@@ -1012,7 +988,9 @@ impl DeferredReads {
                 branched = true;
                 pending.extend(branches.into_iter().rev());
             } else {
-                let projection = project(reader.reader.projection, branched);
+                let projection = reader.reader.projection;
+                let projection = if branched { projection.proof() }
+                    else { self.proof.get_or_init(|| projection.proof()).clone() };
                 outcomes.push((projection, value));
             }
         }
@@ -1022,10 +1000,6 @@ impl DeferredReads {
 }
 
 impl DeferredReader<'_> {
-    pub(crate) fn crc32(&mut self, offset: u64, size: u64) -> Result<u32, DeferredReadError> {
-        self.load(|reader| reader.crc32(offset, size))
-    }
-
     pub(crate) fn read(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, DeferredReadError> {
         if self.disk_relative {
             return self.read_disk_offset(0, 0, offset, len);
@@ -1051,7 +1025,7 @@ impl DeferredReader<'_> {
         if bytes.len() == len { Ok(bytes) } else { Err(DeferredReadError::Missing) }
     }
 
-    fn load<T>(
+    pub(in crate::password) fn load<T>(
         &mut self,
         read: impl FnOnce(&mut AttemptReader<'_>) -> io::Result<T>,
     ) -> Result<T, DeferredReadError> {
@@ -1086,20 +1060,9 @@ impl DeferredReader<'_> {
 }
 
 impl AttemptReader<'_> {
-    pub(crate) fn crc32(&mut self, offset: u64, mut size: u64) -> io::Result<u32> {
-        self.seek(SeekFrom::Start(offset))?;
-        let mut crc = crc32fast::Hasher::new();
-        let mut buffer = [0; 64 * 1024];
-        while size != 0 {
-            Cancellation::check_current_io()?;
-            let count = size.min(buffer.len() as u64) as usize;
-            self.read_exact(&mut buffer[..count])?;
-            crc.update(&buffer[..count]);
-            size -= count as u64;
-        }
-        Ok(crc.finalize())
+    pub(in crate::password) fn read_native_disk(&mut self, disk: usize, offset: u64, bytes: &mut [u8]) -> io::Result<usize> {
+        self.read_domain(Some((disk, offset)), bytes)
     }
-
     fn new(sources: &Arc<[AttemptSource]>, projection: Arc<Projection>) -> AttemptReader<'_> {
         AttemptReader {
             sources,
@@ -1121,7 +1084,7 @@ impl AttemptReader<'_> {
             sources: Arc::clone(self.sources),
             projection: Arc::clone(&self.projection),
             disk_relative,
-            proof: Arc::new(OnceLock::new()),
+            proof: Arc::default(),
         }
     }
 

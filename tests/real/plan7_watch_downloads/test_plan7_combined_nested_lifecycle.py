@@ -6,7 +6,7 @@ from tests.helpers.marker_utils import marker_present
 from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree
 from tests.helpers.real_archives import ArchiveCase, choose_entry_path, create_7z_archive
 from tests.real.archive_boundary import require_generator
-from tests.real.nested_cases import NESTED_FIXTURE_CANDIDATE_RATIO, assert_nested_outputs, build_nested_case
+from tests.real.nested_cases import assert_nested_outputs, build_nested_case
 from tests.real.plan6_confused_volumes.plan6_support import SCENARIOS, apply_volume_confusion
 from tests.real.plan7_watch_downloads.plan7_support import download, wait_for, watch_setup
 
@@ -20,7 +20,7 @@ pytestmark = pytest.mark.requires_watch_broker
 def test_plan7_disguised_encrypted_split_nested_carrier(package, tmp_path, outer_format, cleanup, restart):
     require_generator(outer_format)
     case = build_nested_case(tmp_path / "fixtures", f"watch-{outer_format}", outer_format)
-    package.configure(embedded_scan={"recursive_candidate_ratio": NESTED_FIXTURE_CANDIDATE_RATIO})
+    package.configure(embedded_scan={"recursive_candidate_ratio": 0})
     watch = watch_setup(package, tmp_path, passwords=case.passwords[:2], cleanup=cleanup, flatten=True)
     for part in reversed(case.parts[:-1]):
         download(watch, part)

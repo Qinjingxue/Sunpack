@@ -1276,7 +1276,7 @@ fn aes_lengths(strength: u8) -> Option<(usize, usize)> {
 /// ASCII is identical in every ANSI codepage and stays borrowed.
 pub(crate) fn zip_password_bytes(password: &str) -> Cow<'_, [u8]> {
     const CP_ACP: u32 = 0;
-    super::password_codepage_bytes(password, CP_ACP, usize::MAX)
+    super::password_codepage_bytes(password, CP_ACP)
         .unwrap_or(Cow::Borrowed(password.as_bytes()))
 }
 

@@ -26,63 +26,20 @@ pub(crate) struct EvidenceContext {
     pub independent_rar: Vec<Option<Arc<super::rar::RarPasswordContext>>>,
 }
 
-#[derive(Clone, Debug)]
-enum RejectedCandidates {
-    One(usize),
-    Shared(Arc<Vec<usize>>),
-}
-
-impl RejectedCandidates {
-    fn as_slice(&self) -> &[usize] {
-        match self {
-            Self::One(index) => std::slice::from_ref(index),
-            Self::Shared(indices) => indices,
-        }
-    }
-
-    fn from_ordered(mut indices: Vec<usize>) -> Option<Self> {
-        match indices.len() {
-            0 => None,
-            1 => Some(Self::One(indices.pop().unwrap())),
-            _ => Some(Self::Shared(Arc::new(indices))),
-        }
-    }
-}
-
-/// Keep the projection once when a proof rejects the same path for a batch
-/// of candidates. The shared index list is remapped once at each boundary.
 #[derive(Debug, Default)]
-pub(crate) struct ScopedRejections(Vec<(Arc<VolumeProjection>, RejectedCandidates)>);
+pub(crate) struct ScopedRejections(Vec<(Arc<VolumeProjection>, usize)>);
 
 impl ScopedRejections {
     pub(crate) fn is_empty(&self) -> bool { self.0.is_empty() }
 
-    pub(crate) fn push(&mut self, (path, index): (Arc<VolumeProjection>, usize)) {
-        self.0.push((path, RejectedCandidates::One(index)));
-    }
-
-    pub(crate) fn add_shared(&mut self, paths: &[Arc<VolumeProjection>], indices: &[usize]) {
-        if paths.is_empty() { return; }
-        let indices = match indices {
-            [] => return,
-            [index] => RejectedCandidates::One(*index),
-            _ => RejectedCandidates::Shared(Arc::new(indices.to_vec())),
-        };
-        self.0.extend(paths.iter().map(|path| (Arc::clone(path), indices.clone())));
+    pub(crate) fn push(&mut self, rejected: (Arc<VolumeProjection>, usize)) {
+        self.0.push(rejected);
     }
 
     pub(crate) fn remap(&mut self, map_index: impl Fn(usize) -> Option<usize>) {
-        let mut shared = HashMap::new();
-        self.0.retain_mut(|(_, indices)| {
-            let mapped = match indices {
-                RejectedCandidates::One(index) => map_index(*index).map(RejectedCandidates::One),
-                RejectedCandidates::Shared(group) => shared.entry(Arc::as_ptr(group))
-                    .or_insert_with(|| RejectedCandidates::from_ordered(
-                        group.iter().copied().filter_map(&map_index).collect(),
-                    )).clone(),
-            };
-            if let Some(mapped) = mapped {
-                *indices = mapped;
+        self.0.retain_mut(|(_, index)| {
+            if let Some(mapped) = map_index(*index) {
+                *index = mapped;
                 true
             } else {
                 false
@@ -93,7 +50,7 @@ impl ScopedRejections {
 
 impl Extend<(Arc<VolumeProjection>, usize)> for ScopedRejections {
     fn extend<I: IntoIterator<Item = (Arc<VolumeProjection>, usize)>>(&mut self, values: I) {
-        self.0.extend(values.into_iter().map(|(path, index)| (path, RejectedCandidates::One(index))));
+        self.0.extend(values);
     }
 }
 
@@ -168,7 +125,7 @@ impl CandidateDomains {
             };
             rules.push((path, rule));
         }
-        rules.extend(self.scoped.0.iter().map(|(path, indices)| (path.as_ref(), Rule::Reject(indices.as_slice()))));
+        rules.extend(self.scoped.0.iter().map(|(path, index)| (path.as_ref(), Rule::Reject(std::slice::from_ref(index)))));
         let mut rejected = Vec::new();
         let mut allowed = Vec::new();
         let mut terminal = |state: &State, ends: &Ends| -> Option<usize> {
@@ -376,7 +333,7 @@ impl EvidenceContext {
         })
     }
 
-    fn public_plan(&self) -> std::io::Result<Option<Arc<VolumeAttemptPlan>>> {
+    pub(super) fn public_plan(&self) -> std::io::Result<Option<Arc<VolumeAttemptPlan>>> {
         if self.rejected.is_empty() {
             return Ok(self.public_reduced.then(|| self.plan.clone()));
         }
@@ -414,6 +371,16 @@ impl EvidenceContext {
                     "no password candidates supplied",
                 )
             });
+        }
+        if !self.alternatives.is_empty() && self.alternatives.iter().all(|(context, _)| matches!(
+            context, PasswordContext::SevenZip(super::seven_zip::SevenZipPasswordContext::MemberOnly)
+        )) {
+            let mut result = self.unresolved.as_ref().map_or_else(
+                || PasswordVerification::status("unknown_needs_final_verifier", "7z payload requires member verification"),
+                PreparedStatus::verification,
+            );
+            result.volume_attempts = self.public_plan()?;
+            return Ok(result);
         }
         let rar_contexts = self.alternatives.iter().filter_map(|(context, _)| match context {
             PasswordContext::Rar(context) => Some(context.as_ref()),
@@ -459,6 +426,11 @@ impl EvidenceContext {
     ) -> std::io::Result<PasswordVerification> {
         let cancellation = Cancellation::current();
         cancellation.check_io()?;
+        let public_plan = self.public_plan()?;
+        let plan = public_plan.as_deref().unwrap_or(&self.plan);
+        let unique_volume = matches!(&*plan.layouts, [layout] if
+            (layout.minimum_slots == 0 || layout.minimum_slots == layout.slots.len()) &&
+            layout.slots.iter().all(|slot| plan.domains[slot.domain].choices.len() == 1));
         let keys = SharedCandidateKeys::new(&self.alternatives, |context| {
             let context = match context {
                 PasswordContext::SevenZip(context) => Some(context),
@@ -479,7 +451,7 @@ impl EvidenceContext {
             .map(|(context, _)| {
                 cancellation.run(|| match context {
                     PasswordContext::SevenZip(context) => context
-                        .verify_cached(candidates, Some(&keys)),
+                        .verify_cached(candidates, Some(&keys), unique_volume),
                     PasswordContext::Zip(context) => context.verify_cached(
                         candidates,
                         zip_keys,
@@ -521,8 +493,8 @@ impl EvidenceContext {
                 if !survivors(result).contains(index) {
                     removed.push(projection);
                 } else {
-                    removed.extend(result.scoped_rejections.0.iter().filter_map(|(path, indices)| {
-                        indices.as_slice().binary_search(&index).is_ok().then_some(path.as_ref())
+                    removed.extend(result.scoped_rejections.0.iter().filter_map(|(path, rejected)| {
+                        (*rejected == index).then_some(path.as_ref())
                     }));
                 }
             }
@@ -565,7 +537,7 @@ impl EvidenceContext {
             removed.extend(self.rejected.iter().map(Arc::as_ref));
             Some(Arc::new(remove_paths(&self.plan, &removed)?))
         } else {
-            self.public_plan()?
+            public_plan
         };
         if let Some(index) = confirmed {
             let mut result = results

@@ -123,10 +123,13 @@ fn logical_crc_reuses_geometry_between_volume_boundaries() {
     let readers = prepared.pop().unwrap();
     let (observations, visits) = count_logical_edges(|| readers.evaluate(|reader| {
         assert!(readers.shares_projection(reader));
-        let head = reader.crc32(0, (8 * CHUNK) as u64).unwrap();
+        let mut head = crc32fast::Hasher::new();
+        for offset in (0..8 * CHUNK).step_by(CHUNK) {
+            head.update(&reader.read(offset as u64, CHUNK).unwrap());
+        }
         // A backward seek must resolve the earlier volume again.
         let restart = reader.read(0, 1).unwrap();
-        (head, restart)
+        (head.finalize(), restart)
     }));
     let observations = observations.unwrap();
     assert_eq!(observations.len(), 1);

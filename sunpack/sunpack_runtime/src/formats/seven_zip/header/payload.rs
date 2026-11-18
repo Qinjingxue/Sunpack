@@ -11,6 +11,7 @@ use std::sync::Arc;
 struct SevenZipPayloadProbe {
     offset: u64,
     properties: Vec<u8>,
+    inner_aes: Box<[Vec<u8>]>,
     encrypted: [u8; 16],
     kind: SevenZipPayloadEvidence,
 }
@@ -18,6 +19,7 @@ struct SevenZipPayloadProbe {
 pub(crate) struct SevenZipPayloadPrefix {
     plaintext: [u8; 32],
     len: usize,
+    inner_keys: Vec<SevenZipAesKey>,
     pub(crate) check: SevenZipPrefixCheck,
 }
 
@@ -31,17 +33,6 @@ pub(crate) struct SevenZipPayloadProbes {
     /// Only the first usable prefix is materialized before trying passwords.
     rest: Vec<SevenZipPayloadPlan>,
     source: Option<SevenZipPayloadSource>,
-    packed: Option<PackedChecks>,
-}
-
-struct PackedChecks {
-    spans: Vec<(u64, u64, u32)>,
-    selected: std::sync::OnceLock<PackedSelection>,
-}
-
-pub(crate) struct PackedSelection {
-    pub(crate) remaining: Vec<SevenZipPayloadSource>,
-    pub(crate) rejected: Vec<Arc<VolumeProjection>>,
 }
 
 type SevenZipRead<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), DeferredReadError> + 'a;
@@ -86,48 +77,24 @@ impl SevenZipPayloadSource {
 }
 
 impl SevenZipPayloadProbes {
-    pub(crate) fn packed_selection(&self) -> std::io::Result<Option<&PackedSelection>> {
-        let (Some(packed), Some(SevenZipPayloadSource::Projected(reads))) = (&self.packed, &self.source) else {
-            return Ok(None);
-        };
-        if packed.selected.get().is_none() {
-            let scan = |source: &DeferredReads, (size, offset, expected)| source.partition(|reader| {
-                match reader.crc32(offset, size) {
-                    Ok(actual) => actual != expected,
-                    Err(DeferredReadError::Truncated) => true,
-                    Err(_) => false,
-                }
-            });
-            let (&first, rest) = packed.spans.split_first().unwrap();
-            let (mut remaining, mut rejected) = scan(reads, first)?;
-            for &span in rest {
-                let mut next = Vec::new();
-                for source in remaining {
-                    let (mut available, mut contradicted) = scan(&source, span)?;
-                    next.append(&mut available);
-                    rejected.append(&mut contradicted);
-                }
-                remaining = next;
-                if remaining.is_empty() { break; }
-            }
-            let _ = packed.selected.set(PackedSelection {
-                remaining: remaining.into_iter().map(SevenZipPayloadSource::Projected).collect(),
-                rejected,
-            });
-        }
-        Ok(packed.selected.get())
-    }
-
     pub(crate) fn key_properties(&self) -> impl Iterator<Item = &[u8]> {
         std::iter::once(self.first.properties.as_slice())
-            .chain(self.rest.iter().map(|plan| plan.properties.as_slice()))
+            .chain(self.first.inner_aes.iter().map(Vec::as_slice))
+            .chain(self.rest.iter().flat_map(|plan| {
+                std::iter::once(plan.properties.as_slice()).chain(plan.inner_aes.iter().map(Vec::as_slice))
+            }))
     }
 
-    pub(crate) fn prescreen(&self, key: &SevenZipAesKey) -> Result<SevenZipPayloadPrefix, String> {
-        let (plaintext, len) = self.first.kind.decrypt_prefix(
-            &self.first.encrypted, key,
-        )?;
-        Ok(SevenZipPayloadPrefix { check: self.first.kind.check_prefix(&plaintext[..len]), plaintext, len })
+    pub(crate) fn prescreen<'a>(
+        &'a self, first_key: &SevenZipAesKey,
+        key: impl FnMut(&'a [u8]) -> Result<SevenZipAesKey, String>,
+    ) -> Result<SevenZipPayloadPrefix, String> {
+        let inner_keys = self.first.inner_aes.iter().map(Vec::as_slice).map(key)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (plaintext, len) = self.first.kind.decrypt_prefix_with_inner(&self.first.encrypted, first_key, &inner_keys)?;
+        Ok(SevenZipPayloadPrefix {
+            check: self.first.kind.check_prefix(&plaintext[..len]), plaintext, len, inner_keys,
+        })
     }
 
     pub(crate) fn has_followup(&self) -> bool {
@@ -155,72 +122,56 @@ impl SevenZipPayloadProbes {
         mut reject: impl FnMut(Arc<VolumeProjection>),
     ) -> Result<SevenZipPrefixCheck, String> {
         use SevenZipPrefixCheck::Reject;
-        let sources = match self.packed.as_ref().and_then(|packed| packed.selected.get()) {
-            Some(packed) => packed.remaining.as_slice(),
-            None => self.source.as_slice(),
-        };
-        let mut fault = None;
-        let mut survivors = 0;
-        let mut rejected = Vec::new();
-        for source in sources {
-            let result = source.validate(|read| {
-                let mut fault = None;
-                match self.first.kind.check_successor(
-                    self.first.offset, &self.first.encrypted, &prefix.plaintext[..prefix.len],
-                    first_key, read, source,
+        let Some(source) = &self.source else { return Ok(prefix.check); };
+        source.validate(|read| {
+            let mut fault = None;
+            match self.first.kind.check_successor(
+                self.first.offset, &self.first.encrypted, &prefix.plaintext[..prefix.len],
+                first_key, &prefix.inner_keys, read, source,
+            ) {
+                Ok(Reject) => return Ok(Reject),
+                Err(DeferredReadError::Truncated) => return Ok(Reject),
+                Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
+                    return Err(seven_zip_deferred_error(error)),
+                Err(error) => { fault = Some(seven_zip_deferred_error(error)); }
+                _ => {}
+            }
+            for plan in &self.rest {
+                check_password_cancellation()?;
+                // Load before deriving a key for a stream that may cross a hole.
+                let mut encrypted = [0u8; 16];
+                if let Err(error) = read(plan.offset, &mut encrypted) {
+                    if matches!(error, DeferredReadError::Truncated) {
+                        return Ok(Reject);
+                    }
+                    if matches!(error, DeferredReadError::Pending | DeferredReadError::Cancelled) {
+                        return Err(seven_zip_deferred_error(error));
+                    }
+                    fault.get_or_insert_with(|| seven_zip_deferred_error(error));
+                    continue;
+                }
+                let candidate = key(&plan.properties)?;
+                let inner_keys = plan.inner_aes.iter().map(Vec::as_slice).map(&mut key)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (plaintext, length) = plan.kind.decrypt_prefix_with_inner(
+                    &encrypted, &candidate, &inner_keys,
+                )?;
+                if plan.kind.check_prefix(&plaintext[..length]) == Reject {
+                    return Ok(Reject);
+                }
+                match plan.kind.check_successor(
+                    plan.offset, &encrypted, &plaintext[..length], &candidate, &inner_keys, read, source,
                 ) {
                     Ok(Reject) => return Ok(Reject),
                     Err(DeferredReadError::Truncated) => return Ok(Reject),
                     Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
                         return Err(seven_zip_deferred_error(error)),
-                    Err(error) => { fault = Some(seven_zip_deferred_error(error)); }
+                    Err(error) => { fault.get_or_insert_with(|| seven_zip_deferred_error(error)); }
                     _ => {}
                 }
-                for plan in &self.rest {
-                    check_password_cancellation()?;
-                    // Load before deriving a key for a stream that may cross a hole.
-                    let mut encrypted = [0u8; 16];
-                    if let Err(error) = read(plan.offset, &mut encrypted) {
-                        if matches!(error, DeferredReadError::Truncated) {
-                            return Ok(Reject);
-                        }
-                        if matches!(error, DeferredReadError::Pending | DeferredReadError::Cancelled) {
-                            return Err(seven_zip_deferred_error(error));
-                        }
-                        fault.get_or_insert_with(|| seven_zip_deferred_error(error));
-                        continue;
-                    }
-                    let candidate = key(&plan.properties)?;
-                    let (plaintext, length) = plan.kind.decrypt_prefix(&encrypted, &candidate)?;
-                    if plan.kind.check_prefix(&plaintext[..length]) == Reject {
-                        return Ok(Reject);
-                    }
-                    match plan.kind.check_successor(
-                        plan.offset, &encrypted, &plaintext[..length], &candidate, read, source,
-                    ) {
-                        Ok(Reject) => return Ok(Reject),
-                        Err(DeferredReadError::Truncated) => return Ok(Reject),
-                        Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
-                            return Err(seven_zip_deferred_error(error)),
-                        Err(error) => { fault.get_or_insert_with(|| seven_zip_deferred_error(error)); }
-                        _ => {}
-                    }
-                }
-                fault.map_or(Ok(prefix.check), Err)
-            }, &mut reject);
-            match result {
-                Ok(Reject) => {
-                    if let SevenZipPayloadSource::Projected(reads) = source {
-                        rejected.push(reads.scope());
-                    }
-                }
-                Err(error) => { fault.get_or_insert(error); survivors += 1; }
-                Ok(_) => survivors += 1,
             }
-        }
-        if survivors == 0 && !sources.is_empty() { return Ok(Reject); }
-        rejected.into_iter().for_each(reject);
-        fault.map_or(Ok(prefix.check), Err)
+            fault.map_or(Ok(prefix.check), Err)
+        }, &mut reject)
     }
 }
 
@@ -275,6 +226,7 @@ impl SevenZipPayloadEvidence {
         }
     }
 
+    #[cfg(test)]
     fn check_encrypted_prefix(
         &self,
         encrypted: &[u8],
@@ -302,6 +254,18 @@ impl SevenZipPayloadEvidence {
         Ok((buffer, len))
     }
 
+    fn decrypt_prefix_with_inner(
+        &self, encrypted: &[u8], first: &SevenZipAesKey, inner: &[SevenZipAesKey],
+    ) -> Result<([u8; 32], usize), String> {
+        let (mut bytes, len) = self.decrypt_prefix(encrypted, first)?;
+        for material in inner {
+            Aes256CbcDec::new(&material.key.into(), &material.iv.into())
+                .decrypt_padded::<NoPadding>(&mut bytes[..len.next_multiple_of(16)])
+                .expect("the nested CBC prefix covers complete blocks");
+        }
+        Ok((bytes, len))
+    }
+
     fn check_prefix(&self, plaintext: &[u8]) -> SevenZipPrefixCheck {
         match self {
             Self::Header { packed_size } => seven_zip_plain_header_prefix(plaintext, *packed_size),
@@ -318,7 +282,8 @@ impl SevenZipPayloadEvidence {
 
     fn check_successor(
         &self, offset: u64, first_encrypted: &[u8; 16], plaintext: &[u8],
-        material: &SevenZipAesKey, read: &mut SevenZipRead<'_>, source: &SevenZipPayloadSource,
+        material: &SevenZipAesKey, inner: &[SevenZipAesKey],
+        read: &mut SevenZipRead<'_>, source: &SevenZipPayloadSource,
     ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
         let Self::Compressed { method, packed_size, unpack_size } = self else {
             return Ok(SevenZipPrefixCheck::Weak);
@@ -330,14 +295,16 @@ impl SevenZipPayloadEvidence {
                 out.copy_from_slice(bytes);
                 return Ok(());
             }
-            // CBC at a proven logical offset only needs the previous block
-            // and the blocks containing the requested framing bytes.
+            // Each CBC layer needs one preceding block, except at offset zero
+            // where it uses the IV. Discard these blocks in place as each layer
+            // advances the plaintext window toward the requested offset.
             let block_start = at & !15;
-            let window = block_start.saturating_sub(16);
-            let target = (block_start - window) as usize;
-            let start = target + (at - block_start) as usize;
+            let predecessors = 16 * (1 + inner.len()) as u64;
+            let window = block_start.saturating_sub(predecessors);
+            let start = (at - window) as usize;
             let end = (start + out.len()).next_multiple_of(16);
-            const WINDOW: usize = (deflate_prefix::MAX_DYNAMIC_HEADER_SIZE + 31).next_multiple_of(16);
+            const WINDOW: usize = (deflate_prefix::MAX_DYNAMIC_HEADER_SIZE + 15).next_multiple_of(16)
+                + 16 * SEVEN_Z_MAX_FOLDER_CODERS;
             let mut ciphertext = [0; WINDOW];
             let cached = if window == 0 {
                 ciphertext[..16].copy_from_slice(first_encrypted);
@@ -348,10 +315,20 @@ impl SevenZipPayloadEvidence {
             if end > cached {
                 read(offset + window + cached as u64, &mut ciphertext[cached..end])?;
             }
-            let iv = if target == 0 { material.iv } else { ciphertext[..16].try_into().unwrap() };
-            Aes256CbcDec::new(&material.key.into(), &iv.into())
-                .decrypt_padded::<NoPadding>(&mut ciphertext[target..end])
-                .expect("CBC window is block-aligned");
+            let mut from = 0;
+            for (layer, material) in std::iter::once(material).chain(inner).enumerate() {
+                let next = block_start.saturating_sub(16 * (inner.len() - layer.min(inner.len())) as u64);
+                let iv = if next != 0 {
+                    let previous = ciphertext[from..from + 16].try_into().unwrap();
+                    from += 16;
+                    previous
+                } else {
+                    material.iv
+                };
+                Aes256CbcDec::new(&material.key.into(), &iv.into())
+                    .decrypt_padded::<NoPadding>(&mut ciphertext[from..end])
+                    .expect("CBC window is block-aligned");
+            }
             out.copy_from_slice(&ciphertext[start..start + out.len()]);
             Ok(())
         };
@@ -376,7 +353,7 @@ impl SevenZipPayloadEvidence {
         if seven_zip_has_block_successor(method) {
             let ambiguous = |next: u64| match source {
                 SevenZipPayloadSource::Projected(reads) => {
-                    let window = (next & !15u64).saturating_sub(16);
+                    let window = (next & !15u64).saturating_sub(16 * (1 + inner.len()) as u64);
                     reads.range_is_ambiguous(offset + window, self.followup_span() - window)
                 }
                 SevenZipPayloadSource::Fixed(_) => false,
@@ -395,12 +372,14 @@ fn seven_zip_is_deflate(method: &[u8]) -> bool {
 struct SevenZipPayloadPlan {
     offset: u64,
     properties: Vec<u8>,
+    inner_aes: Box<[Vec<u8>]>,
     kind: SevenZipPayloadEvidence,
     cost: u64,
 }
 
 pub(crate) enum SevenZipPasswordContext {
     Header(SevenZipPasswordProbe),
+    MemberOnly,
     Prefix {
         probe: SevenZipPayloadProbes,
         header: bool,
@@ -423,6 +402,9 @@ pub(crate) trait SevenZipEvidenceReads<R> {
     fn payload_source(&self, _reader: &R) -> Option<SevenZipPayloadSource> {
         None
     }
+    fn checks_public_packs(&self) -> bool {
+        false
+    }
     fn check_packed(
         &self,
         _reader: &mut R,
@@ -434,6 +416,39 @@ pub(crate) trait SevenZipEvidenceReads<R> {
     }
 }
 impl<R> SevenZipEvidenceReads<R> for () {}
+
+fn check_public_packs<'a, R: Read + Seek>(
+    reader: &mut R,
+    before: u64,
+    packs: impl IntoIterator<Item = &'a SevenZipPackInfoAst>,
+    evidence: &impl SevenZipEvidenceReads<R>,
+) -> Result<(), SevenZipMetadataError> {
+    if !evidence.checks_public_packs() { return Ok(()); }
+    let mut digests = Vec::new();
+    for pack in packs {
+        if pack.sizes.len() != pack.num_streams || pack.crcs.is_empty() {
+            continue;
+        }
+        let start = (SEVEN_Z_HEADER_SIZE as u64).checked_add(pack.pack_pos);
+        let end = pack.sizes.iter().try_fold(start.unwrap_or(u64::MAX), |offset, &size| {
+            offset.checked_add(size)
+        });
+        let Some(mut offset) = start.filter(|_| end.is_some_and(|end| end <= before)) else { continue };
+        for (&size, &crc) in pack.sizes.iter().zip(&pack.crcs) {
+            if let Some(expected) = crc {
+                if evidence.range_is_ambiguous(reader, offset, size) {
+                    digests.push((size, offset, expected));
+                }
+            }
+            offset += size;
+        }
+    }
+    digests.sort_unstable();
+    for (size, offset, expected) in digests {
+        evidence.check_packed(reader, offset, size, expected)?;
+    }
+    Ok(())
+}
 
 impl SevenZipPasswordContext {
     /// Read and check the public descriptor once. Its tag selects either an
@@ -457,7 +472,7 @@ impl SevenZipPasswordContext {
         if crc32(&raw) != next.crc {
             return Err("7z next header crc mismatch".into());
         }
-        if !enabled {
+        if !enabled && !evidence.checks_public_packs() {
             return Err("7z password probe is disabled".into());
         }
         let raw = if raw.first() == Some(&SZ_ENCODED_HEADER) {
@@ -468,6 +483,10 @@ impl SevenZipPasswordContext {
                 .iter()
                 .any(|coder| coder.method_id == EncoderMethod::ID_AES256_SHA256)
             {
+                if !enabled {
+                    check_public_packs(reader, next.offset, [&pack], evidence)?;
+                    return Err("7z password probe is disabled".into());
+                }
                 if seven_zip_probe_folder_supported(&folder) {
                     match evidence.independent(reader, |reader| {
                         read_seven_zip_packed_data(reader, reader_len, next.offset, &pack, &folder, 0)
@@ -485,6 +504,7 @@ impl SevenZipPasswordContext {
                 }
                 // A distant or unsupported metadata graph may still expose
                 // a valid compressor or Header prefix.
+                check_public_packs(reader, next.offset, [&pack], evidence)?;
                 let streams = SevenZipStreams {
                     pack: Some(pack),
                     folders: vec![folder],
@@ -495,7 +515,7 @@ impl SevenZipPasswordContext {
             }
             let packed =
                 read_seven_zip_packed_data(reader, reader_len, next.offset, &pack, &folder, 0)?;
-            let decoded = decode_seven_zip_encoded_folder(&packed, &folder, None)
+            let decoded = decode_seven_zip_encoded_folder(&packed, &folder)
                 .map_err(std::borrow::Cow::Owned)?;
             if folder
                 .expected_crc
@@ -518,6 +538,9 @@ impl SevenZipPasswordContext {
             let pack = streams.pack.as_ref().ok_or("7z external folder PackInfo is missing")?;
             let first: usize = streams.folders[..index].iter().map(|folder| folder.packed_streams.len()).sum();
             let encrypted = folder.coders.iter().any(|coder| coder.method_id == EncoderMethod::ID_AES256_SHA256);
+            if encrypted && !enabled {
+                return Err("7z password probe is disabled".into());
+            }
             if encrypted && !seven_zip_probe_folder_supported(folder) {
                 return Err("7z external folder encryption graph is unsupported".into());
             }
@@ -531,7 +554,7 @@ impl SevenZipPasswordContext {
                 ));
                 return Err("7z external folder data needs password".into());
             }
-            let decoded = decode_seven_zip_encoded_folder(&packed, folder, None)
+            let decoded = decode_seven_zip_encoded_folder(&packed, folder)
                 .map_err(std::borrow::Cow::Owned)?;
             if folder.expected_crc.is_some_and(|expected| crc32(&decoded) != expected) {
                 return Err("7z external folder metadata crc mismatch".into());
@@ -541,6 +564,16 @@ impl SevenZipPasswordContext {
         let parsed = parse_seven_zip_header_with_data(
             &raw, &mut streams, &mut additional_streams, true, Some(&mut additional),
         );
+        if parsed.is_ok() || encrypted_metadata.is_some()
+            || parsed.as_ref().is_err_and(|error| error == "7z password probe is disabled") {
+            // Main PackInfo is public even when an AdditionalStreams folder
+            // supplies encrypted names or external Folder definitions.
+            check_public_packs(reader, next.offset,
+                streams.pack.iter().chain(&additional_streams.pack), evidence)?;
+        }
+        if !enabled {
+            return Err("7z password probe is disabled".into());
+        }
         if let Some(metadata) = encrypted_metadata {
             return Ok(Some(Self::Header(metadata)));
         }
@@ -551,6 +584,7 @@ impl SevenZipPasswordContext {
             return parsed.map(|_| None);
         }
         let mut additional_error = None;
+        let mut additional_member_only = false;
         if seven_zip_streams_encrypted(&additional_streams) {
             // The archive reader decodes these header streams even when the
             // member graph and its Folder definitions are themselves clear.
@@ -563,15 +597,16 @@ impl SevenZipPasswordContext {
             match Self::from_streams(
                 reader, next.offset, additional_streams, Some(SevenZipMetadata::Additional), evidence,
             ) {
+                Ok(Some(Self::MemberOnly)) => additional_member_only = true,
                 Ok(Some(probe)) => return Ok(Some(probe)),
                 Ok(None) => {}
-                Err(error) if error == "7z packed stream crc mismatch" => return Err(error),
                 Err(error) => additional_error = Some(error),
             }
         }
         parsed?;
         match Self::from_streams(reader, next.offset, streams, None, evidence)? {
             Some(result) => Ok(Some(result)),
+            None if additional_member_only => Ok(Some(Self::MemberOnly)),
             None => additional_error.map_or(Ok(None), Err),
         }
     }
@@ -650,7 +685,6 @@ impl SevenZipPasswordContext {
             .checked_add(pack.pack_pos)
             .ok_or("7z payload pack offset overflow")?;
         let mut plans = Vec::new();
-        let mut digests = Vec::new();
         for folder in &streams.folders {
             for &input in &folder.packed_streams {
                 let size = *pack
@@ -662,11 +696,6 @@ impl SevenZipPasswordContext {
                     .ok_or("7z payload pack range overflow")?;
                 if end > before {
                     return Err("7z payload pack range is unavailable".into());
-                }
-                if let Some(expected) = pack.crcs.get(pack_index).copied().flatten() {
-                    if evidence.range_is_ambiguous(reader, offset, size) {
-                        digests.push((size, offset, expected));
-                    }
                 }
                 let plain_header = matches!(metadata, Some(SevenZipMetadata::Header));
                 if let Some(plan) = seven_zip_payload_plan(folder, input, offset, size, plain_header) {
@@ -699,25 +728,18 @@ impl SevenZipPasswordContext {
             }
             check_password_cancellation().map_err(std::borrow::Cow::Owned)?;
         }
-        digests.sort_unstable();
         if let Some(first) = first {
             let source = evidence.payload_source(reader);
             let rest = if source.is_some() { plans.collect() } else { Vec::new() };
-            let packed = (!digests.is_empty()).then(|| PackedChecks { spans: digests, selected: Default::default() });
             return Ok(Some(Self::Prefix {
-                probe: SevenZipPayloadProbes { first, rest, source, packed },
+                probe: SevenZipPayloadProbes { first, rest, source },
                 header: metadata.is_some(),
             }));
-        }
-        // Without a usable password-dependent prefix, packed CRC is the
-        // remaining public evidence for these ranges.
-        for (size, offset, expected) in digests {
-            evidence.check_packed(reader, offset, size, expected)?;
         }
         if !encrypted {
             return Ok(None);
         }
-        Err(first_error.unwrap_or_else(|| "7z payload has no supported prescreen evidence".into()))
+        first_error.map_or(Ok(Some(Self::MemberOnly)), Err)
     }
 }
 
@@ -748,6 +770,7 @@ impl SevenZipPayloadProbe {
         Ok(Self {
             offset: plan.offset,
             properties: plan.properties,
+            inner_aes: plan.inner_aes,
             encrypted,
             kind: plan.kind,
         })
@@ -759,6 +782,7 @@ impl SevenZipPayloadProbe {
 // nodes are transparent; no filter is mistaken for a compressed-stream start.
 struct SevenZipAesStream {
     aes_index: usize,
+    inner_aes: Vec<usize>,
     plaintext_size: u64,
     consumer: Option<(usize, u64)>,
 }
@@ -770,7 +794,9 @@ fn seven_zip_aes_stream(
 ) -> Option<SevenZipAesStream> {
     let mut input = packed_input;
     let mut aes_index = None;
+    let mut inner_aes = Vec::new();
     let mut plaintext_size = 0;
+    let mut input_size = packed_size;
     for _ in 0..folder.coders.len() {
         let mut input_base = 0;
         let mut output_base = 0;
@@ -790,12 +816,13 @@ fn seven_zip_aes_stream(
                 })?;
         if coder.method_id == EncoderMethod::ID_AES256_SHA256 {
             if aes_index.is_some() {
-                return None;
+                inner_aes.push(index);
+            } else {
+                aes_index = Some(index);
             }
             seven_zip_aes_properties(&coder.properties)?;
-            aes_index = Some(index);
             plaintext_size = folder.unpack_size(output);
-            if plaintext_size == 0 || packed_size % 16 != 0 || plaintext_size > packed_size {
+            if plaintext_size == 0 || input_size % 16 != 0 || plaintext_size > input_size {
                 return None;
             }
         } else if coder.method_id == EncoderMethod::ID_COPY && coder.properties.is_empty() {
@@ -812,6 +839,7 @@ fn seven_zip_aes_stream(
             }
             return Some(SevenZipAesStream {
                 aes_index,
+                inner_aes,
                 plaintext_size,
                 consumer: Some((index, folder.unpack_size(output))),
             });
@@ -819,10 +847,12 @@ fn seven_zip_aes_stream(
         if output == folder.main_output_stream {
             return Some(SevenZipAesStream {
                 aes_index: aes_index?,
+                inner_aes,
                 plaintext_size,
                 consumer: None,
             });
         }
+        input_size = folder.unpack_size(output).min(input_size);
         input = folder
             .bind_pairs
             .iter()
@@ -845,11 +875,19 @@ fn seven_zip_payload_plan(
     let size = kind.plaintext_prefix_size().div_ceil(16) as u64 * 16;
     let strong = matches!(&kind, SevenZipPayloadEvidence::Compressed { method, .. } if seven_zip_prefix_is_strong(method));
     let cycles = seven_zip_aes_properties(&aes.properties)?.0;
+    let mut cost = seven_zip_payload_cost(cycles, size, strong);
+    let inner_aes = stream.inner_aes.iter().map(|&index| {
+        let properties = &folder.coders[index].properties;
+        let cycles = seven_zip_aes_properties(properties).unwrap().0;
+        cost = cost.saturating_add(seven_zip_payload_cost(cycles, size, strong));
+        properties.clone()
+    }).collect();
     Some(SevenZipPayloadPlan {
         offset,
         properties: aes.properties.clone(),
+        inner_aes,
         kind,
-        cost: seven_zip_payload_cost(cycles, size, strong),
+        cost,
     })
 }
 

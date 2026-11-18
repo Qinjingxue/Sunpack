@@ -1064,6 +1064,37 @@ fn project_proposal(
     reason
 }
 
+/// Finalize candidate sources with public layout evidence before password
+/// selection. The same parse supplies the task-local Rust password material.
+pub(crate) fn prepare_volume_candidates(
+    input: &mut ArchiveInput,
+    sessions: &[crate::io::reader::NativeArchiveSession],
+    preparation: &mut crate::password::context::Preparation<'_>,
+) -> std::io::Result<()> {
+    let (Some(plan), Some(head)) = (input.volume_attempts.as_ref(), input.parts.first()) else {
+        return Ok(());
+    };
+    let material = match input.format_hint.as_str() {
+        "7z" => crate::password::seven_zip::prepare_seven_zip_volume_input(&head.extent, plan, sessions),
+        "rar" => crate::password::rar::prepare_rar_volume_input(&head.extent, plan, sessions, input.analysis.rar_native_volume),
+        _ => return Ok(()),
+    };
+    crate::io::cancellation::Cancellation::check_current_io()?;
+    use crate::password::context::PasswordContext;
+    input.analysis.password_required |= match &material {
+        Ok(PasswordContext::SevenZip(_)) => true,
+        Ok(PasswordContext::Evidence(evidence)) if input.format_hint == "7z" => {
+            evidence.unresolved.is_none() && !evidence.alternatives.is_empty()
+                && evidence.alternatives.iter().all(|(context, _)| matches!(context, PasswordContext::SevenZip(_)))
+        }
+        _ => false,
+    };
+    if let Some(plan) = preparation.prepare_volume_candidates(material)? {
+        input.volume_attempts = Some(plan);
+    }
+    Ok(())
+}
+
 fn canonical_volume_name(
     prefix: &str,
     number: u32,

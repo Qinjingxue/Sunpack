@@ -187,7 +187,7 @@ def test_watch_recovers_retained_password_and_missing_volume_blockers_in_separat
         archive.writestr("outer.txt", b"complete outer output")
 
     package.configure(
-        recursive_authorization={"enabled": False}, embedded_scan={"recursive_candidate_ratio": 0.01},
+        recursive_authorization={"enabled": False}, embedded_scan={"recursive_candidate_ratio": 0},
     )
     watch = watch_setup(package, tmp_path, passwords=["wrong"], flatten=True)
     outer = download(watch, outer)

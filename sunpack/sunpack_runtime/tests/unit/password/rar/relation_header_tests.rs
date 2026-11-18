@@ -485,29 +485,40 @@ fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
     let password = [Arc::from("secret")];
     assert_eq!(context.verify(&password, None).unwrap().status, "no_match");
 
-    let head = [&prefix[..], &good[..48]].concat();
-    let bad = [&wrong_third[48..], &end[..]].concat();
-    let tail = [&good[48..], &end[..]].concat();
-    let paths: Vec<_> = [head, bad, tail].iter().enumerate().map(|(i, data)|
-        crate::test_support::temp_file(&format!("rar5_third_block_{i}"), data)).collect();
-    let plan = Arc::new(VolumeAttemptPlan {
-        sources: paths.iter().map(|path| InputExtent {
-            path: path.to_string_lossy().into_owned(), start: 0, end: Some(path.metadata().unwrap().len()),
-        }).collect(),
-        layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..2).map(|i| VolumeSlot {
-            number: i as u32 + 1, canonical_name: format!("part.{}", i + 1), domain: i,
-        }).collect() }].into_boxed_slice(),
-        domains: [vec![0], vec![1, 2]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
-        head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
-    });
-    let mut preparation = Preparation::default();
-    preparation.fix_password();
-    let result = rar_fast_verify_passwords_from_attempts(&mut preparation, &plan.sources[0],
-        &plan, &password, &[], false).unwrap();
-    let remaining = result.volume_attempts.expect("third block prunes one tail");
-    assert!(!remaining.sources.contains(&plan.sources[1]));
-    assert!(remaining.sources.contains(&plan.sources[2]));
-    for path in paths { std::fs::remove_file(path).unwrap(); }
+    for native_split in [None, Some(48usize), Some(8)] {
+        let archives = if let Some(split) = native_split {
+            file[1] |= 16;
+            file[3] = split as u8;
+            let head = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 1]), &rar5_block(&file), &good[..split],
+                &rar5_block(&[5, 0, 1])].concat();
+            let tail = |bytes: &[u8]| [RAR5_SIGNATURE, &rar5_block(&[1, 0, 3, 1]),
+                &rar5_block(&[2, 10, bytes.len() as u8, 0, 10, 0, 0x80, 1, 0, 1, b'x']), bytes, &end].concat();
+            [head, tail(&wrong_third[split..]), tail(&good[split..])]
+        } else {
+            [[&prefix[..], &good[..48]].concat(), [&wrong_third[48..], &end[..]].concat(),
+                [&good[48..], &end[..]].concat()]
+        };
+        let paths: Vec<_> = archives.iter().enumerate().map(|(i, data)|
+            crate::test_support::temp_file(&format!("rar5_third_block_{i}"), data)).collect();
+        let plan = Arc::new(VolumeAttemptPlan {
+            sources: paths.iter().map(|path| InputExtent {
+                path: path.to_string_lossy().into_owned(), start: 0, end: Some(path.metadata().unwrap().len()),
+            }).collect(),
+            layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..2).map(|i| VolumeSlot {
+                number: i as u32 + 1, canonical_name: format!("part.{}", i + 1), domain: i,
+            }).collect() }].into_boxed_slice(),
+            domains: [vec![0], vec![1, 2]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
+            head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
+        });
+        let mut preparation = Preparation::default();
+        preparation.fix_password();
+        let result = rar_fast_verify_passwords_from_attempts(&mut preparation, &plan.sources[0],
+            &plan, &password, &[], native_split.is_some()).unwrap();
+        let remaining = result.volume_attempts.expect("third block prunes one tail");
+        assert!(!remaining.sources.contains(&plan.sources[1]));
+        assert!(remaining.sources.contains(&plan.sources[2]));
+        for path in paths { std::fs::remove_file(path).unwrap(); }
+    }
 }
 
 #[test]

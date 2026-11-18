@@ -387,7 +387,7 @@ impl<'a> PromptReply<'a> {
 }
 impl Drop for PromptReply<'_> {
     fn drop(&mut self) {
-        let mut slot = self.slot.lock().unwrap();
+        let mut slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|reply| Arc::ptr_eq(reply, &self.reply)) { slot.take(); }
     }
 }
@@ -496,7 +496,9 @@ impl Connection {
     fn close(&self) {
         self.peer.close();
         self.output.close();
-        if let Some(reply) = self.prompt.lock().unwrap().take() {
+        // Closing discards the prompt; it is safe even after its owner panicked.
+        let reply = self.prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(reply) = reply {
             reply.complete(Err(io::ErrorKind::ConnectionAborted.into()));
         }
     }
@@ -519,6 +521,10 @@ impl Connection {
         output: crate::pipeline::RequestHandle<()>,
     ) -> io::Result<()> {
         let result = cli::settle_unwind(request).await;
+        if result.is_err() && !self.finishing.swap(true, Ordering::AcqRel) {
+            // Keep queued output ahead of the terminal status, as on normal exit.
+            let _ = self.frame(0, &1_i32.to_be_bytes()).await;
+        }
         // main flushes output in finally, including a failed request. Keep
         // control reads alive during drain so disconnect cancels blocked IO.
         let _ = self.output.drain().await;
@@ -753,6 +759,7 @@ impl Server {
         let result = connection.finish_request(async {
             connection.output.enqueue([b"SPS2".as_slice(), &self.build_id].concat()).await?;
             if header.flags & 1 != 0 {
+                connection.finishing.store(true, Ordering::Release);
                 connection.frame(0, &0_i32.to_be_bytes()).await?;
                 connection.output.drain().await?;
                 self.activity.lock().unwrap().shutting_down = true;

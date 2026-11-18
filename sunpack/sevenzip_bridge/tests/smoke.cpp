@@ -160,6 +160,46 @@ bool check_rar5_password_probe_with_unknown_unpacked_size() {
         extracted.status == PasswordTestStatus::Damaged && extracted.password_crc_proven_items == 1;
 }
 
+bool check_rar5_short_keyed_member_password_proof() {
+    using namespace sunpack::sevenzip;
+    // An encrypted single-byte Store member with no password-check field.
+    // The same ciphertext can have either a keyed or an ordinary checksum.
+    constexpr char archive[] =
+        "\x52\x61\x72\x21\x1a\x07\x01\x00\xc5\x1a\x33\x32\x03\x01\x00\x00"
+        "\xa2\xc3\xc1\xff\x34\x02\x03\x25\x10\x04\x01\x00\x56\x7a\xbf\x41"
+        "\x00\x00\x01\x78\x24\x01\x00\x02\x08\x00\x01\x02\x03\x04\x05\x06"
+        "\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16"
+        "\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\xd3\x25\x82\x6a\x92\xa2\xe5"
+        "\x9f\x1e\xe6\xa5\x75\x15\xfa\x0d\x00\x19\xb2\x3a\x35\x03\x05\x00\x00";
+    const auto path = std::filesystem::temp_directory_path() /
+        (L"sunpack-rar-keyed-proof-" + std::to_wstring(GetCurrentProcessId()) + L".rar");
+    std::string fixture(archive, sizeof(archive) - 1);
+    const std::wstring candidates[]{L"wrong-password", L"evidence-key"};
+    const auto probe = [&](const std::wstring* keys, std::size_t count) {
+        {
+            std::ofstream file(path, std::ios::binary);
+            file.write(fixture.data(), fixture.size());
+        }
+        return test_password_batch(path.wstring(), {}, {}, L"rar5", keys, count, {}, true);
+    };
+    const auto keyed = probe(candidates, 2);
+    fixture.replace(16, 4, "\xb7\x98\x2e\xc7", 4);
+    fixture.replace(28, 4, "\x83\x16\xdc\x8c", 4);
+    fixture[39] = 0;
+    const auto plain = probe(candidates + 1, 1);
+    fixture.replace(16, 4, "\x07\x65\x78\xfc", 4);
+    fixture.replace(28, 4, "\x9e\x6d\x9f\x53", 4);
+    fixture[24] = fixture[26] = 0;
+    fixture[39] = 2;
+    fixture.erase(73, 16);
+    const auto empty = probe(candidates + 1, 1);
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    return keyed.status == PasswordTestStatus::Ok && keyed.matched_index == 1 &&
+        plain.status == PasswordTestStatus::Unsupported && plain.weak_match &&
+        empty.status == PasswordTestStatus::Unsupported && empty.password_independent_failure;
+}
+
 bool check_cpu_budget_accounts_base_and_decoder_credits() {
     using namespace sunpack::sevenzip;
     NativeCpuBudget budget(8);
@@ -395,6 +435,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_rar5_password_probe_with_unknown_unpacked_size()) {
         std::cerr << "RAR5 unknown unpacked size password proof check failed\n";
         return 35;
+    }
+    if (!check_rar5_short_keyed_member_password_proof()) {
+        std::cerr << "RAR5 short keyed member password proof check failed\n";
+        return 36;
     }
 
     if (!check_cpu_budget_accounts_base_and_decoder_credits()) {

@@ -90,7 +90,7 @@ fn archive_with_descriptor(body: &[u8], header: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn projected_packed_crc_only_checks_short_screen_survivors() {
+fn projected_packed_crc_prunes_before_password_screening() {
     let mut stream = vec![1, 0, 44];
     stream.extend([0xa9; 45]);
     stream.extend([2, 0, 44]);
@@ -107,9 +107,11 @@ fn projected_packed_crc_only_checks_short_screen_survivors() {
     let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None)
         .unwrap_or_else(|_| panic!("projected prefix and packed CRC"));
     let PasswordContext::Evidence(evidence) = context else { panic!("projection was lost"); };
+    let public = evidence.public_plan().unwrap().unwrap();
+    assert!(!public.sources.iter().any(|source| source.path == sources[1].path));
     let wrong = evidence.verify_batch(&[Arc::from("wrong")], false, true).unwrap();
     assert_eq!(wrong.status, "no_match");
-    assert!(wrong.volume_attempts.is_none());
+    assert!(Arc::ptr_eq(&public, &wrong.volume_attempts.unwrap()));
     let correct = evidence.verify_batch(&[Arc::from("secret")], true, true).unwrap();
     assert_eq!(correct.matched_indices, [0]);
     let plan = correct.volume_attempts.unwrap();

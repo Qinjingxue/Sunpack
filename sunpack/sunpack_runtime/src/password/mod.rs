@@ -17,8 +17,6 @@ use std::{io, sync::Arc};
 
 pub(crate) const VERIFICATION_BATCH_SIZE: usize = 256;
 
-// ZipCrypto and the legacy RAR cipher use the same IEEE CRC table.
-#[unsafe(export_name = "sunpack_password_crc_table")]
 static CRC32_TABLE: [u32; 256] = {
     let mut table = [0u32; 256];
     let mut index = 0;
@@ -39,13 +37,12 @@ static CRC32_TABLE: [u32; 256] = {
     table
 };
 
-fn password_codepage_bytes(password: &str, code_page: u32, utf16_limit: usize) -> Option<Cow<'_, [u8]>> {
+fn password_codepage_bytes(password: &str, code_page: u32) -> Option<Cow<'_, [u8]>> {
     if password.is_ascii() {
-        return Some(Cow::Borrowed(&password.as_bytes()[..password.len().min(utf16_limit)]));
+        return Some(Cow::Borrowed(password.as_bytes()));
     }
-    let wide: Vec<u16> = password.encode_utf16().take(utf16_limit).collect();
+    let wide: Vec<u16> = password.encode_utf16().collect();
     let wide_len = i32::try_from(wide.len()).ok()?;
-    if wide_len == 0 { return Some(Cow::Borrowed(b"")); }
     #[link(name = "Kernel32")]
     extern "system" {
         fn WideCharToMultiByte(
@@ -148,10 +145,7 @@ pub(crate) fn verify(
         // The plan selects a reader, not eligibility for password screening.
         // Each verifier requests its evidence and retains unresolved paths.
         match format {
-            "7z" => return seven_zip::seven_zip_fast_verify_passwords_from_attempts(
-                preparation, &head.extent, plan, passwords, sessions),
-            "rar" => return rar::rar_fast_verify_passwords_from_attempts(
-                preparation, &head.extent, plan, passwords, sessions, input.analysis.rar_native_volume),
+            "7z" | "rar" => return Ok(unsupported()),
             "zip" => return zip::zip_fast_verify_passwords_from_attempts(
                 preparation, &head.extent, plan, passwords, input.analysis.zip_spanned, eocd_offset, sessions),
             _ => {}

@@ -223,7 +223,7 @@ impl CandidateSet {
         input.analysis.password_required = true;
         let mut key = None;
         let plan = match self.plan_inner(
-            &input,
+            &mut input,
             None,
             cancellation,
             Some(std::slice::from_ref(session)),
@@ -280,7 +280,7 @@ impl CandidateSet {
 
     fn plan_inner(
         &self,
-        input: &ArchiveInput,
+        input: &mut ArchiveInput,
         known: Option<Arc<str>>,
         cancellation: &Cancellation,
         sessions: Option<&[NativeArchiveSession]>,
@@ -325,6 +325,14 @@ impl CandidateSet {
             }
             None => &[],
         };
+        crate::relations::prepare_volume_candidates(input, sessions, preparation)?;
+        let needs_password = input.analysis.password_required || input.format_hint == "enc";
+        if input.volume_attempts.as_ref().is_some_and(|plan| plan.layouts.is_empty()) {
+            return Ok(Err(Failure::new(
+                FailureKind::MissingVolume,
+                "no supplied volume candidate satisfies the archive evidence",
+            )));
+        }
         // An independently opened source vanishes with this plan. Memoize
         // only when another caller already owns the source or supplied it.
         let attempts = (borrowed || sessions.iter().any(NativeArchiveSession::shares_source))
@@ -410,7 +418,9 @@ impl CandidateSet {
                 batch.extend(candidates.by_ref().take(limit - batch.len()).cloned());
             }
             if batch.is_empty() {
-                if !has_candidates && needs_password && input.volume_attempts.is_some() {
+                if !has_candidates && needs_password && input.volume_attempts.is_some()
+                    && input.format_hint == "zip"
+                {
                     let public = password::verify(preparation, input, &[], sessions, None)?;
                     *remaining = public.volume_attempts;
                     if remaining

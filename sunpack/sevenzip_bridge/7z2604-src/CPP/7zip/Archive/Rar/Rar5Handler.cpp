@@ -347,6 +347,15 @@ bool CCryptoInfo::Parse(const Byte *p, size_t size)
   return true;
 }
 
+static bool HasKeyedChecksum(const CItem &item)
+{
+  unsigned cryptoSize;
+  const int cryptoOffset = item.FindExtra(NExtraID::kCrypto, cryptoSize);
+  CCryptoInfo info;
+  return cryptoOffset >= 0 &&
+      info.Parse(item.Extra + (unsigned)cryptoOffset, cryptoSize) && info.UseMAC();
+}
+
 
 bool CItem::FindExtra_Version(UInt64 &version) const
 {
@@ -1218,21 +1227,9 @@ HRESULT CUnpacker::Code(const CItem &item, const CItem &lastItem, UInt64 packSiz
       res = S_FALSE;
   }
 
-  // if (res == S_OK)
-  {
-    unsigned cryptoSize = 0;
-    const int cryptoOffset = lastItem.FindExtra(NExtraID::kCrypto, cryptoSize);
-    NCrypto::NRar5::CDecoder *crypto = NULL;
-    if (cryptoOffset >= 0)
-    {
-      CCryptoInfo cryptoInfo;
-      if (cryptoInfo.Parse(lastItem.Extra + (unsigned)cryptoOffset, cryptoSize))
-        if (cryptoInfo.UseMAC())
-          crypto = cryptoDecoder.ClsPtr();
-    }
-    if (NeedCrc)
-      isCrcOK =  outStream->_hash.Check(lastItem, crypto);
-  }
+  if (NeedCrc)
+    isCrcOK = outStream->_hash.Check(lastItem,
+        isCryptoMode && HasKeyedChecksum(lastItem) ? cryptoDecoder.ClsPtr() : NULL);
 
   if (linkFile)
   {
@@ -1997,8 +1994,19 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
 
     case kpidSplitBefore: prop = item.IsSplitBefore(); break;
     case kpidSplitAfter: prop = lastItem.IsSplitAfter(); break;
+    case kpidSunpackMacPackedSize:
+      if (_needChecksumCheck && ref.Link < 0 &&
+          !item.IsSplitBefore() && !lastItem.IsSplitAfter() &&
+          (lastItem.Has_CRC() || lastItem.FindExtra_Blake() >= 0) &&
+          HasKeyedChecksum(lastItem) &&
+          (&item == &lastItem || item.IsEncrypted()) &&
+          (item.PackSize || item.IsSplitAfter() ||
+           (item.Get_Method() == 0 && !item.Is_UnknownSize() && item.Size == 0 &&
+            !item.NeedUse_as_CopyLink_or_HardLink())))
+        prop = GetPackSize((unsigned)index);
+      break;
     case kpidSunpackProofSize:
-      if (ref.Link < 0 && (item.PackSize || item.IsSplitAfter()) &&
+      if (_needChecksumCheck && ref.Link < 0 && (item.PackSize || item.IsSplitAfter()) &&
           !item.IsSplitBefore() && !lastItem.IsSplitAfter() &&
           (lastItem.Has_CRC() || lastItem.FindExtra_Blake() >= 0))
         prop = lastItem.Is_UnknownSize() ? kSunpackUnknownProofSize : lastItem.Size;

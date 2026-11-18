@@ -13,9 +13,6 @@ from tests.helpers.real_archives import (
 from tests.real.plan6_confused_volumes.plan6_support import SCENARIOS, apply_volume_confusion
 
 
-# The small healthy ZIP shares an extracted tree with a much larger encrypted branch.
-NESTED_FIXTURE_CANDIDATE_RATIO = 0.001
-
 
 @dataclass(frozen=True)
 class NestedCase:

@@ -770,7 +770,8 @@ impl<T> Join<T> {
         Self(result)
     }
     fn take(&mut self) -> Option<T> {
-        self.0.state.lock().unwrap().0.take().map(completed)
+        let value = self.0.state.lock().unwrap().0.take();
+        value.map(completed)
     }
     /// Like main's Task done callback, notify only after the complete request
     /// (including all children) has published its result, never from root Drop.

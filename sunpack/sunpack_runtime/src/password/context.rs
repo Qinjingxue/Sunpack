@@ -152,6 +152,18 @@ pub(crate) struct Preparation<'a> {
 }
 
 impl<'a> Preparation<'a> {
+    pub(crate) fn prepare_volume_candidates(
+        &mut self,
+        prepared: Prepared,
+    ) -> std::io::Result<Option<Arc<crate::io::archive_state::VolumeAttemptPlan>>> {
+        let reduced = match &prepared {
+            Ok(PasswordContext::Evidence(evidence)) => evidence.public_plan()?,
+            _ => None,
+        };
+        self.local = Some(Box::new(prepared));
+        Ok(reduced)
+    }
+
     pub(crate) fn fix_password(&mut self) {
         self.fixed_password = true;
     }

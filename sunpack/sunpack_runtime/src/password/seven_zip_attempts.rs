@@ -1,11 +1,9 @@
 // Format metadata drives reads over shared volume evidence projections.
-pub(crate) fn seven_zip_fast_verify_passwords_from_attempts(
-    preparation: &mut Preparation,
+pub(crate) fn prepare_seven_zip_volume_input(
     head: &InputExtent,
     plan: &Arc<VolumeAttemptPlan>,
-    candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
-) -> std::io::Result<PasswordVerification> {
+) -> Result<PasswordContext, PreparedStatus> {
     // A complete invariant prefix does not depend on inaccessible later parts.
     let mut prefix = crate::password::input::prefix::common_attempt_prefix(head, plan, sessions);
     if prefix.is_empty() && plan.head_size_from_total.is_none() && plan.tail_totals.is_empty() {
@@ -29,20 +27,15 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_attempts(
     if let Some(next) = invariant_start {
         if let Ok(ranges) = parse_range_prefix(prefix.iter(), sessions, Some(next.end())) {
             if VirtualRangeReader::streaming(&ranges).len() == next.end() {
-                return preparation.verify(ranges_key("7z", &ranges)?, candidates, || {
-                    let evidence = FixedSevenZipEvidence(ranges.into());
-                    let mut reader = VirtualRangeReader::streaming(&evidence.0);
-                    prepare_seven_zip_descriptor(&mut reader, next.end(), next, true, &evidence)
-                        .map_err(seven_zip_fixed_input_status)
-                        .map(PasswordContext::SevenZip)
-                });
+                let evidence = FixedSevenZipEvidence(ranges.into());
+                let mut reader = VirtualRangeReader::streaming(&evidence.0);
+                return prepare_seven_zip_descriptor(&mut reader, next.end(), next, true, &evidence)
+                    .map_err(seven_zip_fixed_input_status)
+                    .map(PasswordContext::SevenZip);
             }
         }
     }
-    preparation.verify_local(
-        prepare_seven_zip_attempts(head, plan, sessions, invariant_start),
-        candidates,
-    )
+    prepare_seven_zip_attempts(head, plan, sessions, invariant_start)
 }
 
 fn prepare_seven_zip_attempts(
@@ -67,6 +60,7 @@ fn prepare_seven_zip_attempts(
             logical_limit: invariant_start.map(RelationNextHeader::end),
         }
     };
+    let evidence = VolumeEvidence::default();
     let contexts = prepare_attempt_evidence_partial(head, plan, sessions, geometry, |reader| {
         let length = reader.len();
         let (next, supported_start) = match invariant_start {
@@ -90,7 +84,7 @@ fn prepare_seven_zip_attempts(
                 (next, start[6] == 0)
             }
         };
-        prepare_seven_zip_descriptor(reader, length, next, supported_start, &VolumeEvidence)
+        prepare_seven_zip_descriptor(reader, length, next, supported_start, &evidence)
             .map(Some)
             .or_else(|status| match status {
                 PreparedStatus::Status("invalid_volume_evidence", _) => Ok(None),
@@ -106,9 +100,10 @@ fn prepare_seven_zip_attempts(
     Ok(contexts.into_context(PasswordContext::SevenZip))
 }
 
-use crate::password::input::attempts::AttemptReader;
+use crate::password::input::attempts::{AttemptReader, PackedCrcs};
 
-struct VolumeEvidence;
+#[derive(Default)]
+struct VolumeEvidence(PackedCrcs);
 impl<'a> SevenZipEvidenceReads<AttemptReader<'a>> for VolumeEvidence {
     fn independent<T, E>(
         &self,
@@ -126,6 +121,10 @@ impl<'a> SevenZipEvidenceReads<AttemptReader<'a>> for VolumeEvidence {
         Some(SevenZipPayloadSource::Projected(reader.deferred_reads(false)))
     }
 
+    fn checks_public_packs(&self) -> bool {
+        true
+    }
+
     fn check_packed(
         &self,
         reader: &mut AttemptReader<'a>,
@@ -133,14 +132,12 @@ impl<'a> SevenZipEvidenceReads<AttemptReader<'a>> for VolumeEvidence {
         size: u64,
         expected: u32,
     ) -> Result<(), std::borrow::Cow<'static, str>> {
-        if !reader.range_is_ambiguous(offset, size) {
-            return Ok(());
+        match reader.packed_matches(offset, size, expected, &self.0) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("7z packed stream crc mismatch".into()),
+            // Let the preparation reader replay on separated mappings, without
+            // reading a password prefix or walking any other descriptor.
+            Err(error) => Err(format!("resource_unavailable: {error}").into()),
         }
-        // An unavailable independent digest cannot block a prefix in another volume.
-        let digest = reader.independent_evidence(|reader| reader.crc32(offset, size));
-        if digest.is_ok_and(|actual| actual != expected) {
-            return Err("7z packed stream crc mismatch".into());
-        }
-        Ok(())
     }
 }

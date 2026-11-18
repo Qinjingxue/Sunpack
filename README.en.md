@@ -118,7 +118,7 @@ Open the manager from the Watch tray or by searching for Sunpackgui in the Start
 
 ### Recognition Capability
 
-- Identifies potential archive files by analyzing their binary data, including disguised archives embedded within carrier files and multi-volume archives.Currently supports ZIP, ZIPX, RAR, 7z, Zstandard (Zstd), Gzip, TAR, TBZ2, XZ, LZ4, ENCV4. ZIPX does not support WinZip-specific JPEG, MP3, or WavPack compression methods. LZ4 does not support legacy format or dictionaries.
+- Identifies potential archive files by analyzing their binary data, including disguised archives embedded within carrier files and multi-volume archives. Currently supports ZIP, ZIPX, RAR3/4/5, 7z, Zstandard (Zstd), Gzip, TAR, TBZ2, XZ, LZ4, and ENC v4. ZIPX does not support WinZip-specific JPEG, MP3, or WavPack compression methods. LZ4 does not support legacy format or dictionaries.
 
 ### Recursive processing
 

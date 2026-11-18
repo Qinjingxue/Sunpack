@@ -1,9 +1,13 @@
 #![cfg(windows)]
 #![windows_subsystem = "windows"]
 
+#[cfg(not(panic = "unwind"))]
+compile_error!("SunPack Watch Broker requires panic unwinding for connection and service cleanup");
+
 use std::collections::HashMap;
 use std::ffi::{c_void, OsString};
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
@@ -148,7 +152,7 @@ fn serve_watch_lifetimes(stop_event: &OwnedHandle, mut listener: PipeListener) -
     let ever_had_lease = &AtomicBool::new(false);
     let state_changed = &journals.state_changed;
     thread::scope(|workers| {
-        let result = (|| {
+        let result = catch_unwind(AssertUnwindSafe(|| {
             loop {
                 let clients = connected_clients.load(Ordering::Acquire);
                 let had_lease = ever_had_lease.load(Ordering::Acquire);
@@ -206,7 +210,11 @@ fn serve_watch_lifetimes(stop_event: &OwnedHandle, mut listener: PipeListener) -
                     // Drop the join handle immediately. The scope still waits for
                     // clients on stop without retaining each finished OS handle.
                     thread::Builder::new().spawn_scoped(workers, move || {
-                        let _ = serve_client(pipe, stop_event.raw(), journals, ever_had_lease);
+                        // A failed client must release its lease count without
+                        // propagating a panic to the listener's thread scope.
+                        let _ = catch_unwind(|| {
+                            serve_client(pipe, stop_event.raw(), journals, ever_had_lease)
+                        });
                         connected_clients.fetch_sub(1, Ordering::AcqRel);
                         state_changed.signal();
                     })?;
@@ -218,7 +226,8 @@ fn serve_watch_lifetimes(stop_event: &OwnedHandle, mut listener: PipeListener) -
                 }
             }
             Ok(())
-        })();
+        }))
+        .unwrap_or_else(|_| Err(io::Error::other("Watch Broker listener panicked")));
         // Errors must wake blocked clients before the scope joins them.
         stop_event.signal();
         drop(listener);

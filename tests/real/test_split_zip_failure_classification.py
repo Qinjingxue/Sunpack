@@ -149,7 +149,7 @@ def _assert_mixed_outputs(cases, output):
 
 def test_cli_nested_disguised_split_groups_keep_failure_classifications(package, tmp_path):
     # Admit each physical volume from the mixed tree before classifying it.
-    package.configure(embedded_scan={"recursive_candidate_ratio": 0.001})
+    package.configure(embedded_scan={"recursive_candidate_ratio": 0})
     outer, cases = _mixed_nested_carrier(tmp_path)
     output = tmp_path / "out"
     package.configure(filesystem={"scan_filters_enabled": False})
@@ -164,7 +164,7 @@ def test_cli_nested_disguised_split_groups_keep_failure_classifications(package,
 @pytest.mark.requires_watch_broker
 def test_watch_nested_split_groups_persist_distinct_blockers(package, tmp_path):
     # Admit each physical volume from the mixed tree before classifying it.
-    package.configure(embedded_scan={"recursive_candidate_ratio": 0.001})
+    package.configure(embedded_scan={"recursive_candidate_ratio": 0})
     outer, cases = _mixed_nested_carrier(tmp_path)
     output = tmp_path / "out"
     watch = Watch(package, outer.parent, output)

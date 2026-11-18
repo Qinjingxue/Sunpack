@@ -17,12 +17,15 @@ def entry_mode(request):
     return request.param
 
 
-@pytest.mark.parametrize("ratio", [0, 0.3], ids=["disabled", "per-tree"])
-def test_nested_carrier_ratio_is_local_to_each_extracted_tree(package, tmp_path, entry_mode, ratio):
+@pytest.mark.parametrize(
+    ("ratio", "selected"), [(0, ("sparse", "dense")), (0.3, ("sparse",)), (1, ())],
+    ids=["all", "per-tree", "none"],
+)
+def test_nested_carrier_ratio_is_local_to_each_extracted_tree(package, tmp_path, entry_mode, ratio, selected):
     # Main compares a carrier to its own extracted tree. Two equal-sized
     # carriers must make opposite decisions in one batch because only one
-    # of their trees contains a large unrelated file. Zero disables nested
-    # Embedded scanning without disabling the first Deep discovery round.
+    # of their trees contains a large unrelated file. The endpoints apply
+    # only to nested Embedded scanning, so both outer archives still extract.
     inputs = tmp_path / "inputs"
     inputs.mkdir()
     expected = b"nested payload selected by its own tree's size"
@@ -45,7 +48,7 @@ def test_nested_carrier_ratio_is_local_to_each_extracted_tree(package, tmp_path,
     output = tmp_path / "out"
     if entry_mode == "cli":
         report = extract_report(package, inputs, output, cleanup="d", deep=True)
-        assert report["summary"]["success_count"] == (3 if ratio else 2), report
+        assert report["summary"]["success_count"] == 2 + len(selected), report
         assert report["summary"]["failed_count"] == 0, report
         assert not any(inputs.iterdir())
     else:
@@ -55,14 +58,15 @@ def test_nested_carrier_ratio_is_local_to_each_extracted_tree(package, tmp_path,
         watch.stop()
         watch.assert_no_terminal_failures()
 
-    assert [path.read_bytes() for path in output.rglob("sparse-leaf.txt")] == ([expected] if ratio else [])
-    assert not marker_present(output, "dense-leaf.txt")
-    assert [path.read_bytes() for path in output.rglob("sparse.opaque")] == (
-        [] if ratio else [(tmp_path / "sparse.opaque").read_bytes()]
-    )
-    assert [path.read_bytes() for path in output.rglob("dense.opaque")] == [
-        (tmp_path / "dense.opaque").read_bytes()
-    ]
+    for name in ("sparse", "dense"):
+        leaves = list(output.rglob(f"{name}-leaf.txt"))
+        carriers = list(output.rglob(f"{name}.opaque"))
+        if name in selected:
+            assert [path.read_bytes() for path in leaves] == [expected]
+            assert not carriers
+        else:
+            assert not leaves
+            assert [path.read_bytes() for path in carriers] == [(tmp_path / f"{name}.opaque").read_bytes()]
 
 
 def test_blacklisted_middle_volume_is_admitted_after_rename(package, tmp_path, entry_mode):

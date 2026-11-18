@@ -18,8 +18,7 @@ impl AsRef<[u8]> for CoderInput<'_> {
 pub(crate) struct SevenZipPasswordProbe {
     packed_data: Vec<Blob>,
     folder: SevenZipFolderAst,
-    aes_index: usize,
-    prefix: Option<(usize, SevenZipPayloadEvidence)>,
+    prefix: Option<SevenZipHeaderPrefix>,
     metadata: SevenZipMetadata,
 }
 
@@ -31,13 +30,15 @@ enum SevenZipMetadata {
     Names(u64),
 }
 
+struct SevenZipHeaderPrefix {
+    packed: usize,
+    aes: usize,
+    inner_aes: Vec<usize>,
+    evidence: SevenZipPayloadEvidence,
+}
+
 impl SevenZipPasswordProbe {
     fn from_parts(packed_data: Vec<Blob>, folder: SevenZipFolderAst, metadata: SevenZipMetadata) -> Self {
-        let aes_index = folder
-            .coders
-            .iter()
-            .position(|coder| coder.method_id == EncoderMethod::ID_AES256_SHA256)
-            .expect("supported encrypted folder");
         let prefix = folder
             .packed_streams
             .iter()
@@ -46,40 +47,60 @@ impl SevenZipPasswordProbe {
                 seven_zip_aes_stream(&folder, input, packed_data[index].len() as u64)
                     .and_then(|stream| SevenZipPayloadEvidence::from_stream(
                         &folder, &stream, matches!(metadata, SevenZipMetadata::Header),
-                    ))
-                    .map(|evidence| (index, evidence))
+                    ).map(|evidence| SevenZipHeaderPrefix {
+                        packed: index, aes: stream.aes_index, inner_aes: stream.inner_aes, evidence,
+                    }))
             });
         Self {
             packed_data,
             folder,
-            aes_index,
             prefix,
             metadata,
         }
     }
 
-    pub(crate) fn key_properties(&self) -> &[u8] {
-        &self.folder.coders[self.aes_index].properties
+    pub(crate) fn key_properties(&self) -> impl Iterator<Item = &[u8]> {
+        self.folder.coders.iter()
+            .filter(|coder| coder.method_id == EncoderMethod::ID_AES256_SHA256)
+            .map(|coder| coder.properties.as_slice())
     }
 
     pub(crate) fn has_crc(&self) -> bool {
         self.folder.expected_crc.is_some()
     }
 
-    pub(crate) fn check_header(&self, key: &SevenZipAesKey) -> Result<SevenZipPrefixCheck, String> {
+    pub(crate) fn check_header<'a>(
+        &'a self,
+        mut key: impl FnMut(&'a [u8]) -> Result<SevenZipAesKey, String>,
+    ) -> Result<SevenZipPrefixCheck, String> {
         use SevenZipPrefixCheck::{Confirmed, Reject, Strong, Weak};
-        if let Some((packed, prefix)) = &self.prefix {
-            if prefix.check_encrypted_prefix(&self.packed_data[*packed], key)?
-                == Reject
-            {
+        let mut prepared = None;
+        let mut inner = Vec::new();
+        if let Some(prefix) = &self.prefix {
+            let derived = key(&self.folder.coders[prefix.aes].properties)?;
+            inner = prefix.inner_aes.iter().map(|&index| key(&self.folder.coders[index].properties))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (plain, len) = prefix.evidence.decrypt_prefix_with_inner(
+                &self.packed_data[prefix.packed], &derived, &inner,
+            )?;
+            if prefix.evidence.check_prefix(&plain[..len]) == Reject {
                 return Ok(Reject);
             }
+            prepared = Some((prefix.aes, derived));
         }
-        let decoded = match decode_seven_zip_encoded_folder_with_key(
+        let mut inner = self.prefix.iter().flat_map(|prefix| prefix.inner_aes.iter().copied()).zip(inner).peekable();
+        let decoded = match decode_seven_zip_encoded_folder_with_keys(
             &self.packed_data,
             &self.folder,
-            None,
-            Some((self.aes_index, key)),
+            &mut |coder, properties| {
+                if prepared.as_ref().is_some_and(|(index, _)| *index == coder) {
+                    return Ok(prepared.take().unwrap().1);
+                }
+                if let Some((_, key)) = inner.next_if(|(index, _)| *index == coder) {
+                    return Ok(key);
+                }
+                key(properties).map_err(resource_error)
+            },
         ) {
             Ok(decoded) => decoded,
             Err(error) if error.starts_with("resource_unavailable:") => return Err(error),
@@ -267,16 +288,16 @@ fn lzma2_dict_size(prop: u8) -> Option<u32> {
 fn decode_seven_zip_encoded_folder(
     packed_data: &[Blob],
     folder: &SevenZipFolderAst,
-    password: Option<&str>,
 ) -> Result<Blob, String> {
-    decode_seven_zip_encoded_folder_with_key(packed_data, folder, password, None)
+    decode_seven_zip_encoded_folder_with_keys(packed_data, folder, &mut |_, _| {
+        Err("encoded_header_decode_password_required".into())
+    })
 }
 
-fn decode_seven_zip_encoded_folder_with_key(
+fn decode_seven_zip_encoded_folder_with_keys<'a>(
     packed_data: &[Blob],
-    folder: &SevenZipFolderAst,
-    password: Option<&str>,
-    key: Option<(usize, &SevenZipAesKey)>,
+    folder: &'a SevenZipFolderAst,
+    key: &mut impl FnMut(usize, &'a [u8]) -> Result<SevenZipAesKey, String>,
 ) -> Result<Blob, String> {
     if folder.coders.is_empty() {
         return Err("encoded_header_decoder_unsupported_method".to_string());
@@ -286,18 +307,16 @@ fn decode_seven_zip_encoded_folder_with_key(
         folder.main_output_stream,
         packed_data,
         folder,
-        password,
         key,
         &mut visiting,
     )
 }
 
-fn decode_seven_zip_output(
+fn decode_seven_zip_output<'a>(
     output_stream: u64,
     packed_data: &[Blob],
-    folder: &SevenZipFolderAst,
-    password: Option<&str>,
-    key: Option<(usize, &SevenZipAesKey)>,
+    folder: &'a SevenZipFolderAst,
+    key: &mut impl FnMut(usize, &'a [u8]) -> Result<SevenZipAesKey, String>,
     visiting: &mut [bool],
 ) -> Result<Blob, String> {
     let mut input_base = 0u64;
@@ -336,7 +355,6 @@ fn decode_seven_zip_output(
                 *upstream_output,
                 packed_data,
                 folder,
-                password,
                 key,
                 visiting,
             )
@@ -369,14 +387,11 @@ fn decode_seven_zip_output(
     }
     let input = read_input(0)?;
     visiting[coder_index] = false;
-    if let Some((index, key)) = key.filter(|(index, _)| *index == coder_index) {
-        debug_assert_eq!(
-            folder.coders[index].method_id,
-            EncoderMethod::ID_AES256_SHA256
-        );
-        return decrypt_seven_zip_aes_with_key(input.as_ref(), key, unpack_size);
+    if coder.method_id == EncoderMethod::ID_AES256_SHA256 {
+        let key = key(coder_index, &coder.properties)?;
+        return decrypt_seven_zip_aes_with_key(input.as_ref(), &key, unpack_size);
     }
-    decode_seven_zip_encoded_coder(input, coder, password, unpack_size)
+    decode_seven_zip_encoded_coder(input, coder, unpack_size)
 }
 
 fn seven_zip_bcj_start_pos(coder: &SevenZipCoderAst) -> Result<usize, String> {
@@ -414,19 +429,10 @@ fn seven_zip_bcj_start_pos(coder: &SevenZipCoderAst) -> Result<usize, String> {
 fn decode_seven_zip_encoded_coder(
     data: CoderInput<'_>,
     coder: &SevenZipCoderAst,
-    password: Option<&str>,
     unpack_size: u64,
 ) -> Result<Blob, String> {
     if coder.method_id.as_slice() == EncoderMethod::ID_COPY {
         return collect_decoded(Cursor::new(data), unpack_size);
-    }
-    if coder.method_id.as_slice() == EncoderMethod::ID_AES256_SHA256 {
-        return decrypt_seven_zip_aes256_sha256(
-            data.as_ref(),
-            &coder.properties,
-            password,
-            unpack_size,
-        );
     }
     if coder.method_id.as_slice() == [0x04, 0xf7, 0x11, 0x04] {
         if coder.properties.len() != 5 {
@@ -676,20 +682,6 @@ fn collect_decoded(reader: impl Read, size: u64) -> Result<Blob, String> {
     }
     Ok(output)
 }
-fn decrypt_seven_zip_aes256_sha256(
-    data: &[u8],
-    properties: &[u8],
-    password: Option<&str>,
-    unpack_size: u64,
-) -> Result<Blob, String> {
-    let Some(password) = password.filter(|value| !value.is_empty()) else {
-        return Err("encoded_header_decode_password_required".into());
-    };
-    let password_bytes = Password::from(password);
-    let (key, iv) = seven_zip_aes_key_iv(properties, password_bytes.as_slice())?;
-    decrypt_seven_zip_aes_with_key(data, &SevenZipAesKey { key, iv }, unpack_size)
-}
-
 fn decrypt_seven_zip_aes_with_key(
     data: &[u8],
     key: &SevenZipAesKey,
@@ -853,7 +845,7 @@ fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result
 }
 
 fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
-    let mut aes_count = 0usize;
+    let mut encrypted = false;
     for coder in &folder.coders {
         let method = coder.method_id.as_slice();
         let inputs = if method == EncoderMethod::ID_BCJ2 {
@@ -865,7 +857,7 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
             return false;
         }
         if method == EncoderMethod::ID_AES256_SHA256 {
-            aes_count += 1;
+            encrypted = true;
             if seven_zip_aes_properties(&coder.properties).is_none() {
                 return false;
             }
@@ -908,7 +900,7 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
             return false;
         }
     }
-    aes_count == 1
+    encrypted
 }
 
 #[cfg(test)]

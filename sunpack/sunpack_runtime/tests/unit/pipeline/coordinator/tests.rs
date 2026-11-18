@@ -1686,7 +1686,7 @@ fn recursive_discovery_waits_for_consent_and_releases_the_manifest() {
         config.recursive_authorization.enabled = false;
         config.filesystem.scan_filters_enabled = false;
         config.embedded_scan.enabled = true;
-        config.embedded_scan.recursive_candidate_ratio = 0.3;
+        config.embedded_scan.recursive_candidate_ratio = 0.0;
         let observer = |_: Event| {};
         let mut run = test_run(&engine, &request, &observer);
         Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(

@@ -277,6 +277,7 @@ fn real_prompt_resize_cancel_and_panic_flush_settle_all_connection_work() {
                 assert_eq!(connection.terminal_size(), (120, 40));
                 assert_eq!(connection.read_line_async("second").await?, None);
                 connection.awrite(Stream::Out, b"queued-before-panic").await?;
+                let _prompt = connection.prompt.lock().unwrap();
                 panic!("request failure after enqueue");
             }, Some(control), output).await
         }));
@@ -313,7 +314,15 @@ fn real_prompt_resize_cancel_and_panic_flush_settle_all_connection_work() {
     assert!(notice < final_output);
     assert_eq!(frames[notice].1, format!("{}\n", crate::core::i18n::Language::Zh.text("interrupt.stopping")).as_bytes());
     assert_eq!(frames.iter().filter(|(kind, _)| *kind == Stream::Err as u8).count(), 1);
+    assert_eq!(frames.last(), Some(&(0, 1_i32.to_be_bytes().to_vec())));
     assert!(request.join().is_err());
+
+    let (mut client, next) = connect(&server);
+    client.write_all(&help_request(&server)).unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    assert!(response.ends_with(&output_frame(0, &0_i32.to_be_bytes())));
+    next.join().unwrap().unwrap();
 }
 
 #[test]

@@ -26,7 +26,6 @@
 
 #include "../../Compress/CopyCoder.h"
 
-#include "../../Crypto/Rar20Crypto.h"
 #include "../../Crypto/RarAes.h"
 
 #include "../Common/FindSignature.h"
@@ -50,6 +49,16 @@ static const Byte kMarker[NHeader::kMarkerSize] =
   { 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00 };
 
 const unsigned kPasswordLen_MAX = 127;
+
+static bool IsSupportedMethod(const CItem &item)
+{
+  // Unencrypted stored data needs no legacy codec. Its unpack version is
+  // only the minimum reader version and may be lower than the writer's.
+  if (item.Method == '0' && !item.IsEncrypted())
+    return true;
+  return item.Method >= '0' && item.Method <= '5'
+      && item.UnPackVersion >= 29 && item.UnPackVersion <= 40;
+}
       
 bool CItem::IgnoreItem() const
 {
@@ -827,14 +836,7 @@ UInt64 CHandler::GetPackSize(unsigned refIndex) const
 
 bool CHandler::IsSolid(unsigned refIndex) const
 {
-  const CItem &item = _items[_refItems[refIndex].ItemIndex];
-  if (item.UnPackVersion < 20)
-  {
-    if (_arcInfo.IsSolid())
-      return (refIndex > 0);
-    return false;
-  }
-  return item.IsSolid();
+  return _items[_refItems[refIndex].ItemIndex].IsSolid();
 }
 
 Z7_COM7F_IMF(CHandler::GetArchiveProperty(PROPID propID, PROPVARIANT *value))
@@ -1016,7 +1018,7 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
     case kpidCommented: prop = item.IsCommented(); break;
     case kpidSplitBefore: prop = item.IsSplitBefore(); break;
     case kpidSunpackProofSize:
-      if (!item.IsSplitBefore() && !lastItem.IsSplitAfter() && lastItem.Is_Size_Defined())
+      if (IsSupportedMethod(item) && !item.IsSplitBefore() && !lastItem.IsSplitAfter() && lastItem.Is_Size_Defined())
         prop = lastItem.Size;
       break;
     case kpidSunpackProofDisks:
@@ -1311,13 +1313,6 @@ Z7_COM7F_IMF(CHandler::Close())
   COM_TRY_END
 }
 
-struct CMethodItem
-{
-  Byte RarUnPackVersion;
-  CMyComPtr<ICompressCoder> Coder;
-};
-
-
 Z7_CLASS_IMP_NOQIB_1(
   CVolsInStream
   , ISequentialInStream
@@ -1478,14 +1473,14 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
   UInt64 currentImportantTotalPacked = 0;
   UInt64 currentUnPackSize, currentPackSize;
 
-  CObjectVector<CMethodItem> methodItems;
+  CMyComPtr<ICompressCoder> rar3Decoder;
+  CMyComPtr<ICompressSetDecoderProperties2> rar3DecoderProperties;
 
   CMyComPtr2_Create<ICompressCoder, NCompress::CCopyCoder> copyCoder;
 
   CFilterCoder *filterStreamSpec = new CFilterCoder(false);
   CMyComPtr<ISequentialInStream> filterStream = filterStreamSpec;
 
-  CMyComPtr2<ICompressFilter, NCrypto::NRar2::CDecoder> rar20CryptoDecoder;
   CMyComPtr2<ICompressFilter, NCrypto::NRar3::CDecoder> rar3CryptoDecoder;
 
   CMyComPtr2<ISequentialInStream, CVolsInStream> volsInStream;
@@ -1564,6 +1559,13 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
     RINOK(extractCallback->PrepareOperation(askMode))
 
+    if (!IsSupportedMethod(item))
+    {
+      realOutStream.Release();
+      RINOK(extractCallback->SetOperationResult(NExtract::NOperationResult::kUnsupportedMethod))
+      continue;
+    }
+
     COutStreamWithCRC *outStreamSpec = new COutStreamWithCRC;
     CMyComPtr<ISequentialOutStream> outStream(outStreamSpec);
     outStreamSpec->SetStream(realOutStream);
@@ -1582,34 +1584,6 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
     
     if (item.IsEncrypted())
     {
-      // CMyComPtr<ICryptoSetPassword> cryptoSetPassword;
-      
-      if (item.UnPackVersion >= 29)
-      {
-        rar3CryptoDecoder.Create_if_Empty();
-        // rar3CryptoDecoder->SetRar350Mode(item.UnPackVersion < 36);
-        /*
-        CMyComPtr<ICompressSetDecoderProperties2> cryptoProperties;
-        RINOK(rar3CryptoDecoder.QueryInterface(IID_ICompressSetDecoderProperties2,
-            &cryptoProperties));
-        */
-        RINOK(rar3CryptoDecoder->SetDecoderProperties2(item.Salt, item.HasSalt() ? sizeof(item.Salt) : 0))
-        filterStreamSpec->Filter = rar3CryptoDecoder;
-      }
-      else if (item.UnPackVersion >= 20)
-      {
-        rar20CryptoDecoder.Create_if_Empty();
-        filterStreamSpec->Filter = rar20CryptoDecoder;
-      }
-      else
-      {
-        outStream.Release();
-        RINOK(extractCallback->SetOperationResult(NExtract::NOperationResult::kUnsupportedMethod))
-        continue;
-      }
-      
-      // RINOK(filterStreamSpec->Filter.QueryInterface(IID_ICryptoSetPassword, &cryptoSetPassword));
-
       if (!getTextPassword)
         extractCallback->QueryInterface(IID_ICryptoGetTextPassword, (void **)&getTextPassword);
 
@@ -1620,47 +1594,26 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
         continue;
       }
 
-      // if (getTextPassword)
+      rar3CryptoDecoder.Create_if_Empty();
+      RINOK(rar3CryptoDecoder->SetDecoderProperties2(item.Salt, item.HasSalt() ? sizeof(item.Salt) : 0))
+      filterStreamSpec->Filter = rar3CryptoDecoder;
+
       {
         CMyComBSTR_Wipe password;
         RINOK(getTextPassword->CryptoGetTextPassword(&password))
-        
-        if (item.UnPackVersion >= 29)
+
+        unsigned len = password ? MyStringLen(password) : 0;
+        if (len > kPasswordLen_MAX)
+          len = kPasswordLen_MAX;
+        CByteBuffer_Wipe buffer(len * 2);
+        for (unsigned k = 0; k < len; k++)
         {
-          unsigned len = 0;
-          if (password)
-            len = MyStringLen(password);
-          if (len > kPasswordLen_MAX)
-            len = kPasswordLen_MAX;
-          CByteBuffer_Wipe buffer(len * 2);
-          for (unsigned k = 0; k < len; k++)
-          {
-            wchar_t c = password[k];
-            ((Byte *)buffer)[k * 2] = (Byte)c;
-            ((Byte *)buffer)[k * 2 + 1] = (Byte)(c >> 8);
-          }
-          rar3CryptoDecoder->SetPassword((const Byte *)buffer, len * 2);
+          wchar_t c = password[k];
+          ((Byte *)buffer)[k * 2] = (Byte)c;
+          ((Byte *)buffer)[k * 2 + 1] = (Byte)(c >> 8);
         }
-        else
-        {
-          AString_Wipe oemPassword;
-          if (password)
-          {
-            UString_Wipe unicode;
-            unicode.SetFromBstr(password);
-            if (unicode.Len() > kPasswordLen_MAX)
-              unicode.DeleteFrom(kPasswordLen_MAX);
-            UnicodeStringToMultiByte2(oemPassword, unicode, CP_OEMCP);
-          }
-          rar20CryptoDecoder->SetPassword((const Byte *)(const char *)oemPassword, oemPassword.Len());
-        }
+        rar3CryptoDecoder->SetPassword((const Byte *)buffer, len * 2);
       }
-      /*
-      else
-      {
-        RINOK(cryptoSetPassword->CryptoSetPassword(NULL, 0));
-      }
-      */
       
       filterStreamSpec->SetInStream(volsInStream);
       filterStreamSpec->SetOutStreamSize(NULL);
@@ -1686,42 +1639,17 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
       case '4':
       case '5':
       {
-        unsigned m;
-        for (m = 0; m < methodItems.Size(); m++)
-          if (methodItems[m].RarUnPackVersion == item.UnPackVersion)
-            break;
-        if (m == methodItems.Size())
+        if (!rar3Decoder)
         {
-          CMethodItem mi;
-          mi.RarUnPackVersion = item.UnPackVersion;
-
-          mi.Coder.Release();
-          if (item.UnPackVersion <= 40)
-          {
-            UInt32 methodID = 0x40300;
-            if (item.UnPackVersion < 20)
-              methodID += 1;
-            else if (item.UnPackVersion < 29)
-              methodID += 2;
-            else
-              methodID += 3;
-            RINOK(CreateCoder_Id(EXTERNAL_CODECS_VARS methodID, false, mi.Coder))
-          }
-         
-          if (!mi.Coder)
+          RINOK(CreateCoder_Id(EXTERNAL_CODECS_VARS 0x40303, false, rar3Decoder))
+          if (!rar3Decoder)
           {
             outStream.Release();
             RINOK(extractCallback->SetOperationResult(NExtract::NOperationResult::kUnsupportedMethod))
             continue;
           }
-
-          m = methodItems.Add(mi);
+          RINOK(rar3Decoder.QueryInterface(IID_ICompressSetDecoderProperties2, &rar3DecoderProperties))
         }
-        CMyComPtr<ICompressCoder> decoder = methodItems[m].Coder;
-
-        CMyComPtr<ICompressSetDecoderProperties2> compressSetDecoderProperties;
-        RINOK(decoder.QueryInterface(IID_ICompressSetDecoderProperties2,
-            &compressSetDecoderProperties))
         
         Byte isSolid = (Byte)((IsSolid(index) || item.IsSplitBefore()) ? 1: 0);
         if (solidStart)
@@ -1731,9 +1659,9 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
         }
 
 
-        RINOK(compressSetDecoderProperties->SetDecoderProperties2(&isSolid, 1))
+        RINOK(rar3DecoderProperties->SetDecoderProperties2(&isSolid, 1))
           
-        commonCoder = decoder;
+        commonCoder = rar3Decoder;
         break;
       }
       default:

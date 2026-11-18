@@ -244,7 +244,7 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
     config["extraction"] = {"content_requirement": "allow_partial"}
     config["recursive_authorization"] = {"enabled": False}
     # Keep the small verified ZIP eligible alongside its many intact siblings.
-    config["embedded_scan"] = {"recursive_candidate_ratio": 0.1}
+    config["embedded_scan"] = {"recursive_candidate_ratio": 0}
     settings.write_text(json.dumps(config), encoding="utf-8")
 
     carrier = tmp_path / "damaged.zip"

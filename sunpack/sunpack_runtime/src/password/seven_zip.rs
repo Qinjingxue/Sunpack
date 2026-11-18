@@ -82,25 +82,33 @@ type SevenZipKeyCache<'a> =
 impl SevenZipPasswordContext {
     pub(super) fn kdf_parameters(&self) -> impl Iterator<Item = (u8, &[u8])> + '_ {
         let (header, payload) = match self {
-            Self::Header(probe) => (Some(probe.key_properties()), None),
+            Self::Header(probe) => (Some(probe), None),
             Self::Prefix { probe, .. } => (None, Some(probe)),
+            Self::MemberOnly => (None, None),
         };
         header
             .into_iter()
+            .flat_map(|probe| probe.key_properties())
             .chain(payload.into_iter().flat_map(|probe| probe.key_properties()))
             .filter_map(|properties| seven_zip_aes_properties(properties))
             .map(|(cycles, salt, _)| (cycles, salt))
     }
 
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
-        self.verify_cached(candidates, None)
+        self.verify_cached(candidates, None, true)
     }
 
     pub(super) fn verify_cached<'a>(
         &'a self,
         candidates: &[Arc<str>],
         cache: Option<&SevenZipKeyCache<'a>>,
+        unique_volume: bool,
     ) -> std::io::Result<PasswordVerification> {
+        if matches!(self, Self::MemberOnly) {
+            return Ok(PasswordVerification::status(
+                "unknown_needs_final_verifier", "7z payload requires member verification",
+            ));
+        }
         let local: SevenZipKeyCache<'a>;
         let cache = match cache {
             Some(cache) => cache,
@@ -127,38 +135,28 @@ impl SevenZipPasswordContext {
                 if password.is_empty() {
                     return Ok((SevenZipPrefixCheck::Reject, ()));
                 }
-                let check = probe.check_header(&key(index, password, probe.key_properties())?)?;
+                let check = probe.check_header(|properties| key(index, password, properties))?;
                 Ok((check, ()))
             })?;
             return Ok(candidate_result(&matches, candidates.len(), evidence));
         };
         let evidence = Some(if *header { "7z_header_prefix" } else { "7z_payload_prefix" });
         let properties = probe.key_properties().next().unwrap();
-        let apply_packed = |result: &mut PasswordVerification| -> std::io::Result<bool> {
-            if !result.matched_indices.is_empty() {
-                if let Some(packed) = probe.packed_selection()? {
-                    result.scoped_rejections.add_shared(&packed.rejected, &result.matched_indices);
-                    return Ok(packed.remaining.is_empty());
-                }
-            }
-            Ok(false)
-        };
         if !probe.has_followup() {
             let matches = collect_candidates(candidates, false, |index, password| {
-                let prefix = probe.prescreen(&key(index, password, properties)?)?;
+                let prefix = probe.prescreen(&key(index, password, properties)?,
+                    |inner| key(index, password, inner))?;
                 Ok((prefix.check, ()))
             })?;
-            let mut result = candidate_result(&matches, candidates.len(), evidence);
-            apply_packed(&mut result)?;
-            return Ok(result);
+            return Ok(candidate_result(&matches, candidates.len(), evidence));
         }
         let matches = collect_candidates(candidates, false, |index, password| {
-            let key = key(index, password, properties)?;
-            let prefix = probe.prescreen(&key)?;
-            Ok((prefix.check, (key, prefix)))
+            let first_key = key(index, password, properties)?;
+            let prefix = probe.prescreen(&first_key, |inner| key(index, password, inner))?;
+            Ok((prefix.check, (first_key, prefix)))
         })?;
         let mut result = candidate_result(&matches, candidates.len(), evidence);
-        if apply_packed(&mut result)? || (result.matched_indices.len() == 1 && !probe.has_ambiguous_followup()) {
+        if result.matched_indices.len() == 1 && (unique_volume || !probe.has_ambiguous_followup()) {
             return Ok(result);
         }
         let followups = matches.iter().filter(|(_, check)| check.is_ok())
@@ -379,9 +377,7 @@ fn prepare_seven_zip_descriptor<R: Read + Seek>(
             {
                 return Err(PreparedStatus::new("invalid_volume_evidence", message));
             }
-            Err(message)
-                if message.starts_with("resource_unavailable:")
-                    || message == "7z payload has no supported prescreen evidence" =>
+            Err(message) if message.starts_with("resource_unavailable:") =>
             {
                 return Err(PreparedStatus::new("unknown_needs_final_verifier", message));
             }

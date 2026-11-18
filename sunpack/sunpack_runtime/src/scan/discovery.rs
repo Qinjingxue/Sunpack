@@ -1350,29 +1350,26 @@ impl NativeCandidateTable {
         recursive_ratio: f64,
     ) -> NativeEmbeddedBatch {
         let mut ids = std::mem::take(&mut routes.embedded);
-        let ratio = recursive_ratio.clamp(0.0, 1.0);
-        let select_all = enabled && !recursive;
-        if !select_all {
-            let mut threshold = 0.0;
-            let mut sizes = Vec::new();
-            if enabled && ratio > 0.0 {
-                sizes.reserve_exact(ids.len());
-                let mut total = 0.0;
-                for &index in &ids {
-                    let size = match &self.rows[index] {
-                        Candidate::File(table, row) => table.sizes[*row],
-                        Candidate::Relation(group) => group.logical_size(),
-                    }
-                    .unwrap_or(0);
-                    sizes.push(size);
-                    total += size as f64;
+        let scan_candidates = enabled && (!recursive || recursive_ratio < 1.0);
+        if !scan_candidates {
+            ids.clear();
+        } else if recursive && recursive_ratio > 0.0 {
+            let mut sizes = Vec::with_capacity(ids.len());
+            let mut total = 0.0;
+            for &index in &ids {
+                let size = match &self.rows[index] {
+                    Candidate::File(table, row) => table.sizes[*row],
+                    Candidate::Relation(group) => group.logical_size(),
                 }
-                threshold = total * ratio;
+                .unwrap_or(0);
+                sizes.push(size);
+                total += size as f64;
             }
+            let threshold = total * recursive_ratio;
             // Sizes follow the candidate order, so selection needs no hash set.
             let mut sizes = sizes.into_iter();
             ids.retain(|_| {
-                let size = sizes.next().unwrap_or(0);
+                let size = sizes.next().unwrap();
                 size > 0 && size as f64 >= threshold
             });
         }
@@ -1461,7 +1458,7 @@ impl NativeCandidateTable {
             seen_paths: HashSet::new(),
             force_scan: false,
         };
-        if enabled && (select_all || ratio > 0.0) {
+        if scan_candidates {
             batch.enqueue_volume_peers(self);
         }
         batch

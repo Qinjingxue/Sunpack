@@ -1173,6 +1173,23 @@ fn drain_wakes_after_stop_and_panicking_batch_completion() {
 }
 
 #[test]
+fn synchronous_watch_stage_panic_returns_an_error_after_unwinding() {
+    let engine = Engine::new(PathBuf::from("unused-worker"));
+    let (settled, cleanup) = mpsc::channel();
+    struct NotifyOnDrop(mpsc::Sender<()>);
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) { let _ = self.0.send(()); }
+    }
+    let error = engine.run_stage("watch_complete_state", Origin::Watch, || -> () {
+        let _notify = NotifyOnDrop(settled);
+        panic!("Watch completion failed");
+    }).unwrap_err();
+    assert!(error.to_string().contains("watch_complete_state"));
+    cleanup.try_recv().unwrap();
+    assert_eq!(engine.run_stage("watch_close", Origin::Watch, || 42).unwrap(), 42);
+}
+
+#[test]
 fn empty_watch_defers_rules_until_first_root_activation() {
     let mut raw = json!({"filesystem":{
         "scan_filters_enabled":true,

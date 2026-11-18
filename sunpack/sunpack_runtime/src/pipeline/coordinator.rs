@@ -138,10 +138,15 @@ impl Engine {
         if super::scheduling::in_stage() { return Ok(work()); }
         let cancel = Cancellation::default();
         let id = self.next_id();
-        self.scheduler.get_or_init(Scheduler::new).run(id, origin, &cancel, |_| Box::pin(async {
-            stage(name, &cancel).await?;
-            Ok(work())
+        // The scoped scheduler joins its tasks before rethrowing. Return that
+        // failure to Watch so it can drain active requests and retain recovery intent.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.scheduler.get_or_init(Scheduler::new).run(id, origin, &cancel, |_| Box::pin(async {
+                stage(name, &cancel).await?;
+                Ok(work())
+            }))
         }))
+        .unwrap_or_else(|_| Err(io::Error::other(format!("Watch stage {name} panicked"))))
     }
 
     pub(crate) fn submit<O: Observer + 'static, T: Send + 'static>(
@@ -2988,7 +2993,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     .and_then(|index| usize::try_from(index).ok());
                 let success = worker::string(value, "status") == "ok";
                 if self.request.mode == Mode::Scan {
-                    if flag(value, "volume_candidates_exhausted") {
+                    if flag(value, "volume_candidates_exhausted")
+                        && worker::string(value, "failure_kind") == "missing_volume"
+                    {
                         if let Some(plan) = &input.volume_attempts {
                             let empty = plan.with_remaining(Vec::new(), Vec::new());
                             Arc::make_mut(&mut input).volume_attempts = Some(Arc::new(empty));

@@ -126,7 +126,7 @@ def test_compressed_tar_recovers_pkzip_disks_and_an_enc_inside_lz4(package, tmp_
     assemble_carrier(source, [tar], seed=819)
     package.configure(
         # Keep the tiny LZ4 stream eligible beside the much larger ZIP disks.
-        embedded_scan={"recursive_candidate_ratio": 0.001},
+        embedded_scan={"recursive_candidate_ratio": 0},
         filesystem={"scan_filters_enabled": False}, recursive_authorization={"enabled": False},
     )
     passwords = ["wrong", zip_case.password, ENC_PASSWORD]

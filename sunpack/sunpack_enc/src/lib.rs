@@ -1,5 +1,9 @@
 //! SSE ENC v4: bounded password proof followed by authenticated stream decryption.
 //! This is the sole container parser, shared by discovery and the 7-Zip adapter.
+
+#[cfg(not(panic = "unwind"))]
+compile_error!("SunPack ENC requires panic unwinding to return errors at its C ABI boundary");
+
 mod cipher;
 mod ffi;
 mod kdf;

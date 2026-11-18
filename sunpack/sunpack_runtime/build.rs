@@ -59,19 +59,6 @@ fn main() {
     println!("cargo:rerun-if-changed={}", cpp.display());
     println!("cargo:rerun-if-changed={deflate64_header}");
 
-    let rar_crypto = seven_zip.join("../CPP/7zip/Crypto");
-    let rar2_prefix = "src/password/rar2_crypto.cpp";
-    cc::Build::new()
-        .cpp(true)
-        .include(&rar_crypto)
-        .define("g_CrcTable", "sunpack_password_crc_table")
-        .file(rar_crypto.join("Rar20Crypto.cpp"))
-        .file(rar2_prefix)
-        .warnings(false)
-        .compile("sunpack_rar2_crypto");
-    println!("cargo:rerun-if-changed={}", rar_crypto.display());
-    println!("cargo:rerun-if-changed={rar2_prefix}");
-
     let target = std::env::var("TARGET").expect("Cargo build target");
     if target.ends_with("-windows-msvc") {
         embed_windows_resources(&target);
