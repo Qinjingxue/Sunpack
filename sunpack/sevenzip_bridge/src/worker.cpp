@@ -567,9 +567,8 @@ struct RequestOutcome {
 };
 
 bool extraction_rejects_password(const sunpack::sevenzip::ExtractArchiveResult& result) {
-    // With a complete callback inventory, rejection by every eligible encrypted
-    // member also proves rejection by whichever member the fallback would test.
-    // Reuse decoder receipts; do not parse or rediscover the archive here.
+    // Only a complete callback inventory can establish that every eligible
+    // encrypted member rejected the candidate.
     if (!result.item_count || result.output_trace.items.size() != result.item_count) return false;
     bool tested = false;
     for (const auto& item : result.output_trace.items) {
@@ -979,7 +978,6 @@ RequestOutcome run_request(
             [&](const auto& slot) { return request.archive_input.volume_attempts.domains[slot.domain].size() == 1; });
     std::optional<PasswordTestResult> selected_probe;
     RejectedLayout rejection;
-    bool single_probe_done = false;
     auto extract_with_password = [&](const std::wstring& selected_password) {
         if (volume_trials) volume_replay->volume_output_started = true;
         // The callback is synchronous and its emit() serializes calls. Each
@@ -1072,13 +1070,12 @@ RequestOutcome run_request(
             volume_replay->candidate_output_owned = directory_is_empty_or_missing(root);
             volume_replay->candidates_started = true;
         }
-        if (!volume_trials && password_candidates.size() > 1 && !single_probe_done &&
+        if (!volume_trials && password_candidates.size() > 1 &&
             (!volume_replay || !volume_replay->password_probe_done)) {
             if (request.report_progress) progress({"total", 0, 0, 0});
             selected_probe = test_password_batch(archive_input.archive_path, archive_input.part_paths,
                 archive_input.ranges, format_hint, password_candidates.data(), password_candidates.size(), archive_input.canonical_names,
-                false, !volume_replay || !volume_replay->candidate_output_owned);
-            single_probe_done = true;
+                false, false);
         }
         // Probe lanes share the job budget. An interrupted decoder cannot
         // establish a password/volume rejection; replay the same cursor.
@@ -1185,8 +1182,7 @@ RequestOutcome run_request(
                         index = static_cast<std::size_t>(selected_probe->matched_index);
                         if (replay) replay->candidate_index = index;
                     }
-                    // Confirmation shares the real extraction and its CRC receipts.
-                    // Only ambiguous failures need the existing read-only probe.
+                    // Confirmation uses the real extraction and its CRC receipts.
                     if (replay) replay->candidate_index = index;
                     result = extract_with_password(password_candidates[index]);
                     const bool direct_ok = result.status == PasswordTestStatus::Ok;
@@ -1200,10 +1196,7 @@ RequestOutcome run_request(
                         !(current_native_memory_job() && current_native_memory_job()->revoked.load(std::memory_order_acquire)) &&
                         !(current_native_memory_job() && current_native_memory_job()->denied.load(std::memory_order_acquire)) &&
                         !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
-                        if (extraction_rejects_password(result) ||
-                            (!selected_probe && (!replay || !replay->password_probe_done) &&
-                             test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
-                                format_hint, &password_candidates[index], 1, archive_input.canonical_names).status == PasswordTestStatus::WrongPassword)) {
+                        if (extraction_rejects_password(result)) {
                             result.status = PasswordTestStatus::WrongPassword;
                             result.encrypted = true;
                             result.wrong_password = true;

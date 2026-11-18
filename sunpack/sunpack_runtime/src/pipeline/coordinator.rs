@@ -3554,9 +3554,11 @@ fn worker_evidence(
         if let Some(count) = proof_count {
             (Some("entry_crc_proven_before_failure".to_owned()), Some(count), None)
         } else if weak_failure {
-            (Some(if password_evidence == Some("empty_password_direct") {
-                "empty_password_failed_without_crc_proof"
-            } else { "zipcrypto_failure_without_password_proof" }.to_owned()),
+            (Some(match password_evidence {
+                Some("empty_password_direct") => "empty_password_failed_without_crc_proof",
+                Some("zip_pkware_strong_padding") => "pkware_strong_failure_without_password_proof",
+                _ => "zipcrypto_failure_without_password_proof",
+            }.to_owned()),
              None, Some(worker::string(result, "operation_result_name").to_owned()))
         } else { (None, None, None) };
     let stage = field("failure_stage");
@@ -3597,7 +3599,7 @@ fn worker_evidence(
 }
 
 fn weak_password_failure(result: &Value, evidence: Option<&str>) -> bool {
-    (evidence == Some("zipcrypto_header_byte")
+    (matches!(evidence, Some("zipcrypto_header_byte" | "zip_pkware_strong_padding"))
         || (evidence == Some("empty_password_direct") && flag(result, "encrypted")))
         && (matches!(worker::string(result, "operation_result_name"), "wrong_password" | "data_error" | "crc_error")
             || matches!(worker::string(result, "failure_kind"),

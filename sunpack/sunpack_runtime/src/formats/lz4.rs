@@ -47,7 +47,7 @@ pub(crate) fn identity(reader: &ManagedReader, offset: u64) -> Result<bool, &'st
         }
         let header = parse_header(input.field(cursor, ((limit - cursor).min(19)) as usize)?)?;
         let block = input.word(cursor + header.len as u64)?;
-        return Ok(block & 0x7fffffff <= header.block_max);
+        return Ok(header.block_span(block).is_ok());
     }
 }
 
@@ -58,6 +58,20 @@ pub(crate) struct Header {
     pub(crate) content_size: Option<u64>,
     pub(crate) block_checksum: bool,
     pub(crate) content_checksum: bool,
+}
+
+impl Header {
+    /// Number of bytes after the size field, including the relevant checksum.
+    pub(crate) fn block_span(&self, value: u32) -> Result<u64, &'static str> {
+        if value == 0 {
+            return Ok(if self.content_checksum { 4 } else { 0 });
+        }
+        let size = value & 0x7fff_ffff;
+        if size > self.block_max {
+            return Err("lz4_block_size_invalid");
+        }
+        Ok(u64::from(size) + if self.block_checksum { 4 } else { 0 })
+    }
 }
 pub(crate) fn parse_header(bytes: &[u8]) -> Result<Header, &'static str> {
     if bytes.len() < 7 {
@@ -257,24 +271,14 @@ fn walk_inner(
             advance(&mut cursor, header.len as u64, limit)?;
             loop {
                 let value = input.word(cursor)?;
-                advance(&mut cursor, 4, limit)?;
+                advance(&mut cursor, 4 + header.block_span(value)?, limit)?;
                 if value == 0 {
                     break;
                 }
-                let size = value & 0x7fffffff;
-                if size > header.block_max || (size == 0 && value & 0x80000000 == 0) {
-                    return Err("lz4_block_size_invalid");
-                }
-                advance(
-                    &mut cursor,
-                    u64::from(size) + if header.block_checksum { 4 } else { 0 },
-                    limit,
-                )?;
                 #[cfg(test)]
                 { index.blocks += 1; }
             }
             if header.content_checksum {
-                advance(&mut cursor, 4, limit)?;
                 #[cfg(test)]
                 { index.content_checksums += 1; }
             }

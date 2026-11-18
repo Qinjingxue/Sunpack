@@ -197,6 +197,8 @@ fn worker_failure_proof_survives_json_and_streamed_report() {
             json!({"classification_evidence":"entry_crc_proven_before_failure", "password_crc_proven_items":2})),
         (json!({"failure_kind":"checksum_error", "operation_result_name":"crc_error"}), Some("zipcrypto_header_byte"),
             json!({"classification_evidence":"zipcrypto_failure_without_password_proof", "backend_operation_result":"crc_error"})),
+        (json!({"failure_kind":"checksum_error", "operation_result_name":"crc_error"}), Some("zip_pkware_strong_padding"),
+            json!({"classification_evidence":"pkware_strong_failure_without_password_proof", "backend_operation_result":"crc_error"})),
         (json!({"failure_kind":"checksum_error", "operation_result_name":"crc_error", "encrypted":true}), Some("empty_password_direct"),
             json!({"classification_evidence":"empty_password_failed_without_crc_proof", "backend_operation_result":"crc_error"})),
     ];

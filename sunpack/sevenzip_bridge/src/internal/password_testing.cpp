@@ -59,7 +59,6 @@ namespace sunpack::sevenzip
         struct BoundedPasswordProbeSelection
         {
             std::optional<UInt32> index;
-            bool open_proof = false;
             bool member_mode = false;
             bool weak = false;
             bool item_count_known = false;
@@ -233,9 +232,6 @@ namespace sunpack::sevenzip
             } else if (best) {
                 selection.index = best->index;
                 selection.weak = best->weak;
-            } else if (header_password && selection.item_count != 0) {
-                selection.open_proof = true;
-                selection.weak = true;
             }
             return selection;
         }
@@ -269,11 +265,15 @@ namespace sunpack::sevenzip
             auto *raw_callback = new ExtractCallback(password);
             CMyComPtr<IArchiveExtractCallback> callback(raw_callback);
             hr = S_OK;
-            if (selection.index) {
+            if (final_read_only) {
+                // The final read-only pass covers every member. A preceding
+                // bounded proof has already removed its rejected passwords.
+                hr = archive->Extract(nullptr, kAllItems, kTestMode, callback);
+            } else if (selection.index) {
                 const auto mode = selection.member_mode ? kSunpackVerifyMember : kTestMode;
                 hr = archive->Extract(&*selection.index, 1, mode, callback);
             }
-            if (selection.weak && selection.member_mode && selection.index &&
+            if (!final_read_only && selection.weak && selection.member_mode && selection.index &&
                 hr == S_OK && raw_callback->operation_result() == kOpOk) {
                 // A seekable AES/Copy substream can verify another CRC with
                 // the same key without decoding the solid prefix again.
@@ -311,11 +311,6 @@ namespace sunpack::sevenzip
                 }
                 clear_prop(block);
             }
-            // Existing-output confirmation finishes read-only. A short
-            // CRC alone must never accept the first colliding candidate.
-            if (selection.weak && final_read_only && (!selection.index || selection.item_count > 1) &&
-                hr == S_OK && raw_callback->operation_result() == kOpOk)
-                hr = archive->Extract(nullptr, kAllItems, kTestMode, callback);
             operation = raw_callback->operation_result();
             encryption_evidence = encryption_evidence || raw_callback->password_requested();
         }
@@ -374,7 +369,7 @@ namespace sunpack::sevenzip
                 {
                     result.status = PasswordTestStatus::Ok;
                     result.message = "password accepted";
-                    result.weak_match = cache.selection.weak;
+                    result.weak_match = cache.selection.weak && !final_read_only;
                     return result;
                 }
                 if (looks_wrong_password(hr, operation, encrypted))
@@ -489,7 +484,7 @@ namespace sunpack::sevenzip
             any_opened = true;
             result.archive_type = canonical_archive_type_for_guid(format);
             auto selection = bounded_password_probe_selection(archive, result.archive_type, raw_open_callback->password_requested(), volumes);
-            if (!raw_open_callback->missing_volume_requested() && selection.item_count_known && rar4_rejected_empty_encrypted_headers(
+            if (final_read_only && !raw_open_callback->missing_volume_requested() && selection.item_count_known && rar4_rejected_empty_encrypted_headers(
                     archive.Interface(), format, selection.item_count, raw_open_callback->password_requested()))
             {
                 result.status = PasswordTestStatus::WrongPassword;
@@ -509,7 +504,7 @@ namespace sunpack::sevenzip
                 result.status = PasswordTestStatus::Ok;
                 return result;
             }
-            if (!selection.index && !selection.open_proof)
+            if (!selection.index && !(final_read_only && raw_open_callback->password_requested() && selection.item_count != 0))
             {
                 archive->Close();
                 if (raw_open_callback->missing_volume_requested())
@@ -526,7 +521,7 @@ namespace sunpack::sevenzip
                 return hr == E_NOTIMPL || (hr == S_OK &&
                     (last_op_res == kOpUnsupportedMethod || last_op_res == kOpUnavailable));
             };
-            if (method_unavailable() && selection.index && selection.item_count > 1) {
+            if (!final_read_only && method_unavailable() && selection.index && selection.item_count > 1) {
                 // Build the ordered inventory only when the cheapest member's
                 // codec or data was unavailable. Normal probes retain one index.
                 std::vector<MemberProof> alternatives;
@@ -568,7 +563,7 @@ namespace sunpack::sevenzip
                 result.password_independent_failure = !raw_open_callback->password_requested();
                 return result;
             }
-            const bool weak_match = selection.weak;
+            const bool weak_match = selection.weak && !final_read_only;
             if (!raw_open_callback->password_requested() &&
                 looks_wrong_password(hr, last_op_res, last_encryption_evidence))
             {
@@ -707,8 +702,8 @@ namespace sunpack::sevenzip
         std::atomic<std::size_t> next{0}, earliest{count};
         std::vector<std::optional<PasswordTestResult>> outcomes(parallel.size());
         std::vector<std::optional<PasswordTestResult>> unresolved(parallel.size());
-        std::vector<std::vector<std::size_t>> possible(parallel.size());
-        std::vector<std::size_t> first_weak(parallel.size(), count);
+        enum class CandidateProof : unsigned char { Untested, Rejected, Unresolved, Weak };
+        std::vector<CandidateProof> proofs(count, CandidateProof::Untested);
         parallel.run(parallel.size(), [&](std::size_t lane, std::size_t) {
           PasswordProbeCache cache;
           for (;;) {
@@ -721,8 +716,7 @@ namespace sunpack::sevenzip
                 part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes);
             if (native_job_cancelled()) break;
             if (current.weak_match && !final_read_only) {
-                first_weak[lane] = (std::min)(first_weak[lane], index);
-                possible[lane].push_back(index);
+                proofs[index] = CandidateProof::Weak;
                 continue;
             }
             if (!current.password_independent_failure &&
@@ -730,7 +724,7 @@ namespace sunpack::sevenzip
                  current.status == PasswordTestStatus::Damaged)) {
                 // Decrypting another header can expose a different usable
                 // member. Preserve this candidate and continue the method.
-                possible[lane].push_back(index);
+                proofs[index] = CandidateProof::Unresolved;
                 if (!unresolved[lane]) {
                     current.matched_index = static_cast<int>(index);
                     unresolved[lane] = std::move(current);
@@ -745,6 +739,7 @@ namespace sunpack::sevenzip
                 outcomes[lane] = std::move(current);
                 break;
             }
+            proofs[index] = CandidateProof::Rejected;
           }
         });
         PasswordTestResult last;
@@ -768,16 +763,16 @@ namespace sunpack::sevenzip
                 if (outcome && (last.matched_index == -1 || outcome->matched_index < last.matched_index))
                     last = std::move(*outcome);
         }
-        for (auto& lane : possible)
-            last.possible_candidates.insert(last.possible_candidates.end(), lane.begin(), lane.end());
-        if (!last.possible_candidates.empty() || (stop > 0 && stop < count)) {
-            // An inconclusive read also preserves its entire untested suffix.
-            last.possible_candidates.erase(std::remove_if(last.possible_candidates.begin(), last.possible_candidates.end(),
-                [stop](auto i) { return i >= stop; }), last.possible_candidates.end());
-            std::sort(last.possible_candidates.begin(), last.possible_candidates.end());
-            const bool weak_match = *std::min_element(first_weak.begin(), first_weak.end()) < stop;
-            for (auto& i : last.possible_candidates) i = global_index(i);
-            for (auto i = stop; i < count; ++i) last.possible_candidates.push_back(global_index(i));
+        bool weak_match = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (proofs[i] == CandidateProof::Rejected) continue;
+            if (i < stop && proofs[i] == CandidateProof::Untested) continue;
+            weak_match |= proofs[i] == CandidateProof::Weak;
+            last.possible_candidates.push_back(global_index(i));
+        }
+        if (stop == 0 && last.possible_candidates.size() == count && !weak_match)
+            last.possible_candidates.clear();
+        if (!last.possible_candidates.empty()) {
             last.encrypted |= weak_match;
             last.weak_match = weak_match;
             if (last.matched_index < 0) last.status = PasswordTestStatus::Unsupported;

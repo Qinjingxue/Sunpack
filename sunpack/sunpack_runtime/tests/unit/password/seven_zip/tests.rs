@@ -109,12 +109,18 @@ fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
     // the archive. It must not hide the good tail as an unknown alternative.
     plan.domains[1].choices = Arc::new(vec![2, 3]);
     assert!(prepare_seven_zip_attempts(&sources[0], &plan, &[], None).is_ok());
-    // In contrast, a source shortened below its declared extent is a real I/O
-    // failure, not password evidence and not an invalid-length combination.
+    // A physical EOF inside the declared extent excludes this choice when
+    // another tail supplies the range. An open failure retains its choice.
     plan.sources[3].end = Some((bytes.len() - 48) as u64);
+    let unavailable = InputExtent { path: format!("{}.absent", sources[3].path), ..plan.sources[3].clone() };
+    plan.sources = plan.sources.iter().cloned().chain([unavailable.clone()]).collect();
+    plan.domains[1].choices = Arc::new(vec![2, 3, 4]);
     let uncertain = prepare_seven_zip_attempts(&sources[0], &plan, &[], None).unwrap_or_else(|_| panic!("retain unsupported paths"));
-    assert_eq!(uncertain.verify(&[Arc::from("secret")], None).unwrap().status,
-        "unknown_needs_final_verifier");
+    let result = uncertain.verify(&[Arc::from("secret")], None).unwrap();
+    assert_eq!(result.status, "unknown_needs_final_verifier");
+    let remaining = result.volume_attempts.unwrap();
+    assert!(!remaining.sources.iter().any(|source| source.path == sources[3].path));
+    assert!(remaining.sources.iter().any(|source| source.path == unavailable.path));
     // A fixed-size tail proves the head trim, but does not prove a Copy key.
     plan.domains[1].choices = Arc::new(vec![2]);
     plan.head_size_from_total = Some(bytes.len() as u64);

@@ -3,6 +3,7 @@ use super::*;
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_reader_at_offset, resolve_encrypted_relation_anchor,
 };
+use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
 use aes::cipher::BlockModeEncrypt;
 
 fn vint(mut value: u64) -> Vec<u8> {
@@ -98,14 +99,52 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     two_headers.extend(seal(rar4_block(0x75, 0, &[]), key, iv));
     two_headers.extend(next_salt);
     two_headers.extend(seal(rar4_block(0x7b, 0, &[]), key2, iv2));
-    let confirm = |bytes: Vec<u8>| {
+    let verify = |bytes: Vec<u8>| {
         let reader = ManagedReader::from_bytes(bytes, Default::default());
         prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("RAR4 header proof"))
-            .verify(&passwords, None).unwrap().final_confirmation_required
+            .verify(&passwords, None).unwrap()
     };
-    assert_eq!(confirm(two_headers.clone()), Some(false));
+    assert_eq!(verify(two_headers.clone()).final_confirmation_required, Some(false));
     *two_headers.last_mut().unwrap() ^= 1;
-    assert_eq!(confirm(two_headers), Some(true));
+    assert_eq!(verify(two_headers).final_confirmation_required, Some(true));
+
+    let mut comment = rar4_block(0x75, 0, &[0, 0, 0, 0, 0, 0]);
+    let mut file_header = rar4_block(0x74, 0x8000 | RAR4_FILE_COMMENT, &[0; 25]);
+    let header_size = (file_header.len() + comment.len()) as u16;
+    file_header[5..7].copy_from_slice(&header_size.to_le_bytes());
+    let header_crc = crc32(&file_header[2..]) as u16;
+    file_header[..2].copy_from_slice(&header_crc.to_le_bytes());
+    file_header.append(&mut comment);
+    let mut commented = data[37..offset as usize].to_vec();
+    commented.extend(salt);
+    commented.extend(seal(file_header, key, iv));
+    let result = verify(commented);
+    assert_eq!((result.matched_index, result.final_confirmation_required), (Some(0), Some(true)));
+
+    // A short encrypted header at the end of the first byte-split part is
+    // useful even when every undecided tail is unavailable.
+    let split_head = [RAR4_SIGNATURE, &rar4_block(0x73, RAR4_MAIN_HEADER_PASSWORD, &[0; 6]), &data[offset as usize..]].concat();
+    let head = crate::test_support::temp_file("rar4_split_short_header", &split_head);
+    let mut sources = vec![InputExtent {
+        path: head.to_string_lossy().into_owned(), start: 0, end: Some(split_head.len() as u64),
+    }];
+    for length in [17, 71] {
+        sources.push(InputExtent {
+            path: head.with_extension(format!("missing-{length}")).to_string_lossy().into_owned(),
+            start: 0, end: Some(length),
+        });
+    }
+    let slot = |number, domain| VolumeSlot { number, canonical_name: format!("part.{number}"), domain };
+    let plan = VolumeAttemptPlan {
+        sources: sources.into_boxed_slice(),
+        layouts: vec![VolumeLayout { minimum_slots: 0, slots: vec![slot(1, 0), slot(2, 1)].into_boxed_slice() }].into_boxed_slice(),
+        domains: [vec![0], vec![1, 2]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
+        head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
+    };
+    let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &plan.sources[0],
+        &plan, &parallel, &[], false).unwrap();
+    assert_eq!((result.matched_indices.as_slice(), result.final_confirmation_required), (&[2, 3][..], Some(true)), "{}", result.message);
+    std::fs::remove_file(head).unwrap();
 
     let unrelated = RarProvenKey::Rar4 { salt: [0; 8], key: [0; 16], iv: [0; 16] };
     assert!(matches!(probe_header_passwords(&reader, 37, &passwords, true, Some(&unrelated)).unwrap(),
@@ -209,7 +248,6 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
 
     // The normal attempt dispatcher resolves a first cipher block split
     // between two disks, while both unrelated tail choices are absent.
-    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
     let split = first_disk.len() - 5;
     let paths = [crate::test_support::temp_file("rar5_split_head", &first_disk[..split]),
         crate::test_support::temp_file("rar5_split_ciphertext", &first_disk[split..])];

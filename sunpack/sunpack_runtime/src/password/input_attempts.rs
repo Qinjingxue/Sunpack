@@ -722,6 +722,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                         fault: None,
                         evidence_fault: None,
                         unresolved_fault: None,
+                        truncated_choices: Vec::new(),
                     };
                     let result = prepare(&mut reader);
                     (reader, result)
@@ -732,6 +733,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
             .check_io()
             .map_err(|error| unknown(error.to_string()))?;
         for (mut reader, result) in outcomes {
+            rejected.append(&mut reader.truncated_choices);
             if let Some(fault) = reader.unresolved_fault.take() {
                 unresolved.get_or_insert_with(|| unknown(format!("resource_unavailable: {fault}")));
             }
@@ -790,6 +792,7 @@ pub(crate) struct AttemptReader<'a> {
     fault: Option<io::Error>,
     evidence_fault: Option<io::Error>,
     unresolved_fault: Option<io::Error>,
+    truncated_choices: Vec<Arc<crate::password::evidence::VolumeProjection>>,
 }
 impl AttemptReader<'_> {
     /// Keep method selection stable when a read splits a projection and its
@@ -1062,7 +1065,8 @@ impl AttemptReader<'_> {
                 }
                 Ok(value) => read += value,
                 Err(error) => {
-                    self.fault = Some(error);
+                    // Only a successful zero-byte read proves physical EOF.
+                    self.fault = Some(io::Error::other(error));
                     return Err(io::Error::other("volume source read failed"));
                 }
             }
@@ -1153,7 +1157,14 @@ impl AttemptReader<'_> {
         }
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
         let mut buckets = HashMap::<u32, Vec<usize>>::new();
-        let mut reads = HashMap::<(usize, u64), usize>::new();
+        #[derive(Clone, Copy)]
+        enum Observation {
+            Bytes(usize),
+            Truncated,
+            Unavailable,
+        }
+        let mut reads = HashMap::<(usize, u64), Observation>::new();
+        let mut truncated = Vec::new();
         let mut bytes = vec![0; count];
         let mut comparison = Vec::new();
         for &index in &covering {
@@ -1165,8 +1176,12 @@ impl AttemptReader<'_> {
                         .map(|(_, offset)| offset)
                         .unwrap_or(self.position.saturating_sub(edge.start)),
             );
-            if let Some(&group) = reads.get(&location) {
-                groups[group].1.push(index);
+            if let Some(&read) = reads.get(&location) {
+                match read {
+                    Observation::Bytes(group) => groups[group].1.push(index),
+                    Observation::Truncated => truncated.push(index),
+                    Observation::Unavailable => {}
+                }
                 continue;
             }
             if let Err(error) = self.read_edge(index, &mut bytes, disk.map(|(_, offset)| offset)) {
@@ -1174,9 +1189,14 @@ impl AttemptReader<'_> {
                     return Err(error);
                 }
                 let fault = self.fault.take().unwrap_or(error);
-                if self.unresolved_fault.is_none() {
-                    self.unresolved_fault = Some(fault);
-                }
+                let observation = if fault.kind() == io::ErrorKind::UnexpectedEof {
+                    truncated.push(index);
+                    Observation::Truncated
+                } else {
+                    self.unresolved_fault.get_or_insert(fault);
+                    Observation::Unavailable
+                };
+                reads.insert(location, observation);
                 continue;
             }
             // CRC is only a grouping index, never a format/password proof.
@@ -1214,11 +1234,29 @@ impl AttemptReader<'_> {
                 buckets.entry(hash).or_default().push(group);
                 group
             };
-            reads.insert(location, group);
+            reads.insert(location, Observation::Bytes(group));
         }
         if groups.is_empty() {
             self.fault = self.unresolved_fault.take();
+            if self.fault.is_none() && !truncated.is_empty() {
+                self.fault = Some(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "all volume sources shortened",
+                ));
+            }
             return Err(io::Error::other("no readable evidence projection"));
+        }
+        if !truncated.is_empty() {
+            // Another choice supplied this exact logical range. A source that
+            // cannot fill its declared extent cannot supply the same evidence.
+            let projection = if disk.is_some() {
+                self.projection.select_disk(&covering, &truncated, &[])
+            } else {
+                self.projection.select(&covering, &truncated, false, self.position)
+            };
+            if let Some(projection) = projection {
+                self.truncated_choices.push(projection.proof());
+            }
         }
         if groups.len() > 1 || short {
             let mut branches = Vec::new();

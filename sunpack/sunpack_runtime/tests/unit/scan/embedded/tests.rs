@@ -905,39 +905,6 @@ fn validates_supported_stream_headers_in_one_pass() {
 }
 
 #[test]
-fn rejects_mp4_zstd_false_positive_prefixes_with_oversized_blocks() {
-    let oversized_raw = [
-        0x28, 0xb5, 0x2f, 0xfd, 0xe2, 0x04, 0xe5, 0xea, 0x82, 0xaa, 0xa3, 0x96, 0x2a, 0x14,
-        0x47, 0x61, 0x9e, 0xa6, 0xbf, 0xea, 0x4b,
-    ];
-    let oversized_rle = [
-        0x28, 0xb5, 0x2f, 0xfd, 0x66, 0xad, 0xef, 0x45, 0xf2, 0x0b, 0x32, 0xcd, 0x37, 0x1d,
-        0x2c, 0xb3, 0xa5, 0xed, 0xc9, 0x47, 0x0c,
-    ];
-
-    assert!(parse_zstd_prefix(&oversized_raw).is_none());
-    assert!(parse_zstd_prefix(&oversized_rle).is_none());
-}
-
-#[test]
-fn zstd_first_block_respects_window_and_rfc_block_limits() {
-    let smaller_than_block_window = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x08, 0x49, 0x00, 0x00];
-    assert!(parse_zstd_prefix(&smaller_than_block_window).is_none());
-
-    let mut maximum_block = ZSTD.to_vec();
-    maximum_block.push(0xe0);
-    maximum_block.extend_from_slice(&(128u64 * 1024).to_le_bytes());
-    maximum_block.extend_from_slice(&0x10_0001u32.to_le_bytes()[..3]);
-    assert!(parse_zstd_prefix(&maximum_block).is_some());
-
-    let mut oversized_block = ZSTD.to_vec();
-    oversized_block.push(0xe0);
-    oversized_block.extend_from_slice(&(128u64 * 1024 + 1).to_le_bytes());
-    oversized_block.extend_from_slice(&0x10_0009u32.to_le_bytes()[..3]);
-    assert!(parse_zstd_prefix(&oversized_block).is_none());
-}
-
-#[test]
 fn validates_zstd_maximum_frame_header_layout() {
     let mut data = ZSTD.to_vec();
     data.push(0xc3);

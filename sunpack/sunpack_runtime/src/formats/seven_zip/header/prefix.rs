@@ -62,55 +62,107 @@ pub(crate) fn seven_zip_prefix_check(
                 _ => Reject,
             }
         }
-        [0x04, 0xf7, 0x11, 0x04] => {
-            // SunPack's 7z LZ4 codec uses standard frames, with optional
-            // skippable frames. Reuse its parser and XXH32, not a second parser.
-            if prefix.len() < 4 {
-                return Weak;
-            }
-            let magic = u32::from_le_bytes(prefix[..4].try_into().unwrap());
-            if crate::formats::lz4::skippable(magic) {
-                return Strong;
-            }
-            if magic != 0x184d2204 {
-                return Reject;
-            }
-            match crate::formats::lz4::parse_header(prefix) {
-                Ok(_) => Strong,
-                Err("lz4_header_truncated") => Weak,
-                Err(_) => Reject,
-            }
-        }
-        [0x04, 0xf7, 0x11, 0x01] => {
-            // RFC 8878: skippable frames are part of the format, and the
-            // unused descriptor bit is NOT a reserved bit that can be rejected.
-            if prefix.len() < 5 {
-                return Weak;
-            }
-            let magic = u32::from_le_bytes(prefix[..4].try_into().unwrap());
-            if magic & 0xfffffff0 == 0x184d2a50 {
-                return Strong;
-            }
-            if magic == 0xfd2fb528 && prefix[4] & 8 == 0 {
-                Strong
-            } else {
-                Reject
-            }
-        }
+        [0x04, 0xf7, 0x11, 0x04] => seven_zip_frame_prefix(prefix, packed_size, true),
+        [0x04, 0xf7, 0x11, 0x01] => seven_zip_frame_prefix(prefix, packed_size, false),
         [0x04, 0x01, 0x08] | [0x04, 0x01, 0x09] => {
-            if crate::scan::compression_stream::deflate_prefix_is_possible(
-                prefix,
-                method == [0x04, 0x01, 0x09],
-                unpack_size,
-            ) {
-                Weak
-            } else {
-                Reject
+            // Only the common framing bits and optional uncompressed block
+            // length are used here. The worker owns Huffman/payload decoding.
+            match prefix.first().map(|first| (first >> 1) & 3) {
+                Some(3) => Reject,
+                Some(0) if prefix.len() >= 5 => {
+                    let len = u16::from_le_bytes([prefix[1], prefix[2]]);
+                    let complement = u16::from_le_bytes([prefix[3], prefix[4]]);
+                    if len != !complement || u64::from(len) > unpack_size || u64::from(len) + 5 > packed_size {
+                        Reject
+                    } else {
+                        Weak
+                    }
+                }
+                _ => Weak,
             }
         }
         // Copy, filters and unknown codecs have no generic plaintext magic.
         _ => Weak,
     }
+}
+
+fn seven_zip_frame_prefix(
+    mut prefix: &[u8],
+    mut packed_size: u64,
+    is_lz4: bool,
+) -> SevenZipPrefixCheck {
+    use crate::formats::{lz4, zstd};
+    use SevenZipPrefixCheck::{Reject, Strong, Weak};
+
+    let magic = loop {
+        let Some(magic) = prefix.first_chunk::<4>().copied().map(u32::from_le_bytes) else {
+            return Weak;
+        };
+        if !lz4::skippable(magic) {
+            break magic;
+        }
+        if packed_size < 8 {
+            return Reject;
+        }
+        let Some(size) = prefix.get(4..8) else {
+            return Weak;
+        };
+        let span = 8 + u64::from(u32::from_le_bytes(size.try_into().unwrap()));
+        if span > packed_size {
+            return Reject;
+        }
+        packed_size -= span;
+        let Ok(span) = usize::try_from(span) else {
+            return Weak;
+        };
+        prefix = prefix.get(span..).unwrap_or_default();
+    };
+    let needed = if is_lz4 {
+        if !prefix.starts_with(lz4::MAGIC) {
+            return Reject;
+        }
+        let header = match lz4::parse_header(prefix) {
+            Ok(header) => header,
+            Err("lz4_header_truncated") => return Weak,
+            Err(_) => return Reject,
+        };
+        let end = header.len + 4;
+        if end as u64 > packed_size {
+            return Reject;
+        }
+        let Some(block) = prefix.get(header.len..end) else {
+            return Weak;
+        };
+        let word = u32::from_le_bytes(block.try_into().unwrap());
+        header.block_span(word).ok().map(|span| {
+            let end_marker = if word == 0 { 0 } else { 4 + u64::from(header.content_checksum) * 4 };
+            end as u64 + span + end_marker
+        })
+    } else if magic == zstd::MAGIC {
+        let Some(&descriptor) = prefix.get(4) else {
+            return Weak;
+        };
+        if descriptor & 8 != 0 {
+            return Reject;
+        }
+        let offset = 4 + zstd::frame_header_size(descriptor);
+        let end = offset + zstd::BLOCK_HEADER_SIZE;
+        if end as u64 > packed_size {
+            return Reject;
+        }
+        let Some(block) = prefix.get(offset..end) else {
+            return Weak;
+        };
+        zstd::FrameHeader::parse(&prefix[4..offset]).and_then(|frame| {
+            let block = frame.block(block.try_into().unwrap())?;
+            let next_header = if block.last { 0 } else { zstd::BLOCK_HEADER_SIZE as u64 };
+            let checksum_size = if frame.has_checksum { 4 } else { 0 };
+            Some(end as u64 + block.encoded_size + next_header + checksum_size)
+        })
+    } else {
+        None
+    };
+    if needed.is_some_and(|size| size <= packed_size) { Strong } else { Reject }
 }
 
 fn seven_zip_lzma2_prefix(
@@ -231,62 +283,6 @@ mod seven_zip_prefix_tests {
     }
 
     #[test]
-    fn bounded_deflate_probe_keeps_stored_fixed_and_dynamic_prefixes() {
-        // Raw zlib encodings of repeated "hello deflate ": Z_FIXED and
-        // default dynamic Huffman. Exercise every available input prefix,
-        // including incomplete trees and long matches with no output buffer.
-        let fixed = [
-            203, 72, 205, 201, 201, 87, 72, 73, 77, 203, 73, 44, 73, 85, 200, 24, 229, 141, 242,
-            134, 12, 15, 0,
-        ];
-        let dynamic = [
-            237, 199, 177, 9, 0, 32, 12, 0, 176, 87, 250, 154, 96, 165, 67, 161, 139, 255, 227, 15,
-            206, 201, 150, 202, 238, 137, 157, 167, 215, 205, 40, 51,
-        ];
-        let stored = [1, 1, 0, 254, 255, 65];
-        for (stream, size) in [(&fixed[..], 700), (&dynamic[..], 14000), (&stored[..], 1)] {
-            for length in 0..=stream.len() {
-                assert_eq!(check(&[4, 1, 8], &[], &stream[..length], size), Weak);
-            }
-        }
-        // 7-Zip Deflate64 fixtures (fixed and dynamic), plus a fixed stream
-        // checked by 7z t that emits 65545 bytes using length 285 and both
-        // extended distance symbols. No output buffer is needed by the probe.
-        let fixed64 = [
-            203, 72, 205, 201, 201, 87, 72, 73, 77, 203, 73, 44, 73, 53, 51, 81, 24, 241, 124, 18,
-            249, 0,
-        ];
-        let dynamic64 = [
-            228, 193, 129, 0, 0, 0, 0, 128, 32, 182, 253, 165, 6, 169, 226, 241, 120, 60, 30, 143,
-            199, 227, 241, 120, 60, 30, 143, 199, 227, 241, 120, 60,
-        ];
-        let wide64 = [115, 28, 253, 255, 7, 192, 7, 0, 0, 255, 255, 15, 0];
-        for (stream, size) in [
-            (&fixed64[..], 320),
-            (&dynamic64[..], 70000),
-            (&wide64[..], 65545),
-            (&stored[..], 1),
-        ] {
-            for length in 0..=stream.len() {
-                assert_eq!(check(&[4, 1, 9], &[], &stream[..length], size), Weak);
-            }
-        }
-        // Legal literal-only dynamic block: no distance codes at all. Both
-        // variants must accept it, but using an empty distance tree must fail.
-        let empty_distance = [5, 192, 129, 8, 0, 0, 0, 0, 32, 182, 253, 165, 78];
-        for method in [&[4, 1, 8][..], &[4, 1, 9][..]] {
-            for length in 0..=empty_distance.len() {
-                assert_eq!(check(method, &[], &empty_distance[..length], 1), Weak);
-            }
-            assert_eq!(check(method, &[], &[3, 2, 0], 1), Reject);
-            assert_eq!(check(method, &[], &[3, 0], 0), Weak);
-            assert_eq!(check(method, &[], &[3, 0], 1), Reject);
-        }
-        // HLIT=31 is reserved in Deflate32, unlike a merely incomplete tree.
-        assert_eq!(check(&[4, 1, 8], &[], &[0xfd; 32], 1), Reject);
-    }
-
-    #[test]
     fn compressor_prefixes_preserve_legal_variants_and_reject_impossible_starts() {
         let lzma = &[3, 1, 1];
         let ppmd = &[3, 4, 1];
@@ -310,13 +306,13 @@ mod seven_zip_prefix_tests {
         assert_eq!(check(&[4, 2, 2], &[], &[0; 16], 1), Reject);
         for method in [&[4, 0xf7, 0x11, 1][..], &[4, 0xf7, 0x11, 4][..]] {
             for first in 0x50..=0x5f {
-                assert_eq!(check(method, &[], &[first, 0x2a, 0x4d, 0x18, 0], 1), Strong);
+                assert_eq!(check(method, &[], &[first, 0x2a, 0x4d, 0x18, 0], 1), Weak);
             }
             assert_eq!(check(method, &[], &[0; 16], 1), Reject);
         }
         assert_eq!(
             check(&[4, 0xf7, 0x11, 1], &[], &[0x28, 0xb5, 0x2f, 0xfd, 0x10], 1),
-            Strong
+            Weak
         );
         assert_eq!(
             check(&[4, 0xf7, 0x11, 1], &[], &[0x28, 0xb5, 0x2f, 0xfd, 8], 1),
@@ -330,6 +326,40 @@ mod seven_zip_prefix_tests {
         }
         assert_eq!(check(&[0], &[], &[0xff; 16], 1), Weak);
         assert_eq!(check(lzma, &[], &[], 1), Weak);
+    }
+
+    #[test]
+    fn framed_codecs_check_first_block_without_reading_its_body() {
+        let zstd = [4, 0xf7, 0x11, 1];
+        // Single-segment window of 8 and the decoder-ignored flag bit.
+        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x30, 8, 0x43, 0, 0];
+        assert_eq!(seven_zip_prefix_check(&zstd, &frame, 10, 8), Strong);
+        assert_eq!(seven_zip_prefix_check(&zstd, &frame[..8], 10, 8), Weak);
+        assert_eq!(seven_zip_prefix_check(&zstd, &frame, 9, 8), Reject);
+        for word in [0x47, 0x49, 0x0d] { // reserved, raw over window, then too-short compressed
+            let mut invalid = frame;
+            invalid[6] = word;
+            assert_eq!(seven_zip_prefix_check(&zstd, &invalid, 100, 8), Reject);
+        }
+        let mut skippable = vec![0x5f, 0x2a, 0x4d, 0x18, 1, 0, 0, 0, 0xff];
+        skippable.extend(frame);
+        assert_eq!(seven_zip_prefix_check(&zstd, &skippable, 19, 8), Strong);
+        assert_eq!(seven_zip_prefix_check(&zstd, &skippable[..8], 19, 8), Weak);
+        assert_eq!(seven_zip_prefix_check(&zstd, &skippable[..8], 8, 8), Reject);
+
+        let lz4 = [4, 0xf7, 0x11, 4];
+        let mut frame = [4, 0x22, 0x4d, 0x18, 0x54, 0x40, 0, 0, 0, 0, 0];
+        frame[6] = (crate::formats::lz4::xxh32(&frame[4..6]) >> 8) as u8;
+        // Zero is an end marker with a content checksum. A set high bit
+        // denotes a valid empty raw block followed by a block checksum.
+        for (word, required) in [(0u32, 15), (0x8000_0000, 23)] {
+            frame[7..].copy_from_slice(&word.to_le_bytes());
+            assert_eq!(seven_zip_prefix_check(&lz4, &frame[..10], required, 8), Weak);
+            assert_eq!(seven_zip_prefix_check(&lz4, &frame, required - 1, 8), Reject);
+            assert_eq!(seven_zip_prefix_check(&lz4, &frame, required, 8), Strong);
+        }
+        frame[7..].copy_from_slice(&65537u32.to_le_bytes());
+        assert_eq!(seven_zip_prefix_check(&lz4, &frame, 70000, 8), Reject);
     }
 
     #[test]

@@ -396,7 +396,7 @@ fn seven_zip_payload_plan(
 
 fn seven_zip_prefix_read_size(method: &[u8]) -> u64 {
     if matches!(method, [4, 1, 8] | [4, 1, 9]) {
-        128
+        5
     } else {
         32
     }

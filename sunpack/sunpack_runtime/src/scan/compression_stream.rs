@@ -1,3 +1,4 @@
+use crate::formats::zstd::{frame_header_size, FrameHeader, MAGIC as ZSTD_MAGIC, MAX_FRAME_HEADER_SIZE};
 use crate::io::reader::{CachedBytes, ManagedReader};
 use crc32fast::{hash as crc32, Hasher};
 use std::borrow::Cow;
@@ -8,7 +9,6 @@ const INITIAL_PROBE_BYTES: usize = 256;
 const GZIP_MAGIC: &[u8] = b"\x1f\x8b\x08";
 const BZIP2_MAGIC: &[u8] = b"BZh";
 const XZ_MAGIC: &[u8] = b"\xfd7zXZ\x00";
-const ZSTD_MAGIC: u32 = 0xfd2fb528;
 
 #[derive(Debug)]
 pub(crate) enum ValidationError {
@@ -586,12 +586,11 @@ const FIXED_DISTANCE_TREE: LsbHuffman<'static> = LsbHuffman {
 
 fn dynamic_deflate_trees(
     bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>,
-    deflate64: bool,
 ) -> ValidationResult<(Huffman, Huffman)> {
     let literal_count = bits.read(5)? as usize + 257;
     let distance_count = bits.read(5)? as usize + 1;
     let code_count = bits.read(4)? as usize + 4;
-    if literal_count > (if deflate64 { 288 } else { 286 }) || distance_count > 32 {
+    if literal_count > 286 || distance_count > 32 {
         return invalid("invalid_deflate_dynamic_counts");
     }
     const ORDER: [usize; 19] = [
@@ -673,13 +672,6 @@ fn add_decoded_size(size: u64, count: u64) -> ValidationResult<u64> {
 }
 
 fn parse_deflate(bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>) -> ValidationResult<u64> {
-    parse_deflate_mode(bits, false)
-}
-
-fn parse_deflate_mode(
-    bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>,
-    deflate64: bool,
-) -> ValidationResult<u64> {
     let mut decoded_size = 0u64;
     loop {
         let final_block = bits.read(1)? != 0;
@@ -698,7 +690,7 @@ fn parse_deflate_mode(
             let (literal_tree, distance_tree) = if block_type == 1 {
                 (FIXED_LITERAL_TREE, FIXED_DISTANCE_TREE)
             } else {
-                dynamic_trees = dynamic_deflate_trees(bits, deflate64)?;
+                dynamic_trees = dynamic_deflate_trees(bits)?;
                 (dynamic_trees.0.lsb(), dynamic_trees.1.lsb())
             };
             loop {
@@ -707,26 +699,15 @@ fn parse_deflate_mode(
                     256 => break,
                     symbol @ 257..=285 => {
                         let index = usize::from(symbol - 257);
-                        // 7-Zip DeflateConst.h: Deflate64 replaces code 285
-                        // with base 3 + 16 bits and adds distance codes 30/31.
-                        let length = if deflate64 && symbol == 285 {
-                            3 + u64::from(bits.read(16)?)
-                        } else {
-                            u64::from(LENGTH_BASE[index])
-                                + u64::from(bits.read(LENGTH_EXTRA[index])?)
-                        };
+                        let length = u64::from(LENGTH_BASE[index])
+                            + u64::from(bits.read(LENGTH_EXTRA[index])?);
                         let distance_symbol = distance_tree.decode(bits)? as usize;
-                        let distance = if distance_symbol < DIST_BASE.len() {
-                            u64::from(DIST_BASE[distance_symbol])
-                                + u64::from(bits.read(DIST_EXTRA[distance_symbol])?)
-                        } else if deflate64 && distance_symbol < 32 {
-                            32769 + (distance_symbol as u64 - 30) * 16384
-                                + u64::from(bits.read(14)?)
-                        } else {
+                        if distance_symbol >= DIST_BASE.len() {
                             return invalid("invalid_deflate_distance_symbol");
-                        };
-                        let window = if deflate64 { 65536 } else { DEFLATE_WINDOW_SIZE };
-                        if distance > decoded_size.min(window) {
+                        }
+                        let distance = u64::from(DIST_BASE[distance_symbol])
+                            + u64::from(bits.read(DIST_EXTRA[distance_symbol])?);
+                        if distance > decoded_size.min(DEFLATE_WINDOW_SIZE) {
                             return invalid("deflate_distance_out_of_range");
                         }
                         length
@@ -742,26 +723,6 @@ fn parse_deflate_mode(
             bits.align_byte();
             return Ok(decoded_size);
         }
-    }
-}
-
-// Password prescreen over an already decrypted prefix. Reuse the structural
-// parser, including fixed lookup tables, rather than allocating a decoder or
-// dictionary. Exhausting the supplied prefix is not evidence against a key.
-// No output or iteration budget is needed: each step consumes input bits.
-pub(crate) fn deflate_prefix_is_possible(
-    prefix: &[u8],
-    deflate64: bool,
-    expected_size: u64,
-) -> bool {
-    let mut read = |_offset, _length| -> io::Result<&[u8]> { Ok(&[]) };
-    let mut cursor = ByteCursor::new(&mut read, 0, prefix.len() as u64, prefix);
-    match parse_deflate_mode(&mut LsbBits::new(&mut cursor), deflate64) {
-        // Only a complete final block gives an exact output size. A short
-        // prefix has not proved that the remaining output is absent.
-        Ok(decoded_size) => decoded_size == expected_size,
-        Err(ValidationError::Invalid("unexpected_end_of_stream")) => true,
-        Err(_) => false,
     }
 }
 
@@ -1425,51 +1386,25 @@ pub(crate) fn validate_zstd_structure(
             if descriptor & 0x18 != 0 {
                 return invalid("zstd_reserved_or_unused_bit_set");
             }
-            let single_segment = descriptor & 0x20 != 0;
-            let has_checksum = descriptor & 0x04 != 0;
-            let dictionary_size = match descriptor & 0x03 {
-                0 => 0,
-                1 => 1,
-                2 => 2,
-                _ => 4,
-            };
-            let window_size = if single_segment {
-                None
-            } else {
-                let value = bytes.read_byte()?;
-                let base = 1u64 << (10 + u32::from(value >> 3));
-                Some(base + (base / 8) * u64::from(value & 7))
-            };
-            bytes.skip(dictionary_size)?;
-            let frame_content_size = match (descriptor >> 6, single_segment) {
-                (0, false) => None,
-                (0, true) => Some(u64::from(bytes.read_byte()?)),
-                (1, _) => Some(u64::from(u16::from_le_bytes(bytes.read_array::<2>()?)) + 256),
-                (2, _) => Some(u64::from(u32::from_le_bytes(bytes.read_array::<4>()?))),
-                _ => Some(u64::from_le_bytes(bytes.read_array::<8>()?)),
-            };
-            let window_size = if single_segment {
-                frame_content_size.ok_or(ValidationError::Invalid("zstd_content_size_missing"))?
-            } else {
-                window_size.unwrap()
-            };
+            let size = frame_header_size(descriptor);
+            let mut header = [0; MAX_FRAME_HEADER_SIZE];
+            header[0] = descriptor;
+            let mut copied = 1;
+            bytes.read_chunks(size - 1, |part| {
+                header[copied..copied + part.len()].copy_from_slice(part);
+                copied += part.len();
+            })?;
+            let frame = FrameHeader::parse(&header[..size])
+                .ok_or(ValidationError::Invalid("zstd_frame_header_invalid"))?;
             loop {
-                let header = bytes.read_array::<3>()?;
-                let value = u32::from(header[0])
-                    | (u32::from(header[1]) << 8)
-                    | (u32::from(header[2]) << 16);
-                let last = value & 1 != 0;
-                let block_type = (value >> 1) & 3;
-                let block_size = u64::from(value >> 3);
-                if block_type == 3 || block_size > window_size.min(128 * 1024) {
-                    return invalid("zstd_block_header_invalid");
-                }
-                bytes.skip(if block_type == 1 { 1 } else { block_size })?;
-                if last {
+                let block = frame.block(bytes.read_array()?)
+                    .ok_or(ValidationError::Invalid("zstd_block_header_invalid"))?;
+                bytes.skip(block.encoded_size)?;
+                if block.last {
                     break;
                 }
             }
-            if has_checksum {
+            if frame.has_checksum {
                 bytes.skip(4)?;
             }
             cursor = bytes.position();
