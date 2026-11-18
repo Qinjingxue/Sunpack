@@ -3,8 +3,9 @@
 #include "7zip/PropID.h"
 
 // Size of the complete plaintext covered by a handler-verified checksum.
-// Kept separate from kpidCRC, which is returned to callers as a plaintext CRC.
+// The sentinel requires counting the decoded bytes during the member test.
 inline constexpr PROPID kpidSunpackProofSize = kpidUserDefined + 256;
+inline constexpr UInt64 kSunpackUnknownProofSize = static_cast<UInt64>(-1);
 inline constexpr PROPID kpidSunpackMacPackedSize = kpidUserDefined + 257;
 // The selected item's packed offset (7z logical stream, ZIP disk-relative)
 // and the packed bytes required there. RAR exposes its two inclusive disks.

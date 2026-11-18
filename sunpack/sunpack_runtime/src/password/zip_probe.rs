@@ -1,6 +1,6 @@
 use super::{le_u16, PasswordVerification, ZipCryptoState, ZipVolumeReader};
 use crate::formats::deflate_prefix;
-use crate::formats::seven_zip::{seven_zip_prefix_check, SevenZipPrefixCheck};
+use crate::formats::seven_zip::{seven_zip_prefix_check, seven_zip_successor_prefix, SevenZipPrefixCheck};
 use crate::formats::zip::zip64::CentralValues;
 use crate::io::cancellation::Cancellation;
 use crate::password::evidence::VolumeProjection;
@@ -12,6 +12,7 @@ use std::io;
 use std::sync::Arc;
 
 const MAX_IMPLODE_TABLES: usize = (1 + 256) + 2 * (1 + 64);
+const ZSTD_METHOD: &[u8] = &[0x04, 0xf7, 0x11, 0x01];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ZipLocation {
@@ -135,7 +136,7 @@ pub(super) enum ZipPrefixKey {
 
 impl ZipPrefix {
     pub(super) fn new(method: u16, flags: u16, start: u64, overhead: u64, sizes: Option<&CentralValues>) -> Option<Self> {
-        matches!(method, 6 | 8 | 9 | 12 | 14 | 93 | 95 | 98 | 99).then(|| Self {
+        matches!(method, 1 | 6 | 8 | 9 | 12 | 14 | 93 | 95 | 98 | 99).then(|| Self {
             method, flags, start, overhead, sizes: None, read: None,
         }.with_sizes(sizes))
     }
@@ -155,8 +156,11 @@ impl ZipPrefix {
     pub(super) fn can_screen(&self, matches: usize, derive_aes_key: bool) -> bool {
         let Some(read) = &self.read else { return false; };
         let size = self.read_size();
+        let span = if derive_aes_key && self.method == 93 {
+            self.sizes.map_or(size as u64, |(packed, _)| packed)
+        } else { size as u64 };
         matches != 0 && size != 0
-            && (!derive_aes_key || matches > 1 || read.ambiguous(self.start, size as u64))
+            && (!derive_aes_key || matches > 1 || read.ambiguous(self.start, span))
     }
 
     pub(super) fn needs_size(&self) -> bool {
@@ -165,6 +169,7 @@ impl ZipPrefix {
 
     fn prefix_size(&self) -> usize {
         match self.method {
+            1 => 2,
             6 => MAX_IMPLODE_TABLES,
             8 | 9 => deflate_prefix::MAX_DYNAMIC_HEADER_SIZE,
             12 => 10,
@@ -182,41 +187,59 @@ impl ZipPrefix {
             12 | 93 | 99 => 4,
             14 => 5,
             95 => 6,
-            98 => 2,
+            1 | 98 => 2,
             _ => unreachable!(),
         }
     }
 
     fn read_size(&self) -> usize {
-        let Some((packed, _)) = self.sizes else { return self.minimum_prefix(); };
-        packed.min(self.prefix_size() as u64) as usize
+        match self.sizes {
+            // An empty Shrink stream has no initial code. With an unknown
+            // size those bytes could belong to the following descriptor.
+            None if self.method == 1 => 0,
+            None => self.prefix_size(),
+            Some((packed, _)) => packed.min(self.prefix_size() as u64) as usize,
+        }
     }
 
     pub(super) fn screen(
         &self, keys: &[(usize, ZipPrefixKey)], result: &mut PasswordVerification,
     ) -> io::Result<()> {
-        let Some(read) = &self.read else { return Ok(()); };
+        let Some(source) = &self.read else { return Ok(()); };
         let size = self.read_size();
-        let first = size.min(16);
-        let checks = read.evaluate(|read| {
+        let zstd_sizes = if self.method == 93 && matches!(keys.first(), Some((_, ZipPrefixKey::Aes { .. }))) {
+            self.sizes
+        } else { None };
+        let zstd_volumes = zstd_sizes.is_some_and(|(packed, _)| source.ambiguous(self.start, packed));
+        let initial = size.min(16);
+        let minimum = self.minimum_prefix().min(size);
+        let first = if zstd_volumes {
+            // A skippable frame needs only its 8-byte header before jumping.
+            size.min(8)
+        } else if initial > minimum && source.ambiguous(self.start, initial as u64) {
+            minimum
+        } else {
+            initial
+        };
+        let checks = source.evaluate(|read| {
             let mut unavailable = None;
             let mut encrypted = match read(self.start, first) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     unavailable = Some(error);
-                    let shorter = first.min(self.minimum_prefix());
-                    if shorter == first { return (vec![None; keys.len()], unavailable); }
-                    match read(self.start, shorter) {
+                    if minimum == first { return (vec![None; keys.len()], unavailable); }
+                    match read(self.start, minimum) {
                         Ok(bytes) => bytes,
                         Err(error) => return (vec![None; keys.len()], Some(error)),
                     }
                 }
             };
-            let mut verdicts: Vec<_> = keys.iter().map(|(_, key)|
-                self.check(key, &encrypted)).collect();
-            while unavailable.is_none() && encrypted.len() < size && verdicts.iter().any(Option::is_none) {
+            let mut verdicts = if zstd_volumes && unavailable.is_none() { vec![None; keys.len()] }
+                else { keys.iter().map(|(_, key)| self.check(key, &encrypted)).collect() };
+            while !zstd_volumes && unavailable.is_none() && encrypted.len() < size
+                && verdicts.iter().any(Option::is_none) {
                 let previous = encrypted.len();
-                let next = (2 * previous).min(size);
+                let next = (2 * previous).max(5).min(size);
                 let more = match read(self.start + previous as u64, next - previous) {
                     Ok(bytes) => bytes,
                     Err(error) => { unavailable = Some(error); break; }
@@ -228,15 +251,39 @@ impl ZipPrefix {
                     }
                 }
             }
+            if let Some(sizes) = zstd_sizes.filter(|_| unavailable.is_none() && (
+                zstd_volumes || verdicts.iter().filter(|&&v| v != Some(false)).nth(1).is_some()
+            )) {
+                for ((_, key), verdict) in keys.iter().zip(&mut verdicts) {
+                    if *verdict == Some(false) { continue; }
+                    let outcome = self.check_aes_zstd_successors(key, &encrypted, sizes, source, read);
+                    *verdict = match outcome {
+                        Ok(SevenZipPrefixCheck::Reject) => Some(false),
+                        Ok(SevenZipPrefixCheck::Weak) => None,
+                        Ok(_) => Some(true),
+                        Err(DeferredReadError::Truncated) if zstd_volumes => Some(false),
+                        Err(error) => {
+                            if matches!(error, DeferredReadError::Pending) { break; }
+                            unavailable.get_or_insert(error);
+                            None
+                        }
+                    };
+                }
+            }
             (verdicts, unavailable)
         })?;
+        let contradicts = |scope: &Option<Arc<VolumeProjection>>, verdict: Option<bool>, error: Option<&DeferredReadError>| {
+            verdict == Some(false) || (verdict.is_none() && scope.is_some() && self.sizes.is_some()
+                && matches!(error, Some(DeferredReadError::Truncated)))
+        };
         result.matched_indices.clear();
         for (position, &(index, _)) in keys.iter().enumerate() {
-            if checks.is_empty() || checks.iter().any(|(_, (verdicts, _))| verdicts[position] != Some(false)) {
+            if checks.is_empty() || checks.iter().any(|(scope, (verdicts, error))|
+                !contradicts(scope, verdicts[position], error.as_ref())) {
                 result.matched_indices.push(index);
-                for (scope, (verdicts, _)) in &checks {
-                    if let (Some(scope), Some(false)) = (scope, verdicts[position]) {
-                        result.scoped_rejections.push((scope.clone(), index));
+                for (scope, (verdicts, error)) in &checks {
+                    if contradicts(scope, verdicts[position], error.as_ref()) {
+                        if let Some(scope) = scope { result.scoped_rejections.push((scope.clone(), index)); }
                     }
                 }
             }
@@ -274,6 +321,33 @@ impl ZipPrefix {
         self.check_plain(plain)
     }
 
+    fn check_aes_zstd_successors(
+        &self, key: &ZipPrefixKey, encrypted: &[u8], (packed, unpacked): (u64, u64),
+        source: &ZipRead, read: &mut CheckRead<'_>,
+    ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
+        fn verify<C: KeyInit + BlockCipherEncrypt>(
+            prefix: &ZipPrefix, key: &[u8], encrypted: &[u8], packed: u64, unpacked: u64,
+            source: &ZipRead, read: &mut CheckRead<'_>,
+        ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
+            let cipher = C::new_from_slice(key).unwrap();
+            let mut plain = [0; 24];
+            let plain = &mut plain[..encrypted.len()];
+            plain.copy_from_slice(encrypted);
+            winzip_aes_ctr(&cipher, 0, plain);
+            seven_zip_successor_prefix(ZSTD_METHOD, plain, packed, unpacked, |offset, output| {
+                output.copy_from_slice(&read(prefix.start + offset, output.len())?);
+                winzip_aes_ctr(&cipher, offset, output);
+                Ok(())
+            }, |offset| source.ambiguous(prefix.start + offset, packed - offset))
+        }
+        match key {
+            ZipPrefixKey::Aes { key, len: 16 } => verify::<Aes128>(self, &key[..16], encrypted, packed, unpacked, source, read),
+            ZipPrefixKey::Aes { key, len: 24 } => verify::<Aes192>(self, &key[..24], encrypted, packed, unpacked, source, read),
+            ZipPrefixKey::Aes { key, len: 32 } => verify::<Aes256>(self, key, encrypted, packed, unpacked, source, read),
+            _ => unreachable!(),
+        }
+    }
+
     pub(super) fn cbc_first_block_offset(&self) -> Option<u64> {
         // The encrypted length includes PKCS7 padding. It is a safe upper
         // bound for compression framing, but cannot be used as an exact size.
@@ -285,6 +359,9 @@ impl ZipPrefix {
     pub(super) fn check_plain(&self, plain: &[u8]) -> Option<bool> {
         let (packed, unpacked) = self.sizes.unzip();
         let codec = match self.method {
+            // Shrink starts in nine-bit mode with an empty dictionary. A
+            // control code or a dictionary reference cannot start a stream.
+            1 => return Some(plain.get(1)? & 1 == 0),
             6 => return implode_tables(plain, self.flags & 4 != 0),
             8 | 9 => return deflate_prefix::check_prefix(plain, packed, unpacked, self.method == 9),
             12 => &[0x04, 0x02, 0x02][..],
@@ -293,10 +370,13 @@ impl ZipPrefix {
                 if properties != 5 || *plain.get(4)? >= 225 {
                     return Some(false);
                 }
-                return Some(seven_zip_prefix_check(&[0x03, 0x01, 0x01], plain.get(9..)?, packed.unwrap_or(u64::MAX).saturating_sub(9), unpacked.unwrap_or(u64::MAX))
-                    != SevenZipPrefixCheck::Reject);
+                let range = plain.get(9..)?;
+                if seven_zip_prefix_check(&[0x03, 0x01, 0x01], range, packed.unwrap_or(u64::MAX).saturating_sub(9), unpacked.unwrap_or(u64::MAX)) == SevenZipPrefixCheck::Reject {
+                    return Some(false);
+                }
+                return (range.len() >= 5).then_some(true);
             }
-            93 => &[0x04, 0xf7, 0x11, 0x01][..],
+            93 => ZSTD_METHOD,
             95 => {
                 if plain.get(..6)? != b"\xfd7zXZ\x00" {
                     return Some(false);
@@ -308,7 +388,7 @@ impl ZipPrefix {
                 if properties & 15 == 0 || properties >> 12 > 2 {
                     return Some(false);
                 }
-                return Some(plain.get(2..6).is_none_or(|code| code != [0xff; 4]));
+                return Some(plain.get(2..6)? != [0xff; 4]);
             }
             99 => return lzfse_block(plain, packed, unpacked),
             _ => unreachable!(),
@@ -377,12 +457,21 @@ fn lzfse_block(bytes: &[u8], packed: Option<u64>, unpacked: Option<u64>) -> Opti
 
 fn winzip_aes_prefix<C: BlockCipherEncrypt + KeyInit>(key: &[u8], bytes: &mut [u8]) {
     let cipher = C::new_from_slice(key).unwrap();
-    for (index, chunk) in bytes.chunks_mut(16).enumerate() {
+    winzip_aes_ctr(&cipher, 0, bytes);
+}
+
+fn winzip_aes_ctr<C: BlockCipherEncrypt>(cipher: &C, mut offset: u64, mut bytes: &mut [u8]) {
+    while !bytes.is_empty() {
         let mut counter = Block::<C>::default();
-        counter[..4].copy_from_slice(&(index as u32 + 1).to_le_bytes());
+        counter[..8].copy_from_slice(&(offset / 16 + 1).to_le_bytes());
         cipher.encrypt_block(&mut counter);
-        for (byte, &mask) in chunk.iter_mut().zip(counter.iter()) {
+        let mask = &counter[(offset % 16) as usize..];
+        let len = bytes.len().min(mask.len());
+        let (chunk, rest) = bytes.split_at_mut(len);
+        for (byte, &mask) in chunk.iter_mut().zip(mask) {
             *byte ^= mask;
         }
+        bytes = rest;
+        offset += len as u64;
     }
 }

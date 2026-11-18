@@ -119,16 +119,14 @@ fn prepare_zip_attempts(
         else { AttemptGeometry::Forward { logical_limit: None } };
     let evidence = prepare_attempt_evidence_partial(head, plan, sessions, geometry, |reader| {
         let len = reader.len();
-        let directory = reader.independent_evidence(|reader| if spanned {
-            let count = reader.last_disk().map_err(|error| ReadFault::from_io(error,
-                "zip_disk_count", 0, 0, 0, len).with_field("zip.eocd", FieldLocation::Tail))?
-                .and_then(|last| last.checked_add(1)).ok_or_else(invalid_password_directory)?;
-            let volumes = CertainZipVolumes { reader: std::cell::RefCell::new(reader), count };
+        let directory = reader.independent_evidence(|reader| {
+            let count = if spanned {
+                reader.last_disk().map_err(|error| ReadFault::from_io(error,
+                    "zip_disk_count", 0, 0, 0, len).with_field("zip.eocd", FieldLocation::Tail))?
+                    .and_then(|last| last.checked_add(1)).ok_or_else(invalid_password_directory)?
+            } else { 1 };
+            let volumes = CertainZipVolumes { reader: std::cell::RefCell::new(reader), count, spanned };
             prepare_zip_volume_directory(&volumes, eocd_offset, anchor.as_ref())
-        } else {
-            prepare_zip_directory_stream_from(reader, len, eocd_offset, anchor.as_ref(), |reader| {
-                Some(ZipReadInput::Projected(Arc::new(reader.deferred_reads(false))))
-            })
         });
         match directory {
             Ok(context) => Ok(Some(context)),
@@ -154,14 +152,14 @@ fn prepare_zip_attempts(
                             if bytes.len() != size { return Err(ReadFault::short_read("read_volume", offset, size, bytes.len(), len).with_field(field, location).into()); }
                             Ok(bytes)
                         };
-                        load(reader)
+                        if field == ZIP_LOCAL_FIXED_FIELD { load(reader) } else { reader.independent_evidence(load) }
                     })?
                 } else {
                     prepare_zip_local_chain(|offset, size, field| {
                         let load = |reader: &mut super::input::attempts::AttemptReader<'_>| {
                             read_zip_anchor_field(reader, len, offset, size, field)
                         };
-                        load(reader)
+                        if field == ZIP_LOCAL_FIXED_FIELD { load(reader) } else { reader.independent_evidence(load) }
                     })?
                 };
                 let anchor = context.ok_or_else(invalid_password_directory)?;
@@ -345,6 +343,10 @@ trait ZipVolumeReader {
     fn volume_len(&self, disk: usize) -> Option<u64>;
     fn read_disk_spanning_field(&self, disk: usize, offset: u64, size: usize,
         field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault>;
+    fn read_proof_field(&self, disk: usize, offset: u64, size: usize,
+        field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault> {
+        self.read_disk_spanning_field(disk, offset, size, field, location)
+    }
     fn deferred(&self, disk: usize, offset: u64) -> Option<ZipRead>;
     fn advance_disk_offset(&self, mut disk: usize, mut offset: u64, mut amount: u64) -> Option<(usize, u64)> {
         loop {
@@ -382,21 +384,17 @@ impl ZipVolumeReader for Arc<VolumeSet> {
 struct CertainZipVolumes<'a, 'b> {
     reader: std::cell::RefCell<&'a mut super::input::attempts::AttemptReader<'b>>,
     count: usize,
+    spanned: bool,
 }
-impl ZipVolumeReader for CertainZipVolumes<'_, '_> {
-    fn len(&self) -> usize { self.count }
-    fn advance_disk_offset(&self, disk: usize, offset: u64, amount: u64) -> Option<(usize, u64)> {
-        self.reader.borrow_mut().advance_disk_offset(disk, offset, amount).ok().flatten()
-    }
-    fn volume_len(&self, disk: usize) -> Option<u64> {
-        if disk >= self.count { return None; }
-        self.reader.borrow_mut().volume_len(disk).ok().flatten()
-    }
-    fn read_disk_spanning_field(&self, disk: usize, offset: u64, size: usize,
-        field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault> {
+impl CertainZipVolumes<'_, '_> {
+    fn read_field(&self, disk: usize, offset: u64, size: usize,
+        field: &'static str, location: FieldLocation, independent: bool) -> Result<Vec<u8>, ReadFault> {
         let mut reader = self.reader.borrow_mut();
         let length = reader.len();
         let load = |reader: &mut super::input::attempts::AttemptReader<'_>| {
+            if !self.spanned {
+                return read_zip_stream_field(reader, length, disk, offset, size, field, location);
+            }
             let bytes = reader.read_disk_spanning(disk, offset, size)
                 .map_err(|error| ReadFault::from_io(error, "read_volume", offset, size, 0, length)
                     .with_field(field, location).with_volume(disk as u32 + 1))?;
@@ -406,12 +404,35 @@ impl ZipVolumeReader for CertainZipVolumes<'_, '_> {
             }
             Ok(bytes)
         };
-        load(&mut reader)
+        if independent { reader.independent_evidence(load) } else { load(&mut reader) }
+    }
+}
+impl ZipVolumeReader for CertainZipVolumes<'_, '_> {
+    fn len(&self) -> usize { self.count }
+    fn advance_disk_offset(&self, disk: usize, offset: u64, amount: u64) -> Option<(usize, u64)> {
+        if !self.spanned {
+            let end = offset.checked_add(amount)?;
+            return (end <= self.volume_len(disk)?).then_some((disk, end));
+        }
+        self.reader.borrow_mut().advance_disk_offset(disk, offset, amount).ok().flatten()
+    }
+    fn volume_len(&self, disk: usize) -> Option<u64> {
+        if disk >= self.count { return None; }
+        if !self.spanned { return Some(self.reader.borrow().len()); }
+        self.reader.borrow_mut().volume_len(disk).ok().flatten()
+    }
+    fn read_disk_spanning_field(&self, disk: usize, offset: u64, size: usize,
+        field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault> {
+        self.read_field(disk, offset, size, field, location, false)
+    }
+    fn read_proof_field(&self, disk: usize, offset: u64, size: usize,
+        field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault> {
+        self.read_field(disk, offset, size, field, location, true)
     }
     fn deferred(&self, disk: usize, offset: u64) -> Option<ZipRead> {
         Some(ZipRead {
-            input: ZipReadInput::Projected(Arc::new(self.reader.borrow().deferred_reads(true))),
-            location: ZipLocation { disk: Some(disk), offset },
+            input: ZipReadInput::Projected(Arc::new(self.reader.borrow().deferred_reads(self.spanned))),
+            location: ZipLocation { disk: self.spanned.then_some(disk), offset },
         })
     }
 }
@@ -573,21 +594,25 @@ fn prepare_zip_volume_directory(
             flags & 0x0001 != 0
         };
         if inspect_entry {
-            let (variable_disk, variable_offset) = volumes.advance_disk_offset(disk, offset, 46)
-                .ok_or_else(invalid_password_directory)?;
-            let variable = volumes.read_disk_spanning_field(variable_disk, variable_offset,
-                (name_len + extra_len) as usize, "zip.central_directory.name_extra", FieldLocation::Tail)?;
-            let values = zip64::central_entry_values(&fixed, &variable[name_len as usize..])
-                .ok_or_else(invalid_password_directory)?;
-            let entry = (values.disk as usize, values.local_offset);
-            // ZIP members may use different passwords. A shared anchor and
-            // the directory must refer to the same member.
-            if anchor.is_none() || same_anchor_position(entry) {
-                match prepare_zip_volume_entry_checked(volumes, entry.0, entry.1, Some((&fixed, &variable, values)), anchor) {
-                    Ok(context) => return Ok(context),
-                    Err(error @ PreparedStatus::Status("invalid_volume_evidence", _)) if anchor.is_some() => return Err(error),
-                    Err(error) => { unavailable.get_or_insert(error); }
-                }
+            let context = (|| {
+                let (variable_disk, variable_offset) = volumes.advance_disk_offset(disk, offset, 46)
+                    .ok_or_else(invalid_password_directory)?;
+                let variable = volumes.read_proof_field(variable_disk, variable_offset,
+                    (name_len + extra_len) as usize, "zip.central_directory.name_extra", FieldLocation::Tail)?;
+                let values = zip64::central_entry_values(&fixed, &variable[name_len as usize..])
+                    .ok_or_else(invalid_password_directory)?;
+                let entry = (values.disk as usize, values.local_offset);
+                // ZIP members can use different passwords. The directory may
+                // only refine a shared anchor by describing that same member.
+                if anchor.is_some() && !same_anchor_position(entry) { return Ok(None); }
+                prepare_zip_volume_entry_checked(volumes, entry.0, entry.1, Some((&fixed, &variable, values)), anchor)
+                    .map(Some)
+            })();
+            match context {
+                Ok(Some(context)) => return Ok(context),
+                Ok(None) => {}
+                Err(error @ PreparedStatus::Status("invalid_volume_evidence", _)) if anchor.is_some() => return Err(error),
+                Err(error) => { unavailable.get_or_insert(error); }
             }
         }
         let Some(next) = volumes.advance_disk_offset(disk, offset, record_len) else {
@@ -611,11 +636,11 @@ fn prepare_zip_volume_entry_checked(
     central: Option<(&[u8], &[u8], zip64::CentralValues)>,
     anchor: Option<&ZipAnchor>,
 ) -> Result<ZipPasswordContext, PreparedStatus> {
-    let fixed = match volumes.read_disk_spanning_field(
+    let fixed = match volumes.read_proof_field(
         disk,
         local_offset,
         30,
-        "zip.local_header.fixed",
+        ZIP_LOCAL_FIXED_FIELD,
         FieldLocation::Body,
     ) {
         Ok(data) => data,
@@ -645,7 +670,7 @@ fn prepare_zip_volume_entry_checked(
             "zip local header crosses a missing volume",
         ));
     };
-    let variable = match volumes.read_disk_spanning_field(
+    let variable = match volumes.read_proof_field(
         variable_disk,
         variable_offset,
         (name_len + extra_len) as usize,
@@ -682,7 +707,7 @@ fn prepare_zip_volume_entry_checked(
         let (disk, offset) = if relative == 0 { (data_disk, data_offset) } else {
             volumes.advance_disk_offset(data_disk, data_offset, relative).ok_or_else(invalid_password_directory)?
         };
-        Ok(volumes.read_disk_spanning_field(disk, offset, size, field, FieldLocation::Body)?)
+        Ok(volumes.read_proof_field(disk, offset, size, field, FieldLocation::Body)?)
     };
     let mut context = if let Some(anchor) = anchor {
         anchor.context.clone().with_sizes(sizes_and_crc.map(|(sizes, _)| sizes))
@@ -821,6 +846,8 @@ fn local_zip_sizes(fixed: &[u8], extra: &[u8]) -> Option<zip64::CentralValues> {
 
 // A known logical anchor can provide password evidence without a tail or
 // central directory. Never scan for signatures or guess descriptor boundaries.
+const ZIP_LOCAL_FIXED_FIELD: &str = "zip.local_header.fixed";
+
 fn prepare_zip_local_chain(
     mut read: impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, PreparedStatus>,
 ) -> Result<Option<ZipAnchor>, PreparedStatus> {
@@ -829,7 +856,7 @@ fn prepare_zip_local_chain(
     let mut unavailable = None;
     loop {
         if Cancellation::current().cancelled() { return Ok(None); }
-        let mut bytes = match read(offset, 30, header) {
+        let mut bytes = match read(offset, 30, ZIP_LOCAL_FIXED_FIELD) {
             Ok(bytes) => bytes,
             Err(error) => {
                 if matches!(&error, PreparedStatus::ReadFault(fault) if fault.code == "io_error") { return Err(error); }
@@ -838,29 +865,41 @@ fn prepare_zip_local_chain(
         };
         if offset == 0 && bytes.starts_with(b"PK\x07\x08") {
             offset = 4;
-            bytes = read(offset, 30, header)?;
+            bytes = read(offset, 30, ZIP_LOCAL_FIXED_FIELD)?;
         }
         let Some(length) = crate::formats::zip::relation_local_header_len(&bytes, 0) else { return unavailable.map_or(Ok(None), Err); };
-        if length > bytes.len() {
-            let variable = offset.checked_add(bytes.len() as u64).ok_or_else(invalid_password_directory)?;
-            bytes.extend_from_slice(&read(variable, length - bytes.len(), header)?);
-        }
         let flags = le_u16(&bytes, 6).unwrap();
-        let extra = &bytes[30 + usize::from(le_u16(&bytes, 26).unwrap())..];
-        let sizes = (flags & 0x2000 == 0).then(|| local_zip_sizes(&bytes, extra)).flatten();
+        let aes_extra_needed = flags & 0x2001 == 1 && le_u16(&bytes, 8) == Some(99);
+        let zip64_extra_needed = flags & 0x2008 == 0
+            && (le_u32(&bytes, 18) == Some(u32::MAX) || le_u32(&bytes, 22) == Some(u32::MAX));
+        let extra_len = usize::from(le_u16(&bytes, 28).unwrap());
+        // The fixed header locates the member data. Names and unrelated
+        // extra fields are only needed for the central-directory comparison.
+        let extra = if extra_len != 0 && (aes_extra_needed || zip64_extra_needed) {
+            let at = offset.checked_add((length - extra_len) as u64).ok_or_else(invalid_password_directory)?;
+            match read(at, extra_len, header) {
+                Ok(extra) => Some(extra),
+                Err(error) => {
+                    unavailable.get_or_insert(error);
+                    None
+                }
+            }
+        } else { Some(Vec::new()) };
+        let sizes = (flags & 0x2000 == 0)
+            .then(|| local_zip_sizes(&bytes, extra.as_deref().unwrap_or_default()))
+            .flatten();
         let data_offset = offset.checked_add(length as u64).ok_or_else(invalid_password_directory)?;
-        if flags & 1 != 0 {
+        if flags & 1 != 0 && (!aes_extra_needed || extra.is_some()) {
             let sizes_and_crc = sizes.as_ref().map(|sizes| (sizes, le_u32(&bytes, 14).unwrap()));
-            let context = ZipEncryption::from_local(&bytes, extra, None).and_then(|encryption| encryption.prepare(sizes_and_crc, |relative, size, field| {
+            let context = ZipEncryption::from_local(&bytes, extra.as_deref().unwrap_or_default(), None).and_then(|encryption| encryption.prepare(sizes_and_crc, |relative, size, field| {
                 let at = data_offset.checked_add(relative).ok_or_else(invalid_password_directory)?;
                 read(at, size, field)
             }));
             match context {
                 Ok(context) => return Ok(Some(ZipAnchor { local_offset: offset, data_offset, context })),
-                Err(error @ PreparedStatus::Status("unsupported_method" | "unknown_needs_final_verifier" | "damaged", _)) => {
+                Err(error) => {
                     unavailable.get_or_insert(error);
                 }
-                Err(error) => return Err(error),
             }
         }
         // Only authoritative sizes can advance this local walk. Reuse the
@@ -938,10 +977,7 @@ fn read_zip_anchor_field<R: Read + Seek>(file: &mut R, total_len: u64, offset: u
         if offset.checked_add(size as u64).is_none_or(|end| end > total_len) {
             return Err(ReadFault::short_read("read_volume", offset, size, 0, total_len).with_field(field, location).into());
         }
-        seek_field(file, offset, total_len, field, location)?;
-        let mut bytes = vec![0; size];
-        read_exact_field(file, &mut bytes, total_len, field, location)?;
-        Ok(bytes)
+    Ok(read_zip_stream_field(file, total_len, 0, offset, size, field, location)?)
 }
 
 #[cfg(test)]
@@ -963,7 +999,7 @@ fn prepare_zip_stream_from<R: Read + Seek>(
     if let Ok(Some(anchor)) = context {
         if eocd_offset.is_some() && anchor.context.needs_sizes() {
             if let Ok(context) = prepare_zip_directory_stream_from(file, total_len, eocd_offset,
-                Some(&anchor), |_| input.cloned())
+                Some(&anchor), input)
             {
                 if !context.needs_sizes() { return Ok(context); }
             }
@@ -971,17 +1007,17 @@ fn prepare_zip_stream_from<R: Read + Seek>(
         let location = anchor.location();
         return Ok(anchor.context.bind(input.cloned(), location));
     }
-    prepare_zip_directory_stream_from(file, total_len, eocd_offset, None, |_| input.cloned())
+    prepare_zip_directory_stream_from(file, total_len, eocd_offset, None, input)
         .or_else(|error| context.and(Err(error)))
 }
 
-struct ZipStream<'a, R, F> {
+struct ZipStream<'a, R> {
     file: std::cell::RefCell<&'a mut R>,
     length: u64,
-    input: F,
+    input: Option<&'a ZipReadInput>,
 }
 
-impl<R: Read + Seek, F: Fn(&R) -> Option<ZipReadInput>> ZipVolumeReader for ZipStream<'_, R, F> {
+impl<R: Read + Seek> ZipVolumeReader for ZipStream<'_, R> {
     fn len(&self) -> usize { 1 }
 
     fn volume_len(&self, disk: usize) -> Option<u64> {
@@ -990,31 +1026,34 @@ impl<R: Read + Seek, F: Fn(&R) -> Option<ZipReadInput>> ZipVolumeReader for ZipS
 
     fn read_disk_spanning_field(&self, disk: usize, offset: u64, size: usize,
         field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault> {
-        if disk != 0 {
-            return Err(ReadFault::short_read("read_volume", offset, size, 0, 0)
-                .with_field(field, location).with_possible_missing_volume());
-        }
-        let mut file = self.file.borrow_mut();
-        seek_field(&mut **file, offset, self.length, field, location)?;
-        let mut bytes = vec![0; size];
-        read_exact_field(&mut **file, &mut bytes, self.length, field, location)?;
-        Ok(bytes)
+        read_zip_stream_field(&mut **self.file.borrow_mut(), self.length, disk, offset, size, field, location)
     }
     fn deferred(&self, disk: usize, offset: u64) -> Option<ZipRead> {
         if disk != 0 { return None; }
-        let file = self.file.borrow();
-        Some(ZipRead { input: (self.input)(&file)?, location: ZipLocation { disk: None, offset } })
+        Some(ZipRead { input: self.input?.clone(), location: ZipLocation { disk: None, offset } })
     }
+}
+
+fn read_zip_stream_field(file: &mut (impl Read + Seek), length: u64, disk: usize, offset: u64, size: usize,
+    field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault> {
+    if disk != 0 {
+        return Err(ReadFault::short_read("read_volume", offset, size, 0, 0)
+            .with_field(field, location).with_possible_missing_volume());
+    }
+    seek_field(file, offset, length, field, location)?;
+    let mut bytes = vec![0; size];
+    read_exact_field(file, &mut bytes, length, field, location)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
 fn prepare_zip_directory_stream<R: Read + Seek>(file: &mut R, total_len: u64, eocd_offset: Option<u64>, anchor: Option<&ZipAnchor>) -> Result<ZipPasswordContext, PreparedStatus> {
-    prepare_zip_directory_stream_from(file, total_len, eocd_offset, anchor, |_| None)
+    prepare_zip_directory_stream_from(file, total_len, eocd_offset, anchor, None)
 }
 
 fn prepare_zip_directory_stream_from<R: Read + Seek>(file: &mut R, total_len: u64,
     eocd_offset: Option<u64>, anchor: Option<&ZipAnchor>,
-    input: impl Fn(&R) -> Option<ZipReadInput>,
+    input: Option<&ZipReadInput>,
 ) -> Result<ZipPasswordContext, PreparedStatus> {
     let stream = ZipStream { file: std::cell::RefCell::new(file), length: total_len, input };
     prepare_zip_volume_directory(&stream, eocd_offset, anchor)
@@ -1186,73 +1225,9 @@ fn aes_lengths(strength: u8) -> Option<(usize, usize)> {
 /// it would reject (or accept) candidates the extractor treats differently.
 /// ASCII is identical in every ANSI codepage and stays borrowed.
 pub(crate) fn zip_password_bytes(password: &str) -> Cow<'_, [u8]> {
-    if password.is_ascii() {
-        return Cow::Borrowed(password.as_bytes());
-    }
-    Cow::Owned(ansi_codepage_bytes(password))
-}
-
-#[cfg(windows)]
-fn ansi_codepage_bytes(password: &str) -> Vec<u8> {
-    #[link(name = "Kernel32")]
-    extern "system" {
-        fn WideCharToMultiByte(
-            code_page: u32,
-            flags: u32,
-            wide: *const u16,
-            wide_len: i32,
-            multi: *mut u8,
-            multi_len: i32,
-            default_char: *const u8,
-            used_default_char: *mut i32,
-        ) -> i32;
-    }
     const CP_ACP: u32 = 0;
-    const DEFAULT_CHAR: &[u8; 2] = b"_\0";
-
-    let wide: Vec<u16> = password.encode_utf16().collect();
-    let Ok(wide_len) = i32::try_from(wide.len()) else {
-        return password.as_bytes().to_vec();
-    };
-    let mut used_default = 0i32;
-    let required = unsafe {
-        WideCharToMultiByte(
-            CP_ACP,
-            0,
-            wide.as_ptr(),
-            wide_len,
-            std::ptr::null_mut(),
-            0,
-            DEFAULT_CHAR.as_ptr(),
-            &mut used_default,
-        )
-    };
-    if required <= 0 {
-        return password.as_bytes().to_vec();
-    }
-    let mut output = vec![0u8; required as usize];
-    let written = unsafe {
-        WideCharToMultiByte(
-            CP_ACP,
-            0,
-            wide.as_ptr(),
-            wide_len,
-            output.as_mut_ptr(),
-            required,
-            DEFAULT_CHAR.as_ptr(),
-            &mut used_default,
-        )
-    };
-    if written <= 0 {
-        return password.as_bytes().to_vec();
-    }
-    output.truncate(written as usize);
-    output
-}
-
-#[cfg(not(windows))]
-fn ansi_codepage_bytes(password: &str) -> Vec<u8> {
-    password.as_bytes().to_vec()
+    super::password_codepage_bytes(password, CP_ACP, usize::MAX)
+        .unwrap_or(Cow::Borrowed(password.as_bytes()))
 }
 
 fn winzip_aes_verifier(
@@ -1350,28 +1325,8 @@ impl ZipCryptoState {
     }
 }
 
-const CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut index = 0;
-    while index < 256 {
-        let mut value = index as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            value = if value & 1 != 0 {
-                (value >> 1) ^ 0xedb8_8320
-            } else {
-                value >> 1
-            };
-            bit += 1;
-        }
-        table[index] = value;
-        index += 1;
-    }
-    table
-};
-
 fn crc32_update(crc: u32, byte: u8) -> u32 {
-    CRC32_TABLE[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8)
+    super::CRC32_TABLE[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8)
 }
 
 fn le_u16(bytes: &[u8], offset: usize) -> Option<u16> {

@@ -11,9 +11,67 @@ pub(crate) mod zip;
 use crate::io::archive_state::{ArchiveInput, OpenMode};
 use crate::io::read_fault::ReadFault;
 use crate::io::reader::{ManagedReader, NativeArchiveSession};
+use std::borrow::Cow;
 use std::{io, sync::Arc};
 
 pub(crate) const VERIFICATION_BATCH_SIZE: usize = 256;
+
+// ZipCrypto and the legacy RAR cipher use the same IEEE CRC table.
+#[unsafe(export_name = "sunpack_password_crc_table")]
+static CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 != 0 {
+                (value >> 1) ^ 0xedb8_8320
+            } else {
+                value >> 1
+            };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+};
+
+fn password_codepage_bytes(password: &str, code_page: u32, utf16_limit: usize) -> Option<Cow<'_, [u8]>> {
+    if password.is_ascii() {
+        return Some(Cow::Borrowed(&password.as_bytes()[..password.len().min(utf16_limit)]));
+    }
+    let wide: Vec<u16> = password.encode_utf16().take(utf16_limit).collect();
+    let wide_len = i32::try_from(wide.len()).ok()?;
+    if wide_len == 0 { return Some(Cow::Borrowed(b"")); }
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn WideCharToMultiByte(
+            code_page: u32,
+            flags: u32,
+            wide: *const u16,
+            wide_len: i32,
+            multi: *mut u8,
+            multi_len: i32,
+            default_char: *const u8,
+            used_default_char: *mut i32,
+        ) -> i32;
+    }
+    let required = unsafe {
+        WideCharToMultiByte(code_page, 0, wide.as_ptr(), wide_len, std::ptr::null_mut(), 0,
+            std::ptr::null(), std::ptr::null_mut())
+    };
+    if required <= 0 { return None; }
+    let mut output = vec![0; required as usize];
+    let written = unsafe {
+        WideCharToMultiByte(code_page, 0, wide.as_ptr(), wide_len, output.as_mut_ptr(), required,
+            b"_\0".as_ptr(), std::ptr::null_mut())
+    };
+    if written <= 0 { return None; }
+    output.truncate(written as usize);
+    Some(Cow::Owned(output))
+}
 
 #[derive(Debug)]
 pub(crate) struct PasswordVerification {

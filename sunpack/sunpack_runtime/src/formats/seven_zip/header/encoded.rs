@@ -1,4 +1,5 @@
 use crate::io::scratch::{Blob, Spool};
+use std::ffi::c_void;
 use std::io::Write;
 
 enum CoderInput<'a> {
@@ -26,6 +27,8 @@ pub(crate) struct SevenZipPasswordProbe {
 enum SevenZipMetadata {
     Header,
     Folders(usize),
+    Additional,
+    Names(u64),
 }
 
 impl SevenZipPasswordProbe {
@@ -92,10 +95,21 @@ impl SevenZipPasswordProbe {
         }
         let syntax = match self.metadata {
             SevenZipMetadata::Header => parse_seven_zip_header_with_data(
-                &decoded, &mut SevenZipStreams::default(), false, None,
-            ),
+                &decoded, &mut SevenZipStreams::default(), &mut SevenZipStreams::default(),
+                false, None,
+            ).map(|_| ()),
             SevenZipMetadata::Folders(count) => parse_seven_zip_folders(&decoded, &mut 0, count, false)
                 .map(|_| ()).map_err(std::borrow::Cow::Borrowed),
+            SevenZipMetadata::Additional => return Ok(Weak),
+            SevenZipMetadata::Names(count) => {
+                // ReadHeader's Name property requires one UTF-16 terminator
+                // per file. The SDK merely flags unused trailing name bytes.
+                let complete = decoded.chunks_exact(2)
+                    .filter(|unit| *unit == [0, 0])
+                    .take(usize::try_from(count).unwrap_or(usize::MAX))
+                    .count() as u64;
+                return Ok(if complete == count { Weak } else { Reject });
+            }
         };
         match syntax {
             Ok(()) => Ok(Strong),
@@ -437,6 +451,19 @@ fn decode_seven_zip_encoded_coder(
     {
         return decode_lzma(data.as_ref(), coder, unpack_size);
     }
+    if coder.method_id.as_slice() == [0x03, 0x04, 0x01] {
+        return decode_ppmd_header(data.as_ref(), &coder.properties, unpack_size);
+    }
+    if coder.method_id.as_slice() == [0x04, 0x01, 0x09] {
+        let input = data.as_ref();
+        return decode_native_header("Deflate64", unpack_size, |context, write| {
+            // The decoder uses the complete immutable metadata and the
+            // synchronous output callback for the duration of this call.
+            unsafe { sunpack_decode_deflate64_header(
+                input.as_ptr(), input.len(), unpack_size, context, write,
+            ) }
+        });
+    }
     let compressed = Cursor::new(data);
     match coder.method_id.as_slice() {
         [0x04, 0x01, 0x08] => return collect_decoded(flate2::read::DeflateDecoder::new(compressed), unpack_size),
@@ -499,6 +526,94 @@ fn decode_error(error: std::io::Error) -> String {
         format!("encoded_header_payload_crc_bad:{error}")
     } else {
         resource_error(error)
+    }
+}
+
+fn ppmd_header_properties(properties: &[u8]) -> Option<(u32, u32)> {
+    let [order, a, b, c, d, ..] = properties else { return None };
+    let memory = u32::from_le_bytes([*a, *b, *c, *d]);
+    ((2..=64).contains(order) && ((1 << 11)..=(u32::MAX - 36)).contains(&memory))
+        .then_some((u32::from(*order), memory))
+}
+
+fn decode_ppmd_header(data: &[u8], properties: &[u8], size: u64) -> Result<Blob, String> {
+    let (order, memory) = ppmd_header_properties(properties)
+        .ok_or("encoded_header_decoder_unsupported_method:ppmd_properties")?;
+    decode_native_header("PPMd", size, |context, write| {
+        // The decoder borrows its complete input and output state for this call.
+        unsafe { sunpack_decode_ppmd7_header(
+            data.as_ptr(), data.len(), memory, order, size, context, write,
+        ) }
+    })
+}
+
+type HeaderWrite = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
+
+unsafe extern "C" {
+    fn sunpack_decode_ppmd7_header(
+        data: *const u8,
+        len: usize,
+        memory: u32,
+        order: u32,
+        size: u64,
+        context: *mut c_void,
+        write: HeaderWrite,
+    ) -> i32;
+
+    fn sunpack_decode_deflate64_header(
+        data: *const u8,
+        len: usize,
+        size: u64,
+        context: *mut c_void,
+        write: HeaderWrite,
+    ) -> i32;
+}
+
+fn decode_native_header(
+    codec: &'static str,
+    size: u64,
+    run: impl FnOnce(*mut c_void, HeaderWrite) -> i32,
+) -> Result<Blob, String> {
+    use std::io;
+    struct Output<'a> {
+        exact: ExactOutput<'a>,
+        error: Option<io::Error>,
+    }
+    unsafe extern "C" fn write(context: *mut c_void, bytes: *const u8, len: usize) -> i32 {
+        // The synchronous decoder calls this with its current output block
+        // and the original Rust state, neither of which escapes this call.
+        let output = unsafe { &mut *context.cast::<Output<'_>>() };
+        let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+        if output.error.is_some() {
+            return 1;
+        }
+        let result = if bytes.is_empty() {
+            crate::io::cancellation::Cancellation::check_current_io()
+        } else {
+            output.exact.write_all(bytes)
+        };
+        match result {
+            Ok(()) => 0,
+            Err(error) => {
+                output.error = Some(error);
+                1
+            }
+        }
+    }
+    check_password_cancellation()?;
+    let mut spool = Spool::default();
+    let mut output = Output {
+        exact: ExactOutput { output: &mut spool, remaining: size },
+        error: None,
+    };
+    let status = run((&mut output as *mut Output).cast(), write);
+    if let Some(error) = output.error {
+        return Err(decode_error(error));
+    }
+    match status {
+        0 if output.exact.remaining == 0 => spool.finish().map_err(resource_error),
+        2 => Err(resource_error(format!("7z {codec} header allocation failed"))),
+        _ => Err(format!("encoded_header_payload_crc_bad:{codec}")),
     }
 }
 struct ExactOutput<'a> {
@@ -762,8 +877,12 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
             if coder.properties.len() != 5 {
                 return false;
             }
-        } else if matches!(method, [0x04, 0x01, 0x08] | [0x04, 0x02, 0x02] | [0x04, 0xf7, 0x11, 0x01]) {
-            // Deflate, BZip2 and Zstd derive their settings from the stream.
+        } else if matches!(method, [0x04, 0x01, 0x08 | 0x09] | [0x04, 0x02, 0x02] | [0x04, 0xf7, 0x11, 0x01]) {
+            // Deflate, Deflate64, BZip2 and Zstd use stream parameters.
+        } else if method == [0x03, 0x04, 0x01] {
+            if ppmd_header_properties(&coder.properties).is_none() {
+                return false;
+            }
         } else if method == EncoderMethod::ID_LZMA {
             if coder.properties.len() < 5 {
                 return false;

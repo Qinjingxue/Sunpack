@@ -14,6 +14,7 @@ const SZ_CRC: u8 = 0x0A;
 const SZ_FOLDER: u8 = 0x0B;
 const SZ_CODERS_UNPACK_SIZE: u8 = 0x0C;
 const SZ_NUM_UNPACK_STREAM: u8 = 0x0D;
+const SZ_NAME: u8 = 0x11;
 const SZ_ENCODED_HEADER: u8 = 0x17;
 // Per-Folder decoder graph constraints, not archive-wide record quotas.
 const SEVEN_Z_MAX_FOLDER_CODERS: usize = 64;

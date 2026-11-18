@@ -95,6 +95,53 @@ bool check_password_probe_status_names() {
     )) == "needs_volume_or_tail_damaged";
 }
 
+bool check_rar5_password_probe_with_unknown_unpacked_size() {
+    using namespace sunpack::sevenzip;
+    // A RAR5 Store member of 16 bytes with CRC32, no password-check bytes,
+    // and the unknown-unpacked-size flag. The AES password is "evidence-key".
+    constexpr char archive[] =
+        "\x52\x61\x72\x21\x1a\x07\x01\x00\xc5\x1a\x33\x32\x03\x01\x00\x00"
+        "\x36\x86\xaa\x4e\x34\x02\x03\x25\x10\x0c\x00\x00\x9f\xe6\xf6\xe0"
+        "\x00\x00\x01\x78\x24\x01\x00\x00\x08\x00\x01\x02\x03\x04\x05\x06"
+        "\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16"
+        "\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x79\x2a\x0e\x2c\x6a\xf2\x37"
+        "\xa7\x1f\x84\xce\xfa\x88\xae\x90\x32\x19\xb2\x3a\x35\x03\x05\x00\x00";
+    const auto path = std::filesystem::temp_directory_path() /
+        (L"sunpack-rar-proof-" + std::to_wstring(GetCurrentProcessId()) + L".rar");
+    {
+        std::ofstream file(path, std::ios::binary);
+        file.write(archive, sizeof(archive) - 1);
+    }
+    const std::wstring candidates[]{L"wrong-before", L"evidence-key"};
+    const auto rejected = test_password_batch(path.wstring(), {}, {}, L"rar", candidates, 1, {}, true);
+    const auto accepted = test_password_batch(path.wstring(), {}, {}, L"rar", candidates, 2, {}, true);
+
+    // The extraction receipt is used on failure. Append a second, damaged
+    // member with a different name and a matching header CRC.
+    constexpr std::size_t member_start = 16, end_header = sizeof(archive) - 1 - 8;
+    std::string damaged(archive + member_start, archive + end_header);
+    damaged.replace(0, 4, "\xd4\x7b\x22\xc3", 4);
+    damaged[19] = 'y';
+    damaged.back() ^= 1;
+    {
+        std::ofstream file(path, std::ios::binary);
+        file.write(archive, end_header);
+        file.write(damaged.data(), damaged.size());
+        file.write(archive + end_header, sizeof(archive) - 1 - end_header);
+    }
+    auto output = path;
+    output.replace_extension(L".out");
+    const auto extracted = extract_archive(path.wstring(), {}, {}, L"rar", candidates[1], output.wstring(), L"");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(output / L"x", error);
+    std::filesystem::remove(output / L"y", error);
+    std::filesystem::remove(output, error);
+    return rejected.status == PasswordTestStatus::WrongPassword &&
+        accepted.status == PasswordTestStatus::Ok && accepted.matched_index == 1 && !accepted.weak_match &&
+        extracted.status == PasswordTestStatus::Damaged && extracted.password_crc_proven_items == 1;
+}
+
 bool check_cpu_budget_accounts_base_and_decoder_credits() {
     using namespace sunpack::sevenzip;
     NativeCpuBudget budget(8);
@@ -326,6 +373,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_password_probe_status_names()) {
         std::cerr << "password probe status name check failed\n";
         return 4;
+    }
+    if (!check_rar5_password_probe_with_unknown_unpacked_size()) {
+        std::cerr << "RAR5 unknown unpacked size password proof check failed\n";
+        return 35;
     }
 
     if (!check_cpu_budget_accounts_base_and_decoder_credits()) {

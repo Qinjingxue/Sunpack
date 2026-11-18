@@ -156,7 +156,8 @@ namespace sunpack::sevenzip
                     !item.is_dir &&
                     item.done &&
                     (!item.has_expected_size || item.bytes_written == item.expected_size) &&
-                    item.strong_password_proof)
+                    (item.password_proof == OutputPasswordProof::Strong ||
+                     (item.password_proof == OutputPasswordProof::MeasureSize && strong_member_crc(item.bytes_written))))
                 {
                     ++count;
                 }

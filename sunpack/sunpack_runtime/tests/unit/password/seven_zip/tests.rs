@@ -114,6 +114,52 @@ fn projected_lzma2_successor_removes_bad_cbc_source_after_prefix_survives() {
 }
 
 #[test]
+fn projected_concatenated_frame_rejects_incompatible_next_volume() {
+    let lz4_frame = |body: &[u8]| {
+        let mut frame = vec![4, 0x22, 0x4d, 0x18, 0x60, 0x40];
+        frame.push((crate::formats::lz4::xxh32(&frame[4..]) >> 8) as u8);
+        frame.extend((0x8000_0000 | body.len() as u32).to_le_bytes());
+        frame.extend(body);
+        frame.extend([0; 4]);
+        frame
+    };
+    let zstd_frame = |body: &[u8]| {
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, body.len() as u8];
+        frame.extend([((body.len() as u8) << 3) | 1, (body.len() >> 5) as u8, 0]);
+        frame.extend(body);
+        frame
+    };
+    let cases = [
+        (lz4_frame(&[3; 33]), lz4_frame(&[42]), &[0x24, 4, 0xf7, 0x11, 4, 5, 1, 10, 1, 0, 0][..], 34),
+        (zstd_frame(&[3; 39]), zstd_frame(&[42]), &[4, 4, 0xf7, 0x11, 1][..], 40),
+    ];
+    for (mut stream, next_frame, coder, unpack_size) in cases {
+        let next = stream.len();
+        assert_eq!(next % 16, 0);
+        stream.extend(next_frame);
+        let encrypted = direct_key_ciphertext(&stream);
+        let mut header = vec![
+            1, 4, 6, 0, 1, 9, encrypted.len() as u8, 0, 7, 11, 1, 0,
+            2, 0x24, 6, 0xf1, 7, 1, 1, 0x3f,
+        ];
+        header.extend(coder);
+        header.extend([1, 0, 12, stream.len() as u8, unpack_size, 0, 0, 0]);
+        let archive = archive_with_descriptor(&encrypted, &header);
+        let (paths, sources, plan) = uncertain_tail_fixture_at(&archive, &[], SEVEN_Z_HEADER_SIZE + next);
+        let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None)
+            .unwrap_or_else(|_| panic!("concatenated frame descriptor"));
+        let PasswordContext::Evidence(evidence) = context else {
+            panic!("the first frame is common to both candidate volumes");
+        };
+        let proof = evidence.verify_batch(&[Arc::from("secret")], true, true).unwrap();
+        assert_eq!(proof.matched_indices, [0]);
+        assert!(!proof.volume_attempts.unwrap().sources.iter().any(|source| source.path == sources[1].path));
+        drop(evidence);
+        for path in paths { std::fs::remove_file(path).unwrap(); }
+    }
+}
+
+#[test]
 fn external_folder_metadata_locates_encrypted_payload_stream() {
     let mut body = direct_key_ciphertext(&[1, 0, 0, 42, 0]);
     body.extend(AES_LZMA2_FOLDER);
@@ -134,6 +180,80 @@ fn external_folder_metadata_locates_encrypted_payload_stream() {
     assert_eq!(proof.matched_indices, [1]);
     assert_eq!(proof.match_evidence, Some("7z_payload_prefix"));
     assert_eq!(proof.final_confirmation_required, Some(true));
+}
+
+#[test]
+fn encrypted_external_names_supply_password_proof_for_clear_members() {
+    for (name, crc) in [(&b"x\0\0\0"[..], true), (&b"x\0\0\0\0\0\xff"[..], false)] {
+        let encrypted = direct_key_ciphertext(name);
+        let mut header = vec![
+            1, 3, 6, 0, 1, 9, 16, 0, // AdditionalStreamsInfo
+            7, 11, 1, 0, 1, 0x24, 6, 0xf1, 7, 1, 1, 0x3f, // AES folder
+            12, name.len() as u8,
+        ];
+        if crc {
+            header.extend([10, 1]);
+            header.extend(crc32fast::hash(name).to_le_bytes());
+        }
+        header.extend([
+            0, 0, 5, 1, 14, 1, 0x80, 15, 1, 0x80, // one empty file
+            17, 2, 1, 0, 0, 0,                   // its name is in external folder 0
+        ]);
+        let archive = archive_with_descriptor(&encrypted, &header);
+        let context = prepare_seven_zip(std::io::Cursor::new(&archive), archive.len() as u64, &())
+            .unwrap_or_else(|_| panic!("external names have CRC or name structure evidence"));
+        let proof = context.verify(&[Arc::from("wrong"), Arc::from("secret")]).unwrap();
+        assert_eq!(proof.matched_indices, [1]);
+        assert_eq!(proof.final_confirmation_required, Some(!crc));
+    }
+}
+
+#[test]
+fn ppmd_encoded_header_confirms_password_from_decoder_output_crc() {
+    // NanaZip PPMd order 6 with a 64 KiB model. The decoded header is
+    // [Header, FilesInfo, number of files = 0, End, End].
+    let packed = [0, 0x01, 0x07, 0xd0, 0xcd, 0x32, 0x9f, 0x4e];
+    let encrypted = direct_key_ciphertext(&packed);
+    let mut header = vec![
+        0x17, 6, 0, 1, 9, 16, 0,
+        7, 11, 1, 0, 2, 0x24, 6, 0xf1, 7, 1, 1, 0x3f,  // AES
+        0x23, 3, 4, 1, 5, 6, 0, 0, 1, 0,             // PPMd
+        1, 0, 12, packed.len() as u8, 5, 10, 1,
+    ];
+    header.extend(crc32fast::hash(&[1, 5, 0, 0, 0]).to_le_bytes());
+    header.extend([0, 0]);
+    let archive = archive_with_descriptor(&encrypted, &header);
+    let context = prepare_seven_zip(std::io::Cursor::new(&archive), archive.len() as u64, &())
+        .unwrap_or_else(|_| panic!("PPMd encoded header descriptor"));
+    let proof = context.verify(&[Arc::from("wrong"), Arc::from("secret")]).unwrap();
+    assert_eq!(proof.matched_indices, [1]);
+    assert_eq!(proof.final_confirmation_required, Some(false));
+}
+
+#[test]
+fn deflate64_encoded_header_confirms_password_with_extended_match_length() {
+    // Fixed Huffman block with Deflate64 symbol 285 and a 16-bit length
+    // extension. A Deflate32 decoder cannot read this 300-byte match.
+    let packed = [0x63, 0x64, 0x92, 0x6c, 0xd4, 0x8d, 0x18, 0x4d, 9, 0, 0x0c, 0x0c, 0];
+    let mut plaintext = vec![1, 2, 0x19, 0x81, 0x2d]; // 301 bytes of an archive property
+    plaintext.extend([b'X'; 301]);
+    plaintext.extend([0, 0]);
+    let encrypted = direct_key_ciphertext(&packed);
+    let mut header = vec![
+        0x17, 6, 0, 1, 9, 16, 0,
+        7, 11, 1, 0, 2, 0x24, 6, 0xf1, 7, 1, 1, 0x3f,
+        3, 4, 1, 9, 1, 0,
+        12, packed.len() as u8, 0x80 | (plaintext.len() >> 8) as u8, plaintext.len() as u8,
+        10, 1,
+    ];
+    header.extend(crc32fast::hash(&plaintext).to_le_bytes());
+    header.extend([0, 0]);
+    let archive = archive_with_descriptor(&encrypted, &header);
+    let context = prepare_seven_zip(std::io::Cursor::new(&archive), archive.len() as u64, &())
+        .unwrap_or_else(|_| panic!("Deflate64 encoded header descriptor"));
+    let proof = context.verify(&[Arc::from("wrong"), Arc::from("secret")]).unwrap();
+    assert_eq!(proof.matched_indices, [1]);
+    assert_eq!(proof.final_confirmation_required, Some(false));
 }
 
 #[test]

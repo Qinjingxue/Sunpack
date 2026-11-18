@@ -61,6 +61,7 @@ namespace sunpack::sevenzip
             std::optional<UInt32> index;
             bool member_mode = false;
             bool weak = false;
+            bool measure_coverage = false;
             bool item_count_known = false;
             UInt32 item_count = 0;
             bool encrypted = false;
@@ -74,6 +75,8 @@ namespace sunpack::sevenzip
             bool variable;
             bool operator<(const MemberProof& other) const {
                 if (weak != other.weak) return !weak;
+                // Unknown lengths can supply a strong proof after decoding.
+                // Prefer these to a checksum known to cover only a few bytes.
                 if (weak && coverage != other.coverage) return coverage > other.coverage;
                 if (cost != other.cost) return cost < other.cost;
                 if (variable != other.variable) return variable;
@@ -241,7 +244,14 @@ namespace sunpack::sevenzip
                     cost = size + (offset - start);
                     variable = volumes.intersects(*copy_start + start, (cost + 15) & ~UInt64{15});
                 } else variable = volumes.contains(archive, index, format);
-                MemberProof member{index, cost, coverage, !authenticated && !strong_member_crc(coverage), variable};
+                const bool measured = coverage == kSunpackUnknownProofSize;
+                if (measured) {
+                    if (get_item_property(archive, index, kpidPackSize, value))
+                        cost += (std::min)(prop_u64(value), UINT64_MAX - cost);
+                    clear_prop(value);
+                }
+                MemberProof member{index, cost, coverage,
+                    !authenticated && (measured || !strong_member_crc(coverage)), variable};
                 if (!best || member < *best) best = member;
                 if (alternatives) alternatives->push_back(member);
             }
@@ -250,6 +260,7 @@ namespace sunpack::sevenzip
             } else if (best) {
                 selection.index = best->index;
                 selection.weak = best->weak;
+                selection.measure_coverage = best->coverage == kSunpackUnknownProofSize;
             }
             return selection;
         }
@@ -286,12 +297,13 @@ namespace sunpack::sevenzip
         }
 
         void probe_opened_archive(
-            IInArchive *archive, const BoundedPasswordProbeSelection &selection,
+            IInArchive *archive, BoundedPasswordProbeSelection &selection,
             const std::wstring &password, bool &encryption_evidence, bool final_read_only,
             HRESULT &hr, Int32 &operation, OpenCallback& open, ExtractInputTrace& trace,
             const ProbeVolumeRanges& volumes)
         {
-            auto *raw_callback = new ExtractCallback(password);
+            const auto measure_item = !final_read_only && selection.measure_coverage ? selection.index : std::nullopt;
+            auto *raw_callback = new ExtractCallback(password, measure_item);
             CMyComPtr<IArchiveExtractCallback> callback(raw_callback);
             hr = S_OK;
             if (final_read_only) {
@@ -302,7 +314,7 @@ namespace sunpack::sevenzip
                 const auto mode = selection.member_mode ? kSunpackVerifyMember : kTestMode;
                 hr = archive->Extract(&*selection.index, 1, mode, callback);
             }
-            if (!final_read_only && selection.weak && selection.member_mode && selection.index &&
+            if (!final_read_only && !measure_item && selection.weak && selection.member_mode && selection.index &&
                 hr == S_OK && raw_callback->operation_result() == kOpOk && !FAILED(probe_read_error(open, trace, hr))) {
                 // A seekable AES/Copy substream can verify another CRC with
                 // the same key without decoding the solid prefix again.
@@ -346,6 +358,11 @@ namespace sunpack::sevenzip
                 clear_prop(block);
             }
             operation = raw_callback->operation_result();
+            if (measure_item && hr == S_OK && operation == kOpOk) {
+                const auto coverage = raw_callback->measured_size();
+                if (!coverage) operation = kOpUnavailable;
+                selection.weak = !strong_member_crc(coverage);
+            }
             encryption_evidence = encryption_evidence || raw_callback->password_requested();
         }
 
@@ -368,10 +385,12 @@ namespace sunpack::sevenzip
                 }
             };
             const auto can_try_another = [&] {
+                // ZIP can report a damaged local header for just this member.
                 return !native_job_cancelled() && hr != E_ABORT && hr != E_OUTOFMEMORY &&
                     (FAILED(read_error) || hr == E_NOTIMPL ||
                      (hr == S_OK && (operation == kOpUnsupportedMethod ||
-                        operation == kOpUnavailable || operation == kOpUnexpectedEnd)));
+                        operation == kOpUnavailable || operation == kOpUnexpectedEnd ||
+                        (operation == kOpHeadersError && format == L"zip"))));
             };
             probe();
             if (final_read_only || !selection.index || selection.item_count <= 1 || !can_try_another()) return;
@@ -388,6 +407,7 @@ namespace sunpack::sevenzip
                 if (member.index == *first.index) continue;
                 selection.index = member.index;
                 selection.weak = member.weak;
+                selection.measure_coverage = member.coverage == kSunpackUnknownProofSize;
                 probe();
                 if (!can_try_another()) return;
                 if ((FAILED(read_error) && (failure_hr == E_NOTIMPL || !FAILED(failure_hr))) ||

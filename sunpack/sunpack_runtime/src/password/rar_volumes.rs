@@ -239,7 +239,8 @@ pub(super) fn prepare(head: &InputExtent, plan: &VolumeAttemptPlan, sessions: &[
         for strong in [true, false] {
             for &disk in &disks {
                 let source = reader.native_proof(disk, |source| materials[source].as_ref().and_then(|ctx| {
-                    let is_strong = matches!(ctx.material, RarPasswordMaterial::Rar5(_) | RarPasswordMaterial::Rar5Header { .. });
+                    let is_strong = ctx.material.empty_mac_strength() != 0
+                        || matches!(ctx.material, RarPasswordMaterial::Rar5Header { .. });
                     (strong == is_strong).then_some(source)
                 })).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
                 if let Some(source) = source { return Ok(materials[source].clone()); }

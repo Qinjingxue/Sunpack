@@ -65,6 +65,26 @@ fn anchor_walk_can_skip_unsupported_encryption_with_an_authoritative_size() {
     ));
 }
 
+#[test]
+fn sized_local_walk_uses_later_proof_despite_unreadable_member_bytes() {
+    let mut first = local_crypto_header();
+    first[18..22].copy_from_slice(&12u32.to_le_bytes());
+    let second = local_crypto_header();
+    let next = first.len();
+    first.extend(second);
+    let result = prepare_zip_local_chain(|offset, size, _| {
+        let offset = offset as usize;
+        // Neither name is needed for a local proof. The first member's
+        // encrypted header cannot be read, but its successor is located.
+        if offset < next && offset + size > 30 || offset == next + 30 {
+            return Err(invalid_password_directory());
+        }
+        Ok(first[offset..offset + size].to_vec())
+    });
+    let anchor = result.ok().flatten().expect("later encrypted header is readable");
+    assert_eq!(anchor.local_offset, next as u64);
+}
+
 // Covers all three verifier block positions, unsupported AE versions,
 // and the strong-encryption flag on both local and directory-selected paths.
 #[test]
@@ -107,7 +127,7 @@ fn aes_strength_drives_the_weak_screen_for_supported_versions() {
 }
 
 #[test]
-fn zipcrypto_deflate_rejects_a_header_collision_and_the_affected_volume() {
+fn zipcrypto_deflate_uses_dynamic_tables_with_unknown_descriptor_sizes() {
     use std::io::Write;
 
     let plain = b"these symbols compress into a dynamic table ".repeat(256);
@@ -117,8 +137,8 @@ fn zipcrypto_deflate_rejects_a_header_collision_and_the_affected_volume() {
     assert_eq!((body[0] >> 1) & 3, 2);
     let mut local = local_crypto_header();
     local[8] = 8;
-    local[18..22].copy_from_slice(&((12 + body.len()) as u32).to_le_bytes());
-    local[22..26].copy_from_slice(&(plain.len() as u32).to_le_bytes());
+    local[6] |= 8;
+    local[11] = 0x5a;
     let encrypt = |state: &mut ZipCryptoState, byte: &mut u8| {
         let plain = *byte;
         *byte ^= state.decrypt_byte();
@@ -138,7 +158,7 @@ fn zipcrypto_deflate_rejects_a_header_collision_and_the_affected_volume() {
         let mut state = zipcrypto_header_state(password.as_bytes(), &header, 0x5a)?;
         let decoded: Vec<_> = body.iter().map(|&byte| state.decrypt(byte)).collect();
         ((decoded[0] >> 1) & 3 == 2 && !crate::formats::deflate_prefix::matches_prefix(
-            &decoded, Some(body.len() as u64), Some(plain.len() as u64), false,
+            &decoded, None, None, false,
         )).then(|| Arc::from(password))
     }).expect("a check-byte collision whose Deflate table is invalid");
     let mut bad = body.clone();
@@ -152,6 +172,52 @@ fn zipcrypto_deflate_rejects_a_header_collision_and_the_affected_volume() {
     preparation.fix_password();
     let verified = preparation.verify_prepared(&[Arc::from("secret")]).unwrap().unwrap();
     let reduced = verified.volume_attempts.expect("the bad body variant was eliminated");
+    assert_eq!(reduced.sources.len(), 2);
+    assert_eq!(reduced.sources[1].path, sources[2].path);
+    drop(preparation);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+}
+
+#[test]
+fn winzip_aes_jumps_to_zstd_header_in_another_volume() {
+    use aes::{cipher::{Block, BlockCipherEncrypt, KeyInit}, Aes128};
+
+    let unpacked = b"frame after skippable bytes";
+    let frame = zstd::stream::encode_all(&unpacked[..], 1).unwrap();
+    let mut payload = Vec::from(b"\x50\x2a\x4d\x18\x1d\0\0\0");
+    payload.extend([0; 29]);
+    let split = payload.len();
+    payload.extend(frame);
+    let mut local = local_crypto_header()[..31].to_vec();
+    local[8] = 99;
+    local[18..22].copy_from_slice(&((20 + payload.len()) as u32).to_le_bytes());
+    local[22..26].copy_from_slice(&(unpacked.len() as u32).to_le_bytes());
+    local[28] = 11;
+    local.extend([1, 0x99, 7, 0, 2, 0, b'A', b'E', 1, 93, 0]);
+    let salt = [0x83; 8];
+    let mut derived = [0; 34];
+    pbkdf2::pbkdf2_hmac::<Sha1>(b"secret", &salt, 1000, &mut derived);
+    local.extend(salt);
+    local.extend(&derived[32..]);
+    let cipher = Aes128::new_from_slice(&derived[..16]).unwrap();
+    for (index, chunk) in payload.chunks_mut(16).enumerate() {
+        let mut mask = Block::<Aes128>::from(((index + 1) as u128).to_le_bytes());
+        cipher.encrypt_block(&mut mask);
+        for (byte, mask) in chunk.iter_mut().zip(mask) { *byte ^= mask; }
+    }
+    local.extend(&payload[..split]);
+    let mut good = payload[split..].to_vec();
+    good.extend([0; 10]); // The Rust proof never opens the member MAC.
+    let mut bad = good.clone();
+    bad[0] ^= 1;
+    let (paths, sources, plan) = volume_alternatives(&local, &bad, &good);
+    let mut preparation = Preparation::default();
+    let result = zip_fast_verify_passwords_from_attempts(&mut preparation, &sources[0], &plan,
+        &[Arc::from("wrong"), Arc::from("secret")], false, Some(0), &[]).unwrap();
+    assert_eq!(result.matched_indices, [1]);
+    preparation.fix_password();
+    let verified = preparation.verify_prepared(&[Arc::from("secret")]).unwrap().unwrap();
+    let reduced = verified.volume_attempts.expect("Zstd frame ruled out the wrong volume");
     assert_eq!(reduced.sources.len(), 2);
     assert_eq!(reduced.sources[1].path, sources[2].path);
     drop(preparation);

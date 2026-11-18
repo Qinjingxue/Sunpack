@@ -415,6 +415,16 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     mixed.truncate(mixed.len() - end.len());
     mixed.extend(rar5_block(&file));
     mixed.extend(end);
+    let unavailable_offset = mixed.windows(valid.len()).position(|window| window == valid).unwrap() as u64;
+    let context = prepare_rar(|offset, size, field| {
+        if offset == unavailable_offset && field == "rar5.compressed_block" {
+            return Err(ReadFault::from_io(io::Error::new(io::ErrorKind::PermissionDenied, "fixture"),
+                "read", offset, size, 0, mixed.len() as u64));
+        }
+        let start = (offset as usize).min(mixed.len());
+        Ok(mixed[start..(start + size).min(mixed.len())].to_vec())
+    }).unwrap_or_else(|_| panic!("available explicit check after an unreadable block"));
+    assert_eq!(context.verify(&[Arc::from("secret"), Arc::from("later")], None).unwrap().matched_index, Some(1));
     let context = prepare(mixed).unwrap_or_else(|_| panic!("later independent member"));
     let result = context.verify(&[Arc::from("secret"), Arc::from("later")], None).unwrap();
     assert_eq!(result.matched_index, Some(1));
@@ -429,6 +439,104 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     // Missing optional follow-up evidence preserves the first-block survivors.
     assert_eq!(prepare(archive).unwrap_or_else(|_| panic!("available first block"))
         .verify(&candidates, None).unwrap().matched_indices, [1, 2]);
+}
+
+#[test]
+fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
+    let salt = [0x32; 16];
+    let iv = [0x43; 16];
+    let mut key = [0; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(b"secret", &salt, 16, &mut key);
+    let mut compressed = [0u8; 80];
+    let mut header = |offset: usize, flags: u8, length: u8| {
+        compressed[offset..offset + 3].copy_from_slice(&[flags, 0x5a ^ flags ^ length, length]);
+    };
+    header(0, 0x87, 29);
+    header(32, 0x07, 29);
+    header(64, 0x47, 0);
+    compressed[3] = 0x11; // Complete code-length tree with two codes of length 1.
+    let encrypt = |mut bytes: [u8; 80]| {
+        let size = bytes.len();
+        cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
+            .encrypt_padded::<NoPadding>(&mut bytes, size).unwrap();
+        bytes
+    };
+    let good = encrypt(compressed);
+    let mut bad_table = compressed;
+    bad_table[3] = 0; // Every length is zero despite the valid block checksum.
+    let bad_table = encrypt(bad_table);
+    let mut wrong_third = good;
+    wrong_third[49] ^= 1; // CBC change to the third header's checked byte.
+    let mut extra = vec![36, 1, 0, 0, 4];
+    extra.extend(salt);
+    extra.extend(iv);
+    let mut file = vec![2, 3];
+    file.extend(vint(extra.len() as u64));
+    file.extend(vint(good.len() as u64));
+    file.extend([0, 10, 0]);
+    file.extend(vint(1 << 7));
+    file.extend([0, 1, b'x']);
+    file.extend(extra);
+    let prefix = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 0]), &rar5_block(&file)].concat();
+    let end = rar5_block(&[5, 0, 0]);
+    let bad_archive = [&prefix[..], &bad_table[..], &end[..]].concat();
+    let reader = ManagedReader::from_bytes(bad_archive, Default::default());
+    let context = prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("visible block"));
+    let password = [Arc::from("secret")];
+    assert_eq!(context.verify(&password, None).unwrap().status, "no_match");
+
+    let head = [&prefix[..], &good[..48]].concat();
+    let bad = [&wrong_third[48..], &end[..]].concat();
+    let tail = [&good[48..], &end[..]].concat();
+    let paths: Vec<_> = [head, bad, tail].iter().enumerate().map(|(i, data)|
+        crate::test_support::temp_file(&format!("rar5_third_block_{i}"), data)).collect();
+    let plan = VolumeAttemptPlan {
+        sources: paths.iter().map(|path| InputExtent {
+            path: path.to_string_lossy().into_owned(), start: 0, end: Some(path.metadata().unwrap().len()),
+        }).collect(),
+        layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..2).map(|i| VolumeSlot {
+            number: i as u32 + 1, canonical_name: format!("part.{}", i + 1), domain: i,
+        }).collect() }].into_boxed_slice(),
+        domains: [vec![0], vec![1, 2]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
+        head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
+    };
+    let mut preparation = Preparation::default();
+    preparation.fix_password();
+    let result = rar_fast_verify_passwords_from_attempts(&mut preparation, &plan.sources[0],
+        &plan, &password, &[], false).unwrap();
+    let remaining = result.volume_attempts.expect("third block prunes one tail");
+    assert!(!remaining.sources.contains(&plan.sources[1]));
+    assert!(remaining.sources.contains(&plan.sources[2]));
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+}
+
+#[test]
+fn rar5_empty_stored_member_can_prove_its_keyed_digest_without_payload() {
+    // 7-Zip verifies both fixtures with "secret" and rejects "wrong".
+    let blake_mac = [
+        0xb7, 0x11, 0x99, 0x69, 0x28, 0xbd, 0xdd, 0xd8, 0xc4, 0xcd, 0x3e, 0x38, 0x35, 0xb3, 0xad, 0x53,
+        0x4f, 0xee, 0x3a, 0x22, 0x3c, 0x92, 0x13, 0x47, 0x6c, 0xad, 0xbf, 0x37, 0x14, 0xd2, 0x70, 0x7a,
+    ];
+    for blake in [false, true] {
+        let mut extra = vec![36, 1, 0, 2, 4];
+        extra.extend([0x73; 16]);
+        extra.extend([0x64; 16]);
+        if blake {
+            extra.extend([34, 2, 0]);
+            extra.extend(blake_mac);
+        }
+        let mut file = vec![2, 1, extra.len() as u8, if blake { 0 } else { 4 }, 0, 0];
+        if !blake { file.extend(0x0a5b01e3u32.to_le_bytes()); }
+        file.extend([0, 0, 1, b'x']);
+        file.extend(&extra);
+        let archive = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 0]), &rar5_block(&file), &rar5_block(&[5, 0, 0])].concat();
+        let reader = ManagedReader::from_bytes(archive, Default::default());
+        let context = prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("keyed empty digest"));
+        let result = context.verify(&[Arc::from("wrong"), Arc::from("secret")], None).unwrap();
+        assert_eq!(result.match_evidence, Some("rar5_empty_member_mac"));
+        assert_eq!(result.matched_indices, [1]);
+        assert_eq!(result.final_confirmation_required, Some(false));
+    }
 }
 
 #[test]

@@ -42,9 +42,21 @@ pub(crate) fn seven_zip_prefix_check(
     match method {
         // 7-Zip C/LzmaDec.c: initialization rejects a nonzero first byte and
         // the impossible initial repetition range (kBadRepCode).
-        [0x03, 0x01, 0x01] => seven_zip_range_prefix(prefix, Some(0xbfff_fc00)),
-        // 7-Zip C/Ppmd7Dec.c: Ppmd7z_RangeDec_Init, not ZIP's PPMd coder.
-        [0x03, 0x04, 0x01] => seven_zip_range_prefix(prefix, Some(u32::MAX)),
+        [0x03, 0x01, 0x01] => {
+            if unpack_size != 0 && packed_size < 5 {
+                return Reject;
+            }
+            seven_zip_range_prefix(prefix, Some(0xbfff_fc00))
+        }
+        // Ppmd7.c initializes 256 literals of frequency one and a single
+        // escape. At the root that escape ends the stream before any output.
+        [0x03, 0x04, 0x01] => {
+            if unpack_size != 0 && packed_size < 5 {
+                return Reject;
+            }
+            let bound = if unpack_size == 0 { u32::MAX } else { (u32::MAX / 257) * 256 };
+            seven_zip_range_prefix(prefix, Some(bound))
+        }
         [0x21] => seven_zip_lzma2_prefix(prefix, packed_size, unpack_size),
         [0x04, 0x02, 0x02] => {
             // BZip2Decoder.cpp ReadStreamSignature2 / ReadBlockSignature2.
@@ -82,7 +94,7 @@ pub(crate) fn seven_zip_prefix_check(
 
 enum SevenZipFrameStep {
     Skip(u64),
-    Last,
+    Last(u64),
     Lz4(crate::formats::lz4::Header, u64),
     Zstd(crate::formats::zstd::FrameHeader, u64),
 }
@@ -136,11 +148,9 @@ fn seven_zip_frame_step(
         }
         let Some(block) = prefix.get(header.len..end) else { return Ok(None) };
         let word = u32::from_le_bytes(block.try_into().unwrap());
-        seven_zip_lz4_block(&header, word, packed_size - end as u64).map(|next| {
-            Some(match next {
-                Some(span) => SevenZipFrameStep::Lz4(header, end as u64 + span),
-                None => SevenZipFrameStep::Last,
-            })
+        seven_zip_lz4_block(&header, word, packed_size - end as u64).map(|(span, last)| {
+            let next = end as u64 + span;
+            Some(if last { SevenZipFrameStep::Last(next) } else { SevenZipFrameStep::Lz4(header, next) })
         })
     } else if magic == zstd::MAGIC {
         let Some(&descriptor) = prefix.get(4) else { return Ok(None) };
@@ -154,11 +164,9 @@ fn seven_zip_frame_step(
         }
         let Some(block) = prefix.get(offset..end) else { return Ok(None) };
         let frame = zstd::FrameHeader::parse(&prefix[4..offset]).ok_or(())?;
-        seven_zip_zstd_block(&frame, block.try_into().unwrap(), packed_size - end as u64).map(|next| {
-            Some(match next {
-                Some(span) => SevenZipFrameStep::Zstd(frame, end as u64 + span),
-                None => SevenZipFrameStep::Last,
-            })
+        seven_zip_zstd_block(&frame, block.try_into().unwrap(), packed_size - end as u64).map(|(span, last)| {
+            let next = end as u64 + span;
+            Some(if last { SevenZipFrameStep::Last(next) } else { SevenZipFrameStep::Zstd(frame, next) })
         })
     } else {
         Err(())
@@ -167,20 +175,21 @@ fn seven_zip_frame_step(
 
 fn seven_zip_lz4_block(
     header: &crate::formats::lz4::Header, word: u32, remaining: u64,
-) -> Result<Option<u64>, ()> {
+) -> Result<(u64, bool), ()> {
     let span = header.block_span(word).map_err(|_| ())?;
     let next_header = if word == 0 { 0 } else { 4 + u64::from(header.content_checksum) * 4 };
-    (span + next_header <= remaining).then_some((word != 0).then_some(span)).ok_or(())
+    (span + next_header <= remaining).then_some((span, word == 0)).ok_or(())
 }
 
 fn seven_zip_zstd_block(
     frame: &crate::formats::zstd::FrameHeader, header: [u8; 3], remaining: u64,
-) -> Result<Option<u64>, ()> {
+) -> Result<(u64, bool), ()> {
     let block = frame.block(header).ok_or(())?;
     let next_header = if block.last { 0 } else { 3 };
     let checksum_size = if frame.has_checksum { 4 } else { 0 };
     (block.encoded_size + next_header + checksum_size <= remaining)
-        .then_some((!block.last).then_some(block.encoded_size)).ok_or(())
+        .then_some((block.encoded_size + if block.last { checksum_size } else { 0 }, block.last))
+        .ok_or(())
 }
 
 fn seven_zip_lzma2_prefix(
@@ -270,7 +279,7 @@ fn seven_zip_has_block_successor(method: &[u8]) -> bool {
 
 // Each extra read is derived from an already checked codec length. There is
 // no magic scan, decompression, or dependence on the intervening block body.
-fn seven_zip_successor_prefix<E>(
+pub(crate) fn seven_zip_successor_prefix<E>(
     method: &[u8], prefix: &[u8], packed: u64, unpacked: u64,
     mut read: impl FnMut(u64, &mut [u8]) -> Result<(), E>,
     mut still_ambiguous: impl FnMut(u64) -> bool,
@@ -314,7 +323,9 @@ fn seven_zip_successor_prefix<E>(
     let mut checked_successor = false;
     loop {
         step = match step {
-            Ok(Some(SevenZipFrameStep::Skip(span))) => {
+            Ok(Some(SevenZipFrameStep::Last(span))) if
+                packed - offset == span || !still_ambiguous(offset + span) => return Ok(Strong),
+            Ok(Some(SevenZipFrameStep::Skip(span) | SevenZipFrameStep::Last(span))) => {
                 offset += span;
                 if packed - offset < 4 {
                     return Ok(Weak);
@@ -324,7 +335,6 @@ fn seven_zip_successor_prefix<E>(
                 read(offset, &mut header[..size])?;
                 seven_zip_frame_step(&header[..size], packed - offset, is_lz4)
             }
-            Ok(Some(SevenZipFrameStep::Last)) => return Ok(Strong),
             Ok(Some(SevenZipFrameStep::Lz4(frame, next))) => {
                 if checked_successor && !still_ambiguous(offset + next) {
                     return Ok(Strong);
@@ -333,7 +343,10 @@ fn seven_zip_successor_prefix<E>(
                 read(offset + next, &mut header)?;
                 checked_successor = true;
                 seven_zip_lz4_block(&frame, u32::from_le_bytes(header), packed - offset - next - 4)
-                    .map(|span| Some(span.map_or(SevenZipFrameStep::Last, |span| SevenZipFrameStep::Lz4(frame, next + 4 + span))))
+                    .map(|(span, last)| {
+                        let next = next + 4 + span;
+                        Some(if last { SevenZipFrameStep::Last(next) } else { SevenZipFrameStep::Lz4(frame, next) })
+                    })
             }
             Ok(Some(SevenZipFrameStep::Zstd(frame, next))) => {
                 if checked_successor && !still_ambiguous(offset + next) {
@@ -343,7 +356,10 @@ fn seven_zip_successor_prefix<E>(
                 read(offset + next, &mut header)?;
                 checked_successor = true;
                 seven_zip_zstd_block(&frame, header, packed - offset - next - 3)
-                    .map(|span| Some(span.map_or(SevenZipFrameStep::Last, |span| SevenZipFrameStep::Zstd(frame, next + 3 + span))))
+                    .map(|(span, last)| {
+                        let next = next + 3 + span;
+                        Some(if last { SevenZipFrameStep::Last(next) } else { SevenZipFrameStep::Zstd(frame, next) })
+                    })
             }
             Ok(None) => return Ok(Weak),
             Err(()) => return Ok(Reject),
@@ -402,8 +418,15 @@ mod seven_zip_prefix_tests {
         let ppmd = &[3, 4, 1];
         assert_eq!(check(lzma, &[], &[0, 0xbf, 0xff, 0xfb, 0xff], 1), Weak);
         assert_eq!(check(lzma, &[], &[0, 0xbf, 0xff, 0xfc, 0], 1), Reject);
-        assert_eq!(check(ppmd, &[], &[0, 0xff, 0xff, 0xff, 0xfe], 1), Weak);
+        let boundary = (u32::MAX / 257) * 256;
+        let mut ppmd_code = [0; 5];
+        ppmd_code[1..].copy_from_slice(&(boundary - 1).to_be_bytes());
+        assert_eq!(check(ppmd, &[], &ppmd_code, 1), Weak);
+        ppmd_code[1..].copy_from_slice(&boundary.to_be_bytes());
+        assert_eq!(check(ppmd, &[], &ppmd_code, 1), Reject);
+        assert_eq!(check(ppmd, &[], &ppmd_code, 0), Weak);
         assert_eq!(check(ppmd, &[], &[0, 0xff, 0xff, 0xff, 0xff], 1), Reject);
+        assert_eq!(seven_zip_prefix_check(ppmd, &[0], 4, 1), Reject);
         assert_eq!(check(&[0x21], &[], &[0], 0), Weak);
         assert_eq!(check(&[0x21], &[], &[0], 1), Reject);
         assert_eq!(check(&[0x21], &[], &[1, 0, 1, 255, 255], 2), Weak);

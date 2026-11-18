@@ -310,23 +310,44 @@ namespace sunpack::sevenzip
         std::wstring failed_volume_name_;
     };
 
+    class PasswordProofOutStream final : public CMyUnknownImp, public ISequentialOutStream
+    {
+        Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+    public:
+        UInt32 covered() const { return covered_; }
+
+        HRESULT STDMETHODCALLTYPE Write(const void*, UInt32 size, UInt32* processed) SUP7Z_NOEXCEPT override {
+            if (covered_ < sizeof(UInt32))
+                covered_ += (std::min)(size, static_cast<UInt32>(sizeof(UInt32)) - covered_);
+            if (processed) *processed = size;
+            return S_OK;
+        }
+
+    private:
+        UInt32 covered_ = 0;
+    };
+
     class ExtractCallback final : public CMyUnknownImp, public IArchiveExtractCallback, public ICryptoGetTextPassword
     {
         Z7_COM_UNKNOWN_IMP_3(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword)
         
 
     public:
-        explicit ExtractCallback(std::wstring password) : password_(std::move(password)), cancel_token_(native_job_cancel_token()) {}
+        explicit ExtractCallback(std::wstring password, std::optional<UInt32> measure_item = std::nullopt)
+            : password_(std::move(password)), cancel_token_(native_job_cancel_token()), measure_item_(measure_item) {}
 
         Int32 operation_result() const { return operation_result_; }
         bool password_requested() const { return password_requested_; }
+        UInt32 measured_size() const {
+            return measurement_ ? static_cast<PasswordProofOutStream*>(measurement_.Interface())->covered() : 0;
+        }
 
 
         HRESULT STDMETHODCALLTYPE SetTotal(UInt64) SUP7Z_NOEXCEPT override { return cancelled() ? E_ABORT : S_OK; }
 
         HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *) SUP7Z_NOEXCEPT override { return cancelled() ? E_ABORT : S_OK; }
 
-        HRESULT STDMETHODCALLTYPE GetStream(UInt32, ISequentialOutStream **outStream, Int32) SUP7Z_NOEXCEPT override
+        HRESULT STDMETHODCALLTYPE GetStream(UInt32 index, ISequentialOutStream **outStream, Int32 mode) SUP7Z_NOEXCEPT override
         {
 
             if (!outStream)
@@ -336,7 +357,17 @@ namespace sunpack::sevenzip
             }
 
             *outStream = nullptr;
-            return cancelled() ? E_ABORT : S_OK;
+            if (cancelled()) return E_ABORT;
+            if (mode == NArchive::NExtract::NAskMode::kTest && measure_item_ == index) {
+                if (!measurement_) {
+                    auto* stream = new (std::nothrow) PasswordProofOutStream;
+                    if (!stream) return E_OUTOFMEMORY;
+                    measurement_ = stream;
+                }
+                *outStream = measurement_.Interface();
+                (*outStream)->AddRef();
+            }
+            return S_OK;
         }
 
         HRESULT STDMETHODCALLTYPE PrepareOperation(Int32) SUP7Z_NOEXCEPT override { return cancelled() ? E_ABORT : S_OK; }
@@ -370,6 +401,8 @@ namespace sunpack::sevenzip
         bool cancelled() const noexcept { return cancel_token_ && cancel_token_->load(std::memory_order_acquire); }
         std::wstring password_;
         std::shared_ptr<std::atomic<bool>> cancel_token_;
+        std::optional<UInt32> measure_item_;
+        CMyComPtr<ISequentialOutStream> measurement_;
 
         Int32 operation_result_ = kOpOk;
         bool password_requested_ = false;
@@ -983,14 +1016,18 @@ namespace sunpack::sevenzip
             clear_prop(value);
             // A payload checksum or MAC can confirm its password.
             // RAR5 link records carry no encrypted payload.
-            bool strong_password_proof = false;
+            auto password_proof = OutputPasswordProof::None;
             if (encrypted && !is_hard_link)
             {
-                strong_password_proof = get_item_property(archive_, index, kpidSunpackProofSize, value) &&
-                    strong_member_crc(prop_u64(value));
+                if (get_item_property(archive_, index, kpidSunpackProofSize, value)) {
+                    const auto proof_size = prop_u64(value);
+                    if (proof_size == kSunpackUnknownProofSize) password_proof = OutputPasswordProof::MeasureSize;
+                    else if (strong_member_crc(proof_size)) password_proof = OutputPasswordProof::Strong;
+                }
                 clear_prop(value);
-                if (!strong_password_proof)
-                    strong_password_proof = get_item_property(archive_, index, kpidSunpackMacPackedSize, value);
+                if (password_proof != OutputPasswordProof::Strong &&
+                    get_item_property(archive_, index, kpidSunpackMacPackedSize, value))
+                    password_proof = OutputPasswordProof::Strong;
                 clear_prop(value);
             }
 
@@ -1012,7 +1049,7 @@ namespace sunpack::sevenzip
             encrypted_ |= encrypted;
             item.expected_size = expected_size;
             item.has_expected_size = has_expected_size;
-            item.strong_password_proof = strong_password_proof;
+            item.password_proof = password_proof;
             // Keep names only for potential hard-link targets. Positions
             // correspond to trace entries, including empty directory slots.
             if (supports_hard_links_)

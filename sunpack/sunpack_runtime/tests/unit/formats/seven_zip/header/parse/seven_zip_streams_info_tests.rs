@@ -94,7 +94,7 @@ fn parses_folder_graph_and_inherited_single_substream_crc() {
     // The inherited folder CRC leaves no explicit CRC flags or values.
     raw.extend([SZ_SUB_STREAMS_INFO, SZ_CRC, SZ_END, SZ_END, SZ_END]);
     let mut streams = SevenZipStreams::default();
-    parse_seven_zip_header_with_data(&raw, &mut streams, true, None).unwrap();
+    parse_seven_zip_header_with_data(&raw, &mut streams, &mut SevenZipStreams::default(), true, None).unwrap();
     assert_eq!(streams.folders.len(), 1);
     assert_eq!(streams.folders[0].unpack_size(0), 20);
     assert_eq!(streams.folders[0].coders[0].method_id, [0]);

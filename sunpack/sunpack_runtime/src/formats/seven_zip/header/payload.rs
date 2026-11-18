@@ -428,7 +428,9 @@ impl SevenZipPasswordContext {
                     pack: Some(pack),
                     folders: vec![folder],
                 };
-                return Self::from_streams(reader, next.offset, streams, true, evidence);
+                return Self::from_streams(
+                    reader, next.offset, streams, Some(SevenZipMetadata::Header), evidence,
+                );
             }
             let packed =
                 read_seven_zip_packed_data(reader, reader_len, next.offset, &pack, &folder, 0)?;
@@ -448,6 +450,7 @@ impl SevenZipPasswordContext {
             return Err("7z payload probe header tree is unsupported".into());
         }
         let mut streams = SevenZipStreams::default();
+        let mut additional_streams = SevenZipStreams::default();
         let mut encrypted_metadata = None;
         let mut additional = |streams: &mut SevenZipStreams, index, count| {
             let folder = streams.folders.get(index).ok_or("7z external folder stream index is invalid")?;
@@ -457,7 +460,9 @@ impl SevenZipPasswordContext {
             if encrypted && !seven_zip_probe_folder_supported(folder) {
                 return Err("7z external folder encryption graph is unsupported".into());
             }
-            let packed = read_seven_zip_packed_data(reader, reader_len, next.offset, pack, folder, first)?;
+            let packed = evidence.independent(reader, |reader| {
+                read_seven_zip_packed_data(reader, reader_len, next.offset, pack, folder, first)
+            })?;
             if encrypted {
                 let folder = streams.folders.remove(index);
                 encrypted_metadata = Some(SevenZipPasswordProbe::from_parts(
@@ -472,20 +477,101 @@ impl SevenZipPasswordContext {
             }
             Ok(decoded)
         };
-        let parsed = parse_seven_zip_header_with_data(&raw, &mut streams, true, Some(&mut additional));
+        let parsed = parse_seven_zip_header_with_data(
+            &raw, &mut streams, &mut additional_streams, true, Some(&mut additional),
+        );
         if let Some(metadata) = encrypted_metadata {
             return Ok(Some(Self::Header(metadata)));
         }
-        parsed?;
         drop(raw);
-        Self::from_streams(reader, next.offset, streams, false, evidence)
+        if parsed.as_ref().is_err_and(|error| matches!(
+            error.as_ref(), "7z packed stream crc mismatch" | "7z external folder metadata crc mismatch"
+        )) {
+            return parsed.map(|_| None);
+        }
+        let mut additional_error = None;
+        if seven_zip_streams_encrypted(&additional_streams) {
+            // The archive reader decodes these header streams even when the
+            // member graph and its Folder definitions are themselves clear.
+            let names = parsed.as_ref().ok().copied().flatten();
+            if let Some(probe) = Self::additional_metadata_probe(
+                reader, reader_len, next.offset, &mut additional_streams, names, evidence,
+            )? {
+                return Ok(Some(probe));
+            }
+            match Self::from_streams(
+                reader, next.offset, additional_streams, Some(SevenZipMetadata::Additional), evidence,
+            ) {
+                Ok(Some(probe)) => return Ok(Some(probe)),
+                Ok(None) => {}
+                Err(error) if error == "7z packed stream crc mismatch" => return Err(error),
+                Err(error) => additional_error = Some(error),
+            }
+        }
+        parsed?;
+        match Self::from_streams(reader, next.offset, streams, None, evidence)? {
+            Some(result) => Ok(Some(result)),
+            None => additional_error.map_or(Ok(None), Err),
+        }
+    }
+
+    fn additional_metadata_probe<R: Read + Seek>(
+        reader: &mut R,
+        reader_len: u64,
+        before: u64,
+        streams: &mut SevenZipStreams,
+        names: Option<(usize, u64)>,
+        evidence: &impl SevenZipEvidenceReads<R>,
+    ) -> Result<Option<Self>, SevenZipMetadataError> {
+        let Some(pack) = &streams.pack else { return Ok(None) };
+        let mut first = 0;
+        let mut candidates = Vec::new();
+        for (index, folder) in streams.folders.iter().enumerate() {
+            let end = first + folder.packed_streams.len();
+            let Some(sizes) = pack.sizes.get(first..end) else { return Ok(None) };
+            let metadata = if folder.expected_crc.is_some() {
+                Some(SevenZipMetadata::Additional)
+            } else {
+                names.filter(|&(folder, _)| folder == index)
+                    .map(|(_, count)| SevenZipMetadata::Names(count))
+            };
+            if let Some(metadata) = metadata.filter(|_| seven_zip_probe_folder_supported(folder)) {
+                let (cycles, _, _) = folder.coders.iter()
+                    .find(|coder| coder.method_id == EncoderMethod::ID_AES256_SHA256)
+                    .and_then(|coder| seven_zip_aes_properties(&coder.properties))
+                    .expect("supported encrypted folder");
+                let size = sizes.iter().copied().fold(0u64, u64::saturating_add);
+                let strong = folder.expected_crc.is_some();
+                candidates.push((seven_zip_payload_cost(cycles, size, strong), index, first, metadata));
+            }
+            first = end;
+        }
+        candidates.sort_unstable_by_key(|&(cost, index, _, _)| (cost, index));
+        for (_, index, first, metadata) in candidates {
+            let folder = &streams.folders[index];
+            match evidence.independent(reader, |reader| {
+                read_seven_zip_packed_data(reader, reader_len, before, pack, folder, first)
+            }) {
+                Ok(packed) => {
+                    let folder = streams.folders.remove(index);
+                    return Ok(Some(Self::Header(SevenZipPasswordProbe::from_parts(
+                        packed, folder, metadata,
+                    ))));
+                }
+                Err(error) if error.starts_with("resource_unavailable:") => {
+                    check_password_cancellation().map_err(std::borrow::Cow::Owned)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 
     fn from_streams<R: Read + Seek>(
         reader: &mut R,
         before: u64,
         streams: SevenZipStreams,
-        header: bool,
+        metadata: Option<SevenZipMetadata>,
         evidence: &impl SevenZipEvidenceReads<R>,
     ) -> Result<Option<Self>, std::borrow::Cow<'static, str>> {
         if streams.folders.is_empty() && streams.pack.is_none() {
@@ -521,7 +607,8 @@ impl SevenZipPasswordContext {
                         digests.push((size, offset, expected));
                     }
                 }
-                if let Some(plan) = seven_zip_payload_plan(folder, input, offset, size, header) {
+                let plain_header = matches!(metadata, Some(SevenZipMetadata::Header));
+                if let Some(plan) = seven_zip_payload_plan(folder, input, offset, size, plain_header) {
                     let ambiguous = evidence.range_is_ambiguous(reader, plan.offset, 16);
                     plans.push((ambiguous, plan));
                 }
@@ -532,12 +619,7 @@ impl SevenZipPasswordContext {
         if pack_index != pack.sizes.len() {
             return Err("7z payload pack stream count mismatch".into());
         }
-        let encrypted = streams.folders.iter().any(|folder| {
-                folder
-                    .coders
-                    .iter()
-                    .any(|coder| coder.method_id == EncoderMethod::ID_AES256_SHA256)
-            });
+        let encrypted = seven_zip_streams_encrypted(&streams);
         drop(streams);
         plans.sort_by_key(|(ambiguous, plan)| (!ambiguous, plan.cost));
         let mut first_error = None;
@@ -567,7 +649,7 @@ impl SevenZipPasswordContext {
             let rest = if source.is_some() { plans.collect() } else { Vec::new() };
             return Ok(Some(Self::Prefix {
                 probe: SevenZipPayloadProbes { first, rest, source },
-                header,
+                header: metadata.is_some(),
             }));
         }
         if !encrypted {
@@ -575,6 +657,12 @@ impl SevenZipPasswordContext {
         }
         Err(first_error.unwrap_or_else(|| "7z payload has no supported prescreen evidence".into()))
     }
+}
+
+fn seven_zip_streams_encrypted(streams: &SevenZipStreams) -> bool {
+    streams.folders.iter().any(|folder| {
+        folder.coders.iter().any(|coder| coder.method_id == EncoderMethod::ID_AES256_SHA256)
+    })
 }
 
 impl SevenZipPayloadProbe {

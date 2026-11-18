@@ -84,6 +84,8 @@ struct ExtractInputTrace {
     std::wstring last_source_path;
 };
 
+enum class OutputPasswordProof : unsigned char { None, Strong, MeasureSize };
+
 struct ExtractOutputItemTrace {
     unsigned int index = 0;
     unsigned long long bytes_written = 0;
@@ -92,7 +94,7 @@ struct ExtractOutputItemTrace {
     bool is_dir = false;
     bool encrypted = false;
     bool has_expected_size = false;
-    bool strong_password_proof = false;
+    OutputPasswordProof password_proof = OutputPasswordProof::None;
     bool done = false;
     bool failed = false;
     bool has_mtime_ns = false;

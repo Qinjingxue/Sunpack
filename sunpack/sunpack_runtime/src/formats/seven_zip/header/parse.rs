@@ -24,30 +24,31 @@ type SevenZipAdditionalFolders<'a> =
     dyn FnMut(&mut SevenZipStreams, usize, usize) -> Result<Blob, SevenZipMetadataError> + 'a;
 
 fn parse_seven_zip_header_with_data(
-    raw: &[u8], streams: &mut SevenZipStreams, retain_decode_data: bool,
+    raw: &[u8], streams: &mut SevenZipStreams, additional: &mut SevenZipStreams,
+    retain_decode_data: bool,
     mut resolve: Option<&mut SevenZipAdditionalFolders<'_>>,
-) -> Result<(), SevenZipMetadataError> {
+) -> Result<Option<(usize, u64)>, SevenZipMetadataError> {
     let mut pos = 1;
-    let mut additional = SevenZipStreams::default();
+    let mut external_names = None;
     loop {
         let nid = read_sz_vint(raw, &mut pos).ok_or("header_tree_truncated_before_end")?;
         let nid = u8::try_from(nid).map_err(|_| "unsupported_header_nid")?;
         match nid {
-            SZ_END => return Ok(()),
+            SZ_END => return Ok(external_names),
             SZ_ARCHIVE_PROPERTIES => skip_seven_zip_properties(raw, &mut pos)?,
             SZ_ADDITIONAL_STREAMS_INFO => {
-                let crc = parse_seven_zip_streams_info(raw, &mut pos, &mut additional, resolve.is_some(), &mut None)?;
+                let crc = parse_seven_zip_streams_info(raw, &mut pos, additional, resolve.is_some(), &mut None)?;
                 if let [folder] = additional.folders.as_mut_slice() {
                     folder.expected_crc = folder.expected_crc.or(crc);
                 }
             }
             SZ_MAIN_STREAMS_INFO => {
                 let mut fetch = |index, count| {
-                    resolve.as_mut().ok_or("unpack_info_external_folders_unsupported")?(&mut additional, index, count)
+                    resolve.as_mut().ok_or("unpack_info_external_folders_unsupported")?(additional, index, count)
                 };
                 parse_seven_zip_streams_info(raw, &mut pos, streams, retain_decode_data, &mut Some(&mut fetch))?;
             }
-            SZ_FILES_INFO => parse_seven_zip_files_info(raw, &mut pos)?,
+            SZ_FILES_INFO => external_names = parse_seven_zip_files_info(raw, &mut pos)?,
             _ => return Err("unsupported_header_nid".into()),
         }
     }
@@ -578,28 +579,42 @@ fn skip_seven_zip_crcs(
     Ok(())
 }
 
-fn parse_seven_zip_files_info(data: &[u8], pos: &mut usize) -> Result<(), &'static str> {
-    let _num_files = read_sz_vint(data, pos).ok_or("7z FilesInfo file count is truncated")?;
-    skip_seven_zip_properties(data, pos)
+fn parse_seven_zip_files_info(data: &[u8], pos: &mut usize) -> Result<Option<(usize, u64)>, &'static str> {
+    let num_files = read_sz_vint(data, pos).ok_or("7z FilesInfo file count is truncated")?;
+    let mut external_names = None;
+    while let Some((nid, property)) = read_seven_zip_property(data, pos)? {
+        if nid == u64::from(SZ_NAME) {
+            external_names = match property {
+                [flag, index @ ..] if *flag != 0 && num_files != 0 => {
+                    read_sz_vint(index, &mut 0)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .map(|index| (index, num_files))
+                }
+                _ => None,
+            };
+        }
+    }
+    Ok(external_names)
 }
 
 fn skip_seven_zip_properties(data: &[u8], pos: &mut usize) -> Result<(), &'static str> {
-    loop {
-        let nid = read_sz_vint(data, pos).ok_or("7z property ID is truncated")?;
-        if nid == u64::from(SZ_END) {
-            return Ok(());
-        }
-        let size = read_sz_vint(data, pos).ok_or("7z property size is truncated")?;
-        let prop_size =
-            usize::try_from(size).map_err(|_| "7z property size is too large")?;
-        let prop_end = (*pos)
-            .checked_add(prop_size)
-            .ok_or("7z property range overflowed")?;
-        if prop_end > data.len() {
-            return Err("7z property is truncated");
-        }
-        *pos = prop_end;
+    while read_seven_zip_property(data, pos)?.is_some() {}
+    Ok(())
+}
+
+fn read_seven_zip_property<'a>(
+    data: &'a [u8], pos: &mut usize,
+) -> Result<Option<(u64, &'a [u8])>, &'static str> {
+    let nid = read_sz_vint(data, pos).ok_or("7z property ID is truncated")?;
+    if nid == u64::from(SZ_END) {
+        return Ok(None);
     }
+    let size = read_sz_vint(data, pos).ok_or("7z property size is truncated")?;
+    let size = usize::try_from(size).map_err(|_| "7z property size is too large")?;
+    let end = pos.checked_add(size).ok_or("7z property range overflowed")?;
+    let property = data.get(*pos..end).ok_or("7z property is truncated")?;
+    *pos = end;
+    Ok(Some((nid, property)))
 }
 
 #[cfg(test)]

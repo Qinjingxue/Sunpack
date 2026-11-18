@@ -24,6 +24,54 @@ fn main() {
     println!("cargo:rerun-if-changed={}", seven_zip.display());
     println!("cargo:rerun-if-changed=src/password/rar_blake2sp.c");
 
+    let ppmd_header = "src/formats/seven_zip/header/ppmd.c";
+    cc::Build::new()
+        .include(seven_zip)
+        .file(seven_zip.join("Ppmd7.c"))
+        .file(seven_zip.join("Ppmd7Dec.c"))
+        .file(ppmd_header)
+        .warnings(false)
+        .compile("sunpack_ppmd7");
+    println!("cargo:rerun-if-changed={ppmd_header}");
+
+    let cpp = seven_zip.join("../CPP");
+    let deflate64_header = "src/formats/seven_zip/header/deflate64.cpp";
+    let mut deflate64 = cc::Build::new();
+    deflate64
+        .cpp(true)
+        .include(&seven_zip)
+        .include(&cpp)
+        .define("NOMINMAX", None)
+        .define("MidAlloc", "SunpackDeflate64Alloc")
+        .define("MidFree", "SunpackDeflate64Free")
+        .flag_if_supported("/EHsc")
+        .warnings(false);
+    for name in [
+        "7zip/Compress/BitlDecoder.cpp",
+        "7zip/Compress/DeflateDecoder.cpp",
+        "7zip/Compress/LzOutWindow.cpp",
+        "7zip/Common/InBuffer.cpp",
+        "7zip/Common/OutBuffer.cpp",
+    ] {
+        deflate64.file(cpp.join(name));
+    }
+    deflate64.file(deflate64_header).compile("sunpack_deflate64");
+    println!("cargo:rerun-if-changed={}", cpp.display());
+    println!("cargo:rerun-if-changed={deflate64_header}");
+
+    let rar_crypto = seven_zip.join("../CPP/7zip/Crypto");
+    let rar2_prefix = "src/password/rar2_crypto.cpp";
+    cc::Build::new()
+        .cpp(true)
+        .include(&rar_crypto)
+        .define("g_CrcTable", "sunpack_password_crc_table")
+        .file(rar_crypto.join("Rar20Crypto.cpp"))
+        .file(rar2_prefix)
+        .warnings(false)
+        .compile("sunpack_rar2_crypto");
+    println!("cargo:rerun-if-changed={}", rar_crypto.display());
+    println!("cargo:rerun-if-changed={rar2_prefix}");
+
     let target = std::env::var("TARGET").expect("Cargo build target");
     if target.ends_with("-windows-msvc") {
         embed_windows_resources(&target);

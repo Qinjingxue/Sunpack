@@ -65,6 +65,11 @@ impl ValidationUnavailable {
             Self::Read(error) => read_reason(error),
         }
     }
+
+    fn contradicts_header(&self) -> bool {
+        // These bytes have already been located by a password-only header.
+        matches!(self, Self::Certificate | Self::InvalidSize | Self::Read(DeferredReadError::Truncated))
+    }
 }
 
 impl PasswordHeader {
@@ -268,12 +273,16 @@ impl PasswordHeader {
                         // VData is the first ciphertext in this CBC stream.
                         // Its final block is already available as the chaining
                         // value for the adjacent compression header.
-                        if let Ok(bytes) = first_body_block.get_or_insert_with(|| read(offset, BLOCK)) {
-                            let previous = validation.bytes.last_chunk::<BLOCK>().unwrap();
-                            let plain = decrypt_block(&file_cipher, previous, bytes);
-                            if prefix.check_plain(&plain) == Some(false) {
-                                return ValidationMatch::BodyContradiction;
+                        match first_body_block.get_or_insert_with(|| read(offset, BLOCK)) {
+                            Ok(bytes) => {
+                                let previous = validation.bytes.last_chunk::<BLOCK>().unwrap();
+                                let plain = decrypt_block(&file_cipher, previous, bytes);
+                                if prefix.check_plain(&plain) == Some(false) {
+                                    return ValidationMatch::BodyContradiction;
+                                }
                             }
+                            Err(DeferredReadError::Truncated) => return ValidationMatch::BodyContradiction,
+                            Err(_) => {}
                         }
                     }
                     ValidationMatch::Proven
@@ -284,13 +293,15 @@ impl PasswordHeader {
                 })
             })?
         } else { Vec::new() };
-        let unavailable = checks.iter().find_map(|(_, check)| check.as_ref().err());
+        let unavailable = checks.iter().find_map(|(_, check)| {
+            check.as_ref().err().filter(|error| !error.contradicts_header())
+        });
         let viable_body = checks.iter().any(|(_, check)| {
             check.as_ref().is_ok_and(|evidence| evidence.matches.contains(&ValidationMatch::Proven))
         });
         let crc_matches = viable_body || checks.iter().any(|(_, check)| check.as_ref().is_ok_and(
             |evidence| evidence.matches.contains(&ValidationMatch::BodyContradiction)));
-        let reason = if let Some(error) = unavailable {
+        let reason = if let Some(error) = checks.iter().find_map(|(_, check)| check.as_ref().err()) {
             error.reason()
         } else if checks.is_empty() {
             "validation range is unavailable".into()
@@ -313,10 +324,13 @@ impl PasswordHeader {
             }
             if crc_matches {
                 for (scope, check) in &checks {
-                    if let (Some(scope), Ok(evidence)) = (scope, check) {
+                    if let Some(scope) = scope {
                         // A valid VCRC can establish the password even when
                         // the particular member body contradicts this layout.
-                        if evidence.matches[position] != ValidationMatch::Proven {
+                        if match check {
+                            Ok(evidence) => evidence.matches[position] != ValidationMatch::Proven,
+                            Err(error) => error.contradicts_header(),
+                        } {
                             result.scoped_rejections.push((scope.clone(), index));
                         }
                     }
