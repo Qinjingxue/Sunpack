@@ -24,8 +24,8 @@ rayon = "1.10"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "compress"] }
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = { version = "0.10", features = ["compress"] }
+sha2 = { version = "0.10", features = ["compress"] }
 sha2_11 = { package = "sha2", version = "0.11" }
 sunpack-usn-core = { path = "../sunpack_usn_core", default-features = false, features = ["client"] }
 xz2 = "0.1"

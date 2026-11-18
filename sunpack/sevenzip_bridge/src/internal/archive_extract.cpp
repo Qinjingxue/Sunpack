@@ -323,6 +323,7 @@ namespace sunpack::sevenzip
         // before the right one gets its turn. Keep search for carrier fallback.
         const UInt64 start_only = 0;
         const bool bounded_composition = current_extraction_replay && current_extraction_replay->volumes.started;
+        OpenedArchiveStream input{};
         for (std::size_t attempt_index = 0; attempt_index < formats.size() * (bounded_composition ? 1 : 2); ++attempt_index)
         {
             if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
@@ -370,13 +371,16 @@ namespace sunpack::sevenzip
                 }
             }
 
-            auto input = [&] {
+            {
 #ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::StreamOpen);
 #endif
-                return open_archive_stream(archive_path, part_paths, &result.input_trace,
-                    canonical_names, prefetch_config, input_ranges);
-            }();
+                // All handlers in this attempt use the same logical input.
+                // Rewind it instead of reopening and restating its volumes.
+                if (!input.stream || input.stream->Seek(0, STREAM_SEEK_SET, nullptr) != S_OK)
+                    input = open_archive_stream(archive_path, part_paths, &result.input_trace,
+                        canonical_names, prefetch_config, input_ranges);
+            }
 
             if (!input.opened)
             {
@@ -405,7 +409,7 @@ namespace sunpack::sevenzip
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
 #endif
                 return new OpenCallback(
-                    password, std::move(input.callback_path), part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
+                    password, input.callback_path, part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
             }();
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
@@ -549,6 +553,7 @@ namespace sunpack::sevenzip
 #endif
                 archive->Close();
                 archive.Release();
+                input.stream.Release();
             }
             {
 #ifdef SUP7Z_DEBUG

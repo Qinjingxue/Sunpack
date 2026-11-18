@@ -67,6 +67,16 @@ namespace sunpack::sevenzip
             bool encrypted = false;
         };
 
+        constexpr std::size_t large_zip_directory_entries = 2048;
+
+        bool may_have_large_zip_directory(const std::wstring& path) {
+            // A central-directory record has at least 46 bytes. A short
+            // archive can use the existing parallel path immediately.
+            std::error_code error;
+            const auto size = std::filesystem::file_size(win32_extended_path(path), error);
+            return !error && size >= 46 * large_zip_directory_entries;
+        }
+
         struct MemberProof {
             UInt32 index;
             UInt64 cost;
@@ -196,12 +206,19 @@ namespace sunpack::sevenzip
                 const bool is_encrypted = get_item_property(archive, index, kpidEncrypted, value) && prop_bool(value);
                 clear_prop(value);
                 selection.encrypted |= is_encrypted;
+                if (!solid && selection.encrypted && !is_encrypted) continue;
                 const bool is_dir = get_item_property(archive, index, kpidIsDir, value) && prop_bool(value);
                 clear_prop(value);
                 if (is_dir) continue;
-                get_item_property(archive, index, kpidSize, value);
-                const UInt64 size = prop_u64(value);
-                clear_prop(value);
+                // ZIP's proof properties already return the packed MAC span
+                // or the unpacked CRC span. Only solid cost accumulation and
+                // the ordinary fallback need a separate size in that format.
+                UInt64 size = 0;
+                if (solid || !zip || !is_encrypted) {
+                    get_item_property(archive, index, kpidSize, value);
+                    size = prop_u64(value);
+                    clear_prop(value);
+                }
                 UInt64 cost = size;
                 if (solid) {
                     if (seven_zip) {
@@ -223,7 +240,8 @@ namespace sunpack::sevenzip
                     solid_prefix += size;
                     cost = solid_prefix;
                 }
-                if (!regular || cost < regular->cost) regular = MemberProof{index, cost, 0, false, false};
+                if (!selection.encrypted && (!regular || cost < regular->cost))
+                    regular = MemberProof{index, cost, 0, false, false};
                 if (!is_encrypted) continue;
                 const bool authenticated = zip &&
                     get_item_property(archive, index, kpidSunpackMacPackedSize, value);
@@ -233,6 +251,7 @@ namespace sunpack::sevenzip
                 if (!authenticated && get_item_property(archive, index, kpidSunpackProofSize, value))
                     coverage = prop_u64(value);
                 clear_prop(value);
+                if (zip && !solid && !authenticated) cost = coverage;
                 // A single tiny CRC contains only 8 * size evidence bits.
                 // Do not add evidence across members: different folders may
                 // repeat the same encrypted bytes, IV and contents.
@@ -265,7 +284,7 @@ namespace sunpack::sevenzip
             return selection;
         }
 
-        // One batch owns at most one reusable handler. Encrypted headers still
+        // Each lane owns at most one reusable handler. Encrypted headers still
         // open per candidate; neither archive objects nor callbacks enter a
         // process cache or survive the batch's last confirmation.
         struct PasswordProbeCache
@@ -277,6 +296,16 @@ namespace sunpack::sevenzip
             PasswordTestResult evidence;
             ExtractInputTrace input_trace;
             std::vector<MemberProof> alternatives;
+
+            void remember(IInArchive* input, IArchiveOpenCallback* open, OpenCallback* state,
+                          BoundedPasswordProbeSelection selected, const PasswordTestResult& result)
+            {
+                archive = input;
+                callback = open;
+                callback_state = state;
+                selection = selected;
+                evidence = result;
+            }
 
             void reset()
             {
@@ -441,7 +470,8 @@ namespace sunpack::sevenzip
         const std::vector<std::wstring> &canonical_names,
         const std::wstring &format_hint,
         PasswordProbeCache &cache,
-        bool scan_only, bool final_read_only, const ProbeVolumeRanges& volumes
+        bool scan_only, bool final_read_only, const ProbeVolumeRanges& volumes,
+        bool* defer_small_zip = nullptr
 
     )
     {
@@ -634,6 +664,12 @@ namespace sunpack::sevenzip
                 result.password_independent_failure = !raw_open_callback->password_requested();
                 return result;
             }
+            if (defer_small_zip && selection.item_count < large_zip_directory_entries && !raw_open_callback->password_requested() &&
+                !result.missing_volume) {
+                cache.remember(archive.Interface(), open_callback.Interface(), raw_open_callback, selection, result);
+                *defer_small_zip = true;
+                return result;
+            }
             probe_available_member(archive, selection, *raw_open_callback, cache, result.archive_type, volumes,
                 password, last_encryption_evidence, final_read_only, hr, last_op_res);
             result.operation_result = last_op_res;
@@ -666,13 +702,10 @@ namespace sunpack::sevenzip
             }
             const bool weak_match = selection.weak && !final_read_only;
             if (!raw_open_callback->password_requested() &&
-                looks_wrong_password(hr, last_op_res, last_encryption_evidence))
+                (looks_wrong_password(hr, last_op_res, last_encryption_evidence) ||
+                 (weak_match && hr == S_OK && last_op_res == kOpOk)))
             {
-                cache.archive = archive;
-                cache.callback = open_callback;
-                cache.callback_state = raw_open_callback;
-                cache.selection = std::move(selection);
-                cache.evidence = result;
+                cache.remember(archive.Interface(), open_callback.Interface(), raw_open_callback, selection, result);
             }
             else archive->Close();
 
@@ -798,26 +831,49 @@ namespace sunpack::sevenzip
             volumes.attach(result);
             return result;
         }
-        PasswordParallelism parallel(count);
-        std::atomic<std::size_t> next{0}, earliest{count};
+        // A prioritized ZIP password often already has a structural match.
+        // Give it the first decode before other lanes duplicate the archive's
+        // directory. Keep the same lane and handler when more keys are needed.
+        const bool prioritized = !volume_plan && !final_read_only && format_hint == L"zip" && count >= 8 &&
+            part_paths.empty() && input_ranges.empty() && may_have_large_zip_directory(archive_path);
+        PasswordProbeCache primary_cache;
+        std::optional<PasswordTestResult> first;
+        bool deferred = false;
+        if (prioritized) {
+            ExtractionReplayScope replay(nullptr);
+            first = test_one_password(archive_path, candidates[global_index(0)],
+                part_paths, formats, input_ranges, canonical_names, format_hint, primary_cache,
+                scan_only, final_read_only, volumes, &deferred);
+            if (deferred) first.reset();
+            if (first && first->status == PasswordTestStatus::Ok && !first->weak_match && !native_job_cancelled()) {
+                first->matched_index = static_cast<int>(global_index(0));
+                volumes.attach(*first);
+                return std::move(*first);
+            }
+        }
+        auto lanes = count - std::size_t{!deferred && prioritized};
+        const auto& selected = primary_cache.selection;
+        if (primary_cache.archive && selected.weak && !selected.measure_coverage &&
+            selected.item_count >= large_zip_directory_entries && selected.index) {
+            // Each lane parses at least 92 KiB of directory. For a proof covering
+            // at most 256 packed bytes, four lanes keep candidates parallel while
+            // amortizing that directory cost across more attempts per handler.
+            PROPVARIANT packed{};
+            if (get_item_property(primary_cache.archive, *selected.index, kpidPackSize, packed) &&
+                prop_u64(packed) <= 256)
+                lanes = (std::min)(lanes, std::size_t{4});
+            clear_prop(packed);
+        }
+        PasswordParallelism parallel(lanes);
+        std::atomic<std::size_t> next{std::size_t{prioritized}}, earliest{count};
         std::vector<std::optional<PasswordTestResult>> outcomes(parallel.size());
         std::vector<std::optional<PasswordTestResult>> unresolved(parallel.size());
         enum class CandidateProof : unsigned char { Untested, Rejected, Unresolved, Weak };
         std::vector<CandidateProof> proofs(count, CandidateProof::Untested);
-        parallel.run(parallel.size(), [&](std::size_t lane, std::size_t) {
-          PasswordProbeCache cache;
-          for (;;) {
-            const auto index = next.fetch_add(1, std::memory_order_relaxed);
-            if (index >= earliest.load(std::memory_order_relaxed)) break;
-            if (native_job_cancelled()) {
-                break;
-            }
-            auto current = test_one_password(archive_path, candidate_count == 0 ? empty : candidates[global_index(index)],
-                part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes);
-            if (native_job_cancelled()) break;
+        const auto record = [&](std::size_t lane, std::size_t index, PasswordTestResult current) {
             if (current.weak_match && !final_read_only) {
                 proofs[index] = CandidateProof::Weak;
-                continue;
+                return false;
             }
             if (!current.password_independent_failure &&
                 (current.status == PasswordTestStatus::Unsupported || current.status == PasswordTestStatus::NeedsVolumeOrTailDamaged ||
@@ -829,7 +885,7 @@ namespace sunpack::sevenzip
                     current.matched_index = static_cast<int>(index);
                     unresolved[lane] = std::move(current);
                 }
-                continue;
+                return false;
             }
             if (current.status != PasswordTestStatus::WrongPassword)
             {
@@ -837,9 +893,22 @@ namespace sunpack::sevenzip
                 auto old = earliest.load(std::memory_order_relaxed);
                 while (index < old && !earliest.compare_exchange_weak(old, index, std::memory_order_relaxed)) {}
                 outcomes[lane] = std::move(current);
-                break;
+                return true;
             }
             proofs[index] = CandidateProof::Rejected;
+            return false;
+        };
+        if (first && !native_job_cancelled()) record(0, 0, std::move(*first));
+        if (earliest.load(std::memory_order_relaxed) != 0) parallel.run(parallel.size(), [&](std::size_t lane, std::size_t) {
+          PasswordProbeCache extra_cache;
+          auto& cache = lane == 0 ? primary_cache : extra_cache;
+          bool use_deferred = lane == 0 && deferred;
+          for (;;) {
+            const auto index = std::exchange(use_deferred, false) ? 0 : next.fetch_add(1, std::memory_order_relaxed);
+            if (index >= earliest.load(std::memory_order_relaxed) || native_job_cancelled()) break;
+            auto current = test_one_password(archive_path, candidates[global_index(index)],
+                part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes);
+            if (native_job_cancelled() || record(lane, index, std::move(current))) break;
           }
         });
         PasswordTestResult last;

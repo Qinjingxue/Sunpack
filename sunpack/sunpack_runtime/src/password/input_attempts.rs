@@ -10,6 +10,20 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, OnceLock};
 
+#[cfg(test)]
+thread_local! {
+    static EDGE_READS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn count_edge_reads<T>(read: impl FnOnce() -> T) -> (T, usize) {
+    EDGE_READS.with(|reads| {
+        let previous = reads.replace(Some(0));
+        let result = read();
+        (result, reads.replace(previous).unwrap())
+    })
+}
+
 struct AttemptFile {
     path: String,
     reader: OnceLock<Result<ManagedReader, String>>,
@@ -1281,6 +1295,8 @@ impl AttemptReader<'_> {
         bytes: &mut [u8],
         disk_offset: Option<u64>,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        EDGE_READS.with(|reads| reads.set(reads.get().map(|count| count + 1)));
         let edge = &self.projection.topology.edges[index];
         let source = &self.sources[edge.source];
         let offset = source.start + disk_offset.unwrap_or(self.position.saturating_sub(edge.start));
@@ -1410,6 +1426,7 @@ impl AttemptReader<'_> {
         let mut unavailable = Vec::new();
         let mut bytes = vec![0; count];
         let mut comparison = Vec::new();
+        let mut compared_group = None;
         for &index in &covering {
             let edge = &self.projection.topology.edges[index];
             let location = (
@@ -1455,12 +1472,11 @@ impl AttemptReader<'_> {
                     let representative = if group == 0 {
                         &buffer[..count]
                     } else {
-                        comparison.resize(count, 0);
-                        self.read_edge(
-                            groups[group].0,
-                            &mut comparison,
-                            disk.map(|(_, offset)| offset),
-                        )?;
+                        if compared_group != Some(group) {
+                            comparison.resize(count, 0);
+                            self.read_edge(groups[group].0, &mut comparison, disk.map(|(_, offset)| offset))?;
+                            compared_group = Some(group);
+                        }
                         comparison.as_slice()
                     };
                     if bytes == representative {

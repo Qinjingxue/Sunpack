@@ -188,3 +188,42 @@ fn delayed_read_keeps_unavailable_choices_separate_from_readable_bytes() {
         if index != 3 { std::fs::remove_file(path).unwrap(); }
     }
 }
+
+#[test]
+fn equal_volume_evidence_reuses_its_comparison_bytes() {
+    use super::attempts::{count_edge_reads, prepare_attempt_evidence, AttemptGeometry};
+    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    use std::sync::Arc;
+
+    const COPIES: usize = 8;
+    let mut paths = vec![temp_file("shared_evidence_head", b"H"), temp_file("distinct_tail", b"A")];
+    paths.extend((0..COPIES).map(|_| temp_file("repeated_tail", b"B")));
+    let plan = VolumeAttemptPlan {
+        sources: paths.iter().map(|path| InputExtent {
+            path: path.to_string_lossy().into_owned(), start: 0, end: Some(1),
+        }).collect(),
+        domains: [vec![0], (1..paths.len()).collect()].map(|choices|
+            VolumeDomain { choices: Arc::new(choices) }).into(),
+        layouts: vec![VolumeLayout {
+            minimum_slots: 0,
+            slots: (0..2).map(|domain| VolumeSlot {
+                number: domain as u32 + 1, canonical_name: domain.to_string(), domain,
+            }).collect(),
+        }].into(),
+        head_size_from_total: None,
+        minimum_size: None,
+        tail_totals: Box::default(),
+    };
+    let values = prepare_attempt_evidence(&plan.sources[0], &plan, &[],
+        AttemptGeometry::Forward { logical_limit: None },
+        |reader| Ok(Some(reader.deferred_reads(false))),
+    ).unwrap_or_else(|_| panic!("volume alternatives"));
+    let (observations, reads) = count_edge_reads(|| values[0].evaluate(|reader| reader.read(1, 1)));
+    let bytes: Vec<_> = observations.unwrap().into_iter().map(|(_, read)| read.unwrap()[0]).collect();
+    assert_eq!(bytes, [b'A', b'B']);
+    // One read per source in discovery and replay, plus one comparison
+    // read for the representatives not kept in the caller's buffer.
+    assert_eq!(reads, (COPIES + 1) * 2 + 1);
+    drop(values);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+}

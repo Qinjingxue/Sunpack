@@ -4,6 +4,7 @@ pub(crate) mod enc;
 pub(crate) mod evidence;
 pub(crate) mod input;
 pub(crate) mod lists;
+mod pbkdf;
 pub(crate) mod rar;
 pub(crate) mod seven_zip;
 pub(crate) mod zip;

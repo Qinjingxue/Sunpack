@@ -9,8 +9,8 @@ use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedS
 use crate::password::input::{
     parse_ranges, parse_volumes, ranges_key, RangeSpec, VirtualRangeReader, VolumeSet,
 };
-use hmac::{Hmac, Mac};
 use rayon::prelude::*;
+#[cfg(test)]
 use sha1::Sha1;
 use std::borrow::Cow;
 use std::io::{Read, Seek};
@@ -1293,40 +1293,21 @@ fn winzip_aes_verifier(
     // during candidate filtering. Keep all collisions for the final verifier.
     let offset = key_len * 2;
     let block_index = (offset / 20 + 1) as u32;
-    let template = Hmac::<Sha1>::new_from_slice(password).expect("HMAC accepts any key length");
-    let derived = winzip_aes_block(&template, salt, block_index)?;
+    let template = super::pbkdf::sha1(password);
+    let cancellation = Cancellation::current();
+    let derived = template.block(salt, block_index, 999, || !cancellation.cancelled())?;
     Some([derived[offset % 20], derived[offset % 20 + 1]])
 }
 
 fn winzip_aes_encryption_key(password: &[u8], salt: &[u8], len: usize) -> Option<[u8; 32]> {
-    let template = Hmac::<Sha1>::new_from_slice(password).expect("HMAC accepts any key length");
+    let template = super::pbkdf::sha1(password);
+    let cancellation = Cancellation::current();
     let mut key = [0; 32];
     for (index, block) in key[..len].chunks_mut(20).enumerate() {
-        let derived = winzip_aes_block(&template, salt, index as u32 + 1)?;
+        let derived = template.block(salt, index as u32 + 1, 999, || !cancellation.cancelled())?;
         block.copy_from_slice(&derived[..block.len()]);
     }
     Some(key)
-}
-
-fn winzip_aes_block(template: &Hmac<Sha1>, salt: &[u8], block_index: u32) -> Option<[u8; 20]> {
-    let mut mac = template.clone();
-    mac.update(salt);
-    mac.update(&block_index.to_be_bytes());
-    let mut previous = mac.finalize().into_bytes();
-    let mut derived = previous;
-    let cancellation = Cancellation::current();
-    for round in 1..1000 {
-        if round & 63 == 1 && cancellation.cancelled() {
-            return None;
-        }
-        let mut mac = template.clone();
-        mac.update(&previous);
-        previous = mac.finalize().into_bytes();
-        for (value, byte) in derived.iter_mut().zip(previous.iter()) {
-            *value ^= byte;
-        }
-    }
-    Some(derived.into())
 }
 
 #[cfg(test)]

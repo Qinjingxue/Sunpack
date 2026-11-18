@@ -37,7 +37,7 @@ fn rar4_batched_kdf_preserves_key_and_all_iv_checkpoints() {
 
 #[test]
 fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
-    for password in ["", "secret", "密碼🔐", &"long-password".repeat(10)] {
+    for password in ["", "secret", "密碼🔐", &"s".repeat(64), &"long-password".repeat(10)] {
         for lg2_count in [0, 4, 10] {
             let iterations = 1u32 << lg2_count;
             let mut header = Rar5EncryptionIdentity {
@@ -47,7 +47,14 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
                 password_check: None,
             };
             let mut key = [0u8; 32];
+            let mut hash = [0u8; 32];
             let mut check = [0u8; 32];
+            pbkdf2::pbkdf2_hmac::<Sha256>(
+                password.as_bytes(),
+                &header.salt,
+                iterations + 16,
+                &mut hash,
+            );
             pbkdf2::pbkdf2_hmac::<Sha256>(
                 password.as_bytes(),
                 &header.salt,
@@ -65,6 +72,7 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
             let password: Arc<str> = Arc::from(password);
             let cache = RarKeyCache::default();
             assert_eq!(cache.rar5(&password, &header), Some(key));
+            assert_eq!(cache.rar5_hash_key(&password, &header), Some(hash));
             assert!(cache.rar5.lock().unwrap().values().all(|slot|
                 slot.get().unwrap().as_ref().unwrap().check.get().is_none()));
             header.password_check = Some(proof);

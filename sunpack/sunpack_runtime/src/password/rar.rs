@@ -1938,20 +1938,18 @@ struct Rar5KeyCheckpoint {
 
 impl Rar5KeyCheckpoint {
     fn hash_key(&self, password: &str) -> [u8; 32] {
-        let mac = HmacSha256::new_from_slice(password.as_bytes()).expect("HMAC accepts any key length");
         let mut block = self.block;
         let mut digest = self.key;
-        rar5_extend_key(&mac, &mut block, &mut digest, 16);
+        super::pbkdf::sha256(password.as_bytes()).extend(&mut block, &mut digest, 16, || true);
         digest
     }
 
     fn verify(&self, password: &str, expected: Option<[u8; 8]>) -> Option<[u8; 32]> {
         let Some(expected) = expected else { return Some(self.key); };
         let check = self.check.get_or_init(|| {
-            let mac = HmacSha256::new_from_slice(password.as_bytes()).expect("HMAC accepts any key length");
             let mut block = self.block;
             let mut digest = self.key;
-            rar5_extend_key(&mac, &mut block, &mut digest, 32);
+            super::pbkdf::sha256(password.as_bytes()).extend(&mut block, &mut digest, 32, || true);
             let mut check = [0; 8];
             for (i, byte) in digest.into_iter().enumerate() { check[i % 8] ^= byte; }
             check
@@ -1963,35 +1961,13 @@ impl Rar5KeyCheckpoint {
 fn derive_rar5_key(password: &str, header: &Rar5EncryptionIdentity) -> Option<Rar5KeyCheckpoint> {
     let cancellation = Cancellation::current();
     let iterations = 1u32.checked_shl(header.lg2_count as u32)?;
-    let mut salt_extended = [0u8; 20];
-    salt_extended[..16].copy_from_slice(&header.salt);
-    salt_extended[19] = 1;
-
-    // RAR's PBKDF2 uses the same HMAC key for every round. Clone the
-    // precomputed inner/outer SHA-256 states, as the official UnRAR
-    // implementation does, instead of rebuilding ipad/opad every time.
-    let mac_template = HmacSha256::new_from_slice(password.as_bytes()).ok()?;
-    let mut mac = mac_template.clone();
-    mac.update(&salt_extended);
-    let mut block: [u8; 32] = mac.finalize().into_bytes().into();
+    let template = super::pbkdf::sha256(password.as_bytes());
+    let mut block = template.start(&header.salt, 1);
     let mut key = block;
-    let mut remaining = iterations - 1;
-    while remaining != 0 {
-        if cancellation.cancelled() { return None; }
-        let count = remaining.min(64);
-        rar5_extend_key(&mac_template, &mut block, &mut key, count);
-        remaining -= count;
+    if !template.extend(&mut block, &mut key, iterations - 1, || !cancellation.cancelled()) {
+        return None;
     }
     Some(Rar5KeyCheckpoint { key, block, check: Default::default() })
-}
-
-fn rar5_extend_key(template: &HmacSha256, block: &mut [u8; 32], digest: &mut [u8; 32], count: u32) {
-    for _ in 0..count {
-        let mut mac = template.clone();
-        mac.update(block);
-        *block = mac.finalize().into_bytes().into();
-        for (total, &byte) in digest.iter_mut().zip(block.iter()) { *total ^= byte; }
-    }
 }
 
 pub(crate) enum HeaderPassword {
