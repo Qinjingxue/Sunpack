@@ -31,6 +31,17 @@ pub(crate) struct SevenZipPayloadProbes {
     /// Only the first usable prefix is materialized before trying passwords.
     rest: Vec<SevenZipPayloadPlan>,
     source: Option<SevenZipPayloadSource>,
+    packed: Option<PackedChecks>,
+}
+
+struct PackedChecks {
+    spans: Vec<(u64, u64, u32)>,
+    selected: std::sync::OnceLock<PackedSelection>,
+}
+
+pub(crate) struct PackedSelection {
+    pub(crate) remaining: Vec<SevenZipPayloadSource>,
+    pub(crate) rejected: Vec<Arc<VolumeProjection>>,
 }
 
 type SevenZipRead<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), DeferredReadError> + 'a;
@@ -75,6 +86,38 @@ impl SevenZipPayloadSource {
 }
 
 impl SevenZipPayloadProbes {
+    pub(crate) fn packed_selection(&self) -> std::io::Result<Option<&PackedSelection>> {
+        let (Some(packed), Some(SevenZipPayloadSource::Projected(reads))) = (&self.packed, &self.source) else {
+            return Ok(None);
+        };
+        if packed.selected.get().is_none() {
+            let scan = |source: &DeferredReads, (size, offset, expected)| source.partition(|reader| {
+                match reader.crc32(offset, size) {
+                    Ok(actual) => actual != expected,
+                    Err(DeferredReadError::Truncated) => true,
+                    Err(_) => false,
+                }
+            });
+            let (&first, rest) = packed.spans.split_first().unwrap();
+            let (mut remaining, mut rejected) = scan(reads, first)?;
+            for &span in rest {
+                let mut next = Vec::new();
+                for source in remaining {
+                    let (mut available, mut contradicted) = scan(&source, span)?;
+                    next.append(&mut available);
+                    rejected.append(&mut contradicted);
+                }
+                remaining = next;
+                if remaining.is_empty() { break; }
+            }
+            let _ = packed.selected.set(PackedSelection {
+                remaining: remaining.into_iter().map(SevenZipPayloadSource::Projected).collect(),
+                rejected,
+            });
+        }
+        Ok(packed.selected.get())
+    }
+
     pub(crate) fn key_properties(&self) -> impl Iterator<Item = &[u8]> {
         std::iter::once(self.first.properties.as_slice())
             .chain(self.rest.iter().map(|plan| plan.properties.as_slice()))
@@ -112,54 +155,72 @@ impl SevenZipPayloadProbes {
         mut reject: impl FnMut(Arc<VolumeProjection>),
     ) -> Result<SevenZipPrefixCheck, String> {
         use SevenZipPrefixCheck::Reject;
-        let Some(source) = &self.source else {
-            return Ok(prefix.check);
+        let sources = match self.packed.as_ref().and_then(|packed| packed.selected.get()) {
+            Some(packed) => packed.remaining.as_slice(),
+            None => self.source.as_slice(),
         };
-        source.validate(|read| {
-            let mut fault = None;
-            match self.first.kind.check_successor(
-                self.first.offset, &self.first.encrypted, &prefix.plaintext[..prefix.len],
-                first_key, read, source,
-            ) {
-                Ok(Reject) => return Ok(Reject),
-                Err(DeferredReadError::Truncated) => return Ok(Reject),
-                Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
-                    return Err(seven_zip_deferred_error(error)),
-                Err(error) => { fault = Some(seven_zip_deferred_error(error)); }
-                _ => {}
-            }
-            for plan in &self.rest {
-                check_password_cancellation()?;
-                // Load before deriving a key for a stream that may cross a hole.
-                let mut encrypted = [0u8; 16];
-                if let Err(error) = read(plan.offset, &mut encrypted) {
-                    if matches!(error, DeferredReadError::Truncated) {
-                        return Ok(Reject);
-                    }
-                    if matches!(error, DeferredReadError::Pending | DeferredReadError::Cancelled) {
-                        return Err(seven_zip_deferred_error(error));
-                    }
-                    fault.get_or_insert_with(|| seven_zip_deferred_error(error));
-                    continue;
-                }
-                let candidate = key(&plan.properties)?;
-                let (plaintext, length) = plan.kind.decrypt_prefix(&encrypted, &candidate)?;
-                if plan.kind.check_prefix(&plaintext[..length]) == Reject {
-                    return Ok(Reject);
-                }
-                match plan.kind.check_successor(
-                    plan.offset, &encrypted, &plaintext[..length], &candidate, read, source,
+        let mut fault = None;
+        let mut survivors = 0;
+        let mut rejected = Vec::new();
+        for source in sources {
+            let result = source.validate(|read| {
+                let mut fault = None;
+                match self.first.kind.check_successor(
+                    self.first.offset, &self.first.encrypted, &prefix.plaintext[..prefix.len],
+                    first_key, read, source,
                 ) {
                     Ok(Reject) => return Ok(Reject),
                     Err(DeferredReadError::Truncated) => return Ok(Reject),
                     Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
                         return Err(seven_zip_deferred_error(error)),
-                    Err(error) => { fault.get_or_insert_with(|| seven_zip_deferred_error(error)); }
+                    Err(error) => { fault = Some(seven_zip_deferred_error(error)); }
                     _ => {}
                 }
+                for plan in &self.rest {
+                    check_password_cancellation()?;
+                    // Load before deriving a key for a stream that may cross a hole.
+                    let mut encrypted = [0u8; 16];
+                    if let Err(error) = read(plan.offset, &mut encrypted) {
+                        if matches!(error, DeferredReadError::Truncated) {
+                            return Ok(Reject);
+                        }
+                        if matches!(error, DeferredReadError::Pending | DeferredReadError::Cancelled) {
+                            return Err(seven_zip_deferred_error(error));
+                        }
+                        fault.get_or_insert_with(|| seven_zip_deferred_error(error));
+                        continue;
+                    }
+                    let candidate = key(&plan.properties)?;
+                    let (plaintext, length) = plan.kind.decrypt_prefix(&encrypted, &candidate)?;
+                    if plan.kind.check_prefix(&plaintext[..length]) == Reject {
+                        return Ok(Reject);
+                    }
+                    match plan.kind.check_successor(
+                        plan.offset, &encrypted, &plaintext[..length], &candidate, read, source,
+                    ) {
+                        Ok(Reject) => return Ok(Reject),
+                        Err(DeferredReadError::Truncated) => return Ok(Reject),
+                        Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
+                            return Err(seven_zip_deferred_error(error)),
+                        Err(error) => { fault.get_or_insert_with(|| seven_zip_deferred_error(error)); }
+                        _ => {}
+                    }
+                }
+                fault.map_or(Ok(prefix.check), Err)
+            }, &mut reject);
+            match result {
+                Ok(Reject) => {
+                    if let SevenZipPayloadSource::Projected(reads) = source {
+                        rejected.push(reads.scope());
+                    }
+                }
+                Err(error) => { fault.get_or_insert(error); survivors += 1; }
+                Ok(_) => survivors += 1,
             }
-            fault.map_or(Ok(prefix.check), Err)
-        }, &mut reject)
+        }
+        if survivors == 0 && !sources.is_empty() { return Ok(Reject); }
+        rejected.into_iter().for_each(reject);
+        fault.map_or(Ok(prefix.check), Err)
     }
 }
 
@@ -638,19 +699,20 @@ impl SevenZipPasswordContext {
             }
             check_password_cancellation().map_err(std::borrow::Cow::Owned)?;
         }
-        // Public checks also work when none of the encrypted streams exposes
-        // a password-dependent prefix. Read shorter spans first.
         digests.sort_unstable();
-        for (size, offset, expected) in digests {
-            evidence.check_packed(reader, offset, size, expected)?;
-        }
         if let Some(first) = first {
             let source = evidence.payload_source(reader);
             let rest = if source.is_some() { plans.collect() } else { Vec::new() };
+            let packed = (!digests.is_empty()).then(|| PackedChecks { spans: digests, selected: Default::default() });
             return Ok(Some(Self::Prefix {
-                probe: SevenZipPayloadProbes { first, rest, source },
+                probe: SevenZipPayloadProbes { first, rest, source, packed },
                 header: metadata.is_some(),
             }));
+        }
+        // Without a usable password-dependent prefix, packed CRC is the
+        // remaining public evidence for these ranges.
+        for (size, offset, expected) in digests {
+            evidence.check_packed(reader, offset, size, expected)?;
         }
         if !encrypted {
             return Ok(None);

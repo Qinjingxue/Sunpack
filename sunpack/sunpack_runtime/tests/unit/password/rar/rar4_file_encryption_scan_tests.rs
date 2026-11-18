@@ -42,8 +42,9 @@ fn rar4_aes_compressed_member_uses_its_table_only_at_an_independent_start() {
     let material = |flags, valid| {
         let mut prefix = [0; 16];
         if valid {
-            // LZ mode, fresh table, two one-bit codes, unused other entries.
-            prefix[..2].copy_from_slice(&[0x04, 0x40]);
+            // LZ mode and two one-bit level codes, then three zero runs
+            // covering all four decoder trees.
+            prefix[..6].copy_from_slice(&[0x07, 0xfc, 0x07, 0xff, 0xff, 0xfc]);
         }
         cbc::Encryptor::<Aes128>::new(&key.into(), &iv.into())
             .encrypt_padded::<NoPadding>(&mut prefix, 16).unwrap();
@@ -66,6 +67,15 @@ fn rar4_aes_compressed_member_uses_its_table_only_at_an_independent_start() {
     for flags in [1, RAR4_FILE_SOLID] {
         assert_eq!(status_of(material(flags, true)), "unknown_needs_final_verifier");
     }
+}
+
+#[test]
+fn rar3_level_table_cannot_repeat_an_undefined_first_length() {
+    // Symbols zero and 16 each have one-bit codes. The four-tree descriptor
+    // starts with symbol 16, which requires a previous length.
+    let bytes = [0x07, 0xf4, 0x7c, 0x60];
+    assert!(rar_level_table::<false>(&bytes, 2, 32) == LevelTable::Complete);
+    assert!(rar3_lz_tables(&bytes) == LevelTable::Impossible);
 }
 
 #[test]

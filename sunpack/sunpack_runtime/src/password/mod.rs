@@ -91,6 +91,17 @@ pub(crate) struct PasswordVerification {
 }
 
 impl PasswordVerification {
+    fn restore_indices(&mut self, indices: &[usize], total: usize) {
+        self.matched_index = self.matched_index.map(|index| indices[index]);
+        for index in &mut self.matched_indices {
+            *index = indices[*index];
+        }
+        for (_, index) in &mut self.scoped_rejections {
+            *index = indices[*index];
+        }
+        self.attempts = total;
+    }
+
     pub(crate) fn status(status: &'static str, message: impl Into<String>) -> Self {
         Self {
             password_domains: Vec::new(),

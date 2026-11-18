@@ -137,20 +137,7 @@ impl<'a> SevenZipEvidenceReads<AttemptReader<'a>> for VolumeEvidence {
             return Ok(());
         }
         // An unavailable independent digest cannot block a prefix in another volume.
-        let digest = reader.independent_evidence(|reader| -> std::io::Result<u32> {
-            reader.seek(SeekFrom::Start(offset))?;
-            let mut crc = crc32fast::Hasher::new();
-            let mut remaining = size;
-            let mut buffer = [0; 64 * 1024];
-            while remaining != 0 {
-                Cancellation::check_current_io()?;
-                let count = remaining.min(buffer.len() as u64) as usize;
-                reader.read_exact(&mut buffer[..count])?;
-                crc.update(&buffer[..count]);
-                remaining -= count as u64;
-            }
-            Ok(crc.finalize())
-        });
+        let digest = reader.independent_evidence(|reader| reader.crc32(offset, size));
         if digest.is_ok_and(|actual| actual != expected) {
             return Err("7z packed stream crc mismatch".into());
         }

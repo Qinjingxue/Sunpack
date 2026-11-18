@@ -143,6 +143,15 @@ impl SevenZipPasswordContext {
             Ok(check)
         })?;
         let surviving = surviving.into_inner().unwrap();
+        if !result.matched_indices.is_empty() {
+            if let Some(packed) = probe.packed_selection()? {
+                result.scoped_rejections.extend(packed.rejected.iter().flat_map(|path|
+                    result.matched_indices.iter().map(move |&index| (Arc::clone(path), index))));
+                if packed.remaining.is_empty() {
+                    return Ok(result);
+                }
+            }
+        }
         if surviving.is_empty() || (result.matched_indices.len() == 1 && !probe.has_ambiguous_followup()) {
             return Ok(result);
         }

@@ -83,19 +83,62 @@ pub(crate) fn zip_fast_verify_passwords_from_attempts(
     eocd_offset: Option<u64>,
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
-    let build = || prepare_zip_attempts(head, plan, spanned, eocd_offset, sessions);
-    preparation.verify_local(build(), candidates)
+    let anchor = preparation.zip_anchor.take().or_else(||
+        prepare_zip_attempt_anchor(head, plan, sessions).map(Box::new));
+    let Some(anchor) = anchor else {
+        return preparation.verify_local(
+            prepare_zip_attempts(head, plan, spanned, eocd_offset, sessions, None), candidates);
+    };
+    let material = anchor.context.kdf_parameters().unwrap();
+    let mut keys = ZipKeyCache::from_parameters([material, material]);
+    let mut early = anchor.context.verify_cached(candidates, Some(&keys))?;
+    if early.status == "no_match" {
+        preparation.zip_anchor = Some(anchor);
+        return Ok(early);
+    }
+    let prepared = match prepare_zip_attempts(head, plan, spanned, eocd_offset, sessions, Some(&anchor)) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let fallback = error.verification();
+            early.message = fallback.message;
+            early.read_fault = fallback.read_fault;
+            preparation.zip_anchor = Some(anchor);
+            return Ok(early);
+        }
+    };
+    preparation.verify_local_with(Ok(prepared), |prepared, fixed, other_batches, _| {
+        match prepared {
+            Ok(PasswordContext::Evidence(context)) => {
+                if early.matched_indices.len() == candidates.len() {
+                    return context.verify_batch_with_zip_keys(candidates, fixed, !other_batches, Some(&keys));
+                }
+                let indices = &early.matched_indices;
+                keys.keep_candidates(&material, indices);
+                let survivors: Vec<_> = indices.iter().map(|&index| Arc::clone(&candidates[index])).collect();
+                let mut result = context.verify_batch_with_zip_keys(&survivors, fixed, !other_batches, Some(&keys))?;
+                if !matches!(result.status, "match" | "no_match") {
+                    early.volume_attempts = result.volume_attempts;
+                    early.message = result.message;
+                    early.read_fault = result.read_fault;
+                    return Ok(early);
+                }
+                result.restore_indices(indices, candidates.len());
+                Ok(result)
+            }
+            Ok(PasswordContext::Reduced(_, plan)) => Ok(PasswordVerification {
+                volume_attempts: Some(plan.clone()), ..early
+            }),
+            Ok(_) => Ok(early),
+            Err(_) => unreachable!(),
+        }
+    })
 }
 
-fn prepare_zip_attempts(
+fn prepare_zip_attempt_anchor(
     head: &InputExtent,
     plan: &VolumeAttemptPlan,
-    spanned: bool,
-    eocd_offset: Option<u64>,
     sessions: &[NativeArchiveSession],
-) -> Result<PasswordContext, PreparedStatus> {
-    use super::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
-    let anchor = (|| {
+) -> Option<ZipAnchor> {
     let mut prefix = super::input::prefix::common_attempt_prefix(head, plan, sessions);
     if prefix.is_empty() && plan.head_size_from_total.is_none() && plan.tail_totals.is_empty() {
         prefix.push(head.clone());
@@ -112,7 +155,17 @@ fn prepare_zip_attempts(
         prefix.pop();
     }
         None
-    })();
+}
+
+fn prepare_zip_attempts(
+    head: &InputExtent,
+    plan: &VolumeAttemptPlan,
+    spanned: bool,
+    eocd_offset: Option<u64>,
+    sessions: &[NativeArchiveSession],
+    anchor: Option<&ZipAnchor>,
+) -> Result<PasswordContext, PreparedStatus> {
+    use super::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
     let geometry = if !plan.tail_totals.is_empty() { AttemptGeometry::TailTotals }
         else if let Some(total) = plan.head_size_from_total { AttemptGeometry::TrimmedHead { total } }
         else if spanned { AttemptGeometry::DiskRelative }
@@ -126,7 +179,7 @@ fn prepare_zip_attempts(
                     .and_then(|last| last.checked_add(1)).ok_or_else(invalid_password_directory)?
             } else { 1 };
             let volumes = CertainZipVolumes { reader: std::cell::RefCell::new(reader), count, spanned };
-            prepare_zip_volume_directory(&volumes, eocd_offset, anchor.as_ref())
+            prepare_zip_volume_directory(&volumes, eocd_offset, anchor)
         });
         match directory {
             Ok(context) => Ok(Some(context)),
@@ -173,7 +226,7 @@ fn prepare_zip_attempts(
     })?;
     match anchor {
         Some(anchor) if evidence.contexts.iter().all(|context| context == &anchor.context) =>
-            evidence.with_anchor(PasswordContext::Zip(anchor.context)),
+            evidence.with_anchor(PasswordContext::Zip(anchor.context.clone())),
         _ => Ok(evidence.into_context(PasswordContext::Zip)),
     }
 }
@@ -823,7 +876,7 @@ impl ZipPasswordContext {
     }
 }
 
-struct ZipAnchor {
+pub(super) struct ZipAnchor {
     local_offset: u64,
     data_offset: u64,
     context: ZipPasswordContext,
@@ -1075,7 +1128,7 @@ pub(super) enum ZipKey {
     Strong([u8; 32]),
 }
 
-type ZipKeyCache<'a> = super::evidence::SharedCandidateKeys<ZipKeyMaterial<'a>, Option<ZipKey>>;
+pub(super) type ZipKeyCache<'a> = super::evidence::SharedCandidateKeys<ZipKeyMaterial<'a>, Option<ZipKey>>;
 
 fn verify_winzip_aes_candidates(
     candidates: &[Arc<str>], key_len: usize, salt: &[u8], verifier: &[u8; 2],

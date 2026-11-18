@@ -201,6 +201,15 @@ impl<K: Copy + Eq + std::hash::Hash, V> SharedCandidateKeys<K, V> {
                 .get_or_init(|| (0..count).map(|_| std::sync::OnceLock::new()).collect()),
         )
     }
+
+    pub(super) fn keep_candidates(&mut self, key: &K, indices: &[usize]) {
+        let cell = self.0.get_mut(key).unwrap();
+        let values = cell.take().unwrap();
+        let mut keep = indices.iter().copied().peekable();
+        let _ = cell.set(values.into_vec().into_iter().enumerate()
+            .filter_map(|(index, value)| keep.next_if_eq(&index).map(|_| value))
+            .collect());
+    }
 }
 
 impl EvidenceContext {
@@ -224,6 +233,16 @@ impl EvidenceContext {
         fixed: bool,
         complete: bool,
     ) -> std::io::Result<PasswordVerification> {
+        self.verify_batch_with_zip_keys(candidates, fixed, complete, None)
+    }
+
+    pub(super) fn verify_batch_with_zip_keys(
+        &self,
+        candidates: &[Arc<str>],
+        fixed: bool,
+        complete: bool,
+        zip_keys: Option<&super::zip::ZipKeyCache<'_>>,
+    ) -> std::io::Result<PasswordVerification> {
         if candidates.is_empty() {
             return Ok(PasswordVerification {
                 volume_attempts: self.public_plan()?,
@@ -244,7 +263,7 @@ impl EvidenceContext {
                 }
                 let survivors: Vec<_> = indices.iter().map(|&i| candidates[i].clone()).collect();
                 let confirmed = anchor_result.final_confirmation_required == Some(false);
-                let mut result = self.verify_inner(&survivors, confirmed, complete, &rar_keys, Some(anchor))?;
+                let mut result = self.verify_inner(&survivors, confirmed, complete, &rar_keys, Some(anchor), None)?;
                 if confirmed {
                     anchor_result.volume_attempts = result.volume_attempts;
                     return Ok(anchor_result);
@@ -253,18 +272,11 @@ impl EvidenceContext {
                     anchor_result.volume_attempts = result.volume_attempts;
                     return Ok(anchor_result);
                 }
-                result.matched_index = result.matched_index.map(|i| indices[i]);
-                for i in &mut result.matched_indices {
-                    *i = indices[*i];
-                }
-                for (_, i) in &mut result.scoped_rejections {
-                    *i = indices[*i];
-                }
-                result.attempts = candidates.len();
+                result.restore_indices(indices, candidates.len());
                 return Ok(result);
             }
         }
-        self.verify_inner(candidates, fixed, complete, &rar_keys, None)
+        self.verify_inner(candidates, fixed, complete, &rar_keys, None, zip_keys)
     }
 
     fn verify_inner(
@@ -274,6 +286,7 @@ impl EvidenceContext {
         complete: bool,
         rar_keys: &super::rar::RarKeyCache,
         screened_anchor: Option<&Arc<super::rar::RarPasswordContext>>,
+        shared_zip_keys: Option<&super::zip::ZipKeyCache<'_>>,
     ) -> std::io::Result<PasswordVerification> {
         let cancellation = Cancellation::current();
         cancellation.check_io()?;
@@ -284,10 +297,16 @@ impl EvidenceContext {
             };
             context.into_iter().flat_map(|context| context.kdf_parameters())
         });
-        let zip_keys = SharedCandidateKeys::new(&self.alternatives, |context| match context {
-            PasswordContext::Zip(context) => context.kdf_parameters(),
-            _ => None,
-        });
+        let local_zip_keys;
+        let zip_keys = if shared_zip_keys.is_some() || self.alternatives.len() <= 1 {
+            shared_zip_keys
+        } else {
+            local_zip_keys = SharedCandidateKeys::new(&self.alternatives, |context| match context {
+                PasswordContext::Zip(context) => context.kdf_parameters(),
+                _ => None,
+            });
+            Some(&local_zip_keys)
+        };
         let results: Vec<_> = self
             .alternatives
             .par_iter()
@@ -297,7 +316,7 @@ impl EvidenceContext {
                         .verify_cached(candidates, Some(&keys)),
                     PasswordContext::Zip(context) => context.verify_cached(
                         candidates,
-                        (self.alternatives.len() > 1).then_some(&zip_keys),
+                        zip_keys,
                     ),
                     PasswordContext::Rar(context) => {
                         if screened_anchor.is_some_and(|anchor| Arc::ptr_eq(context, anchor)) {

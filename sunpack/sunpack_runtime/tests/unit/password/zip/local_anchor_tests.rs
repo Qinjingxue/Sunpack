@@ -14,6 +14,21 @@ fn local_crypto_header() -> Vec<u8> {
 }
 
 #[test]
+fn rejected_zip_anchor_does_not_prepare_alternative_tails() {
+    let local = local_crypto_header();
+    let (paths, sources, plan) = volume_alternatives(&local, &[0; 25], &[0; 26]);
+    let wrong = (0..).map(|i| format!("wrong-{i}")).find(|password|
+        zipcrypto_header_state(password.as_bytes(), &[0x9b; 12], 0x5a).is_none()).unwrap();
+    let mut preparation = Preparation::default();
+    let result = zip_fast_verify_passwords_from_attempts(&mut preparation, &sources[0], &plan,
+        &[Arc::from(wrong)], false, None, &[]).unwrap();
+    assert_eq!(result.status, "no_match");
+    assert!(preparation.verify_prepared(&[]).unwrap().is_none());
+    drop(preparation);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+}
+
+#[test]
 fn local_anchor_never_reads_across_a_missing_disk_or_unknown_descriptor() {
     let material = local_crypto_header();
     let make = |first: Vec<u8>, tail: Vec<u8>| Arc::new(VolumeSet::new(vec![

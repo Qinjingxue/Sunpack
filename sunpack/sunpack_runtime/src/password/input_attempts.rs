@@ -888,6 +888,10 @@ pub(crate) struct DeferredReader<'a> {
 }
 
 impl DeferredReads {
+    pub(crate) fn scope(&self) -> Arc<crate::password::evidence::VolumeProjection> {
+        self.proof.get_or_init(|| self.projection.proof()).clone()
+    }
+
     pub(crate) fn range_is_ambiguous(&self, start: u64, size: u64) -> bool {
         if self.disk_relative {
             self.disk_range_is_ambiguous(0, start, size)
@@ -903,6 +907,36 @@ impl DeferredReads {
     pub(crate) fn evaluate<T>(
         &self, mut verify: impl FnMut(&mut DeferredReader<'_>) -> T,
     ) -> io::Result<Vec<(Arc<crate::password::evidence::VolumeProjection>, T)>> {
+        self.evaluate_with(&mut verify, |projection, branched| {
+            if branched { projection.proof() }
+            else { self.proof.get_or_init(|| projection.proof()).clone() }
+        })
+    }
+
+    pub(crate) fn partition(
+        &self, mut rejects: impl FnMut(&mut DeferredReader<'_>) -> bool,
+    ) -> io::Result<(Vec<Self>, Vec<Arc<crate::password::evidence::VolumeProjection>>)> {
+        let mut retained = Vec::new();
+        let mut rejected = Vec::new();
+        for (projection, reject) in self.evaluate_with(&mut rejects, |projection, _| projection)? {
+            if reject {
+                rejected.push(projection.proof());
+            } else {
+                retained.push(Self {
+                    sources: Arc::clone(&self.sources),
+                    projection,
+                    disk_relative: self.disk_relative,
+                    proof: Default::default(),
+                });
+            }
+        }
+        Ok((retained, rejected))
+    }
+
+    fn evaluate_with<T, P>(
+        &self, verify: &mut impl FnMut(&mut DeferredReader<'_>) -> T,
+        mut project: impl FnMut(Projection, bool) -> P,
+    ) -> io::Result<Vec<(P, T)>> {
         let mut pending = Vec::new();
         let mut current = Some(self.projection.clone());
         let mut outcomes = Vec::new();
@@ -918,11 +952,7 @@ impl DeferredReads {
                 branched = true;
                 pending.extend(branches.into_iter().rev());
             } else {
-                let projection = if branched {
-                    reader.reader.projection.proof()
-                } else {
-                    self.proof.get_or_init(|| reader.reader.projection.proof()).clone()
-                };
+                let projection = project(reader.reader.projection, branched);
                 outcomes.push((projection, value));
             }
         }
@@ -932,11 +962,15 @@ impl DeferredReads {
 }
 
 impl DeferredReader<'_> {
+    pub(crate) fn crc32(&mut self, offset: u64, size: u64) -> Result<u32, DeferredReadError> {
+        self.load(|reader| reader.crc32(offset, size))
+    }
+
     pub(crate) fn read(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, DeferredReadError> {
         if self.disk_relative {
             return self.read_disk_offset(0, 0, offset, len);
         }
-        self.load(len, |reader| {
+        self.load(|reader| {
             reader.seek(SeekFrom::Start(offset))?;
             let mut bytes = crate::io::resource_error::bytes_with_capacity(len)?;
             bytes.resize(len, 0);
@@ -948,18 +982,19 @@ impl DeferredReader<'_> {
     pub(crate) fn read_disk_offset(
         &mut self, disk: usize, base: u64, relative: u64, len: usize,
     ) -> Result<Vec<u8>, DeferredReadError> {
-        self.load(len, |reader| {
+        let bytes = self.load(|reader| {
             let Some((disk, offset)) = reader.advance_disk_offset(disk, base, relative)? else {
                 return Ok(Vec::new());
             };
             reader.read_disk_spanning(disk, offset, len)
-        })
+        })?;
+        if bytes.len() == len { Ok(bytes) } else { Err(DeferredReadError::Missing) }
     }
 
-    fn load(
-        &mut self, len: usize,
-        read: impl FnOnce(&mut AttemptReader<'_>) -> io::Result<Vec<u8>>,
-    ) -> Result<Vec<u8>, DeferredReadError> {
+    fn load<T>(
+        &mut self,
+        read: impl FnOnce(&mut AttemptReader<'_>) -> io::Result<T>,
+    ) -> Result<T, DeferredReadError> {
         if self.reader.pending.is_some() {
             return Err(DeferredReadError::Pending);
         }
@@ -983,8 +1018,7 @@ impl DeferredReader<'_> {
             });
         }
         match result {
-            Ok(bytes) if bytes.len() == len => Ok(bytes),
-            Ok(_) => Err(DeferredReadError::Missing),
+            Ok(value) => Ok(value),
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Err(DeferredReadError::Missing),
             Err(error) => Err(DeferredReadError::Io(error)),
         }
@@ -992,6 +1026,20 @@ impl DeferredReader<'_> {
 }
 
 impl AttemptReader<'_> {
+    pub(crate) fn crc32(&mut self, offset: u64, mut size: u64) -> io::Result<u32> {
+        self.seek(SeekFrom::Start(offset))?;
+        let mut crc = crc32fast::Hasher::new();
+        let mut buffer = [0; 64 * 1024];
+        while size != 0 {
+            Cancellation::check_current_io()?;
+            let count = size.min(buffer.len() as u64) as usize;
+            self.read_exact(&mut buffer[..count])?;
+            crc.update(&buffer[..count]);
+            size -= count as u64;
+        }
+        Ok(crc.finalize())
+    }
+
     fn new(sources: &Arc<[AttemptSource]>, projection: Projection) -> AttemptReader<'_> {
         AttemptReader {
             sources,

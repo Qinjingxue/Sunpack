@@ -547,7 +547,7 @@ fn prepare_rar4_members(
                             Ok(encrypted) => {
                                 let next = data_offset.checked_add(16).ok_or_else(unknown)?;
                                 let source = if matches!(crypto, Rar4FileCrypto::Legacy) { RarTailSource::PrefixOnly }
-                                    else { ranges.tail_source(next, (data_size - 16).min(16)) };
+                                    else { ranges.tail_source(next, (data_size - 16).min((RAR3_TABLE_WINDOW - 16) as u64)) };
                                 let material = RarPasswordMaterial::Rar4Block(Rar4BlockProbe {
                                     crypto, encrypted, next, data_size, split_after: block.flags & 2 != 0, source,
                                 });
@@ -831,6 +831,12 @@ enum LevelTable {
 /// RAR2 has 19 raw lengths. RAR3 and RAR5 share a 20-entry alphabet with
 /// zero runs. Validate its lengths without reading any member symbols.
 fn rar_level_table<const LEGACY: bool>(data: &[u8], bit: usize, available: usize) -> LevelTable {
+    rar_level_lengths::<LEGACY>(data, bit, available).map_or_else(|status| status, |_| LevelTable::Complete)
+}
+
+fn rar_level_lengths<const LEGACY: bool>(
+    data: &[u8], bit: usize, available: usize,
+) -> Result<([u8; 20], usize), LevelTable> {
     let mut position = bit;
     let mut next = || {
         let start = position;
@@ -841,13 +847,14 @@ fn rar_level_table<const LEGACY: bool>(data: &[u8], bit: usize, available: usize
     };
     let mut slots = 1 << 15;
     let mut entries = if LEGACY { 19usize } else { 20 };
+    let mut lengths = [0; 20];
     while entries != 0 {
         let Some(length) = next() else {
-            return if position > available { LevelTable::Impossible } else { LevelTable::Incomplete };
+            return Err(if position > available { LevelTable::Impossible } else { LevelTable::Incomplete });
         };
         if !LEGACY && length == 15 {
             let Some(run) = next() else {
-                return if position > available { LevelTable::Impossible } else { LevelTable::Incomplete };
+                return Err(if position > available { LevelTable::Impossible } else { LevelTable::Incomplete });
             };
             if run != 0 {
                 entries = entries.saturating_sub(run + 2);
@@ -856,11 +863,91 @@ fn rar_level_table<const LEGACY: bool>(data: &[u8], bit: usize, available: usize
         }
         if length != 0 {
             slots -= 1 << (15 - length);
-            if slots < 0 { return LevelTable::Impossible; }
+            if slots < 0 { return Err(LevelTable::Impossible); }
         }
+        lengths[20 - entries] = length as u8;
         entries -= 1;
     }
-    if slots == 0 { LevelTable::Complete } else { LevelTable::Impossible }
+    if slots == 0 { Ok((lengths, position)) } else { Err(LevelTable::Impossible) }
+}
+
+// The RAR3 LZ block declares four consecutive Huffman trees. Each of the
+// 404 lengths costs at most a 15-bit code and 7 extra bits.
+const RAR3_TREE_SIZES: [usize; 4] = [299, 60, 17, 28];
+const RAR3_TABLE_WINDOW: usize = (2usize + 20 * 8 + 404 * 22).div_ceil(128) * 16;
+
+fn rar3_lz_tables(data: &[u8]) -> LevelTable {
+    let (levels, mut bit) = match rar_level_lengths::<false>(data, 2, usize::MAX) {
+        Ok(levels) => levels,
+        Err(state) => return state,
+    };
+    let mut sorted = [0usize; 20];
+    let mut counts = [0usize; 16];
+    for &length in levels.iter().filter(|&&length| length != 0) { counts[length as usize] += 1; }
+    let mut next = [0usize; 16];
+    for length in 2..next.len() {
+        next[length] = next[length - 1] + counts[length - 1];
+    }
+    for (symbol, &length) in levels.iter().enumerate() {
+        if length == 0 { continue; }
+        let slot = &mut next[length as usize];
+        sorted[*slot] = symbol;
+        *slot += 1;
+    }
+    let mut read = |width: usize| {
+        let end = bit + width;
+        if end > data.len() * 8 { return None; }
+        let mut value = 0;
+        while bit < end {
+            value = (value << 1) | usize::from((data[bit / 8] >> (7 - bit % 8)) & 1);
+            bit += 1;
+        }
+        Some(value)
+    };
+    let mut remaining = RAR3_TREE_SIZES.into_iter();
+    let mut tree_end = remaining.next().unwrap();
+    let total: usize = RAR3_TREE_SIZES.iter().sum();
+    let mut position = 0;
+    let mut units = 0;
+    let mut previous = 0;
+    while position < total {
+        let mut code = 0;
+        let mut start = 0;
+        let mut symbol = None;
+        for &count in &counts[1..] {
+            let Some(next) = read(1) else { return LevelTable::Incomplete; };
+            code = (code << 1) + next;
+            if code < count {
+                symbol = Some(sorted[start + code]);
+                break;
+            }
+            code -= count;
+            start += count;
+        }
+        let Some(symbol) = symbol else { return LevelTable::Impossible; };
+        let (length, end) = if symbol < 16 {
+            (symbol, position + 1)
+        } else {
+            if symbol < 18 && position == 0 { return LevelTable::Impossible; }
+            let extra = 3 + (symbol & 1) * 4;
+            let Some(run) = read(extra) else { return LevelTable::Incomplete; };
+            let end = (position + run + extra * 2 - 3).min(total);
+            (if symbol < 18 { previous } else { 0 }, end)
+        };
+        previous = length;
+        let step = if length == 0 { 0 } else { 1usize << (15 - length) };
+        while position < end {
+            let stop = tree_end.min(end);
+            units += (stop - position) * step;
+            if units > 1 << 15 { return LevelTable::Impossible; }
+            position = stop;
+            if position == tree_end {
+                units = 0;
+                tree_end += remaining.next().unwrap_or(0);
+            }
+        }
+    }
+    LevelTable::Complete
 }
 
 impl Rar4BlockProbe {
@@ -879,24 +966,35 @@ impl Rar4BlockProbe {
             let flags = first[0];
             return Ok(if flags & 0x20 != 0 && flags & 0x1f != 0 { weak } else { RarProof::Reject }.into());
         }
-        let bits = if self.split_after { usize::MAX } else { self.data_size.min(32) as usize * 8 };
-        match rar_level_table::<false>(&first, 2, bits) {
+        match rar3_lz_tables(&first) {
             LevelTable::Impossible => Ok(RarProof::Reject.into()),
             LevelTable::Complete => Ok(weak.into()),
-            LevelTable::Incomplete if self.data_size < 32 => Ok(if self.split_after {
-                RarProof::Weak(Some("RAR4 compressed table continues in the next volume"))
-            } else { RarProof::Reject }.into()),
             LevelTable::Incomplete => self.source.verify(|read| {
-                let second = match read(self.next, 16) {
-                    Ok(second) => second,
-                    Err(DeferredReadError::Truncated) => return RarProof::Reject,
-                    Err(error) => return RarProof::fallback(error),
-                };
-                let mut previous = iv;
-                let mut plain = [0; 32];
+                let mut plain = [0; RAR3_TABLE_WINDOW];
                 plain[..16].copy_from_slice(&first);
-                plain[16..].copy_from_slice(&decrypt_cbc_block(&cipher, &mut previous, &second));
-                if rar_level_table::<false>(&plain, 2, bits) == LevelTable::Complete { weak } else { RarProof::Reject }
+                let mut previous = iv;
+                let end = self.data_size.min(plain.len() as u64) as usize & !15;
+                let mut len = 16;
+                while len < end {
+                    let next = (len * 2).min(end);
+                    let Some(offset) = self.next.checked_add((len - 16) as u64) else { return RarProof::Reject; };
+                    let bytes = match read(offset, next - len) {
+                        Ok(bytes) => bytes,
+                        Err(DeferredReadError::Truncated) => return RarProof::Reject,
+                        Err(error) => return RarProof::fallback(error),
+                    };
+                    for (ciphertext, output) in bytes.chunks_exact(16).zip(plain[len..next].chunks_exact_mut(16)) {
+                        output.copy_from_slice(&decrypt_cbc_block(&cipher, &mut previous, ciphertext));
+                    }
+                    len = next;
+                    match rar3_lz_tables(&plain[..len]) {
+                        LevelTable::Impossible => return RarProof::Reject,
+                        LevelTable::Complete => return weak,
+                        LevelTable::Incomplete => {}
+                    }
+                }
+                if self.split_after { RarProof::Weak(Some("RAR4 compressed table continues in the next volume")) }
+                else { RarProof::Reject }
             }),
         }
     }

@@ -86,6 +86,35 @@ fn archive_with_descriptor(body: &[u8], header: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn projected_packed_crc_only_checks_short_screen_survivors() {
+    let mut stream = vec![1, 0, 44];
+    stream.extend([0xa9; 45]);
+    stream.extend([2, 0, 44]);
+    stream.extend([0x4a; 45]);
+    stream.push(0);
+    let encrypted = direct_key_ciphertext(&stream);
+    let mut header = vec![1, 4, 6, 0, 1, 9, encrypted.len() as u8, 10, 1];
+    header.extend(crc32fast::hash(&encrypted).to_le_bytes());
+    header.extend([0, 7, 11, 1, 0]);
+    header.extend(AES_LZMA2_FOLDER);
+    header.extend([12, stream.len() as u8, 90, 0, 0, 0]);
+    let archive = archive_with_descriptor(&encrypted, &header);
+    let (paths, sources, plan) = uncertain_tail_fixture_at(&archive, &[], 48);
+    let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None)
+        .unwrap_or_else(|_| panic!("projected prefix and packed CRC"));
+    let PasswordContext::Evidence(evidence) = context else { panic!("projection was lost"); };
+    let wrong = evidence.verify_batch(&[Arc::from("wrong")], false, true).unwrap();
+    assert_eq!(wrong.status, "no_match");
+    assert!(wrong.volume_attempts.is_none());
+    let correct = evidence.verify_batch(&[Arc::from("secret")], true, true).unwrap();
+    assert_eq!(correct.matched_indices, [0]);
+    let plan = correct.volume_attempts.unwrap();
+    assert!(!plan.sources.iter().any(|source| source.path == sources[1].path));
+    drop(evidence);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+}
+
+#[test]
 fn projected_lzma2_successor_removes_bad_cbc_source_after_prefix_survives() {
     // Two LZMA2 blocks have known controls and lengths, and their intervening
     // bodies need no scan. The end marker's CBC predecessor is on the disputed

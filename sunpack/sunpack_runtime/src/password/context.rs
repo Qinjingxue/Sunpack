@@ -147,6 +147,7 @@ pub(crate) struct Preparation<'a> {
     pub(crate) other_password_batches: bool,
     slot: Option<Arc<PreparedSlot>>,
     local: Option<Box<Prepared>>,
+    pub(super) zip_anchor: Option<Box<super::zip::ZipAnchor>>,
     rar_key: Option<&'a mut Option<super::rar::RarProvenKey>>,
 }
 
@@ -162,16 +163,25 @@ impl<'a> Preparation<'a> {
         prepared: Prepared,
         candidates: &[Arc<str>],
     ) -> std::io::Result<PasswordVerification> {
-        let reusable = !prepared.as_ref().is_err_and(|error| error.transient());
-        let result = Self::verify_material(
+        self.verify_local_with(prepared, |prepared, fixed, other_batches, rar_key| Self::verify_material(
             None,
-            &prepared,
+            prepared,
             candidates,
-            self.rar_key.as_deref_mut(),
+            rar_key,
             &Cancellation::current(),
-            self.fixed_password,
-            self.other_password_batches,
-        );
+            fixed,
+            other_batches,
+        ))
+    }
+
+    pub(super) fn verify_local_with(
+        &mut self,
+        prepared: Prepared,
+        verify: impl FnOnce(&Prepared, bool, bool, Option<&mut Option<super::rar::RarProvenKey>>)
+            -> std::io::Result<PasswordVerification>,
+    ) -> std::io::Result<PasswordVerification> {
+        let reusable = !prepared.as_ref().is_err_and(|error| error.transient());
+        let result = verify(&prepared, self.fixed_password, self.other_password_batches, self.rar_key.as_deref_mut());
         if reusable && result.is_ok() {
             self.local = Some(Box::new(prepared));
         }
@@ -197,6 +207,7 @@ impl<'a> Preparation<'a> {
             other_password_batches: false,
             slot: None,
             local: None,
+            zip_anchor: None,
             rar_key: Some(key),
         }
     }
