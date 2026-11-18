@@ -2,7 +2,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <tuple>
 #include <vector>
 #include "sevenzip_bridge/bridge.hpp"
 
@@ -29,6 +31,12 @@ struct VolumeAttemptPlan {
     std::vector<unsigned long long> domain_capacity;
     bool insufficient_sources = false;
     std::vector<unsigned char> feasible_layouts;
+    struct LayoutPivot {
+        std::size_t slot, source, layout;
+        auto key() const { return std::pair{slot, source}; }
+    };
+    std::vector<LayoutPivot> layout_pivots;
+    std::vector<std::size_t> pivot_slots;
 
     std::size_t minimum_slots_for(std::size_t layout) const {
         return minimum_slots.empty() || !minimum_slots[layout] ? layouts[layout].size() : minimum_slots[layout];
@@ -36,6 +44,50 @@ struct VolumeAttemptPlan {
     std::size_t domain_for(std::size_t layout, std::size_t count, std::size_t ordinal) const {
         const auto& slots = layouts[layout];
         return slots[ordinal + 1 == count ? slots.size() - 1 : ordinal].domain;
+    }
+
+    void prepare_layout_pivots() {
+        layout_pivots.clear();
+        pivot_slots.clear();
+        if (layouts.size() < 8) return;
+        // Index one rare fixed choice per layout. Every length represented
+        // by a family must contain the choice at the same ordinal.
+        const auto fixed_prefix = [&](std::size_t layout) {
+            const auto count = minimum_slots_for(layout);
+            return count == layouts[layout].size() ? count : count - 1;
+        };
+        std::vector<std::size_t> references(sources.size());
+        for (std::size_t layout = 0; layout < layouts.size(); ++layout)
+            for (std::size_t slot = 0; slot < fixed_prefix(layout); ++slot) {
+                const auto& choices = domains[layouts[layout][slot].domain];
+                if (choices.size() == 1) ++references[choices.front()];
+            }
+        layout_pivots.reserve(layouts.size());
+        std::vector<bool> indexed(variation.size());
+        for (std::size_t layout = 0; layout < layouts.size(); ++layout) {
+            LayoutPivot best{SIZE_MAX, 0, layout};
+            auto frequency = layouts.size();
+            for (std::size_t slot = 0; slot < fixed_prefix(layout); ++slot) {
+                const auto& choices = domains[layouts[layout][slot].domain];
+                if (choices.size() == 1 && references[choices.front()] < frequency) {
+                    frequency = references[choices.front()];
+                    best = {slot, choices.front(), layout};
+                }
+            }
+            layout_pivots.push_back(best);
+            if (best.slot != SIZE_MAX && !indexed[best.slot]) {
+                indexed[best.slot] = true;
+                pivot_slots.push_back(best.slot);
+            }
+        }
+        if (pivot_slots.empty()) { std::vector<LayoutPivot>().swap(layout_pivots); return; }
+        std::sort(layout_pivots.begin(), layout_pivots.end(), [](const auto& a, const auto& b) {
+            return std::tie(a.slot, a.source, a.layout) < std::tie(b.slot, b.source, b.layout);
+        });
+        std::sort(pivot_slots.begin(), pivot_slots.end());
+        // Membership in layouts without a discriminating choice is checked
+        // at the tail of the same index.
+        if (layout_pivots.back().slot == SIZE_MAX) pivot_slots.push_back(SIZE_MAX);
     }
 
     // The plan is immutable after parsing. Summarize domains once, then merge
@@ -94,7 +146,7 @@ struct VolumeAttemptPlan {
         const auto [shortest, longest] = std::minmax_element(layouts.begin(), layouts.end(),
             [](const auto& a, const auto& b) { return a.size() < b.size(); });
         variation.clear();
-        if (longest == layouts.end()) return;
+        if (longest == layouts.end()) { prepare_layout_pivots(); return; }
         variation.reserve(longest->size());
         for (const auto& slot : *longest) variation.push_back(summaries[slot.domain]);
         for (const auto& slots : layouts) for (std::size_t i = 0; i < slots.size(); ++i) {
@@ -116,6 +168,7 @@ struct VolumeAttemptPlan {
         }
         if (!variation.empty() && (head_size_from_total || !tail_totals.empty()))
             variation.front().variable = variation.front().variable_length = true;
+        prepare_layout_pivots();
     }
 };
 
@@ -130,6 +183,9 @@ struct VolumeAttemptCursor {
     // A stopped search retains its exact DFS depth. The worker requests the
     // next composition separately from replaying an already yielded candidate.
     bool started = false, discard_pending = false, needs_next = true, searching = false;
+#ifdef SUP7Z_DEBUG
+    std::size_t previous_layout_checks = 0;
+#endif
     void reserve(const VolumeAttemptPlan& plan) {
         const auto maximum = plan.variation.size();
         digits.reserve(maximum); selected.reserve(maximum);
@@ -179,6 +235,39 @@ struct VolumeAttemptCursor {
         else { ++layout; slot_count = 0; }
         searching = false;
         digits.clear(); selected.clear();
+    }
+    bool duplicate(const VolumeAttemptPlan& plan) {
+        const auto& slots = plan.layouts[layout];
+        const auto matches = [&](std::size_t old) {
+#ifdef SUP7Z_DEBUG
+            ++previous_layout_checks;
+#endif
+            if (!plan.layout_password_domains.empty() &&
+                plan.layout_password_domains[old] != plan.layout_password_domains[layout]) return false;
+            const auto& previous = plan.layouts[old];
+            if (slot_count > previous.size() || slot_count < plan.minimum_slots_for(old)) return false;
+            for (std::size_t i = 0; i < slot_count; ++i) {
+                if (previous[i].number != slots[i].number || previous[i].name != slots[i].name) return false;
+                const auto older_domain = plan.domain_for(old, slot_count, i);
+                if (older_domain == plan.domain_for(layout, slot_count, i)) continue;
+                const auto& choices = plan.domains[older_domain];
+                if (std::find(choices.begin(), choices.end(), selected[i]) == choices.end()) return false;
+            }
+            return true;
+        };
+        if (plan.layout_pivots.empty()) {
+            for (std::size_t old = 0; old < layout; ++old) if (matches(old)) return true;
+            return false;
+        }
+        for (const auto slot : plan.pivot_slots) {
+            if (slot >= slot_count && slot != SIZE_MAX) continue;
+            const auto key = std::pair{slot, slot == SIZE_MAX ? 0 : selected[slot]};
+            auto found = std::lower_bound(plan.layout_pivots.begin(), plan.layout_pivots.end(), key,
+                [](const auto& pivot, const auto& key) { return pivot.key() < key; });
+            for (; found != plan.layout_pivots.end() && found->key() == key && found->layout < layout; ++found)
+                if (matches(found->layout)) return true;
+        }
+        return false;
     }
     bool next(const VolumeAttemptPlan& plan, const std::atomic<bool>* cancel = nullptr) {
         if (plan.insufficient_sources) return false;
@@ -251,25 +340,7 @@ struct VolumeAttemptCursor {
                 if (++depth != slot_count) { digits[depth] = 0; continue; }
                 // Overlapping evidence tiers can denote the same composition.
                 // Membership in an earlier layout avoids an ever-growing seen set.
-                bool duplicate = false;
-                for (std::size_t old = 0; old < layout && !duplicate; ++old) {
-                    if (!plan.layout_password_domains.empty() &&
-                        plan.layout_password_domains[old] != plan.layout_password_domains[layout]) continue;
-                    const auto& previous = plan.layouts[old];
-                    if (slot_count > previous.size() || slot_count < plan.minimum_slots_for(old)) continue;
-                    duplicate = true;
-                    for (std::size_t i = 0; i < slot_count; ++i)
-                        if (previous[i].number != slots[i].number || previous[i].name != slots[i].name) {
-                            duplicate = false; break;
-                        }
-                        else if (plan.domain_for(old, slot_count, i) != plan.domain_for(layout, slot_count, i)) {
-                            const auto& domain = plan.domains[plan.domain_for(old, slot_count, i)];
-                            if (std::find(domain.begin(), domain.end(), selected[i]) == domain.end()) {
-                                duplicate = false; break;
-                            }
-                        }
-                }
-                if (!duplicate) { ++attempts; searching = needs_next = false; return true; }
+                if (!layout || !duplicate(plan)) { ++attempts; searching = needs_next = false; return true; }
                 --depth; unselect(plan, depth); ++digits[depth];
             }
             advance(plan);

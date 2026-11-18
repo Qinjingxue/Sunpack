@@ -576,8 +576,11 @@ fn rar5_packed_blake2sp_prunes_only_complete_nonfinal_fragments() {
         domains: [vec![0], vec![1, 2], vec![3]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
         head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
     });
+    let sessions: Vec<_> = plan.sources[..3].iter()
+        .map(|source| NativeArchiveSession::new(source.path.clone()).unwrap()).collect();
     let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &plan.sources[0],
-        &plan, &[Arc::from("secret")], &[], true).unwrap();
+        &plan, &[Arc::from("secret")], &sessions, true).unwrap();
+    drop(sessions);
     let remaining = result.volume_attempts.unwrap();
     assert!(remaining.sources.contains(&plan.sources[2]));
     assert!(remaining.sources.contains(&plan.sources[3]));

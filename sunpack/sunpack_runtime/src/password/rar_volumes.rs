@@ -2,7 +2,7 @@ use super::*;
 use crate::io::archive_state::VolumeAttemptPlan;
 use crate::password::evidence::{remove_paths, EvidenceContext, VolumeProjection};
 use crate::password::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
-use crate::password::input::VirtualRangeReader;
+use crate::password::input::{InputReaders, VirtualRangeReader};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 
@@ -46,10 +46,10 @@ impl VolumeFacts {
 // Stream only complete non-final fragments of structurally viable sources.
 // Final unpacked checksums and omitted legacy RAR4 CRCs never enter this list.
 fn packed_mismatch(spans: &[(u64, u64, PackedDigest)], source: &InputExtent,
-    sessions: &[NativeArchiveSession], cancel: &Cancellation) -> bool {
+    readers: &InputReaders<'_>, cancel: &Cancellation) -> bool {
     if spans.is_empty() { return false; }
-    let Ok(ranges) = parse_ranges(std::iter::once(source), sessions) else { return false; };
-    let mut reader = VirtualRangeReader::streaming(&ranges);
+    let Ok(range) = readers.single_range(source) else { return false; };
+    let mut reader = VirtualRangeReader::streaming(std::slice::from_ref(&range));
     let mut buffer = Vec::new();
     for &(offset, length, ref expected) in spans {
         if offset.checked_add(length).is_none_or(|end| end > reader.len()) { continue; }
@@ -181,19 +181,21 @@ pub(in crate::password) fn rejected_sources(plan: &VolumeAttemptPlan, bad: &[boo
 pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, sessions: &[NativeArchiveSession], native_volume: bool)
     -> Result<Option<PasswordContext>, PreparedStatus> {
     let cancel = Cancellation::current();
+    let Some(head_index) = plan.sources.iter().position(|s| s.path == head.path && s.start == head.start &&
+        (s.end == head.end || head.end.is_none())) else { return Ok(None); };
+    let readers = InputReaders::new(sessions);
     let inspect = |extent: &InputExtent, check_data: bool| {
         let mut facts = VolumeFacts { packed: check_data.then(Vec::new), ..VolumeFacts::default() };
-        let ranges = parse_ranges(std::iter::once(extent), sessions).ok()?;
-        let mut reader = VirtualRangeReader::streaming(&ranges);
+        let range = readers.single_range(extent).ok()?;
+        let ranges = std::slice::from_ref(&range);
+        let mut reader = VirtualRangeReader::streaming(ranges);
         let len = reader.len();
         let context = prepare_rar_volume(|offset, size, field| {
             reader.read_at(offset, size).map_err(|err|
                 ReadFault::from_io(err, "read_volume", offset, size, 0, len).with_field(field, FieldLocation::Head))
-        }, Some(&mut facts), RarRanges::Fixed(&ranges)).ok().map(Arc::new);
+        }, Some(&mut facts), RarRanges::Fixed(ranges)).ok().map(Arc::new);
         Some((facts, context))
     };
-    let Some(head_index) = plan.sources.iter().position(|s| s.path == head.path && s.start == head.start &&
-        (s.end == head.end || head.end.is_none())) else { return Ok(None); };
     let Some((anchor, context)) = inspect(&plan.sources[head_index], false) else { return Ok(None); };
     if !native_volume && !anchor.native { return Ok(None); }
     let mut variable = vec![false; plan.sources.len()];
@@ -216,7 +218,7 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
     let anchor_context = materials[head_index].clone();
     let by_extent: HashMap<_, _> = plan.sources.iter().enumerate().map(|(i,s)| (s,i)).collect();
     let bad: Vec<_> = remaining.sources.par_iter().map(|s| {
-        facts[by_extent[s]].packed.as_deref().is_some_and(|spans| packed_mismatch(spans, s, sessions, &cancel))
+        facts[by_extent[s]].packed.as_deref().is_some_and(|spans| packed_mismatch(spans, s, &readers, &cancel))
     }).collect();
     cancel.check_io().map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
     if bad.iter().any(|&value| value) {

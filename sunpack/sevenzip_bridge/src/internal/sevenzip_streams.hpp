@@ -41,6 +41,8 @@ namespace sunpack::sevenzip
 
 #ifdef SUP7Z_DEBUG
     inline thread_local UInt64 observed_logical_read_bytes = 0;
+    inline thread_local std::size_t observed_range_size_queries = 0;
+    inline thread_local std::size_t observed_range_handle_opens = 0;
 #endif
 
     struct InputPrefetchConfig
@@ -605,6 +607,8 @@ namespace sunpack::sevenzip
         {
 
             ranges_.reserve(ranges.size());
+            const std::wstring* sized_path = nullptr;
+            UInt64 file_size = 0;
 
             for (const auto &input : ranges)
             {
@@ -615,13 +619,21 @@ namespace sunpack::sevenzip
                     continue;
                 }
 
-                std::error_code error;
-                const UInt64 file_size = std::filesystem::file_size(input.path, error);
-                if (error)
+                if (!sized_path || *sized_path != input.path)
                 {
-                    open_hresult_ = HRESULT_FROM_WIN32(error.value());
-                    record_input_error(trace_, input.path, open_hresult_);
-                    continue;
+                    std::error_code error;
+#ifdef SUP7Z_DEBUG
+                    ++observed_range_size_queries;
+#endif
+                    const auto size = std::filesystem::file_size(input.path, error);
+                    if (error)
+                    {
+                        open_hresult_ = HRESULT_FROM_WIN32(error.value());
+                        record_input_error(trace_, input.path, open_hresult_);
+                        continue;
+                    }
+                    sized_path = &input.path;
+                    file_size = size;
                 }
 
                 const UInt64 start = std::min<UInt64>(input.start, file_size);
@@ -891,15 +903,18 @@ namespace sunpack::sevenzip
 
         HRESULT ensure_cached_handle(std::size_t index)
         {
-
-            if (cached_handle_ != INVALID_HANDLE_VALUE && cached_index_ == index)
+            if (cached_handle_ != INVALID_HANDLE_VALUE &&
+                (cached_index_ == index || ranges_[cached_index_].path == ranges_[index].path))
             {
-
+                cached_index_ = index;
                 return S_OK;
             }
 
             close_cached_handle();
 
+#ifdef SUP7Z_DEBUG
+            ++observed_range_handle_opens;
+#endif
             cached_handle_ = CreateFileW(win32_extended_path(ranges_[index].path).c_str(), GENERIC_READ,
                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);

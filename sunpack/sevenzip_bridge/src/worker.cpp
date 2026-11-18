@@ -662,6 +662,7 @@ class CompleteVolumeGeometry {
 public:
 #ifdef SUP7Z_DEBUG
     std::size_t inspected_choices = 0;
+    std::size_t file_size_queries = 0;
 #endif
     bool known(const sunpack::sevenzip::VolumeAttemptPlan& plan, std::size_t layout) {
         if (plan.minimum_slots_for(layout) != plan.layouts[layout].size()) return false;
@@ -670,6 +671,7 @@ public:
         complete_ = false;
         const auto source_offset = plan.domains.size();
         std::vector<bool> checked(source_offset + plan.sources.size());
+        std::unordered_map<std::wstring_view, std::uintmax_t> file_sizes;
         for (const auto& slot : plan.layouts[layout]) {
             if (checked[slot.domain]) continue;
             checked[slot.domain] = true;
@@ -680,9 +682,17 @@ public:
                 if (checked[source_offset + id]) continue;
                 checked[source_offset + id] = true;
                 const auto& source = plan.sources[id];
-                std::error_code error;
-                if (sunpack::sevenzip::native_job_cancelled() || !source.has_end ||
-                    std::filesystem::file_size(source.path, error) < source.end || error) return false;
+                if (sunpack::sevenzip::native_job_cancelled() || !source.has_end) return false;
+                auto [size, inserted] = file_sizes.try_emplace(source.path);
+                if (inserted) {
+                    std::error_code error;
+#ifdef SUP7Z_DEBUG
+                    ++file_size_queries;
+#endif
+                    size->second = std::filesystem::file_size(source.path, error);
+                    if (error) return false;
+                }
+                if (size->second < source.end) return false;
             }
         }
         complete_ = true;
@@ -788,6 +798,13 @@ sunpack::sevenzip::PasswordTestResult probe_input(const WorkerRequest& request, 
     return proof;
 }
 
+std::size_t rejected_prefix_size(const sunpack::sevenzip::PasswordTestResult& probe, std::size_t slots) {
+    const auto& observed = probe.observed_volume_slots;
+    if (!observed || observed->empty()) return 0;
+    const auto count = observed->back() + 1;
+    return count < slots ? count : 0;
+}
+
 std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
     sunpack::sevenzip::VolumeAttemptCursor& next, const std::atomic<bool>* cancel, VolumeProbeCache& cache) {
     using namespace sunpack::sevenzip;
@@ -805,6 +822,16 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
             // An earlier uncached composition can still win. Nothing after
             // this confirmed one is needed, including cursor advancement.
             if (cached->status == PasswordTestStatus::Ok) break;
+            if (cached->status == PasswordTestStatus::WrongPassword) {
+                const auto prefix = rejected_prefix_size(*cached, prepared.sources.size());
+                if ((cached->rejects_fixed_geometry || prefix) && cache.can_skip_suffix(plan, prepared.layout)) {
+                    // Keep the witness in the wave for the scan report and
+                    // the extraction cursor. The lookahead need not copy or
+                    // dispatch any composition under its rejected branch.
+                    if (cached->rejects_fixed_geometry) next.skip_layout();
+                    else next.skip_suffix(plan, prefix - 1);
+                }
+            }
         } else pending.push_back(i);
     }
     const auto capacity = parallel.size();
@@ -840,13 +867,6 @@ void append_volume_selection(std::string& fields, std::size_t layout,
     fields += wire::object() + wire::key("layout") + wire::number(layout) + wire::key("sources") + wire::array();
     for (std::size_t i = 0; i < (std::min)(count, sources.size()); ++i) wire::append_number(fields, sources[i]);
     fields += wire::end() + wire::end();
-}
-
-std::size_t rejected_prefix_size(const sunpack::sevenzip::PasswordTestResult& probe, std::size_t slots) {
-    const auto& observed = probe.observed_volume_slots;
-    if (!observed || observed->empty()) return 0;
-    const auto count = observed->back() + 1;
-    return count < slots ? count : 0;
 }
 
 bool same_volume_prefix(const std::vector<std::size_t>& left, const std::vector<std::size_t>& right, std::size_t size) {
@@ -1190,8 +1210,9 @@ RequestOutcome run_request(
                 const auto prefix = rejected_prefix_size(*selected_probe, cursor.selected.size());
                 if ((selected_probe->rejects_fixed_geometry || prefix) && proof_cache.can_skip_suffix(plan, cursor.layout)) {
                     if (selected_probe->rejects_fixed_geometry) {
+                        while (!prepared_attempts.empty() && prepared_attempts.front().layout == cursor.layout)
+                            prepared_attempts.pop_front();
                         cursor.skip_layout();
-                        prepared_attempts.clear();
                     } else {
                         while (!prepared_attempts.empty() && prepared_attempts.front().layout == cursor.layout &&
                             same_volume_prefix(cursor.selected, prepared_attempts.front().sources, prefix))

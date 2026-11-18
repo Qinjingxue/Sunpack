@@ -143,7 +143,7 @@ int main() {
             if (domain.empty()) domain.push_back(random() % plan.sources.size());
             std::shuffle(domain.begin(), domain.end(), random);
         }
-        plan.layouts.resize(1 + random() % 3);
+        plan.layouts.resize(trial % 10 == 0 ? 8 + random() % 3 : 1 + random() % 3);
         for (auto& layout : plan.layouts) {
             const auto size = 1 + random() % 6;
             for (std::size_t i = 0; i < size; ++i) {

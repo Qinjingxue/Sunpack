@@ -371,7 +371,19 @@ pub(crate) struct VolumeAttemptPlan {
 // These indexes are invocation-local: domains share Arc-backed choice lists,
 // so large unnamed volume pools are indexed once, not scanned for every slot.
 type DomainKey = *const Vec<usize>;
-type DomainMembers = HashMap<DomainKey, HashSet<usize>>;
+#[derive(Default)]
+pub(crate) struct DomainMembers(HashMap<DomainKey, HashSet<usize>>);
+
+impl DomainMembers {
+    pub(crate) fn contains(&mut self, choices: &Arc<Vec<usize>>, source: usize) -> bool {
+        if choices.len() <= 8 {
+            return choices.contains(&source);
+        }
+        self.0.entry(Arc::as_ptr(choices))
+            .or_insert_with(|| choices.iter().copied().collect())
+            .contains(&source)
+    }
+}
 type ExtentKey<'a> = (&'a str, u64, Option<u64>);
 
 enum ExtentCandidates {
@@ -405,10 +417,10 @@ impl VolumeAttemptPlan {
     }
 
     pub(crate) fn selected_parts(&self, selection: &VolumeSelection) -> io::Result<Box<[InputPart]>> {
-        self.selected_parts_indexed(selection, &mut DomainMembers::new())
+        self.selected_parts_indexed(selection, &mut DomainMembers::default())
     }
 
-    fn selected_parts_indexed(
+    pub(crate) fn selected_parts_indexed(
         &self, selection: &VolumeSelection, domains: &mut DomainMembers,
     ) -> io::Result<Box<[InputPart]>> {
         let layout = self
@@ -432,9 +444,7 @@ impl VolumeAttemptPlan {
                 slot.domain
             };
             let choices = &self.domains[domain].choices;
-            let members = domains.entry(Arc::as_ptr(choices))
-                .or_insert_with(|| choices.iter().copied().collect());
-            if !seen.insert(source) || !members.contains(&source) {
+            if !seen.insert(source) || !domains.contains(choices, source) {
                 return Err(invalid("worker selected an unplanned volume"));
             }
             parts.push(InputPart {
@@ -478,7 +488,7 @@ impl VolumeAttemptPlan {
         if parts.is_empty() {
             return false;
         }
-        let mut members = DomainMembers::new();
+        let mut members = DomainMembers::default();
         let mut domains: HashMap<(DomainKey, bool), HashMap<ExtentKey<'_>, ExtentCandidates>> = HashMap::new();
         for (index, layout) in self.layouts.iter().enumerate() {
             if parts.len() != layout.slots.len()

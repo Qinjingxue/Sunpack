@@ -85,6 +85,42 @@ fn scan_frontier_restores_each_suffix_choice_once() {
     assert_eq!(FRONTIER_RESTORED_CHOICES.get(), count - 1);
 }
 
+#[test]
+fn scan_discarded_prefix_skips_wide_unvisited_suffixes() {
+    let width = 64;
+    let count = 48;
+    let plan = VolumeAttemptPlan {
+        sources: (0..=width * (count - 1)).map(|id| InputExtent {
+            path: id.to_string(), start: 0, end: Some(1),
+        }).collect(),
+        domains: std::iter::once(VolumeDomain { choices: Arc::new(vec![0]) })
+            .chain((0..count - 1).map(|index| VolumeDomain {
+                choices: Arc::new((index * width + 1..=(index + 1) * width).collect()),
+            })).collect(),
+        layouts: Box::new([VolumeLayout {
+            minimum_slots: 0,
+            slots: (0..count).map(|domain| VolumeSlot {
+                number: domain as u32 + 1, canonical_name: String::new(), domain,
+            }).collect(),
+        }]),
+        head_size_from_total: None,
+        minimum_size: None,
+        tail_totals: Box::new([]),
+    };
+    let prefixes = (1..width).rev().map(|id| VolumeSelection {
+        layout: 0, sources: vec![0, id],
+    }).collect();
+    PARTITION_EDGE_VISITS.set(0);
+    let kept = remove_scan_paths(&plan, Vec::new(), prefixes, Vec::new(), None).unwrap();
+    assert_eq!(kept.layouts.len(), 1);
+    let slots = &kept.layouts[0].slots;
+    let choice_paths = |index: usize| kept.domains[slots[index].domain].choices.iter()
+        .map(|&id| kept.sources[id].path.as_str()).collect::<Vec<_>>();
+    assert_eq!(choice_paths(1), [width.to_string().as_str()]);
+    assert_eq!(choice_paths(count - 1).len(), width);
+    assert_eq!(PARTITION_EDGE_VISITS.get(), 1 + width);
+}
+
 // A cross-volume failure must preserve either fragment with another partner.
 // Check actual serialized candidates and order, not the discarded evidence.
 #[test]

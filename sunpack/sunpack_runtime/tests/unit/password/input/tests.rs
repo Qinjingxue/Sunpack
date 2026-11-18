@@ -84,6 +84,59 @@ fn disk_relative_reads_visit_only_the_requested_volume_edges() {
 }
 
 #[test]
+fn logical_crc_reuses_geometry_between_volume_boundaries() {
+    use super::attempts::{count_logical_edges, prepare_attempt_evidence, AttemptGeometry};
+    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    use std::sync::Arc;
+
+    const VOLUMES: usize = 128;
+    const CHUNK: usize = 64 * 1024;
+    let mut bytes = vec![b'A'; 8 * CHUNK];
+    bytes[4 * CHUNK..].fill(b'B');
+    bytes.extend([b'C'; VOLUMES - 2]);
+    let file = temp_file("logical_crc_geometry", &bytes);
+    let path = file.to_string_lossy();
+    let mut start = 0;
+    let sources = (0..VOLUMES).map(|i| {
+        let end = start + if i < 2 { 4 * CHUNK as u64 } else { 1 };
+        let extent = InputExtent { path: path.to_string(), start, end: Some(end) };
+        start = end;
+        extent
+    }).collect();
+    let plan = VolumeAttemptPlan {
+        sources,
+        layouts: vec![VolumeLayout {
+            minimum_slots: 0,
+            slots: (0..VOLUMES).map(|domain| VolumeSlot {
+                number: domain as u32 + 1, canonical_name: domain.to_string(), domain,
+            }).collect(),
+        }].into(),
+        domains: (0..VOLUMES).map(|source| VolumeDomain { choices: Arc::new(vec![source]) }).collect(),
+        head_size_from_total: None,
+        minimum_size: None,
+        tail_totals: Box::default(),
+    };
+    let mut prepared = prepare_attempt_evidence(&plan.sources[0], &plan, &[],
+        AttemptGeometry::Forward { logical_limit: None },
+        |reader| Ok(Some(reader.deferred_reads(false))),
+    ).unwrap_or_else(|_| panic!("logical geometry"));
+    let readers = prepared.pop().unwrap();
+    let (observations, visits) = count_logical_edges(|| readers.evaluate(|reader| {
+        assert!(readers.shares_projection(reader));
+        let head = reader.crc32(0, (8 * CHUNK) as u64).unwrap();
+        // A backward seek must resolve the earlier volume again.
+        let restart = reader.read(0, 1).unwrap();
+        (head, restart)
+    }));
+    let observations = observations.unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].1, (crc32fast::hash(&bytes[..8 * CHUNK]), vec![b'A']));
+    assert_eq!(visits, 3 * VOLUMES);
+    drop(readers);
+    std::fs::remove_file(file).unwrap();
+}
+
+#[test]
 fn tail_total_table_prefers_source_then_falls_back_to_global_trim() {
     use super::attempts::{prepare_attempt_evidence, AttemptGeometry};
     use crate::io::archive_state::{
@@ -221,7 +274,10 @@ fn delayed_read_keeps_unavailable_choices_separate_from_readable_bytes() {
     ).unwrap_or_else(|_| panic!("shared prefix geometry"));
     assert!(!values[0].disk_range_is_ambiguous(0, 0, 1));
     assert!(values[0].disk_range_is_ambiguous(0, 1, 1));
-    let observations = values[0].evaluate(|reader| reader.read(1, 1)).unwrap();
+    let observations = values[0].evaluate(|reader| {
+        assert_eq!(reader.read(0, 1).unwrap(), b"H");
+        reader.read(1, 1)
+    }).unwrap();
     let mut count = 0;
     for (projection, read) in observations {
         let source = projection.edges.iter().find(|edge| edge[2] != 0).unwrap()[2];

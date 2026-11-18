@@ -1,7 +1,7 @@
 //! Task-local byte dependencies reduce the existing candidate plan directly.
 //! Worker layouts carry only the passwords still viable for their bytes.
 use super::{context::{PasswordContext, PreparedStatus}, PasswordVerification};
-use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSelection};
+use crate::io::archive_state::{DomainMembers, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSelection};
 use crate::io::cancellation::Cancellation;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -177,7 +177,7 @@ impl CandidateDomains {
             rejected.clear();
             for node in state {
                 match ends.get(node) {
-                    Some(Rule::Remove) => return None,
+                    Some(Rule::Remove | Rule::RemovePrefix) => return None,
                     Some(Rule::Domain(id)) => group = if group == 0 { *id } else { group.min(*id) },
                 Some(Rule::Reject(indices)) => {
                     if first_rejection.is_none() {
@@ -680,7 +680,7 @@ pub(super) fn remove_paths(
 pub(crate) fn remove_scan_paths(
     plan: &VolumeAttemptPlan,
     selections: Vec<VolumeSelection>,
-    mut prefixes: Vec<VolumeSelection>,
+    prefixes: Vec<VolumeSelection>,
     layouts: Vec<usize>,
     first: Option<&VolumeSelection>,
 ) -> std::io::Result<VolumeAttemptPlan> {
@@ -688,7 +688,10 @@ pub(crate) fn remove_scan_paths(
     let mut proof = VolumeProjection { roots: Vec::new(), edges: Vec::new(), ends: Vec::new() };
     let mut roots = HashMap::new();
     let mut edges = HashMap::new();
-    let mut suffixes = HashMap::new();
+    let mut members = DomainMembers::default();
+    if let Some(first) = first {
+        plan.selected_parts_indexed(first, &mut members)?;
+    }
     let mut nodes = 0;
     let mut node = || { nodes += 1; nodes };
     let start = first.map_or(0, |selection| selection.layout);
@@ -696,8 +699,6 @@ pub(crate) fn remove_scan_paths(
     for layout in layouts {
         *dropped.get_mut(layout).ok_or_else(invalid)? = true;
     }
-    // Create wildcard suffixes before narrower paths can occupy the same edge.
-    prefixes.sort_unstable_by_key(|selection| selection.sources.len());
     for (selection, prefix) in prefixes.into_iter().map(|value| (value, true))
         .chain(selections.into_iter().map(|value| (value, false))) {
         let layout = plan.layouts.get(selection.layout).ok_or_else(invalid)?;
@@ -714,27 +715,16 @@ pub(crate) fn remove_scan_paths(
         let mut at = *roots.entry((selection.layout, count)).or_insert_with(&mut node);
         for (index, source) in selection.sources.into_iter().enumerate() {
             let slot = if index + 1 == count { layout.slots.last().unwrap() } else { &layout.slots[index] };
-            if !plan.domains[slot.domain].choices.contains(&source) {
+            if !members.contains(&plan.domains[slot.domain].choices, source) {
                 return Err(invalid());
             }
             at = *edges.entry((at, source)).or_insert_with(&mut node);
-        }
-        if prefix {
-            // Tie each rejected prefix to a shared, ordinary suffix chain.
-            // All unused choices remain factored while partition removes it.
-            for index in used..count {
-                let end = *suffixes.entry((selection.layout, index)).or_insert_with(&mut node);
-                for &source in plan.domains[layout.slots[index].domain].choices.iter() {
-                    edges.entry((at, source)).or_insert(end);
-                }
-                at = end;
-            }
         }
         proof.ends.push(at);
     }
     proof.roots.extend(roots.into_iter().map(|((layout, count), at)| [layout, count, at]));
     proof.edges.extend(edges.into_iter().map(|((from, source), to)| [from, to, source]));
-    let (plan, _) = partition_from(plan, &[(&proof, Rule::Remove)], &dropped, first, &mut remove_terminal)?;
+    let (plan, _) = partition_from(plan, &[(&proof, Rule::RemovePrefix)], &dropped, first, &mut remove_terminal)?;
     Ok(plan)
 }
 
@@ -744,6 +734,7 @@ pub(crate) fn remove_scan_paths(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Rule<'a> {
     Remove,
+    RemovePrefix,
     Domain(usize),
     Reject(&'a [usize]),
 }
@@ -762,8 +753,8 @@ fn partition_from(
     first: Option<&VolumeSelection>,
     terminal: &mut impl FnMut(&State, &Ends) -> Option<usize>,
 ) -> std::io::Result<(VolumeAttemptPlan, Vec<usize>)> {
-    if let Some(first) = first { plan.selected_parts(first)?; }
-    let tracks_domains = rules.iter().any(|(_, rule)| *rule != Rule::Remove);
+    let tracks_domains = rules.iter().any(|(_, rule)| matches!(rule, Rule::Domain(_) | Rule::Reject(_)));
+    let removes_prefixes = rules.iter().any(|(_, rule)| *rule == Rule::RemovePrefix);
     let mut edges: HashMap<(usize, usize, usize), Vec<usize>> = HashMap::new();
     let mut ends = HashMap::new();
     let mut roots = HashMap::<(usize, usize), State>::new();
@@ -787,6 +778,7 @@ fn partition_from(
         root: State,
         edges: &HashMap<(usize, usize, usize), Vec<usize>>,
         ends: &Ends,
+        removes_prefixes: bool,
         terminal: &mut impl FnMut(&State, &Ends) -> Option<usize>,
     ) -> std::io::Result<Vec<(Vec<Arc<Vec<usize>>>, usize)>> {
         if root.is_empty() {
@@ -801,9 +793,17 @@ fn partition_from(
             let mut ids = HashMap::new();
             let mut steps = Vec::with_capacity(layer.len());
             for state in layer {
+                // A worker prefix rejects every continuation. Empty targets,
+                // by contrast, mean the evidence stopped constraining the path.
+                if removes_prefixes && state.iter().any(|node| ends.get(node) == Some(&Rule::RemovePrefix)) {
+                    steps.push(None);
+                    continue;
+                }
                 let mut targets = Vec::new();
                 if !state.is_empty() {
                     for &source in domain.iter() {
+                        #[cfg(test)]
+                        PARTITION_EDGE_VISITS.with(|count| count.set(count.get() + 1));
                         let mut target = Vec::new();
                         for &(proof, node) in &state {
                             if let Some(nodes) = edges.get(&(proof, node, source)) {
@@ -819,7 +819,7 @@ fn partition_from(
                         }));
                     }
                 }
-                steps.push(targets);
+                steps.push(Some(targets));
             }
             layers.push(steps);
             layer = next;
@@ -849,6 +849,7 @@ fn partition_from(
             suffixes = steps
                 .into_iter()
                 .map(|targets| {
+                    let Some(targets) = targets else { return Vec::new(); };
                     if targets.is_empty() {
                         return vec![unconstrained];
                     }
@@ -953,13 +954,13 @@ fn partition_from(
             };
             match frontier {
                 None => {
-                    for (remaining, group) in subtract(&choices, state, &edges, &ends, terminal)? {
+                    for (remaining, group) in subtract(&choices, state, &edges, &ends, removes_prefixes, terminal)? {
                         keep(remaining, group);
                     }
                 }
                 Some(selection) => {
                     visit_ordered_suffix(&choices, &selection.sources, |suffix| {
-                        for (remaining, group) in subtract(suffix, state.clone(), &edges, &ends, terminal)? {
+                        for (remaining, group) in subtract(suffix, state.clone(), &edges, &ends, removes_prefixes, terminal)? {
                             keep(remaining, group);
                         }
                         Ok(())
@@ -997,6 +998,7 @@ fn visit_ordered_suffix(
 #[cfg(test)]
 thread_local! {
     static FRONTIER_RESTORED_CHOICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PARTITION_EDGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

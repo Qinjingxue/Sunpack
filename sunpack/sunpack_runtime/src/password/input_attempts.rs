@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 thread_local! {
     static EDGE_READS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static DISK_EDGE_VISITS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static LOGICAL_EDGE_VISITS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -28,6 +29,15 @@ pub(super) fn count_edge_reads<T>(read: impl FnOnce() -> T) -> (T, usize) {
 #[cfg(test)]
 pub(super) fn count_disk_edges<T>(read: impl FnOnce() -> T) -> (T, usize) {
     DISK_EDGE_VISITS.with(|visits| {
+        let previous = visits.replace(Some(0));
+        let result = read();
+        (result, visits.replace(previous).unwrap())
+    })
+}
+
+#[cfg(test)]
+pub(super) fn count_logical_edges<T>(read: impl FnOnce() -> T) -> (T, usize) {
+    LOGICAL_EDGE_VISITS.with(|visits| {
         let previous = visits.replace(Some(0));
         let result = read();
         (result, visits.replace(previous).unwrap())
@@ -344,7 +354,7 @@ impl Projection {
         }
         self.ends.iter().any(|value| *value)
     }
-    fn select_disk(&self, all: &[usize], keep: &[usize], missing_cases: &[usize]) -> Option<Self> {
+    fn select_disk(&self, all: &[usize], keep: &[usize], missing_cases: &[usize]) -> Option<Arc<Self>> {
         let mut result = self.clone();
         let mut cases = std::collections::HashSet::new();
         cases.extend(missing_cases.iter().copied());
@@ -361,7 +371,7 @@ impl Projection {
         for (index, &(_, _, case, _)) in result.topology.ends.iter().enumerate() {
             result.ends[index] &= cases.contains(&case);
         }
-        result.prune().then_some(result)
+        result.prune().then(|| Arc::new(result))
     }
 
     fn select(
@@ -370,7 +380,7 @@ impl Projection {
         keep: &[usize],
         short: bool,
         position: u64,
-    ) -> Option<Self> {
+    ) -> Option<Arc<Self>> {
         let mut result = self.clone();
         for &index in covering {
             result.active[index] = false;
@@ -393,7 +403,7 @@ impl Projection {
                 }
             }
         }
-        result.prune().then_some(result)
+        result.prune().then(|| Arc::new(result))
     }
 }
 fn unknown(message: impl Into<String>) -> PreparedStatus {
@@ -814,7 +824,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
             ends,
             len,
         };
-        projection.prune().then_some(projection)
+        projection.prune().then(|| Arc::new(projection))
     });
     let mut pending = Vec::new();
     let mut prepared_contexts = Vec::new();
@@ -898,9 +908,10 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
 
 pub(crate) struct AttemptReader<'a> {
     sources: &'a Arc<[AttemptSource]>,
-    projection: Projection,
+    projection: Arc<Projection>,
     position: u64,
-    pending: Option<Vec<Projection>>,
+    logical_span: Option<(usize, u64)>,
+    pending: Option<Vec<Arc<Projection>>>,
     fault: Option<io::Error>,
     evidence_fault: Option<io::Error>,
     unresolved_fault: Option<io::Error>,
@@ -912,7 +923,7 @@ pub(crate) struct AttemptReader<'a> {
 #[derive(Clone)]
 pub(crate) struct DeferredReads {
     sources: Arc<[AttemptSource]>,
-    projection: Projection,
+    projection: Arc<Projection>,
     disk_relative: bool,
     proof: Arc<OnceLock<Arc<crate::password::evidence::VolumeProjection>>>,
 }
@@ -932,6 +943,11 @@ pub(crate) struct DeferredReader<'a> {
 }
 
 impl DeferredReads {
+    #[cfg(test)]
+    pub(super) fn shares_projection(&self, reader: &DeferredReader<'_>) -> bool {
+        Arc::ptr_eq(&self.projection, &reader.reader.projection)
+    }
+
     pub(crate) fn scope(&self) -> Arc<crate::password::evidence::VolumeProjection> {
         self.proof.get_or_init(|| self.projection.proof()).clone()
     }
@@ -979,10 +995,10 @@ impl DeferredReads {
 
     fn evaluate_with<T, P>(
         &self, verify: &mut impl FnMut(&mut DeferredReader<'_>) -> T,
-        mut project: impl FnMut(Projection, bool) -> P,
+        mut project: impl FnMut(Arc<Projection>, bool) -> P,
     ) -> io::Result<Vec<(P, T)>> {
         let mut pending = Vec::new();
-        let mut current = Some(self.projection.clone());
+        let mut current = Some(Arc::clone(&self.projection));
         let mut outcomes = Vec::new();
         let mut branched = false;
         while let Some(projection) = current.take().or_else(|| pending.pop()) {
@@ -1084,11 +1100,12 @@ impl AttemptReader<'_> {
         Ok(crc.finalize())
     }
 
-    fn new(sources: &Arc<[AttemptSource]>, projection: Projection) -> AttemptReader<'_> {
+    fn new(sources: &Arc<[AttemptSource]>, projection: Arc<Projection>) -> AttemptReader<'_> {
         AttemptReader {
             sources,
             projection,
             position: 0,
+            logical_span: None,
             pending: None,
             fault: None,
             evidence_fault: None,
@@ -1102,7 +1119,7 @@ impl AttemptReader<'_> {
     pub(crate) fn deferred_reads(&self, disk_relative: bool) -> DeferredReads {
         DeferredReads {
             sources: Arc::clone(self.sources),
-            projection: self.projection.clone(),
+            projection: Arc::clone(&self.projection),
             disk_relative,
             proof: Arc::new(OnceLock::new()),
         }
@@ -1135,12 +1152,12 @@ impl AttemptReader<'_> {
         }
         let mut branches = Vec::new();
         for disk in disks {
-            let mut projection = self.projection.clone();
+            let mut projection = self.projection.as_ref().clone();
             for (index, &(_, _, _, value)) in projection.topology.ends.iter().enumerate() {
                 projection.ends[index] &= value == disk;
             }
             if projection.prune() {
-                branches.push(projection);
+                branches.push(Arc::new(projection));
             }
         }
         self.pending = Some(branches);
@@ -1313,19 +1330,17 @@ impl AttemptReader<'_> {
         &mut self,
         load: impl FnOnce(&mut Self) -> Result<T, E>,
     ) -> Result<T, E> {
-        let isolate = self.pending.is_none() && self.fault.is_none();
-        let before = self.projection.clone();
+        let before = (self.pending.is_none() && self.fault.is_none()).then(|| Arc::clone(&self.projection));
         let result = load(self);
-        if isolate
-            && result.is_err()
-            && self.pending.is_none()
-            && !Cancellation::current().cancelled()
-        {
+        if let Some(before) = before.filter(|_| {
+            result.is_err() && self.pending.is_none() && !Cancellation::current().cancelled()
+        }) {
             if let Some(error) = self.fault.take() {
                 if self.evidence_fault.is_none() {
                     self.evidence_fault = Some(error);
                 }
                 self.projection = before;
+                self.logical_span = None;
             }
         }
         result
@@ -1383,8 +1398,20 @@ impl AttemptReader<'_> {
         if buffer.is_empty() || (disk.is_none() && self.position >= self.len()) {
             return Ok(0);
         }
+        if disk.is_none() {
+            if let Some((index, until)) = self.logical_span {
+                if self.position < until {
+                    let edge_end = self.projection.topology.edges[index].end;
+                    let count = (edge_end.min(self.len()) - self.position).min(buffer.len() as u64) as usize;
+                    self.read_edge(index, &mut buffer[..count], None)?;
+                    self.position += count as u64;
+                    return Ok(count);
+                }
+                self.logical_span = None;
+            }
+        }
+        let mut first = None;
         let mut covering = Vec::new();
-        let mut beyond_gap = Vec::new();
         let mut count = if disk.is_some() {
             buffer.len()
         } else {
@@ -1395,32 +1422,66 @@ impl AttemptReader<'_> {
                 return;
             }
             if offset < edge.end - edge.start {
-                if disk.is_none() && edge.unresolved {
-                    beyond_gap.push(index);
+                if let Some(earlier) = first {
+                    if covering.is_empty() {
+                        covering.push(earlier);
+                    }
+                    covering.push(index);
+                } else {
+                    first = Some(index);
                 }
-                covering.push(index);
                 count = count.min((edge.end - edge.start - offset) as usize);
             }
         };
+        let mut next_change = self.len();
+        let mut short = false;
         if let Some((disk, offset)) = disk {
             for (index, edge) in self.projection.topology.disk_edges(disk) {
                 consider(index, edge, offset);
             }
         } else {
+            #[cfg(test)]
+            LOGICAL_EDGE_VISITS.with(|visits| {
+                visits.set(visits.get().map(|count| count + self.projection.topology.edges.len()));
+            });
             for (index, edge) in self.projection.topology.edges.iter().enumerate() {
                 if edge.start <= self.position {
                     consider(index, edge, self.position - edge.start);
+                } else if edge.start < edge.end && self.projection.active[index] {
+                    next_change = next_change.min(edge.start);
+                }
+            }
+            for (index, &(_, end, _, _)) in self.projection.topology.ends.iter().enumerate() {
+                if self.projection.ends[index] {
+                    next_change = next_change.min(end);
+                    if end <= self.position {
+                        short = true;
+                        break;
+                    }
                 }
             }
         }
-        let short =
-            disk.is_none()
-                && self.projection.topology.ends.iter().enumerate().any(
-                    |(index, &(_, end, _, _))| self.projection.ends[index] && end <= self.position,
-                );
+        let covering = if covering.is_empty() { first.as_slice() } else { covering.as_slice() };
         if covering.is_empty() {
             return Ok(0);
         }
+        if let [index] = covering {
+            let edge = &self.projection.topology.edges[*index];
+            if !short && (disk.is_some() || !edge.unresolved) {
+                let until = next_change.min(edge.end);
+                self.read_edge(*index, &mut buffer[..count], disk.map(|(_, offset)| offset))?;
+                if disk.is_none() {
+                    // A later read can begin within a new competing range.
+                    // Keep the existing read size and recheck at that boundary.
+                    self.logical_span = Some((*index, until));
+                    self.position += count as u64;
+                }
+                return Ok(count);
+            }
+        }
+        let beyond_gap: Vec<_> = covering.iter().copied().filter(|&index| {
+            disk.is_none() && self.projection.topology.edges[index].unresolved
+        }).collect();
         if !beyond_gap.is_empty() {
             self.unresolved_fault = Some(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1434,15 +1495,15 @@ impl AttemptReader<'_> {
             let mut branches = Vec::new();
             if let Some(branch) = self
                 .projection
-                .select(&covering, &known, false, self.position)
+                .select(covering, &known, false, self.position)
             {
                 branches.push(branch);
             }
             if self.preserve_unreadable && (!branches.is_empty() || short) {
-                branches.extend(self.projection.select(&covering, &beyond_gap, false, self.position));
+                branches.extend(self.projection.select(covering, &beyond_gap, false, self.position));
             }
             if short {
-                branches.extend(self.projection.select(&covering, &[], true, self.position));
+                branches.extend(self.projection.select(covering, &[], true, self.position));
             }
             if branches.is_empty() {
                 self.missing = true;
@@ -1451,13 +1512,6 @@ impl AttemptReader<'_> {
                 self.pending = Some(branches);
             }
             return Err(io::Error::other("unresolved logical volume position"));
-        }
-        if let ([index], false) = (covering.as_slice(), short) {
-            self.read_edge(*index, &mut buffer[..count], disk.map(|(_, offset)| offset))?;
-            if disk.is_none() {
-                self.position += count as u64;
-            }
-            return Ok(count);
         }
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
         let mut buckets = HashMap::<u32, Vec<usize>>::new();
@@ -1473,7 +1527,7 @@ impl AttemptReader<'_> {
         let mut bytes = vec![0; count];
         let mut comparison = Vec::new();
         let mut compared_group = None;
-        for &index in &covering {
+        for &index in covering {
             let edge = &self.projection.topology.edges[index];
             let location = (
                 edge.source,
@@ -1559,9 +1613,9 @@ impl AttemptReader<'_> {
             // Another choice supplied this exact logical range. A source that
             // cannot fill its declared extent cannot supply the same evidence.
             let projection = if disk.is_some() {
-                self.projection.select_disk(&covering, &truncated, &[])
+                self.projection.select_disk(covering, &truncated, &[])
             } else {
-                self.projection.select(&covering, &truncated, false, self.position)
+                self.projection.select(covering, &truncated, false, self.position)
             };
             if let Some(projection) = projection {
                 self.truncated_choices.push(projection.proof());
@@ -1572,17 +1626,17 @@ impl AttemptReader<'_> {
             let failures = [unavailable, if self.preserve_unreadable { truncated } else { Vec::new() }];
             for edges in groups.into_iter().map(|(_, edges)| edges).chain(failures).filter(|edges| !edges.is_empty()) {
                 let branch = if disk.is_some() {
-                    self.projection.select_disk(&covering, &edges, &[])
+                    self.projection.select_disk(covering, &edges, &[])
                 } else {
                     self.projection
-                        .select(&covering, &edges, false, self.position)
+                        .select(covering, &edges, false, self.position)
                 };
                 if let Some(branch) = branch {
                     branches.push(branch);
                 }
             }
             if short {
-                if let Some(branch) = self.projection.select(&covering, &[], true, self.position) {
+                if let Some(branch) = self.projection.select(covering, &[], true, self.position) {
                     branches.push(branch);
                 }
             }
@@ -1592,16 +1646,17 @@ impl AttemptReader<'_> {
         let (_, edges) = groups.pop().unwrap();
         if edges.len() != covering.len() {
             let projection = if disk.is_some() {
-                self.projection.select_disk(&covering, &edges, &[])
+                self.projection.select_disk(covering, &edges, &[])
             } else {
                 self.projection
-                    .select(&covering, &edges, false, self.position)
+                    .select(covering, &edges, false, self.position)
             };
             let Some(projection) = projection else {
                 self.pending = Some(Vec::new());
                 return Err(io::Error::other("invalid repeated volume source"));
             };
             self.projection = projection;
+            self.logical_span = None;
         }
         if disk.is_none() {
             self.position += count as u64;
@@ -1621,8 +1676,12 @@ impl Seek for AttemptReader<'_> {
             SeekFrom::End(value) => i128::from(self.len()) + i128::from(value),
             SeekFrom::Current(value) => i128::from(self.position) + i128::from(value),
         };
-        self.position = u64::try_from(position)
+        let position = u64::try_from(position)
             .map_err(|_| io::Error::other("invalid volume evidence seek"))?;
-        Ok(self.position)
+        if position < self.position {
+            self.logical_span = None;
+        }
+        self.position = position;
+        Ok(position)
     }
 }

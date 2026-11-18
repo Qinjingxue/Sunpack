@@ -236,6 +236,10 @@ void check_completed_outputs_release_past_decoder_failure()
                   callback->SetOperationResult(kOpOk) == S_OK, "receipt sweep reached");
             check(raw->files_written() == 63, "settled outputs behind a failed decoder receipt are released");
         }
+#ifdef SUP7Z_DEBUG
+        check(raw->directory_keys_built_for_test() == 1,
+            "consecutive output files in the same directory share the directory check and key");
+#endif
         raw->finalize_output();
         check(raw->files_written() == 64 && trace.items.front().failed &&
               trace.items.front().operation_result == kOpDataError, "finalization retains the failed receipt");
@@ -628,33 +632,44 @@ void check_output_path_reservations()
     const auto root = std::filesystem::temp_directory_path() /
         (L"sunpack-reserved-paths-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
     OutputPathAllocator paths(root);
-    const auto original = root / L"entry.txt";
+    const std::filesystem::path original = L"entry.txt";
     check(paths.allocate(original, true) == original, "first output keeps original name");
-    check(paths.allocate(root / L"ENTRY.txt", true) == root / L"ENTRY(1).txt", "pending case-insensitive collision advances without a disk file");
-    check(paths.allocate(root / L"entry(1).txt", true) == root / L"entry(1)(1).txt", "explicit names cannot take a pending numbered output");
-    check(paths.allocate(original, true) == root / L"entry(2).txt", "numbered reservations advance monotonically");
+    check(paths.allocate(L"ENTRY.txt", true) == L"ENTRY(1).txt", "pending case-insensitive collision advances without a disk file");
+    check(paths.allocate(L"entry(1).txt", true) == L"entry(1)(1).txt", "explicit names cannot take a pending numbered output");
+    check(paths.allocate(original, true) == L"entry(2).txt", "numbered reservations advance monotonically");
 
     OutputPathAllocator failed_paths(root);
-    const auto invalid = root / (std::wstring(260, L'a') + L".txt");
+    const auto invalid = std::filesystem::path(std::wstring(260, L'a') + L".txt");
     check(failed_paths.allocate(invalid, true) == invalid, "reserve a name whose async create will fail");
-    check(failed_paths.allocate(invalid, true) == root / (std::wstring(260, L'a') + L"(1).txt"), "failed create cannot spin on the same name");
+    check(failed_paths.allocate(invalid, true) == std::wstring(260, L'a') + L"(1).txt", "failed create cannot spin on the same name");
 
     OutputPathAllocator many(root);
     many.reserve(10001);
     many.allocate(original, true);
     std::filesystem::path last;
     for (int index = 0; index < 10000; ++index) { last = many.allocate(original, true); }
-    check(last == root / L"entry(10000).txt", "large duplicate group advances without rescanning prior reservations");
+    check(last == L"entry(10000).txt", "large duplicate group advances without rescanning prior reservations");
+#ifdef SUP7Z_DEBUG
+    check(many.path_key_units_for_test() < 150'000, "reservations omit the shared absolute output root");
+#endif
 
     ExtractionReplay interrupted;
     interrupted.initialized = true;
-    interrupted.directories.emplace(normalized_output_path_key(root / L"logs"), root / L"logs(1)");
+    interrupted.directories.emplace(L"logs", L"logs(1)");
+    interrupted.files[0].path = (root / L"logs(1)" / L"A.txt").native();
     OutputPathAllocator resumed(root, &interrupted);
-    check(resumed.allocate(root / L"logs" / L"a.txt", true) == root / L"logs(1)" / L"a.txt",
-        "resumed allocation kept the saved directory collision result");
-    resumed.allocate(root / L"new" / L"b.txt", true);
-    check(interrupted.directories.count(normalized_output_path_key(root / L"new")) == 1,
+    check(resumed.allocate(L"LOGS/a.txt", true) == std::filesystem::path(L"logs(1)\\a(1).txt"),
+        "resumed allocation keeps the directory and protects an existing file receipt");
+    resumed.allocate(L"new/b.txt", true);
+    check(interrupted.directories.count(L"new") == 1,
         "resumed allocation updated the existing reservation table directly");
+
+    std::filesystem::create_directories(root / L"logs");
+    { std::ofstream existing(root / L"logs" / L"a.txt"); existing << "existing"; }
+    OutputPathAllocator populated(root);
+    check(populated.allocate(L"logs/a.txt", false) == std::filesystem::path(L"logs\\a(1).txt"),
+        "a populated output reuses its existing directory and leaves its original file untouched");
+    std::filesystem::remove_all(root);
 }
 
 #ifdef SUP7Z_DEBUG

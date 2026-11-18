@@ -231,6 +231,7 @@ void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
     require(cache.find(plan, attempt(4)) == nullptr && cache.find(plan, attempt(6)) == nullptr &&
         cache.find(plan, attempt(7)) != nullptr, "probe cache grew after losing CPU credits");
     require(cache.geometry.inspected_choices == 8, "geometry rechecked the shared choice domain for each slot");
+    require(cache.geometry.file_size_queries == 1, "geometry re-queried the same carrier for each extent");
     for (std::size_t tail : {4, 5, 6}) cache.remember(plan, attempt(tail), 4);
 
     NativeCpuBudget budget(8);
@@ -266,6 +267,65 @@ void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
     }
     require(first_match.attempts == 2 && accepted.scheduled_probes == 0,
         "cached winner advanced the cursor past its proof");
+
+    VolumeProbeCache prefixes(plan);
+    rejection.observed_volume_slots = std::vector<std::size_t>{0};
+    for (std::size_t head = 0; head < 4; ++head)
+        prefixes.remember(plan, {0, {head, (head + 1) % 4, 4}, rejection}, 4);
+    VolumeAttemptCursor prefix_cursor;
+    prefix_cursor.reserve(plan);
+    std::size_t head = 0;
+    for (;;) {
+        auto wave = probe_volume_wave(request, prefix_cursor, nullptr, prefixes);
+        if (wave.empty()) break;
+        for (const auto& item : wave) {
+            require(item.sources.front() == head++ && item.probe.status == PasswordTestStatus::WrongPassword,
+                "cached prefix did not retain its first representative in relation order");
+        }
+    }
+    require(head == 4 && prefix_cursor.attempts == 4 && prefixes.scheduled_probes == 0,
+        "known rejected suffixes were reconstructed by the wave");
+}
+
+void carrier_slices_share_open_file(const std::filesystem::path& archive) {
+    std::vector<ExtractInputRange> parts;
+    // Noncontiguous and reversed slices must still seek correctly while
+    // sharing the same handle. Read all extents in one decoder request.
+    for (auto index : {5, 2, 1, 3, 0, 4})
+        parts.push_back({archive.wstring(), static_cast<UInt64>(index), static_cast<UInt64>(index + 1), true});
+    observed_range_size_queries = observed_range_handle_opens = 0;
+    auto* stream = new MultiRangeInStream(parts);
+    CMyComPtr<IInStream> owner(stream);
+    std::array<char, 6> data{};
+    UInt32 read = 0;
+    std::ifstream file(archive, std::ios::binary);
+    std::array<char, 6> original{};
+    file.read(original.data(), original.size());
+    require(stream->Read(data.data(), data.size(), &read) == S_OK && read == data.size() &&
+        data == std::array<char, 6>{original[5], original[2], original[1], original[3], original[0], original[4]},
+        "sharing a carrier handle changed the logical byte order");
+    require(observed_range_size_queries == 1 && observed_range_handle_opens == 1,
+        "each carrier slice reopened or re-statted its file");
+}
+
+void disjoint_layouts_do_not_repeat_comparisons() {
+    constexpr std::size_t layouts = 512;
+    VolumeAttemptPlan plan;
+    plan.sources.resize(layouts + 1);
+    plan.domains.push_back({0});
+    for (std::size_t source = 1; source <= layouts; ++source) {
+        plan.domains.push_back({source});
+        plan.layouts.push_back({{1, L"first", 0}, {2, L"tail", source}});
+    }
+    plan.layouts.push_back(plan.layouts.back());
+    plan.prepare();
+    VolumeAttemptCursor cursor;
+    cursor.reserve(plan);
+    for (std::size_t source = 1; source <= layouts; ++source)
+        require(cursor.next(plan) && cursor.layout + 1 == source && cursor.selected.back() == source,
+            "indexed layout membership changed candidate order");
+    require(!cursor.next(plan) && cursor.previous_layout_checks == 1,
+        "complete layouts still scanned disjoint predecessors or missed a duplicate");
 }
 
 int main() {
@@ -282,6 +342,8 @@ int main() {
     { std::ofstream file(archive, std::ios::binary); file.write(zip, sizeof(zip) - 1); }
     check_chunked_request(archive);
     warm_volume_waves_reuse_proofs(archive);
+    carrier_slices_share_open_file(archive);
+    disjoint_layouts_do_not_repeat_comparisons();
     rejected_composition_is_not_prepared(root / L"encrypted.zip", root / L"rejected");
     unsigned index = 0;
     for (bool after_failure : {false, true}) for (bool cancel : {false, true})

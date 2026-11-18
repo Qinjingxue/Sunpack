@@ -23,20 +23,51 @@ impl RangeSpec {
         let end = ranges.partition_point(|r| r.virtual_start < offset.saturating_add(size));
         &ranges[start..end.max(start)]
     }
+
+    fn for_extent(
+        reader: ManagedReader, range: &InputExtent, virtual_start: u64, limit: Option<u64>,
+    ) -> std::io::Result<Self> {
+        let file_len = reader.len();
+        let start = range.start;
+        if start > file_len {
+            return Err(std::io::Error::other("range start is beyond file length"));
+        }
+        let effective_end = range.end.unwrap_or(file_len).min(file_len);
+        if effective_end < start {
+            return Err(std::io::Error::other("range end is before start"));
+        }
+        let mut len = effective_end - start;
+        if let Some(limit) = limit {
+            let remaining = limit - virtual_start;
+            if len < remaining && range.end.is_some_and(|end| end > file_len) {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            len = len.min(remaining);
+        }
+        Ok(Self { reader, start, len, virtual_start })
+    }
 }
 
 // The caller already holds lifecycle borrows. Reuse their validated readers
 // instead of reopening every physical member for every password batch.
-struct InputReaders<'a>(HashMap<&'a str, ManagedReader>);
+pub(super) struct InputReaders<'a>(HashMap<&'a str, ManagedReader>);
 
 impl<'a> InputReaders<'a> {
-    fn new(sessions: &'a [NativeArchiveSession]) -> Self {
+    pub(super) fn new(sessions: &'a [NativeArchiveSession]) -> Self {
         Self(
             sessions
                 .iter()
                 .map(NativeArchiveSession::borrowed_reader)
                 .collect(),
         )
+    }
+
+    pub(super) fn single_range(&self, range: &InputExtent) -> std::io::Result<RangeSpec> {
+        let reader = match self.0.get(range.path.as_str()) {
+            Some(reader) => reader.clone(),
+            None => ManagedReader::open(&range.path)?,
+        };
+        RangeSpec::for_extent(reader, range, 0, None)
     }
 
     fn open(&mut self, path: &'a str, reuse: bool) -> std::io::Result<ManagedReader> {
@@ -99,37 +130,15 @@ fn extend_range_prefix<'a>(
     for range in ranges {
         #[cfg(test)]
         RANGE_PROJECTIONS.with(|value| value.set(value.get().map(|n| n + 1)));
-        let (path, start, end) = (&range.path, range.start, range.end);
-        let reader = readers.open(path, reuse)?;
-        let file_len = reader.len();
-        if start > file_len {
-            return Err(std::io::Error::other("range start is beyond file length"));
-        }
-        let effective_end = end.unwrap_or(file_len).min(file_len);
-        if effective_end < start {
-            return Err(std::io::Error::other("range end is before start"));
-        }
-        let mut len = effective_end - start;
-        if let Some(limit) = limit {
-            let remaining = limit - cursor;
-            if len < remaining && end.is_some_and(|end| end > file_len) {
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
-            }
-            len = len.min(remaining);
-        }
-        let next = cursor.checked_add(len).ok_or_else(|| {
+        let reader = readers.open(&range.path, reuse)?;
+        let projected = RangeSpec::for_extent(reader, range, cursor, limit)?;
+        cursor = cursor.checked_add(projected.len).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "logical input size overflow",
             )
         })?;
-        parsed.push(RangeSpec {
-            reader,
-            start,
-            len,
-            virtual_start: cursor,
-        });
-        cursor = next;
+        parsed.push(projected);
         if Some(cursor) == limit {
             break;
         }

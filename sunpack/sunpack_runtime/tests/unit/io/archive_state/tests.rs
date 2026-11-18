@@ -259,7 +259,7 @@ fn shared_volume_domains_are_indexed_once_and_validate_checkpoint_geometry() {
         minimum_size: None,
         tail_totals: Box::new([]),
     };
-    let mut indexes = DomainMembers::new();
+    let mut indexes = DomainMembers::default();
     let mut selection = VolumeSelection {
         layout: 0,
         sources: (0..count).rev().collect(),
@@ -267,8 +267,8 @@ fn shared_volume_domains_are_indexed_once_and_validate_checkpoint_geometry() {
     let parts = plan
         .selected_parts_indexed(&selection, &mut indexes)
         .unwrap();
-    assert_eq!(indexes.len(), 1);
-    assert_eq!(indexes.values().map(HashSet::len).sum::<usize>(), count);
+    assert_eq!(indexes.0.len(), 1);
+    assert_eq!(indexes.0.values().map(HashSet::len).sum::<usize>(), count);
     assert!(plan.admits_parts(&parts));
     selection.sources[1] = selection.sources[0];
     assert!(plan.selected_parts(&selection).is_err());
