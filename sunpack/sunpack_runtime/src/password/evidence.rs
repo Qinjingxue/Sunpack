@@ -26,12 +26,83 @@ pub(crate) struct EvidenceContext {
     pub independent_rar: Vec<Option<Arc<super::rar::RarPasswordContext>>>,
 }
 
+#[derive(Clone, Debug)]
+enum RejectedCandidates {
+    One(usize),
+    Shared(Arc<Vec<usize>>),
+}
+
+impl RejectedCandidates {
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::One(index) => std::slice::from_ref(index),
+            Self::Shared(indices) => indices,
+        }
+    }
+
+    fn from_ordered(mut indices: Vec<usize>) -> Option<Self> {
+        match indices.len() {
+            0 => None,
+            1 => Some(Self::One(indices.pop().unwrap())),
+            _ => Some(Self::Shared(Arc::new(indices))),
+        }
+    }
+}
+
+/// Keep the projection once when a proof rejects the same path for a batch
+/// of candidates. The shared index list is remapped once at each boundary.
+#[derive(Debug, Default)]
+pub(crate) struct ScopedRejections(Vec<(Arc<VolumeProjection>, RejectedCandidates)>);
+
+impl ScopedRejections {
+    pub(crate) fn is_empty(&self) -> bool { self.0.is_empty() }
+
+    pub(crate) fn push(&mut self, (path, index): (Arc<VolumeProjection>, usize)) {
+        self.0.push((path, RejectedCandidates::One(index)));
+    }
+
+    pub(crate) fn add_shared(&mut self, paths: &[Arc<VolumeProjection>], indices: &[usize]) {
+        if paths.is_empty() { return; }
+        let indices = match indices {
+            [] => return,
+            [index] => RejectedCandidates::One(*index),
+            _ => RejectedCandidates::Shared(Arc::new(indices.to_vec())),
+        };
+        self.0.extend(paths.iter().map(|path| (Arc::clone(path), indices.clone())));
+    }
+
+    pub(crate) fn remap(&mut self, map_index: impl Fn(usize) -> Option<usize>) {
+        let mut shared = HashMap::new();
+        self.0.retain_mut(|(_, indices)| {
+            let mapped = match indices {
+                RejectedCandidates::One(index) => map_index(*index).map(RejectedCandidates::One),
+                RejectedCandidates::Shared(group) => shared.entry(Arc::as_ptr(group))
+                    .or_insert_with(|| RejectedCandidates::from_ordered(
+                        group.iter().copied().filter_map(&map_index).collect(),
+                    )).clone(),
+            };
+            if let Some(mapped) = mapped {
+                *indices = mapped;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+impl Extend<(Arc<VolumeProjection>, usize)> for ScopedRejections {
+    fn extend<I: IntoIterator<Item = (Arc<VolumeProjection>, usize)>>(&mut self, values: I) {
+        self.0.extend(values.into_iter().map(|(path, index)| (path, RejectedCandidates::One(index))));
+    }
+}
+
 /// Only allocate per-path indices after a globally viable password is
 /// excluded on that path. All indices refer to the final worker list.
 #[derive(Default)]
 pub(crate) struct CandidateDomains {
     prepared: Vec<Option<Vec<usize>>>,
-    scoped: Vec<(Arc<VolumeProjection>, usize)>,
+    scoped: ScopedRejections,
 }
 
 impl CandidateDomains {
@@ -55,12 +126,17 @@ impl CandidateDomains {
     }
 
     pub(crate) fn append_scoped(
-        &mut self, rejected: Vec<(Arc<VolumeProjection>, usize)>, offset: usize, ordinals: &[usize],
+        &mut self, mut rejected: ScopedRejections, offset: usize, ordinals: &[usize],
     ) {
-        self.scoped.extend(rejected.into_iter().filter_map(|(path, index)| {
+        rejected.remap(|index| {
             let &ordinal = ordinals.get(index)?;
-            (ordinal != usize::MAX).then(|| (path, offset + ordinal))
-        }));
+            (ordinal != usize::MAX).then(|| offset + ordinal)
+        });
+        if self.scoped.is_empty() {
+            self.scoped = rejected;
+        } else {
+            self.scoped.0.extend(rejected.0);
+        }
     }
 
     pub(crate) fn finish(
@@ -92,27 +168,39 @@ impl CandidateDomains {
             };
             rules.push((path, rule));
         }
-        rules.extend(self.scoped.iter().map(|(path, index)| (path.as_ref(), Rule::Reject(*index))));
+        rules.extend(self.scoped.0.iter().map(|(path, indices)| (path.as_ref(), Rule::Reject(indices.as_slice()))));
         let mut rejected = Vec::new();
         let mut allowed = Vec::new();
         let mut terminal = |state: &State, ends: &Ends| -> Option<usize> {
             let mut group = 0;
+        let mut first_rejection = None;
             rejected.clear();
             for node in state {
                 match ends.get(node) {
                     Some(Rule::Remove) => return None,
                     Some(Rule::Domain(id)) => group = if group == 0 { *id } else { group.min(*id) },
-                    Some(Rule::Reject(index)) => rejected.push(*index),
+                Some(Rule::Reject(indices)) => {
+                    if first_rejection.is_none() {
+                        first_rejection = Some(*indices);
+                    } else {
+                        rejected.extend_from_slice(indices);
+                    }
+                }
                     None => {}
                 }
             }
-            if rejected.is_empty() {
-                return Some(group);
-            }
+        let Some(first) = first_rejection else { return Some(group); };
+        let excluded = if rejected.is_empty() {
+            first
+        } else {
+            rejected.extend_from_slice(first);
             rejected.sort_unstable();
             rejected.dedup();
+            rejected.as_slice()
+        };
+        if excluded.len() == count { return None; }
             allowed.clear();
-            let mut rejected = rejected.iter().copied().peekable();
+        let mut rejected = excluded.iter().copied().peekable();
             let mut retain = |index| {
                 while rejected.next_if(|i| *i < index).is_some() {}
                 if rejected.next_if_eq(&index).is_none() {
@@ -127,6 +215,7 @@ impl CandidateDomains {
                 if allowed.len() == groups[group].len() { return Some(group); }
             }
             if allowed.is_empty() { return None; }
+            if let Some(&id) = ids.get(allowed.as_slice()) { return Some(id); }
             Some(*ids.entry(allowed.as_slice().into()).or_insert_with_key(|indices| {
                 groups.push(indices.clone());
                 groups.len() - 1
@@ -432,8 +521,8 @@ impl EvidenceContext {
                 if !survivors(result).contains(index) {
                     removed.push(projection);
                 } else {
-                    removed.extend(result.scoped_rejections.iter().filter_map(|(path, i)| {
-                        (*i == index).then_some(path.as_ref())
+                    removed.extend(result.scoped_rejections.0.iter().filter_map(|(path, indices)| {
+                        indices.as_slice().binary_search(&index).is_ok().then_some(path.as_ref())
                     }));
                 }
             }
@@ -554,7 +643,7 @@ impl EvidenceContext {
             .or_else(|| results.iter().find_map(|result| result.read_fault.clone()));
         Ok(PasswordVerification {
             password_domains,
-            scoped_rejections: results.into_iter().flat_map(|result| result.scoped_rejections).collect(),
+            scoped_rejections: ScopedRejections(results.into_iter().flat_map(|result| result.scoped_rejections.0).collect()),
             matched_index: matches.first().copied(),
             matched_indices: matches,
             attempts: candidates.len(),
@@ -653,14 +742,14 @@ pub(crate) fn remove_scan_paths(
 // alternatives partition the byte observations. Paths without readable proof
 // use domain zero, which contains every globally surviving candidate.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Rule {
+enum Rule<'a> {
     Remove,
     Domain(usize),
-    Reject(usize),
+    Reject(&'a [usize]),
 }
 
 type State = Vec<(usize, usize)>;
-type Ends = HashMap<(usize, usize), Rule>;
+type Ends<'a> = HashMap<(usize, usize), Rule<'a>>;
 
 fn remove_terminal(state: &State, ends: &Ends) -> Option<usize> {
     (!state.iter().any(|node| ends.contains_key(node))).then_some(0)
@@ -840,14 +929,13 @@ fn partition_from(
                     lowest = next;
                 }
             }
-            let mut slots = layout.slots[..count].to_vec();
-            slots[count - 1].domain = layout.slots[maximum - 1].domain;
-            let choices: Vec<_> = slots
-                .iter()
+            let slots = &layout.slots[..count];
+            let choices: Vec<_> = slots[..count - 1].iter()
+                .chain(&layout.slots[maximum - 1..])
                 .map(|slot| Arc::clone(&plan.domains[slot.domain].choices))
                 .collect();
             let mut keep = |remaining: Vec<Arc<Vec<usize>>>, group| {
-                let mut slots = slots.clone();
+                let mut slots = slots.to_vec();
                 for (slot, choices) in slots.iter_mut().zip(remaining) {
                     slot.domain = *domain_ids.entry(choices.clone()).or_insert_with(|| {
                         let index = domains.len();
@@ -870,11 +958,12 @@ fn partition_from(
                     }
                 }
                 Some(selection) => {
-                    for suffix in ordered_suffix(&choices, &selection.sources) {
-                        for (remaining, group) in subtract(&suffix, state.clone(), &edges, &ends, terminal)? {
+                    visit_ordered_suffix(&choices, &selection.sources, |suffix| {
+                        for (remaining, group) in subtract(suffix, state.clone(), &edges, &ends, terminal)? {
                             keep(remaining, group);
                         }
-                    }
+                        Ok(())
+                    })?;
                 }
             }
         }
@@ -882,19 +971,32 @@ fn partition_from(
     Ok((plan.with_remaining(layouts, domains), layout_groups))
 }
 
-fn ordered_suffix(choices: &[Arc<Vec<usize>>], first: &[usize]) -> Vec<Vec<Arc<Vec<usize>>>> {
-    let mut suffix = Vec::new();
+fn visit_ordered_suffix(
+    choices: &[Arc<Vec<usize>>], first: &[usize],
+    mut visit: impl FnMut(&[Arc<Vec<usize>>]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut path: Vec<_> = first.iter().map(|source| Arc::new(vec![*source])).collect();
+    let mut restore_end = choices.len();
     for index in (0..choices.len()).rev() {
         let domain = &choices[index];
         let position = domain.iter().position(|source| *source == first[index]).unwrap();
         let start = position + usize::from(index + 1 != choices.len());
         if start == domain.len() { continue; }
-        path[index + 1..].clone_from_slice(&choices[index + 1..]);
+        // The previous suffix already restored everything past its pivot.
+        let restore = index + 1..restore_end;
+        #[cfg(test)]
+        FRONTIER_RESTORED_CHOICES.with(|count| count.set(count.get() + restore.len()));
+        path[restore.clone()].clone_from_slice(&choices[restore]);
         path[index] = if start == 0 { domain.clone() } else { Arc::new(domain[start..].to_vec()) };
-        suffix.push(path.clone());
+        visit(&path)?;
+        restore_end = index + 1;
     }
-    suffix
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FRONTIER_RESTORED_CHOICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

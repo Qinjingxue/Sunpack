@@ -645,7 +645,44 @@ void check_output_path_reservations()
     std::filesystem::path last;
     for (int index = 0; index < 10000; ++index) { last = many.allocate(original, true); }
     check(last == root / L"entry(10000).txt", "large duplicate group advances without rescanning prior reservations");
+
+    ExtractionReplay interrupted;
+    interrupted.initialized = true;
+    interrupted.directories.emplace(normalized_output_path_key(root / L"logs"), root / L"logs(1)");
+    OutputPathAllocator resumed(root, &interrupted);
+    check(resumed.allocate(root / L"logs" / L"a.txt", true) == root / L"logs(1)" / L"a.txt",
+        "resumed allocation kept the saved directory collision result");
+    resumed.allocate(root / L"new" / L"b.txt", true);
+    check(interrupted.directories.count(normalized_output_path_key(root / L"new")) == 1,
+        "resumed allocation updated the existing reservation table directly");
 }
+
+#ifdef SUP7Z_DEBUG
+void check_tentative_output_reservations()
+{
+    constexpr UInt32 items = 65'536;
+    const auto root = std::filesystem::temp_directory_path() / L"sunpack-tentative-volume";
+    ExtractionReplay replay;
+    replay.volumes.started = true;
+    ExtractionReplayScope scope(&replay);
+    // Root directory markers generate trace rows without writing files.
+    CMyComPtr<IInArchive> archive(new EntryArchive(L".", true));
+    ExtractOutputTrace trace;
+    auto *callback = new ExtractToDiskCallback(archive, L"", root.wstring(), {}, trace, items);
+    CMyComPtr<IArchiveExtractCallback> owner(callback);
+    check(trace.items.capacity() < items && callback->path_buckets_for_test() < items,
+        "tentative volume reserved the whole archive before any item was decoded");
+    bool accepted = true;
+    for (UInt32 index = 0; index <= 64; ++index) {
+        CMyComPtr<ISequentialOutStream> stream;
+        accepted &= callback->GetStream(index, &stream, kExtractMode) == S_OK && !stream &&
+            callback->SetOperationResult(kOpOk) == S_OK;
+    }
+    check(accepted && trace.items.size() == 65 && trace.items.capacity() >= items &&
+        callback->path_buckets_for_test() >= items,
+        "continuing volume did not reserve archive capacity after its successful prefix");
+}
+#endif
 
 } // namespace
 
@@ -664,6 +701,9 @@ int main()
     check_prefetch_virtual_inputs();
     check_open_archive_stream_ownership();
     check_output_path_reservations();
+#ifdef SUP7Z_DEBUG
+    check_tentative_output_reservations();
+#endif
 
     if (g_failures != 0)
     {

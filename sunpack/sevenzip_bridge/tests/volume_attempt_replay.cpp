@@ -211,6 +211,63 @@ void rejected_composition_is_not_prepared(const std::filesystem::path& archive,
         !std::filesystem::exists(destination), "a composition rejected by the member probe reached extraction setup");
 }
 
+void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
+    WorkerRequest request;
+    auto& plan = request.archive_input.volume_attempts;
+    for (std::size_t i = 0; i < 8; ++i) plan.sources.push_back({archive.wstring(), i, i + 1, true});
+    plan.domains = {{0, 1, 2, 3}, {4, 5, 6, 7}};
+    plan.layouts = {{{1, L"one", 0}, {2, L"two", 0}, {3, L"three", 1}}};
+    plan.prepare();
+
+    VolumeProbeCache cache(plan);
+    PasswordTestResult rejection;
+    rejection.status = PasswordTestStatus::WrongPassword;
+    rejection.observed_volume_slots = std::vector<std::size_t>{2};
+    const auto attempt = [&](std::size_t tail) { return PreparedAttempt{0, {0, 1, tail}, rejection}; };
+    for (std::size_t tail : {4, 5, 6}) cache.remember(plan, attempt(tail), 4);
+    // A concurrent job can claim credits between waves. A smaller wave must
+    // shrink the cache even if it already holds more than its new capacity.
+    cache.remember(plan, attempt(7), 1);
+    require(cache.find(plan, attempt(4)) == nullptr && cache.find(plan, attempt(6)) == nullptr &&
+        cache.find(plan, attempt(7)) != nullptr, "probe cache grew after losing CPU credits");
+    require(cache.geometry.inspected_choices == 8, "geometry rechecked the shared choice domain for each slot");
+    for (std::size_t tail : {4, 5, 6}) cache.remember(plan, attempt(tail), 4);
+
+    NativeCpuBudget budget(8);
+    NativeCpuJobContext job(budget);
+    NativeCpuContextScope cpu(&job);
+    VolumeAttemptCursor cursor, expected;
+    cursor.reserve(plan);
+    expected.reserve(plan);
+    for (;;) {
+        auto wave = probe_volume_wave(request, cursor, nullptr, cache);
+        if (wave.empty()) break;
+        for (const auto& item : wave) {
+            require(expected.next(plan) && item.sources == expected.selected &&
+                item.probe.status == PasswordTestStatus::WrongPassword &&
+                item.probe.observed_volume_slots == rejection.observed_volume_slots,
+                "cached volume wave changed relation order or lost its proof");
+        }
+    }
+    require(expected.attempts == 48 && cache.scheduled_probes == 0,
+        "known volume proof was dispatched as a decoder task");
+
+    VolumeProbeCache accepted(plan);
+    accepted.remember(plan, attempt(4), 4);
+    auto match = attempt(5);
+    match.probe.status = PasswordTestStatus::Ok;
+    accepted.remember(plan, match, 4);
+    VolumeAttemptCursor first_match;
+    first_match.reserve(plan);
+    while (first_match.attempts < 2) {
+        auto wave = probe_volume_wave(request, first_match, nullptr, accepted);
+        require(!wave.empty() && (first_match.attempts != 2 || wave.back().probe.status == PasswordTestStatus::Ok),
+            "cached winner did not terminate its ordered wave");
+    }
+    require(first_match.attempts == 2 && accepted.scheduled_probes == 0,
+        "cached winner advanced the cursor past its proof");
+}
+
 int main() {
     // Tiny stored ZIP: ok.txt contains "cursor replay". Split through the
     // member's data so success requires both chosen ranges in the right order.
@@ -224,6 +281,7 @@ int main() {
     const auto archive = root / L"input.zip";
     { std::ofstream file(archive, std::ios::binary); file.write(zip, sizeof(zip) - 1); }
     check_chunked_request(archive);
+    warm_volume_waves_reuse_proofs(archive);
     rejected_composition_is_not_prepared(root / L"encrypted.zip", root / L"rejected");
     unsigned index = 0;
     for (bool after_failure : {false, true}) for (bool cancel : {false, true})

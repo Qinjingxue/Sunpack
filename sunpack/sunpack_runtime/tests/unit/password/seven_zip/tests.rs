@@ -18,41 +18,45 @@ fn payload_prefix_collisions_survive_until_complete_header_evidence() {
         .into_iter()
         .map(Arc::from)
         .collect();
-    let weak = collect_candidates(&candidates, Some("7z_payload_prefix"), |_, value| {
+    let evidence = Some("7z_payload_prefix");
+    let weak = collect_candidates(&candidates, false, |index, value| {
         Ok(if value == "collision" || value == "correct" {
-            SevenZipPrefixCheck::Weak
+            (SevenZipPrefixCheck::Weak, index + 1)
         } else {
-            SevenZipPrefixCheck::Reject
+            (SevenZipPrefixCheck::Reject, 0)
         })
     })
     .unwrap();
+    assert_eq!(weak, [(1, Ok((SevenZipPrefixCheck::Weak, 2))), (3, Ok((SevenZipPrefixCheck::Weak, 4)))]);
+    let weak = candidate_result(&weak, candidates.len(), evidence);
     assert_eq!(weak.matched_indices, [1, 3]);
     assert_eq!(weak.attempts, candidates.len());
     assert_eq!(weak.final_confirmation_required, Some(true));
-    let confirmed = collect_candidates(&candidates, Some("7z_payload_prefix"), |_, value| {
-        Ok(match value {
+    let confirmed = collect_candidates(&candidates, false, |_, value| {
+        Ok((match value {
             "collision" => SevenZipPrefixCheck::Strong,
             "correct" => SevenZipPrefixCheck::Confirmed,
             _ => SevenZipPrefixCheck::Reject,
-        })
+        }, ()))
     })
     .unwrap();
+    let confirmed = candidate_result(&confirmed, candidates.len(), evidence);
     assert_eq!(confirmed.matched_index, Some(3));
     assert_eq!(confirmed.final_confirmation_required, Some(false));
-    let absent =
-        collect_candidates(&candidates, Some("7z_payload_prefix"), |_, _| Ok(SevenZipPrefixCheck::Reject))
-            .unwrap();
+    let absent = collect_candidates(&candidates, false, |_, _| Ok((SevenZipPrefixCheck::Reject, ()))).unwrap();
+    let absent = candidate_result(&absent, candidates.len(), evidence);
     assert_eq!(absent.status, "no_match");
     assert_eq!(absent.attempts, candidates.len());
     let fault_or_reject = |index, _: &str| {
         if index == 2 {
             Err("resource_unavailable: test".into())
         } else {
-            Ok(SevenZipPrefixCheck::Reject)
+            Ok((SevenZipPrefixCheck::Reject, ()))
         }
     };
     for (proof, tested) in [(Some("7z_payload_prefix"), candidates.len()), (None, 3)] {
-        let fault = collect_candidates(&candidates, proof, fault_or_reject).unwrap();
+        let fault = collect_candidates(&candidates, proof.is_none(), fault_or_reject).unwrap();
+        let fault = candidate_result(&fault, candidates.len(), proof);
         assert_eq!(fault.matched_indices, [2]);
         assert_eq!(fault.attempts, tested);
         assert_eq!(fault.final_confirmation_required, Some(true));
@@ -333,14 +337,14 @@ fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
     }
     // A completed combination shorter than the declared NextHeader cannot be
     // the archive. It must not hide the good tail as an unknown alternative.
-    plan.domains[1].choices = Arc::new(vec![2, 3]);
+    Arc::make_mut(&mut plan).domains[1].choices = Arc::new(vec![2, 3]);
     assert!(prepare_seven_zip_attempts(&sources[0], &plan, &[], None).is_ok());
     // A physical EOF inside the declared extent excludes this choice when
     // another tail supplies the range. An open failure retains its choice.
-    plan.sources[3].end = Some((bytes.len() - 48) as u64);
+    Arc::make_mut(&mut plan).sources[3].end = Some((bytes.len() - 48) as u64);
     let unavailable = InputExtent { path: format!("{}.absent", sources[3].path), ..plan.sources[3].clone() };
-    plan.sources = plan.sources.iter().cloned().chain([unavailable.clone()]).collect();
-    plan.domains[1].choices = Arc::new(vec![2, 3, 4]);
+    Arc::make_mut(&mut plan).sources = plan.sources.iter().cloned().chain([unavailable.clone()]).collect();
+    Arc::make_mut(&mut plan).domains[1].choices = Arc::new(vec![2, 3, 4]);
     let uncertain = prepare_seven_zip_attempts(&sources[0], &plan, &[], None).unwrap_or_else(|_| panic!("retain unsupported paths"));
     let result = uncertain.verify(&[Arc::from("secret")], None).unwrap();
     assert_eq!(result.status, "unknown_needs_final_verifier");
@@ -348,8 +352,8 @@ fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
     assert!(!remaining.sources.iter().any(|source| source.path == sources[3].path));
     assert!(remaining.sources.iter().any(|source| source.path == unavailable.path));
     // A fixed-size tail proves the head trim, but does not prove a Copy key.
-    plan.domains[1].choices = Arc::new(vec![2]);
-    plan.head_size_from_total = Some(bytes.len() as u64);
+    Arc::make_mut(&mut plan).domains[1].choices = Arc::new(vec![2]);
+    Arc::make_mut(&mut plan).head_size_from_total = Some(bytes.len() as u64);
     let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None)
         .unwrap_or_else(|_| panic!("exact tail geometry proves carrier trim"));
     assert_eq!(
@@ -368,7 +372,7 @@ fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
 // Both tests use the same real two-part layout; only the evidence kind differs.
 fn uncertain_tail_fixture(
     bytes: &[u8],
-) -> (Vec<std::path::PathBuf>, Vec<InputExtent>, VolumeAttemptPlan) {
+) -> (Vec<std::path::PathBuf>, Vec<InputExtent>, Arc<VolumeAttemptPlan>) {
     uncertain_tail_fixture_at(bytes, &[], 48)
 }
 
@@ -376,7 +380,7 @@ fn uncertain_tail_fixture_at(
     bytes: &[u8],
     suffix: &[u8],
     split: usize,
-) -> (Vec<std::path::PathBuf>, Vec<InputExtent>, VolumeAttemptPlan) {
+) -> (Vec<std::path::PathBuf>, Vec<InputExtent>, Arc<VolumeAttemptPlan>) {
     use crate::io::archive_state::{VolumeDomain, VolumeLayout, VolumeSlot};
     let mut bad = bytes[split..].to_vec();
     bad[0] ^= 1;
@@ -396,7 +400,7 @@ fn uncertain_tail_fixture_at(
             end: Some(std::fs::metadata(path).unwrap().len()),
         })
         .collect();
-    let plan = VolumeAttemptPlan {
+    let plan = Arc::new(VolumeAttemptPlan {
         sources: sources.clone().into_boxed_slice(),
         layouts: vec![VolumeLayout {
             minimum_slots: 0,
@@ -427,7 +431,7 @@ fn uncertain_tail_fixture_at(
         head_size_from_total: None,
         minimum_size: Some(bytes.len() as u64),
         tail_totals: Box::new([]),
-    };
+    });
     (paths.into(), sources, plan)
 }
 
@@ -504,6 +508,7 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
     let PasswordContext::Evidence(evidence) = &context else {
         panic!("must prepare alternatives")
     };
+    assert!(Arc::ptr_eq(&evidence.plan, &plan));
     assert_eq!(
         evidence.alternatives.len(),
         2,
@@ -591,8 +596,8 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
         paths.push(path);
     }
     use crate::io::archive_state::{VolumeDomain, VolumeLayout, VolumeSlot};
-    plan.sources = sources.clone().into_boxed_slice();
-    plan.domains = vec![
+    Arc::make_mut(&mut plan).sources = sources.clone().into_boxed_slice();
+    Arc::make_mut(&mut plan).domains = vec![
         VolumeDomain {
             choices: Arc::new(vec![0]),
         },
@@ -604,7 +609,7 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
         },
     ]
     .into_boxed_slice();
-    plan.layouts = vec![VolumeLayout {
+    Arc::make_mut(&mut plan).layouts = vec![VolumeLayout {
         minimum_slots: 2,
         slots: (0..3)
             .map(|index| VolumeSlot {

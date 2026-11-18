@@ -37,6 +37,54 @@ fn adding_branch_keys_preserves_initialized_anchor_slots() {
     assert_eq!(keys.cells(&2, 1).unwrap().len(), 1);
 }
 
+#[test]
+fn repeated_packed_rejections_share_one_candidate_list_and_remap_once() {
+    let projections: Vec<_> = (0..64).map(|source| Arc::new(VolumeProjection {
+        roots: vec![[0, 2, 0]],
+        edges: vec![[0, 1, 0], [1, 2, source]],
+        ends: vec![2],
+    })).collect();
+    let batch: Vec<_> = (0..256).collect();
+    let mut scoped = ScopedRejections::default();
+    scoped.add_shared(&projections, &batch);
+    assert_eq!(scoped.0.len(), projections.len());
+    let translated = std::cell::Cell::new(0);
+    scoped.remap(|index| {
+        translated.set(translated.get() + 1);
+        (index % 2 == 1).then(|| 20 + index / 2)
+    });
+    assert_eq!(translated.get(), batch.len());
+    assert_eq!(scoped.0[0].1.as_slice(), (20..148).collect::<Vec<_>>());
+    for ((path, members), original) in scoped.0.iter().zip(&projections) {
+        assert!(Arc::ptr_eq(path, original));
+        assert!(std::ptr::eq(members.as_slice(), scoped.0[0].1.as_slice()));
+    }
+}
+
+#[test]
+fn scan_frontier_restores_each_suffix_choice_once() {
+    let count = 512;
+    let choices: Vec<_> = (0..count).map(|index| Arc::new(vec![2 * index, 2 * index + 1])).collect();
+    let first: Vec<_> = (0..count).map(|index| 2 * index).collect();
+    let mut pivot = count;
+    let mut backing = None;
+    FRONTIER_RESTORED_CHOICES.set(0);
+    visit_ordered_suffix(&choices, &first, |path| {
+        assert_eq!(path.as_ptr(), *backing.get_or_insert(path.as_ptr()));
+        pivot -= 1;
+        if pivot + 1 == count {
+            assert_eq!(*path[pivot], *choices[pivot]);
+        } else {
+            assert_eq!(*path[pivot], [2 * pivot + 1]);
+            assert!(Arc::ptr_eq(&path[pivot + 1], &choices[pivot + 1]));
+        }
+        if pivot > 0 { assert_eq!(*path[pivot - 1], [first[pivot - 1]]); }
+        Ok(())
+    }).unwrap();
+    assert_eq!(pivot, 0);
+    assert_eq!(FRONTIER_RESTORED_CHOICES.get(), count - 1);
+}
+
 // A cross-volume failure must preserve either fragment with another partner.
 // Check actual serialized candidates and order, not the discarded evidence.
 #[test]
@@ -232,7 +280,9 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
                 ends: vec![2],
             });
             let ordinals = [0, usize::MAX, usize::MAX, 1];
-            domains.append_scoped(vec![(scope.clone(), 1), (scope, 3)], count, &ordinals);
+            let mut rejected = ScopedRejections::default();
+            rejected.add_shared(&[scope], &[1, 3]);
+            domains.append_scoped(rejected, count, &ordinals);
         }
         count += candidates.len();
     }

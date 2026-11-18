@@ -240,7 +240,9 @@ void sparse_replay(const std::filesystem::path &directory) {
         writer->record_operation_result(file, 0);
     }
     require(writer->finish_job(job) == S_OK, "replay completion failed");
-    writer->capture_replay(file);
+    const auto settled = writer->take_file_snapshot(file, true);
+    require(settled.closed && settled.written_bytes == expected.size(),
+        "settled replay file could not be released before the rest of extraction finishes");
     std::ifstream input(receipt.path, std::ios::binary);
     const std::vector<unsigned char> actual((std::istreambuf_iterator<char>(input)), {});
     require(actual == expected, "replayed holes have incorrect data or offsets");

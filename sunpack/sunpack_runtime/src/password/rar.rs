@@ -140,7 +140,7 @@ pub(crate) fn rar_fast_verify_passwords_from_volumes(
 pub(crate) fn rar_fast_verify_passwords_from_attempts(
     preparation: &mut Preparation,
     head: &InputExtent,
-    plan: &crate::io::archive_state::VolumeAttemptPlan,
+    plan: &Arc<crate::io::archive_state::VolumeAttemptPlan>,
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
     native_volume: bool,
@@ -1437,7 +1437,7 @@ fn verify_rar_structural_candidates(
         _ => None,
     });
     let mut indices = Vec::with_capacity(survivors.len());
-    let mut scoped_rejections = Vec::new();
+    let mut scoped_rejections = super::evidence::ScopedRejections::default();
     for (index, checked) in survivors {
         indices.push(index);
         scoped_rejections.extend(checked.rejected.into_iter().map(|projection| (projection, index)));

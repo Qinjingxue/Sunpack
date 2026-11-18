@@ -440,12 +440,7 @@ namespace sunpack::sevenzip
             if (!file || (!file->replay && !saved)) return;
             std::lock_guard<std::mutex> lock(mutex_);
             auto &receipt = saved ? saved->files[file->item_index] : *file->replay;
-            if (receipt.path.empty()) receipt.path = std::move(file->path);
-            receipt.created = receipt.created || file->output_created;
-            receipt.written = std::move(file->written_ranges_);
-            receipt.complete = receipt.complete || (file->closed && file->hresult == S_OK && file->operation_result_set && file->operation_result == 0);
-            receipt.has_mtime = file->has_mtime_ns;
-            receipt.mtime = file->mtime_ns;
+            save_file_receipt(*file, receipt);
         }
 
         std::size_t idle_memory_bytes() noexcept {
@@ -838,11 +833,12 @@ namespace sunpack::sevenzip
             std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
             if (completed_only)
             {
-                // Earlier successes can be released during extraction. Keep
-                // files with old replay receipts until they are reconciled.
-                if (file->replay || !lock.try_lock() || !file->closed || file->hresult != S_OK ||
+                // Reconcile existing receipts before releasing a settled file.
+                // A later withdrawal can use the newly finished ranges too.
+                if (!lock.try_lock() || !file->closed || file->hresult != S_OK ||
                     !file->operation_result_set || file->operation_result != 0)
                     return snapshot;
+                if (file->replay) save_file_receipt(*file, *file->replay);
             }
             else
             {
@@ -894,6 +890,17 @@ namespace sunpack::sevenzip
         }
 
     private:
+        static void save_file_receipt(FileState &file, ReplayFile &receipt) noexcept
+        {
+            if (receipt.path.empty()) receipt.path = std::move(file.path);
+            receipt.created = receipt.created || file.output_created;
+            receipt.written = std::move(file.written_ranges_);
+            receipt.complete = receipt.complete || (file.closed && file.hresult == S_OK &&
+                file.operation_result_set && file.operation_result == 0);
+            receipt.has_mtime = file.has_mtime_ns;
+            receipt.mtime = file.mtime_ns;
+        }
+
         void trim_free_payloads_locked(std::size_t remaining) noexcept
         {
             // Producers take from the back. Preserve their nearest buffers

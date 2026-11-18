@@ -140,12 +140,12 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
         });
     }
     let slot = |number, domain| VolumeSlot { number, canonical_name: format!("part.{number}"), domain };
-    let plan = VolumeAttemptPlan {
+    let plan = Arc::new(VolumeAttemptPlan {
         sources: sources.into_boxed_slice(),
         layouts: vec![VolumeLayout { minimum_slots: 0, slots: vec![slot(1, 0), slot(2, 1)].into_boxed_slice() }].into_boxed_slice(),
         domains: [vec![0], vec![1, 2]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
         head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
-    };
+    });
     let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &plan.sources[0],
         &plan, &parallel, &[], false).unwrap();
     assert_eq!((result.matched_indices.as_slice(), result.final_confirmation_required), (&[2, 3][..], Some(true)), "{}", result.message);
@@ -263,14 +263,14 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
         sources.push(InputExtent { path: paths[0].with_extension(format!("missing-{len}")).to_string_lossy().into_owned(),
             start: 0, end: Some(len) });
     }
-    let plan = VolumeAttemptPlan {
+    let plan = Arc::new(VolumeAttemptPlan {
         sources: sources.into_boxed_slice(),
         layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..3).map(|i| VolumeSlot {
             number: 1 + i as u32, canonical_name: format!("part.{i}"), domain: i,
         }).collect() }].into_boxed_slice(),
         domains: [vec![0], vec![1], vec![2, 3]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
         head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
-    };
+    });
     let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &plan.sources[0],
         &plan, &parallel, &[], false).unwrap();
     assert_eq!((result.matched_index, result.final_confirmation_required), (Some(2), Some(false)), "{}", result.message);
@@ -301,14 +301,14 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     ];
     let sources: Vec<_> = paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
         start: 0, end: Some(path.metadata().unwrap().len()) }).collect();
-    let cut = VolumeAttemptPlan {
+    let cut = Arc::new(VolumeAttemptPlan {
         sources: sources.into_boxed_slice(),
         layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..2).map(|i| VolumeSlot {
             number: i as u32 + 1, canonical_name: format!("part.{}", i + 1), domain: i,
         }).collect() }].into_boxed_slice(),
         domains: [vec![0], vec![1, 2, 3, 4]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
         head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
-    };
+    });
     let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &cut.sources[0],
         &cut, &parallel, &[], false).unwrap();
     assert_eq!((result.matched_index, result.final_confirmation_required), (Some(2), Some(false)), "{}", result.message);
@@ -490,7 +490,7 @@ fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
     let tail = [&good[48..], &end[..]].concat();
     let paths: Vec<_> = [head, bad, tail].iter().enumerate().map(|(i, data)|
         crate::test_support::temp_file(&format!("rar5_third_block_{i}"), data)).collect();
-    let plan = VolumeAttemptPlan {
+    let plan = Arc::new(VolumeAttemptPlan {
         sources: paths.iter().map(|path| InputExtent {
             path: path.to_string_lossy().into_owned(), start: 0, end: Some(path.metadata().unwrap().len()),
         }).collect(),
@@ -499,7 +499,7 @@ fn rar5_projected_third_block_and_first_level_table_filter_different_sources() {
         }).collect() }].into_boxed_slice(),
         domains: [vec![0], vec![1, 2]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
         head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
-    };
+    });
     let mut preparation = Preparation::default();
     preparation.fix_password();
     let result = rar_fast_verify_passwords_from_attempts(&mut preparation, &plan.sources[0],
@@ -567,7 +567,7 @@ fn rar5_packed_blake2sp_prunes_only_complete_nonfinal_fragments() {
     let head = volume(0, 16, &packed);
     let paths: Vec<_> = [head, damaged, good, tail].into_iter().enumerate().map(|(i, bytes)|
         crate::test_support::temp_file(&format!("rar5_blake_{i}"), &bytes)).collect();
-    let plan = VolumeAttemptPlan {
+    let plan = Arc::new(VolumeAttemptPlan {
         sources: paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
             start: 0, end: Some(path.metadata().unwrap().len()) }).collect(),
         layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..3).map(|i| VolumeSlot {
@@ -575,7 +575,7 @@ fn rar5_packed_blake2sp_prunes_only_complete_nonfinal_fragments() {
         }).collect() }].into_boxed_slice(),
         domains: [vec![0], vec![1, 2], vec![3]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
         head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
-    };
+    });
     let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &plan.sources[0],
         &plan, &[Arc::from("secret")], &[], true).unwrap();
     let remaining = result.volume_attempts.unwrap();

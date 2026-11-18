@@ -2,7 +2,7 @@
 pub(crate) fn seven_zip_fast_verify_passwords_from_attempts(
     preparation: &mut Preparation,
     head: &InputExtent,
-    plan: &VolumeAttemptPlan,
+    plan: &Arc<VolumeAttemptPlan>,
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
 ) -> std::io::Result<PasswordVerification> {
@@ -47,7 +47,7 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_attempts(
 
 fn prepare_seven_zip_attempts(
     head: &InputExtent,
-    plan: &VolumeAttemptPlan,
+    plan: &Arc<VolumeAttemptPlan>,
     sessions: &[NativeArchiveSession],
     invariant_start: Option<RelationNextHeader>,
 ) -> Result<PasswordContext, PreparedStatus> {

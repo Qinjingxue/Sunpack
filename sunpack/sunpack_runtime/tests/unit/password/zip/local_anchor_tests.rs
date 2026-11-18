@@ -240,7 +240,7 @@ fn winzip_aes_jumps_to_zstd_header_in_another_volume() {
 }
 
 pub(super) fn volume_alternatives(head: &[u8], bad: &[u8], good: &[u8])
-    -> ([std::path::PathBuf; 3], Vec<InputExtent>, VolumeAttemptPlan)
+    -> ([std::path::PathBuf; 3], Vec<InputExtent>, Arc<VolumeAttemptPlan>)
 {
     use crate::io::archive_state::{VolumeDomain, VolumeLayout, VolumeSlot};
     let paths = [
@@ -251,7 +251,7 @@ pub(super) fn volume_alternatives(head: &[u8], bad: &[u8], good: &[u8])
     let sources: Vec<_> = paths.iter().zip([head.len(), bad.len(), good.len()]).map(|(path, len)| {
         InputExtent { path: path.to_string_lossy().into_owned(), start: 0, end: Some(len as u64) }
     }).collect();
-    let plan = VolumeAttemptPlan {
+    let plan = Arc::new(VolumeAttemptPlan {
         sources: sources.clone().into_boxed_slice(),
         layouts: vec![VolumeLayout {
             minimum_slots: 0,
@@ -267,6 +267,6 @@ pub(super) fn volume_alternatives(head: &[u8], bad: &[u8], good: &[u8])
         minimum_size: Some((head.len() + good.len()) as u64),
         head_size_from_total: None,
         tail_totals: Box::new([]),
-    };
+    });
     (paths, sources, plan)
 }

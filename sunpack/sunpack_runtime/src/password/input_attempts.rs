@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 thread_local! {
     static EDGE_READS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static DISK_EDGE_VISITS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -21,6 +22,15 @@ pub(super) fn count_edge_reads<T>(read: impl FnOnce() -> T) -> (T, usize) {
         let previous = reads.replace(Some(0));
         let result = read();
         (result, reads.replace(previous).unwrap())
+    })
+}
+
+#[cfg(test)]
+pub(super) fn count_disk_edges<T>(read: impl FnOnce() -> T) -> (T, usize) {
+    DISK_EDGE_VISITS.with(|visits| {
+        let previous = visits.replace(Some(0));
+        let result = read();
+        (result, visits.replace(previous).unwrap())
     })
 }
 
@@ -84,8 +94,8 @@ struct Topology {
 }
 
 struct DiskMapping {
-    source: usize,
-    length: u64,
+    first: usize,
+    rest: Vec<usize>,
     different_source: bool,
     different_length: bool,
 }
@@ -119,32 +129,49 @@ impl Topology {
         ranges.get(index).is_some_and(|&(from, _)| from < start.saturating_add(size))
     }
 
-    fn disk_range_is_ambiguous(&self, mut disk: usize, mut offset: u64, mut size: u64) -> bool {
-        let mappings = self.disk_mappings.get_or_init(|| {
+    fn disk_mappings(&self) -> &BTreeMap<usize, DiskMapping> {
+        self.disk_mappings.get_or_init(|| {
             let mut mappings = BTreeMap::<_, DiskMapping>::new();
-            for edge in &self.edges {
-                let length = edge.end - edge.start;
+            for (index, edge) in self.edges.iter().enumerate() {
                 mappings.entry(edge.disk).and_modify(|mapping| {
-                    mapping.different_source |= mapping.source != edge.source;
-                    mapping.different_length |= mapping.length != length;
+                    let first = &self.edges[mapping.first];
+                    mapping.different_source |= first.source != edge.source;
+                    mapping.different_length |= first.end - first.start != edge.end - edge.start;
+                    mapping.rest.push(index);
                 }).or_insert(DiskMapping {
-                    source: edge.source, length, different_source: false, different_length: false,
+                    first: index, rest: Vec::new(), different_source: false, different_length: false,
                 });
             }
             mappings
-        });
+        })
+    }
+
+    fn disk_edges(&self, disk: usize) -> impl Iterator<Item = (usize, &Edge)> + '_ {
+        self.disk_mappings().get(&disk).into_iter().flat_map(|mapping| {
+            std::iter::once(mapping.first).chain(mapping.rest.iter().copied())
+        }).map(|index| {
+            #[cfg(test)]
+            DISK_EDGE_VISITS.with(|visits| visits.set(visits.get().map(|count| count + 1)));
+            (index, &self.edges[index])
+        })
+    }
+
+    fn disk_range_is_ambiguous(&self, mut disk: usize, mut offset: u64, mut size: u64) -> bool {
+        let mappings = self.disk_mappings();
         while size != 0 {
             let Some(mapping) = mappings.get(&disk) else { break; };
             if mapping.different_length {
                 return true;
             }
-            if offset >= mapping.length {
-                offset -= mapping.length;
+            let first = &self.edges[mapping.first];
+            let length = first.end - first.start;
+            if offset >= length {
+                offset -= length;
             } else {
                 if mapping.different_source {
                     return true;
                 }
-                size = size.saturating_sub(mapping.length - offset);
+                size = size.saturating_sub(length - offset);
                 offset = 0;
             }
             disk += 1;
@@ -438,7 +465,7 @@ pub(crate) fn prepare_attempt_evidence<T: Send>(
     geometry: AttemptGeometry,
     prepare: impl Fn(&mut AttemptReader<'_>) -> Result<Option<T>, PreparedStatus> + Sync,
 ) -> Result<Vec<T>, PreparedStatus> {
-    let prepared = prepare_attempt_evidence_partial(head, plan, sessions, geometry, prepare)?;
+    let prepared = prepare_attempt_evidence_partial(head, &Arc::new(plan.clone()), sessions, geometry, prepare)?;
     match prepared.unresolved {
         Some(error) => Err(error),
         None => Ok(prepared.contexts),
@@ -447,7 +474,7 @@ pub(crate) fn prepare_attempt_evidence<T: Send>(
 
 pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
     head: &InputExtent,
-    plan: &VolumeAttemptPlan,
+    plan: &Arc<VolumeAttemptPlan>,
     sessions: &[NativeArchiveSession],
     geometry: AttemptGeometry,
     prepare: impl Fn(&mut AttemptReader<'_>) -> Result<Option<T>, PreparedStatus> + Sync,
@@ -508,6 +535,13 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
         .collect::<Result<Vec<_>, PreparedStatus>>()?
         .into();
     let mut graph = Topology::default();
+    // A terminal source can appear in several layout lengths. Index the
+    // declared total once, retaining the earliest declaration for a source.
+    let tail_totals: HashMap<_, _> = if matches!(geometry, AttemptGeometry::TailTotals) {
+        plan.tail_totals.iter().rev().map(|entry| (entry.source, entry.total)).collect()
+    } else {
+        HashMap::new()
+    };
     // Once the required prefix and minimum total are present, suffix lengths
     // cannot change this method's coordinates. Merge those paths immediately.
     let prefix_end = match geometry {
@@ -552,11 +586,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                 let total = match geometry {
                     AttemptGeometry::Forward { .. } | AttemptGeometry::DiskRelative => None,
                     AttemptGeometry::TrimmedHead { total } => Some(total),
-                    AttemptGeometry::TailTotals => plan
-                        .tail_totals
-                        .iter()
-                        .find(|entry| entry.source == source)
-                        .map(|entry| entry.total)
+                    AttemptGeometry::TailTotals => tail_totals.get(&source).copied()
                         .or(plan.head_size_from_total),
                 };
                 terminal_groups.entry(total).or_default().push(source);
@@ -858,7 +888,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
         .map(|(_, context, projection)| (context, projection))
         .unzip();
     Ok(PreparedEvidence {
-        plan: Arc::new(plan.clone()),
+        plan: Arc::clone(plan),
         contexts,
         projections,
         rejected,
@@ -1128,8 +1158,8 @@ impl AttemptReader<'_> {
         let mut groups = BTreeMap::<Option<usize>, Vec<usize>>::new();
         let mut all = Vec::new();
         let mut present = vec![false; self.projection.topology.cases];
-        for (i, edge) in self.projection.topology.edges.iter().enumerate() {
-            if self.projection.active[i] && edge.disk == disk {
+        for (i, edge) in self.projection.topology.disk_edges(disk) {
+            if self.projection.active[i] {
                 all.push(i);
                 present[edge.case] = true;
                 groups.entry(identify(edge.source)).or_default().push(i);
@@ -1164,11 +1194,16 @@ impl AttemptReader<'_> {
 
     pub(crate) fn volume_len(&mut self, disk: usize) -> io::Result<Option<u64>> {
         self.metadata_ready()?;
+        let topology = &self.projection.topology;
+        if topology.cases == 1 && topology.disk_mappings().get(&disk).is_none_or(|m| !m.different_length) {
+            return Ok(topology.disk_edges(disk).find(|(index, _)| self.projection.active[*index])
+                .map(|(_, edge)| edge.end - edge.start));
+        }
         let mut groups = BTreeMap::<u64, Vec<usize>>::new();
         let mut all = Vec::new();
         let mut present = std::collections::HashSet::new();
-        for (index, edge) in self.projection.topology.edges.iter().enumerate() {
-            if self.projection.active[index] && edge.disk == disk {
+        for (index, edge) in self.projection.topology.disk_edges(disk) {
+            if self.projection.active[index] {
                 all.push(index);
                 present.insert(edge.case);
                 groups.entry(edge.end - edge.start).or_default().push(index);
@@ -1236,6 +1271,12 @@ impl AttemptReader<'_> {
             }
             written += read;
             offset += read as u64;
+            if written < size && offset == length {
+                disk = disk
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("volume number overflow"))?;
+                offset = 0;
+            }
         }
         bytes.truncate(written);
         Ok(bytes)
@@ -1349,22 +1390,27 @@ impl AttemptReader<'_> {
         } else {
             (self.len() - self.position).min(buffer.len() as u64) as usize
         };
-        for (index, edge) in self.projection.topology.edges.iter().enumerate() {
+        let mut consider = |index: usize, edge: &Edge, offset: u64| {
             if !self.projection.active[index] {
-                continue;
+                return;
             }
-            let offset = match disk {
-                Some((number, offset)) if edge.disk == number => offset,
-                Some(_) => continue,
-                None if edge.start <= self.position => self.position - edge.start,
-                None => continue,
-            };
             if offset < edge.end - edge.start {
                 if disk.is_none() && edge.unresolved {
                     beyond_gap.push(index);
                 }
                 covering.push(index);
                 count = count.min((edge.end - edge.start - offset) as usize);
+            }
+        };
+        if let Some((disk, offset)) = disk {
+            for (index, edge) in self.projection.topology.disk_edges(disk) {
+                consider(index, edge, offset);
+            }
+        } else {
+            for (index, edge) in self.projection.topology.edges.iter().enumerate() {
+                if edge.start <= self.position {
+                    consider(index, edge, self.position - edge.start);
+                }
             }
         }
         let short =

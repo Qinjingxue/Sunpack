@@ -499,17 +499,23 @@ namespace sunpack::sevenzip
     class OutputPathAllocator
     {
     public:
-        explicit OutputPathAllocator(const std::filesystem::path &root, ExtractionReplay *replay = nullptr) : root_(root), replay_(replay) {
+        explicit OutputPathAllocator(const std::filesystem::path &root, ExtractionReplay *replay = nullptr)
+            : directories_(replay && replay->initialized ? replay->directories : local_directories_),
+              root_(root), replay_(replay) {
             if (replay_) {
                 for (const auto &item : replay_->files) if (!item.second.path.empty()) used_.insert(normalized_output_path_key(item.second.path));
-                for (const auto &directory : replay_->directories) {
-                    directories_.emplace(directory);
+                for (const auto &directory : directories_)
                     used_.insert(normalized_output_path_key(directory.second));
-                }
             }
         }
         void reserve(std::size_t count) { used_.reserve(count); }
-        void preserve_replay() { if (replay_) replay_->directories = std::move(directories_); }
+#ifdef SUP7Z_DEBUG
+        std::size_t path_buckets_for_test() const noexcept { return used_.bucket_count(); }
+#endif
+        void preserve_replay() {
+            if (replay_ && &directories_ == &local_directories_)
+                replay_->directories = std::move(local_directories_);
+        }
 
         std::filesystem::path allocate(const std::filesystem::path &requested, bool initially_empty, bool is_directory = false)
         {
@@ -590,7 +596,8 @@ namespace sunpack::sevenzip
 
         std::unordered_set<std::wstring> used_;
         std::unordered_map<std::wstring, std::size_t> next_numbers_;
-        std::unordered_map<std::wstring, std::filesystem::path> directories_;
+        std::unordered_map<std::wstring, std::filesystem::path> local_directories_;
+        decltype(local_directories_) &directories_;
         std::filesystem::path root_;
         ExtractionReplay *replay_;
     };
@@ -761,7 +768,10 @@ namespace sunpack::sevenzip
         {
             if (replay_ && !replay_->initialized)
                 replay_->root_was_empty = output_root_initially_empty_;
-            output_paths_->reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
+            // A volume trial unwinds at the first failing member. Delay a
+            // large reservation until the attempt actually reaches the batch.
+            if (replay_ && replay_->volumes.started && !replay_->initialized && estimated_items > kSnapshotBatch)
+                deferred_item_reservation_ = estimated_items;
             // Query the handler's property schema once. ZIP/7z/stream hot paths
             // need neither a per-file link query nor a link index.
             UInt32 count = 0;
@@ -775,7 +785,7 @@ namespace sunpack::sevenzip
                     SysFreeString(name);
                     if (hr == S_OK && property == kpidHardLink) { supports_hard_links_ = true; break; }
                 }
-            if (supports_hard_links_) hard_link_names_.reserve(estimated_items);
+            reserve_output_items(deferred_item_reservation_ ? kSnapshotBatch : estimated_items);
             // Register only after callback setup succeeds. A failed
             // constructor cannot unregister a writer job in its destructor.
             if (!async_writer_) async_writer_ = std::make_shared<AsyncFileWriter>();
@@ -816,6 +826,8 @@ namespace sunpack::sevenzip
         bool output_root_initially_empty() const { return output_root_initially_empty_; }
 
 #ifdef SUP7Z_DEBUG
+        std::size_t path_buckets_for_test() const noexcept { return output_paths_->path_buckets_for_test(); }
+
         bool ensure_directory_for_test(const std::wstring &directory, int *out_error_code)
         {
             std::error_code error;
@@ -950,6 +962,17 @@ namespace sunpack::sevenzip
             {
 
                 return S_OK;
+            }
+
+            if (deferred_item_reservation_ && output_trace_.items.size() >= kSnapshotBatch)
+            {
+                try { reserve_output_items(deferred_item_reservation_); }
+                catch (const std::bad_alloc &)
+                {
+                    mark_current_item_failure(E_OUTOFMEMORY);
+                    return E_OUTOFMEMORY;
+                }
+                deferred_item_reservation_ = 0;
             }
 
             // Harvest settled files without waiting for the writer. Keep the
@@ -1230,6 +1253,13 @@ namespace sunpack::sevenzip
         }
 
     private:
+        void reserve_output_items(std::size_t count)
+        {
+            output_trace_.items.reserve(count);
+            output_paths_->reserve(count * 2U + 1U);
+            if (supports_hard_links_) hard_link_names_.reserve(count);
+        }
+
         void apply_file_snapshot(std::size_t trace_index, AsyncFileWriter::FileSnapshot snapshot)
         {
             auto &item = output_trace_.items[trace_index];
@@ -1637,6 +1667,7 @@ namespace sunpack::sevenzip
         std::deque<AsyncFileWriter::FileStatePtr> async_files_;
         static constexpr std::size_t kSnapshotBatch = 64;
         std::size_t next_snapshot_sweep_ = kSnapshotBatch;
+        std::size_t deferred_item_reservation_ = 0;
 
         AsyncFileWriter::FileStatePtr current_async_file_;
 

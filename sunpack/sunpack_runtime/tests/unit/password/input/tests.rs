@@ -48,6 +48,42 @@ fn virtual_ranges_read_and_seek_across_files() {
 }
 
 #[test]
+fn disk_relative_reads_visit_only_the_requested_volume_edges() {
+    use super::attempts::{count_disk_edges, prepare_attempt_evidence, AttemptGeometry};
+    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    use std::sync::Arc;
+
+    let bytes: Vec<u8> = (0..128).collect();
+    let file = temp_file("native_disk_edges", &bytes);
+    let path = file.to_string_lossy().into_owned();
+    let plan = VolumeAttemptPlan {
+        sources: (0..128).map(|start| InputExtent {
+            path: path.clone(), start, end: Some(start + 1),
+        }).collect(),
+        layouts: vec![VolumeLayout {
+            minimum_slots: 0,
+            slots: (0..128).map(|domain| VolumeSlot {
+                number: domain as u32 + 1, canonical_name: domain.to_string(), domain,
+            }).collect(),
+        }].into(),
+        domains: (0..128).map(|source| VolumeDomain { choices: Arc::new(vec![source]) }).collect(),
+        head_size_from_total: None,
+        minimum_size: None,
+        tail_totals: Box::default(),
+    };
+    let mut prepared = prepare_attempt_evidence(&plan.sources[0], &plan, &[], AttemptGeometry::DiskRelative,
+        |reader| Ok(Some(reader.deferred_reads(true)))).unwrap_or_else(|_| panic!("disk-relative topology"));
+    let readers = prepared.pop().unwrap();
+    let (observations, visits) = count_disk_edges(|| readers.evaluate(|reader| reader.read_disk_offset(100, 0, 0, 4)));
+    let observations = observations.unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].1.as_deref().unwrap(), &bytes[100..104]);
+    assert_eq!(visits, 9);
+    drop(readers);
+    std::fs::remove_file(file).unwrap();
+}
+
+#[test]
 fn tail_total_table_prefers_source_then_falls_back_to_global_trim() {
     use super::attempts::{prepare_attempt_evidence, AttemptGeometry};
     use crate::io::archive_state::{

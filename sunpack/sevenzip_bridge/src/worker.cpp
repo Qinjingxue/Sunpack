@@ -660,19 +660,30 @@ class CompleteVolumeGeometry {
     std::optional<std::size_t> checked_;
     bool complete_ = false;
 public:
+#ifdef SUP7Z_DEBUG
+    std::size_t inspected_choices = 0;
+#endif
     bool known(const sunpack::sevenzip::VolumeAttemptPlan& plan, std::size_t layout) {
         if (plan.minimum_slots_for(layout) != plan.layouts[layout].size()) return false;
         if (checked_ == layout) return complete_;
         checked_ = layout;
         complete_ = false;
-        std::vector<bool> checked_source(plan.sources.size());
-        for (const auto& slot : plan.layouts[layout]) for (auto id : plan.domains[slot.domain]) {
-            if (checked_source[id]) continue;
-            checked_source[id] = true;
-            const auto& source = plan.sources[id];
-            std::error_code error;
-            if (sunpack::sevenzip::native_job_cancelled() || !source.has_end ||
-                std::filesystem::file_size(source.path, error) < source.end || error) return false;
+        const auto source_offset = plan.domains.size();
+        std::vector<bool> checked(source_offset + plan.sources.size());
+        for (const auto& slot : plan.layouts[layout]) {
+            if (checked[slot.domain]) continue;
+            checked[slot.domain] = true;
+            for (auto id : plan.domains[slot.domain]) {
+#ifdef SUP7Z_DEBUG
+                ++inspected_choices;
+#endif
+                if (checked[source_offset + id]) continue;
+                checked[source_offset + id] = true;
+                const auto& source = plan.sources[id];
+                std::error_code error;
+                if (sunpack::sevenzip::native_job_cancelled() || !source.has_end ||
+                    std::filesystem::file_size(source.path, error) < source.end || error) return false;
+            }
         }
         complete_ = true;
         return true;
@@ -708,6 +719,9 @@ class VolumeProbeCache {
 public:
     explicit VolumeProbeCache(const sunpack::sevenzip::VolumeAttemptPlan& plan) : fixed_(fixed_volume_geometry(plan)) {}
     CompleteVolumeGeometry geometry;
+#ifdef SUP7Z_DEBUG
+    std::size_t scheduled_probes = 0;
+#endif
 
     bool can_skip_suffix(const sunpack::sevenzip::VolumeAttemptPlan& plan, std::size_t layout) {
         return fixed_ && geometry.known(plan, layout);
@@ -726,8 +740,8 @@ public:
 
     void remember(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt, std::size_t capacity) {
         const auto& observed = attempt.probe.observed_volume_slots;
-        if (!observed || !geometry.known(plan, attempt.layout) || find(plan, attempt)) return;
-        if (entries_.size() == capacity) entries_.pop_front();
+        if (!observed || find(plan, attempt) || !geometry.known(plan, attempt.layout)) return;
+        while (entries_.size() >= capacity) entries_.pop_front();
         Entry entry{attempt.layout, {}, attempt.probe, {}, 0};
         entry.sources.reserve(observed->size());
         for (const auto slot : *observed) entry.sources.emplace_back(slot, attempt.sources[slot]);
@@ -777,35 +791,45 @@ sunpack::sevenzip::PasswordTestResult probe_input(const WorkerRequest& request, 
 std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
     sunpack::sevenzip::VolumeAttemptCursor& next, const std::atomic<bool>* cancel, VolumeProbeCache& cache) {
     using namespace sunpack::sevenzip;
+    const auto& plan = request.archive_input.volume_attempts;
     std::deque<PreparedAttempt> prepared_attempts;
     PasswordParallelism parallel((std::max)(std::thread::hardware_concurrency(), 1u));
+    std::vector<std::size_t> pending;
 
     for (std::size_t i = 0; i < parallel.size(); ++i) {
-        const bool found = next.next(request.archive_input.volume_attempts, cancel);
-        if (!found ||
-            (cancel && cancel->load())) break;
+        if (!next.next(plan, cancel) || (cancel && cancel->load())) break;
         prepared_attempts.push_back({next.layout, next.selected, {}});
+        auto& prepared = prepared_attempts.back();
+        if (const auto* cached = cache.find(plan, prepared)) {
+            prepared.probe = *cached;
+            // An earlier uncached composition can still win. Nothing after
+            // this confirmed one is needed, including cursor advancement.
+            if (cached->status == PasswordTestStatus::Ok) break;
+        } else pending.push_back(i);
     }
     const auto capacity = parallel.size();
-    parallel.limit(prepared_attempts.size());
+    parallel.limit(pending.size());
+#ifdef SUP7Z_DEBUG
+    cache.scheduled_probes += pending.size();
+#endif
     std::atomic<std::size_t> earliest{prepared_attempts.size()};
-    parallel.run(prepared_attempts.size(), [&](std::size_t lane, std::size_t) {
+    parallel.run(pending.size(), [&](std::size_t task, std::size_t) {
+        const auto lane = pending[task];
         if (lane > earliest.load()) return;
         auto& prepared = prepared_attempts[lane];
-        if (const auto* cached = cache.find(request.archive_input.volume_attempts, prepared)) prepared.probe = *cached;
-        else {
-            WorkerArchiveInput input;
-            select_volume_attempt(request.archive_input, prepared.layout, prepared.sources, input);
-            prepared.probe = probe_input(request, input, request.passwords_for_layout(prepared.layout));
-        }
+        WorkerArchiveInput input;
+        select_volume_attempt(request.archive_input, prepared.layout, prepared.sources, input);
+        prepared.probe = probe_input(request, input, request.passwords_for_layout(prepared.layout));
         if (prepared.probe.status == PasswordTestStatus::Ok) {
             auto old = earliest.load();
             while (lane < old && !earliest.compare_exchange_weak(old, lane)) {}
         }
     });
     if (earliest.load() < prepared_attempts.size()) prepared_attempts.resize(earliest.load() + 1);
-    if (!native_job_cancelled()) for (const auto& attempt : prepared_attempts)
-        cache.remember(request.archive_input.volume_attempts, attempt, capacity);
+    if (!native_job_cancelled()) for (const auto lane : pending) {
+        if (lane >= prepared_attempts.size()) break;
+        cache.remember(plan, prepared_attempts[lane], capacity);
+    }
     return prepared_attempts;
 }
 

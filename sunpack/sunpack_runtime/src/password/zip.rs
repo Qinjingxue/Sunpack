@@ -77,7 +77,7 @@ pub(crate) fn zip_fast_verify_passwords_from_volumes(
 pub(crate) fn zip_fast_verify_passwords_from_attempts(
     preparation: &mut Preparation,
     head: &InputExtent,
-    plan: &VolumeAttemptPlan,
+    plan: &Arc<VolumeAttemptPlan>,
     candidates: &[Arc<str>],
     spanned: bool,
     eocd_offset: Option<u64>,
@@ -156,7 +156,7 @@ fn prepare_zip_attempt_anchor(
 
 fn prepare_zip_attempts(
     head: &InputExtent,
-    plan: &VolumeAttemptPlan,
+    plan: &Arc<VolumeAttemptPlan>,
     spanned: bool,
     eocd_offset: Option<u64>,
     sessions: &[NativeArchiveSession],

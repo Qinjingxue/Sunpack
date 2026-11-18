@@ -166,7 +166,7 @@ fn certain_zip_directory_supplies_proof_after_descriptor_sized_plain_head() {
         let paths = [temp_file("zip_cd_head", &head), temp_file("zip_cd_right", &tail)];
         let sources: Vec<_> = paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
             start: 0, end: Some(std::fs::metadata(path).unwrap().len()) }).collect();
-        let plan = VolumeAttemptPlan {
+        let plan = Arc::new(VolumeAttemptPlan {
             sources: sources.clone().into_boxed_slice(),
             layouts: vec![VolumeLayout { minimum_slots: 0, slots: vec![
                 VolumeSlot { number: 1, canonical_name: "x.001".into(), domain: 0 },
@@ -174,7 +174,7 @@ fn certain_zip_directory_supplies_proof_after_descriptor_sized_plain_head() {
             ].into_boxed_slice() }].into_boxed_slice(),
             domains: vec![VolumeDomain { choices: Arc::new(vec![0]) }, VolumeDomain { choices: Arc::new(vec![1]) }].into_boxed_slice(),
             head_size_from_total: None, minimum_size: None, tail_totals: Box::new([]),
-        };
+        });
         {
             let mut preparation = context::Preparation::default();
             let result = zip::zip_fast_verify_passwords_from_attempts(&mut preparation, &sources[0], &plan,

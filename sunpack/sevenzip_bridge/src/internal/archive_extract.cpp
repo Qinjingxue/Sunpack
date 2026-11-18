@@ -470,13 +470,7 @@ namespace sunpack::sevenzip
 #endif
                 item_count_read = archive->GetNumberOfItems(&num_items) == S_OK;
             }
-            if (item_count_read)
-            {
-
-                result.item_count = num_items;
-
-                result.output_trace.items.reserve(num_items);
-            }
+            if (item_count_read) result.item_count = num_items;
 
             result.archive_type = canonical_archive_type_for_guid(format);
             if (rar4_rejected_empty_encrypted_headers(

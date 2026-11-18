@@ -178,7 +178,7 @@ pub(in crate::password) fn rejected_sources(plan: &VolumeAttemptPlan, bad: &[boo
     rejections(plan, &[], None, bad)
 }
 
-pub(super) fn prepare(head: &InputExtent, plan: &VolumeAttemptPlan, sessions: &[NativeArchiveSession], native_volume: bool)
+pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, sessions: &[NativeArchiveSession], native_volume: bool)
     -> Result<Option<PasswordContext>, PreparedStatus> {
     let cancel = Cancellation::current();
     let inspect = |extent: &InputExtent, check_data: bool| {
@@ -211,8 +211,8 @@ pub(super) fn prepare(head: &InputExtent, plan: &VolumeAttemptPlan, sessions: &[
     let public = rejections(plan, &facts, Some(&facts[head_index]), &[]);
     let mut reduced = !public.ends.is_empty();
     let mut remaining = if reduced {
-        remove_paths(plan, &[&public]).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?
-    } else { plan.clone() };
+        Arc::new(remove_paths(plan, &[&public]).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?)
+    } else { Arc::clone(plan) };
     let anchor_context = materials[head_index].clone();
     let by_extent: HashMap<_, _> = plan.sources.iter().enumerate().map(|(i,s)| (s,i)).collect();
     let bad: Vec<_> = remaining.sources.par_iter().map(|s| {
@@ -221,10 +221,10 @@ pub(super) fn prepare(head: &InputExtent, plan: &VolumeAttemptPlan, sessions: &[
     cancel.check_io().map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
     if bad.iter().any(|&value| value) {
         let rejected = rejected_sources(&remaining, &bad);
-        remaining = remove_paths(&remaining, &[&rejected]).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
+        remaining = Arc::new(remove_paths(&remaining, &[&rejected]).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?);
         reduced = true;
     }
-    let plan = Arc::new(remaining);
+    let plan = remaining;
     let materials: Vec<_> = plan.sources.iter().map(|s| materials[by_extent[s]].clone()).collect();
     if plan.layouts.is_empty() || materials.iter().all(Option::is_none) {
         return Ok(Some(PasswordContext::Evidence(EvidenceContext {
