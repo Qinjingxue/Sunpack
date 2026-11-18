@@ -13,6 +13,17 @@ fn main() {
     println!("cargo:rerun-if-changed=../third_party/lz4");
     println!("cargo:rerun-if-changed=../lz4_stream");
 
+    let seven_zip = std::path::Path::new("../sevenzip_bridge/7z2604-src/C");
+    cc::Build::new()
+        .include(seven_zip)
+        .file(seven_zip.join("Blake2s.c"))
+        .file(seven_zip.join("CpuArch.c"))
+        .file("src/password/rar_blake2sp.c")
+        .warnings(false)
+        .compile("sunpack_blake2sp");
+    println!("cargo:rerun-if-changed={}", seven_zip.display());
+    println!("cargo:rerun-if-changed=src/password/rar_blake2sp.c");
+
     let target = std::env::var("TARGET").expect("Cargo build target");
     if target.ends_with("-windows-msvc") {
         embed_windows_resources(&target);

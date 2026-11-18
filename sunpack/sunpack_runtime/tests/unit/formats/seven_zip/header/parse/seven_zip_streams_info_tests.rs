@@ -84,18 +84,22 @@ fn archive_counts_follow_header_bytes_while_folder_graphs_stay_bounded() {
 #[test]
 fn parses_folder_graph_and_inherited_single_substream_crc() {
     let expected_crc = 0x4433_2211;
-    let mut raw = vec![SZ_PACK_INFO, 0, 1, SZ_SIZE, 10, SZ_END, SZ_UNPACK_INFO];
+    let mut raw = vec![
+        SZ_HEADER, SZ_ARCHIVE_PROPERTIES, 0x80, 0x31, 1, 0x02, SZ_END,
+        SZ_ADDITIONAL_STREAMS_INFO, SZ_UNPACK_INFO,
+    ];
+    raw.extend(one_copy_folder(10, None));
+    raw.extend([SZ_END, SZ_MAIN_STREAMS_INFO, SZ_PACK_INFO, 0, 1, SZ_SIZE, 10, SZ_END, SZ_UNPACK_INFO]);
     raw.extend(one_copy_folder(20, Some(expected_crc)));
     // The inherited folder CRC leaves no explicit CRC flags or values.
-    raw.extend([SZ_SUB_STREAMS_INFO, SZ_CRC, SZ_END, SZ_END]);
-    let mut pos = 0;
+    raw.extend([SZ_SUB_STREAMS_INFO, SZ_CRC, SZ_END, SZ_END, SZ_END]);
     let mut streams = SevenZipStreams::default();
-    parse_seven_zip_streams_info(&raw, &mut pos, &mut streams, false).unwrap();
+    parse_seven_zip_header_with_data(&raw, &mut streams, true).unwrap();
     assert_eq!(streams.folders.len(), 1);
     assert_eq!(streams.folders[0].unpack_size(0), 20);
     assert_eq!(streams.folders[0].coders[0].method_id, [0]);
     assert_eq!(streams.folders[0].expected_crc.unwrap(), expected_crc);
-    assert_eq!(pos, raw.len());
+    assert_eq!(streams.pack.unwrap().sizes, [10]);
 }
 
 #[test]
@@ -118,7 +122,7 @@ fn parses_multiple_substream_sizes_and_crcs() {
     raw.extend([SZ_END, SZ_END]);
     let mut pos = 0;
     let mut streams = SevenZipStreams::default();
-    parse_seven_zip_streams_info(&raw, &mut pos, &mut streams, false).unwrap();
+    assert_eq!(parse_seven_zip_streams_info(&raw, &mut pos, &mut streams, false).unwrap(), None);
     assert_eq!(pos, raw.len());
     raw.truncate(raw.len() - 3);
     assert_eq!(

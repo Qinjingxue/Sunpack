@@ -247,6 +247,36 @@ fn decoder_follows_bind_pairs_instead_of_coder_declaration_order() {
     assert_eq!(decoded, b"test");
 }
 
+#[test]
+fn unavailable_second_aes_block_keeps_first_block_structure() {
+    use aes::cipher::BlockModeEncrypt;
+
+    let properties = vec![0x3f]; // Direct AES key for this fixture.
+    let key = SevenZipAesKey::derive(&properties, "secret").unwrap();
+    let mut encrypted = [0; 32];
+    encrypted[..4].copy_from_slice(b"BZh9");
+    encrypted[4..10].copy_from_slice(b"1AY&SY");
+    cbc::Encryptor::<Aes256>::new(&key.key.into(), &key.iv.into())
+        .encrypt_padded::<NoPadding>(&mut encrypted, 32)
+        .unwrap();
+    let mut reader = Cursor::new(&encrypted[..16]);
+    let plan = SevenZipPayloadPlan {
+        offset: 0,
+        size: 32,
+        properties,
+        kind: SevenZipPayloadEvidence::Compressed {
+            method: vec![4, 2, 2],
+            packed_size: 32,
+            unpack_size: 1,
+        },
+        cost: 0,
+    };
+    let probe = SevenZipPayloadProbe::load_plan(&mut reader, 32, plan, &()).unwrap();
+    assert_eq!(probe.test_with_key(&key).unwrap(), SevenZipPrefixCheck::Strong);
+    let wrong = SevenZipAesKey::derive(probe.key_properties(), "wrong").unwrap();
+    assert_eq!(probe.test_with_key(&wrong).unwrap(), SevenZipPrefixCheck::Reject);
+}
+
 // Real password tests cover malformed plaintext, but cannot inject OOM or
 // OS read failures. This tiny case preserves that independent distinction
 // without large allocations or another archive-generation matrix.

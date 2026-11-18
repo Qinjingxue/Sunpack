@@ -271,6 +271,29 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     assert_eq!((result.matched_index, result.final_confirmation_required), (Some(2), Some(false)), "{}", result.message);
     for path in paths { std::fs::remove_file(path).unwrap(); }
 
+    // Only the active projection knows the remainder of this encrypted
+    // main header. Both possible sources share those bytes and have
+    // distinct outside padding, which must never enter the CRC proof.
+    let paths = [
+        crate::test_support::temp_file("rar5_active_prefix", &data[..start + 16]),
+        crate::test_support::temp_file("rar5_active_body_a", &[&data[start + 16..], &[0x5a]].concat()),
+        crate::test_support::temp_file("rar5_active_body_b", &[&data[start + 16..], &[0xa5]].concat()),
+    ];
+    let sources: Vec<_> = paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
+        start: 0, end: Some(path.metadata().unwrap().len()) }).collect();
+    let cut = VolumeAttemptPlan {
+        sources: sources.into_boxed_slice(),
+        layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..2).map(|i| VolumeSlot {
+            number: i as u32 + 1, canonical_name: format!("part.{}", i + 1), domain: i,
+        }).collect() }].into_boxed_slice(),
+        domains: [vec![0], vec![1, 2]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
+        head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
+    };
+    let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &cut.sources[0],
+        &cut, &parallel, &[], false).unwrap();
+    assert_eq!((result.matched_index, result.final_confirmation_required), (Some(2), Some(false)), "{}", result.message);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+
     data.truncate(300);
     let reader = ManagedReader::from_bytes(data, Default::default());
     let anchor = probe_volume_anchor_reader_at_offset(&reader, "", 0, "rar").unwrap();
@@ -352,4 +375,50 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     // Missing optional follow-up evidence preserves the first-block survivors.
     assert_eq!(prepare(archive).unwrap_or_else(|_| panic!("available first block"))
         .verify(&candidates, None).unwrap().matched_indices, [1, 2]);
+}
+
+#[test]
+fn rar5_packed_blake2sp_prunes_only_complete_nonfinal_fragments() {
+    // BLAKE2sp tree digest for this payload, independently generated with
+    // eight BLAKE2s leaves and one root. The payload spans two read buffers.
+    let mut packed: Vec<_> = (0..66000).map(|i| ((i ^ (i >> 8)) * 17) as u8).collect();
+    let hash = [
+        0xa3, 0xc4, 0x37, 0xe2, 0x7e, 0xc1, 0x59, 0x36, 0x99, 0x8c, 0x98, 0xf8, 0x6f, 0xe3, 0x43, 0x83,
+        0x1e, 0x29, 0xa2, 0x40, 0x01, 0xe1, 0x5f, 0x16, 0x92, 0xb3, 0xf7, 0x36, 0x2d, 0xfe, 0x94, 0xa6,
+    ];
+    let volume = |number: u8, split: u8, bytes: &[u8]| {
+        let mut extra = vec![34, 2, 0];
+        extra.extend(hash);
+        let mut member = vec![2, 3 | split];
+        member.extend(vint(extra.len() as u64));
+        member.extend(vint(66000));
+        member.extend([0, 0, 0, 0, 0, 1, b'x']);
+        member.extend(extra);
+        let main = if number == 0 { rar5_block(&[1, 0, 1]) } else { rar5_block(&[1, 0, 3, number]) };
+        [RAR5_SIGNATURE, &main, &rar5_block(&member), bytes,
+            &rar5_block(&[5, 0, u8::from(split & 16 != 0)])].concat()
+    };
+    let good = volume(1, 24, &packed);
+    packed[65999] ^= 1;
+    let damaged = volume(1, 24, &packed);
+    let tail = volume(2, 8, &packed);
+    let head = volume(0, 16, &packed);
+    let paths: Vec<_> = [head, damaged, good, tail].into_iter().enumerate().map(|(i, bytes)|
+        crate::test_support::temp_file(&format!("rar5_blake_{i}"), &bytes)).collect();
+    let plan = VolumeAttemptPlan {
+        sources: paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
+            start: 0, end: Some(path.metadata().unwrap().len()) }).collect(),
+        layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..3).map(|i| VolumeSlot {
+            number: i as u32 + 1, canonical_name: format!("part.{}", i + 1), domain: i,
+        }).collect() }].into_boxed_slice(),
+        domains: [vec![0], vec![1, 2], vec![3]].into_iter().map(|choices| VolumeDomain { choices: Arc::new(choices) }).collect(),
+        head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
+    };
+    let result = rar_fast_verify_passwords_from_attempts(&mut Preparation::default(), &plan.sources[0],
+        &plan, &[Arc::from("secret")], &[], true).unwrap();
+    let remaining = result.volume_attempts.unwrap();
+    assert!(remaining.sources.contains(&plan.sources[2]));
+    assert!(remaining.sources.contains(&plan.sources[3]));
+    assert!(!remaining.sources.contains(&plan.sources[1]));
+    for path in paths { std::fs::remove_file(path).unwrap(); }
 }

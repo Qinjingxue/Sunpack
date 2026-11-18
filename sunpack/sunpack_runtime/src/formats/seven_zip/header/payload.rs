@@ -2,7 +2,8 @@
 // verification, including AES/Copy, belongs to the worker decoder.
 pub(crate) struct SevenZipPayloadProbe {
     properties: Vec<u8>,
-    encrypted: Blob,
+    encrypted: [u8; 32],
+    encrypted_len: usize,
     kind: SevenZipPayloadEvidence,
 }
 
@@ -44,12 +45,13 @@ impl SevenZipPayloadEvidence {
         material: &SevenZipAesKey,
     ) -> Result<SevenZipPrefixCheck, String> {
         check_password_cancellation()?;
-        let len = self.plaintext_prefix_size();
-        let Some(encrypted) = encrypted.get(..len.div_ceil(16) * 16) else {
+        let len = self.plaintext_prefix_size().min(encrypted.len());
+        if len == 0 {
             return Ok(SevenZipPrefixCheck::Weak);
-        };
-        let mut buffer = [0u8; 128];
-        let prefix = &mut buffer[..encrypted.len()];
+        }
+        let mut buffer = [0u8; 32];
+        let prefix = &mut buffer[..len.div_ceil(16) * 16];
+        let encrypted = &encrypted[..prefix.len()];
         prefix.copy_from_slice(encrypted);
         Aes256CbcDec::new(&material.key.into(), &material.iv.into())
             .decrypt_padded::<NoPadding>(prefix)
@@ -247,9 +249,7 @@ impl SevenZipPasswordContext {
         let mut first_error = None;
         for (_, plan) in plans {
             check_password_cancellation().map_err(std::borrow::Cow::Owned)?;
-            match evidence.independent(reader, |reader| {
-                SevenZipPayloadProbe::load_plan(reader, before, plan)
-            }) {
+            match SevenZipPayloadProbe::load_plan(reader, before, plan, evidence) {
                 Ok(probe) => return Ok(Some(Self::Prefix { probe, header })),
                 Err(error) => {
                     first_error.get_or_insert(error);
@@ -266,19 +266,33 @@ impl SevenZipPayloadProbe {
         reader: &mut R,
         reader_len: u64,
         plan: SevenZipPayloadPlan,
+        evidence: &impl SevenZipEvidenceReads<R>,
     ) -> Result<Self, std::borrow::Cow<'static, str>> {
-        let encrypted = read_seven_zip_probe_range(
-            reader,
-            reader_len,
-            plan.offset,
-            usize::try_from(plan.size).map_err(|_| "7z payload evidence is too large")?,
-            "7z.payload.evidence",
-            FieldLocation::Body,
-        )
-        .map_err(resource_error)?;
+        let mut encrypted = [0; 32];
+        let read = |reader: &mut R, offset, bytes: &mut [u8]| -> std::io::Result<()> {
+            let field = "7z.payload.evidence";
+            seek_field(reader, offset, reader_len, field, FieldLocation::Body)
+                .map_err(|fault| fault.into_io_error())?;
+            read_exact_field(reader, bytes, reader_len, field, FieldLocation::Body)
+                .map_err(|fault| fault.into_io_error())
+        };
+        evidence.independent(reader, |reader| read(reader, plan.offset, &mut encrypted[..16]))
+            .map_err(resource_error)?;
+        let mut encrypted_len = 16;
+        if plan.size == 32 {
+            // Failure here leaves the first block and its volume projection
+            // usable. Pending alternatives still replay in the shared reader.
+            if evidence.independent(reader, |reader| {
+                read(reader, plan.offset + 16, &mut encrypted[16..])
+            }).is_ok() {
+                encrypted_len = 32;
+            }
+        }
+        check_password_cancellation().map_err(std::borrow::Cow::Owned)?;
         Ok(Self {
             properties: plan.properties,
             encrypted,
+            encrypted_len,
             kind: plan.kind,
         })
     }
@@ -291,7 +305,7 @@ impl SevenZipPayloadProbe {
         &self,
         material: &SevenZipAesKey,
     ) -> Result<SevenZipPrefixCheck, String> {
-        self.kind.check_encrypted_prefix(&self.encrypted, material)
+        self.kind.check_encrypted_prefix(&self.encrypted[..self.encrypted_len], material)
     }
 }
 

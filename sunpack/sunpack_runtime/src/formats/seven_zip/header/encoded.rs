@@ -187,16 +187,15 @@ fn parse_seven_zip_encoded_header_descriptor(
     }
     let mut pos = 1;
     let mut streams = SevenZipStreams::default();
-    parse_seven_zip_streams_info(raw, &mut pos, &mut streams, true)?;
+    let substream_crc = parse_seven_zip_streams_info(raw, &mut pos, &mut streams, true)?;
     if streams.folders.len() != 1 {
         return Err("encoded_header_folder_not_unique");
     }
+    let mut folder = streams.folders.pop().unwrap();
+    folder.expected_crc = folder.expected_crc.or(substream_crc);
     Ok((
         streams.pack.ok_or("encoded_header_pack_info_missing")?,
-        streams
-            .folders
-            .pop()
-            .ok_or("encoded_header_unpack_info_missing")?,
+        folder,
     ))
 }
 

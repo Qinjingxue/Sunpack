@@ -13,14 +13,31 @@ use std::sync::Arc;
 
 const BLOCK: usize = 16;
 const FIELD: &str = "zip.strong_encryption.decryption_header";
+pub(super) const VALIDATION_FIELD: &str = "zip.strong_encryption.validation";
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PasswordHeader {
     iv: [u8; BLOCK],
     iv_len: usize,
     key_len: usize,
+    erd_tail: [[u8; BLOCK]; 2],
+    ranges: ValidationRanges,
+    validation: Option<Validation>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ValidationRanges {
+    body_offset: u64,
     erd_len: usize,
-    body: Arc<[u8]>,
+    validation_len: usize,
+    validation_size_checked: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct Validation {
+    erd_prefix: Arc<[u8]>,
+    erd_has_random_data: bool,
+    bytes: Arc<[u8]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,7 +49,7 @@ enum Evidence {
 
 impl PasswordHeader {
     pub(super) fn read(
-        sizes_and_crc: Option<(CentralValues, u32)>,
+        sizes_and_crc: Option<(&CentralValues, u32)>,
         mut read: impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, PreparedStatus>,
     ) -> Result<Self, PreparedStatus> {
         let unsupported = || {
@@ -84,7 +101,9 @@ impl PasswordHeader {
         }
         let remaining = le_u32(fields, 0).ok_or_else(invalid)?;
         let erd_len = usize::from(le_u16(fields, 12).ok_or_else(invalid)?);
-        let validation_len = (remaining as usize).checked_sub(erd_len + 16).ok_or_else(invalid)?;
+        let validation_len = (remaining as usize)
+            .checked_sub(erd_len + 16)
+            .ok_or_else(invalid)?;
         if erd_len == 0
             || erd_len % BLOCK != 0
             || validation_len == 0
@@ -97,22 +116,87 @@ impl PasswordHeader {
             return Err(invalid());
         }
         let body_offset = (explicit_iv_len + 16) as u64;
-        // Read the certificate marker and VSize before the encrypted fields.
-        let lengths = read(body_offset + erd_len as u64, 6, FIELD)?;
-        if le_u32(&lengths, 0) != Some(0) {
-            return Err(unsupported());
-        }
-        if le_u16(&lengths, 4) != Some(validation_len as u16) {
-            return Err(invalid());
-        }
-        let body = read(body_offset, erd_len + 6 + validation_len, FIELD)?;
-        Ok(Self {
+        let tail_len = erd_len.min(2 * BLOCK);
+        let erd_prefix_len = erd_len - tail_len;
+        let tail = read(body_offset + erd_prefix_len as u64, tail_len, FIELD)?;
+        let erd_tail = [
+            if tail_len == BLOCK {
+                iv
+            } else {
+                tail[..BLOCK].try_into().unwrap()
+            },
+            tail[tail_len - BLOCK..].try_into().unwrap(),
+        ];
+        let mut header = Self {
             iv,
             iv_len,
             key_len,
+            erd_tail,
+            ranges: ValidationRanges {
+                body_offset,
+                erd_len,
+                validation_len,
+                validation_size_checked: false,
+            },
+            validation: None,
+        };
+        header.load_validation(read)?;
+        Ok(header)
+    }
+
+    pub(super) fn has_validation(&self) -> bool {
+        self.validation.is_some()
+    }
+
+    pub(super) fn load_validation(
+        &mut self,
+        mut read: impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, PreparedStatus>,
+    ) -> Result<(), PreparedStatus> {
+        // Only the ERD tail is required for the padding proof. Inspect the
+        // certificate marker and declared VSize before reading the ciphertext.
+        let ValidationRanges {
+            body_offset,
             erd_len,
-            body: body.into(),
-        })
+            validation_len,
+            validation_size_checked,
+        } = self.ranges;
+        let erd_prefix_len = erd_len.saturating_sub(2 * BLOCK);
+        let validation_offset = body_offset + erd_len as u64;
+        if !validation_size_checked {
+            let Ok(lengths) = read(validation_offset, 6, VALIDATION_FIELD) else {
+                return Ok(());
+            };
+            if le_u32(&lengths, 0) != Some(0) {
+                return Err(PreparedStatus::new(
+                    "unsupported_method",
+                    "unsupported PKWARE Strong certificate data",
+                ));
+            }
+            if le_u16(&lengths, 4) != Some(validation_len as u16) {
+                return Err(PreparedStatus::new(
+                    "unknown_needs_final_verifier",
+                    "invalid PKWARE Strong validation size",
+                ));
+            }
+            self.ranges.validation_size_checked = true;
+        }
+        self.validation = read(validation_offset + 6, validation_len, VALIDATION_FIELD)
+            .ok()
+            .and_then(|bytes| {
+                let erd_prefix = if erd_prefix_len == 0 {
+                    Arc::default()
+                } else {
+                    read(body_offset, erd_prefix_len, VALIDATION_FIELD)
+                        .ok()?
+                        .into()
+                };
+                Some(Validation {
+                    erd_prefix,
+                    erd_has_random_data: erd_len > BLOCK,
+                    bytes: bytes.into(),
+                })
+            });
+        Ok(())
     }
 
     pub(super) fn verify(
@@ -191,30 +275,31 @@ impl PasswordHeader {
     }
 
     fn check<C: BlockCipherDecrypt + KeyInit>(&self, master_key: &[u8; 32]) -> Evidence {
-        let erd = &self.body[..self.erd_len];
-        let random_len = erd.len() - BLOCK;
         let master_cipher = C::new_from_slice(&master_key[..self.key_len]).unwrap();
         // The final CBC block is known full padding in the supported native
         // method. Reject before walking ERD or deriving the file key.
-        let prev = if random_len == 0 {
-            &self.iv[..]
-        } else {
-            &erd[random_len - BLOCK..random_len]
-        };
-        if decrypt_block(&master_cipher, prev, &erd[random_len..]) != [BLOCK as u8; BLOCK] {
+        if decrypt_block(&master_cipher, &self.erd_tail[0], &self.erd_tail[1])
+            != [BLOCK as u8; BLOCK]
+        {
             return Evidence::Reject;
         }
+        let Some(validation) = &self.validation else {
+            return Evidence::Possible;
+        };
         let mut previous = &self.iv[..];
         let mut sha = Sha1::new_with_prefix(&self.iv[..self.iv_len]);
-        for block in erd[..random_len].chunks_exact(BLOCK) {
+        for block in validation.erd_prefix.chunks_exact(BLOCK) {
             sha.update(decrypt_block(&master_cipher, previous, block));
             previous = block;
+        }
+        if validation.erd_has_random_data {
+            sha.update(decrypt_block(&master_cipher, previous, &self.erd_tail[0]));
         }
         let file_key = derive_key(sha);
         let file_cipher = C::new_from_slice(&file_key[..self.key_len]).unwrap();
         let mut previous = &self.iv[..];
         let mut crc = crc32fast::Hasher::new();
-        let mut blocks = self.body[self.erd_len + 6..].chunks_exact(BLOCK);
+        let mut blocks = validation.bytes.chunks_exact(BLOCK);
         let last = blocks.next_back().unwrap();
         for block in blocks {
             crc.update(&decrypt_block(&file_cipher, previous, block));

@@ -4,6 +4,12 @@ use crate::password::evidence::{remove_paths, EvidenceContext, VolumeProjection}
 use crate::password::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
 use crate::password::input::VirtualRangeReader;
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::c_void;
+
+pub(super) enum PackedDigest {
+    Crc32(u32),
+    Blake2sp([u8; 32]),
+}
 
 // A successfully decoded header can constrain a native disk. Absent fields
 // and a short read never imply disagreement with a neighbouring disk.
@@ -15,46 +21,102 @@ pub(super) struct VolumeFacts {
     pub(super) invalid: bool,
     pub(super) number: Option<u32>,
     pub(super) has_next: Option<bool>,
-    packed: Option<Vec<(u64, u64, u32)>>,
+    packed: Option<Vec<(u64, u64, PackedDigest)>>,
     first: Option<Option<Vec<u8>>>,
     last: Option<Option<Vec<u8>>>,
 }
 
 impl VolumeFacts {
+    pub(super) fn checks_packed(&self) -> bool {
+        self.packed.is_some()
+    }
+
     pub(super) fn file(&mut self, before: bool, after: bool, name: &[u8]) {
         self.first.get_or_insert_with(|| before.then(|| name.to_vec()));
         self.last = Some(after.then(|| name.to_vec()));
     }
 
-    pub(super) fn packed(&mut self, offset: u64, length: u64, crc: u32) {
+    pub(super) fn packed(&mut self, offset: u64, length: u64, digest: PackedDigest) {
         if let Some(spans) = &mut self.packed {
-            spans.push((offset, length, crc));
+            spans.push((offset, length, digest));
         }
     }
 }
 
 // Stream only complete non-final fragments of structurally viable sources.
-// Key-dependent RAR5 hashes and omitted legacy RAR4 CRCs never enter this list.
-fn packed_mismatch(spans: &[(u64, u64, u32)], source: &InputExtent,
+// Final unpacked checksums and omitted legacy RAR4 CRCs never enter this list.
+fn packed_mismatch(spans: &[(u64, u64, PackedDigest)], source: &InputExtent,
     sessions: &[NativeArchiveSession], cancel: &Cancellation) -> bool {
     if spans.is_empty() { return false; }
     let Ok(ranges) = parse_ranges(std::iter::once(source), sessions) else { return false; };
     let mut reader = VirtualRangeReader::streaming(&ranges);
     let mut buffer = Vec::new();
-    for &(mut offset, mut length, crc) in spans {
+    for &(offset, length, ref expected) in spans {
         if offset.checked_add(length).is_none_or(|end| end > reader.len()) { continue; }
-        let mut digest = crc32fast::Hasher::new();
-        while length != 0 {
-            if cancel.cancelled() { return false; }
-            let size = length.min(64 * 1024) as usize;
-            if reader.read_at_into(offset, size, &mut buffer).is_err() || buffer.len() != size { return false; }
-            digest.update(&buffer);
-            offset += size as u64;
-            length -= size as u64;
-        }
-        if digest.finalize() != crc { return true; }
+        let mut stream = PackedStream { reader: &mut reader, buffer: &mut buffer, offset, length, cancel };
+        let matched = match expected {
+            PackedDigest::Crc32(expected) => {
+                let mut crc = crc32fast::Hasher::new();
+                stream.update(|data| crc.update(data)).then(|| crc.finalize() == *expected)
+            }
+            PackedDigest::Blake2sp(expected) => stream.blake2sp().map(|actual| actual == *expected),
+        };
+        if matched == Some(false) { return true; }
     }
     false
+}
+
+struct PackedStream<'a, 'ranges> {
+    reader: &'a mut VirtualRangeReader<'ranges>,
+    buffer: &'a mut Vec<u8>,
+    offset: u64,
+    length: u64,
+    cancel: &'a Cancellation,
+}
+
+unsafe extern "C" {
+    fn sunpack_blake2sp_run(context: *mut c_void, run: unsafe extern "C" fn(*mut c_void, *mut c_void));
+    fn Blake2sp_Update(state: *mut c_void, data: *const u8, size: usize);
+    fn Blake2sp_Final(state: *mut c_void, digest: *mut u8);
+    fn z7_Black2sp_Prepare();
+}
+
+impl PackedStream<'_, '_> {
+    fn update(&mut self, mut consume: impl FnMut(&[u8])) -> bool {
+        while self.length != 0 {
+            if self.cancel.cancelled() { return false; }
+            let size = self.length.min(64 * 1024) as usize;
+            if self.reader.read_at_into(self.offset, size, self.buffer).is_err() || self.buffer.len() != size {
+                return false;
+            }
+            consume(self.buffer);
+            self.offset += size as u64;
+            self.length -= size as u64;
+        }
+        true
+    }
+
+    fn blake2sp(&mut self) -> Option<[u8; 32]> {
+        static INITIALIZE: std::sync::Once = std::sync::Once::new();
+        INITIALIZE.call_once(|| unsafe { z7_Black2sp_Prepare() });
+        struct Run<'a, 'stream, 'ranges> {
+            stream: &'a mut PackedStream<'stream, 'ranges>,
+            digest: Option<[u8; 32]>,
+        }
+        unsafe extern "C" fn update(context: *mut c_void, state: *mut c_void) {
+            // The synchronous shim supplies an aligned, initialized 7-Zip
+            // state and keeps it alive across this callback.
+            let run = unsafe { &mut *context.cast::<Run<'_, '_, '_>>() };
+            if run.stream.update(|data| unsafe { Blake2sp_Update(state, data.as_ptr(), data.len()) }) {
+                let mut result = [0; 32];
+                unsafe { Blake2sp_Final(state, result.as_mut_ptr()); }
+                run.digest = Some(result);
+            }
+        }
+        let mut run = Run { stream: self, digest: None };
+        unsafe { sunpack_blake2sp_run((&raw mut run).cast(), update); }
+        run.digest
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

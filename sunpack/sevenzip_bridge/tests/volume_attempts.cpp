@@ -75,6 +75,18 @@ int main() {
     plan.layouts = {{slot(0, 0), slot(1, 1), slot(2, 1), slot(3, 1)},
                     {slot(0, 2), slot(1, 1), slot(2, 1), slot(3, 1)}};
     if (!compare(plan)) return 1;
+    const auto combinations = reference(plan);
+    plan.prepare();
+    VolumeAttemptCursor after_proof;
+    after_proof.reserve(plan);
+    if (!after_proof.next(plan)) return 6;
+    const auto rejected_prefix = after_proof.selected;
+    after_proof.skip_suffix(plan, 1);
+    for (const auto& [layout, sources] : combinations) {
+        if (layout == 0 && sources[0] == rejected_prefix[0] && sources[1] == rejected_prefix[1]) continue;
+        if (!after_proof.next(plan) || after_proof.layout != layout || after_proof.selected != sources) return 6;
+    }
+    if (after_proof.next(plan)) return 6;
 
     // Each slot sees the same large source, but injectivity permits its bytes
     // only once. This is length infeasibility despite enough distinct choices.

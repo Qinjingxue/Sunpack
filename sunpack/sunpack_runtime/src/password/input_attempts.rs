@@ -10,21 +10,21 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, OnceLock};
 
-struct AttemptFile<'a> {
-    path: &'a str,
+struct AttemptFile {
+    path: String,
     reader: OnceLock<Result<ManagedReader, String>>,
 }
 
-impl AttemptFile<'_> {
+impl AttemptFile {
     fn open(&self) -> Result<&ManagedReader, &String> {
         self.reader
-            .get_or_init(|| ManagedReader::open(self.path).map_err(|error| error.to_string()))
+            .get_or_init(|| ManagedReader::open(&self.path).map_err(|error| error.to_string()))
             .as_ref()
     }
 }
 
-struct AttemptSource<'a> {
-    file: Arc<AttemptFile<'a>>,
+struct AttemptSource {
+    file: Arc<AttemptFile>,
     start: u64,
     len: Option<u64>,
 }
@@ -368,13 +368,13 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
             (
                 path,
                 Arc::new(AttemptFile {
-                    path,
+                    path: path.to_owned(),
                     reader: OnceLock::from(Ok(reader)),
                 }),
             )
         })
         .collect();
-    let sources = plan
+    let sources: Arc<[_]> = plan
         .sources
         .iter()
         .map(|extent| {
@@ -384,7 +384,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                 .entry(extent.path.as_str())
                 .or_insert_with_key(|path| {
                     Arc::new(AttemptFile {
-                        path,
+                        path: (*path).to_owned(),
                         reader: OnceLock::new(),
                     })
                 })
@@ -413,7 +413,8 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                 len,
             })
         })
-        .collect::<Result<Vec<_>, PreparedStatus>>()?;
+        .collect::<Result<Vec<_>, PreparedStatus>>()?
+        .into();
     let mut graph = Topology::default();
     // Once the required prefix and minimum total are present, suffix lengths
     // cannot change this method's coordinates. Merge those paths immediately.
@@ -714,16 +715,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
             .into_par_iter()
             .map(|projection| {
                 cancellation.run(|| {
-                    let mut reader = AttemptReader {
-                        sources: &sources,
-                        projection,
-                        position: 0,
-                        pending: None,
-                        fault: None,
-                        evidence_fault: None,
-                        unresolved_fault: None,
-                        truncated_choices: Vec::new(),
-                    };
+                    let mut reader = AttemptReader::new(&sources, projection);
                     let result = prepare(&mut reader);
                     (reader, result)
                 })
@@ -785,7 +777,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
 }
 
 pub(crate) struct AttemptReader<'a> {
-    sources: &'a [AttemptSource<'a>],
+    sources: &'a Arc<[AttemptSource]>,
     projection: Projection,
     position: u64,
     pending: Option<Vec<Projection>>,
@@ -794,7 +786,61 @@ pub(crate) struct AttemptReader<'a> {
     unresolved_fault: Option<io::Error>,
     truncated_choices: Vec<Arc<crate::password::evidence::VolumeProjection>>,
 }
+
+#[derive(Clone)]
+pub(crate) struct DeferredReads {
+    sources: Arc<[AttemptSource]>,
+    projection: Projection,
+    disk_relative: bool,
+}
+
+impl DeferredReads {
+    pub(crate) fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut reader = AttemptReader::new(&self.sources, self.projection.clone());
+        let bytes = if self.disk_relative {
+            let (disk, local) = reader.advance_disk_offset(0, 0, offset)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "required volume is unavailable")
+            })?;
+            reader.read_disk_spanning(disk, local, len)?
+        } else {
+            reader.seek(SeekFrom::Start(offset))?;
+            let mut bytes = crate::io::resource_error::bytes_with_capacity(len)?;
+            bytes.resize(len, 0);
+            reader.read_exact(&mut bytes)?;
+            bytes
+        };
+        if let Some(error) = reader.unresolved_fault.or(reader.fault) {
+            return Err(error);
+        }
+        if !reader.truncated_choices.is_empty() || bytes.len() != len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "required volume extent is incomplete"));
+        }
+        Ok(bytes)
+    }
+}
+
 impl AttemptReader<'_> {
+    fn new(sources: &Arc<[AttemptSource]>, projection: Projection) -> AttemptReader<'_> {
+        AttemptReader {
+            sources,
+            projection,
+            position: 0,
+            pending: None,
+            fault: None,
+            evidence_fault: None,
+            unresolved_fault: None,
+            truncated_choices: Vec::new(),
+        }
+    }
+
+    pub(crate) fn deferred_reads(&self, disk_relative: bool) -> DeferredReads {
+        DeferredReads {
+            sources: Arc::clone(self.sources),
+            projection: self.projection.clone(),
+            disk_relative,
+        }
+    }
+
     /// Keep method selection stable when a read splits a projection and its
     /// parser is replayed. Only overlapping *distinct physical mappings*
     /// can yield different bytes at the same logical position.

@@ -234,6 +234,28 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
     assert_eq!(result.matched_indices, [1]);
     assert_eq!(result.match_evidence, Some("7z_header_prefix"));
     assert_eq!(result.final_confirmation_required, Some(true));
+    // A single substream covers the whole encrypted metadata folder.
+    // Move the original folder digest to SubStreamsInfo, then split the
+    // StartHeader across two alternative second volumes.
+    let mut substream_digest = crc_less;
+    substream_digest.splice(crc_field + 1..crc_field + 1,
+        [8, 10, 1].into_iter().chain(bytes[crc_field + 2..crc_field + 6].iter().copied()).chain([0]));
+    update_descriptor_crc(&mut substream_digest);
+    let (fragment_paths, fragment_sources, fragment_plan) =
+        uncertain_tail_fixture_at(&substream_digest, &[], 20);
+    let context = prepare_seven_zip_attempts(&fragment_sources[0], &fragment_plan, &[], None)
+        .unwrap_or_else(|_| panic!("split StartHeader and encoded-header substream CRC"));
+    let result = context.verify(&[Arc::from("wrong-first"), Arc::from("secret")], None).unwrap();
+    assert_eq!(result.matched_indices, [1]);
+    assert_eq!(result.final_confirmation_required, Some(false));
+    assert!(!result
+        .volume_attempts
+        .unwrap()
+        .sources
+        .iter()
+        .any(|source| source.path == fragment_sources[1].path));
+    drop(context);
+    for path in fragment_paths { std::fs::remove_file(path).unwrap(); }
     // The correct tail has trailing carrier junk, unlike the bad-cipher tail.
     // Right-aligning it at NextHeader.end would discard the correct password.
     let (mut paths, mut sources, mut plan) =

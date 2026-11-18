@@ -132,18 +132,22 @@ use super::*;
 
 #[test]
 fn scan_removes_only_discarded_combinations_in_original_order() {
-    let domains = [vec![0, 1], vec![2, 3, 4]].map(|choices| VolumeDomain { choices: Arc::new(choices) });
+    let domains = [vec![0, 1, 5], vec![2, 3, 4]].map(|choices| VolumeDomain { choices: Arc::new(choices) });
     let layout = VolumeLayout { minimum_slots: 0, slots: [0,1].map(|domain| VolumeSlot {
         number: domain as u32 + 1, canonical_name: domain.to_string(), domain,
     }).into() };
     let plan = VolumeAttemptPlan {
-        sources: (0..5).map(|i| InputExtent { path: i.to_string(), start: 0, end: Some(1) }).collect(),
+        sources: (0..6).map(|i| InputExtent { path: i.to_string(), start: 0, end: Some(1) }).collect(),
         layouts: vec![layout.clone(), layout].into(), domains: domains.into(),
         tail_totals: Box::default(), minimum_size: None, head_size_from_total: None,
     };
     let first = VolumeSelection { layout: 0, sources: vec![0, 3] };
     let remaining = crate::password::evidence::remove_scan_paths(
-        &plan, vec![VolumeSelection { layout: 0, sources: vec![1, 3] }], vec![1], Some(&first),
+        &plan,
+        vec![VolumeSelection { layout: 0, sources: vec![1, 3] }, VolumeSelection { layout: 0, sources: vec![5, 3] }],
+        vec![VolumeSelection { layout: 0, sources: vec![5] }],
+        vec![1],
+        Some(&first),
     ).unwrap();
     let mut paths = Vec::new();
     for layout in &remaining.layouts {

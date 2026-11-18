@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <atomic>
+#include <optional>
 
 namespace sunpack::sevenzip {
 
@@ -57,6 +58,7 @@ struct PasswordTestResult {
     bool weak_match = false;
     bool password_independent_failure = false;
     bool rejects_fixed_geometry = false;
+    std::optional<std::vector<std::size_t>> observed_volume_slots;
     std::vector<std::size_t> possible_candidates;
     int matched_index = -1;
     int operation_result = 0;

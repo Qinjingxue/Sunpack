@@ -38,6 +38,33 @@ fn local_anchor_never_reads_across_a_missing_disk_or_unknown_descriptor() {
     assert!(matches!(result, Ok(None)), "must not guess the next local header after a descriptor-sized entry");
 }
 
+#[test]
+fn anchor_walk_can_skip_unsupported_encryption_with_an_authoritative_size() {
+    let mut unsupported = local_crypto_header();
+    unsupported[6] = 0x41;
+    unsupported[8] = 99; // Contradictory encryption mode.
+    unsupported[18..22].copy_from_slice(&12u32.to_le_bytes());
+    let next_offset = unsupported.len();
+    unsupported.extend(local_crypto_header());
+    let prepare =
+        |bytes: &[u8]| prepare_zip_anchor(&mut std::io::Cursor::new(bytes), bytes.len() as u64);
+    let anchor = prepare(&unsupported)
+        .ok()
+        .flatten()
+        .expect("next local header is readable");
+    assert_eq!(anchor.local_offset, next_offset as u64);
+    assert!(matches!(
+        anchor.context,
+        ZipPasswordContext::ZipCrypto { .. }
+    ));
+
+    unsupported[6] |= 8;
+    assert!(matches!(
+        prepare(&unsupported),
+        Err(PreparedStatus::Status("unsupported_method", _))
+    ));
+}
+
 // Covers all three verifier block positions, unsupported AE versions,
 // and the strong-encryption flag on both local and directory-selected paths.
 #[test]

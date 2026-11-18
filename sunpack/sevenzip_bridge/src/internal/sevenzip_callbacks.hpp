@@ -149,7 +149,10 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE GetStream(const wchar_t *name, IInStream **inStream) SUP7Z_NOEXCEPT override
         {
             // Named-volume existence and physical stream sizes also affect Open.
-            if (probe_reads_) probe_reads_->uncertain_read.store(true, std::memory_order_relaxed);
+            if (probe_reads_) {
+                probe_reads_->uncertain_read.store(true, std::memory_order_relaxed);
+                probe_reads_->named_volume_requested.store(true, std::memory_order_relaxed);
+            }
 
             if (!inStream)
             {

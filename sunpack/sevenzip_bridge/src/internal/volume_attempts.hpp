@@ -160,6 +160,12 @@ struct VolumeAttemptCursor {
         used[selected[depth]] = 0;
         ++domain_remaining[plan.domain_for(layout, slot_count, depth)];
     }
+    void skip_suffix(const VolumeAttemptPlan& plan, std::size_t last_read_slot) {
+        // The yielded prefix through this slot has already been rejected.
+        while (depth > last_read_slot) unselect(plan, --depth);
+        ++digits[depth];
+        searching = true;
+    }
     void skip_layout() {
         for (auto source : selected) used[source] = 0;
         ++layout;

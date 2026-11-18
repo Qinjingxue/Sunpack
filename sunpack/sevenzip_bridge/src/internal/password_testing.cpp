@@ -74,9 +74,9 @@ namespace sunpack::sevenzip
             bool variable;
             bool operator<(const MemberProof& other) const {
                 if (weak != other.weak) return !weak;
-                if (variable != other.variable) return variable;
                 if (weak && coverage != other.coverage) return coverage > other.coverage;
                 if (cost != other.cost) return cost < other.cost;
+                if (variable != other.variable) return variable;
                 return index < other.index;
             }
         };
@@ -105,9 +105,24 @@ namespace sunpack::sevenzip
                     if (reads && plan->variation[i].variable)
                         reads->uncertain_ranges.emplace_back(starts[i], starts[i + 1]);
                 }
+                if (reads && !reads->uncertain_ranges.empty())
+                    reads->observed = std::make_unique<std::atomic<bool>[]>(reads->uncertain_ranges.size());
             }
             VolumeReadUncertainty* observer() const { return reads ? &*reads : nullptr; }
-            bool independent() const { return reads && !reads->uncertain_read.load(std::memory_order_relaxed); }
+            void attach(PasswordTestResult& result) const {
+                if (!reads || reads->named_volume_requested.load(std::memory_order_relaxed) ||
+                    result.missing_volume || native_job_cancelled() ||
+                    (result.status != PasswordTestStatus::WrongPassword &&
+                     (result.status != PasswordTestStatus::Ok || !result.encrypted))) return;
+                result.rejects_fixed_geometry = result.status == PasswordTestStatus::WrongPassword &&
+                    !reads->uncertain_read.load(std::memory_order_relaxed);
+                if (!reads->observed) return;
+                auto& used = result.observed_volume_slots.emplace();
+                for (std::size_t slot = 0, range = 0; slot + 1 < variable.size(); ++slot) {
+                    if (variable[slot] == variable[slot + 1]) continue;
+                    if (reads->observed[range++].load(std::memory_order_relaxed)) used.push_back(slot);
+                }
+            }
             bool contains(IInArchive* archive, UInt32 index, const std::wstring& format) const {
                 if (starts.empty()) return false;
                 PROPVARIANT prop{};
@@ -695,7 +710,7 @@ namespace sunpack::sevenzip
                     result.possible_candidates.push_back(index);
                 }
             }
-            result.rejects_fixed_geometry = result.status == PasswordTestStatus::WrongPassword && volumes.independent();
+            volumes.attach(result);
             return result;
         }
         PasswordParallelism parallel(count);
@@ -752,6 +767,7 @@ namespace sunpack::sevenzip
             if (!outcome || static_cast<std::size_t>(outcome->matched_index) != earliest.load()) continue;
             if (outcome->status == PasswordTestStatus::Ok) {
                 outcome->matched_index = static_cast<int>(global_index(outcome->matched_index));
+                volumes.attach(*outcome);
                 return std::move(*outcome);
             }
             last = std::move(*outcome);
@@ -784,7 +800,7 @@ namespace sunpack::sevenzip
             return last;
         }
         last.status = PasswordTestStatus::WrongPassword;
-        last.rejects_fixed_geometry = volumes.independent();
+        volumes.attach(last);
         last.encrypted = true;
         last.matched_index = -1;
         last.message = "wrong password";

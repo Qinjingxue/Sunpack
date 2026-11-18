@@ -245,13 +245,11 @@ fn seven_zip_plain_header_prefix(prefix: &[u8], plaintext_size: u64) -> SevenZip
     let Some(section) = read_sz_vint(prefix, &mut pos) else {
         return if (prefix.len() as u64) < plaintext_size { Weak } else { Reject };
     };
-    const ARCHIVE_PROPERTIES: u8 = 2;
-    const ADDITIONAL_STREAMS_INFO: u8 = 3;
     match u8::try_from(section) {
-        Ok(SZ_END | ARCHIVE_PROPERTIES | SZ_FILES_INFO) => Weak,
+        Ok(SZ_END | SZ_ARCHIVE_PROPERTIES | SZ_FILES_INFO) => Weak,
         // 7zFormat.txt lists the four optional Header sections. The first
         // property of either StreamsInfo must be one of its section tags.
-        Ok(ADDITIONAL_STREAMS_INFO | SZ_MAIN_STREAMS_INFO) => {
+        Ok(SZ_ADDITIONAL_STREAMS_INFO | SZ_MAIN_STREAMS_INFO) => {
             match read_sz_vint(prefix, &mut pos) {
                 Some(id) if matches!(u8::try_from(id), Ok(SZ_END | SZ_PACK_INFO | SZ_UNPACK_INFO | SZ_SUB_STREAMS_INFO)) => Weak,
                 None if (prefix.len() as u64) < plaintext_size => Weak,

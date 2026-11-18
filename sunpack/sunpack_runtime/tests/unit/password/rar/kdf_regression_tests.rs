@@ -41,7 +41,6 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
         for lg2_count in [0, 4, 10] {
             let iterations = 1u32 << lg2_count;
             let mut header = Rar5EncryptionIdentity {
-                keyed_hash: false,
                 iv: [0; 16],
                 lg2_count,
                 salt: [0x73; 16],

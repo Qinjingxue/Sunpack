@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <filesystem>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -61,12 +62,19 @@ struct ReplayFile {
 struct VolumeReadUncertainty {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> uncertain_ranges;
     std::atomic<bool> uncertain_read{false};
+    std::unique_ptr<std::atomic<bool>[]> observed;
+    std::atomic<bool> named_volume_requested{false};
     void observe_logical_read(std::uint64_t offset, std::uint32_t size) {
-        if (!size || uncertain_read.load(std::memory_order_relaxed)) return;
+        if (!size || (!observed && uncertain_read.load(std::memory_order_relaxed))) return;
         const auto range = std::upper_bound(uncertain_ranges.begin(), uncertain_ranges.end(), offset,
             [](auto value, const auto& range) { return value < range.second; });
-        if (range != uncertain_ranges.end() && (range->first <= offset || range->first - offset < size))
-            uncertain_read.store(true, std::memory_order_relaxed);
+        if (range == uncertain_ranges.end() || (range->first > offset && range->first - offset >= size)) return;
+        uncertain_read.store(true, std::memory_order_relaxed);
+        if (!observed) return;
+        for (auto it = range; it != uncertain_ranges.end() && (it->first <= offset || it->first - offset < size); ++it) {
+            auto& touched = observed[it - uncertain_ranges.begin()];
+            if (!touched.load(std::memory_order_relaxed)) touched.store(true, std::memory_order_relaxed);
+        }
     }
 };
 struct ExtractionReplay : VolumeReadUncertainty {

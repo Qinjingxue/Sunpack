@@ -22,11 +22,19 @@ fn parse_seven_zip_header_with_data(
 ) -> Result<(), &'static str> {
     let mut pos = 1;
     loop {
-        let nid = *raw.get(pos).ok_or("header_tree_truncated_before_end")?;
-        pos += 1;
+        let nid = read_sz_vint(raw, &mut pos).ok_or("header_tree_truncated_before_end")?;
+        let nid = u8::try_from(nid).map_err(|_| "unsupported_header_nid")?;
         match nid {
             SZ_END => return Ok(()),
-            SZ_MAIN_STREAMS_INFO => parse_seven_zip_streams_info(raw, &mut pos, streams, retain_decode_data)?,
+            SZ_ARCHIVE_PROPERTIES => skip_seven_zip_properties(raw, &mut pos)?,
+            SZ_ADDITIONAL_STREAMS_INFO => {
+                // The CRC-checked descriptor gives the main stream coordinates.
+                // Additional streams are needed only to resolve external metadata.
+                parse_seven_zip_streams_info(raw, &mut pos, &mut SevenZipStreams::default(), false)?;
+            }
+            SZ_MAIN_STREAMS_INFO => {
+                parse_seven_zip_streams_info(raw, &mut pos, streams, retain_decode_data)?;
+            }
             SZ_FILES_INFO => parse_seven_zip_files_info(raw, &mut pos)?,
             _ => return Err("unsupported_header_nid"),
         }
@@ -38,15 +46,16 @@ fn parse_seven_zip_streams_info(
     pos: &mut usize,
     streams: &mut SevenZipStreams,
     retain_decode_data: bool,
-) -> Result<(), &'static str> {
+) -> Result<Option<u32>, &'static str> {
     // A new StreamsInfo section supersedes the previous section, including
     // when the new section ends early with only partial facts.
     streams.folders = Vec::new();
+    let mut header_crc = None;
     loop {
         let nid = *data.get(*pos).ok_or("streams_info_truncated_before_end")?;
         *pos += 1;
         match nid {
-            SZ_END => return Ok(()),
+            SZ_END => return Ok(header_crc),
             SZ_PACK_INFO => {
                 let pack = parse_seven_zip_pack_info(data, pos, retain_decode_data)?;
                 if retain_decode_data {
@@ -56,12 +65,13 @@ fn parse_seven_zip_streams_info(
             SZ_UNPACK_INFO => {
                 let folders = parse_seven_zip_unpack_info(data, pos, retain_decode_data)?;
                 streams.folders = folders;
+                header_crc = None;
             }
             SZ_SUB_STREAMS_INFO => {
                 if streams.folders.is_empty() {
                     return Err("substreams_info_requires_unpack_info");
                 }
-                parse_seven_zip_substreams_info(data, pos, &streams.folders)?;
+                header_crc = parse_seven_zip_substreams_info(data, pos, &streams.folders)?;
             }
             _ => return Err("unsupported_streams_info_nid"),
         }
@@ -412,7 +422,7 @@ fn parse_seven_zip_substreams_info(
     data: &[u8],
     pos: &mut usize,
     folders: &[SevenZipFolderAst],
-) -> Result<(), &'static str> {
+) -> Result<Option<u32>, &'static str> {
     let mut counts = Vec::new();
     let mut nid = *data.get(*pos).ok_or("substreams_info_truncated")?;
     if nid == SZ_NUM_UNPACK_STREAM {
@@ -450,21 +460,26 @@ fn parse_seven_zip_substreams_info(
     if nid == SZ_SIZE {
         nid = *data.get(*pos).ok_or("substreams_info_truncated_after_sizes")?;
     }
+    let mut header_crc = None;
     if nid == SZ_CRC {
         *pos += 1;
         let inherited = folders.iter().enumerate()
             .filter(|(index, folder)| count_at(*index) == 1 && folder.expected_crc.is_some()).count();
         let crc_count = total_streams - inherited;
         let defined = parse_seven_zip_crc_flags(data, pos, crc_count)?;
-        if defined.defined_count(crc_count) > data.len().saturating_sub(*pos) / 4 {
+        let defined_count = defined.defined_count(crc_count);
+        if defined_count > data.len().saturating_sub(*pos) / 4 {
             return Err("substreams_info_crc_truncated");
         }
-        *pos += defined.defined_count(crc_count) * 4;
+        if folders.len() == 1 && total_streams == 1 && defined_count == 1 {
+            header_crc = Some(u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap()));
+        }
+        *pos += defined_count * 4;
         nid = *data.get(*pos).ok_or("substreams_info_truncated_after_crc")?;
     }
     if nid != SZ_END { return Err("unsupported_substreams_info_nid"); }
     *pos += 1;
-    Ok(())
+    Ok(header_crc)
 }
 
 enum SevenZipCrcFlags<'a> {
@@ -538,26 +553,26 @@ fn skip_seven_zip_crcs(
 
 fn parse_seven_zip_files_info(data: &[u8], pos: &mut usize) -> Result<(), &'static str> {
     let _num_files = read_sz_vint(data, pos).ok_or("7z FilesInfo file count is truncated")?;
+    skip_seven_zip_properties(data, pos)
+}
+
+fn skip_seven_zip_properties(data: &[u8], pos: &mut usize) -> Result<(), &'static str> {
     loop {
-        let Some(nid) = data.get(*pos).copied() else {
-            return Err("7z FilesInfo ended before End NID");
-        };
-        *pos += 1;
-        if nid == SZ_END {
-            break;
+        let nid = read_sz_vint(data, pos).ok_or("7z property ID is truncated")?;
+        if nid == u64::from(SZ_END) {
+            return Ok(());
         }
-        let size = read_sz_vint(data, pos).ok_or("7z FilesInfo property size is truncated")?;
+        let size = read_sz_vint(data, pos).ok_or("7z property size is truncated")?;
         let prop_size =
-            usize::try_from(size).map_err(|_| "7z FilesInfo property size is too large")?;
+            usize::try_from(size).map_err(|_| "7z property size is too large")?;
         let prop_end = (*pos)
             .checked_add(prop_size)
-            .ok_or("7z FilesInfo property range overflowed")?;
+            .ok_or("7z property range overflowed")?;
         if prop_end > data.len() {
-            return Err("7z FilesInfo property is truncated");
+            return Err("7z property is truncated");
         }
         *pos = prop_end;
     }
-    Ok(())
 }
 
 #[cfg(test)]

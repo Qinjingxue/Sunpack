@@ -108,7 +108,12 @@ fn pkware_strong_structural_proof_across_disk_and_damage() {
         assert_eq!(proof.match_evidence, Some("zip_pkware_strong_vcrc32"));
         assert_eq!(proof.final_confirmation_required, Some(false));
         let volumes = VolumeSet::new(vec![part(&bytes[..split], 1), part(&bytes[split..], 3)]);
-        assert!(prepare_zip_volumes(&volumes, None).is_err());
+        let context = prepare_zip_volumes(&volumes, None)
+            .unwrap_or_else(|_| panic!("ERD tail remains usable without the validation range"));
+        let proof = context.verify(&password).unwrap();
+        assert_eq!(proof.matched_indices, [1]);
+        assert_eq!(proof.match_evidence, Some("zip_pkware_strong_padding"));
+        assert_eq!(proof.final_confirmation_required, Some(true));
 
         bytes[validation] ^= 1;
         let context =

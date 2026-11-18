@@ -435,6 +435,7 @@ pub(super) fn remove_paths(
 pub(crate) fn remove_scan_paths(
     plan: &VolumeAttemptPlan,
     selections: Vec<VolumeSelection>,
+    mut prefixes: Vec<VolumeSelection>,
     layouts: Vec<usize>,
     first: Option<&VolumeSelection>,
 ) -> std::io::Result<VolumeAttemptPlan> {
@@ -442,6 +443,7 @@ pub(crate) fn remove_scan_paths(
     let mut proof = VolumeProjection { roots: Vec::new(), edges: Vec::new(), ends: Vec::new() };
     let mut roots = HashMap::new();
     let mut edges = HashMap::new();
+    let mut suffixes = HashMap::new();
     let mut nodes = 0;
     let mut node = || { nodes += 1; nodes };
     let start = first.map_or(0, |selection| selection.layout);
@@ -449,11 +451,16 @@ pub(crate) fn remove_scan_paths(
     for layout in layouts {
         *dropped.get_mut(layout).ok_or_else(invalid)? = true;
     }
-    for selection in selections {
+    // Create wildcard suffixes before narrower paths can occupy the same edge.
+    prefixes.sort_unstable_by_key(|selection| selection.sources.len());
+    for (selection, prefix) in prefixes.into_iter().map(|value| (value, true))
+        .chain(selections.into_iter().map(|value| (value, false))) {
         let layout = plan.layouts.get(selection.layout).ok_or_else(invalid)?;
-        let count = selection.sources.len();
+        let used = selection.sources.len();
         let minimum = if layout.minimum_slots == 0 { layout.slots.len() } else { layout.minimum_slots };
-        if !(minimum..=layout.slots.len()).contains(&count) {
+        let count = if prefix { layout.slots.len() } else { used };
+        if !(minimum..=layout.slots.len()).contains(&count)
+            || (prefix && (minimum != count || used == 0 || used >= count)) {
             return Err(invalid());
         }
         if selection.layout < start || dropped[selection.layout] {
@@ -466,6 +473,17 @@ pub(crate) fn remove_scan_paths(
                 return Err(invalid());
             }
             at = *edges.entry((at, source)).or_insert_with(&mut node);
+        }
+        if prefix {
+            // Tie each rejected prefix to a shared, ordinary suffix chain.
+            // All unused choices remain factored while partition removes it.
+            for index in used..count {
+                let end = *suffixes.entry((selection.layout, index)).or_insert_with(&mut node);
+                for &source in plan.domains[layout.slots[index].domain].choices.iter() {
+                    edges.entry((at, source)).or_insert(end);
+                }
+                at = end;
+            }
         }
         proof.ends.push(at);
     }

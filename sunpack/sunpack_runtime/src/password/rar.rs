@@ -9,6 +9,7 @@ use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedS
 use crate::password::input::{
     parse_ranges, parse_volumes, ranges_key, read_ranges_at_field, RangeSpec, VirtualRangeReader, VolumeSet,
 };
+use crate::password::input::attempts::{AttemptGeometry, DeferredReads, prepare_attempt_evidence_partial};
 use aes::cipher::{
     Block, BlockCipherDecrypt, KeyInit,
 };
@@ -145,7 +146,6 @@ pub(crate) fn rar_fast_verify_passwords_from_attempts(
     sessions: &[NativeArchiveSession],
     native_volume: bool,
 ) -> io::Result<PasswordVerification> {
-    use super::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
     let build = || {
         if let Some(context) = native_volumes::prepare(head, plan, sessions, native_volume)? { return Ok(context); }
         // A byte-split RAR has a single logical header stream. Native disks
@@ -154,18 +154,12 @@ pub(crate) fn rar_fast_verify_passwords_from_attempts(
             else if let Some(total) = plan.head_size_from_total { AttemptGeometry::TrimmedHead { total } }
             else if plan.minimum_size.is_none() { AttemptGeometry::DiskRelative }
             else { AttemptGeometry::Forward { logical_limit: None } };
-        let prefix = std::sync::OnceLock::new();
-        let common = || Arc::clone(prefix.get_or_init(|| {
-            let extents = super::input::prefix::common_attempt_prefix(head, plan, sessions);
-            let paths: std::collections::HashSet<_> = extents.iter().map(|e| e.path.as_str()).collect();
-            let sessions = sessions.iter().filter(|s| paths.contains(s.path())).cloned().collect();
-            Arc::new(RarCommonPrefix { extents: extents.into_boxed_slice(), sessions })
-        }));
         let evidence = prepare_attempt_evidence_partial(head, plan, sessions, geometry, |reader| {
             use std::io::{Read, Seek, SeekFrom};
             let length = reader.len();
-            prepare_rar_volume(|offset, size, field| {
-                if matches!(geometry, AttemptGeometry::DiskRelative) {
+            let disk_relative = matches!(geometry, AttemptGeometry::DiskRelative);
+            let mut context = prepare_rar_volume(|offset, size, field| {
+                if disk_relative {
                     return reader.advance_disk_offset(0, 0, offset).and_then(|position| match position {
                         Some((disk, local)) => reader.read_disk_spanning(disk, local, size),
                         None => Ok(Vec::new()),
@@ -178,7 +172,11 @@ pub(crate) fn rar_fast_verify_passwords_from_attempts(
                     .map_err(|err| ReadFault::from_io(err, "read", offset, size, 0, length)
                         .with_field(field, FieldLocation::Head))?;
                 Ok(bytes)
-            }, None, RarRanges::Projected(&common)).map(Some)
+            }, None, RarRanges::Projected)?;
+            if let Some(source) = context.material.tail_source() {
+                *source = RarTailSource::Projected(reader.deferred_reads(disk_relative));
+            }
+            Ok(Some(context))
         })?;
         Ok(evidence.into_context(|c| PasswordContext::Rar(Arc::new(c))))
     };
@@ -202,18 +200,10 @@ fn prepare_rar_volumes(volumes: &VolumeSet, native_volume: bool) -> Result<RarPa
     first
 }
 
-// A projected parser may still refer lazily to the physical ranges shared
-// by every layout. Bytes outside that prefix belong to its projection.
 #[derive(Clone, Copy)]
 enum RarRanges<'a> {
     Fixed(&'a [RangeSpec]),
-    Projected(&'a (dyn Fn() -> Arc<RarCommonPrefix> + Sync)),
-}
-
-#[derive(Default)]
-struct RarCommonPrefix {
-    extents: Box<[InputExtent]>,
-    sessions: Vec<NativeArchiveSession>,
+    Projected,
 }
 
 fn prepare_rar_ranges(ranges: &[RangeSpec]) -> Result<RarPasswordContext, PreparedStatus> {
@@ -226,7 +216,7 @@ fn prepare_rar_ranges(ranges: &[RangeSpec]) -> Result<RarPasswordContext, Prepar
 fn prepare_rar(
     mut read_at: impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, ReadFault>,
 ) -> Result<RarPasswordContext, PreparedStatus> {
-    prepare_rar_volume(&mut read_at, None, RarRanges::Projected(&Arc::default))
+    prepare_rar_volume(&mut read_at, None, RarRanges::Projected)
 }
 
 fn prepare_rar_volume(
@@ -258,7 +248,7 @@ fn prepare_rar_volume(
     }
     let prefix_size = match ranges {
         RarRanges::Fixed(_) => RAR_INITIAL_PREFIX_SCAN,
-        RarRanges::Projected(_) => RAR4_SIGNATURE.len() + RAR4_MIN_HEADER_SIZE,
+        RarRanges::Projected => RAR4_SIGNATURE.len() + RAR4_MIN_HEADER_SIZE,
     };
     let data = read_at(0, prefix_size, "rar.header_prefix")?;
     let main_offset = RAR4_SIGNATURE.len() as u64;
@@ -345,8 +335,12 @@ fn prepare_rar5_stream(
         let file = if matches!(fields.kind, 2 | 3) && (fields.extra_size != 0 || facts.is_some()) {
             rar5_file_fields(&header, fields.body, length)
         } else { None };
-        let file_crypto = matches!(fields.kind, 2 | 3).then(||
-            rar5_file_encryption_extra(&header, fields.extra_size)).flatten();
+        let extras = if matches!(fields.kind, 2 | 3) {
+            rar5_file_extras(&header, fields.extra_size, fields.flags & 16 != 0 && facts.as_ref().is_some_and(|f| f.checks_packed()))
+        } else {
+            Rar5FileExtras::default()
+        };
+        let file_crypto = extras.encryption;
         let encryption = match fields.kind {
             4 => parse_rar5_encryption_body(&header, fields.body, length, false, false).map(|identity| (identity, 0)),
             2 | 3 => file_crypto.zip(file.as_ref()).and_then(|(record, file)|
@@ -370,10 +364,13 @@ fn prepare_rar5_stream(
             if fields.kind == 2 {
                 if let Some(file) = &file {
                     facts.file(fields.flags & 8 != 0, fields.flags & 16 != 0, file.name);
-                    if fields.flags & 16 != 0 && (file_crypto.is_none()
-                        || encryption.as_ref().is_some_and(|(identity, _)| !identity.keyed_hash)) {
+                    // Writer-produced non-final fragments have an unkeyed
+                    // checksum over these stored bytes, even when encrypted.
+                    if fields.flags & 16 != 0 && !extras.keyed_hash {
                         if let Some(crc) = file.crc {
-                            facts.packed(offset + length as u64, fields.data_size, crc);
+                            facts.packed(offset + length as u64, fields.data_size, native_volumes::PackedDigest::Crc32(crc));
+                        } else if let Some(hash) = extras.blake2sp {
+                            facts.packed(offset + length as u64, fields.data_size, native_volumes::PackedDigest::Blake2sp(hash));
                         }
                     }
                 }
@@ -479,7 +476,7 @@ fn rar4_members_are_plain(
                     }
                     if block.flags & 2 != 0 && header.get(24).is_some_and(|&version| version >= 20) {
                         if let Some(crc) = le_u32(&header, 16).filter(|&crc| crc != u32::MAX) {
-                            facts.packed(data_offset, data_size, crc);
+                            facts.packed(data_offset, data_size, native_volumes::PackedDigest::Crc32(crc));
                         }
                     }
                 } else if encrypted { return Ok(false); }
@@ -553,6 +550,17 @@ enum RarPasswordMaterial {
     Header(Rar4HeaderProbe),
 }
 
+impl RarPasswordMaterial {
+    fn tail_source(&mut self) -> Option<&mut RarTailSource> {
+        match self {
+            Self::Rar5(_) => None,
+            Self::Rar5Header { tail, .. } => Some(&mut tail.source),
+            Self::Rar5Block { block, .. } => Some(&mut block.source),
+            Self::Header(header) => Some(&mut header.source),
+        }
+    }
+}
+
 struct Rar5HeaderTail {
     source: RarTailSource,
     offset: u64,
@@ -560,31 +568,27 @@ struct Rar5HeaderTail {
 
 enum RarTailSource {
     Fixed(Box<[RangeSpec]>),
-    Common(Arc<RarCommonPrefix>),
+    Projected(DeferredReads),
+    PrefixOnly,
 }
 
 impl RarRanges<'_> {
     fn tail_source(self, offset: u64, len: u64) -> RarTailSource {
         match self {
             Self::Fixed(ranges) => RarTailSource::Fixed(RangeSpec::covering(ranges, offset, len).into()),
-            Self::Projected(common) => RarTailSource::Common(common()),
+            Self::Projected => RarTailSource::PrefixOnly,
         }
     }
 }
 
 impl RarTailSource {
-    fn with_reader<T>(&self, end: u64, read: impl FnOnce(&mut VirtualRangeReader<'_>) -> Option<T>) -> Option<T> {
-        let opened;
-        let ranges = match self {
-            Self::Fixed(ranges) => ranges,
-            Self::Common(common) => {
-                opened = super::input::parse_range_prefix(common.extents.iter(), &common.sessions, Some(end)).ok()?;
-                opened.as_slice()
-            }
-        };
-        let mut reader = VirtualRangeReader::streaming(ranges);
-        if reader.len() < end { return None; }
-        read(&mut reader)
+    fn read(&self, offset: u64, size: usize) -> Option<Vec<u8>> {
+        let bytes = match self {
+            Self::Fixed(ranges) => VirtualRangeReader::streaming(ranges).read_at(offset, size),
+            Self::Projected(reader) => reader.read(offset, size),
+            Self::PrefixOnly => return None,
+        }.ok()?;
+        (bytes.len() == size).then_some(bytes)
     }
 }
 
@@ -603,12 +607,8 @@ struct Rar4HeaderProbe {
 }
 
 impl Rar4HeaderProbe {
-    fn read(&self, at: u64, size: usize) -> Option<Vec<u8>> {
-        self.source.with_reader(at.checked_add(size as u64)?, |reader| reader.read_at(at, size).ok())
-    }
-
     fn first_header(&self, key: [u8; 16], iv: [u8; 16]) -> Option<Option<Vec<u8>>> {
-        decrypt_rar4_header_with(&self.prefix[8..], key, iv, |remaining| self.read(self.offset.checked_add(24)?, remaining))
+        decrypt_rar4_header_with(&self.prefix[8..], key, iv, |remaining| self.source.read(self.offset.checked_add(24)?, remaining))
     }
 
     fn corroborates(&self, first: &[u8], salt: &[u8; 8], password: &Arc<str>, keys: &RarKeyCache) -> bool {
@@ -616,7 +616,7 @@ impl Rar4HeaderProbe {
         let Some(body) = crate::formats::rar::rar4_data_size(first) else { return false; };
         let Some(relative) = (8 + first.len().next_multiple_of(16) as u64).checked_add(body) else { return false; };
         let Some(offset) = self.offset.checked_add(relative) else { return false; };
-        let read = |at, size| Ok(self.read(at, size).unwrap_or_default());
+        let read = |at, size| Ok(self.source.read(at, size).unwrap_or_default());
         // Older archives can end without ENDARC. Damage or trailing carrier
         // bytes cannot invalidate the independently checked first header.
         read_rar4_encrypted_header(offset, read, |next_salt| {
@@ -648,22 +648,19 @@ impl Rar5BlockProbe {
         let end = (next + count).next_multiple_of(16);
         if end as u64 > self.packed_size { return None; }
         let read_start = start.max(16);
-        self.source.with_reader(self.offset.checked_add(end as u64)?, |reader| {
-            let bytes = reader.read_at(self.offset.checked_add(read_start as u64)?, end - read_start).ok()?;
-            if bytes.len() != end - read_start { return None; }
-            let mut window = [0; 48]; // Previous block followed by up to two target blocks.
-            if start == 0 { window[..16].copy_from_slice(&first); }
-            if start >= 16 { previous.copy_from_slice(&bytes[..16]); }
-            let decrypt_start = start + 16;
-            for (i, chunk) in bytes[decrypt_start - read_start..].chunks_exact(16).enumerate() {
-                let dest = 16 + i * 16;
-                window[dest..dest + 16].copy_from_slice(&decrypt_cbc_block(cipher, &mut previous, chunk));
-            }
-            let prefix = &window[next - start..next - start + count];
-            let Some(width) = rar5_block_header_size(prefix[0]) else { return Some(false); };
-            if width > count { return (!self.split_after).then_some(false); }
-            Some(self.next_fits(&prefix[..width], available))
-        })
+        let bytes = self.source.read(self.offset.checked_add(read_start as u64)?, end - read_start)?;
+        let mut window = [0; 48]; // Previous block followed by up to two target blocks.
+        if start == 0 { window[..16].copy_from_slice(&first); }
+        if start >= 16 { previous.copy_from_slice(&bytes[..16]); }
+        let decrypt_start = start + 16;
+        for (i, chunk) in bytes[decrypt_start - read_start..].chunks_exact(16).enumerate() {
+            let dest = 16 + i * 16;
+            window[dest..dest + 16].copy_from_slice(&decrypt_cbc_block(cipher, &mut previous, chunk));
+        }
+        let prefix = &window[next - start..next - start + count];
+        let Some(width) = rar5_block_header_size(prefix[0]) else { return Some(false); };
+        if width > count { return (!self.split_after).then_some(false); }
+        Some(self.next_fits(&prefix[..width], available))
     }
 
     fn next_fits(&self, header: &[u8], available: u64) -> bool {
@@ -700,18 +697,15 @@ impl Rar5HeaderTail {
         digest.update(&first[4..]);
         let mut done = 0;
         let rest = ((size + 15) & !15) - 16;
-        self.source.with_reader(self.offset.checked_add(rest as u64)?, |reader| {
-            let mut chunk = Vec::new();
-            while done < rest {
-                let count = (rest - done).min(64 * 1024);
-                reader.read_at_into(self.offset + done as u64, count, &mut chunk).ok()?;
-                if chunk.len() != count { return None; }
-                decrypt_cbc_blocks(&cipher, &mut previous, &mut chunk);
-                digest.update(&chunk[..count.min(size - 16 - done)]);
-                done += count;
-            }
-            Some(digest.finalize() == expected)
-        })
+        while done < rest {
+            let count = (rest - done).min(64 * 1024);
+            let offset = self.offset.checked_add(done as u64)?;
+            let mut chunk = self.source.read(offset, count)?;
+            decrypt_cbc_blocks(&cipher, &mut previous, &mut chunk);
+            digest.update(&chunk[..count.min(size - 16 - done)]);
+            done += count;
+        }
+        Some(digest.finalize() == expected)
     }
 }
 
@@ -1124,7 +1118,6 @@ thread_local! {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Rar5EncryptionIdentity {
-    keyed_hash: bool,
     iv: [u8; 16],
     lg2_count: u8,
     salt: [u8; 16],
@@ -1209,22 +1202,42 @@ fn rar5_file_fields(data: &[u8], mut offset: usize, header_end: usize) -> Option
 
 }
 
-fn rar5_file_encryption_extra(data: &[u8], extra_area_size: u64) -> Option<&[u8]> {
+#[derive(Default)]
+struct Rar5FileExtras<'a> {
+    encryption: Option<&'a [u8]>,
+    blake2sp: Option<[u8; 32]>,
+    keyed_hash: bool,
+}
+
+fn rar5_file_extras(data: &[u8], extra_area_size: u64, collect_hash: bool) -> Rar5FileExtras<'_> {
     let extra_end = data.len();
-    let mut offset = extra_end.checked_sub(usize::try_from(extra_area_size).ok()?)?;
+    let mut result = Rar5FileExtras::default();
+    let Some(mut offset) = usize::try_from(extra_area_size).ok().and_then(|size| extra_end.checked_sub(size)) else { return result; };
     while offset < extra_end {
-        let (record_size, record_body) = read_vint_bounded(data, offset, extra_end)?;
-        let record_end = record_body.checked_add(usize::try_from(record_size).ok()?)?;
-        if record_end > extra_end {
-            return None;
-        }
-        let (record_type, body) = read_vint_bounded(data, record_body, record_end)?;
-        if record_type == 1 {
-            return data.get(body..record_end);
+        let Some((record_size, record_body)) = read_vint_bounded(data, offset, extra_end) else { break; };
+        let Some(record_end) = usize::try_from(record_size).ok().and_then(|size| record_body.checked_add(size)) else { break; };
+        if record_end > extra_end { break; }
+        let Some((record_type, body)) = read_vint_bounded(data, record_body, record_end) else { break; };
+        let record = &data[body..record_end];
+        match record_type {
+            1 if result.encryption.is_none() => {
+                result.encryption = Some(record);
+                if !collect_hash { break; }
+                // Official UnRAR honors the hash-key flag during volume
+                // transitions. An unusual flagged non-final fragment must
+                // not be rejected solely by a raw digest mismatch.
+                result.keyed_hash = read_vint(record, 0)
+                    .and_then(|(version, next)| (version == 0).then(|| read_vint(record, next)).flatten())
+                    .is_none_or(|(flags, _)| flags & 2 != 0);
+            }
+            2 if collect_hash && result.blake2sp.is_none() && record.first() == Some(&0) => {
+                result.blake2sp = record[1..].try_into().ok();
+            }
+            _ => {}
         }
         offset = record_end;
     }
-    None
+    result
 }
 
 fn parse_rar5_encryption_body(
@@ -1264,7 +1277,7 @@ fn parse_rar5_encryption_body(
     } else {
         None
     };
-    Some(Rar5EncryptionIdentity { keyed_hash: include_iv && flags & 2 != 0, lg2_count, salt, password_check, iv })
+    Some(Rar5EncryptionIdentity { lg2_count, salt, password_check, iv })
 }
 
 struct Rar5KeyCheckpoint {

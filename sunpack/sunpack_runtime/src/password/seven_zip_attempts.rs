@@ -57,30 +57,35 @@ fn prepare_seven_zip_attempts(
             "7z volume password material is unavailable",
         )
     };
-    let (next, supported_start) = match invariant_start {
-        Some(next) => (next, true),
-        None => {
-            let ranges = parse_ranges(std::iter::once(head), sessions).map_err(|_| unknown())?;
-            let mut reader = VirtualRangeReader::streaming(&ranges);
-            let mut start = [0; SEVEN_Z_HEADER_SIZE];
-            reader.read_exact(&mut start).map_err(|_| unknown())?;
-            if !start.starts_with(SEVEN_Z_MAGIC) || !seven_zip_start_header_crc_matches(&start) {
-                return Err(unknown());
-            }
-            (RelationNextHeader::checked_fields(&start).ok_or_else(unknown)?, start[6] == 0)
-        }
-    };
     let geometry = if !plan.tail_totals.is_empty() {
         AttemptGeometry::TailTotals
     } else if let Some(total) = plan.head_size_from_total {
         AttemptGeometry::TrimmedHead { total }
     } else {
         AttemptGeometry::Forward {
-            logical_limit: Some(next.end()),
+            logical_limit: invariant_start.map(RelationNextHeader::end),
         }
     };
     let contexts = prepare_attempt_evidence_partial(head, plan, sessions, geometry, |reader| {
         let length = reader.len();
+        let (next, supported_start) = match invariant_start {
+            Some(next) => (next, true),
+            None => {
+                let mut start = [0; SEVEN_Z_HEADER_SIZE];
+                if length < start.len() as u64 {
+                    // The candidate alone does not contain this evidence.
+                    return Err(unknown());
+                }
+                reader.read_exact(&mut start).map_err(|_| unknown())?;
+                if !start.starts_with(SEVEN_Z_MAGIC) {
+                    return Err(unknown());
+                }
+                if !seven_zip_start_header_crc_matches(&start) {
+                    return Ok(None);
+                }
+                (RelationNextHeader::checked_fields(&start).ok_or_else(unknown)?, start[6] == 0)
+            }
+        };
         prepare_seven_zip_descriptor(reader, length, next, supported_start, &VolumeEvidence)
             .map(Some)
             .or_else(|status| match status {
