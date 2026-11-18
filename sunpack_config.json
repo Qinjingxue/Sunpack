@@ -205,6 +205,34 @@
           {
             "value": "tmp",
             "regex": false
+                    },
+          {
+            "value": "ppt",
+            "regex": false
+          },
+          {
+            "value": "doc",
+            "regex": false
+          },
+          {
+            "value": "xls",
+            "regex": false
+          },
+          {
+            "value": "dps",
+            "regex": false
+          },
+          {
+            "value": "wps",
+            "regex": false
+          },
+          {
+            "value": "et",
+            "regex": false
+          },
+          {
+            "value": "csv",
+            "regex": false
           }
         ]
       },
