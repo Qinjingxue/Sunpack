@@ -159,7 +159,8 @@ PasswordTestResult test_password_batch(
     const std::vector<std::wstring>& canonical_names,
     bool scan_only = false, bool final_read_only = false,
     const std::size_t* candidate_indices = nullptr,
-    const VolumeAttemptPlan* volume_plan = nullptr
+    const VolumeAttemptPlan* volume_plan = nullptr,
+    bool leave_last_candidate = false
 );
 
 ExtractArchiveResult extract_archive(

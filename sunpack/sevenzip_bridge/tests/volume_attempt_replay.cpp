@@ -186,11 +186,11 @@ void request_recovery(const std::filesystem::path& archive, const std::filesyste
 
 void rejected_composition_is_not_prepared(const std::filesystem::path& archive,
                                           const std::filesystem::path& destination) {
-    // ZipCrypto stored member. The two candidate keys both fail its check byte.
+    // ZipCrypto stored member with key "fixture-known". Both trial keys fail.
     static constexpr char encrypted_zip[] =
         "\x50\x4b\x03\x04\x14\x00\x01\x00\x00\x00\x00\x00\x21\x00\x0a\x67\x73\x71\x19\x00\x00\x00\x0d\x00\x00\x00\x06\x00"
-        "\x00\x00\x6f\x6b\x2e\x74\x78\x74\xcc\xa7\x97\xbd\x1f\xcf\x6f\x92\xf9\xa6\xcf\xb2\xbf\xec\x58\x0f\x12\xe6\x0f\xef"
-        "\xa3\x45\xb3\xb4\xcb\x50\x4b\x01\x02\x3f\x00\x14\x00\x01\x00\x00\x00\x00\x00\x21\x00\x0a\x67\x73\x71\x19\x00\x00"
+        "\x00\x00\x6f\x6b\x2e\x74\x78\x74\xca\x7e\xe7\xd0\xd3\x19\xa3\x6b\xc5\xf0\x69\x84\xfc\x4f\x90\x86\x6f\x57\xfe\x76"
+        "\x5c\xb8\x05\x5d\xfd\x50\x4b\x01\x02\x3f\x00\x14\x00\x01\x00\x00\x00\x00\x00\x21\x00\x0a\x67\x73\x71\x19\x00\x00"
         "\x00\x0d\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20\x00\x00\x00\x00\x00\x00\x00\x6f\x6b\x2e\x74\x78"
         "\x74\x50\x4b\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00\x34\x00\x00\x00\x3d\x00\x00\x00\x00\x00";
     { std::ofstream file(archive, std::ios::binary); file.write(encrypted_zip, sizeof(encrypted_zip) - 1); }
@@ -205,14 +205,67 @@ void rejected_composition_is_not_prepared(const std::filesystem::path& archive,
     auto& plan = request.archive_input.volume_attempts;
     plan.sources = {{archive.wstring(), 0, 45, true}, {archive.wstring(), 45, sizeof(encrypted_zip) - 1, true}};
     plan.domains = {{0}, {1}};
-    plan.layouts = {{{1, L"v1", 0}, {2, L"v2", 1}}};
+    const std::vector<VolumeAttemptSlot> slots = {{1, L"v1", 0}, {2, L"v2", 1}};
+    plan.layouts = {slots, slots};
+    request.password_domains = {{0, 1}, {1}};
+    plan.layout_password_domains = {0, 1};
     const auto outcome = run_request(request);
-    require(outcome.code == 1 && replay.rejected_compositions == 1 && replay.prepared_compositions == 0 &&
-        !std::filesystem::exists(destination), "a composition rejected by the member probe reached extraction setup");
+    require(outcome.code == 1 && replay.rejected_compositions == 1 && replay.prepared_compositions == 1 &&
+        replay.volumes.layout == 1 && !replay.password_probe_done,
+        "the rejected composition reached extraction or the sole remaining pair was probed again");
+}
+
+void sole_injective_composition_skips_member_probe(const std::filesystem::path& archive,
+                                                  const std::filesystem::path& destination) {
+    ExtractionReplay replay;
+    ExtractionReplayScope scope(&replay);
+    WorkerRequest request;
+    request.job_id = "sole-composition";
+    request.output_dir = destination.wstring();
+    request.password_candidates = {L"unused by this layout", L"remaining"};
+    request.password_domains = {{1}};
+    request.archive_input.archive_path = archive.wstring();
+    request.archive_input.format_hint = L"zip";
+    auto& plan = request.archive_input.volume_attempts;
+    plan.sources = {{archive.wstring(), 0, 40, true},
+                    {archive.wstring(), 40, std::filesystem::file_size(archive), true}};
+    // Source 1 appears in both slot domains, so injectivity leaves only {0, 1}.
+    plan.domains = {{0, 1}, {1}};
+    plan.layouts = {{{1, L"v1", 0}, {2, L"v2", 1}}};
+    plan.layout_password_domains = {0};
+    const auto outcome = run_request(request);
+    std::ifstream member(destination / L"ok.txt", std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(member)), {});
+    require(outcome.code == 0 && replay.volumes.attempts == 1 && replay.prepared_compositions == 1 &&
+        !replay.password_probe_done && replay.candidate_index == 1 && contents == "cursor replay",
+        "the sole viable password and composition did not go directly to real extraction");
+}
+
+void last_password_extracts_into_existing_destination(const std::filesystem::path& archive,
+                                                       const std::filesystem::path& destination) {
+    std::filesystem::create_directories(destination);
+    { std::ofstream sentinel(destination / L"keep.txt"); sentinel << "existing output"; }
+    ExtractionReplay replay;
+    ExtractionReplayScope scope(&replay);
+    WorkerRequest request;
+    request.job_id = "sole-password-in-existing-output";
+    request.output_dir = destination.wstring();
+    request.password_candidates = {L"incorrect", L"fixture-known"};
+    request.archive_input.archive_path = archive.wstring();
+    request.archive_input.format_hint = L"zip";
+    const auto outcome = run_request(request);
+    require(outcome.code == 0 && replay.screened_candidates == std::vector<std::size_t>{1} &&
+        replay.candidate_index == 1 && !replay.candidates_started,
+        "the last password repeated read-only confirmation before extraction");
+    std::ifstream member(destination / L"ok.txt", std::ios::binary), sentinel(destination / L"keep.txt");
+    require(std::string((std::istreambuf_iterator<char>(member)), {}) == "cursor replay" &&
+        std::string((std::istreambuf_iterator<char>(sentinel)), {}) == "existing output",
+        "sole-password extraction changed existing output");
 }
 
 void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
     WorkerRequest request;
+    request.scan_only = true;
     auto& plan = request.archive_input.volume_attempts;
     for (std::size_t i = 0; i < 8; ++i) plan.sources.push_back({archive.wstring(), i, i + 1, true});
     plan.domains = {{0, 1, 2, 3}, {4, 5, 6, 7}};
@@ -245,8 +298,8 @@ void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
         if (wave.empty()) break;
         for (const auto& item : wave) {
             require(expected.next(plan) && item.sources == expected.selected &&
-                item.probe.status == PasswordTestStatus::WrongPassword &&
-                item.probe.observed_volume_slots == rejection.observed_volume_slots,
+                item.probe->status == PasswordTestStatus::WrongPassword &&
+                item.probe->observed_volume_slots == rejection.observed_volume_slots,
                 "cached volume wave changed relation order or lost its proof");
         }
     }
@@ -256,13 +309,13 @@ void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
     VolumeProbeCache accepted(plan);
     accepted.remember(plan, attempt(4), 4);
     auto match = attempt(5);
-    match.probe.status = PasswordTestStatus::Ok;
+    match.probe->status = PasswordTestStatus::Ok;
     accepted.remember(plan, match, 4);
     VolumeAttemptCursor first_match;
     first_match.reserve(plan);
     while (first_match.attempts < 2) {
         auto wave = probe_volume_wave(request, first_match, nullptr, accepted);
-        require(!wave.empty() && (first_match.attempts != 2 || wave.back().probe.status == PasswordTestStatus::Ok),
+        require(!wave.empty() && (first_match.attempts != 2 || wave.back().probe->status == PasswordTestStatus::Ok),
             "cached winner did not terminate its ordered wave");
     }
     require(first_match.attempts == 2 && accepted.scheduled_probes == 0,
@@ -279,7 +332,7 @@ void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
         auto wave = probe_volume_wave(request, prefix_cursor, nullptr, prefixes);
         if (wave.empty()) break;
         for (const auto& item : wave) {
-            require(item.sources.front() == head++ && item.probe.status == PasswordTestStatus::WrongPassword,
+            require(item.sources.front() == head++ && item.probe->status == PasswordTestStatus::WrongPassword,
                 "cached prefix did not retain its first representative in relation order");
         }
     }
@@ -306,6 +359,52 @@ void carrier_slices_share_open_file(const std::filesystem::path& archive) {
         "sharing a carrier handle changed the logical byte order");
     require(observed_range_size_queries == 1 && observed_range_handle_opens == 1,
         "each carrier slice reopened or re-statted its file");
+}
+
+void unavailable_member_is_not_reprobed_for_an_unread_slice(
+    const std::filesystem::path& archive, const std::filesystem::path& carrier) {
+    std::ifstream original(archive, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(original)), {});
+    const auto directory = bytes.find("\x50\x4b\x01\x02");
+    require(directory != std::string::npos, "unsupported ZIP fixture has no central directory");
+    bytes[8] = bytes[directory + 10] = 97; // Unknown member compression method.
+    constexpr std::size_t padding = 1024 * 1024;
+    bytes.insert(directory, 2 * padding + 1, '\0');
+    const auto offset = directory + 2 * padding + 1;
+    std::string encoded;
+    wire::little(encoded, offset, 4);
+    bytes.replace(bytes.size() - 6, 4, encoded);
+    { std::ofstream file(carrier, std::ios::binary); file.write(bytes.data(), bytes.size()); }
+    const auto middle = directory + padding;
+
+    WorkerRequest request;
+    request.password_candidates = {L"candidate one", L"candidate two"};
+    request.archive_input.format_hint = L"zip";
+    auto& plan = request.archive_input.volume_attempts;
+    const auto path = carrier.wstring();
+    plan.sources = {{path, 0, middle, true}, {path, middle, middle + 1, true},
+                    {path, middle - 1, middle, true}, {path, middle + 1, bytes.size(), true}};
+    plan.domains = {{0}, {1, 2}, {3}};
+    plan.layouts = {{{1, L"one", 0}, {2, L"two", 1}, {3, L"three", 2}}};
+    plan.prepare();
+
+    VolumeAttemptCursor cursor;
+    cursor.reserve(plan);
+    VolumeProbeCache cache(plan);
+    auto lookahead = cursor;
+    const auto cold = probe_volume_wave(request, lookahead, nullptr, cache);
+    require(cold.size() == 1 && cold.front().probe &&
+        cold.front().probe->status == PasswordTestStatus::Unsupported &&
+        cold.front().probe->password_independent_failure &&
+        cold.front().probe->observed_volume_slots && cold.front().probe->observed_volume_slots->empty(),
+        "unavailable ZIP member did not preserve its read dependencies");
+    require(cursor.next(plan) && cursor.selected == cold.front().sources, "unexpected first slice choice");
+    lookahead = cursor;
+    const auto warm = probe_volume_wave(request, lookahead, nullptr, cache);
+    require(warm.size() == 1 && warm.front().sources != cold.front().sources && warm.front().probe &&
+        warm.front().probe->status == PasswordTestStatus::Unsupported &&
+        !warm.front().probe->rejects_fixed_geometry && cache.scheduled_probes == 1,
+        "the unread slice reran an unavailable method or was falsely rejected");
 }
 
 void disjoint_layouts_do_not_repeat_comparisons() {
@@ -343,8 +442,11 @@ int main() {
     check_chunked_request(archive);
     warm_volume_waves_reuse_proofs(archive);
     carrier_slices_share_open_file(archive);
+    unavailable_member_is_not_reprobed_for_an_unread_slice(archive, root / L"unsupported-carrier.zip");
     disjoint_layouts_do_not_repeat_comparisons();
     rejected_composition_is_not_prepared(root / L"encrypted.zip", root / L"rejected");
+    sole_injective_composition_skips_member_probe(archive, root / L"direct");
+    last_password_extracts_into_existing_destination(root / L"encrypted.zip", root / L"existing");
     unsigned index = 0;
     for (bool after_failure : {false, true}) for (bool cancel : {false, true})
         request_recovery(archive, root / std::to_wstring(++index), after_failure, cancel);

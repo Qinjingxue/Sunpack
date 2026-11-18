@@ -5,6 +5,7 @@
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
 #include "internal/sevenzip_callbacks.hpp"
+#include "internal/sevenzip_streams.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -112,9 +113,24 @@ bool check_rar5_password_probe_with_unknown_unpacked_size() {
         std::ofstream file(path, std::ios::binary);
         file.write(archive, sizeof(archive) - 1);
     }
-    const std::wstring candidates[]{L"wrong-before", L"evidence-key"};
+    const std::wstring candidates[]{L"wrong-before", L"out-of-domain", L"evidence-key"};
+    const std::size_t domain[]{0, 2};
+#ifdef SUP7Z_DEBUG
+    observed_logical_read_bytes = 0;
+#endif
     const auto rejected = test_password_batch(path.wstring(), {}, {}, L"rar", candidates, 1, {}, true);
-    const auto accepted = test_password_batch(path.wstring(), {}, {}, L"rar", candidates, 2, {}, true);
+#ifdef SUP7Z_DEBUG
+    const auto rejected_bytes = observed_logical_read_bytes;
+    observed_logical_read_bytes = 0;
+#endif
+    const auto deferred = test_password_batch(path.wstring(), {}, {}, L"rar", candidates, 2, {},
+        false, false, domain, nullptr, true);
+#ifdef SUP7Z_DEBUG
+    const bool read_only_rejected_candidate = rejected_bytes > 0 && observed_logical_read_bytes == rejected_bytes;
+#else
+    const bool read_only_rejected_candidate = true;
+#endif
+    const auto accepted = test_password_batch(path.wstring(), {}, {}, L"rar", candidates, 2, {}, true, false, domain);
 
     // The extraction receipt is used on failure. Append a second, damaged
     // member with a different name and a matching header CRC.
@@ -131,14 +147,16 @@ bool check_rar5_password_probe_with_unknown_unpacked_size() {
     }
     auto output = path;
     output.replace_extension(L".out");
-    const auto extracted = extract_archive(path.wstring(), {}, {}, L"rar", candidates[1], output.wstring(), L"");
+    const auto extracted = extract_archive(path.wstring(), {}, {}, L"rar", candidates[2], output.wstring(), L"");
     std::error_code error;
     std::filesystem::remove(path, error);
     std::filesystem::remove(output / L"x", error);
     std::filesystem::remove(output / L"y", error);
     std::filesystem::remove(output, error);
     return rejected.status == PasswordTestStatus::WrongPassword &&
-        accepted.status == PasswordTestStatus::Ok && accepted.matched_index == 1 && !accepted.weak_match &&
+        deferred.status == PasswordTestStatus::Unsupported && deferred.matched_index == -1 &&
+        deferred.possible_candidates == std::vector<std::size_t>{2} && read_only_rejected_candidate &&
+        accepted.status == PasswordTestStatus::Ok && accepted.matched_index == 2 && !accepted.weak_match &&
         extracted.status == PasswordTestStatus::Damaged && extracted.password_crc_proven_items == 1;
 }
 

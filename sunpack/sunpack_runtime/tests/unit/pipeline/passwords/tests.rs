@@ -53,12 +53,8 @@ fn relations_share_batched_password_proofs_and_skip_single_volume_directory() {
     std::fs::remove_file(source).unwrap();
 }
 
-#[test]
-fn empty_and_three_configured_passwords_share_the_encrypted_header_batch() {
-    // 7-Zip 26.03: 7z a -t7z -mx=0 -mhe=on -pcorrect batch.7z payload
-    // The encrypted header has a folder CRC, which the fast verifier
-    // needs to prove the password before the worker opens the archive.
-    let bytes = [
+// 7-Zip 26.03: 7z a -t7z -mx=0 -mhe=on -pcorrect batch.7z payload
+const ENCRYPTED_7Z_HEADER: &[u8] = &[
         0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0x00, 0x04, 0xf8, 0xcd, 0x9d, 0x80, 0x80, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x2e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3c, 0xaf, 0x9b, 0x43,
         0x4a, 0x97, 0x2e, 0x47, 0x3d, 0xd1, 0x5d, 0xe9, 0x9a, 0xd8, 0x48, 0xe3, 0x95, 0x3f, 0x88, 0x67,
@@ -72,8 +68,11 @@ fn empty_and_three_configured_passwords_share_the_encrypted_header_batch() {
         0x17, 0x06, 0x10, 0x01, 0x09, 0x70, 0x00, 0x07, 0x0b, 0x01, 0x00, 0x01, 0x24, 0x06, 0xf1, 0x07,
         0x01, 0x12, 0x53, 0x0f, 0x43, 0xf9, 0xce, 0x0c, 0x83, 0x81, 0x11, 0x6a, 0x12, 0x6e, 0x4e, 0xe5,
         0xe3, 0x46, 0xa6, 0x12, 0x0c, 0x6a, 0x0a, 0x01, 0x26, 0xac, 0x20, 0x83, 0x00, 0x00,
-    ];
-    let source = crate::test_support::temp_file("password_batch_7z", &bytes);
+];
+
+#[test]
+fn empty_and_three_configured_passwords_share_the_encrypted_header_batch() {
+    let source = crate::test_support::temp_file("password_batch_7z", ENCRYPTED_7Z_HEADER);
     // Relations' header geometry does not declare encryption. Exercise that
     // actual password plan, rather than manually invoking the verifier.
     let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "archive".into());
@@ -135,7 +134,7 @@ fn attempt_cache_keeps_batch_proofs_and_individual_negative_lru() {
     cache.reject(key(130), &rejected);
     let mut candidates = sparse.iter();
     let mut batch = Vec::new();
-    cache.fill_available(&key(130), &mut batch, &mut candidates, &Cancellation::new()).unwrap();
+    cache.fill_available(&key(130), &mut batch, &mut candidates, BATCH_SIZE, &Cancellation::new()).unwrap();
     assert!(batch.iter().eq(sparse.iter().skip(1).step_by(2)));
     assert!(candidates.next().is_none());
     let cache = AttemptCache::default();
@@ -419,7 +418,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
 }
 
 #[test]
-fn copy_payload_preserves_candidates_across_batches_for_worker() {
+fn copy_payload_hands_off_unfilterable_candidate_suffix_without_reprobing() {
     // Real 7-Zip Copy + AES, plain header, one short CRC-bearing member.
     let source = crate::test_support::temp_file("payload_prescreen_plan", &[55, 122, 188, 175, 39, 28, 0, 4, 178, 190, 162, 6, 16, 0, 0, 0, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 137, 92, 122, 211, 37, 116, 224, 226, 140, 241, 42, 72, 179, 115, 25, 153, 186, 152, 193, 102, 1, 4, 6, 0, 1, 9, 16, 0, 7, 11, 1, 0, 2, 36, 6, 241, 7, 1, 18, 83, 15, 90, 12, 52, 178, 191, 180, 172, 56, 77, 7, 166, 158, 159, 175, 101, 31, 1, 0, 1, 0, 12, 16, 16, 0, 8, 10, 1, 53, 59, 166, 46, 0, 0, 5, 1, 25, 3, 0, 0, 0, 17, 5, 0, 120, 0, 0, 0, 20, 10, 1, 0, 100, 53, 227, 238, 121, 118, 221, 1, 21, 6, 1, 0, 32, 0, 0, 0, 0, 0]);
     let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "archive".into());
@@ -430,8 +429,55 @@ fn copy_payload_preserves_candidates_across_batches_for_worker() {
     PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
     let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
     let batches = PLANNED_BATCHES.with(|value| value.borrow_mut().take().unwrap());
-    assert_eq!(batches.len(), 2);
+    assert_eq!(batches.len(), 1);
     assert!(plan.verified_password.is_none());
     assert_eq!(&plan.candidates[1..], values.as_slice());
     std::fs::remove_file(source).unwrap();
+}
+
+#[test]
+fn full_final_batch_confirms_password_and_prunes_ciphertext_alternative() {
+    use crate::io::archive_state::{InputExtent, InputPart, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+
+    // Both tails keep the same valid public descriptor. Only one can match
+    // the encrypted header's CRC, and the candidate list ends on a batch boundary.
+    let split = 48;
+    let mut corrupt = ENCRYPTED_7Z_HEADER[split..].to_vec();
+    corrupt[0] ^= 1;
+    let paths = [crate::test_support::temp_file("full_batch_head_7z", &ENCRYPTED_7Z_HEADER[..split]),
+        crate::test_support::temp_file("full_batch_decoy_7z", &corrupt),
+        crate::test_support::temp_file("full_batch_tail_7z", &ENCRYPTED_7Z_HEADER[split..])];
+    let sources: Box<[_]> = paths.iter().map(|path| InputExtent {
+        path: path.to_string_lossy().into_owned(),
+        start: 0,
+        end: Some(path.metadata().unwrap().len()),
+    }).collect();
+    let mut input = ArchiveInput::file(sources[0].path.clone(), "7z".into(), "archive".into());
+    input.analysis.password_required = true;
+    input.parts = Box::new([InputPart::range(sources[0].clone())]);
+    input.volume_attempts = Some(Arc::new(VolumeAttemptPlan {
+        sources,
+        layouts: Box::new([VolumeLayout {
+            slots: Box::new([
+                VolumeSlot { number: 1, canonical_name: "archive.7z.001".into(), domain: 0 },
+                VolumeSlot { number: 2, canonical_name: "archive.7z.002".into(), domain: 1 },
+            ]),
+            minimum_slots: 0,
+        }]),
+        domains: Box::new([VolumeDomain { choices: Arc::new(vec![0]) },
+            VolumeDomain { choices: Arc::new(vec![1, 2]) }]),
+        head_size_from_total: None,
+        minimum_size: Some(ENCRYPTED_7Z_HEADER.len() as u64),
+        tail_totals: Box::new([]),
+    }));
+    let passwords = std::iter::once(Arc::from("correct"))
+        .chain((1..BATCH_SIZE).map(|n| Arc::from(format!("wrong-{n}"))))
+        .collect();
+    let candidates = CandidateSet::new(passwords, None, &RecentPasswords::default(), None);
+    let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
+    assert_eq!(plan.verified_password.as_deref(), Some("correct"));
+    let volume = input.volume_attempts.unwrap();
+    assert!(volume.sources.iter().any(|source| Path::new(&source.path) == paths[2]));
+    assert!(!volume.sources.iter().any(|source| Path::new(&source.path) == paths[1]));
+    for path in paths { std::fs::remove_file(path).unwrap(); }
 }

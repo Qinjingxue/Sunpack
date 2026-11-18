@@ -300,7 +300,7 @@ impl CandidateSet {
         ) {
             return Ok(Ok(PasswordPlan::clear()));
         }
-        let mut check_single_enc = input.format_hint == "enc" && input.volume_attempts.is_none();
+        let single_enc_can_defer = input.format_hint == "enc" && input.volume_attempts.is_none();
         let needs_password = input.analysis.password_required || input.format_hint == "enc";
         // Discovery already identifies inputs that require a password. For the
         // rest, an empty candidate can be confirmed by the ordinary worker
@@ -376,12 +376,14 @@ impl CandidateSet {
         let candidates = self
             .for_path(&input.entry_path)
             .filter(|value| needs_password || !value.is_empty());
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let projected = input.volume_attempts.is_some();
+        let mut batch = Vec::with_capacity(BATCH_SIZE + usize::from(projected));
         let mut pending = Vec::new();
         let mut evidence = None;
         let mut domains = password::evidence::CandidateDomains::default();
         let mut password_rejected = false;
         let mut uncertain_volumes = false;
+        let mut deferred_from = None;
         let mut has_candidates = false;
         let mut candidates = candidates.inspect(|_| has_candidates = true);
         // Empty has first-candidate priority, not a separate verification phase.
@@ -397,12 +399,15 @@ impl CandidateSet {
         }
         loop {
             cancellation.check_io()?;
+            // A full batch may also be the last. A single buffered candidate
+            // distinguishes these cases without sending a larger KDF batch.
+            let limit = BATCH_SIZE + usize::from(projected && pending.is_empty() && deferred_from.is_none());
             // Fill after skipping cached negatives; sparse survivors must still
             // reach the native parallel paths.
             if let Some((key, cache)) = attempts.as_ref() {
-                cache.fill_available(key, &mut batch, &mut candidates, cancellation)?;
+                cache.fill_available(key, &mut batch, &mut candidates, limit, cancellation)?;
             } else {
-                batch.extend(candidates.by_ref().take(BATCH_SIZE - batch.len()).cloned());
+                batch.extend(candidates.by_ref().take(limit - batch.len()).cloned());
             }
             if batch.is_empty() {
                 if !has_candidates && needs_password && input.volume_attempts.is_some() {
@@ -421,20 +426,24 @@ impl CandidateSet {
                 password_rejected |= has_candidates;
                 break;
             }
-            if check_single_enc && batch.len() == 1 {
+            if deferred_from.is_some() {
+                pending.append(&mut batch);
+                continue;
+            }
+            if single_enc_can_defer && pending.is_empty() && batch.len() == 1 {
                 // The worker authenticates the sole ENC candidate when opening
                 // the archive. A host probe would repeat the same Argon2 work.
                 pending.append(&mut batch);
                 break;
             }
-            check_single_enc = false;
+            let next = (batch.len() > BATCH_SIZE).then(|| batch.pop().unwrap());
             #[cfg(test)]
             PLANNED_BATCHES.with(|capture| {
                 if let Some(batches) = capture.borrow_mut().as_mut() {
                     batches.push(batch.clone());
                 }
             });
-            preparation.other_password_batches = !pending.is_empty() || batch.len() == BATCH_SIZE;
+            preparation.other_password_batches = !pending.is_empty() || next.is_some();
             let mut result = password::verify(preparation, input, &batch, sessions, None)?;
             if let Some(reduced) = result.volume_attempts.take() {
                 let exhausted = reduced.layouts.is_empty();
@@ -447,9 +456,7 @@ impl CandidateSet {
                 }
             }
             let offset = pending.len();
-            let mut tested = 0;
-            let mut cache_rejections = false;
-            match result.status {
+            let (tested, cache_rejections) = match result.status {
                 "not_required" => {
                     if let Some((key, cache)) = attempts
                         .as_ref()
@@ -478,21 +485,19 @@ impl CandidateSet {
                         }
                         return Ok(Ok(PasswordPlan::verified(password)));
                     }
-                    tested = result.attempts.min(batch.len());
-                    cache_rejections = true;
                     evidence = match (evidence, result.match_evidence) {
                         (None, next) => next,
                         (old, next) if old == next => old,
                         _ => Some("mixed"),
                     };
+                    (result.attempts.min(batch.len()), true)
                 }
                 "no_match" => {
                     password_rejected |= result.attempts != 0;
                     let uncertain =
                         result.match_evidence == Some("password_or_volume_inconclusive");
                     uncertain_volumes |= uncertain;
-                    tested = result.attempts.min(batch.len());
-                    cache_rejections = !uncertain;
+                    (result.attempts.min(batch.len()), !uncertain)
                 }
                 "damaged" | "needs_volume_or_tail_damaged" | "missing_volume"
                     if input.volume_attempts.is_none() =>
@@ -521,8 +526,16 @@ impl CandidateSet {
                     }));
                     return Ok(Err(failure));
                 }
-                _ => {},
-            }
+                _ => {
+                    // This is a preparation result, independent of the
+                    // passwords in this batch. Forward the eligible suffix
+                    // without retrying the same unavailable verifier.
+                    deferred_from = Some(offset);
+                    pending.append(&mut batch);
+                    batch.extend(next);
+                    continue;
+                }
+            };
             let cache = attempts.as_ref().filter(|_| cache_rejections);
             let scoped = std::mem::take(&mut result.scoped_rejections);
             if scoped.is_empty() && (tested == 0 || result.status == "no_match") {
@@ -554,6 +567,10 @@ impl CandidateSet {
                 }
             }
             domains.append(result.password_domains, offset, pending.len() - offset);
+            batch.extend(next);
+        }
+        if let Some(offset) = deferred_from {
+            domains.append(Vec::new(), offset, pending.len() - offset);
         }
         if pending.is_empty() {
             if uncertain_volumes {

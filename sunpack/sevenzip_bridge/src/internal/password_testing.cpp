@@ -56,6 +56,14 @@ namespace sunpack::sevenzip
             return result;
         }
 
+        PasswordTestResult unsupported_decoder_result(PasswordTestResult result, const OpenCallback& open)
+        {
+            result.status = PasswordTestStatus::Unsupported;
+            result.message = "no supported decoder could confirm the password";
+            result.password_independent_failure = !open.password_requested();
+            return result;
+        }
+
         struct BoundedPasswordProbeSelection
         {
             std::optional<UInt32> index;
@@ -127,9 +135,13 @@ namespace sunpack::sevenzip
             }
             VolumeReadUncertainty* observer() const { return reads ? &*reads : nullptr; }
             void attach(PasswordTestResult& result) const {
+                // An unavailable method can be reused for the same bytes
+                // and candidate domain. It never rejects a composition.
+                const bool unavailable = result.status == PasswordTestStatus::Unsupported &&
+                    result.password_independent_failure && result.possible_candidates.empty();
                 if (!reads || reads->untracked_named_volume.load(std::memory_order_relaxed) ||
                     result.missing_volume || incomplete_read.load(std::memory_order_relaxed) || native_job_cancelled() ||
-                    (result.status != PasswordTestStatus::WrongPassword &&
+                    (!unavailable && result.status != PasswordTestStatus::WrongPassword &&
                      (result.status != PasswordTestStatus::Ok || !result.encrypted))) return;
                 result.rejects_fixed_geometry = result.status == PasswordTestStatus::WrongPassword &&
                     !reads->uncertain_read.load(std::memory_order_relaxed);
@@ -520,6 +532,7 @@ namespace sunpack::sevenzip
             probe_available_member(cache.archive, selection, *cache.callback_state, cache, result.archive_type, volumes,
                 password, encrypted, final_read_only, hr, operation);
             result.operation_result = operation;
+            result.missing_volume = cache.callback_state->missing_volume_requested();
             if (cache.callback_state->missing_volume_requested() && (hr != S_OK || operation != kOpOk) &&
                 !((result.archive_type == L"rar4" || result.archive_type == L"rar5") &&
                   selection.index && looks_wrong_password(hr, operation, encrypted)))
@@ -532,6 +545,9 @@ namespace sunpack::sevenzip
                 cache.reset();
                 cache.input.stream.Release();
                 return result;
+            }
+            if (hr == E_NOTIMPL || operation == kOpUnsupportedMethod) {
+                return unsupported_decoder_result(std::move(result), *cache.callback_state);
             }
             if (!cache.callback_state->password_requested())
             {
@@ -733,10 +749,7 @@ namespace sunpack::sevenzip
             }
             if (hr == E_NOTIMPL || last_op_res == kOpUnsupportedMethod) {
                 archive->Close();
-                result.status = PasswordTestStatus::Unsupported;
-                result.message = "no supported decoder could confirm the password";
-                result.password_independent_failure = !raw_open_callback->password_requested();
-                return result;
+                return unsupported_decoder_result(std::move(result), *raw_open_callback);
             }
             const bool weak_match = selection.weak && !final_read_only;
             if (!raw_open_callback->password_requested() &&
@@ -843,16 +856,25 @@ namespace sunpack::sevenzip
         const std::wstring *candidates,
         std::size_t candidate_count,
         const std::vector<std::wstring> &canonical_names,
-        bool scan_only, bool final_read_only, const std::size_t* candidate_indices, const VolumeAttemptPlan* volume_plan)
+        bool scan_only, bool final_read_only, const std::size_t* candidate_indices,
+        const VolumeAttemptPlan* volume_plan, bool leave_last_candidate)
     {
 #ifdef _WIN32
-        const auto formats = extraction_formats_for_hint(format_hint);
-        const ProbeVolumeRanges volumes(volume_plan, input_ranges, format_hint);
-        const std::wstring empty;
         const auto count = (std::max)(candidate_count, std::size_t{1});
         const auto global_index = [candidate_indices](std::size_t index) {
             return candidate_indices ? candidate_indices[index] : index;
         };
+        const auto probe_end = leave_last_candidate && candidate_count && !scan_only && !final_read_only
+            ? count - 1 : count;
+        if (!probe_end) {
+            PasswordTestResult result;
+            result.status = PasswordTestStatus::Unsupported;
+            result.possible_candidates.push_back(global_index(0));
+            return result;
+        }
+        const auto formats = extraction_formats_for_hint(format_hint);
+        const ProbeVolumeRanges volumes(volume_plan, input_ranges, format_hint);
+        const std::wstring empty;
         if (count == 1) {
             ExtractionReplayScope replay(nullptr);
             PasswordProbeCache cache;
@@ -889,7 +911,7 @@ namespace sunpack::sevenzip
                 return std::move(*first);
             }
         }
-        auto lanes = count - std::size_t{!deferred && prioritized};
+        auto lanes = probe_end - std::size_t{!deferred && prioritized};
         const auto& selected = primary_cache.selection;
         if (primary_cache.archive && !selected.measure_coverage &&
             selected.item_count >= large_zip_directory_entries && selected.index) {
@@ -951,12 +973,27 @@ namespace sunpack::sevenzip
           bool use_deferred = lane == 0 && deferred;
           for (;;) {
             const auto index = std::exchange(use_deferred, false) ? 0 : next.fetch_add(1, std::memory_order_relaxed);
-            if (index >= earliest.load(std::memory_order_relaxed) || native_job_cancelled()) break;
+            if (index >= probe_end || index >= earliest.load(std::memory_order_relaxed) || native_job_cancelled()) break;
             auto current = test_one_password(archive_path, candidates[global_index(index)],
                 part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes);
             if (native_job_cancelled() || record(lane, index, std::move(current))) break;
           }
         });
+        if (probe_end < count && earliest.load(std::memory_order_relaxed) == count && !native_job_cancelled()) {
+            // The caller already has the only viable volume composition.
+            // If every earlier key was disproved, extraction can confirm
+            // the final candidate without decoding a member twice.
+            if (std::all_of(proofs.begin(), proofs.begin() + probe_end,
+                    [](auto proof) { return proof == CandidateProof::Rejected; })) {
+                proofs.back() = CandidateProof::Unresolved;
+            } else {
+                parallel.limit(1);
+                ExtractionReplayScope replay(nullptr);
+                record(0, probe_end, test_one_password(archive_path, candidates[global_index(probe_end)],
+                    part_paths, formats, input_ranges, canonical_names, format_hint, primary_cache,
+                    scan_only, final_read_only, volumes));
+            }
+        }
         PasswordTestResult last;
         if (native_job_cancelled()) {
             last.status = PasswordTestStatus::Error;
@@ -997,6 +1034,7 @@ namespace sunpack::sevenzip
         }
         if (last.matched_index >= 0) {
             last.matched_index = -1;
+            volumes.attach(last);
             return last;
         }
         last.status = PasswordTestStatus::WrongPassword;

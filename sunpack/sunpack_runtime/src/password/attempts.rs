@@ -125,9 +125,10 @@ impl AttemptCache {
         key: &Key,
         batch: &mut Vec<Arc<str>>,
         candidates: &mut impl Iterator<Item = &'p Arc<str>>,
+        limit: usize,
         cancellation: &Cancellation,
     ) -> io::Result<()> {
-        while batch.len() < BATCH_SIZE {
+        while batch.len() < limit {
             cancellation.check_io()?;
             let mut state = self.0.lock().unwrap();
             // Bound the work under the cache lock even if every candidate
@@ -136,7 +137,7 @@ impl AttemptCache {
                 let Some(candidate) = candidates.next() else { return Ok(()); };
                 if state.negative.get(&(key.clone(), candidate.clone())).is_none() {
                     batch.push(candidate.clone());
-                    if batch.len() == BATCH_SIZE {
+                    if batch.len() == limit {
                         return Ok(());
                     }
                 }
