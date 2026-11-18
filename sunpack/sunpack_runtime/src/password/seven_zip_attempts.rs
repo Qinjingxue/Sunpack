@@ -12,34 +12,43 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_attempts(
         prefix.push(head.clone());
     }
     use crate::password::input::parse_range_prefix;
-    if !prefix.is_empty() {
-        let next = parse_range_prefix(prefix.iter(), sessions, Some(SEVEN_Z_HEADER_SIZE as u64))
+    let invariant_start = if !prefix.is_empty() {
+        parse_range_prefix(prefix.iter(), sessions, Some(SEVEN_Z_HEADER_SIZE as u64))
             .ok()
             .and_then(|ranges| {
                 let mut start = [0; SEVEN_Z_HEADER_SIZE];
                 VirtualRangeReader::streaming(&ranges)
                     .read_exact(&mut start)
                     .ok()?;
-                RelationNextHeader::parse(&start)
-            });
-        if let Some(next) = next {
-            if let Ok(ranges) = parse_range_prefix(prefix.iter(), sessions, Some(next.end())) {
-                let reader = VirtualRangeReader::streaming(&ranges);
-                if reader.len() == next.end() {
-                    return preparation.verify(ranges_key("7z", &ranges)?, candidates, || {
-                        prepare_seven_zip(reader, next.end()).map(PasswordContext::SevenZip)
-                    });
-                }
+                let next = RelationNextHeader::parse(&start)?;
+                seven_zip_start_header_crc_matches(&start).then_some(next)
+            })
+    } else {
+        None
+    };
+    if let Some(next) = invariant_start {
+        if let Ok(ranges) = parse_range_prefix(prefix.iter(), sessions, Some(next.end())) {
+            let mut reader = VirtualRangeReader::streaming(&ranges);
+            if reader.len() == next.end() {
+                return preparation.verify(ranges_key("7z", &ranges)?, candidates, || {
+                    prepare_seven_zip_descriptor(&mut reader, next.end(), next, true, &())
+                        .map_err(seven_zip_fixed_input_status)
+                        .map(PasswordContext::SevenZip)
+                });
             }
         }
     }
-    preparation.verify_local(prepare_seven_zip_attempts(head, plan, sessions), candidates)
+    preparation.verify_local(
+        prepare_seven_zip_attempts(head, plan, sessions, invariant_start),
+        candidates,
+    )
 }
 
 fn prepare_seven_zip_attempts(
     head: &InputExtent,
     plan: &VolumeAttemptPlan,
     sessions: &[NativeArchiveSession],
+    invariant_start: Option<RelationNextHeader>,
 ) -> Result<PasswordContext, PreparedStatus> {
     use crate::password::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
     let unknown = || {
@@ -48,16 +57,19 @@ fn prepare_seven_zip_attempts(
             "7z volume password material is unavailable",
         )
     };
-    let ranges = parse_ranges(std::iter::once(head), sessions).map_err(|_| unknown())?;
-    let mut reader = VirtualRangeReader::streaming(&ranges);
-    let mut start = [0; SEVEN_Z_HEADER_SIZE];
-    reader.read_exact(&mut start).map_err(|_| unknown())?;
-    if !start.starts_with(SEVEN_Z_MAGIC)
-        || crc32fast::hash(&start[12..32]) != u32::from_le_bytes(start[8..12].try_into().unwrap())
-    {
-        return Err(unknown());
-    }
-    let next = RelationNextHeader::checked_fields(&start).ok_or_else(unknown)?;
+    let (next, supported_start) = match invariant_start {
+        Some(next) => (next, true),
+        None => {
+            let ranges = parse_ranges(std::iter::once(head), sessions).map_err(|_| unknown())?;
+            let mut reader = VirtualRangeReader::streaming(&ranges);
+            let mut start = [0; SEVEN_Z_HEADER_SIZE];
+            reader.read_exact(&mut start).map_err(|_| unknown())?;
+            if !start.starts_with(SEVEN_Z_MAGIC) || !seven_zip_start_header_crc_matches(&start) {
+                return Err(unknown());
+            }
+            (RelationNextHeader::checked_fields(&start).ok_or_else(unknown)?, start[6] == 0)
+        }
+    };
     let geometry = if !plan.tail_totals.is_empty() {
         AttemptGeometry::TailTotals
     } else if let Some(total) = plan.head_size_from_total {
@@ -69,7 +81,7 @@ fn prepare_seven_zip_attempts(
     };
     let contexts = prepare_attempt_evidence_partial(head, plan, sessions, geometry, |reader| {
         let length = reader.len();
-        prepare_seven_zip_descriptor(reader, length, next, start[6] == 0, &VolumeEvidence)
+        prepare_seven_zip_descriptor(reader, length, next, supported_start, &VolumeEvidence)
             .map(Some)
             .or_else(|status| match status {
                 PreparedStatus::Status("invalid_volume_evidence", _) => Ok(None),

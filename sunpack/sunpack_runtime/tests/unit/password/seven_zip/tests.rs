@@ -44,16 +44,19 @@ fn payload_prefix_collisions_survive_until_complete_header_evidence() {
             .unwrap();
     assert_eq!(absent.status, "no_match");
     assert_eq!(absent.attempts, candidates.len());
-    let fault = collect_candidates(&candidates, Some("7z_payload_prefix"), |_, value| {
-        if value == "wrong2" {
+    let fault_or_reject = |index, _: &str| {
+        if index == 2 {
             Err("resource_unavailable: test".into())
         } else {
             Ok(SevenZipPrefixCheck::Reject)
         }
-    })
-    .unwrap();
-    assert_eq!(fault.status, "unknown_needs_final_verifier");
-    assert_eq!(fault.attempts, 0);
+    };
+    for (proof, tested) in [(Some("7z_payload_prefix"), candidates.len()), (None, 3)] {
+        let fault = collect_candidates(&candidates, proof, fault_or_reject).unwrap();
+        assert_eq!(fault.matched_indices, [2]);
+        assert_eq!(fault.attempts, tested);
+        assert_eq!(fault.final_confirmation_required, Some(true));
+    }
 }
 
 #[test]
@@ -73,7 +76,7 @@ fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
     with_digest.splice(55..55, [0x0a, 1].into_iter().chain(digest.to_le_bytes()));
     update_descriptor_crc(&mut with_digest);
     let (paths, sources, plan) = uncertain_tail_fixture_at(&with_digest, &[], 32);
-    let context = prepare_seven_zip_attempts(&sources[0], &plan, &[]).unwrap_or_else(|_| panic!("packed CRC"));
+    let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None).unwrap_or_else(|_| panic!("packed CRC"));
     let result = context.verify(&[Arc::from("secret")], None).unwrap();
     assert!(!result.volume_attempts.unwrap().sources.iter().any(|source| source.path == sources[1].path));
     drop(context);
@@ -81,7 +84,7 @@ fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
     let (paths, sources, mut plan) = uncertain_tail_fixture(bytes);
     {
         let context =
-            prepare_seven_zip_attempts(&sources[0], &plan, &[]).unwrap_or_else(
+            prepare_seven_zip_attempts(&sources[0], &plan, &[], None).unwrap_or_else(
                 |error| match error {
                     PreparedStatus::Status(status, message) => {
                         panic!("valid tail: {status}: {message}")
@@ -105,17 +108,17 @@ fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
     // A completed combination shorter than the declared NextHeader cannot be
     // the archive. It must not hide the good tail as an unknown alternative.
     plan.domains[1].choices = Arc::new(vec![2, 3]);
-    assert!(prepare_seven_zip_attempts(&sources[0], &plan, &[]).is_ok());
+    assert!(prepare_seven_zip_attempts(&sources[0], &plan, &[], None).is_ok());
     // In contrast, a source shortened below its declared extent is a real I/O
     // failure, not password evidence and not an invalid-length combination.
     plan.sources[3].end = Some((bytes.len() - 48) as u64);
-    let uncertain = prepare_seven_zip_attempts(&sources[0], &plan, &[]).unwrap_or_else(|_| panic!("retain unsupported paths"));
+    let uncertain = prepare_seven_zip_attempts(&sources[0], &plan, &[], None).unwrap_or_else(|_| panic!("retain unsupported paths"));
     assert_eq!(uncertain.verify(&[Arc::from("secret")], None).unwrap().status,
         "unknown_needs_final_verifier");
     // A fixed-size tail proves the head trim, but does not prove a Copy key.
     plan.domains[1].choices = Arc::new(vec![2]);
     plan.head_size_from_total = Some(bytes.len() as u64);
-    let context = prepare_seven_zip_attempts(&sources[0], &plan, &[])
+    let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None)
         .unwrap_or_else(|_| panic!("exact tail geometry proves carrier trim"));
     assert_eq!(
         context
@@ -236,11 +239,11 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
     let mut earlier_head = fixed_head.clone();
     earlier_head.end = Some(47);
     assert!(
-        prepare_seven_zip_attempts(&earlier_head, &plan, &[]).is_err(),
+        prepare_seven_zip_attempts(&earlier_head, &plan, &[], None).is_err(),
         "an earlier explicit boundary is a different logical head"
     );
     let context =
-        prepare_seven_zip_attempts(&fixed_head, &plan, &[]).unwrap_or_else(|error| match error {
+        prepare_seven_zip_attempts(&fixed_head, &plan, &[], None).unwrap_or_else(|error| match error {
             PreparedStatus::Status(status, message) => panic!("header tails: {status}: {message}"),
             PreparedStatus::ReadFault(fault) => panic!("header tails: {fault:?}"),
         });
@@ -285,7 +288,7 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
         160, 112, 147, 151, 76, 80, 117, 37, 103, 180, 233, 252, 59, 8, 199, 27,
     ]);
     std::fs::write(&paths[1], second_tail).unwrap();
-    let two = prepare_seven_zip_attempts(&fixed_head, &plan, &[])
+    let two = prepare_seven_zip_attempts(&fixed_head, &plan, &[], None)
         .unwrap_or_else(|_| panic!("two valid encrypted tails"));
     let PasswordContext::Evidence(two) = two else { panic!("expected two tail choices") };
     let passwords = ["wrong", "secret", "second-tail"].map(Arc::from);
@@ -359,7 +362,7 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
             .into_boxed_slice(),
     }]
     .into_boxed_slice();
-    let middle = prepare_seven_zip_attempts(&fixed_head, &plan, &[])
+    let middle = prepare_seven_zip_attempts(&fixed_head, &plan, &[], None)
         .unwrap_or_else(|_| panic!("middle evidence projection"));
     let result = middle
         .verify(&[

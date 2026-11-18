@@ -210,10 +210,6 @@
           {
             "value": "et",
             "regex": false
-          },
-          {
-            "value": "csv",
-            "regex": false
           }
         ]
       },

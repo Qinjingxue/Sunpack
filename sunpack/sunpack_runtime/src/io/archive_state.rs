@@ -404,52 +404,7 @@ impl VolumeAttemptPlan {
             head_size_from_total: self.head_size_from_total, minimum_size: self.minimum_size }
     }
 
-    /// Worker observations always refer to pre-scan IDs. Apply slot removals
-    /// and the ordered frontier before compacting source/domain numbers once.
-    pub(crate) fn remaining_after_scan(&self, first: Option<&VolumeSelection>, updates: Vec<LayoutSurvivors>) -> io::Result<Self> {
-        if let Some(first) = first { self.selected_parts(first)?; }
-        let start = first.map_or(0, |f| f.layout);
-        let mut choices = self.domains.to_vec();
-        let mut layouts = Vec::new();
-        let mut updates = updates.into_iter().filter(|u| u.layout >= start).peekable();
-        for (id, original) in self.layouts.iter().enumerate().skip(start) {
-            let mut layout = original.clone();
-            if let Some(update) = updates.next_if(|u| u.layout == id) {
-                if update.slots.is_empty() { continue; }
-                if update.slots.len() != layout.slots.len() { return Err(invalid_survivors()); }
-                for (slot, keep) in layout.slots.iter_mut().zip(update.slots) {
-                    let domain = &choices[slot.domain].choices;
-                    if keep == **domain { continue; }
-                    let mut ordered = domain.iter();
-                    if keep.is_empty() || !keep.iter().all(|source| ordered.any(|old| old == source)) {
-                        return Err(invalid_survivors());
-                    }
-                    slot.domain = choices.len();
-                    choices.push(VolumeDomain { choices: Arc::new(keep) });
-                }
-            }
-            if let Some(first) = first.filter(|f| f.layout == id) {
-                layout.append_suffix(&first.sources, &mut choices, &mut layouts)?;
-            } else {
-                layouts.push(layout);
-            }
-        }
-        if updates.next().is_some() { return Err(invalid_survivors()); }
-        // Only reachable domains and source paths belong in the scan report.
-        let mut ids = vec![None; choices.len()];
-        let mut domains = Vec::new();
-        for layout in &mut layouts {
-            for slot in &mut layout.slots {
-                slot.domain = *ids[slot.domain].get_or_insert_with(|| {
-                    domains.push(choices[slot.domain].clone());
-                    domains.len() - 1
-                });
-            }
-        }
-        Ok(self.with_remaining(layouts, domains))
-    }
-
-    fn selected_parts(&self, selection: &VolumeSelection) -> io::Result<Box<[InputPart]>> {
+    pub(crate) fn selected_parts(&self, selection: &VolumeSelection) -> io::Result<Box<[InputPart]>> {
         self.selected_parts_indexed(selection, &mut DomainMembers::new())
     }
 
@@ -605,49 +560,6 @@ impl VolumeAttemptPlan {
 pub(crate) struct VolumeLayout {
     pub slots: Box<[VolumeSlot]>,
     pub minimum_slots: usize,
-}
-
-impl VolumeLayout {
-    fn append_suffix(&self, first: &[usize], choices: &mut Vec<VolumeDomain>, output: &mut Vec<Self>) -> io::Result<()> {
-        let count = first.len();
-        let mut slots = self.slots[..count].to_vec();
-        slots[count - 1].domain = self.slots.last().unwrap().domain;
-        let all = slots.clone();
-        for (slot, &source) in slots.iter_mut().zip(first) {
-            slot.domain = choices.len();
-            choices.push(VolumeDomain { choices: Arc::new(vec![source]) });
-        }
-        for i in (0..count).rev() {
-            let domain = &choices[all[i].domain].choices;
-            let position = domain.iter().position(|source| *source == first[i]).ok_or_else(invalid_survivors)?;
-            let start = position + usize::from(i + 1 != count);
-            slots[i + 1..].clone_from_slice(&all[i + 1..]);
-            if start < domain.len() {
-                slots[i].domain = all[i].domain;
-                if start != 0 {
-                    slots[i].domain = choices.len();
-                    choices.push(VolumeDomain { choices: Arc::new(domain[start..].to_vec()) });
-                }
-                output.push(Self { slots: slots.clone().into(), minimum_slots: 0 });
-            }
-        }
-        if self.minimum_slots != 0 && count > self.minimum_slots {
-            let mut shorter = self.slots[..count - 1].to_vec();
-            shorter.last_mut().unwrap().domain = self.slots.last().unwrap().domain;
-            output.push(Self { slots: shorter.into(), minimum_slots: self.minimum_slots });
-        }
-        Ok(())
-    }
-}
-
-#[derive(Deserialize)]
-pub(crate) struct LayoutSurvivors {
-    layout: usize,
-    slots: Vec<Vec<usize>>,
-}
-
-fn invalid_survivors() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "invalid worker volume survivors")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

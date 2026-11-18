@@ -273,6 +273,44 @@ namespace sunpack::sevenzip
                 const auto mode = selection.member_mode ? kSunpackVerifyMember : kTestMode;
                 hr = archive->Extract(&*selection.index, 1, mode, callback);
             }
+            if (selection.weak && selection.member_mode && selection.index &&
+                hr == S_OK && raw_callback->operation_result() == kOpOk) {
+                // A seekable AES/Copy substream can verify another CRC with
+                // the same key without decoding the solid prefix again.
+                PROPVARIANT block{};
+                if (get_item_property(archive, *selection.index, kpidBlock, block) && block.vt == VT_UI4) {
+                    const auto folder = prop_u32(block);
+                    clear_prop(block);
+                    const auto next = *selection.index + 1;
+                    PROPVARIANT proof{};
+                    PROPVARIANT copy{};
+                    if (next < selection.item_count &&
+                        get_item_property(archive, next, kpidBlock, block) &&
+                        block.vt == VT_UI4 && prop_u32(block) == folder &&
+                        get_item_property(archive, next, kpidSunpackAesCopyStart, copy) &&
+                        copy.vt == VT_UI8 &&
+                        get_item_property(archive, next, kpidSunpackProofSize, proof) &&
+                        prop_u64(proof) != 0 &&
+                        prop_u64(proof) <= sizeof(UInt32)) {
+                        auto *second = new ExtractCallback(password);
+                        CMyComPtr<IArchiveExtractCallback> second_callback(second);
+                        const auto second_hr = archive->Extract(&next, 1, kSunpackVerifyMember, second_callback);
+                        if (second_hr == S_OK && (second->operation_result() == kOpWrongPassword ||
+                                                  second->operation_result() == kOpCrcError)) {
+                            hr = second_hr;
+                            operation = second->operation_result();
+                            encryption_evidence = true;
+                            clear_prop(proof);
+                            clear_prop(copy);
+                            clear_prop(block);
+                            return;
+                        }
+                    }
+                    clear_prop(proof);
+                    clear_prop(copy);
+                }
+                clear_prop(block);
+            }
             // Existing-output confirmation finishes read-only. A short
             // CRC alone must never accept the first colliding candidate.
             if (selection.weak && final_read_only && (!selection.index || selection.item_count > 1) &&

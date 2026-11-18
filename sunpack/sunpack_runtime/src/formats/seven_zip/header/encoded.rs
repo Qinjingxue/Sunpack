@@ -18,7 +18,7 @@ pub(crate) struct SevenZipPasswordProbe {
     packed_data: Vec<Blob>,
     folder: SevenZipFolderAst,
     aes_index: usize,
-    prefix: Option<(usize, SevenZipAesStream)>,
+    prefix: Option<(usize, SevenZipPayloadEvidence)>,
 }
 
 impl SevenZipPasswordProbe {
@@ -34,7 +34,8 @@ impl SevenZipPasswordProbe {
             .enumerate()
             .find_map(|(index, &input)| {
                 seven_zip_aes_stream(&folder, input, packed_data[index].len() as u64)
-                    .map(|stream| (index, stream))
+                    .and_then(|stream| SevenZipPayloadEvidence::from_stream(&folder, &stream, true))
+                    .map(|evidence| (index, evidence))
             });
         Self {
             packed_data,
@@ -49,13 +50,10 @@ impl SevenZipPasswordProbe {
     }
 
     pub(crate) fn check_header(&self, key: &SevenZipAesKey) -> Result<bool, String> {
-        if let Some((packed, stream)) = &self.prefix {
-            if !seven_zip_header_prefix_matches(
-                &self.packed_data[*packed],
-                &self.folder,
-                stream,
-                key,
-            )? {
+        if let Some((packed, prefix)) = &self.prefix {
+            if prefix.check_encrypted_prefix(&self.packed_data[*packed], key)?
+                == SevenZipPrefixCheck::Reject
+            {
                 return Ok(false);
             }
         }
@@ -100,39 +98,6 @@ impl Drop for SevenZipAesKey {
         self.key.fill(0);
         self.iv.fill(0);
     }
-}
-
-fn seven_zip_header_prefix_matches(
-    encrypted: &[u8],
-    folder: &SevenZipFolderAst,
-    stream: &SevenZipAesStream,
-    key: &SevenZipAesKey,
-) -> Result<bool, String> {
-    let limit = stream.consumer.map_or(16, |(index, _)| {
-        seven_zip_prefix_read_size(&folder.coders[index].method_id)
-    });
-    let len = stream.plaintext_size.min(limit) as usize;
-    let encrypted_len = len.div_ceil(16) * 16;
-    let Some(encrypted) = encrypted.get(..encrypted_len) else {
-        return Ok(true);
-    };
-    let mut prefix = [0u8; 128];
-    prefix[..encrypted_len].copy_from_slice(encrypted);
-    Aes256CbcDec::new(&key.key.into(), &key.iv.into())
-        .decrypt_padded::<NoPadding>(&mut prefix[..encrypted_len])
-        .map_err(|_| "encoded_header_payload_crc_bad:aes_block_size".to_string())?;
-    Ok(match stream.consumer {
-        Some((index, unpack_size)) => {
-            let coder = &folder.coders[index];
-            seven_zip_prefix_check(
-                &coder.method_id,
-                &coder.properties,
-                &prefix[..len],
-                unpack_size,
-            ) != SevenZipPrefixCheck::Reject
-        }
-        None => prefix.first() == Some(&SZ_HEADER),
-    })
 }
 
 fn read_seven_zip_packed_data<R: Read + Seek>(

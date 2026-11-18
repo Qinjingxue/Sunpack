@@ -743,66 +743,13 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
     return prepared_attempts;
 }
 
-// Keep the marginal choices for one fully traversed layout, in relation order.
-// Unread combinations of the current layout stay eligible after an early match.
-class ScanLayoutSurvivors {
-    const sunpack::sevenzip::VolumeAttemptPlan& plan_;
-    std::optional<std::size_t> layout_;
-    bool any_ = false, rejected_ = false;
-    struct Slot {
-        std::size_t ordinal;
-        std::unordered_set<std::size_t> kept;
-    };
-    std::vector<Slot> variable_;
-    std::string updates_;
-
-    void finish_layout() {
-        if (!layout_ || !rejected_) return;
-        const auto& slots = plan_.layouts[*layout_];
-        if (any_ && std::all_of(variable_.begin(), variable_.end(), [&](const auto& slot) {
-            return slot.kept.size() == plan_.domains[slots[slot.ordinal].domain].size();
-        })) return;
-        updates_ += wire::object() + wire::key("layout") + wire::number(*layout_) + wire::key("slots") + wire::array();
-        if (any_) {
-            auto variable = variable_.begin();
-            for (std::size_t i = 0; i < slots.size(); ++i) {
-                const bool tracked = variable != variable_.end() && variable->ordinal == i;
-                updates_ += wire::array();
-                for (auto source : plan_.domains[slots[i].domain])
-                    if (!tracked || variable->kept.count(source)) wire::append_number(updates_, source);
-                updates_ += wire::end();
-                if (tracked) ++variable;
-            }
-        }
-        updates_ += wire::end() + wire::end();
-    }
-public:
-    explicit ScanLayoutSurvivors(const sunpack::sevenzip::VolumeAttemptPlan& plan): plan_(plan) {}
-    void observe(std::size_t layout, const std::vector<std::size_t>& sources, bool rejected) {
-        if (layout_ != layout) {
-            finish_layout();
-            layout_ = layout;
-            any_ = rejected_ = false;
-            variable_.clear();
-            const auto& slots = plan_.layouts[layout];
-            if (slots.size() == plan_.minimum_slots_for(layout)) {
-                for (std::size_t i = 0; i < slots.size(); ++i)
-                    if (plan_.domains[slots[i].domain].size() > 1) variable_.push_back({i, {}});
-            }
-        }
-        if (rejected) { rejected_ = true; return; }
-        any_ = true;
-        for (auto& slot : variable_) slot.kept.insert(sources[slot.ordinal]);
-    }
-    void append(std::string& fields, bool exhausted) {
-        if (exhausted) finish_layout();
-        if (!updates_.empty()) {
-            fields += wire::key("volume_layout_survivors") + wire::array();
-            fields += updates_;
-            fields += wire::end();
-        }
-    }
-};
+// Scan returns transient observations in request coordinates. Rust reduces
+// the ordinary plan before exposing it to scan callers.
+void append_volume_selection(std::string& fields, std::size_t layout, const std::vector<std::size_t>& sources) {
+    fields += wire::object() + wire::key("layout") + wire::number(layout) + wire::key("sources") + wire::array();
+    for (auto source : sources) wire::append_number(fields, source);
+    fields += wire::end() + wire::end();
+}
 
 RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* cancel) {
     using namespace sunpack::sevenzip;
@@ -828,7 +775,8 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
             cursor.reserve(plan);
             bool rejected_prefix = false;
             bool frontier_found = false;
-            ScanLayoutSurvivors survivors(plan);
+            std::string discarded_paths;
+            std::string discarded_layouts;
             RejectedLayout rejection;
             std::optional<std::size_t> skipped_layout;
             while (!tested) {
@@ -838,26 +786,29 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
                     if (skipped_layout == candidate.layout) continue;
                     probe = std::move(candidate.probe);
                     const bool rejected = probe.status == PasswordTestStatus::WrongPassword;
-                    survivors.observe(candidate.layout, candidate.sources, rejected);
                     if (rejected && rejection.excludes(plan, candidate.layout, probe)) {
                         skipped_layout = candidate.layout;
+                        if (frontier_found) wire::append_number(discarded_layouts, candidate.layout);
                         if (cursor.layout == candidate.layout && !cursor.searching) cursor.skip_layout();
+                    } else if (rejected && frontier_found) {
+                        append_volume_selection(discarded_paths, candidate.layout, candidate.sources);
                     }
                     if (!frontier_found && rejected) rejected_prefix = true;
                     if (!frontier_found && !rejected) {
                         frontier_found = true;
                         if (rejected_prefix) {
-                            fields += wire::key("first_remaining_volume") + wire::object() +
-                                wire::key("layout") + wire::number(candidate.layout) + wire::key("sources") + wire::array();
-                            for (auto source : candidate.sources) wire::append_number(fields, source);
-                            fields += wire::end() + wire::end();
+                            fields += wire::key("first_remaining_volume");
+                            append_volume_selection(fields, candidate.layout, candidate.sources);
                         }
                     }
                     if (probe.status == PasswordTestStatus::Ok) { tested = true; break; }
                 }
                 if (native_job_cancelled()) return interrupted_result(request.job_id);
             }
-            survivors.append(fields, !tested);
+            if (!discarded_paths.empty())
+                fields += wire::key("discarded_volume_paths") + wire::array() + discarded_paths + wire::end();
+            if (!discarded_layouts.empty())
+                fields += wire::key("discarded_volume_layouts") + wire::array() + discarded_layouts + wire::end();
             // Unavailable evidence leaves the corresponding scan input pending.
             if (!tested && !frontier_found && rejected_prefix) {
                 ok = false;
@@ -1090,6 +1041,8 @@ RequestOutcome run_request(
                 volume_replay->uncertain_read.store(false, std::memory_order_relaxed);
                 volume_replay->candidate_index = 0;
                 volume_replay->confirmed_candidate_index = -1;
+                volume_replay->screened_candidates.clear();
+                volume_replay->password_probe_done = false;
                 volume_replay->volume_password_uncertain = false;
                 volume_replay->candidates_started = volume_replay->candidate_output_owned = volume_replay->candidate_discard_pending = false;
                 cursor.discard_pending = false;
@@ -1119,7 +1072,8 @@ RequestOutcome run_request(
             volume_replay->candidate_output_owned = directory_is_empty_or_missing(root);
             volume_replay->candidates_started = true;
         }
-        if (!volume_trials && password_candidates.size() > 1 && !single_probe_done) {
+        if (!volume_trials && password_candidates.size() > 1 && !single_probe_done &&
+            (!volume_replay || !volume_replay->password_probe_done)) {
             if (request.report_progress) progress({"total", 0, 0, 0});
             selected_probe = test_password_batch(archive_input.archive_path, archive_input.part_paths,
                 archive_input.ranges, format_hint, password_candidates.data(), password_candidates.size(), archive_input.canonical_names,
@@ -1152,6 +1106,10 @@ RequestOutcome run_request(
             selected_probe->status == PasswordTestStatus::Ok && selected_probe->encrypted && !selected_probe->weak_match) {
             volume_replay->confirmed_candidate_index = selected_probe->matched_index;
         }
+        if (volume_replay && selected_probe && !volume_replay->password_probe_done) {
+            volume_replay->screened_candidates = std::move(selected_probe->possible_candidates);
+            volume_replay->password_probe_done = true;
+        }
         if (archive_input.missing_volume_number > 0) {
             result.status = PasswordTestStatus::Damaged;
             result.damaged = true;
@@ -1167,13 +1125,19 @@ RequestOutcome run_request(
             auto *replay = current_extraction_replay;
             // Existing outputs belong to a continuation/user. Keep the read-only
             // diagnostic fallback there; fresh outputs can confirm by extracting.
-            const auto* remaining = selected_probe && !selected_probe->possible_candidates.empty()
-                ? &selected_probe->possible_candidates : domain;
+            const auto* remaining = replay && !replay->screened_candidates.empty() ? &replay->screened_candidates :
+                selected_probe && !selected_probe->possible_candidates.empty() ? &selected_probe->possible_candidates : domain;
             const auto count = remaining ? remaining->size() : password_candidates.size();
             const bool direct_candidates = password_candidates.size() == 1 ||
                 (replay && replay->candidate_output_owned);
             if (!direct_candidates) {
-                const auto probe = selected_probe ? std::move(*selected_probe) :
+                const auto probe = replay && replay->confirmed_candidate_index >= 0 ? [&] {
+                    PasswordTestResult confirmed;
+                    confirmed.status = PasswordTestStatus::Ok;
+                    confirmed.matched_index = replay->confirmed_candidate_index;
+                    return confirmed;
+                }() : selected_probe && (selected_probe->status == PasswordTestStatus::Ok ||
+                    (!remaining && selected_probe->password_independent_failure)) ? std::move(*selected_probe) :
                     test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
                         format_hint, password_candidates.data(), count, archive_input.canonical_names, false, true,
                         remaining ? remaining->data() : nullptr);
@@ -1181,6 +1145,9 @@ RequestOutcome run_request(
                     static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
                     result = password_candidate_failure(probe);
                 } else {
+                    if (replay && probe.encrypted && !(current_native_memory_job() &&
+                        current_native_memory_job()->revoked.load(std::memory_order_acquire)))
+                        replay->confirmed_candidate_index = probe.matched_index;
                     result = extract_with_password(password_candidates[probe.matched_index]);
                     result.matched_index = probe.matched_index;
                 }
@@ -1234,7 +1201,8 @@ RequestOutcome run_request(
                         !(current_native_memory_job() && current_native_memory_job()->denied.load(std::memory_order_acquire)) &&
                         !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
                         if (extraction_rejects_password(result) ||
-                            (!selected_probe && test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
+                            (!selected_probe && (!replay || !replay->password_probe_done) &&
+                             test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
                                 format_hint, &password_candidates[index], 1, archive_input.canonical_names).status == PasswordTestStatus::WrongPassword)) {
                             result.status = PasswordTestStatus::WrongPassword;
                             result.encrypted = true;

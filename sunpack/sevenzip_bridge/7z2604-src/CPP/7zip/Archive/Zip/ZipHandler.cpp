@@ -1188,7 +1188,7 @@ HRESULT CZipDecoder::Decode(
     const HRESULT headerResult = _wzAesDecoder->ReadHeader(inStream);
     if (headerResult == S_FALSE) { res = NExtract::NOperationResult::kUnexpectedEnd; return S_OK; }
     RINOK(headerResult)
-    if (!_wzAesDecoder->Init_and_CheckPassword())
+    if (!_wzAesDecoder->Init_and_CheckPassword(authenticateOnly))
     {
       res = NExtract::NOperationResult::kWrongPassword;
       return S_OK;

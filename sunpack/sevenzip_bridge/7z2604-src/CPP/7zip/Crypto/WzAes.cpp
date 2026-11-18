@@ -32,14 +32,15 @@ Z7_COM7F_IMF(CBaseCoder::CryptoSetPassword(const Byte *data, UInt32 size))
   return S_OK;
 }
 
-void CBaseCoder::Init2()
+void CBaseCoder::Init2(bool authenticateOnly)
 {
   _hmacOverCalc = 0;
   const unsigned dkSizeMax32 = (2 * kAesKeySizeMax + kPwdVerifSize + 3) / 4;
   Byte dk[dkSizeMax32 * 4];
 
   const unsigned keySize = _key.GetKeySize();
-  const unsigned dkSize = 2 * keySize + ((kPwdVerifSize + 3) & ~(unsigned)3);
+  const unsigned dkSize = 2 * keySize + kPwdVerifSize;
+  const unsigned dkOffset = authenticateOnly ? keySize : 0;
   
   // for (unsigned ii = 0; ii < 1000; ii++)
   {
@@ -47,11 +48,14 @@ void CBaseCoder::Init2()
         _key.Password, _key.Password.Size(),
         _key.Salt, _key.GetSaltSize(),
         kNumKeyGenIterations,
-        dk, dkSize);
+        dk + dkOffset, dkSize - dkOffset, dkOffset);
   }
 
   Hmac()->SetKey(dk + keySize, keySize);
   memcpy(_key.PwdVerifComputed, dk + 2 * keySize, kPwdVerifSize);
+
+  if (authenticateOnly)
+    return;
 
   // Aes_SetKey_Enc(_aes.Aes() + 8, dk, keySize);
   // AesCtr2_Init(&_aes);
@@ -114,9 +118,9 @@ static inline bool CompareArrays(const Byte *p1, const Byte *p2, unsigned size)
   return true;
 }
 
-bool CDecoder::Init_and_CheckPassword()
+bool CDecoder::Init_and_CheckPassword(bool authenticateOnly)
 {
-  Init2();
+  Init2(authenticateOnly);
   return CompareArrays(_key.PwdVerifComputed, _pwdVerifFromArchive, kPwdVerifSize);
 }
 

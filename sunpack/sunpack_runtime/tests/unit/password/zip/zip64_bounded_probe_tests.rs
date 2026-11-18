@@ -139,7 +139,7 @@ fn zip64_password_probe_resolves_disk_relative_entry_and_end_records() {
             prepare_zip_directory_stream(&mut std::io::Cursor::new(archive), len, Some(eocd), None)
         };
         match prepared {
-            Ok(ZipPasswordContext::ZipCrypto { header, check_byte }) => {
+            Ok(ZipPasswordContext::ZipCrypto { header, check_byte, .. }) => {
                 assert_eq!(header, [0x9b; 12]);
                 assert_eq!(check_byte, 0x5a);
             }

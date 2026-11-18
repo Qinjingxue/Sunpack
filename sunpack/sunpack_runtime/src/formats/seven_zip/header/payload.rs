@@ -7,12 +7,61 @@ pub(crate) struct SevenZipPayloadProbe {
 }
 
 enum SevenZipPayloadEvidence {
-    Header,
+    Header { packed_size: u64 },
     Compressed {
-        coder: SevenZipCoderAst,
+        method: Vec<u8>,
+        packed_size: u64,
         unpack_size: u64,
-        plaintext_size: usize,
     },
+}
+
+impl SevenZipPayloadEvidence {
+    fn from_stream(folder: &SevenZipFolderAst, stream: &SevenZipAesStream, header: bool) -> Option<Self> {
+        let packed_size = stream.plaintext_size;
+        match stream.consumer {
+            Some((index, unpack_size)) => Some(Self::Compressed {
+                method: folder.coders[index].method_id.clone(),
+                packed_size,
+                unpack_size,
+            }),
+            None if header => Some(Self::Header { packed_size }),
+            None => None,
+        }
+    }
+
+    fn plaintext_prefix_size(&self) -> usize {
+        match self {
+            Self::Header { packed_size } => (*packed_size).min(16) as usize,
+            Self::Compressed { method, packed_size, .. } => {
+                (*packed_size).min(seven_zip_prefix_read_size(method)) as usize
+            }
+        }
+    }
+
+    fn check_encrypted_prefix(
+        &self,
+        encrypted: &[u8],
+        material: &SevenZipAesKey,
+    ) -> Result<SevenZipPrefixCheck, String> {
+        check_password_cancellation()?;
+        let len = self.plaintext_prefix_size();
+        let Some(encrypted) = encrypted.get(..len.div_ceil(16) * 16) else {
+            return Ok(SevenZipPrefixCheck::Weak);
+        };
+        let mut buffer = [0u8; 128];
+        let prefix = &mut buffer[..encrypted.len()];
+        prefix.copy_from_slice(encrypted);
+        Aes256CbcDec::new(&material.key.into(), &material.iv.into())
+            .decrypt_padded::<NoPadding>(prefix)
+            .map_err(|_| "encoded_header_payload_crc_bad:aes_block_size".to_string())?;
+        let prefix = &prefix[..len];
+        Ok(match self {
+            Self::Header { packed_size } => seven_zip_plain_header_prefix(prefix, *packed_size),
+            Self::Compressed { method, packed_size, unpack_size } => {
+                seven_zip_prefix_check(method, prefix, *packed_size, *unpack_size)
+            }
+        })
+    }
 }
 
 struct SevenZipPayloadPlan {
@@ -242,27 +291,7 @@ impl SevenZipPayloadProbe {
         &self,
         material: &SevenZipAesKey,
     ) -> Result<SevenZipPrefixCheck, String> {
-        check_password_cancellation()?;
-        let key = material.key;
-        let mut prefix = [0u8; 128];
-        prefix[..self.encrypted.len()].copy_from_slice(&self.encrypted);
-        Aes256CbcDec::new(&key.into(), &material.iv.into())
-            .decrypt_padded::<NoPadding>(&mut prefix[..self.encrypted.len()])
-            .map_err(|_| "7z payload AES block size is invalid".to_string())?;
-        Ok(match &self.kind {
-            SevenZipPayloadEvidence::Header if prefix[0] == SZ_HEADER => SevenZipPrefixCheck::Weak,
-            SevenZipPayloadEvidence::Header => SevenZipPrefixCheck::Reject,
-            SevenZipPayloadEvidence::Compressed {
-                coder,
-                unpack_size,
-                plaintext_size,
-            } => seven_zip_prefix_check(
-                &coder.method_id,
-                &coder.properties,
-                &prefix[..*plaintext_size],
-                *unpack_size,
-            ),
-        })
+        self.kind.check_encrypted_prefix(&self.encrypted, material)
     }
 }
 
@@ -352,26 +381,9 @@ fn seven_zip_payload_plan(
 ) -> Option<SevenZipPayloadPlan> {
     let stream = seven_zip_aes_stream(folder, packed_input, packed_size)?;
     let aes = &folder.coders[stream.aes_index];
-    let (kind, size, strong) = match stream.consumer {
-        Some((index, unpack_size)) => {
-            let coder = &folder.coders[index];
-            let plaintext_size = stream
-                .plaintext_size
-                .min(seven_zip_prefix_read_size(&coder.method_id))
-                as usize;
-            (
-                SevenZipPayloadEvidence::Compressed {
-                    coder: coder.clone(),
-                    unpack_size,
-                    plaintext_size,
-                },
-                (plaintext_size as u64).div_ceil(16) * 16,
-                seven_zip_prefix_is_strong(&coder.method_id),
-            )
-        }
-        None if header => (SevenZipPayloadEvidence::Header, 16, false),
-        None => return None, // Arbitrary Copy member data has no prefix constraint.
-    };
+    let kind = SevenZipPayloadEvidence::from_stream(folder, &stream, header)?;
+    let size = kind.plaintext_prefix_size().div_ceil(16) as u64 * 16;
+    let strong = matches!(&kind, SevenZipPayloadEvidence::Compressed { method, .. } if seven_zip_prefix_is_strong(method));
     let cycles = seven_zip_aes_properties(&aes.properties)?.0;
     Some(SevenZipPayloadPlan {
         offset,

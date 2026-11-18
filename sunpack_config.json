@@ -205,7 +205,7 @@
           {
             "value": "tmp",
             "regex": false
-                    },
+          },
           {
             "value": "ppt",
             "regex": false
@@ -228,10 +228,6 @@
           },
           {
             "value": "et",
-            "regex": false
-          },
-          {
-            "value": "csv",
             "regex": false
           }
         ]

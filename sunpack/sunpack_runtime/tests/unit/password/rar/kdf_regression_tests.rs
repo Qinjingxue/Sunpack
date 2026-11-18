@@ -65,6 +65,9 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
             for (index, byte) in check.iter().enumerate() { proof[index % 8] ^= byte; }
             let password: Arc<str> = Arc::from(password);
             let cache = RarKeyCache::default();
+            assert_eq!(cache.rar5(&password, &header), Some(key));
+            assert!(cache.rar5.lock().unwrap().values().all(|slot|
+                slot.get().unwrap().as_ref().unwrap().check.get().is_none()));
             header.password_check = Some(proof);
             assert_eq!(cache.rar5(&password, &header), Some(key));
             proof[0] ^= 1;

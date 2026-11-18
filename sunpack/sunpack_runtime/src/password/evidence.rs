@@ -1,7 +1,7 @@
 //! Task-local byte dependencies reduce the existing candidate plan directly.
 //! Worker layouts carry only the passwords still viable for their bytes.
 use super::{context::PasswordContext, PasswordVerification};
-use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout};
+use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSelection};
 use crate::io::cancellation::Cancellation;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -192,7 +192,12 @@ impl EvidenceContext {
                     return Ok(anchor_result);
                 }
                 let survivors: Vec<_> = indices.iter().map(|&i| candidates[i].clone()).collect();
-                let mut result = self.verify_inner(&survivors, false, complete, &rar_keys)?;
+                let confirmed = anchor_result.final_confirmation_required == Some(false);
+                let mut result = self.verify_inner(&survivors, confirmed, complete, &rar_keys, Some(anchor))?;
+                if confirmed {
+                    anchor_result.volume_attempts = result.volume_attempts;
+                    return Ok(anchor_result);
+                }
                 if !matches!(result.status, "match" | "no_match") {
                     anchor_result.volume_attempts = result.volume_attempts;
                     return Ok(anchor_result);
@@ -205,7 +210,7 @@ impl EvidenceContext {
                 return Ok(result);
             }
         }
-        self.verify_inner(candidates, fixed, complete, &rar_keys)
+        self.verify_inner(candidates, fixed, complete, &rar_keys, None)
     }
 
     fn verify_inner(
@@ -214,6 +219,7 @@ impl EvidenceContext {
         fixed: bool,
         complete: bool,
         rar_keys: &super::rar::RarKeyCache,
+        screened_anchor: Option<&Arc<super::rar::RarPasswordContext>>,
     ) -> std::io::Result<PasswordVerification> {
         let cancellation = Cancellation::current();
         cancellation.check_io()?;
@@ -237,6 +243,14 @@ impl EvidenceContext {
                         (self.alternatives.len() > 1).then_some(&zip_keys),
                     ),
                     PasswordContext::Rar(context) => {
+                        if screened_anchor.is_some_and(|anchor| Arc::ptr_eq(context, anchor)) {
+                            return Ok(PasswordVerification {
+                                attempts: candidates.len(),
+                                matched_index: Some(0),
+                                matched_indices: (0..candidates.len()).collect(),
+                                ..PasswordVerification::status("match", "RAR anchor password candidates already screened")
+                            });
+                        }
                         context.verify_cached(candidates, None, rar_keys)
                     }
                     PasswordContext::Evidence(context) => {
@@ -283,12 +297,24 @@ impl EvidenceContext {
             }
         }
         let native_rejections = if let Some(index) = confirmed.or_else(|| fixed.then_some(0)) {
+            let screened: HashMap<_, _> = self.alternatives.iter().zip(&results)
+                .filter_map(|((context, _), result)| match context {
+                    PasswordContext::Rar(context) => Some((Arc::as_ptr(context) as usize, survives(result, index))),
+                    _ => None,
+                })
+                .collect();
             self.independent_rar
                 .par_iter()
                 .map(|context| -> std::io::Result<bool> {
                     let Some(context) = context else {
                         return Ok(false);
                     };
+                    if screened_anchor.is_some_and(|anchor| Arc::ptr_eq(context, anchor)) {
+                        return Ok(false);
+                    }
+                    if let Some(&kept) = screened.get(&(Arc::as_ptr(context) as usize)) {
+                        return Ok(!kept);
+                    }
                     cancellation
                         .run(|| context.verify_cached(&candidates[index..=index], None, &rar_keys))
                         .map(|result| result.status == "no_match")
@@ -403,6 +429,52 @@ pub(super) fn remove_paths(
     Ok(partition(plan, &rules, 1)?.0)
 }
 
+/// Worker results use the original request's source IDs. Subtract the actual
+/// paths before reporting the plan so independent slot choices cannot recreate
+/// a combination the decoder already rejected.
+pub(crate) fn remove_scan_paths(
+    plan: &VolumeAttemptPlan,
+    selections: Vec<VolumeSelection>,
+    layouts: Vec<usize>,
+    first: Option<&VolumeSelection>,
+) -> std::io::Result<VolumeAttemptPlan> {
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid worker volume result");
+    let mut proof = VolumeProjection { roots: Vec::new(), edges: Vec::new(), ends: Vec::new() };
+    let mut roots = HashMap::new();
+    let mut edges = HashMap::new();
+    let mut nodes = 0;
+    let mut node = || { nodes += 1; nodes };
+    let start = first.map_or(0, |selection| selection.layout);
+    let mut dropped = vec![false; plan.layouts.len()];
+    for layout in layouts {
+        *dropped.get_mut(layout).ok_or_else(invalid)? = true;
+    }
+    for selection in selections {
+        let layout = plan.layouts.get(selection.layout).ok_or_else(invalid)?;
+        let count = selection.sources.len();
+        let minimum = if layout.minimum_slots == 0 { layout.slots.len() } else { layout.minimum_slots };
+        if !(minimum..=layout.slots.len()).contains(&count) {
+            return Err(invalid());
+        }
+        if selection.layout < start || dropped[selection.layout] {
+            continue;
+        }
+        let mut at = *roots.entry((selection.layout, count)).or_insert_with(&mut node);
+        for (index, source) in selection.sources.into_iter().enumerate() {
+            let slot = if index + 1 == count { layout.slots.last().unwrap() } else { &layout.slots[index] };
+            if !plan.domains[slot.domain].choices.contains(&source) {
+                return Err(invalid());
+            }
+            at = *edges.entry((at, source)).or_insert_with(&mut node);
+        }
+        proof.ends.push(at);
+    }
+    proof.roots.extend(roots.into_iter().map(|((layout, count), at)| [layout, count, at]));
+    proof.edges.extend(edges.into_iter().map(|((from, source), to)| [from, to, source]));
+    let (plan, _) = partition_from(plan, &[(&proof, None)], 1, &dropped, first)?;
+    Ok(plan)
+}
+
 // A terminal either removes a path or assigns its password domain. Prepared
 // alternatives partition the byte observations. Paths without readable proof
 // use domain zero, which contains every globally surviving candidate.
@@ -411,6 +483,17 @@ fn partition(
     rules: &[(&VolumeProjection, Option<usize>)],
     domain_count: usize,
 ) -> std::io::Result<(VolumeAttemptPlan, Vec<usize>)> {
+    partition_from(plan, rules, domain_count, &[], None)
+}
+
+fn partition_from(
+    plan: &VolumeAttemptPlan,
+    rules: &[(&VolumeProjection, Option<usize>)],
+    domain_count: usize,
+    dropped: &[bool],
+    first: Option<&VolumeSelection>,
+) -> std::io::Result<(VolumeAttemptPlan, Vec<usize>)> {
+    if let Some(first) = first { plan.selected_parts(first)?; }
     type State = Vec<(usize, usize)>;
     let mut edges: HashMap<(usize, usize, usize), Vec<usize>> = HashMap::new();
     let mut ends = HashMap::new();
@@ -557,20 +640,25 @@ fn partition(
     let mut layout_groups = Vec::new();
     let mut domains: Vec<VolumeDomain> = Vec::new();
     let mut domain_ids: HashMap<Arc<Vec<usize>>, usize> = HashMap::new();
-    for (layout_index, layout) in plan.layouts.iter().enumerate() {
+    let start = first.map_or(0, |selection| selection.layout);
+    for (layout_index, layout) in plan.layouts.iter().enumerate().skip(start) {
+        if dropped.get(layout_index) == Some(&true) { continue; }
         let maximum = layout.slots.len();
         let minimum = if layout.minimum_slots == 0 {
             maximum
         } else {
             layout.minimum_slots
         };
-        let mut counts = (minimum..=maximum).rev().peekable();
+        let frontier = first.filter(|selection| selection.layout == layout_index);
+        let maximum_count = frontier.map_or(maximum, |selection| selection.sources.len());
+        let mut counts = (minimum..=maximum_count).rev().peekable();
         while let Some(count) = counts.next() {
             let state = roots.remove(&(layout_index, count)).unwrap_or_default();
             // A run of untouched counts is already represented by minimum_slots.
             // Keep it factored instead of copying a slot vector for every length.
             let mut lowest = count;
-            if state.is_empty() {
+            let frontier = frontier.filter(|selection| selection.sources.len() == count);
+            if state.is_empty() && frontier.is_none() {
                 while let Some(next) = counts.next_if(|n| !roots.contains_key(&(layout_index, *n)))
                 {
                     lowest = next;
@@ -582,7 +670,7 @@ fn partition(
                 .iter()
                 .map(|slot| Arc::clone(&plan.domains[slot.domain].choices))
                 .collect();
-            for (remaining, group) in subtract(&choices, state, &edges, &ends, domain_count)? {
+            let mut keep = |remaining: Vec<Arc<Vec<usize>>>, group| {
                 let mut slots = slots.clone();
                 for (slot, choices) in slots.iter_mut().zip(remaining) {
                     slot.domain = *domain_ids.entry(choices.clone()).or_insert_with(|| {
@@ -598,10 +686,39 @@ fn partition(
                 if domain_count > 1 {
                     layout_groups.push(group);
                 }
+            };
+            match frontier {
+                None => {
+                    for (remaining, group) in subtract(&choices, state, &edges, &ends, domain_count)? {
+                        keep(remaining, group);
+                    }
+                }
+                Some(selection) => {
+                    for suffix in ordered_suffix(&choices, &selection.sources) {
+                        for (remaining, group) in subtract(&suffix, state.clone(), &edges, &ends, domain_count)? {
+                            keep(remaining, group);
+                        }
+                    }
+                }
             }
         }
     }
     Ok((plan.with_remaining(layouts, domains), layout_groups))
+}
+
+fn ordered_suffix(choices: &[Arc<Vec<usize>>], first: &[usize]) -> Vec<Vec<Arc<Vec<usize>>>> {
+    let mut suffix = Vec::new();
+    let mut path: Vec<_> = first.iter().map(|source| Arc::new(vec![*source])).collect();
+    for index in (0..choices.len()).rev() {
+        let domain = &choices[index];
+        let position = domain.iter().position(|source| *source == first[index]).unwrap();
+        let start = position + usize::from(index + 1 != choices.len());
+        if start == domain.len() { continue; }
+        path[index + 1..].clone_from_slice(&choices[index + 1..]);
+        path[index] = if start == 0 { domain.clone() } else { Arc::new(domain[start..].to_vec()) };
+        suffix.push(path.clone());
+    }
+    suffix
 }
 
 #[cfg(test)]

@@ -90,6 +90,8 @@ struct ExtractionReplay : VolumeReadUncertainty {
     // memory withdrawals. Never replay one password's bytes under another.
     std::size_t candidate_index = 0;
     int confirmed_candidate_index = -1;
+    std::vector<std::size_t> screened_candidates;
+    bool password_probe_done = false;
     bool volume_output_started = false;
     bool candidates_started = false, candidate_output_owned = false, candidate_discard_pending = false;
     void clear_output() {

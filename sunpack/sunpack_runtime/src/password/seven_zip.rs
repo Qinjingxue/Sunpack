@@ -188,30 +188,24 @@ fn collect_candidates(
             ..PasswordVerification::status("match", "7z password confirmed by complete evidence")
         });
     }
-    // An I/O/resource failure is not password evidence. Hand the entire batch
-    // to the existing worker fallback rather than caching false rejections.
-    if let Some(message) = matches.iter().find_map(|(_, value)| value.as_ref().err()) {
-        return Ok(PasswordVerification::status(
-            "unknown_needs_final_verifier",
-            message,
-        ));
-    }
     let Some((first, _)) = matches.first() else {
         return Ok(PasswordVerification {
             attempts: candidates.len(),
             ..PasswordVerification::status("no_match", "7z prescreen rejected candidates")
         });
     };
+    // Unavailable candidates survive. With a strong probe, an unavailable
+    // candidate terminates the ordered search, leaving its suffix untouched.
+    let uncertainty = matches.iter().find_map(|(_, value)| value.as_ref().err());
     Ok(PasswordVerification {
         matched_index: Some(*first),
         matched_indices: matches.iter().map(|(index, _)| *index).collect(),
         attempts: if strong { first + 1 } else { candidates.len() },
         final_confirmation_required: Some(true),
         match_evidence: prefix_evidence,
-        ..PasswordVerification::status(
-            "match",
-            "7z payload candidates require extraction confirmation",
-        )
+        ..PasswordVerification::status("match", uncertainty.map_or(
+            "7z payload candidates require extraction confirmation", String::as_str,
+        ))
     })
 }
 
@@ -243,17 +237,22 @@ fn prepare_seven_zip<R: Read + Seek>(
         FieldLocation::Head,
     )?;
     let next = seven_zip_tail_requirement(&start_header, total_len)?;
-    let enabled = start_header[6] == 0
-        && crc32fast::hash(&start_header[12..32])
-            == u32::from_le_bytes(start_header[8..12].try_into().unwrap());
-    prepare_seven_zip_descriptor(&mut reader, total_len, next, enabled, &()).map_err(|error| {
-        match error {
-            PreparedStatus::Status("invalid_volume_evidence", message) => {
-                PreparedStatus::new("damaged", message)
-            }
-            other => other,
+    let enabled = start_header[6] == 0 && seven_zip_start_header_crc_matches(&start_header);
+    prepare_seven_zip_descriptor(&mut reader, total_len, next, enabled, &())
+        .map_err(seven_zip_fixed_input_status)
+}
+
+fn seven_zip_start_header_crc_matches(start: &[u8; SEVEN_Z_HEADER_SIZE]) -> bool {
+    crc32fast::hash(&start[12..32]) == u32::from_le_bytes(start[8..12].try_into().unwrap())
+}
+
+fn seven_zip_fixed_input_status(error: PreparedStatus) -> PreparedStatus {
+    match error {
+        PreparedStatus::Status("invalid_volume_evidence", message) => {
+            PreparedStatus::new("damaged", message)
         }
-    })
+        other => other,
+    }
 }
 
 fn prepare_seven_zip_descriptor<R: Read + Seek>(

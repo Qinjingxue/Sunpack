@@ -118,7 +118,7 @@ protected:
     _aesCoder = _aesCoderSpec;
   }
 
-  void Init2();
+  void Init2(bool authenticateOnly = false);
 public:
   unsigned GetHeaderSize() const { return _key.GetSaltSize() + kPwdVerifSize; }
   unsigned GetAddPackSize() const { return GetHeaderSize() + kMacSize; }
@@ -152,7 +152,7 @@ class CDecoder Z7_final:
 public:
   // Z7_IFACE_COM7_IMP(ICompressSetDecoderProperties2)
   HRESULT ReadHeader(ISequentialInStream *inStream);
-  bool Init_and_CheckPassword();
+  bool Init_and_CheckPassword(bool authenticateOnly);
   void Authenticate(const Byte *data, UInt32 size) { Hmac()->Update(data, size); }
   HRESULT CheckMac(ISequentialInStream *inStream, bool &isOK);
 };

@@ -209,13 +209,7 @@ fn header_prescreen_and_full_crc_share_one_candidate_scoped_key() {
             folder.main_output_stream = 1;
             folder.unpack_sizes = SevenZipUnpackSizes::All(vec![encoded.len() as u64, 2]);
         }
-        let stream = seven_zip_aes_stream(&folder, 0, 16).unwrap();
-        let mut probe = SevenZipPasswordProbe {
-            packed_data: vec![encrypted.into()],
-            folder,
-            aes_index: 0,
-            prefix: Some((0, stream)),
-        };
+        let mut probe = SevenZipPasswordProbe::from_parts(vec![encrypted.into()], folder);
         for password in ["wrong", "secret", "secret"] {
             SEVEN_ZIP_KDF_DERIVATIONS.with(|count| count.set(0));
             let key = SevenZipAesKey::derive(probe.key_properties(), password).unwrap();

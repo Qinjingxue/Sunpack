@@ -2995,9 +2995,10 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                     } else if let Some(plan) = &input.volume_attempts {
                         let first = value.get("first_remaining_volume").map(VolumeSelection::deserialize).transpose()?;
-                        let updates = value.get("volume_layout_survivors").map(Vec::deserialize).transpose()?.unwrap_or_default();
-                        if first.is_some() || !updates.is_empty() {
-                            let remaining = plan.remaining_after_scan(first.as_ref(), updates)?;
+                        let paths: Vec<_> = value.get("discarded_volume_paths").map(Vec::deserialize).transpose()?.unwrap_or_default();
+                        let layouts: Vec<_> = value.get("discarded_volume_layouts").map(Vec::deserialize).transpose()?.unwrap_or_default();
+                        if first.is_some() || !paths.is_empty() || !layouts.is_empty() {
+                            let remaining = crate::password::evidence::remove_scan_paths(plan, paths, layouts, first.as_ref())?;
                             Arc::make_mut(&mut input).volume_attempts = Some(Arc::new(remaining));
                         }
                     }

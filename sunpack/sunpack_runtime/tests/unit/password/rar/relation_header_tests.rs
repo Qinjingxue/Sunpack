@@ -67,13 +67,45 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     assert!(matches!(probe_header_passwords(&reader, 37, &[], true, None).unwrap(),
         HeaderPassword::Inconclusive));
     let offset = prepare_rar4_encrypted_headers(&reader, 37).unwrap().unwrap();
-    let context = RarPasswordContext { material: RarPasswordMaterial::Header(
-        reader.read_at(offset, 8 + 65536).unwrap()) };
+    let path = crate::test_support::temp_file("rar4_hp_carrier", &data);
+    let range = InputExtent {
+        path: path.to_string_lossy().into_owned(), start: 37, end: Some(data.len() as u64),
+    };
+    let ranges = parse_ranges(std::iter::once(&range), &[]).unwrap();
+    let context = prepare_rar_ranges(&ranges).unwrap_or_else(|_| panic!("encrypted RAR4 carrier"));
     let mut proof = None;
     assert_eq!(context.verify(&passwords, Some(&mut proof)).unwrap().matched_index, Some(0));
     assert!(matches!(proof, Some(RarProvenKey::Rar4 { .. })));
     assert!(matches!(probe_header_passwords(&reader, 37, &passwords, true, proof.as_ref()).unwrap(),
         HeaderPassword::Matched(0, RarTerminalProof { terminal: Some(_), .. })));
+    drop(context);
+    drop(ranges);
+    std::fs::remove_file(path).unwrap();
+
+    // A second genuine header has a separate salt and can confirm a weak
+    // initial hit. A single ENDARC or corrupted successor stays weak.
+    let next_salt = [0xb8; 8];
+    let (key2, iv2) = derive_rar3_key_iv("secret", Some(&next_salt)).unwrap();
+    let seal = |mut header: Vec<u8>, key: [u8; 16], iv: [u8; 16]| {
+        let size = header.len().next_multiple_of(16);
+        header.resize(size, 0);
+        cbc::Encryptor::<Aes128>::new(&key.into(), &iv.into())
+            .encrypt_padded::<NoPadding>(&mut header, size).unwrap();
+        header
+    };
+    let mut two_headers = data[37..offset as usize].to_vec();
+    two_headers.extend(salt);
+    two_headers.extend(seal(rar4_block(0x75, 0, &[]), key, iv));
+    two_headers.extend(next_salt);
+    two_headers.extend(seal(rar4_block(0x7b, 0, &[]), key2, iv2));
+    let confirm = |bytes: Vec<u8>| {
+        let reader = ManagedReader::from_bytes(bytes, Default::default());
+        prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("RAR4 header proof"))
+            .verify(&passwords, None).unwrap().final_confirmation_required
+    };
+    assert_eq!(confirm(two_headers.clone()), Some(false));
+    *two_headers.last_mut().unwrap() ^= 1;
+    assert_eq!(confirm(two_headers), Some(true));
 
     let unrelated = RarProvenKey::Rar4 { salt: [0; 8], key: [0; 16], iv: [0; 16] };
     assert!(matches!(probe_header_passwords(&reader, 37, &passwords, true, Some(&unrelated)).unwrap(),
@@ -217,16 +249,21 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     let iv = [0x62; 16];
     let mut key = [0; 32];
     pbkdf2::pbkdf2_hmac::<Sha256>(b"secret", &salt, 16, &mut key);
+    let encrypt = |block: &mut [u8]| {
+        let size = block.len();
+        cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
+            .encrypt_padded::<NoPadding>(block, size).unwrap();
+    };
     let mut block = [0u8; 16];
-    block[1] = 0x5a; // Legal empty block, reusing solid tables.
-    cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
-        .encrypt_padded::<NoPadding>(&mut block, 16).unwrap();
-    let make = |split: bool, method: u64, version: u64| {
+    block[0] = 0x40;
+    block[1] = 0x1a; // Legal empty final block, reusing solid tables.
+    encrypt(&mut block);
+    let make = |split: bool, method: u64, version: u64, block: &[u8]| {
         let mut encryption = vec![1, 0, 0, 4]; // extra type, version, flags, KDF log
         encryption.extend(salt); encryption.extend(iv);
         let mut extra = vint(encryption.len() as u64); extra.extend(encryption);
         let mut file = vec![2, 3 | if split { 8 } else { 0 }];
-        file.extend(vint(extra.len() as u64)); file.extend(vint(16));
+        file.extend(vint(extra.len() as u64)); file.extend(vint(block.len() as u64));
         file.extend([0, 0, 0]); // file flags, unpack size, attributes
         file.extend(vint(method << 7 | 0x40 | version)); // solid
         file.extend([0, 1, b'x']); file.extend(extra);
@@ -238,7 +275,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
         let reader = ManagedReader::from_bytes(bytes, Default::default());
         prepare_rar(|offset, size, _| Ok(reader.read_at(offset, size).unwrap()))
     };
-    let context = prepare(make(false, 1, 0)).unwrap_or_else(|_| panic!("compressed first block"));
+    let context = prepare(make(false, 1, 0, &block)).unwrap_or_else(|_| panic!("compressed first block"));
     let candidates = [Arc::from("wrong"), Arc::from("secret"), Arc::from("secret")];
     let result = context.verify(&candidates, None).unwrap();
     assert_eq!(result.matched_indices, [1, 2]);
@@ -246,7 +283,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     assert_eq!(result.match_evidence, Some("rar5_compressed_block"));
     // A missing middle disk and a stored first member do not make a
     // later independent RAR7-compatible compressed member unreadable.
-    let volumes = VolumeSet::new([make(false, 0, 0), make(false, 1, 1)].into_iter().enumerate().map(|(i, data)|
+    let volumes = VolumeSet::new([make(false, 0, 0, &block), make(false, 1, 1, &block)].into_iter().enumerate().map(|(i, data)|
         crate::password::input::VolumeSpec { reader: ManagedReader::from_bytes(data, Default::default()),
             number: 1 + (2 * i) as u32, start: 0, end: None }).collect());
     let later = prepare_rar_volumes(&volumes, true).unwrap_or_else(|_| panic!("independent later member"));
@@ -254,6 +291,27 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     let plain_first = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 1]), &rar5_block(&[5, 0, 1])].concat();
     assert!(matches!(prepare(plain_first), Err(PreparedStatus::Status("unknown_needs_final_verifier", _))));
     for (split, method) in [(true, 1), (false, 0)] {
-        assert!(matches!(prepare(make(split, method, 0)), Err(PreparedStatus::Status("unknown_needs_final_verifier", _))));
+        assert!(matches!(prepare(make(split, method, 0, &block)), Err(PreparedStatus::Status("unknown_needs_final_verifier", _))));
     }
+
+    let mut plaintext = [0u8; 64];
+    plaintext[..3].copy_from_slice(&[0x07, 0x5a ^ 7 ^ 44, 44]);
+    // The next header starts at byte 47, crossing two CBC blocks. It
+    // requires the preceding ciphertext but no intervening decompression.
+    plaintext[47..50].copy_from_slice(&[0x40, 0x1a, 0]);
+    let mut valid = plaintext;
+    encrypt(&mut valid);
+    let reader = ManagedReader::from_bytes(make(false, 1, 0, &valid), Default::default());
+    let context = prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("second block"));
+    assert_eq!(context.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
+
+    plaintext[48] ^= 1;
+    encrypt(&mut plaintext);
+    let archive = make(false, 1, 0, &plaintext);
+    let reader = ManagedReader::from_bytes(archive.clone(), Default::default());
+    let context = prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("invalid second block"));
+    assert_eq!(context.verify(&candidates, None).unwrap().status, "no_match");
+    // Missing optional follow-up evidence preserves the first-block survivors.
+    assert_eq!(prepare(archive).unwrap_or_else(|_| panic!("available first block"))
+        .verify(&candidates, None).unwrap().matched_indices, [1, 2]);
 }
