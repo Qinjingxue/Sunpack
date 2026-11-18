@@ -211,6 +211,37 @@ fn winzip_aes_jumps_to_zstd_header_in_another_volume() {
 }
 
 #[test]
+fn winzip_aes_deflate_skips_stored_blocks_to_check_a_later_volume() {
+    // The first successor is still on the fixed head. Only its Stored
+    // length leads to the third header and discriminates the two tails.
+    let first = [0x59; 600];
+    let second = [0x31; 40];
+    let split = first.len() + second.len() + 10;
+    let payload = stored_deflate_blocks(&[&first, &second, b"last"]);
+    for method in [8, 9] {
+        let (mut local, payload) = winzip_aes_member(payload.clone(), first.len() + second.len() + 4, method);
+        local.extend_from_slice(&payload[..split]);
+        let mut good = payload[split..].to_vec();
+        good.extend([0; 10]);
+        let mut bad = good.clone();
+        bad[3] ^= 1;
+        assert_aes_member_scope(&local, &bad, &good);
+    }
+}
+
+pub(super) fn stored_deflate_blocks(blocks: &[&[u8]]) -> Vec<u8> {
+    let mut packed = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let len = u16::try_from(block.len()).unwrap();
+        packed.push(u8::from(index + 1 == blocks.len()));
+        packed.extend(len.to_le_bytes());
+        packed.extend((!len).to_le_bytes());
+        packed.extend(*block);
+    }
+    packed
+}
+
+#[test]
 fn winzip_aes_screens_xz_block_after_fixed_stream_header() {
     let input = b"XZ framing on a second volume";
     let payload = xz_payload(input);

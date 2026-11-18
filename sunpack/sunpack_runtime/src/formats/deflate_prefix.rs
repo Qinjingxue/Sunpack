@@ -1,4 +1,4 @@
-//! First-block structure shared by ZIP and 7z. No member symbols are decoded.
+//! Block structure shared by ZIP and 7z. No member symbols are decoded.
 
 const CODE_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 pub(crate) const MAX_DYNAMIC_HEADER_SIZE: usize = (3usize + 14 + 19 * 3 + (288 + 32) * 7).div_ceil(8);
@@ -19,19 +19,88 @@ pub(crate) fn check_prefix(
     unpack_size: Option<u64>,
     deflate64: bool,
 ) -> Option<bool> {
+    check_header(bytes, packed_size, unpack_size, deflate64).map(|header| !matches!(header, Header::Invalid))
+}
+
+enum Header {
+    Invalid,
+    Checked,
+    Stored(u16),
+}
+
+fn check_header(
+    bytes: &[u8], packed_size: Option<u64>, unpack_size: Option<u64>, deflate64: bool,
+) -> Option<Header> {
     let first = *bytes.first()?;
-    match (first >> 1) & 3 {
+    Some(match (first >> 1) & 3 {
         0 => {
-            let header = bytes.get(1..5)?;
-            let len = u16::from_le_bytes([header[0], header[1]]);
-            let inverse = u16::from_le_bytes([header[2], header[3]]);
-            Some(len == !inverse
-                && packed_size.is_none_or(|size| u64::from(len) + 5 <= size)
-                && unpack_size.is_none_or(|size| u64::from(len) <= size))
+            let &[lo, hi, inverse_lo, inverse_hi] = bytes.get(1..)?.first_chunk()?;
+            let len = u16::from_le_bytes([lo, hi]);
+            let inverse = u16::from_le_bytes([inverse_lo, inverse_hi]);
+            if len != !inverse || packed_size.is_some_and(|size| u64::from(len) + 5 > size)
+                || unpack_size.is_some_and(|size| u64::from(len) > size) {
+                Header::Invalid
+            } else if first & 1 == 0 {
+                Header::Stored(len)
+            } else {
+                Header::Checked
+            }
         }
-        1 => Some(true),
-        2 => dynamic_tables(bytes, deflate64),
-        _ => Some(false),
+        1 => Header::Checked,
+        2 if dynamic_tables(bytes, deflate64)? => Header::Checked,
+        _ => Header::Invalid,
+    })
+}
+
+// A non-final Stored block starts and ends its payload on byte boundaries.
+// Its successor is reachable by seeking over LEN bytes. Compressed blocks
+// require member decoding to locate their successor, so stop at their header.
+pub(crate) fn check_successors<E>(
+    prefix: &[u8], (packed, mut unpacked): (u64, u64), readable: u64, deflate64: bool,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), E>,
+    mut still_ambiguous: impl FnMut(u64) -> bool,
+) -> Result<Option<bool>, E> {
+    let mut offset = 0;
+    let mut header = [0; MAX_DYNAMIC_HEADER_SIZE];
+    loop {
+        let available = (readable.saturating_sub(offset).min(MAX_DYNAMIC_HEADER_SIZE as u64)) as usize;
+        if available == 0 {
+            return Ok(None);
+        }
+        let cached = usize::try_from(offset).ok().and_then(|at| prefix.get(at..)).unwrap_or_default();
+        let cached = &cached[..cached.len().min(available)];
+        let check = |bytes| check_header(bytes, Some(packed - offset), Some(unpacked), deflate64);
+        let mut verdict = check(cached);
+        if verdict.is_none() {
+            let mut loaded = cached.len();
+            header[..loaded].copy_from_slice(cached);
+            if loaded == 0 {
+                read(offset, &mut header[..1])?;
+                loaded = 1;
+            }
+            let limit = match header[0] & 6 {
+                0 => 5,
+                4 => MAX_DYNAMIC_HEADER_SIZE,
+                _ => 1,
+            }.min(available);
+            if loaded < limit {
+                read(offset + loaded as u64, &mut header[loaded..limit])?;
+                loaded = limit;
+            }
+            verdict = check(&header[..loaded]);
+        }
+        match verdict {
+            Some(Header::Stored(len)) => {
+                let next = offset + 5 + u64::from(len);
+                if next >= packed { return Ok(Some(false)); }
+                if offset != 0 && !still_ambiguous(next) { return Ok(Some(true)); }
+                offset = next;
+                unpacked -= u64::from(len);
+            }
+            Some(Header::Checked) => return Ok(Some(true)),
+            Some(Header::Invalid) => return Ok(Some(false)),
+            None => return Ok(None),
+        }
     }
 }
 

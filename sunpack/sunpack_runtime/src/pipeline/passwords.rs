@@ -1,4 +1,4 @@
-use super::{Failure, FailureKind};
+use super::{Failure, FailureKind, Mode};
 use crate::core::passwords::PasswordSnapshot;
 use crate::io::archive_state::{ArchiveInput, OpenMode};
 use crate::io::cancellation::Cancellation;
@@ -226,6 +226,7 @@ impl CandidateSet {
             &mut input,
             None,
             cancellation,
+            Mode::Scan,
             Some(std::slice::from_ref(session)),
             &mut password::context::Preparation::capturing_rar_key(&mut key),
             &mut None,
@@ -262,12 +263,14 @@ impl CandidateSet {
         input: &mut ArchiveInput,
         known: Option<Arc<str>>,
         cancellation: &Cancellation,
+        mode: Mode,
     ) -> io::Result<Result<PasswordPlan, Failure>> {
         let mut remaining = None;
         let result = self.plan_inner(
             input,
             known,
             cancellation,
+            mode,
             None,
             &mut password::context::Preparation::default(),
             &mut remaining,
@@ -283,6 +286,7 @@ impl CandidateSet {
         input: &mut ArchiveInput,
         known: Option<Arc<str>>,
         cancellation: &Cancellation,
+        mode: Mode,
         sessions: Option<&[NativeArchiveSession]>,
         preparation: &mut password::context::Preparation<'_>,
         remaining: &mut Option<Arc<crate::io::archive_state::VolumeAttemptPlan>>,
@@ -300,7 +304,7 @@ impl CandidateSet {
         ) {
             return Ok(Ok(PasswordPlan::clear()));
         }
-        let single_enc_can_defer = input.format_hint == "enc" && input.volume_attempts.is_none();
+        let single_enc_can_defer = mode == Mode::Extract && input.format_hint == "enc" && input.volume_attempts.is_none();
         let needs_password = input.analysis.password_required || input.format_hint == "enc";
         // Discovery already identifies inputs that require a password. For the
         // rest, an empty candidate can be confirmed by the ordinary worker
@@ -441,8 +445,7 @@ impl CandidateSet {
                 continue;
             }
             if single_enc_can_defer && pending.is_empty() && batch.len() == 1 {
-                // The worker authenticates the sole ENC candidate when opening
-                // the archive. A host probe would repeat the same Argon2 work.
+                // Real extraction can reuse this key for payload authentication.
                 pending.append(&mut batch);
                 break;
             }

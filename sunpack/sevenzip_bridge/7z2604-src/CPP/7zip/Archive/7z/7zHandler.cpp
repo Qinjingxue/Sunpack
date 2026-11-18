@@ -637,10 +637,8 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
       if (folder == kNumNoIndex) break;
       if (propID == kpidSunpackProofOffset)
         PropVarEm_Set_UInt64(value, _db.GetFolderStreamPos(folder, 0));
-      else if (index + 1 == _db.Files.Size() || _db.FileIndexToFolderIndexMap[index + 1] != folder)
-        PropVarEm_Set_UInt64(value, _db.GetFolderFullPackSize(folder));
       else
-        PropVarEm_Set_UInt64(value, 1); // A partial solid decode starts at the folder.
+        PropVarEm_Set_UInt64(value, _db.GetFolderFullPackSize(folder));
       break;
     }
     case kpidSunpackAesCopyStart:

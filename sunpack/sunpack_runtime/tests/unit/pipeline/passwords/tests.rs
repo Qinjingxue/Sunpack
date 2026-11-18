@@ -83,7 +83,7 @@ fn empty_and_three_configured_passwords_share_the_encrypted_header_batch() {
         let cache = RecentPasswords::default();
         let candidates = CandidateSet::new(Arc::from([Arc::from("wrong1"), Arc::from("wrong2"), Arc::from(tail)]), None, &cache, None);
         PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
-        let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap();
+        let plan = candidates.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap();
         PLANNED_BATCHES.with(|value| {
             let borrow = value.borrow(); let batches = borrow.as_ref().unwrap();
             assert_eq!(batches.len(), 1);
@@ -105,7 +105,7 @@ fn encrypted_empty_rar_crc_failure_uses_verified_direct_password_plan() {
     let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "rar".into(), "archive".into());
     let cache = RecentPasswords::default();
     let candidates = CandidateSet::new(Arc::from([Arc::from("fixture-secret")]), None, &cache, None);
-    let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = candidates.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     assert_eq!(plan.verified_password.as_deref(), Some("fixture-secret"));
     assert!(plan.candidates.is_empty(), "must not use the all-rejected candidate fallback");
     std::fs::remove_file(source).unwrap();
@@ -249,7 +249,7 @@ fn preflight_read_failure_retains_machine_readable_evidence() {
     let mut input = ArchiveInput::file(path.to_string_lossy().into_owned(), "enc".into(), "archive".into());
     let cache = RecentPasswords::default();
     let candidates = CandidateSet::new(Arc::from(["first".into(), "second".into()]), None, &cache, None);
-    let failure = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().err().unwrap();
+    let failure = candidates.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().err().unwrap();
     assert_eq!(failure.kind, FailureKind::Damaged);
     let json = serde_json::to_value(&failure).unwrap();
     let evidence = &json["evidence"];
@@ -265,18 +265,17 @@ fn preflight_read_failure_retains_machine_readable_evidence() {
     // confirmed missing volume. Relation discovery may confirm it.
     let mut hinted = input.clone();
     hinted.analysis.missing_volume_evidence = Some("seven_zip_start_header_length".into());
-    assert_eq!(candidates.plan(&mut hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
+    assert_eq!(candidates.plan(&mut hinted, None, &Cancellation::new(), Mode::Extract).unwrap().err().unwrap().kind,
         FailureKind::Damaged);
     hinted.analysis.origin = crate::io::archive_state::AnalysisOrigin::Relations;
-    assert_eq!(candidates.plan(&mut hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
+    assert_eq!(candidates.plan(&mut hinted, None, &Cancellation::new(), Mode::Extract).unwrap().err().unwrap().kind,
         FailureKind::MissingVolume);
     let _ = std::fs::remove_file(path);
 }
 
 #[test]
-fn sole_enc_candidate_after_cached_rejections_uses_worker_confirmation() {
-    // A host ENC probe would fail on this header. Planning can proceed
-    // because the worker will confirm the sole remaining candidate.
+fn sole_enc_candidate_uses_rust_only_when_scanning() {
+    // This short header proves which mode actually runs Rust preflight.
     let path = crate::test_support::temp_file("enc_single_candidate_plan", b"short");
     let name = path.to_string_lossy().into_owned();
     let mut input = ArchiveInput::file(name.clone(), "enc".into(), "archive".into());
@@ -293,12 +292,15 @@ fn sole_enc_candidate_after_cached_rejections_uses_worker_confirmation() {
         None,
     );
     let plan = candidates
-        .plan(&mut input, None, &Cancellation::new())
+        .plan(&mut input, None, &Cancellation::new(), Mode::Extract)
         .unwrap()
         .unwrap();
     assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("confirm-in-worker")]);
     assert_eq!(plan.encrypted, Some(true));
     assert!(plan.verified_password.is_none());
+    let failure = candidates.plan(&mut input, None, &Cancellation::new(), Mode::Scan)
+        .unwrap().err().unwrap();
+    assert_eq!(failure.kind, FailureKind::Damaged);
 
     assert!(proof_lifetime.upgrade().is_some());
     drop(sessions);
@@ -312,21 +314,21 @@ fn explicit_empty_enc_candidate_is_not_absent_or_implicit() {
     let mut input = ArchiveInput::file(name, "enc".into(), "archive".into());
     let cache = RecentPasswords::default();
     let empty = CandidateSet::new(Arc::from([Arc::from("")]), None, &cache, None);
-    let plan = empty.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = empty.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
     let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
-    assert_eq!(absent.plan(&mut input, None, &Cancellation::new()).unwrap()
+    assert_eq!(absent.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap()
         .err().unwrap().kind, FailureKind::WrongPassword);
     let sessions = member_sessions(&input, NativeArchiveSession::new(input.entry_path.clone()).unwrap());
     let (key, attempts) = Key::for_input(&input, &sessions).unwrap();
     attempts.reject(key.clone(), &[Arc::from("wrong")]);
     let mixed = CandidateSet::new(Arc::from([Arc::from("wrong"), Arc::from("")]), None, &cache, None);
-    let plan = mixed.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = mixed.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
     attempts.remember_proof(key, Some(Arc::from("")));
-    let cached = empty.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
+    let cached = empty.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     assert_eq!(cached.verified_password.as_deref(), Some(""));
-    let known = empty.plan(&mut input, Some(Arc::from("")), &Cancellation::new()).unwrap().unwrap();
+    let known = empty.plan(&mut input, Some(Arc::from("")), &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     assert_eq!(known.verified_password.as_deref(), Some(""));
     drop(sessions);
     let _ = std::fs::remove_file(path);
@@ -358,7 +360,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
         // The invalid header would fail a fresh verifier call; a stored
         // proof must return before parsing/KDF for every compound layout.
         let configured = CandidateSet::new(Arc::from([Arc::from("right")]), None, &cache, None);
-        let plan = configured.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
+        let plan = configured.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
         assert_eq!(plan.verified_password.as_deref(), Some("right"));
         let mut changed = input.clone();
         changed.parts[1].extent.start = 1;
@@ -427,7 +429,7 @@ fn copy_payload_hands_off_unfilterable_candidate_suffix_without_reprobing() {
     values.extend((0..300).map(|i| Arc::from(format!("wrong-{i}"))));
     let candidates = CandidateSet::new(values.clone().into(), None, &recent, None);
     PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
-    let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = candidates.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     let batches = PLANNED_BATCHES.with(|value| value.borrow_mut().take().unwrap());
     assert_eq!(batches.len(), 1);
     assert!(plan.verified_password.is_none());
@@ -474,7 +476,7 @@ fn full_final_batch_confirms_password_and_prunes_ciphertext_alternative() {
         .chain((1..BATCH_SIZE).map(|n| Arc::from(format!("wrong-{n}"))))
         .collect();
     let candidates = CandidateSet::new(passwords, None, &RecentPasswords::default(), None);
-    let plan = candidates.plan(&mut input, None, &Cancellation::new()).unwrap().unwrap();
+    let plan = candidates.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     assert_eq!(plan.verified_password.as_deref(), Some("correct"));
     let volume = input.volume_attempts.unwrap();
     assert!(volume.sources.iter().any(|source| Path::new(&source.path) == paths[2]));

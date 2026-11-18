@@ -424,6 +424,44 @@ fn delta_successor_uses_only_readable_headers_with_full_packed_bounds() {
 }
 
 #[test]
+fn deflate_successor_reads_only_its_cbc_window_and_respects_delta_boundary() {
+    use aes::cipher::BlockModeEncrypt;
+    use SevenZipPrefixCheck::{Reject, Weak};
+
+    let key = SevenZipAesKey::derive(&[0x3f], "secret").unwrap();
+    for (readable, bad, expected) in [(135, true, Weak), (137, true, Weak), (140, true, Reject), (140, false, Weak)] {
+        let structure = SevenZipPayloadEvidence {
+            packed_size: 145,
+            unchanged_prefix: readable,
+            verifier: SevenZipPayloadVerifier::Compressed {
+                method: vec![0x04, 0x01, 0x08],
+                unpack_size: 135,
+            },
+        };
+        let mut ciphertext = [0; 160];
+        ciphertext[..5].copy_from_slice(&[0, 130, 0, 125, 255]);
+        // Final five-byte Stored block. Its body lies beyond the Delta limit.
+        ciphertext[135..140].copy_from_slice(&[1, 5, 0, if bad { 251 } else { 250 }, 255]);
+        cbc::Encryptor::<Aes256>::new(&key.key.into(), &key.iv.into())
+            .encrypt_padded::<NoPadding>(&mut ciphertext, 160).unwrap();
+        let first = ciphertext.first_chunk::<16>().unwrap();
+        let (prefix, len) = structure.decrypt_prefix(first, &key).unwrap();
+        assert_eq!(structure.check_prefix(&prefix[..len]), Weak);
+        let mut did_read = false;
+        let mut read = |offset, output: &mut [u8]| -> Result<(), DeferredReadError> {
+            assert!(!did_read);
+            assert_eq!((offset, output.len()), (112, 32));
+            output.copy_from_slice(&ciphertext[112..144]);
+            did_read = true;
+            Ok(())
+        };
+        assert_eq!(structure.check_successor(0, first, &prefix[..len], &key, &[], &mut read,
+            &SevenZipPayloadSource::Fixed(Arc::new([]))).unwrap(), expected);
+        assert_eq!(did_read, readable > 135);
+    }
+}
+
+#[test]
 fn decoder_follows_bind_pairs_instead_of_coder_declaration_order() {
     let copy = || SevenZipCoderAst {
         method_id: EncoderMethod::ID_COPY.to_vec(),

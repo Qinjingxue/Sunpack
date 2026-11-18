@@ -97,6 +97,25 @@ bool check_password_probe_status_names() {
     )) == "needs_volume_or_tail_damaged";
 }
 
+bool check_encrypted_header_open_is_not_a_member_proof() {
+    using namespace sunpack::sevenzip;
+    // Empty 7z with an AES-encrypted directory and no data members.
+    constexpr char archive[] =
+        "\x37\x7a\xbc\xaf\x27\x1c\x00\x04\xc7\x28\x03\x8d\x10\x00\x00\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00"
+        "\x00\x00\x00\x4f\x01\xf1\xa6\x6e\x7e\x20\x01\x39\x36\x14\x82\xa7\x41\xc3\x2d\xe1\xd1\xde\x86\x17\x06"
+        "\x00\x01\x09\x10\x00\x07\x0b\x01\x00\x01\x24\x06\xf1\x07\x01\x01\x3f\x0c\x02\x0a\x01\xbe\x23\xc2\x58"
+        "\x00\x00";
+    const auto path = std::filesystem::temp_directory_path() /
+        (L"sunpack-encrypted-directory-" + std::to_wstring(GetCurrentProcessId()) + L".7z");
+    { std::ofstream file(path, std::ios::binary); file.write(archive, sizeof(archive) - 1); }
+    const std::wstring wrong = L"incorrect";
+    const auto bounded = test_password_batch(path.wstring(), {}, {}, L"7z", &wrong, 1, {}, true);
+    const auto final = test_password_batch(path.wstring(), {}, {}, L"7z", &wrong, 1, {}, false, true);
+    std::filesystem::remove(path);
+    return bounded.status == PasswordTestStatus::Unsupported && bounded.encrypted &&
+        !bounded.password_independent_failure && final.status == PasswordTestStatus::WrongPassword;
+}
+
 bool check_rar5_password_probe_with_unknown_unpacked_size() {
     using namespace sunpack::sevenzip;
     // A RAR5 Store member of 16 bytes with CRC32, no password-check bytes,
@@ -546,6 +565,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_password_probe_status_names()) {
         std::cerr << "password probe status name check failed\n";
         return 4;
+    }
+    if (!check_encrypted_header_open_is_not_a_member_proof()) {
+        std::cerr << "bounded probe classified encrypted directory Open as member evidence\n";
+        return 38;
     }
     if (!check_rar5_password_probe_with_unknown_unpacked_size()) {
         std::cerr << "RAR5 unknown unpacked size password proof check failed\n";

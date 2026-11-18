@@ -261,7 +261,7 @@ static HRESULT TestCopySubstream(const CDbEx &db, IInStream *stream, UInt32 inde
   const auto &file = db.Files[index];
   const CNum folderIndex = db.FileIndexToFolderIndexMap[index];
   if (!file.CrcDefined || !file.Size || folderIndex == kNumNoIndex ||
-      db.FolderStartFileIndex[folderIndex] == index ||
+      db.NumUnpackStreamsVector[folderIndex] <= 1 ||
       (db.FolderCRCs.ValidAndDefined(folderIndex) &&
        (index + 1 == db.Files.Size() || db.FileIndexToFolderIndexMap[index + 1] != folderIndex)))
     return S_OK;
@@ -272,9 +272,8 @@ static HRESULT TestCopySubstream(const CDbEx &db, IInStream *stream, UInt32 inde
   UInt64 offset = 0;
   for (auto i = db.FolderStartFileIndex[folderIndex]; i < index; ++i)
     offset += db.Files[i].Size;
-  if (offset < 16) return S_OK;
-  const UInt64 start = (offset & ~(UInt64)15) - 16;
-  const UInt64 packSize = db.GetFolderFullPackSize(folderIndex);
+  const UInt64 start = SunpackAesCopyReadStart(offset);
+  const UInt64 packSize = db.GetFolderFullPackSize(folderIndex) & ~(UInt64)15;
   if (offset > packSize || file.Size > packSize - offset) return S_OK;
   handled = true;
 

@@ -227,8 +227,7 @@ impl SevenZipPayloadEvidence {
         };
         let readable = self.readable_size();
         match method.as_slice() {
-            method if readable > 16 && seven_zip_is_deflate(method) =>
-                readable.min(deflate_prefix::MAX_DYNAMIC_HEADER_SIZE as u64),
+            method if readable >= 5 && seven_zip_is_deflate(method) => readable,
             // Prescreening already walks all LZMA2 headers in the first AES block.
             [0x21] if readable > 16 => readable,
             // A skippable frame and the next magic can fit in the first AES block.
@@ -317,12 +316,22 @@ impl SevenZipPayloadEvidence {
         if readable == 0 {
             return Ok(SevenZipPrefixCheck::Weak);
         }
-        let mut read_plain = |at: u64, out: &mut [u8]| {
+        const WINDOW: usize = (deflate_prefix::MAX_DYNAMIC_HEADER_SIZE + 15).next_multiple_of(16)
+            + 16 * SEVEN_Z_MAX_FOLDER_CODERS;
+        let mut ciphertext = [0; WINDOW];
+        let mut window_start = 0;
+        let mut decrypted = 0..0;
+        let read_plain = |at: u64, out: &mut [u8]| {
             debug_assert!(at + out.len() as u64 <= readable);
             if let Some(bytes) = usize::try_from(at).ok()
                 .and_then(|at| at.checked_add(out.len()).and_then(|end| plaintext.get(at..end)))
             {
                 out.copy_from_slice(bytes);
+                return Ok(());
+            }
+            if at >= decrypted.start && at + out.len() as u64 <= decrypted.end {
+                let start = (at - window_start) as usize;
+                out.copy_from_slice(&ciphertext[start..start + out.len()]);
                 return Ok(());
             }
             // Each CBC layer needs one preceding block, except at offset zero
@@ -333,9 +342,6 @@ impl SevenZipPayloadEvidence {
             let window = block_start.saturating_sub(predecessors);
             let start = (at - window) as usize;
             let end = (start + out.len()).next_multiple_of(16);
-            const WINDOW: usize = (deflate_prefix::MAX_DYNAMIC_HEADER_SIZE + 15).next_multiple_of(16)
-                + 16 * SEVEN_Z_MAX_FOLDER_CODERS;
-            let mut ciphertext = [0; WINDOW];
             let cached = if window == 0 {
                 ciphertext[..16].copy_from_slice(first_encrypted);
                 16
@@ -360,26 +366,10 @@ impl SevenZipPayloadEvidence {
                     .expect("CBC window is block-aligned");
             }
             out.copy_from_slice(&ciphertext[start..start + out.len()]);
+            window_start = window;
+            decrypted = block_start..window + end as u64;
             Ok(())
         };
-        if seven_zip_is_deflate(method) {
-            let bound = readable as usize;
-            let deflate64 = method[2] == 9;
-            let check = |bytes: &[u8]| deflate_prefix::check_prefix(
-                bytes, Some(packed_size), Some(*unpack_size), deflate64,
-            );
-            if bound <= plaintext.len() || check(plaintext).is_some() {
-                return Ok(SevenZipPrefixCheck::Weak);
-            }
-            let mut header = [0; deflate_prefix::MAX_DYNAMIC_HEADER_SIZE];
-            header[..plaintext.len()].copy_from_slice(plaintext);
-            read_plain(plaintext.len() as u64, &mut header[plaintext.len()..bound])?;
-            return Ok(if check(&header[..bound]) == Some(false) {
-                SevenZipPrefixCheck::Reject
-            } else {
-                SevenZipPrefixCheck::Weak
-            });
-        }
         let ciphertext_span = readable.next_multiple_of(16);
         let ambiguous = |next: u64| {
             if next >= readable {
@@ -393,6 +383,12 @@ impl SevenZipPayloadEvidence {
                 SevenZipPayloadSource::Fixed(_) => false,
             }
         };
+        if seven_zip_is_deflate(method) {
+            let check = deflate_prefix::check_successors(
+                plaintext, (packed_size, *unpack_size), readable, method[2] == 9, read_plain, ambiguous,
+            )?;
+            return Ok(if check == Some(false) { SevenZipPrefixCheck::Reject } else { SevenZipPrefixCheck::Weak });
+        }
         seven_zip_successor_prefix(method, plaintext, packed_size, *unpack_size, readable, read_plain, ambiguous)
     }
 }

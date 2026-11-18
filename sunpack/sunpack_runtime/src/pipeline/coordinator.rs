@@ -2857,7 +2857,7 @@ impl<'run, O: Observer> Run<'run, O> {
         } else {
             None
         };
-        let mut plan = match candidates.plan(&mut input, password, &self.request.cancel) {
+        let mut plan = match candidates.plan(&mut input, password, &self.request.cancel, self.request.mode) {
             Ok(Ok(plan)) => plan,
             Ok(Err(failure)) => {
                 result.failure = Some(failure.with_context(super::FailureContext::PasswordResolution));

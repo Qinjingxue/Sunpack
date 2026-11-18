@@ -176,7 +176,7 @@ impl ZipPrefix {
     pub(super) fn can_screen(&self, matches: usize, derive_aes_key: bool) -> bool {
         let Some(read) = &self.read else { return false; };
         let size = self.read_size();
-        let span = if derive_aes_key && self.method == 93 {
+        let span = if derive_aes_key && self.has_aes_successor() {
             self.sizes.map_or(size as u64, |(packed, _)| packed)
         } else { size as u64 };
         matches != 0 && size != 0
@@ -185,6 +185,15 @@ impl ZipPrefix {
 
     pub(super) fn needs_size(&self) -> bool {
         self.sizes.is_none()
+    }
+
+    fn has_aes_successor(&self) -> bool {
+        matches!(self.method, 8 | 9 | 93)
+    }
+
+    pub(super) fn cbc_deflate_probe(&self) -> Option<((u64, u64), bool)> {
+        let sizes = self.sizes?;
+        (matches!(self.method, 8 | 9) && sizes.0.is_multiple_of(16)).then_some((sizes, self.method == 9))
     }
 
     fn prefix_size(&self) -> usize {
@@ -228,15 +237,19 @@ impl ZipPrefix {
     ) -> io::Result<()> {
         let Some(source) = &self.read else { return Ok(()); };
         let size = self.read_size();
-        let zstd_sizes = if self.method == 93 && matches!(keys.first(), Some((_, ZipPrefixKey::Aes { .. }))) {
+        let successor_sizes = if self.has_aes_successor() && matches!(keys.first(), Some((_, ZipPrefixKey::Aes { .. }))) {
             self.sizes
         } else { None };
-        let zstd_volumes = zstd_sizes.is_some_and(|(packed, _)| source.ambiguous(self.start, packed));
+        let successor_volumes = successor_sizes.is_some_and(|(packed, _)| source.ambiguous(self.start, packed));
         let xz = self.method == 95;
-        let initial = size.min(if xz { 13 } else { 16 });
+        let initial = size.min(match self.method {
+            8 | 9 if successor_volumes => 5,
+            95 => 13,
+            _ => 16,
+        });
         let next_size = |read: usize| if xz { size } else { (2 * read).max(5).min(size) };
         let minimum = self.minimum_prefix().min(size);
-        let first = if zstd_volumes {
+        let first = if self.method == 93 && successor_volumes {
             // A skippable frame needs only its 8-byte header before jumping.
             size.min(8)
         } else if initial > minimum && source.ambiguous(self.start, initial as u64) {
@@ -259,9 +272,9 @@ impl ZipPrefix {
                 }
             };
             let mut next = next_size(encrypted.len());
-            let mut verdicts = if zstd_volumes && unavailable.is_none() { vec![None; keys.len()] }
+            let mut verdicts = if successor_volumes && unavailable.is_none() { vec![None; keys.len()] }
                 else { keys.iter().map(|(_, key)| self.check(key, &encrypted, &mut next, &mut scratch)).collect() };
-            while !zstd_volumes && unavailable.is_none() && encrypted.len() < size
+            while !successor_volumes && unavailable.is_none() && encrypted.len() < size
                 && verdicts.iter().any(Option::is_none) {
                 let previous = encrypted.len();
                 let more = match read(self.start + previous as u64, next - previous) {
@@ -276,17 +289,17 @@ impl ZipPrefix {
                     }
                 }
             }
-            if let Some(sizes) = zstd_sizes.filter(|_| unavailable.is_none() && (
-                zstd_volumes || verdicts.iter().filter(|&&v| v != Some(false)).nth(1).is_some()
+            if let Some(sizes) = successor_sizes.filter(|_| unavailable.is_none() && (
+                successor_volumes || verdicts.iter().filter(|&&v| v != Some(false)).nth(1).is_some()
             )) {
                 for ((_, key), verdict) in keys.iter().zip(&mut verdicts) {
                     if *verdict == Some(false) { continue; }
-                    let outcome = self.check_aes_zstd_successors(key, &encrypted, sizes, source, read);
+                    let outcome = self.check_aes_successors(key, &encrypted, sizes, source, read, &mut scratch);
                     *verdict = match outcome {
                         Ok(SevenZipPrefixCheck::Reject) => Some(false),
                         Ok(SevenZipPrefixCheck::Weak) => None,
                         Ok(_) => Some(true),
-                        Err(DeferredReadError::Truncated) if zstd_volumes => Some(false),
+                        Err(DeferredReadError::Truncated) if successor_volumes => Some(false),
                         Err(error) => {
                             if matches!(error, DeferredReadError::Pending) { break; }
                             unavailable.get_or_insert(error);
@@ -349,29 +362,39 @@ impl ZipPrefix {
         self.check_plain(plain, next)
     }
 
-    fn check_aes_zstd_successors(
-        &self, key: &ZipPrefixKey, encrypted: &[u8], (packed, unpacked): (u64, u64),
-        source: &ZipRead, read: &mut CheckRead<'_>,
+    fn check_aes_successors(
+        &self, key: &ZipPrefixKey, encrypted: &[u8], sizes: (u64, u64),
+        source: &ZipRead, read: &mut CheckRead<'_>, scratch: &mut ZipPrefixScratch,
     ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
         fn verify<C: KeyInit + BlockCipherEncrypt>(
-            prefix: &ZipPrefix, key: &[u8], encrypted: &[u8], packed: u64, unpacked: u64,
-            source: &ZipRead, read: &mut CheckRead<'_>,
+            prefix: &ZipPrefix, key: &[u8], encrypted: &[u8], (packed, unpacked): (u64, u64),
+            source: &ZipRead, read: &mut CheckRead<'_>, scratch: &mut ZipPrefixScratch,
         ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
             let cipher = C::new_from_slice(key).unwrap();
-            let mut plain = [0; 24];
-            let plain = &mut plain[..encrypted.len()];
+            let plain = scratch.bytes(encrypted.len());
             plain.copy_from_slice(encrypted);
             winzip_aes_ctr(&cipher, 0, plain);
-            seven_zip_successor_prefix(ZSTD_METHOD, plain, packed, unpacked, packed, |offset, output| {
+            let read_plain = |offset, output: &mut [u8]| {
                 output.copy_from_slice(&read(prefix.start + offset, output.len())?);
                 winzip_aes_ctr(&cipher, offset, output);
                 Ok(())
-            }, |offset| source.ambiguous(prefix.start + offset, packed - offset))
+            };
+            let ambiguous = |offset| source.ambiguous(prefix.start + offset, packed - offset);
+            if prefix.method == 93 {
+                seven_zip_successor_prefix(ZSTD_METHOD, plain, packed, unpacked, packed, read_plain, ambiguous)
+            } else {
+                deflate_prefix::check_successors(plain, (packed, unpacked), packed, prefix.method == 9, read_plain, ambiguous)
+                    .map(|verdict| match verdict {
+                        Some(false) => SevenZipPrefixCheck::Reject,
+                        Some(true) => SevenZipPrefixCheck::Strong,
+                        None => SevenZipPrefixCheck::Weak,
+                    })
+            }
         }
         match key {
-            ZipPrefixKey::Aes { key, len: 16 } => verify::<Aes128>(self, &key[..16], encrypted, packed, unpacked, source, read),
-            ZipPrefixKey::Aes { key, len: 24 } => verify::<Aes192>(self, &key[..24], encrypted, packed, unpacked, source, read),
-            ZipPrefixKey::Aes { key, len: 32 } => verify::<Aes256>(self, key, encrypted, packed, unpacked, source, read),
+            ZipPrefixKey::Aes { key, len: 16 } => verify::<Aes128>(self, &key[..16], encrypted, sizes, source, read, scratch),
+            ZipPrefixKey::Aes { key, len: 24 } => verify::<Aes192>(self, &key[..24], encrypted, sizes, source, read, scratch),
+            ZipPrefixKey::Aes { key, len: 32 } => verify::<Aes256>(self, key, encrypted, sizes, source, read, scratch),
             _ => unreachable!(),
         }
     }
@@ -380,8 +403,12 @@ impl ZipPrefix {
         // The encrypted length includes PKCS7 padding. It is a safe upper
         // bound for compression framing, but cannot be used as an exact size.
         let (packed, _) = self.sizes?;
-        let maximum = if self.method == 95 { MAX_XZ_PREFIX_SIZE.next_multiple_of(16) } else { 16 };
-        (packed >= 16).then_some((self.start, packed.min(maximum as u64)))
+        let span = match self.method {
+            8 | 9 if packed.is_multiple_of(16) => packed,
+            95 => packed.min(MAX_XZ_PREFIX_SIZE.next_multiple_of(16) as u64),
+            _ => 16,
+        };
+        (packed >= 16).then_some((self.start, span))
     }
 
     pub(super) fn check_plain(&self, plain: &[u8], next: &mut usize) -> Option<bool> {

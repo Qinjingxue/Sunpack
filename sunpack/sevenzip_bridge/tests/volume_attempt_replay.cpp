@@ -478,6 +478,47 @@ void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {
     require(rejected.status == PasswordTestStatus::WrongPassword && !rejected.rejects_fixed_geometry &&
         accepted.status == PasswordTestStatus::Ok && accepted.matched_index == 0,
         "the fixed member masked a bad volume that the second CRC can reject");
+
+    // Place the second local record away from both Open's head read and the
+    // central directory. It can be indexed but its member data cannot open.
+    constexpr std::size_t gap = 1024 * 1024;
+    constexpr std::size_t second = gap, directory = 2 * gap + end - start;
+    const auto blocked = carrier.parent_path() / L"locked-volume.bin";
+    {
+        std::string central(zip + end, zip + length);
+        std::string encoded;
+        wire::little(encoded, second, 4);
+        central.replace(47 + 42, 4, encoded); // Second central record's local offset.
+        encoded.clear();
+        wire::little(encoded, directory, 4);
+        central.replace(central.size() - 6, 4, encoded);
+        std::ofstream file(carrier, std::ios::binary | std::ios::trunc);
+        file.write(zip, start);
+        file.seekp(2 * gap - 1);
+        file.put('\0');
+        file.write(central.data(), central.size());
+        std::ofstream part(blocked, std::ios::binary);
+        part.write(zip + start, end - start);
+    }
+    const auto handle = CreateFileW(blocked.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    require(handle != INVALID_HANDLE_VALUE, "could not lock the ZIP member volume");
+    const std::vector<ExtractInputRange> locked_ranges{
+        {path, 0, gap, true}, {blocked.wstring(), 0, end - start, true},
+        {path, gap, 2 * gap + length - end, true}
+    };
+    plan.sources = locked_ranges;
+    plan.sources.push_back({path, gap, gap + end - start, true});
+    plan.prepare();
+    const std::wstring candidates[]{L"incorrect", password};
+    const auto recovered = test_password_batch(
+        path, {}, locked_ranges, L"zip", candidates, 2, {}, true, false, nullptr, &plan);
+    const auto inconclusive_volume = test_password_batch(
+        path, {}, locked_ranges, L"zip", candidates, 1, {}, true, false, nullptr, &plan);
+    CloseHandle(handle);
+    require(recovered.status == PasswordTestStatus::Ok && recovered.matched_index == 1 &&
+        recovered.observed_volume_slots && *recovered.observed_volume_slots == std::vector<std::size_t>{1} &&
+        !inconclusive_volume.observed_volume_slots && !inconclusive_volume.rejects_fixed_geometry,
+        "a failed ZIP read poisoned the successful fallback proof or made a rejection reusable");
 }
 
 void short_copy_crc_skips_unverifiable_items(const std::filesystem::path& archive) {
@@ -494,6 +535,42 @@ void short_copy_crc_skips_unverifiable_items(const std::filesystem::path& archiv
     const auto result = test_password_batch(archive.wstring(), {}, {}, L"7z", &password, 1, {}, true);
     require(result.status == PasswordTestStatus::WrongPassword,
         "AES/Copy follow-up missed the next verifiable member past empty or unchecksummed items");
+}
+
+void solid_aes_copy_crc_checks_the_uncertain_block(const std::filesystem::path& carrier) {
+    // The first CRC covers four bytes in the fixed block. The next member
+    // starts in that same block but ends in the uncertain one. A trailing
+    // stream without a CRC makes the second member a partial solid proof.
+    static constexpr char seven_zip[] =
+        "\x37\x7a\xbc\xaf\x27\x1c\x00\x04\xb4\x3d\xe1\xee\x20\x00\x00\x00\x00\x00\x00\x00\x2e\x00\x00\x00\x00"
+        "\x00\x00\x00\x6e\xce\xac\xa7\xde\x41\xc7\xaf\x93\x22\x9d\x33\x00\x13\x4d\x1b\x9e\xe3\xe1\x13\xd8\xdf"
+        "\x80\x57\xfd\x65\x26\xb2\x0e\x33\x1d\xf4\xb4\xf5\x5a\x61\x01\x04\x06\x00\x01\x09\x20\x00\x07\x0b\x01"
+        "\x00\x01\x24\x06\xf1\x07\x01\x01\x3f\x0c\x18\x00\x08\x0d\x03\x09\x04\x10\x0a\x00\xc0\xc9\x97\xb8\x50"
+        "\xe0\x9c\xe8\x4a\x00\x00\x05\x03\x00\x00";
+    constexpr auto length = sizeof(seven_zip) - 1;
+    constexpr std::size_t start = 48, end = 64;
+    std::string damaged(seven_zip + start, seven_zip + end);
+    damaged.back() ^= 1;
+    { std::ofstream file(carrier, std::ios::binary); file.write(seven_zip, length); file << damaged; }
+
+    const auto path = carrier.wstring();
+    const std::vector<ExtractInputRange> ranges = {
+        {path, 0, start, true}, {path, start, end, true}, {path, end, length, true}
+    };
+    VolumeAttemptPlan plan;
+    plan.sources = ranges;
+    plan.sources.push_back({path, length, length + damaged.size(), true});
+    plan.domains = {{0}, {3, 1}, {2}};
+    plan.layouts = {{{1, L"one", 0}, {2, L"two", 1}, {3, L"three", 2}}};
+    plan.prepare();
+    const std::wstring password = L"fixture-known";
+    auto wrong = ranges;
+    wrong[1] = plan.sources.back();
+    const auto rejected = test_password_batch(path, {}, wrong, L"7z", &password, 1, {}, true, false, nullptr, &plan);
+    const auto accepted = test_password_batch(path, {}, ranges, L"7z", &password, 1, {}, true, false, nullptr, &plan);
+    require(rejected.status == PasswordTestStatus::WrongPassword && !rejected.rejects_fixed_geometry &&
+        accepted.status == PasswordTestStatus::Ok && accepted.matched_index == 0,
+        "the fixed member masked an uncertain block in an early AES/Copy substream");
 }
 
 void disjoint_layouts_do_not_repeat_comparisons() {
@@ -534,6 +611,7 @@ int main() {
     unavailable_member_is_not_reprobed_for_an_unread_slice(archive, root / L"unsupported-carrier.zip");
     member_crc_rejects_a_bad_volume(root / L"encrypted-carrier.zip");
     short_copy_crc_skips_unverifiable_items(root / L"solid-aes-copy.7z");
+    solid_aes_copy_crc_checks_the_uncertain_block(root / L"solid-aes-carrier.7z");
     disjoint_layouts_do_not_repeat_comparisons();
     rejected_composition_is_not_prepared(root / L"encrypted.zip", root / L"rejected");
     scan_confirms_only_unproven_password(root / L"encrypted.zip");

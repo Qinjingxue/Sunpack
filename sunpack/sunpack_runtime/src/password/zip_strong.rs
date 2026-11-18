@@ -4,6 +4,7 @@ use super::{
     ZipKeyMaterial,
 };
 use super::probe::{read_reason, CheckRead, ZipPrefix, ZipPrefixScratch, ZipRead};
+use crate::formats::deflate_prefix;
 use crate::formats::zip::zip64::CentralValues;
 use crate::io::cancellation::Cancellation;
 use crate::password::input::attempts::DeferredReadError;
@@ -267,6 +268,7 @@ impl PasswordHeader {
                 let validation = self.load_validation(read)?;
                 let mut first_body_block = None;
                 let mut body_tail: Option<(usize, Result<Vec<u8>, DeferredReadError>)> = None;
+                let mut deflate_issue = None;
                 let matches = survivors.iter().map(|(_, cipher)| {
                     let Some(file_cipher) = self.check_validation(cipher, &validation) else {
                         return ValidationMatch::CrcMismatch;
@@ -279,6 +281,18 @@ impl PasswordHeader {
                             Ok(bytes) => {
                                 let previous = validation.bytes.last_chunk::<BLOCK>().unwrap();
                                 let plain = decrypt_block(&file_cipher, previous, bytes);
+                                if let Some((sizes, deflate64)) = prefix.cbc_deflate_probe() {
+                                    match check_deflate_body(&file_cipher, bytes, &plain, sizes, deflate64,
+                                        |at, size| read(offset + at, size),
+                                        |at| source.ambiguous(offset + at, sizes.0 - at),
+                                    ) {
+                                        Ok(Some(false)) | Err(DeferredReadError::Truncated) =>
+                                            return ValidationMatch::BodyContradiction,
+                                        Err(error) => { deflate_issue.get_or_insert(error); }
+                                        _ => {}
+                                    }
+                                    return ValidationMatch::Proven;
+                                }
                                 let mut next = usize::MAX;
                                 if prefix.check_plain(&plain, &mut next) == Some(false) {
                                     return ValidationMatch::BodyContradiction;
@@ -311,7 +325,8 @@ impl PasswordHeader {
                 Ok(ValidationEvidence {
                     matches,
                     body_issue: first_body_block.and_then(Result::err)
-                        .or_else(|| body_tail.and_then(|(_, result)| result.err())),
+                        .or_else(|| body_tail.and_then(|(_, result)| result.err()))
+                        .or(deflate_issue),
                 })
             })?
         } else { Vec::new() };
@@ -418,17 +433,52 @@ fn decrypt_block<C: BlockCipherDecrypt>(
 }
 
 fn check_body_tail<'a, C: BlockCipherDecrypt>(
-    prefix: &ZipPrefix, cipher: &C, mut previous: &'a [u8], encrypted: &'a [u8],
+    prefix: &ZipPrefix, cipher: &C, previous: &'a [u8], encrypted: &'a [u8],
     first: [u8; BLOCK], size: usize, scratch: &mut ZipPrefixScratch,
 ) -> bool {
     let body = scratch.bytes(BLOCK + encrypted.len());
     body[..BLOCK].copy_from_slice(&first);
-    for (output, block) in body[BLOCK..].chunks_exact_mut(BLOCK).zip(encrypted.chunks_exact(BLOCK)) {
+    decrypt_body_blocks(cipher, previous, encrypted, &mut body[BLOCK..]);
+    let mut needed = size;
+    prefix.check_plain(&body[..size], &mut needed) == Some(false)
+}
+
+fn decrypt_body_blocks<'a, C: BlockCipherDecrypt>(
+    cipher: &C, mut previous: &'a [u8], encrypted: &'a [u8], output: &mut [u8],
+) {
+    for (output, block) in output.chunks_exact_mut(BLOCK).zip(encrypted.chunks_exact(BLOCK)) {
         output.copy_from_slice(&decrypt_block(cipher, previous, block));
         previous = block;
     }
-    let mut needed = size;
-    prefix.check_plain(&body[..size], &mut needed) == Some(false)
+}
+
+fn check_deflate_body<C: BlockCipherDecrypt>(
+    cipher: &C, first_ciphertext: &[u8], first_plaintext: &[u8], sizes: (u64, u64), deflate64: bool,
+    mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, DeferredReadError>,
+    mut ambiguous: impl FnMut(u64) -> bool,
+) -> Result<Option<bool>, DeferredReadError> {
+    const WINDOW: usize = (deflate_prefix::MAX_DYNAMIC_HEADER_SIZE + BLOCK - 1).next_multiple_of(BLOCK);
+    let mut plain = [0; WINDOW];
+    let mut cached = 0..0;
+    let previous_block = |at: u64| (at & !((BLOCK - 1) as u64)).saturating_sub(BLOCK as u64);
+    deflate_prefix::check_successors(first_plaintext, sizes, sizes.0, deflate64, |at, out| {
+        let end = at + out.len() as u64;
+        if at < cached.start || end > cached.end {
+            let start = at & !((BLOCK - 1) as u64);
+            debug_assert!(start >= BLOCK as u64);
+            let len = (end - start).next_multiple_of(BLOCK as u64) as usize;
+            if start == BLOCK as u64 {
+                decrypt_body_blocks(cipher, first_ciphertext, &read(start, len)?, &mut plain[..len]);
+            } else {
+                let bytes = read(previous_block(at), BLOCK + len)?;
+                decrypt_body_blocks(cipher, &bytes[..BLOCK], &bytes[BLOCK..], &mut plain[..len]);
+            }
+            cached = start..start + len as u64;
+        }
+        let skip = (at - cached.start) as usize;
+        out.copy_from_slice(&plain[skip..skip + out.len()]);
+        Ok(())
+    }, |at| ambiguous(previous_block(at)))
 }
 
 fn derive_key(sha: Sha1) -> [u8; 32] {
