@@ -220,6 +220,29 @@ fn failure_signatures_share_lazy_explicit_digest_without_changing_candidates() {
 }
 
 #[test]
+fn large_dictionary_reuses_recent_membership_across_inputs() {
+    let recent = RecentPasswords::default();
+    let values: Vec<Arc<str>> = (0..1024).map(|index| format!("item-{index}").into()).collect();
+    recent.remember_recent(values[900].clone());
+    recent.remember_recent(Arc::from("from-another-request"));
+    let candidates = CandidateSet::new(values.clone().into(), None, &recent, None);
+    PRIORITY_CANDIDATES.set(0);
+    for index in 0..32 {
+        let path = format!("archive-{index}.zip");
+        let order: Vec<_> = candidates.for_path(&path).take(3).map(AsRef::as_ref).collect();
+        assert_eq!(order, ["item-900", "item-0", "item-1"]);
+    }
+    assert_eq!(PRIORITY_CANDIDATES.get(), values.len());
+
+    // The next snapshot changes priority, including across nested scopes.
+    recent.remember_recent(values[800].clone());
+    let nested = candidates.with_scope(Some(Path::new(r"C:\parent")));
+    let order: Vec<_> = nested.for_path(r"C:\output\inner.zip").take(3).map(AsRef::as_ref).collect();
+    assert_eq!(order, ["item-800", "item-900", "item-0"]);
+    assert_eq!(PRIORITY_CANDIDATES.get(), values.len() * 2);
+}
+
+#[test]
 fn preflight_read_failure_retains_machine_readable_evidence() {
     // Two passwords force the Rust probe, unlike single-candidate worker
     // confirmation. This exercises the terminal planning projection.

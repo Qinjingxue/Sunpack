@@ -969,17 +969,17 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
                                 bool password_verified) {
     using namespace sunpack::sevenzip;
     if (result.status == PasswordTestStatus::Ok ||
-        ((result.wrong_password || result.password_rejected) && !password_verified &&
-         result.password_crc_proven_items == 0 && !uncertain_volume_password(result, replay)) ||
-        (result.encrypted && result.password_crc_proven_items == 0 && !password_verified && !uncertain_volume_password(result, replay)) ||
         result.unsupported_method || result.status == PasswordTestStatus::BackendUnavailable ||
         result.status == PasswordTestStatus::Error ||
         (FAILED(result.input_trace.read_hresult) && result.missing_volume_evidence != "open_volume_file_missing")) return false;
+    const bool can_attribute_to_volume = password_verified || result.password_crc_proven_items != 0 ||
+        uncertain_volume_password(result, replay);
+    if (!can_attribute_to_volume && (result.encrypted || result.wrong_password || result.password_rejected)) return false;
     if (result.missing_volume) return true;
     if (result.failure_stage != "archive_open" && result.failure_stage != "item_extract") return false;
     if (result.failure_kind != "structure_recognition" && result.failure_kind != "checksum_error" &&
         result.failure_kind != "data_error" && result.failure_kind != "corrupted_data" && result.failure_kind != "headers_error" &&
-        !((password_verified || result.password_crc_proven_items != 0 || uncertain_volume_password(result, replay)) && result.failure_kind == "encrypted_or_wrong_password") &&
+        !(can_attribute_to_volume && result.failure_kind == "encrypted_or_wrong_password") &&
         result.failure_kind != "unexpected_end" && result.failure_kind != "missing_volume_or_tail") return false;
     // Binary readers record whether a variable source/range participated.
     // Seeks, fixed tails and failures confined to the fixed head are not proof.
@@ -1139,30 +1139,6 @@ RequestOutcome run_request(
                 volume_replay->candidates_started = volume_replay->candidate_output_owned = volume_replay->candidate_discard_pending = false;
                 cursor.discard_pending = false;
             }
-            select_volume_attempt(request.archive_input, cursor.layout, cursor.selected, selected_input);
-            volume_replay->uncertain_ranges.clear();
-            volume_replay->uncertain_paths.clear();
-            unsigned long long offset = 0;
-            bool variable_offset = false;
-            for (std::size_t i = 0; i < selected_input.ranges.size(); ++i) {
-                const auto& range = selected_input.ranges[i];
-                const auto length = range.has_end ? (std::min)(range.end - range.start, UINT64_MAX - offset) : UINT64_MAX - offset;
-                const auto& variation = request.archive_input.volume_attempts.variation[i];
-                const bool variable = variation.variable;
-                const bool variable_length = variation.variable_length || variation.length != length;
-                if (variable || variable_offset)
-                    volume_replay->uncertain_ranges.emplace_back(offset, offset + length);
-                if (variable)
-                    volume_replay->uncertain_paths.insert(range.path);
-                variable_offset |= variable_length;
-                offset += length;
-            }
-        }
-        const auto* domain = volume_trials ? request.passwords_for_layout(volume_replay->volumes.layout) : nullptr;
-        if (password_candidates.size() > 1 && volume_replay && !volume_replay->candidates_started) {
-            const auto root = std::filesystem::path(win32_extended_path(output_dir));
-            volume_replay->candidate_output_owned = directory_is_empty_or_missing(root);
-            volume_replay->candidates_started = true;
         }
         if (!volume_trials && password_candidates.size() > 1 &&
             (!volume_replay || !volume_replay->password_probe_done)) {
@@ -1181,6 +1157,9 @@ RequestOutcome run_request(
         if (cancel_token && cancel_token->load(std::memory_order_acquire)) return interrupted_result(job_id);
         if (selected_probe && selected_probe->status == PasswordTestStatus::WrongPassword) {
             if (volume_trials) {
+#ifdef SUP7Z_DEBUG
+                ++volume_replay->rejected_compositions;
+#endif
                 volume_replay->volume_password_ambiguous |= !request.password_verified;
                 auto& cursor = volume_replay->volumes;
                 const auto& plan = request.archive_input.volume_attempts;
@@ -1201,6 +1180,39 @@ RequestOutcome run_request(
             }
             result = password_candidate_failure(*selected_probe);
             break;
+        }
+        if (volume_trials) {
+            const auto& cursor = volume_replay->volumes;
+            const auto& plan = request.archive_input.volume_attempts;
+#ifdef SUP7Z_DEBUG
+            ++volume_replay->prepared_compositions;
+#endif
+            select_volume_attempt(request.archive_input, cursor.layout, cursor.selected, selected_input);
+            auto& uncertainty = volume_replay->uncertain_ranges;
+            uncertainty.clear();
+            volume_replay->uncertain_paths.clear();
+            unsigned long long offset = 0;
+            bool variable_offset = false;
+            for (std::size_t i = 0; i < selected_input.ranges.size(); ++i) {
+                const auto& range = selected_input.ranges[i];
+                const auto length = range.has_end ? (std::min)(range.end - range.start, UINT64_MAX - offset) : UINT64_MAX - offset;
+                const auto& variation = plan.variation[i];
+                if (variation.variable || variable_offset) {
+                    if (!uncertainty.empty() && uncertainty.back().second == offset)
+                        uncertainty.back().second += length;
+                    else uncertainty.emplace_back(offset, offset + length);
+                }
+                if (variation.variable)
+                    volume_replay->uncertain_paths.insert(plan.sources[cursor.selected[i]].path);
+                variable_offset |= variation.variable_length || variation.length != length;
+                offset += length;
+            }
+        }
+        const auto* domain = volume_trials ? request.passwords_for_layout(volume_replay->volumes.layout) : nullptr;
+        if (password_candidates.size() > 1 && volume_replay && !volume_replay->candidates_started) {
+            const auto root = std::filesystem::path(win32_extended_path(output_dir));
+            volume_replay->candidate_output_owned = directory_is_empty_or_missing(root);
+            volume_replay->candidates_started = true;
         }
         if (volume_replay && volume_replay->confirmed_candidate_index < 0 && selected_probe &&
             selected_probe->status == PasswordTestStatus::Ok && selected_probe->encrypted && !selected_probe->weak_match) {

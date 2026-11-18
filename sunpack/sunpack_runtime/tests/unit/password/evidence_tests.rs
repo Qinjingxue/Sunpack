@@ -1,6 +1,42 @@
 use super::*;
 use crate::io::archive_state::{InputExtent, VolumeSlot};
 
+#[test]
+fn sparse_candidates_and_unchecked_suffix_are_combined_in_order() {
+    let proof = PasswordVerification {
+        matched_index: Some(1),
+        matched_indices: vec![1, 3],
+        attempts: 252,
+        ..PasswordVerification::status("match", "test")
+    };
+    let strong = PasswordVerification {
+        matched_index: Some(4),
+        attempts: 5,
+        final_confirmation_required: Some(false),
+        ..PasswordVerification::status("match", "test")
+    };
+    let weak = SurvivingCandidates::new(&proof, 256);
+    let confirmed = SurvivingCandidates::new(&strong, 256);
+    let mut combined = [false; 256];
+    weak.mark_union(&mut combined);
+    confirmed.mark_union(&mut combined);
+    assert_eq!(weak.iter().collect::<Vec<_>>(), [1, 3, 252, 253, 254, 255]);
+    assert_eq!(confirmed.iter().collect::<Vec<_>>(), [4]);
+    assert_eq!(combined.into_iter().enumerate().filter_map(|(i, yes)| yes.then_some(i)).collect::<Vec<_>>(),
+        [1, 3, 4, 252, 253, 254, 255]);
+}
+
+#[test]
+fn adding_branch_keys_preserves_initialized_anchor_slots() {
+    let mut keys = SharedCandidateKeys::<_, usize>::from_parameters([1, 1]);
+    keys.cells(&1, 2).unwrap()[1].set(41).unwrap();
+    keys.include_repeated([2, 3, 2]);
+    assert!(keys.cells(&3, 2).is_none());
+    keys.keep_candidates(&1, &[1]);
+    assert_eq!(keys.cells(&1, 1).unwrap()[0].get(), Some(&41));
+    assert_eq!(keys.cells(&2, 1).unwrap().len(), 1);
+}
+
 // A cross-volume failure must preserve either fragment with another partner.
 // Check actual serialized candidates and order, not the discarded evidence.
 #[test]
@@ -195,7 +231,8 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
                 edges: vec![[0, 1, 0], [1, 2, 3]],
                 ends: vec![2],
             });
-            domains.append_scoped(vec![(scope, 1)], count, &result.matched_indices);
+            let ordinals = [0, usize::MAX, usize::MAX, 1];
+            domains.append_scoped(vec![(scope.clone(), 1), (scope, 3)], count, &ordinals);
         }
         count += candidates.len();
     }

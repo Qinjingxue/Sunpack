@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include "volume_attempts.hpp"
@@ -88,7 +89,12 @@ struct ExtractionReplay : VolumeReadUncertainty {
     VolumeAttemptCursor volumes;
     bool volume_password_uncertain = false;
     bool volume_password_ambiguous = false;
-    std::unordered_set<std::wstring> uncertain_paths;
+    // Named volume reads resolve against the immutable request's source paths.
+    std::unordered_set<std::wstring_view> uncertain_paths;
+#ifdef SUP7Z_DEBUG
+    std::size_t rejected_compositions = 0;
+    std::size_t prepared_compositions = 0;
+#endif
     void observe_volume_read(std::uint64_t offset, std::uint32_t size, const std::wstring* physical = nullptr) {
         if (!volumes.started) return;
         if (!physical) observe_logical_read(offset, size);

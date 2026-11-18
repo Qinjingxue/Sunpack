@@ -1256,30 +1256,58 @@ impl Rar5HeaderTail {
 }
 
 type SharedRarKey<T> = Arc<std::sync::OnceLock<Option<T>>>;
+type Rar5KeyParameters = (u8, [u8; 16]);
+type Rar5PasswordSlots = std::sync::Mutex<std::collections::HashMap<Arc<str>, SharedRarKey<Rar5KeyCheckpoint>>>;
 #[derive(Default)]
 pub(crate) struct RarKeyCache {
     direct: bool,
     rar4: std::sync::Mutex<std::collections::HashMap<(Option<[u8; 8]>, Arc<str>), SharedRarKey<([u8; 16], [u8; 16])>>>,
-    rar5: std::sync::Mutex<std::collections::HashMap<(u8, [u8; 16], Arc<str>), SharedRarKey<Rar5KeyCheckpoint>>>,
+    rar5: std::collections::HashMap<Rar5KeyParameters, Rar5PasswordSlots>,
+    #[cfg(test)]
+    rar5_derivations: std::sync::atomic::AtomicUsize,
 }
 impl RarKeyCache {
+    pub(super) fn for_contexts<'a>(contexts: impl Iterator<Item = &'a RarPasswordContext>) -> Self {
+        let mut keys = Self::default();
+        super::evidence::for_repeated_parameters(contexts.filter_map(|context| match &context.material {
+            RarPasswordMaterial::Rar5(identity) | RarPasswordMaterial::Rar5Header { identity, .. }
+            | RarPasswordMaterial::Rar5Block { identity, .. } | RarPasswordMaterial::Rar5EmptyMac { identity, .. } =>
+                Some((identity.lg2_count, identity.salt)),
+            _ => None,
+        }), |parameters| { keys.rar5.entry(parameters).or_default(); });
+        keys
+    }
+
     fn rar4(&self, password: &Arc<str>, salt: Option<&[u8; 8]>) -> Option<([u8; 16], [u8; 16])> {
         if self.direct { return derive_rar3_key_iv(password, salt); }
         let slot = self.rar4.lock().unwrap().entry((salt.copied(), Arc::clone(password))).or_default().clone();
         *slot.get_or_init(|| derive_rar3_key_iv(password, salt))
     }
     fn rar5(&self, password: &Arc<str>, identity: &Rar5EncryptionIdentity) -> Option<[u8; 32]> {
-        if self.direct { return derive_rar5_key(password, identity)?.verify(password, identity.password_check); }
-        let slot = self.rar5_slot(password, identity);
-        slot.get_or_init(|| derive_rar5_key(password, identity)).as_ref()?.verify(password, identity.password_check)
+        self.with_rar5_key(password, identity, |checkpoint| checkpoint.verify(password, identity.password_check))
     }
     fn rar5_hash_key(&self, password: &Arc<str>, identity: &Rar5EncryptionIdentity) -> Option<[u8; 32]> {
-        if self.direct { return Some(derive_rar5_key(password, identity)?.hash_key(password)); }
-        let slot = self.rar5_slot(password, identity);
-        Some(slot.get_or_init(|| derive_rar5_key(password, identity)).as_ref()?.hash_key(password))
+        self.with_rar5_key(password, identity, |checkpoint| Some(checkpoint.hash_key(password)))
     }
-    fn rar5_slot(&self, password: &Arc<str>, identity: &Rar5EncryptionIdentity) -> SharedRarKey<Rar5KeyCheckpoint> {
-        self.rar5.lock().unwrap().entry((identity.lg2_count, identity.salt, Arc::clone(password))).or_default().clone()
+    fn with_rar5_key<T>(
+        &self,
+        password: &Arc<str>,
+        identity: &Rar5EncryptionIdentity,
+        use_key: impl FnOnce(&Rar5KeyCheckpoint) -> Option<T>,
+    ) -> Option<T> {
+        let derive = || {
+            #[cfg(test)]
+            self.rar5_derivations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            derive_rar5_key(password, identity)
+        };
+        if let Some(slots) = self.rar5.get(&(identity.lg2_count, identity.salt)) {
+            // Each identity has its own lock, and only competing probes for
+            // that salt ever populate or retain candidate checkpoints.
+            let slot = slots.lock().unwrap().entry(Arc::clone(password)).or_default().clone();
+            use_key(slot.get_or_init(derive).as_ref()?)
+        } else {
+            use_key(&derive()?)
+        }
     }
 }
 

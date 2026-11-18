@@ -2,6 +2,22 @@ use super::*;
 use crate::test_support::temp_file;
 
 #[test]
+fn available_prefix_visits_each_range_once_before_a_gap() {
+    let file = temp_file("password_available_prefix", b"volume");
+    let path = file.to_string_lossy().into_owned();
+    let ranges: Vec<_> = (0..256).map(|i| InputExtent {
+        path: path.clone(), start: if i == 128 { 10 } else { 0 }, end: Some(6),
+    }).collect();
+    RANGE_PROJECTIONS.set(Some(0));
+    let prefix = available_range_prefix(ranges.iter(), &[]);
+    assert_eq!(RANGE_PROJECTIONS.replace(None), Some(129));
+    assert_eq!(prefix.len(), 128);
+    assert_eq!(VirtualRangeReader::streaming(&prefix).len(), 128 * 6);
+    drop(prefix);
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
 fn virtual_ranges_read_and_seek_across_files() {
     let first = temp_file("password_range_first", b"012345");
     let second = temp_file("password_range_second", b"abcdef");

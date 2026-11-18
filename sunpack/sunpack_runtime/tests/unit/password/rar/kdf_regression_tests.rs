@@ -70,10 +70,14 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
             let mut proof = [0; 8];
             for (index, byte) in check.iter().enumerate() { proof[index % 8] ^= byte; }
             let password: Arc<str> = Arc::from(password);
-            let cache = RarKeyCache::default();
+            let first = RarPasswordContext { material: RarPasswordMaterial::Rar5(header) };
+            let other = RarPasswordContext {
+                material: RarPasswordMaterial::Rar5(Rar5EncryptionIdentity { iv: [0xa5; 16], ..header }),
+            };
+            let cache = RarKeyCache::for_contexts([&first, &other].into_iter());
             assert_eq!(cache.rar5(&password, &header), Some(key));
             assert_eq!(cache.rar5_hash_key(&password, &header), Some(hash));
-            assert!(cache.rar5.lock().unwrap().values().all(|slot|
+            assert!(cache.rar5[&(lg2_count, header.salt)].lock().unwrap().values().all(|slot|
                 slot.get().unwrap().as_ref().unwrap().check.get().is_none()));
             header.password_check = Some(proof);
             assert_eq!(cache.rar5(&password, &header), Some(key));
@@ -83,7 +87,27 @@ fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
             header.password_check = None;
             header.iv = [0xa5; 16];
             assert_eq!(cache.rar5(&password, &header), Some(key));
-            assert_eq!(cache.rar5.lock().unwrap().len(), 1, "check and IV are not KDF inputs");
+            assert_eq!(cache.rar5_derivations.load(std::sync::atomic::Ordering::Relaxed), 1,
+                "check and IV are not KDF inputs");
         }
     }
+}
+
+#[test]
+fn distinct_rar5_salts_do_not_retain_candidate_checkpoints() {
+    let contexts: Vec<_> = (0..64).map(|salt| RarPasswordContext {
+        material: RarPasswordMaterial::Rar5(Rar5EncryptionIdentity {
+            iv: [0; 16], lg2_count: 0, salt: [salt; 16], password_check: None,
+        }),
+    }).collect();
+    let cache = RarKeyCache::for_contexts(contexts.iter());
+    let candidates: Vec<Arc<str>> = (0..32).map(|index| Arc::from(index.to_string())).collect();
+    for context in &contexts {
+        let RarPasswordMaterial::Rar5(identity) = &context.material else { unreachable!() };
+        for password in &candidates {
+            assert!(cache.rar5(password, identity).is_some());
+        }
+    }
+    assert_eq!(cache.rar5_derivations.load(std::sync::atomic::Ordering::Relaxed), 64 * 32);
+    assert!(cache.rar5.is_empty(), "each unique salt needs no reusable candidate slots");
 }

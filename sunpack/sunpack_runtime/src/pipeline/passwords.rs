@@ -3,7 +3,7 @@ use crate::core::passwords::PasswordSnapshot;
 use crate::io::archive_state::{ArchiveInput, OpenMode};
 use crate::io::cancellation::Cancellation;
 use crate::io::reader::NativeArchiveSession;
-use crate::password::{self, attempts::Key};
+use crate::password::{self, attempts::Key, evidence::SurvivingCandidates};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::Path;
@@ -12,12 +12,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 const BATCH_SIZE: usize = password::VERIFICATION_BATCH_SIZE;
 const MAX_RECENT_PASSWORDS: usize = 64;
 
+type RecentOrder = Arc<VecDeque<Arc<str>>>;
+
 #[derive(Clone, Default)]
-pub(super) struct RecentPasswords(Arc<Mutex<VecDeque<Arc<str>>>>);
+pub(super) struct RecentPasswords(Arc<Mutex<RecentOrder>>);
 
 impl RecentPasswords {
     pub(super) fn recent(&self) -> Vec<Arc<str>> {
-        self.0.lock().unwrap().iter().cloned().collect()
+        self.snapshot().iter().cloned().collect()
+    }
+
+    fn snapshot(&self) -> RecentOrder {
+        Arc::clone(&self.0.lock().unwrap())
     }
 
     pub(super) fn clear(&self) {
@@ -29,7 +35,11 @@ impl RecentPasswords {
         if password.is_empty() {
             return;
         }
-        let mut recent = self.0.lock().unwrap();
+        let mut current = self.0.lock().unwrap();
+        if current.front() == Some(&password) {
+            return;
+        }
+        let recent = Arc::make_mut(&mut current);
         if let Some(index) = recent.iter().position(|old| *old == password) {
             recent.remove(index);
         }
@@ -49,6 +59,39 @@ struct CandidateSources {
     snapshot: Arc<PasswordSnapshot>,
     explicit_signature: OnceLock<String>,
     recent: RecentPasswords,
+    recent_priority: Mutex<Option<RecentPriority>>,
+}
+
+struct RecentPriority {
+    recent: RecentOrder,
+    indices: Arc<[usize]>,
+}
+
+impl CandidateSources {
+    fn base_password(&self, index: usize) -> &Arc<str> {
+        if index < self.explicit.len() {
+            &self.explicit[index]
+        } else {
+            &self.snapshot.global()[index - self.explicit.len()]
+        }
+    }
+
+    fn recent_indices(&self, recent: RecentOrder) -> Arc<[usize]> {
+        if let Some(cached) = self.recent_priority.lock().unwrap().as_ref()
+            .filter(|cached| Arc::ptr_eq(&cached.recent, &recent))
+        {
+            return Arc::clone(&cached.indices);
+        }
+        // One request can have many inputs sharing these immutable sources.
+        // Store only the recent matches, including an empty answer, and keep
+        // a dictionary-sized search outside the lock shared by these inputs.
+        let configured = self.explicit.iter().chain(self.snapshot.global()).enumerate();
+        let indices: Arc<[_]> = prioritize(&recent, configured).into();
+        let cached = RecentPriority { recent, indices: Arc::clone(&indices) };
+        let displaced = self.recent_priority.lock().unwrap().replace(cached);
+        drop(displaced);
+        indices
+    }
 }
 
 impl CandidateSet {
@@ -64,6 +107,7 @@ impl CandidateSet {
                 snapshot: snapshot.unwrap_or_default(),
                 explicit_signature: OnceLock::new(),
                 recent: recent.clone(),
+                recent_priority: Mutex::default(),
             }),
             inherited_scope: inherited_scope.map(Arc::from),
         }
@@ -120,34 +164,27 @@ impl CandidateSet {
     }
 
     fn for_path<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
-        let recent = self.sources.recent.recent();
-        let mut seen: HashSet<&str> = HashSet::new();
+        let recent = self.sources.recent.snapshot();
+        let has_scopes = self.sources.snapshot.has_scopes();
+        let unique_bucket = !has_scopes && self.sources.explicit.is_empty();
         let priority = if recent.is_empty() {
             Vec::new()
+        } else if !has_scopes
+            && self.sources.explicit.len() + self.sources.snapshot.global().len() >= BATCH_SIZE
+        {
+            self.sources.recent_indices(recent).iter()
+                .map(|&index| self.sources.base_password(index)).collect()
         } else {
-            let mut positions: HashMap<_, _> = recent
-                .iter()
-                .enumerate()
-                .map(|(index, password)| (password.as_ref(), index))
-                .collect();
-            let mut priority = vec![None; recent.len()];
-            for password in self.configured(path) {
-                if let Some(index) = positions.remove(password.as_ref()) {
-                    priority[index] = Some(password);
-                    seen.insert(password.as_ref());
-                    if positions.is_empty() {
-                        break;
-                    }
-                }
-            }
-            priority
+            prioritize(&recent, self.configured(path).map(|value| (value, value)))
         };
+        let mut seen: HashSet<&str> = priority.iter().map(|&value| value.as_ref()).collect();
         priority
             .into_iter()
-            .flatten()
             .chain(self.configured(path).filter(move |value| {
                 let value: &'b Arc<str> = *value;
-                seen.insert(value.as_ref())
+                // The builtin bucket is already deduplicated. Only skip the
+                // entries emitted first, without indexing the whole dictionary.
+                if unique_bucket { !seen.contains(value.as_ref()) } else { seen.insert(value.as_ref()) }
             }))
     }
 
@@ -410,6 +447,8 @@ impl CandidateSet {
                 }
             }
             let offset = pending.len();
+            let mut tested = 0;
+            let mut cache_rejections = false;
             match result.status {
                 "not_required" => {
                     if let Some((key, cache)) = attempts
@@ -439,21 +478,8 @@ impl CandidateSet {
                         }
                         return Ok(Ok(PasswordPlan::verified(password)));
                     }
-                    let tested = result.attempts.min(batch.len());
-                    let mut rejected = Vec::new();
-                    for (index, value) in batch.iter().enumerate() {
-                        if result.matched_index == Some(index)
-                            || result.matched_indices.binary_search(&index).is_ok()
-                            || index >= tested
-                        {
-                            pending.push(value.clone());
-                        } else if attempts.is_some() {
-                            rejected.push(value.clone());
-                        }
-                    }
-                    if let Some((key, cache)) = attempts.as_ref().filter(|_| !rejected.is_empty()) {
-                        cache.reject(key.clone(), &rejected);
-                    }
+                    tested = result.attempts.min(batch.len());
+                    cache_rejections = true;
                     evidence = match (evidence, result.match_evidence) {
                         (None, next) => next,
                         (old, next) if old == next => old,
@@ -465,13 +491,8 @@ impl CandidateSet {
                     let uncertain =
                         result.match_evidence == Some("password_or_volume_inconclusive");
                     uncertain_volumes |= uncertain;
-                    if let Some((key, cache)) = attempts
-                        .as_ref()
-                        .filter(|_| result.attempts != 0 && !uncertain)
-                    {
-                        cache.reject(key.clone(), &batch[..result.attempts.min(batch.len())]);
-                    }
-                    pending.extend(batch.iter().skip(result.attempts).cloned());
+                    tested = result.attempts.min(batch.len());
+                    cache_rejections = !uncertain;
                 }
                 "damaged" | "needs_volume_or_tail_damaged" | "missing_volume"
                     if input.volume_attempts.is_none() =>
@@ -500,21 +521,39 @@ impl CandidateSet {
                     }));
                     return Ok(Err(failure));
                 }
-                _ => pending.extend(batch.iter().cloned()),
+                _ => {},
+            }
+            let cache = attempts.as_ref().filter(|_| cache_rejections);
+            let scoped = std::mem::take(&mut result.scoped_rejections);
+            if scoped.is_empty() && (tested == 0 || result.status == "no_match") {
+                if tested != 0 {
+                    if let Some((key, cache)) = cache {
+                        cache.reject(key.clone(), &batch[..tested]);
+                    }
+                    batch.drain(..tested);
+                }
+                pending.append(&mut batch);
+            } else {
+                let mut rejected = Vec::new();
+                let mut ordinals = (!scoped.is_empty()).then(|| [usize::MAX; BATCH_SIZE]);
+                let viable = SurvivingCandidates::new(&result, batch.len());
+                let mut survivors = viable.iter().peekable();
+                for (index, value) in batch.drain(..).enumerate() {
+                    if survivors.next_if_eq(&index).is_some() {
+                        if let Some(ordinals) = &mut ordinals { ordinals[index] = pending.len() - offset; }
+                        pending.push(value);
+                    } else if cache.is_some() {
+                        rejected.push(value);
+                    }
+                }
+                if let Some((key, cache)) = cache.filter(|_| !rejected.is_empty()) {
+                    cache.reject(key.clone(), &rejected);
+                }
+                if let Some(ordinals) = &ordinals {
+                    domains.append_scoped(scoped, offset, ordinals);
+                }
             }
             domains.append(result.password_domains, offset, pending.len() - offset);
-            if !result.scoped_rejections.is_empty() {
-                let tested = result.attempts.min(batch.len());
-                let surviving: Vec<_> = (0..batch.len())
-                    .filter(|&i| i >= tested || match result.status {
-                        "match" => result.matched_index == Some(i) || result.matched_indices.binary_search(&i).is_ok(),
-                        "no_match" => false,
-                        _ => true,
-                    })
-                    .collect();
-                domains.append_scoped(result.scoped_rejections, offset, &surviving);
-            }
-            batch.clear();
         }
         if pending.is_empty() {
             if uncertain_volumes {
@@ -568,6 +607,24 @@ impl CandidateSet {
         };
         Ok(Ok(plan))
     }
+}
+
+fn prioritize<'a, T: Copy>(
+    recent: &VecDeque<Arc<str>>,
+    configured: impl Iterator<Item = (T, &'a Arc<str>)>,
+) -> Vec<T> {
+    let mut positions: HashMap<_, _> = recent.iter().enumerate()
+        .map(|(index, password)| (password.as_ref(), index)).collect();
+    let mut priority = vec![None; recent.len()];
+    for (id, password) in configured {
+        #[cfg(test)]
+        PRIORITY_CANDIDATES.with(|count| count.set(count.get() + 1));
+        if let Some(index) = positions.remove(password.as_ref()) {
+            priority[index] = Some(id);
+            if positions.is_empty() { break; }
+        }
+    }
+    priority.into_iter().flatten().collect()
 }
 
 fn open_sessions(input: &ArchiveInput) -> io::Result<Vec<NativeArchiveSession>> {
@@ -670,6 +727,7 @@ impl Failure {
 #[cfg(test)]
 thread_local! {
     static PLANNED_BATCHES: std::cell::RefCell<Option<Vec<Vec<Arc<str>>>>> = const { std::cell::RefCell::new(None) };
+    static PRIORITY_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

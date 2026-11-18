@@ -104,6 +104,10 @@ impl PasswordSnapshot {
         &self.global.values
     }
 
+    pub(crate) fn has_scopes(&self) -> bool {
+        !self.scoped.is_empty()
+    }
+
     pub fn scoped(&self, path: &Path) -> impl Iterator<Item = &[Arc<str>]> + '_ {
         self.scoped_buckets(path)
             .map(|bucket| bucket.values.as_ref())

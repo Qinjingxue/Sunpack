@@ -7,7 +7,7 @@ use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
 use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
 use crate::password::input::{
-    parse_ranges, parse_volumes, ranges_key, RangeSpec, VirtualRangeReader, VolumeSet,
+    available_range_prefix, parse_ranges, parse_volumes, ranges_key, RangeSpec, VirtualRangeReader, VolumeSet,
 };
 use rayon::prelude::*;
 #[cfg(test)]
@@ -90,7 +90,7 @@ pub(crate) fn zip_fast_verify_passwords_from_attempts(
             prepare_zip_attempts(head, plan, spanned, eocd_offset, sessions, None), candidates);
     };
     let material = anchor.context.kdf_parameters().unwrap();
-    let mut keys = ZipKeyCache::from_parameters([material, material]);
+    let keys = ZipKeyCache::from_parameters([material, material]);
     let mut early = anchor.context.verify_cached(candidates, Some(&keys))?;
     if early.status == "no_match" {
         preparation.zip_anchor = Some(anchor);
@@ -109,6 +109,10 @@ pub(crate) fn zip_fast_verify_passwords_from_attempts(
     preparation.verify_local_with(Ok(prepared), |prepared, fixed, other_batches, _| {
         match prepared {
             Ok(PasswordContext::Evidence(context)) => {
+                let mut keys = keys;
+                // Retain the anchor work and share any other repeated member
+                // identities discovered in the volume alternatives.
+                keys.include_repeated(context.zip_key_parameters());
                 if early.matched_indices.len() == candidates.len() {
                     return context.verify_batch_with_zip_keys(candidates, fixed, !other_batches, Some(&keys));
                 }
@@ -143,18 +147,11 @@ fn prepare_zip_attempt_anchor(
     if prefix.is_empty() && plan.head_size_from_total.is_none() && plan.tail_totals.is_empty() {
         prefix.push(head.clone());
     }
-    while !prefix.is_empty() {
-        if let Ok(ranges) = parse_ranges(prefix.iter(), sessions) {
-            let mut reader = VirtualRangeReader::streaming(&ranges);
-            let len = reader.len();
-            if let Ok(Some(context)) = prepare_zip_anchor(&mut reader, len) {
-                return Some(context);
-            }
-            break;
-        }
-        prefix.pop();
-    }
-        None
+    if prefix.is_empty() { return None; }
+    let ranges = available_range_prefix(prefix.iter(), sessions);
+    let mut reader = VirtualRangeReader::streaming(&ranges);
+    let len = reader.len();
+    prepare_zip_anchor(&mut reader, len).ok().flatten()
 }
 
 fn prepare_zip_attempts(

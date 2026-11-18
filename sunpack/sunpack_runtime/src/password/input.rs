@@ -66,13 +66,41 @@ pub(crate) fn parse_range_prefix<'a>(
     sessions: &'a [NativeArchiveSession],
     limit: Option<u64>,
 ) -> std::io::Result<Vec<RangeSpec>> {
+    let mut parsed = if limit.is_some() { Vec::new() } else { Vec::with_capacity(ranges.size_hint().0) };
+    extend_range_prefix(ranges, sessions, limit, &mut parsed)?;
+    Ok(parsed)
+}
+
+/// Structural evidence at the head can use the part before the first
+/// unavailable range without repeatedly parsing shorter descriptions.
+pub(super) fn available_range_prefix<'a>(
+    ranges: impl Iterator<Item = &'a InputExtent>,
+    sessions: &'a [NativeArchiveSession],
+) -> Vec<RangeSpec> {
+    let mut parsed = Vec::new();
+    let _ = extend_range_prefix(ranges, sessions, None, &mut parsed);
+    parsed
+}
+
+#[cfg(test)]
+thread_local! {
+    static RANGE_PROJECTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn extend_range_prefix<'a>(
+    ranges: impl Iterator<Item = &'a InputExtent>,
+    sessions: &'a [NativeArchiveSession],
+    limit: Option<u64>,
+    parsed: &mut Vec<RangeSpec>,
+) -> std::io::Result<()> {
     let mut readers = InputReaders::new(sessions);
-    let (minimum, maximum) = ranges.size_hint();
-    let mut parsed = if limit.is_some() { Vec::new() } else { Vec::with_capacity(minimum) };
+    let reuse = ranges.size_hint().1.is_none_or(|count| count > 1);
     let mut cursor = 0u64;
     for range in ranges {
+        #[cfg(test)]
+        RANGE_PROJECTIONS.with(|value| value.set(value.get().map(|n| n + 1)));
         let (path, start, end) = (&range.path, range.start, range.end);
-        let reader = readers.open(path, maximum.is_none_or(|count| count > 1))?;
+        let reader = readers.open(path, reuse)?;
         let file_len = reader.len();
         if start > file_len {
             return Err(std::io::Error::other("range start is beyond file length"));
@@ -89,23 +117,24 @@ pub(crate) fn parse_range_prefix<'a>(
             }
             len = len.min(remaining);
         }
+        let next = cursor.checked_add(len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "logical input size overflow",
+            )
+        })?;
         parsed.push(RangeSpec {
             reader,
             start,
             len,
             virtual_start: cursor,
         });
-        cursor = cursor.checked_add(len).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "logical input size overflow",
-            )
-        })?;
+        cursor = next;
         if Some(cursor) == limit {
             break;
         }
     }
-    Ok(parsed)
+    Ok(())
 }
 
 pub(crate) fn ranges_key(format: &'static str, ranges: &[RangeSpec]) -> std::io::Result<InputKey> {

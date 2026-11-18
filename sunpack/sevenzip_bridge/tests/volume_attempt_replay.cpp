@@ -171,6 +171,9 @@ void request_recovery(const std::filesystem::path& archive, const std::filesyste
     } else {
         require(outcome.code == 0 && replay.volumes.selected == std::vector<std::size_t>{0, 1}, "replay lost the valid composition");
         require(replay.volumes.attempts == (after_failure ? 2 : 1), "replay repeated a rejected composition");
+        require(replay.uncertain_ranges.size() == 1 && replay.uncertain_ranges.front().first == 0 &&
+            replay.uncertain_ranges.front().second == std::filesystem::file_size(archive),
+            "adjacent uncertain ranges were not coalesced over the selected input");
         std::ifstream member(destination / L"ok.txt", std::ios::binary);
         std::string contents((std::istreambuf_iterator<char>(member)), {});
         require(contents == "cursor replay", "replayed composition wrote incorrect output");
@@ -179,6 +182,33 @@ void request_recovery(const std::filesystem::path& archive, const std::filesyste
     wire::write(output, outcome.response);
     check_final_results(output, 1, user_cancel ? "cancelled" : "ok");
     manager.end(job);
+}
+
+void rejected_composition_is_not_prepared(const std::filesystem::path& archive,
+                                          const std::filesystem::path& destination) {
+    // ZipCrypto stored member. The two candidate keys both fail its check byte.
+    static constexpr char encrypted_zip[] =
+        "\x50\x4b\x03\x04\x14\x00\x01\x00\x00\x00\x00\x00\x21\x00\x0a\x67\x73\x71\x19\x00\x00\x00\x0d\x00\x00\x00\x06\x00"
+        "\x00\x00\x6f\x6b\x2e\x74\x78\x74\xcc\xa7\x97\xbd\x1f\xcf\x6f\x92\xf9\xa6\xcf\xb2\xbf\xec\x58\x0f\x12\xe6\x0f\xef"
+        "\xa3\x45\xb3\xb4\xcb\x50\x4b\x01\x02\x3f\x00\x14\x00\x01\x00\x00\x00\x00\x00\x21\x00\x0a\x67\x73\x71\x19\x00\x00"
+        "\x00\x0d\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20\x00\x00\x00\x00\x00\x00\x00\x6f\x6b\x2e\x74\x78"
+        "\x74\x50\x4b\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00\x34\x00\x00\x00\x3d\x00\x00\x00\x00\x00";
+    { std::ofstream file(archive, std::ios::binary); file.write(encrypted_zip, sizeof(encrypted_zip) - 1); }
+    ExtractionReplay replay;
+    ExtractionReplayScope scope(&replay);
+    WorkerRequest request;
+    request.job_id = "rejected-composition";
+    request.output_dir = destination.wstring();
+    request.password_candidates = {L"incorrect", L"also wrong"};
+    request.archive_input.archive_path = archive.wstring();
+    request.archive_input.format_hint = L"zip";
+    auto& plan = request.archive_input.volume_attempts;
+    plan.sources = {{archive.wstring(), 0, 45, true}, {archive.wstring(), 45, sizeof(encrypted_zip) - 1, true}};
+    plan.domains = {{0}, {1}};
+    plan.layouts = {{{1, L"v1", 0}, {2, L"v2", 1}}};
+    const auto outcome = run_request(request);
+    require(outcome.code == 1 && replay.rejected_compositions == 1 && replay.prepared_compositions == 0 &&
+        !std::filesystem::exists(destination), "a composition rejected by the member probe reached extraction setup");
 }
 
 int main() {
@@ -194,6 +224,7 @@ int main() {
     const auto archive = root / L"input.zip";
     { std::ofstream file(archive, std::ios::binary); file.write(zip, sizeof(zip) - 1); }
     check_chunked_request(archive);
+    rejected_composition_is_not_prepared(root / L"encrypted.zip", root / L"rejected");
     unsigned index = 0;
     for (bool after_failure : {false, true}) for (bool cancel : {false, true})
         request_recovery(archive, root / std::to_wstring(++index), after_failure, cancel);

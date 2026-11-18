@@ -126,43 +126,37 @@ namespace sunpack::sevenzip
             return "unknown";
         }
 
-        std::string output_trace_damage_kind(const ExtractOutputTrace &trace)
+        std::string summarize_failed_output(ExtractArchiveResult &result, bool collect_damage)
         {
-            for (const auto &item : trace.items)
-            {
-                if ((!item.failed && item.operation_result == kOpOk) || item.operation_result == kOpUnsupportedMethod)
-                {
-                    continue;
-                }
-                const std::string kind = kind_for_operation_result(item.operation_result);
-                return kind == "unknown" ? "corrupted_data" : kind;
-            }
-            return "";
-        }
-
-        unsigned int password_crc_proven_items(const ExtractOutputTrace &trace)
-        {
-            unsigned int count = 0;
-            for (const auto &item : trace.items)
+            bool collect_proof = result.encrypted;
+            if (!collect_damage && !collect_proof) return {};
+            for (const auto &item : result.output_trace.items)
             {
                 // A later success cannot prove the password was right after an earlier failure:
                 // only CRC matches completed before the first failing item count as evidence.
                 if (item.failed || item.operation_result != kOpOk)
                 {
-                    break;
+                    if (!collect_damage) break;
+                    if (item.operation_result != kOpUnsupportedMethod)
+                    {
+                        const std::string kind = kind_for_operation_result(item.operation_result);
+                        return kind == "unknown" ? "corrupted_data" : kind;
+                    }
+                    collect_proof = false;
+                    continue;
                 }
                 if (
-                    item.encrypted &&
+                    collect_proof && item.encrypted &&
                     !item.is_dir &&
                     item.done &&
                     (!item.has_expected_size || item.bytes_written == item.expected_size) &&
                     (item.password_proof == OutputPasswordProof::Strong ||
                      (item.password_proof == OutputPasswordProof::MeasureSize && strong_member_crc(item.bytes_written))))
                 {
-                    ++count;
+                    ++result.password_crc_proven_items;
                 }
             }
-            return count;
+            return {};
         }
 
         HRESULT apply_zip_codepage(IInArchive *archive, const std::wstring &codepage)
@@ -594,11 +588,11 @@ namespace sunpack::sevenzip
 
             // CRC receipts only decide whether extraction failures can be
             // attributed to damage after a password was confirmed.
-            if (result.encrypted)
-                result.password_crc_proven_items = password_crc_proven_items(result.output_trace);
+            const bool output_failed = raw_extract_callback->output_error();
+            const auto trace_damage_kind = summarize_failed_output(result, !read_failed && !output_failed);
             if (read_failed) return result;
 
-            if (raw_extract_callback->output_error())
+            if (output_failed)
             {
 
                 result.status = PasswordTestStatus::Error;
@@ -610,7 +604,6 @@ namespace sunpack::sevenzip
                 return result;
             }
 
-            const std::string trace_damage_kind = output_trace_damage_kind(result.output_trace);
             if (!trace_damage_kind.empty() && (!last_encryption_evidence || result.password_crc_proven_items != 0))
             {
                 result.status = PasswordTestStatus::Damaged;

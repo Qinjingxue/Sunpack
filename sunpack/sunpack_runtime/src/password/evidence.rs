@@ -5,6 +5,7 @@ use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, Vo
 use crate::io::cancellation::Cancellation;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -54,10 +55,11 @@ impl CandidateDomains {
     }
 
     pub(crate) fn append_scoped(
-        &mut self, rejected: Vec<(Arc<VolumeProjection>, usize)>, offset: usize, surviving: &[usize],
+        &mut self, rejected: Vec<(Arc<VolumeProjection>, usize)>, offset: usize, ordinals: &[usize],
     ) {
         self.scoped.extend(rejected.into_iter().filter_map(|(path, index)| {
-            surviving.binary_search(&index).ok().map(|index| (path, offset + index))
+            let &ordinal = ordinals.get(index)?;
+            (ordinal != usize::MAX).then(|| (path, offset + ordinal))
         }));
     }
 
@@ -183,15 +185,13 @@ impl<K: Copy + Eq + std::hash::Hash, V> SharedCandidateKeys<K, V> {
     }
 
     pub(super) fn from_parameters(parameters: impl IntoIterator<Item = K>) -> Self {
-        let mut shared = HashMap::new();
-        let mut parameters = parameters.into_iter();
-        if let (Some(first), Some(second)) = (parameters.next(), parameters.next()) {
-            let mut seen = std::collections::HashSet::from([first]);
-            for key in std::iter::once(second).chain(parameters) {
-                if !seen.insert(key) { shared.entry(key).or_default(); }
-            }
-        }
-        Self(shared)
+        let mut shared = Self(HashMap::new());
+        shared.include_repeated(parameters);
+        shared
+    }
+
+    pub(super) fn include_repeated(&mut self, parameters: impl IntoIterator<Item = K>) {
+        for_repeated_parameters(parameters, |key| { self.0.entry(key).or_default(); });
     }
 
     pub(super) fn cells(&self, key: &K, count: usize) -> Option<&[std::sync::OnceLock<V>]> {
@@ -212,7 +212,81 @@ impl<K: Copy + Eq + std::hash::Hash, V> SharedCandidateKeys<K, V> {
     }
 }
 
+pub(super) fn for_repeated_parameters<K: Copy + Eq + std::hash::Hash>(
+    parameters: impl IntoIterator<Item = K>,
+    mut repeat: impl FnMut(K),
+) {
+    let mut parameters = parameters.into_iter();
+    if let (Some(first), Some(second)) = (parameters.next(), parameters.next()) {
+        let mut seen = std::collections::HashSet::from([first]);
+        for key in std::iter::once(second).chain(parameters) {
+            if !seen.insert(key) { repeat(key); }
+        }
+    }
+}
+
+fn confirmed_password(result: &PasswordVerification) -> Option<usize> {
+    (result.status == "match" && result.final_confirmation_required == Some(false))
+        .then_some(result.matched_index)
+        .flatten()
+}
+
+/// A verifier reports sorted surviving indices inside its tested prefix. An
+/// ordered probe that stopped early leaves the entire untested suffix viable.
+pub(crate) struct SurvivingCandidates<'a> {
+    tested: &'a [usize],
+    single: Option<usize>,
+    untested: Range<usize>,
+}
+
+impl<'a> SurvivingCandidates<'a> {
+    pub(crate) fn new(result: &'a PasswordVerification, count: usize) -> Self {
+        if let Some(index) = confirmed_password(result) {
+            return Self { tested: &[], single: Some(index), untested: count..count };
+        }
+        if !matches!(result.status, "match" | "no_match") {
+            return Self { tested: &[], single: None, untested: 0..count };
+        }
+        let end = result.attempts.min(count);
+        let mut tested = result.matched_indices.as_slice();
+        if tested.last().is_some_and(|&index| index >= end) {
+            tested = &tested[..tested.partition_point(|&index| index < end)];
+        }
+        // Single-index results need not also allocate a matched-index list.
+        debug_assert!(tested.is_empty() || tested.first().copied() == result.matched_index);
+        let single = result.matched_index.filter(|&index| index < end && tested.is_empty());
+        Self { tested, single, untested: end..count }
+    }
+
+    fn len(&self) -> usize {
+        self.tested.len() + usize::from(self.single.is_some()) + self.untested.len()
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.untested.contains(&index) || self.single == Some(index)
+            || self.tested.binary_search(&index).is_ok()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.tested.iter().copied().chain(self.single).chain(self.untested.clone())
+    }
+
+    fn mark_union(&self, union: &mut [bool]) {
+        for index in self.tested.iter().copied().chain(self.single) {
+            union[index] = true;
+        }
+        union[self.untested.clone()].fill(true);
+    }
+}
+
 impl EvidenceContext {
+    pub(super) fn zip_key_parameters(&self) -> impl Iterator<Item = super::zip::ZipKeyMaterial<'_>> + '_ {
+        self.alternatives.iter().filter_map(|(context, _)| match context {
+            PasswordContext::Zip(context) => context.kdf_parameters(),
+            _ => None,
+        })
+    }
+
     fn public_plan(&self) -> std::io::Result<Option<Arc<VolumeAttemptPlan>>> {
         if self.rejected.is_empty() {
             return Ok(self.public_reduced.then(|| self.plan.clone()));
@@ -252,7 +326,13 @@ impl EvidenceContext {
                 )
             });
         }
-        let rar_keys = super::rar::RarKeyCache::default();
+        let rar_contexts = self.alternatives.iter().filter_map(|(context, _)| match context {
+            PasswordContext::Rar(context) => Some(context.as_ref()),
+            _ => None,
+        });
+        let rar_keys = super::rar::RarKeyCache::for_contexts(rar_contexts
+            .chain(self.rar_anchor.as_deref())
+            .chain(self.independent_rar.iter().filter_map(Option::as_deref)));
         if !fixed {
             if let Some(anchor) = &self.rar_anchor {
                 let mut anchor_result = anchor.verify_cached(candidates, None, &rar_keys)?;
@@ -301,10 +381,7 @@ impl EvidenceContext {
         let zip_keys = if shared_zip_keys.is_some() || self.alternatives.len() <= 1 {
             shared_zip_keys
         } else {
-            local_zip_keys = SharedCandidateKeys::new(&self.alternatives, |context| match context {
-                PasswordContext::Zip(context) => context.kdf_parameters(),
-                _ => None,
-            });
+            local_zip_keys = SharedCandidateKeys::from_parameters(self.zip_key_parameters());
             Some(&local_zip_keys)
         };
         let results: Vec<_> = self
@@ -321,9 +398,7 @@ impl EvidenceContext {
                     PasswordContext::Rar(context) => {
                         if screened_anchor.is_some_and(|anchor| Arc::ptr_eq(context, anchor)) {
                             return Ok(PasswordVerification {
-                                attempts: candidates.len(),
                                 matched_index: Some(0),
-                                matched_indices: (0..candidates.len()).collect(),
                                 ..PasswordVerification::status("match", "RAR anchor password candidates already screened")
                             });
                         }
@@ -337,29 +412,16 @@ impl EvidenceContext {
             })
             .collect::<std::io::Result<_>>()?;
         cancellation.check_io()?;
-        let strong = |result: &PasswordVerification| {
-            (result.status == "match" && result.final_confirmation_required == Some(false))
-                .then_some(result.matched_index)
-                .flatten()
-        };
-        let survives = |result: &PasswordVerification, index: usize| {
-            if let Some(hit) = strong(result) {
-                return index == hit;
-            }
-            !matches!(result.status, "match" | "no_match")
-                || index >= result.attempts
-                || result.matched_index == Some(index)
-                || result.matched_indices.binary_search(&index).is_ok()
-        };
+        let survivors = |result| SurvivingCandidates::new(result, candidates.len());
         // A strong proof on one possible tail belongs to that tail. Another
         // tail may be a valid archive using a different configured password.
-        let confirmed = results.iter().find_map(strong).filter(|&hit| {
+        let confirmed = results.iter().find_map(confirmed_password).filter(|&hit| {
             fixed
                 || (self.unresolved.is_none()
                     && results.iter().all(|result| {
-                        strong(result) == Some(hit)
-                            || (complete
-                                && (0..candidates.len()).all(|i| i == hit || !survives(result, i)))
+                        if confirmed_password(result) == Some(hit) { return true; }
+                        let viable = survivors(result);
+                        complete && viable.len() <= usize::from(viable.contains(hit))
                     }))
         });
         let mut removed: Vec<&VolumeProjection> = Vec::new();
@@ -367,7 +429,7 @@ impl EvidenceContext {
             // The plan has one confirmed password. Remove volume paths that
             // contradict it; there is no password/volume rule to carry onward.
             for ((_, projection), result) in self.alternatives.iter().zip(&results) {
-                if !survives(result, index) {
+                if !survivors(result).contains(index) {
                     removed.push(projection);
                 } else {
                     removed.extend(result.scoped_rejections.iter().filter_map(|(path, i)| {
@@ -379,7 +441,7 @@ impl EvidenceContext {
         let native_rejections = if let Some(index) = confirmed.or_else(|| fixed.then_some(0)) {
             let screened: HashMap<_, _> = self.alternatives.iter().zip(&results)
                 .filter_map(|((context, _), result)| match context {
-                    PasswordContext::Rar(context) => Some((Arc::as_ptr(context) as usize, survives(result, index))),
+                    PasswordContext::Rar(context) => Some((Arc::as_ptr(context) as usize, survivors(result).contains(index))),
                     _ => None,
                 })
                 .collect();
@@ -435,7 +497,7 @@ impl EvidenceContext {
             result.volume_attempts = volume_attempts;
             return Ok(result);
         }
-        let mut possible = vec![self.unresolved.is_some(); candidates.len()];
+        let mut possible = self.unresolved.is_none().then(|| vec![false; candidates.len()]);
         let mut method = None;
         for result in &results {
             if result.status == "match" {
@@ -445,31 +507,36 @@ impl EvidenceContext {
                     _ => Some("mixed"),
                 };
             }
-            for (index, possible) in possible.iter_mut().enumerate() {
-                *possible |= survives(&result, index);
+            if let Some(mask) = &mut possible {
+                let viable = survivors(result);
+                if viable.len() == candidates.len() {
+                    possible = None;
+                } else {
+                    viable.mark_union(mask);
+                }
             }
         }
-        let matches: Vec<_> = possible
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &yes)| yes.then_some(i))
-            .collect();
+        let matches: Vec<_> = match possible {
+            None => (0..candidates.len()).collect(),
+            Some(mask) => mask.into_iter().enumerate().filter_map(|(i, yes)| yes.then_some(i)).collect(),
+        };
         let mut password_domains = Vec::new();
         if !fixed && !matches.is_empty() {
+            let mut ordinals = None;
             for (path, result) in results.iter().enumerate() {
-                if matches.iter().any(|&index| !survives(result, index)) {
+                let viable = survivors(result);
+                if viable.len() != matches.len() {
                     if password_domains.is_empty() {
                         password_domains.resize_with(results.len(), || None);
                     }
-                    password_domains[path] = Some(
-                        matches
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(ordinal, &index)| {
-                                survives(result, index).then_some(ordinal)
-                            })
-                            .collect(),
-                    );
+                    let ordinals = ordinals.get_or_insert_with(|| {
+                        let mut ordinals = vec![usize::MAX; candidates.len()];
+                        for (ordinal, &index) in matches.iter().enumerate() {
+                            ordinals[index] = ordinal;
+                        }
+                        ordinals
+                    });
+                    password_domains[path] = Some(viable.iter().map(|index| ordinals[index]).collect());
                 }
             }
         }
