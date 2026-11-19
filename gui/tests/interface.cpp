@@ -1,5 +1,6 @@
 #include "event_publication.hpp"
 #include "application.hpp"
+#include "background.hpp"
 #include "ui_defaults_json.h"
 #include "registry_fixture.hpp"
 #include <algorithm>
@@ -736,6 +737,23 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
 
     click(app,"allRoots");
     pump([&]{return state(app.page(),"passwords")["scope"]=="@all";},"Show global passwords");
+    auto card_color=[&](const std::string& id) {
+        ui_window_relayout(app.window());
+        auto* card=window(app).Root()->FindById("password-"+id);
+        assert(card && card->visible);
+        return card->bgColor;
+    };
+    auto saved_card_color=[&] {
+        return card_color(state(app.page(),"passwords")["rows"][0]["id"].get<std::string>());
+    };
+    const auto expected=ui_theme_get_mode()==UI_THEME_DARK?D2D1::ColorF(0x2b2b2b):theme::Current().cardBg;
+    gui_test::same_color(saved_card_color(),expected);
+    click(app,"clipboardHistory");
+    pump([&]{return state(app.page(),"passwordHistory")==true;},"Show clipboard history");
+    gui_test::same_color(card_color("0"),expected);
+    click(app,"savedPasswords");
+    pump([&]{return state(app.page(),"passwordHistory")==false;},"Return to saved passwords");
+    gui_test::same_color(saved_card_color(),expected);
     click(app,"clipboardHistory");
     pump([&]{return state(app.page(),"passwordHistory")==true;},"Show clipboard history");
     click(app,"save-history-0");
@@ -745,6 +763,17 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     assert(read_file(passwords_path)=="{\n  \"passwords\": "+history["passwords"].dump()+
         ",\n  \"clipboard_history\": "+history["clipboard_history"].dump()+"\n}\n");
     screenshot(app.window(),L"clipboard-history.png");
+
+    click(app,"newPassword");
+    const auto empty_password=state(app.page(),"passwordCell").get<std::string>();
+    focus(app,"password-input-"+empty_password);
+    // Let the saved-list refresh complete while the new editor is still open.
+    pump([&]{return state(app.page(),"passwords")["scope"]=="@all";},"Refresh saved passwords with an empty editor");
+    click(app,"passwordSearch");
+    ui_debug_pump();
+    ui_window_relayout(app.window());
+    assert(state(app.page(),"passwordCell")=="" && !state(app.page(),"passwordDrafts").contains(empty_password));
+    assert(!window(app).Root()->FindById("password-"+empty_password));
 
     navigate(app,"tabRoots","roots");
     click(app,("delete-root-"+root_id).c_str());

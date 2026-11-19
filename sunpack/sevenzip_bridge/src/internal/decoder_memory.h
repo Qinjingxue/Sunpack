@@ -27,9 +27,12 @@ typedef struct SunpackMemoryReservation {
     void *owner;
     size_t committed;
 } SunpackMemoryReservation;
-int sunpack_memory_reserve(SunpackMemoryReservation *reservation, size_t size);
-int sunpack_memory_commit(SunpackMemoryReservation *reservation, void *address, size_t size);
-void sunpack_memory_release(SunpackMemoryReservation *reservation);
+typedef struct SunpackMemoryReservationOps {
+    int (*reserve)(SunpackMemoryReservation *reservation, size_t size);
+    int (*commit)(SunpackMemoryReservation *reservation, void *address, size_t size);
+    void (*release)(SunpackMemoryReservation *reservation);
+} SunpackMemoryReservationOps;
+extern const SunpackMemoryReservationOps sunpack_memory_reservation_ops;
 int sunpack_memory_free(void *address);
 size_t sunpack_memory_size(void *address);
 void *sunpack_decoder_allocate(void *opaque, size_t size);

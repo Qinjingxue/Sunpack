@@ -25,14 +25,17 @@ fn main() {
     println!("cargo:rerun-if-changed=src/password/rar_blake2sp.c");
 
     let ppmd_header = "src/formats/seven_zip/header/ppmd.c";
+    let decoder_memory = "../sevenzip_bridge/src/internal/decoder_memory.h";
     cc::Build::new()
         .include(seven_zip)
+        .include("../sevenzip_bridge/src")
         .file(seven_zip.join("Ppmd7.c"))
         .file(seven_zip.join("Ppmd7Dec.c"))
         .file(ppmd_header)
         .warnings(false)
         .compile("sunpack_ppmd7");
     println!("cargo:rerun-if-changed={ppmd_header}");
+    println!("cargo:rerun-if-changed={decoder_memory}");
 
     let cpp = seven_zip.join("../CPP");
     let deflate64_header = "src/formats/seven_zip/header/deflate64.cpp";

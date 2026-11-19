@@ -428,7 +428,7 @@ HRESULT CDecoder::InitPPM()
       Ppmd7_Free(&_ppmd, &g_BigAlloc);
       return S_FALSE;
     }
-    if (!Ppmd7_AllocReserved(&_ppmd, (maxMB + 1) << 20, &g_BigAlloc))
+    if (!Ppmd7_AllocReserved(&_ppmd, (maxMB + 1) << 20, &g_BigAlloc, &sunpack_memory_reservation_ops))
       return E_OUTOFMEMORY;
     Ppmd7_Init(&_ppmd, maxOrder);
     if (_ppmd.CommitFailed)

@@ -172,11 +172,8 @@ export default {
       if(snapshot.scope!=='@history') {
         // Own save receipts must not move a new row from the top to the end
         // while the same mouse gesture selects another row or directory.
+        // Until saved, editor rows live only in the draft state used by shownPasswords.
         let byId=new Map(snapshot.rows.map(p=>[p.id,p])),rows=[];
-        for(let id of Object.keys(this.passwordDrafts)) {
-          let d=this.passwordDrafts[id];
-          if(d.historyValue===undefined&&d.scope===this.directorySelection&&!byId.has(id)&&!d.original&&(d.pending||d.error||this.passwordCell===id)) byId.set(id,d);
-        }
         for(let previousRows of [this.passwordNew,this.passwords.rows])
           for(let previous of previousRows) if(byId.has(previous.id)) {
             let current=byId.get(previous.id); byId.delete(previous.id);
@@ -843,8 +840,8 @@ export default {
   .tag-setting .setting-copy .tag-regex-check { width:24px; height:24px; flex-shrink:0; }
   .tag-region { height:112px; min-width:0px; padding:6px 18px 6px 6px; border:1px solid var(--card-border); border-radius:6px; }
   .history-entry { gap:0px; padding:0px 12px; border:1px solid var(--card-border); border-radius:8px; }
-  .light .history-entry, .light .root-header { background:var(--card-bg); }
-  .dark .history-entry, .dark .root-header { background:#2b2b2b; }
+  .history-entry.light, .light .history-entry, .light .root-header { background:var(--card-bg); }
+  .history-entry.dark, .dark .history-entry, .dark .root-header { background:#2b2b2b; }
   .history-entry > .action-row { padding-bottom:10px; }
   .history-row { flex-direction:row; align-items:center; gap:12px; padding:10px 0px; min-height:52px; }
   .password-table-row { flex-direction:row; align-items:center; gap:12px; }
@@ -1046,7 +1043,7 @@ export default {
         <div class="password-table">
         <ScrollView id="passwordListScroll"><div id="passwordBody" class="column">
           <div v-show="shownPasswords.length>0">
-            <VirtualList id="passwordItems" v-show="shownPasswords.length>0" style="gap:8px" estimated-height="62px"><div v-for="p in shownPasswords" :key="p.id" :id="'password-'+p.id" class="history-entry">
+            <VirtualList id="passwordItems" v-show="shownPasswords.length>0" style="gap:8px" estimated-height="62px"><div v-for="p in shownPasswords" :key="p.id" :id="'password-'+p.id" :class="'history-entry '+appearance">
               <div v-show="!passwordHistory" class="password-table-row">
                 <div class="password-value-column">
                   <button v-show="passwordCell!==p.id" :id="'password-text-'+p.id" class="password-text" @mousedown="e=>rememberCellPointer(p.id,'value',e)" @click="beginPassword(p)"><label :id="'password-value-'+p.id" class="password-text-value">{{ passwordText(p) }}</label><div :id="'password-hover-'+p.id" class="password-hover-line"/></button>

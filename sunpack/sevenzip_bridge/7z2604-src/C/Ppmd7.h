@@ -84,6 +84,7 @@ typedef struct
   Byte *Base, *LoUnit, *HiUnit, *Text, *UnitsStart;
   /* RAR can reserve the whole model and commit the two gaps from their edges. */
   SunpackMemoryReservation Reservation;
+  const SunpackMemoryReservationOps *ReservationOps;
   Byte *TextEnd, *SpillBegin, *UnitsEnd, *ContextsBegin;
   BoolInt CommitFailed;
 
@@ -110,7 +111,8 @@ typedef struct
 
 void Ppmd7_Construct(CPpmd7 *p);
 BoolInt Ppmd7_Alloc(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc);
-BoolInt Ppmd7_AllocReserved(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc);
+BoolInt Ppmd7_AllocReserved(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc,
+    const SunpackMemoryReservationOps *ops);
 void Ppmd7_Free(CPpmd7 *p, ISzAllocPtr alloc);
 void Ppmd7_Init(CPpmd7 *p, unsigned maxOrder);
 #define Ppmd7_WasAllocated(p) ((p)->Base != NULL)

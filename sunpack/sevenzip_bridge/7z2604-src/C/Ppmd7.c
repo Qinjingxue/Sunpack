@@ -54,7 +54,7 @@ void Ppmd7_Construct(CPpmd7 *p)
   unsigned i, k, m;
 
   p->Base = NULL;
-  p->Reservation.base = NULL;
+  p->ReservationOps = NULL;
   p->CommitFailed = False;
 
   for (i = 0, k = 0; i < PPMD_NUM_INDEXES; i++)
@@ -85,8 +85,11 @@ void Ppmd7_Construct(CPpmd7 *p)
 
 void Ppmd7_Free(CPpmd7 *p, ISzAllocPtr alloc)
 {
-  if (p->Reservation.base)
-    sunpack_memory_release(&p->Reservation);
+  if (p->ReservationOps)
+  {
+    p->ReservationOps->release(&p->Reservation);
+    p->ReservationOps = NULL;
+  }
   else
     ISzAlloc_Free(alloc, p->Base);
   p->Size = 0;
@@ -96,7 +99,7 @@ void Ppmd7_Free(CPpmd7 *p, ISzAllocPtr alloc)
 
 BoolInt Ppmd7_Alloc(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc)
 {
-  if (!p->Base || p->Size != size || p->Reservation.base)
+  if (!p->Base || p->Size != size || p->ReservationOps)
   {
     Ppmd7_Free(p, alloc);
     p->AlignOffset = (4 - size) & 3;
@@ -114,15 +117,17 @@ BoolInt Ppmd7_Alloc(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc)
 #define PPMD7_COMMIT_CHUNK ((UInt32)1 << 16)
 #define PPMD7_UNITS_START(end, size) ((end) - (size) / 8 / UNIT_SIZE * 7 * UNIT_SIZE)
 
-BoolInt Ppmd7_AllocReserved(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc)
+BoolInt Ppmd7_AllocReserved(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc,
+    const SunpackMemoryReservationOps *ops)
 {
   p->CommitFailed = False;
-  if (!p->Reservation.base || p->Size != size)
+  if (p->ReservationOps != ops || p->Size != size)
   {
     Byte *end;
     Ppmd7_Free(p, alloc);
-    if (!sunpack_memory_reserve(&p->Reservation, size))
+    if (!ops->reserve(&p->Reservation, size))
       return False;
+    p->ReservationOps = ops;
     p->Base = (Byte *)p->Reservation.base;
     p->Size = size;
     p->AlignOffset = 0;
@@ -144,7 +149,7 @@ static Z7_NO_INLINE BoolInt Ppmd7_Commit(CPpmd7 *p, Byte *target, Byte **lo, Byt
   Byte *edge = p->Base + ((offset + (up ? PPMD7_COMMIT_CHUNK - 1 : 0)) & ~(PPMD7_COMMIT_CHUNK - 1));
   Byte *start = (up || edge < *lo) ? *lo : edge;
   Byte *end = (!up || edge > *hi) ? *hi : edge;
-  if (!sunpack_memory_commit(&p->Reservation, start, (size_t)(end - start)))
+  if (!p->ReservationOps->commit(&p->Reservation, start, (size_t)(end - start)))
   {
     p->CommitFailed = True;
     return False;

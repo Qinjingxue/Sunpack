@@ -108,7 +108,7 @@ void rar_ppmd_growth_under_pressure() {
     NativeMemoryScope scope(&job);
     CPpmd7 model;
     Ppmd7_Construct(&model);
-    require(Ppmd7_AllocReserved(&model, 128 * MiB, &g_BigAlloc) && !job.committed,
+    require(Ppmd7_AllocReserved(&model, 128 * MiB, &g_BigAlloc, &sunpack_memory_reservation_ops) && !job.committed,
             "PPMd charged its full virtual workspace");
     Ppmd7_Init(&model, 8);
     require(!model.CommitFailed && job.committed == 2 * chunk,

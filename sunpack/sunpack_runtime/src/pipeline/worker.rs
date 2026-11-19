@@ -581,7 +581,7 @@ impl Process {
                 };
                 if let Err(error) = sent {
                     let mut state = self.shared.state.lock().unwrap();
-                    if state.jobs.remove(job_id).is_some() && retry {
+                    if state.take_job(job_id).is_some() && retry {
                         state.grant_retry();
                     }
                     return Err(error);
@@ -872,12 +872,15 @@ impl Shared {
         if let Err(error) = cancellation.check_io() {
             drop(updates);
             let mut state = self.state.lock().unwrap();
-            if state.jobs.remove(job_id).is_some() {
+            if state.take_job(job_id).is_some() {
                 // No bytes have been sent for the reserved attempt. Pass its
                 // slot to the next waiter without waiting for native completion.
                 state.grant_retry();
             } else {
                 state.parked.retain(|(id, _)| id != job_id);
+                if state.parked.capacity() > 256 {
+                    crate::collections::trim_deque(&mut state.parked);
+                }
             }
             return Poll::Ready(Err(error));
         }
@@ -944,7 +947,7 @@ impl Shared {
         }
         let job_id = string(&frame.summary, "job_id");
         if kind == "native_event" && string(&frame.summary, "event") == "job_finished" {
-            if let Some((job_id, mut job)) = state.jobs.remove_entry(job_id) {
+            if let Some((job_id, mut job)) = state.take_job(job_id) {
                 let result = job.result.take().unwrap_or_else(|| {
                     Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -971,9 +974,6 @@ impl Shared {
                     }
                 }
                 job.mailbox.update(|updates| updates.result = Some(result));
-                if state.jobs.capacity() > 256 {
-                    crate::collections::trim_map(&mut state.jobs);
-                }
             }
             return;
         }
@@ -1113,6 +1113,14 @@ impl State {
                 Err(error) => self.abort_startup = Some(WorkerExit { failure_kind: "process_io", message: error.to_string().into(), kind: error.kind() }),
             }
         }
+    }
+
+    fn take_job(&mut self, job_id: &str) -> Option<(String, Job)> {
+        let job = self.jobs.remove_entry(job_id)?;
+        if self.jobs.capacity() > 256 {
+            crate::collections::trim_map(&mut self.jobs);
+        }
+        Some(job)
     }
 
     fn grant_retry(&mut self) -> bool {

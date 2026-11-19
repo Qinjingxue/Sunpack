@@ -434,13 +434,13 @@ void *sunpack_memory_try_alloc(size_t size) {
     auto *job = static_cast<sunpack::sevenzip::NativeMemoryJob *>(sunpack_memory_current_context());
     return job ? job->owner.allocate(*job, size, true) : nullptr;
 }
-int sunpack_memory_reserve(SunpackMemoryReservation *reservation, size_t size) {
+static int reserve_memory(SunpackMemoryReservation *reservation, size_t size) {
     void *base = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
     if (!base) return 0;
     *reservation = {base, sunpack_memory_current_context(), 0};
     return 1;
 }
-int sunpack_memory_commit(SunpackMemoryReservation *reservation, void *address, size_t size) {
+static int commit_memory(SunpackMemoryReservation *reservation, void *address, size_t size) {
     auto *job = static_cast<sunpack::sevenzip::NativeMemoryJob *>(reservation->owner);
     void *result = job ? job->owner.allocate(*job, size, false, address)
                        : VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE);
@@ -448,12 +448,15 @@ int sunpack_memory_commit(SunpackMemoryReservation *reservation, void *address, 
     reservation->committed += size;
     return 1;
 }
-void sunpack_memory_release(SunpackMemoryReservation *reservation) {
+static void release_memory(SunpackMemoryReservation *reservation) {
     auto *job = static_cast<sunpack::sevenzip::NativeMemoryJob *>(reservation->owner);
     if (job) job->owner.released(*job, reservation->base, reservation->committed);
     else VirtualFree(reservation->base, 0, MEM_RELEASE);
     *reservation = {};
 }
+const SunpackMemoryReservationOps sunpack_memory_reservation_ops = {
+    reserve_memory, commit_memory, release_memory
+};
 size_t sunpack_memory_size(void *address) {
     if ((reinterpret_cast<std::uintptr_t>(address) & 65535) != 0 || !address ||
         !allocations_ready.load(std::memory_order_acquire)) return 0;

@@ -1358,6 +1358,10 @@ impl ReaderManager {
             .extract_if(|path, _| path_is_under_roots(path, roots))
             .filter_map(|(_, source)| source.upgrade())
             .collect();
+        // Detached sources no longer have a table entry to retire on drop.
+        if handles.capacity() > 256 {
+            crate::collections::trim_map(&mut handles);
+        }
         drop(handles);
         for source in &sources {
             source.close()?;
@@ -1591,9 +1595,9 @@ pub(crate) fn invalidate_reader_path(path: &Path) {
     let mut handles = manager.handles.lock().unwrap_or_else(|e| e.into_inner());
     // Do not close a source used by an older request. Its late block loads
     // carry its source id and cannot repopulate the new source's cache.
-    let retired = handles.remove(path.as_path());
-    drop(handles);
-    drop(retired);
+    if handles.remove(path.as_path()).is_some() && handles.capacity() > 256 {
+        crate::collections::trim_map(&mut handles);
+    }
 }
 
 fn manager() -> &'static ReaderManager {
