@@ -771,8 +771,24 @@ bool registry_trims_payloads_at_completion(const std::filesystem::path& director
     if (writer->idle_memory_bytes() != (12U << 20) || reap_changes != 0) return false;
     overlapping.reset();
     auto reused = registry.acquire("batch-volume");
-    return &reused.writer() == writer.get() && writer->idle_memory_bytes() == AsyncFileWriter::kDefaultFileInFlightBytes &&
-        reap_changes == 1;
+    if (&reused.writer() != writer.get() || writer->idle_memory_bytes() != AsyncFileWriter::kDefaultFileInFlightBytes ||
+        reap_changes != 1) return false;
+
+    // A smaller batch keeps the same writer busy but no longer needs the
+    // large payloads. Advance only their retention clock.
+    const auto tiny_job = writer->make_job();
+    const auto tiny_file = writer->make_file(tiny_job, (directory / L"batch-tiny").wstring(), 0, 0);
+    UInt32 processed = 0;
+    if (writer->write(tiny_file, payload.data(), 64, &processed) != S_OK || processed != 64) return false;
+    writer->record_operation_result(tiny_file, 0);
+    writer->close_file(tiny_file, {});
+    if (writer->finish_job(tiny_job) != S_OK) return false;
+    writer->trim_completed_batch(std::chrono::steady_clock::now() + config.idle_timeout, config.idle_timeout);
+    if (writer->idle_memory_bytes() >= (1U << 20)) {
+        std::cerr << "tiny batch renewed the large payload window\n";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace

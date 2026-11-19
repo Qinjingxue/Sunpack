@@ -93,6 +93,7 @@ namespace sunpack::sevenzip
     void VolumeWriterRegistry::release(const std::string &key) noexcept
     {
         std::shared_ptr<AsyncFileWriter> writer;
+        std::chrono::steady_clock::time_point released_at;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto found = entries_.find(key);
@@ -112,11 +113,12 @@ namespace sunpack::sevenzip
             }
             else
             {
-                entry.reap_deadline = std::chrono::steady_clock::now() + config_.idle_timeout;
+                released_at = std::chrono::steady_clock::now();
+                entry.reap_deadline = released_at + config_.idle_timeout;
                 writer = entry.writer;
             }
         }
-        if (writer) writer->trim_completed_batch();
+        if (writer) writer->trim_completed_batch(released_at, config_.idle_timeout);
         if (on_reap_change_) on_reap_change_();
     }
 

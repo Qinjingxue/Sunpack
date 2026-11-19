@@ -328,13 +328,11 @@ impl NativeOutputInventory {
         options: &NativeDirectoryScanOptions,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let root = lexical_normalize_path(Path::new(&self.root));
-        let manifest;
         let (mut files, directory_ends, manifest_rows, deduplicate_paths, errors) = match self.files {
             OutputInventoryFiles::Disk(inventory) => {
                 (inventory.files, Some(inventory.directory_ends), None, inventory.lossy_paths, inventory.errors)
             }
-            OutputInventoryFiles::Manifest(files) => {
-                manifest = files;
+            OutputInventoryFiles::Manifest(manifest) => {
                 let mut records = Vec::with_capacity(manifest.len());
                 let mut item_indices = Vec::with_capacity(manifest.len());
                 for (index, item) in manifest.iter().enumerate() {
@@ -344,7 +342,7 @@ impl NativeOutputInventory {
                     records.push(output_file_record(path_to_string(&path), item.size, item.mtime_ns));
                     item_indices.push(index);
                 }
-                (records, None, Some((manifest.as_slice(), item_indices)), true, DirectoryReadErrors::default())
+                (records, None, Some((manifest, item_indices)), true, DirectoryReadErrors::default())
             }
         };
         let (directories, filtered) = build_inventory_snapshot_views(
@@ -717,7 +715,7 @@ fn build_inventory_snapshot_views(
     root: &Path,
     raw_files: &mut [DirectoryEntryRecord],
     directory_ends: Option<Vec<usize>>,
-    manifest_rows: Option<(&[OutputFileRecord], Vec<usize>)>,
+    manifest_rows: Option<(Arc<Vec<OutputFileRecord>>, Vec<usize>)>,
     options: &DirectoryScanOptions,
     deduplicate_paths: bool,
 ) -> (Vec<DirectoryEntryRecord>, Vec<usize>) {
@@ -786,6 +784,9 @@ fn build_inventory_snapshot_views(
                 ));
             }
         }
+        // The path projection and prefix probes now own everything needed
+        // from the wire rows. Free them before building the snapshot views.
+        drop(manifest);
     }
 
     // Keep parents of files accepted before the final mtime filter, even

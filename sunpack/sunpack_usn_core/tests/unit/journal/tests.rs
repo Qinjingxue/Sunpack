@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 fn record(major: u16, file_id: u128, usn: i64, reason: u32) -> Vec<u8> {
     let (length, file_id_end, usn_offset, reason_offset) = match major {
@@ -248,20 +249,40 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
         .unwrap();
         assert_eq!(page.journal_id, 42);
         assert!(page.next_usn > cursor && page.next_usn <= end_usn);
-        assert_eq!(
-            page.changes
-                .iter()
-                .map(|(_, name)| 8 + name.len())
-                .sum::<usize>(),
-            page.payload_bytes,
-        );
-        assert!(page.payload_bytes <= MAX_DIRECTORY_RESPONSE_BYTES);
-        actual.extend(page.changes);
+        assert!(page.payload.len() <= MAX_DIRECTORY_RESPONSE_BYTES);
+        let mut distinct = HashSet::new();
+        let mut input = page.payload.as_slice();
+        for _ in 0..page.count {
+            let index = u32::from_le_bytes(input[..4].try_into().unwrap());
+            let length = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+            let name = std::str::from_utf8(&input[8..8 + length]).unwrap();
+            assert!(distinct.insert((index, name.to_owned())));
+            input = &input[8 + length..];
+        }
+        assert!(input.is_empty());
+        actual.extend(distinct);
         cursor = page.next_usn;
         pages += 1;
     }
     assert!(pages > 1);
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn directory_page_keeps_distinct_names_with_the_same_hash() {
+    let mut page = DirectoryPageBuilder::default();
+    let first = (2, String::from("same-length.7z"));
+    let second = (2, String::from("same-length.01"));
+    let other_parent = (3, second.1.clone());
+    for change in [&first, &second, &other_parent] {
+        // Force the collision path without relying on the hash seed.
+        assert!(!page.contains(0, change));
+        page.append(0, change);
+    }
+    for change in [&first, &second, &other_parent] {
+        assert!(page.contains(0, change));
+    }
+    assert_eq!(page.finish(1, 2).count, 3);
 }
 
 #[test]

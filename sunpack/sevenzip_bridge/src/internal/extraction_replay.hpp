@@ -126,7 +126,8 @@ inline thread_local ExtractionReplay *current_extraction_replay = nullptr;
 class ExtractionReplayScope {
 public:
     explicit ExtractionReplayScope(ExtractionReplay *value) : previous_(current_extraction_replay) { current_extraction_replay = value; }
-    ~ExtractionReplayScope() { current_extraction_replay = previous_; }
+    ~ExtractionReplayScope() { restore(); }
+    void restore() noexcept { current_extraction_replay = previous_; }
 private:
     ExtractionReplay *previous_;
 };

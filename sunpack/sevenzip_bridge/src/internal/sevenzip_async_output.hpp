@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
@@ -305,6 +306,8 @@ namespace sunpack::sevenzip
         };
         static_assert(offsetof(IoRequest, overlapped) == 0);
 
+        static constexpr std::size_t kSmallBufferSize = 16U << 10;
+
         struct Buffer
         {
             Buffer() { request.buffer = this; }
@@ -313,8 +316,7 @@ namespace sunpack::sevenzip
             {
                 // Keep the logical 1 MiB staging limit. Small files only pay
                 // for a small allocation, which can grow once if needed.
-                constexpr std::size_t small_capacity = 16U << 10;
-                const auto new_capacity = required <= small_capacity ? small_capacity : kBufferSize;
+                const auto new_capacity = required <= kSmallBufferSize ? kSmallBufferSize : kBufferSize;
                 std::unique_ptr<unsigned char[]> payload(new unsigned char[new_capacity]);
                 if (size) std::memcpy(payload.get(), data.get(), size);
                 data = std::move(payload);
@@ -442,13 +444,19 @@ namespace sunpack::sevenzip
             return bytes;
         }
 
-        void trim_completed_batch() noexcept {
+        void trim_completed_batch(std::chrono::steady_clock::time_point now,
+                                  std::chrono::milliseconds idle_timeout) noexcept {
             std::lock_guard<std::mutex> lock(mutex_);
             // A lease can be acquired again before the registry calls us.
             if (!active_jobs_.empty() || !active_files_.empty() || free_buffers_.size() != buffers_.size()) return;
             // Keep one file's write window hot. Deeper windows serve
-            // concurrent writers and are funded again as demand returns.
-            trim_free_payloads_locked(kDefaultFileInFlightBytes);
+            // concurrent writers. Small jobs do not renew the large window.
+            if (large_payload_used_) {
+                large_window_deadline_ = (std::max)(large_window_deadline_, now + idle_timeout);
+                large_payload_used_ = false;
+            }
+            trim_free_payloads_locked(kDefaultFileInFlightBytes,
+                now < large_window_deadline_ ? kBufferSize : kSmallBufferSize);
         }
 
         // Memory pressure can reclaim free buffers even during a batch.
@@ -857,14 +865,14 @@ namespace sunpack::sevenzip
             receipt.mtime = file.mtime_ns;
         }
 
-        void trim_free_payloads_locked(std::size_t remaining) noexcept
+        void trim_free_payloads_locked(std::size_t remaining, std::size_t max_payload = kBufferSize) noexcept
         {
             // Producers take from the back. Preserve their nearest buffers
             // first, including those already sized for a full write.
             for (auto it = free_buffers_.rbegin(); it != free_buffers_.rend(); ++it)
             {
                 auto *buffer = *it;
-                if (buffer->capacity <= remaining)
+                if (buffer->capacity <= remaining && buffer->capacity <= max_payload)
                 {
                     remaining -= buffer->capacity;
                     continue;
@@ -1724,6 +1732,7 @@ namespace sunpack::sevenzip
                 if (file->outstanding_data != 0)
                     --file->outstanding_data;
                 file->job->inflight_bytes -= buffer->size;
+                large_payload_used_ |= buffer->size > kSmallBufferSize;
                 buffer->file.reset();
                 buffer->size = 0;
                 free_buffers_.push_back(buffer);
@@ -1759,6 +1768,8 @@ namespace sunpack::sevenzip
         std::vector<std::unique_ptr<Buffer>> buffers_;
         // Every entry belongs to buffers_; returning one must never allocate.
         std::vector<Buffer *> free_buffers_;
+        std::chrono::steady_clock::time_point large_window_deadline_{};
+        bool large_payload_used_ = false;
         std::vector<std::thread> workers_;
         std::deque<WorkItem> work_queue_;
         std::vector<std::weak_ptr<JobState>> active_jobs_;

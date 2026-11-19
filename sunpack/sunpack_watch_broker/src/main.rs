@@ -348,21 +348,28 @@ fn read_directory_query(
     if remaining != 0 && remaining_message_bytes()? != remaining {
         return Ok(None);
     }
-    let mut parents = HashMap::with_capacity(id_bytes / FILE_ID_BYTES);
-    let mut next_index = 0;
-    let mut insert = |bytes: &[u8]| {
-        for id in bytes.as_chunks::<FILE_ID_BYTES>().0 {
-            parents.insert(*id, next_index);
-            next_index += 1;
+    let first_ids = first / FILE_ID_BYTES;
+    let mut parents = HashMap::with_capacity(first_ids);
+    let mut next_index = 0u32;
+    let mut insert = |parents: &mut HashMap<_, _>, bytes: &[u8]| {
+        let ids = bytes.as_chunks::<FILE_ID_BYTES>().0;
+        for group in ids.chunk_by(|left, right| left == right) {
+            next_index += group.len() as u32;
+            parents.insert(group[0], next_index - 1);
         }
     };
-    insert(&buffer[..first]);
+    insert(&mut parents, &buffer[..first]);
+    // A distinct first fragment is the usual path. For repeated IDs, grow
+    // with the actual distinct count while preserving the last wire index.
+    if remaining != 0 && parents.len() == first_ids {
+        parents.reserve(remaining / FILE_ID_BYTES);
+    }
     while remaining != 0 {
         let size = remaining.min(buffer.len());
         if !receive_query_fragment(read(&mut buffer[..size])?, size, remaining) {
             return Ok(None);
         }
-        insert(&buffer[..size]);
+        insert(&mut parents, &buffer[..size]);
         remaining -= size;
     }
     Ok(Some(DirectoryQuery { journal, parents }))
@@ -604,20 +611,13 @@ fn handle_request(
                     )
                 })
                 .map(|page| {
-                    let count = page.changes.len() as u32;
-                    payload = Vec::with_capacity(page.payload_bytes);
-                    for (index, name) in page.changes {
-                        payload.extend_from_slice(&index.to_le_bytes());
-                        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                        payload.extend_from_slice(name.as_bytes());
-                    }
-                    debug_assert_eq!(payload.len(), page.payload_bytes);
+                    payload = page.payload;
                     (
                         page.journal_id,
                         page.next_usn,
                         sunpack_usn_core::ChangeReasons {
                             all: payload.len() as u32,
-                            without_close: count,
+                            without_close: page.count,
                         },
                     )
                 })

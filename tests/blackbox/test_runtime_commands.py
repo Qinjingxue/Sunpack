@@ -259,9 +259,13 @@ def test_existing_runtime_uses_latest_archive_request_idle_setting(package, tmp_
     assert not state.exists()
 
 
-def test_resident_cli_clears_reusable_archive_state_after_idle(package, tmp_path):
+@pytest.mark.parametrize("paused_watch", [False, True], ids=["cli", "paused-watch"])
+def test_resident_cli_clears_reusable_archive_state_after_idle(package, tmp_path, paused_watch):
     package.configure(performance={"persistent_server_idle_seconds": "+inf"},
                       watch={"runtime_cache_cleanup_idle_seconds": 60})
+    if paused_watch:
+        status = package.json("watch", "disable")["summary"]
+        assert status["running"] and not status["enabled"]
     member = tmp_path / "member.txt"
     member.write_bytes(b"archive cache probe")
     encrypted = tmp_path / "encrypted.7z"
@@ -283,6 +287,8 @@ def test_resident_cli_clears_reusable_archive_state_after_idle(package, tmp_path
     owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
 
     package.configure(watch={"runtime_cache_cleanup_idle_seconds": 0})
+    if paused_watch:
+        package.json("watch", "reload")
     assert package.json("scan", plain)["summary"]["archive_count"] == 1
     probes = count()
     wait_for(lambda: extract(plain, f"idle-{next(probes)}") == [],

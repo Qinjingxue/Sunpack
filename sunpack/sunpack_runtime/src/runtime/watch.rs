@@ -2446,6 +2446,7 @@ impl Scheduler {
         result?;
         self.journal.log(json!({"event":if enabled { "watch_enabled" } else { "watch_disabled" }}));
         self.suspend_empty_scheduler()?;
+        if !enabled { self.arm_idle_cleanup(); }
         Ok(true)
     }
 
@@ -3275,12 +3276,14 @@ impl Scheduler {
                     self.journal.compact()
                 })??;
             }
-            let due = if self.dedup_rebuild.is_none() { self.next_admission() } else { None };
-            let deadline = match (due, self.cache_deadline) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
+            // The resident CLI delegates cache cleanup to a live Watch. Its
+            // deadline remains relevant while Watch admission is paused.
+            let deadline = if self.enabled() {
+                let due = if self.dedup_rebuild.is_none() { self.next_admission() } else { None };
+                self.cache_deadline.into_iter().chain(due).chain(self.candidate_diagnostics.deadline()).min()
+            } else {
+                self.cache_deadline
             };
-            let deadline = if self.enabled() { deadline.into_iter().chain(self.candidate_diagnostics.deadline()).min() } else { None };
             let mut signals = self.hub.wait(deadline);
             self.candidate_diagnostics.clear_expired(Instant::now());
             if signals.dedup_rebuild { self.rebuild_dedup(false)?; }
@@ -3365,8 +3368,8 @@ impl Scheduler {
                     );
                 }
             }
-            if !self.enabled() { continue; }
-            if !signals.volumes.is_empty() {
+            let enabled = self.enabled();
+            if enabled && !signals.volumes.is_empty() {
                 for (id, (root, _)) in &self.roots {
                     let observed = self.root_observers.contains_key(id);
                     if signals.volumes.affects(&root.path, observed) {
@@ -3377,7 +3380,7 @@ impl Scheduler {
                     }
                 }
             }
-            if !signals.changes.changed_roots.is_empty() {
+            if enabled && !signals.changes.changed_roots.is_empty() {
                 if self.options.is_some() && !signals.changes.topology_roots.is_empty() {
                     self.rearm_root_observers(Some(&signals.changes.topology_roots))?;
                 }
@@ -3394,6 +3397,7 @@ impl Scheduler {
                 if self.active.is_empty() && self.pending.is_empty() {
                     let engine = Arc::clone(&self.engine);
                     windows::maintain_when_foreground_idle(&engine, || engine.clear_idle_caches(), || {
+                        if !enabled { return Ok(()); }
                         self.checkpoint(&HashMap::new(), true, false)?;
                         engine.run_stage("catalog_maintenance", Origin::Watch, || {
                             self.commit_idle_catalog();

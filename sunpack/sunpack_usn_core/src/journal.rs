@@ -1,6 +1,7 @@
 use crate::protocol::{FILE_ID_BYTES, MAX_DIRECTORY_RESPONSE_BYTES};
 use crate::ChangeReasons;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap};
+use std::hash::BuildHasher;
 use std::ffi::c_void;
 use std::io;
 use std::ops::ControlFlow::{self, Break, Continue};
@@ -23,8 +24,8 @@ const USN_REASON_CLOSE: u32 = 0x8000_0000;
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 
 pub struct DirectoryChangesPage {
-    pub changes: HashSet<(u32, String)>,
-    pub payload_bytes: usize,
+    pub payload: Vec<u8>,
+    pub count: u32,
     pub next_usn: i64,
     pub journal_id: u64,
 }
@@ -349,6 +350,59 @@ fn next_journal_record<'a>(records: &mut &'a [u8]) -> io::Result<&'a [u8]> {
     Ok(record)
 }
 
+#[derive(Default)]
+struct DirectoryPageBuilder {
+    payload: Vec<u8>,
+    offsets: HashMap<u64, u32>,
+    collisions: Vec<(u64, u32)>,
+}
+
+impl DirectoryPageBuilder {
+    fn contains(&self, hash: u64, (index, name): &DirectoryChange) -> bool {
+        let matches = |offset: u32| {
+            let record = &self.payload[offset as usize..];
+            record[..4] == index.to_le_bytes()
+                && record[4..8] == (name.len() as u32).to_le_bytes()
+                && record[8..8 + name.len()] == *name.as_bytes()
+        };
+        // Hashes only index the existing wire records, including collisions.
+        self.offsets.get(&hash).is_some_and(|&offset| {
+            matches(offset)
+                || self
+                    .collisions
+                    .iter()
+                    .any(|&(key, other)| key == hash && matches(other))
+        })
+    }
+
+    fn append(&mut self, hash: u64, (index, name): &DirectoryChange) {
+        let offset = self.payload.len() as u32;
+        let needed = self.payload.len() + 8 + name.len();
+        if needed > self.payload.capacity() {
+            let capacity = needed.next_power_of_two().min(MAX_DIRECTORY_RESPONSE_BYTES);
+            self.payload.reserve_exact(capacity - self.payload.len());
+        }
+        self.payload.extend_from_slice(&index.to_le_bytes());
+        self.payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        self.payload.extend_from_slice(name.as_bytes());
+        match self.offsets.entry(hash) {
+            Entry::Vacant(entry) => {
+                entry.insert(offset);
+            }
+            Entry::Occupied(_) => self.collisions.push((hash, offset)),
+        }
+    }
+
+    fn finish(self, journal_id: u64, next_usn: i64) -> DirectoryChangesPage {
+        DirectoryChangesPage {
+            payload: self.payload,
+            count: (self.offsets.len() + self.collisions.len()) as u32,
+            next_usn,
+            journal_id,
+        }
+    }
+}
+
 // Resume at the USN of an entire unconsumed record, never at the next buffer.
 // A record may yield both a directory change and a child name; keep it atomic.
 fn scan_directories_page(
@@ -359,8 +413,7 @@ fn scan_directories_page(
     mut read: impl FnMut(i64, &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<DirectoryChangesPage> {
     let mut cursor = start_usn;
-    let mut payload_bytes = 0usize;
-    let mut changed = HashSet::new();
+    let mut page = DirectoryPageBuilder::default();
     let mut scratch = Default::default();
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     'journal: while cursor < end_usn {
@@ -384,15 +437,19 @@ fn scan_directories_page(
             if record.usn >= end_usn {
                 break 'journal;
             }
-            let changes = record.changes.map(|change| change.filter(|item| !changed.contains(*item)));
-            let added: usize = changes.iter().flatten().map(|change| 8 + change.1.len()).sum();
+            let changes = record.changes.map(|change| {
+                let change = change?;
+                let hash = page.offsets.hasher().hash_one(change);
+                (!page.contains(hash, change)).then_some((hash, change))
+            });
+            let added: usize = changes.iter().flatten().map(|(_, change)| 8 + change.1.len()).sum();
             if added > MAX_DIRECTORY_RESPONSE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "USN name exceeds response frame",
                 ));
             }
-            if payload_bytes + added > MAX_DIRECTORY_RESPONSE_BYTES {
+            if page.payload.len() + added > MAX_DIRECTORY_RESPONSE_BYTES {
                 let next_usn = record.usn;
                 if next_usn <= start_usn {
                     return Err(io::Error::new(
@@ -400,24 +457,15 @@ fn scan_directories_page(
                         "non-progressing USN page",
                     ));
                 }
-                return Ok(DirectoryChangesPage {
-                    changes: changed,
-                    payload_bytes,
-                    next_usn,
-                    journal_id,
-                });
+                return Ok(page.finish(journal_id, next_usn));
             }
-            payload_bytes += added;
-            changed.extend(changes.into_iter().flatten().cloned());
+            for (hash, change) in changes.into_iter().flatten() {
+                page.append(hash, change);
+            }
         }
         cursor = returned_next;
     }
-    Ok(DirectoryChangesPage {
-        changes: changed,
-        payload_bytes,
-        next_usn: end_usn,
-        journal_id,
-    })
+    Ok(page.finish(journal_id, end_usn))
 }
 
 type DirectoryChange = (u32, String);

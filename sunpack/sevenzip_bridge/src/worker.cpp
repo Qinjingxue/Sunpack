@@ -29,6 +29,7 @@ extern "C" __declspec(dllimport) void __cdecl SetOaNoCache();
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "internal/sevenzip_status.hpp"
@@ -1212,18 +1213,19 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
     return replay.uncertain_read.load(std::memory_order_relaxed);
 }
 
-RequestOutcome run_request(
+using RequestExecution = std::variant<RequestOutcome, sunpack::sevenzip::ExtractArchiveResult>;
+
+RequestExecution execute_request(
     WorkerRequest& request,
     // The registry lease in worker_loop covers the output-volume writer.
-    const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
-    const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr,
-    const std::function<void()>& release_writer = {}
+    const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer,
+    const std::shared_ptr<std::atomic<bool>>& cancel_token
 ) {
     using namespace sunpack::sevenzip;
 
     const std::string& job_id = request.job_id;
     if (auto *memory = current_native_memory_job(); memory && memory->revoked.load(std::memory_order_acquire))
-        return {kMemoryRetry, {}};
+        return RequestOutcome{kMemoryRetry, {}};
     if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
         return interrupted_result(job_id);
     }
@@ -1236,7 +1238,7 @@ RequestOutcome run_request(
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
     if (archive_path.empty() || (!request.scan_only && output_dir.empty())) {
         NativeMemoryScope response_memory(nullptr);
-        return {2,
+        return RequestOutcome{2,
             (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
             (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message") + wire::text("archive_path is required; extraction also requires output_dir") + wire::end())};
     }
@@ -1261,7 +1263,7 @@ RequestOutcome run_request(
 
     if (!request.archive_input.validation_error.empty()) {
         NativeMemoryScope response_memory(nullptr);
-        return {2,
+        return RequestOutcome{2,
             (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
             (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message")) +
             wire::text(request.archive_input.validation_error) + wire::end()};
@@ -1276,7 +1278,7 @@ RequestOutcome run_request(
             const bool output_owned = directory_is_empty_or_missing(root);
             if (!output_owned) {
                 NativeMemoryScope response_memory(nullptr);
-                return {2, (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+                return RequestOutcome{2, (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                     (wire::key("status") + wire::text("failed") + wire::key("failure_stage") + wire::text("output_prepare") + wire::key("failure_kind") + wire::text("output_filesystem") + wire::key("message") + wire::text("volume composition trials require an empty output directory") + wire::end())};
             }
             auto& plan = request.archive_input.volume_attempts;
@@ -1387,7 +1389,7 @@ RequestOutcome run_request(
         if (auto* memory = current_native_memory_job()) {
             if (memory->denied.load(std::memory_order_acquire) && !memory->revoked.load(std::memory_order_acquire))
                 memory->owner.retry(*memory);
-            if (memory->revoked.load(std::memory_order_acquire)) return {kMemoryRetry, {}};
+            if (memory->revoked.load(std::memory_order_acquire)) return RequestOutcome{kMemoryRetry, {}};
         }
         if (cancel_token && cancel_token->load(std::memory_order_acquire)) return interrupted_result(job_id);
         if (selected_probe && rejects_volume_attempt(*selected_probe)) {
@@ -1609,7 +1611,7 @@ RequestOutcome run_request(
                 memory->owner.retry(*memory);
             // An interrupted attempt is internal. Never publish its provisional
             // damage/password/output errors or a final result to the caller.
-            if (memory->revoked.load(std::memory_order_acquire) && result.status != PasswordTestStatus::Ok) return {kMemoryRetry, {}};
+            if (memory->revoked.load(std::memory_order_acquire) && result.status != PasswordTestStatus::Ok) return RequestOutcome{kMemoryRetry, {}};
         }
 
         if (cancel_token && cancel_token->load(std::memory_order_acquire)) return interrupted_result(job_id);
@@ -1669,21 +1671,35 @@ RequestOutcome run_request(
         }
     }
 
+    return RequestExecution{std::move(result)};
+}
+
+RequestOutcome run_request(
+    WorkerRequest& request,
+    const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
+    const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr,
+    const std::function<void()>& retire_extraction = {}
+) {
+    using namespace sunpack::sevenzip;
+    auto execution = execute_request(request, shared_writer, cancel_token);
+    if (auto* finished = std::get_if<RequestOutcome>(&execution)) return std::move(*finished);
+    const auto& result = std::get<ExtractArchiveResult>(execution);
+    const auto& job_id = request.job_id;
     const bool ok = result.status == PasswordTestStatus::Ok;
-    // Output handles have drained. Streaming the manifest needs the result
-    // inventory and the retry state, but can block without holding the writer.
-    if (release_writer) release_writer();
+    const bool include_inventory = request.output_inventory;
     std::string volume_selection;
-    if (volume_trials && ok) {
-        const auto& cursor = volume_replay->volumes;
-        volume_selection = wire::key("volume_selection") + wire::object() +
-            wire::key("layout") + wire::number(cursor.layout) + wire::key("sources") + wire::array();
-        for (const auto source : cursor.selected) wire::append_number(volume_selection, source);
-        volume_selection += wire::end() + wire::end();
+    if (ok && !request.archive_input.volume_attempts.layouts.empty()) {
+        const auto& cursor = current_extraction_replay->volumes;
+        volume_selection = wire::key("volume_selection");
+        append_volume_selection(volume_selection, cursor.layout, cursor.selected);
     }
+    // Only the result inventory and routing ID can be needed while the
+    // terminal reply waits for pipe capacity.
+    if (retire_extraction) retire_extraction();
+    NativeMemoryScope response_memory(nullptr);
     // A preexisting output root needs a directory scan to include its old files.
     const std::string manifest_field = ok && result.output_inventory_complete
-        ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result, request.output_inventory) : "";
+        ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result, include_inventory) : "";
     const auto complete_files = !ok ? std::count_if(
         result.output_trace.items.begin(), result.output_trace.items.end(),
         [](const ExtractOutputItemTrace& item) {
@@ -1700,8 +1716,6 @@ RequestOutcome run_request(
     const std::string pipeline_timing_field = pipeline_timing_enabled() ?
         wire::key("pipeline_timing") + pipeline_timing_wire(result.pipeline_timing) : "";
 #endif
-    // The serialized frame is transport-owned and outlives the managed job.
-    NativeMemoryScope response_memory(nullptr);
     return {ok ? 0 : 1,
         (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
         wire::key("status") + wire::text(ok ? "ok" : "failed") +
@@ -2025,7 +2039,7 @@ private:
             return true;
         }
         sunpack::sevenzip::NativeMemoryJob memory;
-        sunpack::sevenzip::ExtractionReplay replay;
+        std::optional<sunpack::sevenzip::ExtractionReplay> replay{std::in_place};
         std::vector<InputStamp> inputs;
         std::uint64_t memory_episode = 0;
     };
@@ -2320,7 +2334,7 @@ private:
                 sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_);
                 sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
                 sunpack::sevenzip::NativeMemoryScope memory_scope(&memory_job);
-                sunpack::sevenzip::ExtractionReplayScope replay_scope(&job.execution->replay);
+                sunpack::sevenzip::ExtractionReplayScope replay_scope(&*job.execution->replay);
                 try {
                     const bool interrupted = memory_job.cancel->load(std::memory_order_acquire);
                     if (replaying && !interrupted && !job.execution->inputs_unchanged()) {
@@ -2338,19 +2352,28 @@ private:
                         outcome = run_request(job.request, lease.writer_pointer(), memory_job.cancel, [&] {
                             registration.reset();
                             lease.reset();
+                            replay_scope.restore();
+                            job.execution->replay.reset();
+                            decltype(job.execution->inputs){}.swap(job.execution->inputs);
+                            WorkerRequest terminal;
+                            terminal.job_id = std::move(job.request.job_id);
+                            job.request = std::move(terminal);
                         });
                     } else outcome = run_request(job.request, nullptr, memory_job.cancel);
                     if (outcome.response.size() > UINT32_MAX) {
                         outcome = {-100, {}};
                     }
                 } catch (const std::bad_alloc&) {
-                    memory_.retry(memory_job);
-                    outcome.code = kMemoryRetry;
+                    // A terminal manifest may already have reached the client.
+                    if (job.execution->replay) {
+                        memory_.retry(memory_job);
+                        outcome.code = kMemoryRetry;
+                    }
                 } catch (const std::system_error &error) {
                     // MSVC std::thread reports _beginthreadex exhaustion as
                     // EAGAIN, including a failed small stack/CRT allocation.
                     // Writer-facility threads do not use the SDK allocator.
-                    if (error.code() == std::errc::resource_unavailable_try_again) {
+                    if (job.execution->replay && error.code() == std::errc::resource_unavailable_try_again) {
                         memory_.retry(memory_job);
                         outcome.code = kMemoryRetry;
 #ifdef SUP7Z_DEBUG

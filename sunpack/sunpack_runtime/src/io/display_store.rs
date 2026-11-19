@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 pub(crate) const ENTRY_BYTES: usize = 64;
 const RECORD_BLOCK_BYTES: usize = 1024 * 1024;
+const REUSABLE_COMPRESS_BYTES: usize = 64 * 1024;
 pub(crate) const DAY_US: i64 = 86_400_000_000;
 unsafe extern "C" {
     fn LZ4_compressBound(size: i32) -> i32;
@@ -775,8 +776,9 @@ impl Store {
         Ok(())
     }
     pub(crate) fn publish(&mut self) -> io::Result<()> {
-        // A single unusually large group must not leave large scratch buffers resident.
-        if self.compressed.capacity() > 2 * RECORD_BLOCK_BYTES {
+        // Keep normal event scratch, but retire capacity from large groups
+        // once the writer finishes the batch that needed it.
+        if self.compressed.capacity() > REUSABLE_COMPRESS_BYTES {
             self.compressed = Vec::new();
         }
         if let Some(live) = &mut self.live {
