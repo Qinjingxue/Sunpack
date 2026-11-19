@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers.real_archives import create_encrypted_zip_archive
+from tests.helpers.real_archives import create_7z_archive, create_encrypted_zip_archive
 from tests.real.archive_boundary import extract_report, failure_kinds
 from tests.real.plan7_watch_downloads.plan7_support import FACTORY, download, watch_setup
 
@@ -71,4 +71,73 @@ def test_plan7_nested_watch_failure_is_a_retryable_inner_input(package, tmp_path
     watch.stop()
     assert source.is_file()
     assert next(watch.output.rglob("outer-note.txt")).read_bytes() == b"healthy outer payload"
+    watch.assert_no_terminal_failures()
+
+
+@pytest.mark.requires_watch_broker
+@pytest.mark.parametrize("naming,second_kind", [("outer", "password"), ("inner", "missing_volume")])
+def test_plan7_watch_finishes_original_task_after_recursive_blockers(package, tmp_path, naming, second_kind):
+    leaf_password = "nested-leaf-password-only-fixture"
+    other_password = "nested-other-password-only-fixture"
+    first = create_encrypted_zip_archive(tmp_path / "fixtures", "first", password=leaf_password)
+    wrapper_input = tmp_path / "first-wrapper-input"
+    wrapper_input.mkdir()
+    (wrapper_input / "leaf.jpg").write_bytes(first.entry_path.read_bytes())
+    wrapper = tmp_path / "first.7z"
+    create_7z_archive(wrapper_input, wrapper, password=INNER_PASSWORD)
+    missing = None
+    if second_kind == "password":
+        second = create_encrypted_zip_archive(tmp_path / "fixtures", "second", password=other_password)
+        inputs = [(second.entry_path, "second.jpg")]
+        second_status, second_name = "failed_password", "second.jpg"
+    else:
+        second = FACTORY.create(tmp_path / "fixtures", "second", "7z", split=True,
+                                payload_size=320 * 1024, split_volume_size=80 * 1024)
+        parts = sorted(second.archive_dir.iterdir())
+        missing = parts[1]
+        inputs = [(part, part.name) for part in parts if part != missing]
+        second_status, second_name = "suspended_missing_volume", second.entry_path.name
+    outer = tmp_path / "sample.zip"
+    with zipfile.ZipFile(outer, "w") as archive:
+        archive.write(wrapper, "wrapper/first.jpg")
+        for path, name in inputs:
+            archive.write(path, f"wrapper/{name}")
+
+    package.configure(embedded_scan={"recursive_candidate_ratio": 0},
+                      post_extract={"flatten_directory_name": naming})
+    watch = watch_setup(package, tmp_path, passwords=[], cleanup="d" if missing is None else "k", flatten=True)
+    source = download(watch, outer)
+    watch.await_event("failed_password", path="first.jpg")
+    watch.await_event(second_status, path=second_name)
+    assert not watch.event("done", path=outer.name)
+
+    watch.passwords([INNER_PASSWORD, leaf_password])
+    watch.await_archive(first)
+    watch.stop()
+    assert not [row for row in watch.display()["history"] if row["event"] == "done"]
+    assert (watch.output / "sample" / "wrapper").is_dir()
+    assert source.is_file() == (missing is not None)
+    assert package.run("--persistent-shutdown").returncode == 0
+    late_volume = download(watch, missing) if missing is not None else None
+    watch.start()
+
+    if missing is None:
+        watch.passwords([INNER_PASSWORD, leaf_password, other_password])
+    done = watch.await_event("done", path=outer.name)
+    watch.stop()
+    final = watch.output / ("sample" if naming == "outer" else "wrapper")
+    assert [Path(path) for path in done["output_dirs"]] == [final]
+    assert done["success_count"] == 4
+    assert len(list(final.iterdir())) == 2
+    for case in (first, second):
+        marker, = final.rglob(case.marker_name)
+        assert len(marker.relative_to(final).parts) == 2
+        assert marker.read_bytes() == case.marker_text.encode()
+    assert list(watch.output.iterdir()) == [final]
+    if late_volume is not None:
+        assert late_volume.is_file()
+    display = watch.display()
+    assert [Path(row["path"]).name for row in display["history"] if row["event"] == "done"] == [outer.name]
+    assert not [row for row in display["live"] if row["event"] in {
+        "processing_started", "failed_password", "suspended_missing_volume"}]
     watch.assert_no_terminal_failures()

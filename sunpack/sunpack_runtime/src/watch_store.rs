@@ -345,6 +345,10 @@ impl EntryRecord {
         self.status == "suspended_missing_volume"
     }
 
+    pub(crate) fn continuation(&self) -> Option<&str> {
+        self.failure_payload.get("discovery_scope")?["parent"]["id"].as_str()
+    }
+
     fn blocks(&self, blocker: &str) -> bool {
         self.failure_payload
             .get("blockers")
@@ -368,7 +372,11 @@ pub(crate) type PendingUpdate = (PendingObservation, String, Option<Arc<Map<Stri
 enum Collection {
     Pending,
     Entries,
+    SettledEntries,
 }
+
+pub(crate) const CONTINUATION_PREFIX: &str = "continuation|";
+pub(crate) const CONTINUATION_OUTPUT_PREFIX: &str = "continuation-output|";
 
 #[derive(Debug, Clone)]
 enum Operation {
@@ -390,6 +398,7 @@ impl Serialize for Operation {
             Self::PutEntry(_, record) => (1u8, record).serialize(serializer),
             Self::Delete(Collection::Pending, key) => (2u8, key).serialize(serializer),
             Self::Delete(Collection::Entries, key) => (3u8, key).serialize(serializer),
+            Self::Delete(Collection::SettledEntries, key) => (8u8, key).serialize(serializer),
             Self::SetMetadata(generation, signature) => {
                 (4u8, generation, signature).serialize(serializer)
             }
@@ -427,16 +436,16 @@ impl<'de> Deserialize<'de> for Operation {
                         let record: Arc<EntryRecord> = field(&mut seq)?;
                         Operation::PutEntry(path_key(&record.path), record)
                     }
-                    2 | 3 => {
+                    2 | 3 | 8 => {
                         let key: String = field(&mut seq)?;
                         if key.is_empty() {
                             return Err(A::Error::custom("empty record key"));
                         }
                         Operation::Delete(
-                            if tag == 2 {
-                                Collection::Pending
-                            } else {
-                                Collection::Entries
+                            match tag {
+                                2 => Collection::Pending,
+                                3 => Collection::Entries,
+                                _ => Collection::SettledEntries,
                             },
                             key,
                         )
@@ -452,6 +461,7 @@ impl<'de> Deserialize<'de> for Operation {
                     6 => {
                         let key: String = field(&mut seq)?;
                         if key != "watch_control" && !key.starts_with("flatten|")
+                            && !key.starts_with(CONTINUATION_PREFIX) && !key.starts_with(CONTINUATION_OUTPUT_PREFIX)
                         {
                             return Err(A::Error::custom("unknown runtime record"));
                         }
@@ -528,6 +538,8 @@ impl StateData {
             Operation::Runtime(key, value) => {
                 if let Some(value) = value {
                     self.runtime.insert(key.clone(), value.clone());
+                } else if key.starts_with(CONTINUATION_PREFIX) {
+                    self.retire_continuation(key);
                 } else {
                     self.runtime.remove(key);
                 }
@@ -543,8 +555,19 @@ impl StateData {
             Operation::Delete(Collection::Pending, key) => {
                 self.pending.remove(key);
             }
-            Operation::Delete(Collection::Entries, key) => {
+            Operation::Delete(collection @ (Collection::Entries | Collection::SettledEntries), key) => {
                 let previous = self.entries.remove(key);
+                if *collection == Collection::Entries {
+                    if let Some(id) = previous.as_deref().and_then(EntryRecord::continuation) {
+                        if let Some(record) = self.runtime.get_mut(id) {
+                            let record = Arc::make_mut(record);
+                            let remaining = record["remaining"].as_u64().unwrap_or_default().saturating_sub(1);
+                            record["remaining"] = remaining.into();
+                            record["abandoned"] = true.into();
+                            if remaining == 0 { self.retire_continuation(id); }
+                        }
+                    }
+                }
                 self.missing_volume_count -= usize::from(previous.is_some_and(|entry| entry.is_missing_volume()));
             }
             Operation::SetMetadata(generation, signature) => {
@@ -555,7 +578,13 @@ impl StateData {
         }
     }
 
-
+    fn retire_continuation(&mut self, id: &str) {
+        if self.runtime.remove(id).is_none() { return; }
+        let prefix = continuation_output_key(id, "");
+        let paths: Vec<_> = self.runtime.range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix)).map(|(key, _)| key.clone()).collect();
+        for key in paths { self.runtime.remove(&key); }
+    }
 }
 
 /// A batch of decoded operations, shared with the WAL writer at submission.
@@ -591,10 +620,18 @@ impl NativeWatchOperations {
     }
 
     pub(crate) fn finish_pending(&mut self, path: &str, entry: Option<Arc<EntryRecord>>) {
+        self.finish_pending_as(path, entry, Collection::Entries);
+    }
+
+    pub(crate) fn settle_pending(&mut self, path: &str, entry: Option<Arc<EntryRecord>>) {
+        self.finish_pending_as(path, entry, Collection::SettledEntries);
+    }
+
+    fn finish_pending_as(&mut self, path: &str, entry: Option<Arc<EntryRecord>>, collection: Collection) {
         let key = path_key(path);
         let retry = match entry {
             Some(entry) => Operation::PutEntry(key.clone(), entry),
-            None => Operation::Delete(Collection::Entries, key.clone()),
+            None => Operation::Delete(collection, key.clone()),
         };
         self.0.push(retry);
         self.retire_pending(key);
@@ -823,7 +860,7 @@ impl NativeWatchState {
             let mut data = self.lock();
             let mut removed = Vec::new();
             for operation in operations.0.iter() {
-                if let (Some(_), Operation::Delete(Collection::Entries, path)) = (&events, operation) {
+                if let (Some(_), Operation::Delete(Collection::Entries | Collection::SettledEntries, path)) = (&events, operation) {
                     if let Some(record) = data.entries.get(path) {
                         removed.push(Arc::clone(record));
                     }
@@ -869,6 +906,11 @@ impl NativeWatchState {
             }
         }
     }
+
+}
+
+pub(crate) fn continuation_output_key(id: &str, path: &str) -> String {
+    format!("{CONTINUATION_OUTPUT_PREFIX}{id}|{path}")
 }
 
 impl NativeWatchState {

@@ -32,6 +32,7 @@ use std::time::Instant;
 
 mod dedup;
 mod dedup_hash;
+mod continuation;
 mod journal;
 mod quiet;
 #[cfg(test)]
@@ -899,7 +900,7 @@ impl Watch {
     ) -> io::Result<()> {
         let external = self.external.current.write().unwrap();
         if let Some(journal) = external.as_ref().and_then(|external| external.journal.upgrade()) {
-            prepare_flatten(&journal, "", output, work, leaf, destination)?;
+            prepare_flatten(&journal, "", output, work, leaf, destination, None)?;
         } else {
             let mut paths = crate::path_keys::output_path_aliases(output)?;
             paths.extend(crate::path_keys::output_path_aliases(work)?);
@@ -1991,11 +1992,12 @@ fn handoff_nested_blocker(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Recovery {
     max_depth: Option<usize>,
     scope: NativeDiscoveryScope,
     password_scope: PathBuf,
+    parent: Option<continuation::Parent>,
 }
 
 impl Recovery {
@@ -2017,14 +2019,18 @@ impl Recovery {
             max_depth: scope.get("extract_depth").and_then(Value::as_u64).map(|n| n as usize),
             scope: NativeDiscoveryScope::new(root, depth, excluded),
             password_scope: PathBuf::from(password_scope),
+            parent: scope.get("parent").and_then(|value| continuation::Parent::deserialize(value).ok()),
         })
     }
 
     fn record(&self) -> serde_json::Map<String, Value> {
         let mut record = scope_record(&self.scope);
         record.insert("extract_depth".into(), json!(self.max_depth));
+        if let Some(parent) = &self.parent { record.insert("parent".into(), json!(parent)); }
         record
     }
+
+    fn start_depth(&self) -> usize { self.parent.as_ref().map_or(1, |parent| parent.depth) }
 
     fn password_dir<'a>(&'a self, path: &'a Path) -> &'a Path {
         if self.password_scope.as_os_str().is_empty() {
@@ -3516,6 +3522,7 @@ impl Scheduler {
         let mut retired = Vec::new();
         for path in paths {
             let Some(entry) = self.journal.state().entry(&path) else { continue; };
+            if self.claimed_continuation(&entry, &watch_path_key(&path)) { continue; }
             let changed = match watch_candidate_for_path(Path::new(&path), Some(entry.change_usn)) {
                 Ok(Some(current)) => crate::postprocess::watch_source_changed(entry.size.max(0) as u64,
                     entry.mtime, &entry.file_id, entry.change_usn, &current),
@@ -3533,7 +3540,9 @@ impl Scheduler {
         let mut retired = Vec::new();
         for path in paths {
             let id = watch_path_key(&path);
-            if !self.pending.contains_key(&id) && self.journal.state().entry_by_key(&id).is_none()
+            let entry = self.journal.state().entry_by_key(&id);
+            if entry.as_deref().is_some_and(|entry| self.claimed_continuation(entry, &id)) { continue; }
+            if !self.pending.contains_key(&id) && entry.is_none()
                 && self.journal.state().pending(&path).is_none() { continue; }
             if let Some(pending) = self.pending.remove(&id) { self.due.remove(&(pending.due, id.clone())); }
             self.unpublished.remove(&id);
@@ -4080,6 +4089,7 @@ impl Scheduler {
             .into_iter()
             .filter_map(|entry| {
                 let id = crate::path_keys::path_key(&entry.path);
+                if self.claimed_continuation(&entry, &id) { return None; }
                 let root = containing_root(&self.roots, &id)
                     .map(|(_, (root, _))| &root.path)
                     .or_else(|| {
@@ -4109,6 +4119,11 @@ impl Scheduler {
                 keys,
             ))
         })
+    }
+
+    fn claimed_continuation(&self, entry: &crate::watch_store::EntryRecord, key: &str) -> bool {
+        entry.continuation().is_some()
+            && (self.active_paths.contains_key(key) || self.hub.claims.lock().unwrap().contains_key(key))
     }
 
     fn departed(&mut self, path: &str, recursive: bool) -> io::Result<()> {
@@ -4689,6 +4704,7 @@ impl Scheduler {
                         .contains_key(&watch_path_key(owner))
             })
         })?;
+        self.recover_continuations(roots)?;
         let scopes = self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>();
         let published = self.catalog.publish_outputs(&settled, &scopes, &self.deep_options, None)?;
         if !published.is_empty() { self.hub.update(|signals| signals.published_outputs.extend(published)); }
@@ -4866,6 +4882,7 @@ impl Scheduler {
                     max_depth: None,
                     scope: output_scope,
                     password_scope: password_scope.clone(),
+                    parent: None,
                 }));
             }
             if revisit.is_empty() && verified.is_empty() {
@@ -4924,6 +4941,7 @@ impl Scheduler {
                             )
                         },
                         password_scope: password_scope.clone(),
+                        parent: None,
                     })))
                 };
                 self.observe_candidate_with_event(&root, path.clone(), admission, recovery, None, None,
@@ -5312,6 +5330,7 @@ impl Scheduler {
             request.output_root = root.output.clone();
         }
         request.max_depth = cli::depth(self.settings.recursive_extract).min(recovery.as_ref().and_then(|r| r.max_depth).unwrap_or(usize::MAX));
+        request.start_depth = recovery.as_deref().map_or(1, Recovery::start_depth);
         request.deep = root.deep;
         let passwords = self.passwords.snapshot();
         request.passwords = Arc::clone(&self.settings.user_passwords);
@@ -5845,13 +5864,23 @@ impl Scheduler {
         let mut retry = Vec::new();
         let mut regrouped_recoveries = Vec::new();
         let mut published = HashSet::new();
+        let start_depth = active.recovery.as_deref().map_or(1, Recovery::start_depth);
+        let parent = active.recovery.as_ref().and_then(|recovery| recovery.parent.as_ref())
+            .filter(|_| !active.inputs.is_empty());
+        let mut resumed = match parent {
+            Some(parent) => continuation::Continuation::load(&self.journal, &parent.id)?
+                .map(|continuation| (parent.id.clone(), continuation)),
+            None => None,
+        };
+        let mut parents = HashMap::<String, (String, continuation::Continuation)>::new();
+        let mut continuations = Vec::new();
         let generated = std::cell::OnceCell::new();
         let recovery_receipts = std::cell::OnceCell::new();
         let recovery_receipts = || recovery_receipts.get_or_init(|| RecoveryReceipts::new(&outcome.checkpoints));
         for archive in outcome
             .archives
             .iter()
-            .filter(|archive| nested_retry(archive, &input_failures))
+            .filter(|archive| archive.depth > start_depth && nested_retry(archive, &input_failures))
         {
             let input_failure = &input_failures[&crate::path_keys::path_key(&archive.path.to_string_lossy())];
             let failure = input_failure.failure().expect("retained input has a retry cause");
@@ -5893,12 +5922,22 @@ impl Scheduler {
                     .collect(),
             };
             let directory = archive.path.parent().unwrap_or(Path::new(""));
-            // Keep the failed input in place with its remaining recursion
-            // depth and inherited password scope; this grants no directory permission.
+            let continuation = resumed.as_mut().or_else(|| {
+                let owner = completion_owner(&archive.path, &completed.outputs, &groups)?;
+                Some(parents.entry(owner.clone()).or_insert_with(|| {
+                    (continuation::Continuation::id(batch, &owner), continuation::Continuation::default())
+                }))
+            });
+            let parent = continuation.map(|(record, continuation)| {
+                continuation.block(id.clone());
+                continuation::Parent { id: record.clone(), depth: archive.depth }
+            });
+            // A generated input resumes at its original depth and password scope.
             let recovery = Recovery {
-                max_depth: Some(active.max_depth.saturating_sub(archive.depth.saturating_sub(1))),
+                max_depth: Some(active.max_depth),
                 scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), Some(0), Vec::new()),
                 password_scope: active.password_scope.clone(),
+                parent,
             };
             let mut entry = make_blocker(
                 &candidate,
@@ -5972,7 +6011,11 @@ impl Scheduler {
             // the other volumes, retire only their physical pending records.
             if !completed.cancelled {
                 if id != canonical_id {
-                    operations.finish_pending(&candidate.path, None);
+                    if resumed.is_some() {
+                        operations.settle_pending(&candidate.path, None);
+                    } else {
+                        operations.finish_pending(&candidate.path, None);
+                    }
                 }
                 if self.pending.contains_key(&canonical_id)
                     || !projected_groups.insert(canonical_id.clone())
@@ -6050,8 +6093,21 @@ impl Scheduler {
                     scope: NativeDiscoveryScope::new(Path::new(&candidate.path).parent().unwrap_or(Path::new(""))
                         .to_string_lossy().into_owned(), Some(0), Vec::new()),
                     password_scope: active.password_scope.clone(),
+                    parent: None,
                 });
+            let deferred = parents.remove(&canonical_id);
             let recovery = active.recovery.as_deref().or(regrouped_recovery.as_ref());
+            let linked_recovery = blocker.and_then(|_| resumed.as_ref().or(deferred.as_ref())).map(|(id, _)| {
+                let mut recovery = recovery.cloned().unwrap_or_else(|| Recovery {
+                    max_depth: Some(active.max_depth),
+                    scope: self.roots[&active.root].1.clone(),
+                    password_scope: active.password_scope.clone(),
+                    parent: None,
+                });
+                recovery.parent = Some(continuation::Parent { id: id.clone(), depth: start_depth });
+                recovery
+            });
+            let recovery = linked_recovery.as_ref().or(recovery);
             let record = if completed.cancelled {
                 // Only the cancelled generation is retired. A generation
                 // queued while the batch was in flight is left in the WAL.
@@ -6129,9 +6185,39 @@ impl Scheduler {
                         failure, self.settings.cli.language,
                     )]);
                 }
-                self.journal.log(event);
+                let deferred_completion = resumed.is_some() || deferred.is_some();
+                if let Some((_, continuation)) = resumed.as_mut() {
+                    if record.is_none() || !retryable {
+                        continuation.settle(&event, counts);
+                    }
+                } else if let Some((id, mut continuation)) = deferred {
+                    if record.is_some() && retryable {
+                        continuation.block(watch_path_key(&candidate.path));
+                        event["event"] = json!("done");
+                        event["error"] = Value::Null;
+                        event["error_kind"] = Value::Null;
+                        counts.write(&mut event);
+                    }
+                    if let Some(group) = group.filter(|group| group.members.len() > 1) {
+                        event["group"] = json!(group.record());
+                    }
+                    continuation.begin(&active.root, event);
+                    continuations.push((id, continuation));
+                } else {
+                    self.journal.log(event);
+                }
+                if deferred_completion && record.is_none() {
+                    // Remove the running card. The parent publishes history when
+                    // the last blocking input has settled.
+                    self.journal.log(json!({"event":"no_tasks_found","path":canonical,
+                        "owner":batch,"retire_group":true}));
+                }
             }
-            operations.finish_pending(&candidate.path, record);
+            if resumed.is_some() {
+                operations.settle_pending(&candidate.path, record);
+            } else {
+                operations.finish_pending(&candidate.path, record);
+            }
         }
         if !completed.cancelled {
             for error in &outcome.errors {
@@ -6148,7 +6234,15 @@ impl Scheduler {
                 }
             }
         }
+        continuations.extend(resumed);
+        let mut ready = Vec::new();
+        for (id, continuation) in continuations {
+            continuation.defer(&self.journal, &id, &outcome.deferred_flatten, &mut operations);
+            continuation.store(id.clone(), &mut operations);
+            if continuation.ready() { ready.push((id, continuation)); }
+        }
         self.journal.commit(true, |_| Ok(operations))?;
+        for (id, continuation) in ready { self.finish_continuation(&id, continuation)?; }
         // A change observed during an active retry must not be overwritten
         // by that retry's late completion of the original generation.
         if active.recovery.is_some() || !regrouped_recoveries.is_empty() {
@@ -6463,7 +6557,10 @@ fn completion_archives<'a>(
             let partial = crate::pipeline::TaskStatus::of(archive) == crate::pipeline::TaskStatus::Partial;
             match counted.entry((path.clone(), archive.depth)) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let owner = completion_owner_key(&path, outputs, groups).unwrap_or_else(|| path.clone());
+                    // Flattening can move the output beyond the original source path.
+                    let owner = completion_owner_key(&path, outputs, groups)
+                        .or_else(|| archive.output.as_deref().and_then(|output| completion_owner(output, outputs, groups)))
+                        .unwrap_or_else(|| path.clone());
                     let count = counts.entry(owner.clone()).or_default();
                     count.success_count += 1;
                     count.partial_success_count += usize::from(partial);
@@ -6888,7 +6985,7 @@ impl Observer for WatchObserver {
 
     fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path, destination: &Path) -> io::Result<()> {
         let owner = self.owner_for_path(root).unwrap_or_default();
-        prepare_flatten(&self.journal, &owner, root, work, leaf, destination)?;
+        prepare_flatten(&self.journal, &owner, root, work, leaf, destination, None)?;
         if !owner.is_empty() {
             self.outputs.lock().unwrap().insert(key(work), owner);
         }
@@ -6950,6 +7047,7 @@ fn prepare_flatten(
     work: &Path,
     leaf: &Path,
     destination: &Path,
+    continuation: Option<&str>,
 ) -> io::Result<()> {
     journal.commit(true, |state| {
         use crate::watch_store::NativeWatchOperations;
@@ -6961,6 +7059,7 @@ fn prepare_flatten(
             "owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,
             "new_identity":new,"work_paths":work_paths,"destination":destination,
         });
+        if let Some(id) = continuation { record["continuation"] = json!(id); }
         if root != destination && key(root) != key(destination) {
             let destination_paths = crate::path_keys::output_path_aliases(destination)?;
             record["root_paths"] = json!(paths);
@@ -6979,7 +7078,9 @@ fn prepare_flatten(
         paths.extend(work_paths);
         state.register_output_paths(&paths, &[&old, &new]);
         Ok(operations)
-    })
+    })?;
+    if continuation.is_some() { journal.wait_before_mutation()?; }
+    Ok(())
 }
 
 fn finish_flatten(journal: &journal::Journal, root: &str) -> io::Result<()> {
@@ -7045,6 +7146,11 @@ fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root:
         let work_leaf = Path::new(work).join(relative).to_string_lossy().into_owned();
         operations.relocate_output(owner, root.to_owned(), leaf.to_owned(), destination.to_owned(), current.clone());
         operations.relocate_output(owner, work.to_owned(), work_leaf, destination.to_owned(), current.clone());
+    }
+    if published && !already_rebased {
+        if let Some(id) = record["continuation"].as_str() {
+            continuation::relocate_output(state, id, Path::new(root), Path::new(destination), &mut operations)?;
+        }
     }
     if work_exists { paths.extend(work_paths.clone().map(str::to_owned)); }
     state.register_output_paths(&paths, &[&current, old]);

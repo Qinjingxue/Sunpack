@@ -771,6 +771,7 @@ fn retained_regroup_handoff_persists_the_new_current_root() {
         max_depth: None,
         scope: NativeDiscoveryScope::new(r"C:\watch\old".into(), Some(0), Vec::new()),
         password_scope: r"C:\passwords".into(),
+        parent: None,
     };
     let mut entry = Arc::new(observed_entry(&candidate, "suspended_missing_volume"));
     let payload = &mut Arc::make_mut(&mut entry).failure_payload;
@@ -965,6 +966,7 @@ fn admitted_password_scope_survives_family_head_retry_and_retained_recovery() {
         max_depth: None,
         scope: NativeDiscoveryScope::new(r"C:\output\nested".into(), Some(0), Vec::new()),
         password_scope: b.to_owned(),
+        parent: None,
     };
     assert_eq!(candidate_password_scope(&state, r"C:\output\nested\inner.zip", Some(&retained)), b);
     let pending_path = r"C:\watch\A\pending.zip";
@@ -1963,7 +1965,7 @@ fn flatten_recovery_rebases_durable_output_identities() {
                     .unwrap())
             })
             .unwrap();
-        prepare_flatten(&journal, owner, &root, &work, &leaf, &root).unwrap();
+        prepare_flatten(&journal, owner, &root, &work, &leaf, &root, None).unwrap();
         assert_eq!(journal.state().active_output_keys().len(), 4);
         fs::rename(&root, &work).unwrap();
         journal.flush().unwrap();
@@ -2014,7 +2016,7 @@ fn flatten_keeps_physical_work_when_its_literal_junction_disappears() {
         .args(["/d", "/c", "mklink", "/J"]).arg(&alias).arg(&real).output().unwrap();
     assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
     let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
-    prepare_flatten(&journal, "", &root, &work, &leaf, &root).unwrap();
+    prepare_flatten(&journal, "", &root, &work, &leaf, &root, None).unwrap();
     fs::rename(&root, &work).unwrap();
     fs::rename(physical_work.join("leaf"), &root).unwrap();
     fs::remove_dir(alias).unwrap();

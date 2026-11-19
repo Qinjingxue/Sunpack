@@ -186,12 +186,9 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Set up Rust
-        shell: pwsh
-        run: |
-          rustup default stable
-          rustup target add ${{ matrix.rust_target }}
-          cargo --version
-          rustc -Vv
+        uses: ./.github/actions/setup-rust
+        with:
+          target: ${{ matrix.rust_target }}
 
       - name: Restore native build cache
         id: native-cache

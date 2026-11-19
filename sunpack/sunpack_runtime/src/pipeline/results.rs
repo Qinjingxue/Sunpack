@@ -3,6 +3,7 @@
 use super::{ArchiveResult, CleanupResult, FailureKind, InputError,
     InputErrorKind, InputCheckpoint, Outcome, GeneratedSource, ScanTaskFailure};
 use std::collections::LinkedList;
+use std::path::PathBuf;
 #[cfg(test)]
 use std::ops::Index;
 
@@ -148,6 +149,7 @@ pub(super) struct RunOutcome {
     pub checkpoints: Results<InputCheckpoint>,
     pub cleanup_results: Results<CleanupResult>,
     pub generated_sources: Results<GeneratedSource>,
+    pub deferred_flatten: LinkedList<PathBuf>,
     pub scan_incomplete: bool,
     pub uncommitted: bool,
 }
@@ -164,6 +166,7 @@ impl From<Outcome> for RunOutcome {
             scan_failures: value.scan_failures,
             checkpoints: value.checkpoints.into(), cleanup_results: value.cleanup_results.into(),
             generated_sources: value.generated_sources.into(),
+            deferred_flatten: value.deferred_flatten,
             scan_incomplete: value.scan_incomplete, uncommitted: value.uncommitted }
     }
 }
@@ -173,6 +176,7 @@ impl From<RunOutcome> for Outcome {
             scan_failures: value.scan_failures,
             checkpoints: value.checkpoints.into_vec(), cleanup_results: value.cleanup_results.into_vec(),
             generated_sources: value.generated_sources.into_vec(), coalesced_from: None,
+            deferred_flatten: value.deferred_flatten,
             scan_incomplete: value.scan_incomplete, uncommitted: value.uncommitted }
     }
 }

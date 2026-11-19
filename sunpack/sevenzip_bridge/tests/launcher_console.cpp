@@ -2,21 +2,40 @@
 // The private console and local pipe require no resident runtime or fixtures.
 #include <windows.h>
 
+#include <algorithm>
+#include <array>
+#include <string_view>
+
 namespace {
 // Change the reported dimensions only while the console listener is stopped.
 SMALL_RECT test_viewport{0, 0, 79, 24};
+const std::array<std::wstring_view, 3>* test_console_chunks = nullptr;
+std::size_t test_console_read = 0;
 
 BOOL read_test_viewport(HANDLE output, CONSOLE_SCREEN_BUFFER_INFO* screen) {
     if (!GetConsoleScreenBufferInfo(output, screen)) return FALSE;
     screen->srWindow = test_viewport;
     return TRUE;
 }
+
+BOOL read_test_console(HANDLE input, void* buffer, DWORD capacity, DWORD* read,
+                       CONSOLE_READCONSOLE_CONTROL* control) {
+    if (!test_console_chunks) return ReadConsoleW(input, buffer, capacity, read, control);
+    if (test_console_read == test_console_chunks->size()) return FALSE;
+    const auto chunk = (*test_console_chunks)[test_console_read++];
+    if (chunk.size() > capacity) return FALSE;
+    std::copy(chunk.begin(), chunk.end(), static_cast<wchar_t*>(buffer));
+    *read = static_cast<DWORD>(chunk.size());
+    return TRUE;
+}
 }
 
 #define GetConsoleScreenBufferInfo read_test_viewport
+#define ReadConsoleW read_test_console
 #define wmain sunpack_launcher_main
 #include "../src/launcher.cpp"
 #undef wmain
+#undef ReadConsoleW
 #undef GetConsoleScreenBufferInfo
 
 #include <stdexcept>
@@ -24,6 +43,21 @@ BOOL read_test_viewport(HANDLE output, CONSOLE_SCREEN_BUFFER_INFO* screen) {
 namespace {
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void expect_split_surrogate() {
+    // Force the high unit to end the first read independently of conhost.
+    std::wstring prefix(4094, L'x');
+    prefix.push_back(L'\xd83d');
+    const std::array<std::wstring_view, 3> chunks{prefix, L"\xde00", L"\r\n"};
+    test_console_chunks = &chunks;
+    test_console_read = 0;
+    const auto text = read_input_line();
+    const auto terminator = read_input_line();
+    test_console_chunks = nullptr;
+    require(text == std::string(4094, 'x') + "\xf0\x9f\x98\x80",
+            "preserve a surrogate pair across console reads");
+    require(terminator == "\r\n", "read the subsequent line terminator");
 }
 
 void development_entrypoint_contract() {
@@ -57,11 +91,11 @@ void development_entrypoint_contract() {
     fs::remove_all(root);
 }
 
-void key(HANDLE input, wchar_t value, WORD repeat = 1) {
+void key(HANDLE input, wchar_t value) {
     INPUT_RECORD record{};
     record.EventType = KEY_EVENT;
     record.Event.KeyEvent.bKeyDown = TRUE;
-    record.Event.KeyEvent.wRepeatCount = repeat;
+    record.Event.KeyEvent.wRepeatCount = 1;
     const SHORT virtual_key = VkKeyScanW(value);
     record.Event.KeyEvent.wVirtualKeyCode = value == L'\r' ? VK_RETURN : virtual_key == -1 ? 0 : virtual_key & 0xff;
     record.Event.KeyEvent.uChar.UnicodeChar = value;
@@ -163,15 +197,7 @@ int main() {
             test_viewport = {0, 0, 39, 9};
             for (wchar_t value : std::wstring(L"quietQpassword\r")) key(input, value);
             require(read_input_line().find("quietQpassword") != std::string::npos, "prompt owns Q keys");
-            // The first ReadConsoleW returns the high unit at its exact buffer
-            // boundary. The chunk must contain the whole scalar, not signal EOF.
-            key(input, L'x', 4094);
-            key(input, 0xd83d);
-            key(input, 0xde00);
-            key(input, L'\r');
-            require(read_input_line() == std::string(4094, 'x') + "\xf0\x9f\x98\x80",
-                    "preserve a surrogate pair across console reads");
-            require(read_input_line() == "\r\n", "read the subsequent line terminator");
+            expect_split_surrogate();
             expect_empty(server);
             controls.resume(); // Recheck even if line input consumed the event.
             expect_resize(server, 40, 10);

@@ -292,6 +292,14 @@ impl Journal {
         self.wait_commits(&tickets.0)
     }
 
+    // A deferred completion must make its intent durable before changing files.
+    pub(super) fn wait_before_mutation(&self) -> io::Result<()> {
+        let tickets = DEFERRED.with(|slot| slot.borrow_mut().as_mut()
+            .filter(|(owner, _)| *owner == self as *const Self as usize)
+            .map(|(_, tickets)| std::mem::take(tickets)).unwrap_or_default());
+        self.wait_commits(&tickets)
+    }
+
     pub(super) fn defer_waits<T>(&self, prepare: impl FnOnce() -> T) -> (T, io::Result<()>) {
         let (result, tickets) = self.prepare_waits(prepare);
         (result, self.wait_prepared(tickets))

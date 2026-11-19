@@ -1,0 +1,17 @@
+name: Set up Rust
+description: Install the same Rust toolchain for acceptance and packaging
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      env:
+        SUNPACK_RUST_TARGET: ${{ inputs.target }}
+      run: |
+        rustup toolchain install 1.100.0 --profile minimal --target $env:SUNPACK_RUST_TARGET --override
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        cargo --version
+        rustc -Vv

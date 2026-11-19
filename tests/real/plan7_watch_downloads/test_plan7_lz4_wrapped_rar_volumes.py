@@ -65,13 +65,13 @@ def test_plan7_lz4_wrapped_volumes(package, tmp_path, format, mode, cleanup, ord
 
     watch = watch_setup(package, tmp_path, cleanup=cleanup, flatten=cleanup == "d", recursive=recursive, output_inside=inside)
     if order != "overlap":
-        # A completed wrapper is a real barrier: either register the missing
-        # head before peers exist, or persist raw tails before the head exists.
+        # Wait until this wrapper registers its blocked head or publishes
+        # its raw tail before supplying the remaining inputs.
         first = download(watch, sources[0], directory=watch.root / "first" if recursive else watch.root)
-        watch.await_event("done", path=first.name)
         if order == "head-first":
             watch.await_event("suspended_missing_volume", path=case.entry_path.name)
         else:
+            watch.await_event("done", path=first.name)
             generated, = (path for path in watch.output.rglob(parts[-1].name) if path.is_file())
             if order == "stale-tail":
                 # Byte-identical replacement is outside the ordinary scope:

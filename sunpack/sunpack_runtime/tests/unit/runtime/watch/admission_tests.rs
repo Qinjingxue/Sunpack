@@ -1288,7 +1288,7 @@ fn readiness_seals_post_close_usn_before_discovery_without_reauthorizing_recover
     }).unwrap();
     scheduler.enqueue(&root, source.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
     scheduler.pending.get_mut(&id).unwrap().recovery = Some(Arc::new(Recovery {
-        max_depth: None, scope: scheduler.roots[&root].1.clone(), password_scope: base.join("input"),
+        max_depth: None, scope: scheduler.roots[&root].1.clone(), password_scope: base.join("input"), parent: None,
     }));
     let rewritten = source.clone(); let mtime = fs::metadata(&source).unwrap().modified().unwrap();
     *READINESS_HOOK.lock().unwrap() = Some((scheduler.pending[&id].candidate.path.clone(), Box::new(move || {

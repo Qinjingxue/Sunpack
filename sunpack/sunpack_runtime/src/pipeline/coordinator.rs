@@ -150,6 +150,19 @@ impl Engine {
         .unwrap_or_else(|_| Err(io::Error::other(format!("Watch stage {name} panicked"))))
     }
 
+    pub(crate) fn finalize_directory(
+        &self, observer: &impl Observer, source: &Path, output: PathBuf,
+        naming: crate::core::config::FlattenDirectoryName,
+    ) -> io::Result<(Option<PathBuf>, Vec<super::CleanupResult>)> {
+        if output_is_gone(&output, true) { return Ok((None, Vec::new())); }
+        let id = self.next_id();
+        let names = OutputReservationGuard { registry: Arc::clone(&self.output_names), owner: id };
+        let mut result = ArchiveResult { path: source.to_owned(), output: Some(output), ..ArchiveResult::default() };
+        let mut outcome = Outcome::default();
+        flatten_result(observer, id, &mut result, &mut outcome, None, &names, naming)?;
+        Ok((result.output, outcome.cleanup_results.into_vec()))
+    }
+
     pub(crate) fn submit<O: Observer + 'static, T: Send + 'static>(
         &self, request: Request, observer: Arc<O>,
         complete: impl FnOnce(io::Result<PublicOutcome>) -> T + Send + 'static,
@@ -1262,7 +1275,10 @@ impl<'run, O: Observer> Run<'run, O> {
         // Request admission covers only the user's original selections, as in
         // main. Discovery may resolve different selections to one volume family;
         // claim_task shares reads within a request and serializes other requests.
-        let executed = self.execute_batch(discovered, 1, None, None, spawner, requested).await;
+        let inherited_scope = self.request.password_scope.as_deref()
+            .filter(|_| self.request.start_depth > 1)
+            .map(|path| Arc::new(RecursiveScope { password: Some(Arc::from(path)) }));
+        let executed = self.execute_batch(discovered, self.request.start_depth, inherited_scope, None, spawner, requested).await;
         let result = self.finish(executed).await.map(PublicOutcome::from);
         if let Some(watch) = watch { watch.finish(&result, &self.request.cancel); }
         result
@@ -1380,9 +1396,10 @@ impl<'run, O: Observer> Run<'run, O> {
     ) -> io::Result<Outcome> {
         // Blocked paths are only used while projecting discovery candidates.
         drop(batch.blocked_paths);
+        let request_entry = depth == self.request.start_depth;
         // Scan has no request claim to reveal aliases. Reuse the resolved
         // paths from deduplication for read leases in both modes.
-        let resolved_paths = if depth == 1 && batch.tasks.len() > 1
+        let resolved_paths = if request_entry && batch.tasks.len() > 1
             && (self.resolve_aliases || (self.request.mode == Mode::Scan && self.request.inputs.len() > 1))
         {
             dedup_resolved_plans(&mut batch.tasks)
@@ -1390,7 +1407,7 @@ impl<'run, O: Observer> Run<'run, O> {
             HashMap::new()
         };
         let mut root_errors = HashMap::new();
-        if depth == 1 && self.request.watch_catalog.is_some()
+        if request_entry && self.request.watch_catalog.is_some()
             && batch.errors.iter().any(|error| error.kind == InputErrorKind::EmbeddedDiscovery)
         {
             use crate::scan::catalog::catalog_stem;
@@ -1423,7 +1440,7 @@ impl<'run, O: Observer> Run<'run, O> {
         let has_root_errors = !root_errors.is_empty();
         let root_errors = Mutex::new(root_errors);
         let task_count = batch.tasks.len();
-        if depth == 1 {
+        if request_entry {
             self.observer.roots_planned(batch.tasks.iter().map(|task| {
                 (task.entry().entry_path.as_str(), task.owned_paths.as_slice())
             }));
@@ -1473,7 +1490,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     (_, errors) => errors,
                 };
-                let result = if depth == 1 && (this.request.mode == Mode::Extract || O::PUBLISHES_ROOTS) {
+                let result = if request_entry && (this.request.mode == Mode::Extract || O::PUBLISHES_ROOTS) {
                     let publication = boxed_phase(|| this.finish_root(id, &path, result));
                     publication.await
                 } else {
@@ -1526,6 +1543,7 @@ impl<'run, O: Observer> Run<'run, O> {
             outcome.uncommitted |= branch.uncommitted;
             outcome.checkpoints.append(&mut branch.checkpoints);
             outcome.cleanup_results.append(&mut branch.cleanup_results);
+            outcome.deferred_flatten.append(&mut branch.deferred_flatten);
             outcome
                 .generated_sources
                 .append(&mut branch.generated_sources);
@@ -1667,7 +1685,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let cancel = &this.request.cancel;
             cancel.check_io()?;
             stage("preflight", cancel).await?;
-            let watch_root = depth == 1
+            let watch_root = depth == this.request.start_depth
                 && this.request.origin == Origin::Watch
                 && this.request.mode == Mode::Extract;
             let captured = requested.is_none().then(|| this.requested_generation(&task, watch_root)).flatten();
@@ -1715,11 +1733,10 @@ impl<'run, O: Observer> Run<'run, O> {
                     task.inputs.iter().map(|logical| logical.failure.clone()).collect::<Vec<_>>()
                 } else { Vec::new() };
                 this.admit_missing_inputs(&mut task, &missing);
-                this.observer.claim_sources(
-                    Path::new(&task.entry().entry_path),
-                    &task.owned_paths,
-                    depth,
-                )?;
+                // Claims belong to the dispatched request. Archive depth still
+                // belongs to the original recursive tree.
+                let dispatch_depth = depth - this.request.start_depth + 1;
+                this.observer.claim_sources(Path::new(&task.entry().entry_path), &task.owned_paths, dispatch_depth)?;
                 let owner_path = PathBuf::from(&task.entry().entry_path);
                 let source_scope = inherited_scope.as_ref().and_then(|scope| scope.password.as_deref())
                     .or_else(|| owner_path.parent());
@@ -2044,11 +2061,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                     }
                                 };
                                 this.admit_missing_inputs(&mut replacement, &missing);
-                                this.observer.claim_sources(
-                                    Path::new(&replacement.entry().entry_path),
-                                    &replacement.owned_paths,
-                                    depth,
-                                )?;
+                                this.observer.claim_sources(Path::new(&replacement.entry().entry_path), &replacement.owned_paths, dispatch_depth)?;
                                 attempted = replacement.entry().volume_attempts.as_ref().map(|_| {
                                     replacement
                                         .entry()
@@ -2276,13 +2289,12 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                         // A carrier's segments are independent output trees. Their
                         // containers must keep the original layout for continuation.
-                        if !multi
+                        let flatten = !multi
                             && !result.retained
                             && result.failure.is_none()
                             && this.request.config.post_extract.flatten_single_directory
-                            && children_complete
-                            && !cancel.cancelled()
-                        {
+                            && !cancel.cancelled();
+                        if flatten && children_complete {
                             if !ran_recursive_children {
                                 if let Some(output) = result.output.as_deref() {
                                     this.drain_cleanup(Some(output), &mut descendants).await;
@@ -2294,7 +2306,10 @@ impl<'run, O: Observer> Run<'run, O> {
                                 this.request.config.post_extract.flatten_directory_name,
                             )?;
                             children_complete &= descendants.subtree_complete();
+                        } else if flatten && this.request.origin == Origin::Watch {
+                            if let Some(output) = &result.output { outcome.deferred_flatten.push_back(output.clone()); }
                         }
+                        outcome.deferred_flatten.append(&mut descendants.deferred_flatten);
                         carrier_children_complete &= children_complete;
                         let mut checkpoint = parent_checkpoints.get_mut(index).and_then(Option::take);
                         if let Some(checkpoint) = &mut checkpoint { checkpoint.settle_result(&result); }
@@ -2331,12 +2346,12 @@ impl<'run, O: Observer> Run<'run, O> {
                     if let Some(retained) = replacement_result { completed.push(retained); }
                     // Only the final carrier namespace is flattened. Individual segment
                     // layouts remain intact while any input or recursive subtree may resume.
-                    if multi && outputs_committed && carrier_children_complete
+                    let flatten = multi && outputs_committed
                         && completed.iter().all(|result| result.failure.is_none())
                         && !continued_output
                         && this.request.config.post_extract.flatten_single_directory
-                        && !cancel.cancelled()
-                    {
+                        && !cancel.cancelled();
+                    if flatten && carrier_children_complete {
                         if let Some(root) = carrier.clone().filter(|_| completed.iter().any(|result| result.output.is_some())) {
                             this.drain_cleanup(Some(&root), &mut children).await;
                             stage("postprocess", cancel).await?;
@@ -2357,6 +2372,8 @@ impl<'run, O: Observer> Run<'run, O> {
                             carrier = container.output;
                             flattened?;
                         }
+                    } else if flatten && this.request.origin == Origin::Watch {
+                        if let Some(root) = &carrier { outcome.deferred_flatten.push_back(root.clone()); }
                     }
                     if multi && outputs_committed && children.settled()
                         && completed.iter().all(|result| !result.failure.as_ref()
@@ -2441,7 +2458,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                 carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
                         }
                         let cleanup_paths = sources.release(true);
-                        let mode = if depth > 1 { CleanupMode::Delete }
+                        let mode = if dispatch_depth > 1 { CleanupMode::Delete }
                             else { this.request.config.post_extract.archive_cleanup_mode };
                         let mut deletes = Vec::new();
                         let mut recycles = Vec::new();
@@ -2586,12 +2603,12 @@ impl<'run, O: Observer> Run<'run, O> {
         watch_root: bool,
         depth: usize,
     ) -> Option<GeneratedSource> {
-        if depth == 1 && !watch_root && self.generated_sources.is_empty() {
+        if depth == self.request.start_depth && !watch_root && self.generated_sources.is_empty() {
             return None;
         }
         let key = path_key(path);
         let generation = generations.get(&key)?;
-        if depth > 1 { return Some(GeneratedSource::from_generation(Path::new(path), generation)); }
+        if depth > self.request.start_depth { return Some(GeneratedSource::from_generation(Path::new(path), generation)); }
         self.generated_sources
             .get(&key)
             .map(|&index| &self.request.generated_sources[index])
@@ -2626,12 +2643,12 @@ impl<'run, O: Observer> Run<'run, O> {
         let destination_matches = match checkpoint.container() {
             Some(container) => {
                 output_candidate(preferred_carrier, container)
-                    || (depth == 1
+                    || (depth == self.request.start_depth
                         && self
                             .generated_source(
                                 &input.entry_path,
                                 generations,
-                                self.request.origin == Origin::Watch, 1,
+                                self.request.origin == Origin::Watch, depth,
                             )
                             .is_some())
             }

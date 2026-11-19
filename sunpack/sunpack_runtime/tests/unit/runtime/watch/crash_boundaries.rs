@@ -46,7 +46,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
             }
             Ok(operations)
         }).unwrap();
-        prepare_flatten(&journal, owner_text, &root, &work, &leaf, &destination).unwrap();
+        prepare_flatten(&journal, owner_text, &root, &work, &leaf, &destination, None).unwrap();
         let phase = std::env::var(PHASE).unwrap();
         if phase != "prepared" {
             crate::io::atomic_file::rename_no_replace(&root, &work).unwrap();
@@ -108,7 +108,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                 let result = crate::postprocess::flatten_single_branch_directories(
                     &root, &work, crate::postprocess::FlattenLeaf::Prepared(&leaf),
                     &destination,
-                    || prepare_flatten(&journal, owner.to_str().unwrap(), &root, &work, &leaf, &destination),
+                    || prepare_flatten(&journal, owner.to_str().unwrap(), &root, &work, &leaf, &destination, None),
                 );
                 assert!(matches!(result, crate::postprocess::FlattenOutcome::Published { cleanup_error: None }), "{result:?}");
                 finish_flatten(&journal, root.to_str().unwrap()).unwrap();
