@@ -172,13 +172,9 @@
       "zh": "剪贴板历史",
       "en": "Clipboard history"
     },
-    "saveHistoryToDirectory": {
-      "zh": "保存到当前目录",
-      "en": "Save to folder"
-    },
-    "saveHistoryGlobally": {
-      "zh": "保存到全部目录",
-      "en": "Save globally"
+    "savePassword": {
+      "zh": "保存密码",
+      "en": "Save password"
     },
     "savedPasswords": {
       "zh": "密码列表",

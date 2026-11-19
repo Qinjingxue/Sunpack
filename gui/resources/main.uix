@@ -923,7 +923,6 @@ export default {
   .light .password-text:hover { background:#00000008; }
   .dark .password-text:hover { background:#ffffff08; }
   .history-text { width:100%; white-space:pre-wrap; }
-  .history-save { width:132px; flex-shrink:0; }
   .root-table { flex:1; gap:6px; }
   .root-columns { flex-direction:row; align-items:center; gap:8px; }
   .root-header { padding:10px 12px; margin:2px 18px 0px 2px; flex-shrink:0; border:1px solid var(--card-border); border-radius:8px; }
@@ -1143,7 +1142,7 @@ export default {
                   </div>
                   <label v-if="passwordHistory" class="history-text" :id="'history-value-'+p.id">{{ p.value }}</label>
                 </div>
-                <button v-show="passwordHistory" class="history-save" :id="'save-history-'+p.id" :enabled="!historyDraft(p).pending" @click="saveHistory(p)">{{ directorySelection?texts.saveHistoryToDirectory:texts.saveHistoryGlobally }}</button>
+                <button v-show="passwordHistory" :id="'save-history-'+p.id" :enabled="!historyDraft(p).pending" @click="saveHistory(p)">{{ texts.savePassword }}</button>
                 <div v-show="!passwordHistory" class="record-switch">
                   <toggle :id="'enabled-password-'+p.id" :checked="passwordDraft(p).enabled" @change="v=>togglePassword(p,v)"/>
                 </div>

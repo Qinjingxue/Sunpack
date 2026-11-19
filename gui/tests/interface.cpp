@@ -672,6 +672,19 @@ std::string root_row_id(Application& app,const fs::path& path) {
 }
 
 void roots_and_passwords(Application& app,const fs::path& dir) {
+    auto resize_toolbar=[&](const char* search,const char* record,const char* below,int width) {
+        ui_window_set_size(app.window(),width,560);
+        // Inspect the resize layout itself: another layout would mask a stale row count.
+        auto* button=window(app).Root()->FindById(record);
+        const auto bounds=button->rect;
+        assert((bounds.top>=rect(app,search).bottom)==(width==850));
+        assert(std::abs(button->Parent()->rect.bottom-bounds.bottom)<1);
+        const float gap=rect(app,below).top-bounds.bottom;
+        assert(gap>0 && gap<bounds.bottom-bounds.top);
+        auto* hit=window(app).Root()->HitTest((bounds.left+bounds.right)/2,bounds.bottom-2);
+        while(hit && hit!=button) hit=hit->Parent();
+        assert(hit==button);
+    };
     const auto root=dir/"new-root";
     fs::create_directory(root);
     const auto root_path=dir/"sunpack_watch_roots.txt", passwords_path=dir/"builtin_passwords.json";
@@ -792,6 +805,8 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     assert(rect(app,"savedPasswords").top>=rect(app,"passwordSearch").bottom);
     assert(std::abs(rect(app,"savedPasswords").left-rect(app,"passwordSearch").left)<1);
     screenshot(app.window(),L"clipboard-history.png");
+    resize_toolbar("passwordSearch","openPasswordsRecord","savedPasswords",850);
+    resize_toolbar("passwordSearch","openPasswordsRecord","savedPasswords",1120);
     click(app,"selectAllPasswords");
     click(app,"deleteSelectedPasswords");
     finish_input(app);
@@ -815,7 +830,7 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     finish_input(app);
     assert(read_json(passwords_path)["passwords"].size()==1);
     navigate(app,"tabRoots","roots");
-    ui_window_set_size(app.window(),850,560);
+    resize_toolbar("rootSearch","openRootsRecord","rootTableHeader",850);
     click(app,("enabled-root-"+root_id).c_str());
     finish_input(app);
     ui_window_relayout(app.window());

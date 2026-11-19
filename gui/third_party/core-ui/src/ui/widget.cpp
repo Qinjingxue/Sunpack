@@ -659,6 +659,41 @@ void VBoxWidget::DoLayout() {
     std::vector<float> heights(vis.size());
     for (size_t i = 0; i < vis.size(); ++i) {
         auto* child = vis[i];
+        // Cross-axis (width + horizontal position). align-self overrides
+        // container's align-items per-child when set.
+        LayoutAlign effAlign = (child->alignSelfOverride < 0)
+            ? crossAlign_
+            : static_cast<LayoutAlign>(child->alignSelfOverride);
+        // CSS display: inline / inline-block items have intrinsic cross-size
+        // and don't honor align-items: stretch (use SizeHint instead). User
+        // explicit align-self: stretch opt-in still wins.
+        bool intrinsic = (child->display == Display::Inline ||
+                          child->display == Display::InlineBlock) &&
+                         child->alignSelfOverride < 0;
+        float availW = cw - child->marginL - child->marginR;
+        float childW;
+        if (child->fixedW > 0) {
+            childW = std::clamp(child->fixedW, child->minW, child->maxW);
+        } else if (effAlign == LayoutAlign::Stretch && !intrinsic) {
+            childW = std::clamp(availW, child->minW, child->maxW);
+        } else {
+            float hintW = child->SizeHint().width;
+            if (hintW <= 0) hintW = availW;
+            childW = std::clamp(hintW, child->minW, child->maxW);
+        }
+
+        float childX = cx + child->marginL;
+        switch (effAlign) {
+            case LayoutAlign::Stretch:
+            case LayoutAlign::Start:   break;
+            case LayoutAlign::Center:  childX += (availW - childW) * 0.5f; break;
+            case LayoutAlign::End:     childX += availW - childW; break;
+        }
+
+        // Wrapped rows measure their height against this layout pass's width.
+        child->rect.left = childX;
+        child->rect.right = childX + childW;
+
         usedH += child->marginT + child->marginB;
         if (child->expanding && child->fixedH <= 0) {
             totalFlex += child->flex;
@@ -715,38 +750,8 @@ void VBoxWidget::DoLayout() {
 
         y += child->marginT;
 
-        // Cross-axis (width + horizontal position). align-self overrides
-        // container's align-items per-child when set.
-        LayoutAlign effAlign = (child->alignSelfOverride < 0)
-            ? crossAlign_
-            : static_cast<LayoutAlign>(child->alignSelfOverride);
-        // CSS display: inline / inline-block items have intrinsic cross-size
-        // and don't honor align-items: stretch (use SizeHint instead). User
-        // explicit align-self: stretch opt-in still wins.
-        bool intrinsic = (child->display == Display::Inline ||
-                          child->display == Display::InlineBlock) &&
-                         child->alignSelfOverride < 0;
-        float availW = cw - child->marginL - child->marginR;
-        float childW;
-        if (child->fixedW > 0) {
-            childW = std::clamp(child->fixedW, child->minW, child->maxW);
-        } else if (effAlign == LayoutAlign::Stretch && !intrinsic) {
-            childW = std::clamp(availW, child->minW, child->maxW);
-        } else {
-            float hintW = child->SizeHint().width;
-            if (hintW <= 0) hintW = availW;
-            childW = std::clamp(hintW, child->minW, child->maxW);
-        }
-
-        float childX = cx + child->marginL;
-        switch (effAlign) {
-            case LayoutAlign::Stretch:
-            case LayoutAlign::Start:   break;
-            case LayoutAlign::Center:  childX += (availW - childW) * 0.5f; break;
-            case LayoutAlign::End:     childX += availW - childW; break;
-        }
-
-        child->rect = {childX, y, childX + childW, y + h};
+        child->rect.top = y;
+        child->rect.bottom = y + h;
         child->DoLayout();
 
         y += h + child->marginB + gap_ + extraGap;
@@ -1172,9 +1177,7 @@ D2D1_SIZE_F HBoxWidget::SizeHint() const {
     w += padL + padR;
     h += padT + padB;
 
-    // When wrapping, height grows with rows. Use last-known rect width
-    // (from a prior layout pass) to estimate row count; first frame falls
-    // back to single-row height.
+    // Once a width is assigned, include each wrapped row in the height hint.
     if (flexWrap_ && !items.empty()) {
         float availW = (rect.right - rect.left) - padL - padR;
         if (fixedW > 0) availW = fixedW - padL - padR;
