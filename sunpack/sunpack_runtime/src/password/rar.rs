@@ -1,6 +1,6 @@
 use super::PasswordVerification;
 use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
-use crate::io::archive_state::{InputExtent, InputPart, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+use crate::io::archive_state::{InputExtent, InputPart, VolumeAttemptPlan};
 use crate::io::cancellation::{is_cancellation, Cancellation};
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
@@ -134,26 +134,11 @@ pub(crate) fn rar_fast_verify_passwords_from_volumes(
 ) -> std::io::Result<PasswordVerification> {
     let volumes = VolumeSet::new(parse_volumes(parts, sessions)?);
     preparation.verify(volumes.key(if native_volume { "rar-native" } else { "rar" })?, candidates, || {
-        let context = prepare_rar_volumes(&volumes, native_volume)?;
-        if parts.len() > 1 && parts[0].volume_number == Some(1) && native_volume && context.can_follow_native() {
-            // Only split block proofs need the fragment reader in a fixed
-            // layout. A local password check still reads just its own disk.
-            let slots = parts.iter().enumerate().map(|(domain, part)| VolumeSlot {
-                number: part.volume_number.unwrap(),
-                canonical_name: part.canonical_name.clone(),
-                domain,
-            }).collect();
-            let plan = Arc::new(VolumeAttemptPlan {
-                sources: parts.iter().map(|part| part.extent.clone()).collect(),
-                domains: (0..parts.len()).map(|source| VolumeDomain { choices: Arc::new(vec![source]) }).collect(),
-                layouts: Box::new([VolumeLayout { slots, minimum_slots: 0 }]),
-                head_size_from_total: None,
-                minimum_size: None,
-                tail_totals: Box::default(),
-            });
-            return prepare_rar_volume_input(&parts[0].extent, &plan, sessions, true);
+        if native_volume {
+            native_volumes::prepare_fixed(&volumes, parts, sessions)
+        } else {
+            prepare_rar_ranges(&volumes.contiguous_ranges()).map(|context| PasswordContext::Rar(Arc::new(context)))
         }
-        Ok(PasswordContext::Rar(Arc::new(context)))
     })
 }
 
@@ -161,7 +146,7 @@ pub(crate) fn rar_fast_verify_passwords_from_volumes(
 fn rar_fast_verify_passwords_from_attempts(
     preparation: &mut Preparation,
     head: &InputExtent,
-    plan: &Arc<crate::io::archive_state::VolumeAttemptPlan>,
+    plan: &Arc<VolumeAttemptPlan>,
     candidates: &[Arc<str>],
     sessions: &[NativeArchiveSession],
     native_volume: bool,
@@ -171,7 +156,7 @@ fn rar_fast_verify_passwords_from_attempts(
 
 pub(crate) fn prepare_rar_volume_input(
     head: &InputExtent,
-    plan: &Arc<crate::io::archive_state::VolumeAttemptPlan>,
+    plan: &Arc<VolumeAttemptPlan>,
     sessions: &[NativeArchiveSession],
     native_volume: bool,
 ) -> Result<PasswordContext, PreparedStatus> {
@@ -216,29 +201,6 @@ pub(crate) fn prepare_rar_volume_input(
         Ok(evidence.into_context(|c| PasswordContext::Rar(Arc::new(c))))
 }
 
-fn prepare_rar_volumes(volumes: &VolumeSet, native_volume: bool) -> Result<RarPasswordContext, PreparedStatus> {
-    if !native_volume {
-        return prepare_rar_ranges(&volumes.contiguous_ranges());
-    }
-    let first_disk = volumes.disk_range(0).ok_or_else(||
-        PreparedStatus::new("needs_volume_or_tail_damaged", "RAR volume unavailable"))?;
-    let mut first = prepare_rar_fixed(&[first_disk], true);
-    if first.as_ref().is_ok_and(|context| !matches!(context.material, RarPasswordMaterial::Rar5Block { .. })) {
-        return first;
-    }
-    for disk in 1..volumes.len() {
-        if let Some(range) = volumes.disk_range(disk) {
-            if let Ok(context) = prepare_rar_fixed(&[range], true) {
-                if !matches!(context.material, RarPasswordMaterial::Rar5Block { .. }) {
-                    return Ok(context);
-                }
-                if first.is_err() { first = Ok(context); }
-            }
-        }
-    }
-    first
-}
-
 #[derive(Clone, Copy)]
 enum RarRanges<'a> {
     Fixed(&'a [RangeSpec], bool),
@@ -246,11 +208,7 @@ enum RarRanges<'a> {
 }
 
 fn prepare_rar_ranges(ranges: &[RangeSpec]) -> Result<RarPasswordContext, PreparedStatus> {
-    prepare_rar_fixed(ranges, false)
-}
-
-fn prepare_rar_fixed(ranges: &[RangeSpec], native: bool) -> Result<RarPasswordContext, PreparedStatus> {
-    prepare_rar_volume(|offset, size, field| read_ranges_at_field(ranges, offset, size, field), None, RarRanges::Fixed(ranges, native))
+    prepare_rar_volume(|offset, size, field| read_ranges_at_field(ranges, offset, size, field), None, RarRanges::Fixed(ranges, false))
 }
 
 /// `read_at(offset, len, field)` returns fewer than `len` bytes only at the end
@@ -335,20 +293,55 @@ fn prepare_rar_volume(
 
 fn prepare_rar5_stream(
     read_at: &mut impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, ReadFault>,
-    mut facts: Option<&mut VolumeFacts>,
+    facts: Option<&mut VolumeFacts>,
     ranges: RarRanges<'_>,
 ) -> Result<RarPasswordContext, PreparedStatus> {
+    // Scan headers for a short, strong check before touching compressed
+    // data. Retain one weak location and only revisit later headers after
+    // an actual read failure at that location.
+    let mut first = None;
+    let mut more = false;
+    let result = walk_rar5_stream(read_at, facts, ranges, RAR5_SIGNATURE.len() as u64, |candidate, _| {
+        if first.is_some() {
+            more = true;
+        } else {
+            first = Some(candidate);
+        }
+        None
+    });
+    let Some(first) = first.filter(|_| result.is_err() && !Cancellation::current().cancelled()) else {
+        return result;
+    };
+    match first.prepare(read_at, ranges) {
+        Ok(context) => Ok(context),
+        Err(error) if more && !Cancellation::current().cancelled() => {
+            walk_rar5_stream(read_at, None, ranges, first.offset + first.packed_size,
+                |candidate, read| candidate.prepare(read, ranges).ok()).or(Err(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn walk_rar5_stream<R>(
+    read_at: &mut R,
+    mut facts: Option<&mut VolumeFacts>,
+    ranges: RarRanges<'_>,
+    mut offset: u64,
+    mut weak: impl FnMut(Rar5BlockStart, &mut R) -> Option<RarPasswordContext>,
+) -> Result<RarPasswordContext, PreparedStatus>
+where
+    R: FnMut(u64, usize, &'static str) -> Result<Vec<u8>, ReadFault>,
+{
     let unknown = || {
         PreparedStatus::new(
             "unknown_needs_final_verifier",
             "RAR5 encryption metadata is unavailable",
         )
     };
-    let mut offset = RAR5_SIGNATURE.len() as u64;
+    let stop_at_proof = facts.as_ref().is_none_or(|facts| facts.stop_at_proof);
     let mut encrypted_seen = false;
     let mut saved: Option<RarPasswordMaterial> = None;
     let mut fallback = None;
-    let mut prefix_failure = None;
     let scanned = (|| loop {
         let read_hint = if matches!(ranges, RarRanges::Fixed(..)) { 64 } else { 7 };
         let fixed = read_at(offset, read_hint, "rar5.block_header")?;
@@ -427,6 +420,7 @@ fn prepare_rar5_stream(
         if let Some((encryption, compression)) = encryption {
             if encryption.password_check.is_none() {
                 let data_offset = offset.checked_add(length as u64).ok_or_else(unknown)?;
+                let next = data_offset.checked_add(fields.data_size).ok_or_else(unknown)?;
                 let empty_mac = (empty_stored && extras.keyed_hash && !extras.redirected)
                     .then(|| Rar5EmptyMac { crc: file.as_ref()?.crc, blake: extras.blake2sp }.into_present()).flatten();
                 let material = if fields.kind == 4 {
@@ -443,28 +437,17 @@ fn prepare_rar5_stream(
                 } else if saved.is_none() && fields.flags & 8 == 0 && compression & 0x3f <= 1
                     && (1..=5).contains(&((compression >> 7) & 7))
                     && (fields.data_size >= 16 || (ranges.native() && fields.flags & 16 != 0)) {
-                    let encrypted = match (fields.data_size >= 16)
-                        .then(|| read_compressed_start(read_at, data_offset, "rar5.compressed_block")).transpose() {
-                        Ok(encrypted) => encrypted,
-                        Err(error) => {
-                            prefix_failure.get_or_insert(error);
-                            offset = data_offset.checked_add(fields.data_size).ok_or_else(unknown)?;
-                            continue;
-                        }
-                    };
-                    let source = ranges.tail_source(data_offset.checked_add(16).ok_or_else(unknown)?,
-                        fields.data_size.saturating_sub(16));
-                    RarPasswordMaterial::Rar5Block {
+                    if let Some(context) = weak(Rar5BlockStart {
                         identity: encryption,
-                        block: Rar5BlockProbe {
-                            encrypted,
-                            offset: data_offset,
-                            packed_size: fields.data_size,
-                            split_after: fields.flags & 16 != 0,
-                            solid: compression & 0x40 != 0,
-                            source,
-                        },
+                        offset: data_offset,
+                        packed_size: fields.data_size,
+                        split_after: fields.flags & 16 != 0,
+                        solid: compression & 0x40 != 0,
+                    }, read_at) {
+                        return Ok(context);
                     }
+                    offset = next;
+                    continue;
                 } else {
                     // Stored/continuation/unknown methods carry no safe block
                     // prefix. A later independent member can still prove a key.
@@ -477,11 +460,11 @@ fn prepare_rar5_stream(
                     } else {
                         "RAR5 compressed stream has no supported structural check"
                     });
-                    offset = data_offset.checked_add(fields.data_size).ok_or_else(unknown)?;
+                    offset = next;
                     continue;
                 };
                 if fields.kind == 4 { return Ok(RarPasswordContext { material }); }
-                if facts.is_none() && material.empty_mac_strength() != 0 {
+                if stop_at_proof && material.empty_mac_strength() != 0 {
                     return Ok(RarPasswordContext { material });
                 }
                 if saved.as_ref().is_none_or(|earlier| material.empty_mac_strength() > earlier.empty_mac_strength()) {
@@ -489,7 +472,7 @@ fn prepare_rar5_stream(
                 }
             } else {
                 let material = RarPasswordMaterial::Rar5(encryption);
-                if facts.is_none() || fields.kind == 4 { return Ok(RarPasswordContext { material }); }
+                if stop_at_proof || fields.kind == 4 { return Ok(RarPasswordContext { material }); }
                 if !matches!(saved, Some(RarPasswordMaterial::Rar5(_))) { saved = Some(material); }
             }
 
@@ -513,8 +496,41 @@ fn prepare_rar5_stream(
             .ok_or_else(unknown)?;
     })();
     // A later short read cannot erase an independently complete earlier proof.
-    scanned.or_else(|error| saved.map(|material| RarPasswordContext { material })
-        .ok_or_else(|| prefix_failure.unwrap_or(error)))
+    scanned.or_else(|error| saved.map(|material| RarPasswordContext { material }).ok_or(error))
+}
+
+struct Rar5BlockStart {
+    identity: Rar5EncryptionIdentity,
+    offset: u64,
+    packed_size: u64,
+    split_after: bool,
+    solid: bool,
+}
+
+impl Rar5BlockStart {
+    fn prepare(
+        &self,
+        read_at: &mut impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, ReadFault>,
+        ranges: RarRanges<'_>,
+    ) -> Result<RarPasswordContext, PreparedStatus> {
+        let encrypted = (self.packed_size >= 16)
+            .then(|| read_compressed_start(read_at, self.offset, "rar5.compressed_block"))
+            .transpose()?;
+        let next = self.offset.checked_add(16).ok_or_else(|| PreparedStatus::new(
+            "unknown_needs_final_verifier", "RAR5 first encrypted block is outside the input"))?;
+        let source = ranges.tail_source(next, self.packed_size.saturating_sub(16));
+        Ok(RarPasswordContext { material: RarPasswordMaterial::Rar5Block {
+            identity: self.identity,
+            block: Rar5BlockProbe {
+                encrypted,
+                offset: self.offset,
+                packed_size: self.packed_size,
+                split_after: self.split_after,
+                solid: self.solid,
+                source,
+            },
+        } })
+    }
 }
 
 fn read_compressed_start(
@@ -587,7 +603,10 @@ fn prepare_rar4_members(
                                 let material = RarPasswordMaterial::Rar4Block(Rar4BlockProbe {
                                     salt, encrypted, next, data_size, split_after: block.flags & 2 != 0, source,
                                 });
-                                if facts.is_none() { return Ok(RarPasswordContext { material }); }
+                                if facts.as_ref().is_none_or(|facts|
+                                    facts.stop_at_proof && block.flags & 2 == 0) {
+                                    return Ok(RarPasswordContext { material });
+                                }
                                 saved = Some(material);
                             }
                             Err(error) => { prefix_failure.get_or_insert(error); }

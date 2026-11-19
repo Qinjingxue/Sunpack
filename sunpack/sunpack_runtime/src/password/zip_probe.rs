@@ -13,6 +13,7 @@ use std::io;
 use std::sync::Arc;
 
 const MAX_IMPLODE_TABLES: usize = (1 + 256) + 2 * (1 + 64);
+const INITIAL_PREFIX_LIMIT: usize = 16;
 const ZSTD_METHOD: &[u8] = &[0x04, 0xf7, 0x11, 0x01];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,6 +136,28 @@ pub(super) enum ZipPrefixKey {
     Aes { key: [u8; 32], len: usize },
 }
 
+impl ZipPrefixKey {
+    fn decrypt(&mut self, offset: usize, encrypted: &[u8], plain: &mut [u8]) {
+        match self {
+            Self::ZipCrypto(state) => {
+                for (output, &byte) in plain.iter_mut().zip(encrypted) {
+                    *output = state.decrypt(byte);
+                }
+            }
+            Self::Aes { key, len } => {
+                plain.copy_from_slice(encrypted);
+                let offset = offset as u64;
+                match *len {
+                    16 => winzip_aes_decrypt::<Aes128>(&key[..16], offset, plain),
+                    24 => winzip_aes_decrypt::<Aes192>(&key[..24], offset, plain),
+                    32 => winzip_aes_decrypt::<Aes256>(key, offset, plain),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct ZipPrefixScratch {
     small: [u8; MAX_IMPLODE_TABLES],
     large: Vec<u8>,
@@ -146,11 +169,41 @@ impl ZipPrefixScratch {
     }
 
     pub(super) fn bytes(&mut self, len: usize) -> &mut [u8] {
-        if let Some(bytes) = self.small.get_mut(..len) { bytes }
-        else {
-            self.large.resize(len, 0);
-            &mut self.large
+        self.grow(0, len)
+    }
+
+    fn grow(&mut self, previous: usize, len: usize) -> &mut [u8] {
+        if len <= self.small.len() { return &mut self.small[..len]; }
+        self.large.resize(len, 0);
+        if previous <= self.small.len() {
+            self.large[..previous].copy_from_slice(&self.small[..previous]);
         }
+        &mut self.large
+    }
+}
+
+struct ZipPrefixProgress {
+    position: usize,
+    key: ZipPrefixKey,
+    len: usize,
+    plain: ZipPrefixScratch,
+}
+
+impl ZipPrefixProgress {
+    fn new(position: usize, key: ZipPrefixKey, prefix: &[u8]) -> Self {
+        let mut plain = ZipPrefixScratch::new();
+        plain.bytes(prefix.len()).copy_from_slice(prefix);
+        Self { position, key, len: prefix.len(), plain }
+    }
+
+    fn extend(&mut self, encrypted: &[u8]) -> &[u8] {
+        let previous = self.len;
+        let plain = self.plain.grow(previous, encrypted.len());
+        if previous < encrypted.len() {
+            self.key.decrypt(previous, &encrypted[previous..], &mut plain[previous..]);
+            self.len = encrypted.len();
+        }
+        plain
     }
 }
 
@@ -256,7 +309,7 @@ impl ZipPrefix {
         let initial = size.min(match self.method {
             8 | 9 if successor_volumes => 5,
             95 => 13,
-            _ => 16,
+            _ => INITIAL_PREFIX_LIMIT,
         });
         let next_size = |read: usize| if xz { size } else { (2 * read).max(5).min(size) };
         let minimum = self.minimum_prefix().min(size);
@@ -268,7 +321,7 @@ impl ZipPrefix {
         } else {
             initial
         };
-        let mut scratch = ZipPrefixScratch::new();
+        let mut scratch = None;
         let checks = source.evaluate(|read| {
             let mut unavailable = None;
             let mut encrypted = match read(self.start, first) {
@@ -286,8 +339,27 @@ impl ZipPrefix {
                 }
             };
             let mut next = next_size(encrypted.len());
-            let mut verdicts = if encrypted.is_empty() || (successor_volumes && unavailable.is_none()) { vec![None; keys.len()] }
-                else { keys.iter().map(|(_, key)| self.check(key, &encrypted, &mut next, &mut scratch)).collect() };
+            let mut primary = None;
+            let mut additional = Vec::new();
+            let mut verdicts = if encrypted.is_empty() || (successor_volumes && unavailable.is_none()) {
+                vec![None; keys.len()]
+            } else {
+                let mut buffer = [0; INITIAL_PREFIX_LIMIT];
+                keys.iter().enumerate().map(|(position, &(_, mut key))| {
+                    let plain = &mut buffer[..encrypted.len()];
+                    key.decrypt(0, &encrypted, plain);
+                    let verdict = self.check_plain(plain, &mut next);
+                    // Keep the common one-candidate continuation on the stack.
+                    // Completed prefixes only need storage for successor checks.
+                    if unavailable.is_none() && ((verdict.is_none() && encrypted.len() < size) ||
+                        (successor_sizes.is_some() && verdict != Some(false))) {
+                        let progress = ZipPrefixProgress::new(position, key, plain);
+                        if primary.is_none() { primary = Some(progress); }
+                        else { additional.push(progress); }
+                    }
+                    verdict
+                }).collect()
+            };
             while !successor_volumes && unavailable.is_none() && encrypted.len() < size
                 && verdicts.iter().any(Option::is_none) {
                 let previous = encrypted.len();
@@ -297,18 +369,22 @@ impl ZipPrefix {
                 };
                 encrypted.extend_from_slice(&more);
                 next = next_size(encrypted.len());
-                for ((_, key), verdict) in keys.iter().zip(&mut verdicts) {
+                for progress in primary.iter_mut().chain(&mut additional) {
+                    let verdict = &mut verdicts[progress.position];
                     if verdict.is_none() {
-                        *verdict = self.check(key, &encrypted, &mut next, &mut scratch);
+                        *verdict = self.check_plain(progress.extend(&encrypted), &mut next);
                     }
                 }
             }
             if let Some(sizes) = successor_sizes.filter(|_| unavailable.is_none() && (
                 successor_volumes || verdicts.iter().filter(|&&v| v != Some(false)).nth(1).is_some()
             )) {
-                for ((_, key), verdict) in keys.iter().zip(&mut verdicts) {
+                let mut progress = primary.iter_mut().chain(&mut additional).peekable();
+                for (position, ((_, key), verdict)) in keys.iter().zip(&mut verdicts).enumerate() {
+                    let saved = progress.next_if(|saved| saved.position == position);
                     if *verdict == Some(false) { continue; }
-                    let outcome = self.check_aes_successors(key, &encrypted, sizes, source, read, &mut scratch);
+                    let plain = saved.map(|saved| saved.extend(&encrypted));
+                    let outcome = self.check_aes_successors(key, &encrypted, plain, sizes, source, read, &mut scratch);
                     *verdict = match outcome {
                         Ok(SevenZipPrefixCheck::Reject) => Some(false),
                         Ok(SevenZipPrefixCheck::Weak) => None,
@@ -329,7 +405,7 @@ impl ZipPrefix {
                     Ok(tail) => {
                         for ((_, key), verdict) in keys.iter().zip(&mut verdicts) {
                             if *verdict == Some(false) { continue; }
-                            match self.check_aes_successors(key, &tail, sizes, source, read, &mut scratch) {
+                            match self.check_aes_successors(key, &tail, None, sizes, source, read, &mut scratch) {
                                 Ok(SevenZipPrefixCheck::Reject) => *verdict = Some(false),
                                 Ok(_) => {}
                                 Err(DeferredReadError::Pending) => break,
@@ -386,42 +462,25 @@ impl ZipPrefix {
         Ok(())
     }
 
-    fn check(&self, key: &ZipPrefixKey, encrypted: &[u8], next: &mut usize, scratch: &mut ZipPrefixScratch) -> Option<bool> {
-        let plain = scratch.bytes(encrypted.len());
-        match *key {
-            ZipPrefixKey::ZipCrypto(mut state) => {
-                for (output, &byte) in plain.iter_mut().zip(encrypted) {
-                    *output = state.decrypt(byte);
-                }
-            }
-            ZipPrefixKey::Aes { key, len } => {
-                plain.copy_from_slice(encrypted);
-                match len {
-                    16 => winzip_aes_prefix::<Aes128>(&key[..16], plain),
-                    24 => winzip_aes_prefix::<Aes192>(&key[..24], plain),
-                    32 => winzip_aes_prefix::<Aes256>(&key, plain),
-                    _ => unreachable!(),
-                }
-            }
-        }
-        self.check_plain(plain, next)
-    }
-
     fn check_aes_successors(
-        &self, key: &ZipPrefixKey, encrypted: &[u8], sizes: (u64, u64),
-        source: &ZipRead, read: &mut CheckRead<'_>, scratch: &mut ZipPrefixScratch,
+        &self, key: &ZipPrefixKey, encrypted: &[u8], plain: Option<&[u8]>, sizes: (u64, u64),
+        source: &ZipRead, read: &mut CheckRead<'_>, scratch: &mut Option<ZipPrefixScratch>,
     ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
         fn verify<C: KeyInit + BlockCipherEncrypt>(
-            prefix: &ZipPrefix, key: &[u8], encrypted: &[u8], (packed, unpacked): (u64, u64),
-            source: &ZipRead, read: &mut CheckRead<'_>, scratch: &mut ZipPrefixScratch,
+            prefix: &ZipPrefix, key: &[u8], encrypted: &[u8], plain: Option<&[u8]>,
+            (packed, unpacked): (u64, u64), source: &ZipRead, read: &mut CheckRead<'_>,
+            scratch: &mut Option<ZipPrefixScratch>,
         ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
             let cipher = C::new_from_slice(key).unwrap();
             if prefix.method == 95 {
                 return check_aes_xz_tail(&cipher, prefix.start, packed, encrypted, read);
             }
-            let plain = scratch.bytes(encrypted.len());
-            plain.copy_from_slice(encrypted);
-            winzip_aes_ctr(&cipher, 0, plain);
+            let plain = plain.unwrap_or_else(|| {
+                let out = scratch.get_or_insert_with(ZipPrefixScratch::new).bytes(encrypted.len());
+                out.copy_from_slice(encrypted);
+                winzip_aes_ctr(&cipher, 0, out);
+                out
+            });
             let read_plain = |offset, output: &mut [u8]| {
                 output.copy_from_slice(&read(prefix.start + offset, output.len())?);
                 winzip_aes_ctr(&cipher, offset, output);
@@ -440,9 +499,9 @@ impl ZipPrefix {
             }
         }
         match key {
-            ZipPrefixKey::Aes { key, len: 16 } => verify::<Aes128>(self, &key[..16], encrypted, sizes, source, read, scratch),
-            ZipPrefixKey::Aes { key, len: 24 } => verify::<Aes192>(self, &key[..24], encrypted, sizes, source, read, scratch),
-            ZipPrefixKey::Aes { key, len: 32 } => verify::<Aes256>(self, key, encrypted, sizes, source, read, scratch),
+            ZipPrefixKey::Aes { key, len: 16 } => verify::<Aes128>(self, &key[..16], encrypted, plain, sizes, source, read, scratch),
+            ZipPrefixKey::Aes { key, len: 24 } => verify::<Aes192>(self, &key[..24], encrypted, plain, sizes, source, read, scratch),
+            ZipPrefixKey::Aes { key, len: 32 } => verify::<Aes256>(self, key, encrypted, plain, sizes, source, read, scratch),
             _ => unreachable!(),
         }
     }
@@ -597,9 +656,9 @@ fn lzfse_block(bytes: &[u8], packed: Option<u64>, unpacked: Option<u64>) -> Opti
     }
 }
 
-fn winzip_aes_prefix<C: BlockCipherEncrypt + KeyInit>(key: &[u8], bytes: &mut [u8]) {
+fn winzip_aes_decrypt<C: BlockCipherEncrypt + KeyInit>(key: &[u8], offset: u64, bytes: &mut [u8]) {
     let cipher = C::new_from_slice(key).unwrap();
-    winzip_aes_ctr(&cipher, 0, bytes);
+    winzip_aes_ctr(&cipher, offset, bytes);
 }
 
 fn winzip_aes_ctr<C: BlockCipherEncrypt>(cipher: &C, mut offset: u64, mut bytes: &mut [u8]) {

@@ -169,10 +169,9 @@ pub(crate) fn verify(
     // available extent would put unrelated bytes at plausible proof offsets.
     let mut parts = input.parts.as_ref();
     if input.mode.structured() && matches!(format, "7z" | "zip" | "rar") {
-        if let Some(gap) = parts.iter().enumerate()
-            .position(|(i, part)| part.volume_number != Some(i as u32 + 1)) {
-            if gap == 0 { return Ok(PasswordVerification::status("missing_volume", "logical volume prefix is unavailable")); }
-            parts = &parts[..gap];
+        parts = crate::io::archive_state::contiguous_volume_prefix(parts);
+        if parts.is_empty() && !input.parts.is_empty() {
+            return Ok(PasswordVerification::status("missing_volume", "logical volume prefix is unavailable"));
         }
     }
     let path = match (input.mode, parts) {

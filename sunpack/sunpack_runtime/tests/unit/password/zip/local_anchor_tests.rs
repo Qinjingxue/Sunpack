@@ -318,8 +318,17 @@ pub(super) fn stored_deflate_blocks(blocks: &[&[u8]]) -> Vec<u8> {
 #[test]
 fn winzip_aes_screens_xz_block_after_fixed_stream_header() {
     let input = b"XZ framing on a second volume";
-    let payload = xz_payload(input);
-    let block_end = 12 + (usize::from(payload[12]) + 1) * 4;
+    let stream = xz_payload(input);
+    let old_block_end = 12 + (usize::from(stream[12]) + 1) * 4;
+    // Exercise a 13-byte first read and a continuation that grows beyond
+    // the inline prefix buffer. Only the block header is under test.
+    let block_end = 12 + 512;
+    let mut payload = stream[..old_block_end - 4].to_vec();
+    payload[12] = (512 / 4 - 1) as u8;
+    payload.resize(block_end - 4, 0);
+    let crc = crc32fast::hash(&payload[12..]);
+    payload.extend(crc.to_le_bytes());
+    payload.extend(&stream[old_block_end..]);
     let (mut local, payload) = winzip_aes_member(payload, input.len(), 95);
     local.extend_from_slice(&payload[..16]);
     let mut good = payload[16..].to_vec();

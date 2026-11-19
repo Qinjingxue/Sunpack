@@ -166,6 +166,48 @@ fn alternate_short_prefix_rejects_without_reading_first_stream_successor() {
 }
 
 #[test]
+fn fixed_layout_leaves_last_prefix_survivor_to_final_confirmation() {
+    let mut stream = vec![1, 0, 44];
+    stream.extend([0xa9; 45]);
+    // A complete first chunk followed by an invalid control in the next CBC window.
+    stream.extend([0x7f; 16]);
+    let first = direct_key_ciphertext(&stream);
+    let packed = first.len() as u8;
+    let passwords: Vec<Arc<str>> = (0..4)
+        .map(|index| Arc::from(format!("secret{}{index}", "\0".repeat(10))))
+        .collect();
+    let mut second = [0xa9; 32];
+    second[..3].copy_from_slice(&[1, 0, 27]);
+    second[31] = 0;
+    // Cover successor-only reads, the parallel wave, and the tail after
+    // staging two viable candidates with a separate stream.
+    for (count, staged, expected_reads) in [(2, false, 32), (4, false, 96), (3, true, 96)] {
+        let (body, header) = if staged {
+            let mut body = first.clone();
+            body.extend(direct_key_ciphertext(&second));
+            let mut header = vec![1, 4, 6, 0, 2, 9, packed, 32, 0, 7, 11, 2, 0];
+            header.extend(AES_LZMA2_FOLDER);
+            header.extend(AES_LZMA2_FOLDER);
+            header.extend([12, stream.len() as u8, 90, 32, 28, 0, 0, 0]);
+            (body, header)
+        } else {
+            let mut header = vec![1, 4, 6, 0, 1, 9, packed, 0, 7, 11, 1, 0];
+            header.extend(AES_LZMA2_FOLDER);
+            header.extend([12, stream.len() as u8, 90, 0, 0, 0]);
+            (first.clone(), header)
+        };
+        let reader = ManagedReader::from_bytes(archive_with_descriptor(&body, &header), Default::default());
+        let evidence = FixedSevenZipEvidence(Arc::new([RangeSpec::entire(&reader)]));
+        let context = prepare_seven_zip(reader.stream_cursor(), reader.len(), &evidence).ok().unwrap();
+        let before = reader.stats().read_bytes;
+        let proof = context.verify(&passwords[..count]).unwrap();
+        assert_eq!(proof.matched_indices, [count - 1]);
+        assert_eq!(proof.final_confirmation_required, Some(true));
+        assert_eq!(reader.stats().read_bytes - before, expected_reads);
+    }
+}
+
+#[test]
 fn projected_packed_crc_prunes_before_password_screening() {
     let mut stream = vec![1, 0, 44];
     stream.extend([0xa9; 45]);

@@ -261,6 +261,14 @@ void last_password_extracts_into_existing_destination(const std::filesystem::pat
     require(std::string((std::istreambuf_iterator<char>(member)), {}) == "cursor replay" &&
         std::string((std::istreambuf_iterator<char>(sentinel)), {}) == "existing output",
         "sole-password extraction changed existing output");
+
+    ExtractionReplay gap_replay;
+    ExtractionReplayScope gap_scope(&gap_replay);
+    request.archive_input.missing_volume_number = 2;
+    const auto missing = run_request(request);
+    require(missing.code == 1 && !gap_replay.password_probe_done &&
+        missing.response.find(wire::key("missing_volume_evidence") + wire::text("structured_volume_gap")) != std::string::npos,
+        "fixed missing volume repeated password work before returning the known gap");
 }
 
 void scan_confirms_only_unproven_password(const std::filesystem::path& archive) {

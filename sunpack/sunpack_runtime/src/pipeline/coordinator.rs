@@ -2897,6 +2897,17 @@ impl<'run, O: Observer> Run<'run, O> {
         };
         if let Some(password) = &plan.verified_password {
             result.password = Some(password.to_string());
+            if self.request.mode == Mode::Scan && complete_verified_scan_layout(&mut input, &mut result) {
+                self.request.cancel.check_io()?;
+                result.encrypted = plan.encrypted;
+                self.notify(|| Event::Finalizing { id });
+                return Ok(Executed {
+                    planned_output: None,
+                    result,
+                    inventory: None,
+                    input: Arc::new(input),
+                });
+            }
         }
         let codepage = if self.request.mode == Mode::Extract
             && input.format_hint == "zip"
@@ -3508,6 +3519,21 @@ fn cleanup_failure(path: &Path, mode: &'static str, removed: io::Result<()>) -> 
         error_code: error.raw_os_error().unwrap_or(0),
         message: error.to_string(),
     })
+}
+
+fn complete_verified_scan_layout(input: &mut ArchiveInput, result: &mut ArchiveResult) -> bool {
+    use crate::io::archive_state::contiguous_volume_prefix;
+    let complete = |parts: &[crate::io::archive_state::InputPart]| {
+        !parts.is_empty() && contiguous_volume_prefix(parts).len() == parts.len()
+    };
+    if let Some(plan) = &input.volume_attempts {
+        let Some(parts) = plan.sole_parts().filter(|parts| complete(parts)) else { return false; };
+        input.parts = parts;
+        input.volume_attempts = None;
+        result.source_paths = input.physical_paths().map(PathBuf::from).collect();
+        return true;
+    }
+    !input.mode.structured() || complete(&input.parts)
 }
 
 fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> ArchiveResult {

@@ -169,11 +169,11 @@ fn local_header_password_evidence_does_not_require_contiguous_volumes() {
         reader: ManagedReader::from_bytes(data.to_vec(), Default::default()),
         number: i as u32 + 1, start: 0, end: None,
     }).collect());
-    assert!(matches!(prepare_rar_volumes(&split, false), Ok(RarPasswordContext { material: RarPasswordMaterial::Header(_) })));
+    assert!(matches!(prepare_rar_ranges(&split.contiguous_ranges()), Ok(RarPasswordContext { material: RarPasswordMaterial::Header(_) })));
     let volumes = VolumeSet::new(vec![
         VolumeSpec { reader: ManagedReader::from_bytes(head, Default::default()), number: 1, start: 0, end: None },
         VolumeSpec { reader: ManagedReader::from_bytes(vec![], Default::default()), number: 3, start: 0, end: None },
     ]);
-    let result = prepare_rar_volumes(&volumes, true);
-    assert!(matches!(result, Ok(RarPasswordContext { material: RarPasswordMaterial::Header(_) })));
+    let result = native_volumes::prepare_fixed(&volumes, &[], &[]);
+    assert!(matches!(result, Ok(PasswordContext::Rar(context)) if matches!(context.material, RarPasswordMaterial::Header(_))));
 }

@@ -373,7 +373,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     let volumes = VolumeSet::new([make(false, 0, 0, &block), make(false, 1, 1, &block)].into_iter().enumerate().map(|(i, data)|
         crate::password::input::VolumeSpec { reader: ManagedReader::from_bytes(data, Default::default()),
             number: 1 + (2 * i) as u32, start: 0, end: None }).collect());
-    let later = prepare_rar_volumes(&volumes, true).unwrap_or_else(|_| panic!("independent later member"));
+    let later = native_volumes::prepare_fixed(&volumes, &[], &[]).unwrap_or_else(|_| panic!("independent later member"));
     assert_eq!(later.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
     let plain_first = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 1]), &rar5_block(&[5, 0, 1])].concat();
     assert!(matches!(prepare(plain_first), Err(PreparedStatus::Status("unknown_needs_final_verifier", _))));
@@ -393,7 +393,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     assert_eq!(context.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
 
     // A later independent member has its own password. Prefer its stronger
-    // check without intersecting the earlier weak hit with a different scope.
+    // check without reading the earlier compressed block.
     let later_salt = [0x93; 16];
     let mut check = [0; 8];
     let mut digest = [0; 32];
@@ -414,13 +414,10 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     let end = rar5_block(&[5, 0, 0]);
     mixed.truncate(mixed.len() - end.len());
     mixed.extend(rar5_block(&file));
-    mixed.extend(end);
+    mixed.extend_from_slice(&end);
     let unavailable_offset = mixed.windows(valid.len()).position(|window| window == valid).unwrap() as u64;
     let context = prepare_rar(|offset, size, field| {
-        if offset == unavailable_offset && field == "rar5.compressed_block" {
-            return Err(ReadFault::from_io(io::Error::new(io::ErrorKind::PermissionDenied, "fixture"),
-                "read", offset, size, 0, mixed.len() as u64));
-        }
+        assert_ne!((offset, field), (unavailable_offset, "rar5.compressed_block"));
         let start = (offset as usize).min(mixed.len());
         Ok(mixed[start..(start + size).min(mixed.len())].to_vec())
     }).unwrap_or_else(|_| panic!("available explicit check after an unreadable block"));
@@ -429,6 +426,28 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     let result = context.verify(&[Arc::from("secret"), Arc::from("later")], None).unwrap();
     assert_eq!(result.matched_index, Some(1));
     assert_eq!(result.match_evidence, Some("rar5_password_check"));
+
+    let mut weak_members = make(false, 1, 0, &block);
+    let first_block = weak_members.len() - end.len() - block.len();
+    let second_member = RAR5_SIGNATURE.len() + rar5_block(&[1, 0, 0]).len();
+    let next = weak_members[second_member..].to_vec();
+    weak_members.truncate(first_block + block.len());
+    weak_members.extend(next);
+    let mut inspected = Vec::new();
+    let context = prepare_rar(|offset, size, field| {
+        if field == "rar5.compressed_block" {
+            inspected.push(offset);
+            if offset == first_block as u64 {
+                return Err(ReadFault::from_io(io::Error::new(io::ErrorKind::PermissionDenied, "fixture"),
+                    "read", offset, size, 0, weak_members.len() as u64));
+            }
+        }
+        let start = (offset as usize).min(weak_members.len());
+        Ok(weak_members[start..(start + size).min(weak_members.len())].to_vec())
+    }).unwrap_or_else(|_| panic!("available weak member after an unreadable one"));
+    let second_block = weak_members.len() - end.len() - block.len();
+    assert_eq!(inspected, [first_block as u64, second_block as u64]);
+    assert_eq!(context.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
 
     plaintext[48] ^= 1;
     encrypt(&mut plaintext);
@@ -522,6 +541,25 @@ fn rar5_successor_blocks_and_first_level_table_filter_different_sources() {
         let remaining = result.volume_attempts.expect("a successor block prunes one tail");
         assert!(!remaining.sources.contains(&plan.sources[1]));
         assert!(remaining.sources.contains(&plan.sources[2]));
+        if native_split == Some(48) {
+            let parts: Vec<_> = [0, 2].into_iter().enumerate().map(|(index, source)| {
+                let mut part = InputPart::range(plan.sources[source].clone());
+                part.volume_number = Some(index as u32 + 1);
+                part.canonical_name = format!("part.{}", index + 1);
+                part
+            }).collect();
+            let sessions: Vec<_> = parts.iter().map(|part|
+                NativeArchiveSession::new(part.extent.path.clone()).unwrap()).collect();
+            let volumes = VolumeSet::new(parse_volumes(&parts, &sessions).unwrap());
+            let head = sessions[0].borrowed_reader().1;
+            let before = head.stats().direct_read_bytes;
+            let context = native_volumes::prepare_fixed(&volumes, &parts, &sessions)
+                .unwrap_or_else(|_| panic!("fixed native split block context"));
+            // The first disk's cached header walk supplies the continuation
+            // metadata; binding the split must not stream its headers again.
+            assert_eq!(head.stats().direct_read_bytes, before);
+            assert_eq!(context.verify(&password, None).unwrap().matched_index, Some(0));
+        }
         for path in paths { std::fs::remove_file(path).unwrap(); }
     }
 }

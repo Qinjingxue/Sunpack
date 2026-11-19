@@ -1297,7 +1297,7 @@ RequestOutcome run_request(
                 cursor.discard_pending = false;
             }
         }
-        if (!volume_trials && password_candidates.size() > 1 &&
+        if (!volume_trials && !archive_input.missing_volume_number && password_candidates.size() > 1 &&
             (!volume_replay || !volume_replay->password_probe_done)) {
             if (request.report_progress) progress({"total", 0, 0, 0});
             selected_probe = test_password_batch(archive_input.archive_path, archive_input.part_paths,

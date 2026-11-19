@@ -574,6 +574,57 @@ fn preflight_damage_keeps_a_proven_password_in_scan_and_extract() {
 }
 
 #[test]
+fn verified_scan_finishes_without_starting_worker() {
+    use crate::io::archive_state::{InputExtent, InputPart, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    let source = crate::test_support::temp_file("verified_scan", &encrypted_rar_fixture());
+    let engine = Engine::new(source.with_extension("missing-worker.exe"));
+    let request = Request::new(vec![source.clone()], Mode::Scan);
+    let observer = |_: Event| {};
+    let mut run = test_run(&engine, &request, &observer);
+    Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(
+        Arc::from([Arc::from("secret")]), None, &engine.recent_passwords, None,
+    );
+    for projected in [false, true] {
+        let path = source.to_string_lossy().into_owned();
+        let mut input = ArchiveInput::file(path.clone(), "rar".into(), "encrypted".into());
+        input.analysis.password_required = true;
+        if projected {
+            let extent = InputExtent { path, start: 0, end: Some(fs::metadata(&source).unwrap().len()) };
+            let mut part = InputPart::range(extent.clone());
+            part.volume_number = Some(1);
+            part.canonical_name = "archive.part1.rar".into();
+            input.mode = OpenMode::NativeVolumes;
+            input.parts = Box::new([part]);
+            input.volume_attempts = Some(Arc::new(VolumeAttemptPlan {
+                sources: Box::new([extent]),
+                layouts: Box::new([VolumeLayout {
+                    slots: Box::new([VolumeSlot { number: 1, canonical_name: "archive.part1.rar".into(), domain: 0 }]),
+                    minimum_slots: 0,
+                }]),
+                domains: Box::new([VolumeDomain { choices: Arc::new(vec![0]) }]),
+                head_size_from_total: None,
+                minimum_size: None,
+                tail_totals: Box::default(),
+            }));
+        }
+        let logical = LogicalInput { input, password: None, failure: None };
+        let mut shell = engine.shell.branch();
+        let mut outcome = Outcome::default();
+        let executed = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |_| {
+            Box::pin(run.execute_input(logical, 1, DiscoverySource::Detection,
+                1, None, None, &run.candidates, &mut shell, &mut outcome))
+        }).unwrap();
+        assert!(executed.result.failure.is_none(), "{:?}", executed.result.failure);
+        assert_eq!(executed.result.encrypted, Some(true));
+        assert_eq!(executed.result.password.as_deref(), Some("secret"));
+        assert!(executed.input.volume_attempts.is_none());
+        assert!(engine.worker.lock().unwrap().process.is_none());
+    }
+    release_reader_resources_under_roots(vec![source.to_string_lossy().into_owned()]).unwrap();
+    fs::remove_file(source).unwrap();
+}
+
+#[test]
 fn worker_failure_preserves_only_noncontradicted_strong_password() {
     use crate::scan::worker_wire::NativeWorkerFrameDecoder;
     struct Input(mpsc::Sender<Vec<u8>>);
@@ -590,7 +641,9 @@ fn worker_failure_preserves_only_noncontradicted_strong_password() {
         ("encrypted_or_wrong_password", FailureKind::WrongPassword, None),
     ] {
         let engine = Engine::new(PathBuf::from("unused-worker"));
-        let request = Request::new(Vec::new(), Mode::Scan);
+        let mut request = Request::new(Vec::new(), Mode::Extract);
+        let output = source.with_extension("output");
+        request.output_root = Some(output.clone());
         let observer = |_: Event| {};
         let mut run = test_run(&engine, &request, &observer);
         Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(
@@ -629,6 +682,7 @@ fn worker_failure_preserves_only_noncontradicted_strong_password() {
         assert_eq!(submitted["password"], "secret");
         assert_eq!(result.failure.unwrap().kind, kind);
         assert_eq!(result.password.as_deref(), expected);
+        fs::remove_dir(output).unwrap();
     }
     release_reader_resources_under_roots(vec![source.to_string_lossy().into_owned()]).unwrap();
     fs::remove_file(source).unwrap();

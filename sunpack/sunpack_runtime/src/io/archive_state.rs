@@ -191,6 +191,13 @@ impl ArchiveInput {
     }
 }
 
+pub(crate) fn contiguous_volume_prefix(parts: &[InputPart]) -> &[InputPart] {
+    let count = parts.iter().enumerate()
+        .take_while(|(index, part)| part.volume_number == Some(*index as u32 + 1))
+        .count();
+    &parts[..count]
+}
+
 /// Main's public archive_input receipt, distinct from the compact worker wire.
 /// All values borrow the canonical input; rendering does not clone a descriptor.
 pub(crate) struct ArchiveInputReport<'a>(&'a ArchiveInput);
@@ -395,6 +402,23 @@ enum ExtentCandidates {
 
 
 impl VolumeAttemptPlan {
+    pub(crate) fn sole_parts(&self) -> Option<Box<[InputPart]>> {
+        let [layout] = self.layouts.as_ref() else { return None; };
+        if layout.minimum_slots != 0 && layout.minimum_slots != layout.slots.len() {
+            return None;
+        }
+        let sources = layout.slots.iter().map(|slot| match self.domains.get(slot.domain)?.choices.as_slice() {
+            [source] => Some(*source),
+            _ => None,
+        }).collect::<Option<Vec<_>>>()?;
+        let parts = self.selected_parts(&VolumeSelection { layout: 0, sources }).ok()?;
+        let missing = parts.iter().fold(self.minimum_size.unwrap_or(0), |missing, part| {
+            let size = part.extent.end.map_or(u64::MAX, |end| end.saturating_sub(part.extent.start));
+            missing.saturating_sub(size)
+        });
+        (missing == 0).then_some(parts)
+    }
+
     pub(crate) fn with_remaining(&self, layouts: Vec<VolumeLayout>, mut domains: Vec<VolumeDomain>) -> Self {
         // Drop unused source paths and remap the surviving domains once.
         let mut used = vec![false; self.sources.len()];

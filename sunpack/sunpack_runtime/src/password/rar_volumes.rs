@@ -1,5 +1,5 @@
 use super::*;
-use crate::io::archive_state::VolumeAttemptPlan;
+use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
 use crate::password::evidence::{remove_paths, EvidenceContext, VolumeProjection};
 use crate::password::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
 use crate::password::input::{InputReaders, VirtualRangeReader};
@@ -21,6 +21,7 @@ pub(super) struct VolumeFacts {
     pub(super) invalid: bool,
     pub(super) number: Option<u32>,
     pub(super) has_next: Option<bool>,
+    pub(super) stop_at_proof: bool,
     packed: Option<Vec<(u64, u64, PackedDigest)>>,
     first: Option<Option<RarContinuationFragment>>,
     last: Option<Option<RarContinuationFragment>>,
@@ -228,6 +229,85 @@ fn variable_sources(plan: &VolumeAttemptPlan) -> Vec<bool> {
     variable
 }
 
+type VolumeInspection = (VolumeFacts, Option<Arc<RarPasswordContext>>);
+
+fn inspect_volume(range: RangeSpec, facts: &mut VolumeFacts, native: bool)
+    -> Result<RarPasswordContext, PreparedStatus> {
+    let ranges = std::slice::from_ref(&range);
+    let mut reader = if facts.stop_at_proof {
+        VirtualRangeReader::new(ranges)
+    } else {
+        VirtualRangeReader::streaming(ranges)
+    };
+    let len = reader.len();
+    prepare_rar_volume(|offset, size, field| {
+        reader.read_at(offset, size).map_err(|err|
+            ReadFault::from_io(err, "read_volume", offset, size, 0, len).with_field(field, FieldLocation::Head))
+    }, Some(facts), RarRanges::Fixed(ranges, native))
+}
+
+pub(super) fn prepare_fixed(volumes: &VolumeSet, parts: &[InputPart], sessions: &[NativeArchiveSession])
+    -> Result<PasswordContext, PreparedStatus> {
+    let first = volumes.disk_range(0).ok_or_else(||
+        PreparedStatus::new("needs_volume_or_tail_damaged", "RAR volume unavailable"))?;
+    let can_bind = parts.len() > 1 && parts[0].volume_number == Some(1);
+    let mut inspected = Vec::new();
+    let prefer_later = |context: &RarPasswordContext| matches!(context.material, RarPasswordMaterial::Rar5Block { .. });
+    let mut inspect = |range| {
+        let mut facts = VolumeFacts { stop_at_proof: true, ..Default::default() };
+        let context = inspect_volume(range, &mut facts, true).map(Arc::new);
+        if can_bind && !context.as_ref().is_ok_and(|ctx| !prefer_later(ctx) && !ctx.can_follow_native()) {
+            inspected.push((facts, context.as_ref().ok().cloned()));
+        }
+        context
+    };
+    let mut selected = inspect(first);
+    if !selected.as_ref().is_ok_and(|ctx| !prefer_later(ctx)) {
+        for range in (1..volumes.len()).filter_map(|disk| volumes.disk_range(disk)) {
+            if let Ok(context) = inspect(range) {
+                if !prefer_later(&context) {
+                    selected = Ok(context);
+                    break;
+                }
+                if selected.is_err() { selected = Ok(context); }
+            }
+        }
+    }
+    let selected = selected?;
+    if !can_bind || !selected.can_follow_native() {
+        return Ok(PasswordContext::Rar(selected));
+    }
+
+    // The preliminary walk already recorded the headers it needed. Complete
+    // the remaining disks once before binding the native continuation reader.
+    let slots = parts.iter().enumerate().map(|(domain, part)| VolumeSlot {
+        number: part.volume_number.unwrap(),
+        canonical_name: part.canonical_name.clone(),
+        domain,
+    }).collect();
+    let plan = Arc::new(VolumeAttemptPlan {
+        sources: parts.iter().map(|part| part.extent.clone()).collect(),
+        domains: (0..parts.len()).map(|source| VolumeDomain { choices: Arc::new(vec![source]) }).collect(),
+        layouts: Box::new([VolumeLayout { slots, minimum_slots: 0 }]),
+        head_size_from_total: None,
+        minimum_size: None,
+        tail_totals: Box::default(),
+    });
+    let cancel = Cancellation::current();
+    let scanned = inspected.len();
+    inspected.par_extend((scanned..volumes.len()).into_par_iter().map(|disk| cancel.run(|| {
+        let mut facts = VolumeFacts::default();
+        let material = volumes.disk_range(disk)
+            .and_then(|range| inspect_volume(range, &mut facts, true).ok()).map(Arc::new);
+        (facts, material)
+    })));
+    let members = parts.iter().map(|part| {
+        let disk = volumes.ordinal(part.volume_number.unwrap() as usize - 1).unwrap();
+        std::mem::take(&mut inspected[disk])
+    }).collect();
+    prepare_inspected(&parts[0].extent, &plan, sessions, 0, members, None)
+}
+
 pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, sessions: &[NativeArchiveSession], native_volume: bool)
     -> Result<Option<PasswordContext>, PreparedStatus> {
     let cancel = Cancellation::current();
@@ -237,13 +317,7 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
     let inspect = |extent: &InputExtent, check_data: bool| {
         let mut facts = VolumeFacts { packed: check_data.then(Vec::new), ..VolumeFacts::default() };
         let range = readers.single_range(extent).ok()?;
-        let ranges = std::slice::from_ref(&range);
-        let mut reader = VirtualRangeReader::streaming(ranges);
-        let len = reader.len();
-        let context = prepare_rar_volume(|offset, size, field| {
-            reader.read_at(offset, size).map_err(|err|
-                ReadFault::from_io(err, "read_volume", offset, size, 0, len).with_field(field, FieldLocation::Head))
-        }, Some(&mut facts), RarRanges::Fixed(ranges, native_volume)).ok().map(Arc::new);
+        let context = inspect_volume(range, &mut facts, native_volume).ok().map(Arc::new);
         Some((facts, context))
     };
     let Some((anchor, context)) = inspect(&plan.sources[head_index], false) else { return Ok(None); };
@@ -253,6 +327,18 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
         if i == head_index { Default::default() } else { cancel.run(|| inspect(s, variable[i])).unwrap_or_default() }
     ).collect();
     members[head_index] = (anchor, context);
+    prepare_inspected(head, plan, sessions, head_index, members, Some(&variable)).map(Some)
+}
+
+fn prepare_inspected(
+    head: &InputExtent,
+    plan: &Arc<VolumeAttemptPlan>,
+    sessions: &[NativeArchiveSession],
+    head_index: usize,
+    members: Vec<VolumeInspection>,
+    variable: Option<&[bool]>,
+) -> Result<PasswordContext, PreparedStatus> {
+    let cancel = Cancellation::current();
     cancel.check_io().map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
     let (facts, materials): (Vec<_>, Vec<_>) = members.into_iter().unzip();
     let public = rejections(plan, &facts, Some(&facts[head_index]), &[]);
@@ -262,12 +348,13 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
     } else { Arc::clone(plan) };
     let anchor_context = materials[head_index].clone();
     let by_extent: HashMap<_, _> = plan.sources.iter().enumerate().map(|(i,s)| (s,i)).collect();
-    if facts.iter().any(|f| f.packed.as_ref().is_some_and(|spans| !spans.is_empty())) {
+    if let Some(variable) = variable.filter(|_| facts.iter().any(|f| f.packed.as_ref().is_some_and(|spans| !spans.is_empty()))) {
+        let readers = InputReaders::new(sessions);
         let narrowed;
         let variable = if reduced {
             narrowed = variable_sources(&remaining);
             &narrowed
-        } else { &variable };
+        } else { variable };
         let bad: Vec<_> = remaining.sources.par_iter().enumerate().map(|(i, s)| {
             variable[i] && facts[by_extent[s]].packed.as_deref().is_some_and(|spans| packed_mismatch(spans, s, &readers, &cancel))
         }).collect();
@@ -281,10 +368,10 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
     let plan = remaining;
     let materials: Vec<_> = plan.sources.iter().map(|s| materials[by_extent[s]].clone()).collect();
     if plan.layouts.is_empty() || materials.iter().all(Option::is_none) {
-        return Ok(Some(PasswordContext::Evidence(EvidenceContext {
+        return Ok(PasswordContext::Evidence(EvidenceContext {
             plan, alternatives: Vec::new(), rejected: Vec::new(), public_plan: Default::default(), unresolved: None,
             public_reduced: reduced, independent_rar: Vec::new(), rar_anchor: None,
-        })));
+        }));
     }
     // Native disk methods use their own offset zero and ignore all earlier
     // disk lengths. Read each source once, then branch only on usable proofs.
@@ -326,5 +413,5 @@ pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, session
         context.independent_rar = materials;
         context.rar_anchor = anchor_context.filter(|c| matches!(c.material, RarPasswordMaterial::Header(_) | RarPasswordMaterial::Rar5Header { .. }));
     }
-    Ok(Some(PasswordContext::Evidence(context)))
+    Ok(PasswordContext::Evidence(context))
 }

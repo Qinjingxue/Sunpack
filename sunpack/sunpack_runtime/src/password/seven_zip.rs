@@ -182,7 +182,8 @@ impl SevenZipPasswordContext {
         })?;
         let mut result = candidate_result(&matches, candidates.len(), evidence, true);
         let narrow_volumes_only = result.matched_indices.len() == 1;
-        if narrow_volumes_only && volume_scope == SevenZipVolumeScope::Unique {
+        let stop_at_one = volume_scope == SevenZipVolumeScope::Unique;
+        if narrow_volumes_only && stop_at_one {
             return Ok(result);
         }
         let followups = matches.iter().filter(|(_, check)| check.is_ok())
@@ -193,10 +194,10 @@ impl SevenZipPasswordContext {
         let cancellation = Cancellation::current();
         let mut outcomes = Vec::new();
         let mut remaining = matches.into_iter();
-        if volume_scope == SevenZipVolumeScope::Unique && probe.can_stage_followup() {
+        let mut viable = result.matched_indices.len();
+        if stop_at_one && probe.can_stage_followup() {
             let mut pending = Vec::with_capacity(2);
-            let mut viable = 0;
-            for (index, check) in remaining.by_ref() {
+            while let Some((index, check)) = remaining.next() {
                 if let Ok((_, (first_key, prefix))) = check {
                     let staged = cancellation.run(|| probe.prepare_followup(|properties| {
                         key(index, &candidates[index], properties)
@@ -204,24 +205,20 @@ impl SevenZipPasswordContext {
                     match staged {
                         Ok(Some(prepared)) => {
                             pending.push((index, first_key, prefix, prepared));
-                            viable += 1;
                         }
-                        Ok(None) => outcomes.push((index, Ok(SevenZipPrefixCheck::Reject), Vec::new())),
-                        Err(error) => {
-                            viable += 1;
-                            outcomes.push((index, Err(error), Vec::new()));
+                        Ok(None) => {
+                            viable -= 1;
+                            outcomes.push((index, Ok(SevenZipPrefixCheck::Reject), Vec::new()));
                         }
+                        Err(error) => outcomes.push((index, Err(error), Vec::new())),
                     }
-                } else {
-                    viable += 1;
                 }
                 // Buffer at most two states. As soon as another candidate
                 // remains viable, the successor checks can narrow the result.
-                if viable >= 2 && !pending.is_empty() {
+                if viable - remaining.len() >= 2 && !pending.is_empty() {
                     break;
                 }
             }
-            viable += remaining.len();
             for (index, first_key, prefix, prepared) in pending {
                 let proof = if viable == 1 {
                     prepared.prefix_result(prefix.check)
@@ -249,8 +246,29 @@ impl SevenZipPasswordContext {
         // Both collections follow input order. The candidate item carries its
         // own follow-up data across the two phases.
         if followups >= PARALLEL_PASSWORD_THRESHOLD && remaining.len() >= PARALLEL_PASSWORD_THRESHOLD {
-            let remaining: Vec<_> = remaining.collect();
+            let mut remaining: Vec<_> = remaining.collect();
+            // Keep the last candidate outside the wave when extraction can
+            // confirm it against the only remaining layout.
+            let last = if stop_at_one { remaining.pop() } else { None };
+            let first = outcomes.len();
             outcomes.par_extend(remaining.into_par_iter().filter_map(test));
+            if let Some(last) = last {
+                let rejected = outcomes[first..].iter()
+                    .filter(|(_, proof, _)| *proof == Ok(SevenZipPrefixCheck::Reject)).count();
+                if viable - rejected > 1 {
+                    outcomes.extend(test(last));
+                }
+            }
+        } else if stop_at_one {
+            for candidate in remaining {
+                if viable == 1 {
+                    break;
+                }
+                if let Some(outcome) = test(candidate) {
+                    viable -= usize::from(outcome.1 == Ok(SevenZipPrefixCheck::Reject));
+                    outcomes.push(outcome);
+                }
+            }
         } else {
             outcomes.extend(remaining.filter_map(test));
         }
