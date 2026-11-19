@@ -94,6 +94,7 @@ struct ExtractionReplay : VolumeReadUncertainty {
 #ifdef SUP7Z_DEBUG
     std::size_t rejected_compositions = 0;
     std::size_t prepared_compositions = 0;
+    std::size_t scheduled_volume_probes = 0;
 #endif
     void observe_volume_read(std::uint64_t offset, std::uint32_t size, const std::wstring* physical = nullptr) {
         if (!volumes.started) return;

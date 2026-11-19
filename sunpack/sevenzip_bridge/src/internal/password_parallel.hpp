@@ -51,6 +51,8 @@ public:
             }
         } catch (const std::system_error&) { /* Use the already admitted lanes. */ }
         catch (...) { launch_failure = std::current_exception(); }
+        // Logical lanes that run on the calling thread need no extra credit.
+        limit(spawned);
         if (!launch_failure) {
             if (count) invoke(0);
             for (auto lane = spawned; lane < count; ++lane) invoke(lane);

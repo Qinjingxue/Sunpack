@@ -69,6 +69,13 @@ impl Default for PasswordSnapshot {
 }
 
 impl PasswordSnapshot {
+    #[cfg(test)]
+    pub(crate) fn from_test_document(text: &str) -> Self {
+        let mut index = IndexBuilder::default();
+        Document::parse(text).unwrap().read_passwords(Some(&mut index)).unwrap();
+        index.finish(&Self::default()).unwrap_or_default()
+    }
+
     fn new(global: Bucket, scoped: HashMap<Box<str>, Bucket>) -> Self {
         let mut hash = Hash128::new();
         hash.update(&0_u64.to_le_bytes());
@@ -102,10 +109,6 @@ impl PasswordSnapshot {
 
     pub fn global(&self) -> &[Arc<str>] {
         &self.global.values
-    }
-
-    pub(crate) fn has_scopes(&self) -> bool {
-        !self.scoped.is_empty()
     }
 
     pub fn scoped(&self, path: &Path) -> impl Iterator<Item = &[Arc<str>]> + '_ {

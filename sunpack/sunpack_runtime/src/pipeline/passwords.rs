@@ -64,7 +64,7 @@ struct CandidateSources {
 
 struct RecentPriority {
     recent: RecentOrder,
-    indices: Arc<[usize]>,
+    indices: Arc<[(usize, usize)]>,
 }
 
 impl CandidateSources {
@@ -76,9 +76,9 @@ impl CandidateSources {
         }
     }
 
-    fn recent_indices(&self, recent: RecentOrder) -> Arc<[usize]> {
+    fn recent_indices(&self, recent: &RecentOrder) -> Arc<[(usize, usize)]> {
         if let Some(cached) = self.recent_priority.lock().unwrap().as_ref()
-            .filter(|cached| Arc::ptr_eq(&cached.recent, &recent))
+            .filter(|cached| Arc::ptr_eq(&cached.recent, recent))
         {
             return Arc::clone(&cached.indices);
         }
@@ -86,8 +86,8 @@ impl CandidateSources {
         // Store only the recent matches, including an empty answer, and keep
         // a dictionary-sized search outside the lock shared by these inputs.
         let configured = self.explicit.iter().chain(self.snapshot.global()).enumerate();
-        let indices: Arc<[_]> = prioritize(&recent, configured).into();
-        let cached = RecentPriority { recent, indices: Arc::clone(&indices) };
+        let indices: Arc<[_]> = prioritize(recent, configured).into();
+        let cached = RecentPriority { recent: Arc::clone(recent), indices: Arc::clone(&indices) };
         let displaced = self.recent_priority.lock().unwrap().replace(cached);
         drop(displaced);
         indices
@@ -165,26 +165,40 @@ impl CandidateSet {
 
     fn for_path<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
         let recent = self.sources.recent.snapshot();
-        let has_scopes = self.sources.snapshot.has_scopes();
-        let unique_bucket = !has_scopes && self.sources.explicit.is_empty();
+        let scoped: Vec<_> = self.sources.snapshot.scoped(self.scope(path)).collect();
+        let global = self.sources.snapshot.global();
+        let explicit = &self.sources.explicit;
         let priority = if recent.is_empty() {
             Vec::new()
-        } else if !has_scopes
-            && self.sources.explicit.len() + self.sources.snapshot.global().len() >= BATCH_SIZE
-        {
-            self.sources.recent_indices(recent).iter()
-                .map(|&index| self.sources.base_password(index)).collect()
+        } else if explicit.len() + global.len() >= BATCH_SIZE {
+            let base = self.sources.recent_indices(&recent);
+            let mut ranked: Vec<_> = if scoped.is_empty() {
+                Vec::new()
+            } else {
+                prioritize(&recent, scoped.iter().flat_map(|bucket| bucket.iter()).map(|value| (value, value)))
+            };
+            // An applicable scoped entry has precedence over the shared base.
+            // Only merge recent entries, regardless of dictionary size.
+            ranked.extend(base.iter().map(|&(rank, index)| (rank, self.sources.base_password(index))));
+            if !scoped.is_empty() {
+                ranked.sort_by_key(|&(rank, _)| rank);
+                ranked.dedup_by_key(|entry| entry.0);
+            }
+            ranked
         } else {
-            prioritize(&recent, self.configured(path).map(|value| (value, value)))
+            let values = scoped.iter().flat_map(|bucket| bucket.iter()).chain(explicit.iter()).chain(global);
+            prioritize(&recent, values.map(|value| (value, value)))
         };
-        let mut seen: HashSet<&str> = priority.iter().map(|&value| value.as_ref()).collect();
+        let mut seen: HashSet<&str> = priority.iter().map(|&(_, value)| value.as_ref()).collect();
+        let prefix = scoped.into_iter().flatten().chain(explicit.iter()).map(|value| (value, true));
         priority
             .into_iter()
-            .chain(self.configured(path).filter(move |value| {
-                let value: &'b Arc<str> = *value;
-                // The builtin bucket is already deduplicated. Only skip the
-                // entries emitted first, without indexing the whole dictionary.
-                if unique_bucket { !seen.contains(value.as_ref()) } else { seen.insert(value.as_ref()) }
+            .map(|(_, value)| value)
+            .chain(prefix.chain(global.iter().map(|value| (value, false))).filter_map(move |(value, track)| {
+                // Global entries are already unique. Only earlier sources can
+                // duplicate them, so the set never grows with this dictionary.
+                let unique = if track { seen.insert(value.as_ref()) } else { !seen.contains(value.as_ref()) };
+                unique.then_some(value)
             }))
     }
 
@@ -642,7 +656,7 @@ impl CandidateSet {
 fn prioritize<'a, T: Copy>(
     recent: &VecDeque<Arc<str>>,
     configured: impl Iterator<Item = (T, &'a Arc<str>)>,
-) -> Vec<T> {
+) -> Vec<(usize, T)> {
     let mut positions: HashMap<_, _> = recent.iter().enumerate()
         .map(|(index, password)| (password.as_ref(), index)).collect();
     let mut priority = vec![None; recent.len()];
@@ -654,7 +668,7 @@ fn prioritize<'a, T: Copy>(
             if positions.is_empty() { break; }
         }
     }
-    priority.into_iter().flatten().collect()
+    priority.into_iter().enumerate().filter_map(|(rank, value)| value.map(|value| (rank, value))).collect()
 }
 
 fn open_sessions(input: &ArchiveInput) -> io::Result<Vec<NativeArchiveSession>> {

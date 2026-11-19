@@ -95,7 +95,7 @@ pub(crate) fn zip_fast_verify_passwords_from_attempts(
     };
     let material = anchor.context.kdf_parameters().unwrap();
     let keys = ZipKeyCache::from_parameters([material, material]);
-    let mut early = anchor.context.verify_cached(candidates, Some(&keys))?;
+    let mut early = anchor.context.verify_cached(candidates, Some(&keys), false)?;
     if early.status == "no_match" {
         preparation.zip_anchor = Some(anchor);
         return Ok(early);
@@ -920,19 +920,21 @@ impl ZipPasswordContext {
     }
 
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
-        self.verify_cached(candidates, None)
+        self.verify_cached(candidates, None, true)
     }
 
-    pub(super) fn verify_cached(&self, candidates: &[Arc<str>], cache: Option<&ZipKeyCache>) -> std::io::Result<PasswordVerification> {
+    pub(super) fn verify_cached(&self, candidates: &[Arc<str>], cache: Option<&ZipKeyCache>,
+        unique_volumes: bool,
+    ) -> std::io::Result<PasswordVerification> {
         match self {
             Self::Aes {
                 key_len,
                 salt,
                 verifier,
                 prefix,
-            } => verify_winzip_aes_candidates(candidates, *key_len, salt, verifier, prefix.as_ref(), cache),
+            } => verify_winzip_aes_candidates(candidates, *key_len, salt, verifier, prefix.as_ref(), cache, unique_volumes),
             Self::ZipCrypto { header, check_byte, prefix } => {
-                verify_zipcrypto_material(candidates, header, *check_byte, prefix.as_ref(), cache)
+                verify_zipcrypto_material(candidates, header, *check_byte, prefix.as_ref(), cache, unique_volumes)
             }
             Self::Strong(header) => header.verify(candidates, cache),
         }
@@ -1197,6 +1199,7 @@ fn verify_winzip_aes_candidates(
     candidates: &[Arc<str>], key_len: usize, salt: &[u8], verifier: &[u8; 2],
     prefix: Option<&ZipPrefix>,
     cache: Option<&ZipKeyCache>,
+    unique_volumes: bool,
 ) -> std::io::Result<PasswordVerification> {
     let attempts = candidates.len();
     let cancellation = Cancellation::current();
@@ -1235,7 +1238,9 @@ fn verify_winzip_aes_candidates(
             ..PasswordVerification::status("no_match", "winzip aes password verifier did not match")
         }
     };
-    if let Some(prefix) = prefix.filter(|prefix| prefix.can_screen(result.matched_indices.len(), true)) {
+    if let Some((prefix, minimum)) = prefix.and_then(|prefix| prefix
+        .screening_minimum(result.matched_indices.len(), true, unique_volumes)
+        .map(|minimum| (prefix, minimum))) {
         let mut keys = Vec::with_capacity(result.matched_indices.len());
         for &index in &result.matched_indices {
             let derive = || winzip_aes_encryption_key(&zip_password_bytes(&candidates[index]), salt, key_len);
@@ -1251,7 +1256,7 @@ fn verify_winzip_aes_candidates(
             }
         }
         cancellation.check_io()?;
-        prefix.screen(&keys, &mut result)?;
+        prefix.screen(&keys, minimum, &mut result)?;
     }
     Ok(result)
 }
@@ -1262,6 +1267,7 @@ fn verify_zipcrypto_material(
     check_byte: u8,
     prefix: Option<&ZipPrefix>,
     cache: Option<&ZipKeyCache>,
+    unique_volumes: bool,
 ) -> std::io::Result<PasswordVerification> {
     let attempts = candidates.len();
     let cancellation = Cancellation::current();
@@ -1300,8 +1306,10 @@ fn verify_zipcrypto_material(
             ..PasswordVerification::status("no_match", "zipcrypto password material did not match")
         }
     };
-    if let Some(prefix) = prefix.filter(|prefix| prefix.can_screen(keys.len(), false)) {
-        prefix.screen(&keys, &mut result)?;
+    if let Some((prefix, minimum)) = prefix.and_then(|prefix| prefix
+        .screening_minimum(keys.len(), false, unique_volumes)
+        .map(|minimum| (prefix, minimum))) {
+        prefix.screen(&keys, minimum, &mut result)?;
     }
     Ok(result)
 }

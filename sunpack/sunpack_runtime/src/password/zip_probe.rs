@@ -226,15 +226,19 @@ impl ZipPrefix {
         self.read = Some(read);
     }
 
-    pub(super) fn can_screen(&self, matches: usize, derive_aes_key: bool) -> bool {
-        let Some(read) = &self.read else { return false; };
+    pub(super) fn screening_minimum(&self, matches: usize, derive_aes_key: bool, unique_volumes: bool) -> Option<usize> {
+        let read = self.read.as_ref()?;
         let size = self.read_size();
-        let span = if derive_aes_key && self.has_aes_successor() {
+        if matches == 0 || size == 0 { return None; }
+        // With one complete layout, extraction can confirm the last candidate.
+        // An individual projection can be fixed while other layouts remain.
+        let minimum = if unique_volumes { 2 } else { 1 };
+        if matches < minimum { return None; }
+        if !derive_aes_key || matches > 1 { return Some(minimum); }
+        let span = if self.has_aes_successor() {
             self.sizes.map_or(size as u64, |(packed, _)| packed)
         } else { size as u64 };
-        matches != 0 && size != 0
-            && (!derive_aes_key || matches > 1 || read.ambiguous(self.start, span)
-                || self.xz_tail(read).is_some())
+        (read.ambiguous(self.start, span) || self.xz_tail(read).is_some()).then_some(minimum)
     }
 
     pub(super) fn needs_size(&self) -> bool {
@@ -294,7 +298,7 @@ impl ZipPrefix {
     }
 
     pub(super) fn screen(
-        &self, keys: &[(usize, ZipPrefixKey)], result: &mut PasswordVerification,
+        &self, keys: &[(usize, ZipPrefixKey)], minimum_candidates: usize, result: &mut PasswordVerification,
     ) -> io::Result<()> {
         let Some(source) = &self.read else { return Ok(()); };
         let size = self.read_size();
@@ -360,7 +364,8 @@ impl ZipPrefix {
                     verdict
                 }).collect()
             };
-            while !successor_volumes && unavailable.is_none() && encrypted.len() < size
+            let mut viable = verdicts.iter().filter(|&&verdict| verdict != Some(false)).count();
+            while viable >= minimum_candidates && !successor_volumes && unavailable.is_none() && encrypted.len() < size
                 && verdicts.iter().any(Option::is_none) {
                 let previous = encrypted.len();
                 let more = match read(self.start + previous as u64, next - previous) {
@@ -373,12 +378,15 @@ impl ZipPrefix {
                     let verdict = &mut verdicts[progress.position];
                     if verdict.is_none() {
                         *verdict = self.check_plain(progress.extend(&encrypted), &mut next);
+                        if *verdict == Some(false) {
+                            viable -= 1;
+                            if viable < minimum_candidates { break; }
+                        }
                     }
                 }
             }
-            if let Some(sizes) = successor_sizes.filter(|_| unavailable.is_none() && (
-                successor_volumes || verdicts.iter().filter(|&&v| v != Some(false)).nth(1).is_some()
-            )) {
+            if let Some(sizes) = successor_sizes.filter(|_| unavailable.is_none() && viable >= minimum_candidates
+                && (successor_volumes || viable > 1)) {
                 let mut progress = primary.iter_mut().chain(&mut additional).peekable();
                 for (position, ((_, key), verdict)) in keys.iter().zip(&mut verdicts).enumerate() {
                     let saved = progress.next_if(|saved| saved.position == position);
@@ -396,9 +404,13 @@ impl ZipPrefix {
                             None
                         }
                     };
+                    if *verdict == Some(false) {
+                        viable -= 1;
+                        if viable < minimum_candidates { break; }
+                    }
                 }
             }
-            if let Some(sizes) = xz_tail.filter(|_| verdicts.iter().any(|&verdict| verdict != Some(false))
+            if let Some(sizes) = xz_tail.filter(|_| viable >= minimum_candidates
                 && !matches!(unavailable, Some(DeferredReadError::Pending)))
             {
                 match read(self.start + sizes.0 - 12, 12) {

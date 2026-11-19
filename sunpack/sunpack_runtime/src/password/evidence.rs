@@ -463,6 +463,7 @@ impl EvidenceContext {
                     PasswordContext::Zip(context) => context.verify_cached(
                         candidates,
                         zip_keys,
+                        seven_zip_scope == SevenZipVolumeScope::Unique,
                     ),
                     PasswordContext::Rar(context) => {
                         if screened_anchor.is_some_and(|anchor| Arc::ptr_eq(context, anchor)) {

@@ -110,10 +110,16 @@ bool check_encrypted_header_open_is_not_a_member_proof() {
     { std::ofstream file(path, std::ios::binary); file.write(archive, sizeof(archive) - 1); }
     const std::wstring wrong = L"incorrect";
     const auto bounded = test_password_batch(path.wstring(), {}, {}, L"7z", &wrong, 1, {}, true);
+    const std::wstring candidates[]{wrong, L"out-of-domain", L"another-wrong-password"};
+    const std::size_t domain[]{0, 2};
+    const auto unresolved = test_password_batch(path.wstring(), {}, {}, L"7z", candidates, 2, {},
+        false, false, domain, nullptr, true);
     const auto final = test_password_batch(path.wstring(), {}, {}, L"7z", &wrong, 1, {}, false, true);
     std::filesystem::remove(path);
     return bounded.status == PasswordTestStatus::Unsupported && bounded.encrypted &&
-        !bounded.password_independent_failure && final.status == PasswordTestStatus::WrongPassword;
+        !bounded.password_independent_failure && unresolved.status == PasswordTestStatus::Unsupported &&
+        unresolved.encrypted && !unresolved.password_independent_failure && unresolved.matched_index == -1 &&
+        unresolved.possible_candidates.empty() && final.status == PasswordTestStatus::WrongPassword;
 }
 
 bool check_rar5_password_probe_with_unknown_unpacked_size() {

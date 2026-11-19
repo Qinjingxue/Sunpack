@@ -237,8 +237,36 @@ void sole_injective_composition_skips_member_probe(const std::filesystem::path& 
     std::ifstream member(destination / L"ok.txt", std::ios::binary);
     const std::string contents((std::istreambuf_iterator<char>(member)), {});
     require(outcome.code == 0 && replay.volumes.attempts == 1 && replay.prepared_compositions == 1 &&
-        !replay.password_probe_done && replay.candidate_index == 1 && contents == "cursor replay",
+        replay.scheduled_volume_probes == 0 && !replay.password_probe_done &&
+        replay.candidate_index == 1 && contents == "cursor replay",
         "the sole viable password and composition did not go directly to real extraction");
+}
+
+void sparse_layout_skips_password_probe(const std::filesystem::path& archive,
+                                        const std::filesystem::path& destination) {
+    NativeCpuBudget budget(2);
+    NativeCpuJobContext job(budget);
+    NativeCpuContextScope cpu(&job);
+    ExtractionReplay replay;
+    ExtractionReplayScope scope(&replay);
+    WorkerRequest request;
+    request.job_id = "sparse-layout";
+    request.output_dir = destination.wstring();
+    request.password_candidates = {L"incorrect", L"fixture-known"};
+    request.archive_input.archive_path = archive.wstring();
+    request.archive_input.format_hint = L"zip";
+    auto& plan = request.archive_input.volume_attempts;
+    plan.sources = {{archive.wstring(), 0, 45, true},
+                    {archive.wstring(), 45, std::filesystem::file_size(archive), true},
+                    {archive.wstring(), 45, 46, true}};
+    plan.domains = {{0}, {1, 2}, {1}};
+    plan.layouts = {{{1, L"v1", 0}, {3, L"v3", 1}}, {{1, L"v1", 0}, {2, L"v2", 2}}};
+    const auto outcome = run_request(request);
+    std::ifstream member(destination / L"ok.txt", std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(member)), {});
+    require(outcome.code == 0 && replay.volumes.attempts == 2 && replay.volumes.layout == 1 &&
+        replay.scheduled_volume_probes == 1 && replay.screened_candidates == std::vector<std::size_t>{1} &&
+        contents == "cursor replay", "a sparse layout spent a probe or invalidated the next layout's proof");
 }
 
 void last_password_extracts_into_existing_destination(const std::filesystem::path& archive,
@@ -717,6 +745,7 @@ int main() {
     solid_aes_copy_crc_checks_the_uncertain_block(root / L"solid-aes-carrier.7z");
     disjoint_layouts_do_not_repeat_comparisons();
     rejected_composition_is_not_prepared(root / L"encrypted.zip", root / L"rejected");
+    sparse_layout_skips_password_probe(root / L"encrypted.zip", root / L"sparse");
     scan_confirms_only_unproven_password(root / L"encrypted.zip");
     sole_injective_composition_skips_member_probe(archive, root / L"direct");
     last_password_extracts_into_existing_destination(root / L"encrypted.zip", root / L"existing");

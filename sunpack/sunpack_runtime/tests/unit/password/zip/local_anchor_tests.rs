@@ -221,6 +221,7 @@ fn zipcrypto_deflate_uses_dynamic_tables_with_unknown_descriptor_sizes() {
     encoder.write_all(&plain).unwrap();
     let mut body = encoder.finish().unwrap();
     assert_eq!((body[0] >> 1) & 3, 2);
+    assert_eq!(crate::formats::deflate_prefix::check_prefix(&body[..16], None, None, false), None);
     let mut local = local_crypto_header();
     local[8] = 8;
     local[6] |= 8;
@@ -239,6 +240,23 @@ fn zipcrypto_deflate_uses_dynamic_tables_with_unknown_descriptor_sizes() {
         encrypt(&mut state, byte);
     }
     let header = local[31..].try_into().unwrap();
+    let early_collision: Arc<str> = (0..20_000).find_map(|value| {
+        let password = format!("candidate-{value}");
+        let mut state = zipcrypto_header_state(password.as_bytes(), &header, 0x5a)?;
+        ((state.decrypt(body[0]) >> 1) & 3 == 3).then(|| Arc::from(password))
+    }).expect("a check-byte collision with a reserved Deflate block type");
+    let mut fixed = local.clone();
+    fixed.extend_from_slice(&body);
+    let reader = ManagedReader::from_bytes(fixed, Default::default());
+    let input = ZipReadInput::Ranges(Arc::new([RangeSpec::entire(&reader)]));
+    let context = prepare_zip_stream_from(&mut reader.stream_cursor(), reader.len(), None, Some(&input)).ok().unwrap();
+    let before = reader.stats().direct_read_bytes;
+    let correct = Arc::from("secret");
+    assert_eq!(context.verify(std::slice::from_ref(&correct)).unwrap().matched_indices, [0]);
+    assert_eq!(reader.stats().direct_read_bytes, before);
+    assert_eq!(context.verify(&[early_collision, correct]).unwrap().matched_indices, [1]);
+    assert_eq!(reader.stats().direct_read_bytes - before, 16);
+
     let collision: Arc<str> = (0..20_000).find_map(|value| {
         let password = format!("candidate-{value}");
         let mut state = zipcrypto_header_state(password.as_bytes(), &header, 0x5a)?;

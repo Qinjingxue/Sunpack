@@ -835,6 +835,12 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
         if (cancel && cancel->load()) break;
         prepared_attempts.push_back({next.layout, next.selected, {}});
         auto& prepared = prepared_attempts.back();
+        if (!request.scan_only && plan.layouts[prepared.layout][prepared.sources.size() - 1].number != prepared.sources.size()) {
+            // Other choices cannot fill a hole in this layout. Keep one
+            // witness for extraction's missing-volume classification.
+            next.skip_layout();
+            continue;
+        }
         if (const auto* cached = cache.find(plan, prepared)) {
             prepared.probe = *cached;
             // An earlier uncached composition can still win. Nothing after
@@ -1222,6 +1228,7 @@ RequestOutcome run_request(
     }
     const auto& archive_input = volume_trials ? selected_input : request.archive_input;
     std::deque<PreparedAttempt> prepared_attempts;
+    VolumeAttemptCursor lookahead;
     const bool unique_volume_choice = volume_trials && request.archive_input.volume_attempts.layouts.size() == 1 &&
         request.archive_input.volume_attempts.minimum_slots_for(0) == request.archive_input.volume_attempts.layouts[0].size() &&
         std::all_of(request.archive_input.volume_attempts.layouts[0].begin(), request.archive_input.volume_attempts.layouts[0].end(),
@@ -1248,8 +1255,12 @@ RequestOutcome run_request(
                 if (prepared_attempts.empty() && !(unique_volume_choice &&
                     request.password_count(request.passwords_for_layout(0)) <= 1)) {
                     if (request.report_progress) progress({"total", 0, 0, 0});
-                    auto lookahead = cursor;
+                    lookahead = cursor;
                     prepared_attempts = probe_volume_wave(request, lookahead, cancel_token.get(), proof_cache);
+#ifdef SUP7Z_DEBUG
+                    volume_replay->scheduled_volume_probes += proof_cache.scheduled_probes;
+                    proof_cache.scheduled_probes = 0;
+#endif
                 }
                 const bool found = cursor.next(request.archive_input.volume_attempts, cancel_token.get());
                 if (!found) {
@@ -1353,6 +1364,9 @@ RequestOutcome run_request(
         if (volume_trials) {
             const auto& cursor = volume_replay->volumes;
             const auto& plan = request.archive_input.volume_attempts;
+            // Keep the scratch cursor while rejecting a wave. The extraction
+            // itself has no use for a second copy of the search state.
+            lookahead = VolumeAttemptCursor{};
 #ifdef SUP7Z_DEBUG
             ++volume_replay->prepared_compositions;
 #endif
@@ -1533,8 +1547,9 @@ RequestOutcome run_request(
                 }); })) break;
         auto& cursor = volume_replay->volumes;
         // Every composition of a sparse layout is missing the same slot.
-        // Slot 1 instead denotes a candidate-dependent carrier trim failure.
-        if (archive_input.missing_volume_number > 1) { cursor.skip_layout(); prepared_attempts.clear(); }
+        // The wave holds just one witness for that layout. Slot 1 instead
+        // denotes a candidate-dependent carrier trim failure.
+        if (archive_input.missing_volume_number > 1) cursor.skip_layout();
         cursor.needs_next = true;
     }
 
