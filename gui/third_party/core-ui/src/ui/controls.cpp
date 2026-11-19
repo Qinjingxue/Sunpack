@@ -1338,7 +1338,7 @@ bool TextInputWidget::OnKeyDown(int vk) {
     ResetCaretBlink();
     extern MeasureContext* g_activeMeasureContext;
     if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
-    if ((vk == 0x2E || (ctrl && vk == 'V') || (ctrl && vk == 'X')) && onTextChanged)
+    if (vk == VK_DELETE && onTextChanged)
         onTextChanged(text_);
     return true;
 }
@@ -1442,7 +1442,6 @@ IDWriteTextLayout* TextAreaWidget::EnsureLayout(MeasureContext& measure, float f
 
     bool needRebuild = layoutDirty_
                     || !cachedLayout_
-                    || layoutText_     != text_
                     || layoutMaxW_     != layoutW
                     || layoutFontSize_ != fontSize
                     || layoutWrap_     != wrap_;
@@ -1450,22 +1449,14 @@ IDWriteTextLayout* TextAreaWidget::EnsureLayout(MeasureContext& measure, float f
     if (!needRebuild) return cachedLayout_.Get();
 
     // Empty text → single space so we still get line metrics for caret height.
-    std::wstring src = text_.empty() ? std::wstring(L" ") : text_;
-    cachedLayout_ = measure.CreateTextLayout(src, layoutW, 1e6f, fontSize, wrap_);
+    static const std::wstring emptyLine = L" ";
+    cachedLayout_ = measure.CreateTextLayout(text_.empty() ? emptyLine : text_, layoutW, 1e6f, fontSize, wrap_);
     if (!cachedLayout_) return nullptr;
 
-    // Sample a baseline line height from line metrics.
-    UINT32 lineCount = 0;
-    cachedLayout_->GetLineMetrics(nullptr, 0, &lineCount);
-    if (lineCount > 0) {
-        std::vector<DWRITE_LINE_METRICS> lines(lineCount);
-        cachedLayout_->GetLineMetrics(lines.data(), lineCount, &lineCount);
-        layoutLineHeight_ = lines[0].height > 0 ? lines[0].height : (fontSize + 6.0f);
-    } else {
-        layoutLineHeight_ = fontSize + 6.0f;
-    }
-
-    layoutText_     = text_;
+    FLOAT x, y;
+    DWRITE_HIT_TEST_METRICS first{};
+    layoutLineHeight_ = SUCCEEDED(cachedLayout_->HitTestTextPosition(0, FALSE, &x, &y, &first)) && first.height > 0
+        ? first.height : fontSize + 6.0f;
     layoutMaxW_     = layoutW;
     layoutFontSize_ = fontSize;
     layoutWrap_     = wrap_;
@@ -1556,6 +1547,7 @@ void TextAreaWidget::EnsureCursorVisible(MeasureContext* measure) {
         float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
         EnsureLayout(*measure, fontSize);
     }
+    if (autoGrow && std::abs(SizeHint().height - VisibleHeight()) > 0.5f) RequestLayout();
     if (!cachedLayout_) return;
     float cx, cy, ch;
     if (!CaretXYForPos(cursorPos_, cx, cy, ch)) return;
@@ -1905,7 +1897,7 @@ bool TextAreaWidget::OnKeyChar(wchar_t ch) {
         text_.insert(cursorPos_, 1, ch);
         cursorPos_++;
         layoutDirty_ = true;
-    }
+    } else return true;
 
     ResetCaretBlink();
     extern MeasureContext* g_activeMeasureContext;
@@ -1914,8 +1906,26 @@ bool TextAreaWidget::OnKeyChar(wchar_t ch) {
     return true;
 }
 
+void TextAreaWidget::InsertText(const std::wstring& value) {
+    const int selected = HasSelection() ? std::abs(selectionEnd_ - selectionStart_) : 0;
+    if (value.empty() || readOnly || (maxLength >= 0 &&
+        text_.size() - selected + value.size() > static_cast<size_t>(maxLength))) return;
+    DeleteSelection();
+    text_.insert(cursorPos_, value);
+    cursorPos_ += static_cast<int>(value.size());
+    layoutDirty_ = true;
+    ResetCaretBlink();
+    EnsureCursorVisible(g_activeMeasureContext);
+    if (onTextChanged) onTextChanged(text_);
+}
+
 bool TextAreaWidget::OnKeyDown(int vk) {
     if (!focused || !enabled) return false;
+    if (vk == 'S' && onSubmitHook && (GetKeyState(VK_CONTROL) & 0x8000) &&
+        !(GetKeyState(VK_SHIFT) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000)) {
+        onSubmitHook();
+        return true;
+    }
 
     /* build 288: ESC 冒泡给宿主, 理由同 TextInputWidget::OnKeyDown。 */
     if (vk == VK_ESCAPE) return false;
@@ -1939,22 +1949,13 @@ bool TextAreaWidget::OnKeyDown(int vk) {
         if (HasSelection()) {
             SetClipboardText(GetSelectedText());
             DeleteSelection();
+            EnsureCursorVisible(g_activeMeasureContext);
+            if (onTextChanged) onTextChanged(text_);
         }
         return true;
     }
     if (ctrl && vk == 'V') {
-        if (readOnly) return true;
-        std::wstring paste = GetClipboardText();
-        if (!paste.empty()) {
-            if (HasSelection()) DeleteSelection();
-            if (maxLength < 0 || (int)(text_.size() + paste.size()) <= maxLength) {
-                text_.insert(cursorPos_, paste);
-                cursorPos_ += (int)paste.size();
-                layoutDirty_ = true;
-            }
-        }
-        ResetCaretBlink();
-        EnsureCursorVisible(g_activeMeasureContext);
+        if (!readOnly) InsertText(GetClipboardText());
         return true;
     }
     if (ctrl && vk == 'A') {
@@ -1999,7 +2000,7 @@ bool TextAreaWidget::OnKeyDown(int vk) {
 
     ResetCaretBlink();
     EnsureCursorVisible(g_activeMeasureContext);
-    if ((vk == 0x2E || (ctrl && vk == 'V') || (ctrl && vk == 'X')) && onTextChanged)
+    if (vk == VK_DELETE && onTextChanged)
         onTextChanged(text_);
     if ((selectionStart_ != oldSelStart || selectionEnd_ != oldSelEnd) &&
         onSelectionChanged) {
@@ -2009,7 +2010,26 @@ bool TextAreaWidget::OnKeyDown(int vk) {
 }
 
 D2D1_SIZE_F TextAreaWidget::SizeHint() const {
+    if (autoGrow && fixedH <= 0) {
+        if (g_activeMeasureContext && rect.right > rect.left)
+            EnsureLayout(*g_activeMeasureContext, css.fontSize > 0 ? css.fontSize : theme::kFontSizeNormal);
+        float height = std::ceil(ContentHeight());
+        float insets = marginT + marginB;
+        for (auto* parent = Parent(); parent; parent = parent->Parent()) {
+            if (dynamic_cast<ScrollViewWidget*>(parent)) {
+                height = std::min(height, parent->ContentHeight() - insets);
+                break;
+            }
+            insets += parent->padT + parent->padB + parent->marginT + parent->marginB;
+        }
+        return {fixedW > 0 ? fixedW : 300.0f, std::max(minH, height)};
+    }
     return {fixedW > 0 ? fixedW : 300.0f, fixedH > 0 ? fixedH : 150.0f};
+}
+
+void TextAreaWidget::DoLayout() {
+    Widget::DoLayout();
+    if (autoGrow) ClampScroll();
 }
 
 void ComboBoxWidget::OnDraw(Renderer& r) {

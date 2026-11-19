@@ -688,6 +688,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     }
     if (prop == "placeholder") {
         if (auto* input = dynamic_cast<TextInputWidget*>(w)) input->SetPlaceholder(ToWide(v.ToString()));
+        else if (auto* area = dynamic_cast<TextAreaWidget*>(w)) area->SetPlaceholder(ToWide(v.ToString()));
         return;
     }
     if (prop == "ellipsis-start") {

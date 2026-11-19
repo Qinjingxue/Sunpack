@@ -124,9 +124,9 @@
       "zh": "监控目录管理",
       "en": "Monitored folders"
     },
-    "rootPasteHint": {
-      "zh": "可粘贴多行目录",
-      "en": "Paste one or more folders"
+    "recordEditHint": {
+      "zh": "一行一个，Ctrl+S或失焦保存",
+      "en": "One per line, Ctrl+S or leave the field to save"
     },
     "rootOutputHint": {
       "zh": "同归档所在文件夹",
@@ -143,6 +143,10 @@
     "add": {
       "zh": "添加",
       "en": "Add"
+    },
+    "batchAdd": {
+      "zh": "批量添加",
+      "en": "Bulk add"
     },
     "selectAll": {
       "zh": "全选",
@@ -328,10 +332,6 @@
       "zh": "搜索密码",
       "en": "Search passwords"
     },
-    "passwordPasteHint": {
-      "zh": "可粘贴多行内容",
-      "en": "Paste multiple lines of passwords"
-    },
     "passwordText": {
       "zh": "密码",
       "en": "Password"
@@ -343,10 +343,6 @@
     "cancelEntries": {
       "zh": "取消",
       "en": "Cancel"
-    },
-    "saveEntries": {
-      "zh": "保存",
-      "en": "Save"
     },
     "operationFailed": {
       "zh": "操作未完成",
@@ -515,10 +511,6 @@
     "rootInvalid": {
       "zh": "目录不能为空且不能包含分隔符或换行",
       "en": "The folder must not be empty or contain separators or line breaks."
-    },
-    "rootMissing": {
-      "zh": "监控目录必须是已存在的文件夹",
-      "en": "Choose an existing folder to monitor."
     },
     "rootDuplicate": {
       "zh": "监控目录已存在",

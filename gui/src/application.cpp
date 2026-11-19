@@ -318,7 +318,8 @@ void Application::acknowledge_save(const Json& ack) {
                 else next["operation"]=remove?"addMany":"save";
             }
         }
-        auto reply=Json{{"snapshot",job.at("snapshot")},{"ok",ok},{"error",localized_error(ack.at("error").get_ref<const std::string&>())},
+        if(!ok) set_error("actionError",ack.at("error").get<std::string>());
+        auto reply=Json{{"snapshot",job.at("snapshot")},{"ok",ok},
             {"records",std::move(records)},{"pending",std::move(pending)}};
         reply["removedPasswordScopes"]=std::move(removed_scopes);
         reply["passwordRebases"]=ack.value("passwordRebases",Json::array());
@@ -733,15 +734,15 @@ void Application::handle_command(Json command) {
             ui_page_set_json(page_,"tagEdits","{}");
             set_text(page_,"configCategory",p.at("category").get<std::string>());
         }
-        const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":nullptr;
+        const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":id=="rootItems"?"rootListScroll":nullptr;
         if(scroll) scroll_top(window_,scroll);
         return;
     }
     if(op=="blurRoot") {
         if(choosing_directory_ || page_value(page_,"rootCell")!=p.at("id") || page_value(page_,"rootPart")!=p.at("part")) return;
         auto* focused=ui::GetContext().GetWindow(window_)->FocusedWidget();
-        auto suffix=p.at("part").get<std::string>()+"-"+p.at("id").get<std::string>();
-        if(focused && focused->id=="browse-root-"+suffix) return;
+        auto id=p.at("id").get<std::string>(),part=p.at("part").get<std::string>();
+        if(focused && (focused->id=="browse-editor-"+part+"-"+id || focused->id=="root-"+part+"-input-"+id)) return;
         ui_page_call_json(page_,"finishRootCell","{}"); return;
     }
     if(op=="discardPassword") {
@@ -766,29 +767,27 @@ void Application::handle_command(Json command) {
         if(target) {
             window->FocusWidget(target,false);
             if(p.contains("pointerX") && p["pointerX"].is_number()) {
-                if(auto* input=dynamic_cast<ui::TextInputWidget*>(target)) {
-                    ui::MeasureContext measure; measure.BindRenderer(&window->GetRenderer());
-                    float offset=0;
-                    if(root && !input->Text().empty()) {
-                        auto* label=window->Root()->FindById("root-"+part+"-value-"+id);
-                        if(label) {
-                            float font=label->css.fontSize>0?label->css.fontSize:theme::kFontSizeNormal;
-                            auto shown=window->GetRenderer().EllipsizeStart(input->Text(),label->ContentWidth(),font);
-                            if(shown!=input->Text() && !shown.empty()) {
-                                auto hidden=input->Text().size()-(shown.size()-1);
-                                offset=measure.MeasureTextWidth(input->Text().substr(0,hidden),font)-measure.MeasureTextWidth(L"\u2026",font);
-                            }
-                        }
+                auto* area=dynamic_cast<ui::TextAreaWidget*>(target);
+                auto* label=window->Root()->FindById(root?"root-"+part+"-value-"+id:"password-value-"+id);
+                if(area && label && !area->Text().empty()) {
+                    auto& renderer=window->GetRenderer();
+                    float font=label->css.fontSize>0?label->css.fontSize:theme::kFontSizeNormal;
+                    auto shown=root?renderer.EllipsizeStart(area->Text(),label->ContentWidth(),font):area->Text();
+                    auto layout=renderer.CreateTextLayout(shown,std::max(1.0f,label->ContentWidth()),32,font,false);
+                    BOOL trailing,inside;
+                    DWRITE_HIT_TEST_METRICS hit{};
+                    if(layout && SUCCEEDED(layout->HitTestPoint(p["pointerX"].get<float>()-label->padL,0,&trailing,&inside,&hit))) {
+                        int pos=static_cast<int>(hit.textPosition+(trailing?hit.length:0)+area->Text().size()-shown.size());
+                        area->SetSelectionRange(pos,pos);
                     }
-                    input->PlaceCaretFromX(measure,target->rect.left+p["pointerX"].get<float>(),offset);
                 }
             }
         }
         return;
     }
     if(op=="browseRoot") {
-        auto part=p.at("part").get<std::string>(); if(part!="input" && part!="output") return;
-        auto value=p.at("value").get<std::string>();
+        auto part=p.at("part").get<std::string>(); if(part!="input" && part!="output" && part!="add") return;
+        auto value=p.value("value",std::string());
         auto base=options_.root_base();
         if(part=="output" && !p.at("input").get<std::string>().empty()) base=resolve_path(wide(p.at("input").get<std::string>()),base);
         choosing_directory_=true;
@@ -796,7 +795,7 @@ void Application::handle_command(Json command) {
         try { selected=choose_directory(hwnd_,value.empty()?fs::path():resolve_path(wide(value),base)); }
         catch(...) { choosing_directory_=false; throw; }
         choosing_directory_=false;
-        auto picked=Json{{"id",p.at("id")},{"part",part},{"value",utf8(selected.wstring())}}.dump();
+        auto picked=Json{{"id",p.value("id",std::string())},{"part",part},{"value",utf8(selected.wstring())}}.dump();
         if(ui_page_call_json(page_,"rootPicked",picked.c_str())!=0) throw std::runtime_error("uiBindingFailed");
         return;
     }
@@ -940,7 +939,7 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
             if(message==WM_CLOSE) self->date_popup_.reset();
             else if(self->date_popup_) self->date_popup_->close();
         }
-        if((message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_KILLFOCUS) && !self->choosing_directory_ &&
+        if((message==WM_ENTERSIZEMOVE || message==WM_KILLFOCUS) && !self->choosing_directory_ &&
            (page_value(self->page_,"passwordCell")!="" || page_value(self->page_,"rootCell")!="")) {
             ui_window_focus_widget(self->window_,0);
             ui_page_call_json(self->page_,"finishRootCell","{}");

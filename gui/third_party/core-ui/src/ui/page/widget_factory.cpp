@@ -1069,9 +1069,11 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
         std::wstring ph;
         // wrap default = true (browser DOM <textarea wrap="soft"> 默认软换行)
         bool wrap = true;
+        bool autoGrow = false;
         for (const auto& a : node.attrs) {
             if (a.kind != ui::uix::AttrKind::Static) continue;
             if (a.name == "placeholder") ph = ToWide(a.rawValue);
+            else if (a.name == "auto-grow") autoGrow = a.rawValue == "true";
             else if (a.name == "wrap") {
                 // soft|hard|on|off|true|false (HTML uses soft/hard, our 别名)
                 wrap = !(a.rawValue == "off" || a.rawValue == "hard" ||
@@ -1080,6 +1082,7 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
         }
         auto ta = std::make_shared<TextAreaWidget>(ph);
         ta->SetWrap(wrap);
+        ta->autoGrow = autoGrow;
         (void)wtext;  // text handled separately
         return ta;
     }

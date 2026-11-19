@@ -403,9 +403,14 @@ public:
 
     const std::wstring& Text() const { return text_; }
     void SetText(const std::wstring& t);
+    void InsertText(const std::wstring& value);
     static UINT EffectiveCaretBlinkMs();
     void ResetCaretBlink();
     bool ShouldShowCaret() const;
+
+    void SetPlaceholder(const std::wstring& value) { placeholder_ = value; }
+    bool autoGrow = false;
+    void DoLayout() override;
 
     /* Soft-wrap on width (matches DOM <textarea wrap="soft">, the browser
      * default). When false, long lines stay single-line and overflow with
@@ -465,7 +470,6 @@ private:
      * MeasureTextWidth 误差).*/
     mutable ComPtr<IDWriteTextLayout> cachedLayout_;
     mutable bool layoutDirty_ = true;
-    mutable std::wstring layoutText_;
     mutable float layoutMaxW_ = -1;
     mutable float layoutFontSize_ = -1;
     mutable bool  layoutWrap_ = true;

@@ -458,7 +458,6 @@ static void apply_root_changes(WatchRoots& roots,const fs::path& base,const Json
         auto path = resolve_path(wide(input),base);
         if (input.empty() || input.find_first_of("|\r\n") != std::string::npos || output.find_first_of("|\r\n") != std::string::npos)
             throw std::runtime_error("rootInvalid");
-        if (op!="delete" && enabled && !fs::is_directory(path)) throw std::runtime_error("rootMissing");
         auto previous = original.empty()?std::wstring():path_key(wide(original));
         auto found=indices.find(previous);
         auto index=found==indices.end()?size_t(-1):found->second;

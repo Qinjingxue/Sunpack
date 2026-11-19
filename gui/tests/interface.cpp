@@ -247,7 +247,7 @@ void search_config(Application& app,const wchar_t* query) {
     ui_window_relayout(app.window());
 }
 
-void finish_input(Application& app,bool expect_success=true) {
+void finish_input(Application& app) {
     ui_window_focus_widget(app.window(),0);
     ui_debug_pump();
     pump([&]{
@@ -257,10 +257,9 @@ void finish_input(Application& app,bool expect_success=true) {
             if(draft.value("pending",false)) return false;
         return true;
     },"Automatic writes");
-    if(!expect_success) return;
     auto errors=state(app.page(),"saveErrors");
     if(!errors.empty()) throw std::runtime_error(errors.dump());
-    for(auto kind:{"rootDrafts","passwordDrafts"}) for(const auto& draft:state(app.page(),kind)) {
+    for(const auto& draft:state(app.page(),"passwordDrafts")) {
         auto error=draft.find("error");
         if(error!=draft.end() && *error!="") throw std::runtime_error(error->dump());
     }
@@ -686,7 +685,6 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
         assert(hit==button);
     };
     const auto root=dir/"new-root";
-    fs::create_directory(root);
     const auto root_path=dir/"sunpack_watch_roots.txt", passwords_path=dir/"builtin_passwords.json";
     const auto scope=utf8(root.wstring());
     const auto directory="directory-"+utf8(path_key(root));
@@ -698,19 +696,12 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     };
 
     navigate(app,"tabRoots","roots");
-    click(app,"addRoot");
+    click(app,"batchAddRoot");
     auto new_root=state(app.page(),"rootCell").get<std::string>();
     focus(app,"root-input-input-"+new_root);
-    auto missing=dir/"missing-root";
-    assert(ui_debug_type_text(app.window(),missing.c_str())==0);
-    finish_input(app,false);
-    auto error=state(app.page(),"rootDrafts").at(new_root).at("error");
-    assert(error.at("source")=="rootMissing" && !error.at("text").get<std::string>().empty());
-    click(app,("root-input-text-"+new_root).c_str());
-    focus(app,"root-input-input-"+new_root);
-    replace_text(app.window(),root.c_str());
+    assert(ui_debug_type_text(app.window(),root.c_str())==0);
     finish_input(app);
-    assert(disk_root({}));
+    assert(disk_root({}) && !fs::exists(root));
 
     // Exercise the observer's missing-file path after a successful GUI add.
     // Keeping the name absent also checks the settled empty-list behavior.
@@ -854,6 +845,63 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     finish_input(app);
     ui_window_set_size(app.window(),1120,720);
     assert(read_roots(root_path).size()==1);
+    // Both editors keep a single draft until focus leaves. InsertText is the
+    // native Ctrl+V insertion path, without touching the user's clipboard.
+    click(app,"batchAddRoot");
+    auto root_editor="root-input-input-"+state(app.page(),"rootCell").get<std::string>();
+    focus(app,root_editor);
+    auto* area=dynamic_cast<ui::TextAreaWidget*>(window(app).FocusedWidget());
+    assert(area);
+    area->InsertText(root.wstring());
+    const auto single=rect(app,root_editor);
+    assert(ui_debug_type_char(app.window(),L'\r')==0);
+    const auto second_root=dir/"second-root";
+    fs::create_directory(second_root);
+    auto root_id_edit=state(app.page(),"rootCell").get<std::string>();
+    auto* browse=window(app).Root()->FindById("browse-editor-input-"+root_id_edit);
+    const auto icon=browse->Children().front()->rect;
+    assert(std::abs(icon.left+icon.right-browse->rect.left-browse->rect.right)<2);
+    assert(std::abs(icon.top+icon.bottom-browse->rect.top-browse->rect.bottom)<2);
+    window(app).FocusWidget(browse,false);
+    ui_debug_pump();
+    auto picked=Json{{"id",root_id_edit},{"part","input"},{"value",utf8(second_root.wstring())}}.dump();
+    assert(ui_page_call_json(app.page(),"rootPicked",picked.c_str())==0);
+    ui_debug_pump();
+    focus(app,root_editor);
+    assert(area->Text()==root.wstring()+L"\n"+second_root.wstring());
+    auto two=rect(app,root_editor);
+    assert(two.bottom-two.top>single.bottom-single.top+5);
+    assert(window(app).FocusedWidget()==area && read_roots(root_path).size()==1);
+    assert(ui_debug_key_mod(app.window(),'S',1,0,0)==0);
+    pump([&]{return state(app.page(),"rootCell")=="" && disk_root({});},"Save directory draft with Ctrl+S");
+    finish_input(app);
+    auto roots=read_roots(root_path);
+    assert(roots.size()==3 && disk_root({}) && std::any_of(roots.begin(),roots.end(),[&](const auto& r){return r.input==second_root;}));
+
+    navigate(app,"tabPasswords","passwords");
+    click(app,"newPassword");
+    auto id=state(app.page(),"passwordCell").get<std::string>();
+    focus(app,"password-input-"+id);
+    area=dynamic_cast<ui::TextAreaWidget*>(window(app).FocusedWidget());
+    assert(area);
+    auto before=read_json(passwords_path)["passwords"];
+    std::wstring batch=L"  #first  ";
+    for(int i=0;i<100;++i) batch+=L"\r\nline "+std::to_wstring(i);
+    area->InsertText(batch);
+    ui_debug_pump();
+    const auto view=rect(app,"passwordListScroll"),editing_card=rect(app,"password-"+id);
+    assert(area->NeedsScrollbar() && editing_card.bottom<=view.bottom+1 && editing_card.top>=view.top-1);
+    assert(editing_card.bottom-editing_card.top>view.bottom-view.top-40);
+    POINT point={LONG((area->rect.left+area->rect.right)/2),LONG((area->rect.top+area->rect.bottom)/2)};
+    ClientToScreen(window(app).Handle(),&point);
+    SendMessageW(window(app).Handle(),WM_MOUSEWHEEL,MAKEWPARAM(0,WHEEL_DELTA),MAKELPARAM(point.x,point.y));
+    ui_debug_pump();
+    assert(window(app).FocusedWidget()==area && read_json(passwords_path)["passwords"]==before);
+    click(app,"passwordSearch");
+    finish_input(app);
+    saved=read_json(passwords_path)["passwords"];
+    assert(saved.size()==before.size()+101 && saved[before.size()]["value"]=="  #first  " && saved.back()["value"]=="line 99");
+
 }
 
 ui::Widget* active_find_widget(ui::Widget* root) {

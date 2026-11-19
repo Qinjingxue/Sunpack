@@ -474,7 +474,7 @@ void batch_editing(Fixture& fixture) {
     assert(password_matches_scope(joined.record,utf8(dir.wstring())) && password_matches_scope(joined.record,joined_scope));
     // Batch folder additions preflight together and ignore identical duplicates.
     auto first=dir/"first", second=dir/"second"; fs::create_directory(first); fs::create_directory(second);
-    Json batch=Json::array({Json{{"operation","addMany"},{"inputs",{utf8(first.wstring()),utf8((dir/"missing").wstring())}},{"output",""},{"deep",true}}});
+    Json batch=Json::array({Json{{"operation","addMany"},{"inputs",{utf8(first.wstring()),"invalid|root"}},{"output",""},{"deep",true}}});
     auto before=read_file(roots);
     auto bad=save_changes(dir,Json(),Json::array(),batch);
     assert(!bad["error"].get<std::string>().empty() && read_file(roots)==before);
