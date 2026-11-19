@@ -124,8 +124,8 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                 Path::new(task) == base.join("segment.bin") && Path::new(output) == destination));
             assert!(pending.active_outputs.iter().any(|(task, output)|
                 Path::new(task) == destination.join("nested.zip") && Path::new(output) == destination.join("nested")));
-            assert!(journal.state().owned_root(root.to_str().unwrap()).is_none());
-            assert!(journal.state().owned_root(work.to_str().unwrap()).is_none());
+            assert!(!journal.state().owns_path(root.to_str().unwrap()));
+            assert!(!journal.state().owns_path(work.to_str().unwrap()));
         }
         fs::remove_dir_all(&base).unwrap();
         fs::remove_file(marker).unwrap();

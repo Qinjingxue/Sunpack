@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -54,7 +55,7 @@ namespace sunpack::sevenzip
             bool valid() const noexcept { return writer_ != nullptr; }
             AsyncFileWriter &writer() const noexcept { return *writer_; }
 #endif
-            std::shared_ptr<AsyncFileWriter> writer_pointer() const noexcept { return writer_; }
+            const std::shared_ptr<AsyncFileWriter> &writer_pointer() const noexcept { return writer_; }
             const VolumeStatePtr &volume() const noexcept
             {
                 return writer_ ? writer_->volume_state() : empty_state();
@@ -119,25 +120,22 @@ namespace sunpack::sevenzip
         std::unordered_map<std::string, Entry> entries_;
     };
 
-    using VolumeWriterRegistryPtr = std::shared_ptr<VolumeWriterRegistry>;
-
-    // 必须在 volume lease 之后声明，才能先于 lease 析构：注销发生在 lease 释放之前。
+    // The writer lease and the immutable job ID outlive this registration.
     class SpaceJobRegistration final
     {
     public:
         SpaceJobRegistration(const VolumeWriterRegistry::Lease &lease,
-                             const std::string &job_id) noexcept
+                             std::string_view job_id) noexcept
         {
             if (job_id.empty())
             {
                 return;
             }
             const VolumeStatePtr &state = lease.volume();
-            if (state && state->space_gate)
+            if (state && state->space_gate && state->space_gate->register_job(job_id))
             {
-                gate_ = state->space_gate;
+                gate_ = state->space_gate.get();
                 job_id_ = job_id;
-                gate_->register_job(job_id_);
             }
         }
 
@@ -152,13 +150,9 @@ namespace sunpack::sevenzip
         SpaceJobRegistration(const SpaceJobRegistration &) = delete;
         SpaceJobRegistration &operator=(const SpaceJobRegistration &) = delete;
 
-#ifdef SUP7Z_DEBUG
-        bool registered() const noexcept { return gate_ != nullptr; }
-#endif
-
     private:
-        std::shared_ptr<VolumeSpaceGate> gate_;
-        std::string job_id_;
+        VolumeSpaceGate *gate_ = nullptr;
+        std::string_view job_id_;
     };
 
 }

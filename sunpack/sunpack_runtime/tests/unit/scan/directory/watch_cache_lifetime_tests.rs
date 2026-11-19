@@ -114,7 +114,7 @@ fn refresh_rescans_when_output_is_published_after_enumeration() {
     assert!(!reopened.generated_under(&scope, root.join("out").to_str().unwrap()));
 
     fs::remove_file(&file).unwrap();
-    reopened.retire_consumed(std::iter::once(file));
+    reopened.retire_consumed(std::iter::once(file.as_path()));
     reopened.flush().unwrap();
     drop(reopened);
     let reopened = NativeWatchCatalog::new(&state, Some(cache_path.to_owned()));

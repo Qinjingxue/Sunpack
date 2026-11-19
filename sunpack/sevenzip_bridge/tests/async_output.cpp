@@ -424,7 +424,7 @@ bool quiescence_tracks_jobs_and_files(const std::filesystem::path& directory) {
         return false;
     }
     // Once the job drained and no file is live, the facility is reclaimable.
-    if (!writer.is_quiescent() || writer.has_active_jobs()) {
+    if (!writer.is_quiescent()) {
         std::cerr << "drained writer is not quiescent\n";
         return false;
     }

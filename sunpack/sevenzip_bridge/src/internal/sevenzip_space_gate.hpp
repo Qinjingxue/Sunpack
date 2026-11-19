@@ -284,8 +284,8 @@ namespace sunpack::sevenzip
         //
         // set 语义：空 job_id 或已存在的 id → 不注册、返回 false、绝不产生第二条事件；
         //           注册时若卷非 Ready → 立即给该 job 补发一条 space_blocked。
-        bool register_job(const std::string &job_id) noexcept;
-        void unregister_job(const std::string &job_id) noexcept;
+        bool register_job(std::string_view job_id) noexcept;
+        void unregister_job(std::string_view job_id) noexcept;
 
         // failed_path：引致失败的实际路径；synthetic 卷首次用它就地解析查询根，必须传。
         //
@@ -422,7 +422,7 @@ namespace sunpack::sevenzip
         WaitResult decide_locked(const std::shared_ptr<VolumeSpaceGate> &self,
                                  const TerminalPredicate &terminal) noexcept;
         VolumeSpaceTransition make_transition_locked(VolumeSpaceTransition::Kind kind,
-                                                     const std::string *new_job = nullptr) const;
+                                                     std::string_view new_job = {}) const;
         void emit_transition(const std::optional<VolumeSpaceTransition> &transition) noexcept;
 
         // synthetic 卷的查询根解析：锁外做 Win32 调用，锁内只提交结果。
@@ -527,7 +527,7 @@ namespace sunpack::sevenzip
         gate_.reset();
     }
 
-    inline bool VolumeSpaceGate::register_job(const std::string &job_id) noexcept
+    inline bool VolumeSpaceGate::register_job(std::string_view job_id) noexcept
     {
         if (job_id.empty())
         {
@@ -542,29 +542,28 @@ namespace sunpack::sevenzip
             {
                 return false;
             }
-            affected_jobs_.push_back(job_id);
+            affected_jobs_.emplace_back(job_id);
             if (sink_ && phase_ != VolumeSpacePhase::Ready)
             {
                 // 事件补齐：job 已注册，却因 producer backpressure 没有任何 writer 线程
                 // 进入 gate->wait()。
                 transition.emplace(make_transition_locked(VolumeSpaceTransition::Kind::Blocked,
-                                                          &job_id));
+                                                          job_id));
             }
         }
         emit_transition(transition);
         return true;
     }
 
-    inline void VolumeSpaceGate::unregister_job(const std::string &job_id) noexcept
+    inline void VolumeSpaceGate::unregister_job(std::string_view job_id) noexcept
     {
         if (job_id.empty())
         {
             return;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        affected_jobs_.erase(
-            std::remove(affected_jobs_.begin(), affected_jobs_.end(), job_id),
-            affected_jobs_.end());
+        const auto found = std::find(affected_jobs_.begin(), affected_jobs_.end(), job_id);
+        if (found != affected_jobs_.end()) affected_jobs_.erase(found);
         if (affected_jobs_.empty())
         {
             last_status_at_ = {};
@@ -865,7 +864,7 @@ namespace sunpack::sevenzip
 #endif
 
     inline VolumeSpaceTransition VolumeSpaceGate::make_transition_locked(
-        VolumeSpaceTransition::Kind kind, const std::string *new_job) const
+        VolumeSpaceTransition::Kind kind, std::string_view new_job) const
     {
         VolumeSpaceTransition transition;
         transition.kind = kind;
@@ -877,7 +876,7 @@ namespace sunpack::sevenzip
 #endif
         transition.query_ok = last_query_ok_;
         transition.query_error = last_query_error_;
-        if (new_job) transition.job_ids.push_back(*new_job);
+        if (!new_job.empty()) transition.job_ids.emplace_back(new_job);
         else transition.job_ids = affected_jobs_;
         return transition;
     }

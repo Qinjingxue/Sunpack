@@ -1960,7 +1960,7 @@ fn flatten_recovery_rebases_durable_output_identities() {
             assert!(catalog.is_owned(output.join("nested.zip").to_str().unwrap()));
         }
         for output in [&work, &real.join("work")] {
-            assert!(journal.state().owned_root(output.to_str().unwrap()).is_none());
+            assert!(!journal.state().owns_path(output.to_str().unwrap()));
         }
         let pending = journal.state().pending(owner).unwrap();
         assert_eq!(
@@ -1999,7 +1999,7 @@ fn flatten_keeps_physical_work_when_its_literal_junction_disappears() {
     fs::remove_dir(alias).unwrap();
     finish_flatten(&journal, root.to_str().unwrap()).unwrap();
     assert_eq!(journal.state().runtime_keys("flatten|").len(), 1);
-    assert!(journal.state().owned_root(physical_work.to_str().unwrap()).is_some());
+    assert!(journal.state().owns_path(physical_work.to_str().unwrap()));
     fs::remove_dir(&physical_work).unwrap();
     finish_flatten(&journal, root.to_str().unwrap()).unwrap();
     assert!(journal.state().runtime_keys("flatten|").is_empty());

@@ -109,57 +109,36 @@ pub(crate) fn parse_worker_transport_event(frame: &[u8]) -> io::Result<WorkerFra
     }
 }
 
-pub(crate) struct NativeWorkerResultAccumulator {
-    job_id: String,
+#[derive(Default)]
+pub(crate) struct NativeWorkerManifestChunks {
     manifest_seq: usize,
     files: Vec<OutputFileRecord>,
-    finished: bool,
 }
 
-impl NativeWorkerResultAccumulator {
-    pub(crate) fn new(job_id: String) -> Self {
-        Self {
-            job_id,
-            manifest_seq: 0,
-            files: Vec::new(),
-            finished: false,
+impl NativeWorkerManifestChunks {
+    pub(crate) fn append(&mut self, frame: WorkerFrame) -> io::Result<()> {
+        let seq = count(&frame.summary, "seq")?;
+        if seq != self.manifest_seq {
+            return Err(protocol_error(format!(
+                "manifest chunk sequence {seq}, expected {}", self.manifest_seq
+            )));
         }
+        let mut files = frame.chunk.ok_or_else(|| protocol_error("worker manifest rows missing"))?;
+        if self.files.is_empty() {
+            self.files = files;
+        } else {
+            self.files.append(&mut files);
+        }
+        self.manifest_seq += 1;
+        Ok(())
     }
 
-    /// Chunks are consumed. A result moves the accumulated tables into its envelope.
-    pub(crate) fn accept(&mut self, mut frame: WorkerFrame) -> io::Result<Option<WorkerFrame>> {
-        let payload = &mut frame.summary;
-        let kind = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| protocol_error("worker event type missing"))?;
-        if !matches!(kind, "manifest_chunk" | "result") {
-            return Ok(Some(frame));
-        }
-        if self.finished {
-            return Err(protocol_error("worker data received after result"));
-        }
-        if payload.get("job_id").and_then(Value::as_str) != Some(self.job_id.as_str()) {
-            return Err(protocol_error("worker chunk belongs to another job"));
-        }
-        if kind == "manifest_chunk" {
-            let seq = count(payload, "seq")?;
-            if seq != self.manifest_seq {
-                return Err(protocol_error(format!(
-                    "manifest chunk sequence {seq}, expected {}", self.manifest_seq
-                )));
-            }
-            let files = frame.chunk.ok_or_else(|| protocol_error("worker manifest rows missing"))?;
-            append_chunk(&mut self.files, files);
-            self.manifest_seq += 1;
-            return Ok(None);
-        }
-
+    pub(crate) fn finish(self, mut frame: WorkerFrame) -> io::Result<WorkerFrame> {
         match frame.manifest_summary.take() {
             Some(summary) if summary.chunk_count == Some(self.manifest_seq)
                 && summary.file_count == self.files.len() => {
                 frame.manifest = Some(NativeWorkerManifest::from_parts(
-                    std::mem::take(&mut self.files), summary.complete, summary.total_size,
+                    self.files, summary.complete, summary.total_size,
                 ));
             }
             Some(summary) if summary.chunk_count.is_none() && self.manifest_seq == 0 => {
@@ -170,16 +149,7 @@ impl NativeWorkerResultAccumulator {
             None if self.manifest_seq == 0 => {}
             _ => return Err(protocol_error("worker manifest chunk summary count mismatch")),
         }
-        self.finished = true;
-        Ok(Some(frame))
-    }
-}
-
-fn append_chunk<T>(table: &mut Vec<T>, mut chunk: Vec<T>) {
-    if table.is_empty() {
-        *table = chunk;
-    } else {
-        table.append(&mut chunk);
+        Ok(frame)
     }
 }
 

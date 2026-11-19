@@ -812,8 +812,17 @@ impl Watch {
     }
 
     fn external_output(&self, path: &Path, exclusive: bool) -> io::Result<()> {
-        let create = || crate::scan::scope::OutputRootCreation::create(path, exclusive)
-            .map_err(crate::pipeline::OutputCreateError::wrap);
+        use crate::watch_store::active_outputs::{covers_path, register, OutputReservations};
+        let reserve = |outputs: &OutputReservations| -> io::Result<()> {
+            let creation = crate::scan::scope::OutputRootCreation::create(path, exclusive)
+                .map_err(crate::pipeline::OutputCreateError::wrap)?;
+            let paths = crate::path_keys::output_path_aliases(path)?;
+            if !paths.iter().any(|path| covers_path(outputs, path)) {
+                register(outputs, &paths, &[&output_identity(&path.to_string_lossy())?]);
+            }
+            creation.commit();
+            Ok(())
+        };
         loop {
             let journal = self.external.current.read().unwrap().as_ref()
                 .and_then(ExternalOutputs::active_journal);
@@ -821,12 +830,7 @@ impl Watch {
                 // mkdir and reservation share the observer publication gate.
                 let mut created = false;
                 journal.commit(true, |state| {
-                    let creation = create()?;
-                    let paths = crate::path_keys::output_path_aliases(path)?;
-                    if !paths.iter().any(|path| state.owned_root(path).is_some()) {
-                        state.register_output_paths(&paths, &[&output_identity(&path.to_string_lossy())?]);
-                    }
-                    creation.commit();
+                    reserve(&state.outputs)?;
                     created = true;
                     Ok(crate::watch_store::NativeWatchOperations::empty())
                 })?;
@@ -841,14 +845,7 @@ impl Watch {
             }
             // Serialize the rootless check and reservation with attachment and
             // with other rootless output registrations.
-            let creation = create()?;
-            let paths = crate::path_keys::output_path_aliases(path)?;
-            let outputs = &self.external.reservations;
-            if !paths.iter().any(|path| crate::watch_store::active_outputs::find_owned_root(outputs, path).is_some()) {
-                crate::watch_store::active_outputs::register(outputs, &paths, &[&output_identity(&path.to_string_lossy())?]);
-            }
-            creation.commit();
-            return Ok(());
+            return reserve(&self.external.reservations);
         }
     }
 
@@ -4661,7 +4658,7 @@ impl Scheduler {
                 record["owner"].as_str().map(watch_path_key)
             })
             .collect();
-        for pending in self.journal.state().pending_items() {
+        'pending: for pending in self.journal.state().pending_items() {
             let id = watch_path_key(&pending.path);
             if flatten_owners.contains(&id)
                 || self.pending.contains_key(&id)
@@ -4786,7 +4783,6 @@ impl Scheduler {
             }
             let mut verified = Vec::new();
             let mut missing_output = false;
-            let mut unavailable = false;
             for output in pending.committed_roots.iter() {
                 if recovery_output_matches(&pending, output) {
                     verified.push(output);
@@ -4805,31 +4801,29 @@ impl Scheduler {
             }
             // Missing siblings may require the owner to be rebuilt, but do
             // not replace recovery of unfinished descendants in surviving outputs.
+            let password_scope = PathBuf::from(&pending.password_scope_dir);
+            let mut recoveries = HashMap::with_capacity(verified.len());
             for output in &verified {
-                let output_scope =
-                    NativeDiscoveryScope::new((*output).clone(), None, Vec::new());
-                match recovery_scan_paths(
+                let output_scope = NativeDiscoveryScope::new((*output).clone(), None, Vec::new());
+                let Ok(paths) = recovery_scan_paths(
                     &self.journal, &pending.path, output,
                     crate::scan::directory::scope_file_paths(&output_scope),
-                ) {
-                    Ok(paths) => {
-                        for path in paths {
-                            let path = path.to_string_lossy().into_owned();
-                            if !pending.completed_sources.contains(&path)
-                                && fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0)
-                            {
-                                revisit.insert(watch_path_key(&path), path);
-                            }
-                        }
-                    }
-                    _ => {
-                        unavailable = true;
-                        break;
+                ) else {
+                    continue 'pending;
+                };
+                for path in paths {
+                    let path = path.to_string_lossy().into_owned();
+                    if !pending.completed_sources.contains(&path)
+                        && fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0)
+                    {
+                        revisit.insert(watch_path_key(&path), path);
                     }
                 }
-            }
-            if unavailable {
-                continue;
+                recoveries.insert(watch_path_key(output).trim_end_matches('\\').to_owned(), Arc::new(Recovery {
+                    max_depth: None,
+                    scope: output_scope,
+                    password_scope: password_scope.clone(),
+                }));
             }
             if revisit.is_empty() && verified.is_empty() {
                 if has_active_output {
@@ -4844,15 +4838,18 @@ impl Scheduler {
             }
             let owner = id;
             let mut rebase = !revisit.contains_key(&owner);
-            let admission = if pending.internal_recovery || pending.has_output_work() {
+            let has_output_work = pending.has_output_work();
+            let admission = if pending.internal_recovery || has_output_work {
                 CandidateAdmission::CrashRecovery
             } else if pending.force {
                 CandidateAdmission::Retry
             } else {
                 CandidateAdmission::QueuedRecovery
             };
+            let event = CandidateEvent::Business(if has_output_work { "crash_recovery" } else { "recovery" });
+            let saved_recovery = std::cell::OnceCell::new();
             for (id, path) in revisit {
-                if state.entry(&path).is_some_and(|entry| {
+                if state.entry_by_key(&id).is_some_and(|entry| {
                     matches!(
                         entry.status.as_str(),
                         "failed_password" | "suspended_missing_volume"
@@ -4863,41 +4860,31 @@ impl Scheduler {
                 let recovery = if id == owner && !pending.internal_recovery {
                     None
                 } else {
-                    let nested = verified
-                        .iter()
-                        .filter(|output| is_path_under(&id, &watch_path_key(output)))
-                        .max_by_key(|output| output.len());
-                    let recovery = if let Some(output) = nested {
-                        Recovery {
-            max_depth: None,
-                            scope: NativeDiscoveryScope::new((**output).clone(), None, Vec::new()),
-                            password_scope: PathBuf::from(&pending.password_scope_dir),
-                        }
-                    } else {
-                        Recovery::from_record(&pending.discovery_scope, &pending.password_scope_dir)
-                            .filter(|recovery| recovery.scope.contains(&path))
-                            .unwrap_or_else(|| Recovery {
-            max_depth: None,
-                                scope: if scope.contains(&path) {
-                                    scope.clone()
-                                } else {
-                                    let parent =
-                                        Path::new(&path).parent().unwrap_or(Path::new("."));
-                                    NativeDiscoveryScope::new(
-                                        parent.to_string_lossy().into_owned(),
-                                        Some(0),
-                                        Vec::new(),
-                                    )
-                                },
-                                password_scope: PathBuf::from(&pending.password_scope_dir),
-                            })
-                    };
-                    Some(Arc::new(recovery))
+                    let nested = crate::path_keys::path_ancestors(&id).skip(1)
+                        .find_map(|ancestor| recoveries.get(ancestor));
+                    let recovery = nested.or_else(|| {
+                        saved_recovery.get_or_init(|| {
+                            Recovery::from_record(&pending.discovery_scope, &pending.password_scope_dir)
+                                .map(Arc::new)
+                        }).as_ref().filter(|recovery| recovery.scope.contains(&path))
+                    });
+                    Some(recovery.cloned().unwrap_or_else(|| Arc::new(Recovery {
+                        max_depth: None,
+                        scope: if scope.contains(&path) {
+                            scope.clone()
+                        } else {
+                            let parent = Path::new(&path).parent().unwrap_or(Path::new("."));
+                            NativeDiscoveryScope::new(
+                                parent.to_string_lossy().into_owned(),
+                                Some(0),
+                                Vec::new(),
+                            )
+                        },
+                        password_scope: password_scope.clone(),
+                    })))
                 };
                 self.observe_candidate_with_event(&root, path.clone(), admission, recovery, None, None,
-                    Some(&CandidateEvent::Business(if pending.has_output_work() {
-                        "crash_recovery"
-                    } else { "recovery" })), None)?;
+                    Some(&event), None)?;
                 if !self.pending.contains_key(&id) && !recorded_file_is_absent(&path) {
                     rebase = false;
                 }
@@ -5186,7 +5173,7 @@ impl Scheduler {
     }
 
     fn retire_owned_admission(&mut self, id: &str, pending: &Pending) -> io::Result<bool> {
-        if pending.recovery.is_some() || self.journal.state().owned_root(&pending.candidate.path).is_none() {
+        if pending.recovery.is_some() || !self.journal.state().owns_path(&pending.candidate.path) {
             return Ok(false);
         }
         // A checkpoint may have queued another generation under this key.
@@ -5762,7 +5749,7 @@ impl Scheduler {
                 return Ok((Outcome::default(), finish));
             }
         };
-        self.catalog.retire_consumed(outcome.archives.iter().flat_map(|archive| archive.source_paths.iter().cloned())
+        self.catalog.retire_consumed(outcome.archives.iter().flat_map(|archive| archive.source_paths.iter().map(PathBuf::as_path))
             .collect::<HashSet<_>>().into_iter());
         let input_failures = outcome.input_failures();
         let (by_path, success_counts) = completion_archives(&outcome, &completed.outputs, &groups, &input_failures);

@@ -787,32 +787,14 @@ namespace sunpack::sevenzip
         bool is_quiescent() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!work_queue_.empty() || !active_files_.empty())
-            {
-                return false;
-            }
-            for (const auto &weak_job : active_jobs_)
-            {
-                if (!weak_job.expired())
-                {
-                    return false;
-                }
-            }
-            return true;
+            return work_queue_.empty() && active_files_.empty() && !has_active_jobs_locked();
         }
 
 #ifdef SUP7Z_DEBUG
         bool has_active_jobs() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto &weak_job : active_jobs_)
-            {
-                if (!weak_job.expired())
-                {
-                    return true;
-                }
-            }
-            return false;
+            return has_active_jobs_locked();
         }
 #endif
 
@@ -1042,6 +1024,12 @@ namespace sunpack::sevenzip
                 return file->staging_buffer->size < kBufferSize;
             }
             return !free_buffers_.empty();
+        }
+
+        bool has_active_jobs_locked() const noexcept
+        {
+            return std::any_of(active_jobs_.begin(), active_jobs_.end(),
+                [](const auto &job) { return !job.expired(); });
         }
 
         void unregister_job_locked(const JobStatePtr &job) noexcept

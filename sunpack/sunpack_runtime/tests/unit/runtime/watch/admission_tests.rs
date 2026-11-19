@@ -637,7 +637,9 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
             if case == "source" {
                 assert_eq!(scheduler.pending.len(), 2);
                 assert!(scheduler.pending.contains_key(&key(&source)));
-                assert!(scheduler.pending.contains_key(&key(&nested)));
+                let recovery = scheduler.pending[&key(&nested)].recovery.as_ref().unwrap();
+                assert_eq!(recovery.scope.key(), key(&surviving));
+                assert_eq!(recovery.password_scope, watched);
                 assert!(scheduler.journal.state().pending(nested.to_str().unwrap()).is_some());
             } else {
                 assert!(scheduler.pending.is_empty(), "unrebuildable owner must remain durable");

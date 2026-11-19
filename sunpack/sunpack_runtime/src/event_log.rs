@@ -1,4 +1,5 @@
 //! Best-effort display history. Business state remains in the existing task store.
+use crate::collections::SmallOrderedSet;
 use crate::io::display_store::{utc_us, EventField, HistoryRecord, LiveEvent, Store, DAY_US};
 use crate::io::display_wake::Wake;
 use crate::watch_store::NativeWatchState;
@@ -73,7 +74,7 @@ enum TaskStatus {
 #[derive(Default)]
 struct Task {
     group: Option<Arc<Value>>,
-    members: HashSet<String>,
+    members: HashSet<Arc<str>>,
     status: TaskStatus,
     stamp: i64,
     blocked: bool,
@@ -85,10 +86,22 @@ impl Task {
     fn processing(&self) -> bool {
         !matches!(self.status, TaskStatus::Unpublished) && !self.blocked
     }
+
+    fn additional_group_path(&self) -> Option<String> {
+        let path = key(field(self.group.as_ref()?, "path"));
+        (!self.members.contains(path.as_str())).then_some(path)
+    }
 }
 struct Retiring {
-    members: HashSet<String>,
+    members: Box<[Arc<str>]>,
     owners: HashSet<String>,
+}
+#[derive(Default)]
+struct Alias {
+    current: Option<Arc<str>>,
+    // A newly claimed group can replace the current alias while an older
+    // owner still has a completion in flight for the same physical path.
+    retiring: Option<SmallOrderedSet<Arc<str>>>,
 }
 #[derive(Default)]
 struct Projection {
@@ -97,7 +110,7 @@ struct Projection {
     tasks: HashMap<Arc<str>, Task>,
     retiring: HashMap<Arc<str>, Retiring>,
     owner_tasks: HashMap<String, HashSet<Arc<str>>>,
-    aliases: HashMap<String, Arc<str>>,
+    aliases: HashMap<Arc<str>, Alias>,
     order: u64,
     dirty: HashSet<Arc<str>>,
     dirty_bytes: usize,
@@ -118,7 +131,11 @@ impl Projection {
         }
     }
     fn unbind(&mut self, id: &str, owners: &HashSet<String>) {
+        let retiring = self.retiring.get(id);
         for owner in owners {
+            if retiring.is_some_and(|task| task.owners.contains(owner)) {
+                continue;
+            }
             if let Some(ids) = self.owner_tasks.get_mut(owner) {
                 ids.remove(id);
                 if ids.is_empty() {
@@ -130,29 +147,37 @@ impl Projection {
     fn release_owner(&mut self, owner: &str) {
         if let Some(ids) = self.owner_tasks.remove(owner) {
             for id in ids {
-                if let Some(task) = self.tasks.get_mut(&id) {
+                if self.tasks.get_mut(&id).is_some_and(|task| {
                     task.owners.remove(owner);
-                }
-                if self
-                    .tasks
-                    .get(&id)
-                    .is_some_and(|task| {
-                        matches!(task.status, TaskStatus::Expired) && task.owners.is_empty()
-                    })
-                {
+                    matches!(task.status, TaskStatus::Expired) && task.owners.is_empty()
+                }) {
                     self.drop_expired(&id);
                 }
                 if let Some(retiring) = self.retiring.get_mut(&id) {
                     retiring.owners.remove(owner);
                     if retiring.owners.is_empty() {
                         let retiring = self.retiring.remove(&id).unwrap();
-                        for member in retiring.members {
-                            if self.aliases.get(&member).is_some_and(|value| value == &id) {
-                                self.aliases.remove(&member);
-                            }
+                        for member in retiring.members.iter() {
+                            self.unbind_alias(member, &id, true);
                         }
                     }
                 }
+            }
+        }
+    }
+    fn alias_id(&self, path: &str) -> Option<&Arc<str>> {
+        self.aliases.get(path)?.current.as_ref()
+    }
+    fn unbind_alias(&mut self, path: &str, id: &Arc<str>, retiring: bool) {
+        if let Some(alias) = self.aliases.get_mut(path) {
+            if alias.current.as_ref() == Some(id) {
+                alias.current = None;
+            }
+            if retiring && alias.retiring.as_mut().is_some_and(|ids| ids.remove(id)) {
+                alias.retiring = None;
+            }
+            if alias.current.is_none() && alias.retiring.is_none() {
+                self.aliases.remove(path);
             }
         }
     }
@@ -183,19 +208,10 @@ impl Projection {
         }
         self.unbind(id, &task.owners);
         for member in &task.members {
-            if self
-                .aliases
-                .get(member)
-                .is_some_and(|current| current.as_ref() == id)
-            {
-                self.aliases.remove(member);
-            }
+            self.unbind_alias(member, &owned_id, false);
         }
-        if let Some(group) = &task.group {
-            let path = key(field(group, "path"));
-            if self.aliases.get(&path).is_some_and(|current| current.as_ref() == id) {
-                self.aliases.remove(&path);
-            }
+        if let Some(primary) = task.additional_group_path() {
+            self.unbind_alias(&primary, &owned_id, false);
         }
         Some(task)
     }
@@ -208,10 +224,10 @@ impl Projection {
                 .insert(id.clone());
         }
         for member in &task.members {
-            self.aliases.insert(member.clone(), id.clone());
+            self.aliases.entry(member.clone()).or_default().current = Some(id.clone());
         }
-        if let Some(group) = &task.group {
-            self.aliases.insert(key(field(group, "path")), id.clone());
+        if let Some(primary) = task.additional_group_path() {
+            self.aliases.entry(primary.into()).or_default().current = Some(id.clone());
         }
         self.tasks.insert(id, task);
     }
@@ -227,8 +243,7 @@ impl Projection {
             return self.tasks.get_key_value(explicit)
                 .map_or_else(|| Arc::from(explicit), |(id, _)| Arc::clone(id));
         }
-        self.aliases
-            .get(physical)
+        self.alias_id(physical)
             .cloned()
             .unwrap_or_else(|| Arc::from(physical))
     }
@@ -259,13 +274,14 @@ impl Projection {
                     if path.is_empty() {
                         continue;
                     }
-                    let members: HashSet<_> = group["members"]
+                    let members: HashSet<Arc<str>> = group["members"]
                         .as_array()
                         .into_iter()
                         .flatten()
                         .filter_map(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .map(key)
+                        .map(Arc::from)
                         .collect();
                     if members.is_empty() {
                         continue;
@@ -275,7 +291,7 @@ impl Projection {
                     let previous: HashSet<_> = if explicit.is_none() {
                         members
                             .iter()
-                            .map(|m| self.aliases.get(m).map_or(m.as_str(), |id| id.as_ref()))
+                            .map(|m| self.alias_id(m).map_or(m.as_ref(), |id| id.as_ref()))
                             .filter_map(|id| self.tasks.get_key_value(id).map(|(key, _)| Arc::clone(key)))
                             .collect()
                     } else {
@@ -349,7 +365,7 @@ impl Projection {
                 .filter_map(Value::as_str)
                 .chain((!path.is_empty()).then_some(path))
                 .map(key)
-                .map(|p| self.aliases.get(&p).cloned().unwrap_or_else(|| p.into()))
+                .map(|p| self.alias_id(&p).cloned().unwrap_or_else(|| p.into()))
                 .collect();
             for id in ids {
                 if self
@@ -390,7 +406,7 @@ impl Projection {
                     .filter(|(_, t)| {
                         !t.processing()
                             && t.members.iter().any(|m| {
-                                *m == physical || crate::watch_store::is_path_under(m, &physical)
+                                m.as_ref() == physical || crate::watch_store::is_path_under(m, &physical)
                             })
                     })
                     .map(|(id, _)| id.clone())
@@ -405,7 +421,7 @@ impl Projection {
             for id in affected {
                 let mut task = self.remove(&id).unwrap();
                 task.members.retain(|m| {
-                    *m != physical
+                    m.as_ref() != physical
                         && !(recursive && crate::watch_store::is_path_under(m, &physical))
                 });
                 if task.members.is_empty() {
@@ -416,7 +432,7 @@ impl Projection {
                     let g = Arc::make_mut(g);
                     if let Some(members) = g["members"].as_array_mut() {
                         members
-                            .retain(|m| m.as_str().is_some_and(|m| task.members.contains(&key(m))));
+                            .retain(|m| m.as_str().is_some_and(|m| task.members.contains(key(m).as_str())));
                     }
                 }
                 self.insert(id, task);
@@ -453,13 +469,9 @@ impl Projection {
             );
             let owner = field(value, "owner");
             if terminal
-                && (self.owner_tasks.get(owner).is_some_and(|ids| {
-                    ids.iter().any(|previous| {
-                        self.retiring
-                            .get(previous)
-                            .is_some_and(|task| task.members.contains(&physical))
-                    })
-                }) || self
+                && (self.aliases.get(physical.as_str()).and_then(|alias| alias.retiring.as_ref())
+                    .is_some_and(|ids| ids.iter().any(|id| self.retiring[id].owners.contains(owner)))
+                    || self
                     .retiring
                     .get(&id)
                     .is_some_and(|task| task.owners.contains(owner)))
@@ -486,7 +498,7 @@ impl Projection {
             value["task_id"] = json!(id);
             let mut task = self.remove(&id).unwrap_or_default();
             if task.group.is_none() {
-                task.members.insert(physical);
+                task.members.insert(physical.into());
             }
             // Snapshot status always addresses its canonical group, even when
             // the original event named a member retired by a later regrouping.
@@ -503,12 +515,23 @@ impl Projection {
             task.order = self.order;
             if terminal {
                 if !task.owners.is_empty() {
-                    let mut members = std::mem::take(&mut task.members);
-                    if let Some(group) = &task.group {
-                        members.insert(key(field(group, "path")));
+                    if let Some(previous) = self.retiring.remove(&id) {
+                        self.unbind(&id, &previous.owners);
+                        for path in previous.members.iter() {
+                            self.unbind_alias(path, &id, true);
+                        }
                     }
-                    for member in &members {
-                        self.aliases.insert(member.clone(), id.clone());
+                    let primary = task.additional_group_path();
+                    let members: Box<[_]> = task.members.into_iter()
+                        .chain(primary.map(Arc::from))
+                        .collect();
+                    for member in members.iter() {
+                        let alias = self.aliases.entry(member.clone()).or_default();
+                        alias.current = Some(id.clone());
+                        match &mut alias.retiring {
+                            Some(ids) => ids.insert(id.clone()),
+                            None => alias.retiring = Some(SmallOrderedSet::One(id.clone())),
+                        }
                     }
                     for owner in &task.owners {
                         self.owner_tasks
@@ -586,13 +609,20 @@ pub(crate) struct Shared {
     stateful: bool,
 }
 impl Shared {
+    fn schedule(&self, state: &mut State) {
+        let idle = !state.working && state.revision == state.published;
+        state.revision += 1;
+        if idle {
+            self.wake.notify();
+        }
+    }
+
     fn configure_retention(&self, retention_days: u32) {
         let retention_days = retention_days.max(1);
         let mut state = self.state.lock().unwrap();
         if state.retention_days != retention_days {
             state.retention_days = retention_days;
-            state.revision += 1;
-            self.wake.notify();
+            self.schedule(&mut state);
         }
     }
 
@@ -644,8 +674,7 @@ impl Shared {
         } else {
             Ok(())
         };
-        state.revision += 1;
-        self.wake.notify();
+        self.schedule(&mut state);
         result
     }
 }
@@ -689,8 +718,6 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             let mut state = shared.state.lock().unwrap();
             let due = deadline.is_some_and(|time| time <= now);
             if state.published == state.revision && !due {
-                state.working = false;
-                shared.drained.notify_all();
                 if state.stopping {
                     break;
                 }
@@ -833,7 +860,7 @@ impl NativeEventLog {
                 revision: 1,
                 published: 0,
                 stopping: false,
-                working: true,
+                working: false,
                 error: None,
                 retention_days: retention_days.max(1),
             }),
@@ -872,23 +899,20 @@ impl NativeEventLog {
                 let _ = state.projection.apply(&mut value);
             }
             state.live_dirty = true;
-            state.revision += 1;
-            shared.wake.notify();
+            shared.schedule(&mut state);
         });
     }
     pub(crate) fn rebuild(&self) {
         let shared = self.shared();
         let mut state = shared.state.lock().unwrap();
         state.rebuild = true;
-        state.revision += 1;
-        shared.wake.notify();
+        shared.schedule(&mut state);
     }
     pub(crate) fn flush(&self) -> std::io::Result<()> {
         let shared = self.shared();
         let mut state = shared.state.lock().unwrap();
         if state.error.is_some() && !state.stopping {
-            state.revision += 1;
-            shared.wake.notify();
+            shared.schedule(&mut state);
         }
         while state.working || state.published != state.revision {
             state = shared.drained.wait(state).unwrap();

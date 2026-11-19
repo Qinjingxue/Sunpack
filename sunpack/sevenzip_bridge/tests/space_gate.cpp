@@ -22,16 +22,13 @@
 
 namespace {
 
-using sunpack::sevenzip::AsyncWriterConfig;
 using sunpack::sevenzip::ProbeLease;
-using sunpack::sevenzip::SpaceJobRegistration;
 using sunpack::sevenzip::TerminalPredicate;
 using sunpack::sevenzip::VolumeSpaceGate;
 using sunpack::sevenzip::VolumeSpaceMonitor;
 using sunpack::sevenzip::VolumeSpacePhase;
 using sunpack::sevenzip::VolumeSpaceTransition;
 using sunpack::sevenzip::VolumeStatePtr;
-using sunpack::sevenzip::VolumeWriterRegistry;
 
 using namespace std::chrono_literals;
 
@@ -990,26 +987,6 @@ void g26_registration_covers_root_directory_creation() {
     }
     check(log->count_for(VolumeSpaceTransition::Kind::Resumed, "J") == 0,
           "G-26: 注销后不得再收到事件");
-
-    // SpaceJobRegistration 的 RAII 语义（含"lease 之后声明 ⇒ 先析构"的约束）。
-    AsyncWriterConfig config;
-
-    config.threads_per_volume = 1;
-    config.buffer_count = 4;
-    auto registry = std::make_shared<VolumeWriterRegistry>(
-        config,
-        VolumeSpaceGate::ChangeSink{});
-    {
-        auto lease = registry->acquire("job:g26-lease");
-        SpaceJobRegistration registration(lease, "R");
-        check(registration.registered(), "G-26: guard 必须已注册");
-        check(lease.volume()->space_gate->affected_job_ids().size() == 1,
-              "G-26: gate 里必须有 R");
-    }
-    check(registry->blocked_volumes().empty(),
-          "G-26: 未 blocked 的卷不出现在 blocked_volumes()");
-
-    registry->shutdown();
 }
 
 void g27_late_registration_reuses_the_episode() {

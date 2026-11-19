@@ -105,6 +105,12 @@ std::int64_t NativeMemoryManager::sample_locked(bool fresh) {
     }
     return cached_headroom_ - static_cast<std::int64_t>(reserved_bytes_);
 }
+void NativeMemoryManager::add_job_locked(NativeMemoryJob &job) {
+    if (job.manager_index != SIZE_MAX) return;
+    const auto index = jobs_.size();
+    jobs_.push_back(&job);
+    job.manager_index = index;
+}
 void NativeMemoryManager::set_admission_locked(NativeMemoryJob &job, std::uint64_t bytes) noexcept {
     reserved_bytes_ = reserved_bytes_ - job.admission + bytes;
     job.admission = bytes;
@@ -121,7 +127,7 @@ void NativeMemoryManager::begin(NativeMemoryJob &job, std::function<void()> wake
     job.denied.store(false, std::memory_order_release);
     job.cancel->store(false, std::memory_order_release);
     job.wake = std::move(wake);
-    if (std::find(jobs_.begin(), jobs_.end(), &job) == jobs_.end()) jobs_.push_back(&job);
+    add_job_locked(job);
     SetEvent(change_);
 }
 void NativeMemoryManager::end(NativeMemoryJob &job) {
@@ -130,7 +136,13 @@ void NativeMemoryManager::end(NativeMemoryJob &job) {
     job.wake_pending = false;
     set_admission_locked(job, 0);
     job.wake = {};
-    jobs_.erase(std::remove(jobs_.begin(), jobs_.end(), &job), jobs_.end());
+    if (job.manager_index != SIZE_MAX) {
+        auto *last = jobs_.back();
+        jobs_[job.manager_index] = last;
+        last->manager_index = job.manager_index;
+        jobs_.pop_back();
+        job.manager_index = SIZE_MAX;
+    }
     SetEvent(change_);
 }
 void NativeMemoryManager::set_wake(NativeMemoryJob &job, std::function<void()> wake) {
@@ -329,7 +341,7 @@ void NativeMemoryManager::monitor() {
                 auto &waiter = *it;
                 auto &job = *waiter.job;
                 const bool canceled = stopped || waiter.cancel->load(std::memory_order_acquire);
-                const auto available = sample_locked();
+                const auto available = cached_headroom_ - static_cast<std::int64_t>(reserved_bytes_);
                 // Retained replay metadata is already in process commitment;
                 // reserve only the additional workspace, never charge it twice.
                 const auto needed = job.required > job.committed ? job.required - job.committed : 0;
@@ -354,7 +366,7 @@ void NativeMemoryManager::monitor() {
                     if (!canceled) {
                         set_admission_locked(job, (std::min)(reservation, static_cast<std::uint64_t>(available)));
                         progressing |= job.admission != 0;
-                        jobs_.push_back(&job);
+                        add_job_locked(job);
                     }
                     callbacks.push_back([waiter = std::move(waiter), available, canceled]() mutable {
                         if (waiter.announced && waiter.notice) waiter.notice(false, available, waiter.job->required);

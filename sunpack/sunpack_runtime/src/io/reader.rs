@@ -814,7 +814,7 @@ pub(crate) struct FileIdentity {
 /// already records the last-write timestamp on Windows.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PhysicalFileGeneration {
-    len: u64,
+    pub(crate) len: u64,
     #[cfg(not(windows))]
     modified: Option<(bool, u64, u32)>,
     created: Option<(bool, u64, u32)>,
@@ -1289,13 +1289,14 @@ impl CacheShard {
         data
     }
 
-    fn remove_entry(&mut self, key: &BlockKey, leave_order_entry: bool) {
+    fn remove_entry(&mut self, key: &BlockKey, source_removed: bool) {
         let entry = self.entries.remove(key).expect("tracked cache entry");
         let queue = self.queue(entry.tier);
         queue.bytes -= entry.data.len();
-        queue.stale += usize::from(leave_order_entry);
+        queue.stale += usize::from(source_removed);
 
-        if let Some(source) = self.by_source.get_mut(&key.source_id) {
+        if !source_removed {
+            let source = self.by_source.get_mut(&key.source_id).expect("tracked cache source");
             source.indices.remove(&key.index);
             if source.indices.is_empty() {
                 self.by_source.remove(&key.source_id);
@@ -1352,11 +1353,10 @@ impl ReaderManager {
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        let matching: Vec<_> = handles.iter()
-            .filter(|(path, _)| path_is_under_roots(path, roots))
-            .map(|(path, _)| Arc::clone(path))
+        let sources: Vec<_> = handles
+            .extract_if(|path, _| path_is_under_roots(path, roots))
+            .filter_map(|(_, source)| source.upgrade())
             .collect();
-        let sources: Vec<_> = matching.iter().filter_map(|path| handles.remove(path)?.upgrade()).collect();
         drop(handles);
         for source in &sources {
             source.close()?;

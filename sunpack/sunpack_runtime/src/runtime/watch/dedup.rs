@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Identity { volume: u64, file: [u8; 16], start: u64, len: u64 }
 #[derive(Clone, Serialize, Deserialize)]
-struct Source { path: String, generation: PhysicalFileGeneration, size: u64, mtime: f64, file_id: String, usn: i64 }
+struct Source { path: String, generation: PhysicalFileGeneration, mtime: f64, file_id: String, usn: i64 }
 type SourceSnapshot = crate::filesystem::WatchFileSnapshot<PhysicalFileGeneration>;
 
 impl Source {
@@ -31,7 +31,7 @@ impl Source {
                 snapshot.captured.object_id() == self.generation.object_id()
                     && snapshot.observation.change_usn >= self.usn
                     && !watch_observed_content_changed(
-                        self.size, self.mtime, &self.file_id, self.usn, snapshot.metadata.len(),
+                        self.generation.len, self.mtime, &self.file_id, self.usn, snapshot.captured.len,
                         mtime_seconds(&snapshot.metadata), &snapshot.observation,
                     )
             })
@@ -709,7 +709,6 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
                 sources.push(Source {
                     path: path.into(),
                     generation: snapshot.captured,
-                    size: snapshot.metadata.len(),
                     mtime: mtime_seconds(&snapshot.metadata),
                     file_id: snapshot.observation.file_id,
                     usn: snapshot.observation.change_usn,
@@ -721,9 +720,10 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
             };
             let observed = &sources[source as usize];
             let Some((volume, file)) = observed.generation.object_id() else { return Ok(false); };
-            let end = match end { Some(end) => end, None if whole => observed.size, None => return Ok(false) };
+            let size = observed.generation.len;
+            let end = match end { Some(end) => end, None if whole => size, None => return Ok(false) };
             let Some(len) = end.checked_sub(start) else { return Ok(false); };
-            if len == 0 || end > observed.size { return Ok(false); }
+            if len == 0 || end > size { return Ok(false); }
             // Physical segmentation is not content identity. Adjacent extents
             // of the same opened source can share one read and identity range.
             if range_sources.last() == Some(&source)

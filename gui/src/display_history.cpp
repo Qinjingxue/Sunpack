@@ -126,7 +126,7 @@ struct RunReader {
         count=std::min(count,uint64_t(size.QuadPart)/EntryBytes);
         if(head>=count) return;
         auto end=count;
-        if(before && !unordered) {
+        if(before && !unordered && run.at("last").get<int64_t>()>=std::get<0>(*before)) {
             uint64_t lo=head,hi=count;
             while(lo<hi) {
                 auto middle=lo+(hi-lo)/2;
@@ -298,8 +298,10 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     const auto& historical=manifest.at("runs");
     std::vector<RunReader> runs;
     runs.reserve(historical.size()+1);
-    for(const auto& run:historical)
+    for(const auto& run:historical) {
+        if(before && !run.value("unordered",false) && run.at("first").get<int64_t>()>std::get<0>(*before)) continue;
         runs.emplace_back(folder,run,before,revision,historical.size()==1);
+    }
     auto query=folded(view.task_query); auto bits=filter(query);
     // UTC microseconds are already indexed, including in old stores. Check
     // local display time before rejecting the path bloom, decode candidates

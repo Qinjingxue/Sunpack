@@ -459,16 +459,6 @@ impl NativeEmbeddedBatch {
         self.ids.len() - self.cursor
     }
 
-    pub(crate) fn release_after_pages(&mut self, table: &mut NativeCandidateTable) {
-        debug_assert_eq!(self.len(), 0);
-        if self.pending_volumes.is_empty() {
-            // Rows have been projected, and no volume resolution needs them.
-            // Release candidates and relation evidence while other roots scan.
-            *table = NativeCandidateTable::default();
-            *self = Self::default();
-        }
-    }
-
     /// Process selected jobs across roots.
     /// Root-local policy, relation ownership and password evidence stay in each batch.
     pub(crate) fn scan_pages(
@@ -1003,8 +993,15 @@ impl NativeCandidateTable {
         if self.rows.is_empty() || self.rows.len() >= filtered.rows.len() {
             return;
         }
+        let stems: HashSet<_> = self.rows.iter().filter_map(|candidate| {
+            let Candidate::File(facts, row) = candidate else { return None; };
+            facts.relation_anchors[*row].as_ref().and_then(CheapAnchor::anchor).is_none()
+                .then(|| catalog_stem(candidate.path()))
+        }).collect();
+        if stems.is_empty() {
+            return;
+        }
         let facts = &filtered.table;
-        let mut stems = None;
         for &row in filtered.rows.iter() {
             if !facts.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor)
                 .is_some_and(|anchor| anchor.multivolume && anchor.is_volume_entry())
@@ -1012,15 +1009,7 @@ impl NativeCandidateTable {
                 continue;
             }
             let path = &facts.paths[row];
-            if targets.names_by_path.contains_key(&path_key(path)) {
-                continue;
-            }
-            let stems = stems.get_or_insert_with(|| self.rows.iter().filter_map(|candidate| {
-                let Candidate::File(facts, row) = candidate else { return None; };
-                facts.relation_anchors[*row].as_ref().and_then(CheapAnchor::anchor).is_none()
-                    .then(|| catalog_stem(candidate.path()))
-            }).collect::<HashSet<_>>());
-            if stems.contains(&catalog_stem(path)) {
+            if stems.contains(&catalog_stem(path)) && !targets.names_by_path.contains_key(&path_key(path)) {
                 self.volume_entry_peers.push((Arc::clone(facts), row));
             }
         }
@@ -1126,6 +1115,9 @@ impl NativeCandidateTable {
     }
 
     pub(crate) fn dedupe(&mut self) {
+        if self.rows.len() < 2 {
+            return;
+        }
         let mut positions: HashMap<String, usize> = HashMap::new();
         let mut unique_len = 0;
         for index in 0..self.rows.len() {

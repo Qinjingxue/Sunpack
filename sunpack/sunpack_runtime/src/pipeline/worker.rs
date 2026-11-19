@@ -7,7 +7,7 @@ pub(crate) use tests::coalesced_wait_batches;
 use crate::core::config::{ProcessMode, WorkerConfig};
 use crate::io::archive_state::ArchiveInput;
 use crate::io::cancellation::{cancelled_io, Cancellation};
-use crate::scan::worker_event::{NativeWorkerResultAccumulator, WorkerFrame};
+use crate::scan::worker_event::{NativeWorkerManifestChunks, WorkerFrame};
 use crate::scan::worker_wire::{encode_worker_frame, small_request, write_request, NativeWorkerFrameDecoder};
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
@@ -229,7 +229,7 @@ impl WorkerExit {
 
 struct Job {
     mailbox: Arc<Mailbox>,
-    accumulator: Option<NativeWorkerResultAccumulator>,
+    chunks: NativeWorkerManifestChunks,
     submission_epoch: u64,
     result: Option<io::Result<WorkerFrame>>,
     disk: Episode,
@@ -238,10 +238,10 @@ struct Job {
 }
 
 impl Job {
-    fn new(id: &str, mailbox: Arc<Mailbox>, submission_epoch: u64) -> Self {
+    fn new(mailbox: Arc<Mailbox>, submission_epoch: u64) -> Self {
         Self {
             mailbox,
-            accumulator: Some(NativeWorkerResultAccumulator::new(id.to_owned())),
+            chunks: NativeWorkerManifestChunks::default(),
             submission_epoch,
             result: None,
             disk: Episode::default(),
@@ -252,7 +252,7 @@ impl Job {
 
     fn protocol_error(&mut self, error: io::Error) {
         self.result = Some(Err(io::Error::new(error.kind(), CommunicationError { kind: "process_io", message: error.to_string().into() })));
-        self.accumulator.take();
+        self.chunks = NativeWorkerManifestChunks::default();
         // Wake the existing submission waiter to use its ordered cancel write.
         // The result stays private until job_finished stops the native writer.
         self.mailbox.update(|updates| updates.cancel_requested = true);
@@ -852,7 +852,7 @@ impl Shared {
         let epoch = state.completion_epoch;
         match state.jobs.entry(job_id.to_owned()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Job::new(job_id, mailbox, epoch));
+                entry.insert(Job::new(mailbox, epoch));
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(io::Error::other("duplicate native job id"))
@@ -1016,12 +1016,19 @@ impl Shared {
                 job.mailbox
                     .update(|updates| updates.progress = Some(update));
             }
-            "progress" | "native_memory" => {}
-            _ => match job.accumulator.as_mut().expect("active job accumulator").accept(frame) {
-                Ok(Some(frame)) if string(&frame.summary, "type") == "result" => job.result = Some(Ok(frame)),
-                Ok(_) => {}
+            "manifest_chunk" => {
+                if let Err(error) = job.chunks.append(frame) {
+                    job.protocol_error(error);
+                }
+            }
+            "result" => match std::mem::take(&mut job.chunks).finish(frame) {
+                Ok(frame) => job.result = Some(Ok(frame)),
                 Err(error) => job.protocol_error(error),
             },
+            "" if frame.summary.get("type").and_then(Value::as_str).is_none() => {
+                job.protocol_error(io::Error::new(io::ErrorKind::InvalidData, "worker event type missing"));
+            }
+            _ => {}
         }
     }
 
@@ -1113,7 +1120,7 @@ impl State {
             if self.parked.capacity() > 256 {
                 crate::collections::trim_deque(&mut self.parked);
             }
-            let job = Job::new(&id, Arc::clone(&mailbox), self.completion_epoch);
+            let job = Job::new(Arc::clone(&mailbox), self.completion_epoch);
             self.jobs.insert(id, job);
             mailbox.update(|updates| updates.retry_granted = true);
             true

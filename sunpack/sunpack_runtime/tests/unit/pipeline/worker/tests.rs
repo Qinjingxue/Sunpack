@@ -467,7 +467,7 @@ fn job_protocol_errors_cancel_once_and_wait_for_native_completion() {
     for malformed in [
         // A frame boundary and job route survive a malformed event body.
         json!({"type": "progress", "job_id": "bad", "rows": "invalid"}),
-        // A valid body can still fail accumulator sequence validation.
+        // A valid body can still fail manifest sequence validation.
         json!({"type": "manifest_chunk", "job_id": "bad", "seq": 1, "rows": []}),
     ] {
         let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -489,7 +489,6 @@ fn job_protocol_errors_cancel_once_and_wait_for_native_completion() {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         dispatch(&process.shared, malformed.clone());
-        assert!(process.shared.state.lock().unwrap().jobs["bad"].accumulator.is_none());
         assert!(mailbox.updates.lock().unwrap().result.is_none());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         let cancel = writing.recv_timeout(Duration::from_secs(10)).unwrap();

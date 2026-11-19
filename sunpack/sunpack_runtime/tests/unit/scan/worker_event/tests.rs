@@ -36,32 +36,22 @@ fn result_frame(job: &str, files: u64) -> WorkerFrame {
 }
 
 #[test]
-fn worker_chunks_move_into_their_own_result_only() {
-    let mut first = NativeWorkerResultAccumulator::new("first".into());
-    let mut second = NativeWorkerResultAccumulator::new("second".into());
-    assert!(second.accept(manifest_frame("second")).unwrap().is_none());
-    assert!(first.accept(manifest_frame("first")).unwrap().is_none());
-    let Err(duplicate) = first.accept(manifest_frame("first")) else {
-        panic!("duplicate chunk")
-    };
-    assert!(duplicate.to_string().contains("sequence"));
-    let Err(mismatch) = first.accept(result_frame("first", 2)) else {
+fn worker_manifest_preserves_binary_rows_and_validates_counts() {
+    let mut chunks = NativeWorkerManifestChunks::default();
+    chunks.append(manifest_frame("job")).unwrap();
+    let manifest = chunks.finish(result_frame("job", 1)).unwrap().manifest.unwrap();
+    assert!(manifest.complete());
+    let row = &manifest.records().unwrap()[0];
+    assert_eq!(row.path, "job-renamed.txt");
+    assert_eq!(&*row.magic, b"abc");
+    assert_eq!(row.mtime_ns, Some(123));
+
+    let mut incomplete = NativeWorkerManifestChunks::default();
+    incomplete.append(manifest_frame("job")).unwrap();
+    let Err(mismatch) = incomplete.finish(result_frame("job", 2)) else {
         panic!("bad count")
     };
     assert!(mismatch.to_string().contains("count mismatch"));
-    for (job, accumulator) in [("first", first), ("second", second)] {
-        let manifest = { accumulator }
-            .accept(result_frame(job, 1))
-            .unwrap()
-            .unwrap()
-            .manifest
-            .unwrap();
-        assert!(manifest.complete());
-        let row = &manifest.records().unwrap()[0];
-        assert_eq!(row.path, format!("{job}-renamed.txt"));
-        assert_eq!(&*row.magic, b"abc");
-        assert_eq!(row.mtime_ns, Some(123));
-    }
 }
 
 #[test]

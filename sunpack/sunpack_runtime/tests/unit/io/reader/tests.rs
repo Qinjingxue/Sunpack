@@ -599,14 +599,14 @@ fn targeted_cache_cleanup_drops_peak_allocations_and_keeps_live_borrows() {
     }
     let live = keys.pop().unwrap();
     for key in keys {
-        shard.remove_entry(&key, true);
+        assert!(shard.remove_source(key.source_id));
     }
     shard.compact_stale_orders();
     assert_eq!(shard.entries.len(), 1);
     assert!(shard.entries.capacity() <= 256 && shard.by_source.capacity() <= 256);
     assert!(shard.hot.order.capacity() <= 256 && shard.general.order.capacity() <= 256);
     assert!(Arc::ptr_eq(&shard.entries[&live].data, &payload));
-    shard.remove_entry(&live, true);
+    assert!(shard.remove_source(live.source_id));
     shard.compact_stale_orders();
     assert_eq!(shard.hot.bytes + shard.general.bytes, 0);
     assert_eq!(
@@ -1035,10 +1035,10 @@ fn bug_regression_in_place_write_with_restored_mtime_invalidates_blocks() {
     let old_source = manager().open_file(&path).unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let old_key = BlockKey::new(&old_source, 0);
-    manager().cache_shards[cache_shard_index(&old_key)]
+    assert!(manager().cache_shards[cache_shard_index(&old_key)]
         .lock()
         .unwrap()
-        .remove_entry(&old_key, true);
+        .remove_source(old_key.source_id));
     std::fs::write(&path, b"last").unwrap();
     let writer = TrackedFile::open_with(&path, |options| {
         options.write(true);

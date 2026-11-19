@@ -101,30 +101,22 @@ fn compares_v2_and_zero_extended_v3_file_ids() {
 fn scans_v2_v3_and_v4_reasons_between_usn_bounds() {
     for major in [2u16, 3, 4] {
         let expected = if major == 2 { 0x1234 } else { (7u128 << 64) | 0x1234 };
-        let mut page = 103i64.to_le_bytes().to_vec();
+        let mut page = 104i64.to_le_bytes().to_vec();
         page.extend(record(major, expected, 100, 0x01));
         page.extend(record(major, expected ^ 1, 101, 0x08));
         page.extend(record(major, expected, 101, 0x02));
-        page.extend(record(major, expected, 102, 0x04));
+        page.extend(record(major, expected, 102, USN_REASON_CLOSE | 0x10));
+        page.extend(record(major, expected, 103, 0x04));
         // The rest of a kernel page belongs to later changes.
         page.push(0);
-        let reasons = scan_change_reasons(expected, 100, 101, |start, output| {
+        let reasons = scan_change_reasons(expected, 100, 102, |start, output| {
             assert_eq!(start, 100);
             output[..page.len()].copy_from_slice(&page);
             Ok(page.len())
         }).unwrap();
-        assert_eq!(reasons.all, 0x02);
+        assert_eq!(reasons.all, USN_REASON_CLOSE | 0x12);
+        assert_eq!(reasons.without_close, 0x02);
     }
-}
-
-#[test]
-fn close_only_reason_is_excluded_from_non_close_aggregate() {
-    let mut reasons = ChangeReasons::default();
-    reasons.observe(USN_REASON_CLOSE | 0x0000_0001);
-    assert_eq!(reasons.all, USN_REASON_CLOSE | 0x0000_0001);
-    assert_eq!(reasons.without_close, 0);
-    reasons.observe(0x0000_0002);
-    assert_eq!(reasons.without_close, 0x0000_0002);
 }
 
 #[test]

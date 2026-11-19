@@ -177,7 +177,7 @@ std::wstring row_status_text(Application& app,const std::string& row_id) {
 void append_log_lines(const fs::path& path,const std::string& text) {
     auto folder=path.parent_path()/(path.filename().wstring()+L".store"); fs::create_directories(folder);
     Json manifest=fs::exists(path)?read_json(path):Json{{"format",1},{"task_revision",0},{"runs",Json::array()},{"live",nullptr}};
-    if(manifest["runs"].empty()) manifest["runs"].push_back({{"name","fixture-1"},{"head",0},{"count",0},{"unordered",false}});
+    if(manifest["runs"].empty()) manifest["runs"].push_back({{"name","fixture-1"},{"head",0},{"count",0},{"unordered",false},{"first",0},{"last",0}});
     auto& run=manifest["runs"].back(); auto name=run["name"].get<std::string>();
     std::ofstream data(folder/(name+".data"),std::ios::binary|std::ios::app),index(folder/(name+".index"),std::ios::binary|std::ios::app);
     size_t at=0;
@@ -196,7 +196,10 @@ void append_log_lines(const fs::path& path,const std::string& text) {
         memcpy(entry.data(),&time,8); memcpy(entry.data()+8,&offset,8); memcpy(entry.data()+16,&length,4);
         memcpy(entry.data()+20,&raw_size,4); memcpy(entry.data()+24,&kind,4); memset(entry.data()+32,255,32);
         data.write(compressed.data(),size); index.write(entry.data(),64);
-        run["count"]=run["count"].get<uint64_t>()+1;
+        auto count=run["count"].get<uint64_t>();
+        if(!count) run["first"]=time;
+        run["last"]=time;
+        run["count"]=count+1;
     }
     data.close(); index.close();
     manifest["task_revision"]=manifest["task_revision"].get<uint64_t>()+1;

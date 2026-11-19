@@ -13,12 +13,11 @@ pub(crate) struct OutputReservation {
     identities: Vec<String>,
 }
 
-pub(crate) fn find_owned_root(state: &Mutex<BTreeMap<String, Arc<OutputReservation>>>, path: &str) -> Option<String> {
+pub(crate) fn covers_path(state: &OutputReservations, path: &str) -> bool {
     let key = path_key(path);
     let data = state.lock().unwrap_or_else(|e| e.into_inner());
-    let found = crate::path_keys::path_ancestors(&key)
-        .find(|key| data.contains_key(*key)).map(str::to_owned);
-    found
+    let owned = crate::path_keys::path_ancestors(&key).any(|key| data.contains_key(key));
+    owned
 }
 
 pub(crate) fn owned_roots(state: &Mutex<BTreeMap<String, Arc<OutputReservation>>>, under: &str) -> Vec<String> {

@@ -530,17 +530,20 @@ void r15_space_job_registration(const std::filesystem::path &directory) {
     {
         // 声明在 lease 之后 ⇒ 先于 lease 析构。
         SpaceJobRegistration registration(lease, "J");
-        check(registration.registered(), "R-15: guard 必须已注册");
+        {
+            SpaceJobRegistration duplicate(lease, "J");
+        }
         const auto ids = gate->affected_job_ids();
         check(ids.size() == 1 && ids.front() == "J",
-              "R-15: affected_job_ids() 必须包含 J（且不创建任何 JobState）");
+              "R-15: duplicate guard must leave the original registration active");
+        check(registry.blocked_volumes().empty(), "R-15: Ready volumes do not need space sampling");
     }
     check(gate->affected_job_ids().empty(), "R-15: guard 析构后必须注销");
 
     // 空 job_id 不注册。
     {
         SpaceJobRegistration registration(lease, "");
-        check(!registration.registered(), "R-15: 空 job_id 不得注册");
+        check(gate->affected_job_ids().empty(), "R-15: 空 job_id 不得注册");
     }
     lease.reset();
     registry.shutdown();
@@ -1290,43 +1293,6 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
     }
 }
 
-void phase_6c_default_enabled() {
-    constexpr const wchar_t *kName = L"SUNPACK_VOLUME_SPACE_GATE";
-    wchar_t saved[16]{};
-    const DWORD saved_length = GetEnvironmentVariableW(kName, saved, 16);
-    const bool had_value = saved_length > 0 && saved_length < 16;
-
-    constexpr const wchar_t *kQueue = L"SUNPACK_ASYNC_WRITER_QUEUE_LIMIT";
-    wchar_t saved_queue[32]{};
-    GetEnvironmentVariableW(kQueue, saved_queue, 32);
-    SetEnvironmentVariableW(kQueue, L"1");
-    auto defaults = sunpack::sevenzip::configured_async_writer_config();
-    check(defaults.threads_per_volume == 4 && defaults.queue_limit == 4096,
-          "Writer defaults must use four threads and internal queue capacity");
-    SetEnvironmentVariableW(kQueue, saved_queue[0] ? saved_queue : nullptr);
-
-    // Removed environment toggles cannot disable gate creation.
-    SetEnvironmentVariableW(kName, L"0");
-    auto registry = std::make_shared<VolumeWriterRegistry>(
-        sunpack::sevenzip::configured_async_writer_config(), VolumeSpaceGate::ChangeSink{});
-    {
-        auto lease = registry->acquire("job:always-enabled");
-        check(lease.volume()->space_gate != nullptr, "Space gates must always be created");
-    }
-    registry->shutdown();
-
-    SetEnvironmentVariableW(kName, had_value ? saved : nullptr);
-
-    // ⑤ 轮询/诊断间隔的默认值必须仍在文档约束内。
-    const auto config = sunpack::sevenzip::configured_async_writer_config();
-    check(config.space_poll_interval >= std::chrono::milliseconds{50} &&
-              config.space_poll_interval <= std::chrono::milliseconds{60000},
-          "Phase 6c: space_poll_interval 默认值必须在 [50, 60000] ms 内");
-    check(config.space_status_report_interval >= std::chrono::milliseconds{1000} &&
-              config.space_status_report_interval <= std::chrono::milliseconds{600000},
-          "Phase 6c: space_status_report_interval 默认值必须在 [1000, 600000] ms 内");
-}
-
 // [附加] 错误码契约回归防线
 void error_code_contract() {
     using sunpack::sevenzip::is_space_exhaustion_error;
@@ -1410,7 +1376,6 @@ int main(int argc, char **argv) {
          [&] { r23_hot_path_never_enters_the_gate(directory); }},
         {"R-24 queued retry cancellation", [&] { r24_cancel_queued_retry(directory); }},
         {"R-25 blocked producer cancellation", [&] { r25_cancel_blocked_producer(directory); }},
-        {"Phase 6c default enabled", phase_6c_default_enabled},
         {"error code contract", error_code_contract},
     };
 

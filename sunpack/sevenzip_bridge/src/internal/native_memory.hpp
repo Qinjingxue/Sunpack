@@ -25,6 +25,7 @@ struct NativeMemoryJob final {
     std::uint64_t required = 0; // observed failed workspace, retained across early replay withdrawals
     std::int64_t failed_headroom = -1;
     std::int64_t retry_headroom = INT64_MAX;
+    std::size_t manager_index = SIZE_MAX; // index of a running job or its pending admission
     bool running = false, wake_pending = false;
 };
 
@@ -66,6 +67,7 @@ public:
 
 private:
     std::int64_t sample_locked(bool fresh = false);
+    void add_job_locked(NativeMemoryJob &job);
     void set_admission_locked(NativeMemoryJob &job, std::uint64_t bytes) noexcept;
     void failed_locked(NativeMemoryJob &job, std::uint64_t required, std::int64_t headroom);
     void revoke_locked(NativeMemoryJob &job);

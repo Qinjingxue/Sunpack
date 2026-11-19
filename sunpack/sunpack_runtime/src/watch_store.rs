@@ -1012,7 +1012,7 @@ impl NativeWatchState {
                 // gate. An alias retargeted since reservation cannot create an
                 // unregistered tree in another watched namespace.
                 let paths = crate::path_keys::output_path_aliases(path)?;
-                if !paths.iter().any(|path| self.owned_root(path).is_some())
+                if !paths.iter().any(|path| self.owns_path(path))
                 {
                     owned_paths = paths;
                 }
@@ -1072,8 +1072,8 @@ impl NativeWatchState {
             .collect()
     }
 
-    pub(crate) fn owned_root(&self, path: &str) -> Option<String> {
-        active_outputs::find_owned_root(&self.outputs, path)
+    pub(crate) fn owns_path(&self, path: &str) -> bool {
+        active_outputs::covers_path(&self.outputs, path)
     }
 
     pub(crate) fn new() -> Self {

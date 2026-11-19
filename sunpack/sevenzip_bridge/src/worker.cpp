@@ -1754,30 +1754,29 @@ public:
         std::uint64_t memory_reserve_bytes
     )
         : writer_config_(sunpack::sevenzip::configured_async_writer_config()),
-          writer_registry_(std::make_shared<sunpack::sevenzip::VolumeWriterRegistry>(
+          writer_registry_(
               writer_config_,
               [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
                   on_space_transition(transition);
-              })),
-          memory_(memory_reserve_bytes, {}, [this] { writer_registry_->reclaim_idle_memory(); }),
+              }),
+          memory_(memory_reserve_bytes, {}, [this] { writer_registry_.reclaim_idle_memory(); }),
+          space_monitor_(
+              sunpack::sevenzip::VolumeSpaceMonitor::Options{
+                  writer_config_.space_poll_interval,
+                  writer_config_.space_status_report_interval},
+              [this] { return writer_registry_.blocked_volumes(); },
+              [this](const sunpack::sevenzip::VolumeStatePtr &state,
+                     std::uint64_t free_bytes,
+                     bool query_ok,
+                     unsigned long query_error) {
+                  print_volume_space_status(state, free_bytes, query_ok, query_error);
+              }),
           worker_count_(worker_count),
           queue_capacity_(4096),
           cpu_budget_(
               worker_count_,
               &NativeJobExecutor::on_cpu_capacity_available,
               this) {
-        // tick() must be called with the executor mutex_ released; the monitor keeps no membership and pulls blocked volumes from the registry.
-        space_monitor_ = std::make_unique<sunpack::sevenzip::VolumeSpaceMonitor>(
-            sunpack::sevenzip::VolumeSpaceMonitor::Options{
-                writer_config_.space_poll_interval,
-                writer_config_.space_status_report_interval},
-            [this] { return writer_registry_->blocked_volumes(); },
-            [this](const sunpack::sevenzip::VolumeStatePtr &state,
-                   std::uint64_t free_bytes,
-                   bool query_ok,
-                   unsigned long query_error) {
-                print_volume_space_status(state, free_bytes, query_ok, query_error);
-            });
         workers_.reserve(worker_count_);
         try {
             for (std::size_t index = 0; index < worker_count_; ++index) {
@@ -1914,7 +1913,7 @@ public:
     // Terminal conditions must be set before waking, otherwise a worker parked on a volume space gate never sees the stop and join blocks forever.
     void stop(bool cancel_pending_jobs = true) noexcept {
         if (!cancel_pending_jobs) {
-            // Draining must not set stopping_ yet: the monitor exits on stopping_ and is the only driver of space_monitor_->tick(), so a job blocked on a full disk would never be polled again and join would hang forever.
+            // Keep the monitor sampling so jobs blocked on a full disk can finish draining.
             wait_for_pending_jobs_to_drain();
         }
         {
@@ -1948,7 +1947,7 @@ public:
         monitor_condition_.notify_all();
 #ifdef _WIN32
         // Must run before join(): gate waiters would otherwise never see the terminal conditions set above. It only broadcasts and changes no gate state.
-        writer_registry_->abort_all_space_gates();
+        writer_registry_.abort_all_space_gates();
 #endif
         if (monitor_thread_.joinable()) {
             monitor_thread_.join();
@@ -1961,7 +1960,7 @@ public:
         workers_.clear();
 #ifdef _WIN32
         // All leases are released by now (worker threads joined, a lease never outlives its job); the registry mutex is not held here.
-        writer_registry_->shutdown();
+        writer_registry_.shutdown();
 #endif
     }
 
@@ -2167,7 +2166,7 @@ private:
     ) noexcept {
         const bool blocked = transition.kind == sunpack::sevenzip::VolumeSpaceTransition::Kind::Blocked;
         if (blocked) {
-            space_monitor_->note_blocked();
+            space_monitor_.note_blocked();
             request_monitor_recheck();
         }
         for (const auto& job_id : transition.job_ids) {
@@ -2190,7 +2189,7 @@ private:
         for (;;) {
             std::unique_lock<std::mutex> lock(monitor_mutex_);
             const auto now = std::chrono::steady_clock::now();
-            auto deadline = writer_registry_->next_reap_deadline();
+            auto deadline = writer_registry_.next_reap_deadline();
             {
                 std::lock_guard<std::mutex> jobs_lock(mutex_);
                 if (key_cache_deadline_ && now >= *key_cache_deadline_) {
@@ -2202,7 +2201,7 @@ private:
                     deadline = key_cache_deadline_;
                 }
             }
-            if (const auto space = space_monitor_->next_poll_deadline();
+            if (const auto space = space_monitor_.next_poll_deadline();
                 space && (!deadline || *space < *deadline)) deadline = space;
             if (deadline) monitor_condition_.wait_until(lock, *deadline,
                 [this] { return monitor_stopping_ || monitor_recheck_; });
@@ -2211,8 +2210,8 @@ private:
             if (monitor_stopping_) return;
             monitor_recheck_ = false;
             lock.unlock();
-            writer_registry_->reap_idle();
-            space_monitor_->tick(std::chrono::steady_clock::now());
+            writer_registry_.reap_idle();
+            space_monitor_.tick(std::chrono::steady_clock::now());
         }
     }
 
@@ -2310,17 +2309,15 @@ private:
                             (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("input_changed") + wire::key("failure_stage") + wire::text("native_replay") + wire::key("message") + wire::text("archive input changed while waiting for memory; rescan required") + wire::end())};
                     } else if (!job.request.scan_only && !interrupted) {
                         const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
-                        auto lease = writer_registry_->acquire(key);
+                        auto lease = writer_registry_.acquire(key);
                         monitor_recheck_needed = true;
                         register_cancel_writer(job_id, lease.writer_pointer());
                         const auto weak = std::weak_ptr<sunpack::sevenzip::AsyncFileWriter>(lease.writer_pointer());
                         memory_.set_wake(memory_job, [weak] { if (auto writer = weak.lock()) writer->wake_waiters(); });
                         if (job.cancel_token->load(std::memory_order_acquire)) memory_job.cancel->store(true, std::memory_order_release);
                         std::optional<sunpack::sevenzip::SpaceJobRegistration> registration(std::in_place, lease, job_id);
-                        auto writer = lease.writer_pointer();
-                        outcome = run_request(job.request, writer, memory_job.cancel, [&] {
+                        outcome = run_request(job.request, lease.writer_pointer(), memory_job.cancel, [&] {
                             registration.reset();
-                            writer.reset();
                             lease.reset();
                             request_monitor_recheck();
                             monitor_recheck_needed = false;
@@ -2420,10 +2417,10 @@ private:
     std::vector<std::thread> workers_;
     std::thread monitor_thread_;
     sunpack::sevenzip::AsyncWriterConfig writer_config_;
-    sunpack::sevenzip::VolumeWriterRegistryPtr writer_registry_;
+    sunpack::sevenzip::VolumeWriterRegistry writer_registry_;
     // The memory manager can reclaim idle writer buffers from the registry.
     sunpack::sevenzip::NativeMemoryManager memory_;
-    std::unique_ptr<sunpack::sevenzip::VolumeSpaceMonitor> space_monitor_;
+    sunpack::sevenzip::VolumeSpaceMonitor space_monitor_;
 
     // Scheduler hot state: foreground/background queues preserve the existing
     // foreground-first policy without an O(n) scan or middle erase.

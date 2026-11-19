@@ -666,19 +666,20 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
                 .failure
                 .as_ref()
                 .is_some_and(|failure| failure.kind == FailureKind::MissingVolume);
-        let key = path_key(&input.entry_path);
-        let bucket = has_buckets.then(|| crate::scan::catalog::catalog_stem(&input.entry_path));
         let selected = if let Some(by_bucket) = &by_bucket {
-            bucket.as_deref().and_then(|bucket| by_bucket.get(bucket)).copied()
-        } else if let Some(by_root) = &by_root {
-            path_ancestors(&key).find_map(|root| {
-                by_root.get(root)
-                    .filter(|scope| scope.scope.contains_key(&key))
-                    .copied()
-            })
+            by_bucket.get(crate::scan::catalog::catalog_stem(&input.entry_path).as_str()).copied()
         } else {
-            let scope = &scopes[0];
-            scope.scope.contains_key(&key).then_some(scope)
+            let key = path_key(&input.entry_path);
+            if let Some(by_root) = &by_root {
+                path_ancestors(&key).find_map(|root| {
+                    by_root.get(root)
+                        .filter(|scope| scope.scope.contains_key(&key))
+                        .copied()
+                })
+            } else {
+                let scope = &scopes[0];
+                scope.scope.contains_key(&key).then_some(scope)
+            }
         };
         task.context = selected.map(|scope| {
             if task.inputs.len() == 1 && may_split {
@@ -895,7 +896,13 @@ impl Discovered {
         let mut first = 0;
         while first < scopes.len() {
             if scopes[first].1.len() == 0 {
-                scopes[first].1.release_after_pages(&mut tables[first]);
+                let (mut scoped, mut batch, mut embedded_tasks) = std::mem::take(&mut scopes[first]);
+                let mut table = std::mem::take(&mut tables[first]);
+                // No further page can use this scope once its peer frontier
+                // is drained. Resolve and release its evidence before scanning
+                // the remaining scopes.
+                scoped.finish(&mut table, &mut batch, &mut embedded_tasks, candidates, verified)?;
+                emit(scoped);
                 first += 1;
                 continue;
             }
@@ -914,10 +921,6 @@ impl Discovered {
                 let (scoped, _, tasks) = &mut scopes[group];
                 scoped.project_rows(&tables[group], rows, tasks, candidates, verified)?;
             }
-        }
-        for (table, (mut scoped, mut batch, mut embedded_tasks)) in tables.iter_mut().zip(scopes) {
-            scoped.finish(table, &mut batch, &mut embedded_tasks, candidates, verified)?;
-            emit(scoped);
         }
         Ok(())
     }

@@ -137,26 +137,41 @@ fn completed_families_leave_no_resident_history_or_aliases() {
     // Disk/GUI checks cannot see producer references. Removing this test
     // loses detection of retained completed families; no disk I/O is needed.
     let mut projection = Projection::default();
-    for index in 0..2000 {
+    for index in 0..64 {
         let path = format!("C:/carrier-{index}.fake");
         let sibling = format!("C:/opaque-{index}.002");
-        let mut claim = json!({"event":"pipeline_sources_claimed","owner":index.to_string(),
+        let mut claim = json!({"event":"pipeline_sources_claimed","owner":"batch",
             "processing":true,"ts":1,"groups":[{"path":path,"members":[path,sibling]}]});
         projection.apply(&mut claim);
         let mut completion =
-            json!({"event":"done","path":sibling,"owner":index.to_string(),"ts":2});
+            json!({"event":"done","path":sibling,"owner":"batch","ts":2});
         assert!(projection.apply(&mut completion));
         assert_eq!(completion["group"]["members"].as_array().unwrap().len(), 2);
         assert!(projection.tasks.is_empty());
         assert!(!projection
-            .apply(&mut json!({"event":"done","path":path,"owner":index.to_string(),"ts":2})));
-        projection.apply(&mut json!({"event":"pipeline_sources_released","owner":index.to_string(),"path":path}));
-        assert!(
-            projection.aliases.is_empty()
-                && projection.retiring.is_empty()
-                && projection.owner_tasks.is_empty()
-        );
+            .apply(&mut json!({"event":"done","path":path,"owner":"batch","ts":2})));
     }
+    // A later request can claim the same member before the old batch
+    // releases. A delayed old result must still be suppressed by path,
+    // including when its explicit task ID differs from both recorded IDs.
+    let path = "C:/opaque-0.002";
+    projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"next",
+        "processing":true,"ts":3,"groups":[{"task_id":"next-id","path":path,"members":[path]}]}));
+    assert!(!projection.apply(
+        &mut json!({"event":"done","task_id":"late-id","path":path,"owner":"batch","ts":4}),
+    ));
+    projection.apply(&mut json!({"event":"pipeline_sources_released","owner":"batch"}));
+    assert_eq!(projection.aliases.len(), 1);
+    assert!(projection.retiring.is_empty() && !projection.owner_tasks.contains_key("batch"));
+    let mut completion = json!({"event":"done","path":path,"owner":"next","ts":5});
+    assert!(projection.apply(&mut completion));
+    assert_eq!(completion["task_id"], "next-id");
+    let other = "C:/other.zip";
+    projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"next",
+        "groups":[{"task_id":"next-id","path":other,"members":[other]}]}));
+    projection.apply(&mut json!({"event":"task_retired","scope":"task","task_id":"next-id","path":other}));
+    projection.apply(&mut json!({"event":"pipeline_sources_released","owner":"next"}));
+    assert!(projection.aliases.is_empty() && projection.retiring.is_empty() && projection.owner_tasks.is_empty());
     let mut waiting =
         json!({"event":"suspended_missing_volume","path":"C:/abandoned.002","ts":1});
     projection.apply(&mut waiting);

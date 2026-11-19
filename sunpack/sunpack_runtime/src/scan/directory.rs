@@ -1701,7 +1701,7 @@ impl NativeWatchCatalog {
         Ok(invalidated)
     }
 
-    pub(crate) fn retire_consumed(&self, paths: impl Iterator<Item = PathBuf>) {
+    pub(crate) fn retire_consumed<'a>(&self, paths: impl Iterator<Item = &'a Path>) {
         let missing: Vec<_> = paths.filter(|path| matches!(path.try_exists(), Ok(false)))
             .map(|path| crate::path_keys::path_key(&path.to_string_lossy())).collect();
         if missing.is_empty() { return; }
@@ -2068,7 +2068,7 @@ impl NativeWatchCatalog {
     }
 
     pub(crate) fn is_owned(&self, path: &str) -> bool {
-        crate::watch_store::active_outputs::find_owned_root(&self.outputs, path).is_some()
+        crate::watch_store::active_outputs::covers_path(&self.outputs, path)
     }
 }
 

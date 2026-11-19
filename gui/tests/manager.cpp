@@ -57,7 +57,10 @@ std::string event(const std::string& type,const fs::path& p,int ts) {
 void projection(Fixture& f) {
     auto p=f.dir/"events.json", source=f.dir/L"伪装.bin.001";
     std::array<std::string,3> history;
-    for(int i=0;i<350;++i) history[i%3]+=event("done",f.dir/("carrier-"+std::to_string(i)+".001"),i+1);
+    for(int i=0;i<350;++i) {
+        auto run=i%2==0?2:i<175?0:1;
+        history[run]+=event("done",f.dir/("carrier-"+std::to_string(i)+".001"),i+1);
+    }
     publish_events(p,history[0]);
     publish_events(p,history[1],read_json(p).at("runs"));
     publish_events(p,history[2],read_json(p).at("runs"),true);
