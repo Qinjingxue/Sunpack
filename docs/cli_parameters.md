@@ -142,20 +142,20 @@ Usage:
 sunpack.exe watch <add|remove|list|enable|disable|reload|relog|status> [options]
 ```
 
-Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect | initial_scanned | recursive`; the last four columns are optional:
+Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect | initial_scanned | recursive | enabled`. Set the final column to `true` to monitor the folder or `false` to keep it disabled.
 
 ```text
-C:\Downloads
-E:\Archives | E:\Output
-F:\Incoming | . | true
-G:\Incoming | | true
+C:\Downloads | | false | false | false | true
+E:\Archives | E:\Output | false | false | false | true
+F:\Incoming | . | true | false | true | true
+G:\Incoming | | true | false | false | false
 ```
 
-When only the input directory is given, the output column remains empty and extraction writes beside each archive. With `-o`, a relative output path is resolved against that input directory and persisted as an absolute path. The output root may be on a different drive. `watch` only observes the direct files of each root and does not recursively watch subdirectories; the input root must be on an NTFS or ReFS volume with a readable USN Journal.
+With an empty output column, extraction writes beside each archive. With `-o`, a relative output path is resolved against that input directory and persisted as an absolute path. The output root may be on a different drive. `watch` only observes the direct files of each root and does not recursively watch subdirectories; the input root must be on an NTFS or ReFS volume with a readable USN Journal.
 
-`deep_detect` accepts `true` or `false`; an omitted or empty value defaults to `false`. This mode belongs to the input directory. Different input roots may share an output root and use different modes. Nested extraction, password retries, and crash recovery retain the original input root and use its configured mode. Deep mode disables all filesystem scan filters for that root's requests. Editing the column triggers configuration reload; `watch reload` also applies it.
+`deep_detect` accepts `true` or `false`; an empty value defaults to `false`. This mode belongs to the input directory. Different input roots may share an output root and use different modes. Nested extraction, password retries, and crash recovery retain the original input root and use its configured mode. Deep mode disables all filesystem scan filters for that root's requests. Editing the column triggers configuration reload; `watch reload` also applies it.
 
-`initial_scanned` records completion of the first candidate scan and defaults to `false` when omitted or empty. Startup and live reload automatically scan roots marked `false` and write `true` after queuing candidates, without waiting for extraction success. New roots and changed input paths start at `false`; output or deep-mode edits preserve the flag. Existing roots still recover offline changes through USN. Scan-state-only edits, reordered roots, comments, and equivalent path spellings do not restart the scheduler.
+`initial_scanned` records completion of the first candidate scan and defaults to `false` when empty. Startup and live reload automatically scan roots marked `false` and write `true` after queuing candidates, without waiting for extraction success. New roots and changed input paths start at `false`; output or deep-mode edits preserve the flag. Existing roots still recover offline changes through USN. Scan-state-only edits, reordered roots, comments, and equivalent path spellings do not restart the scheduler.
 
 Subcommands and options:
 

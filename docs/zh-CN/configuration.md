@@ -139,17 +139,17 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 状态固定放在可写数据目录下的 `.sunpack_watch`，安装版即 `%ProgramData%\SunPack\.sunpack_watch`，CLI、Watch、GUI 共用。不再提供状态目录配置或运行时切换机制。
 
-升级只由安装器和 `scripts/upgrade_config.ps1` 处理。已安装版本的数字基础版本从 1.2.6 起，保留普通设置、`sunpack_watch_roots.txt` 和 `builtin_passwords.json`。根目录文件逐字节保留，包括 `initial_scanned`。安装器将密码列表和剪贴板历史各压缩为一行，保留内容、顺序和密码作用域。以新普通模板确定配置字段：已有值（包括 `false`、`0`、空值和 `null`）保留，新增字段补默认值，废弃字段移除。过滤模块按名称匹配，不恢复用户省略的模块；旧过滤字段及从高级提升到普通的设置只在升级边界转换。纯高级字段及未知扩展不保留，高级配置直接换成新模板。
+升级只由安装器和 `scripts/upgrade_config.ps1` 处理。已安装版本的数字基础版本从 1.2.6 起，保留普通设置、`sunpack_watch_roots.txt` 和 `builtin_passwords.json`。升级为旧目录和密码补上启用状态，并保留 `initial_scanned`。安装器将密码列表和剪贴板历史各压缩为一行，保留内容、顺序和密码作用域。以新普通模板确定配置字段：已有值（包括 `false`、`0`、空值和 `null`）保留，新增字段补默认值，废弃字段移除。过滤模块按名称匹配，不恢复用户省略的模块；旧过滤字段及从高级提升到普通的设置只在升级边界转换。纯高级字段及未知扩展不保留，高级配置直接换成新模板。
 
 低于 1.2.6 的版本按全新安装清理，包括根目录、密码及普通设置。已知版本升级均清除其他托管数据，包括恢复任务、目录索引、任务和事件历史、缓存及失败报告；自定义 Watch 状态目录仅删除已知 SunPack 记录。兼容根目录保留初扫标记，清理运行状态不会要求重新初扫。已有数据却无法识别或缺少安装版本时，停止升级且不改数据；空数据目录视为新安装。损坏配置或不安全路径也会在替换程序前停止准备。
 
-持久化密码只来自 `builtin_passwords.json`，包括其中的 `clipboard_history`。在 `passwords` 中填写 `value`，可用 `scopes` 指定一个或多个绝对目录，对其子目录也生效；省略 `scopes` 即全局生效。运行时来源包括显式输入（`-p`、`-P` 或密码提示框）与当前剪贴板。
+持久化密码只来自 `builtin_passwords.json`，包括其中的 `clipboard_history`。剪贴板历史使用字符串数组。密码列表中的记录必须带布尔字段 `enabled`，停用的记录保留在文件中。在 `passwords` 中填写 `value`，可用 `scopes` 指定一个或多个绝对目录，对其子目录也生效；省略 `scopes` 即全局生效。运行时来源包括显式输入（`-p`、`-P` 或密码提示框）与当前剪贴板。
 
 ```json
 {
   "passwords": [
-    { "value": "全局密码" },
-    { "value": "目录密码", "scopes": ["D:/Downloads", "E:/Archives"] }
+    { "value": "全局密码", "enabled": true },
+    { "value": "目录密码", "enabled": true, "scopes": ["D:/Downloads", "E:/Archives"] }
   ],
   "clipboard_history": []
 }

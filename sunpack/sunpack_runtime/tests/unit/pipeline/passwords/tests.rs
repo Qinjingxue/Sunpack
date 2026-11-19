@@ -245,11 +245,11 @@ fn scoped_recent_priority_reuses_global_lookup_and_preserves_order() {
     for password in ["item-900", "scoped", "item-800", "from-another-request"] {
         recent.remember_recent(Arc::from(password));
     }
-    let mut records: Vec<_> = (0..1024).map(|index| serde_json::json!({"value": format!("item-{index}")})).collect();
+    let mut records: Vec<_> = (0..1024).map(|index| serde_json::json!({"enabled":true, "value": format!("item-{index}")})).collect();
     records.extend([
-        serde_json::json!({"value": "scoped", "scopes": [r"C:\parent"]}),
-        serde_json::json!({"value": "item-900", "scopes": [r"C:\parent"]}),
-        serde_json::json!({"value": "item-0", "scopes": [r"C:\parent"]}),
+        serde_json::json!({"enabled":true, "value": "scoped", "scopes": [r"C:\parent"]}),
+        serde_json::json!({"enabled":true, "value": "item-900", "scopes": [r"C:\parent"]}),
+        serde_json::json!({"enabled":true, "value": "item-0", "scopes": [r"C:\parent"]}),
     ]);
     let snapshot = PasswordSnapshot::from_test_document(&serde_json::json!({"passwords": records}).to_string());
     let candidates = CandidateSet::new(Arc::from([Arc::from("item-0"), Arc::from("explicit")]), Some(Arc::new(snapshot)), &recent, None);

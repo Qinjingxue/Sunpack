@@ -142,20 +142,20 @@ sunpack.exe scan D:\Downloads -v
 sunpack.exe watch <add|remove|list|enable|disable|reload|relog|status> [options]
 ```
 
-监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned | recursive`，后四列可省略：
+监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned | recursive | enabled`。最后一列填 `true` 启用该目录，填 `false` 停用。
 
 ```text
-C:\Downloads
-E:\Archives | E:\Output
-F:\Incoming | . | true
-G:\Incoming | | true
+C:\Downloads | | false | false | false | true
+E:\Archives | E:\Output | false | false | false | true
+F:\Incoming | . | true | false | true | true
+G:\Incoming | | true | false | false | false
 ```
 
-只写输入目录时输出列保持为空，归档会解压到归档所在文件夹；使用 `-o` 时，相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。每个根使用独立的 `recursive` 标志，默认 `false`；输入根需要位于 NTFS 或 ReFS 卷且有可读取的 USN Journal。
+输出列留空时，归档会解压到归档所在文件夹；使用 `-o` 时，相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。每个根使用独立的 `recursive` 标志，默认 `false`；输入根需要位于 NTFS 或 ReFS 卷且有可读取的 USN Journal。
 
-`deep_detect` 接受 `true` 或 `false`，省略或留空时默认为 `false`。模式绑定输入目录；多个输入目录可共用输出根，并分别采用不同模式。嵌套解压、密码重试和崩溃恢复均保留原始输入目录，按该目录的配置执行。启用 deep 时，该目录请求的全部 filesystem 扫描过滤模块失效。修改此列会触发配置重载，也可执行 `watch reload` 应用修改。
+`deep_detect` 接受 `true` 或 `false`，留空时默认为 `false`。模式绑定输入目录；多个输入目录可共用输出根，并分别采用不同模式。嵌套解压、密码重试和崩溃恢复均保留原始输入目录，按该目录的配置执行。启用 deep 时，该目录请求的全部 filesystem 扫描过滤模块失效。修改此列会触发配置重载，也可执行 `watch reload` 应用修改。
 
-`initial_scanned` 表示是否完成首次候选扫描，省略或留空时为 `false`。启动和运行中重载会自动扫描值为 `false` 的目录，候选入队后回写 `true`；无需等待解压成功。新增目录或修改输入路径时重置为 `false`，仅修改输出根或 deep 模式时保留。已扫描目录的停机变化继续通过 USN 恢复。仅修改扫描标记、目录顺序、注释或等价路径写法不会重启调度器。
+`initial_scanned` 表示是否完成首次候选扫描，留空时为 `false`。启动和运行中重载会自动扫描值为 `false` 的目录，候选入队后回写 `true`；无需等待解压成功。新增目录或修改输入路径时重置为 `false`，仅修改输出根或 deep 模式时保留。已扫描目录的停机变化继续通过 USN 恢复。仅修改扫描标记、目录顺序、注释或等价路径写法不会重启调度器。
 
 子命令和参数：
 

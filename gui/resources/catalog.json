@@ -140,9 +140,33 @@
       "zh": "全部目录",
       "en": "All folders"
     },
-    "addRoot": {
-      "zh": "添加监控目录",
-      "en": "Add monitored folder"
+    "add": {
+      "zh": "添加",
+      "en": "Add"
+    },
+    "selectAll": {
+      "zh": "全选",
+      "en": "Select all"
+    },
+    "enableState": {
+      "zh": "启用状态",
+      "en": "Enabled"
+    },
+    "deleteSelected": {
+      "zh": "删除所选项",
+      "en": "Delete selected"
+    },
+    "openRecord": {
+      "zh": "打开原始记录",
+      "en": "Open raw record"
+    },
+    "recordOpenFailed": {
+      "zh": "无法使用默认文本编辑器打开记录",
+      "en": "Could not open the record in the default text editor."
+    },
+    "recordEnabledRequired": {
+      "zh": "每条记录的 enabled 字段必须为 true 或 false",
+      "en": "Each record requires a boolean enabled field."
     },
     "history": {
       "zh": "剪贴板历史",
@@ -303,10 +327,6 @@
     "rounds": {
       "zh": "轮数（正整数）",
       "en": "Rounds (positive integer)"
-    },
-    "addPasswords": {
-      "zh": "添加密码",
-      "en": "Add passwords"
     },
     "passwordSearch": {
       "zh": "搜索密码",
@@ -589,8 +609,8 @@
       "en": "This folder is inherited and cannot be removed here."
     },
     "rootsLineInvalid": {
-      "zh": "监控目录每行最多包含 input | output | deep_detect",
-      "en": "Each monitored-folder line accepts input | output | deep_detect."
+      "zh": "监控目录格式为 输入 | 输出 | deep_detect | initial_scanned | recursive | enabled",
+      "en": "Expected input | output | deep_detect | initial_scanned | recursive | enabled."
     },
     "deepDetectInvalid": {
       "zh": "deep_detect 只能是 true 或 false",

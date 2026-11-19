@@ -112,7 +112,7 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
             post_extract={"archive_cleanup_mode": "k", "flatten_single_directory": False},
         )
     passwords = package.data / "builtin_passwords.json"
-    passwords.write_text(json.dumps({"passwords": [{"value": "first-key"}]}), encoding="utf-8")
+    passwords.write_text(json.dumps({"passwords": [{"enabled": True, "value": "first-key"}]}), encoding="utf-8")
     package.json("watch", "add", "-d", "-o", output, watched)
 
     package.json("daemon", "start", "-nt")
@@ -137,7 +137,7 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
     for worker in workers:
         worker.wait(timeout=30)
     # Reopening the successful sibling would now fail its password probe.
-    passwords.write_text(json.dumps({"passwords": [{"value": "second-key"}]}), encoding="utf-8")
+    passwords.write_text(json.dumps({"passwords": [{"enabled": True, "value": "second-key"}]}), encoding="utf-8")
     with package.watch_session():
         package.await_watch_event("done", path=carrier.name)
     assert _only_output(output, "first.txt", first) == first_path

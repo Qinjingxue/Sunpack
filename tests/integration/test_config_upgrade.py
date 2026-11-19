@@ -44,10 +44,11 @@ def test_compatible_upgrade_retains_inputs_and_retires_state(tmp_path, repo_root
     roots = data / "sunpack_watch_roots.txt"
     roots.write_bytes(('\ufeff# 保留注释 | output | true | true | false\r\n'
                        'C:\\Downloads | D:\\输出 | true | true | false\r'
-                       'C:\\Other | | false | true | true\n').encode())
+                       'C:\\Other | | false | true | true\n'
+                       'C:\\Disabled | | false | false | false | false\n').encode())
     passwords = data / "builtin_passwords.json"
     password_document = {
-        "passwords": [{"value": ' 密码\r\n "]  ", ', "scopes": ["D:/工作"]}],
+        "passwords": [{"value": ' 密码\r\n "]  ", ', "scopes": ["D:/工作"]}, {"value": "off", "enabled": False}],
         "clipboard_history": ["历史", "/Date(1)/", "  2025-01-01T00:00:00Z  "],
     }
     expanded = json.dumps(password_document, indent=2, ensure_ascii=False).replace("/", r"\/")
@@ -59,7 +60,7 @@ def test_compatible_upgrade_retains_inputs_and_retires_state(tmp_path, repo_root
         (directory / "catalog.wal.bin").write_bytes(b"old catalog")
         (directory / "unrelated.txt").write_bytes(b"user owned")
     advanced_before = advanced.read_bytes()
-    roots_before = roots.read_bytes(), roots.stat().st_mtime_ns
+    roots_before = roots.read_bytes()
     result = _upgrade(repo_root, user, "v1.3.5-2-gabcdef0", advanced)
     assert result.returncode == 0, result.stdout + result.stderr
     migrated = json.loads(user.read_text(encoding="utf-8-sig"))
@@ -75,9 +76,10 @@ def test_compatible_upgrade_retains_inputs_and_retires_state(tmp_path, repo_root
     expected["filesystem"]["scan_filters"] = []
     assert migrated == expected
     assert {p.name for p in data.iterdir()} == {user.name, roots.name, passwords.name}
-    assert (roots.read_bytes(), roots.stat().st_mtime_ns) == roots_before
+    assert roots.read_bytes() == roots_before.replace(b" | false\rC:", b" | false | true\rC:").replace(b" | true\n", b" | true | true\n")
     password_text = passwords.read_bytes()
     assert password_text.startswith(b'\xef\xbb\xbf')
+    password_document["passwords"][0]["enabled"] = True
     assert json.loads(password_text) == password_document
     compact_lines = [
         f'  "{key}": ' + json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("/", r"\/")
@@ -232,7 +234,6 @@ def test_upgrade_boundary_and_current_projection(tmp_path, repo_root):
         roots.write_bytes(b"C:\\input | D:\\out | true | true | false\r\n")
         passwords.write_bytes(b'{\n  "passwords": ["  keep  "],\n  "clipboard_history": ["old"]\n}\n')
         (data / "state.snapshot").write_bytes(b"discard")
-        before_inputs = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)}
         result = _upgrade(repo_root, user, version)
         assert result.returncode == 0, result.stdout + result.stderr
         if version == "1.2.5":
@@ -242,7 +243,11 @@ def test_upgrade_boundary_and_current_projection(tmp_path, repo_root):
             expected["cli"]["language"] = "en"
             expected["watch"]["tray_enabled"] = False
             assert json.loads(user.read_text(encoding="utf-8")) == expected
-            assert {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)} == before_inputs
+            assert roots.read_bytes().endswith(b" | true | false | true\r\n")
+            assert json.loads(passwords.read_bytes()) == {
+                "passwords": [{"value": "  keep  ", "enabled": True}],
+                "clipboard_history": ["old"],
+            }
             assert {p.name for p in data.iterdir()} == {user.name, roots.name, passwords.name}
     missing = tmp_path / "missing" / "sunpack_config.json"
     assert _upgrade(repo_root, missing, "1.2.6").returncode == 0

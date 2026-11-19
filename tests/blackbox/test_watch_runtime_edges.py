@@ -105,7 +105,7 @@ def test_watch_output_home_expansion_in_add_and_roots_file(package, tmp_path):
     roots = package.data / "sunpack_watch_roots.txt"
     assert str(home / "added-output") in roots.read_text(encoding="utf-8")
     with roots.open("a", encoding="utf-8") as stream:
-        stream.write(f"{loaded} | ~\\loaded-output | false | false | false\n")
+        stream.write(f"{loaded} | ~\\loaded-output | false | false | false | true\n")
     with package.watch_session():
         _wait_for_output(home / "added-output", "first.txt", b"added output")
         _wait_for_output(home / "loaded-output", "second.txt", b"roots file output")

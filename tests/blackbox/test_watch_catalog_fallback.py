@@ -36,7 +36,7 @@ def test_runtime_rebuild_keeps_arrivals_after_catalog_persistence_fails(package,
     roots = package.data / "sunpack_watch_roots.txt"
     # A previously-scanned root starts without a trusted persisted catalog.
     # Its old files establish a baseline; only arrivals after startup run.
-    roots.write_text(f"{watched} | {output} | false | true | true\n", encoding="utf-8")
+    roots.write_text(f"{watched} | {output} | false | true | true | true\n", encoding="utf-8")
     state = package.data / ".sunpack_watch"
     state.mkdir()
     # Real snapshot creation failure, not a product test hook. The initial
@@ -71,8 +71,25 @@ def test_relative_roots_file_input_uses_runtime_working_directory(package, tmp_p
     watched.mkdir()
     output = tmp_path / "output"
     _zip(watched / "input.zip", "input.txt", b"process cwd")
-    (package.data / "sunpack_watch_roots.txt").write_text(
-        f"relative-input | {output} | false | false | false\n", encoding="utf-8")
+    paused = tmp_path / "paused"
+    paused.mkdir()
+    _zip(paused / "paused.zip", "paused.txt", b"reactivated")
+    roots = package.data / "sunpack_watch_roots.txt"
+    roots.write_text(f"relative-input | {output} | false | false | false | true\n"
+                     f"{paused} | {output} | false | false | false | false\n", encoding="utf-8")
     with package.watch_session(cwd=cwd):
         package.await_watch_event("done", path="input.zip")
+        assert package.json("watch", "list")["summary"]["count"] == 1
+        assert not list(output.rglob("paused.txt"))
+        # The first scan's marker write must retain the disabled row. Re-enable
+        # it through the same atomic file replacement performed by the GUI.
+        lines = roots.read_text(encoding="utf-8").splitlines()
+        assert lines[1].endswith(" | false")
+        lines[1] = lines[1].rsplit("|", 1)[0] + "| true"
+        pending = roots.with_suffix(".tmp")
+        pending.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        pending.replace(roots)
+        package.json("watch", "reload")
+        package.await_watch_event("done", path="paused.zip")
     assert [p.read_bytes() for p in output.rglob("input.txt")] == [b"process cwd"]
+    assert [p.read_bytes() for p in output.rglob("paused.txt")] == [b"reactivated"]

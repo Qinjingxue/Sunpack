@@ -3,21 +3,22 @@ use std::path::Path;
 
 #[test]
 fn builtin_password_documents_require_objects() {
-    assert!(Document::parse(r#"[[{"value":"secret"}]]"#).is_err());
+    assert!(Document::parse(r#"{"passwords":[{"value":"old-format"}]}"#).unwrap().read_passwords(None).is_err());
+    assert!(Document::parse(r#"[[{"enabled":true,"value":"secret"}]]"#).is_err());
     assert!(Document::parse(r#"{"passwords":[["secret"]]}"#)
         .unwrap().read_passwords(None).is_err());
-    assert!(Document::parse(r#"{"passwords":[{"value":"secret"}]}"#)
+    assert!(Document::parse(r#"{"passwords":[{"enabled":true,"value":"secret"}]}"#)
         .unwrap().read_passwords(None).is_ok());
 }
 
 #[test]
 fn password_notification_overrides_an_unchanged_request_stamp() {
     use super::{physical_file_generation, BuiltinStore, StoreState, TrackedFile};
-    let path = crate::test_support::temp_file("builtin_password_notify", br#"{"passwords":[{"value":"old"}]}"#);
+    let path = crate::test_support::temp_file("builtin_password_notify", br#"{"passwords":[{"enabled":true,"value":"old"}]}"#);
     let store = BuiltinStore { path: path.clone(), state: std::sync::Mutex::new(StoreState::default()), dirty: Default::default() };
     assert_eq!(store.reload().unwrap().global()[0].as_ref(), "old");
 
-    fs::write(&path, br#"{"passwords":[{"value":"new"}]}"#).unwrap();
+    fs::write(&path, br#"{"passwords":[{"enabled":true,"value":"new"}]}"#).unwrap();
     // Simulate an edit that leaves the cached generation unchanged.
     store.state.lock().unwrap().generation = physical_file_generation(&TrackedFile::open_reader(&path).unwrap()).ok();
     assert!(store.state.lock().unwrap().generation.is_some());
@@ -51,7 +52,7 @@ fn clipboard_save_reports_share_conflict_without_waiting_for_reader() {
 #[test]
 fn clipboard_merge_moves_repeated_values_to_the_end_in_copy_order() {
     use super::BuiltinStore;
-    let path = crate::test_support::temp_file("clipboard_merge_order", br#"{"passwords":[{"value":"configured"}],"clipboard_history":["old","copied","old","retained"]}"#);
+    let path = crate::test_support::temp_file("clipboard_merge_order", br#"{"passwords":[{"enabled":true,"value":"configured"}],"clipboard_history":["old","copied","old","retained"]}"#);
     let store = BuiltinStore { path: path.clone(), state: Default::default(), dirty: Default::default() };
     let copied = ["copied".to_owned(), "new".to_owned(), "copied".to_owned()];
     assert!(store.merge_clipboard(&copied, 3).unwrap());
@@ -67,12 +68,12 @@ fn first_clipboard_save_keeps_password_arrays_on_separate_lines() {
     use super::BuiltinStore;
     let path = crate::test_support::temp_file(
         "first_clipboard_save",
-        b"{\n  \"passwords\": [{\"value\":\"configured\"}]\n}\n",
+        b"{\n  \"passwords\": [{\"enabled\":true,\"value\":\"configured\"}]\n}\n",
     );
     let store = BuiltinStore { path: path.clone(), state: Default::default(), dirty: Default::default() };
     assert!(store.merge_clipboard(&[" new password ".to_owned()], 3).unwrap());
     assert_eq!(fs::read_to_string(&path).unwrap(),
-        "{\n  \"passwords\": [{\"value\":\"configured\"}],\n  \"clipboard_history\": [\" new password \"]\n}\n");
+        "{\n  \"passwords\": [{\"enabled\":true,\"value\":\"configured\"}],\n  \"clipboard_history\": [\" new password \"]\n}\n");
     fs::remove_file(path).unwrap();
 }
 
@@ -93,10 +94,11 @@ fn default_password_publication_preserves_concurrent_edit() {
 fn persisted_password_signatures_survive_runtime_migration() {
     let text = r##"{
         "passwords": [
-            {"value":"世界"},
-            {"value":"#literal"},
-            {"value":" secret ","scopes":["C:\\Downloads"]},
-            {"value":"child","scopes":["C:\\Downloads\\child"]}
+            {"enabled":false,"value":"disabled"},
+            {"enabled":true,"value":"世界"},
+            {"enabled":true,"value":"#literal"},
+            {"enabled":true,"value":" secret ","scopes":["C:\\Downloads"]},
+            {"enabled":true,"value":"child","scopes":["C:\\Downloads\\child"]}
         ]
     }"##;
     let mut index = IndexBuilder::default();

@@ -9,6 +9,7 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlwapi.h>
 #include <shlobj.h>
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
@@ -218,7 +219,7 @@ void Application::save_field(const std::string& id,Json draft,const std::string&
 }
 void Application::queue_save(Json job) {
     const auto kind=job.at("kind").get<std::string>();
-    if(kind!="config" && kind!="passwords" && kind!="roots") return;
+    if(kind!="config" && kind!="passwords" && kind!="roots" && kind!="collection") return;
     const auto& key=job.at("key");
     if(kind=="config") save_error(key.get_ref<const std::string&>(),"");
     auto previous=std::find_if(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==key;});
@@ -264,6 +265,12 @@ void Application::start_save() {
 void Application::acknowledge_save(const Json& ack) {
     const auto& job=*active_save_; auto kind=job.at("kind").get<std::string>();
     bool ok=ack.at("ok").get<bool>();
+    if(kind=="collection") {
+        ui_page_set_bool(page_,"collectionPending",false);
+        if(!ok) set_error("actionError",ack.at("error").get<std::string>());
+        active_save_.reset();
+        return;
+    }
     if(kind=="roots") {
         Json records=Json::array(),pending=Json::array();
         Json removed_scopes=Json::array();
@@ -298,15 +305,15 @@ void Application::acknowledge_save(const Json& ack) {
         if(ok) for(auto& edit:job.at("edits")) {
             const auto& id=edit.at("row").get_ref<const std::string&>();
             bool remove=edit.at("operation")=="delete";
-            auto input=remove?std::string():utf8(resolve_path(wide(edit.at("input").get<std::string>()),options_.data_dir).wstring());
+            auto input=remove?std::string():utf8(resolve_path(wide(edit.at("input").get<std::string>()),options_.root_base()).wstring());
             auto output=edit.at("output").get<std::string>(); auto first=output.find_first_not_of(" \t\r\n");
             output=first==std::string::npos?"":output.substr(first,output.find_last_not_of(" \t\r\n")-first+1);
-            records.push_back({{"id",id},{"input",input},{"identity",remove?std::string():utf8(path_key(wide(input)))},{"output",output},{"deep",edit.at("deep")},{"recursive",edit.value("recursive",false)},{"remove",remove}});
+            records.push_back({{"id",id},{"input",input},{"identity",remove?std::string():utf8(path_key(wide(input)))},{"output",output},{"deep",edit.at("deep")},{"recursive",edit.value("recursive",false)},{"enabled",edit.value("enabled",true)},{"remove",remove}});
             auto [first_match,end]=queued_rows.equal_range(id);
             for(auto match=first_match;match!=end;++match) {
                 auto& next=*match->second;
                 next["original"]=input;
-                next["expected"]=remove?Json():Json{{"output",output},{"deep",edit["deep"]},{"recursive",edit.value("recursive",false)}};
+                next["expected"]=remove?Json():Json{{"output",output},{"deep",edit["deep"]},{"recursive",edit.value("recursive",false)},{"enabled",edit.value("enabled",true)}};
                 if(next["operation"]=="delete") next["input"]=input;
                 else next["operation"]=remove?"addMany":"save";
             }
@@ -421,7 +428,7 @@ void Application::apply_pending() {
     auto task_snapshot=take("tasks");
     VisualBatch visual(window_);
     auto ack=take("saveAck");
-    const bool cell_ack=!ack.is_null() && active_save_ && ((*active_save_)["kind"]=="passwords" || (*active_save_)["kind"]=="roots");
+    const bool cell_ack=!ack.is_null() && active_save_ && (*active_save_)["kind"]!="config";
     const bool config_ack=!ack.is_null() && active_save_ && !cell_ack;
     if(cell_ack) acknowledge_save(ack);
     auto password_snapshot=take("passwords");
@@ -782,7 +789,7 @@ void Application::handle_command(Json command) {
     if(op=="browseRoot") {
         auto part=p.at("part").get<std::string>(); if(part!="input" && part!="output") return;
         auto value=p.at("value").get<std::string>();
-        auto base=options_.data_dir;
+        auto base=options_.root_base();
         if(part=="output" && !p.at("input").get<std::string>().empty()) base=resolve_path(wide(p.at("input").get<std::string>()),base);
         choosing_directory_=true;
         fs::path selected;
@@ -815,6 +822,25 @@ void Application::handle_command(Json command) {
     }
     if(op=="saveField") { save_field(p.at("id"),std::move(p.at("draft")),p.at("type"),p.at("datetimeRange")); return; }
     if(op=="saveRecord") { queue_save(std::move(p)); return; }
+    if(op=="openRecord") {
+        bool roots=p.at("roots");
+        auto path=options_.data_dir/(roots?"sunpack_watch_roots.txt":"builtin_passwords.json");
+        if(!fs::exists(path)) {
+            FileMutex lock(path,roots?L"SunPackWatchRoots":L"SunPack.EditableFile");
+            if(!fs::exists(path)) atomic_write(path,roots?"":"{\n  \"passwords\": [],\n  \"clipboard_history\": []\n}\n");
+        }
+        HKEY text_class=nullptr;
+        if(FAILED(AssocQueryKeyW(ASSOCF_NONE,ASSOCKEY_SHELLEXECCLASS,L".txt",nullptr,&text_class)))
+            throw std::runtime_error("recordOpenFailed");
+        SHELLEXECUTEINFOW launch{sizeof(launch)};
+        launch.fMask=SEE_MASK_CLASSKEY|SEE_MASK_FLAG_NO_UI;
+        launch.hwnd=hwnd_; launch.lpFile=path.c_str();
+        launch.hkeyClass=text_class; launch.nShow=SW_SHOWNORMAL;
+        const bool opened=ShellExecuteExW(&launch);
+        RegCloseKey(text_class);
+        if(!opened) throw std::runtime_error("recordOpenFailed");
+        return;
+    }
     if(op=="openPath" || op=="openTask") {
         auto path=op=="openTask"?task_directory(p):fs::path(wide(p.value("path",std::string())));
         if(!path.empty() && fs::exists(path)) {
@@ -1101,12 +1127,14 @@ void Application::work() {
         std::map<unsigned,ReadRetry> retries;
         bool initial_load_complete=false;
         auto retry_io=[&](unsigned bit,const WinError& error) {
-            if(error.code!=ERROR_SHARING_VIOLATION && error.code!=ERROR_LOCK_VIOLATION && error.code!=ERROR_FILE_NOT_FOUND && error.code!=ERROR_PATH_NOT_FOUND) return;
+            if(error.code!=ERROR_SHARING_VIOLATION && error.code!=ERROR_LOCK_VIOLATION && error.code!=ERROR_FILE_NOT_FOUND && error.code!=ERROR_PATH_NOT_FOUND) return false;
             auto& retry=retries[bit];
             // A rename notification can precede the writer releasing its sharing lock.
             // Bounded one-shot deadlines exist only after an observed I/O failure.
             constexpr unsigned delays[]={5,20,80};
-            if(retry.attempts<3) retry.due=Clock::now()+std::chrono::milliseconds(delays[retry.attempts++]);
+            if(retry.attempts>=std::size(delays)) return false;
+            retry.due=Clock::now()+std::chrono::milliseconds(delays[retry.attempts++]);
+            return true;
         };
         for(;;) {
             unsigned flags; std::deque<Command> commands; uint64_t query_generation;
@@ -1183,19 +1211,20 @@ void Application::work() {
                         }
                         PasswordSaveSnapshot saved_passwords;
                         Json password_edits=Json::array();
+                        if(kind=="collection") password_edits.push_back(p.at("edit"));
                         if(kind=="passwords") {
                             password_edits.push_back(p.at("edit"));
                             const auto& edit=p.at("edit");
                             if(edit["operation"]=="replace" && edit["values"].size()>1) {
                                 auto tail=edit["values"]; tail.erase(tail.begin());
-                                password_edits.push_back({{"operation","addMany"},{"values",std::move(tail)},{"scopes",edit["scopes"]}});
+                                password_edits.push_back({{"operation","addMany"},{"values",std::move(tail)},{"scopes",edit["scopes"]},{"enabled",edit.at("enabled")}});
                             }
                         }
                         const Json no_edits=Json::array();
                         auto result=save_changes(dir,config_edit,
                             password_edits,
                             kind=="roots"?p.at("edits"):no_edits,
-                            &saved_passwords,last_passwords);
+                            &saved_passwords,last_passwords,options_.root_base());
                         std::string password_original;
                         for(auto& section:result["saved"]) {
                             if(section=="config") flags|=Config;
@@ -1212,12 +1241,12 @@ void Application::work() {
                                 // in the unfiltered saved-password view.
                                 const auto edit=p.find("edit");
                                 if(!saved_passwords.record.is_null()) password_original=saved_passwords.record.dump();
-                                if(edit!=p.end() && edit->value("operation",std::string())=="replace" &&
+                                if(kind=="passwords" && edit!=p.end() && edit->value("operation",std::string())=="replace" &&
                                    saved_passwords.delta_base_matches && !password_original.empty() && !saved_passwords.record.contains("scopes") &&
                                    edit->at("values").size()<=1 && view.password_query.empty() && view.password_scope=="@all" &&
                                    !passwords_changed && previous_patch.contains("passwords")) {
                                     password_delta={{"scope",view.password_scope},{"original",edit->at("original")},
-                                        {"row",{{"value",saved_passwords.record.at("value")},{"original",password_original}}}};
+                                        {"row",{{"value",saved_passwords.record.at("value")},{"enabled",saved_passwords.record.at("enabled")},{"original",password_original}}}};
                                 } else password_delta=Json();
                                 passwords_changed=true;
                             }
@@ -1270,11 +1299,14 @@ void Application::work() {
                     errors.erase(file);
                     retries.erase(bit);
                 } catch(const WinError& e) {
-                    if(bit==Roots && (e.code==ERROR_FILE_NOT_FOUND || e.code==ERROR_PATH_NOT_FOUND) && retries.count(bit) && retries.at(bit).attempts>=3) {
-                        apply(std::string()); previous.clear(); loaded=true; errors.erase(file); retries.erase(bit);
-                    } else { errors[file]=e.what(); retry_io(bit,e); }
+                    // Retain the displayed snapshot while a replacement can still settle.
+                    if(retry_io(bit,e)) return;
+                    retries.erase(bit);
+                    if(bit==Roots && (e.code==ERROR_FILE_NOT_FOUND || e.code==ERROR_PATH_NOT_FOUND)) {
+                        apply(std::string()); previous.clear(); loaded=true; errors.erase(file);
+                    } else errors[file]=e.what();
                 }
-                catch(const std::exception& e) { errors[file]=e.what(); }
+                catch(const std::exception& e) { retries.erase(bit); errors[file]=e.what(); }
             };
             read(Config,"sunpack_config.json",last_config,config_read,[&](const std::string& text){
                 auto value=parse_json(text); if(!value.is_object()) throw std::runtime_error("configObjectRequired");
@@ -1284,7 +1316,7 @@ void Application::work() {
                 auto value=parse_json(text); validate_passwords(value); passwords=std::move(value); passwords_changed=true;
             });
             read(Roots,"sunpack_watch_roots.txt",last_roots,roots_read,[&](const std::string& text){
-                roots=parse_roots(text,dir); tasks_changed=roots_changed=true;
+                roots=parse_roots(text,options_.root_base()); tasks_changed=roots_changed=true;
             });
             if(!log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
                 log_watcher.reset();

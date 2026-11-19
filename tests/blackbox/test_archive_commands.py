@@ -85,7 +85,7 @@ def test_password_candidates_apply_only_to_their_directory(package, tmp_path):
     # password cache reuse across directory scopes.
     (denied / encrypted.name).hardlink_to(encrypted)
     (package.data / "builtin_passwords.json").write_text(json.dumps({
-        "passwords": [{"value": "pinned secret", "scopes": [str(allowed.parent)]}],
+        "passwords": [{"enabled": True, "value": "pinned secret", "scopes": [str(allowed.parent)]}],
     }), encoding="utf-8")
 
     report = package.json("scan", encrypted)

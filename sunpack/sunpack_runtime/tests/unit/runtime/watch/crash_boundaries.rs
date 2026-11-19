@@ -163,7 +163,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 root_scope_records: HashMap::new(),
                 admission_checkpoint: None,
                 cwd: base.clone(), root_file: base.join(ROOTS_FILE),
-                roots: BTreeMap::from([(key(&watched), (Root { path: watched.clone(), output: None,
+                roots: BTreeMap::from([(key(&watched), (Root { enabled: true, path: watched.clone(), output: None,
                     recursive: true, deep: true, scanned: true }, scope))]),
                 available_roots: HashSet::from([key(&watched)]),
                 user_password_signature: user_password_signature(&settings.user_passwords),

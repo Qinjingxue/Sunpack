@@ -115,22 +115,28 @@ def test_cli_password_values_and_noninteractive_prompt_contract(package):
 
 def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):
     path = package.data / "builtin_passwords.json"
-    path.write_bytes(b'{"passwords":[{"value":"first"}]}')
+    path.write_bytes(b'{"passwords":[{"enabled":true,"value":"first"}]}')
     assert package.json("passwords")["items"][0]["builtin_passwords"] == ["first"]
 
-    path.write_bytes(b'{"passwords":[{"value":"\xff"}]}')
+    path.write_bytes(b'{"passwords":[{"enabled":true,"value":"\xff"}]}')
     assert package.json("passwords")["items"][0]["builtin_passwords"] == ["first"]
 
     # Replace a file with the same length and last-write time while the same
     # runtime is running. The file identity must also invalidate its snapshot.
-    path.write_bytes(b'{"passwords":[{"value":"first"}]}')
+    path.write_bytes(b'{"passwords":[{"enabled":true,"value":"first"}]}')
     assert package.json("passwords")["items"][0]["builtin_passwords"] == ["first"]
     before = path.stat()
     replacement = path.with_suffix(".tmp")
-    replacement.write_bytes(b'{"passwords":[{"value":"other"}]}')
+    replacement.write_bytes(b'{"passwords":[{"enabled":true,"value":"other"}]}')
     os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
     replacement.replace(path)
     assert package.json("passwords")["items"][0]["builtin_passwords"] == ["other"]
+
+    path.write_text(json.dumps({
+        "passwords": [{"value": "other", "enabled": False}],
+        "clipboard_history": ["active"],
+    }), encoding="utf-8")
+    assert package.json("passwords")["items"][0]["builtin_passwords"] == ["active"]
 
     path.unlink()
     assert package.json("passwords")["items"][0]["builtin_passwords"] == []
@@ -467,7 +473,7 @@ def test_continuous_watch_retries_retained_nested_input_after_password_edit(pack
 
     passwords = package.data / "builtin_passwords.json"
     updated = passwords.with_suffix(".tmp")
-    updated.write_text(json.dumps({"passwords": [{"value": "nested-key"}]}), encoding="utf-8")
+    updated.write_text(json.dumps({"passwords": [{"enabled": True, "value": "nested-key"}]}), encoding="utf-8")
     updated.replace(passwords)
     _await_watch(
         lambda: not retained.exists() and any(output.rglob(marker.name)),

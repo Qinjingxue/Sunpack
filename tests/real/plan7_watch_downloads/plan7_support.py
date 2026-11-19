@@ -91,7 +91,7 @@ class Watch:
 def write_passwords(package, root, passwords):
     path = package.data / "builtin_passwords.json"
     pending = path.with_suffix(".tmp")
-    entries = [{"value": password, "scopes": [str(root)]} for password in passwords]
+    entries = [{"enabled": True, "value": password, "scopes": [str(root)]} for password in passwords]
     pending.write_text(json.dumps({"passwords": entries}), encoding="utf-8")
     pending.replace(path)
 

@@ -75,8 +75,21 @@ function Get-CompactPasswordDocument([string]$Path) {
     $text = [Text.StringBuilder]::new($source.Length)
     if ($bom) { [void]$text.Append([char]0xfeff) }
     $depth = 0
+    $section = ''
+    $index = 0
     foreach ($token in [regex]::Matches($json, '"(?:[^"\\]|\\.)*"|[{}\[\],:]|[^"{}\[\],: \t\r\n]+')) {
         $part = $token.Value
+        if ($depth -eq 1 -and $part.StartsWith('"')) {
+            $section = ConvertFrom-Json -InputObject $part
+            $index = 0
+        }
+        $recordArray = $section -ceq 'passwords'
+        if ($depth -eq 2 -and $recordArray -and $part.StartsWith('"')) {
+            $part = '{"value":' + $part + ',"enabled":true}'
+        } elseif ($depth -eq 3 -and $recordArray -and $part -eq '}') {
+            $record = $document.$section[$index]
+            if ($record.PSObject.Properties['value'] -and -not $record.PSObject.Properties['enabled']) { [void]$text.Append(',"enabled":true') }
+        } elseif ($depth -eq 2 -and $part -eq ',') { ++$index }
         switch -Exact ($part) {
             '{' { if ($depth -eq 0) { $part = "{`n  " }; ++$depth }
             '[' { ++$depth }
@@ -92,8 +105,7 @@ function Get-CompactPasswordDocument([string]$Path) {
 }
 
 # Installation owns compatibility: v1.2.6 introduced the retained input formats.
-# Compatible upgrades retain roots and password contents while rebuilding
-# managed state. Password documents may be compacted during publication.
+# Compatible upgrades migrate editable records before rebuilding managed state.
 $dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
 Assert-PlainPath $dataDirectory
 Assert-PrivateDirectory $dataDirectory
@@ -384,10 +396,26 @@ if ($advanced.PSObject.Properties['watch'] -and $advanced.watch -is [pscustomobj
 if ($retainInputs) {
     $passwordFile = Join-Path $dataDirectory 'builtin_passwords.json'
     $passwordText = Get-CompactPasswordDocument $passwordFile
+    $rootsFile = Join-Path $dataDirectory 'sunpack_watch_roots.txt'
+    $rootsText = $null
+    if ([IO.File]::Exists($rootsFile)) {
+        $source = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($rootsFile))
+        $updated = [regex]::Replace($source, '[^\r\n]+', {
+            param($match)
+            $line = $match.Value
+            $entry = $line.TrimStart([char]0xfeff).Trim()
+            if (-not $entry -or $entry.StartsWith('#')) { return $line }
+            $columns = $entry.Split('|').Length
+            if ($columns -gt 5) { return $line }
+            return $line + (' | ' * (5 - $columns)) + ' | true'
+        })
+        if ($source -cne $updated) { $rootsText = $updated }
+    }
     $text = (ConvertTo-OrdinaryConfigJson $user) + [Environment]::NewLine
     $null = $text | ConvertFrom-Json
     $null = [IO.Directory]::CreateDirectory($dataDirectory)
     Write-UpgradeFile $UserConfig $text
+    if ($null -ne $rootsText) { Write-UpgradeFile $rootsFile $rootsText }
     if ($null -ne $passwordText) { Write-UpgradeFile $passwordFile $passwordText }
 }
 foreach ($record in $customRecords) {

@@ -92,7 +92,7 @@ def _configure_watch(app, args, inputs, outputs, *, live=False, deep=True):
         config["post_extract"]["archive_cleanup_mode"] = "d"
     path.write_text(json.dumps(config), encoding="utf-8")
     (app.data / "builtin_passwords.json").write_text(
-        json.dumps({"passwords": [{"value": value} for value in args.password]}), encoding="utf-8",
+        json.dumps({"passwords": [{"enabled": True, "value": value} for value in args.password]}), encoding="utf-8",
     )
     scan_flags = ("-d",) if deep else ()
     app.run("watch", "add", "-R", *scan_flags, "-o", outputs, inputs)
@@ -277,10 +277,10 @@ def main(argv=None):
                 tool = Path(__file__).resolve().parents[2] / ("tools" if args.arch == "x64" else "tools/arm64") / "7z.exe"
                 subprocess.run([str(tool), "a", "-t7z", "-mhe=on", "-pbenchmark-key", str(archive), str(payload)], check=True, stdout=subprocess.DEVNULL)
                 entries = [
-                    {"value": f"candidate-{i}", "scopes": [str(workspace.corpus / f"unrelated-{i}")]}
+                    {"enabled": True, "value": f"candidate-{i}", "scopes": [str(workspace.corpus / f"unrelated-{i}")]}
                     for i in range(args.password_entries)
                 ]
-                entries.append({"value": "benchmark-key", "scopes": [str(selected)]})
+                entries.append({"enabled": True, "value": "benchmark-key", "scopes": [str(selected)]})
                 (app.data / "builtin_passwords.json").write_text(json.dumps({"passwords": entries}), encoding="utf-8")
                 for run in range(args.runs):
                     if args.cold:

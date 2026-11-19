@@ -157,7 +157,7 @@ end;
     # Verify effective non-elevated IO as well as exact root and inherited child grants.
     for directory in (existing, fresh):
         roots_file = directory / "sunpack_watch_roots.txt"
-        roots_file.write_text("C:\\Downloads\n", encoding="utf-8")
+        roots_file.write_text("C:\\Downloads | | false | false | false | true\n", encoding="utf-8")
         temp = directory / ".clipboard.tmp"
         temp.write_text('{"passwords":[],"clipboard_history":["updated"]}', encoding="utf-8")
         temp.replace(directory / "builtin_passwords.json")
@@ -169,7 +169,7 @@ end;
                                 capture_output=True, text=True, timeout=10)
         assert result.returncode == 0, result.stdout + result.stderr
         assert json.loads((directory / "builtin_passwords.json").read_text(encoding="utf-8")) == {
-            "passwords": [{"value": "GUI saved"}], "clipboard_history": ["updated"],
+            "passwords": [{"value": "GUI saved", "enabled": True}], "clipboard_history": ["updated"],
         }
     security = _powershell(f"""
 $ErrorActionPreference = 'Stop'

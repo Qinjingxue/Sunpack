@@ -331,7 +331,7 @@ def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(packa
             sibling.read_bytes() + b"carrier suffix"
         )
         (package.data / "builtin_passwords.json").write_text(
-            json.dumps({"passwords": [{"value": "crash-key"}]}), encoding="utf-8",
+            json.dumps({"passwords": [{"enabled": True, "value": "crash-key"}]}), encoding="utf-8",
         )
         # Recovery needs the small nested volumes admitted by recursive Deep.
         package.configure(
@@ -435,7 +435,7 @@ def test_invalid_password_edit_keeps_watch_running_with_last_valid_passwords(pac
         check=True, capture_output=True,
     )
     table = package.data / "builtin_passwords.json"
-    table.write_text(json.dumps({"passwords": [{"value": password}]}), encoding="utf-8")
+    table.write_text(json.dumps({"passwords": [{"enabled": True, "value": password}]}), encoding="utf-8")
     assert package.json("passwords")["items"][0]["builtin_passwords"] == [password]
     package.json("watch", "add", watched, "-o", output)
     package.json("daemon", "start", "-nt")

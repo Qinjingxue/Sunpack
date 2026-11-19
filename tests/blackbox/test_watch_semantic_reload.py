@@ -63,7 +63,7 @@ def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_p
         roots = package.data / "sunpack_watch_roots.txt"
         pending = roots.with_suffix(".tmp")
         replacement_output = tmp_path / "new-output"
-        pending.write_text(f"{watched} | {replacement_output} | false | true | false\n", encoding="utf-8")
+        pending.write_text(f"{watched} | {replacement_output} | false | true | false | true\n", encoding="utf-8")
         pending.replace(roots)
     package.json("watch", "reload")
     _wait_for_blocker(events, parts[0], completion)

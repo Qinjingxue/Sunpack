@@ -198,7 +198,7 @@ void projection(Fixture& f) {
 }
 void editing(Fixture& f) {
     auto p=f.dir/"builtin_passwords.json";
-    Json original={{"value","  #中文 密码  "},{"scopes",{"C:/A","D:/B"}}};
+    Json original={{"value","  #中文 密码  "},{"enabled",true},{"scopes",{"C:/A","D:/B"}}};
     atomic_write(p,Json({{"passwords",{original}},{"clipboard_history",{"后台密码"}}}).dump());
     save_password_edit(p,{{"operation","removeScope"},{"original",original.dump()},{"scope","c:\\a"}});
     auto j=read_json(p); assert(j["passwords"][0]["scopes"]==Json::array({"D:/B"}));
@@ -209,7 +209,7 @@ void editing(Fixture& f) {
     fails([&]{save_password_edit(p,{{"operation","replace"},{"original",original.dump()},{"value","wrong record"}});});
     for(auto raw:{"{\"passwords\":[{\"value\":\"a\",\"scopes\":[]}]}","{\"passwords\":[],\"unknown\":1}","{\"passwords\":[{\"value\":\"a\",\"unknown\":1}]}","{\"passwords\":[],\"passwords\":[]}"})
         fails([&]{validate_passwords(parse_json(raw));});
-    validate_passwords(parse_json(R"({"passwords":[{"value":"#","scopes":["\\\\server\\share","C:/中文"]}],"clipboard_history":[]})"));
+    validate_passwords(parse_json(R"({"passwords":[{"value":"#","enabled":true,"scopes":["\\\\server\\share","C:/中文"]}],"clipboard_history":[]})"));
     // Coordinate with a second writer using the exact production lock.
     std::thread writer([&]{ FileMutex lock(p); auto current=read_json(p); current["clipboard_history"].push_back("latest"); atomic_write(p,current.dump()); }); writer.join();
     save_password_edit(p,{{"operation","add"},{"value","after history"}}); assert(read_json(p)["clipboard_history"].back()=="latest");
@@ -220,7 +220,7 @@ void editing(Fixture& f) {
     assert(read_json(p)["passwords"].size()==4 && read_json(p)["clipboard_history"].back()=="latest");
     // Add, replacement and scope changes share runtime-compatible coverage:
     // globals subsume scoped copies; distinct scopes share one stored record.
-    Json scope_a={{"value","same"},{"scopes",{"C:/A"}}},scope_b={{"value","same"},{"scopes",{"D:/B"}}};
+    Json scope_a={{"value","same"},{"enabled",true},{"scopes",{"C:/A"}}},scope_b={{"value","same"},{"enabled",true},{"scopes",{"D:/B"}}};
     Json document={{"passwords",{scope_a,scope_b}},{"clipboard_history",{"retained"}}},retained;
     atomic_write(p,document.dump());
     auto apply_edit=[&](Json edit) {
@@ -233,30 +233,30 @@ void editing(Fixture& f) {
         apply_edit({{"operation",operation},{"original",old.is_null()?"":old.dump()},{"value",value},{"values",{value}},{"scopes",std::move(scopes)}});
     };
     apply("addMany",Json(),"same",{"c:\\a\\child"});
-    assert(document["passwords"]==Json::array({Json{{"value","same"},{"scopes",{"C:/A","D:/B"}}}}) && retained.is_null());
+    assert(document["passwords"]==Json::array({Json{{"value","same"},{"enabled",true},{"scopes",{"C:/A","D:/B"}}}}) && retained.is_null());
     auto combined=document["passwords"][0];
     apply_edit({{"operation","replace"},{"original",combined.dump()},{"scope","D:/B"},{"value","same"},{"scopes",{"C:/A"}}});
     assert(document["passwords"]==Json::array({scope_a}) && retained.is_null());
-    apply("addMany",Json(),"same",Json::array()); assert(document["passwords"]==Json::array({Json{{"value","same"}}}) && !retained.is_null());
+    apply("addMany",Json(),"same",Json::array()); assert(document["passwords"]==Json::array({Json{{"value","same"},{"enabled",true}}}) && !retained.is_null());
     apply("addMany",Json(),"same",{"D:/B"}); assert(document["passwords"].size()==1 && retained.is_null());
     apply("addMany",Json(),"different",{"D:/B"});
     apply("replace",document["passwords"].back(),"same",{"D:/B"});
     assert(document["passwords"].size()==1 && retained.is_null() && document["clipboard_history"][0]=="retained");
-    Json earlier={{"value","earlier"}},existing={{"value","same"}};
+    Json earlier={{"value","earlier"},{"enabled",true}},existing={{"value","same"},{"enabled",true}};
     document["passwords"]=Json::array({earlier,existing});
     atomic_write(p,document.dump());
     apply("replace",earlier,"same",Json::array());
     assert(document["passwords"]==Json::array({existing}) && retained.is_null());
     // A multi-scope legacy record is edited/deleted only in the selected
     // directory; other associations survive the same atomic transaction.
-    Json multi={{"value","old"},{"scopes",{"C:/A","D:/B"}}};
+    Json multi={{"value","old"},{"enabled",true},{"scopes",{"C:/A","D:/B"}}};
     atomic_write(p,Json{{"passwords",{multi}}}.dump());
     apply_edit({{"operation","replace"},{"original",multi.dump()},{"scope","c:\\a"},{"value","new"},{"scopes",{"C:/A"}}});
-    assert(retained==Json({{"value","new"},{"scopes",{"C:/A"}}}));
-    assert(document["passwords"].size()==2 && document["passwords"][1]==Json({{"value","old"},{"scopes",{"D:/B"}}}));
+    assert(retained==Json({{"value","new"},{"enabled",true},{"scopes",{"C:/A"}}}));
+    assert(document["passwords"].size()==2 && document["passwords"][1]==Json({{"value","old"},{"enabled",true},{"scopes",{"D:/B"}}}));
     auto selected=document["passwords"][0];
     apply_edit({{"operation","removeScope"},{"original",selected.dump()},{"scope","C:/A"}});
-    assert(document["passwords"]==Json::array({Json{{"value","old"},{"scopes",{"D:/B"}}}}));
+    assert(document["passwords"]==Json::array({Json{{"value","old"},{"enabled",true},{"scopes",{"D:/B"}}}}));
     save_password_edit(p,{{"operation","add"},{"value","shared stored"},{"scopes",{"C:/A"}}});
     save_password_edit(p,{{"operation","add"},{"value","shared stored"},{"scopes",{"D:/B","c:\\a\\"}}});
     auto stored=read_json(p)["passwords"];
@@ -387,12 +387,12 @@ void localization(Fixture& fixture) {
 }
 void roots(Fixture& f) {
     auto p=f.dir/"sunpack_watch_roots.txt";
-    atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | relative | false\n"+utf8(f.dir.wstring())+" | 末条 | TRUE\n");
+    atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | relative | false | false | false | true\n"+utf8(f.dir.wstring())+" | 末条 | TRUE | false | false | true\n");
     auto roots=read_roots(p); assert(roots.size()==1 && roots[0].deep && roots[0].output=="末条");
     auto nested=f.dir/"Data"; fs::create_directory(nested);
     // A runtime-only fourth column must survive GUI edits of other settings;
     // changing the input path must make the replacement eligible for scanning.
-    atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | 末条 | true | true\n");
+    atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | 末条 | true | true | false | true\n");
     edit_root(p,"save",utf8(f.dir.wstring()),utf8(f.dir.wstring()),"末条",true);
     assert(read_roots(p)[0].initial_scanned);
     edit_root(p,"save",utf8(f.dir.wstring()),utf8(nested.wstring()),"changed",false);
@@ -419,9 +419,9 @@ void batch_editing(Fixture& fixture) {
     auto dir=fixture.dir/"batch"; fs::create_directory(dir);
     auto config=dir/"sunpack_config.json", passwords=dir/"builtin_passwords.json", roots=dir/"sunpack_watch_roots.txt";
     atomic_write(config,R"({"watch":{"out_dir":".","toast_enabled":true,"clipboard_builtin_max_entries":1},"large":123456789012345678901234567890})");
-    Json old={{"value","old"},{"scopes",{utf8(dir.wstring())}}};
+    Json old={{"value","old"},{"enabled",true},{"scopes",{utf8(dir.wstring())}}};
     atomic_write(passwords,Json{{"passwords",{old}},{"clipboard_history",{"latest background history"}}}.dump());
-    atomic_write(roots,"# retained\n"+utf8(dir.wstring())+"\n");
+    atomic_write(roots,"# retained\n"+utf8(dir.wstring())+" | | false | false | false | true\n");
     Json field={{"pointer","/watch/toast_enabled"},{"original","true"},{"type","boolean"},{"text",""},{"boolean",false}};
     Json pwd=Json::array({Json{{"operation","replace"},{"original",old.dump()},{"value","changed"},{"scopes",{utf8(dir.wstring())}}}});
     Json root=Json::array({Json{{"operation","save"},{"original",utf8(dir.wstring())},{"input",utf8(dir.wstring())},{"output","new"},{"deep",true},{"expected",{{"output",""},{"deep",false}}}}});
@@ -430,7 +430,7 @@ void batch_editing(Fixture& fixture) {
     auto rejected=save_changes(dir,invalid,pwd,root);
     assert(rejected["saved"].empty() && rejected["error"]!="");
     assert(read_file(config)==before_config && read_file(passwords)==before_passwords && read_file(roots)==before_roots);
-    atomic_write(roots,utf8(dir.wstring())+" | external\n");
+    atomic_write(roots,utf8(dir.wstring())+" | external | false | false | false | true\n");
     rejected=save_changes(dir,field,pwd,root); assert(rejected["saved"].empty() && rejected["error"]=="rootConflict");
     assert(read_file(config)==before_config && read_file(passwords)==before_passwords);
     atomic_write(roots,before_roots);
@@ -452,7 +452,7 @@ void batch_editing(Fixture& fixture) {
     assert(rejected_password["saved"].empty() && failed_snapshot.document.is_null());
     PasswordSaveSnapshot snapshot;
     Json updated_password=Json::array({Json{{"operation","replace"},
-        {"original",Json{{"value","changed"},{"scopes",{utf8(dir.wstring())}}}.dump()},
+        {"original",Json{{"value","changed"},{"enabled",true},{"scopes",{utf8(dir.wstring())}}}.dump()},
         {"value","fast-delta"},{"scopes",{utf8(dir.wstring())}}}});
     // Equal row count cannot make an older file snapshot a valid delta base.
     auto committed=save_changes(dir,Json(),updated_password,Json::array(),&snapshot,before_passwords);
@@ -484,7 +484,7 @@ void batch_editing(Fixture& fixture) {
     assert(saved_roots.size()==3 && saved_roots.back().deep);
     View view;
     auto saved=read_json(passwords);
-    saved["passwords"].push_back({{"value","everywhere"}});
+    saved["passwords"].push_back({{"value","everywhere"},{"enabled",true}});
     auto global=password_rows(saved,view);
     assert(global["rows"].size()==1 && global["rows"][0]["value"]=="everywhere");
     view.password_scope=utf8(dir.wstring());
@@ -496,10 +496,10 @@ void batch_editing(Fixture& fixture) {
     edit_root(roots,"save","",utf8(child.wstring()),"",false);
     auto alias=first.wstring(); CharUpperBuffW(alias.data(),DWORD(alias.size())); alias+=L"/";
     Json cleanup={{"passwords",Json::array({
-        Json{{"value","only"},{"scopes",{utf8(alias),utf8(first.wstring())}}},
-        Json{{"value","shared"},{"scopes",{utf8(first.wstring()),utf8(second.wstring())}}},
-        Json{{"value","global"}},Json{{"value","child"},{"scopes",{utf8(child.wstring())}}},
-        Json{{"value","sibling-prefix"},{"scopes",{utf8((dir/"first2").wstring())}}}
+        Json{{"value","only"},{"enabled",true},{"scopes",{utf8(alias),utf8(first.wstring())}}},
+        Json{{"value","shared"},{"enabled",true},{"scopes",{utf8(first.wstring()),utf8(second.wstring())}}},
+        Json{{"value","global"},{"enabled",true}},Json{{"value","child"},{"enabled",true},{"scopes",{utf8(child.wstring())}}},
+        Json{{"value","sibling-prefix"},{"enabled",true},{"scopes",{utf8((dir/"first2").wstring())}}}
     })},{"clipboard_history",{"only","background update"}}};
     atomic_write(passwords,cleanup.dump());
     Json deletion=Json::array({Json{{"operation","delete"},{"original",utf8(first.wstring())},{"input",utf8(first.wstring())},{"output",""},{"deep",false}}});

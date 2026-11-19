@@ -55,7 +55,7 @@ def measure_native(executable, case, candidates, correct, runs):
 def measure_cli(app, case, candidates, correct, output):
     app.shutdown()
     (app.data / 'builtin_passwords.json').write_text(
-        json.dumps({'passwords': [{'value': value} for value in candidates]}), encoding='utf-8')
+        json.dumps({'passwords': [{'enabled': True, 'value': value} for value in candidates]}), encoding='utf-8')
     flags = ('-d',) if case.carrier_start is not None else ()
     row = app.run('extract', *flags, '-npa', '-nf', '-c', 'k', '-o', output,
                   case.path, accepted=(0, 1))

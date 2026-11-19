@@ -2,6 +2,7 @@
 #include "platform.hpp"
 #include <nlohmann/json.hpp>
 #include <string_view>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -15,17 +16,17 @@ Json parse_json(const std::string& text);
 Json read_json(const fs::path& path);
 void validate_passwords(const Json& document);
 bool password_matches_scope(const Json& record, const std::string& scope);
-struct WatchRoot { fs::path input; std::string output; bool deep = false; bool initial_scanned = false; bool recursive = false; };
+struct WatchRoot { fs::path input; std::string output; bool deep = false; bool initial_scanned = false; bool recursive = false; bool enabled = true; };
 using WatchRoots = std::vector<WatchRoot>;
 WatchRoots parse_roots(std::string_view text, const fs::path& base, std::string* comments = nullptr);
-WatchRoots read_roots(const fs::path& path, std::string* comments = nullptr);
+WatchRoots read_roots(const fs::path& path, std::string* comments = nullptr, const fs::path& base = {});
 // The saved document is already parsed while validating the write; return it
 // to the GUI instead of immediately re-reading and re-projecting the file.
 struct PasswordSaveSnapshot { Json document; std::string file_text; Json record, rebases; bool delta_base_matches = false; };
 // Preflight every file under the existing locks, then replace each file once.
 // A write failure reports completed sections so remaining drafts can be retried.
 Json save_changes(const fs::path& directory, const Json& field, const Json& passwords,
-    const Json& roots, PasswordSaveSnapshot* password_snapshot = nullptr, std::string_view password_baseline = {});
+    const Json& roots, PasswordSaveSnapshot* password_snapshot = nullptr, std::string_view password_baseline = {}, const fs::path& root_base = {});
 class EventLog {
     fs::path path_;
 public:

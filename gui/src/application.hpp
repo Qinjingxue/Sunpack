@@ -16,6 +16,7 @@ struct Options {
     CliCommand cli;
     bool allow_cli = true;
     std::vector<std::wstring> shell_watch;
+    const fs::path& root_base() const { return allow_cli && !cli.app_root.empty()?cli.app_root:data_dir; }
 };
 class Application {
     Options options_;

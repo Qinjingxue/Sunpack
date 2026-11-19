@@ -30,7 +30,9 @@ def test_source_runtime_watch_and_native_launcher_share_checkout_root(package, r
     (checkout / "builtin_passwords.json").write_text('{"passwords":[]}', encoding="utf-8")
     observed = checkout / "input"
     observed.mkdir()
-    (checkout / "sunpack_watch_roots.txt").write_text(str(observed) + "\n", encoding="utf-8")
+    (checkout / "sunpack_watch_roots.txt").write_text(
+        f"{observed} | | false | false | false | true\n"
+        "disabled | | false | false | false | false\n", encoding="utf-8")
     # A caller in another valid checkout must not redirect runtime resources,
     # writable state, watch roots, or launcher selection away from its binary.
     caller = tmp_path / "other checkout"

@@ -164,14 +164,14 @@ where
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record<'a> {
+    enabled: bool,
     #[serde(borrow)]
     value: Cow<'a, str>,
     #[serde(borrow, default, deserialize_with = "present_raw")]
     scopes: Option<&'a RawValue>,
 }
 
-// The password file schema uses objects. Serde's derived struct parser also
-// accepts arrays of positional fields unless we request a map explicitly.
+// Serde also accepts positional arrays for structs unless we require a map.
 struct JsonObject<T>(T);
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for JsonObject<T> {
@@ -262,6 +262,7 @@ impl<'de> Visitor<'de> for Passwords<'_> {
 
     fn visit_seq<A: SeqAccess<'de>>(mut self, mut entries: A) -> Result<(), A::Error> {
         while let Some(JsonObject(record)) = entries.next_element::<JsonObject<Record<'_>>>()? {
+            if !record.enabled { continue; }
             valid_text(&record.value).map_err(de::Error::custom)?;
             let password = self
                 .0

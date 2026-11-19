@@ -63,7 +63,7 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(package, tmp_p
 
     package.configure(recursive_extract="*")
     write_passwords(package, tmp_path, ["wrong", PASSWORD])
-    save_roots(f"{old.root} | {old.output} | false | true\n{pending.root} | {pending.output} | true\n")
+    save_roots(f"{old.root} | {old.output} | false | true | false | true\n{pending.root} | {pending.output} | true | false | false | true\n")
     generation = pending.start()["generation"]
     pending.await_archive(inner)
     wait_for(lambda: scan_events() == [["pending"]] and scanned_count() == 2, "one pending-root scan")
@@ -71,19 +71,19 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(package, tmp_p
 
     alias = str(pending.root).upper().replace("\\", "/") + "/."
     save_roots(
-        f"# policy-neutral edit\n{alias} | {str(pending.output).upper()} | true | true\n"
-        f"{old.root} | {old.output} | false | true\n"
+        f"# policy-neutral edit\n{alias} | {str(pending.output).upper()} | true | true | false | true\n"
+        f"{old.root} | {old.output} | false | true | false | true\n"
     )
     assert package.json("watch", "reload")["summary"]["generation"] == generation
     assert scan_events() == [["pending"]]
     assert not marker_present(old.output, ignored.marker_name)
 
-    save_roots(f"{pending.root} | {pending.output} | true | true\n{old.root} | {old.output} | true | true\n")
+    save_roots(f"{pending.root} | {pending.output} | true | true | false | true\n{old.root} | {old.output} | true | true | false | true\n")
     package.json("watch", "reload")
     assert scan_events() == [["pending"]]
     assert not marker_present(old.output, ignored.marker_name)
 
-    save_roots(f"{pending.root} | {pending.output} | true | true\n{old.root} | {old.output} | false | false\n")
+    save_roots(f"{pending.root} | {pending.output} | true | true | false | true\n{old.root} | {old.output} | false | false | false | true\n")
     old.await_archive(ignored)
     wait_for(lambda: scan_events() == [["pending"], ["old"]], "live scan-flag reset")
     assert package.json("watch", "status")["summary"]["generation"] == generation

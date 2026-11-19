@@ -81,6 +81,7 @@ fn admission_candidate(mut candidate: WatchCandidateRow, since_usn: i64) -> io::
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Root {
+    enabled: bool,
     path: PathBuf,
     output: Option<PathBuf>,
     recursive: bool,
@@ -191,6 +192,12 @@ fn configuration_changes(
 }
 
 fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
+    let mut roots = read_root_records(path)?;
+    roots.retain(|root| root.enabled);
+    Ok(roots)
+}
+
+fn read_root_records(path: &Path) -> io::Result<Vec<Root>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(Vec::new()),
@@ -199,7 +206,7 @@ fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
     let mut roots: Vec<Root> = Vec::new();
     let mut positions = HashMap::new();
     let cwd = std::env::current_dir()?;
-    for (index, line) in text.lines().enumerate() {
+    for (index, line) in text.trim_start_matches('\u{feff}').lines().flat_map(|line| line.split('\r')).enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -226,11 +233,12 @@ fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
         let deep = boolean("deep_detect")?;
         let scanned = boolean("initial_scanned")?;
         let recursive = boolean("recursive")?;
-        if fields.next().is_some() {
+        let enabled = fields.next().and_then(|s| s.to_ascii_lowercase().parse::<bool>().ok());
+        if enabled.is_none() || fields.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{}:{}: expected input | output | deep_detect | initial_scanned | recursive",
+                    "{}:{}: expected input | output | deep_detect | initial_scanned | recursive | enabled",
                     path.display(),
                     index + 1
                 ),
@@ -238,6 +246,7 @@ fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
         }
         let id = root_key(&input);
         let mut root = Root {
+            enabled: enabled.unwrap(),
             path: input,
             output,
             recursive,
@@ -260,8 +269,8 @@ fn write_roots(path: &Path, roots: &[Root]) -> io::Result<()> {
     use std::fmt::Write;
     let mut text = String::new();
     if let Ok(previous) = fs::read_to_string(path) {
-        for comment in previous
-            .lines()
+        for comment in previous.trim_start_matches('\u{feff}')
+            .split(['\r', '\n'])
             .filter(|line| line.trim_start().starts_with('#'))
         {
             writeln!(text, "{comment}").unwrap();
@@ -278,12 +287,13 @@ fn write_roots(path: &Path, roots: &[Root]) -> io::Result<()> {
             .unwrap_or_default();
         writeln!(
             text,
-            "{} | {} | {} | {} | {}",
+            "{} | {} | {} | {} | {} | {}",
             root.path.display(),
             output,
             root.deep,
             root.scanned,
-            root.recursive
+            root.recursive,
+            root.enabled
         )
         .unwrap();
     }
@@ -678,15 +688,16 @@ impl Watch {
         let running = self.is_running();
         {
             let _lock = FileMutex::lock(&path, ROOTS_LOCK)?;
-            let mut roots = read_roots(&path)?;
+            let mut roots = read_root_records(&path)?;
             let mut positions: HashMap<_, _> = roots.iter().enumerate()
                 .map(|(index, root)| (root_key(&root.path), index)).collect();
             for root in paths {
                 let id = root_key(root);
                 if let Some(&index) = positions.get(&id) {
                     let existing = &mut roots[index];
-                    let changed = (recursive && !existing.recursive) || (deep && !existing.deep);
+                    let changed = !existing.enabled || (recursive && !existing.recursive) || (deep && !existing.deep);
                     existing.scanned &= !recursive || existing.recursive;
+                    existing.enabled = true;
                     existing.recursive |= recursive;
                     existing.deep |= deep;
                     if changed {
@@ -696,6 +707,7 @@ impl Watch {
                 }
                 positions.insert(id, roots.len());
                 roots.push(Root {
+                    enabled: true,
                     path: root.clone(),
                     output: output.map(str::trim).filter(|value| !value.is_empty())
                         .map(|value| resolve_output(root, value)).transpose()?,
@@ -747,7 +759,7 @@ impl Watch {
         {
             let _lock = FileMutex::lock(&path, ROOTS_LOCK)?;
             let keys: HashSet<_> = paths.iter().map(|path| root_key(path)).collect();
-            let mut roots = read_roots(&path)?;
+            let mut roots = read_root_records(&path)?;
             roots.retain(|root| {
                 if keys.contains(&root_key(&root.path)) {
                     removed.push(root.path.clone());
@@ -2771,10 +2783,11 @@ impl Scheduler {
             // writers share this lock; pruning an older snapshot can remove a
             // root that has since moved back onto a supported filesystem.
             let _guard = FileMutex::lock(&self.root_file, ROOTS_LOCK)?;
-            let mut entries = read_roots(&self.root_file)?;
+            let mut entries = read_root_records(&self.root_file)?;
             let mut filesystems = HashMap::new();
             let mut rejected = Vec::new();
             entries.retain(|entry| {
+                if !entry.enabled { return true; }
                 let Some(directory) = nearest_directory(&entry.path) else {
                     return true;
                 };
@@ -2791,6 +2804,7 @@ impl Scheduler {
             if !rejected.is_empty() {
                 write_roots(&self.root_file, &entries)?;
             }
+            entries.retain(|root| root.enabled);
             (entries, rejected)
         };
         if !rejected.is_empty() {
@@ -4006,12 +4020,12 @@ impl Scheduler {
             // user configuration marker must not stop unrelated roots.
             let marked = (|| -> io::Result<Vec<PathBuf>> {
                 let _lock = FileMutex::lock(&self.root_file, ROOTS_LOCK)?;
-                let mut latest = read_roots(&self.root_file)?;
+                let mut latest = read_root_records(&self.root_file)?;
                 let mut dirty = false;
                 let mut matched = Vec::new();
                 for root in &mut latest {
                     let id = key(&root.path);
-                    if marks.contains(&id) {
+                    if root.enabled && marks.contains(&id) {
                         if let Some((current, _)) = self.roots.get_mut(&id) {
                             if root.same_policy(current) {
                                 dirty |= !root.scanned;

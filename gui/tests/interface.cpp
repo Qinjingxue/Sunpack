@@ -252,7 +252,7 @@ void finish_input(Application& app,bool expect_success=true) {
     ui_debug_pump();
     pump([&]{
         if(!state(app.page(),"requests").empty() || state(app.page(),"dispatch")==true ||
-            !state(app.page(),"pendingFields").empty()) return false;
+            !state(app.page(),"pendingFields").empty() || state(app.page(),"collectionPending")==true) return false;
         for(auto kind:{"rootDrafts","passwordDrafts"}) for(const auto& draft:state(app.page(),kind))
             if(draft.value("pending",false)) return false;
         return true;
@@ -699,6 +699,20 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     finish_input(app);
     assert(disk_root({}));
 
+    // Exercise the observer's missing-file path after a successful GUI add.
+    // Keeping the name absent also checks the settled empty-list behavior.
+    const auto staged_roots=dir/"staged-roots.txt";
+    fs::rename(root_path,staged_roots);
+    pump([&]{
+        auto errors=state(app.page(),"errors");
+        if(!errors.empty()) throw std::runtime_error("Unexpected file warning: "+errors.dump());
+        return state(app.page(),"rootRows").empty();
+    },"Observe absent optional roots file");
+    atomic_write(root_path,"invalid root record");
+    pump([&]{return state(app.page(),"errors").contains("sunpack_watch_roots.txt");},"Report invalid roots file");
+    atomic_write(root_path,read_file(staged_roots));
+    pump([&]{return state(app.page(),"rootRows").size()==2 && state(app.page(),"errors").empty();},"Observe republished roots");
+
     auto root_id=root_row_id(app,root);
     click(app,("root-output-text-"+root_id).c_str());
     focus(app,"root-output-input-"+root_id);
@@ -722,7 +736,7 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     assert(ui_debug_type_text(app.window(),L"  #局部密码  ")==0);
     finish_input(app);
     auto saved=read_json(passwords_path)["passwords"];
-    assert((saved.back()==Json{{"value","  #局部密码  "},{"scopes",{scope}}}));
+    assert((saved.back()==Json{{"value","  #局部密码  "},{"enabled",true},{"scopes",{scope}}}));
 
     auto password_id=state(app.page(),"passwords")["rows"][0]["id"].get<std::string>();
     click(app,("password-text-"+password_id).c_str());
@@ -731,6 +745,9 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     finish_input(app);
     assert(read_json(passwords_path)["passwords"].back()["value"]=="edited password");
     password_id=state(app.page(),"passwords")["rows"][0]["id"].get<std::string>();
+    click(app,("enabled-password-"+password_id).c_str());
+    finish_input(app);
+    assert(read_json(passwords_path)["passwords"].back().at("enabled")==false);
     click(app,("delete-password-"+password_id).c_str());
     finish_input(app);
     assert(read_json(passwords_path)["passwords"].size()==1);
@@ -748,21 +765,37 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     };
     const auto expected=ui_theme_get_mode()==UI_THEME_DARK?D2D1::ColorF(0x2b2b2b):theme::Current().cardBg;
     gui_test::same_color(saved_card_color(),expected);
+    const auto select_all=rect(app,"selectAllPasswords");
     click(app,"clipboardHistory");
+    // Click before the native event loop delivers the new list.
+    assert(state(app.page(),"passwordHistory")==false);
+    assert(window(app).Root()->FindById("selectAllPasswords")->enabled);
+    assert(ui_debug_click_at(app.window(),(select_all.left+select_all.right)/2,(select_all.top+select_all.bottom)/2)==0);
+    assert(state(app.page(),"passwordChecked").empty());
     pump([&]{return state(app.page(),"passwordHistory")==true;},"Show clipboard history");
-    gui_test::same_color(card_color("0"),expected);
+    auto selected_history=state(app.page(),"passwords")["rows"][0]["id"].get<std::string>();
+    assert(state(app.page(),"passwordChecked")==Json({{selected_history,true}}));
+    gui_test::same_color(saved_card_color(),expected);
     click(app,"savedPasswords");
     pump([&]{return state(app.page(),"passwordHistory")==false;},"Return to saved passwords");
     gui_test::same_color(saved_card_color(),expected);
     click(app,"clipboardHistory");
     pump([&]{return state(app.page(),"passwordHistory")==true;},"Show clipboard history");
-    click(app,"save-history-0");
+    click(app,("save-history-"+state(app.page(),"passwords")["rows"][0]["id"].get<std::string>()).c_str());
     finish_input(app);
     auto history=read_json(passwords_path);
     assert(history["passwords"].back()["value"]=="history" && history["clipboard_history"]==Json::array({"history"}));
     assert(read_file(passwords_path)=="{\n  \"passwords\": "+history["passwords"].dump()+
         ",\n  \"clipboard_history\": "+history["clipboard_history"].dump()+"\n}\n");
+    auto history_id=state(app.page(),"passwords")["rows"][0]["id"].get<std::string>();
+    assert(rect(app,"history-value-"+history_id).right<=rect(app,"save-history-"+history_id).left);
+    assert(rect(app,"savedPasswords").top>=rect(app,"passwordSearch").bottom);
+    assert(std::abs(rect(app,"savedPasswords").left-rect(app,"passwordSearch").left)<1);
     screenshot(app.window(),L"clipboard-history.png");
+    click(app,"selectAllPasswords");
+    click(app,"deleteSelectedPasswords");
+    finish_input(app);
+    assert(read_json(passwords_path).at("clipboard_history").empty());
 
     click(app,"newPassword");
     const auto empty_password=state(app.page(),"passwordCell").get<std::string>();
@@ -775,9 +808,36 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     assert(state(app.page(),"passwordCell")=="" && !state(app.page(),"passwordDrafts").contains(empty_password));
     assert(!window(app).Root()->FindById("password-"+empty_password));
 
-    navigate(app,"tabRoots","roots");
-    click(app,("delete-root-"+root_id).c_str());
+    assert(ui_page_call_json(app.page(),"searchPasswords",R"("HISTORY")")==0);
+    pump([&]{return state(app.page(),"passwords")["rows"].size()==1;},"Filter saved password");
+    click(app,"selectAllPasswords");
+    click(app,"deleteSelectedPasswords");
     finish_input(app);
+    assert(read_json(passwords_path)["passwords"].size()==1);
+    navigate(app,"tabRoots","roots");
+    ui_window_set_size(app.window(),850,560);
+    click(app,("enabled-root-"+root_id).c_str());
+    finish_input(app);
+    ui_window_relayout(app.window());
+    const auto card=rect(app,"root-row-"+root_id), remove=rect(app,"delete-root-"+root_id);
+    const auto heading=rect(app,"rootEnabledHeading"), toggle=rect(app,"enabled-root-"+root_id);
+    // The unlabeled switch paints its 40-DIP track two DIPs from the left.
+    assert(std::abs((heading.left+heading.right)/2-(toggle.left+22))<1);
+    assert(remove.right<=card.right-12);
+    auto* hit=window(app).Root()->HitTest(remove.right-2,(remove.top+remove.bottom)/2);
+    assert(hit && hit->id=="delete-root-"+root_id);
+    screenshot(app.window(),L"roots-narrow.png");
+    assert(!read_roots(root_path).back().enabled);
+    assert(ui_page_call_json(app.page(),"searchRoots",R"("new-root")")==0);
+    assert(state(app.page(),"shownRootRows").size()==1);
+    click(app,"selectAllRoots");
+    const auto check=rect(app,"selectAllRoots");
+    const float middle=(check.top+check.bottom)/2;
+    assert(ui_debug_mouse_move(app.window(),check.right+1,middle)==0);
+    assert(!window(app).Root()->FindById("selectAllRoots")->hovered);
+    click(app,"deleteSelectedRoots");
+    finish_input(app);
+    ui_window_set_size(app.window(),1120,720);
     assert(read_roots(root_path).size()==1);
 }
 
@@ -1055,8 +1115,8 @@ int wmain(int argc,wchar_t** argv) {
         config["cli"]["language"]="zh";
         config["watch"]["out_dir"]=".";
         atomic_write(dir/"sunpack_config.json",config.dump());
-        atomic_write(dir/"builtin_passwords.json",R"({"passwords":[{"value":"  #中文  "}],"clipboard_history":["history"]})");
-        atomic_write(dir/"sunpack_watch_roots.txt",utf8(dir.wstring())+"\n");
+        atomic_write(dir/"builtin_passwords.json",R"({"passwords":[{"value":"  #中文  ","enabled":true}],"clipboard_history":["history"]})");
+        atomic_write(dir/"sunpack_watch_roots.txt",utf8(dir.wstring())+" | | false | false | false | true\n");
         publish_events(dir/".sunpack_watch"/"events.json",
             Json{{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}.dump()+"\n");
 

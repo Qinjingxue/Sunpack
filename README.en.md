@@ -89,7 +89,7 @@ Use the [manager](#gui-manager) to edit passwords by folder or save clipboard hi
 
 For maximum convenience, SunPack gathers passwords from several sources at run time, tries all candidate passwords at high speed — with thousands of candidates it is nearly imperceptible — and automatically finds and uses the correct one. The password sources are:
 
-- JSON password file: the installed version uses `%ProgramData%\SunPack\builtin_passwords.json`, editable on the manager's Passwords page. Records in `passwords` contain `value` and optional `scopes` listing absolute directories; omit `scopes` for global use. Watch maintains a separate `clipboard_history`, limited to 30 entries by default.
+- JSON password file: the installed version uses `%ProgramData%\SunPack\builtin_passwords.json`, editable on the manager's Passwords page. Records in `passwords` contain `value` and optional `scopes` listing absolute directories; omit `scopes` for global use. Watch maintains a separate `clipboard_history`, limited to 30 entries by default. Each saved password requires a boolean `enabled` field.
 - User input: the context menu, and the interactive password prompt launched from the CLI.
 - Clipboard: the clipboard text is read as a password before extraction.
 

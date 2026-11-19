@@ -137,7 +137,7 @@ end;
             (data / ".sunpack_watch/state.snapshot").write_bytes(b"old state")
             config = {"cli": {"language": "en"}, "watch": {"tray_enabled": False}}
             (data / "sunpack_config.json").write_text(json.dumps(config), encoding="utf-8")
-            (data / "builtin_passwords.json").write_bytes(b'{"passwords": []}\r\n')
+            (data / "builtin_passwords.json").write_bytes(b'{"passwords": [{"value":"old"}],"clipboard_history":["from clipboard"]}\r\n')
             (data / "sunpack_watch_roots.txt").write_bytes(
                 b"# keep\r\nC:\\Downloads | D:\\out | true | true | false\r\n")
             (installed / "sunpack_advanced_config.json").write_text(json.dumps({
@@ -186,8 +186,11 @@ end;
                     # completed before that application's directory was deleted.
                     if index in (1, 2):
                         assert updated["watch"]["toast_enabled"] is False
-                    assert (data / "sunpack_watch_roots.txt").read_bytes() == originals["data\\sunpack_watch_roots.txt"]
-                    assert (data / "builtin_passwords.json").read_bytes() == originals["data\\builtin_passwords.json"]
+                    assert (data / "sunpack_watch_roots.txt").read_bytes() == originals["data\\sunpack_watch_roots.txt"].replace(b"false\r\n", b"false | true\r\n")
+                    assert json.loads((data / "builtin_passwords.json").read_bytes()) == {
+                        "passwords": [{"value": "old", "enabled": True}],
+                        "clipboard_history": ["from clipboard"],
+                    }
                     assert {p.name for p in data.iterdir()} == {
                         "sunpack_config.json", "builtin_passwords.json", "sunpack_watch_roots.txt"}
                     assert not (custom / "state.snapshot").exists()

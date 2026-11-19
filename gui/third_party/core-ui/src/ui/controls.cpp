@@ -600,7 +600,7 @@ void CheckBoxWidget::OnDraw(Renderer& r) {
 float CheckBoxWidget::ContentRight_() const {
     float boxSize = 20.0f, gap = 8.0f;
     float textW = theme::kFontSizeNormal * 0.65f * (float)text_.size();
-    return rect.left + padL + boxSize + gap + textW + 8.0f;
+    return std::min(rect.right, rect.left + padL + boxSize + gap + textW + 8.0f);
 }
 
 bool CheckBoxWidget::OnMouseUp(const MouseEvent& e) {

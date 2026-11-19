@@ -44,7 +44,7 @@ def test_concurrent_nested_groups_isolate_password_failure_and_cleanup(package, 
         embedded_scan={"recursive_candidate_ratio": 0},
     )
     scopes = [
-        {"value": value, "scopes": [str(case.outer.archive_dir)]}
+        {"enabled": True, "value": value, "scopes": [str(case.outer.archive_dir)]}
         for case, values in ((healthy, healthy.passwords), (blocked, blocked.passwords[:2]))
         for value in values
     ]

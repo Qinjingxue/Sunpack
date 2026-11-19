@@ -303,10 +303,10 @@ void seed(const fs::path& dir,const RunOptions& o) {
     config["watch"]["out_dir"]=".";
     write_utf8(dir/"sunpack_config.json",config.dump(2)+"\n");
     std::string roots;
-    roots+=utf8(monitored.wstring())+"\n";
+    roots+=utf8(monitored.wstring())+" | | false | false | false | true\n";
     for(size_t i=0;i<o.roots;i++) {
         auto path=dir/(L"folder-"+std::to_wstring(i)); fs::create_directories(path);
-        roots+=utf8(path.wstring())+"\n";
+        roots+=utf8(path.wstring())+" | | false | false | false | true\n";
     }
     write_utf8(dir/"sunpack_watch_roots.txt",roots);
     std::string log; log.reserve(o.tasks*220);
@@ -330,7 +330,7 @@ void seed(const fs::path& dir,const RunOptions& o) {
         }
     }
     Json passwords=Json::array(),history=Json::array();
-    for(size_t i=0;i<o.passwords;i++) passwords.push_back({{"value","saved-password-"+std::to_string(i)}});
+    for(size_t i=0;i<o.passwords;i++) passwords.push_back({{"value","saved-password-"+std::to_string(i)},{"enabled",true}});
     for(size_t i=0;i<o.history;i++) history.push_back("clipboard-password-"+std::to_string(i));
     write_utf8(dir/"builtin_passwords.json",Json{{"passwords",passwords},{"clipboard_history",history}}.dump(2)+"\n");
 }

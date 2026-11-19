@@ -367,7 +367,7 @@ fn candidate_wait_history_survives_pending_retirement_and_expires_with_a_bound()
 #[test]
 fn root_policy_normalizes_only_equivalent_nonrecursive_output_layouts() {
     let path = PathBuf::from(r"C:\downloads");
-    let mut implicit = Root { path: path.clone(), output: None, recursive: false,
+    let mut implicit = Root { enabled: true, path: path.clone(), output: None, recursive: false,
         deep: true, scanned: false };
     let mut explicit = implicit.clone();
     explicit.output = Some(path);
@@ -386,7 +386,7 @@ fn root_policy_normalizes_only_equivalent_nonrecursive_output_layouts() {
 #[test]
 fn root_scopes_route_nested_descendants_and_keep_prefix_siblings() {
     let roots: Vec<_> = [r"C:\", r"C:\watch", r"C:\watch\sub", r"C:\watch\sub\deep", r"C:\watch\sub-old"]
-        .into_iter().map(|path| Root {
+        .into_iter().map(|path| Root { enabled: true,
             path: PathBuf::from(path), output: None, recursive: true, deep: false, scanned: false,
         }).collect();
     let scopes = root_scopes(&roots, &[]);
@@ -536,7 +536,7 @@ fn native_burst_updates_activity_before_scheduler_drains_its_coalesced_signal() 
     let directory = marker.with_extension("work");
     let watched = directory.join("watched");
     fs::create_dir_all(&watched).unwrap();
-    let root = Root { path: watched.clone(), output: None, recursive: true, deep: false, scanned: true };
+    let root = Root { enabled: true, path: watched.clone(), output: None, recursive: true, deep: false, scanned: true };
     let state = directory.join("state");
     let journal = Arc::new(journal::Journal::open(&state, 7).unwrap());
     let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
@@ -583,7 +583,7 @@ fn business_root_routes_password_file_notification_only_to_password_reload() {
     let directory = marker.with_extension("work");
     let watched = directory.join("watched");
     fs::create_dir_all(&watched).unwrap();
-    let root = Root { path: watched.clone(), output: None, recursive: true, deep: false, scanned: true };
+    let root = Root { enabled: true, path: watched.clone(), output: None, recursive: true, deep: false, scanned: true };
     let state = directory.join("state");
     let journal = Arc::new(journal::Journal::open(&state, 7).unwrap());
     let hub = Arc::new(Hub::new());
@@ -605,7 +605,7 @@ fn business_root_routes_password_file_notification_only_to_password_reload() {
 #[test]
 fn relative_roots_use_process_directory_not_roots_file_directory() {
     let marker = crate::test_support::temp_file("relative_watch_roots", b"");
-    fs::write(&marker, "relative-input | child-output | false | true | false\n").unwrap();
+    fs::write(&marker, "relative-input | child-output | false | true | false | true\noffline | | false | false | false | false\n").unwrap();
     let roots = read_roots(&marker).unwrap();
     let input = std::env::current_dir().unwrap().join("relative-input");
     assert_eq!(roots.len(), 1);
@@ -697,7 +697,7 @@ fn content_batches_do_not_invalidate_topology_but_overflow_does() {
 fn parent_subscription_is_shared_and_routes_only_affected_roots() {
     let temp = std::env::temp_dir().join(format!("sunpack-parent-sharing-{}", std::process::id()));
     std::fs::create_dir_all(&temp).unwrap();
-    let roots = ["one", "two", "missing/child"].map(|name| Root {
+    let roots = ["one", "two", "missing/child"].map(|name| Root { enabled: true,
         path: temp.join(name), output: None, recursive: false, deep: false, scanned: false,
     });
     let groups = parent_memberships(roots.iter());
@@ -714,7 +714,7 @@ fn parent_subscription_is_shared_and_routes_only_affected_roots() {
 
 #[test]
 fn completion_blockers_follow_reloaded_roots_without_losing_recovery_routes() {
-    let root = Root { path: r"C:\watch".into(), output: None,
+    let root = Root { enabled: true, path: r"C:\watch".into(), output: None,
         recursive: true, deep: false, scanned: false };
     let id = key(&root.path);
     let recursive = NativeDiscoveryScope::new(r"C:\watch".into(), None, Vec::new());
@@ -756,7 +756,7 @@ fn completion_blockers_follow_reloaded_roots_without_losing_recovery_routes() {
 fn retained_regroup_handoff_persists_the_new_current_root() {
     let marker = crate::test_support::temp_file("watch_rerouted_recovery", b"");
     let directory = marker.with_extension("state");
-    let root = Root { path: r"C:\watch".into(), output: None,
+    let root = Root { enabled: true, path: r"C:\watch".into(), output: None,
         recursive: true, deep: false, scanned: false };
     let root_id = key(&root.path);
     let roots = BTreeMap::from([(root_id.clone(), (root.clone(),
