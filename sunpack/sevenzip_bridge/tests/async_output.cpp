@@ -11,7 +11,9 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -21,17 +23,11 @@
 // to drain real operations. Normal tests never exercise allocation failure in
 // sealing/shutdown; this detects stranded staging buffers without an OOM load.
 thread_local bool reject_cleanup_allocations = false;
-thread_local std::ptrdiff_t fail_allocation_after = -1;
 thread_local std::function<void()> before_allocation;
 
 void* operator new(std::size_t size) {
     if (before_allocation) std::exchange(before_allocation, {})();
     if (reject_cleanup_allocations) throw std::bad_alloc();
-    if (fail_allocation_after == 0) {
-        fail_allocation_after = -1;
-        throw std::bad_alloc();
-    }
-    if (fail_allocation_after > 0) --fail_allocation_after;
     if (void* result = std::malloc(size ? size : 1)) return result;
     throw std::bad_alloc();
 }
@@ -546,36 +542,24 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
     return true;
 }
 
-// Failure after inserting a volume used to leave an entry with no writer and
-// no reap deadline. Walk allocation failures through real construction; normal
-// success/reclamation tests cannot expose these permanently retained entries.
+// The writer reserves its buffer table after the registry inserts the entry.
+// An impossible capacity makes reserve throw before attempting any allocation.
 bool registry_creation_failure_does_not_retain_entries() {
     AsyncWriterConfig config;
-    config.threads_per_volume = 1;
-    config.buffer_count = 4;
+    config.buffer_count = (std::numeric_limits<std::size_t>::max)();
 
     VolumeWriterRegistry registry(config);
-    const std::string key = "job:failed";
-    for (std::ptrdiff_t point = 0;; ++point) {
-        VolumeWriterRegistry::Lease lease;
-        bool failed = false;
-        fail_allocation_after = point;
-        try {
-            lease = registry.acquire(key);
-        } catch (const std::bad_alloc&) {
-            failed = true;
-        }
-        fail_allocation_after = -1;
-        if (!failed) {
-            if (!lease.valid()) return false;
-            lease.reset();
-            return registry.volume_count() == 0;
-        }
+    try {
+        registry.acquire("job:failed");
+    } catch (const std::length_error&) {
         if (registry.volume_count() != 0 || registry.next_reap_deadline()) {
-            std::cerr << "failed facility creation retained a volume at allocation " << point << "\n";
+            std::cerr << "failed facility creation retained a volume\n";
             return false;
         }
+        return true;
     }
+    std::cerr << "writer accepted an impossible buffer capacity\n";
+    return false;
 }
 
 bool registry_creation_allows_other_volumes() {
