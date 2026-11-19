@@ -28,6 +28,57 @@ fn finish(index: &mut Index, mut prepared: Prepared) -> bool {
     }
 }
 #[test]
+fn compaction_sharing_conflict_keeps_the_index_writable() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let dir = Sandbox::new();
+    let mut index = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root).unwrap();
+    let padding = Delta::Journals(vec![("scope".into(), "test-volume".repeat(384), 1)]);
+    for _ in 0..1024 {
+        index.append(&padding).unwrap();
+    }
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    index.finish_rebuild().unwrap();
+    assert!(fs::metadata(&index.path).unwrap().len() >= 4 * 1024 * 1024);
+    let blocker = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&index.path).unwrap();
+    let (send, receive) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = index.compact().and_then(|_| {
+            assert!(index.reconcile_journals(&[("scope".into(), "test-volume".into(), 2)])?);
+            index.finish_rebuild()
+        });
+        send.send(result).unwrap();
+        index
+    });
+    let result = receive.recv_timeout(Duration::from_secs(5));
+    drop(blocker);
+    let index = worker.join().unwrap();
+    result.expect("dedup must not wait for the external handle").unwrap();
+    assert!(fs::metadata(&index.path).unwrap().len() >= 4 * 1024 * 1024);
+    assert!(!index.path.with_extension("tmp").exists());
+    drop(index);
+    let mut index = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root).unwrap();
+    assert!(!index.needs_rebuild());
+    assert_eq!(index.journals["scope"], ("test-volume".into(), 2));
+    let stamp = Delta::Journals(vec![("scope".into(), "test-volume".into(), 2)]);
+    for _ in 0..1024 {
+        index.append(&stamp).unwrap();
+    }
+    index.compact().unwrap();
+    assert!(fs::metadata(&index.path).unwrap().len() < 4096);
+    assert!(index.reconcile_journals(&[("scope".into(), "test-volume".into(), 3)]).unwrap());
+    index.finish_rebuild().unwrap();
+    drop(index);
+    let reopened = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root).unwrap();
+    assert!(!reopened.needs_rebuild());
+    assert_eq!(reopened.journals["scope"], ("test-volume".into(), 3));
+}
+
+#[test]
 fn live_identity_alias_lifetime_and_mode_reset() {
     let dir = Sandbox::new(); let first = dir.file("first.zip", b"confirmed archive bytes");
     let mut alias = first.clone(); alias.entry_path = dir.0.join("alias.zip").to_string_lossy().into_owned();

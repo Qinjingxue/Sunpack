@@ -23,7 +23,7 @@ fn foreground_output_reservation_survives_scheduler_replacement_and_is_published
         let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
         options.catalog_update(&catalog, &scope, None).unwrap();
         assert!(catalog.is_owned(member.to_str().unwrap()));
-        assert!(catalog.candidate_paths(&scope, None).is_empty());
+        assert!(catalog.candidate_paths(&scope).is_empty());
         *watch.external.current.write().unwrap() = Some(ExternalOutputs {
             journal: Arc::downgrade(&journal), scopes: Arc::from([scope.clone()]),
             catalog: Arc::clone(&catalog), options: options.clone(), hub: Weak::new(),
@@ -335,9 +335,17 @@ fn candidate_wait_history_survives_pending_retirement_and_expires_with_a_bound()
     assert_eq!(history.len(), 2048);
     assert_eq!(history.paths.len(), 2048);
     assert!(!history.paths.contains_key("path"));
+    let survivor_at = at + std::time::Duration::from_secs(1);
+    assert!(history.admit(survivor_at, "survivor", 0));
     history.clear_expired(at + std::time::Duration::from_secs(30));
+    assert_eq!(history.len(), 1);
+    assert!(history.paths.capacity() <= 256);
+    assert!(history.readiness.capacity() <= 256);
+    assert!(!history.admit(at + std::time::Duration::from_secs(30), "survivor", 0));
+    history.clear_expired(survivor_at + std::time::Duration::from_secs(30));
     assert!(history.paths.is_empty());
     assert!(history.deadline().is_none());
+    let at = survivor_at + std::time::Duration::from_secs(30);
     let child = r"C:\retired\pending.zip";
     let sibling = r"C:\retired-other\pending.zip";
     for path in [child, sibling] {

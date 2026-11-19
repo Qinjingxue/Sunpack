@@ -87,6 +87,15 @@ impl NativeDirectorySnapshot {
         )
     }
 
+    pub(crate) fn same_view(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.table, &other.table)
+            && match (&self.selected_rows, &other.selected_rows) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
     pub(crate) fn file_route_view(&self, route: u8) -> Self {
         self.view(
             self.rows()
@@ -1563,40 +1572,27 @@ impl NativeWatchCatalog {
 
     pub(crate) fn candidate_paths(
         &self,
-
         scope: &crate::scan::scope::NativeDiscoveryScope,
-        under: Option<&str>,
     ) -> Vec<String> {
-        (|| {
-            let mut target = crate::path_keys::path_key(under.unwrap_or(&scope.root));
-            target.truncate(target.trim_end_matches('\\').len());
-            let mut paths: Vec<String> = self
-                .catalogs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .scopes
-                .get(&crate::path_keys::path_key(&scope.root))
-                .into_iter()
-                .flat_map(|catalog| {
-                    catalog
-                        .rows
-                        .range::<str, _>((
-                            std::ops::Bound::Included(target.as_str()),
-                            std::ops::Bound::Unbounded,
-                        ))
-                        .take_while(|(key, _)| key.starts_with(&target))
-                        .filter(|(key, _)| {
-                            key.as_ref() == target || key[target.len()..].starts_with('\\')
-                        })
-                        .filter(|(_, row)| row.persistent() && !row.is_dir())
-                        .map(|(_, row)| row.path())
-                })
-                .collect();
-            // Admission owns the fresh observation. The catalog supplies
-            // paths only, without opening each file before the actual probe.
-            paths.retain(|path| scope.contains(path) && !self.is_owned(path));
-            paths
-        })()
+        let target = scope.key();
+        let descendants = crate::path_keys::descendant_key_range(target);
+        let root = crate::path_keys::path_key(&scope.root);
+        let mut paths: Vec<_> = {
+            let catalogs = self.catalogs.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(catalog) = catalogs.scopes.get(&root) else { return Vec::new(); };
+            catalog.rows.get_key_value(target).into_iter()
+                .chain(catalog.rows.range::<str, _>((
+                    std::ops::Bound::Included(descendants.start.as_str()),
+                    std::ops::Bound::Excluded(descendants.end.as_str()),
+                )))
+                .filter(|(key, row)| row.persistent() && !row.is_dir() && scope.contains_key(key))
+                .map(|(_, row)| row.path())
+                .collect()
+        };
+        // Admission owns the fresh observation. The catalog supplies
+        // paths only, without opening each file before the actual probe.
+        paths.retain(|path| !self.is_owned(path));
+        paths
     }
 
     pub(crate) fn generated_observation(&self, path: &str) -> Option<NativeWatchObservation> {

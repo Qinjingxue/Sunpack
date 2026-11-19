@@ -108,6 +108,7 @@ std::vector<ui::TextHighlight> FindController::match(Search& s,const std::string
     return ranges;
 }
 void FindController::refresh(Search& s) {
+    if(s.query.empty() && page_value(page_,(std::string(s.scope)+"Query").c_str())=="") return;
     auto argument=Json(s.scope).dump();
     if(ui_page_call_json(page_,"searchSources",argument.c_str())!=0) throw std::runtime_error("uiBindingFailed");
     auto snapshot=page_value(page_,"searchSnapshot",true);
@@ -118,7 +119,7 @@ void FindController::refresh(Search& s) {
     const bool had_results=!s.targets.empty();
     auto old=changed?Selection{}:s.targets.empty()?std::move(s.saved):selection(s);
     s.saved={};
-    if(changed || query.empty()) clear_matches(s);
+    if(changed) clear_matches(s);
     if(changed) s.pending=0;
     s.before=snapshot.value("before",false); s.after=snapshot.value("after",false);
     s.query=std::move(query); s.targets.clear(); s.byId.clear(); s.ticks.clear();

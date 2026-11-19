@@ -57,8 +57,9 @@ std::string event(const std::string& type,const fs::path& p,int ts) {
 void projection(Fixture& f) {
     auto p=f.dir/"events.json", source=f.dir/L"伪装.bin.001";
     std::array<std::string,3> history;
-    for(int i=0;i<350;++i) {
-        auto run=i%2==0?2:i<175?0:1;
+    constexpr int records=420;
+    for(int i=0;i<records;++i) {
+        auto run=i%2==0?2:i<records/2?0:1;
         history[run]+=event("done",f.dir/("carrier-"+std::to_string(i)+".001"),i+1);
     }
     publish_events(p,history[0]);
@@ -70,7 +71,7 @@ void projection(Fixture& f) {
     auto moved_index=cold_index; moved_index+=L".away";
     // An older run outside the newest page must not block that page's query.
     fs::rename(cold_index,moved_index);
-    View view; int next=349; size_t pages=0;
+    View view; int next=records-1; size_t pages=0;
     for(;;) {
         auto result=log.query({},view);
         if(!pages) fs::rename(moved_index,cold_index);
@@ -80,9 +81,10 @@ void projection(Fixture& f) {
         if(!result["hasMore"].get<bool>()) break;
         view.task_cursor=result["next"].get<std::string>();
     }
-    assert(next==-1 && pages==4);
-    view.task_cursor.clear(); view.task_query="carrier-349";
-    assert(log.query({},view)["rows"].size()==1);
+    assert(next==-1 && pages==5);
+    view.task_cursor.clear(); view.task_query="carrier-1.001";
+    auto matched=log.query({},view);
+    assert(matched["rows"].size()==1 && matched["rows"][0]["name"]==view.task_query);
     log.cancelled=[]{return true;}; view.task_query="not-present";
     assert(log.query({},view).is_null()); log.cancelled={};
     // A background rebuild can reuse the revision. Ordinary appends cannot

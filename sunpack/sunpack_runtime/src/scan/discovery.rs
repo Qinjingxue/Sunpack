@@ -504,6 +504,10 @@ impl NativeEmbeddedBatch {
     // Volume evidence extends the same physical discovery frontier. Index raw
     // row references only when needed, then consume each source/stem once.
     fn enqueue_volume_peers(&mut self, table: &mut NativeCandidateTable) {
+        if self.peer_rows.as_ref().is_some_and(HashMap::is_empty) {
+            self.nominated = self.pending_volumes.len();
+            return;
+        }
         let mut selected = HashSet::new();
         let mut relations = HashMap::new();
         for item in &self.pending_volumes[self.nominated..] {
@@ -941,7 +945,11 @@ impl NativeEmbeddedBatch {
 impl NativeCandidateTable {
     pub(crate) fn extend(&mut self, other: &mut Self) {
         self.rows.append(&mut other.rows);
-        self.relation_sources.append(&mut other.relation_sources);
+        for snapshot in other.relation_sources.drain(..) {
+            if self.relation_sources.last().is_none_or(|last| !last.same_view(&snapshot)) {
+                self.relation_sources.push(snapshot);
+            }
+        }
         self.volume_seeds.append(&mut other.volume_seeds);
         self.volume_entry_peers.append(&mut other.volume_entry_peers);
     }

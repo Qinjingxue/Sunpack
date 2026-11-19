@@ -83,6 +83,11 @@ namespace sunpack::sevenzip
         return config;
     }
 
+    inline bool is_missing_input_file(HRESULT hr) noexcept
+    {
+        return hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    }
+
     inline void record_input_error(ExtractInputTrace *trace, const std::wstring &path,
                                    HRESULT hr, [[maybe_unused]] UInt64 offset = 0,
                                    [[maybe_unused]] UInt64 source = 0,
@@ -96,8 +101,7 @@ namespace sunpack::sevenzip
         trace->last_read_requested = requested;
 #else
         // Only a missing file needs the source name for failure classification.
-        if (hr != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
-            hr != HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)) return;
+        if (!is_missing_input_file(hr)) return;
 #endif
         try { trace->last_source_path = path; }
         catch (const std::bad_alloc &) { trace->last_source_path.clear(); }

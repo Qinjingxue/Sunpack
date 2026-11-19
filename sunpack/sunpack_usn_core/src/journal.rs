@@ -530,7 +530,7 @@ fn scan_change_reasons(
 ) -> io::Result<ChangeReasons> {
     let mut next_usn = previous_usn;
     let mut reasons = ChangeReasons::default();
-    let mut found = false;
+    let mut found_current = false;
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     'journal: while next_usn <= current_usn {
         let bytes_returned = read(next_usn, &mut output)?;
@@ -542,8 +542,8 @@ fn scan_change_reasons(
             let record = next_journal_record(&mut records)?;
             match record_change_reason(record, expected_file_id, previous_usn, current_usn)? {
                 Break(()) => break 'journal,
-                Continue(Some(reason)) => {
-                    found = true;
+                Continue(Some((usn, reason))) => {
+                    found_current |= usn == current_usn;
                     reasons.observe(reason);
                 }
                 Continue(None) => {}
@@ -551,7 +551,7 @@ fn scan_change_reasons(
         }
         next_usn = returned_next;
     }
-    if !found {
+    if !found_current {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "USN journal did not contain the current file record",
@@ -565,7 +565,7 @@ fn record_change_reason(
     expected_file_id: u128,
     previous_usn: i64,
     current_usn: i64,
-) -> io::Result<ControlFlow<(), Option<u32>>> {
+) -> io::Result<ControlFlow<(), Option<(i64, u32)>>> {
     if record.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -593,9 +593,8 @@ fn record_change_reason(
     if usn <= previous_usn || file_id_value(&record[8..file_id_end]) != expected_file_id {
         return Ok(Continue(None));
     }
-    Ok(Continue(Some(u32::from_le_bytes(
-        record[reason_offset..reason_offset + 4].try_into().unwrap(),
-    ))))
+    let reason = u32::from_le_bytes(record[reason_offset..reason_offset + 4].try_into().unwrap());
+    Ok(Continue(Some((usn, reason))))
 }
 
 fn file_id_value(bytes: &[u8]) -> u128 {

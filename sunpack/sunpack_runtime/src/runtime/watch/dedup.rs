@@ -662,9 +662,19 @@ impl Index {
         write(&Delta::Journals(self.journals.iter().map(|(scope, (volume, id))| (scope.clone(), volume.clone(), *id)).collect()))?;
         for r in self.records.values() { write(&Delta::Put(Cow::Borrowed(r)))?; }
         if self.ready { write(&Delta::Ready)?; }
-        file.sync_all()?; drop(file); self.file = None;
-        crate::io::atomic_file::replace(&temp, &self.path)?;
-        self.file = Some(OpenOptions::new().append(true).open(&self.path)?); self.seq = seq; self.edits = 0; Ok(())
+        file.sync_all()?;
+        drop(file);
+        self.file = None;
+        match crate::io::atomic_file::replace_once(&temp, &self.path) {
+            Ok(()) => self.seq = seq,
+            Err(error) if crate::io::atomic_file::sharing_conflict(&error) => {
+                let _ = fs::remove_file(&temp);
+            }
+            Err(error) => return Err(error),
+        }
+        self.file = Some(OpenOptions::new().append(true).open(&self.path)?);
+        self.edits = 0;
+        Ok(())
     }
 }
 fn remove_bucket<K: std::hash::Hash + Eq>(map: &mut HashMap<K, RecordIds>, key: &K, id: u64) {

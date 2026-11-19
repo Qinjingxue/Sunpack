@@ -755,7 +755,7 @@ bool fixed_volume_geometry(const sunpack::sevenzip::VolumeAttemptPlan& plan) {
 class VolumeProbeCache {
     struct Entry {
         std::size_t layout;
-        std::vector<std::pair<std::size_t, std::size_t>> sources;
+        std::vector<std::size_t> observed_sources;
         sunpack::sevenzip::PasswordTestResult result;
         std::vector<unsigned long long> sizes;
         unsigned long long trim_total = 0;
@@ -786,8 +786,10 @@ public:
     const sunpack::sevenzip::PasswordTestResult* find(
         const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt) const {
         for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
-            if (it->layout == attempt.layout && std::all_of(it->sources.begin(), it->sources.end(),
-                [&](const auto& source) { return attempt.sources[source.first] == source.second; }) &&
+            if (it->layout == attempt.layout &&
+                std::equal(it->observed_sources.begin(), it->observed_sources.end(),
+                    it->result.observed_volume_slots->begin(),
+                    [&](auto source, auto slot) { return attempt.sources[slot] == source; }) &&
                 (fixed_ || (it->trim_total == trim_total(plan, attempt) &&
                     std::equal(it->sizes.begin(), it->sizes.end(), attempt.sources.begin(), attempt.sources.end(),
                         [&](auto size, auto source) { return size == size_of(plan, source); })))) return &it->result;
@@ -810,8 +812,8 @@ public:
         if (find(plan, attempt)) return false;
         while (entries_.size() >= capacity) entries_.pop_front();
         Entry entry{attempt.layout, {}, *attempt.probe, {}, 0};
-        entry.sources.reserve(observed->size());
-        for (const auto slot : *observed) entry.sources.emplace_back(slot, attempt.sources[slot]);
+        entry.observed_sources.reserve(observed->size());
+        for (const auto slot : *observed) entry.observed_sources.push_back(attempt.sources[slot]);
         if (!fixed_) {
             entry.trim_total = trim_total(plan, attempt);
             entry.sizes.reserve(attempt.sources.size());

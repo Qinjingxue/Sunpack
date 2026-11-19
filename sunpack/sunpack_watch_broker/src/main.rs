@@ -707,6 +707,10 @@ impl PipeListener {
     fn listen(&mut self, first_instance: bool) -> io::Result<()> {
         debug_assert!(!self.is_listening());
         let pipe = create_pipe(&self.name, &self.descriptor, first_instance)?;
+        self.listen_on(pipe)
+    }
+
+    fn listen_on(&mut self, pipe: OwnedHandle) -> io::Result<()> {
         if unsafe { ResetEvent(self.event.raw()) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -714,17 +718,19 @@ impl PipeListener {
             hEvent: self.event.raw(),
             ..Default::default()
         };
-        let connected = unsafe { ConnectNamedPipe(pipe.raw(), self.overlapped.as_mut()) };
-        let pending = if connected != 0 {
-            false
-        } else {
-            let error = unsafe { GetLastError() };
-            if error == ERROR_PIPE_CONNECTED {
-                false
-            } else if error == ERROR_IO_PENDING {
-                true
-            } else {
-                return Err(io::Error::from_raw_os_error(error as i32));
+        let pending = loop {
+            if unsafe { ConnectNamedPipe(pipe.raw(), self.overlapped.as_mut()) } != 0 {
+                break false;
+            }
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => break false,
+                ERROR_IO_PENDING => break true,
+                ERROR_NO_DATA => {
+                    if unsafe { DisconnectNamedPipe(pipe.raw()) } == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                error => return Err(io::Error::from_raw_os_error(error as i32)),
             }
         };
         // A client may connect before ConnectNamedPipe. Route that case

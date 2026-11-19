@@ -116,6 +116,14 @@ fn scans_v2_v3_and_v4_reasons_between_usn_bounds() {
         }).unwrap();
         assert_eq!(reasons.all, USN_REASON_CLOSE | 0x12);
         assert_eq!(reasons.without_close, 0x02);
+        let mut incomplete = 103i64.to_le_bytes().to_vec();
+        incomplete.extend(record(major, expected, 101, 0x02));
+        incomplete.extend(record(major, expected ^ 1, 102, 0x04));
+        let error = scan_change_reasons(expected, 100, 102, |_, output| {
+            output[..incomplete.len()].copy_from_slice(&incomplete);
+            Ok(incomplete.len())
+        }).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 }
 

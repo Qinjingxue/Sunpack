@@ -127,10 +127,15 @@ namespace sunpack::sevenzip
 
     void VolumeWriterRegistry::reap_idle()
     {
+        reap_idle_at(std::nullopt);
+    }
+
+    void VolumeWriterRegistry::reap_idle_at(std::optional<std::chrono::steady_clock::time_point> cutoff)
+    {
         std::vector<std::shared_ptr<AsyncFileWriter>> retired;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = cutoff ? *cutoff : std::chrono::steady_clock::now();
             std::size_t retained_states = 0;
             for (auto it = entries_.begin(); it != entries_.end();)
             {

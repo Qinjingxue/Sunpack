@@ -532,6 +532,9 @@ struct CleanupTasks {
 impl CleanupTasks {
     fn retire(&mut self, id: u64, failures: Vec<CleanupResult>) -> Vec<CleanupResult> {
         if self.active.remove(&id).is_some() {
+            if self.active.capacity() > 256 {
+                crate::collections::trim_map(&mut self.active);
+            }
             for failure in failures {
                 self.record_failure(failure);
             }
@@ -1295,11 +1298,12 @@ impl<'run, O: Observer> Run<'run, O> {
         let (mut failures, pending) = {
             let mut tasks = self.cleanup_tasks.lock().unwrap();
             let failures = tasks.take_failures(root);
-            let ids: Vec<_> = tasks.active.iter().filter_map(|(&id, task)| {
+            let pending: Vec<_> = tasks.active.extract_if(|_, task| {
                 root.is_none_or(|root| task.paths.iter().any(|path| relative_to(path, root).is_some()))
-                    .then_some(id)
-            }).collect();
-            let pending: Vec<_> = ids.into_iter().filter_map(|id| tasks.active.remove(&id)).map(|task| task.task).collect();
+            }).map(|(_, task)| task.task).collect();
+            if tasks.active.capacity() > 256 {
+                crate::collections::trim_map(&mut tasks.active);
+            }
             (failures, pending)
         };
         for pending in pending {

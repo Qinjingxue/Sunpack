@@ -653,7 +653,7 @@ bool registry_reclaims_aggregate_small_pools(const std::filesystem::path& direct
     return true;
 }
 
-bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
+bool registry_reclaims_idle_facilities() {
     AsyncWriterConfig config;
     config.threads_per_volume = 2;
     config.buffer_count = 8;
@@ -692,7 +692,12 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
             return false;
         }
     }
-    registry.reap_idle();
+    const auto deadline = registry.next_reap_deadline();
+    if (!deadline) {
+        std::cerr << "persistent facility did not arm its idle deadline\n";
+        return false;
+    }
+    registry.reap_idle_for_test(*deadline - config.idle_timeout);
     if (persistent_writer.expired()) {
         std::cerr << "persistent facility was reclaimed before its idle timeout\n";
         return false;
@@ -701,8 +706,7 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         std::cerr << "persistent entry disappeared before reclamation\n";
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    registry.reap_idle();
+    registry.reap_idle_for_test(*deadline);
     // The volume state survives facility reclamation.
     if (registry.volume_count() != 1) {
         std::cerr << "persistent volume state did not survive reclamation\n";
@@ -720,8 +724,7 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
             return false;
         }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    registry.reap_idle();
+    registry.reap_idle_for_test(std::chrono::steady_clock::now() + config.idle_timeout);
     if (registry.volume_count() > 64) {
         std::cerr << "persistent volume retention cap was exceeded\n";
         return false;
@@ -808,7 +811,7 @@ int main() {
         registry_routes_by_volume_and_releases_leases(directory) &&
         registry_reclaims_aggregate_small_pools(directory) &&
         registry_trims_payloads_at_completion(directory) &&
-        registry_reclaims_idle_facilities(directory);
+        registry_reclaims_idle_facilities();
     std::error_code error;
     std::filesystem::remove_all(directory, error);
     if (!passed) {

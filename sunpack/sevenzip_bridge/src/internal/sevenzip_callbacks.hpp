@@ -200,6 +200,9 @@ namespace sunpack::sevenzip
                 if (!stream->is_open())
                 {
                     volume_open_failed_ = true;
+#ifndef SUP7Z_DEBUG
+                    if (is_missing_input_file(input_error()))
+#endif
                     failed_volume_name_ = std::filesystem::path(path).filename().wstring();
                     return E_FAIL;
                 }
@@ -1257,7 +1260,7 @@ namespace sunpack::sevenzip
         void apply_file_snapshot(std::size_t trace_index, AsyncFileWriter::FileSnapshot snapshot)
         {
             auto &item = output_trace_.items[trace_index];
-            const bool decoder_ok = snapshot.operation_result_set && snapshot.operation_result == kOpOk;
+            const bool decoder_ok = snapshot.decoder_succeeded;
             const bool output_ok = snapshot.closed && snapshot.hresult == S_OK;
             if (decoder_ok && output_ok)
             {
@@ -1265,7 +1268,6 @@ namespace sunpack::sevenzip
             }
 
             item.bytes_written = snapshot.written_bytes;
-            item.operation_result = snapshot.operation_result;
             item.magic = std::move(snapshot.magic);
             item.has_mtime_ns = snapshot.has_mtime_ns;
             item.mtime_ns = snapshot.mtime_ns;

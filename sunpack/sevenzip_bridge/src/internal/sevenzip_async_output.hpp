@@ -167,9 +167,8 @@ namespace sunpack::sevenzip
         struct FileSnapshot
         {
             UInt64 written_bytes = 0;
-            Int32 operation_result = 0;
             HRESULT hresult = S_OK;
-            bool operation_result_set = false;
+            bool decoder_succeeded = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
             std::vector<unsigned char> magic;
@@ -279,12 +278,11 @@ namespace sunpack::sevenzip
             std::size_t peak_active_data_writes = 0;
 #endif
             UInt64 written_bytes = 0;
-            Int32 operation_result = 0;
             HRESULT hresult = S_OK;
 #ifdef SUP7Z_DEBUG
             ArchiveMetadataErrors metadata_errors;
 #endif
-            bool operation_result_set = false;
+            bool decoder_succeeded = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
             std::vector<unsigned char> magic;
@@ -783,8 +781,7 @@ namespace sunpack::sevenzip
                 return false;
             }
             std::lock_guard<std::mutex> lock(mutex_);
-            file->operation_result = operation_result;
-            file->operation_result_set = true;
+            file->decoder_succeeded = operation_result == 0;
             // new_writes includes staging; the cursor also covers replayed bytes.
             return operation_result != 0 && (file->new_writes || file->next_write_offset != 0);
         }
@@ -801,8 +798,7 @@ namespace sunpack::sevenzip
             {
                 // Reconcile existing receipts before releasing a settled file.
                 // A later withdrawal can use the newly finished ranges too.
-                if (!lock.try_lock() || !file->closed || file->hresult != S_OK ||
-                    !file->operation_result_set || file->operation_result != 0)
+                if (!lock.try_lock() || !file->closed || file->hresult != S_OK || !file->decoder_succeeded)
                     return snapshot;
                 if (file->replay) save_file_receipt(*file, *file->replay);
             }
@@ -811,9 +807,8 @@ namespace sunpack::sevenzip
                 lock.lock();
             }
             snapshot.written_bytes = file->written_bytes;
-            snapshot.operation_result = file->operation_result;
             snapshot.hresult = file->hresult;
-            snapshot.operation_result_set = file->operation_result_set;
+            snapshot.decoder_succeeded = file->decoder_succeeded;
             snapshot.has_mtime_ns = file->has_mtime_ns;
             snapshot.mtime_ns = file->mtime_ns;
             snapshot.magic = std::move(file->magic);
@@ -839,8 +834,6 @@ namespace sunpack::sevenzip
             producer_cv_.notify_all();
             if (state_->space_gate) state_->space_gate->wake_waiters();
             seal_job_files(nullptr);
-            if (state_->space_gate) state_->space_gate->wake_waiters();
-            producer_cv_.notify_all();
             drain_cancelled_retries();
             {
                 std::unique_lock<std::mutex> lock(mutex_);
@@ -861,8 +854,7 @@ namespace sunpack::sevenzip
             if (receipt.path.empty()) receipt.path = std::move(file.path);
             receipt.created = receipt.created || file.output_created;
             receipt.written = std::move(file.written_ranges_);
-            receipt.complete = receipt.complete || (file.closed && file.hresult == S_OK &&
-                file.operation_result_set && file.operation_result == 0);
+            receipt.complete = receipt.complete || (file.closed && file.hresult == S_OK && file.decoder_succeeded);
             receipt.has_mtime = file.has_mtime_ns;
             receipt.mtime = file.mtime_ns;
         }

@@ -43,7 +43,7 @@ std::string_view indexed_root(const fs::path& path,const RootIndex& index) {
     return "@other";
 }
 // See io/display_store.rs. Little-endian, 64 bytes per entry; no archive I/O.
-constexpr size_t EntryBytes=64, PageRows=100, PageBytes=8*1024*1024;
+constexpr size_t EntryBytes=64, IndexBlockRows=256, PageRows=100, PageBytes=8*1024*1024;
 struct Entry { int64_t time; uint64_t offset; uint32_t compressed,raw,kind,reserved; uint64_t bits[4]; };
 static_assert(sizeof(Entry)==EntryBytes);
 // Run names are immutable and owned by the readers for the whole query.
@@ -151,16 +151,22 @@ struct RunReader {
             if(!committed || committed!=revision) throw WinError(ERROR_SHARING_VIOLATION,"opReadEventLog");
         }
     }
-    Entry at(uint64_t pos) {
+    Entry at(uint64_t pos,size_t entries=IndexBlockRows) {
         if(cache.empty() || pos<cache_start || pos>=cache_start+cache.size()) {
-            cache_start=pos>255?std::max(head,pos-255):head;
+            cache_start=pos-std::min<uint64_t>(pos-head,entries-1);
             auto length=pos-cache_start+1;
             cache.resize(size_t(length)); read_at(index,cache_start*EntryBytes,cache.data(),cache.size()*EntryBytes);
         }
         return cache[size_t(pos-cache_start)];
     }
     Cursor key() const { return {current.time,name,unordered?current.offset:uint64_t(position)}; }
-    void previous() { if(position<=int64_t(filtered?0:head)) position=-1; else { --position; current=filtered?selected[size_t(position)]:at(uint64_t(position)); } }
+    void previous() {
+        if(position<=int64_t(filtered?0:head)) position=-1;
+        else {
+            --position;
+            current=filtered?selected[size_t(position)]:at(uint64_t(position),cache.empty()?PageRows:IndexBlockRows);
+        }
+    }
     Json value(std::vector<char>& packed,std::vector<char>& raw) {
         try { return decode_value(packed,raw); }
         catch(...) {

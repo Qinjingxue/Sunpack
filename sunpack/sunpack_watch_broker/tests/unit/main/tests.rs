@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn listener_recovers_when_peer_disconnects_before_connect_named_pipe() {
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    let name = format!(r"\\.\pipe\SunPack.WatchBroker.Test.early-close.{}", std::process::id());
+    let mut listener = PipeListener::new(&name).unwrap();
+    let connect = || std::fs::OpenOptions::new().read(true).write(true).open(&name).unwrap();
+    let initial_client = connect();
+    assert_eq!(unsafe { WaitForSingleObject(listener.event.raw(), 3000) }, WAIT_OBJECT_0);
+    drop(listener.accept().unwrap());
+    drop(initial_client);
+
+    let pipe = create_pipe(&listener.name, &listener.descriptor, true).unwrap();
+    drop(connect());
+    listener.listen_on(pipe).unwrap();
+    let _client = connect();
+    assert_eq!(unsafe { WaitForSingleObject(listener.event.raw(), 3000) }, WAIT_OBJECT_0);
+    assert!(listener.accept().is_ok());
+}
+
+#[test]
 fn lifetime_waits_for_first_lease_and_exits_on_stop_or_last_client() {
     // The shape/dispatcher tests never run the accept loop. This single
     // real-pipe test covers initial standby, stop, overlapping short leases

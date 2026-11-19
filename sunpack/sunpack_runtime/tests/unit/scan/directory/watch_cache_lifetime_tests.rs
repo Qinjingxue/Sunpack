@@ -92,7 +92,7 @@ fn refresh_rescans_when_output_is_published_after_enumeration() {
     let publish_path = path.to_owned();
     AFTER_CATALOG_SCAN.with(|hook| hook.set(Some(Box::new(move || {
         assert!(during.catalogs.try_lock().is_ok());
-        assert!(during.candidate_paths(&publish_scope, None).is_empty());
+        assert!(during.candidate_paths(&publish_scope).is_empty());
         let published = during.publish_outputs(&[publish_path], &[publish_scope], &publish_options, None).unwrap();
         assert_eq!(published.len(), 1);
     }))));
@@ -105,6 +105,9 @@ fn refresh_rescans_when_output_is_published_after_enumeration() {
     assert_eq!(catalog.path_is_directory(&scope, path), Some(true));
     assert!(catalog.generated_observation(file.to_str().unwrap()).is_some());
     assert!(!catalog.is_owned(path));
+    assert_eq!(catalog.candidate_paths(&scope), arrivals);
+    let limited_scope = NativeDiscoveryScope::new(scope.root.clone(), Some(0), Vec::new());
+    assert!(catalog.candidate_paths(&limited_scope).is_empty());
 
     catalog.close();
     assert!(catalog.error().is_none());

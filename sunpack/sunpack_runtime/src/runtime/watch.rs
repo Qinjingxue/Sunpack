@@ -1806,13 +1806,16 @@ impl CandidateDiagnostics {
     }
 
     fn clear_expired(&mut self, now: Instant) {
+        let mut expired = false;
         for queue in [&mut self.readiness, &mut self.observations] {
+            if !queue.front().is_some_and(|entry| entry.expires <= now) { continue; }
             while queue.front().is_some_and(|entry| entry.expires <= now) {
                 Self::remove_event(&mut self.paths, queue.pop_front().unwrap());
             }
-            if queue.is_empty() { *queue = VecDeque::new(); }
+            crate::collections::trim_deque(queue);
+            expired = true;
         }
-        if self.paths.is_empty() && self.paths.capacity() != 0 { self.paths = HashMap::new(); }
+        if expired { crate::collections::trim_map(&mut self.paths); }
     }
 
     fn retire_path(&mut self, path: &str, recursive: bool) {
@@ -3910,7 +3913,7 @@ impl Scheduler {
             }
             let recovered_paths = paths.len();
             if !root.scanned {
-                paths.extend(self.catalog.candidate_paths(&scope, None));
+                paths.extend(self.catalog.candidate_paths(&scope));
                 // The initial scan records a completed directory enumeration.
                 // It has its own durable candidate barrier below, even when
                 // the USN cursor is temporarily unavailable.

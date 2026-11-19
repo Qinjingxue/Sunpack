@@ -382,7 +382,7 @@ namespace sunpack::sevenzip
                 if (set_memory_failure(result, "input_open", error))
                     return result;
 
-                if (!canonical_names.empty() && (error == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || error == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))) {
+                if (!canonical_names.empty() && is_missing_input_file(error)) {
                     set_missing_volume_failure(result, "input_open", "open_volume_file_missing",
                         result.input_trace.last_source_path, error);
                     return result;
@@ -427,7 +427,7 @@ namespace sunpack::sevenzip
                 if (set_memory_failure(result, "input_read", error)) return true;
                 if (FAILED(callback_error))
                     record_input_error(&result.input_trace, raw_open_callback->failed_volume_name(), callback_error);
-                if (error == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || error == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)) {
+                if (is_missing_input_file(error)) {
                     const auto &name = FAILED(callback_error) ? raw_open_callback->failed_volume_name()
                         : result.input_trace.last_source_path;
                     set_missing_volume_failure(result, "input_read", "open_volume_file_missing", name, error);
