@@ -19,6 +19,7 @@ use crate::scan::scope::NativeDiscoveryScope;
 use crate::watch_store::{is_path_under, recorded_file_is_absent, watch_path_key};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
@@ -147,6 +148,33 @@ fn key(path: &Path) -> String {
     watch_path_key(&path.to_string_lossy())
 }
 
+// Expand DOS aliases at the configuration boundary, not during event lookup.
+// GetLongPathName preserves junction spellings (canonicalize would redirect
+// them). Resolve only the existing prefix so offline/new children stay valid.
+fn configured_path(path: &Path) -> Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+        if path.as_os_str().encode_wide().any(|unit| unit == b'~' as u16) {
+            for ancestor in path.ancestors() {
+                let input: Vec<_> = ancestor.as_os_str().encode_wide().chain(Some(0)).collect();
+                let length = unsafe { GetLongPathNameW(input.as_ptr(), std::ptr::null_mut(), 0) };
+                if length == 0 { continue; }
+                let mut output = vec![0; length as usize];
+                let written = unsafe { GetLongPathNameW(input.as_ptr(), output.as_mut_ptr(), length) };
+                if written == 0 || written >= length { continue; }
+                output.truncate(written as usize);
+                let resolved = PathBuf::from(std::ffi::OsString::from_wide(&output));
+                if let Ok(suffix) = path.strip_prefix(ancestor) {
+                    return Cow::Owned(if suffix.as_os_str().is_empty() { resolved } else { resolved.join(suffix) });
+                }
+            }
+        }
+    }
+    Cow::Borrowed(path)
+}
+
 fn root_key(path: &Path) -> String {
     let mut id = key(path);
     id.truncate(id.trim_end_matches('\\').len());
@@ -165,10 +193,10 @@ fn resolve_output(root: &Path, value: &str) -> io::Result<PathBuf> {
         });
         if let Some(home) = home {
             let path = PathBuf::from(home).join(value[1..].trim_start_matches(['/', '\\']));
-            return cli::resolve(root, &path.to_string_lossy());
+            return cli::resolve(root, &path.to_string_lossy()).map(|path| configured_path(&path).into_owned());
         }
     }
-    cli::resolve(root, value)
+    cli::resolve(root, value).map(|path| configured_path(&path).into_owned())
 }
 
 fn roots_path(cwd: &Path) -> io::Result<PathBuf> {
@@ -217,7 +245,7 @@ fn read_root_records(path: &Path) -> io::Result<Vec<Root>> {
         if input.is_empty() {
             continue;
         }
-        let input = cli::resolve(&cwd, input)?;
+        let input = configured_path(&cli::resolve(&cwd, input)?).into_owned();
         let output = fields
             .next()
             .filter(|output| !output.is_empty())
@@ -693,7 +721,8 @@ impl Watch {
             let mut positions: HashMap<_, _> = roots.iter().enumerate()
                 .map(|(index, root)| (root_key(&root.path), index)).collect();
             for root in paths {
-                let id = root_key(root);
+                let root = configured_path(root).into_owned();
+                let id = root_key(&root);
                 if let Some(&index) = positions.get(&id) {
                     let existing = &mut roots[index];
                     let changed = !existing.enabled || (recursive && !existing.recursive) || (deep && !existing.deep);
@@ -711,7 +740,7 @@ impl Watch {
                     enabled: true,
                     path: root.clone(),
                     output: output.map(str::trim).filter(|value| !value.is_empty())
-                        .map(|value| resolve_output(root, value)).transpose()?,
+                        .map(|value| resolve_output(&root, value)).transpose()?,
                     deep,
                     recursive,
                     scanned: false,
@@ -729,7 +758,7 @@ impl Watch {
             let retained: HashSet<_> = read_roots(&path)?.iter().map(|root| root_key(&root.path)).collect();
             for changes in [&mut added, &mut updated] {
                 changes.retain(|root| {
-                    let keep = retained.contains(&root_key(root));
+                    let keep = retained.contains(&root_key(&configured_path(root)));
                     if !keep {
                         rejected.push(root.clone());
                     }
@@ -759,7 +788,7 @@ impl Watch {
         let mut removed = Vec::new();
         {
             let _lock = FileMutex::lock(&path, ROOTS_LOCK)?;
-            let keys: HashSet<_> = paths.iter().map(|path| root_key(path)).collect();
+            let keys: HashSet<_> = paths.iter().map(|path| root_key(&configured_path(path))).collect();
             let mut roots = read_root_records(&path)?;
             roots.retain(|root| {
                 if keys.contains(&root_key(&root.path)) {
@@ -5805,10 +5834,11 @@ impl Scheduler {
             }
             Err(error) => {
                 let mut absent = crate::watch_store::NativeWatchOperations::empty();
+                let error_kind = error.kind();
                 let error = error.to_string();
                 for candidate in &active.inputs {
                     self.retry_pipeline_error(batch, &active.root, active.recovery.as_ref(),
-                        &candidate.path, &error, quiet, &mut absent)?;
+                        &candidate.path, &error, error_kind, quiet, &mut absent)?;
                 }
                 self.journal.commit(true, |_| Ok(absent))?;
                 self.persist_candidates(BTreeMap::new(), true)?;
@@ -6000,11 +6030,13 @@ impl Scheduler {
             let canonical_id = watch_path_key(&canonical);
             let archives = by_path.get(&canonical_id).or_else(|| by_path.get(&id));
             let input_error = error_paths.get(&canonical_id).or_else(|| error_paths.get(&id));
-            if let Some(error) = input_error.filter(|error| error.kind == crate::pipeline::InputErrorKind::WatchDiscoveryIo) {
-                if !completed.cancelled {
-                    self.retry_pipeline_error(batch, &active.root, active.recovery.as_ref(),
-                        &candidate.path, &error.message, quiet, &mut operations)?;
-                    continue;
+            if let Some(error) = input_error {
+                if let crate::pipeline::InputErrorKind::WatchDiscoveryIo(kind) = error.kind {
+                    if !completed.cancelled {
+                        self.retry_pipeline_error(batch, &active.root, active.recovery.as_ref(),
+                            &candidate.path, &error.message, kind, quiet, &mut operations)?;
+                        continue;
+                    }
                 }
             }
             // One logical result owns the blocker and archive evidence. For
@@ -6275,7 +6307,7 @@ impl Scheduler {
             }
         }
         let discovery_retry = outcome.errors.iter()
-            .any(|error| error.kind == crate::pipeline::InputErrorKind::WatchDiscoveryIo);
+            .any(|error| matches!(error.kind, crate::pipeline::InputErrorKind::WatchDiscoveryIo(_)));
         self.persist_candidates(BTreeMap::new(), discovery_retry)?;
         let state = self.journal.state().lock();
         self.volume_checks.retain(|path, (_, plan)| state.has_missing_volume(path)
@@ -6313,7 +6345,7 @@ impl Scheduler {
 
     fn retry_pipeline_error(
         &mut self, batch: &str, root: &str, recovery: Option<&Arc<Recovery>>,
-        path: &str, error: &str, quiet: &mut HashMap<String, quiet::Activity>,
+        path: &str, error: &str, kind: io::ErrorKind, quiet: &mut HashMap<String, quiet::Activity>,
         operations: &mut crate::watch_store::NativeWatchOperations,
     ) -> io::Result<()> {
         let id = watch_path_key(path);
@@ -6324,8 +6356,15 @@ impl Scheduler {
         }
         // Main re-admits an infrastructure/read exception, unlike a
         // terminal archive result or a password/volume blocker.
-        self.journal.log(json!({"event":"failed_terminal","path":path,
-            "owner":batch,"error":error}));
+        // If a file vanished during discovery but its name is present again,
+        // the current file still needs admission. Do not attach the old
+        // missing-path failure to that newly observed generation.
+        let event = if matches!(kind, io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) {
+            "pipeline_discovery_retry"
+        } else {
+            "failed_terminal"
+        };
+        self.journal.log(json!({"event":event,"path":path,"owner":batch,"error":error}));
         self.observe_candidate_with_event(
             root, path.to_owned(), CandidateAdmission::ExplicitRetry, recovery.cloned(),
             None, quiet.remove(&id), Some(&CandidateEvent::Business("pipeline_completion_error")), None,

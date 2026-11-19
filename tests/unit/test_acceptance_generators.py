@@ -71,7 +71,10 @@ class AcceptanceGeneratorsTest(unittest.TestCase):
             self.assertEqual(len(errors), 9, errors)
             for name, path in overrides.items():
                 if name != "sunpack_TEST_WINRAR":
-                    self.assertTrue(any(path in error for error in errors), path)
+                    # Windows TEMP may use an 8.3 alias; diagnostics report the
+                    # resolved tool path even when the leaf does not exist.
+                    resolved = str(Path(path).resolve())
+                    self.assertTrue(any(resolved in error for error in errors), errors)
             self.assertTrue(any("WinRAR generator is missing" in error for error in errors))
 
 

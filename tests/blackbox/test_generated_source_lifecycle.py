@@ -138,7 +138,8 @@ def test_in_place_recovery_expires_with_its_source(package, tmp_path, mutation):
         wait_for(recovery_retired, "live recovery retirement before retry")
     watch.passwords(["secret-key"])
     if mutation is None:
-        watch.await_event("done", path=retained.name)
+        watch.await_event("done", path=source.name)
+        assert watch.event("done", path=retained.name) is None
     watch.restart()
     package.await_watch_admission()
     watch.stop()

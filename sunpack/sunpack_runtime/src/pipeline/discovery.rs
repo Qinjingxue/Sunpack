@@ -826,7 +826,7 @@ pub(super) fn find_watch_volume(
 
 fn watch_discovery_error(path: PathBuf, error: io::Error) -> InputError {
     InputError {
-        path, message: error.to_string(), kind: InputErrorKind::WatchDiscoveryIo,
+        path, message: error.to_string(), kind: InputErrorKind::WatchDiscoveryIo(error.kind()),
         failure: None, scan_operation: None,
     }
 }

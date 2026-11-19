@@ -320,7 +320,7 @@ pub enum InputErrorKind {
     InvalidInput,
     FilesystemScan,
     EmbeddedDiscovery,
-    WatchDiscoveryIo,
+    WatchDiscoveryIo(io::ErrorKind),
 }
 
 #[derive(Debug, Serialize)]

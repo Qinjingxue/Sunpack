@@ -346,6 +346,13 @@ $acl = Get-Acl -LiteralPath $Path
 if ($Restore) {
     $acl.SetSecurityDescriptorSddlForm([IO.File]::ReadAllText($Saved), [Security.AccessControl.AccessControlSections]::Access)
 } else {
+    # Isolate this temporary file's DACL from inheritance. Reapplying an
+    # unprotected descriptor can merge parent ACEs during Set-Acl, preventing
+    # an exact restore even if the explicit test deny was removed.
+    $acl.SetAccessRuleProtection($true, $true)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+    $acl = Get-Acl -LiteralPath $Path
+    if (-not $acl.AreAccessRulesProtected) { throw "Test DACL still inherits from its parent" }
     [IO.File]::WriteAllText($Saved, $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $raw = New-Object Security.AccessControl.RawSecurityDescriptor($acl.Sddl)

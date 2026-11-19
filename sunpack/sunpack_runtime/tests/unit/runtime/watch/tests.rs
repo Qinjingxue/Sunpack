@@ -602,6 +602,48 @@ fn business_root_routes_password_file_notification_only_to_password_reload() {
     fs::remove_file(marker).unwrap();
 }
 
+// Covers configuration identity, missing descendants, and junction spelling in
+// one filesystem fixture; ordinary admission tests bypass this boundary.
+#[test]
+fn configured_roots_expand_dos_aliases_without_resolving_junctions() {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let marker = crate::test_support::temp_file("watch_root_alias", b"");
+    let base = marker.with_extension("directory");
+    let real = base.join("physical directory");
+    let alias = base.join("literal~junction");
+    fs::create_dir_all(&real).unwrap();
+    let junction = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"]).arg(&alias).arg(&real).output().unwrap();
+    assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
+    // The tilde forces the expansion path, but is part of this literal name.
+    assert_eq!(configured_path(&alias).as_ref(), alias);
+    assert_eq!(configured_path(&alias.join("offline/child")).as_ref(), alias.join("offline/child"));
+
+    let input: Vec<_> = real.as_os_str().encode_wide().chain(Some(0)).collect();
+    let length = unsafe { GetShortPathNameW(input.as_ptr(), std::ptr::null_mut(), 0) };
+    assert_ne!(length, 0);
+    let mut short = vec![0; length as usize];
+    let written = unsafe { GetShortPathNameW(input.as_ptr(), short.as_mut_ptr(), length) };
+    assert!(written > 0 && written < length);
+    short.truncate(written as usize);
+    let short = PathBuf::from(std::ffi::OsString::from_wide(&short));
+    // Volumes with 8.3 creation disabled can return the original long name.
+    assert_eq!(configured_path(&short).as_ref(), real);
+    assert_eq!(root_key(&configured_path(&short)), root_key(&real));
+    let output = short.join("not-created/child");
+    fs::write(&marker, format!("{} | {} | false | true | true | true\n",
+        short.display(), output.display())).unwrap();
+    let roots = read_root_records(&marker).unwrap();
+    assert_eq!(roots[0].path, real);
+    assert_eq!(roots[0].output, Some(real.join("not-created/child")));
+    write_roots(&marker, &roots).unwrap();
+    assert_eq!(read_root_records(&marker).unwrap()[0].path, real);
+    fs::remove_dir(&alias).unwrap();
+    fs::remove_dir_all(base).unwrap();
+    fs::remove_file(marker).unwrap();
+}
+
 #[test]
 fn relative_roots_use_process_directory_not_roots_file_directory() {
     let marker = crate::test_support::temp_file("relative_watch_roots", b"");

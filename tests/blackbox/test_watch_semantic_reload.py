@@ -119,7 +119,7 @@ def test_watch_restart_keeps_carrier_outputs_and_retries_retained_child(package,
     assert package.run("--persistent-shutdown").returncode == 0
     package.configure(user_passwords=["recovered-key"])
     with package.watch_session():
-        package.await_watch_event("done", path=Path(blocked["path"]).name)
+        package.await_watch_event("done", path=source.name)
     assert [path.read_bytes() for path in output.rglob("secret.txt")] == [b"retained child"]
     assert list(output.rglob("ordinary.txt")) == [ordinary]
     assert (ordinary.stat().st_ino, ordinary.stat().st_mtime_ns) == identity
