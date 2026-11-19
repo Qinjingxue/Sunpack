@@ -16,7 +16,6 @@
 #include <mutex>
 #include <cstdint>
 #include <cstring>
-#include <cwchar>
 #include <filesystem>
 #include <cmath>
 #include "toast.h"
@@ -40,9 +39,6 @@ using winrt::Windows::UI::Notifications::ToastNotificationManager;
 
 constexpr wchar_t kAppId[] = L"SunPack.Watch.Toast";
 constexpr wchar_t kToastGroup[] = L"SunPack";
-constexpr wchar_t kClsidText[] = L"{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}";
-constexpr wchar_t kToastDisplayName[] = L"SunPack";
-constexpr wchar_t kToastIconBackgroundColor[] = L"FF0078D4";
 constexpr CLSID kToastActivatorClsid = {
     0xc5a6b4e9, 0x3184, 0x44e2, {0x9f, 0x15, 0x6a, 0x71, 0x80, 0x4f, 0x7a, 0x36}
 };
@@ -105,95 +101,6 @@ struct Snapshot {
     std::wstring progress_value_text;
     std::vector<Action> actions;
 };
-
-void set_registry_string(HKEY root, const std::wstring& subkey,
-                         const wchar_t* value_name, const std::wstring& value,
-                         DWORD value_type = REG_SZ) {
-    HKEY key = nullptr;
-    const LSTATUS created = RegCreateKeyExW(
-        root,
-        subkey.c_str(),
-        0,
-        nullptr,
-        REG_OPTION_NON_VOLATILE,
-        KEY_SET_VALUE,
-        nullptr,
-        &key,
-        nullptr
-    );
-    if (created != ERROR_SUCCESS) {
-        winrt::check_hresult(HRESULT_FROM_WIN32(created));
-    }
-    const LSTATUS written = RegSetValueExW(
-        key,
-        value_name,
-        0,
-        value_type,
-        reinterpret_cast<const BYTE*>(value.c_str()),
-        static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t))
-    );
-    RegCloseKey(key);
-    if (written != ERROR_SUCCESS) {
-        winrt::check_hresult(HRESULT_FROM_WIN32(written));
-    }
-}
-
-std::optional<std::wstring> get_registry_string(
-    HKEY root, const std::wstring& subkey, const wchar_t* value_name,
-    DWORD value_type = REG_SZ
-) {
-    const DWORD read_flags = value_type == REG_EXPAND_SZ
-        ? RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND
-        : RRF_RT_REG_SZ;
-    DWORD bytes = 0;
-    if (RegGetValueW(
-        root, subkey.c_str(), value_name, read_flags,
-        nullptr, nullptr, &bytes
-    ) != ERROR_SUCCESS || bytes < sizeof(wchar_t)) {
-        return std::nullopt;
-    }
-    std::wstring value(bytes / sizeof(wchar_t), L'\0');
-    if (RegGetValueW(
-        root, subkey.c_str(), value_name, read_flags,
-        nullptr, value.data(), &bytes
-    ) != ERROR_SUCCESS) {
-        return std::nullopt;
-    }
-    value.resize(std::wcslen(value.c_str()));
-    return value;
-}
-
-std::wstring toast_app_id_registry_path() {
-    return std::wstring(L"Software\\Classes\\AppUserModelId\\") + kAppId;
-}
-
-std::wstring toast_icon_path(const std::wstring& executable) {
-    return (std::filesystem::path(executable).parent_path() / L"sunpack.ico").wstring();
-}
-
-void register_toast_app_identity(const std::wstring& executable) {
-    const std::wstring app_id_path = toast_app_id_registry_path();
-    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName", kToastDisplayName, REG_EXPAND_SZ);
-    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri", toast_icon_path(executable), REG_EXPAND_SZ);
-    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconBackgroundColor", kToastIconBackgroundColor);
-    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"CustomActivator", kClsidText);
-}
-
-bool toast_app_identity_registered(const std::wstring& executable) noexcept {
-    try {
-        const std::wstring app_id_path = toast_app_id_registry_path();
-        return get_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName", REG_EXPAND_SZ) ==
-                   kToastDisplayName &&
-               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri", REG_EXPAND_SZ) ==
-                   toast_icon_path(executable) &&
-               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconBackgroundColor") ==
-                   kToastIconBackgroundColor &&
-               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"CustomActivator") ==
-                   kClsidText;
-    } catch (...) {
-        return false;
-    }
-}
 
 std::wstring xml_escape(std::wstring_view text) {
     std::wstring result;
@@ -741,16 +648,11 @@ ToastContext& context_on_owner_thread(void* raw) {
 
 } // namespace
 
-HRESULT sunpack_toast_create_context(const wchar_t* executable, void** output) noexcept {
+HRESULT sunpack_toast_create(void** output) noexcept {
     if (!output) return E_POINTER;
     *output = nullptr;
     return protect([&] {
-        if (!executable) winrt::throw_hresult(E_INVALIDARG);
-        auto context = std::make_unique<ToastContext>();
-        if (!toast_app_identity_registered(executable)) {
-            register_toast_app_identity(executable);
-        }
-        *output = context.release();
+        *output = new ToastContext();
     });
 }
 

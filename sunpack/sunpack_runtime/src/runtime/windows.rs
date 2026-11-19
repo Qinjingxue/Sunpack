@@ -339,12 +339,11 @@ impl ToastLibrary {
     }
 
     pub(super) fn presenter(&self) -> io::Result<ToastPresenter<'_>> {
-        type Create = unsafe extern "C" fn(*const u16, *mut *mut c_void) -> i32;
+        type Create = unsafe extern "C" fn(*mut *mut c_void) -> i32;
         let create: Create =
-            unsafe { std::mem::transmute(self.procedure(b"sunpack_toast_create_context\0")?) };
-        let exe = wide(std::env::current_exe()?.as_os_str());
+            unsafe { std::mem::transmute(self.procedure(b"sunpack_toast_create\0")?) };
         let mut context = null_mut();
-        hresult(unsafe { create(exe.as_ptr(), &mut context) })?;
+        hresult(unsafe { create(&mut context) })?;
         Ok(ToastPresenter {
             library: self,
             context,

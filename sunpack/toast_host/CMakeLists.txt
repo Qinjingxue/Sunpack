@@ -39,7 +39,6 @@ target_link_libraries(sunpack_toast PRIVATE
     runtimeobject
     ole32
     shell32
-    advapi32
 )
 
 enable_testing()
@@ -59,6 +58,6 @@ if(MSVC)
     target_compile_options(sunpack_toast_presenter_test PRIVATE /utf-8 /permissive- /W4)
 endif()
 target_link_libraries(sunpack_toast_presenter_test PRIVATE
-    windowsapp runtimeobject ole32 shell32 advapi32
+    windowsapp runtimeobject ole32 shell32
 )
 add_test(NAME sunpack_toast_presenter_test COMMAND sunpack_toast_presenter_test)
