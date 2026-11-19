@@ -1558,6 +1558,15 @@ HRESULT CZipDecoder::Decode(
     if (result == S_FALSE)
       return S_OK;
     
+    if (result == NCompress::NPpmdZip::kUnsupportedRestoreMode)
+    {
+      // In an encrypted member, a wrong password can produce the same
+      // unsupported restore mode. Only the decoded bytes made this claim.
+      res = item.IsEncrypted() ? kSunpackEncryptedDecoderUnsupported :
+          NExtract::NOperationResult::kUnsupportedMethod;
+      return S_OK;
+    }
+
     if (result == E_NOTIMPL)
     {
       res = NExtract::NOperationResult::kUnsupportedMethod;

@@ -147,3 +147,21 @@ def test_zipcrypto_header_collision_does_not_block_later_password(package, tmp_p
         watch.assert_no_terminal_failures()
     assert [path.read_bytes() for path in output.rglob("payload.txt")] == [expected]
     assert not source.exists()
+
+
+def test_zipcrypto_ppmd_decoder_uncertainty_does_not_block_later_password(package, tmp_path, repo_root):
+    source = tmp_path / "ppmd.zip"
+    source.write_bytes((repo_root / "tests/data/zipcrypto_ppmd_restore_collision.bin").read_bytes())
+    # The wrong key passes the header check and decrypts to a plausible
+    # PPMd restore mode 2, which the bundled decoder cannot confirm.
+    collision = "wrong-candidate-00000735"
+    rejected_output = tmp_path / "unconfirmed"
+    rejected = extract_report(package, source, rejected_output, passwords=[collision], code=1, deep=False)
+    assert failure_kinds(rejected) == {"unsupported"}
+    assert not any(path.is_file() for path in rejected_output.rglob("*"))
+
+    output = tmp_path / "confirmed"
+    report = extract_report(package, source, output, passwords=[collision, "sunpack-test"], deep=False)
+    assert report["summary"]["failed_count"] == 0
+    expected = (b"sunpack password benchmark payload\0" * 32768)[:1024 * 1024]
+    assert [path.read_bytes() for path in output.rglob("payload.bin")] == [expected]

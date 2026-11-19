@@ -1,6 +1,9 @@
 #pragma once
 
 #include "sevenzip_sdk.hpp"
+#ifdef _WIN32
+#include "password_proof_property.hpp"
+#endif
 
 namespace sunpack::sevenzip
 {
@@ -17,6 +20,11 @@ namespace sunpack::sevenzip
     bool looks_wrong_password(HRESULT hr, Int32 op_res, bool encryption_evidence);
 
     bool looks_damaged(Int32 op_res);
+
+    inline bool unsupported_method(Int32 op_res) noexcept
+    {
+        return op_res == kOpUnsupportedMethod || op_res == kSunpackEncryptedDecoderUnsupported;
+    }
 
     const char *operation_result_name(Int32 op_res);
 

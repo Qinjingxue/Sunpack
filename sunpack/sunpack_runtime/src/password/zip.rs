@@ -18,6 +18,8 @@ use std::sync::{Arc, OnceLock};
 
 #[path = "zip_strong.rs"]
 mod strong;
+#[cfg(test)]
+pub(crate) use strong::tests::benchmark_fixture as strong_benchmark_fixture;
 #[path = "zip_probe.rs"]
 mod probe;
 use probe::{ZipLocation, ZipPrefix, ZipPrefixKey, ZipRead, ZipReadInput};
@@ -28,6 +30,7 @@ const ZIP_EOCD: &[u8] = b"PK\x05\x06";
 const MAX_EOCD_SCAN: usize = 65_557;
 const AES_PARALLEL_PASSWORD_THRESHOLD: usize = 4;
 const ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD: usize = 256;
+const ZIPCRYPTO_SHORT_PASSWORD_BYTES: usize = 64;
 const ZIPCRYPTO_HEADER_LEN: usize = 12;
 
 pub(crate) fn zip_fast_verify_passwords_with_reader(
@@ -826,6 +829,15 @@ pub(crate) enum ZipPasswordContext {
 }
 
 impl ZipPasswordContext {
+    #[cfg(test)]
+    pub(super) fn benchmark_method(&self) -> &'static str {
+        match self {
+            Self::Aes { .. } => "winzip_aes_password_verifier",
+            Self::ZipCrypto { .. } => "zipcrypto_header_byte",
+            Self::Strong(_) => "zip_pkware_strong",
+        }
+    }
+
     fn needs_read(&self) -> bool {
         match self {
             Self::Aes { prefix, .. } | Self::ZipCrypto { prefix, .. } => prefix.is_some(),
@@ -1302,7 +1314,12 @@ fn verify_zipcrypto_material(
         };
         state.map(|state| (index, ZipPrefixKey::ZipCrypto(state)))
     };
-    let keys: Vec<_> = if attempts >= ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD {
+    // Dispatching a normal batch of short ZipCrypto keys costs more than
+    // deriving them serially. Keep the pool for larger or long-key batches.
+    let parallel = attempts >= ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD
+        && (attempts > super::VERIFICATION_BATCH_SIZE
+            || candidates.iter().any(|password| password.len() > ZIPCRYPTO_SHORT_PASSWORD_BYTES));
+    let keys: Vec<_> = if parallel {
         candidates.par_iter().enumerate().filter_map(check).collect()
     } else {
         candidates.iter().enumerate().filter_map(check).collect()

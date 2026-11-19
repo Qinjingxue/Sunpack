@@ -1,7 +1,4 @@
 #include "sevenzip_status.hpp"
-#ifdef _WIN32
-#include "password_proof_property.hpp"
-#endif
 
 namespace sunpack::sevenzip
 {
@@ -37,6 +34,7 @@ namespace sunpack::sevenzip
             return "ok";
 
         case kOpUnsupportedMethod:
+        case kSunpackEncryptedDecoderUnsupported:
 
             return "unsupported_method";
 

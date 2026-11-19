@@ -15,6 +15,10 @@
 namespace NCompress {
 namespace NPpmdZip {
 
+// The method exists, but a parameter read from the compressed stream
+// requires a feature that this decoder was built without.
+inline constexpr HRESULT kUnsupportedRestoreMode = static_cast<HRESULT>(0x8004A701u);
+
 struct CBuf
 {
   Byte *Buf;

@@ -613,26 +613,30 @@ fn rar5_successor_blocks_and_first_level_table_filter_different_sources() {
     }
 }
 
-#[test]
-fn rar5_empty_stored_member_can_prove_its_keyed_digest_without_payload() {
+pub(crate) fn empty_mac_fixture(blake: bool) -> Vec<u8> {
     // 7-Zip verifies both fixtures with "secret" and rejects "wrong".
     let blake_mac = [
         0xb7, 0x11, 0x99, 0x69, 0x28, 0xbd, 0xdd, 0xd8, 0xc4, 0xcd, 0x3e, 0x38, 0x35, 0xb3, 0xad, 0x53,
         0x4f, 0xee, 0x3a, 0x22, 0x3c, 0x92, 0x13, 0x47, 0x6c, 0xad, 0xbf, 0x37, 0x14, 0xd2, 0x70, 0x7a,
     ];
+    let mut extra = vec![36, 1, 0, 2, 4];
+    extra.extend([0x73; 16]);
+    extra.extend([0x64; 16]);
+    if blake {
+        extra.extend([34, 2, 0]);
+        extra.extend(blake_mac);
+    }
+    let mut file = vec![2, 1, extra.len() as u8, if blake { 0 } else { 4 }, 0, 0];
+    if !blake { file.extend(0x0a5b01e3u32.to_le_bytes()); }
+    file.extend([0, 0, 1, b'x']);
+    file.extend(&extra);
+    [RAR5_SIGNATURE, &rar5_block(&[1, 0, 0]), &rar5_block(&file), &rar5_block(&[5, 0, 0])].concat()
+}
+
+#[test]
+fn rar5_empty_stored_member_can_prove_its_keyed_digest_without_payload() {
     for blake in [false, true] {
-        let mut extra = vec![36, 1, 0, 2, 4];
-        extra.extend([0x73; 16]);
-        extra.extend([0x64; 16]);
-        if blake {
-            extra.extend([34, 2, 0]);
-            extra.extend(blake_mac);
-        }
-        let mut file = vec![2, 1, extra.len() as u8, if blake { 0 } else { 4 }, 0, 0];
-        if !blake { file.extend(0x0a5b01e3u32.to_le_bytes()); }
-        file.extend([0, 0, 1, b'x']);
-        file.extend(&extra);
-        let archive = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 0]), &rar5_block(&file), &rar5_block(&[5, 0, 0])].concat();
+        let archive = empty_mac_fixture(blake);
         let reader = ManagedReader::from_bytes(archive, Default::default());
         let context = prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("keyed empty digest"));
         let result = context.verify(&[Arc::from("wrong"), Arc::from("secret")], None).unwrap();

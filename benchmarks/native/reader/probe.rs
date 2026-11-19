@@ -25,12 +25,35 @@ struct Input {
     correct_index: Option<usize>,
     #[serde(default)]
     correct_password: Option<Arc<str>>,
+    #[serde(default)]
+    archive_input: Option<ArchiveInput>,
+    #[serde(default)]
+    production_batches: bool,
 }
 
 fn default_kdf_threads() -> usize { 4 }
 
 fn request() -> Result<Input, serde_json::Error> {
     serde_json::from_reader(BufReader::new(io::stdin().lock()))
+}
+
+#[test]
+#[ignore = "generate specialized password benchmark inputs"]
+fn password_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    let args = request()?;
+    let data = if let Some(bits) = args.format.strip_prefix("zip-strong-") {
+        crate::password::zip::strong_benchmark_fixture(bits.parse()?)
+    } else {
+        let blake = match args.format.as_str() {
+            "rar5-empty-crc" => false,
+            "rar5-empty-blake" => true,
+            _ => return Err(io::Error::other("unknown password benchmark fixture").into()),
+        };
+        crate::password::rar::relation_header_tests::empty_mac_fixture(blake)
+    };
+    std::fs::write(args.path, &data)?;
+    println!("SUNPACK_BENCH {}", json!({"bytes": data.len()}));
+    Ok(())
 }
 
 fn measure<T>(
@@ -140,36 +163,61 @@ fn memory() -> io::Result<Value> {
 #[ignore = "run through the password study harness"]
 fn password_phases() -> Result<(), Box<dyn std::error::Error>> {
     let args = request()?;
-    let session = NativeArchiveSession::new(args.path.clone())?;
-    let input = ArchiveInput::file(args.path, args.format, String::new());
+    let input = args.archive_input.unwrap_or_else(|| ArchiveInput::file(args.path, args.format, String::new()));
+    let mut paths: Vec<_> = input.physical_paths().collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let sessions = paths.into_iter().map(|path| NativeArchiveSession::new(path.to_owned()))
+        .collect::<io::Result<Vec<_>>>()?;
+    let batch_size = if args.production_batches {
+        crate::password::VERIFICATION_BATCH_SIZE
+    } else {
+        args.passwords.len().max(1)
+    };
     let mut rows = Vec::new();
     for _ in 0..args.runs {
         let before = memory()?;
         let mut preparation = crate::password::context::Preparation::default();
         let cpu = cpu_seconds()?;
         let started = Instant::now();
-        let prepared = crate::password::verify(&mut preparation, &input, &[],
-            std::slice::from_ref(&session), None)?;
+        let prepared = crate::password::verify(&mut preparation, &input, &[], &sessions, None)?;
+        let prepare_status = prepared.status;
         let prepare_seconds = started.elapsed().as_secs_f64();
         let prepare_cpu_seconds = cpu_seconds()? - cpu;
         let after_prepare = memory()?;
         let cpu = cpu_seconds()?;
         let started = Instant::now();
-        let found = crate::password::verify(&mut preparation, &input, &args.passwords,
-            std::slice::from_ref(&session), None)?;
+        let mut found = Vec::with_capacity(args.passwords.len().div_ceil(batch_size).max(1));
+        for (batch, candidates) in args.passwords.chunks(batch_size).enumerate() {
+            preparation.other_password_batches = (batch + 1) * batch_size < args.passwords.len();
+            let result = crate::password::verify(&mut preparation, &input, candidates, &sessions, None)?;
+            let confirmed = result.matched_index.is_some() && result.final_confirmation_required == Some(false);
+            found.push((batch * batch_size, result.status, result.matched_index, result.matched_indices,
+                result.attempts, result.final_confirmation_required, result.match_evidence, result.message));
+            if confirmed { break; }
+        }
+        if found.is_empty() {
+            found.push((0, prepared.status, prepared.matched_index, prepared.matched_indices,
+                prepared.attempts, prepared.final_confirmation_required, prepared.match_evidence, prepared.message));
+        }
         let candidates_seconds = started.elapsed().as_secs_f64();
         let candidates_cpu_seconds = cpu_seconds()? - cpu;
         let after_candidates = memory()?;
+        let methods = preparation.benchmark_methods();
         drop(preparation);
         let after_drop = memory()?;
+        let results: Vec<_> = found.into_iter().map(|(offset, status, matched_index, matched_indices,
+            attempts, final_confirmation_required, match_evidence, message)| json!({
+            "offset":offset,"status":status,"matched_index":matched_index,
+            "matched_indices":matched_indices,"attempts":attempts,
+            "final_confirmation_required":final_confirmation_required,
+            "match_evidence":match_evidence,"message":message,
+        })).collect();
         rows.push(json!({"prepare_seconds":prepare_seconds,"prepare_cpu_seconds":prepare_cpu_seconds,
             "candidates_seconds":candidates_seconds,"candidates_cpu_seconds":candidates_cpu_seconds,
             "before":before,"after_prepare":after_prepare,"after_candidates":after_candidates,
-            "after_drop":after_drop,"prepare_status":prepared.status,
-            "result":{"status":found.status,"matched_index":found.matched_index,
-                "matched_indices":found.matched_indices,"attempts":found.attempts,
-                "final_confirmation_required":found.final_confirmation_required,
-                "match_evidence":found.match_evidence}}));
+            "after_drop":after_drop,"methods":methods,"prepare_status":prepare_status,
+            "result":results.last(),"batches":results}));
     }
     println!("SUNPACK_BENCH {}", json!({"rows":rows}));
     Ok(())

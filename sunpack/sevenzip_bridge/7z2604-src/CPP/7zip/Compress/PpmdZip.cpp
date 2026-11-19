@@ -62,7 +62,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     
     #ifndef PPMD8_FREEZE_SUPPORT
     if (restor == 2)
-      return E_NOTIMPL;
+      return kUnsupportedRestoreMode;
     #endif
     
     if (!Ppmd8_Alloc(&_ppmd, mem << 20, &g_BigAlloc))

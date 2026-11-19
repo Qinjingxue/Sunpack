@@ -99,7 +99,7 @@ namespace sunpack::sevenzip
                 return "checksum_error";
             }
 
-            if (op_res == kOpUnsupportedMethod)
+            if (unsupported_method(op_res))
             {
 
                 return "unsupported_method";
@@ -136,7 +136,7 @@ namespace sunpack::sevenzip
                 if (item.failed || item.operation_result != kOpOk)
                 {
                     if (!collect_damage) break;
-                    if (item.operation_result != kOpUnsupportedMethod)
+                    if (!unsupported_method(item.operation_result))
                     {
                         const std::string kind = kind_for_operation_result(item.operation_result);
                         return kind == "unknown" ? "corrupted_data" : kind;
@@ -675,7 +675,7 @@ namespace sunpack::sevenzip
 
             result.status = PasswordTestStatus::Unsupported;
 
-            result.unsupported_method = last_op_res == kOpUnsupportedMethod;
+            result.unsupported_method = unsupported_method(last_op_res);
 
             set_failure(result, "item_extract", result.unsupported_method ? "unsupported_method" : "unknown", hr);
 

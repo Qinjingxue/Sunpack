@@ -27,10 +27,10 @@ def main(argv=None):
     parser.add_argument("--formats", default=",".join(FORMATS_300M))
     parser.add_argument("--large-file-mib", type=int, default=150, help="Each of the two payload files (default 150 MiB; lower for smoke runs).")
     parser.add_argument("--sample", action="append", default=[], metavar="FORMAT=PATH", help="Additional archive, e.g. zipx, lz4 or enc; provide sibling volumes and -p as needed.")
-    parser.add_argument("-p", action="append", default=[])
+    parser.add_argument("-p", dest="password", action="append", default=[])
     parser.add_argument("--shape", choices=("ordinary", "disguised", "carrier"), default="ordinary",
                         help="Use normal discovery for ordinary or renamed archives and force deep scans for carriers.")
-    parser.add_argument("-R", default="*")
+    parser.add_argument("-R", dest="recursive", default="*")
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--rebuild-corpus", action="store_true")
     parser.add_argument("--results-root", type=Path)

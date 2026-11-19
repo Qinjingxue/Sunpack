@@ -1524,6 +1524,18 @@ impl RarKeyCache {
 }
 
 impl RarPasswordContext {
+    #[cfg(test)]
+    pub(super) fn benchmark_method(&self) -> &'static str {
+        match self.material {
+            RarPasswordMaterial::Rar5(_) => "rar5_password_check",
+            RarPasswordMaterial::Rar5Header { .. } => "rar5_header_structure",
+            RarPasswordMaterial::Rar5Block { .. } => "rar5_compressed_block",
+            RarPasswordMaterial::Rar5EmptyMac { .. } => "rar5_empty_member_mac",
+            RarPasswordMaterial::Header(_) => "rar4_header_structure",
+            RarPasswordMaterial::Rar4Block(_) => "rar4_compressed_stream",
+        }
+    }
+
     pub(crate) fn verify(
         &self,
         candidates: &[Arc<str>],
@@ -2590,7 +2602,7 @@ pub(crate) mod rar5_header_decryption_tests;
 
 #[cfg(test)]
 #[path = "../../tests/unit/password/rar/relation_header_tests.rs"]
-mod relation_header_tests;
+pub(crate) mod relation_header_tests;
 
 #[cfg(test)]
 #[path = "../../tests/unit/password/rar/rar4_file_encryption_scan_tests.rs"]

@@ -14,6 +14,32 @@ fn local_crypto_header() -> Vec<u8> {
 }
 
 #[test]
+fn fixed_zip_rejects_single_zipcrypto_collision_before_lzma_or_ppmd_decoder() {
+    let variants: [(u16, [u8; 12], &[u8], &str); 2] = [
+        (14, [150, 222, 142, 132, 158, 35, 253, 42, 53, 38, 33, 137],
+         &[130, 21, 75, 185, 215, 122, 130, 100, 31, 181, 222, 147, 48, 68],
+         "wrong-candidate-00000138"),
+        (98, [110, 160, 87, 25, 2, 192, 123, 61, 196, 222, 125, 179],
+         &[128, 87, 100, 89, 23, 12], "wrong-candidate-00000051"),
+    ];
+    // Encryption headers and packed prefixes from valid ZipCrypto members.
+    for (method, header, packed, collision) in variants {
+        let reader = ManagedReader::from_bytes(packed.to_vec(), ReaderConfig::default());
+        let mut prefix = ZipPrefix::new(method, 1, 0, 12, None).unwrap();
+        prefix.bind(ZipRead {
+            input: ZipReadInput::Ranges(Arc::new([RangeSpec::entire(&reader)])),
+            location: ZipLocation { disk: None, offset: 0 },
+        });
+        assert!(zipcrypto_header_state(collision.as_bytes(), &header, 195).is_some());
+        let check = |password| verify_zipcrypto_material(
+            &[Arc::from(password)], &header, 195, Some(&prefix), None, true,
+        ).unwrap();
+        assert_eq!(check(collision).status, "no_match");
+        assert_eq!(check("sunpack-test").matched_index, Some(0));
+    }
+}
+
+#[test]
 fn rejected_zip_anchor_does_not_prepare_alternative_tails() {
     let local = local_crypto_header();
     let (paths, sources, plan) = volume_alternatives(&local, &[0; 25], &[0; 26]);

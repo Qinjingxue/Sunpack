@@ -24,3 +24,5 @@ inline constexpr PROPID kpidSunpackBoundedPasswordProbe = kpidUserDefined + 262;
 inline constexpr Int32 kSunpackVerifyMember = 2;
 // The bounded ZIP handler read a local header that contradicts its directory.
 inline constexpr Int32 kSunpackZipLocalHeaderConflict = 0x100;
+// A ZIP decoder's unsupported parameter came from decrypted member bytes.
+inline constexpr Int32 kSunpackEncryptedDecoderUnsupported = 0x101;

@@ -494,4 +494,4 @@ fn derive_key(sha: Sha1) -> [u8; 32] {
 
 #[cfg(test)]
 #[path = "../../tests/unit/password/zip/strong_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -506,6 +506,34 @@ pub(crate) enum SevenZipPasswordContext {
     },
 }
 
+#[cfg(test)]
+impl SevenZipPasswordContext {
+    pub(crate) fn benchmark_method(&self) -> &'static str {
+        let Self::Prefix { probe, .. } = self else {
+            return match self {
+                Self::Header(_) => "7z_encrypted_header",
+                Self::MemberOnly => "7z_member_only",
+                Self::Prefix { .. } => unreachable!(),
+            };
+        };
+        match &probe.first.kind.verifier {
+            SevenZipPayloadVerifier::Header => "7z_header_prefix",
+            SevenZipPayloadVerifier::Bcj2Range => "7z_bcj2_range",
+            SevenZipPayloadVerifier::Compressed { method, .. } => match method.as_slice() {
+                [0x03, 0x01, 0x01] => "7z_lzma_prefix",
+                [0x21] => "7z_lzma2_prefix",
+                [0x03, 0x04, 0x01] => "7z_ppmd_prefix",
+                [0x04, 0x02, 0x02] => "7z_bzip2_prefix",
+                [0x04, 0x01, 0x08] => "7z_deflate_prefix",
+                [0x04, 0x01, 0x09] => "7z_deflate64_prefix",
+                [0x04, 0xf7, 0x11, 0x01] => "7z_zstd_prefix",
+                [0x04, 0xf7, 0x11, 0x04] => "7z_lz4_prefix",
+                _ => "7z_other_prefix",
+            },
+        }
+    }
+}
+
 /// When a field is unavailable in one volume, later independent evidence
 /// can still be usable. Resolved readers need no projection bookkeeping.
 pub(crate) trait SevenZipEvidenceReads<R> {

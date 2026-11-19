@@ -252,9 +252,12 @@ impl ZipPrefix {
         let read = self.read.as_ref()?;
         let size = self.read_size();
         if matches == 0 || size == 0 { return None; }
-        // With one complete layout, extraction can confirm the last candidate.
-        // An individual projection can be fixed while other layouts remain.
-        let minimum = if unique_volumes { 2 } else { 1 };
+        // A ZipCrypto check byte can match a wrong key. LZMA and PPMd
+        // decoders can report unsupported properties for that key, which
+        // would stop the worker before the later passwords. Check their
+        // bounded prefix even when only one candidate survives this batch.
+        let can_stop_with_one = unique_volumes && (derive_aes_key || !matches!(self.method, 14 | 98));
+        let minimum = if can_stop_with_one { 2 } else { 1 };
         if matches < minimum { return None; }
         if !derive_aes_key || matches > 1 { return Some(minimum); }
         let span = if self.has_aes_successor() {

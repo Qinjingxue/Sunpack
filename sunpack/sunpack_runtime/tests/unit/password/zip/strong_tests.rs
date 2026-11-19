@@ -29,6 +29,33 @@ fn archive<C: BlockCipherEncrypt + KeyInit>(
     archive_member::<C>(algorithm, size, explicit_iv, 0, MEMBER)
 }
 
+pub(crate) fn benchmark_fixture(bits: u16) -> Vec<u8> {
+    let (algorithm, (mut bytes, _, _)) = match bits {
+        128 => (0x660eu16, archive::<Aes128>(0x660e, 16, false)),
+        192 => (0x660f, archive::<Aes192>(0x660f, 24, true)),
+        256 => (0x6610, archive::<Aes256>(0x6610, 32, true)),
+        _ => unreachable!("unsupported benchmark key size"),
+    };
+    let offset = bytes.len() as u32;
+    let mut central = [0u8; 46];
+    central[..4].copy_from_slice(b"PK\x01\x02");
+    central[6..32].copy_from_slice(&bytes[4..30]);
+    central[28..30].copy_from_slice(&1u16.to_le_bytes());
+    central[30..32].copy_from_slice(&12u16.to_le_bytes());
+    central[32..34].fill(0);
+    bytes.extend(central);
+    bytes.push(b'a');
+    for field in [0x0017u16, 8, 2, algorithm, bits, 1] {
+        bytes.extend(field.to_le_bytes());
+    }
+    let directory_size = bytes.len() as u32 - offset;
+    bytes.extend(b"PK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00");
+    bytes.extend(directory_size.to_le_bytes());
+    bytes.extend(offset.to_le_bytes());
+    bytes.extend([0, 0]);
+    bytes
+}
+
 fn archive_member<C: BlockCipherEncrypt + KeyInit>(algorithm: u16, size: usize,
     explicit_iv: bool, method: u16, packed: &[u8],
 ) -> (Vec<u8>, usize, usize) {

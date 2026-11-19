@@ -13,7 +13,7 @@ import psutil
 from tests.helpers.native_build import native_build_dir, rust_build_dir
 
 from ..watch_broker import SERVICE_ENV, isolated_broker_environment
-from .memory import ProcessSampler
+from .memory import ProcessSampler, bytes_to_mib
 from .workspace import REPO_ROOT
 
 
@@ -128,6 +128,23 @@ class NativePackage:
             "peak_private_mib": max(sample.private_mib for sample in samples),
             "resident": samples[-1].to_dict(),
         }
+
+    def memory_high_water(self) -> list[dict]:
+        """Return separate Windows lifetime peaks for processes still alive."""
+        peaks = []
+        for process in self._processes():
+            try:
+                name = process.name()
+                memory = process.memory_info()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            peaks.append({
+                "pid": process.pid,
+                "name": name,
+                "peak_working_set_mib": bytes_to_mib(memory.peak_wset),
+                "peak_commit_mib": bytes_to_mib(memory.peak_pagefile),
+            })
+        return peaks
 
     def run(self, *arguments, json_output=True, accepted=(0,), require_broker=False) -> dict:
         command = [str(self.launcher), *map(str, arguments)]

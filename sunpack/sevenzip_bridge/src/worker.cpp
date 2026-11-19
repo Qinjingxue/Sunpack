@@ -139,6 +139,10 @@ sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
         break;
     case PasswordTestStatus::Unsupported:
         result.failure_kind = "unsupported_method";
+        if (probe.operation_result == kSunpackEncryptedDecoderUnsupported) {
+            result.operation_result = probe.operation_result;
+            result.encrypted = true;
+        }
         break;
     case PasswordTestStatus::BackendUnavailable:
         result.failure_kind = "backend_unavailable";
@@ -1367,6 +1371,7 @@ RequestOutcome run_request(
                 volume_replay->password_probe_done = false;
                 volume_replay->volume_password_uncertain = false;
                 volume_replay->candidates_started = volume_replay->candidate_output_owned = volume_replay->candidate_discard_pending = false;
+                volume_replay->candidate_decoder_uncertain = false;
                 cursor.discard_pending = false;
             }
         }
@@ -1567,17 +1572,31 @@ RequestOutcome run_request(
                     }
                     result.password_candidates_all_rejected =
                         result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
-                    if (direct_ok || (replay && replay->confirmed_candidate_index >= 0) || (!result.password_candidates_all_rejected && !uncertain_password) || count == 1 ||
+                    const bool decoder_uncertain = count > 1 && !request.password_verified && !result.missing_volume &&
+                        result.status == PasswordTestStatus::Unsupported &&
+                        result.operation_result == kSunpackEncryptedDecoderUnsupported;
+                    if (direct_ok || (replay && replay->confirmed_candidate_index >= 0) ||
+                        (!result.password_candidates_all_rejected && !uncertain_password && !decoder_uncertain) || count == 1 ||
                         (cancel_token && cancel_token->load(std::memory_order_acquire))) break;
-                    // The rejected attempt has no consumers after this point.
+                    // A candidate-dependent decoder result leaves the batch
+                    // inconclusive if every other key is rejected.
+                    replay->candidate_decoder_uncertain |= decoder_uncertain;
+                    // The current attempt has no consumers after this point.
                     // Drop its item inventory before cleanup and the next decoder.
                     result = ExtractArchiveResult{};
                     replay->candidate_discard_pending = true;
                 }
                 if (index == password_candidates.size()) {
                     PasswordTestResult rejected;
-                    rejected.status = PasswordTestStatus::WrongPassword;
-                    rejected.message = "wrong password";
+                    if (replay && replay->candidate_decoder_uncertain) {
+                        rejected.status = PasswordTestStatus::Unsupported;
+                        rejected.archive_type = L"zip";
+                        rejected.operation_result = kSunpackEncryptedDecoderUnsupported;
+                        rejected.message = "no supported decoder could confirm the password";
+                    } else {
+                        rejected.status = PasswordTestStatus::WrongPassword;
+                        rejected.message = "wrong password";
+                    }
                     result = password_candidate_failure(rejected);
                 }
             }

@@ -65,7 +65,9 @@ namespace sunpack::sevenzip
         {
             result.status = PasswordTestStatus::Unsupported;
             result.message = "no supported decoder could confirm the password";
-            result.password_independent_failure = !open.password_requested();
+            const bool encrypted_parameter = result.operation_result == kSunpackEncryptedDecoderUnsupported;
+            result.encrypted |= encrypted_parameter;
+            result.password_independent_failure = !encrypted_parameter && !open.password_requested();
             return result;
         }
 
@@ -592,7 +594,7 @@ namespace sunpack::sevenzip
             const auto can_try_another = [&] {
                 // ZIP can report a damaged local header for just this member.
                 return FAILED(read_error) || hr == E_NOTIMPL ||
-                    (hr == S_OK && (operation == kOpUnsupportedMethod ||
+                    (hr == S_OK && (unsupported_method(operation) ||
                         operation == kOpUnavailable || operation == kOpUnexpectedEnd ||
                         (operation == kOpHeadersError && format == L"zip")));
             };
@@ -669,7 +671,7 @@ namespace sunpack::sevenzip
                 }
                 if ((FAILED(read_error) && (failure_hr == E_NOTIMPL || !FAILED(failure_hr))) ||
                     (hr == S_OK && operation == kOpUnexpectedEnd && (failure_hr == E_NOTIMPL ||
-                        (failure_hr == S_OK && failure_op == kOpUnsupportedMethod)))) {
+                        (failure_hr == S_OK && unsupported_method(failure_op))))) {
                     failure = selection;
                     failure_hr = hr;
                     failure_op = operation;
@@ -740,7 +742,7 @@ namespace sunpack::sevenzip
                 cache.input.stream.Release();
                 return result;
             }
-            if (hr == E_NOTIMPL || operation == kOpUnsupportedMethod) {
+            if (hr == E_NOTIMPL || unsupported_method(operation)) {
                 return unsupported_decoder_result(std::move(result), *cache.callback_state);
             }
             if (!cache.callback_state->password_requested())
@@ -951,7 +953,7 @@ namespace sunpack::sevenzip
                 result.password_independent_failure = hr == E_ABORT || hr == E_OUTOFMEMORY;
                 return result;
             }
-            if (hr == E_NOTIMPL || last_op_res == kOpUnsupportedMethod) {
+            if (hr == E_NOTIMPL || unsupported_method(last_op_res)) {
                 archive->Close();
                 return unsupported_decoder_result(std::move(result), *raw_open_callback);
             }

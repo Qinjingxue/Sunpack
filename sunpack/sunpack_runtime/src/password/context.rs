@@ -152,6 +152,32 @@ pub(crate) struct Preparation<'a> {
 }
 
 impl<'a> Preparation<'a> {
+    #[cfg(test)]
+    pub(crate) fn benchmark_methods(&self) -> Vec<&'static str> {
+        fn collect(context: &PasswordContext, methods: &mut Vec<&'static str>) {
+            let method = match context {
+                PasswordContext::Evidence(evidence) => {
+                    for (context, _) in &evidence.alternatives {
+                        collect(context, methods);
+                    }
+                    return;
+                }
+                PasswordContext::Zip(context) | PasswordContext::ReducedZip(context, _) => context.benchmark_method(),
+                PasswordContext::Rar(context) => context.benchmark_method(),
+                PasswordContext::SevenZip(context) => context.benchmark_method(),
+                PasswordContext::Enc(_) => "enc_v4_quick_block",
+            };
+            if !methods.contains(&method) {
+                methods.push(method);
+            }
+        }
+        let mut methods = Vec::new();
+        if let Some(Ok(context)) = self.local.as_deref().or_else(|| self.slot.as_ref()?.value.get()) {
+            collect(context, &mut methods);
+        }
+        methods
+    }
+
     pub(crate) fn prepare_volume_candidates(
         &mut self,
         prepared: Prepared,

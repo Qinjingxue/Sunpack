@@ -116,6 +116,7 @@ struct ExtractionReplay : VolumeReadUncertainty {
     bool password_probe_done = false;
     bool volume_output_started = false;
     bool candidates_started = false, candidate_output_owned = false, candidate_discard_pending = false;
+    bool candidate_decoder_uncertain = false;
     void clear_output() {
         files.clear(); directories.clear(); handler.fill(0);
         root_was_empty = initialized = false;

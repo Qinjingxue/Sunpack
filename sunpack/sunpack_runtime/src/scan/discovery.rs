@@ -393,6 +393,21 @@ fn scan_embedded_jobs(
             .count()
             .min(parallel_jobs)
             .max(1);
+        let mut order = Vec::new();
+        if parallel_files > 1 && jobs.len() > parallel_jobs {
+            // Start the largest physical scans while both producers are
+            // still busy. Keep the original positions for result projection.
+            order.extend(0..jobs.len());
+            order.sort_by_cached_key(|&position| {
+                let (group, index) = jobs[position];
+                let (table, _) = groups[group];
+                let size = match &table.rows[index] {
+                    Candidate::File(table, row) => table.sizes[*row],
+                    Candidate::Relation(group) => group.entry_anchor().map(|anchor| anchor.size),
+                };
+                std::cmp::Reverse(size.unwrap_or(0))
+            });
+        }
         let next = AtomicUsize::new(0);
         // A fixed number of producers draw from one work list. A large file
         // cannot pin unrelated jobs behind its original root or candidate page.
@@ -403,7 +418,8 @@ fn scan_embedded_jobs(
                 cancellation.run(|| {
                     let mut completed = Vec::new();
                     while !cancellation.cancelled() {
-                        let position = next.fetch_add(1, Ordering::Relaxed);
+                        let slot = next.fetch_add(1, Ordering::Relaxed);
+                        let position = order.get(slot).copied().unwrap_or(slot);
                         let Some(&(group, index)) = jobs.get(position) else {
                             break;
                         };
