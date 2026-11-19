@@ -101,6 +101,80 @@ fn sized_local_walk_uses_later_proof_despite_unreadable_member_bytes() {
 }
 
 #[test]
+fn fixed_zip_reads_descriptor_sizes_only_for_header_collisions() {
+    let mut local = local_crypto_header();
+    local[6] |= 8;
+    local[8] = 1; // Shrink requires a known nonempty packed range.
+    local[11] = 0x5a;
+    local[42] = 0x5a;
+    local.extend_from_slice(b"A\0");
+    let mut state = ZipCryptoState::new();
+    for &byte in b"secret" { state.update_keys(byte); }
+    for byte in &mut local[31..] {
+        let plain = *byte;
+        *byte ^= state.decrypt_byte();
+        state.update_keys(plain);
+    }
+    let header = local[31..43].try_into().unwrap();
+    let collision: Arc<str> = (0..20_000).find_map(|index| {
+        let password = format!("collision-{index}");
+        let mut state = zipcrypto_header_state(password.as_bytes(), &header, 0x5a)?;
+        state.decrypt(local[43]);
+        (state.decrypt(local[44]) & 1 != 0).then(|| Arc::from(password))
+    }).expect("a check-byte collision with an invalid first Shrink code");
+    let crc = crc32fast::hash(b"A");
+    local.extend_from_slice(b"PK\x07\x08");
+    local.extend(crc.to_le_bytes());
+    local.extend(14u32.to_le_bytes());
+    local.extend(1u32.to_le_bytes());
+
+    for spanned in [false, true] {
+        let mut directory = vec![0; 46];
+        directory[..4].copy_from_slice(ZIP_CENTRAL);
+        directory[8..28].copy_from_slice(&local[6..26]);
+        directory[16..20].copy_from_slice(&crc.to_le_bytes());
+        directory[20..24].copy_from_slice(&14u32.to_le_bytes());
+        directory[24..28].copy_from_slice(&1u32.to_le_bytes());
+        directory[28] = 1;
+        directory.push(b'a');
+        let central_size = directory.len() as u32;
+        let eocd_offset = (local.len() + directory.len()) as u64;
+        let disk = u8::from(spanned);
+        let central_offset = if spanned { 0 } else { local.len() as u32 };
+        directory.extend_from_slice(ZIP_EOCD);
+        directory.extend([disk, 0, disk, 0, 1, 0, 1, 0]);
+        directory.extend(central_size.to_le_bytes());
+        directory.extend(central_offset.to_le_bytes());
+        directory.extend([0, 0]);
+
+        let (context, measured) = if spanned {
+            let head = ManagedReader::from_bytes(local.clone(), Default::default());
+            let tail = ManagedReader::from_bytes(directory, Default::default());
+            let volumes = Arc::new(VolumeSet::new(vec![
+                VolumeSpec { reader: head, number: 1, start: 0, end: None },
+                VolumeSpec { reader: tail.clone(), number: 2, start: 0, end: None },
+            ]));
+            (prepare_zip_volumes(&volumes, Some(eocd_offset)).ok().unwrap(), tail)
+        } else {
+            let reader = ManagedReader::from_bytes([local.as_slice(), directory.as_slice()].concat(), Default::default());
+            let input = ZipReadInput::Ranges(Arc::new([RangeSpec::entire(&reader)]));
+            let context = prepare_zip_stream_from(&mut reader.stream_cursor(), reader.len(), Some(eocd_offset), Some(&input)).ok().unwrap();
+            (context, reader)
+        };
+        assert_eq!(measured.stats().read_bytes, 0, "preparation must leave the directory untouched");
+        let correct = Arc::from("secret");
+        assert_eq!(context.verify(std::slice::from_ref(&correct)).unwrap().matched_indices, [0]);
+        assert_eq!(measured.stats().read_bytes, 0, "the last password goes directly to final confirmation");
+        let candidates = [collision.clone(), correct];
+        assert_eq!(context.verify(&candidates).unwrap().matched_indices, [1]);
+        let directory_bytes = measured.stats().read_bytes;
+        assert!(directory_bytes >= u64::from(central_size) + 22);
+        assert_eq!(context.verify(&candidates).unwrap().matched_indices, [1]);
+        assert_eq!(measured.stats().read_bytes, directory_bytes, "later batches reuse the member sizes");
+    }
+}
+
+#[test]
 fn projected_directory_conflict_survives_later_usable_entry_without_a_shared_anchor() {
     fn add_directory_entry(out: &mut Vec<u8>, local: &[u8], name: &[u8], disk: u16, offset: usize) {
         let mut entry = [0; 46];

@@ -66,17 +66,15 @@ fn scan_discarded_prefix_skips_wide_unvisited_suffixes() {
     let width = 64;
     let count = 48;
     let plan = VolumeAttemptPlan {
-        sources: (0..=width * (count - 1)).map(|id| InputExtent {
+        sources: (0..=2 * width).map(|id| InputExtent {
             path: id.to_string(), start: 0, end: Some(1),
         }).collect(),
-        domains: std::iter::once(VolumeDomain { choices: Arc::new(vec![0]) })
-            .chain((0..count - 1).map(|index| VolumeDomain {
-                choices: Arc::new((index * width + 1..=(index + 1) * width).collect()),
-            })).collect(),
+        domains: [vec![0], (1..=width).collect(), (width + 1..=2 * width).collect()]
+            .map(|choices| VolumeDomain { choices: Arc::new(choices) }).into(),
         layouts: Box::new([VolumeLayout {
             minimum_slots: 0,
-            slots: (0..count).map(|domain| VolumeSlot {
-                number: domain as u32 + 1, canonical_name: String::new(), domain,
+            slots: (0..count).map(|slot| VolumeSlot {
+                number: slot as u32 + 1, canonical_name: String::new(), domain: slot.min(2),
             }).collect(),
         }]),
         head_size_from_total: None,
@@ -87,6 +85,7 @@ fn scan_discarded_prefix_skips_wide_unvisited_suffixes() {
         layout: 0, sources: vec![0, id],
     }).collect();
     PARTITION_EDGE_VISITS.set(0);
+    PARTITION_DOMAIN_HASH_CHOICES.set(0);
     let kept = remove_scan_paths(&plan, Vec::new(), prefixes, Vec::new(), None).unwrap();
     assert_eq!(kept.layouts.len(), 1);
     let slots = &kept.layouts[0].slots;
@@ -95,6 +94,7 @@ fn scan_discarded_prefix_skips_wide_unvisited_suffixes() {
     assert_eq!(choice_paths(1), [width.to_string().as_str()]);
     assert_eq!(choice_paths(count - 1).len(), width);
     assert_eq!(PARTITION_EDGE_VISITS.get(), 1 + width);
+    assert_eq!(PARTITION_DOMAIN_HASH_CHOICES.get(), width + 3);
 }
 
 // A cross-volume failure must preserve either fragment with another partner.
@@ -278,27 +278,29 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
     };
     let mut domains = CandidateDomains::default();
     let mut count = 0;
+    let scope = Arc::new(VolumeProjection {
+        roots: vec![[0, 2, 0]],
+        edges: vec![[0, 1, 0], [1, 2, 3]],
+        ends: vec![2],
+    });
     for batch in [vec!["wrong", "first"], vec!["later"]] {
         let candidates: Vec<_> = batch.into_iter().map(Arc::from).collect();
         let result = context.verify(&candidates).unwrap();
         assert_eq!(result.matched_indices.len(), candidates.len());
         domains.append(result.password_domains, count, candidates.len());
-        if count == 0 {
-            // An independent, late check rejects the first password only
-            // on the otherwise unresolved tail, including across batches.
-            let scope = Arc::new(VolumeProjection {
-                roots: vec![[0, 2, 0]],
-                edges: vec![[0, 1, 0], [1, 2, 3]],
-                ends: vec![2],
-            });
-            let ordinals = [0, usize::MAX, usize::MAX, 1];
-            let mut rejected = ScopedRejections::default();
-            rejected.extend([(Arc::clone(&scope), 1), (scope, 3)]);
-            domains.append_scoped(rejected, count, &ordinals);
-        }
+        // Both batches reject only on the otherwise unreadable tail. They
+        // share one byte projection, including duplicate observations.
+        let (index, ordinals): (_, &[_]) = if count == 0 {
+            (3, &[0, usize::MAX, usize::MAX, 1])
+        } else { (0, &[0]) };
+        let mut rejected = ScopedRejections::default();
+        rejected.extend([(scope.clone(), index), (scope.clone(), index), (scope.clone(), 1)]);
+        domains.append_scoped(rejected, count, ordinals);
         count += candidates.len();
     }
+    PARTITION_EDGE_VISITS.set(0);
     let (remaining, passwords) = domains.finish(&context, count).unwrap().unwrap();
+    assert_eq!(PARTITION_EDGE_VISITS.get(), 3 * (1 + 3));
     let actual: Vec<_> = remaining
         .layouts
         .iter()
@@ -317,7 +319,7 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
         [
             ("tailA", &[1][..]),
             ("tailB", &[2][..]),
-            ("unreadable", &[0, 2][..])
+            ("unreadable", &[0][..])
         ]
     );
 }

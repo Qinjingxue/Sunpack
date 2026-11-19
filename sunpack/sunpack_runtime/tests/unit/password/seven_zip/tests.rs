@@ -152,7 +152,7 @@ fn alternate_short_prefix_rejects_without_reading_first_stream_successor() {
     let mut valid = [0xa9; 32];
     valid[..3].copy_from_slice(&[1, 0, 27]);
     valid[31] = 0;
-    for (plain, expected) in [([0xff; 32], &[][..]), (valid, &[0][..])] {
+    for (plain, expected, expected_reads) in [([0xff; 32], [1], 16), (valid, [0], 32)] {
         let mut body = first.clone();
         body.extend(encrypt_payload_fixture(&plain, &key));
         let reader = ManagedReader::from_bytes(archive_with_descriptor(&body, &header), Default::default());
@@ -161,7 +161,8 @@ fn alternate_short_prefix_rejects_without_reading_first_stream_successor() {
         let before = reader.stats().read_bytes;
         let proof = context.verify(&[Arc::from("secret"), Arc::from(equivalent.as_str())]).unwrap();
         assert_eq!(proof.matched_indices, expected);
-        assert_eq!(reader.stats().read_bytes - before, 32);
+        assert_eq!(proof.final_confirmation_required, Some(true));
+        assert_eq!(reader.stats().read_bytes - before, expected_reads);
     }
 }
 

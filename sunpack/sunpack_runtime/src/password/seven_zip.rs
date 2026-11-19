@@ -197,7 +197,8 @@ impl SevenZipPasswordContext {
         let mut viable = result.matched_indices.len();
         if stop_at_one && probe.can_stage_followup() {
             let mut pending = Vec::with_capacity(2);
-            while let Some((index, check)) = remaining.next() {
+            while viable > 1 {
+                let Some((index, check)) = remaining.next() else { break; };
                 if let Ok((_, (first_key, prefix))) = check {
                     let staged = cancellation.run(|| probe.prepare_followup(|properties| {
                         key(index, &candidates[index], properties)

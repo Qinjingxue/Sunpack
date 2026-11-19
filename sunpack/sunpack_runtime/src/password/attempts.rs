@@ -53,6 +53,7 @@ impl Key {
             }
             _ => (input.entry_path.as_str(), 0, None),
         };
+        let session = sessions.iter().find(|session| session.path() == path)?;
         let (generation, compound): (_, Option<Arc<[u8]>>) = if input.volume_attempts.is_some()
             || !matches!(input.mode, OpenMode::File | OpenMode::FileRange) {
             // Iteration follows the descriptor, not HashMap order. Binding all
@@ -74,14 +75,11 @@ impl Key {
             let len = COMPOUND_KEY_BYTES - remaining.len();
             (*generations.get(path)?, Some(Arc::from(&storage[..len])))
         } else {
-            let generation = sessions.iter().find_map(|session| {
-                let (source, generation) = session.generation().ok()?;
-                (source == path).then_some(generation)
-            })?;
+            let (_, generation) = session.generation().ok()?;
             (generation, None)
         };
         let compound_hash = compound.as_deref().map_or(0, |bytes| crate::fast_hash_core::xxh64(bytes, 0));
-        let cache = sessions.iter().find(|session| session.path() == path)?.attempt_cache();
+        let cache = session.attempt_cache();
         Some((Self { generation, format, start, end,
             eocd: input.analysis.zip_eocd_offset, native_disks: input.analysis.zip_spanned || input.analysis.rar_native_volume,
             compound, compound_hash }, cache))
@@ -131,12 +129,20 @@ impl AttemptCache {
         while batch.len() < limit {
             cancellation.check_io()?;
             let mut state = self.0.lock().unwrap();
+            if state.negative.is_empty() {
+                // Cold sources have nothing to filter. Release the lock
+                // before dictionary filtering or candidate copies.
+                drop(state);
+                batch.extend(candidates.by_ref().take(limit - batch.len()).cloned());
+                return Ok(());
+            }
             // Bound the work under the cache lock even if every candidate
             // in this window was rejected on a previous request.
             for _ in 0..BATCH_SIZE {
                 let Some(candidate) = candidates.next() else { return Ok(()); };
-                if state.negative.get(&(key.clone(), candidate.clone())).is_none() {
-                    batch.push(candidate.clone());
+                let entry = (key.clone(), Arc::clone(candidate));
+                if state.negative.get(&entry).is_none() {
+                    batch.push(entry.1);
                     if batch.len() == limit {
                         return Ok(());
                     }
@@ -157,6 +163,25 @@ impl AttemptCache {
                 state.negative.insert((key.clone(), Arc::clone(password)), (), MAX_REJECTIONS);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cold_candidate_filter_runs_outside_cache_lock() {
+        let cache = AttemptCache::default();
+        let key = Key::synthetic(0, None);
+        let passwords = [Arc::from("first"), Arc::from("second"), Arc::from("buffered")];
+        let mut candidates = passwords.iter().inspect(|_| {
+            assert!(cache.0.try_lock().is_ok());
+        });
+        let mut batch = Vec::new();
+        cache.fill_available(&key, &mut batch, &mut candidates, 2, &Cancellation::current()).unwrap();
+        assert_eq!(batch, passwords[..2]);
+        assert_eq!(candidates.next(), Some(&passwords[2]));
     }
 }
 

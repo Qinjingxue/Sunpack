@@ -345,24 +345,25 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     block[0] = 0x40;
     block[1] = 0x1a; // Legal empty final block, reusing solid tables.
     encrypt(&mut block);
-    let make = |split: bool, method: u64, version: u64, block: &[u8]| {
+    let make = |split: u8, method: u64, version: u64, block: &[u8]| {
         let mut encryption = vec![1, 0, 0, 4]; // extra type, version, flags, KDF log
         encryption.extend(salt); encryption.extend(iv);
         let mut extra = vint(encryption.len() as u64); extra.extend(encryption);
-        let mut file = vec![2, 3 | if split { 8 } else { 0 }];
+        let mut file = vec![2, 3 | split];
         file.extend(vint(extra.len() as u64)); file.extend(vint(block.len() as u64));
         file.extend([0, 0, 0]); // file flags, unpack size, attributes
         file.extend(vint(method << 7 | 0x40 | version)); // solid
         file.extend([0, 1, b'x']); file.extend(extra);
         let mut bytes = RAR5_SIGNATURE.to_vec();
-        bytes.extend(rar5_block(&[1,0,0])); bytes.extend(rar5_block(&file));
-        bytes.extend(block); bytes.extend(rar5_block(&[5,0,0])); bytes
+        let next = u8::from(split & 16 != 0);
+        bytes.extend(rar5_block(&[1, 0, next])); bytes.extend(rar5_block(&file));
+        bytes.extend(block); bytes.extend(rar5_block(&[5, 0, next])); bytes
     };
     let prepare = |bytes: Vec<u8>| {
         let reader = ManagedReader::from_bytes(bytes, Default::default());
         prepare_rar(|offset, size, _| Ok(reader.read_at(offset, size).unwrap()))
     };
-    let context = prepare(make(false, 1, 0, &block)).unwrap_or_else(|_| panic!("compressed first block"));
+    let context = prepare(make(0, 1, 0, &block)).unwrap_or_else(|_| panic!("compressed first block"));
     let candidates = [Arc::from("wrong"), Arc::from("secret"), Arc::from("secret")];
     let result = context.verify(&candidates, None).unwrap();
     assert_eq!(result.matched_indices, [1, 2]);
@@ -370,14 +371,58 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     assert_eq!(result.match_evidence, Some("rar5_compressed_block"));
     // A missing middle disk and a stored first member do not make a
     // later independent RAR7-compatible compressed member unreadable.
-    let volumes = VolumeSet::new([make(false, 0, 0, &block), make(false, 1, 1, &block)].into_iter().enumerate().map(|(i, data)|
+    let volumes = VolumeSet::new([make(0, 0, 0, &block), make(0, 1, 1, &block)].into_iter().enumerate().map(|(i, data)|
         crate::password::input::VolumeSpec { reader: ManagedReader::from_bytes(data, Default::default()),
             number: 1 + (2 * i) as u32, start: 0, end: None }).collect());
     let later = native_volumes::prepare_fixed(&volumes, &[], &[]).unwrap_or_else(|_| panic!("independent later member"));
     assert_eq!(later.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
+    // The first two disks provide only 10 bytes of the first AES block.
+    // Disk 3 is missing, but disk 4 has an independent readable member.
+    let continuation = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 3, 1]),
+        &rar5_block(&[2, 26, 2, 0, 0, 0, 0xc0, 1, 0, 1, b'x']), &block[8..10],
+        &rar5_block(&[5, 0, 1])].concat();
+    let tail = make(0, 1, 1, &block);
+    let parts: Vec<_> = [make(16, 1, 0, &block[..8]), continuation, tail].into_iter().zip([1, 2, 4])
+        .map(|(data, number)| {
+            let path = crate::test_support::temp_file("rar5_missing_native_cipher_block", &data);
+            let mut part = InputPart::range(InputExtent {
+                path: path.to_string_lossy().into_owned(), start: 0, end: Some(data.len() as u64),
+            });
+            part.volume_number = Some(number);
+            part.canonical_name = format!("part{number}.rar");
+            part
+        }).collect();
+    for count in [2, 3] {
+        let parts = &parts[..count];
+        let plan = Arc::new(VolumeAttemptPlan {
+            sources: parts.iter().map(|part| part.extent.clone()).collect(),
+            layouts: Box::new([VolumeLayout {
+                minimum_slots: 0,
+                slots: parts.iter().enumerate().map(|(domain, part)| VolumeSlot {
+                    number: part.volume_number.unwrap(), canonical_name: part.canonical_name.clone(), domain,
+                }).collect(),
+            }]),
+            domains: (0..count).map(|source| VolumeDomain { choices: Arc::new(vec![source]) }).collect(),
+            head_size_from_total: None, minimum_size: None, tail_totals: Box::default(),
+        });
+        let mut preparation = Preparation::default();
+        let result = rar_fast_verify_passwords_from_attempts(&mut preparation, &plan.sources[0], &plan,
+            &candidates, &[], true).unwrap();
+        if count == 2 {
+            assert_eq!(result.status, "unknown_needs_final_verifier");
+            assert_eq!(result.attempts, 0);
+        } else {
+            assert_eq!(result.matched_indices, [1, 2]);
+            let fixed = VolumeSet::new(parse_volumes(parts, &[]).unwrap());
+            let context = native_volumes::prepare_fixed(&fixed, parts, &[])
+                .unwrap_or_else(|_| panic!("fixed native continuation fallback"));
+            assert_eq!(context.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
+        }
+    }
+    for part in parts { std::fs::remove_file(part.extent.path).unwrap(); }
     let plain_first = [RAR5_SIGNATURE, &rar5_block(&[1, 0, 1]), &rar5_block(&[5, 0, 1])].concat();
     assert!(matches!(prepare(plain_first), Err(PreparedStatus::Status("unknown_needs_final_verifier", _))));
-    for (split, method) in [(true, 1), (false, 0)] {
+    for (split, method) in [(8, 1), (0, 0)] {
         assert!(matches!(prepare(make(split, method, 0, &block)), Err(PreparedStatus::Status("unknown_needs_final_verifier", _))));
     }
 
@@ -388,7 +433,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     plaintext[47..50].copy_from_slice(&[0x40, 0x1a, 0]);
     let mut valid = plaintext;
     encrypt(&mut valid);
-    let reader = ManagedReader::from_bytes(make(false, 1, 0, &valid), Default::default());
+    let reader = ManagedReader::from_bytes(make(0, 1, 0, &valid), Default::default());
     let context = prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("second block"));
     assert_eq!(context.verify(&candidates, None).unwrap().matched_indices, [1, 2]);
 
@@ -410,7 +455,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     file.extend(vint(extra.len() as u64));
     file.extend([0, 0, 0, 0, 0, 0, 1, b'y']);
     file.extend(extra);
-    let mut mixed = make(false, 1, 0, &valid);
+    let mut mixed = make(0, 1, 0, &valid);
     let end = rar5_block(&[5, 0, 0]);
     mixed.truncate(mixed.len() - end.len());
     mixed.extend(rar5_block(&file));
@@ -427,7 +472,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
     assert_eq!(result.matched_index, Some(1));
     assert_eq!(result.match_evidence, Some("rar5_password_check"));
 
-    let mut weak_members = make(false, 1, 0, &block);
+    let mut weak_members = make(0, 1, 0, &block);
     let first_block = weak_members.len() - end.len() - block.len();
     let second_member = RAR5_SIGNATURE.len() + rar5_block(&[1, 0, 0]).len();
     let next = weak_members[second_member..].to_vec();
@@ -451,7 +496,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
 
     plaintext[48] ^= 1;
     encrypt(&mut plaintext);
-    let archive = make(false, 1, 0, &plaintext);
+    let archive = make(0, 1, 0, &plaintext);
     let reader = ManagedReader::from_bytes(archive.clone(), Default::default());
     let context = prepare_rar_ranges(&[RangeSpec::entire(&reader)]).unwrap_or_else(|_| panic!("invalid second block"));
     assert_eq!(context.verify(&candidates, None).unwrap().status, "no_match");

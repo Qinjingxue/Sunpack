@@ -691,6 +691,14 @@ pub(crate) struct RarPasswordContext {
 }
 
 impl RarPasswordContext {
+    pub(super) fn has_local_evidence(&self) -> bool {
+        match &self.material {
+            RarPasswordMaterial::Rar4Block(block) => block.encrypted.is_some(),
+            RarPasswordMaterial::Rar5Block { block, .. } => block.encrypted.is_some(),
+            _ => true,
+        }
+    }
+
     pub(super) fn can_follow_native(&self) -> bool {
         matches!(&self.material, RarPasswordMaterial::Rar4Block(block) if block.split_after)
             || matches!(&self.material, RarPasswordMaterial::Rar5Block { block, .. } if block.split_after)
@@ -703,8 +711,9 @@ impl RarPasswordContext {
         let prepare = |reader: &mut AttemptReader<'_>, encrypted, follow_headers| {
             let encrypted = match encrypted {
                 Some(encrypted) => Some(encrypted),
-                None => read_native_rar(reader, &mut NativeRarPosition::new(disk, start), start, fragments,
-                    start.offset, 16)?.try_into().ok(),
+                None => reader.independent_evidence(|reader| {
+                    read_native_rar(reader, &mut NativeRarPosition::new(disk, start), start, fragments, start.offset, 16)
+                })?.try_into().ok(),
             };
             let source = RarTailSource::Native(Box::new(NativeRarTail {
                 reads: reader.deferred_reads(true), disk, start: start.clone(), fragments: Arc::clone(fragments),

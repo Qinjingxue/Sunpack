@@ -136,7 +136,7 @@ fn zip64_password_probe_resolves_disk_relative_entry_and_end_records() {
             let mut archive = prefix.clone();
             archive.extend(tail);
             let len = archive.len() as u64;
-            prepare_zip_directory_stream(&mut std::io::Cursor::new(archive), len, Some(eocd), None)
+            prepare_zip_directory_stream(&mut std::io::Cursor::new(archive), len, Some(eocd))
         };
         match prepared {
             Ok(ZipPasswordContext::ZipCrypto { header, check_byte, .. }) => {

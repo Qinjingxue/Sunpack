@@ -618,38 +618,49 @@ std::error_code discard_candidate_output(const std::wstring& output_dir) {
     return error;
 }
 
+struct SelectedVolumeGeometry {
+    int missing = 0;
+    std::optional<unsigned long long> head_end;
+};
+
+SelectedVolumeGeometry selected_volume_geometry(const sunpack::sevenzip::VolumeAttemptPlan& plan,
+    std::size_t layout, const std::vector<std::size_t>& choices) {
+    const auto& slots = plan.layouts[layout];
+    const auto count = choices.size();
+    if (slots[count - 1].number != count) {
+        for (std::size_t i = 0; i < count; ++i)
+            if (slots[i].number != i + 1) return {static_cast<int>(i + 1), {}};
+    }
+    const auto tail_total = plan.tail_totals.empty() ? 0 : plan.tail_totals[choices.back()];
+    auto length = tail_total ? tail_total : plan.head_size_from_total;
+    if (!length) return {};
+    for (std::size_t i = 1; i < count; ++i) {
+        const auto& range = plan.sources[choices[i]];
+        if (!range.has_end || range.end - range.start >= length) return {1, {}};
+        length -= range.end - range.start;
+    }
+    const auto& head = plan.sources[choices.front()];
+    if (!head.has_end || length > head.end - head.start) return {1, {}};
+    return {0, head.start + length};
+}
+
 void select_volume_attempt(const WorkerArchiveInput& source,
                            std::size_t layout, const std::vector<std::size_t>& choices,
-                           WorkerArchiveInput& input) {
-    const auto& slots = source.volume_attempts.layouts[layout];
-    const auto count = choices.size();
+                           WorkerArchiveInput& input, bool scan_only = false) {
+    const auto& plan = source.volume_attempts;
+    const auto geometry = selected_volume_geometry(plan, layout, choices);
+    input.missing_volume_number = geometry.missing;
+    if (geometry.missing && (!scan_only || geometry.missing == 1)) return;
+    const auto count = geometry.missing ? static_cast<std::size_t>(geometry.missing - 1) : choices.size();
+    const auto& slots = plan.layouts[layout];
     input.ranges.resize(count);
     input.canonical_names.resize(count);
-    input.missing_volume_number = 0;
-    unsigned int previous = 0;
     for (std::size_t i = 0; i < count; ++i) {
-        input.ranges[i] = source.volume_attempts.sources[choices[i]];
+        input.ranges[i] = plan.sources[choices[i]];
         input.canonical_names[i] = slots[i].name;
-        if (!input.missing_volume_number && slots[i].number != previous + 1)
-            input.missing_volume_number = static_cast<int>(previous + 1);
-        previous = slots[i].number;
     }
     input.archive_path = input.ranges.front().path;
-    if (input.missing_volume_number) return;
-    const auto tail_total = source.volume_attempts.tail_totals.empty()
-        ? 0 : source.volume_attempts.tail_totals[choices.back()];
-    const auto total = tail_total ? tail_total : source.volume_attempts.head_size_from_total;
-    if (total) {
-        auto length = total;
-        for (std::size_t i = 1; i < input.ranges.size(); ++i) {
-            const auto& range = input.ranges[i];
-            if (!range.has_end || range.end - range.start >= length) { input.missing_volume_number = 1; return; }
-            length -= range.end - range.start;
-        }
-        auto& head = input.ranges.front();
-        if (!head.has_end || length > head.end - head.start) { input.missing_volume_number = 1; return; }
-        head.end = head.start + length;
-    }
+    if (geometry.head_end) input.ranges.front().end = *geometry.head_end;
 }
 
 struct PreparedAttempt {
@@ -659,11 +670,60 @@ struct PreparedAttempt {
     bool missing_without_probe = false;
 };
 
+bool reusable_volume_probe(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt) {
+    const auto& observed = attempt.probe->observed_volume_slots;
+    const auto& slots = plan.layouts[attempt.layout];
+    if (!observed || plan.minimum_slots_for(attempt.layout) != slots.size()) return false;
+    // If the read dependencies fix every choice, no other composition in
+    // this layout can use the proof. Avoid cache work and filesystem queries.
+    auto used = observed->begin();
+    for (std::size_t slot = 0; slot < slots.size(); ++slot) {
+        if (used != observed->end() && *used == slot) { ++used; continue; }
+        if (plan.domains[slots[slot].domain].size() > 1) return true;
+    }
+    return false;
+}
+
 // A logical stream clamps every slice to physical EOF. Confirm its geometry
 // before extending a decoder rejection to untouched slots of the same layout.
 class CompleteVolumeGeometry {
-    std::optional<std::size_t> checked_;
-    bool complete_ = false;
+    enum class State : unsigned char { Unknown, Complete, Incomplete };
+    std::vector<State> layouts_, domains_, sources_;
+
+    bool inspect(const sunpack::sevenzip::VolumeAttemptPlan& plan, std::size_t layout) {
+        std::unordered_map<std::wstring_view, std::uintmax_t> file_sizes;
+        for (const auto& slot : plan.layouts[layout]) {
+            auto& domain = domains_[slot.domain];
+            if (domain == State::Complete) continue;
+            if (domain == State::Incomplete) return false;
+            const bool complete = std::all_of(plan.domains[slot.domain].begin(), plan.domains[slot.domain].end(),
+                [&](auto id) {
+#ifdef SUP7Z_DEBUG
+                    ++inspected_choices;
+#endif
+                    auto& state = sources_[id];
+                    if (state != State::Unknown) return state == State::Complete;
+                    const auto& source = plan.sources[id];
+                    if (sunpack::sevenzip::native_job_cancelled()) return false;
+                    if (!source.has_end) { state = State::Incomplete; return false; }
+                    auto [size, inserted] = file_sizes.try_emplace(source.path);
+                    if (inserted) {
+                        std::error_code error;
+#ifdef SUP7Z_DEBUG
+                        ++file_size_queries;
+#endif
+                        size->second = std::filesystem::file_size(source.path, error);
+                        if (error) { state = State::Incomplete; return false; }
+                    }
+                    const bool covered = size->second >= source.end;
+                    state = covered ? State::Complete : State::Incomplete;
+                    return covered;
+                });
+            domain = complete ? State::Complete : State::Incomplete;
+            if (!complete) return false;
+        }
+        return true;
+    }
 public:
 #ifdef SUP7Z_DEBUG
     std::size_t inspected_choices = 0;
@@ -671,37 +731,16 @@ public:
 #endif
     bool known(const sunpack::sevenzip::VolumeAttemptPlan& plan, std::size_t layout) {
         if (plan.minimum_slots_for(layout) != plan.layouts[layout].size()) return false;
-        if (checked_ == layout) return complete_;
-        checked_ = layout;
-        complete_ = false;
-        const auto source_offset = plan.domains.size();
-        std::vector<bool> checked(source_offset + plan.sources.size());
-        std::unordered_map<std::wstring_view, std::uintmax_t> file_sizes;
-        for (const auto& slot : plan.layouts[layout]) {
-            if (checked[slot.domain]) continue;
-            checked[slot.domain] = true;
-            for (auto id : plan.domains[slot.domain]) {
-#ifdef SUP7Z_DEBUG
-                ++inspected_choices;
-#endif
-                if (checked[source_offset + id]) continue;
-                checked[source_offset + id] = true;
-                const auto& source = plan.sources[id];
-                if (sunpack::sevenzip::native_job_cancelled() || !source.has_end) return false;
-                auto [size, inserted] = file_sizes.try_emplace(source.path);
-                if (inserted) {
-                    std::error_code error;
-#ifdef SUP7Z_DEBUG
-                    ++file_size_queries;
-#endif
-                    size->second = std::filesystem::file_size(source.path, error);
-                    if (error) return false;
-                }
-                if (size->second < source.end) return false;
-            }
+        if (layouts_.empty()) {
+            // A parallel wave may publish different layouts out of order.
+            // Keep the geometry of this immutable plan once per request.
+            domains_.resize(plan.domains.size());
+            sources_.resize(plan.sources.size());
+            layouts_.resize(plan.layouts.size());
         }
-        complete_ = true;
-        return true;
+        auto& state = layouts_[layout];
+        if (state == State::Unknown) state = inspect(plan, layout) ? State::Complete : State::Incomplete;
+        return state == State::Complete;
     }
 };
 
@@ -813,7 +852,12 @@ bool rejects_volume_attempt(const sunpack::sevenzip::PasswordTestResult& probe) 
             probe.observed_volume_slots && !probe.observed_volume_slots->empty());
 }
 
-std::size_t rejected_prefix_size(const sunpack::sevenzip::PasswordTestResult& probe, std::size_t slots) {
+bool unavailable_volume_probe(const sunpack::sevenzip::PasswordTestResult& probe) {
+    return probe.status == sunpack::sevenzip::PasswordTestStatus::Unsupported &&
+        probe.password_independent_failure && probe.possible_candidates.empty() && probe.observed_volume_slots.has_value();
+}
+
+std::size_t observed_prefix_size(const sunpack::sevenzip::PasswordTestResult& probe, std::size_t slots) {
     const auto& observed = probe.observed_volume_slots;
     if (!observed || observed->empty()) return 0;
     const auto count = observed->back() + 1;
@@ -846,13 +890,15 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
             // An earlier uncached composition can still win. Nothing after
             // this confirmed one is needed, including cursor advancement.
             if (cached->status == PasswordTestStatus::Ok) break;
-            if (rejects_volume_attempt(*cached)) {
-                const auto prefix = rejected_prefix_size(*cached, prepared.sources.size());
-                if ((cached->rejects_fixed_geometry || prefix) && cache.can_skip_suffix(plan, prepared.layout)) {
+            const bool unavailable = request.scan_only && unavailable_volume_probe(*cached);
+            if (unavailable || rejects_volume_attempt(*cached)) {
+                const auto prefix = observed_prefix_size(*cached, prepared.sources.size());
+                const bool whole_layout = cached->rejects_fixed_geometry ||
+                    (unavailable && cached->observed_volume_slots->empty());
+                if ((whole_layout || prefix) && cache.can_skip_suffix(plan, prepared.layout)) {
                     // Keep the witness in the wave for the scan report and
-                    // the extraction cursor. The lookahead need not copy or
-                    // dispatch any composition under its rejected branch.
-                    if (cached->rejects_fixed_geometry) next.skip_layout();
+                    // skip the remaining choices with the same proof.
+                    if (whole_layout) next.skip_layout();
                     else next.skip_suffix(plan, prefix - 1);
                 }
             }
@@ -906,15 +952,15 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
             scheduled.fetch_add(1, std::memory_order_relaxed);
 #endif
             WorkerArchiveInput input;
-            select_volume_attempt(request.archive_input, prepared.layout, prepared.sources, input);
+            select_volume_attempt(request.archive_input, prepared.layout, prepared.sources, input, request.scan_only);
             prepared.probe = probe_input(request, input, request.passwords_for_layout(prepared.layout), final_choice == lane);
         }
         if (prepared.probe->status == PasswordTestStatus::Ok) {
             auto old = earliest.load(std::memory_order_relaxed);
             while (lane < old && !earliest.compare_exchange_weak(old, lane, std::memory_order_relaxed)) {}
         }
-        if (decoded && prepared.probe->observed_volume_slots && !native_job_cancelled() &&
-            lane <= earliest.load(std::memory_order_relaxed)) {
+        if (decoded && !native_job_cancelled() && lane <= earliest.load(std::memory_order_relaxed) &&
+            reusable_volume_probe(plan, prepared)) {
             if (!concurrent) {
                 cache.remember(plan, prepared, capacity);
             } else {
@@ -924,6 +970,7 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
         }
     };
     parallel.run(pending.size(), [&](std::size_t task, std::size_t) { probe_lane(pending[task]); });
+    parallel.limit(1);
     if (scan_last && earliest.load(std::memory_order_relaxed) > *scan_last &&
         !native_job_cancelled() && (!cancel || !cancel->load(std::memory_order_relaxed))) {
         if (std::all_of(prepared_attempts.begin(), std::prev(prepared_attempts.end()), [](const auto& attempt) {
@@ -933,9 +980,7 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
             if (const auto* cached = cache.find(plan, last)) {
                 last.probe = *cached;
             } else {
-                WorkerArchiveInput input;
-                select_volume_attempt(request.archive_input, last.layout, last.sources, input);
-                last.missing_without_probe = input.missing_volume_number != 0;
+                last.missing_without_probe = selected_volume_geometry(plan, last.layout, last.sources).missing != 0;
             }
         } else {
             parallel.run(1, [&](std::size_t, std::size_t) { probe_lane(*scan_last); });
@@ -1025,20 +1070,23 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
                     }
                     probe = std::move(*candidate.probe);
                     const bool rejected = rejects_volume_attempt(probe);
+                    const bool unavailable = unavailable_volume_probe(probe);
                     const bool wrong_password = probe.status == PasswordTestStatus::WrongPassword;
                     password_rejected |= wrong_password;
                     // A structural contradiction remains excluded even if
                     // later password rejections leave this scan inconclusive.
                     const bool record_rejection = frontier_found || (rejected && !wrong_password);
-                    const auto prefix = rejected ? rejected_prefix_size(probe, candidate.sources.size()) : 0;
-                    if (probe.rejects_fixed_geometry && proof_cache.can_skip_suffix(plan, candidate.layout)) {
+                    const auto prefix = rejected || unavailable ? observed_prefix_size(probe, candidate.sources.size()) : 0;
+                    const bool whole_layout = probe.rejects_fixed_geometry ||
+                        (unavailable && probe.observed_volume_slots->empty());
+                    if (whole_layout && proof_cache.can_skip_suffix(plan, candidate.layout)) {
                         skipped_layout = candidate.layout;
-                        if (record_rejection) wire::append_number(discarded_layouts, candidate.layout);
+                        if (rejected && record_rejection) wire::append_number(discarded_layouts, candidate.layout);
                         if (cursor.layout == candidate.layout && !cursor.searching) cursor.skip_layout();
                     } else if (prefix && proof_cache.can_skip_suffix(plan, candidate.layout)) {
                         skipped_prefix = &candidate;
                         skipped_slots = prefix;
-                        if (record_rejection) append_volume_selection(discarded_prefixes, candidate.layout, candidate.sources, prefix);
+                        if (rejected && record_rejection) append_volume_selection(discarded_prefixes, candidate.layout, candidate.sources, prefix);
                         if (cursor.layout == candidate.layout && !cursor.searching &&
                             same_volume_prefix(candidate.sources, cursor.selected, prefix))
                             cursor.skip_suffix(plan, prefix - 1);
@@ -1332,7 +1380,7 @@ RequestOutcome run_request(
                     !request.password_verified && selected_probe->status == PasswordTestStatus::WrongPassword;
                 auto& cursor = volume_replay->volumes;
                 const auto& plan = request.archive_input.volume_attempts;
-                const auto prefix = rejected_prefix_size(*selected_probe, cursor.selected.size());
+                const auto prefix = observed_prefix_size(*selected_probe, cursor.selected.size());
                 if ((selected_probe->rejects_fixed_geometry || prefix) && proof_cache.can_skip_suffix(plan, cursor.layout)) {
                     if (selected_probe->rejects_fixed_geometry) {
                         while (!prepared_attempts.empty() && prepared_attempts.front().layout == cursor.layout)
@@ -1376,7 +1424,7 @@ RequestOutcome run_request(
             volume_replay->uncertain_paths.clear();
             unsigned long long offset = 0;
             bool variable_offset = false;
-            for (std::size_t i = 0; i < selected_input.ranges.size(); ++i) {
+            for (std::size_t i = 0; !selected_input.missing_volume_number && i < selected_input.ranges.size(); ++i) {
                 const auto& range = selected_input.ranges[i];
                 const auto length = range.has_end ? (std::min)(range.end - range.start, UINT64_MAX - offset) : UINT64_MAX - offset;
                 const auto& variation = plan.variation[i];
@@ -1439,10 +1487,15 @@ RequestOutcome run_request(
                     result.matched_index = probe.matched_index;
                 }
             } else {
+                auto candidate = remaining ? remaining->begin() : std::vector<std::size_t>::const_iterator{};
                 const auto next_candidate = [&](std::size_t first) {
                     if (!remaining) return first;
-                    const auto it = std::lower_bound(remaining->begin(), remaining->end(), first);
-                    return it == remaining->end() ? password_candidates.size() : *it;
+                    const auto end = remaining->end();
+                    if (candidate != end && *candidate < first) {
+                        ++candidate;
+                        if (candidate != end && *candidate < first) candidate = std::lower_bound(candidate, end, first);
+                    }
+                    return candidate == end ? password_candidates.size() : *candidate;
                 };
                 std::size_t index = replay ? replay->candidate_index : 0;
                 if (!replay || !replay->candidate_discard_pending) index = next_candidate(index);
@@ -1542,9 +1595,12 @@ RequestOutcome run_request(
         if (!volume_trials || !volume_composition_failure(result, *volume_replay, password_verified)) break;
         if (archive_input.missing_volume_number > 0 &&
             std::none_of(request.archive_input.volume_attempts.layouts.begin(), request.archive_input.volume_attempts.layouts.end(),
-                [&](const auto& layout) { return std::any_of(layout.begin(), layout.end(), [&](const auto& slot) {
-                    return slot.number == static_cast<unsigned int>(archive_input.missing_volume_number);
-                }); })) break;
+                [&](const auto& layout) {
+                    const auto number = static_cast<unsigned int>(archive_input.missing_volume_number);
+                    const auto slot = std::lower_bound(layout.begin(), layout.end(), number,
+                        [](const VolumeAttemptSlot& slot, unsigned int number) { return slot.number < number; });
+                    return slot != layout.end() && slot->number == number;
+                })) break;
         auto& cursor = volume_replay->volumes;
         // Every composition of a sparse layout is missing the same slot.
         // The wave holds just one witness for that layout. Slot 1 instead

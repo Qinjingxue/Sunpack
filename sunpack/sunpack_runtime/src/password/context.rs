@@ -109,7 +109,7 @@ impl PreparedStatus {
         Self::Status(status, message.into())
     }
 
-    fn transient(&self) -> bool {
+    pub(super) fn transient(&self) -> bool {
         match self {
             Self::ReadFault(fault) => fault.code == "io_error",
             Self::Status(_, message) => message.starts_with("resource_unavailable:"),

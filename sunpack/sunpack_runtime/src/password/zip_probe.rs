@@ -1,4 +1,4 @@
-use super::{le_u16, PasswordVerification, ZipCryptoState, ZipVolumeReader};
+use super::{le_u16, FixedZipDirectory, PasswordVerification, ZipCryptoState, ZipVolumeReader};
 use crate::formats::deflate_prefix;
 use crate::formats::seven_zip::{seven_zip_prefix_check, seven_zip_successor_prefix, SevenZipPrefixCheck};
 use crate::formats::zip::zip64::CentralValues;
@@ -9,6 +9,7 @@ use crate::password::input::{RangeSpec, VirtualRangeReader, VolumeSet};
 use crate::scan::compression_stream::{check_xz_footer, check_xz_prefix, MAX_XZ_PREFIX_SIZE};
 use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
+use std::borrow::Cow;
 use std::io;
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ pub(super) enum ZipReadInput {
     Ranges(Arc<[RangeSpec]>),
     Volumes(Arc<VolumeSet>),
     Projected(Arc<DeferredReads>),
+    FixedDirectory(Arc<FixedZipDirectory>),
 }
 
 impl PartialEq for ZipReadInput {
@@ -35,6 +37,7 @@ impl PartialEq for ZipReadInput {
             (Self::Ranges(a), Self::Ranges(b)) => Arc::ptr_eq(a, b),
             (Self::Volumes(a), Self::Volumes(b)) => Arc::ptr_eq(a, b),
             (Self::Projected(a), Self::Projected(b)) => Arc::ptr_eq(a, b),
+            (Self::FixedDirectory(a), Self::FixedDirectory(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -84,7 +87,11 @@ impl ZipRead {
         let check = |bytes: Vec<u8>, size| {
             if bytes.len() == size { Ok(bytes) } else { Err(DeferredReadError::Missing) }
         };
-        let result = match &self.input {
+        let input = match &self.input {
+            ZipReadInput::FixedDirectory(directory) => directory.input(),
+            input => input,
+        };
+        let result = match input {
             ZipReadInput::Projected(input) => input.evaluate(|reader| verify(&mut |relative, size| {
                 if let Some(disk) = disk {
                     reader.read_disk_offset(disk, offset, relative, size)
@@ -114,6 +121,7 @@ impl ZipRead {
                 });
                 vec![(None, result)]
             }
+            ZipReadInput::FixedDirectory(_) => unreachable!("fixed source is already unwrapped"),
         };
         Cancellation::check_current_io()?;
         Ok(result)
@@ -226,7 +234,21 @@ impl ZipPrefix {
         self.read = Some(read);
     }
 
-    pub(super) fn screening_minimum(&self, matches: usize, derive_aes_key: bool, unique_volumes: bool) -> Option<usize> {
+    pub(super) fn screening_prefix(&self, matches: usize, derive_aes_key: bool, unique_volumes: bool)
+        -> io::Result<Option<(Cow<'_, Self>, usize)>>
+    {
+        let mut prefix = Cow::Borrowed(self);
+        if matches > 1 {
+            if let Some(ZipReadInput::FixedDirectory(directory)) = self.read.as_ref().map(|read| &read.input) {
+                if let Some((packed, unpacked)) = directory.sizes()? {
+                    prefix.to_mut().sizes = packed.checked_sub(self.overhead).map(|packed| (packed, unpacked));
+                }
+            }
+        }
+        Ok(prefix.screening_minimum(matches, derive_aes_key, unique_volumes).map(|minimum| (prefix, minimum)))
+    }
+
+    fn screening_minimum(&self, matches: usize, derive_aes_key: bool, unique_volumes: bool) -> Option<usize> {
         let read = self.read.as_ref()?;
         let size = self.read_size();
         if matches == 0 || size == 0 { return None; }

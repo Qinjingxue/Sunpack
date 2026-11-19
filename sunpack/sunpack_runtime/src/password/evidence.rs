@@ -59,7 +59,7 @@ impl Extend<(Arc<VolumeProjection>, usize)> for ScopedRejections {
 #[derive(Default)]
 pub(crate) struct CandidateDomains {
     prepared: Vec<Option<Vec<usize>>>,
-    scoped: ScopedRejections,
+    scoped: HashMap<usize, (Arc<VolumeProjection>, Vec<usize>)>,
 }
 
 impl CandidateDomains {
@@ -83,21 +83,19 @@ impl CandidateDomains {
     }
 
     pub(crate) fn append_scoped(
-        &mut self, mut rejected: ScopedRejections, offset: usize, ordinals: &[usize],
+        &mut self, rejected: ScopedRejections, offset: usize, ordinals: &[usize],
     ) {
-        rejected.remap(|index| {
-            let &ordinal = ordinals.get(index)?;
-            (ordinal != usize::MAX).then(|| offset + ordinal)
-        });
-        if self.scoped.is_empty() {
-            self.scoped = rejected;
-        } else {
-            self.scoped.0.extend(rejected.0);
+        for (path, index) in rejected.0 {
+            let Some(&ordinal) = ordinals.get(index) else { continue; };
+            if ordinal == usize::MAX { continue; }
+            // All rejections on the same byte projection share its graph.
+            self.scoped.entry(Arc::as_ptr(&path) as usize)
+                .or_insert_with(|| (path, Vec::new())).1.push(offset + ordinal);
         }
     }
 
     pub(crate) fn finish(
-        self,
+        mut self,
         context: &EvidenceContext,
         count: usize,
     ) -> std::io::Result<Option<(VolumeAttemptPlan, LayoutPasswords)>> {
@@ -125,7 +123,11 @@ impl CandidateDomains {
             };
             rules.push((path, rule));
         }
-        rules.extend(self.scoped.0.iter().map(|(path, index)| (path.as_ref(), Rule::Reject(std::slice::from_ref(index)))));
+        for (_, indices) in self.scoped.values_mut() {
+            if !indices.is_sorted() { indices.sort_unstable(); }
+            indices.dedup();
+        }
+        rules.extend(self.scoped.values().map(|(path, indices)| (path.as_ref(), Rule::Reject(indices.as_slice()))));
         let mut rejected = Vec::new();
         let mut allowed = Vec::new();
         let mut terminal = |state: &State, ends: &Ends| -> Option<usize> {
@@ -784,7 +786,7 @@ fn partition_from(
                 if !state.is_empty() {
                     for &source in domain.iter() {
                         #[cfg(test)]
-                        PARTITION_EDGE_VISITS.with(|count| count.set(count.get() + 1));
+                        PARTITION_EDGE_VISITS.with(|count| count.set(count.get() + state.len()));
                         let mut target = Vec::new();
                         for &(proof, node) in &state {
                             if let Some(nodes) = edges.get(&(proof, node, source)) {
@@ -818,9 +820,16 @@ fn partition_from(
         let mut unconstrained = Suffix::Group(0);
         for (domain, steps) in choices.iter().zip(layers).rev() {
             cancel.check_io()?;
-            let mut intern = HashMap::<(Arc<Vec<usize>>, Suffix), Suffix>::new();
+            let mut intern = HashMap::<(Option<Arc<Vec<usize>>>, Suffix), Suffix>::new();
             let mut node = |choices: Arc<Vec<usize>>, tail| {
-                *intern.entry((choices.clone(), tail)).or_insert_with(|| {
+                // Every choice list here is an ordered subset of this slot.
+                // Key the complete domain without hashing its source IDs.
+                let subset = (choices.len() != domain.len()).then(|| choices.clone());
+                #[cfg(test)]
+                if let Some(subset) = &subset {
+                    PARTITION_DOMAIN_HASH_CHOICES.set(PARTITION_DOMAIN_HASH_CHOICES.get() + subset.len());
+                }
+                *intern.entry((subset, tail)).or_insert_with(|| {
                     let id = Suffix::Node(arena.len());
                     arena.push((choices, tail));
                     id
@@ -887,6 +896,7 @@ fn partition_from(
     let mut layout_groups = Vec::new();
     let mut domains: Vec<VolumeDomain> = Vec::new();
     let mut domain_ids: HashMap<Arc<Vec<usize>>, usize> = HashMap::new();
+    let mut shared_domain_ids = HashMap::new();
     let start = first.map_or(0, |selection| selection.layout);
     for (layout_index, layout) in plan.layouts.iter().enumerate().skip(start) {
         if dropped.get(layout_index) == Some(&true) { continue; }
@@ -919,8 +929,17 @@ fn partition_from(
             let mut keep = |remaining: Vec<Arc<Vec<usize>>>, group| {
                 let mut slots = slots.to_vec();
                 for (slot, choices) in slots.iter_mut().zip(remaining) {
+                    let shared = (choices.len() > 8).then(|| Arc::as_ptr(&choices));
+                    if let Some(&id) = shared.as_ref().and_then(|key| shared_domain_ids.get(key)) {
+                        slot.domain = id;
+                        continue;
+                    }
+                    #[cfg(test)]
+                    PARTITION_DOMAIN_HASH_CHOICES.set(PARTITION_DOMAIN_HASH_CHOICES.get() + choices.len());
                     slot.domain = *domain_ids.entry(choices.clone()).or_insert_with(|| {
                         let index = domains.len();
+                        // The output keeps this Arc alive for the pointer key.
+                        if let Some(key) = shared { shared_domain_ids.insert(key, index); }
                         domains.push(VolumeDomain { choices });
                         index
                     });
@@ -980,6 +999,7 @@ fn visit_ordered_suffix(
 thread_local! {
     static FRONTIER_RESTORED_CHOICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PARTITION_EDGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PARTITION_DOMAIN_HASH_CHOICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

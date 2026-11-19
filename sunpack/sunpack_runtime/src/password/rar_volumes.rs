@@ -252,7 +252,10 @@ pub(super) fn prepare_fixed(volumes: &VolumeSet, parts: &[InputPart], sessions: 
         PreparedStatus::new("needs_volume_or_tail_damaged", "RAR volume unavailable"))?;
     let can_bind = parts.len() > 1 && parts[0].volume_number == Some(1);
     let mut inspected = Vec::new();
-    let prefer_later = |context: &RarPasswordContext| matches!(context.material, RarPasswordMaterial::Rar5Block { .. });
+    let prefer_later = |context: &RarPasswordContext| {
+        matches!(context.material, RarPasswordMaterial::Rar5Block { .. })
+            || (!can_bind && !context.has_local_evidence())
+    };
     let mut inspect = |range| {
         let mut facts = VolumeFacts { stop_at_proof: true, ..Default::default() };
         let context = inspect_volume(range, &mut facts, true).map(Arc::new);
@@ -269,7 +272,11 @@ pub(super) fn prepare_fixed(volumes: &VolumeSet, parts: &[InputPart], sessions: 
                     selected = Ok(context);
                     break;
                 }
-                if selected.is_err() { selected = Ok(context); }
+                if selected.is_err() || (!can_bind && context.has_local_evidence()
+                    && selected.as_ref().is_ok_and(|current| !current.has_local_evidence()))
+                {
+                    selected = Ok(context);
+                }
             }
         }
     }
@@ -379,27 +386,35 @@ fn prepare_inspected(
     let fragments: Option<Arc<[_]>> = materials.iter().flatten().any(|c| c.can_follow_native()).then(|| {
         plan.sources.iter().map(|s| facts[by_extent[s]].first.as_ref().and_then(Clone::clone)).collect()
     });
+    let is_strong = |context: &RarPasswordContext| context.material.empty_mac_strength() != 0
+        || matches!(context.material, RarPasswordMaterial::Rar5Header { .. });
+    let strengths = if materials.iter().flatten().any(|context| is_strong(context)) {
+        &[true, false][..]
+    } else {
+        &[false][..]
+    };
     let prepared = prepare_attempt_evidence_partial(head, &plan, sessions, AttemptGeometry::DiskRelative, |reader| {
-        for strong in [true, false] {
+        for &strong in strengths {
             for &disk in &disks {
+                let next_available = !strong && fragments.is_some() && disks.contains(&(disk + 1));
                 let source = reader.native_proof(disk, |source| materials[source].as_ref().and_then(|ctx| {
-                    let is_strong = ctx.material.empty_mac_strength() != 0
-                        || matches!(ctx.material, RarPasswordMaterial::Rar5Header { .. });
-                    (strong == is_strong).then_some(source)
+                    (strong == is_strong(ctx) && (ctx.has_local_evidence() || (next_available && ctx.can_follow_native()
+                        && facts[by_extent[&plan.sources[source]]].last.as_ref().is_some_and(Option::is_some))))
+                        .then_some(source)
                 })).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))?;
                 if let Some(source) = source {
                     let material = materials[source].as_ref().unwrap();
-                    if material.can_follow_native() && disks.contains(&(disk + 1)) {
+                    if next_available && material.can_follow_native() {
                         let facts = &facts[by_extent[&plan.sources[source]]];
                         if let (Some(fragments), Some(Some(outgoing))) = (&fragments, &facts.last) {
-                            if let Some(material) = material.with_native_tail(
-                                reader, disk, outgoing, fragments,
-                            ).map_err(|err| PreparedStatus::new("unknown_needs_final_verifier", err.to_string()))? {
+                            if let Ok(Some(material)) = material.with_native_tail(reader, disk, outgoing, fragments) {
                                 return Ok(Some(Arc::new(material)));
                             }
                         }
                     }
-                    return Ok(Some(material.clone()));
+                    // A short or unavailable continuation provides no
+                    // password verdict. The next independent disk may.
+                    if material.has_local_evidence() { return Ok(Some(material.clone())); }
                 }
             }
         }

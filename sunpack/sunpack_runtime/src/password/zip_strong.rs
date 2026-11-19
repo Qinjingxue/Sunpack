@@ -179,10 +179,6 @@ impl PasswordHeader {
         self.prefix = self.prefix.take().map(|prefix| prefix.with_sizes(sizes));
     }
 
-    pub(super) fn needs_sizes(&self) -> bool {
-        self.prefix.as_ref().is_some_and(ZipPrefix::needs_size)
-    }
-
     fn load_validation(&self, read: &mut CheckRead<'_>) -> Result<Validation, ValidationUnavailable> {
         let ValidationRanges {
             body_offset,

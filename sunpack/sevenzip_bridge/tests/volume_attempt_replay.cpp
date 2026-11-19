@@ -350,6 +350,15 @@ void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
     plan.layouts = {{{1, L"one", 0}, {2, L"two", 0}, {3, L"three", 1}}};
     plan.prepare();
 
+    auto interleaved = plan;
+    interleaved.domains.push_back({0, 1});
+    interleaved.layouts.push_back({{1, L"one", 2}, {2, L"two", 0}, {3, L"three", 1}});
+    CompleteVolumeGeometry geometry;
+    require(geometry.known(interleaved, 0) && geometry.known(interleaved, 1) &&
+        geometry.known(interleaved, 0) && geometry.inspected_choices == 10 &&
+        geometry.file_size_queries == 1,
+        "interleaved layouts read shared geometry more than once");
+
     VolumeProbeCache cache(plan);
     PasswordTestResult rejection;
     rejection.status = PasswordTestStatus::WrongPassword;
@@ -416,6 +425,20 @@ void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
     }
     require(head == 4 && prefix_cursor.attempts == 4 && prefixes.scheduled_probes == 0,
         "known rejected suffixes were reconstructed by the wave");
+
+    VolumeProbeCache unavailable(plan);
+    PasswordTestResult unsupported;
+    unsupported.status = PasswordTestStatus::Unsupported;
+    unsupported.password_independent_failure = true;
+    unsupported.observed_volume_slots.emplace();
+    require(unavailable.remember(plan, {0, {0, 1, 4}, unsupported}, 4), "could not cache an unavailable probe");
+    VolumeAttemptCursor unresolved;
+    unresolved.reserve(plan);
+    const auto wave = probe_volume_wave(request, unresolved, nullptr, unavailable);
+    require(wave.size() == 1 && wave.front().sources == std::vector<std::size_t>{0, 1, 4} &&
+        wave.front().probe && wave.front().probe->status == PasswordTestStatus::Unsupported &&
+        !rejects_volume_attempt(*wave.front().probe) && !unresolved.next(plan) && unresolved.attempts == 1 &&
+        unavailable.scheduled_probes == 0, "unavailable proof re-enumerated equivalent candidates or lost its witness");
 }
 
 void carrier_slices_share_open_file(const std::filesystem::path& archive) {
@@ -498,6 +521,15 @@ void unavailable_member_is_not_reprobed_for_an_unread_slice(
         warm.front().probe->status == PasswordTestStatus::Unsupported &&
         !warm.front().probe->rejects_fixed_geometry && cache.scheduled_probes == 1,
         "the unread slice reran an unavailable method or was falsely rejected");
+
+    request.scan_only = true;
+    request.archive_input.archive_path = path;
+    const auto scan = run_request(request);
+    require(scan.code == 0 && scan.response.find(wire::key("discarded_volume_paths")) == std::string::npos &&
+        scan.response.find(wire::key("discarded_volume_prefixes")) == std::string::npos &&
+        scan.response.find(wire::key("discarded_volume_layouts")) == std::string::npos &&
+        scan.response.find(wire::key("password_verified") + wire::boolean(false)) != std::string::npos,
+        "Scan discarded a composition when its member proof was unavailable");
 }
 
 void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {
@@ -552,6 +584,23 @@ void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {
         header_conflict.observed_volume_slots == std::optional(std::vector<std::size_t>{1}),
         "the ZIP local/CD contradiction was not returned as a scoped layout failure");
 
+    const auto fixed = carrier.parent_path() / L"damaged-local.zip";
+    std::string fixed_zip(zip, length);
+    fixed_zip.replace(start, conflicting.size(), conflicting);
+    // The first entry is clear and leaves the corrupt local header of the
+    // second entry as the only available encrypted member check.
+    fixed_zip[6] = fixed_zip[end + 8] = 0;
+    fixed_zip[22] = fixed_zip[end + 24] = 17;
+    { std::ofstream file(fixed, std::ios::binary); file << fixed_zip; }
+    observed_logical_read_bytes = 0;
+    const auto single = test_password_batch(fixed.wstring(), {}, {}, L"zip", candidates, 1, {}, true);
+    const auto one_read = observed_logical_read_bytes;
+    observed_logical_read_bytes = 0;
+    const auto batch = test_password_batch(fixed.wstring(), {}, {}, L"zip", candidates, 2, {}, true);
+    require(single.status == PasswordTestStatus::Damaged && batch.status == PasswordTestStatus::Damaged &&
+        one_read > 0 && observed_logical_read_bytes < one_read * 2,
+        "inconclusive member forced the same ZIP directory to reopen for a second key");
+
     WorkerRequest scan;
     scan.scan_only = true;
     scan.encrypted = 1;
@@ -580,7 +629,8 @@ void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {
         VolumeAttemptCursor cursor;
         cursor.reserve(verified_plan);
         auto wave = probe_volume_wave(verified_scan, cursor, nullptr, cache);
-        require(!wave.empty() && wave.front().probe && rejects_volume_attempt(*wave.front().probe),
+        require(!wave.empty() && wave.front().probe && rejects_volume_attempt(*wave.front().probe) &&
+            cache.geometry.file_size_queries == 0,
             "verified Scan failed to discard the contradictory first composition");
         if (wave.size() == 1) wave = probe_volume_wave(verified_scan, cursor, nullptr, cache);
         require(!wave.empty() && wave.back().sources == std::vector<std::size_t>({0, 1, 2}) &&

@@ -179,6 +179,10 @@ impl<K: Eq + Hash + Clone, V> CacheOrder<K, V> {
         self.slots.len()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     pub(crate) fn insert(&mut self, key: K, value: V, limit: usize) -> Option<(K, V)> {
         if let Some(&index) = self.entries.get(&key) {
             self.slots[index].value = value;

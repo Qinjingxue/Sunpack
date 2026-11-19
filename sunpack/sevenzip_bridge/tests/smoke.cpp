@@ -3,6 +3,7 @@
 #include "internal/sevenzip_formats.hpp"
 #include "internal/sevenzip_status.hpp"
 #include "internal/native_cpu_budget.hpp"
+#include "internal/password_parallel.hpp"
 #include "internal/decoder_cpu_budget.h"
 #include "internal/sevenzip_callbacks.hpp"
 #include "internal/sevenzip_streams.hpp"
@@ -383,6 +384,21 @@ bool check_cpu_budget_accounts_base_and_decoder_credits() {
     }
     if (budget.reserved_credits() != 1) {
         return false;
+    }
+    {
+        NativeCpuJobContext job(budget);
+        NativeCpuContextScope cpu(&job);
+        NativeMemoryManager manager(0);
+        NativeMemoryJob memory_job(manager);
+        NativeMemoryScope memory(&memory_job);
+        memory_job.revoked.store(true);
+        PasswordParallelism parallel(4);
+        std::size_t processed = 0;
+        if (parallel.size() != 4) return false;
+        parallel.run(4, [&](std::size_t, std::size_t) {
+            if (budget.reserved_credits() == 1) ++processed;
+        });
+        if (processed != 4) return false;
     }
     budget.release(1);
     return budget.reserved_credits() == 0;
