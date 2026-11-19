@@ -255,6 +255,57 @@ fn winzip_aes_screens_xz_block_after_fixed_stream_header() {
     assert_aes_member_scope(&local, &bad, &good);
 }
 
+#[test]
+fn winzip_aes_xz_footer_screens_padded_concatenated_tail() {
+    use std::io::Write;
+    use xz2::stream::{Check, Stream};
+
+    let input = b"two streams can have different check kinds";
+    let mut payload = xz_payload(input);
+    // The prefix probe cannot reach the final stream.
+    payload.resize(payload.len() + 1040, 0);
+    let mut final_stream = xz2::write::XzEncoder::new_stream(
+        Vec::new(), Stream::new_easy_encoder(1, Check::Crc32).unwrap(),
+    );
+    final_stream.write_all(input).unwrap();
+    payload.extend(final_stream.finish().unwrap());
+    let split = payload.len() - 12;
+    payload.resize(payload.len() + 4112, 0);
+
+    let (mut local, payload) = winzip_aes_member(payload, input.len() * 2, 95);
+    local.extend_from_slice(&payload[..split]);
+    let mut good = payload[split..].to_vec();
+    good.extend([0; 10]);
+    let mut bad = good.clone();
+    bad[0] ^= 1; // Same footer magic and flags, but an invalid footer CRC.
+    let (paths, sources, mut plan) = volume_alternatives(&local, &bad, &good);
+    let mut absent = sources[2].clone();
+    absent.path = paths[2].with_extension("unavailable").to_string_lossy().into_owned();
+    let mut short = sources[2].clone();
+    let short_path = crate::test_support::temp_file("zip_xz_truncated_tail", &good[..4]);
+    short.path = short_path.to_string_lossy().into_owned();
+    let mutable = Arc::make_mut(&mut plan);
+    let mut extended = sources.clone();
+    extended.extend([absent.clone(), short.clone()]);
+    mutable.sources = extended.into_boxed_slice();
+    Arc::make_mut(&mut mutable.domains[1].choices).extend([3, 4]);
+
+    let mut preparation = Preparation::default();
+    preparation.fix_password();
+    let result = zip_fast_verify_passwords_from_attempts(&mut preparation, &sources[0], &plan,
+        &[Arc::from("secret")], false, Some(0), &[]).unwrap();
+    assert_eq!(result.matched_indices, [0]);
+    let remaining = result.volume_attempts.expect("the known footer prunes the invalid tails");
+    assert_eq!(&*remaining.sources, &[sources[0].clone(), sources[2].clone(), absent]);
+    let diagnostic = result.read_fault.expect("the anchor preserves the directory failure");
+    assert_eq!(diagnostic.field, "zip.eocd");
+    assert_eq!(preparation.verify_prepared(&[Arc::from("secret")]).unwrap().unwrap()
+        .read_fault.unwrap().field, diagnostic.field);
+
+    drop(preparation);
+    for path in paths.into_iter().chain([short_path]) { std::fs::remove_file(path).unwrap(); }
+}
+
 pub(super) fn xz_payload(input: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);

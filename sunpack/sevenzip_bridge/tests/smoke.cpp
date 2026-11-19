@@ -247,6 +247,21 @@ bool check_rar5_short_keyed_member_password_proof() {
     fixture.replace(28, 4, "\x83\x16\xdc\x8c", 4);
     fixture[39] = 0;
     const auto plain = probe(candidates + 1, 1);
+    // Verify the cheap one-byte CRC first. A complete proof from the
+    // next member can confirm the password, but its failure must not
+    // erase evidence from the first member.
+    constexpr char second[] =
+        "\x60\xb2\xf9\xd4\x34\x02\x03\x25\x10\x04\x10\x00\x9f\xe6\xf6\xe0"
+        "\x00\x00\x01\x79\x24\x01\x00\x00\x08\x00\x01\x02\x03\x04\x05\x06"
+        "\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16"
+        "\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x79\x2a\x0e\x2c\x6a\xf2\x37"
+        "\xa7\x1f\x84\xce\xfa\x88\xae\x90\x32";
+    const auto end_header = fixture.size() - 8;
+    fixture.insert(end_header, second, sizeof(second) - 1);
+    const auto stronger = probe(candidates + 1, 1);
+    fixture[end_header + sizeof(second) - 2] ^= 1;
+    const auto retained = probe(candidates + 1, 1);
+    fixture.erase(end_header, sizeof(second) - 1);
     fixture.replace(16, 4, "\x07\x65\x78\xfc", 4);
     fixture.replace(28, 4, "\x9e\x6d\x9f\x53", 4);
     fixture[24] = fixture[26] = 0;
@@ -259,6 +274,8 @@ bool check_rar5_short_keyed_member_password_proof() {
         with_metadata.status == PasswordTestStatus::Ok && with_metadata.matched_index == 0 &&
         skipped_payloads && metadata_preserved &&
         plain.status == PasswordTestStatus::Unsupported && plain.weak_match &&
+        stronger.status == PasswordTestStatus::Ok && stronger.matched_index == 0 &&
+        retained.status == PasswordTestStatus::Unsupported && retained.weak_match &&
         empty.status == PasswordTestStatus::Unsupported && empty.password_independent_failure;
 }
 

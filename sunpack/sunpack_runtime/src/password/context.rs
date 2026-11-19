@@ -148,6 +148,7 @@ pub(crate) struct Preparation<'a> {
     slot: Option<Arc<PreparedSlot>>,
     local: Option<Box<Prepared>>,
     pub(super) zip_anchor: Option<Box<super::zip::ZipAnchor>>,
+    pub(super) zip_directory_fallback: Option<Box<PreparedStatus>>,
     rar_key: Option<&'a mut Option<super::rar::RarProvenKey>>,
 }
 
@@ -193,11 +194,25 @@ impl<'a> Preparation<'a> {
             -> std::io::Result<PasswordVerification>,
     ) -> std::io::Result<PasswordVerification> {
         let reusable = !prepared.as_ref().is_err_and(|error| error.transient());
-        let result = verify(&prepared, self.fixed_password, self.other_password_batches, self.rar_key.as_deref_mut());
+        let mut result = verify(&prepared, self.fixed_password, self.other_password_batches, self.rar_key.as_deref_mut());
         if reusable && result.is_ok() {
             self.local = Some(Box::new(prepared));
         }
+        if let Ok(result) = &mut result {
+            self.report_zip_directory_fallback(result);
+        }
         result
+    }
+
+    fn report_zip_directory_fallback(&self, result: &mut PasswordVerification) {
+        if let Some(fallback) = &self.zip_directory_fallback {
+            if result.status == "match" && result.read_fault.is_none() {
+                let diagnostic = fallback.verification();
+                result.message.push_str("; ZIP directory fallback: ");
+                result.message.push_str(&diagnostic.message);
+                result.read_fault = diagnostic.read_fault;
+            }
+        }
     }
 
     pub(crate) fn evidence(&self) -> Option<&super::evidence::EvidenceContext> {
@@ -220,6 +235,7 @@ impl<'a> Preparation<'a> {
             slot: None,
             local: None,
             zip_anchor: None,
+            zip_directory_fallback: None,
             rar_key: Some(key),
         }
     }
@@ -243,7 +259,10 @@ impl<'a> Preparation<'a> {
             self.fixed_password,
             self.other_password_batches,
         )
-        .map(Some)
+        .map(|mut result| {
+            self.report_zip_directory_fallback(&mut result);
+            Some(result)
+        })
     }
 
     pub(crate) fn verify(

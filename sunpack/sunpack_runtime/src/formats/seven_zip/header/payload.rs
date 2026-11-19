@@ -38,6 +38,10 @@ pub(crate) struct SevenZipPayloadProbes {
 type SevenZipRead<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), DeferredReadError> + 'a;
 
 impl SevenZipPayloadSource {
+    fn range_is_ambiguous(&self, offset: u64, size: u64) -> bool {
+        matches!(self, Self::Projected(reads) if reads.range_is_ambiguous(offset, size))
+    }
+
     fn validate(
         &self,
         mut check: impl FnMut(&mut SevenZipRead<'_>) -> Result<SevenZipPrefixCheck, String>,
@@ -53,10 +57,8 @@ impl SevenZipPayloadSource {
                 })
             }
             Self::Projected(ranges) => {
-                let outcomes = ranges.evaluate(|reader| check(&mut |offset, bytes| {
-                    bytes.copy_from_slice(&reader.read(offset, bytes.len())?);
-                    Ok(())
-                })).map_err(resource_error)?;
+                let outcomes = ranges.evaluate(|reader| check(&mut |offset, bytes| reader.read_into(offset, bytes)))
+                    .map_err(resource_error)?;
                 if outcomes.iter().all(|(_, result)| matches!(result, Ok(Reject)))
                     && !outcomes.is_empty()
                 {
@@ -102,40 +104,32 @@ impl SevenZipPayloadProbes {
     }
 
     pub(crate) fn has_ambiguous_followup(&self) -> bool {
-        match &self.source {
-            Some(SevenZipPayloadSource::Projected(reads)) => {
-                let span = self.first.kind.followup_span();
-                (span != 0 && reads.range_is_ambiguous(self.first.offset, span))
-                || self.rest.iter().any(|plan| reads.range_is_ambiguous(
-                    plan.offset, plan.kind.followup_span().max(16),
-                ))
-            }
-            _ => false,
-        }
+        self.source.as_ref().is_some_and(|source| {
+            let span = self.first.kind.followup_span();
+            (span != 0 && source.range_is_ambiguous(self.first.offset, span))
+            || self.rest.iter().any(|plan| source.range_is_ambiguous(
+                plan.offset, plan.kind.followup_span().max(16),
+            ))
+        })
     }
 
     pub(crate) fn verify_followup<'a>(
         &'a self,
         first_key: &SevenZipAesKey,
         prefix: SevenZipPayloadPrefix,
+        narrow_volumes_only: bool,
         mut key: impl FnMut(&'a [u8]) -> Result<SevenZipAesKey, String>,
         mut reject: impl FnMut(Arc<VolumeProjection>),
     ) -> Result<SevenZipPrefixCheck, String> {
         use SevenZipPrefixCheck::Reject;
         let Some(source) = &self.source else { return Ok(prefix.check); };
+        let has_useful_successor = |kind: &SevenZipPayloadEvidence, offset| {
+            let span = kind.followup_span();
+            span != 0 && (!narrow_volumes_only || source.range_is_ambiguous(offset, span))
+        };
         source.validate(|read| {
             let mut fault = None;
-            match self.first.kind.check_successor(
-                self.first.offset, &self.first.encrypted, &prefix.plaintext[..prefix.len],
-                first_key, &prefix.inner_keys, read, source,
-            ) {
-                Ok(Reject) => return Ok(Reject),
-                Err(DeferredReadError::Truncated) => return Ok(Reject),
-                Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
-                    return Err(seven_zip_deferred_error(error)),
-                Err(error) => { fault = Some(seven_zip_deferred_error(error)); }
-                _ => {}
-            }
+            let mut successors = Vec::new();
             for plan in &self.rest {
                 check_password_cancellation()?;
                 // Load before deriving a key for a stream that may cross a hole.
@@ -159,9 +153,18 @@ impl SevenZipPayloadProbes {
                 if plan.kind.check_prefix(&plaintext[..length]) == Reject {
                     return Ok(Reject);
                 }
-                match plan.kind.check_successor(
-                    plan.offset, &encrypted, &plaintext[..length], &candidate, &inner_keys, read, source,
-                ) {
+                if has_useful_successor(&plan.kind, plan.offset) {
+                    successors.push((plan, encrypted, plaintext, length, candidate, inner_keys));
+                }
+            }
+            let first = (&self.first.kind, self.first.offset, &self.first.encrypted,
+                &prefix.plaintext[..prefix.len], first_key, prefix.inner_keys.as_slice());
+            let rest = successors.iter().map(|(plan, encrypted, plaintext, length, key, inner)| {
+                (&plan.kind, plan.offset, encrypted, &plaintext[..*length], key, inner.as_slice())
+            });
+            let first = has_useful_successor(&self.first.kind, self.first.offset).then_some(first);
+            for (kind, offset, encrypted, plaintext, key, inner) in first.into_iter().chain(rest) {
+                match kind.check_successor(offset, encrypted, plaintext, key, inner, read, source) {
                     Ok(Reject) => return Ok(Reject),
                     Err(DeferredReadError::Truncated) => return Ok(Reject),
                     Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
@@ -430,6 +433,9 @@ pub(crate) trait SevenZipEvidenceReads<R> {
     fn payload_source(&self, _reader: &R) -> Option<SevenZipPayloadSource> {
         None
     }
+    fn has_deferred_source(&self) -> bool {
+        false
+    }
     fn checks_public_packs(&self) -> bool {
         false
     }
@@ -516,13 +522,10 @@ impl SevenZipPasswordContext {
                     return Err("7z password probe is disabled".into());
                 }
                 if seven_zip_probe_folder_supported(&folder) {
-                    match evidence.independent(reader, |reader| {
-                        read_seven_zip_packed_data(reader, reader_len, next.offset, &pack, &folder, 0)
-                    }) {
-                        Ok(packed) => {
-                            return Ok(Some(Self::Header(SevenZipPasswordProbe::from_parts(
-                                packed, folder, SevenZipMetadata::Header,
-                            ))))
+                    let metadata = SevenZipMetadata::Header;
+                    match prepare_seven_zip_header(reader, reader_len, next.offset, &pack, &folder, 0, metadata, evidence) {
+                        Ok((packed, prefix)) => {
+                            return Ok(Some(Self::Header(SevenZipPasswordProbe { packed, prefix, folder, metadata })))
                         }
                         Err(error) if error.starts_with("resource_unavailable:") => {
                             check_password_cancellation().map_err(std::borrow::Cow::Owned)?;
@@ -572,16 +575,18 @@ impl SevenZipPasswordContext {
             if encrypted && !seven_zip_probe_folder_supported(folder) {
                 return Err("7z external folder encryption graph is unsupported".into());
             }
+            if encrypted {
+                let metadata = SevenZipMetadata::Folders(count);
+                let (packed, prefix) = prepare_seven_zip_header(
+                    reader, reader_len, next.offset, pack, folder, first, metadata, evidence,
+                )?;
+                let folder = streams.folders.remove(index);
+                encrypted_metadata = Some(SevenZipPasswordProbe { packed, prefix, folder, metadata });
+                return Err("7z external folder data needs password".into());
+            }
             let packed = evidence.independent(reader, |reader| {
                 read_seven_zip_packed_data(reader, reader_len, next.offset, pack, folder, first)
             })?;
-            if encrypted {
-                let folder = streams.folders.remove(index);
-                encrypted_metadata = Some(SevenZipPasswordProbe::from_parts(
-                    packed, folder, SevenZipMetadata::Folders(count),
-                ));
-                return Err("7z external folder data needs password".into());
-            }
             let decoded = decode_seven_zip_encoded_folder(&packed, folder)
                 .map_err(std::borrow::Cow::Owned)?;
             if folder.expected_crc.is_some_and(|expected| crc32(&decoded) != expected) {
@@ -673,14 +678,10 @@ impl SevenZipPasswordContext {
         candidates.sort_unstable_by_key(|&(cost, index, _, _)| (cost, index));
         for (_, index, first, metadata) in candidates {
             let folder = &streams.folders[index];
-            match evidence.independent(reader, |reader| {
-                read_seven_zip_packed_data(reader, reader_len, before, pack, folder, first)
-            }) {
-                Ok(packed) => {
+            match prepare_seven_zip_header(reader, reader_len, before, pack, folder, first, metadata, evidence) {
+                Ok((packed, prefix)) => {
                     let folder = streams.folders.remove(index);
-                    return Ok(Some(Self::Header(SevenZipPasswordProbe::from_parts(
-                        packed, folder, metadata,
-                    ))));
+                    return Ok(Some(Self::Header(SevenZipPasswordProbe { packed, prefix, folder, metadata })));
                 }
                 Err(error) if error.starts_with("resource_unavailable:") => {
                     check_password_cancellation().map_err(std::borrow::Cow::Owned)?;

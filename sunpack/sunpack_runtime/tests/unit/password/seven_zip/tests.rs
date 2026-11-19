@@ -28,7 +28,7 @@ fn payload_prefix_collisions_survive_until_complete_header_evidence() {
     })
     .unwrap();
     assert_eq!(weak, [(1, Ok((SevenZipPrefixCheck::Weak, 2))), (3, Ok((SevenZipPrefixCheck::Weak, 4)))]);
-    let weak = candidate_result(&weak, candidates.len(), evidence);
+    let weak = candidate_result(&weak, candidates.len(), evidence, true);
     assert_eq!(weak.matched_indices, [1, 3]);
     assert_eq!(weak.attempts, candidates.len());
     assert_eq!(weak.final_confirmation_required, Some(true));
@@ -40,11 +40,11 @@ fn payload_prefix_collisions_survive_until_complete_header_evidence() {
         }, ()))
     })
     .unwrap();
-    let confirmed = candidate_result(&confirmed, candidates.len(), evidence);
+    let confirmed = candidate_result(&confirmed, candidates.len(), evidence, true);
     assert_eq!(confirmed.matched_index, Some(3));
     assert_eq!(confirmed.final_confirmation_required, Some(false));
     let absent = collect_candidates(&candidates, false, |_, _| Ok((SevenZipPrefixCheck::Reject, ()))).unwrap();
-    let absent = candidate_result(&absent, candidates.len(), evidence);
+    let absent = candidate_result(&absent, candidates.len(), evidence, true);
     assert_eq!(absent.status, "no_match");
     assert_eq!(absent.attempts, candidates.len());
     let fault_or_reject = |index, _: &str| {
@@ -54,13 +54,18 @@ fn payload_prefix_collisions_survive_until_complete_header_evidence() {
             Ok((SevenZipPrefixCheck::Reject, ()))
         }
     };
-    for (proof, tested) in [(Some("7z_payload_prefix"), candidates.len()), (None, 3)] {
+    for proof in [Some("7z_payload_prefix"), None] {
         let fault = collect_candidates(&candidates, proof.is_none(), fault_or_reject).unwrap();
-        let fault = candidate_result(&fault, candidates.len(), proof);
+        let fault = candidate_result(&fault, candidates.len(), proof, true);
         assert_eq!(fault.matched_indices, [2]);
-        assert_eq!(fault.attempts, tested);
+        assert_eq!(fault.attempts, candidates.len());
         assert_eq!(fault.final_confirmation_required, Some(true));
     }
+    let confirmed = collect_candidates(&candidates, true, |index, password| {
+        if password == "correct" { Ok((SevenZipPrefixCheck::Confirmed, ())) }
+        else { fault_or_reject(index, password) }
+    }).unwrap();
+    assert_eq!(confirmed, [(3, Ok((SevenZipPrefixCheck::Confirmed, ())))]);
 }
 
 const AES_LZMA2_FOLDER: &[u8] = &[2, 0x24, 6, 0xf1, 7, 1, 1, 0x3f, 0x21, 0x21, 1, 0, 1, 0];
@@ -87,6 +92,66 @@ fn archive_with_descriptor(body: &[u8], header: &[u8]) -> Vec<u8> {
     archive.extend_from_slice(header);
     update_descriptor_crc(&mut archive);
     archive
+}
+
+#[test]
+fn encoded_header_reads_packed_remainder_only_for_prefix_survivors() {
+    let mut plain = vec![1, 2, 0x19, 72];
+    plain.extend([b'x'; 72]);
+    plain.extend([0, 0]);
+    let encrypted = direct_key_ciphertext(&plain);
+    let mut descriptor = vec![
+        0x17, 6, 0, 1, 9, encrypted.len() as u8, 0,
+        7, 11, 1, 0, 1, 0x24, 6, 0xf1, 7, 1, 1, 0x3f,
+        12, plain.len() as u8, 10, 1,
+    ];
+    descriptor.extend(crc32fast::hash(&plain).to_le_bytes());
+    descriptor.extend([0, 0]);
+    let archive = archive_with_descriptor(&encrypted, &descriptor);
+    let reader = ManagedReader::from_bytes(archive.clone(), Default::default());
+    let evidence = FixedSevenZipEvidence(Arc::new([RangeSpec::entire(&reader)]));
+    let context = prepare_seven_zip(reader.stream_cursor(), reader.len(), &evidence).ok().unwrap();
+    let before = reader.stats().direct_read_bytes;
+    assert_eq!(context.verify(&[Arc::from("wrong")]).unwrap().status, "no_match");
+    assert_eq!(reader.stats().direct_read_bytes, before);
+    let correct = context.verify(&[Arc::from("secret")]).unwrap();
+    assert_eq!(correct.final_confirmation_required, Some(false));
+    assert_eq!(reader.stats().direct_read_bytes - before, encrypted.len() as u64 - 16);
+    let (paths, sources, plan) = uncertain_tail_fixture_at(&archive, &[], 64);
+    let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None).ok().unwrap();
+    let result = context.verify(&[Arc::from("wrong"), Arc::from("secret")], None).unwrap();
+    assert_eq!(result.matched_indices, [1]);
+    assert_eq!(result.final_confirmation_required, Some(false));
+    assert!(!result.volume_attempts.unwrap().sources.iter().any(|source| source.path == sources[1].path));
+    drop(context);
+    for path in paths { std::fs::remove_file(path).unwrap(); }
+}
+
+#[test]
+fn alternate_short_prefix_rejects_without_reading_first_stream_successor() {
+    let mut stream = vec![1, 0, 44];
+    stream.extend([0xa9; 45]);
+    stream.extend([2, 0, 44]);
+    stream.extend([0x4a; 45]);
+    stream.push(0);
+    let first = direct_key_ciphertext(&stream);
+    let other = direct_key_ciphertext(&[0xff; 32]);
+    let mut header = vec![1, 4, 6, 0, 2, 9, first.len() as u8, 32, 0, 7, 11, 2, 0];
+    header.extend(AES_LZMA2_FOLDER);
+    header.extend(AES_LZMA2_FOLDER);
+    header.extend([12, stream.len() as u8, 90, 32, 1, 0, 0, 0]);
+    let mut body = first;
+    body.extend(other);
+    let reader = ManagedReader::from_bytes(archive_with_descriptor(&body, &header), Default::default());
+    let evidence = FixedSevenZipEvidence(Arc::new([RangeSpec::entire(&reader)]));
+    let context = prepare_seven_zip(reader.stream_cursor(), reader.len(), &evidence).ok().unwrap();
+    let before = reader.stats().read_bytes;
+    // Both candidates pass the first prefix. The direct-key fixture truncates
+    // the second password after its first sixteen UTF-16 code units.
+    let equivalent = format!("secret{}second", "\0".repeat(10));
+    let rejected = context.verify(&[Arc::from("secret"), Arc::from(equivalent)]).unwrap();
+    assert_eq!(rejected.status, "no_match");
+    assert_eq!(reader.stats().read_bytes - before, 32);
 }
 
 #[test]

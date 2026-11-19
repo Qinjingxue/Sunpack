@@ -86,8 +86,12 @@ pub(crate) fn zip_fast_verify_passwords_from_attempts(
     let anchor = preparation.zip_anchor.take().or_else(||
         prepare_zip_attempt_anchor(head, plan, sessions).map(Box::new));
     let Some(anchor) = anchor else {
-        return preparation.verify_local(
-            prepare_zip_attempts(head, plan, spanned, eocd_offset, sessions, None), candidates);
+        let prepared = prepare_zip_attempts(head, plan, spanned, eocd_offset, sessions, None)
+            .map(|(context, fallback)| {
+                preparation.zip_directory_fallback = fallback;
+                context
+            });
+        return preparation.verify_local(prepared, candidates);
     };
     let material = anchor.context.kdf_parameters().unwrap();
     let keys = ZipKeyCache::from_parameters([material, material]);
@@ -97,7 +101,10 @@ pub(crate) fn zip_fast_verify_passwords_from_attempts(
         return Ok(early);
     }
     let prepared = match prepare_zip_attempts(head, plan, spanned, eocd_offset, sessions, Some(&anchor)) {
-        Ok(prepared) => prepared,
+        Ok((prepared, fallback)) => {
+            preparation.zip_directory_fallback = fallback;
+            prepared
+        }
         Err(error) => {
             let fallback = error.verification();
             early.message = fallback.message;
@@ -161,13 +168,13 @@ fn prepare_zip_attempts(
     eocd_offset: Option<u64>,
     sessions: &[NativeArchiveSession],
     anchor: Option<&ZipAnchor>,
-) -> Result<PasswordContext, PreparedStatus> {
+) -> Result<(PasswordContext, Option<Box<PreparedStatus>>), PreparedStatus> {
     use super::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
     let geometry = if !plan.tail_totals.is_empty() { AttemptGeometry::TailTotals }
         else if let Some(total) = plan.head_size_from_total { AttemptGeometry::TrimmedHead { total } }
         else if spanned { AttemptGeometry::DiskRelative }
         else { AttemptGeometry::Forward { logical_limit: None } };
-    let evidence = prepare_attempt_evidence_partial(head, plan, sessions, geometry, |reader| {
+    let mut evidence = prepare_attempt_evidence_partial(head, plan, sessions, geometry, |reader| {
         let len = reader.len();
         let directory = reader.independent_evidence(|reader| {
             let count = if spanned {
@@ -179,16 +186,17 @@ fn prepare_zip_attempts(
             prepare_zip_volume_directory(&volumes, eocd_offset, anchor)
         });
         match directory {
-            Ok(context) => Ok(Some(context)),
+            Ok(context) => Ok(Some((context, None))),
             Err(PreparedStatus::Status("invalid_volume_evidence", _)) => Ok(None),
-            Err(_) if anchor.is_some() => {
+            Err(error) if anchor.is_some() => {
                 let anchor = anchor.as_ref().unwrap();
                 let input = anchor.context.needs_read().then(|| ZipReadInput::Projected(
                     Arc::new(reader.deferred_reads(spanned))
                 ));
-                Ok(Some(anchor.context.clone().bind(input, anchor.location())))
+                let context = anchor.context.clone().bind(input, anchor.location());
+                Ok(Some((context, Some(Box::new(error)))))
             }
-            Err(_) => reader.independent_evidence(|reader| {
+            Err(error) => reader.independent_evidence(|reader| {
                 let context = if spanned {
                     prepare_zip_local_chain(|offset, size, field| {
                         let load = |reader: &mut super::input::attempts::AttemptReader<'_>| {
@@ -217,15 +225,19 @@ fn prepare_zip_attempts(
                     Arc::new(reader.deferred_reads(spanned))
                 ));
                 let location = anchor.location();
-                Ok(Some(anchor.context.bind(input, location)))
+                Ok(Some((anchor.context.bind(input, location), Some(Box::new(error)))))
             }),
         }
     })?;
-    match anchor {
-        Some(anchor) if evidence.contexts.iter().all(|context| context == &anchor.context) =>
-            evidence.with_anchor(PasswordContext::Zip(anchor.context.clone())),
-        _ => Ok(evidence.into_context(PasswordContext::Zip)),
-    }
+    // The planner already orders contexts by relation. Keep the first
+    // directory fault as a diagnostic without marking the anchor unresolved.
+    let fallback = evidence.contexts.iter_mut().find_map(|(_, fallback)| fallback.take());
+    let context = match anchor {
+        Some(anchor) if evidence.contexts.iter().all(|(context, _)| context == &anchor.context) =>
+            evidence.with_anchor(PasswordContext::Zip(anchor.context.clone()))?,
+        _ => evidence.into_context(|(context, _)| PasswordContext::Zip(context)),
+    };
+    Ok((context, fallback))
 }
 
 fn invalid_password_directory() -> PreparedStatus {

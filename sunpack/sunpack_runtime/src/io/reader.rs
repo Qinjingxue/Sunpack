@@ -186,6 +186,7 @@ pub(crate) struct ReaderConfig {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ReaderStats {
     pub(crate) read_bytes: u64,
+    pub(crate) direct_read_bytes: u64,
     pub(crate) cache_hits: u64,
 }
 
@@ -329,6 +330,7 @@ impl RequestCache {
 #[derive(Default)]
 struct ReaderCounters {
     read_bytes: AtomicU64,
+    direct_read_bytes: AtomicU64,
     cache_hits: AtomicU64,
 }
 
@@ -613,6 +615,7 @@ impl ManagedReader {
     pub(crate) fn stats(&self) -> ReaderStats {
         ReaderStats {
             read_bytes: self.counters.read_bytes.load(Ordering::Relaxed),
+            direct_read_bytes: self.counters.direct_read_bytes.load(Ordering::Relaxed),
             cache_hits: self.counters.cache_hits.load(Ordering::Relaxed),
         }
     }
@@ -636,19 +639,24 @@ impl ManagedReader {
     }
 
     pub(crate) fn read_direct_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
-        self.source
-            .read_direct_into_at(offset, buffer)
-            .map_err(|error| {
-                ReadFault::physical(
-                    "read_direct_into_at",
-                    offset,
-                    buffer.len(),
-                    0,
-                    self.len(),
-                    &error,
-                )
-                .into_io_error()
-            })
+        let result = self.source.read_direct_into_at(offset, buffer);
+        #[cfg(test)]
+        if let Ok(count) = result.as_ref() {
+            self.counters
+                .direct_read_bytes
+                .fetch_add(*count as u64, Ordering::Relaxed);
+        }
+        result.map_err(|error| {
+            ReadFault::physical(
+                "read_direct_into_at",
+                offset,
+                buffer.len(),
+                0,
+                self.len(),
+                &error,
+            )
+            .into_io_error()
+        })
     }
 
 }

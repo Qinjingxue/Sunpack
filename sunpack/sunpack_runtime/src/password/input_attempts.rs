@@ -966,6 +966,21 @@ impl DeferredReads {
         }
     }
 
+    pub(crate) fn active_ranges_are_ambiguous(
+        &self,
+        mut ranges: impl Iterator<Item = (u64, u64)> + Clone,
+    ) -> bool {
+        debug_assert!(!self.disk_relative);
+        if !ranges.clone().any(|(start, size)| self.range_is_ambiguous(start, size)) {
+            return false;
+        }
+        // A sufficient prefix may already have pinned the only source in
+        // this projection. Only unreconciled geometry can hide another key.
+        let active = self.projection.topology.edges.iter().zip(&self.projection.active);
+        let ambiguous = ambiguous_logical_ranges(active.filter_map(|(edge, &active)| active.then_some(edge)));
+        ranges.any(|(start, size)| overlaps_range(&ambiguous, start, size))
+    }
+
     pub(crate) fn disk_range_is_ambiguous(&self, disk: usize, offset: u64, size: u64) -> bool {
         self.projection.topology.disk_range_is_ambiguous(disk, offset, size)
     }
@@ -1000,6 +1015,17 @@ impl DeferredReads {
 }
 
 impl DeferredReader<'_> {
+    pub(crate) fn read_into(&mut self, offset: u64, bytes: &mut [u8]) -> Result<(), DeferredReadError> {
+        if self.disk_relative {
+            bytes.copy_from_slice(&self.read_disk_offset(0, 0, offset, bytes.len())?);
+            return Ok(());
+        }
+        self.load(|reader| {
+            reader.seek(SeekFrom::Start(offset))?;
+            reader.read_exact(bytes)
+        })
+    }
+
     pub(crate) fn read(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, DeferredReadError> {
         if self.disk_relative {
             return self.read_disk_offset(0, 0, offset, len);

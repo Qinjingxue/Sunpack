@@ -1129,6 +1129,16 @@ pub(crate) fn parse_xz_footer(footer: &[u8], end: u64) -> ValidationResult<XzFoo
     Ok(footer)
 }
 
+pub(crate) fn check_xz_footer(footer: &[u8], end: u64) -> ValidationResult<()> {
+    let footer = xz_footer_fields(footer, end)?;
+    // The final stream may follow other streams. Its Index must still fit
+    // between its minimum possible header position and this footer.
+    if footer.index_size < 8 || footer.index_size + 24 > end {
+        return invalid("xz_backward_size_out_of_range");
+    }
+    Ok(())
+}
+
 fn xz_footer_fields(footer: &[u8], end: u64) -> ValidationResult<XzFooter> {
     if footer.len() != 12 || &footer[10..12] != b"YZ" {
         return invalid("xz_footer_magic_invalid");

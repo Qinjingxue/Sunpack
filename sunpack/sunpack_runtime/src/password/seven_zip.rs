@@ -70,6 +70,9 @@ impl<R> SevenZipEvidenceReads<R> for FixedSevenZipEvidence {
     fn payload_source(&self, _: &R) -> Option<SevenZipPayloadSource> {
         Some(SevenZipPayloadSource::Fixed(Arc::clone(&self.0)))
     }
+    fn has_deferred_source(&self) -> bool {
+        true
+    }
 }
 
 include!("seven_zip_attempts.rs");
@@ -130,15 +133,30 @@ impl SevenZipPasswordContext {
         };
         let Self::Prefix { probe, header } = self else {
             let Self::Header(probe) = self else { unreachable!() };
-            let evidence = (!probe.has_crc()).then_some("7z_header_structure");
+            let ambiguous = probe.has_ambiguous_material();
+            let evidence = (ambiguous || !probe.has_crc()).then_some("7z_header_structure");
             let matches = collect_candidates(candidates, evidence.is_none(), |index, password| {
                 if password.is_empty() {
-                    return Ok((SevenZipPrefixCheck::Reject, ()));
+                    return Ok((SevenZipPrefixCheck::Reject, (None, Vec::new())));
                 }
-                let check = probe.check_header(|properties| key(index, password, properties))?;
-                Ok((check, ()))
+                let mut rejected = Vec::new();
+                let check = probe.verify_header(
+                    |properties| key(index, password, properties),
+                    |projection| rejected.push((projection, index)),
+                );
+                let verdict = check.as_ref().copied().unwrap_or(SevenZipPrefixCheck::Weak);
+                Ok((verdict, (check.err(), rejected)))
             })?;
-            return Ok(candidate_result(&matches, candidates.len(), evidence));
+            let mut result = candidate_result(&matches, candidates.len(), evidence, !ambiguous || matches.len() == 1);
+            let mut message = None;
+            for (_, checked) in matches {
+                if let Ok((_, (fault, rejected))) = checked {
+                    result.scoped_rejections.extend(rejected);
+                    if let Some(fault) = fault { message.get_or_insert(fault); }
+                }
+            }
+            if let Some(message) = message { result.message = message; }
+            return Ok(result);
         };
         let evidence = Some(if *header { "7z_header_prefix" } else { "7z_payload_prefix" });
         let properties = probe.key_properties().next().unwrap();
@@ -148,15 +166,16 @@ impl SevenZipPasswordContext {
                     |inner| key(index, password, inner))?;
                 Ok((prefix.check, ()))
             })?;
-            return Ok(candidate_result(&matches, candidates.len(), evidence));
+            return Ok(candidate_result(&matches, candidates.len(), evidence, true));
         }
         let matches = collect_candidates(candidates, false, |index, password| {
             let first_key = key(index, password, properties)?;
             let prefix = probe.prescreen(&first_key, |inner| key(index, password, inner))?;
             Ok((prefix.check, (first_key, prefix)))
         })?;
-        let mut result = candidate_result(&matches, candidates.len(), evidence);
-        if result.matched_indices.len() == 1 && (unique_volume || !probe.has_ambiguous_followup()) {
+        let mut result = candidate_result(&matches, candidates.len(), evidence, true);
+        let narrow_volumes_only = result.matched_indices.len() == 1;
+        if narrow_volumes_only && (unique_volume || !probe.has_ambiguous_followup()) {
             return Ok(result);
         }
         let followups = matches.iter().filter(|(_, check)| check.is_ok())
@@ -169,7 +188,7 @@ impl SevenZipPasswordContext {
             let (_, (first_key, prefix)) = check.ok()?;
             Some(cancellation.run(|| {
                 let mut rejected = Vec::new();
-                let proof = probe.verify_followup(&first_key, prefix, |properties| {
+                let proof = probe.verify_followup(&first_key, prefix, narrow_volumes_only, |properties| {
                     key(index, &candidates[index], properties)
                 }, |projection| rejected.push((projection, index)));
                 (index, proof, rejected)
@@ -229,12 +248,22 @@ fn collect_candidates<T: Send>(
             outcome => Some((index, outcome)),
         })
     };
+    let unresolved = std::sync::Mutex::new(Vec::new());
+    let confirm = |candidate| {
+        let matched = test(candidate)?;
+        if matches!(matched.1, Ok((SevenZipPrefixCheck::Confirmed, _))) {
+            Some(matched)
+        } else {
+            unresolved.lock().unwrap().push(matched);
+            None
+        }
+    };
     let search = || {
         if strong {
             candidates
                 .par_iter()
                 .enumerate()
-                .filter_map(test)
+                .filter_map(confirm)
                 .find_first(|_| true)
                 .into_iter()
                 .collect::<Vec<_>>()
@@ -255,23 +284,29 @@ fn collect_candidates<T: Send>(
         candidates
             .iter()
             .enumerate()
-            .find_map(test)
+            .find_map(confirm)
             .into_iter()
             .collect()
     } else {
         candidates.iter().enumerate().filter_map(test).collect()
     };
     cancellation.check_io()?;
+    if strong && matches.is_empty() {
+        let mut unresolved = unresolved.into_inner().unwrap();
+        unresolved.sort_unstable_by_key(|(index, _)| *index);
+        return Ok(unresolved);
+    }
     Ok(matches)
 }
 
 fn candidate_result<T>(
     matches: &[CheckedCandidate<T>], count: usize, prefix_evidence: Option<&'static str>,
+    allow_confirmation: bool,
 ) -> PasswordVerification {
     let strong = prefix_evidence.is_none();
     if let Some((index, _)) = matches
         .iter()
-        .find(|(_, value)| matches!(value, Ok((SevenZipPrefixCheck::Confirmed, _))))
+        .find(|(_, value)| allow_confirmation && matches!(value, Ok((SevenZipPrefixCheck::Confirmed, _))))
     {
         return PasswordVerification {
             matched_index: Some(*index),
@@ -288,13 +323,13 @@ fn candidate_result<T>(
             ..PasswordVerification::status("no_match", "7z prescreen rejected candidates")
         };
     };
-    // Unavailable candidates survive. With a strong probe, an unavailable
-    // candidate terminates the ordered search, leaving its suffix untouched.
+    // Unavailable candidates survive without terminating the search for a
+    // CRC-confirmed candidate.
     let uncertainty = matches.iter().find_map(|(_, value)| value.as_ref().err());
     PasswordVerification {
         matched_index: Some(*first),
         matched_indices: matches.iter().map(|(index, _)| *index).collect(),
-        attempts: if strong { first + 1 } else { count },
+        attempts: count,
         final_confirmation_required: Some(true),
         match_evidence: prefix_evidence,
         ..PasswordVerification::status("match", uncertainty.map_or(

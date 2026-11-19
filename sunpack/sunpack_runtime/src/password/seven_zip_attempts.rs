@@ -121,6 +121,10 @@ impl<'a> SevenZipEvidenceReads<AttemptReader<'a>> for VolumeEvidence {
         Some(SevenZipPayloadSource::Projected(reader.deferred_reads(false)))
     }
 
+    fn has_deferred_source(&self) -> bool {
+        true
+    }
+
     fn checks_public_packs(&self) -> bool {
         true
     }

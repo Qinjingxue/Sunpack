@@ -255,7 +255,9 @@ fn seven_zip_lzma2_chunk(
             pack
         };
         let chunk_end = header_size + chunk_packed as usize;
-        if size > unpacked || chunk_end as u64 > packed {
+    if size > unpacked || chunk_end as u64 > packed
+        || (chunk_end as u64 == packed && size != unpacked)
+    {
             return Err(());
         }
         if header_size == 6
@@ -526,6 +528,8 @@ mod seven_zip_prefix_tests {
         }
         assert_eq!(check(&[1, 0, 8], 8, 9), Reject);
         assert_eq!(check(&[1, 0, 8], 16, 8), Reject);
+        assert_eq!(check(&[1, 0, 8], 12, 10), Reject);
+        assert_eq!(check(&[1, 0, 8], 12, 9), Weak);
         assert_eq!(check(&[1, 0, 0, 0xff, 0x80], 20, 2), Reject);
         assert_eq!(check(&[1, 0, 0, 0xff, 0xc0], 20, 2), Weak);
         assert_eq!(check(&[0xe0, 0, 0, 0, 3], 16, 1), Reject);

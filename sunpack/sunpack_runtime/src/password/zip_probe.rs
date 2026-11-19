@@ -6,7 +6,7 @@ use crate::io::cancellation::Cancellation;
 use crate::password::evidence::VolumeProjection;
 use crate::password::input::attempts::{DeferredReadError, DeferredReads};
 use crate::password::input::{RangeSpec, VirtualRangeReader, VolumeSet};
-use crate::scan::compression_stream::{check_xz_prefix, MAX_XZ_PREFIX_SIZE};
+use crate::scan::compression_stream::{check_xz_footer, check_xz_prefix, MAX_XZ_PREFIX_SIZE};
 use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use std::io;
@@ -180,7 +180,8 @@ impl ZipPrefix {
             self.sizes.map_or(size as u64, |(packed, _)| packed)
         } else { size as u64 };
         matches != 0 && size != 0
-            && (!derive_aes_key || matches > 1 || read.ambiguous(self.start, span))
+            && (!derive_aes_key || matches > 1 || read.ambiguous(self.start, span)
+                || self.xz_tail(read).is_some())
     }
 
     pub(super) fn needs_size(&self) -> bool {
@@ -189,6 +190,13 @@ impl ZipPrefix {
 
     fn has_aes_successor(&self) -> bool {
         matches!(self.method, 8 | 9 | 93)
+    }
+
+    fn xz_tail(&self, read: &ZipRead) -> Option<(u64, u64)> {
+        let sizes = self.sizes?;
+        let packed = sizes.0;
+        (self.method == 95 && packed >= 32 && packed.is_multiple_of(4)
+            && read.ambiguous(self.start + packed - 12, 12)).then_some(sizes)
     }
 
     pub(super) fn cbc_deflate_probe(&self) -> Option<((u64, u64), bool)> {
@@ -242,6 +250,9 @@ impl ZipPrefix {
         } else { None };
         let successor_volumes = successor_sizes.is_some_and(|(packed, _)| source.ambiguous(self.start, packed));
         let xz = self.method == 95;
+        let xz_tail = if matches!(keys.first(), Some((_, ZipPrefixKey::Aes { .. }))) {
+            self.xz_tail(source)
+        } else { None };
         let initial = size.min(match self.method {
             8 | 9 if successor_volumes => 5,
             95 => 13,
@@ -264,15 +275,18 @@ impl ZipPrefix {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     unavailable = Some(error);
-                    if minimum == first { return (vec![None; keys.len()], unavailable); }
-                    match read(self.start, minimum) {
-                        Ok(bytes) => bytes,
-                        Err(error) => return (vec![None; keys.len()], Some(error)),
+                    if minimum == first {
+                        Vec::new()
+                    } else {
+                        match read(self.start, minimum) {
+                            Ok(bytes) => bytes,
+                            Err(error) => { unavailable = Some(error); Vec::new() }
+                        }
                     }
                 }
             };
             let mut next = next_size(encrypted.len());
-            let mut verdicts = if successor_volumes && unavailable.is_none() { vec![None; keys.len()] }
+            let mut verdicts = if encrypted.is_empty() || (successor_volumes && unavailable.is_none()) { vec![None; keys.len()] }
                 else { keys.iter().map(|(_, key)| self.check(key, &encrypted, &mut next, &mut scratch)).collect() };
             while !successor_volumes && unavailable.is_none() && encrypted.len() < size
                 && verdicts.iter().any(Option::is_none) {
@@ -306,6 +320,37 @@ impl ZipPrefix {
                             None
                         }
                     };
+                }
+            }
+            if let Some(sizes) = xz_tail.filter(|_| verdicts.iter().any(|&verdict| verdict != Some(false))
+                && !matches!(unavailable, Some(DeferredReadError::Pending)))
+            {
+                match read(self.start + sizes.0 - 12, 12) {
+                    Ok(tail) => {
+                        for ((_, key), verdict) in keys.iter().zip(&mut verdicts) {
+                            if *verdict == Some(false) { continue; }
+                            match self.check_aes_successors(key, &tail, sizes, source, read, &mut scratch) {
+                                Ok(SevenZipPrefixCheck::Reject) => *verdict = Some(false),
+                                Ok(_) => {}
+                                Err(DeferredReadError::Pending) => break,
+                                Err(error) => {
+                                    *verdict = None;
+                                    // An unavailable step cannot erase a known short extent.
+                                    if !matches!(unavailable, Some(DeferredReadError::Truncated)) {
+                                        unavailable = Some(error);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for verdict in &mut verdicts {
+                            if *verdict != Some(false) { *verdict = None; }
+                        }
+                        if !matches!(unavailable, Some(DeferredReadError::Truncated)) {
+                            unavailable = Some(error);
+                        }
+                    }
                 }
             }
             (verdicts, unavailable)
@@ -371,6 +416,9 @@ impl ZipPrefix {
             source: &ZipRead, read: &mut CheckRead<'_>, scratch: &mut ZipPrefixScratch,
         ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
             let cipher = C::new_from_slice(key).unwrap();
+            if prefix.method == 95 {
+                return check_aes_xz_tail(&cipher, prefix.start, packed, encrypted, read);
+            }
             let plain = scratch.bytes(encrypted.len());
             plain.copy_from_slice(encrypted);
             winzip_aes_ctr(&cipher, 0, plain);
@@ -452,6 +500,46 @@ impl ZipPrefix {
             SevenZipPrefixCheck::Weak => None,
             _ => Some(true),
         }
+    }
+}
+
+fn check_aes_xz_tail<C: BlockCipherEncrypt>(
+    cipher: &C, start: u64, mut end: u64, encrypted: &[u8], read: &mut CheckRead<'_>,
+) -> Result<SevenZipPrefixCheck, DeferredReadError> {
+    use SevenZipPrefixCheck::{Reject, Strong};
+    let mut footer: [u8; 12] = encrypted.try_into().unwrap();
+    winzip_aes_ctr(cipher, end - 12, &mut footer);
+    if footer.ends_with(b"YZ") {
+        return Ok(if check_xz_footer(&footer, end).is_ok() { Strong } else { Reject });
+    }
+
+    // Stream Padding consists of zero words. Skip only bytes actually read
+    // as zeros; the last stream may differ from the first one.
+    let mut bytes: &[u8] = &footer;
+    let mut padding;
+    let mut read_size = 64;
+    loop {
+        let at = end - bytes.len() as u64;
+        if let Some(last) = bytes.iter().rposition(|&byte| byte != 0) {
+            let footer_end = (last + 1).next_multiple_of(4);
+            let end = at + footer_end as u64;
+            if end < 32 { return Ok(Reject); }
+            let verdict = if footer_end >= 12 {
+                check_xz_footer(&bytes[footer_end - 12..footer_end], end)
+            } else {
+                let mut footer = read(start + end - 12, 12)?;
+                winzip_aes_ctr(cipher, end - 12, &mut footer);
+                check_xz_footer(&footer, end)
+            };
+            return Ok(if verdict.is_ok() { Strong } else { Reject });
+        }
+        end = at;
+        if end < 32 { return Ok(Reject); }
+        let len = end.min(read_size) as usize;
+        padding = read(start + end - len as u64, len)?;
+        winzip_aes_ctr(cipher, end - len as u64, &mut padding);
+        bytes = &padding;
+        read_size = (read_size * 4).min(4096);
     }
 }
 

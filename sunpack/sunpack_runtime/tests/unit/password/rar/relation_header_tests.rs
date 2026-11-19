@@ -453,9 +453,10 @@ fn rar5_successor_blocks_and_first_level_table_filter_different_sources() {
     };
     header(0, 0x87, 29);
     header(32, 0x07, 29);
-    header(64, 0x07, 29);
+    header(64, 0x87, 29);
     header(96, 0x47, 0);
     compressed[3] = 0x11; // Complete code-length tree with two codes of length 1.
+    compressed[67] = 0x11;
     let encrypt = |mut bytes: [u8; 112]| {
         let size = bytes.len();
         cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
@@ -466,6 +467,9 @@ fn rar5_successor_blocks_and_first_level_table_filter_different_sources() {
     let mut bad_table = compressed;
     bad_table[3] = 0; // Every length is zero despite the valid block checksum.
     let bad_table = encrypt(bad_table);
+    let mut bad_successor_table = compressed;
+    bad_successor_table[67] = 0; // The successor header and its length remain valid.
+    let bad_successor_table = encrypt(bad_successor_table);
     let mut wrong_last = good;
     wrong_last[81] ^= 1; // CBC change to the fourth header's checked byte.
     let mut extra = vec![36, 1, 0, 0, 4];
@@ -496,7 +500,7 @@ fn rar5_successor_blocks_and_first_level_table_filter_different_sources() {
                 &rar5_block(&[2, 10, bytes.len() as u8, 0, 10, 0, 0x80, 1, 0, 1, b'x']), bytes, &end].concat();
             [head, tail(&wrong_last[split..]), tail(&good[split..])]
         } else {
-            [[&prefix[..], &good[..48]].concat(), [&wrong_last[48..], &end[..]].concat(),
+            [[&prefix[..], &good[..48]].concat(), [&bad_successor_table[48..], &end[..]].concat(),
                 [&good[48..], &end[..]].concat()]
         };
         let paths: Vec<_> = archives.iter().enumerate().map(|(i, data)|

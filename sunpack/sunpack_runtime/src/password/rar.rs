@@ -1298,10 +1298,29 @@ impl Rar5BlockProbe {
                 };
                 let Some(end) = rar5_block_end(header) else { return RarProof::Reject; };
                 let Some(offset) = next.checked_add(end as u64) else { return RarProof::Reject; };
-                let within_first = next.checked_add(width as u64).and_then(|end| end.checked_next_multiple_of(16))
+                let flags = header[0];
+                let mut proof_end = next + width as u64;
+                if flags & 0x80 != 0 {
+                    let size = end - width;
+                    if size == 0 { return RarProof::Reject; }
+                    let bits = (size - 1) * 8 + usize::from(flags & 7) + 1;
+                    // Only inspect table bytes already decrypted for the
+                    // header. A partial table can disprove, but not confirm.
+                    let bytes = if proof_end >= prefix.start && proof_end < prefix.end {
+                        &prefix.plain[(proof_end - prefix.start) as usize..(prefix.end - prefix.start) as usize]
+                    } else {
+                        &first[proof_end.min(16) as usize..]
+                    };
+                    let bytes = &bytes[..bytes.len().min(bits.div_ceil(8))];
+                    if rar_level_table(bytes, 0, bits) == LevelTable::Impossible {
+                        return RarProof::Reject;
+                    }
+                    proof_end += bytes.len() as u64;
+                }
+                let within_first = proof_end.checked_next_multiple_of(16)
                     .is_some_and(|end| end <= self.packed_size);
                 next = offset;
-                last = header[0] & 0x40 != 0;
+                last = flags & 0x40 != 0;
                 checked_successor = true;
                 if self.source.is_native() {
                     if within_first { common_successor = Some((next, last)); }

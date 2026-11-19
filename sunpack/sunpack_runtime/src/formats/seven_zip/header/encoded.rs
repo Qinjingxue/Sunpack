@@ -1,6 +1,7 @@
 use crate::io::scratch::{Blob, Spool};
 use std::ffi::c_void;
 use std::io::Write;
+use std::sync::Mutex;
 
 enum CoderInput<'a> {
     Borrowed(&'a [u8]),
@@ -16,10 +17,36 @@ impl AsRef<[u8]> for CoderInput<'_> {
 }
 
 pub(crate) struct SevenZipPasswordProbe {
-    packed_data: Vec<Blob>,
+    packed: SevenZipHeaderData,
     folder: SevenZipFolderAst,
     prefix: Option<SevenZipHeaderPrefix>,
     metadata: SevenZipMetadata,
+}
+
+enum SevenZipHeaderData {
+    Ready(Vec<Blob>),
+    Deferred(Box<SevenZipDeferredHeader>),
+}
+
+// An incomplete source preserves a candidate. A proven extent contradiction
+// can eliminate this projection even when another source remains unreadable.
+type SevenZipHeaderMaterial = Result<Option<Vec<Blob>>, String>;
+type SevenZipHeaderOutcomes = Vec<(Option<Arc<VolumeProjection>>, SevenZipHeaderMaterial)>;
+
+struct SevenZipDeferredHeader {
+    source: SevenZipPayloadSource,
+    streams: Vec<SevenZipPackedStream>,
+    encrypted_prefix: [u8; 32],
+    prefix_len: usize,
+    material: Mutex<Option<Arc<SevenZipHeaderOutcomes>>>,
+    ambiguous: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SevenZipPackedStream {
+    offset: u64,
+    size: usize,
+    crc: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -38,25 +65,27 @@ struct SevenZipHeaderPrefix {
 }
 
 impl SevenZipPasswordProbe {
+    #[cfg(test)]
     fn from_parts(packed_data: Vec<Blob>, folder: SevenZipFolderAst, metadata: SevenZipMetadata) -> Self {
-        let prefix = folder
+        let prefix = Self::prefix(&folder, metadata, |index| packed_data[index].len() as u64);
+        Self { packed: SevenZipHeaderData::Ready(packed_data), folder, prefix, metadata }
+    }
+
+    fn prefix(
+        folder: &SevenZipFolderAst, metadata: SevenZipMetadata, size: impl Fn(usize) -> u64,
+    ) -> Option<SevenZipHeaderPrefix> {
+        folder
             .packed_streams
             .iter()
             .enumerate()
             .find_map(|(index, &input)| {
-                seven_zip_aes_stream(&folder, input, packed_data[index].len() as u64)
+                seven_zip_aes_stream(folder, input, size(index))
                     .and_then(|stream| SevenZipPayloadEvidence::from_stream(
                         &folder, &stream, matches!(metadata, SevenZipMetadata::Header),
                     ).map(|evidence| SevenZipHeaderPrefix {
                         packed: index, aes: stream.aes_index, inner_aes: stream.inner_aes, evidence,
                     }))
-            });
-        Self {
-            packed_data,
-            folder,
-            prefix,
-            metadata,
-        }
+            })
     }
 
     pub(crate) fn key_properties(&self) -> impl Iterator<Item = &[u8]> {
@@ -69,9 +98,21 @@ impl SevenZipPasswordProbe {
         self.folder.expected_crc.is_some()
     }
 
+    pub(crate) fn has_ambiguous_material(&self) -> bool {
+        matches!(&self.packed, SevenZipHeaderData::Deferred(data) if data.ambiguous)
+    }
+
+    #[cfg(test)]
     pub(crate) fn check_header<'a>(
+        &'a self, key: impl FnMut(&'a [u8]) -> Result<SevenZipAesKey, String>,
+    ) -> Result<SevenZipPrefixCheck, String> {
+        self.verify_header(key, |_| {})
+    }
+
+    pub(crate) fn verify_header<'a>(
         &'a self,
         mut key: impl FnMut(&'a [u8]) -> Result<SevenZipAesKey, String>,
+        mut reject: impl FnMut(Arc<VolumeProjection>),
     ) -> Result<SevenZipPrefixCheck, String> {
         use SevenZipPrefixCheck::{Confirmed, Reject, Strong, Weak};
         let mut prepared = None;
@@ -80,27 +121,67 @@ impl SevenZipPasswordProbe {
             let derived = key(&self.folder.coders[prefix.aes].properties)?;
             inner = prefix.inner_aes.iter().map(|&index| key(&self.folder.coders[index].properties))
                 .collect::<Result<Vec<_>, _>>()?;
-            let (plain, len) = prefix.evidence.decrypt_prefix_with_inner(
-                &self.packed_data[prefix.packed], &derived, &inner,
-            )?;
+            let encrypted = match &self.packed {
+                SevenZipHeaderData::Ready(data) => data[prefix.packed].as_ref(),
+                SevenZipHeaderData::Deferred(data) => &data.encrypted_prefix[..data.prefix_len],
+            };
+            let (plain, len) = prefix.evidence.decrypt_prefix_with_inner(encrypted, &derived, &inner)?;
             if prefix.evidence.check_prefix(&plain[..len]) == Reject {
                 return Ok(Reject);
             }
             prepared = Some((prefix.aes, derived));
         }
-        let mut inner = self.prefix.iter().flat_map(|prefix| prefix.inner_aes.iter().copied()).zip(inner).peekable();
+        let mut check = |packed_data: &[Blob]| self.check_header_material(packed_data, |coder, properties| {
+            if let Some((_, key)) = prepared.as_ref().filter(|(index, _)| *index == coder) {
+                return Ok(key.with_iv(&key.iv));
+            }
+            if let Some(key) = self.prefix.as_ref().and_then(|prefix| {
+                prefix.inner_aes.iter().position(|&index| index == coder).map(|index| &inner[index])
+            }) {
+                return Ok(key.with_iv(&key.iv));
+            }
+            key(properties).map_err(resource_error)
+        });
+        match &self.packed {
+            SevenZipHeaderData::Ready(packed) => check(packed),
+            SevenZipHeaderData::Deferred(data) => {
+                let prefix = self.prefix.as_ref().expect("deferred header has a prefix");
+                let material = data.material(prefix.packed)?;
+                let mut result = Reject;
+                let mut unavailable = None;
+                for (projection, packed) in material.iter() {
+                    let proof = match packed {
+                        Ok(Some(packed)) => check(packed),
+                        Ok(None) => Ok(Reject),
+                        Err(error) => Err(error.clone()),
+                    };
+                    match proof {
+                        Ok(Reject) => {
+                            if let Some(projection) = projection { reject(projection.clone()); }
+                        }
+                        Ok(Confirmed) if result == Reject => result = Confirmed,
+                        Ok(Confirmed) => {}
+                        Ok(Strong) if result == Reject => result = Strong,
+                        Ok(Strong) => {}
+                        Ok(Weak) => result = Weak,
+                        Err(error) => { unavailable.get_or_insert(error); }
+                    }
+                }
+                unavailable.map_or(Ok(result), Err)
+            }
+        }
+    }
+
+    fn check_header_material<'a>(
+        &'a self,
+        packed_data: &[Blob],
+        mut key: impl FnMut(usize, &'a [u8]) -> Result<SevenZipAesKey, String>,
+    ) -> Result<SevenZipPrefixCheck, String> {
+        use SevenZipPrefixCheck::{Confirmed, Reject, Strong, Weak};
         let decoded = match decode_seven_zip_encoded_folder_with_keys(
-            &self.packed_data,
+            packed_data,
             &self.folder,
-            &mut |coder, properties| {
-                if prepared.as_ref().is_some_and(|(index, _)| *index == coder) {
-                    return Ok(prepared.take().unwrap().1);
-                }
-                if let Some((_, key)) = inner.next_if(|(index, _)| *index == coder) {
-                    return Ok(key);
-                }
-                key(properties).map_err(resource_error)
-            },
+            &mut key,
         ) {
             Ok(decoded) => decoded,
             Err(error) if error.starts_with("resource_unavailable:") => return Err(error),
@@ -167,14 +248,99 @@ impl Drop for SevenZipAesKey {
     }
 }
 
-fn read_seven_zip_packed_data<R: Read + Seek>(
+fn prepare_seven_zip_header<R: Read + Seek>(
     reader: &mut R,
     reader_len: u64,
     before: u64,
     pack: &SevenZipPackInfoAst,
     folder: &SevenZipFolderAst,
     first: usize,
-) -> Result<Vec<Blob>, std::borrow::Cow<'static, str>> {
+    metadata: SevenZipMetadata,
+    evidence: &impl SevenZipEvidenceReads<R>,
+) -> Result<(SevenZipHeaderData, Option<SevenZipHeaderPrefix>), SevenZipMetadataError> {
+    let streams = seven_zip_packed_streams(before, pack, folder, first)?;
+    let prefix = SevenZipPasswordProbe::prefix(folder, metadata, |index| streams[index].size as u64);
+    if let Some(check) = prefix.as_ref() {
+        let stream = streams[check.packed];
+        let prefix_len = check.evidence.plaintext_prefix_size().next_multiple_of(16);
+        let has_more = streams.len() > 1 || stream.size > 32 ||
+            (stream.size > prefix_len && evidence.range_is_ambiguous(reader, stream.offset, stream.size as u64));
+        // Public digests that can rule out volume candidates are checked in
+        // the candidate preparation stage. Keep those bytes for the decoder.
+        let ambiguous_crc = streams.iter().any(|stream| stream.crc.is_some()
+            && evidence.range_is_ambiguous(reader, stream.offset, stream.size as u64));
+        if matches!(metadata, SevenZipMetadata::Header) && has_more && !ambiguous_crc && evidence.has_deferred_source() {
+            let mut encrypted_prefix = [0; 32];
+            evidence.independent(reader, |reader| {
+                read_seven_zip_packed_at(reader, reader_len, stream.offset, &mut encrypted_prefix[..prefix_len])
+            }).map_err(resource_error)?;
+            let source = evidence.payload_source(reader).expect("deferred evidence source");
+            let ambiguous = matches!(&source, SevenZipPayloadSource::Projected(source)
+                if source.active_ranges_are_ambiguous(streams.iter().map(|stream| (stream.offset, stream.size as u64))));
+            let data = SevenZipHeaderData::Deferred(Box::new(SevenZipDeferredHeader {
+                source, streams, encrypted_prefix, prefix_len, material: Mutex::default(), ambiguous,
+            }));
+            return Ok((data, prefix));
+        }
+    }
+    let packed = evidence.independent(reader, |reader| {
+        load_seven_zip_packed_data(&streams, None, |offset, bytes| {
+            read_seven_zip_packed_at(reader, reader_len, offset, bytes).map_err(resource_error)
+        })
+    })?;
+    Ok((SevenZipHeaderData::Ready(packed), prefix))
+}
+
+impl SevenZipDeferredHeader {
+    fn material(&self, prefix_stream: usize) -> Result<Arc<SevenZipHeaderOutcomes>, String> {
+        let mut slot = self.material.lock().unwrap();
+        if let Some(material) = &*slot { return Ok(material.clone()); }
+        check_password_cancellation()?;
+        let material = Arc::new(self.read_material(prefix_stream)?);
+        check_password_cancellation()?;
+        *slot = Some(material.clone());
+        Ok(material)
+    }
+
+    fn read_material(&self, prefix_stream: usize) -> Result<SevenZipHeaderOutcomes, String> {
+        let prefix = Some((prefix_stream, &self.encrypted_prefix[..self.prefix_len]));
+        let load = |read: &mut SevenZipRead<'_>| load_seven_zip_packed_data(
+            &self.streams, prefix,
+            |offset, bytes| read(offset, bytes).map_err(seven_zip_deferred_error),
+        );
+        match &self.source {
+            SevenZipPayloadSource::Fixed(ranges) => {
+                let mut reader = VirtualRangeReader::streaming(ranges);
+                let result = load(&mut |offset, bytes| {
+                    reader.seek(std::io::SeekFrom::Start(offset)).map_err(DeferredReadError::Io)?;
+                    reader.read_exact(bytes).map_err(DeferredReadError::Io)
+                });
+                Ok(vec![(None, result.map(Some).map_err(std::borrow::Cow::into_owned))])
+            }
+            SevenZipPayloadSource::Projected(ranges) => ranges.evaluate(|reader| {
+                let mut truncated = false;
+                let result = load_seven_zip_packed_data(&self.streams, prefix, |offset, bytes| {
+                    reader.read_into(offset, bytes).map_err(|error| {
+                        truncated = matches!(error, DeferredReadError::Truncated);
+                        seven_zip_deferred_error(error)
+                    })
+                });
+                (result, truncated)
+            }).map(|outcomes| outcomes.into_iter().map(|(projection, (result, truncated))| {
+                let result = if truncated {
+                    Ok(None)
+                } else {
+                    result.map(Some).map_err(std::borrow::Cow::into_owned)
+                };
+                (Some(projection), result)
+            }).collect()).map_err(resource_error),
+        }
+    }
+}
+
+fn seven_zip_packed_streams(
+    before: u64, pack: &SevenZipPackInfoAst, folder: &SevenZipFolderAst, first: usize,
+) -> Result<Vec<SevenZipPackedStream>, SevenZipMetadataError> {
     if pack.num_streams != pack.sizes.len() {
         return Err("7z password probe pack stream count mismatch".into());
     }
@@ -187,7 +353,7 @@ fn read_seven_zip_packed_data<R: Read + Seek>(
         stream_start = stream_start.checked_add(size)
             .ok_or("7z password probe stream offset overflow")?;
     }
-    let mut packed_data = Vec::with_capacity(sizes.len());
+    let mut streams = Vec::with_capacity(sizes.len());
     for (index, &size) in sizes.iter().enumerate() {
         let stream_end = stream_start
             .checked_add(size)
@@ -195,29 +361,53 @@ fn read_seven_zip_packed_data<R: Read + Seek>(
         if stream_end > before {
             return Err("7z password probe stream range is invalid".into());
         }
-        let stream_size =
-            usize::try_from(size).map_err(|_| "7z password probe stream is too large")?;
-        packed_data.push(
-            read_seven_zip_probe_range(
-                reader,
-                reader_len,
-                stream_start,
-                stream_size,
-                "7z.encoded_header.packed_stream",
-                FieldLocation::Body,
-            )
-            .map_err(resource_error)?,
-        );
-        if pack
-            .crcs
-            .get(first + index)
-            .copied()
-            .flatten()
-            .is_some_and(|expected| crc32(packed_data.last().unwrap()) != expected)
-        {
+        streams.push(SevenZipPackedStream {
+            offset: stream_start,
+            size: usize::try_from(size).map_err(|_| "7z password probe stream is too large")?,
+            crc: pack.crcs.get(first + index).copied().flatten(),
+        });
+        stream_start = stream_end;
+    }
+    Ok(streams)
+}
+
+fn read_seven_zip_packed_data<R: Read + Seek>(
+    reader: &mut R, reader_len: u64, before: u64, pack: &SevenZipPackInfoAst,
+    folder: &SevenZipFolderAst, first: usize,
+) -> Result<Vec<Blob>, SevenZipMetadataError> {
+    let streams = seven_zip_packed_streams(before, pack, folder, first)?;
+    load_seven_zip_packed_data(&streams, None, |offset, bytes| {
+        read_seven_zip_packed_at(reader, reader_len, offset, bytes).map_err(resource_error)
+    })
+}
+
+fn read_seven_zip_packed_at(
+    reader: &mut (impl Read + Seek), reader_len: u64, offset: u64, bytes: &mut [u8],
+) -> std::io::Result<()> {
+    let field = "7z.encoded_header.packed_stream";
+    seek_field(reader, offset, reader_len, field, FieldLocation::Body)
+        .map_err(|fault| fault.into_io_error())?;
+    read_exact_field(reader, bytes, reader_len, field, FieldLocation::Body)
+        .map_err(|fault| fault.into_io_error())
+}
+
+fn load_seven_zip_packed_data(
+    streams: &[SevenZipPackedStream], prefix: Option<(usize, &[u8])>,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), String>,
+) -> Result<Vec<Blob>, SevenZipMetadataError> {
+    let mut packed_data = Vec::with_capacity(streams.len());
+    for (index, stream) in streams.iter().enumerate() {
+        let prefix = prefix.filter(|(source, _)| *source == index).map_or(&[][..], |(_, bytes)| bytes);
+        let mut offset = stream.offset + prefix.len() as u64;
+        let result = read_seven_zip_blob(stream.size, prefix, resource_error, |bytes| {
+            read(offset, bytes)?;
+            offset += bytes.len() as u64;
+            Ok(())
+        })?;
+        if stream.crc.is_some_and(|expected| crc32(&result) != expected) {
             return Err("7z packed stream crc mismatch".into());
         }
-        stream_start = stream_end;
+        packed_data.push(result);
     }
     Ok(packed_data)
 }
@@ -232,25 +422,33 @@ fn read_seven_zip_probe_range<R: Read + Seek>(
 ) -> std::io::Result<Blob> {
     seek_field(reader, offset, source_len, field, location)
         .map_err(|fault| fault.into_io_error())?;
+    read_seven_zip_blob(len, &[], std::convert::identity, |bytes| read_exact_field(reader, bytes, source_len, field, location)
+        .map_err(|fault| fault.into_io_error()))
+}
+
+fn read_seven_zip_blob<E>(
+    len: usize, prefix: &[u8], map_error: impl Fn(std::io::Error) -> E,
+    mut read: impl FnMut(&mut [u8]) -> Result<(), E>,
+) -> Result<Blob, E> {
     if len <= crate::io::scratch::MEMORY_BYTES {
-        let mut bytes = crate::io::resource_error::zeroed_bytes(len)?;
-        read_exact_field(reader, &mut bytes, source_len, field, location)
-            .map_err(|fault| fault.into_io_error())?;
+        let mut bytes = crate::io::resource_error::zeroed_bytes(len).map_err(&map_error)?;
+        bytes[..prefix.len()].copy_from_slice(prefix);
+        if prefix.len() != len { read(&mut bytes[prefix.len()..])?; }
         return Ok(bytes.into());
     }
     let mut output = Spool::default();
-    output.spill()?;
-    let mut remaining = len;
+    output.spill().map_err(&map_error)?;
+    output.write_all(prefix).map_err(&map_error)?;
+    let mut remaining = len - prefix.len();
     let mut bytes = vec![0; 64 * 1024];
     while remaining > 0 {
-        crate::io::cancellation::Cancellation::check_current_io()?;
+        crate::io::cancellation::Cancellation::check_current_io().map_err(&map_error)?;
         let take = remaining.min(bytes.len());
-        read_exact_field(reader, &mut bytes[..take], source_len, field, location)
-            .map_err(|fault| fault.into_io_error())?;
-        output.write_all(&bytes[..take])?;
+        read(&mut bytes[..take])?;
+        output.write_all(&bytes[..take]).map_err(&map_error)?;
         remaining -= take;
     }
-    output.finish()
+    output.finish().map_err(map_error)
 }
 
 fn parse_seven_zip_encoded_header_descriptor(
