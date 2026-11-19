@@ -232,21 +232,18 @@ def test_rust_writer_cpp_query_contract(repo_root, contract):
 @pytest.mark.parametrize(
     ("menu_key", "expected_args"),
     [
-        ("folder_watch", ["watch", "add"]),
         ("background_watch", ["watch", "add"]),
         ("folder_recursive_watch", ["watch", "add", "-R"]),
-        ("background_recursive_watch", ["watch", "add", "-R"]),
-        ("folder_unwatch", ["watch", "remove"]),
         ("background_unwatch", ["watch", "remove"]),
     ],
 )
-def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu_key, expected_args, native_argument_recorder):
+def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, repo_root, menu_key, expected_args, native_argument_recorder):
     # Exercise Explorer command -> actual GUI -> hidden native CLI, not merely
-    # registry text. No admin rights or live Watch service needed.
+    # registry text. The script tests cover both surfaces for every operation.
     scripts_dir = tmp_path / "menu scripts"
     scripts_dir.mkdir()
-    for name in ("register_context_menu.ps1",):
-        shutil.copyfile(Path(__file__).resolve().parents[2] / "scripts" / name, scripts_dir / name)
+    registration_script = "register_context_menu.ps1"
+    shutil.copyfile(repo_root / "scripts" / registration_script, scripts_dir / registration_script)
     arch = "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x64"
     target = {"arm64": "aarch64-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc"}[arch]
     stub = tmp_path / ".cache" / "native" / arch / "ci" / "sevenzip_bridge" / "Release" / "sunpack_launcher.exe"
@@ -255,14 +252,15 @@ def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu
     runtime = tmp_path / ".cache" / "rust-target" / target / "ci" / "sunpack-runtime.exe"
     runtime.parent.mkdir(parents=True)
     runtime.touch()
-    gui = Path(__file__).resolve().parents[2] / ".cache" / f"gui-{arch}" / "Release" / "SunPackGUI.exe"
+    probe = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"))
+    gui = probe.with_name("SunPackGUI.exe")
     assert gui.is_file(), "Build scripts/build_gui.ps1 before running GUI shell integration"
     shutil.copyfile(gui, tmp_path / "SunPackGUI.exe")
     folder = tmp_path / "WeChat's 中文 Files & (2026)"
     folder.mkdir()
     completed = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-File", str(scripts_dir / "register_context_menu.ps1"), "-DryRun"],
+         "-File", str(scripts_dir / registration_script), "-DryRun"],
         check=True, capture_output=True, text=True, encoding="utf-8-sig", timeout=30,
     )
     commands = json.loads(completed.stdout.strip().splitlines()[-1])
@@ -272,7 +270,6 @@ def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu
     mutex = None
     kernel = ctypes.windll.kernel32
     if menu_key == "folder_recursive_watch":
-        probe = gui.with_name("sunpack_gui_tests.exe")
         names = subprocess.check_output([str(probe), "--mutex", str(tmp_path)], text=True)
         name = names.splitlines()[0].replace("SunPack.EditableFile", "SunPack.GUI")
         kernel.CreateMutexW.restype = wintypes.HANDLE

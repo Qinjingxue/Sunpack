@@ -110,15 +110,6 @@ pub(crate) fn merge_roots<T>(
         })
         .collect();
     keyed.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut merged: Vec<(String, T)> = Vec::with_capacity(keyed.len());
-    for (key, root) in keyed {
-        if merged
-            .last()
-            .is_some_and(|(parent, _)| key.starts_with(parent))
-        {
-            continue;
-        }
-        merged.push((key, root));
-    }
-    merged.into_iter().map(|(_, root)| root).collect()
+    keyed.dedup_by(|child, parent| child.0.starts_with(&parent.0));
+    keyed.into_iter().map(|(_, root)| root).collect()
 }

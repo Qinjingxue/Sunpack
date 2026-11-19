@@ -1,6 +1,6 @@
 use crate::protocol::{FILE_ID_BYTES, MAX_DIRECTORY_RESPONSE_BYTES};
 use crate::ChangeReasons;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io;
 use std::ops::ControlFlow::{self, Break, Continue};
@@ -23,7 +23,7 @@ const USN_REASON_CLOSE: u32 = 0x8000_0000;
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 
 pub struct DirectoryChangesPage {
-    pub changes: BTreeSet<(u32, String)>,
+    pub changes: HashSet<(u32, String)>,
     pub payload_bytes: usize,
     pub next_usn: i64,
     pub journal_id: u64,
@@ -360,7 +360,7 @@ fn scan_directories_page(
 ) -> io::Result<DirectoryChangesPage> {
     let mut cursor = start_usn;
     let mut payload_bytes = 0usize;
-    let mut changed = BTreeSet::new();
+    let mut changed = HashSet::new();
     let mut scratch = Default::default();
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     'journal: while cursor < end_usn {

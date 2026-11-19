@@ -87,7 +87,7 @@ or a guarantee for other displays and system loads.
 * `wait_for` drains the message queue **before** sampling state. Sampling first made a
   notification that had already been delivered visible only after the next unrelated
   message (caret blink, paint), which reported phantom 0.9–14 s waits.
-* Waits query cheap state first (`ready`, `passwordCell`, `recordSaving`) and serialize
+* Waits query readiness and the active password draft first and serialize
   the large arrays only on the poll that can finish.
 * `wait_settled` checks visible widget positions, opacity and pending paints.
 

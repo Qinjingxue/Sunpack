@@ -1,4 +1,5 @@
 use super::WatchFileObservation;
+use sunpack_usn_core::ChangeReasons;
 use std::ffi::{c_void, OsStr};
 use std::fs::File;
 use std::io;
@@ -100,13 +101,24 @@ pub(super) fn watch_file_observation_known_kind(
         let handle = open_path(path, FILE_READ_ATTRIBUTES, SHARE_ALL, is_directory)?;
         read_watch_observation(&handle.file, path, since_usn)?
     };
-    Ok(finish_watch_observation(file, volume.as_deref(), since_usn))
+    Ok(file.with_reasons(file.change_reasons(volume.as_deref(), since_usn)))
 }
 
 pub(crate) struct WatchFileSnapshot<T> {
     pub(crate) metadata: std::fs::Metadata,
-    pub(crate) observation: WatchFileObservation,
+    file: FileUsn,
+    pub(crate) change_reasons: Option<ChangeReasons>,
     pub(crate) captured: T,
+}
+
+impl<T> WatchFileSnapshot<T> {
+    pub(crate) fn change_usn(&self) -> i64 {
+        self.file.usn
+    }
+
+    pub(crate) fn observation(&self) -> WatchFileObservation {
+        self.file.with_reasons(self.change_reasons)
+    }
 }
 
 /// Sample one file object while its sharing mode excludes writers and renames.
@@ -134,7 +146,8 @@ pub(crate) fn watch_ready_file_snapshot<T>(
     };
     Ok(Some(WatchFileSnapshot {
         metadata,
-        observation: finish_watch_observation(file, volume.as_deref(), since_usn),
+        change_reasons: file.change_reasons(volume.as_deref(), since_usn),
+        file,
         captured,
     }))
 }
@@ -149,24 +162,6 @@ fn read_watch_observation(
         .filter(|previous| *previous > 0 && *previous < file.usn)
         .and_then(|_| watch_volume_for_handle(handle, path).ok());
     Ok((file, volume))
-}
-
-fn finish_watch_observation(
-    file: FileUsn,
-    volume: Option<&str>,
-    since_usn: Option<i64>,
-) -> WatchFileObservation {
-    let change_reasons = since_usn.filter(|value| *value > 0).and_then(|previous| {
-        if file.usn == previous {
-            Some(sunpack_usn_core::ChangeReasons::default())
-        } else {
-            sunpack_usn_core::broker_read_change_reasons(
-                volume?, file.id, file.id_len, previous, file.usn,
-            )
-            .ok()
-        }
-    });
-    WatchFileObservation { file_id: file.id_text(), change_usn: file.usn, change_reasons }
 }
 
 pub(super) fn directory_file_id(path: &Path, volume: &str) -> io::Result<[u8; 16]> {
@@ -251,8 +246,24 @@ struct FileUsn {
 }
 
 impl FileUsn {
-    fn id_text(&self) -> String {
-        sunpack_usn_core::protocol::format_file_id(&self.id[..usize::from(self.id_len)])
+    fn with_reasons(&self, change_reasons: Option<ChangeReasons>) -> WatchFileObservation {
+        WatchFileObservation {
+            file_id: sunpack_usn_core::protocol::format_file_id(&self.id[..usize::from(self.id_len)]),
+            change_usn: self.usn,
+            change_reasons,
+        }
+    }
+
+    fn change_reasons(&self, volume: Option<&str>, since_usn: Option<i64>) -> Option<ChangeReasons> {
+        let previous = since_usn.filter(|value| *value > 0)?;
+        if self.usn == previous {
+            Some(ChangeReasons::default())
+        } else {
+            sunpack_usn_core::broker_read_change_reasons(
+                volume?, self.id, self.id_len, previous, self.usn,
+            )
+            .ok()
+        }
     }
 }
 

@@ -439,6 +439,7 @@ void print_job_event(const std::string& job_id, const char* event) {
         wire::key("job_id") + wire::text(job_id) + wire::key("event") + wire::text(event) + wire::end());
 }
 
+#ifdef SUP7Z_DEBUG
 std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace) {
     const auto win32_error = HRESULT_FACILITY(trace.read_hresult) == FACILITY_WIN32 ? HRESULT_CODE(trace.read_hresult) : 0;
     return wire::object() +
@@ -450,6 +451,7 @@ std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace) 
         wire::key("requested") + wire::number(trace.last_read_requested) +
         wire::end() + wire::end();
 }
+#endif
 
 // Bound each serialized event by bytes, including its routing envelope. The
 // retained buffer is reused; no result-sized intermediate string is built.
@@ -1674,9 +1676,9 @@ RequestOutcome run_request(
         wire::key("failure_kind") + wire::text(result.failure_kind) +
         wire::key("hresult") + wire::number(result.hresult) +
         wire::key("operation_result_name") + wire::text(operation_result_name(result.operation_result));
+#ifdef SUP7Z_DEBUG
     const std::string input_trace_field = FAILED(result.input_trace.read_hresult) ?
         wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
-#ifdef SUP7Z_DEBUG
     const std::string pipeline_timing_field = pipeline_timing_enabled() ?
         wire::key("pipeline_timing") + pipeline_timing_wire(result.pipeline_timing) : "";
 #endif
@@ -1704,9 +1706,9 @@ RequestOutcome run_request(
         wire::key("archive_type") + wire::text(wide_to_utf8(result.archive_type)) +
         manifest_field +
         wire::key("message") + wire::text(result.message) +
-        failure_fields + input_trace_field
+        failure_fields
 #ifdef SUP7Z_DEBUG
-        + pipeline_timing_field
+        + input_trace_field + pipeline_timing_field
 #endif
         + wire::end()};
 }

@@ -26,9 +26,11 @@ pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {
 pub(crate) fn file_header(kind: Kind) -> [u8; 16] {
     let mut header = [0; 16];
     header[..4].copy_from_slice(b"SPWL");
-    // Task persistence includes the flatten intent and relocation payload.
     let version: u16 = match kind {
+        // Task persistence includes the flatten intent and relocation payload.
         Kind::TaskWal | Kind::TaskSnapshot => 2,
+        // Dedup rebuilds its disposable index with one file identity per source.
+        Kind::DedupWal => 2,
         _ => 1,
     };
     header[4..6].copy_from_slice(&version.to_le_bytes());

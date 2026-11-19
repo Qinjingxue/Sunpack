@@ -520,14 +520,15 @@ int wmain(int argc,wchar_t** argv) {
             }
             for(size_t i=0;i<std::min<size_t>(options.rounds,1);i++) {
                 auto current=page_state(app.page(),"passwords").at("rows").at(0);
-                auto current_edit_id="password-text-"+current.at("id").get<std::string>();
+                const auto& id=current.at("id").get_ref<const std::string&>();
+                auto current_edit_id="password-text-"+id;
                 auto replacement="perf-edited-"+std::to_string(i);
                 measure("password_edit_form_open",[&]{
                     click(app,current_edit_id.c_str());
                     wait_for([&]{return page_state(app.page(),"passwordCell")!="";},"password editor open");
                 });
                 measure("password_edit_input",[&]{
-                    click(app,("password-input-"+current.at("id").get<std::string>()).c_str());
+                    click(app,("password-input-"+id).c_str());
                     ensure(ui_debug_key_mod(app.window(),'A',1,0,0)==0,"select password failed");
                     ensure(ui_debug_type_char(app.window(),8)==0,"clear password failed");
                     ensure(ui_debug_type_text(app.window(),wide(replacement).c_str())==0,"edit password failed");
@@ -543,7 +544,9 @@ int wmain(int argc,wchar_t** argv) {
                         // Cheap flags first: only the final poll pays for a full
                         // password-list serialization.
                         if(page_state(app.page(),"passwordCell")!="") return false;
-                        if(page_state(app.page(),"recordSaving").value("passwords",false)) return false;
+                        auto drafts=page_state(app.page(),"passwordDrafts");
+                        auto draft=drafts.find(id);
+                        if(draft!=drafts.end() && draft->value("pending",false)) return false;
                         auto state=page_state(app.page(),"passwords");
                         return !state.at("rows").empty() && state.at("rows").at(0).value("value",std::string())==replacement;
                     },"password auto-save");

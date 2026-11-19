@@ -76,10 +76,10 @@ struct ExtractProgressEvent {
 struct ExtractInputTrace {
 #ifdef SUP7Z_DEBUG
     PipelineTiming *pipeline_timing = nullptr;
-#endif
     unsigned long long last_read_virtual_offset = 0;
     unsigned long long last_read_source_offset = 0;
     unsigned int last_read_requested = 0;
+#endif
     int read_hresult = 0;
     std::wstring last_source_path;
 };

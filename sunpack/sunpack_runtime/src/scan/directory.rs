@@ -61,22 +61,35 @@ impl DirectorySnapshotTable {
 #[derive(Clone)]
 pub(crate) struct NativeDirectorySnapshot {
     pub(crate) table: Arc<DirectorySnapshotTable>,
-    pub(crate) rows: Arc<Vec<usize>>,
+    // An unfiltered snapshot uses the table's implicit row order.
+    selected_rows: Option<Arc<Vec<usize>>>,
 }
 
 impl NativeDirectorySnapshot {
     pub(crate) fn view(&self, rows: Vec<usize>) -> Self {
         Self {
             table: Arc::clone(&self.table),
-            rows: Arc::new(rows),
+            selected_rows: Some(Arc::new(rows)),
         }
+    }
+
+    pub(crate) fn rows(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        let selected = self.selected_rows.as_deref();
+        (0..selected.map_or(self.table.paths.len(), Vec::len))
+            .map(move |index| selected.map_or(index, |rows| rows[index]))
+    }
+
+    // Relation views keep their rows in table order.
+    pub(crate) fn contains_row(&self, row: usize) -> bool {
+        self.selected_rows.as_deref().map_or_else(
+            || row < self.table.paths.len(),
+            |rows| rows.binary_search(&row).is_ok(),
+        )
     }
 
     pub(crate) fn file_route_view(&self, route: u8) -> Self {
         self.view(
-            self.rows
-                .iter()
-                .copied()
+            self.rows()
                 .filter(|&row| self.table.file_route(row) == route)
                 .collect(),
         )
@@ -93,15 +106,14 @@ impl NativeDirectorySnapshot {
         table.relation_anchor_cells = cells;
         table.scan_errors = errors.into_messages();
         let table = Arc::new(table);
-        let raw_rows = (0..table.paths.len()).collect();
         (
             Self {
                 table: Arc::clone(&table),
-                rows: Arc::new(filtered_rows),
+                selected_rows: Some(Arc::new(filtered_rows)),
             },
             Self {
                 table,
-                rows: Arc::new(raw_rows),
+                selected_rows: None,
             },
         )
     }
@@ -134,7 +146,7 @@ impl NativeDirectorySnapshot {
     }
 
     pub(crate) fn records(&self) -> impl Iterator<Item = (&str, bool, Option<u64>, Option<u64>)> {
-        self.rows.iter().map(|&row| {
+        self.rows().map(|row| {
             (
                 self.table.paths[row].as_str(),
                 self.table.is_dir(row),
@@ -149,9 +161,7 @@ impl NativeDirectorySnapshot {
             return self.clone();
         }
         self.view(
-            self.rows
-                .iter()
-                .copied()
+            self.rows()
                 .filter(|&row| {
                     !excluded.contains(&crate::path_keys::path_key(&self.table.paths[row]))
                 })
@@ -610,10 +620,9 @@ impl NativeDirectoryScanOptions {
                 .map(|record| record.path.as_str())
                 .collect();
             let old: HashMap<&str, usize> = previous
-                .rows
-                .iter()
-                .filter(|&&row| live_paths.contains(previous.table.paths[row].as_str()))
-                .map(|&row| (previous.table.paths[row].as_str(), row))
+                .rows()
+                .filter(|&row| live_paths.contains(previous.table.paths[row].as_str()))
+                .map(|row| (previous.table.paths[row].as_str(), row))
                 .collect();
             drop(live_paths);
             for record in &mut records.raw {

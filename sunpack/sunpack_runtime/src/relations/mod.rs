@@ -437,10 +437,9 @@ pub(crate) fn build_native_candidate_groups_from_snapshot(
     cached: Option<&RelationCache>,
 ) -> Vec<NativeRelationGroup> {
     let filtered_keys: HashSet<String> = filtered_snapshot
-        .rows
-        .iter()
-        .filter(|&&row| !filtered_snapshot.table.is_dir(row))
-        .map(|&row| path_key(&filtered_snapshot.table.paths[row]))
+        .rows()
+        .filter(|&row| !filtered_snapshot.table.is_dir(row))
+        .map(|row| path_key(&filtered_snapshot.table.paths[row]))
         .collect();
     if filtered_keys.is_empty() {
         return Vec::new();
@@ -508,7 +507,7 @@ pub(crate) fn resolve_embedded_volumes(
             break;
         }
         let mut keys = HashSet::new();
-        for &row in snapshot.rows.iter() {
+        for row in snapshot.rows() {
             if let Some(key) = remaining.take(&path_key(&snapshot.table.paths[row])) {
                 keys.insert(key);
                 if remaining.is_empty() {

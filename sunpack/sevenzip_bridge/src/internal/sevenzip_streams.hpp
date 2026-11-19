@@ -84,14 +84,21 @@ namespace sunpack::sevenzip
     }
 
     inline void record_input_error(ExtractInputTrace *trace, const std::wstring &path,
-                                   HRESULT hr, UInt64 offset = 0,
-                                   UInt64 source = 0, UInt32 requested = 0) noexcept
+                                   HRESULT hr, [[maybe_unused]] UInt64 offset = 0,
+                                   [[maybe_unused]] UInt64 source = 0,
+                                   [[maybe_unused]] UInt32 requested = 0) noexcept
     {
         if (!trace || FAILED(trace->read_hresult)) return;
         trace->read_hresult = hr;
+#ifdef SUP7Z_DEBUG
         trace->last_read_virtual_offset = offset;
         trace->last_read_source_offset = source;
         trace->last_read_requested = requested;
+#else
+        // Only a missing file needs the source name for failure classification.
+        if (hr != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
+            hr != HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)) return;
+#endif
         try { trace->last_source_path = path; }
         catch (const std::bad_alloc &) { trace->last_source_path.clear(); }
     }

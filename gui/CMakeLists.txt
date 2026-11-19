@@ -77,7 +77,7 @@ set_tests_properties(gui_file_contracts gui_interface gui_history_window gui_the
 
 # One MSBuild invocation can schedule all independent targets in parallel.
 add_custom_target(sunpack_gui_checks DEPENDS SunPackGUI sunpack_gui_tests sunpack_gui_ui_tests)
-add_executable(sunpack_gui_performance ../benchmarks/gui/performance.cpp resources/app.rc)
+add_executable(sunpack_gui_performance EXCLUDE_FROM_ALL ../benchmarks/gui/performance.cpp resources/app.rc)
 target_include_directories(sunpack_gui_performance PRIVATE "${core_ui_SOURCE_DIR}/src")
 ui_core_embed_text(sunpack_gui_performance FILE ../sunpack_advanced_config.json OUT gui_perf_defaults.h VAR kGuiPerfDefaultsJson)
 target_link_libraries(sunpack_gui_performance PRIVATE sunpack_gui_app sunpack_gui_data core-ui comctl32 psapi)

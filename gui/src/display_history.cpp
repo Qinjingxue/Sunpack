@@ -29,7 +29,9 @@ RootIndex index_roots(const WatchRoots& roots) {
     }
     return index;
 }
-std::string_view indexed_root(std::wstring current,const RootIndex& index) {
+std::string_view indexed_root(const fs::path& path,const RootIndex& index) {
+    if(index.empty()) return "@other";
+    auto current=path_key(path);
     while(!current.empty() && (current.back()==L'\\' || current.back()==L'/')) current.pop_back();
     while(!current.empty()) {
         auto found=index.find(current);
@@ -276,7 +278,7 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
     const auto ts=value.find("ts");
     const auto timestamp=ts!=value.end() && ts->is_number()?ts->get<double>():std::numeric_limits<double>::quiet_NaN();
     return {{{"id",std::move(id)},{"name",utf8(source.filename().wstring())},{"directory",utf8(source.parent_path().wstring())},
-        {"path",std::move(display_path)},{"root",indexed_root(path_key(source),roots)},
+        {"path",std::move(display_path)},{"root",indexed_root(source,roots)},
         {"statusText",translate(label)},{"time",task_time(timestamp)},{"statusTone",tone},{"parts",std::move(parts)},
         {"error",std::move(error)},{"errorType",std::move(error_type)},{"outputs",std::move(outputs)}},
         std::isfinite(timestamp)?timestamp:0.0};
@@ -334,7 +336,10 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     double previous_timestamp=std::numeric_limits<double>::infinity();
     bool needs_sort=false;
     auto matches_root=[&](const Json& value) {
-        return view.task_root.empty() || indexed_root(path_key(wide(value.value("path",std::string()))),root_index)==view.task_root;
+        if(view.task_root.empty()) return true;
+        const auto path=value.find("path");
+        return path!=value.end() && path->is_string() &&
+            indexed_root(wide(path->get_ref<const std::string&>()),root_index)==view.task_root;
     };
     std::optional<Cursor> last;
     std::vector<char> packed,raw;

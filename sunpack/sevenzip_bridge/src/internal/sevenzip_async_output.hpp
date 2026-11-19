@@ -219,12 +219,11 @@ namespace sunpack::sevenzip
                 Close
             };
 
-            static WorkItem data(Buffer *value, UInt64 offset)
+            static WorkItem data(Buffer *value)
             {
                 WorkItem item;
                 item.kind = Kind::Data;
                 item.buffer = value;
-                item.output_offset = offset;
                 return item;
             }
 
@@ -239,8 +238,6 @@ namespace sunpack::sevenzip
             Kind kind = Kind::Data;
             Buffer *buffer = nullptr;
             FileStatePtr file;
-            UInt64 output_offset = 0;
-            unsigned long retry_error = 0;
         };
 
         struct FileState
@@ -261,9 +258,8 @@ namespace sunpack::sevenzip
             const std::size_t trace_index = 0;
 
             bool captures_inventory() const noexcept { return job->capture_inventory; }
-            const WrittenRanges &previous_writes() const noexcept {
-                static const WrittenRanges empty;
-                return replay ? replay->written : empty;
+            const WrittenRanges *previous_writes() const noexcept {
+                return replay ? &replay->written : nullptr;
             }
 
         private:
@@ -500,7 +496,6 @@ namespace sunpack::sevenzip
 
             while (consumed < size)
             {
-                bool queued_staging = false;
                 bool newly_acquired_staging = false;
                 UInt32 previous_size = 0;
                 UInt32 chunk = 0;
@@ -522,22 +517,19 @@ namespace sunpack::sevenzip
                         return error == S_OK ? E_ABORT : error;
                     }
 
-                    if (file->staging_buffer && file->staging_buffer->size == kBufferSize)
+                    if (file->staging_buffer && file->staging_buffer->size == kBufferSize &&
+                        !enqueue_staging_locked(file, false))
                     {
-                        queued_staging = enqueue_staging_locked(file, false);
-                        if (!queued_staging)
+                        const HRESULT enqueue_error = terminal_result_locked(job);
+                        if (enqueue_error != S_OK)
                         {
-                            const HRESULT enqueue_error = terminal_result_locked(job);
-                            if (enqueue_error != S_OK)
+                            if (processed_size)
                             {
-                                if (processed_size)
-                                {
-                                    *processed_size = consumed;
-                                }
-                                return enqueue_error;
+                                *processed_size = consumed;
                             }
-                            continue;
+                            return enqueue_error;
                         }
+                        continue;
                     }
 
                     buffer = file->staging_buffer;
@@ -617,17 +609,11 @@ namespace sunpack::sevenzip
                         test_pending_bytes_.fetch_add(chunk, std::memory_order_relaxed);
 #endif
                         consumed += chunk;
-                        if (buffer->size == kBufferSize)
+                        if (buffer->size == kBufferSize && !enqueue_staging_locked(file, false))
                         {
-                            queued_staging = enqueue_staging_locked(file, false);
-                            if (!queued_staging && terminal_result_locked(job) == S_OK)
-                            {
-                                enqueue_result = E_FAIL;
-                            }
-                            else if (!queued_staging)
-                            {
-                                enqueue_result = terminal_result_locked(job);
-                            }
+                            // Peers can fill the queue while we copy the payload.
+                            // Plain backpressure keeps the accepted buffer staged.
+                            enqueue_result = terminal_result_locked(job);
                         }
                     }
                 }
@@ -1006,19 +992,14 @@ namespace sunpack::sevenzip
 
         bool can_accept_locked(const JobStatePtr &job, const FileStatePtr &file) const noexcept
         {
-            if (!job || !file || file->close_requested ||
-                job->inflight_bytes >= job->max_inflight_bytes ||
-                file->inflight_bytes >= kDefaultFileInFlightBytes)
+            if (!job || !file || file->close_requested) return false;
+            if (file->staging_buffer && file->staging_buffer->size == kBufferSize)
             {
-                return file && file->staging_buffer &&
-                       file->staging_buffer->size == kBufferSize &&
-                       work_queue_.size() < queue_limit_;
+                return work_queue_.size() < queue_limit_;
             }
-            if (file->staging_buffer)
-            {
-                return file->staging_buffer->size < kBufferSize;
-            }
-            return !free_buffers_.empty();
+            return job->inflight_bytes < job->max_inflight_bytes &&
+                   file->inflight_bytes < kDefaultFileInFlightBytes &&
+                   (file->staging_buffer || !free_buffers_.empty());
         }
 
         bool has_active_jobs_locked() const noexcept
@@ -1141,7 +1122,9 @@ namespace sunpack::sevenzip
             }
             try
             {
-                work_queue_.emplace_back(WorkItem::data(buffer, output_offset));
+                buffer->output_offset = output_offset;
+                buffer->transferred = 0;
+                work_queue_.emplace_back(WorkItem::data(buffer));
                 const DWORD error = post_work_locked();
                 if (error != ERROR_SUCCESS)
                 {
@@ -1264,11 +1247,7 @@ namespace sunpack::sevenzip
                     process_close(item.file);
                     continue;
                 }
-                Buffer *buffer = item.buffer;
-                const auto file = buffer->file;
-                buffer->output_offset = item.output_offset;
-                buffer->transferred = 0;
-                dispatch_data(buffer);
+                dispatch_data(item.buffer);
             }
         }
 
@@ -1290,9 +1269,7 @@ namespace sunpack::sevenzip
             settle_space_attempt(buffer->probe_lease, result, file->path);
             if (result.kind == AttemptResult::Kind::SpaceFailure && state_->space_gate)
             {
-                auto item = WorkItem::data(buffer, buffer->output_offset);
-                item.retry_error = held_probe ? 0 : result.win32_error;
-                defer_space_work(std::move(item));
+                defer_space_work(WorkItem::data(buffer), held_probe ? 0 : result.win32_error);
                 return;
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure)
@@ -1337,11 +1314,11 @@ namespace sunpack::sevenzip
         // No waiter thread: the monitor/gate posts one coalesced IOCP packet.
         // Queue publication and admission share mutex_, so a transition cannot
         // be lost between testing Pending and leaving the item in this queue.
-        void defer_space_work(WorkItem item) noexcept
+        void defer_space_work(WorkItem item, unsigned long retry_error) noexcept
         {
             const auto file = item.kind == WorkItem::Kind::Data ? item.buffer->file : item.file;
-            if (item.retry_error)
-                report_retry_space_failure(state_->space_gate.get(), item.retry_error, file->path);
+            if (retry_error)
+                report_retry_space_failure(state_->space_gate.get(), retry_error, file->path);
             try
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1660,9 +1637,7 @@ namespace sunpack::sevenzip
             settle_space_attempt(lease, result, file->path);
             if (result.kind == AttemptResult::Kind::SpaceFailure && state_->space_gate)
             {
-                auto item = WorkItem::close(file);
-                item.retry_error = held_probe ? 0 : result.win32_error;
-                defer_space_work(std::move(item));
+                defer_space_work(WorkItem::close(file), held_probe ? 0 : result.win32_error);
                 return;
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure || result.kind == AttemptResult::Kind::PermanentFailure)

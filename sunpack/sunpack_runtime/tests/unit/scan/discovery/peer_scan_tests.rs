@@ -32,13 +32,16 @@ fn targeted_volume_peer_scan_reuses_known_facts_and_ignores_other_stems() {
     records.extend((0..10_000).map(|index| DirectoryEntryRecord {
         path: format!("unrelated-{index}.bin"), relation_member_eligible: true, ..Default::default()
     }));
-    let source = Arc::new(NativeDirectorySnapshot::build_table(records));
-    let snapshot = NativeDirectorySnapshot { rows: Arc::new((0..source.paths.len() - 1).collect()), table: Arc::clone(&source) };
+    let (snapshot, raw) = NativeDirectorySnapshot::from_views(
+        (0..records.len() - 1).collect(), records, Default::default(), Vec::new(),
+    );
+    let source = raw.table;
     let other_path = head.parent().unwrap().join("other-scope").join(head.file_name().unwrap()).to_string_lossy().into_owned();
-    let other_table = Arc::new(NativeDirectorySnapshot::build_table(vec![DirectoryEntryRecord {
-        path: other_path.clone(), relation_member_eligible: true, ..Default::default()
-    }]));
-    let other = NativeDirectorySnapshot { rows: Arc::new(vec![0]), table: other_table };
+    let (_, other) = NativeDirectorySnapshot::from_views(
+        vec![0], [DirectoryEntryRecord {
+            path: other_path.clone(), relation_member_eligible: true, ..Default::default()
+        }], Default::default(), Vec::new(),
+    );
     let mut table = NativeCandidateTable {
         rows: vec![Candidate::File(Arc::clone(&source), 0)],
         relation_sources: vec![snapshot, other], ..Default::default()

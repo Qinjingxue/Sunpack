@@ -4,6 +4,7 @@
 // Resolve the two range fields from the current snapshot without retaining it.
 const rangeIndexes=new WeakMap();
 const passwordIndexes=new WeakMap();
+const historyDraftIndexes=new WeakMap();
 export default {
   data() { return {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
@@ -13,7 +14,7 @@ export default {
     taskQuery:'',taskDirectoryDirty:false,taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
-    configCategory:'',configQuery:'',drafts:{},rangeUnitDrafts:{},toggleDrafts:{},saving:false,saveErrors:{},pendingFields:[],recordSaving:{passwords:false,roots:false},
+    configCategory:'',configQuery:'',drafts:{},rangeUnitDrafts:{},toggleDrafts:{},saveErrors:{},pendingFields:[],
     passwordHistory:false,passwordHistoryTarget:false,passwordDirectoryDirty:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
     tagInputs:{},tagModes:{},tagEdits:{},searchSnapshot:null
   }; },
@@ -220,7 +221,7 @@ export default {
       this.send('taskPage',{cursor:cursor,window:window});
     },
     applyTasks(packet) {
-      if(packet.pages.some(snapshot=>snapshot.query!==this.taskQuery||snapshot.root!==this.directorySelection||snapshot.status!==(this.statusNames[this.taskStatus]||''))) return;
+      if(packet.query!==this.taskQuery||packet.root!==this.directorySelection||packet.status!==(this.statusNames[this.taskStatus]||'')) return;
       if(packet.reset) this.resetTaskPages();
       this.taskRevision=packet.revision;
       if(packet.full) {
@@ -242,7 +243,6 @@ export default {
       this.taskDirectoryDirty=false;
     },
     applyTaskPage(snapshot) {
-      if(snapshot.query!==this.taskQuery||snapshot.root!==this.directorySelection||snapshot.status!==(this.statusNames[this.taskStatus]||'')) return;
       let pending=this.taskPending, index=this.taskPages.findIndex(page=>page.cursor===snapshot.cursor);
       if(pending&&pending.cursor===snapshot.cursor) {
         this.taskPending=null;
@@ -277,8 +277,7 @@ export default {
     syncDirectoryView() {
       // Refresh the visible page only; the other page catches up on navigation.
       if(this.tab==='tasks') {
-        let first=this.taskPages[0];
-        if(this.taskDirectoryDirty||!first||first.root!==this.directorySelection) this.filterTasks();
+        if(this.taskDirectoryDirty||!this.taskPages.length) this.filterTasks();
       } else if(this.tab==='passwords'&&(this.passwordDirectoryDirty||this.passwords.scope!==this.passwordScope)) this.filterPasswords();
     },
     errorText(error) { return error && typeof error==='object' ? error.text : (this.texts[error]||error); },
@@ -535,7 +534,17 @@ export default {
       this.passwordCell=row.id; this.send('focusPassword',{id:row.id,part:'value',top:true});
     },
     historyDraft(p) {
-      return Object.values(this.passwordDrafts).find(d=>d.historyValue===p.value&&d.scope===this.directorySelection)||{};
+      let drafts=this.passwordDrafts,index=historyDraftIndexes.get(drafts);
+      if(!index) {
+        index=new Map();
+        for(let d of Object.values(drafts)) if(d.historyValue!==undefined) {
+          let scope=index.get(d.scope);
+          if(!scope) { scope=new Map(); index.set(d.scope,scope); }
+          if(!scope.has(d.historyValue)) scope.set(d.historyValue,d);
+        }
+        historyDraftIndexes.set(drafts,index);
+      }
+      return index.get(this.directorySelection)?.get(p.value)||{};
     },
     saveHistory(p) {
       let d=this.historyDraft(p); if(d.pending) return;
@@ -926,7 +935,7 @@ export default {
         </div>
         <ScrollView id="taskListScroll"><div id="taskBody" class="column">
           <VirtualList id="taskItems" class="column" estimated-height="68px" immutable-items="true"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
-            <div class="row"><button :id="'taskName-'+t.id" class="taskname" :tooltip="texts.showInFolder" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
+            <div class="row"><button :id="'taskName-'+t.id" class="taskname" :tooltip="texts.showInFolder" @click="send('openTask',{path:t.path,root:t.root,outputs:t.outputs})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
             <div v-if="t.parts.length||t.errorType||t.error" class="column task-details">
               <div v-show="t.parts.length" :id="'taskParts-'+t.id" class="row task-chips">
                 <label v-for="(part,i) in t.parts" :key="i" :id="'taskPart-'+t.id+'-'+i" class="task-chip volume-chip" tabindex="0" :tooltip="texts.copyTag" @click="send('copyTaskText',{text:part})">{{ part }}</label>

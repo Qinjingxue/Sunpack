@@ -5,7 +5,7 @@ use crate::io::archive_state::{ArchiveInput, OpenMode, VolumeCompleteness, Volum
 use crate::io::reader::{physical_file_generation_from_metadata, PhysicalFileGeneration};
 use crate::collections::{trim_map, SmallOrderedSet};
 use crate::path_keys::{path_ancestors, path_key};
-use crate::postprocess::{mtime_seconds, watch_observed_content_changed};
+use crate::postprocess::{mtime_seconds, watch_usn_content_changed};
 use crate::scan::scope::NativeDiscoveryScope;
 use crate::wal::{self, Kind};
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Identity { volume: u64, file: [u8; 16], start: u64, len: u64 }
 #[derive(Clone, Serialize, Deserialize)]
-struct Source { path: String, generation: PhysicalFileGeneration, mtime: f64, file_id: String, usn: i64 }
+struct Source { path: String, generation: PhysicalFileGeneration, mtime: f64, usn: i64 }
 type SourceSnapshot = crate::filesystem::WatchFileSnapshot<PhysicalFileGeneration>;
 
 impl Source {
@@ -29,10 +29,11 @@ impl Source {
         )
             .ok().flatten().filter(|snapshot| {
                 snapshot.captured.object_id() == self.generation.object_id()
-                    && snapshot.observation.change_usn >= self.usn
-                    && !watch_observed_content_changed(
-                        self.generation.len, self.mtime, &self.file_id, self.usn, snapshot.captured.len,
-                        mtime_seconds(&snapshot.metadata), &snapshot.observation,
+                    && snapshot.captured.len == self.generation.len
+                    && snapshot.change_usn() >= self.usn
+                    && !watch_usn_content_changed(
+                        self.mtime, self.usn, mtime_seconds(&snapshot.metadata),
+                        snapshot.change_usn(), snapshot.change_reasons,
                     )
             })
     }
@@ -44,9 +45,9 @@ impl Source {
     }
 
     fn update_snapshot(&mut self, snapshot: SourceSnapshot) {
-        self.generation = snapshot.captured;
         self.mtime = mtime_seconds(&snapshot.metadata);
-        self.usn = snapshot.observation.change_usn;
+        self.usn = snapshot.change_usn();
+        self.generation = snapshot.captured;
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -242,6 +243,9 @@ impl Index {
         })();
         if loaded.is_err() { index.erase()?; index.start()?; }
         else {
+            // A successful replay can end with few live records even when
+            // historical puts grew the in-memory indexes substantially.
+            index.trim_record_indices();
             // No rehash on restart: only validate the persisted physical generation.
             let stale: Vec<_> = index.records.values().filter(|r| !r.current()).map(|r| r.id).collect();
             index.file = Some(OpenOptions::new().append(true).open(&index.path)?);
@@ -579,13 +583,11 @@ impl Index {
         self.compact()
     }
     fn trim_record_indices(&mut self) {
-        if self.records.capacity() > 256 {
-            trim_map(&mut self.records);
-            trim_map(&mut self.owners);
-            trim_map(&mut self.sizes);
-            trim_map(&mut self.hashes);
-            trim_map(&mut self.objects);
-        }
+        trim_map(&mut self.records);
+        trim_map(&mut self.owners);
+        trim_map(&mut self.sizes);
+        trim_map(&mut self.hashes);
+        trim_map(&mut self.objects);
     }
 
     pub(super) fn release_write_buffer(&mut self) {
@@ -708,10 +710,9 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
                 let id = sources.len() as u32;
                 sources.push(Source {
                     path: path.into(),
-                    generation: snapshot.captured,
                     mtime: mtime_seconds(&snapshot.metadata),
-                    file_id: snapshot.observation.file_id,
-                    usn: snapshot.observation.change_usn,
+                    usn: snapshot.change_usn(),
+                    generation: snapshot.captured,
                 });
                 if let Some(path_id) = path_id {
                     physical.insert(path_id, id);

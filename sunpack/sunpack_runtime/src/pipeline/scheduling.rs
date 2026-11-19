@@ -574,7 +574,10 @@ impl<'a> RequestState<'a> {
                     return self.ready(id);
                 } else { task.status = Status::Parked; }
             }
-            Signal::Done(id) => { self.tasks.remove(&id); }
+            Signal::Done(id) => {
+                self.tasks.remove(&id);
+                crate::collections::trim_map(&mut self.tasks);
+            }
         }
         None
     }

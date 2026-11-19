@@ -151,9 +151,8 @@ fn shared_walk_keeps_child_rows_and_retry_scope_local() {
     assert_eq!(snapshots.len(), 1);
     assert!(Arc::ptr_eq(&outer_raw.table, &inner_raw.table));
     let paths: Vec<_> = inner_raw
-        .rows
-        .iter()
-        .map(|&row| &inner_raw.table.paths[row])
+        .rows()
+        .map(|row| &inner_raw.table.paths[row])
         .collect();
     assert!(paths
         .iter()
@@ -172,7 +171,6 @@ fn shared_walk_keeps_child_rows_and_retry_scope_local() {
         &scopes[0].snapshot.table,
         &scopes[1].snapshot.table
     ));
-    assert!(Arc::ptr_eq(&scopes[0].snapshot.rows, &scopes[1].snapshot.rows));
     let (_, refreshed) = options.refresh_relation_bucket(
         &scopes[1].scope, &head.to_string_lossy(), &scopes[1].snapshot, None,
     ).unwrap();

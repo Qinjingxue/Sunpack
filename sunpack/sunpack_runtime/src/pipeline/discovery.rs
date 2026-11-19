@@ -133,9 +133,7 @@ fn scope_view(
 ) -> NativeDirectorySnapshot {
     snapshot.view(
         snapshot
-            .rows
-            .iter()
-            .copied()
+            .rows()
             .filter(|&row| scope.contains(&snapshot.table.paths[row]))
             .collect(),
     )
@@ -1319,10 +1317,11 @@ fn merge_shared_inputs(tasks: &mut Vec<Task>, blocked_paths: &mut HashSet<String
         task.inputs.dedup_by(|next, previous| {
             let left = &next.input;
             let right = &previous.input;
-            let same = path_key(&left.entry_path) == path_key(&right.entry_path)
-                && left.mode == right.mode
+            let same = left.mode == right.mode
                 && left.format_hint == right.format_hint
                 && left.parts == right.parts
+                && (left.entry_path == right.entry_path
+                    || path_key(&left.entry_path) == path_key(&right.entry_path))
                 && left.volume_attempts == right.volume_attempts;
             if same {
                 if previous.failure.is_some() && next.failure.is_none() {

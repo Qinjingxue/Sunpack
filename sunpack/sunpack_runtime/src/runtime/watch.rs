@@ -75,7 +75,7 @@ fn admission_candidate(mut candidate: WatchCandidateRow, since_usn: i64) -> io::
         Path::new(&candidate.path), Some(since_usn), |_, _| Ok(()))? else { return Ok((candidate, false)); };
     candidate.size = snapshot.metadata.len();
     candidate.mtime = crate::postprocess::mtime_seconds(&snapshot.metadata);
-    candidate.observation = snapshot.observation;
+    candidate.observation = snapshot.observation();
     Ok((candidate, true))
 }
 

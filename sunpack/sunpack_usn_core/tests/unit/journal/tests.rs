@@ -193,7 +193,7 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
     // Record-only tests cannot catch lost entries when a reused buffer is
     // drained across journal reads or a response page ends mid-buffer.
     let mut records = Vec::new();
-    let mut expected = BTreeSet::from([(1, String::new())]);
+    let mut expected = HashSet::from([(1, String::new())]);
     for index in 0..600 {
         let name = format!("{index:04}-{}-新🔐.001", "x".repeat(120));
         expected.insert((0, name.clone()));
@@ -213,7 +213,7 @@ fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
     records.push(record(2, 22, end_usn, 0x1000));
     records.push(vec![0]);
     let mut cursor = 0;
-    let mut actual = BTreeSet::new();
+    let mut actual = HashSet::new();
     let mut pages = 0;
     let parents = HashMap::from([(11u128.to_le_bytes(), 0), (22u128.to_le_bytes(), 1)]);
     while cursor < end_usn {

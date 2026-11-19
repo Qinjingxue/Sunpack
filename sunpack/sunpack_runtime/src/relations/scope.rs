@@ -11,19 +11,18 @@ pub(super) enum RelationSource<'a> {
 
 impl<'a> RelationSource<'a> {
     pub fn indices(&self) -> impl Iterator<Item = usize> + '_ + use<'_, 'a> {
-        let len = match self {
-            Self::Snapshot(snapshot, _) => snapshot.rows.len(),
+        let snapshot = match self {
+            Self::Snapshot(snapshot, _) => Some(snapshot.rows().filter(|&row| !snapshot.table.is_dir(row))),
             #[cfg(test)]
-            Self::Physical(rows) => rows.len(),
+            Self::Physical(_) => None,
         };
-        (0..len).filter_map(|offset| match self {
-            Self::Snapshot(snapshot, _) => {
-                let row = snapshot.rows[offset];
-                (!snapshot.table.is_dir(row)).then_some(row)
-            }
-            #[cfg(test)]
-            Self::Physical(_) => Some(offset),
-        })
+        let rows = snapshot.into_iter().flatten();
+        #[cfg(test)]
+        let rows = rows.chain(0..match self {
+            Self::Snapshot(..) => 0,
+            Self::Physical(rows) => rows.len(),
+        });
+        rows
     }
 
     pub fn path(&self, row: usize) -> &'a str {

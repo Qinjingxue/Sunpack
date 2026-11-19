@@ -24,31 +24,17 @@ file(READ "${SRC}" hex HEX)
 string(LENGTH "${hex}" hexLen)
 math(EXPR byteCount "${hexLen} / 2")
 
-# 头部
-set(out "#pragma once\n")
-set(out "${out}// AUTO-GENERATED — do not edit\n")
-set(out "${out}// source: ${SRC}\n")
-set(out "${out}// bytes:  ${byteCount} (excluding terminator)\n\n")
-set(out "${out}inline constexpr char ${VAR}[] = {\n    ")
+# 每 12 字节换一行，批量转换避免逐字节复制已经生成的内容。
+string(REPEAT "[0-9a-f][0-9a-f]" 12 line)
+string(REGEX REPLACE "(${line})" "\\1\n    " lines "${hex}")
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "(char)0x\\1, " body "${lines}")
+string(REPLACE ", \n" ",\n" body "${body}")
 
-# 主体：每 12 字节换一行，提高可读性
-set(i 0)
-set(col 0)
-while(i LESS hexLen)
-    string(SUBSTRING "${hex}" ${i} 2 b)
-    set(out "${out}(char)0x${b},")
-    math(EXPR i "${i} + 2")
-    math(EXPR col "${col} + 1")
-    if(col EQUAL 12)
-        set(out "${out}\n    ")
-        set(col 0)
-    else()
-        set(out "${out} ")
-    endif()
-endwhile()
-
-# 结尾终结符 + size 常量
-set(out "${out}(char)0x00\n};\n")
-set(out "${out}inline constexpr unsigned ${VAR}_size = sizeof(${VAR}) - 1;\n")
-
-file(WRITE "${DST}" "${out}")
+file(WRITE "${DST}"
+    "#pragma once\n"
+    "// AUTO-GENERATED — do not edit\n"
+    "// source: ${SRC}\n"
+    "// bytes:  ${byteCount} (excluding terminator)\n\n"
+    "inline constexpr char ${VAR}[] = {\n    "
+    "${body}(char)0x00\n};\n"
+    "inline constexpr unsigned ${VAR}_size = sizeof(${VAR}) - 1;\n")

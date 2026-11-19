@@ -312,25 +312,22 @@ pub(crate) fn watch_content_changed(
     usn: i64,
     current: &WatchCandidateRow,
 ) -> bool {
-    watch_observed_content_changed(size, mtime, id, usn, current.size, current.mtime, &current.observation)
+    id != current.observation.file_id || size != current.size || watch_usn_content_changed(
+        mtime, usn, current.mtime, current.observation.change_usn, current.observation.change_reasons,
+    )
 }
 
-pub(crate) fn watch_observed_content_changed(
-    size: u64,
+pub(crate) fn watch_usn_content_changed(
     mtime: f64,
-    id: &str,
     usn: i64,
-    current_size: u64,
     current_mtime: f64,
-    observation: &WatchFileObservation,
+    current_usn: i64,
+    change_reasons: Option<sunpack_usn_core::ChangeReasons>,
 ) -> bool {
-    if id != observation.file_id || size != current_size {
-        return true;
-    }
-    if usn == observation.change_usn {
+    if usn == current_usn {
         return false;
     }
-    if let Some(reasons) = observation.change_reasons {
+    if let Some(reasons) = change_reasons {
         return reasons.without_close & 7 != 0;
     }
     current_mtime >= mtime - 2.0

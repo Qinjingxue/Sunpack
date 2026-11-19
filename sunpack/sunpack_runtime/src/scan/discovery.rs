@@ -118,9 +118,7 @@ impl FileTargets {
     fn select(&self, snapshot: &NativeDirectorySnapshot) -> Option<NativeDirectorySnapshot> {
         let mut exact = 0;
         let rows: Vec<_> = snapshot
-            .rows
-            .iter()
-            .copied()
+            .rows()
             .filter(|&row| {
                 let key = path_key(&snapshot.table.paths[row]);
                 if self.names_by_path.contains_key(&key) {
@@ -213,7 +211,7 @@ impl NativeCandidateTable {
         }
         // Password resolution can introduce candidates after filesystem routing.
         // Borrow their original rows; no new enumeration, analysis or file I/O.
-        for &row in snapshot.rows.iter() {
+        for row in snapshot.rows() {
             if pending.remove(&path_key(&snapshot.table.paths[row])) {
                 self.rows
                     .push(Candidate::File(Arc::clone(&snapshot.table), row));
@@ -252,10 +250,9 @@ impl NativeCandidateTable {
         // their original route.
         if let Some(targeted) = targeted {
             let routed: HashSet<_> = targeted
-                .rows
-                .iter()
-                .filter(|&&row| targeted.table.file_route(row) == FILE_ROUTE_RELATIONS)
-                .map(|&row| path_key(&targeted.table.paths[row]))
+                .rows()
+                .filter(|&row| targeted.table.file_route(row) == FILE_ROUTE_RELATIONS)
+                .map(|row| path_key(&targeted.table.paths[row]))
                 .collect();
             groups.retain(|group| match group {
                 NativeRelationGroup::Ordinary(row, _) => routed.contains(&row.path_key),
@@ -519,9 +516,7 @@ impl NativeEmbeddedBatch {
                     for (source, snapshot) in table.relation_sources.iter().enumerate() {
                         // Only raw snapshots are kept in relation_sources.
                         // Their scope views preserve the original row order.
-                        if Arc::ptr_eq(facts, &snapshot.table)
-                            && (snapshot.rows.len() == snapshot.table.paths.len()
-                                || snapshot.rows.binary_search(row).is_ok())
+                        if Arc::ptr_eq(facts, &snapshot.table) && snapshot.contains_row(*row)
                         {
                             selected.insert((source, stem.clone()));
                         }
@@ -538,7 +533,7 @@ impl NativeEmbeddedBatch {
             let mut matched = HashSet::new();
             for (source, snapshot) in table.relation_sources.iter().enumerate() {
                 matched.clear();
-                for &row in snapshot.rows.iter() {
+                for row in snapshot.rows() {
                     let key = path_key(&snapshot.table.paths[row]);
                     if let Some((key, stem)) = relations.get_key_value(&key) {
                         if matched.insert(key) {
@@ -561,7 +556,7 @@ impl NativeEmbeddedBatch {
             // Build this set only if a raw unknown peer actually exists.
             let mut candidate_stems = None;
             for (source, snapshot) in table.relation_sources.iter().enumerate() {
-                for &row in snapshot.rows.iter() {
+                for row in snapshot.rows() {
                     if snapshot.table.is_dir(row) || !snapshot.table.relation_member_eligible(row)
                         || (!self.force_scan && snapshot.table.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor).is_some()) {
                         continue;
@@ -607,9 +602,8 @@ impl NativeEmbeddedBatch {
         let cache = &self.relation_cache;
         for snapshot in &table.relation_sources {
             let stems: HashSet<_> = snapshot
-                .rows
-                .iter()
-                .filter_map(|&row| {
+                .rows()
+                .filter_map(|row| {
                     let path = &snapshot.table.paths[row];
                     selected.contains(&path_key(path)).then(|| catalog_stem(path))
                 })
@@ -617,7 +611,7 @@ impl NativeEmbeddedBatch {
             if stems.is_empty() {
                 continue;
             }
-            for &row in snapshot.rows.iter() {
+            for row in snapshot.rows() {
                 if !snapshot.table.relation_member_eligible(row) {
                     continue;
                 }
@@ -677,7 +671,7 @@ impl NativeEmbeddedBatch {
             if external.is_empty() {
                 break;
             }
-            for &row in snapshot.rows.iter() {
+            for row in snapshot.rows() {
                 let Some(anchor) = snapshot.table.relation_anchors[row]
                     .as_ref()
                     .and_then(CheapAnchor::anchor) else { continue; };
@@ -841,7 +835,7 @@ impl NativeEmbeddedBatch {
             .collect();
         if !peers.is_empty() {
             for snapshot in sources {
-                for &row in snapshot.rows.iter() {
+                for row in snapshot.rows() {
                     if !snapshot.table.relation_member_eligible(row) {
                         continue;
                     }
@@ -958,7 +952,7 @@ impl NativeCandidateTable {
         targets: Option<&FileTargets>,
         deep: bool,
     ) -> Self {
-        debug_assert!(raw.rows.windows(2).all(|pair| pair[0] < pair[1]));
+        debug_assert!(raw.rows().zip(raw.rows().skip(1)).all(|(a, b)| a < b));
         let mut table = Self::default();
         let selected = targets.and_then(|targets| targets.select(filtered));
         let groups = if deep { Vec::new() } else {
@@ -967,9 +961,9 @@ impl NativeCandidateTable {
         // Embedded is the only producer in deep mode. Keep raw peers for
         // directed volume recovery on both discovery paths.
         let selected = selected.as_ref().unwrap_or(filtered);
-        table.rows.reserve_exact(groups.len() + selected.rows.len());
+        table.rows.reserve_exact(groups.len() + selected.rows().len());
         table.rows.extend(groups.into_iter().map(|group| Candidate::Relation(Box::new(group))));
-        table.rows.extend(selected.rows.iter().copied()
+        table.rows.extend(selected.rows()
             .filter(|&row| !selected.table.is_dir(row)
                 && (deep || selected.table.file_route(row) != FILE_ROUTE_RELATIONS))
             .map(|row| Candidate::File(Arc::clone(&selected.table), row)));
@@ -990,7 +984,7 @@ impl NativeCandidateTable {
     // existing split-entry evidence to open the same Embedded peer frontier
     // from the other end, within this target's original scope.
     fn find_volume_entry_peers(&mut self, filtered: &NativeDirectorySnapshot, targets: &FileTargets) {
-        if self.rows.is_empty() || self.rows.len() >= filtered.rows.len() {
+        if self.rows.is_empty() || self.rows.len() >= filtered.rows().len() {
             return;
         }
         let stems: HashSet<_> = self.rows.iter().filter_map(|candidate| {
@@ -1002,7 +996,7 @@ impl NativeCandidateTable {
             return;
         }
         let facts = &filtered.table;
-        for &row in filtered.rows.iter() {
+        for row in filtered.rows() {
             if !facts.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor)
                 .is_some_and(|anchor| anchor.multivolume && anchor.is_volume_entry())
             {
@@ -1033,7 +1027,7 @@ impl NativeCandidateTable {
         }).collect();
         if stems.is_empty() { return anchors.into_values().collect(); }
         for snapshot in &self.relation_sources {
-            for &row in snapshot.rows.iter() {
+            for row in snapshot.rows() {
                 if !snapshot.table.relation_member_eligible(row) { continue; }
                 let Some(anchor) = snapshot.table.relation_anchors[row].as_ref()
                     .and_then(CheapAnchor::anchor)
@@ -1091,7 +1085,7 @@ impl NativeCandidateTable {
         }
         // A recovered continuation is not a standalone task, but still
         // nominates same-stem opaque carriers when the head is embedded.
-        for &row in raw.rows.iter() {
+        for row in raw.rows() {
             if previous.is_empty() { break; }
             let key = path_key(&raw.table.paths[row]);
             if previous.remove(&key) && cached.anchors.get(&key).is_some_and(|a|

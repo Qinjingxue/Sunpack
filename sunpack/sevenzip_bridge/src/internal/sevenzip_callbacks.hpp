@@ -280,7 +280,8 @@ namespace sunpack::sevenzip
             if (volume_paths_)
             {
                 auto found = volume_paths_->find(base);
-                if (found == volume_paths_->end()) found = volume_paths_->find(lower_text(name));
+                if (found == volume_paths_->end() && !canonical_names_)
+                    found = volume_paths_->find(lower_text(name));
                 if (found != volume_paths_->end()) return found->second;
             }
             else if (!archive_path_.empty())
@@ -464,17 +465,24 @@ namespace sunpack::sevenzip
             }
             UInt32 consumed = 0;
             HRESULT hr = S_OK;
-            while (consumed < size) {
-                const auto run = file_->previous_writes().next(position_, size - consumed);
-                UInt32 done = 0;
-                const auto amount = static_cast<UInt32>(run.second);
-                if (run.first) {
-                    hr = writer_->skip_written(file_, amount);
-                    if (hr == S_OK) done = amount;
-                } else hr = writer_->write(file_, static_cast<const unsigned char *>(data) + consumed, amount, &done);
-                consumed += done;
-                position_ += done;
-                if (hr != S_OK || done != amount) break;
+            if (const auto *previous = file_->previous_writes()) {
+                while (consumed < size) {
+                    const auto [covered, length] = previous->next(position_, size - consumed);
+                    const auto amount = static_cast<UInt32>(length);
+                    UInt32 done = 0;
+                    if (covered) {
+                        hr = writer_->skip_written(file_, amount);
+                        if (hr == S_OK) done = amount;
+                    } else {
+                        const auto *source = static_cast<const unsigned char *>(data);
+                        hr = writer_->write(file_, source ? source + consumed : nullptr, amount, &done);
+                    }
+                    consumed += done;
+                    position_ += done;
+                    if (hr != S_OK || done != amount) break;
+                }
+            } else {
+                hr = writer_->write(file_, data, size, &consumed);
             }
             if (consumed != 0 && magic_.size() < prefix_limit_)
             {

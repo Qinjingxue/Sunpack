@@ -198,6 +198,54 @@ bool blocked_open_does_not_block_other_jobs(const std::filesystem::path& directo
     return independent && sibling_ok && writer.finish_job(blocked_job) == E_ABORT && writer.take_file_snapshot(blocked).closed;
 }
 
+bool full_queue_preserves_staged_output(const std::filesystem::path& directory) {
+    AsyncWriterConfig config;
+    config.threads_per_volume = 1;
+    config.queue_limit = 1;
+    const auto first_path = (directory / L"queue-first.bin").wstring();
+    const auto output_path = directory / L"queue-output.bin";
+    const std::vector<unsigned char> payload(AsyncFileWriter::kBufferSize, 0x71);
+    std::promise<void> entered, release;
+    auto entering = entered.get_future();
+    auto released = release.get_future();
+    AsyncFileWriter writer(std::make_shared<VolumeState>("test:queue", false), config);
+    const auto job = writer.make_job();
+    const auto first = writer.make_file(job, first_path, 0, 0);
+    const auto queued = writer.make_file(job, (directory / L"queue-close.bin").wstring(), 1, 1);
+    const auto output = writer.make_file(job, output_path.wstring(), 2, 2);
+    writer.set_open_probe_for_test([&](const std::wstring& path) {
+        if (path == first_path) {
+            entered.set_value();
+            released.wait();
+        }
+    });
+
+    writer.close_file(first, {});
+    const bool began = entering.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    writer.close_file(queued, {}); // The only queue slot is still occupied.
+    UInt32 processed = 0;
+    const auto staged = writer.write(output, payload.data(), static_cast<UInt32>(payload.size()), &processed);
+    release.set_value();
+    bool resumed = false;
+    if (staged == S_OK) {
+        auto tail = std::async(std::launch::async, [&] {
+            const unsigned char last = 0x5a;
+            UInt32 written = 0;
+            return writer.write(output, &last, 1, &written) == S_OK && written == 1;
+        });
+        const bool ready = tail.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        if (!ready) writer.cancel_job(job);
+        resumed = tail.get() && ready;
+    }
+    writer.close_file(output, {});
+    const auto result = writer.finish_job(job);
+    if (!began || staged != S_OK || processed != payload.size() || !resumed || result != S_OK) {
+        std::cerr << "queue saturation lost a fully staged buffer or prevented its publication\n";
+        return false;
+    }
+    return std::filesystem::file_size(output_path) == payload.size() + 1;
+}
+
 // Only this test reuses the same writer after an actual SetFileTime failure;
 // one-shot archive tests cannot cover that lifetime. Two tiny files suffice.
 bool timestamp_failure_does_not_fail_content(const std::filesystem::path& directory) {
@@ -749,6 +797,7 @@ int main() {
     const bool passed = write_same_file_concurrently(directory) &&
         write_zero_length_file(directory) &&
         blocked_open_does_not_block_other_jobs(directory) &&
+        full_queue_preserves_staged_output(directory) &&
         timestamp_failure_does_not_fail_content(directory) &&
         closes_after_delayed_open_failure(directory) &&
         cancelled_job_returns_pending_to_zero(directory) &&

@@ -106,12 +106,12 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
     # The registered language is taken from the local SunPack configuration.
     assert commands["menu_labels"] in (english_labels, chinese_labels)
 
-    for key in ("folder_prompt", "background_prompt"):
-        expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
+    for key, path in (("folder_prompt", "D:\\"), ("background_prompt", "D:\\"), ("background_prompt", r"D:\Archives")):
+        expanded = commands[key].replace("%1", path).replace("%V", path)
         argv = _windows_argv(expanded)
         assert argv[1] == "extract"
-        assert ntpath.normpath(argv[2]) == "D:\\"
-        assert ntpath.normpath(argv[argv.index("-o") + 1]) == "D:\\"
+        assert ntpath.normpath(argv[2]) == path
+        assert ntpath.normpath(argv[argv.index("-o") + 1]) == path
         assert "-d" not in argv
         assert "-a" in argv
         assert "-pa" in argv
@@ -282,17 +282,6 @@ try {
         assert "-R" not in entries["DirectExtract"]["command"]
         assert "-R" not in entries["WatchFolder"]["command"]
     assert {entry["name"] for entry in result["snapshots"][0]["File"]} == {"DirectExtract", "PromptPassword"}
-
-
-def test_context_menu_directory_token_is_stable_for_normal_paths():
-    command = 'sunpack.exe extract "%V\\." -o "%V\\." -a -pa'
-    argv = _windows_argv(command.replace("%V", r"D:\Archives"))
-
-    assert ntpath.normpath(argv[2]) == r"D:\Archives"
-    assert ntpath.normpath(argv[4]) == r"D:\Archives"
-    assert argv[5:] == ["-a", "-pa"]
-
-
 
 
 def _windows_argv(command: str) -> list[str]:

@@ -75,8 +75,7 @@ fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     index.finish_rebuild().unwrap();
     let generation = index.generation();
     assert!(!index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap());
-    // Represent the space left by a large, now obsolete journal incarnation.
-    index.records.reserve(2048);
+    // Secondary indexes can have more slack than the already trimmed record map.
     index.objects.reserve(2048);
     assert!(index.reconcile_journals(&[("scope".into(), "test-volume".into(), 2)]).unwrap());
     assert!(index.records.is_empty() && index.needs_rebuild());

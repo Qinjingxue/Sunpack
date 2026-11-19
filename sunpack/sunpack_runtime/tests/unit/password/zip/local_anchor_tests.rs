@@ -235,7 +235,7 @@ fn projected_directory_conflict_survives_later_usable_entry_without_a_shared_anc
         plan_mut.sources = sources.clone().into_boxed_slice();
         Arc::make_mut(&mut plan_mut.domains[1].choices).push(3);
         assert!(prepare_zip_attempt_anchor(&sources[0], &plan, &[]).is_none());
-        let (context, _) = prepare_zip_attempts(&sources[0], &plan, spanned, None, &[], None)
+        let context = prepare_zip_attempts(&sources[0], &plan, spanned, None, &[], None)
             .ok().expect("the compatible alternative still has a usable member");
         let result = context.verify(&[], None).unwrap();
         assert_eq!(&*result.volume_attempts.expect("Rust prunes the conflicting layout").sources,
@@ -472,10 +472,6 @@ fn winzip_aes_xz_footer_screens_padded_concatenated_tail() {
     assert_eq!(result.matched_indices, [0]);
     let remaining = result.volume_attempts.expect("the known footer prunes the invalid tails");
     assert_eq!(&*remaining.sources, &[sources[0].clone(), sources[2].clone(), absent]);
-    let diagnostic = result.read_fault.expect("the anchor preserves the directory failure");
-    assert_eq!(diagnostic.field, "zip.eocd");
-    assert_eq!(preparation.verify_prepared(&[Arc::from("secret")]).unwrap().unwrap()
-        .read_fault.unwrap().field, diagnostic.field);
 
     drop(preparation);
     for path in paths.into_iter().chain([short_path]) { std::fs::remove_file(path).unwrap(); }

@@ -249,7 +249,13 @@ void search_config(Application& app,const wchar_t* query) {
 void finish_input(Application& app,bool expect_success=true) {
     ui_window_focus_widget(app.window(),0);
     ui_debug_pump();
-    pump([&]{return state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false && state(app.page(),"saving")==false && state(app.page(),"pendingFields").empty();},"Automatic writes");
+    pump([&]{
+        if(!state(app.page(),"requests").empty() || state(app.page(),"dispatch")==true ||
+            !state(app.page(),"pendingFields").empty()) return false;
+        for(auto kind:{"rootDrafts","passwordDrafts"}) for(const auto& draft:state(app.page(),kind))
+            if(draft.value("pending",false)) return false;
+        return true;
+    },"Automatic writes");
     if(!expect_success) return;
     auto errors=state(app.page(),"saveErrors");
     if(!errors.empty()) throw std::runtime_error(errors.dump());
@@ -702,8 +708,8 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     navigate(app,"tabTasks","tasks");
     click(app,directory.c_str());
     pump([&]{
-        auto pages=state(app.page(),"taskPages");
-        return !pages.empty() && pages[0]["root"]==scope && state(app.page(),"tasks")["rows"].empty();
+        return state(app.page(),"directorySelection")==scope && state(app.page(),"taskDirectoryDirty")==false &&
+            !state(app.page(),"taskPages").empty() && state(app.page(),"tasks")["rows"].empty();
     },"Filter tasks by monitored directory");
 
     navigate(app,"tabPasswords","passwords");

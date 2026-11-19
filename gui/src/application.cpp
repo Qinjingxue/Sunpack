@@ -152,6 +152,16 @@ void Application::changed(unsigned flags) {
     { std::lock_guard<std::mutex> lock(mutex_); if(stopping_) return; dirty_|=flags; }
     cv_.notify_one();
 }
+void Application::request_stop() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(stopping_) return;
+        stopping_=true;
+        ++task_query_generation_;
+    }
+    SetEvent(stop_);
+    cv_.notify_all();
+}
 void Application::publish(Json patch) {
     std::lock_guard<std::mutex> lock(mutex_);
     if(stopping_) return;
@@ -205,12 +215,15 @@ void Application::save_field(const std::string& id,Json draft) {
         auto fields=page_value(page_,"fields");
         auto field=std::find_if(fields.begin(),fields.end(),[&](const Json& f){return f["id"]==id;});
         if(field==fields.end()) throw std::runtime_error("configConflict");
-        auto text=draft.at("text").get<std::string>();
-        if(draft.contains("range")) text=range_configuration(draft["range"],(*field)["editor"]=="datetime_range").dump();
-        Json edit={{"pointer",id},{"label",(*field)["label"]},{"original",draft["original"]},
+        Json edit={{"pointer",id},{"original",std::move(draft.at("original"))},
             {"type",(*field)["editor"]=="recursive"?Json("string"):(*field)["type"]},
-            {"text",text},{"boolean",draft["boolean"]},{"draft",draft}};
-        queue_save(Json{{"kind","config"},{"key",id},{"fields",Json::array({edit})}});
+            {"text",std::move(draft.at("text"))},{"boolean",std::move(draft.at("boolean"))}};
+        if(draft.contains("range")) {
+            auto draft_text=std::move(edit["text"]);
+            edit["text"]=range_configuration(draft["range"],(*field)["editor"]=="datetime_range").dump();
+            edit["draftText"]=std::move(draft_text);
+        }
+        queue_save(Json{{"kind","config"},{"key",id},{"fields",Json::array({std::move(edit)})}});
     } catch(const std::exception& e) { save_error(id,e.what()); }
 }
 void Application::queue_save(Json job) {
@@ -250,17 +263,13 @@ void Application::start_save() {
         { std::lock_guard<std::mutex> lock(mutex_); commands_.emplace_back(active_save_); }
         cv_.notify_one();
     }
-    Json pending=Json::array(), records={{"passwords",false},{"roots",false}};
+    Json pending=Json::array();
     auto include=[&](const Json& job) {
-        if(job.is_null()) return;
-        auto kind=job.at("kind").get<std::string>();
-        if(kind=="config") pending.push_back(job["key"]); else records[kind]=true;
+        if(job.at("kind")=="config") pending.push_back(job["key"]);
     };
     if(active_save_) include(*active_save_);
     for(const auto& job:saves_) include(job);
     auto text=pending.dump(); ui_page_set_json(page_,"pendingFields",text.c_str());
-    text=records.dump(); ui_page_set_json(page_,"recordSaving",text.c_str());
-    ui_page_set_bool(page_,"saving",bool(active_save_));
 }
 void Application::acknowledge_save(const Json& ack) {
     const auto& job=*active_save_; auto kind=job.at("kind").get<std::string>();
@@ -386,21 +395,22 @@ void Application::acknowledge_save(const Json& ack) {
     save_error(job["key"].get_ref<const std::string&>(),ack.at("error"));
     if(ok) {
         const auto& edit=job["fields"][0]; auto id=edit["pointer"].get<std::string>();
+        const auto& draft_text=edit.contains("draftText")?edit["draftText"]:edit["text"];
         auto original=edit["type"]=="string"?Json(edit["text"]).dump():edit["type"]=="boolean"?Json(edit["boolean"]).dump():edit["text"].get<std::string>();
         for(auto name:{"drafts","toggleDrafts"}) {
             auto drafts=page_value(page_,name);
             if(drafts.contains(id)) {
                 auto& current=drafts[id];
                 if(current["original"]==edit["original"]) {
-                    bool same=edit["type"]=="boolean"?current["boolean"]==edit["boolean"]:current["text"]==edit["draft"]["text"];
+                    bool same=edit["type"]=="boolean"?current["boolean"]==edit["boolean"]:current["text"]==draft_text;
                     if(same) drafts.erase(id);
-                    else { current["original"]=original; current["baselineText"]=edit["draft"]["text"]; current["baselineBoolean"]=edit["draft"]["boolean"]; }
+                    else { current["original"]=original; current["baselineText"]=draft_text; current["baselineBoolean"]=edit["boolean"]; }
                 }
             }
             auto text=drafts.dump(); ui_page_set_json(page_,name,text.c_str());
         }
         for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"] && queued["fields"][0]["original"]==edit["original"]) {
-            queued["fields"][0]["original"]=original; queued["fields"][0]["draft"]["original"]=original;
+            queued["fields"][0]["original"]=original;
         }
     }
     active_save_.reset();
@@ -481,7 +491,7 @@ void Application::apply_pending() {
     if(patch.contains("fields") || !ack.is_null()) sync_tags();
     for(auto& id:reset_scroll) scroll_top(window_,id.get_ref<const std::string&>());
     // Only an acknowledgement advances the save queue. Data/log publishes
-    // must not rewrite recordSaving/pendingFields and rebind hidden editors.
+    // must not rewrite pendingFields and rebind hidden editors.
     if(!ack.is_null()) start_save();
     if(patch.contains("language")) {
         date_popup_.reset();
@@ -817,21 +827,15 @@ void Application::handle_command(Json command) {
     }
     if(op=="saveField") { save_field(p.at("id"),p.value("draft",Json())); return; }
     if(op=="saveRecord") { queue_save(std::move(p)); return; }
-    if(op=="openTask") {
-        // Use the already-mounted task, not the full reactive history.
-        if(!p.contains("task") || !p["task"].is_object()) return;
-        p=Json{{"path",utf8(task_directory(p["task"]).wstring())}};
-        op="openPath";
-    }
-    if(op=="openPath") {
-        auto path=wide(p.value("path",std::string()));
+    if(op=="openPath" || op=="openTask") {
+        auto path=op=="openTask"?task_directory(p):fs::path(wide(p.value("path",std::string())));
         if(!path.empty() && fs::exists(path)) {
             if(fs::is_directory(path)) {
                 auto result=ShellExecuteW(hwnd_,L"explore",path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
                 if(reinterpret_cast<INT_PTR>(result)<=32) throw std::runtime_error("explorerFailed");
                 return;
             }
-            auto folder=fs::path(path).parent_path();
+            auto folder=path.parent_path();
             PIDLIST_ABSOLUTE parent=ILCreateFromPathW(folder.c_str()), item=ILCreateFromPathW(path.c_str());
             HRESULT result=E_FAIL;
             if(parent && item) {
@@ -1003,8 +1007,7 @@ void Application::open() {
     rebuild_theme(language);
     ui_window_on_close(window_,[](UiWindow,void* context){
         auto* self=static_cast<Application*>(context);
-        { std::lock_guard<std::mutex> lock(self->mutex_); self->stopping_=true; }
-        SetEvent(self->stop_); self->cv_.notify_all(); ui_quit(0);
+        self->request_stop(); ui_quit(0);
     },this);
     ui_page_set_bool(page_,"cliAllowed",options_.allow_cli);
     stage="stageWatchers";
@@ -1055,10 +1058,9 @@ int Application::run() {
     return result;
 }
 Application::~Application() {
+    request_stop();
     find_.reset();
     date_popup_.reset();
-    { std::lock_guard<std::mutex> lock(mutex_); stopping_=true; }
-    SetEvent(stop_); cv_.notify_all();
     if(worker_.joinable()) worker_.join();
     if(registry_.joinable()) registry_.join();
     if(runtime_.joinable()) runtime_.join();
@@ -1343,7 +1345,7 @@ void Application::work() {
             language=std::move(next_language);
             if(language_changed) { patch["language"]=language; patch["texts"]=interface_texts(language); }
             if(!log_unavailable && (tasks_changed || language_changed || !previous_patch.contains("tasks"))) {
-                log.cancelled=[this,query_generation]{return task_query_generation_.load()!=query_generation || WaitForSingleObject(stop_,0)==WAIT_OBJECT_0;};
+                log.cancelled=[this,query_generation]{return task_query_generation_.load()!=query_generation;};
                 try {
                     // Replaced/expired runs cannot keep old disk cursors alive.
                     if(!log.manifest.is_null()) for(const auto& cursor:task_window) if(!cursor.empty()) {
@@ -1365,7 +1367,6 @@ void Application::work() {
                         auto projected=log.query(roots,selected,language);
                         if(projected.is_null()) { pages=Json(); break; }
                         projected["cursor"]=cursor;
-                        projected["query"]=view.task_query; projected["root"]=view.task_root; projected["status"]=view.task_status;
                         refreshed_window.push_back(cursor);
                         next_cursor=projected["next"].get<std::string>();
                         const bool more=projected["hasMore"].get<bool>();
@@ -1373,7 +1374,9 @@ void Application::work() {
                         if(full && !more) break;
                     }
                     if(!pages.is_null()) {
-                        patch["tasks"]={{"generation",query_generation},{"pages",std::move(pages)},{"reset",task_window_reset},{"full",full},{"window",cursors},{"revision",task_revision}};
+                        patch["tasks"]={{"generation",query_generation},{"pages",std::move(pages)},{"reset",task_window_reset},
+                            {"full",full},{"window",std::move(cursors)},{"revision",task_revision},
+                            {"query",view.task_query},{"root",view.task_root},{"status",view.task_status}};
                         if(full) task_window=std::move(refreshed_window);
                         task_query_pending=false; task_window_reset=false;
                     } else task_query_pending=true;

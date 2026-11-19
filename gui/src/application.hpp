@@ -56,6 +56,7 @@ class Application {
     void rebuild_theme(const std::string& language);
     void navigate(const std::string& tab);
     void work();
+    void request_stop();
     void publish(Json patch);
     void changed(unsigned flags);
     void dispatch();
