@@ -814,17 +814,28 @@ fn completed_cleanup_retires_jobs_and_keeps_only_failures() {
                     };
                     completed.lock().unwrap().retire(id, failures)
                 }));
-                pending.active.insert(id, PendingCleanup { paths: vec![PathBuf::from("source.zip")], task });
+                pending.register(id, vec![Arc::from("source.zip")], task);
             }
         })
     });
     let mut tasks = tasks.lock().unwrap();
-    assert!(tasks.active.is_empty(), "completed paths must not remain in root-drain scans");
-    assert!(tasks.take_failures(Some(Path::new("other"))).is_empty());
+    assert!(tasks.active.is_empty() && tasks.by_path.is_empty());
+    assert!(tasks.take_failures(Some("other")).is_empty());
     let failures = tasks.take_failures(None);
     let [failure] = failures.as_slice() else { panic!("expected one failed cleanup") };
     assert_eq!(failure.path, Path::new("source.zip"));
     assert_eq!(failure.status, CleanupStatus::Failed);
+
+    for (id, paths) in [
+        (32, &["out\\first.zip", "out\\second.zip", "external.zip"][..]),
+        (33, &["out (2)\\sibling.zip"][..]),
+    ] {
+        tasks.register(id, paths.iter().copied().map(Arc::from).collect(), super::super::scheduling::Join::ready(Vec::new()));
+    }
+    assert_eq!(tasks.take_pending(Some("out")).len(), 1);
+    assert!(tasks.take_pending(Some("external.zip")).is_empty());
+    assert_eq!(tasks.take_pending(Some("out (2)")).len(), 1);
+    assert!(tasks.active.is_empty() && tasks.by_path.is_empty());
 }
 
 fn test_run<'a, O: Observer>(

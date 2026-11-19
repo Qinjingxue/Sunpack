@@ -1524,7 +1524,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
         members: vec![names[0].clone(), names[1].clone(), discovered.to_string_lossy().into_owned()] });
     let root = || RootCompleted {
         request: 1,
-        reply: Arc::default(), batch: "first".into(), id: 1, path: head.into(),
+        reply: Arc::default(), batch: "first".into(), id: 1, root_key: key(head),
         groups: group.members.iter().map(|member| (watch_path_key(member), Arc::clone(&group))).collect(),
         completed: Completed { cancelled: false, result: Ok(Outcome::default()),
              outputs: BTreeMap::new() },
@@ -1568,7 +1568,7 @@ fn root_completion_wakes_watch_and_drain_before_batch_exit() {
     // A batch completion test cannot detect a root-only wake being ignored
     // while another native task is still running.
     fn root() -> RootCompleted {
-        RootCompleted { request: 1, reply: Arc::default(), batch: "batch".into(), id: 1, path: "a.zip".into(), groups: HashMap::new(),
+        RootCompleted { request: 1, reply: Arc::default(), batch: "batch".into(), id: 1, root_key: watch_path_key("a.zip"), groups: HashMap::new(),
             completed: Completed { cancelled: false, result: Ok(Outcome::default()),
                  outputs: BTreeMap::new() } }
     }

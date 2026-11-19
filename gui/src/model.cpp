@@ -568,9 +568,13 @@ Json save_changes(const fs::path& dir,const Json& field,const Json& passwords,co
                 rows.erase(rows.begin()+kept,rows.end());
             }
             if(!rebases.empty()) {
+                auto remaining=rebases.size();
                 for(auto& record:committed_passwords["passwords"]) {
                     auto found=rebases.find(record["value"].get_ref<const std::string&>());
-                    if(found!=rebases.end() && !found->second.after) found->second.after=&record;
+                    if(found!=rebases.end() && !found->second.after) {
+                        found->second.after=&record;
+                        if(!--remaining) break;
+                    }
                 }
                 for(auto& [value,rebase]:rebases) {
                     auto& previous=rebase.before;

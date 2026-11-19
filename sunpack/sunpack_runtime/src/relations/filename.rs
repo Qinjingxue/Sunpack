@@ -1,4 +1,7 @@
-use super::{first_dot_stem, logical_name_from_parsed, parse_volume_candidates, ParsedVolume};
+use super::{
+    first_dot_stem, logical_name_from_parsed, parse_volume_candidates_with_regexes, regex_cache,
+    ParsedVolume,
+};
 use crate::path_keys::case_key;
 use std::collections::HashMap;
 
@@ -19,14 +22,15 @@ pub(super) struct NameFeatures {
 
 impl NameFeatures {
     pub fn parse(name: &str) -> Self {
-        let lower = name.to_ascii_lowercase();
-        let suffix = lower
-            .split_once('.')
-            .map_or(lower.as_str(), |(_, suffix)| suffix);
+        let fields = name.split_once('.');
+        let suffix = fields.map_or(name, |(_, suffix)| suffix);
+        let Some(mut cursor) = suffix.bytes().position(|byte| byte.is_ascii_digit()) else {
+            return Self::default();
+        };
+        let suffix = suffix.to_ascii_lowercase();
         let bytes = suffix.as_bytes();
         let mut numbers = Vec::new();
         let mut ordinals = HashMap::new();
-        let mut cursor = 0;
         while cursor < bytes.len() {
             if !bytes[cursor].is_ascii_digit() {
                 cursor += 1;
@@ -63,7 +67,11 @@ impl NameFeatures {
         }
         Self {
             numbers,
-            canonical: parse_volume_candidates(name),
+            canonical: if fields.is_some() {
+                parse_volume_candidates_with_regexes(name, &regex_cache().acquire())
+            } else {
+                Vec::new()
+            },
         }
     }
 

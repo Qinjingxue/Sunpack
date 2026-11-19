@@ -638,6 +638,7 @@ namespace sunpack::sevenzip
 
             std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
             bool direct_close = false;
+            bool wake_producers = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (file->close_requested)
@@ -650,10 +651,11 @@ namespace sunpack::sevenzip
                 if (terminal_result_locked(file->job) != S_OK)
                 {
                     discard_staging_locked(file);
+                    wake_producers = true;
                 }
                 else if (file->staging_buffer)
                 {
-                    enqueue_staging_locked(file, true);
+                    wake_producers = !enqueue_staging_locked(file, true);
                 }
                 if (file->outstanding_data == 0)
                 {
@@ -664,7 +666,7 @@ namespace sunpack::sevenzip
             {
                 process_close(file);
             }
-            producer_cv_.notify_all();
+            if (wake_producers || direct_close) producer_cv_.notify_all();
         }
 
         HRESULT finish_job(const JobStatePtr &job) noexcept
@@ -1683,6 +1685,7 @@ namespace sunpack::sevenzip
                     record_failure(file, HRESULT_FROM_WIN32(error));
                 }
             }
+            bool job_drained = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
 #ifdef SUP7Z_DEBUG
@@ -1701,10 +1704,10 @@ namespace sunpack::sevenzip
                 }
 #endif
                 assert(job->pending_files != 0);
-                --job->pending_files;
+                job_drained = --job->pending_files == 0;
                 unregister_file_locked(file);
             }
-            producer_cv_.notify_all();
+            if (job_drained || result.kind != AttemptResult::Kind::Succeeded) producer_cv_.notify_all();
         }
 
         void release_buffer(Buffer *buffer, const FileStatePtr &file,

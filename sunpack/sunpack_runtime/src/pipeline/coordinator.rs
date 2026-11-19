@@ -10,7 +10,7 @@ use super::{
     Event, Failure, FailureEvidence, FailureKind, FailureRead, InputError, InputErrorKind, Mode,
     Observer, Origin, Outcome as PublicOutcome, Request, ScanTaskFailure, Segment, TaskId,
 };
-use crate::collections::CacheOrder;
+use crate::collections::{CacheOrder, SmallOrderedSet};
 use crate::core::config::{CleanupMode, ContentRequirement, ProcessMode, Recursion, WorkerConfig};
 use crate::io::archive_state::{
     ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection,
@@ -526,15 +526,46 @@ enum RetryOutput<'a> {
 struct CleanupTasks {
     next_id: u64,
     active: HashMap<u64, PendingCleanup>,
+    by_path: BTreeMap<Arc<str>, SmallOrderedSet<u64>>,
     failures: BTreeMap<String, CleanupResult>,
 }
 
 impl CleanupTasks {
-    fn retire(&mut self, id: u64, failures: Vec<CleanupResult>) -> Vec<CleanupResult> {
-        if self.active.remove(&id).is_some() {
-            if self.active.capacity() > 256 {
-                crate::collections::trim_map(&mut self.active);
+    fn register(&mut self, id: u64, paths: Vec<Arc<str>>, task: super::scheduling::Join<Vec<CleanupResult>>) {
+        for path in &paths {
+            self.by_path.entry(Arc::clone(path)).and_modify(|owners| owners.insert(id))
+                .or_insert(SmallOrderedSet::One(id));
+        }
+        self.active.insert(id, PendingCleanup { paths, task });
+    }
+
+    fn remove(&mut self, id: u64) -> Option<PendingCleanup> {
+        let pending = self.active.remove(&id)?;
+        for path in &pending.paths {
+            if self.by_path.get_mut(path).is_some_and(|owners| owners.remove(&id)) {
+                self.by_path.remove(path);
             }
+        }
+        if self.active.capacity() > 256 {
+            crate::collections::trim_map(&mut self.active);
+        }
+        Some(pending)
+    }
+
+    fn take_pending(&mut self, root: Option<&str>) -> Vec<super::scheduling::Join<Vec<CleanupResult>>> {
+        let Some(root) = root else {
+            self.by_path.clear();
+            return std::mem::take(&mut self.active).into_values().map(|pending| pending.task).collect();
+        };
+        let range = descendant_key_range(root);
+        let ids: HashSet<_> = self.by_path.get(root).into_iter().chain(self.by_path.range::<str, _>((
+            std::ops::Bound::Included(range.start.as_str()), std::ops::Bound::Excluded(range.end.as_str()),
+        )).map(|(_, owners)| owners)).flat_map(SmallOrderedSet::iter).copied().collect();
+        ids.into_iter().filter_map(|id| self.remove(id).map(|pending| pending.task)).collect()
+    }
+
+    fn retire(&mut self, id: u64, failures: Vec<CleanupResult>) -> Vec<CleanupResult> {
+        if self.remove(id).is_some() {
             for failure in failures {
                 self.record_failure(failure);
             }
@@ -548,19 +579,18 @@ impl CleanupTasks {
         self.failures.insert(namespace_key(&failure.path), failure);
     }
 
-    fn take_failures(&mut self, root: Option<&Path>) -> Vec<CleanupResult> {
-        let Some(root) = root else {
+    fn take_failures(&mut self, key: Option<&str>) -> Vec<CleanupResult> {
+        let Some(key) = key else {
             return std::mem::take(&mut self.failures).into_values().collect();
         };
-        let key = namespace_key(root);
-        self.failures.remove(&key).into_iter().chain(
-            self.failures.extract_if(descendant_key_range(&key), |_, _| true).map(|(_, failure)| failure),
+        self.failures.remove(key).into_iter().chain(
+            self.failures.extract_if(descendant_key_range(key), |_, _| true).map(|(_, failure)| failure),
         ).collect()
     }
 }
 
 struct PendingCleanup {
-    paths: Vec<PathBuf>,
+    paths: Vec<Arc<str>>,
     task: super::scheduling::Join<Vec<CleanupResult>>,
 }
 
@@ -1295,22 +1325,20 @@ impl<'run, O: Observer> Run<'run, O> {
     }
 
     async fn drain_cleanup(&self, root: Option<&Path>, outcome: &mut Outcome) {
+        let root_key = root.map(namespace_key);
         let (mut failures, pending) = {
             let mut tasks = self.cleanup_tasks.lock().unwrap();
-            let failures = tasks.take_failures(root);
-            let pending: Vec<_> = tasks.active.extract_if(|_, task| {
-                root.is_none_or(|root| task.paths.iter().any(|path| relative_to(path, root).is_some()))
-            }).map(|(_, task)| task.task).collect();
-            if tasks.active.capacity() > 256 {
-                crate::collections::trim_map(&mut tasks.active);
-            }
-            (failures, pending)
+            (tasks.take_failures(root_key.as_deref()), tasks.take_pending(root_key.as_deref()))
         };
         for pending in pending {
             let mut results = pending.wait().await;
-            if let Some(root) = root.filter(|_| !results.is_empty()) {
+            if let Some(root_key) = root_key.as_ref().filter(|_| !results.is_empty()) {
+                let descendants = descendant_key_range(root_key);
                 let mut tasks = self.cleanup_tasks.lock().unwrap();
-                for failure in results.extract_if(.., |failure| relative_to(&failure.path, root).is_none()) {
+                for failure in results.extract_if(.., |failure| {
+                    let key = namespace_key(&failure.path);
+                    key != *root_key && !descendants.contains(&key)
+                }) {
                     tasks.record_failure(failure);
                 }
             }
@@ -2414,7 +2442,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 if deletes.is_empty() && recycles.is_empty() {
                     drop(lease);
                 } else {
-                    let paths = (!watch_root).then(|| deletes.iter().chain(&recycles).cloned().collect());
+                    let paths = (!watch_root).then(|| deletes.iter().chain(&recycles)
+                        .map(|path| Arc::from(namespace_key(path))).collect());
                     let cleanup = Arc::clone(this);
                     let work = async move {
                         // Keep other requests off these sources until cleanup
@@ -2439,7 +2468,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             let failures = work.await;
                             cleanup.cleanup_tasks.lock().unwrap().retire(id, failures)
                         }));
-                        tasks.active.insert(id, PendingCleanup { paths, task });
+                        tasks.register(id, paths, task);
                     } else {
                         root_cleanup = Some(spawner.spawn(Box::pin(work)));
                     }
@@ -4062,9 +4091,12 @@ fn dedup_resolved_plans(tasks: &mut Vec<Task>) -> HashMap<String, Arc<str>> {
 }
 
 fn namespace_key(path: &Path) -> String {
-    path_key(&normalize_windows_extended_prefix(
-        path.to_string_lossy().into_owned(),
-    ))
+    let path = path.to_string_lossy();
+    if path.starts_with(r"\\?\") {
+        path_key(&normalize_windows_extended_prefix(path.into_owned()))
+    } else {
+        path_key(&path)
+    }
 }
 
 fn cleanup_owned_output(path: &Path) -> io::Result<()> {
@@ -4099,7 +4131,7 @@ struct LeaseState {
     watch: HashMap<Arc<str>, Vec<ActiveWatchFamily>>,
     next_waiter: u64,
     waiters: HashMap<u64, LeaseWaiter>,
-    blocked_by: HashMap<LeaseBlocker, HashSet<u64>>,
+    blocked_by: HashMap<LeaseBlocker, SmallOrderedSet<u64>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -4173,25 +4205,31 @@ impl LeaseState {
     fn remove_waiter(&mut self, id: u64) -> Option<Waker> {
         let waiter = self.waiters.remove(&id)?;
         for blocker in waiter.blockers {
-            if let Some(ids) = self.blocked_by.get_mut(&blocker) {
-                ids.remove(&id);
-                if ids.is_empty() { self.blocked_by.remove(&blocker); }
+            if self.blocked_by.get_mut(&blocker).is_some_and(|ids| ids.remove(&id)) {
+                self.blocked_by.remove(&blocker);
             }
         }
         Some(waiter.waker)
     }
 
     fn wait(&mut self, id: u64, blockers: HashSet<LeaseBlocker>, waker: &Waker) {
+        if let Some(waiter) = self.waiters.get_mut(&id) {
+            if waiter.blockers == blockers {
+                waiter.waker.clone_from(waker);
+                return;
+            }
+        }
         self.remove_waiter(id);
         for blocker in &blockers {
-            self.blocked_by.entry(blocker.clone()).or_default().insert(id);
+            self.blocked_by.entry(blocker.clone()).and_modify(|ids| ids.insert(id))
+                .or_insert(SmallOrderedSet::One(id));
         }
         self.waiters.insert(id, LeaseWaiter { waker: waker.clone(), blockers });
     }
 
     fn released(&mut self, blocker: &LeaseBlocker) -> Vec<Waker> {
         let Some(ids) = self.blocked_by.remove(blocker) else { return Vec::new(); };
-        ids.into_iter().filter_map(|id| self.remove_waiter(id)).collect()
+        ids.iter().filter_map(|id| self.remove_waiter(*id)).collect()
     }
 }
 

@@ -135,8 +135,25 @@ fn decorated_rar_sfx_head_keeps_exe_token_before_part_marker() {
 }
 
 #[test]
+fn filename_features_preserve_loose_channels_and_case_folded_contexts() {
+    let plain = filename::NameFeatures::parse("Backup2");
+    assert_eq!(plain.numbers[0].value, 2);
+    assert_eq!(plain.numbers[0].left, "backup");
+    assert!(plain.canonical.is_empty());
+
+    let ordinary = filename::NameFeatures::parse("Backup2.照片");
+    assert!(ordinary.numbers.is_empty() && ordinary.canonical.is_empty());
+
+    let repeated = filename::NameFeatures::parse("照片.PART02.RAR.part3.JPG");
+    assert_eq!(repeated.numbers.len(), 2);
+    assert_eq!(repeated.numbers[0].ordinal, 0);
+    assert_eq!(repeated.numbers[1].ordinal, 1);
+    assert_eq!(repeated.canonical[0].number, 3);
+}
+
+#[test]
 fn structural_part_marker_outranks_numeric_camouflage_suffix() {
-    let candidates = parse_volume_candidates("payload.part2.photo.456");
+    let candidates = filename::NameFeatures::parse("payload.part2.photo.456").canonical;
     assert_eq!(candidates[0].prefix, "payload");
     assert_eq!(candidates[0].number, 2);
     assert_eq!(candidates[0].style, "part_numbered");

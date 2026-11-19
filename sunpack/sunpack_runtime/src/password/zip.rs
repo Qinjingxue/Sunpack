@@ -594,8 +594,7 @@ fn find_zip_directory_entry<T>(
                     .into(),
             );
         }
-        let offset = crate::formats::zip::find_eocd_record(&tail, false)
-            .or_else(|| crate::formats::zip::find_eocd_record(&tail, true))
+        let offset = crate::formats::zip::find_eocd_prefer_exact(&tail)
             .map(|record| record.offset)
             .ok_or_else(|| {
                 ReadFault::invalid_field(

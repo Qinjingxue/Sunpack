@@ -2113,7 +2113,7 @@ struct RootCompleted {
     reply: Arc<super::cli::reporting::Reply<Outcome>>,
     batch: String,
     id: crate::pipeline::TaskId,
-    path: PathBuf,
+    root_key: String,
     groups: HashMap<String, Arc<SourceGroup>>,
     completed: Completed,
 }
@@ -5560,16 +5560,15 @@ impl Scheduler {
             return Err(io::Error::other("Watch request already retired"));
         };
         let members: HashSet<_> = root.groups.keys().cloned()
-            .chain(std::iter::once(key(&root.path))).collect();
+            .chain(std::iter::once(root.root_key)).collect();
         let mut inputs = Vec::new();
         let mut dirty = HashSet::new();
+        let mut quiet = HashMap::new();
         for member in &members {
-            if active.dirty.remove(member) { dirty.insert(member.clone()); }
-        }
-        for member in &members {
+            if let Some(path) = active.dirty.take(member) { dirty.insert(path); }
             if let Some(input) = active.inputs.remove(member) { inputs.push(input); }
+            if let Some((path, tracker)) = active.quiet.remove_entry(member) { quiet.insert(path, tracker); }
         }
-        let quiet = members.iter().filter_map(|path| active.quiet.remove(path).map(|tracker| (path.clone(), tracker))).collect();
         let group = root.groups.values().next().cloned();
         let context = CompletionContext {
             max_depth: active.max_depth,
@@ -5724,17 +5723,18 @@ impl Scheduler {
         // members of the completed request. Restore only their admission keys.
         {
             let claimed = active.claimed.lock().unwrap();
-            for path in completion_claims(active.task, &groups, &claimed).cloned()
-                .chain(active.inputs.iter().map(|candidate| watch_path_key(&candidate.path)))
-            {
-                if let Some(pending) = self.pending.get(&path) {
-                    self.due.insert((pending.due, path), ());
+            for path in completion_claims(active.task, &groups, &claimed) {
+                if let Some(pending) = self.pending.get(path) {
+                    self.due.insert((pending.due, path.clone()), ());
                 }
             }
         }
         for candidate in &active.inputs {
             let id = watch_path_key(&candidate.path);
             self.active_paths.remove(&id);
+            if let Some(pending) = self.pending.get(&id) {
+                self.due.insert((pending.due, id), ());
+            }
         }
         if let Some(owner) = coalesced_from {
             // The leader publishes the physical outcome and its blockers.
@@ -6630,7 +6630,7 @@ impl ObservedOutputs {
         self.insert(output, owner);
     }
 
-    fn take_owners(&mut self, owners: &HashSet<String>) -> BTreeMap<String, String> {
+    fn take_owners<'a>(&mut self, owners: impl Iterator<Item = &'a str>) -> BTreeMap<String, String> {
         let mut outputs = BTreeMap::new();
         for owner in owners {
             for path in self.owners.remove(owner).into_iter().flatten() {
@@ -6755,18 +6755,19 @@ impl Observer for WatchObserver {
         }
         let aliases = groups.take(&root);
         drop(groups);
-        let members: HashSet<_> = aliases.keys().cloned().chain(std::iter::once(root)).collect();
-        claimed.finished.extend(members.iter().cloned());
+        let members = aliases.keys().map(String::as_str)
+            .chain((!aliases.contains_key(&root)).then_some(root.as_str()));
+        claimed.finished.extend(members.clone().map(str::to_owned));
         drop(claimed);
         let mut shared_outputs = self.outputs.lock().unwrap();
-        let outputs = shared_outputs.take_owners(&members);
+        let outputs = shared_outputs.take_owners(members);
         drop(shared_outputs);
         (aliases, outputs)
         };
         let reply = Arc::new(super::cli::reporting::Reply::default());
         self.hub.root_completed(RootCompleted {
             request,
-            reply: Arc::clone(&reply), batch: self.batch.to_string(), id, path: path.to_owned(), groups,
+            reply: Arc::clone(&reply), batch: self.batch.to_string(), id, root_key: root, groups,
             completed: Completed { cancelled: false, result: Ok(outcome), outputs },
         });
         let outcome = reply.wait().await?;

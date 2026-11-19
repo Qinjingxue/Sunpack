@@ -1047,19 +1047,18 @@ fn bitmap_select(data: &[u8], rank: usize) -> u32 {
             (rank - bitmap_prefix(data, lo)) as u32,
         )
 }
-fn run_value(data: &[u8], run: usize, rank: usize) -> u32 {
+fn run_start(data: &[u8], run: usize) -> (u32, u32) {
     let value = small(data, 8 + run * 8);
+    (value & 0x7fff_ffff, u32::from(value >> 31 == 0))
+}
+fn run_value(data: &[u8], run: usize, rank: usize) -> u32 {
+    let (value, step) = run_start(data, run);
     let begin = if run == 0 {
         0
     } else {
         small(data, 4 + run * 8) as usize
     };
-    (value & 0x7fff_ffff)
-        + if value >> 31 != 0 {
-            0
-        } else {
-            (rank - begin) as u32
-        }
+    value + (rank - begin) as u32 * step
 }
 fn group_count(data: &[u8]) -> usize {
     small(data, 4) as usize
@@ -1108,16 +1107,8 @@ const fn lexical_order() -> [u8; PATTERNS.len() + 1] {
     order
 }
 const TYPE_ORDER: [u8; PATTERNS.len() + 1] = lexical_order();
-fn lexical_type(tags: u16, mut rank: usize) -> u8 {
-    for t in TYPE_ORDER {
-        if tags & (1 << t) != 0 {
-            if rank == 0 {
-                return t;
-            }
-            rank -= 1;
-        }
-    }
-    unreachable!()
+fn lexical_types(tags: u16) -> impl Iterator<Item = u8> {
+    TYPE_ORDER.into_iter().filter(move |&tag| tags & (1 << tag) != 0)
 }
 fn encode_leaf(data: &mut [u8], hits: &[PackedHit], plan: Plan) {
     let ctl = plan.leaf.control;
@@ -2551,7 +2542,7 @@ fn decode_one(data: &[u8], ctl: u32, n: usize, i: usize) -> (u32, u8) {
         let tags = u16::from_ne_bytes(data[at..at + 2].try_into().unwrap());
         return (
             first + get_bits(&data[8..], group, width),
-            lexical_type(tags, i - begin),
+            lexical_types(tags).nth(i - begin).unwrap(),
         );
     }
     let (offset, type_pos) = match codec {
@@ -2746,15 +2737,17 @@ fn decode_cache(
         }
         PATCH => decode_patch(data, n, width, offsets),
         BITMAP if ctl & RUNS != 0 => {
-            let mut rank = 0;
-            for run in 0..small(data, 4) as usize {
+            let count = small(data, 4) as usize;
+            let mut start = 0;
+            for run in 0..count {
                 let end = small(data, 12 + run * 8) as usize;
-                while rank < end {
-                    offsets[rank] = run_value(data, run, rank);
-                    rank += 1;
+                let (value, step) = run_start(data, run);
+                for (index, offset) in offsets[start..end].iter_mut().enumerate() {
+                    *offset = value + index as u32 * step;
                 }
+                start = end;
             }
-            8 + small(data, 4) as usize * 8
+            8 + count * 8
         }
         BITMAP => {
             let start = bitmap_start(data);
@@ -2777,11 +2770,12 @@ fn decode_cache(
                 let value = first + get_bits(&data[8..], group, width);
                 let at = masks + group * 3;
                 let tags = u16::from_ne_bytes(data[at..at + 2].try_into().unwrap());
-                for j in 0..tags.count_ones() as usize {
-                    offsets[rank] = value;
-                    patterns[rank] = lexical_type(tags, j);
-                    rank += 1;
+                let end = rank + tags.count_ones() as usize;
+                offsets[rank..end].fill(value);
+                for (pattern, tag) in patterns[rank..end].iter_mut().zip(lexical_types(tags)) {
+                    *pattern = tag;
                 }
+                rank = end;
             }
             debug_assert_eq!(rank, n);
             return;

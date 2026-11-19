@@ -8,26 +8,33 @@ pub(crate) struct EocdInfo {
 }
 
 pub(crate) fn find_eocd_record(data: &[u8], allow_trailing_junk: bool) -> Option<EocdInfo> {
-    let mut pos = memchr::memmem::rfind(data, EOCD_SIG)?;
-    loop {
-        if pos + 22 <= data.len() {
-            let comment_len = u16_le(data, pos + 20) as usize;
-            let end = pos + 22 + comment_len;
-            if end <= data.len() && (allow_trailing_junk || end == data.len()) {
-                return Some(EocdInfo {
-                    offset: pos,
-                    end,
-                    total_entries: u16_le(data, pos + 10),
-                    cd_size: u32_le(data, pos + 12),
-                    cd_offset: u32_le(data, pos + 16),
-                });
-            }
-        }
-        if pos == 0 {
+    eocd_records(data).find(|record| allow_trailing_junk || record.end == data.len())
+}
+
+pub(crate) fn find_eocd_prefer_exact(data: &[u8]) -> Option<EocdInfo> {
+    let mut records = eocd_records(data);
+    let latest = records.next()?;
+    if latest.end == data.len() {
+        return Some(latest);
+    }
+    records.find(|record| record.end == data.len()).or(Some(latest))
+}
+
+fn eocd_records(data: &[u8]) -> impl Iterator<Item = EocdInfo> + '_ {
+    memchr::memmem::rfind_iter(data, EOCD_SIG).filter_map(move |pos| {
+        let fixed_end = pos + 22;
+        if fixed_end > data.len() {
             return None;
         }
-        pos = memchr::memmem::rfind(&data[..pos], EOCD_SIG)?;
-    }
+        let end = fixed_end + usize::from(u16_le(data, pos + 20));
+        (end <= data.len()).then(|| EocdInfo {
+            offset: pos,
+            end,
+            total_entries: u16_le(data, pos + 10),
+            cd_size: u32_le(data, pos + 12),
+            cd_offset: u32_le(data, pos + 16),
+        })
+    })
 }
 
 pub(crate) struct CentralDirectoryRecord<'a> {

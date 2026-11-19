@@ -1313,7 +1313,16 @@ fn split_size_family_key(scheme: &str, prefix: &str) -> String {
 
 #[cfg(test)]
 fn parse_numbered_volume_name(filename: &str) -> Option<ParsedVolume> {
-    parse_volume_candidates(filename).into_iter().next()
+    filename::NameFeatures::parse(filename)
+        .canonical
+        .into_iter()
+        .next()
+}
+
+fn has_numbered_suffix(filename: &str) -> bool {
+    filename
+        .split_once('.')
+        .is_some_and(|(_, suffix)| suffix.bytes().any(|b| b.is_ascii_digit()))
 }
 
 /// Parse standard numbering schemes in descending semantic strength.
@@ -1324,20 +1333,6 @@ fn parse_numbered_volume_name(filename: &str) -> Option<ParsedVolume> {
 /// token.  For example, `movie.part2.456` is primarily part #2 with `.456` as
 /// decoration; the naked-number interpretation remains available only as a
 /// weak fallback candidate.
-fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
-    if has_numbered_suffix(filename) {
-        parse_volume_candidates_with_regexes(filename, &regex_cache().acquire())
-    } else {
-        Vec::new()
-    }
-}
-
-fn has_numbered_suffix(filename: &str) -> bool {
-    filename
-        .split_once('.')
-        .is_some_and(|(_, suffix)| suffix.bytes().any(|b| b.is_ascii_digit()))
-}
-
 fn parse_volume_candidates_with_regexes(
     filename: &str,
     regexes: &RelationRegexes,

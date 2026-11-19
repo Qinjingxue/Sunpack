@@ -120,7 +120,7 @@ struct RecordBuffer : std::streambuf {
 };
 struct RunReader {
     std::string_view name;
-    fs::path data_path;
+    const fs::path& folder;
     Handle index;
     std::optional<Handle> data;
     uint64_t head=0,count=0,revision=0;
@@ -131,7 +131,7 @@ struct RunReader {
     std::vector<Entry> selected;
     uint64_t cache_start=0;
     RunReader(const fs::path& folder,const Json& run,std::string_view name,const std::optional<Cursor>& before,uint64_t revision,bool read_ahead):
-        name(name),data_path(folder/(std::string(name)+".data")),index(open_reader(folder/(std::string(name)+".index"))),revision(revision) {
+        name(name),folder(folder),index(open_reader(folder/(std::string(name)+".index"))),revision(revision) {
         head=run.at("head").get<uint64_t>(); count=run.at("count").get<uint64_t>();
         unordered=run.value("unordered",false);
         validate();
@@ -191,7 +191,7 @@ struct RunReader {
         }
     }
     Json decode_value(DecodeBuffers& buffers) {
-        if(!data) data.emplace(open_reader(data_path));
+        if(!data) data.emplace(open_reader(folder/(std::string(name)+".data")));
         if(!current.raw && !current.compressed) {
             std::array<char,24> header{};read_at(*data,current.offset,header.data(),header.size());
             uint64_t size=0,raw_size=0;std::memcpy(&size,header.data()+8,8);std::memcpy(&raw_size,header.data()+16,8);

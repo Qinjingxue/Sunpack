@@ -68,6 +68,7 @@ fn assert_view(view: HitView<'_>, expected: &[RawHit]) {
 #[test]
 fn codecs_and_index_queries_preserve_the_sorted_multiset() {
     let mut used = [false; 8];
+    let mut used_runs = false;
     let mut random = 0x1234_5678u32;
     for mode in 0..12 {
         for count in [0, 1, 2, 7, 127, 128, 129, 257, 4099] {
@@ -118,10 +119,12 @@ fn codecs_and_index_queries_preserve_the_sorted_multiset() {
                 let segment = view.segment(si);
                 let codec = segment.control as u32 & 7;
                 used[codec as usize] = true;
+                used_runs |= (segment.control as u32 & RUNS) != 0;
                 if codec == LEAVES {
                     for li in 0..view.leaf_count(segment) {
                         let (leaf, _, _) = view.leaf(segment, li);
                         used[(leaf.control & 7) as usize] = true;
+                        used_runs |= leaf.control & RUNS != 0;
                     }
                 }
             }
@@ -154,6 +157,7 @@ fn codecs_and_index_queries_preserve_the_sorted_multiset() {
         used.into_iter().all(|yes| yes),
         "representations exercised: {used:?}"
     );
+    assert!(used_runs);
     let mut maximum = (0..=PATTERNS.len())
         .map(|pattern| RawHit::new(u64::MAX, pattern as u8))
         .collect::<Vec<_>>();

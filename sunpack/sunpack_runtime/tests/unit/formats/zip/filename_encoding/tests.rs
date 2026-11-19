@@ -19,7 +19,9 @@ fn zip_scan_honors_utf8_filename_flag() {
         &1u16.to_le_bytes(),
         &(central.len() as u32).to_le_bytes(),
         &central_offset.to_le_bytes(),
-        &[0, 0],
+        &((2 * ZIP_EOCD_SIGNATURE.len()) as u16).to_le_bytes(),
+        ZIP_EOCD_SIGNATURE,
+        ZIP_EOCD_SIGNATURE,
     ]
     .concat();
     let contents = [local, central, eocd].concat();
@@ -31,6 +33,20 @@ fn zip_scan_honors_utf8_filename_flag() {
     );
     assert_eq!(analyze_zip_filename_encoding(&archive).unwrap(), None);
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn zip_eocd_prefers_exact_tail_and_falls_back_to_latest_record() {
+    use crate::formats::zip::find_eocd_prefer_exact;
+
+    let mut end_record = [0; 22];
+    end_record[..4].copy_from_slice(ZIP_EOCD_SIGNATURE);
+    let mut with_comment = end_record;
+    with_comment[20..].copy_from_slice(&23u16.to_le_bytes());
+    let mut tail = [with_comment.as_slice(), &end_record, b"x"].concat();
+    assert_eq!(find_eocd_prefer_exact(&tail).unwrap().offset, 0);
+    tail.push(b'y');
+    assert_eq!(find_eocd_prefer_exact(&tail).unwrap().offset, 22);
 }
 
 #[test]
