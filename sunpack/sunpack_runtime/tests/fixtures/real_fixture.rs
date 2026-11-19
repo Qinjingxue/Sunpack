@@ -521,9 +521,18 @@ fn run(request: Request) -> io::Result<Value> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     let request = serde_json::from_reader(io::stdin().lock())?;
-    let result = run(request)?;
+    let is_display = matches!(&request, Request::DisplayEvents { .. });
+    let result = match run(request) {
+        // Let an external test distinguish a live snapshot's sharing conflict
+        // from a broken snapshot without depending on the error's language.
+        Err(error) if is_display && cfg!(windows) && error.raw_os_error() == Some(32) => {
+            eprintln!("{error}");
+            return Ok(std::process::ExitCode::from(32));
+        }
+        result => result?,
+    };
     serde_json::to_writer(io::stdout().lock(), &result)?;
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }

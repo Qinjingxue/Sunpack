@@ -307,6 +307,9 @@ jobs:
 
       - name: Verify Core UI manager
         shell: pwsh
+        env:
+          SUNPACK_TEST_ARCH: ${{ matrix.arch }}
+          SUNPACK_TEST_BUILD_PROFILE: release
         run: |
           .\scripts\build_gui.ps1 -Arch ${{ matrix.arch }} -TestsOnly
 

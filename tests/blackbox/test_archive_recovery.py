@@ -139,7 +139,9 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
     # Reopening the successful sibling would now fail its password probe.
     passwords.write_text(json.dumps({"passwords": [{"enabled": True, "value": "second-key"}]}), encoding="utf-8")
     with package.watch_session():
-        package.await_watch_event("done", path=carrier.name)
+        # A retained child completes the original outer task, not a second
+        # task for its generated carrier. The root-carrier case is its own owner.
+        package.await_watch_event("done", path="outer.zip" if nested else carrier.name)
     assert _only_output(output, "first.txt", first) == first_path
     second_path = _only_output(output, "second.txt", second)
     assert first_path.parent.parent == second_path.parent.parent

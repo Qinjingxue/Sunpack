@@ -139,8 +139,8 @@ def launch_unelevated(
 ):
     """Start a process with the interactive shell's medium-integrity token."""
 
-    command = [str(item) for item in argv if str(item)]
-    if not command:
+    command = [str(item) for item in argv]
+    if not command or not command[0]:
         raise ValueError("launch_unelevated requires an executable")
     environment = dict(os.environ if env is None else env)
     if not is_process_elevated():

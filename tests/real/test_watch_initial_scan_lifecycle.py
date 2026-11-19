@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -48,10 +49,22 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(package, tmp_p
         next_file.write_text(text, encoding="utf-8")
         next_file.replace(roots_file)
 
-    def scan_events():
+    def read_display():
+        try:
+            return pending.display()
+        except subprocess.CalledProcessError as error:
+            # The manifest may be exclusively open for its atomic replacement.
+            if error.returncode != 32:  # ERROR_SHARING_VIOLATION
+                raise
+            return None
+
+    def scan_events(*, wait=True):
+        display = wait_for(read_display, "readable Watch event snapshot") if wait else read_display()
+        if display is None:
+            return None
         return [
             [Path(root).name.lower() for root in row["roots"]]
-            for row in pending.display()["history"]
+            for row in display["history"]
             if row["event"] == "initial_scan_completed"
         ]
 
@@ -66,7 +79,7 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(package, tmp_p
     save_roots(f"{old.root} | {old.output} | false | true | false | true\n{pending.root} | {pending.output} | true | false | false | true\n")
     generation = pending.start()["generation"]
     pending.await_archive(inner)
-    wait_for(lambda: scan_events() == [["pending"]] and scanned_count() == 2, "one pending-root scan")
+    wait_for(lambda: scan_events(wait=False) == [["pending"]] and scanned_count() == 2, "one pending-root scan")
     assert not marker_present(old.output, ignored.marker_name)
 
     alias = str(pending.root).upper().replace("\\", "/") + "/."
@@ -85,7 +98,7 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(package, tmp_p
 
     save_roots(f"{pending.root} | {pending.output} | true | true | false | true\n{old.root} | {old.output} | false | false | false | true\n")
     old.await_archive(ignored)
-    wait_for(lambda: scan_events() == [["pending"], ["old"]], "live scan-flag reset")
+    wait_for(lambda: scan_events(wait=False) == [["pending"], ["old"]], "live scan-flag reset")
     assert package.json("watch", "status")["summary"]["generation"] == generation
 
     package.json("watch", "add", "-d", "-o", added.output, added.root)

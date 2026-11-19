@@ -72,10 +72,14 @@ def test_zip_renamed_member_ignores_stale_unicode_path_extra_field(package, tmp_
             member.extra = extra
             archive.writestr(member, data)
 
-    reference = tmp_path / "reference"
-    reference.mkdir()
-    run_cmd(["tar.exe", "-xf", str(source), "-C", str(reference)], tmp_path)
-    assert _files_under(reference) == entries
+    # Verify the authored legacy names and payloads without asking the host's
+    # tar to decode or create a Unicode path under its active code page.
+    # The explicit expected tree below is the oracle for applying the extra.
+    with zipfile.ZipFile(source) as raw_zip:
+        records = raw_zip.infolist()
+        assert [member.orig_filename for member in records] == [original, renamed]
+        assert all(member.extra == extra for member in records)
+        assert [raw_zip.read(member) for member in records] == list(entries.values())
 
     output = tmp_path / "output"
     report = extract_report(package, source, output, recur="1", deep=False)

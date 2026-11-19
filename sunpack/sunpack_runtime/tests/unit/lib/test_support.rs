@@ -9,7 +9,12 @@ pub(crate) fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
         .as_nanos();
     let path = std::env::temp_dir().join(format!("sunpack_runtime_{name}_{nonce}.bin"));
     fs::write(&path, contents).expect("write test file");
-    path
+    // CI's TEMP can use an 8.3 user directory. Production observations resolve
+    // existing files, so fixtures must use the same namespace before deriving
+    // sibling directories and constructing Watch state directly.
+    PathBuf::from(crate::path_keys::normalize_windows_extended_prefix(
+        fs::canonicalize(&path).expect("resolve test file").to_string_lossy().into_owned(),
+    ))
 }
 
 pub(crate) fn built_worker() -> std::io::Result<PathBuf> {

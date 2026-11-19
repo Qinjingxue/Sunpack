@@ -261,6 +261,9 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
     let base = std::env::temp_dir().join(format!("sunpack-claim-release-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(&base).unwrap();
+    let base = PathBuf::from(crate::path_keys::normalize_windows_extended_prefix(
+        fs::canonicalize(&base).unwrap().to_string_lossy().into_owned(),
+    ));
     let test = format!("{}::claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling", module_path!().split_once("::").unwrap().1);
     let output = Command::new(std::env::current_exe().unwrap()).args(["--exact", &test, "--nocapture"])
         .env(CHILD, &base).output().unwrap();

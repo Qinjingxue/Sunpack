@@ -217,6 +217,9 @@ def test_watch_hash_scope_lifecycle_and_nested_root_ownership(package, tmp_path)
     after = time.time()
     package.configure(watch={"deduplication_scope": "global"})
     package.await_watch_event("service_reloaded", after=after)
+    # Reload starts the asynchronous baseline rebuild. Existing archives are
+    # comparable across roots only after that baseline is ready.
+    package.await_watch_event("watch_dedup_rebuilt", after=after)
     duplicate = _copy(a, second / "a-global-copy.zip")
     _duplicate(watch, duplicate)
 
