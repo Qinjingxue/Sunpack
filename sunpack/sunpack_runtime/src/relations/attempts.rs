@@ -706,7 +706,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
         }
         let head_logical;
         let logical = if let Some(logical) = logical { logical } else {
-            head_logical = super::filename::logical_name(&view.rows[head].name,
+            head_logical = super::filename::logical_name(view.rows[head].name(),
                 &view.features[&head], view.format);
             &head_logical
         };

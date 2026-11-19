@@ -4,7 +4,6 @@ fn row(name: &str, format: &'static str, slot: Option<u32>, terminal: bool) -> R
     RelationInput {
         path: name.into(),
         path_key: name.to_ascii_lowercase(),
-        name: name.into(),
         size: Some(100),
         relation_member_eligible: true,
         anchor_cell: None,
@@ -264,16 +263,26 @@ fn loose_numbers_ignore_context_and_ordinal_without_reparsing() {
     assert!(!validation_owned_paths(&groups[0]).contains(&rows[3].path));
     assert!(!validation_owned_paths(&groups[0]).contains(&rows[4].path));
 
-    let cache = RelationCache {
+    let mut cache = RelationCache {
         anchors: groups[0].facts.anchors.clone(),
         names: groups[0].facts.names.clone(),
     };
     let mut renamed = rows.clone();
-    for row in &mut renamed[1..] {
-        row.name = "same.no_digits".into();
+    // Seed collected features on opaque names so reparsing cannot recover the slots.
+    for (member, path) in renamed[1..].iter_mut().zip([
+        "same.red", "same.green", "same.blue", "same.yellow",
+    ]) {
+        let features = cache.names.remove(&member.path_key);
+        *member = row(path, "", None, false);
+        if let Some(features) = features {
+            cache.names.insert(member.path_key.clone(), features);
+        }
     }
     let retried = resolve_buckets(&renamed, &BucketIndex::build(&renamed, None), Some(&cache));
-    assert_eq!(retried[0].proposal.volumes, groups[0].proposal.volumes);
+    assert_eq!(slots(&retried[0]), vec![1, 2, 3]);
+    assert_eq!(retried[0].reason, None);
+    assert_eq!(retried[0].proposal.volumes[1].0, renamed[1].path);
+    assert_eq!(retried[0].proposal.volumes[2].0, renamed[2].path);
 }
 
 #[test]
@@ -611,24 +620,6 @@ fn virtual_siblings_share_padding_despite_physical_widths() {
     let groups = resolve(&rows);
     assert_eq!(slots(&groups[0]), vec![1, 2]);
     assert_eq!(groups[0].proposal.width, 1);
-}
-
-#[test]
-fn retry_reuses_collected_filename_features() {
-    let rows = vec![
-        row("same.build1.chunk1", "7z", Some(1), false),
-        row("same.build1.chunk002", "", None, false),
-    ];
-    let first = resolve(&rows);
-    let cache = RelationCache {
-        anchors: first[0].facts.anchors.clone(),
-        names: first[0].facts.names.clone(),
-    };
-    let mut renamed = rows.clone();
-    renamed[1].name = "same.no_numeric_channel".into();
-    let retried = resolve_buckets(&renamed, &BucketIndex::build(&renamed, None), Some(&cache));
-    assert_eq!(slots(&retried[0]), vec![1, 2]);
-    assert_eq!(retried[0].reason, None);
 }
 
 #[test]

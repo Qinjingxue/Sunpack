@@ -210,7 +210,7 @@ pub(crate) fn filesystem_logical_name(path: &str) -> String {
     // The logical name becomes the output directory name.  Keeping the
     // (possibly disguised) extension would name the directory exactly like
     // the archive beside it and force a numbered collision name.
-    let logical = crate::relations::relations_logical_name(filename, true);
+    let logical = crate::relations::get_logical_name(filename, true);
     if logical.is_empty() {
         filename.to_string()
     } else {

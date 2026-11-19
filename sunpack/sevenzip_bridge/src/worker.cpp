@@ -92,11 +92,13 @@ std::string wide_to_utf8(const std::wstring& value) {
 #endif
 }
 
+using sunpack::sevenzip::ArchiveOpenMode;
+
 struct WorkerArchiveInput {
     sunpack::sevenzip::VolumeAttemptPlan volume_attempts;
     std::wstring archive_path;
     std::wstring format_hint;
-    bool native_volume_input = false;
+    ArchiveOpenMode mode = ArchiveOpenMode::File;
     std::vector<std::wstring> part_paths;
     std::vector<std::wstring> canonical_names;
     std::string analyzed_missing_volume_evidence;
@@ -262,17 +264,16 @@ void read_volume_plan(wire::RequestReader& reader, WorkerArchiveInput& input) {
     })) input.validation_error = "invalid volume attempt slot";
 }
 
-enum class InputMode { File, FileRange, NativeVolumes, SfxWithVolumes };
-
-InputMode read_input_mode(std::string_view mode) {
-    if (mode == "file_range") return InputMode::FileRange;
-    if (mode == "native_volumes") return InputMode::NativeVolumes;
-    if (mode == "sfx_with_volumes") return InputMode::SfxWithVolumes;
-    return InputMode::File;
+ArchiveOpenMode read_input_mode(std::string_view mode) {
+    if (mode == "file_range") return ArchiveOpenMode::FileRange;
+    if (mode == "native_volumes") return ArchiveOpenMode::NativeVolumes;
+    if (mode == "sfx_with_volumes") return ArchiveOpenMode::SfxWithVolumes;
+    return ArchiveOpenMode::File;
 }
 
-void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input, InputMode mode) {
-    const bool structured = mode == InputMode::NativeVolumes || mode == InputMode::SfxWithVolumes;
+void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input) {
+    if (input.mode == ArchiveOpenMode::File) { reader.skip(); return; }
+    const bool structured = input.mode != ArchiveOpenMode::FileRange;
     bool has_ranges = false;
     std::uint64_t previous = 0;
     read_array(reader, [&] {
@@ -284,11 +285,10 @@ void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input, In
             else if (structured && key == "canonical_name") name = utf8_to_wide(reader.text());
             else if (!read_extent_field(reader, key, range)) reader.skip();
         });
-        if (mode == InputMode::FileRange) {
+        if (!structured) {
             if (range.path.empty()) range.path = input.archive_path;
             if (!range.path.empty()) input.ranges.push_back(std::move(range));
         } else if (range.path.empty()) return;
-        else if (!structured) input.part_paths.push_back(std::move(range.path));
         else {
             if (!number || number > INT_MAX || name.empty()) {
                 input.validation_error = "structured volume part requires volume_number and canonical_name";
@@ -317,13 +317,12 @@ void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input, In
 
 WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
     WorkerArchiveInput input;
-    InputMode mode = InputMode::File;
     bool attempts = false;
     read_object(reader, [&](auto key) {
         if (key == "entry_path") input.archive_path = utf8_to_wide(reader.text());
-        else if (key == "open_mode") mode = read_input_mode(reader.text());
+        else if (key == "open_mode") input.mode = read_input_mode(reader.text());
         else if (key == "format_hint") input.format_hint = utf8_to_wide(reader.text());
-        else if (key == "parts") read_input_parts(reader, input, mode);
+        else if (key == "parts") read_input_parts(reader, input);
         else if (key == "volume_attempts") {
             attempts = true;
             read_volume_plan(reader, input);
@@ -337,11 +336,11 @@ WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
             });
         } else reader.skip();
     });
-    input.native_volume_input = mode == InputMode::NativeVolumes;
     if (!attempts && input.validation_error.empty()) {
-        if (mode == InputMode::FileRange && input.ranges.empty())
+        if (input.mode == ArchiveOpenMode::FileRange && input.ranges.empty())
             input.validation_error = "file_range descriptor requires canonical parts with extents";
-        else if ((mode == InputMode::NativeVolumes || mode == InputMode::SfxWithVolumes) && input.canonical_names.empty())
+        else if ((input.mode == ArchiveOpenMode::NativeVolumes || input.mode == ArchiveOpenMode::SfxWithVolumes)
+            && input.canonical_names.empty())
             input.validation_error = "structured volume descriptor has no parts";
     }
     return input;
@@ -848,7 +847,7 @@ sunpack::sevenzip::PasswordTestResult probe_input(const WorkerRequest& request, 
     auto proof = test_password_batch(input.archive_path, input.part_paths, input.ranges, request.archive_input.format_hint,
         candidates.empty() ? &request.password : candidates.data(), count, input.canonical_names, request.scan_only, false,
         domain ? domain->data() : nullptr, plan.layouts.empty() ? nullptr : &plan, final_volume_choice,
-        request.password_verified && count == 1);
+        request.password_verified && count == 1, request.archive_input.mode);
     if (gap) {
         proof.missing_volume = true;
         proof.rejects_fixed_geometry = false;
@@ -1303,7 +1302,7 @@ RequestOutcome run_request(
         return extract_archive(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
             format_hint, selected_password, output_dir, codepage,
             request.report_progress ? ExtractProgressCallback{std::ref(attempt_progress)} : ExtractProgressCallback{},
-            archive_input.canonical_names, request.archive_input.native_volume_input, shared_writer, cancel_token,
+            archive_input.canonical_names, request.archive_input.mode, shared_writer, cancel_token,
             request.output_inventory);
     };
 
@@ -1374,7 +1373,7 @@ RequestOutcome run_request(
             if (request.report_progress) progress({"total", 0, 0, 0});
             selected_probe = test_password_batch(archive_input.archive_path, archive_input.part_paths,
                 archive_input.ranges, format_hint, password_candidates.data(), password_candidates.size(), archive_input.canonical_names,
-                false, false, nullptr, nullptr, true);
+                false, false, nullptr, nullptr, true, false, request.archive_input.mode);
         }
         // Probe lanes share the job budget. An interrupted decoder cannot
         // establish a password/volume rejection; replay the same cursor.
@@ -1487,7 +1486,7 @@ RequestOutcome run_request(
                     std::move(*selected_probe) :
                     test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
                         format_hint, password_candidates.data(), count, archive_input.canonical_names, false, true,
-                        remaining ? remaining->data() : nullptr);
+                        remaining ? remaining->data() : nullptr, nullptr, false, false, request.archive_input.mode);
                 if (probe.status != PasswordTestStatus::Ok || probe.matched_index < 0 ||
                     static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
                     result = password_candidate_failure(probe);

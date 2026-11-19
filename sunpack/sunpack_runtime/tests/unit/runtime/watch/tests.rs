@@ -1041,9 +1041,11 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
     fs::create_dir_all(&unrelated).unwrap();
     let carrier = root.join("carrier.bin");
     let nested = segment.join("nested.zip");
+    let deep = child_output.join("deep.zip");
     let sibling = unrelated.join("nested.zip");
     fs::write(&carrier, b"carrier archive").unwrap();
     fs::write(&nested, b"nested archive").unwrap();
+    fs::write(&deep, b"deeper archive").unwrap();
     fs::write(&sibling, b"unrelated nested archive").unwrap();
     let receipt = |source: &Path, output: &Path, partial: bool| {
         let input = crate::io::archive_state::ArchiveInput::file(
@@ -1062,7 +1064,8 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
         })).unwrap()
     };
     let checkpoints = vec![receipt(&nested, &child_output, true), receipt(&sibling, &unrelated, false),
-        receipt(&carrier, &segment, false)];
+        receipt(&carrier, &segment, false), receipt(&carrier, &child_output, false),
+        receipt(&deep, &child_output.join("deep"), false)];
     let owner_text = owner.to_str().unwrap();
     let carrier_text = carrier.to_str().unwrap();
     {
@@ -1094,9 +1097,10 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
         let journal = journal::Journal::open(&root, 7).unwrap();
         assert!(input_checkpoints(journal.state().entry(owner_text).as_deref()).next().is_none());
         let retained = input_checkpoints(journal.state().entry(carrier_text).as_deref()).collect::<io::Result<Vec<_>>>().unwrap();
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[0].carrier(), nested);
-        assert_eq!(retained[1].carrier(), carrier);
+        // The deeper receipt is covered by both output roots and is handed
+        // off once, in original checkpoint order.
+        assert_eq!(retained.iter().map(|checkpoint| checkpoint.carrier()).collect::<Vec<_>>(),
+            [&nested, &carrier, &carrier, &deep]);
         let nested_receipt = serde_json::to_value(&retained[0]).unwrap();
         assert_eq!(nested_receipt["failure"]["failure"]["kind"], "damaged");
         assert_eq!(nested_receipt["failure"]["partial"], true);

@@ -298,7 +298,8 @@ void editing(Fixture& f) {
     validate_setting("/recursive_extract",Json("12"));
     fails([&]{validate_setting("/recursive_extract",Json("0"));});
     for(auto language:{"zh","en"}) {
-        auto unknown=config_fields(parse_json(R"({"watch":{"custom":["keep"]}})"),"",language);
+        const std::string source=R"({"watch":{"custom":["keep"]}})";
+        auto unknown=config_fields(parse_json(source),source,language);
         for(auto& field:unknown) assert(!field["known"].get<bool>() && field["editor"]=="readonly");
     }
 }
@@ -542,14 +543,6 @@ int wmain(int argc,wchar_t** argv) {
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
     if(argc==4 && std::wstring(argv[1])==L"--password-add") { save_password_edit(argv[2],{{"operation","add"},{"value",utf8(argv[3])}}); return 0; }
-    if(argc==2 && std::wstring(argv[1])==L"--ranges") {
-        auto size=range_editor(Json{{"name","size_range"},{"enabled",true},{"min_bytes",1},{"max_bytes",Json()}});
-        size["lower"]="9007199254740993";
-        DYNAMIC_TIME_ZONE_INFORMATION east{};east.Bias=-480;wcscpy_s(east.TimeZoneKeyName,L"China Standard Time");
-        auto time=range_editor(Json{{"name","mtime_range"},{"enabled",true},{"start_utc",Json()},{"end_utc",Json()}},&east);
-        time["lower"]="2024-02-29 12:34";time["upper"]="2027-01-01 00:00";
-        std::cout<<Json{{"size",range_configuration(size,false)},{"time",range_configuration(time,true,&east)}}.dump(); return 0;
-    }
     try { Fixture f; native_context_menu_entrypoint(f); projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};

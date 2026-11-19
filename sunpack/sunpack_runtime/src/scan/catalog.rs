@@ -3,7 +3,7 @@ use super::directory::DirectoryEntryRecord;
 use crate::analysis_native::volume_anchor::CheapAnchorCell;
 use crate::path_keys::path_key;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -342,7 +342,6 @@ impl ScopeCatalog {
         self.insert_key(Arc::from(path_key(&row.path)), row);
     }
     pub fn insert_key(&mut self, key: Arc<str>, record: DirectoryEntryRecord) {
-        self.touch(&record.path);
         self.insert_row(key, record, false);
     }
     pub fn insert_transient(&mut self, key: Arc<str>, record: DirectoryEntryRecord) {
@@ -364,6 +363,9 @@ impl ScopeCatalog {
                 old.flags = u8::from(record.is_dir) * DIRECTORY
                     | u8::from(record.size.is_some()) * HAS_SIZE
                     | u8::from(record.mtime_ns.is_some()) * HAS_MTIME;
+                if !record.is_dir {
+                    self.touch(&record.path);
+                }
                 return;
             }
         }
@@ -399,15 +401,21 @@ impl ScopeCatalog {
                 self.remove_indexes(&key, &old, None);
             }
         }
-        if row.persistent() && !reuse_indexes {
-            self.persistent_len += 1;
+        if row.persistent() {
+            self.persistent_len += usize::from(!reuse_indexes);
             if !row.is_dir() {
-                let stem = catalog_stem(&record.path);
-                match self.buckets.get_mut(stem.as_str()) {
-                    Some(bucket) => bucket.push(Arc::clone(&key)),
-                    None => {
-                        self.buckets
-                            .insert(stem.into_boxed_str(), CatalogBucket::new(Arc::clone(&key)));
+                let stem = catalog_stem(&record.path).into_boxed_str();
+                match self.buckets.entry(stem) {
+                    Entry::Occupied(mut bucket) => {
+                        if reuse_indexes {
+                            bucket.get_mut().touch();
+                        } else {
+                            bucket.get_mut().push(Arc::clone(&key));
+                        }
+                    }
+                    Entry::Vacant(bucket) => {
+                        debug_assert!(!reuse_indexes);
+                        bucket.insert(CatalogBucket::new(Arc::clone(&key)));
                     }
                 }
             }

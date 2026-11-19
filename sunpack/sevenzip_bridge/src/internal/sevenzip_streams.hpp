@@ -570,13 +570,13 @@ namespace sunpack::sevenzip
 
     public:
         explicit MultiRangeInStream(
-            std::vector<std::wstring> paths,
+            const std::vector<std::wstring> &paths,
             ExtractInputTrace *trace,
             InputPrefetchConfig prefetch_config)
             : trace_(trace)
         {
             ranges_.reserve(paths.size());
-            for (auto &path : paths)
+            for (const auto &path : paths)
             {
                 std::error_code error;
                 const auto length = std::filesystem::file_size(path, error);
@@ -586,7 +586,7 @@ namespace sunpack::sevenzip
                     record_input_error(trace_, path, open_hresult_);
                     continue;
                 }
-                ranges_.push_back({std::move(path), 0, length, total_size_});
+                ranges_.push_back({path, 0, length, total_size_});
                 total_size_ += length;
             }
             initialize(prefetch_config);
@@ -983,7 +983,8 @@ namespace sunpack::sevenzip
         const std::vector<std::wstring> &canonical_names = {},
 
         InputPrefetchConfig prefetch_config = input_prefetch_config(),
-        const std::vector<ExtractInputRange> &input_ranges = {}, VolumeReadUncertainty* probe_reads = nullptr);
+        const std::vector<ExtractInputRange> &input_ranges = {}, VolumeReadUncertainty* probe_reads = nullptr,
+        ArchiveOpenMode mode = ArchiveOpenMode::File);
 
 #endif
 

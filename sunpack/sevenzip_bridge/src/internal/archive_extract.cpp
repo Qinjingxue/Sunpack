@@ -212,7 +212,7 @@ namespace sunpack::sevenzip
         const std::wstring &codepage,
         ExtractProgressCallback progress,
         const std::vector<std::wstring> &canonical_names,
-        bool native_volume_input,
+        ArchiveOpenMode mode,
         std::shared_ptr<AsyncFileWriter> shared_writer,
         std::shared_ptr<std::atomic<bool>> cancel_token,
         bool output_inventory)
@@ -309,7 +309,7 @@ namespace sunpack::sevenzip
 #else
         const auto formats = extraction_formats_for_hint(format_hint).handlers;
 #endif
-        const auto prefetch_config = input_prefetch_config(format_hint, native_volume_input);
+        const auto prefetch_config = input_prefetch_config(format_hint, mode == ArchiveOpenMode::NativeVolumes);
 
         // Try each handler at the canonical input start before allowing
         // signature search. A wrong handler must not scan the whole archive
@@ -372,7 +372,7 @@ namespace sunpack::sevenzip
                 // Rewind it instead of reopening and restating its volumes.
                 if (!input.stream || input.stream->Seek(0, STREAM_SEEK_SET, nullptr) != S_OK)
                     input = open_archive_stream(archive_path, part_paths, &result.input_trace,
-                        canonical_names, prefetch_config, input_ranges);
+                        canonical_names, prefetch_config, input_ranges, nullptr, mode);
             }
 
             if (!input.opened)

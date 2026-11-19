@@ -158,7 +158,7 @@ void FindController::Decorate() { for(auto& s:searches_) if(!s.targets.empty() &
 void FindController::decorate(Search& s) {
     auto* area=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll)); if(!area) return;
     auto* list=root()->FindById(s.list);
-    std::function<void(ui::Widget*,ui::Widget*)> visit=[&](ui::Widget* w,ui::Widget* row) {
+    auto visit=[&](auto&& self,ui::Widget* w,ui::Widget* row) -> void {
         // Clear earlier highlights on hidden editors and tabs once as well.
         if(!w->visible && !s.targets.empty()) return;
         if(w->Parent()==list) row=w;
@@ -181,7 +181,10 @@ void FindController::decorate(Search& s) {
             w->textHighlightRevision=s.revision;
             if(auto* collection=dynamic_cast<TagCollection*>(w)) {
                 std::map<size_t,std::vector<ui::TextHighlight>> tags;
+                int active_tag=-1;
                 if(found!=s.byId.end()) {
+                    const auto& active=s.targets[s.current.target];
+                    if(active.widget==&*found) active_tag=active.tag;
                     auto add=[&](size_t index) {
                         const auto& target=s.targets[index];
                         if(target.tag>=0) tags.insert_or_assign(size_t(target.tag),target.ranges);
@@ -190,7 +193,7 @@ void FindController::decorate(Search& s) {
                     for(size_t index:found->second.remaining) add(index);
                 }
                 const bool has_tags=!tags.empty();
-                collection->SetHighlights(std::move(tags));
+                collection->SetHighlights(std::move(tags),active_tag);
                 if(has_tags) {
                     auto* parent=collection->Parent();
                     while(parent && !dynamic_cast<ui::ScrollViewWidget*>(parent)) parent=parent->Parent();
@@ -205,9 +208,9 @@ void FindController::decorate(Search& s) {
             }
             else if(w->textHighlights.capacity()) decltype(w->textHighlights)().swap(w->textHighlights);
         }
-        for(auto& child:w->Children()) visit(child.get(),row);
+        for(auto& child:w->Children()) self(self,child.get(),row);
     };
-    visit(area,nullptr);
+    visit(visit,area,nullptr);
 }
 void FindController::reveal(Search& s) {
     auto* owner=ui::GetContext().GetWindow(window_);

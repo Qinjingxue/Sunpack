@@ -32,6 +32,6 @@ fn bounded_output_preserves_cancel_notice_and_joins_active_write_on_close() {
     let mut drained = Box::pin(output.drain());
     assert!(matches!(drained.as_mut().poll(&mut cx), Poll::Pending));
     output.acknowledge();
-    crate::pipeline::block_on(drained).unwrap();
+    crate::pipeline::block_on(drained);
     assert!(crate::pipeline::block_on(output.next()).is_none());
 }

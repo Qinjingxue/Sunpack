@@ -704,7 +704,7 @@ namespace sunpack::sevenzip
         const std::vector<std::wstring> &canonical_names,
         const std::wstring &format_hint,
         PasswordProbeCache &cache,
-        bool scan_only, bool final_read_only, const ProbeVolumeRanges& volumes,
+        bool scan_only, bool final_read_only, const ProbeVolumeRanges& volumes, ArchiveOpenMode mode,
         bool* defer_small_zip = nullptr, PasswordProbeFrontier frontier = {}
 
     )
@@ -806,20 +806,16 @@ namespace sunpack::sevenzip
             // and password change as it tries keys or alternate formats.
             if (!input.stream || input.stream->Seek(0, STREAM_SEEK_SET, nullptr) != S_OK) {
                 input = open_archive_stream(archive_path, part_paths, &cache.input_trace,
-                    canonical_names, InputPrefetchConfig{false}, input_ranges, volumes.observer());
+                    canonical_names, InputPrefetchConfig{false}, input_ranges, volumes.observer(), mode);
             }
 
             if (!input.opened)
             {
                 input.stream.Release();
 
-                const auto numbered = [](const std::wstring& path) { return parse_volume_number(path).has_value(); };
-                if (is_sfx_path(archive_path) &&
-                    (std::any_of(part_paths.begin(), part_paths.end(), numbered) ||
-                     (part_paths.empty() && !canonical_names.empty() &&
-                      std::any_of(input_ranges.begin(), input_ranges.end(), [&](const ExtractInputRange& range) {
-                          return numbered(range.path);
-                      }))))
+                const HRESULT error = static_cast<HRESULT>(cache.input_trace.read_hresult);
+                if (mode == ArchiveOpenMode::SfxWithVolumes &&
+                    (error == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || error == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)))
                 {
                     result.status = PasswordTestStatus::NeedsVolumeOrTailDamaged;
                     result.message = "split self-extracting archive stub is missing";
@@ -1037,7 +1033,7 @@ namespace sunpack::sevenzip
         std::size_t candidate_count,
         const std::vector<std::wstring> &canonical_names,
         bool scan_only, bool final_read_only, const std::size_t* candidate_indices,
-        const VolumeAttemptPlan* volume_plan, bool leave_last_candidate, bool password_verified)
+        const VolumeAttemptPlan* volume_plan, bool leave_last_candidate, bool password_verified, ArchiveOpenMode mode)
     {
 #ifdef _WIN32
         const auto formats = extraction_formats_for_hint(format_hint);
@@ -1073,7 +1069,7 @@ namespace sunpack::sevenzip
             PasswordProbeCache cache;
             const auto index = global_index(0);
             auto result = test_one_password(archive_path, candidate_count ? candidates[index] : empty,
-                part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes);
+                part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes, mode);
             if (result.status == PasswordTestStatus::Ok) {
                 if (!result.weak_match || final_read_only) result.matched_index = static_cast<int>(index);
                 else {
@@ -1096,7 +1092,7 @@ namespace sunpack::sevenzip
             ExtractionReplayScope replay(nullptr);
             first = test_one_password(archive_path, candidates[global_index(0)],
                 part_paths, formats, input_ranges, canonical_names, format_hint, primary_cache,
-                scan_only, final_read_only, volumes, &deferred);
+                scan_only, final_read_only, volumes, mode, &deferred);
             if (deferred) first.reset();
             if (first && !first->weak_match && !native_job_cancelled()) {
                 const bool confirmed = first->status == PasswordTestStatus::Ok;
@@ -1178,7 +1174,7 @@ namespace sunpack::sevenzip
             if (index >= probe_end || frontier.passed() || native_job_cancelled()) break;
             auto current = test_one_password(archive_path, candidates[global_index(index)],
                 part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes,
-                nullptr, frontier);
+                mode, nullptr, frontier);
             if (frontier.passed() || native_job_cancelled() || record(lane, index, std::move(current), cache.open_incomplete)) break;
           }
         });
@@ -1197,7 +1193,7 @@ namespace sunpack::sevenzip
             ExtractionReplayScope replay(nullptr);
             auto current = test_one_password(archive_path, candidates[global_index(probe_end)],
                 part_paths, formats, input_ranges, canonical_names, format_hint, primary_cache,
-                scan_only, final_read_only, volumes);
+                scan_only, final_read_only, volumes, mode);
             record(0, probe_end, std::move(current), primary_cache.open_incomplete);
         }
         PasswordTestResult last;

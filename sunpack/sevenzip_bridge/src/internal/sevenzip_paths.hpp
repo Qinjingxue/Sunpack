@@ -6,11 +6,7 @@
 
 #include <filesystem>
 
-#include <optional>
-
 #include <string>
-
-#include <vector>
 
 #endif
 
@@ -22,16 +18,6 @@ namespace sunpack::sevenzip
     std::wstring lower_text(std::wstring value);
 
     std::wstring filename_lower(const std::wstring &path);
-
-    bool ends_with(const std::wstring &value, const std::wstring &suffix);
-
-    bool is_sfx_path(const std::wstring &path);
-
-    std::optional<int> parse_volume_number(const std::wstring &path);
-
-    std::vector<std::wstring> unique_existing_paths(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths);
-
-    std::vector<std::wstring> sorted_data_volume_paths(const std::vector<std::wstring> &paths);
 
     bool directory_is_empty_or_missing(const std::filesystem::path &path);
 

@@ -25,7 +25,8 @@ use crate::io::reader::release_reader_resources_under_roots;
 use crate::io::resource_lifecycle::Promotion;
 use crate::path_keys::{descendant_key_range, normalize_windows_extended_prefix, path_key};
 use crate::postprocess::{
-    discover_flatten_leaf, flatten_single_branch_directories, remove_owned_file, remove_owned_tree, FlattenLeaf,
+    discover_flatten_leaf, flatten_single_branch_directories, remove_owned_file, remove_owned_tree,
+    FlattenLeaf, FlattenOutcome,
 };
 use crate::scan::directory::{
     scan_output_stats, NativeDirectoryScanOptions, NativeOutputInventory,
@@ -2381,15 +2382,6 @@ impl<'run, O: Observer> Run<'run, O> {
                 .iter()
                 .all(|result| result.failure.is_none() && !result.partial)
                 && !cancel.cancelled();
-            // A Watch request may have been admitted before another batch moved
-            // these members. The source leases now cover the actual resolved family.
-            let admitted_generated: Vec<_> = physical_sources
-                .iter()
-                .filter_map(|path| {
-                    this.generated_source(path, &generations, watch_root, depth)
-                        .map(|source| (path, source))
-                })
-                .collect();
             let mut root_cleanup = None;
             if let Some(sources) = sources.as_mut().filter(|_| sources_complete) {
                 if let Some(family) = completed_family {
@@ -2400,12 +2392,14 @@ impl<'run, O: Observer> Run<'run, O> {
                 let cleanup_paths = sources.release(true);
                 let mode = if depth > 1 { CleanupMode::Delete }
                     else { this.request.config.post_extract.archive_cleanup_mode };
-                let generated: HashSet<_> = admitted_generated.into_iter().map(|(path, _)| path).collect();
                 let mut deletes = Vec::new();
                 let mut recycles = Vec::new();
                 for path in &physical_sources {
                     if !cleanup_paths.contains(&namespace_key(Path::new(path))) { continue; }
-                    if mode == CleanupMode::Delete || generated.contains(path) {
+                    // Generated Watch inputs still belong to the pipeline
+                    // under Keep/Recycle. Probe only when this changes which
+                    // cleanup to run for the leased path.
+                    if mode == CleanupMode::Delete || this.generated_source(path, &generations, watch_root, depth).is_some() {
                         deletes.push(PathBuf::from(path));
                     } else if mode == CleanupMode::Recycle {
                         recycles.push(PathBuf::from(path));
@@ -2447,7 +2441,8 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 }
             } else {
-                outcome.generated_sources.extend(admitted_generated.into_iter().map(|(_, source)| source));
+                outcome.generated_sources.extend(physical_sources.iter().filter_map(|path|
+                    this.generated_source(path, &generations, watch_root, depth)));
                 drop(lease);
             }
             if this.request.mode == Mode::Extract {
@@ -3417,11 +3412,11 @@ fn flatten_result(
     let mut attempt = || -> io::Result<_> {
         use crate::core::config::FlattenDirectoryName;
         let mut destination = output.as_path();
-        let preferred;
+        let mut alias = None;
         if naming == FlattenDirectoryName::Inner {
-            preferred = output.with_file_name(leaf.file_name().expect("flatten leaf has a name"));
+            let preferred = output.with_file_name(leaf.file_name().expect("flatten leaf has a name"));
             if path_key(&preferred.to_string_lossy()) == path_key(&output.to_string_lossy()) {
-                destination = &preferred;
+                destination = alias.insert(preferred);
             } else {
                 destination_claim = Some(OutputNames::plan_checked(
                     &names.registry, preferred, &result.path, names.owner, Some(output), Path::try_exists,
@@ -3432,8 +3427,8 @@ fn flatten_result(
         let mut work = output.as_os_str().to_os_string();
         work.push(".__sunpack_flatten_work__");
         let work = PathBuf::from(work);
-        let available = OutputNames::plan(&names.registry,
-            work, &result.path, names.owner, Some(output),
+        let (available, available_key) = OutputNames::plan_checked(&names.registry,
+            work, &result.path, names.owner, Some(output), Path::try_exists,
         )?.map_err(|failure| io::Error::other(failure.message))?;
         let attempt = (|| {
             let _promotion = Promotion::begin(std::iter::once(output.to_owned())
@@ -3446,18 +3441,17 @@ fn flatten_result(
                 || observer.before_flatten(output, &available, &leaf, destination),
             ))
         })();
-        let available_key = output_key(&available);
         names.registry.lock().unwrap().release_path(&available_key, names.owner);
-        attempt
+        attempt.map(|outcome| (outcome, available, alias))
     };
     let attempted = attempt();
-    if let Some((_, key)) = destination_claim {
-        if !attempted.as_ref().is_ok_and(|stats| stats.moved > 0) {
-            names.registry.lock().unwrap().release_path(&key, names.owner);
+    if let Some((_, key)) = &destination_claim {
+        if !matches!(attempted, Ok((FlattenOutcome::Published { .. }, _, _))) {
+            names.registry.lock().unwrap().release_path(key, names.owner);
         }
     }
-    let stats = match attempted {
-        Ok(stats) => stats,
+    let (outcome, work, alias) = match attempted {
+        Ok(parts) => parts,
         Err(error) if is_cancellation(&error) || error.kind() == io::ErrorKind::Interrupted => {
             return Err(error);
         }
@@ -3466,48 +3460,55 @@ fn flatten_result(
             return Ok(());
         }
     };
-    if !stats.errors.is_empty() {
-        let retained = stats.output_dir.as_deref().unwrap_or(output);
-        record_cleanup(
-            children,
-            retained,
-            "flatten",
-            Err(io::Error::other(stats.errors.join("; "))),
-        );
+    let (old, new) = match outcome {
+        FlattenOutcome::Unmoved(error) => {
+            record_cleanup(children, output, "flatten", Err(io::Error::other(error)));
+            return Ok(());
+        }
+        FlattenOutcome::Staged(error) => {
+            record_cleanup(children, &work, "flatten", Err(io::Error::other(error)));
+            (output.as_path(), work)
+        }
+        FlattenOutcome::Published { cleanup_error } => {
+            let destination = destination_claim.map(|(path, _)| path).or(alias)
+                .unwrap_or_else(|| output.clone());
+            if let Some(error) = cleanup_error {
+                record_cleanup(children, &destination, "flatten", Err(io::Error::other(error)));
+            }
+            (leaf.as_path(), destination)
+        }
+    };
+    // Rollback follows the payload even if durable publication fails.
+    if let Some(created) = created {
+        created.lock().unwrap().relocate_flatten(output, old, &new);
     }
-    if let (Some(old), Some(new)) = (stats.source_dir, stats.output_dir) {
-        // Rollback follows the payload even if durable publication fails.
-        if let Some(created) = created {
-            created.lock().unwrap().relocate_flatten(output, &old, &new);
-        }
-        observer.after_flatten(id, output, &old, &new)?;
-        for checkpoint in &mut children.checkpoints {
-            checkpoint.relocate_flatten(output, &old, &new);
-        }
-        let mut relocated_recoveries = HashMap::new();
-        for child in &mut children.archives {
-            if let Some(failure) = &mut child.failure {
-                if let Some(recovery) = &mut failure.recovery {
-                    let key = Arc::as_ptr(recovery);
-                    let relocated = relocated_recoveries.entry(key).or_insert_with(|| {
-                        let mut snapshot = recovery.as_ref().clone();
-                        snapshot.relocate_flatten(output, &old, &new);
-                        Arc::new(snapshot)
-                    });
-                    *recovery = Arc::clone(relocated);
-                }
-            }
-            if let Some(path) = child.output.as_mut() {
-                super::relocate_flatten_output(path, output, &old, &new);
-            }
-        }
-        for receipt in &mut children.cleanup_results {
-            if let Some(suffix) = relative_to(&receipt.path, &old) {
-                receipt.path = new.join(suffix);
-            }
-        }
-        result.output = Some(new);
+    observer.after_flatten(id, output, old, &new)?;
+    for checkpoint in &mut children.checkpoints {
+        checkpoint.relocate_flatten(output, old, &new);
     }
+    let mut relocated_recoveries = HashMap::new();
+    for child in &mut children.archives {
+        if let Some(failure) = &mut child.failure {
+            if let Some(recovery) = &mut failure.recovery {
+                let key = Arc::as_ptr(recovery);
+                let relocated = relocated_recoveries.entry(key).or_insert_with(|| {
+                    let mut snapshot = recovery.as_ref().clone();
+                    snapshot.relocate_flatten(output, old, &new);
+                    Arc::new(snapshot)
+                });
+                *recovery = Arc::clone(relocated);
+            }
+        }
+        if let Some(path) = child.output.as_mut() {
+            super::relocate_flatten_output(path, output, old, &new);
+        }
+    }
+    for receipt in &mut children.cleanup_results {
+        if let Some(suffix) = relative_to(&receipt.path, old) {
+            receipt.path = new.join(suffix);
+        }
+    }
+    result.output = Some(new);
     Ok(())
 }
 

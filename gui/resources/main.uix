@@ -1,8 +1,8 @@
 <window title="SunPack" width="1120" height="720" min-width="850" min-height="560" centered="true" frameless="false"/>
 <script>
 // Loop event closures can retain the previous row object after a snapshot.
-// Resolve the two range fields from the current snapshot without retaining it.
-const rangeIndexes=new WeakMap();
+// Resolve config editor fields from the current snapshot without retaining it.
+const configIndexes=new WeakMap();
 const passwordIndexes=new WeakMap();
 const historyDraftIndexes=new WeakMap();
 export default {
@@ -449,26 +449,29 @@ export default {
     commitField(f) {
       let draft=this.drafts[f.id]||this.toggleDrafts[f.id];
       if(!draft) return;
+      let currentField=this.configField(f.id);
+      if(!currentField) { this.setSaveError(f.id,'configConflict'); return; }
+      f=currentField;
       if(f.editor==='size_range' && draft.range) {
         // Empty-bound units are presentation-only. A blur must not write an
         // unchanged filter merely because its empty-side unit was selected.
-        let baseline=this.rangeField(f).range, current=draft.range;
+        let baseline=f.range, current=draft.range;
         if(baseline && !!current.enabled===!!baseline.enabled &&
            ['lower','upper'].every(side=>{
              let value=String(current[side]).trim(), previous=String(baseline[side]).trim();
              return value===previous && (!value || Number(current[side+'Unit'])===Number(baseline[side+'Unit']));
            })) return;
       }
-      this.send('saveField',{id:f.id,draft:Object.assign({},draft)});
+      this.send('saveField',{id:f.id,type:f.editor==='recursive'?'string':f.type,datetimeRange:f.editor==='datetime_range',draft:Object.assign({},draft)});
     },
     isRange(f) { return f.editor==='size_range'||f.editor==='datetime_range'; },
-    rangeField(f) {
-      let fields=this.fields,index=rangeIndexes.get(fields);
-      if(!index) { index=new Map(); for(let field of fields) if(this.isRange(field)) index.set(field.id,field); rangeIndexes.set(fields,index); }
-      return index.get(f.id)||f;
+    configField(id) {
+      let fields=this.fields,index=configIndexes.get(fields);
+      if(!index) { index=new Map(fields.map(f=>[f.id,f])); configIndexes.set(fields,index); }
+      return index.get(id);
     },
     rangeValue(f) {
-      let range=(this.drafts[f.id]&&this.drafts[f.id].range)||this.rangeField(f).range||{enabled:false,lower:'',upper:'',lowerUnit:0,upperUnit:0};
+      let range=(this.drafts[f.id]&&this.drafts[f.id].range)||(this.configField(f.id)||f).range||{enabled:false,lower:'',upper:'',lowerUnit:0,upperUnit:0};
       let units=f.editor==='size_range'&&this.rangeUnitDrafts[f.id];
       if(!units) return range;
       // Saves store only bytes, so a successful save/reload reconstitutes empty
@@ -481,7 +484,7 @@ export default {
       });
     },
     changeRange(f,key,value,commit) {
-      f=this.rangeField(f);
+      f=this.configField(f.id)||f;
       let range=Object.assign({},this.rangeValue(f),{[key]:value});
       if(f.editor==='size_range') {
         this.rangeUnitDrafts=Object.assign({},this.rangeUnitDrafts,{
@@ -499,7 +502,7 @@ export default {
       if(commit && !emptyUnit) this.commitField(f);
     },
     pickedRange(p) {
-      let f=this.fields.find(f=>f.id===p.id); if(!f) return;
+      let f=this.configField(p.id); if(!f) return;
       this.changeRange(f,p.side,p.value,false);
       // The popup validates in its opening timezone. Preserve that UTC minute
       // if the system timezone changes before the asynchronous save completes.
@@ -508,7 +511,7 @@ export default {
       this.commitField(f);
     },
     changeField(f,value) {
-      f=this.fields.find(current=>current.id===f.id)||f;
+      f=this.configField(f.id)||f;
       let d=this.drafts[f.id]||{original:f.original,text:f.text,boolean:f.boolean,choice:f.choice,baselineText:f.text,baselineBoolean:f.boolean};
       if(this.saveErrors[f.id]&&this.pendingFields.indexOf(f.id)<0) { d.original=f.original; d.baselineText=f.text; d.baselineBoolean=f.boolean; }
       d.text=value;
@@ -659,12 +662,11 @@ export default {
     isDirectoryValue(value) { return typeof value==='string'&&/^(?:[a-zA-Z]:[\\/]|[\\/]{2}|\.{1,2}(?:[\\/]|$)|~[\\/])/.test(value); },
     entryLabel(value) { return value.split(String.fromCharCode(13)).join('␍').split(String.fromCharCode(10)).join('↵'); },
     isRuleList(f) { return f.editor==='rule_list'; },
-    tagField(f) { return this.fields.find(current=>current.id===f.id)||f; },
-    tagValues(f) { f=this.tagField(f); return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
+    tagValues(f) { f=this.configField(f.id)||f; return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
     changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); if(this.configQuery) this.send('refreshSearch'); },
     saveTags(f,values) {
       // Save writes this JSON token directly into the single-line filter module.
-      f=this.tagField(f); this.changeField(f,JSON.stringify(values));
+      this.changeField(f,JSON.stringify(values));
       this.send('syncTags',{id:f.id}); this.commitField(f);
     },
     changeTagMode(f,value) { this.tagModes=Object.assign({},this.tagModes,{[f.id]:value}); },
@@ -675,7 +677,7 @@ export default {
     },
     tagMatches(item,p) { return item.value===p.value&&item.regex===p.regex; },
     editTag(p) {
-      let f=this.fields.find(f=>f.id===p.id); if(!f||f.editor!=='rule_list') return;
+      let f=this.configField(p.id); if(!f||!this.isRuleList(f)) return;
       let values=this.tagValues(f); if(p.index<0||p.index>=values.length||!this.tagMatches(values[p.index],p)) return;
       this.tagEdits=Object.assign({},this.tagEdits,{[f.id]:{index:p.index,value:p.value,regex:p.regex}});
       this.changeTagInput(f,p.value); this.changeTagMode(f,p.regex);
@@ -692,7 +694,7 @@ export default {
       this.saveTags(f,values); this.cancelTagEdit(f);
     },
     removeTag(p) {
-      let f=this.fields.find(f=>f.id===p.id); if(!f||!this.isRuleList(f)) return;
+      let f=this.configField(p.id); if(!f||!this.isRuleList(f)) return;
       let values=this.tagValues(f); if(p.index<0||p.index>=values.length||!this.tagMatches(values[p.index],p)) return;
       this.saveTags(f,values.filter((value,index)=>index!==p.index));
       let edit=this.tagEdits[f.id];

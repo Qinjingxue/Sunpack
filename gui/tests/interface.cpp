@@ -1041,9 +1041,6 @@ int wmain(int argc,wchar_t** argv) {
         assert(IsWindowVisible(hwnd) && state(app.page(),"errors").empty());
         if(mode==L"--history") {
             task_history(app,dir);
-        } else if(mode==L"--ranges") {
-            navigate(app,"tabConfig","config");
-            range_config(app,dir/"sunpack_config.json");
         } else {
             acceptance_contracts(app,dir);
         }

@@ -11,16 +11,17 @@ const std::wstring& TagCollection::label(const Tag& tag,std::wstring& scratch) c
     for(auto& c:scratch) { if(c==L'\r') c=L'␍'; else if(c==L'\n') c=L'↵'; }
     return scratch;
 }
-bool TagCollection::SetItems(const std::string& source) {
-    if(source_==source) return false;
+void TagCollection::SetItems(const std::string& source) {
+    if(source_==source) return;
     auto values=parse_json(source);
     std::vector<Tag> next; next.reserve(values.size());
     for(const auto& value:values) next.push_back({wide(value.at("value").get_ref<const std::string&>()),value.at("regex").get<bool>()});
-    tags_=std::move(next); source_=source; width_=-1;
-    highlights_.clear(); rebuild_markers();
+    tags_=std::move(next); width_=-1;
+    if(source_.capacity()/4>source.size()) source_=std::string(source);
+    else source_=source;
+    SetHighlights({},-1);
     hovered_=pressed_=-1;
     ui::RequestLayout();
-    return true;
 }
 void TagCollection::DoLayout() {
     const float width=std::max(1.0f,rect.right-rect.left);
@@ -37,7 +38,7 @@ void TagCollection::DoLayout() {
             tag.bounds={x,y,x+w,y+chipHeight}; x+=w+gap;
         }
         height_=tags_.empty()?chipHeight:y+chipHeight; width_=width;
-        rebuild_markers();
+        tick_height_=-1;
     }
     rect.bottom=rect.top+height_;
 }
@@ -81,8 +82,11 @@ void TagCollection::OnDraw(ui::Renderer& r) {
         r.DrawLine(cx-3,cy-3,cx+3,cy+3,fg,1); r.DrawLine(cx+3,cy-3,cx-3,cy+3,fg,1);
     }
 }
-void TagCollection::SetHighlights(std::map<size_t,std::vector<ui::TextHighlight>> highlights) {
-    highlights_=std::move(highlights); rebuild_markers();
+void TagCollection::SetHighlights(std::map<size_t,std::vector<ui::TextHighlight>> highlights,int active_tag) {
+    highlights_=std::move(highlights);
+    active_tag_=active_tag>=0 && size_t(active_tag)<tags_.size()?active_tag:-1;
+    tick_height_=-1;
+    if(highlights_.empty()) decltype(ticks_)().swap(ticks_);
 }
 void TagCollection::SetActiveHighlight(size_t tag,size_t range,bool active) {
     auto found=highlights_.find(tag);
@@ -90,26 +94,14 @@ void TagCollection::SetActiveHighlight(size_t tag,size_t range,bool active) {
     found->second[range].active=active;
     active_tag_=active?int(tag):-1;
 }
-void TagCollection::rebuild_markers() {
-    markers_.clear(); tick_height_=-1; active_tag_=-1;
-    if(highlights_.empty()) {
-        decltype(markers_)().swap(markers_);
-        decltype(ticks_)().swap(ticks_);
-        return;
-    }
-    for(auto& item:highlights_) if(item.first<tags_.size()) {
-        const float y=tags_[item.first].bounds.top+chipHeight/2;
-        if(markers_.empty() || markers_.back()!=y) markers_.push_back(y);
-        for(auto& h:item.second) if(h.active) active_tag_=int(item.first);
-    }
-}
 void TagCollection::DrawSearchMarkers(ui::Renderer& r,const ui::ScrollViewWidget& scroll) const {
-    if(markers_.empty()) return;
+    if(highlights_.empty()) return;
     const auto box=scroll.ScrollbarTrackRect();
     const float height=box.bottom-box.top;
     if(tick_height_!=height) {
         tick_height_=height; ticks_.clear();
-        for(float y:markers_) {
+        for(const auto& item:highlights_) if(item.first<tags_.size()) {
+            const float y=tags_[item.first].bounds.top+chipHeight/2;
             float at=std::floor(y/std::max(1.0f,height_)*(height-2));
             if(ticks_.empty() || ticks_.back()!=at) ticks_.push_back(at);
         }

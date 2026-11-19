@@ -33,17 +33,6 @@ impl<'a> RelationSource<'a> {
         }
     }
 
-    fn name(&self, row: usize) -> &'a str {
-        match self {
-            Self::Snapshot(..) => Path::new(self.path(row))
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default(),
-            #[cfg(test)]
-            Self::Physical(rows) => &rows[row].name,
-        }
-    }
-
     fn anchor(&self, row: usize) -> Option<&'a VolumeAnchor> {
         match self {
             Self::Snapshot(snapshot, cached) => cached
@@ -69,7 +58,6 @@ impl<'a> RelationSource<'a> {
         RelationInput {
             path: self.path(row).to_owned(),
             path_key: path_key(self.path(row)),
-            name: self.name(row).to_owned(),
             size,
             relation_member_eligible,
             anchor: self.anchor(row).cloned().or_else(|| match self {
@@ -157,7 +145,7 @@ impl RelationScopeIndex {
         if all_selected || rows.is_empty() {
             return Self { rows };
         }
-        let stem = |row| CaseKey::new(first_dot_stem(source.name(row)));
+        let stem = |row| CaseKey::new(first_dot_stem(physical_filename(source.path(row))));
         let stems: HashSet<_> = rows.iter().copied().map(stem).collect();
         let mut active = HashSet::new();
         // Snapshot facts without overrides can cheaply rule out seeds before

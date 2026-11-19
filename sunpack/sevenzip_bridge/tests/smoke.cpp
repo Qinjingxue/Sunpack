@@ -49,31 +49,6 @@ bool check_probe_cancellation_lifetime() {
     return stopped && survivor->SetCompleted(nullptr) == S_OK;
 }
 
-bool check_numbered_volume_paths() {
-    const std::vector<std::wstring> zip_parts = {
-        L"payload.zip.0002",
-        L"payload.zip.0000",
-        L"payload.zip.0001",
-    };
-    const auto sorted = sunpack::sevenzip::sorted_data_volume_paths(zip_parts);
-    if (sorted.size() != 3 ||
-        std::filesystem::path(sorted[0]).filename() != L"payload.zip.0000" ||
-        std::filesystem::path(sorted[1]).filename() != L"payload.zip.0001" ||
-        std::filesystem::path(sorted[2]).filename() != L"payload.zip.0002" ||
-        sunpack::sevenzip::parse_volume_number(sorted[0]).value_or(-1) != 0) {
-        return false;
-    }
-
-    const std::vector<std::wstring> seven_zip_parts = {
-        L"payload.7z.002",
-        L"payload.7z.001",
-    };
-    const auto seven_zip_sorted = sunpack::sevenzip::sorted_data_volume_paths(seven_zip_parts);
-    return seven_zip_sorted.size() == 2 &&
-        std::filesystem::path(seven_zip_sorted[0]).filename() == L"payload.7z.001" &&
-        std::filesystem::path(seven_zip_sorted[1]).filename() == L"payload.7z.002";
-}
-
 bool check_extraction_handler_selection_is_read_free() {
     using sunpack::sevenzip::extraction_formats_for_hint;
 
@@ -573,10 +548,6 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_probe_cancellation_lifetime()) {
         std::cerr << "password probe cancellation lifetime check failed\n";
         return 34;
-    }
-    if (!check_numbered_volume_paths()) {
-        std::cerr << "numbered volume path check failed\n";
-        return 2;
     }
     if (!check_wrong_password_evidence()) {
         std::cerr << "wrong password evidence check failed\n";

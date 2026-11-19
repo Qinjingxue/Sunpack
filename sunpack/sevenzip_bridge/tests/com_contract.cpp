@@ -316,21 +316,33 @@ void check_open_archive_stream_ownership()
     std::filesystem::create_directories(root);
     const auto head = (root / L"payload.part1.exe").wstring();
     const auto tail = (root / L"payload.part2.exe").wstring();
+    const std::vector<std::wstring> parts{head, tail};
+    const std::vector<std::wstring> names{L"logical.part1.exe", L"logical.part2.rar"};
     std::ofstream(std::filesystem::path(head)).put('a');
     std::ofstream(std::filesystem::path(tail)).put('b');
     {
-        auto input = open_archive_stream(tail, {tail, head});
+        auto input = open_archive_stream(head, parts, nullptr, names, InputPrefetchConfig{false},
+                                         {}, nullptr, ArchiveOpenMode::SfxWithVolumes);
         IUnknown *unknown = as_unknown(input.stream.Interface());
         const ULONG after_add_ref = unknown->AddRef();
         const ULONG after_release = unknown->Release();
         check(after_add_ref == 2 && after_release == 1,
               "open_archive_stream returns exactly one owned COM reference");
 
-        char byte = 0;
+        char bytes[2]{};
         UInt32 read = 0;
-        check(input.opened && input.callback_path == head &&
-              input.stream->Read(&byte, 1, &read) == S_OK && read == 1 && byte == 'a',
-              "unnamed split SFX fallback opens the same head it gives the volume callback");
+        check(input.opened && input.callback_path == names.front() &&
+              input.stream->Read(bytes, sizeof(bytes), &read) == S_OK && read == 1 && bytes[0] == 'a',
+              "SFX mode opens the head and gives the canonical name to the volume callback");
+    }
+    {
+        auto input = open_archive_stream(head, parts, nullptr, names, InputPrefetchConfig{false},
+                                         {}, nullptr, ArchiveOpenMode::NativeVolumes);
+        char bytes[2]{};
+        UInt32 read = 0;
+        check(input.opened && input.stream->Read(bytes, sizeof(bytes), &read) == S_OK &&
+              read == 2 && bytes[0] == 'a' && bytes[1] == 'b',
+              "a native volume set disguised as executables still reads its full logical stream");
     }
     std::filesystem::remove_all(root);
 }

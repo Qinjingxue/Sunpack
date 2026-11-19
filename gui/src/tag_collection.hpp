@@ -14,18 +14,16 @@ class TagCollection final : public ui::Widget {
     int hovered_=-1, pressed_=-1;
     bool hovered_close_=false, pressed_close_=false;
     std::map<size_t,std::vector<ui::TextHighlight>> highlights_;
-    std::vector<float> markers_;
     mutable std::vector<float> ticks_;
     mutable float tick_height_=-1;
     int active_tag_=-1;
-    void rebuild_markers();
     const std::wstring& label(const Tag& tag,std::wstring& scratch) const;
     int tag_at(float x,float y) const;
     D2D1_RECT_F bounds(size_t index) const;
 public:
     std::function<void(size_t,const std::wstring&,bool)> onRemove, onEdit;
-    bool SetItems(const std::string& source);
-    void SetHighlights(std::map<size_t,std::vector<ui::TextHighlight>> highlights);
+    void SetItems(const std::string& source);
+    void SetHighlights(std::map<size_t,std::vector<ui::TextHighlight>> highlights,int active_tag);
     void SetActiveHighlight(size_t tag,size_t range,bool active);
     D2D1_RECT_F TagBounds(size_t index) const { return index<tags_.size()?bounds(index):rect; }
     void DrawSearchMarkers(ui::Renderer& renderer,const ui::ScrollViewWidget& scroll) const;

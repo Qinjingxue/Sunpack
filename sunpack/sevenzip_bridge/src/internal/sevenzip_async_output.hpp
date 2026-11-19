@@ -1470,18 +1470,22 @@ namespace sunpack::sevenzip
             };
         }
 
-        bool begin_data_write(const FileStatePtr &file) noexcept
+        HRESULT begin_data_write(const FileStatePtr &file, HANDLE &handle) noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!file || file->hresult != S_OK || terminal_result_locked(file->job) != S_OK)
-            {
-                return false;
-            }
+            synchronize_cancellation_locked(file->job);
+            const HRESULT error = terminal_result_locked(file->job);
+            if (error != S_OK) return error;
+            if (file->hresult != S_OK) return file->hresult;
+            handle = file->handle;
 #ifdef SUP7Z_DEBUG
-            ++file->active_data_writes;
-            file->peak_active_data_writes = (std::max)(file->peak_active_data_writes, file->active_data_writes);
+            if (handle != INVALID_HANDLE_VALUE)
+            {
+                ++file->active_data_writes;
+                file->peak_active_data_writes = (std::max)(file->peak_active_data_writes, file->active_data_writes);
+            }
 #endif
-            return true;
+            return S_OK;
         }
 
 #ifdef SUP7Z_DEBUG
@@ -1520,17 +1524,27 @@ namespace sunpack::sevenzip
         {
             std::lock_guard<std::mutex> io_lock(buffer->io_mutex);
             submitted = false;
-            const auto job = file->job;
-            const auto global_error = current_error(job);
-            if (global_error != S_OK)
+            // Most blocks target an already-open file. Read the handle and
+            // validate cancellation under the same writer lock.
+            HANDLE handle = INVALID_HANDLE_VALUE;
+            HRESULT error = begin_data_write(file, handle);
+            if (error == S_OK && handle == INVALID_HANDLE_VALUE)
             {
-                record_failure(file, global_error);
+                const auto opened = try_open_file(file);
+                if (opened.kind != AttemptResult::Kind::Succeeded) return opened;
+                // Open runs outside the writer lock. Check for cancellation
+                // or a sibling write failure before submitting this block.
+                error = begin_data_write(file, handle);
+            }
+            if (error != S_OK)
+            {
+                record_failure(file, error);
                 return {AttemptResult::Kind::Terminal, 0};
             }
-            const auto opened = try_open_file(file);
-            if (opened.kind != AttemptResult::Kind::Succeeded) return opened;
-            if (!begin_data_write(file)) return {AttemptResult::Kind::Terminal, 0};
+            // This outstanding buffer prevents a concurrent close.
+            assert(handle != INVALID_HANDLE_VALUE);
 #ifdef SUP7Z_DEBUG
+            const auto &job = file->job;
             unsigned long injected = 0;
             if (write_fault_.consume(injected))
             {
@@ -1548,16 +1562,16 @@ namespace sunpack::sevenzip
             if (chunk && size > chunk) size = chunk;
             if (job->pipeline_timing) job->pipeline_timing->begin(PipelineStage::Output);
 #endif
-            const BOOL started = WriteFile(file->handle, buffer->data.get() + buffer->transferred,
+            const BOOL started = WriteFile(handle, buffer->data.get() + buffer->transferred,
                                            size, nullptr, &buffer->request.overlapped);
-            const DWORD error = started ? ERROR_SUCCESS : GetLastError();
-            if (!started && error != ERROR_IO_PENDING)
+            const DWORD write_error = started ? ERROR_SUCCESS : GetLastError();
+            if (!started && write_error != ERROR_IO_PENDING)
             {
 #ifdef SUP7Z_DEBUG
                 if (job->pipeline_timing) job->pipeline_timing->end(PipelineStage::Output);
                 end_data_write(file);
 #endif
-                return classify_data_failure(file, error);
+                return classify_data_failure(file, write_error);
             }
             submitted = true;
             return {};

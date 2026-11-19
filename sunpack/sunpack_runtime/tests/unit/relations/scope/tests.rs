@@ -4,7 +4,6 @@ fn row(path: &str, seed: bool, eligible: bool) -> RelationInput {
     RelationInput {
         path: path.into(),
         path_key: path_key(path),
-        name: basename(path).into(),
         size: Some(17),
         relation_member_eligible: eligible,
         anchor_cell: None,

@@ -6261,35 +6261,42 @@ impl<'a> RecoveryReceipts<'a> {
         Self { checkpoints, paths }
     }
 
-    fn starting_at(&self, key: &str) -> &[(String, usize, bool)] {
-        &self.paths[self.paths.partition_point(|(path, _, _)| path.as_str() < key)..]
+    fn path_range(&self, key: &str, prefix: bool) -> std::ops::Range<usize> {
+        let start = self.paths.partition_point(|(path, _, _)| path.as_str() < key);
+        let len = self.paths[start..].partition_point(|(path, _, _)| {
+            if prefix { path.starts_with(key) } else { path == key }
+        });
+        start..start + len
     }
 
     fn select<'s>(&self, sources: impl IntoIterator<Item = &'s Path>) -> Vec<&'a crate::pipeline::InputCheckpoint> {
         let mut matches = Vec::new();
         for source in sources {
-            let source = key(source);
-            matches.extend(self.starting_at(&source).iter()
-                .take_while(|(path, _, _)| *path == source).map(|(_, index, _)| *index));
+            matches.extend(self.paths[self.path_range(&key(source), false)].iter().map(|(_, index, _)| *index));
         }
         matches.sort_unstable();
         matches.dedup();
 
         // Hand off descendant receipts under the directly selected outputs,
         // even when their carrier has moved. Keep original receipt order.
-        let mut roots = HashSet::new();
-        for slot in 0..matches.len() {
-            let checkpoint = &self.checkpoints[matches[slot]];
+        // Merge overlapping ranges so a stack of retained outputs does not
+        // repeatedly visit every source below the outermost output.
+        let mut ranges = Vec::new();
+        for &index in &matches {
+            let checkpoint = &self.checkpoints[index];
             if !checkpoint.has_output() { continue; }
             let mut root = key(checkpoint.output());
-            if !roots.insert(root.clone()) { continue; }
-            matches.extend(self.starting_at(&root).iter()
-                .take_while(|(path, _, _)| *path == root)
-                .filter_map(|(_, index, source)| source.then_some(*index)));
+            ranges.push(self.path_range(&root, false));
             root.push('\\');
-            matches.extend(self.starting_at(&root).iter()
-                .take_while(|(path, _, _)| path.starts_with(&root))
+            ranges.push(self.path_range(&root, true));
+        }
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut covered = 0;
+        for range in ranges {
+            if range.end <= covered { continue; }
+            matches.extend(self.paths[range.start.max(covered)..range.end].iter()
                 .filter_map(|(_, index, source)| source.then_some(*index)));
+            covered = range.end;
         }
         matches.sort_unstable();
         matches.dedup();

@@ -38,19 +38,27 @@ impl Drop for TestDirectory {
     }
 }
 
+fn flatten(root: &Path) {
+    let work = root.with_extension("flatten-work");
+    let leaf = discover_flatten_leaf(root).unwrap();
+    let outcome = flatten_single_branch_directories(root, &work, FlattenLeaf::Prepared(&leaf), root, || Ok(()));
+    assert!(matches!(outcome, FlattenOutcome::Published { cleanup_error: None }), "{outcome:?}");
+    assert!(!work.exists());
+}
+
 #[test]
-fn flatten_stops_at_first_branching_level() {
+fn flatten_follows_single_branch_chain_to_first_branching_level() {
     let output = TestDirectory::new("branching");
-    let build = output.path().join("Build");
+    let build = output.path().join("wrapper/Build");
     fs::create_dir_all(build.join("Plugins/x86_64")).unwrap();
     fs::create_dir_all(build.join("StreamingAssets/aa")).unwrap();
     fs::write(build.join("Clicker.exe"), b"exe").unwrap();
     fs::write(build.join("Plugins/x86_64/plugin.dll"), b"dll").unwrap();
     fs::write(build.join("StreamingAssets/aa/catalog.bin"), b"catalog").unwrap();
 
-    let mut stats = FlattenStats::default();
-    flatten_single_branch_chain(output.path(), &mut stats);
+    flatten(output.path());
 
+    assert!(!output.path().join("wrapper").exists());
     assert!(!output.path().join("Build").exists());
     assert!(output.path().join("Clicker.exe").is_file());
     assert!(output.path().join("Plugins/x86_64/plugin.dll").is_file());
@@ -58,10 +66,6 @@ fn flatten_stops_at_first_branching_level() {
         .path()
         .join("StreamingAssets/aa/catalog.bin")
         .is_file());
-    assert_eq!(stats.removed_dirs, 1);
-    assert_eq!(stats.output_dir.as_deref(), Some(output.path()));
-    assert_eq!(stats.source_dir.as_ref(), Some(&build));
-    assert!(stats.errors.is_empty());
 }
 
 #[cfg(windows)]
@@ -88,25 +92,6 @@ fn flatten_keeps_last_proven_level_when_deeper_enumeration_fails() {
     assert_eq!(discovered, leaf);
 }
 
-#[test]
-fn flatten_continues_along_an_unbranched_directory_chain() {
-    let output = TestDirectory::new("chain");
-    let payload = output.path().join("outer/inner/payload.txt");
-    fs::create_dir_all(payload.parent().unwrap()).unwrap();
-    fs::write(&payload, b"payload").unwrap();
-
-    let mut stats = FlattenStats::default();
-    flatten_single_branch_chain(output.path(), &mut stats);
-
-    assert!(output.path().join("payload.txt").is_file());
-    assert!(!output.path().join("outer").exists());
-    assert!(!output.path().join("inner").exists());
-    assert_eq!(stats.removed_dirs, 2);
-    assert_eq!(stats.output_dir.as_deref(), Some(output.path()));
-    assert_eq!(stats.source_dir.as_deref(), payload.parent());
-    assert!(stats.errors.is_empty());
-}
-
 #[cfg(windows)]
 #[test]
 fn flatten_moves_directories_beyond_win32_max_path() {
@@ -116,10 +101,8 @@ fn flatten_moves_directories_beyond_win32_max_path() {
     fs::create_dir_all(output.join("wrapper/first")).unwrap();
     fs::create_dir_all(output.join("wrapper/second")).unwrap();
 
-    let mut stats = FlattenStats::default();
-    flatten_single_branch_chain(&output, &mut stats);
+    flatten(&output);
 
-    assert!(stats.errors.is_empty(), "{:?}", stats.errors);
     assert!(output.join("first").is_dir() && output.join("second").is_dir());
     assert!(!output.join("wrapper").exists());
 }
@@ -131,32 +114,25 @@ fn flatten_publish_failure_reports_retained_payload_without_touching_collision()
     let destination = container.path().join("inner");
     fs::create_dir_all(output.join("outer/inner")).unwrap();
     fs::write(output.join("outer/inner/payload.txt"), b"payload").unwrap();
-    let mut stats = FlattenStats::default();
-    flatten_single_branch_chain_with_publisher(
+    let work = container.path().join("flatten-work");
+    let outcome = flatten_single_branch_directories(
         &output,
-        &mut stats,
-        &container.path().join("flatten-work"),
+        &work,
         FlattenLeaf::Prepared(&output.join("outer/inner")),
         &destination,
-        |leaf, root| {
-            fs::create_dir(root)?;
-            fs::write(root.join("unrelated.txt"), b"unrelated")?;
-            rename_no_replace(leaf, root)
+        || {
+            fs::create_dir(&destination)?;
+            fs::write(destination.join("unrelated.txt"), b"unrelated")
         },
-        || Ok(()),
     );
-    let retained = stats.output_dir.as_ref().unwrap();
-    assert_ne!(retained, &output);
-    assert_eq!(stats.source_dir.as_ref(), Some(&output));
+    assert!(matches!(outcome, FlattenOutcome::Staged(_)), "{outcome:?}");
+    assert!(!output.exists());
     assert_eq!(
-        fs::read(retained.join("outer/inner/payload.txt")).unwrap(),
+        fs::read(work.join("outer/inner/payload.txt")).unwrap(),
         b"payload"
     );
     assert_eq!(
         fs::read(destination.join("unrelated.txt")).unwrap(),
         b"unrelated"
     );
-    assert_eq!(stats.moved, 0);
-    assert_eq!(stats.removed_dirs, 0);
-    assert_eq!(stats.errors.len(), 1);
 }

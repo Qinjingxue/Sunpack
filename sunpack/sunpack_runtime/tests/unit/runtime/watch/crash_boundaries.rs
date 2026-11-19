@@ -110,7 +110,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                     &destination,
                     || prepare_flatten(&journal, owner.to_str().unwrap(), &root, &work, &leaf, &destination),
                 );
-                assert!(result.errors.is_empty(), "{:?}", result.errors);
+                assert!(matches!(result, crate::postprocess::FlattenOutcome::Published { cleanup_error: None }), "{result:?}");
                 finish_flatten(&journal, root.to_str().unwrap()).unwrap();
             }
             assert_eq!(fs::read(destination.join("nested/payload")).unwrap(), b"committed payload");

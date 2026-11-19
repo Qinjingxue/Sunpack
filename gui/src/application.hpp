@@ -42,7 +42,7 @@ class Application {
     struct ControlBinding {
         Application* owner;
         const std::string& id;
-        std::string editor, text, original;
+        std::string editor, type, text, original;
         Json options;
         int choice=-1;
         bool boolean=false, pending_removal=false;
@@ -71,7 +71,7 @@ class Application {
     UINT_PTR date_generation_ = 0;
     void finish_date_popup(UINT_PTR generation);
     bool field_pending(const std::string& id) const;
-    void save_field(const std::string& id, Json draft = Json());
+    void save_field(const std::string& id, Json draft, const std::string& type, bool datetime_range = false);
     void queue_save(Json job);
     void start_save();
     void acknowledge_save(const Json& ack);

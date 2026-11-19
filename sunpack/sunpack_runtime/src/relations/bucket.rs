@@ -3,7 +3,6 @@ use super::*;
 /// The physical scope only. No filename hypotheses are created here.
 #[derive(Debug, Default)]
 pub(super) struct BucketIndex {
-    pub entries_by_path: HashMap<String, usize>,
     pub rows_by_stem: HashMap<String, Vec<usize>>,
 }
 
@@ -20,21 +19,23 @@ impl BucketIndex {
         let selected: Option<HashSet<_>> = filtered_keys.map(|keys| {
             rows.iter()
                 .filter(|r| keys.contains(&r.path_key))
-                .map(|r| case_key(first_dot_stem(&r.name)))
+                .map(|r| case_key(first_dot_stem(r.name())))
                 .collect()
         });
-        let stems: HashSet<_> = rows
-            .iter()
-            .filter(|r| r.anchor.as_ref().is_some_and(Self::has_seed))
-            .map(|r| case_key(first_dot_stem(&r.name)))
-            .filter(|s| selected.as_ref().is_none_or(|set| set.contains(s)))
-            .collect();
         let mut out = Self::default();
+        for row in rows.iter().filter(|r| r.anchor.as_ref().is_some_and(Self::has_seed)) {
+            let stem = case_key(first_dot_stem(row.name()));
+            if selected.as_ref().is_none_or(|set| set.contains(&stem)) {
+                out.rows_by_stem.entry(stem).or_default();
+            }
+        }
+        if out.rows_by_stem.is_empty() {
+            return out;
+        }
         for (i, row) in rows.iter().enumerate() {
-            let stem = case_key(first_dot_stem(&row.name));
-            if stems.contains(&stem) {
-                out.entries_by_path.insert(row.path_key.clone(), i);
-                out.rows_by_stem.entry(stem).or_default().push(i);
+            let stem = case_key(first_dot_stem(row.name()));
+            if let Some(bucket) = out.rows_by_stem.get_mut(&stem) {
+                bucket.push(i);
             }
         }
         out

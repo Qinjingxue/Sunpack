@@ -658,20 +658,15 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
     Json rows=Json::array();
     if(config.empty()) return rows;
     JsonTokens tokens(source);
-    auto original=[&](const std::string& pointer,const Json& item,int indent) {
-        if(source.empty()) return item.dump(indent);
-        tokens.select(pointer);
-        return std::string();
-    };
     std::function<void(const Json&,std::string,std::string)> walk;
     walk=[&](const Json& item,std::string pointer,std::string module) {
         if(item.is_object() && !item.empty()) {
             if(item.contains("name") && item["name"].is_string()) module=item["name"].get<std::string>();
             if(pointer.rfind("/filesystem/scan_filters/",0)==0 && pointer.find('/',25)==std::string::npos && (module=="size_range" || module=="mtime_range")) {
-                auto raw=original(pointer,item,-1);
+                tokens.select(pointer);
                 auto field=describe_setting(pointer,module,language);
                 field.update(Json{{"id",pointer},{"key",pointer+"@"+language+"@"+module},{"type","object"},
-                    {"original",raw},{"text",raw},{"boolean",false},{"choice",-1},{"items",Json::array()},
+                    {"boolean",false},{"choice",-1},{"items",Json::array()},
                     {"block",pointer},{"primary",true},{"editor",module=="mtime_range"?"datetime_range":"size_range"},{"range",range_editor(item)}});
                 rows.push_back(std::move(field)); return;
             }
@@ -683,27 +678,25 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
             for(size_t i=0;i<item.size();++i) walk(item[i],pointer+"/"+std::to_string(i),module); return;
         }
         std::string type=item.is_boolean()?"boolean":item.is_string()?"string":item.is_number()?"number":item.is_array()?"array":item.is_object()?"object":"null";
-        auto raw=original(pointer,item,2);
-        std::string editor=field["editor"], text=item.is_string()?item.get<std::string>():raw;
+        tokens.select(pointer);
+        std::string editor=field["editor"], text=item.is_string()?item.get<std::string>():std::string();
         if(editor.empty()) editor=!field["known"].get<bool>()?"readonly":!field["options"].empty()?"choice":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
         int choice=-1;
         for(size_t i=0;i<field["options"].size();++i) if(field["options"][i]["value"]==item) choice=int(i);
         if(editor=="recursive" && choice<0) choice=2;
-        field.update(Json{{"id",pointer},{"key",pointer+"@"+language},{"type",type},{"original",raw},{"text",text},{"boolean",item.is_boolean()?item.get<bool>():false},
+        field.update(Json{{"id",pointer},{"key",pointer+"@"+language},{"type",type},{"text",std::move(text)},{"boolean",item.is_boolean()?item.get<bool>():false},
             {"editor",editor},{"choice",choice},{"items",editor=="rule_list"?item:Json::array()}});
         rows.push_back(std::move(field));
     };
     walk(config,"","");
-    if(!source.empty()) {
-        tokens.scan();
-        for(auto& field:rows) {
-            const auto& id=field["id"].get_ref<const std::string&>();
-            const auto& range=tokens.ranges.at(id);
-            if(!range.length) throw std::out_of_range("settingChanged");
-            const auto raw=tokens.text(range);
-            field["original"]=std::string(raw);
-            if(field["type"]!="string") field["text"]=std::string(raw);
-        }
+    tokens.scan();
+    for(auto& field:rows) {
+        const auto& id=field["id"].get_ref<const std::string&>();
+        const auto& range=tokens.ranges.at(id);
+        if(!range.length) throw std::out_of_range("settingChanged");
+        const auto raw=tokens.text(range);
+        field["original"]=std::string(raw);
+        if(field["type"]!="string") field["text"]=std::string(raw);
     }
     return rows;
 }

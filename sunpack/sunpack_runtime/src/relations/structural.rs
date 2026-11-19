@@ -3,20 +3,10 @@ use crate::analysis_native::volume_anchor::{upgrade_relation_rar_end, upgrade_re
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum VolumeRole {
-    First,
-    Middle,
-    Terminal,
-    FirstAndTerminal,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SfxRole {
     None,
     ArchiveBearingFirst,
     LauncherCompanion,
-    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +18,9 @@ pub(super) enum NumberingStyle {
 #[derive(Debug, Clone)]
 pub(super) struct StructuralFacts {
     pub exact_slot: Option<u32>,
-    pub role: VolumeRole,
-    pub has_previous: Option<bool>,
+    pub first: bool,
+    pub terminal: bool,
+    pub continues_from_previous: bool,
     pub has_next: Option<bool>,
     pub numbering_style: Option<NumberingStyle>,
     pub sfx_role: SfxRole,
@@ -55,29 +46,14 @@ impl StructuralFacts {
                 a.internal_volume_number.or(first.then_some(1))
             }
         });
-        let has_previous = anchor.and_then(|a| {
-            if first {
-                Some(false)
-            } else if a.continuation_from_previous
-                || a.internal_volume_number.is_some_and(|n| n > 1)
-            {
-                Some(true)
-            } else {
-                None
-            }
+        let continues_from_previous = !first && anchor.is_some_and(|a| {
+            a.continuation_from_previous || a.internal_volume_number.is_some_and(|n| n > 1)
         });
         let has_next = anchor.and_then(|a| {
             a.relation_has_next
                 .or(terminal.then_some(false))
                 .or(a.continuation_to_next.then_some(true))
         });
-        let role = match (first, terminal, has_previous, has_next) {
-            (true, true, _, _) => VolumeRole::FirstAndTerminal,
-            (true, _, _, _) => VolumeRole::First,
-            (_, true, _, _) => VolumeRole::Terminal,
-            (_, _, Some(true), Some(true)) => VolumeRole::Middle,
-            _ => VolumeRole::Unknown,
-        };
         let numbering_style = anchor.and_then(|a| {
             if a.has_any(RAR_OLD_NUMBERING) {
                 Some(NumberingStyle::RarOldStyle)
@@ -101,13 +77,13 @@ impl StructuralFacts {
             {
                 SfxRole::ArchiveBearingFirst
             }
-            Some(a) if a.sfx => SfxRole::Unknown,
             _ => SfxRole::None,
         };
         Self {
             exact_slot,
-            role,
-            has_previous,
+            first,
+            terminal,
+            continues_from_previous,
             has_next,
             numbering_style,
             sfx_role,
@@ -129,18 +105,26 @@ pub(super) fn collect(
     rows: &mut [RelationInput],
     index: &BucketIndex,
 ) {
-    let pe_rows: Vec<_> = index
-        .entries_by_path
-        .values()
-        .copied()
-        .filter(|i| {
-            rows[*i].anchor.as_ref().is_some_and(|a| {
-                a.pe_state != PeState::None
-                    && !a.sfx
-                    && !a.has_any(SFX_CHECKED)
-            })
-        })
-        .collect();
+    let pe_rows = {
+        let mut pe_rows = Vec::new();
+        let mut pending = HashMap::new();
+        for indexes in index.rows_by_stem.values() {
+            for &i in indexes {
+                let row = &rows[i];
+                if row.anchor.as_ref().is_some_and(|a| {
+                    a.pe_state != PeState::None && !a.sfx && !a.has_any(SFX_CHECKED)
+                }) {
+                    pending.insert(row.path_key.as_str(), i);
+                } else if !pending.is_empty() {
+                    // Slices of one physical path share a stem. Keep the last
+                    // row's probe decision, including already resolved slices.
+                    pending.remove(row.path_key.as_str());
+                }
+            }
+            pe_rows.extend(pending.drain().map(|(_, i)| i));
+        }
+        pe_rows
+    };
     for i in pe_rows {
         // One managed context supplies PE headers, overlay, stub and archive
         // confirmation. Its existing caches/guard live only through this row.

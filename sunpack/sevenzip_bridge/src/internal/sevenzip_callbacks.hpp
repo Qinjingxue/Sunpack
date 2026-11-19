@@ -244,30 +244,11 @@ namespace sunpack::sevenzip
             // Publish only a complete index. An allocation failure during
             // GetStream must leave subsequent callbacks free to retry.
             std::unordered_map<std::wstring, std::size_t> paths;
-            if (canonical_names_)
+            paths.reserve(canonical_names_->size());
+            for (std::size_t index = 0; index < canonical_names_->size(); ++index)
             {
-                paths.reserve(canonical_names_->size());
-                for (std::size_t index = 0; index < canonical_names_->size(); ++index)
-                {
-                    auto name = filename_lower((*canonical_names_)[index]);
-                    if (!name.empty()) paths[std::move(name)] = index;
-                }
-            }
-            else
-            {
-                const auto &parts = *part_paths_;
-                const auto add = [&](const std::wstring &path, std::size_t index) {
-                    auto name = filename_lower(path);
-                    if (!name.empty()) paths[std::move(name)] = index;
-                    paths[lower_text(path)] = index;
-                };
-                for (std::size_t index = 0; index < parts.size(); ++index)
-                    add(parts[index], index);
-                if (!archive_path_.empty())
-                {
-                    const auto found = std::find(parts.begin(), parts.end(), archive_path_);
-                    add(archive_path_, static_cast<std::size_t>(found - parts.begin()));
-                }
+                auto name = filename_lower((*canonical_names_)[index]);
+                if (!name.empty()) paths[std::move(name)] = index;
             }
             volume_paths_.emplace(std::move(paths));
         }
@@ -276,12 +257,10 @@ namespace sunpack::sevenzip
         {
             // Most handlers read the supplied stream and never ask for an
             // alias. Prepare the index on the first request that needs it.
-            if (!volume_paths_ && (canonical_names_ || part_paths_)) build_volume_paths();
-            if (volume_paths_)
+            if (canonical_names_)
             {
-                auto found = volume_paths_->find(base);
-                if (found == volume_paths_->end() && !canonical_names_)
-                    found = volume_paths_->find(lower_text(name));
+                if (!volume_paths_) build_volume_paths();
+                const auto found = volume_paths_->find(base);
                 if (found != volume_paths_->end()) return found->second;
             }
             else if (!archive_path_.empty())

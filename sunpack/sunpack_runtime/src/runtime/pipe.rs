@@ -527,7 +527,7 @@ impl Connection {
         }
         // main flushes output in finally, including a failed request. Keep
         // control reads alive during drain so disconnect cancels blocked IO.
-        let _ = self.output.drain().await;
+        self.output.drain().await;
         self.finishing.store(true, Ordering::Release);
         self.close();
         if let Some(control) = control { control.wait().await; }
@@ -585,7 +585,8 @@ impl Connection {
     async fn read_prompt_chunk(&self) -> io::Result<Option<Vec<u8>>> {
         let Some(reply) = PromptReply::new(&self.prompt, &self.cancel)? else { return Ok(None); };
         self.frame(3, &[]).await?;
-        self.output.drain().await?;
+        // The output pump runs independently. The launcher can answer only
+        // after receiving the prompt frame in FIFO order.
         reply.reply.wait().await.map(Some)
     }
 
@@ -627,7 +628,9 @@ impl Session for Connection {
             if self.output.closed() { Ok(()) } else { result }
         })
     }
-    fn drain(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> { Box::pin(self.output.drain()) }
+    fn drain(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        Box::pin(async { self.output.drain().await; Ok(()) })
+    }
     fn read_line(&self, prompt: &str) -> io::Result<Option<String>> { block_on(self.read_line_async(prompt)) }
     fn aread_line<'a>(&'a self, prompt: &'a str) -> Pin<Box<dyn Future<Output = io::Result<Option<String>>> + Send + 'a>> {
         Box::pin(self.read_line_async(prompt))
@@ -761,7 +764,7 @@ impl Server {
             if header.flags & 1 != 0 {
                 connection.finishing.store(true, Ordering::Release);
                 connection.frame(0, &0_i32.to_be_bytes()).await?;
-                connection.output.drain().await?;
+                connection.output.drain().await;
                 self.activity.lock().unwrap().shutting_down = true;
                 self.shutdown.cancel();
                 self.wake.signal();
@@ -800,7 +803,7 @@ impl Server {
             // control EOF can arrive before the completed write is observed.
             connection.finishing.store(true, Ordering::Release);
             connection.frame(0, &code.to_be_bytes()).await?;
-            connection.output.drain().await?;
+            connection.output.drain().await;
             if connection.output.closed() {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }

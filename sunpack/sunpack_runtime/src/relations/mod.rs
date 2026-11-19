@@ -34,11 +34,20 @@ use scope::{RelationScopeIndex, RelationSource};
 pub(crate) struct RelationInput {
     path: String,
     pub(crate) path_key: String,
-    name: String,
     size: Option<u64>,
     relation_member_eligible: bool,
     anchor: Option<VolumeAnchor>,
     anchor_cell: Option<CheapAnchorCell>,
+}
+
+impl RelationInput {
+    fn name(&self) -> &str {
+        physical_filename(&self.path)
+    }
+}
+
+fn physical_filename(path: &str) -> &str {
+    Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -144,7 +153,7 @@ impl<'a> RelationCandidateData<'a> {
                 self.parsed
                     .as_ref()
                     .map(logical_name_from_parsed)
-                    .unwrap_or_else(|| get_logical_name(&row.name, true)),
+                    .unwrap_or_else(|| get_logical_name(row.name(), true)),
             ),
             NativeRelationGroup::Proposal(validation) => {
                 Cow::Borrowed(&validation.proposal.logical_name)
@@ -372,7 +381,7 @@ impl NativeRelationGroup {
             Self::Ordinary(row, confirmed) => {
                 let anchor = row.anchor.as_ref();
                 let parsed = (!confirmed && anchor.is_some_and(anchor_has_split_identity))
-                    .then(|| parse_relation_numbered_volume(&row.name))
+                    .then(|| parse_relation_numbered_volume(row.name()))
                     .flatten();
                 RelationCandidateData {
                     group: self,
@@ -425,10 +434,6 @@ struct ParsedVolume {
     width: usize,
     family: &'static str,
     decorated: bool,
-}
-
-pub(crate) fn relations_logical_name(filename: &str, is_archive: bool) -> String {
-    get_logical_name(filename, is_archive)
 }
 
 pub(crate) fn build_native_candidate_groups_from_snapshot(
@@ -558,7 +563,7 @@ fn resolve_shared_carrier_volumes(
         let mut buckets: HashMap<String, Vec<RelationInput>> = HashMap::new();
         for index in RelationScopeIndex::build(&source, &selected, Some(excluded)).rows {
             let row = source.materialize(index);
-            buckets.entry(case_key(first_dot_stem(&row.name))).or_default().push(row);
+            buckets.entry(case_key(first_dot_stem(row.name()))).or_default().push(row);
         }
         for scope in buckets.into_values() {
             // A physical row can contain several logical volume slices. Keep
@@ -1164,7 +1169,7 @@ fn split_family_for_proposal<'a>(format: &str, style: &'a str) -> Cow<'a, str> {
     }
 }
 
-fn get_logical_name(filename: &str, is_archive: bool) -> String {
+pub(crate) fn get_logical_name(filename: &str, is_archive: bool) -> String {
     // The display-name fallback also recognizes Unicode decimal digits.
     if filename.bytes().any(|b| b.is_ascii_digit() || !b.is_ascii()) {
         let regexes = regex_cache().acquire();

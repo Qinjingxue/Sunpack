@@ -13,7 +13,7 @@ pub(super) struct Output(Mutex<State>);
 struct State {
     frames: VecDeque<Vec<u8>>,
     bytes: usize,
-    unfinished: usize,
+    writing: bool,
     closed: bool,
     reader: Option<Waker>,
     space_waiters: Vec<Waker>,
@@ -26,7 +26,6 @@ fn wait(waiters: &mut Vec<Waker>, waker: &Waker) {
 impl State {
     fn push(&mut self, frame: Vec<u8>) -> Option<Waker> {
         self.bytes += frame.len();
-        self.unfinished += 1;
         self.frames.push_back(frame);
         self.reader.take()
     }
@@ -66,6 +65,11 @@ impl Output {
             let mut state = self.0.lock().unwrap();
             if let Some(frame) = state.frames.pop_front() {
                 state.bytes -= frame.len();
+                debug_assert!(!state.writing);
+                state.writing = true;
+                if state.frames.capacity() > 256 {
+                    crate::collections::trim_deque(&mut state.frames);
+                }
                 let waiters = std::mem::take(&mut state.space_waiters);
                 drop(state);
                 wake(waiters);
@@ -77,32 +81,32 @@ impl Output {
     pub(super) fn acknowledge(&self) {
         let waiters = {
             let mut state = self.0.lock().unwrap();
-            state.unfinished -= 1;
-            if state.unfinished != 0 { return; }
+            debug_assert!(state.writing);
+            state.writing = false;
+            if !state.frames.is_empty() { return; }
             std::mem::take(&mut state.drain_waiters)
         };
         wake(waiters);
     }
-    pub(super) async fn drain(&self) -> io::Result<()> {
+    pub(super) async fn drain(&self) {
         poll_fn(|cx| {
             let mut state = self.0.lock().unwrap();
-            if state.unfinished == 0 { Poll::Ready(Ok(())) }
+            if !state.writing && state.frames.is_empty() { Poll::Ready(()) }
             else { wait(&mut state.drain_waiters, cx.waker()); Poll::Pending }
         }).await
     }
     pub(super) fn close(&self) {
-        let (reader, space, drained) = {
+        let (frames, reader, space, drained) = {
             let mut state = self.0.lock().unwrap();
             state.closed = true;
-            state.unfinished -= state.frames.len();
-            state.frames.clear();
             state.bytes = 0;
-            let drained = if state.unfinished == 0 {
+            let drained = if !state.writing {
                 std::mem::take(&mut state.drain_waiters)
             } else { Vec::new() };
-            (state.reader.take(), std::mem::take(&mut state.space_waiters), drained)
+            (std::mem::take(&mut state.frames), state.reader.take(), std::mem::take(&mut state.space_waiters), drained)
         };
         wake(reader.into_iter().chain(space).chain(drained));
+        drop(frames);
     }
 }
 

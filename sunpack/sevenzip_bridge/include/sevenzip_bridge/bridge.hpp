@@ -148,6 +148,8 @@ struct ExtractInputRange {
 };
 
 struct VolumeAttemptPlan;
+enum class ArchiveOpenMode { File, FileRange, NativeVolumes, SfxWithVolumes };
+
 PasswordTestResult test_password_batch(
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
@@ -159,7 +161,8 @@ PasswordTestResult test_password_batch(
     bool scan_only = false, bool final_read_only = false,
     const std::size_t* candidate_indices = nullptr,
     const VolumeAttemptPlan* volume_plan = nullptr,
-    bool leave_last_candidate = false, bool password_verified = false
+    bool leave_last_candidate = false, bool password_verified = false,
+    ArchiveOpenMode mode = ArchiveOpenMode::File
 );
 
 ExtractArchiveResult extract_archive(
@@ -172,7 +175,7 @@ ExtractArchiveResult extract_archive(
     const std::wstring& codepage,
     ExtractProgressCallback progress = {},
     const std::vector<std::wstring>& canonical_names = {},
-    bool native_volume_input = false,
+    ArchiveOpenMode mode = ArchiveOpenMode::File,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
     std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
     bool output_inventory = true

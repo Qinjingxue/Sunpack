@@ -14,26 +14,6 @@ pub(crate) struct WatchCandidateRow {
     pub(crate) observation: WatchFileObservation,
 }
 
-pub(crate) fn flatten_single_branch_directories(
-    base: &Path,
-    work_path: &Path,
-    leaf: FlattenLeaf<'_>,
-    destination: &Path,
-    before_move: impl FnOnce() -> io::Result<()>,
-) -> FlattenStats {
-    let mut stats = FlattenStats::default();
-    flatten_single_branch_chain_with_publisher(
-        base,
-        &mut stats,
-        work_path,
-        leaf,
-        destination,
-        rename_no_replace,
-        before_move,
-    );
-    stats
-}
-
 pub(crate) fn remove_owned_file(path: &Path) -> io::Result<()> {
     remove_with_readonly(path, |path| fs::remove_file(path))
 }
@@ -155,13 +135,11 @@ fn watch_candidate_from_metadata(
     }))
 }
 
-#[derive(Default)]
-pub(crate) struct FlattenStats {
-    pub(crate) moved: usize,
-    pub(crate) removed_dirs: usize,
-    pub(crate) errors: Vec<String>,
-    pub(crate) output_dir: Option<PathBuf>,
-    pub(crate) source_dir: Option<PathBuf>,
+#[cfg_attr(test, derive(Debug))]
+pub(crate) enum FlattenOutcome {
+    Unmoved(String),
+    Staged(String),
+    Published { cleanup_error: Option<String> },
 }
 
 pub(crate) enum FlattenLeaf<'a> {
@@ -169,29 +147,13 @@ pub(crate) enum FlattenLeaf<'a> {
     Resume { leaf: &'a Path, published: bool },
 }
 
-#[cfg(test)]
-fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
-    let Some(leaf) = discover_flatten_leaf(root) else { return; };
-    flatten_single_branch_chain_with_publisher(
-        root,
-        stats,
-        &root.with_extension("flatten-work"),
-        FlattenLeaf::Prepared(&leaf),
-        root,
-        rename_no_replace,
-        || Ok(()),
-    );
-}
-
-fn flatten_single_branch_chain_with_publisher(
+pub(crate) fn flatten_single_branch_directories(
     root: &Path,
-    stats: &mut FlattenStats,
     work: &Path,
     leaf: FlattenLeaf<'_>,
     destination: &Path,
-    publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
     before_move: impl FnOnce() -> io::Result<()>,
-) {
+) -> FlattenOutcome {
     let (leaf, resume, published) = match leaf {
         FlattenLeaf::Prepared(path) => (path, false, false),
         FlattenLeaf::Resume { leaf, published } => (leaf, true, published),
@@ -199,44 +161,32 @@ fn flatten_single_branch_chain_with_publisher(
     let leaf_relative = match leaf.strip_prefix(root) {
         Ok(relative) if !relative.as_os_str().is_empty() => relative,
         _ => {
-            stats.errors.push(format!(
+            return FlattenOutcome::Unmoved(format!(
                 "{}: flatten leaf is not below output root",
                 normalize_path(root)
             ));
-            return;
         }
     };
 
     if !resume {
         if let Err(error) = before_move().and_then(|_| rename_no_replace(root, work)) {
-            stats
-                .errors
-                .push(format!("{}: {error}", normalize_path(work)));
-            return;
+            return FlattenOutcome::Unmoved(format!("{}: {error}", normalize_path(work)));
         }
     }
-    stats.output_dir = Some(work.to_path_buf());
-    stats.source_dir = Some(root.to_path_buf());
     let leaf_in_work = work.join(leaf_relative);
     if !published {
-        if let Err(error) = publish(&leaf_in_work, destination) {
-            stats.errors.push(format!(
+        if let Err(error) = rename_no_replace(&leaf_in_work, destination) {
+            // Keep the complete payload under work if exclusive publication fails.
+            return FlattenOutcome::Staged(format!(
                 "{} -> {}: {}",
                 normalize_path(&leaf_in_work),
                 normalize_path(destination),
                 error
             ));
-            // Keep the complete payload under work if exclusive publication fails.
-            return;
         }
     }
-    stats.moved += 1;
-    stats.output_dir = Some(destination.to_path_buf());
-    stats.source_dir = Some(leaf.to_path_buf());
-
-    match remove_empty_flatten_wrappers(work, leaf_relative) {
-        Ok(removed) => stats.removed_dirs += removed,
-        Err(error) => stats.errors.push(error),
+    FlattenOutcome::Published {
+        cleanup_error: remove_empty_flatten_wrappers(work, &leaf_in_work).err(),
     }
 }
 
@@ -258,29 +208,24 @@ fn only_child_directory(dir: &Path) -> Option<PathBuf> {
 }
 
 
-fn remove_empty_flatten_wrappers(work: &Path, leaf_relative: &Path) -> Result<usize, String> {
-    let leaf = work.join(leaf_relative);
-    let mut current = leaf.parent().map(Path::to_path_buf);
-    let mut removed = 0usize;
-
-    while let Some(directory) = current {
+fn remove_empty_flatten_wrappers(work: &Path, leaf: &Path) -> Result<(), String> {
+    for directory in leaf.ancestors().skip(1) {
         if !directory.starts_with(work) {
             break;
         }
-        match fs::remove_dir(&directory) {
-            Ok(()) => removed += 1,
+        match fs::remove_dir(directory) {
+            Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(format!("{}: {}", normalize_path(&directory), error));
+                return Err(format!("{}: {}", normalize_path(directory), error));
             }
         }
         if directory == work {
             break;
         }
-        current = directory.parent().map(Path::to_path_buf);
     }
 
-    Ok(removed)
+    Ok(())
 }
 
 fn normalize_path(path: &Path) -> String {

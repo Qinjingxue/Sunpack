@@ -183,7 +183,7 @@ void Application::set_error(const char* field,const std::string& message) {
 }
 void Application::save_error(const std::string& key,const std::string& message) {
     auto errors=page_value(page_,"saveErrors");
-    if(message.empty()) errors.erase(key);
+    if(message.empty()) { if(!errors.erase(key)) return; }
     else errors[key]=localized_error(message);
     auto encoded=errors.dump(); ui_page_set_json(page_,"saveErrors",encoded.c_str());
 }
@@ -204,23 +204,13 @@ bool Application::field_pending(const std::string& id) const {
     auto match=[&](const Json& job){return job.is_object() && job.value("kind",std::string())=="config" && job.value("key",std::string())==id;};
     return (active_save_ && match(*active_save_)) || std::any_of(saves_.begin(),saves_.end(),match);
 }
-void Application::save_field(const std::string& id,Json draft) {
+void Application::save_field(const std::string& id,Json draft,const std::string& type,bool datetime_range) {
     try {
-        if(draft.is_null()) {
-            auto drafts=page_value(page_,"drafts"), toggles=page_value(page_,"toggleDrafts");
-            if(drafts.contains(id)) draft=drafts[id];
-            else if(toggles.contains(id)) draft=toggles[id];
-            else return;
-        }
-        auto fields=page_value(page_,"fields");
-        auto field=std::find_if(fields.begin(),fields.end(),[&](const Json& f){return f["id"]==id;});
-        if(field==fields.end()) throw std::runtime_error("configConflict");
         Json edit={{"pointer",id},{"original",std::move(draft.at("original"))},
-            {"type",(*field)["editor"]=="recursive"?Json("string"):(*field)["type"]},
-            {"text",std::move(draft.at("text"))},{"boolean",std::move(draft.at("boolean"))}};
+            {"type",type},{"text",std::move(draft.at("text"))},{"boolean",std::move(draft.at("boolean"))}};
         if(draft.contains("range")) {
             auto draft_text=std::move(edit["text"]);
-            edit["text"]=range_configuration(draft["range"],(*field)["editor"]=="datetime_range").dump();
+            edit["text"]=range_configuration(draft["range"],datetime_range).dump();
             edit["draftText"]=std::move(draft_text);
         }
         queue_save(Json{{"kind","config"},{"key",id},{"field",std::move(edit)}});
@@ -399,14 +389,11 @@ void Application::acknowledge_save(const Json& ack) {
         auto original=edit["type"]=="string"?Json(edit["text"]).dump():edit["type"]=="boolean"?Json(edit["boolean"]).dump():edit["text"].get<std::string>();
         for(auto name:{"drafts","toggleDrafts"}) {
             auto drafts=page_value(page_,name);
-            if(drafts.contains(id)) {
-                auto& current=drafts[id];
-                if(current["original"]==edit["original"]) {
-                    bool same=edit["type"]=="boolean"?current["boolean"]==edit["boolean"]:current["text"]==draft_text;
-                    if(same) drafts.erase(id);
-                    else { current["original"]=original; current["baselineText"]=draft_text; current["baselineBoolean"]=edit["boolean"]; }
-                }
-            }
+            auto current=drafts.find(id);
+            if(current==drafts.end() || (*current)["original"]!=edit["original"]) continue;
+            bool same=edit["type"]=="boolean"?(*current)["boolean"]==edit["boolean"]:(*current)["text"]==draft_text;
+            if(same) drafts.erase(current);
+            else { (*current)["original"]=original; (*current)["baselineText"]=draft_text; (*current)["baselineBoolean"]=edit["boolean"]; }
             auto text=drafts.dump(); ui_page_set_json(page_,name,text.c_str());
         }
         for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"] && queued["field"]["original"]==edit["original"]) {
@@ -435,6 +422,7 @@ void Application::apply_pending() {
     VisualBatch visual(window_);
     auto ack=take("saveAck");
     const bool cell_ack=!ack.is_null() && active_save_ && ((*active_save_)["kind"]=="passwords" || (*active_save_)["kind"]=="roots");
+    const bool config_ack=!ack.is_null() && active_save_ && !cell_ack;
     if(cell_ack) acknowledge_save(ack);
     auto password_snapshot=take("passwords");
     auto directory_snapshot=take("directories");
@@ -484,11 +472,10 @@ void Application::apply_pending() {
         }
     }
     if(!action.is_null()) set_error("actionError",action.get<std::string>());
-    if(!ack.is_null() && active_save_ && !cell_ack) acknowledge_save(ack);
-    if(!ack.is_null()) ui_page_call_json(page_,"prunePasswordDrafts","{}");
-    if(!ack.is_null() || !directory_snapshot.is_null()) ui_page_call_json(page_,"pruneRootDrafts","{}");
-    if(patch.contains("fields") || !ack.is_null()) sync_toggles();
-    if(patch.contains("fields") || !ack.is_null()) sync_tags();
+    if(config_ack) acknowledge_save(ack);
+    if(cell_ack) ui_page_call_json(page_,"prunePasswordDrafts","{}");
+    if(cell_ack || !directory_snapshot.is_null()) ui_page_call_json(page_,"pruneRootDrafts","{}");
+    if(patch.contains("fields") || config_ack) { sync_toggles(); sync_tags(); }
     for(auto& id:reset_scroll) scroll_top(window_,id.get_ref<const std::string&>());
     // Only an acknowledgement advances the save queue. Data/log publishes
     // must not rewrite pendingFields and rebind hidden editors.
@@ -573,6 +560,7 @@ void Application::bind_controls(const Json& fields) {
         if(!binding) binding=std::make_unique<ControlBinding>(ControlBinding{this,id});
         binding->pending_removal=false;
         binding->editor=editor;
+        binding->type=editor=="recursive"?"string":field["type"].get<std::string>();
         binding->text=field["text"].get<std::string>();
         binding->original=rule_editor(editor)?std::string():field["original"].get<std::string>();
         binding->options=editor=="choice" || editor=="recursive"?field["options"]:Json();
@@ -620,7 +608,7 @@ void Application::bind_controls(const Json& fields) {
                     if(draft["boolean"]==draft["baselineBoolean"] && !self->field_pending(id)) drafts.erase(id); else drafts[id]=std::move(draft);
                     auto encoded=drafts.dump(); ui_page_set_json(self->page_,"toggleDrafts",encoded.c_str());
                     self->save_error(id,"");
-                    self->save_field(id);
+                    if(auto selected=drafts.find(id); selected!=drafts.end()) self->save_field(id,std::move(*selected),binding->type);
                     } catch(const std::exception& e) { self->save_error(binding->id,e.what()); }
                 },binding);
                 ui_widget_add_child(parent,widget); ui_widget_destroy(widget); return;
@@ -646,7 +634,7 @@ void Application::bind_controls(const Json& fields) {
                     if(draft["text"]==draft["baselineText"] && !self->field_pending(id)) drafts.erase(id); else drafts[id]=std::move(draft);
                     auto encoded=drafts.dump(); ui_page_set_json(self->page_,"drafts",encoded.c_str());
                     self->save_error(id,"");
-                    self->save_field(id);
+                    if(auto selected=drafts.find(id); selected!=drafts.end()) self->save_field(id,std::move(*selected),binding->type);
                 } catch(const std::exception& e) { self->set_error("actionError",e.what()); }
             },binding);
             ui_widget_add_child(parent,combo); ui_widget_destroy(combo);
@@ -825,7 +813,7 @@ void Application::handle_command(Json command) {
         date_popup_->show();
         return;
     }
-    if(op=="saveField") { save_field(p.at("id"),p.value("draft",Json())); return; }
+    if(op=="saveField") { save_field(p.at("id"),std::move(p.at("draft")),p.at("type"),p.at("datetimeRange")); return; }
     if(op=="saveRecord") { queue_save(std::move(p)); return; }
     if(op=="openPath" || op=="openTask") {
         auto path=op=="openTask"?task_directory(p):fs::path(wide(p.value("path",std::string())));

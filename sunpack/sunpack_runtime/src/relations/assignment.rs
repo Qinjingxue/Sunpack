@@ -1,5 +1,5 @@
 use super::filename::{NameFeatures, NameProfile, NumberChannel};
-use super::structural::{NumberingStyle, SfxRole, StructuralFacts, VolumeRole};
+use super::structural::{NumberingStyle, SfxRole, StructuralFacts};
 use super::*;
 #[cfg(test)]
 use crate::analysis_native::volume_anchor::RAR_VERSION_5;
@@ -66,13 +66,12 @@ impl BucketView<'_> {
     pub(super) fn legal(&self, i: usize, n: u32, terminal: Option<u32>) -> bool {
         let f = &self.facts[&i];
         n > 0
-            && (f.has_previous != Some(true) || n > 1)
-            && (!matches!(f.role, VolumeRole::First | VolumeRole::FirstAndTerminal) || n == 1)
+            && (!f.continues_from_previous || n > 1)
+            && (!f.first || n == 1)
             && terminal.is_none_or(|end| {
                 n <= end
                     && (f.has_next != Some(true) || n < end)
-                    && (!matches!(f.role, VolumeRole::Terminal | VolumeRole::FirstAndTerminal)
-                        || n == end)
+                    && (!f.terminal || n == end)
             })
     }
 
@@ -602,7 +601,7 @@ pub(super) fn resolve_buckets(
                 // Opaque continuation disks remain candidates just as in each
                 // head's original scope; known other formats were excluded above.
                 if require_family_hint && !f.owned {
-                    let suffix = row.name.split_once('.').map_or("", |(_, s)| s);
+                    let suffix = row.name().split_once('.').map_or("", |(_, s)| s);
                     if archive_family_hint(suffix) != Some(format) {
                         continue;
                     }
@@ -713,7 +712,7 @@ pub(super) fn resolve_buckets(
                     for &i in &members {
                         features.entry(i).or_insert_with(|| cached
                             .and_then(|cache| cache.names.get(&rows[i].path_key)).cloned()
-                            .unwrap_or_else(|| NameFeatures::parse(&rows[i].name)));
+                            .unwrap_or_else(|| NameFeatures::parse(rows[i].name())));
                     }
                     let view = BucketView { rows, indexes: &members, facts: &facts,
                         features: &features, format, loose_numeric_allowed: true };
@@ -738,7 +737,7 @@ pub(super) fn resolve_buckets(
                             cached
                                 .and_then(|c| c.names.get(&rows[i].path_key))
                                 .cloned()
-                                .unwrap_or_else(|| NameFeatures::parse(&rows[i].name))
+                                .unwrap_or_else(|| NameFeatures::parse(rows[i].name()))
                         });
                     }
                 }
@@ -851,7 +850,7 @@ pub(super) fn resolve_buckets(
                     };
                     if profile_matches {
                         launchers
-                            .entry(case_key(&get_logical_name(&rows[i].name, false)))
+                            .entry(case_key(&get_logical_name(rows[i].name(), false)))
                             .or_default()
                             .push(i);
                     }
@@ -864,7 +863,7 @@ pub(super) fn resolve_buckets(
                             cached
                                 .and_then(|c| c.names.get(&rows[*i].path_key))
                                 .cloned()
-                                .unwrap_or_else(|| NameFeatures::parse(&rows[*i].name))
+                                .unwrap_or_else(|| NameFeatures::parse(rows[*i].name()))
                         });
                     }
                     if indexes.is_empty() {
@@ -902,7 +901,7 @@ pub(super) fn resolve_buckets(
                             .and_then(|i| {
                                 features
                                     .get(i)
-                                    .map(|f| filename::logical_name(&rows[*i].name, f, format))
+                                    .map(|f| filename::logical_name(rows[*i].name(), f, format))
                             })
                             .unwrap_or_else(|| family.clone())
                     } else {
