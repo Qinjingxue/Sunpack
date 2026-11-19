@@ -444,11 +444,24 @@ void range_config(Application& app,const fs::path& config_path) {
     DateTestActivation activation;
     auto* popup=open_date(app,date,"lower");
     auto popup_hwnd=popup->Handle();
-    pump([&]{
-        BYTE alpha=0;
-        DWORD flags=0;
-        return GetLayeredWindowAttributes(popup_hwnd,nullptr,&alpha,&flags) && alpha==255 && (flags&LWA_ALPHA);
-    },"Date picker first frame");
+    BYTE alpha=0;
+    DWORD flags=0;
+    bool has_alpha=false;
+    try {
+        pump([&]{
+            has_alpha=GetLayeredWindowAttributes(popup_hwnd,nullptr,&alpha,&flags) && (flags&LWA_ALPHA);
+            if(!has_alpha && !IsWindow(popup_hwnd))
+                throw std::runtime_error("Date picker closed before fade-in completed");
+            return has_alpha && alpha==255;
+        },"Date picker fade-in");
+    } catch(const std::runtime_error& error) {
+        auto* live=date_popup_window(popup_hwnd);
+        if(live!=popup) throw;
+        throw std::runtime_error(std::string(error.what())+
+            " (window visible="+std::to_string(IsWindowVisible(popup_hwnd)!=FALSE)+
+            ", alpha="+(has_alpha?std::to_string(alpha):"unavailable")+
+            ", root opacity="+std::to_string(live->Root()->opacity)+")");
+    }
     assert(GetActiveWindow()!=popup_hwnd);
     assert(popup_text(*popup,"dateSelected")==L"2024-01-31");
     {
