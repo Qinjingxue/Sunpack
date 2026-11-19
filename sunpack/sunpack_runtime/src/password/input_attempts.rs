@@ -966,19 +966,42 @@ impl DeferredReads {
         }
     }
 
+    pub(crate) fn has_single_path(&self) -> bool {
+        let graph = &self.projection.topology;
+        let mut ends = graph.ends.iter().zip(&self.projection.ends).filter(|(_, active)| **active);
+        let Some((&(_, _, case, _), _)) = ends.next() else { return false; };
+        ends.next().is_none() &&
+            self.projection.active.iter().filter(|&&active| active).count() == graph.case_layouts[case].1
+    }
+
+    pub(crate) fn read_single<T>(&self, read: impl FnOnce(&mut DeferredReader<'_>) -> T) -> T {
+        let mut reader = AttemptReader::new(&self.sources, Arc::clone(&self.projection));
+        reader.preserve_unreadable = true;
+        read(&mut DeferredReader { reader, disk_relative: self.disk_relative })
+    }
+
     pub(crate) fn active_ranges_are_ambiguous(
         &self,
-        mut ranges: impl Iterator<Item = (u64, u64)> + Clone,
+        mut ranges: impl Iterator<Item = (u64, u64)>,
     ) -> bool {
+        let overlaps = self.active_range_filter();
+        ranges.any(|(start, size)| overlaps(start, size))
+    }
+
+    pub(crate) fn active_range_filter(&self) -> impl Fn(u64, u64) -> bool + '_ {
         debug_assert!(!self.disk_relative);
-        if !ranges.clone().any(|(start, size)| self.range_is_ambiguous(start, size)) {
-            return false;
+        let ranges = std::cell::OnceCell::<Vec<(u64, u64)>>::new();
+        move |start, size| {
+            if let Some(ranges) = ranges.get() {
+                return overlaps_range(ranges, start, size);
+            }
+            self.range_is_ambiguous(start, size)
+                && overlaps_range(ranges.get_or_init(|| {
+                    // Anchor or descriptor reads may already have removed some mappings.
+                    let active = self.projection.topology.edges.iter().zip(&self.projection.active);
+                    ambiguous_logical_ranges(active.filter_map(|(edge, &active)| active.then_some(edge)))
+                }), start, size)
         }
-        // A sufficient prefix may already have pinned the only source in
-        // this projection. Only unreconciled geometry can hide another key.
-        let active = self.projection.topology.edges.iter().zip(&self.projection.active);
-        let ambiguous = ambiguous_logical_ranges(active.filter_map(|(edge, &active)| active.then_some(edge)));
-        ranges.any(|(start, size)| overlaps_range(&ambiguous, start, size))
     }
 
     pub(crate) fn disk_range_is_ambiguous(&self, disk: usize, offset: u64, size: u64) -> bool {
@@ -1116,6 +1139,10 @@ impl AttemptReader<'_> {
 
     pub(crate) fn range_is_ambiguous(&self, start: u64, size: u64) -> bool {
         self.projection.topology.range_is_ambiguous(start, size)
+    }
+
+    pub(in crate::password) fn disk_range_is_ambiguous(&self, disk: usize, offset: u64, size: u64) -> bool {
+        self.projection.topology.disk_range_is_ambiguous(disk, offset, size)
     }
 
     pub(in crate::password) fn last_ambiguous_native_disk(&self, after: usize) -> Option<usize> {

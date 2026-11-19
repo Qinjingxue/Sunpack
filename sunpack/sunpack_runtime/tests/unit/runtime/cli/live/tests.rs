@@ -168,13 +168,14 @@ fn flatten_relocates_visible_and_buffered_descendant_outputs() {
         result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None,
             output: Some("root/wrapper/leaf/nested".into()) },
     });
-    let (old, new) = (std::path::Path::new("root/wrapper/leaf"), std::path::Path::new("root"));
-    reports.notify(Event::OutputsRelocated { id: 1, old: old.to_owned(), new: new.to_owned() });
+    let root = std::path::Path::new("root");
+    let (old, new) = (std::path::Path::new("root/wrapper/leaf"), std::path::Path::new("leaf"));
+    reports.notify(Event::OutputsRelocated { id: 1, root: root.to_owned(), old: old.to_owned(), new: new.to_owned() });
     for event in reports.take_events() {
         panel.update(&terminal, Language::En, event, false);
     }
-    for (id, expected) in [(2, "root/nested"), (3, "root/nested/deep"),
-                           (4, "root"), (5, "elsewhere/output"), (6, "root/queued")] {
+    for (id, expected) in [(2, "leaf/nested"), (3, "leaf/nested/deep"),
+                           (4, "leaf"), (5, "elsewhere/output"), (6, "leaf/queued")] {
         let Phase::Finished(result) = &panel.tasks[&id].phase else { panic!("expected completion for {id}"); };
         assert_eq!(result.output.as_deref(), Some(std::path::Path::new(expected)));
     }
@@ -182,7 +183,7 @@ fn flatten_relocates_visible_and_buffered_descendant_outputs() {
     // spelling, determines the relocation's visit set.
     let Phase::Finished(result) = &mut panel.tasks.get_mut(&5).unwrap().phase else { panic!("expected completion"); };
     result.output = Some("root/wrapper/leaf/unrelated".into());
-    panel.relocate_outputs(1, old, new);
+    panel.relocate_outputs(1, root, old, new);
     let Phase::Finished(result) = &mut panel.tasks.get_mut(&5).unwrap().phase else { panic!("expected completion"); };
     assert_eq!(result.output.as_deref(),
         Some(std::path::Path::new("root/wrapper/leaf/unrelated")));

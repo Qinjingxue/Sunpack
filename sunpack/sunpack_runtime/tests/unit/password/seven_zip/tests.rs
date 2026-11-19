@@ -71,13 +71,17 @@ fn payload_prefix_collisions_survive_until_complete_header_evidence() {
 const AES_LZMA2_FOLDER: &[u8] = &[2, 0x24, 6, 0xf1, 7, 1, 1, 0x3f, 0x21, 0x21, 1, 0, 1, 0];
 
 fn direct_key_ciphertext(plaintext: &[u8]) -> Vec<u8> {
-    use aes::cipher::{block_padding::NoPadding, BlockModeEncrypt, KeyIvInit};
     let mut key = [0; 32];
     key[..12].copy_from_slice(b"s\0e\0c\0r\0e\0t\0");
+    encrypt_payload_fixture(plaintext, &key)
+}
+
+fn encrypt_payload_fixture(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    use aes::cipher::{block_padding::NoPadding, BlockModeEncrypt, KeyIvInit};
     let mut encrypted = plaintext.to_vec();
     let length = plaintext.len().next_multiple_of(16);
     encrypted.resize(length, 0);
-    cbc::Encryptor::<aes::Aes256>::new(&key.into(), &[0; 16].into())
+    cbc::Encryptor::<aes::Aes256>::new(key.into(), &[0; 16].into())
         .encrypt_padded::<NoPadding>(&mut encrypted, length)
         .unwrap();
     encrypted
@@ -135,23 +139,30 @@ fn alternate_short_prefix_rejects_without_reading_first_stream_successor() {
     stream.extend([0x4a; 45]);
     stream.push(0);
     let first = direct_key_ciphertext(&stream);
-    let other = direct_key_ciphertext(&[0xff; 32]);
     let mut header = vec![1, 4, 6, 0, 2, 9, first.len() as u8, 32, 0, 7, 11, 2, 0];
     header.extend(AES_LZMA2_FOLDER);
-    header.extend(AES_LZMA2_FOLDER);
-    header.extend([12, stream.len() as u8, 90, 32, 1, 0, 0, 0]);
-    let mut body = first;
-    body.extend(other);
-    let reader = ManagedReader::from_bytes(archive_with_descriptor(&body, &header), Default::default());
-    let evidence = FixedSevenZipEvidence(Arc::new([RangeSpec::entire(&reader)]));
-    let context = prepare_seven_zip(reader.stream_cursor(), reader.len(), &evidence).ok().unwrap();
-    let before = reader.stats().read_bytes;
-    // Both candidates pass the first prefix. The direct-key fixture truncates
-    // the second password after its first sixteen UTF-16 code units.
+    let mut other_folder = AES_LZMA2_FOLDER.to_vec();
+    other_folder[7] = 0;
+    header.extend(other_folder);
+    header.extend([12, stream.len() as u8, 90, 32, 28, 0, 0, 0]);
+    // The first stream uses a direct key and truncates the password. The
+    // other stream uses a one-round SHA-256 key and distinguishes the suffix.
     let equivalent = format!("secret{}second", "\0".repeat(10));
-    let rejected = context.verify(&[Arc::from("secret"), Arc::from(equivalent)]).unwrap();
-    assert_eq!(rejected.status, "no_match");
-    assert_eq!(reader.stats().read_bytes - before, 32);
+    let key = <sha2_11::Sha256 as sha2_11::Digest>::digest(b"s\0e\0c\0r\0e\0t\0\0\0\0\0\0\0\0\0").into();
+    let mut valid = [0xa9; 32];
+    valid[..3].copy_from_slice(&[1, 0, 27]);
+    valid[31] = 0;
+    for (plain, expected) in [([0xff; 32], &[][..]), (valid, &[0][..])] {
+        let mut body = first.clone();
+        body.extend(encrypt_payload_fixture(&plain, &key));
+        let reader = ManagedReader::from_bytes(archive_with_descriptor(&body, &header), Default::default());
+        let evidence = FixedSevenZipEvidence(Arc::new([RangeSpec::entire(&reader)]));
+        let context = prepare_seven_zip(reader.stream_cursor(), reader.len(), &evidence).ok().unwrap();
+        let before = reader.stats().read_bytes;
+        let proof = context.verify(&[Arc::from("secret"), Arc::from(equivalent.as_str())]).unwrap();
+        assert_eq!(proof.matched_indices, expected);
+        assert_eq!(reader.stats().read_bytes - before, 32);
+    }
 }
 
 #[test]
@@ -187,6 +198,8 @@ fn projected_packed_crc_prunes_before_password_screening() {
 
 #[test]
 fn projected_lzma2_successor_removes_bad_cbc_source_after_prefix_survives() {
+    use crate::io::archive_state::{VolumeDomain, VolumeSlot};
+
     // Two LZMA2 blocks have known controls and lengths, and their intervening
     // bodies need no scan. The end marker's CBC predecessor is on the disputed
     // volume, beyond the first successor already checked in the common head.
@@ -195,21 +208,48 @@ fn projected_lzma2_successor_removes_bad_cbc_source_after_prefix_survives() {
     stream.extend([2, 0, 44]);
     stream.extend([0x4a; 45]);
     stream.push(0);
-    let encrypted = direct_key_ciphertext(&stream);
-    let mut header = vec![1, 4, 6, 0, 1, 9, encrypted.len() as u8, 0, 7, 11, 1, 0];
+    let mut encrypted = direct_key_ciphertext(&stream);
+    let fixed_start = SEVEN_Z_HEADER_SIZE + encrypted.len();
+    let packed = encrypted.len() as u8;
+    let mut header = vec![1, 4, 6, 0, 2, 9, packed, packed, 0, 7, 11, 2, 0];
     header.extend(AES_LZMA2_FOLDER);
-    header.extend([12, stream.len() as u8, 90, 0, 0, 0]);
+    header.extend(AES_LZMA2_FOLDER);
+    header.extend([12, stream.len() as u8, 90, stream.len() as u8, 90, 0, 0, 0]);
+    encrypted.extend(direct_key_ciphertext(&stream));
     let archive = archive_with_descriptor(&encrypted, &header);
-    let (paths, sources, plan) = uncertain_tail_fixture_at(&archive, &[], 112);
-    let context = prepare_seven_zip_attempts(&sources[0], &plan, &[], None)
+    let (mut paths, mut sources, mut plan) = uncertain_tail_fixture_at(&archive[..fixed_start], &[], 112);
+    let fixed_path = crate::test_support::temp_file("7z_fixed_tail", &archive[fixed_start..]);
+    sources.push(InputExtent {
+        path: fixed_path.to_string_lossy().into_owned(),
+        start: 0,
+        end: Some((archive.len() - fixed_start) as u64),
+    });
+    paths.push(fixed_path);
+    let input = Arc::make_mut(&mut plan);
+    input.sources = sources.clone().into_boxed_slice();
+    input.minimum_size = Some(archive.len() as u64);
+    let mut slots = input.layouts[0].slots.to_vec();
+    slots.push(VolumeSlot { number: 3, canonical_name: "x.003".into(), domain: 2 });
+    input.layouts[0].slots = slots.into_boxed_slice();
+    let mut domains = input.domains.to_vec();
+    domains.push(VolumeDomain { choices: Arc::new(vec![sources.len() - 1]) });
+    input.domains = domains.into_boxed_slice();
+
+    let session = NativeArchiveSession::new(sources.last().unwrap().path.clone()).unwrap();
+    let (_, fixed_tail) = session.borrowed_reader();
+    let context = prepare_seven_zip_attempts(&sources[0], &plan, std::slice::from_ref(&session), None)
         .unwrap_or_else(|_| panic!("LZMA2 projected header"));
     let PasswordContext::Evidence(evidence) = context else {
         panic!("the common prefix should retain separate successor sources");
     };
+    let before = fixed_tail.stats().direct_read_bytes;
     let proof = evidence.verify_batch(&[Arc::from("secret")], true, true).unwrap();
     assert_eq!(proof.matched_indices, [0]);
     assert!(!proof.volume_attempts.unwrap().sources.iter().any(|source| source.path == sources[1].path));
+    assert_eq!(fixed_tail.stats().direct_read_bytes, before);
     drop(evidence);
+    drop(fixed_tail);
+    drop(session);
     for path in paths { std::fs::remove_file(path).unwrap(); }
 }
 

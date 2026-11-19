@@ -43,6 +43,7 @@ extern "C" __declspec(dllimport) void __cdecl SetOaNoCache();
 #include "internal/extraction_replay.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/password_parallel.hpp"
+#include "internal/password_proof_property.hpp"
 #include "internal/sevenzip_streams.hpp"
 #include "7zip/Crypto/7zAes.h"
 #include "7zip/Crypto/Rar5Aes.h"
@@ -655,6 +656,7 @@ struct PreparedAttempt {
     std::size_t layout = 0;
     std::vector<std::size_t> sources;
     std::optional<sunpack::sevenzip::PasswordTestResult> probe;
+    bool missing_without_probe = false;
 };
 
 // A logical stream clamps every slice to physical EOF. Confirm its geometry
@@ -751,10 +753,10 @@ public:
         return nullptr;
     }
 
-    void remember(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt, std::size_t capacity) {
-        if (!attempt.probe) return;
+    bool remember(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt, std::size_t capacity) {
+        if (!attempt.probe) return false;
         const auto& observed = attempt.probe->observed_volume_slots;
-        if (!observed || find(plan, attempt) || !geometry.known(plan, attempt.layout)) return;
+        if (!observed || find(plan, attempt) || !geometry.known(plan, attempt.layout)) return false;
         while (entries_.size() >= capacity) entries_.pop_front();
         Entry entry{attempt.layout, {}, *attempt.probe, {}, 0};
         entry.sources.reserve(observed->size());
@@ -765,6 +767,7 @@ public:
             for (const auto source : attempt.sources) entry.sizes.push_back(size_of(plan, source));
         }
         entries_.push_back(std::move(entry));
+        return true;
     }
 };
 
@@ -792,7 +795,8 @@ sunpack::sevenzip::PasswordTestResult probe_input(const WorkerRequest& request, 
     const auto& plan = request.archive_input.volume_attempts;
     auto proof = test_password_batch(input.archive_path, input.part_paths, input.ranges, request.archive_input.format_hint,
         candidates.empty() ? &request.password : candidates.data(), count, input.canonical_names, request.scan_only, false,
-        domain ? domain->data() : nullptr, plan.layouts.empty() ? nullptr : &plan, final_volume_choice);
+        domain ? domain->data() : nullptr, plan.layouts.empty() ? nullptr : &plan, final_volume_choice,
+        request.password_verified && count == 1);
     if (gap) {
         proof.missing_volume = true;
         proof.rejects_fixed_geometry = false;
@@ -800,6 +804,13 @@ sunpack::sevenzip::PasswordTestResult probe_input(const WorkerRequest& request, 
         if (proof.status != PasswordTestStatus::Ok) proof.status = PasswordTestStatus::NeedsVolumeOrTailDamaged;
     }
     return proof;
+}
+
+bool rejects_volume_attempt(const sunpack::sevenzip::PasswordTestResult& probe) {
+    using sunpack::sevenzip::PasswordTestStatus;
+    return probe.status == PasswordTestStatus::WrongPassword ||
+        (probe.status == PasswordTestStatus::Damaged && probe.operation_result == kSunpackZipLocalHeaderConflict &&
+            probe.observed_volume_slots && !probe.observed_volume_slots->empty());
 }
 
 std::size_t rejected_prefix_size(const sunpack::sevenzip::PasswordTestResult& probe, std::size_t slots) {
@@ -810,7 +821,8 @@ std::size_t rejected_prefix_size(const sunpack::sevenzip::PasswordTestResult& pr
 }
 
 std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
-    sunpack::sevenzip::VolumeAttemptCursor& next, const std::atomic<bool>* cancel, VolumeProbeCache& cache) {
+    sunpack::sevenzip::VolumeAttemptCursor& next, const std::atomic<bool>* cancel, VolumeProbeCache& cache,
+    bool preceding_rejected = true) {
     using namespace sunpack::sevenzip;
     const auto& plan = request.archive_input.volume_attempts;
     std::deque<PreparedAttempt> prepared_attempts;
@@ -828,7 +840,7 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
             // An earlier uncached composition can still win. Nothing after
             // this confirmed one is needed, including cursor advancement.
             if (cached->status == PasswordTestStatus::Ok) break;
-            if (cached->status == PasswordTestStatus::WrongPassword) {
+            if (rejects_volume_attempt(*cached)) {
                 const auto prefix = rejected_prefix_size(*cached, prepared.sources.size());
                 if ((cached->rejects_fixed_geometry || prefix) && cache.can_skip_suffix(plan, prepared.layout)) {
                     // Keep the witness in the wave for the scan report and
@@ -840,14 +852,19 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
             }
         } else pending.push_back(i);
     }
-    if (request.scan_only && request.password_verified && next.attempts == 1 && pending.size() == 1) {
-        // Check uniqueness before the first member probe. A single-CPU wave
-        // must keep its cursor unchanged when a second composition exists.
+    std::optional<std::size_t> scan_last;
+    if (request.scan_only && request.password_verified && preceding_rejected && !pending.empty() &&
+        pending.back() + 1 == prepared_attempts.size()) {
+        // Reserve the last possible scan composition until the preceding
+        // probes finish. They still run as a normal parallel wave.
         if (!exhausted) {
             auto lookahead = next;
             exhausted = !lookahead.next(plan, cancel);
         }
-        if (exhausted && (!cancel || !cancel->load(std::memory_order_relaxed))) return prepared_attempts;
+        if (exhausted && (!cancel || !cancel->load(std::memory_order_relaxed))) {
+            scan_last = pending.back();
+            pending.pop_back();
+        }
     }
     std::optional<std::size_t> final_choice;
     if (!request.scan_only && !pending.empty() && pending.back() + 1 == prepared_attempts.size() &&
@@ -861,27 +878,68 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
     }
     const auto capacity = parallel.size();
     parallel.limit(pending.size());
+    const bool concurrent = pending.size() > 1;
+    std::mutex cache_mutex;
+    std::atomic<bool> published{false};
 #ifdef SUP7Z_DEBUG
-    cache.scheduled_probes += pending.size();
+    std::atomic<std::size_t> scheduled{0};
 #endif
     std::atomic<std::size_t> earliest{prepared_attempts.size()};
-    parallel.run(pending.size(), [&](std::size_t task, std::size_t) {
-        const auto lane = pending[task];
-        if (lane > earliest.load()) return;
+    const auto probe_lane = [&](std::size_t lane) {
+        if (lane > earliest.load(std::memory_order_relaxed)) return;
         auto& prepared = prepared_attempts[lane];
-        WorkerArchiveInput input;
-        select_volume_attempt(request.archive_input, prepared.layout, prepared.sources, input);
-        prepared.probe = probe_input(request, input, request.passwords_for_layout(prepared.layout), final_choice == lane);
-        if (prepared.probe->status == PasswordTestStatus::Ok) {
-            auto old = earliest.load();
-            while (lane < old && !earliest.compare_exchange_weak(old, lane)) {}
+        // Thread admission and scheduling can leave a lane pending while a
+        // preceding one has already proved the same observed input.
+        if (published.load(std::memory_order_relaxed)) {
+            std::lock_guard lock(cache_mutex);
+            if (const auto* prior = cache.find(plan, prepared)) prepared.probe = *prior;
         }
-    });
-    if (earliest.load() < prepared_attempts.size()) prepared_attempts.resize(earliest.load() + 1);
-    if (!native_job_cancelled()) for (const auto lane : pending) {
-        if (lane >= prepared_attempts.size()) break;
-        cache.remember(plan, prepared_attempts[lane], capacity);
+        const bool decoded = !prepared.probe;
+        if (decoded) {
+#ifdef SUP7Z_DEBUG
+            scheduled.fetch_add(1, std::memory_order_relaxed);
+#endif
+            WorkerArchiveInput input;
+            select_volume_attempt(request.archive_input, prepared.layout, prepared.sources, input);
+            prepared.probe = probe_input(request, input, request.passwords_for_layout(prepared.layout), final_choice == lane);
+        }
+        if (prepared.probe->status == PasswordTestStatus::Ok) {
+            auto old = earliest.load(std::memory_order_relaxed);
+            while (lane < old && !earliest.compare_exchange_weak(old, lane, std::memory_order_relaxed)) {}
+        }
+        if (decoded && prepared.probe->observed_volume_slots && !native_job_cancelled() &&
+            lane <= earliest.load(std::memory_order_relaxed)) {
+            if (!concurrent) {
+                cache.remember(plan, prepared, capacity);
+            } else {
+                std::lock_guard lock(cache_mutex);
+                if (cache.remember(plan, prepared, capacity)) published.store(true, std::memory_order_relaxed);
+            }
+        }
+    };
+    parallel.run(pending.size(), [&](std::size_t task, std::size_t) { probe_lane(pending[task]); });
+    if (scan_last && earliest.load(std::memory_order_relaxed) > *scan_last &&
+        !native_job_cancelled() && (!cancel || !cancel->load(std::memory_order_relaxed))) {
+        if (std::all_of(prepared_attempts.begin(), std::prev(prepared_attempts.end()), [](const auto& attempt) {
+                return attempt.probe && rejects_volume_attempt(*attempt.probe);
+            })) {
+            auto& last = prepared_attempts.back();
+            if (const auto* cached = cache.find(plan, last)) {
+                last.probe = *cached;
+            } else {
+                WorkerArchiveInput input;
+                select_volume_attempt(request.archive_input, last.layout, last.sources, input);
+                last.missing_without_probe = input.missing_volume_number != 0;
+            }
+        } else {
+            parallel.run(1, [&](std::size_t, std::size_t) { probe_lane(*scan_last); });
+        }
     }
+#ifdef SUP7Z_DEBUG
+    cache.scheduled_probes += scheduled.load(std::memory_order_relaxed);
+#endif
+    const auto winner = earliest.load(std::memory_order_relaxed);
+    if (winner < prepared_attempts.size()) prepared_attempts.resize(winner + 1);
     return prepared_attempts;
 }
 
@@ -900,6 +958,9 @@ bool same_volume_prefix(const std::vector<std::size_t>& left, const std::vector<
 
 RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* cancel) {
     using namespace sunpack::sevenzip;
+    const auto cancelled = [&] {
+        return cancel ? cancel->load(std::memory_order_acquire) : native_job_cancelled();
+    };
     const auto& input = request.archive_input;
     const bool ambiguous = !input.volume_attempts.layouts.empty();
     PasswordTestResult probe;
@@ -921,6 +982,7 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
             VolumeAttemptCursor cursor;
             cursor.reserve(plan);
             bool rejected_prefix = false;
+            bool password_rejected = false;
             bool frontier_found = false;
             std::string discarded_paths;
             std::string discarded_prefixes;
@@ -928,35 +990,53 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
             VolumeProbeCache proof_cache(plan);
             std::optional<std::size_t> skipped_layout;
             while (!tested) {
-                auto wave = probe_volume_wave(request, cursor, cancel, proof_cache);
+                auto wave = probe_volume_wave(request, cursor, cancel, proof_cache, !frontier_found);
+                if (cancelled()) break;
                 if (wave.empty()) break;
                 const PreparedAttempt* skipped_prefix = nullptr;
                 std::size_t skipped_slots = 0;
                 for (auto& candidate : wave) {
-                    if (!candidate.probe && verified) {
-                        fields += wire::key("volume_selection");
-                        append_volume_selection(fields, candidate.layout, candidate.sources);
-                        tested = true;
-                        break;
-                    }
                     if (skipped_layout == candidate.layout) continue;
                     if (skipped_prefix && skipped_prefix->layout == candidate.layout &&
                         same_volume_prefix(skipped_prefix->sources, candidate.sources, skipped_slots)) continue;
+                    if (!candidate.probe && verified) {
+                        if (rejected_prefix) {
+                            fields += wire::key("first_remaining_volume");
+                            append_volume_selection(fields, candidate.layout, candidate.sources);
+                        }
+                        if (candidate.missing_without_probe) {
+                            ok = false;
+                            if (!input.missing_volume_number)
+                                fields += wire::key("missing_volume") + wire::boolean(true) +
+                                    wire::key("missing_volume_evidence") + wire::text("structured_volume_gap") +
+                                    wire::key("failure_kind") + wire::text("missing_volume");
+                        } else {
+                            fields += wire::key("volume_selection");
+                            append_volume_selection(fields, candidate.layout, candidate.sources);
+                        }
+                        tested = true;
+                        break;
+                    }
                     probe = std::move(*candidate.probe);
-                    const bool rejected = probe.status == PasswordTestStatus::WrongPassword;
+                    const bool rejected = rejects_volume_attempt(probe);
+                    const bool wrong_password = probe.status == PasswordTestStatus::WrongPassword;
+                    password_rejected |= wrong_password;
+                    // A structural contradiction remains excluded even if
+                    // later password rejections leave this scan inconclusive.
+                    const bool record_rejection = frontier_found || (rejected && !wrong_password);
                     const auto prefix = rejected ? rejected_prefix_size(probe, candidate.sources.size()) : 0;
                     if (probe.rejects_fixed_geometry && proof_cache.can_skip_suffix(plan, candidate.layout)) {
                         skipped_layout = candidate.layout;
-                        if (frontier_found) wire::append_number(discarded_layouts, candidate.layout);
+                        if (record_rejection) wire::append_number(discarded_layouts, candidate.layout);
                         if (cursor.layout == candidate.layout && !cursor.searching) cursor.skip_layout();
                     } else if (prefix && proof_cache.can_skip_suffix(plan, candidate.layout)) {
                         skipped_prefix = &candidate;
                         skipped_slots = prefix;
-                        if (frontier_found) append_volume_selection(discarded_prefixes, candidate.layout, candidate.sources, prefix);
+                        if (record_rejection) append_volume_selection(discarded_prefixes, candidate.layout, candidate.sources, prefix);
                         if (cursor.layout == candidate.layout && !cursor.searching &&
                             same_volume_prefix(candidate.sources, cursor.selected, prefix))
                             cursor.skip_suffix(plan, prefix - 1);
-                    } else if (rejected && frontier_found) {
+                    } else if (rejected && record_rejection) {
                         append_volume_selection(discarded_paths, candidate.layout, candidate.sources);
                     }
                     if (!frontier_found && rejected) rejected_prefix = true;
@@ -969,7 +1049,7 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
                     }
                     if (probe.status == PasswordTestStatus::Ok) { tested = true; break; }
                 }
-                if (native_job_cancelled()) return interrupted_result(request.job_id);
+                if (cancelled()) break;
             }
             if (!discarded_paths.empty())
                 fields += wire::key("discarded_volume_paths") + wire::array() + discarded_paths + wire::end();
@@ -980,7 +1060,8 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
             // Unavailable evidence leaves the corresponding scan input pending.
             if (!tested && !frontier_found && rejected_prefix) {
                 ok = false;
-                fields += wire::key("failure_kind") + wire::text(verified ? "missing_volume" : "password_or_volume_inconclusive") +
+                fields += wire::key("failure_kind") + wire::text(verified || !password_rejected
+                    ? "missing_volume" : "password_or_volume_inconclusive") +
                     wire::key("volume_candidates_exhausted") + wire::boolean(true);
             }
         } else {
@@ -993,7 +1074,7 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
                     memory->owner.retry(*memory);
                 if (memory->revoked.load(std::memory_order_acquire)) return {kMemoryRetry, {}};
             }
-            if (native_job_cancelled()) return interrupted_result(request.job_id);
+            if (cancelled()) return interrupted_result(request.job_id);
             verified |= probe.status == PasswordTestStatus::Ok && probe.encrypted;
             ok = ok && (probe.status == PasswordTestStatus::Ok || probe.weak_match || ambiguous);
             if (!ambiguous && !input.missing_volume_number && probe.status == PasswordTestStatus::Ok && probe.missing_volume) {
@@ -1231,12 +1312,13 @@ RequestOutcome run_request(
             if (memory->revoked.load(std::memory_order_acquire)) return {kMemoryRetry, {}};
         }
         if (cancel_token && cancel_token->load(std::memory_order_acquire)) return interrupted_result(job_id);
-        if (selected_probe && selected_probe->status == PasswordTestStatus::WrongPassword) {
+        if (selected_probe && rejects_volume_attempt(*selected_probe)) {
             if (volume_trials) {
 #ifdef SUP7Z_DEBUG
                 ++volume_replay->rejected_compositions;
 #endif
-                volume_replay->volume_password_ambiguous |= !request.password_verified;
+                volume_replay->volume_password_ambiguous |=
+                    !request.password_verified && selected_probe->status == PasswordTestStatus::WrongPassword;
                 auto& cursor = volume_replay->volumes;
                 const auto& plan = request.archive_input.volume_attempts;
                 const auto prefix = rejected_prefix_size(*selected_probe, cursor.selected.size());

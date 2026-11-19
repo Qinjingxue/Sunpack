@@ -425,7 +425,8 @@ public:
 
 
   HRESULT CheckDescriptor(const CItemEx &item);
-  HRESULT Read_LocalItem_After_CdItem(CItemEx &item, bool &isAvail, bool &headersError);
+  enum class CLocalItemRead { HeaderError, Unavailable, Conflict };
+  HRESULT Read_LocalItem_After_CdItem(CItemEx &item, CLocalItemRead &result, bool &headersError);
   HRESULT Read_LocalItem_After_CdItem_Full(CItemEx &item);
 
   HRESULT GetItemStream(const CItemEx &item, bool seekPackData, CMyComPtr<ISequentialInStream> &stream);

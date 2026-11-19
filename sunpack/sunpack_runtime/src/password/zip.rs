@@ -376,26 +376,62 @@ fn check_password_directory(
     Err(invalid_password_directory())
 }
 
-// Share Relations' descriptor/ZIP64 normalization. Only comparable fields
-// establish a contradiction; masked local fields are not negative evidence.
-fn compare_zip_entry(central: &[u8], central_variable: &[u8], sizes: &zip64::CentralValues, local: &[u8], local_variable: &[u8]) -> Result<(), PreparedStatus> {
+struct ZipDirectoryEntry<'a> {
+    fixed: &'a [u8],
+    variable: &'a [u8],
+    sizes: zip64::CentralValues,
+    disk: usize,
+    offset: u64,
+}
+
+// Share Relations' descriptor/ZIP64 normalization. Without a shared anchor,
+// use only contradictions that the decoder cannot tolerate.
+fn compare_zip_entry(
+    directory: &ZipDirectoryEntry<'_>, local: &[u8], local_variable: &[u8],
+    known_anchor: bool, ambiguous: impl Fn(bool) -> bool,
+) -> Result<(), PreparedStatus> {
     use crate::formats::zip::RelationLocalFields;
+    let ZipDirectoryEntry { fixed: central, variable: central_variable, sizes, .. } = directory;
     let flags = le_u16(local, 6).unwrap();
-    if flags & 0x2000 != 0 {
+    let central_flags = le_u16(central, 8).unwrap();
+    if (flags | central_flags) & 0x2000 != 0 {
         return Err(PreparedStatus::new("unsupported_method", "ZIP local fields are masked"));
     }
-    let central_name = le_u16(central, 28).unwrap() as usize;
-    let local_name = le_u16(local, 26).unwrap() as usize;
+    let central_name = &central_variable[..le_u16(central, 28).unwrap() as usize];
+    let local_name_len = le_u16(local, 26).unwrap() as usize;
+    let local_name = &local_variable[..local_name_len];
     let mut local_sizes = [0; 46];
     if flags & 8 == 0 { local_sizes[20..28].copy_from_slice(&local[18..26]); }
-    let lf = zip64::central_entry_values(&local_sizes, &local_variable[local_name..]).ok_or_else(invalid_password_directory)?;
-    let expected = RelationLocalFields::new(le_u16(central, 10).unwrap(), le_u16(central, 8).unwrap(),
-        le_u32(central, 16).unwrap(), sizes.compressed, sizes.uncompressed);
-    let actual = RelationLocalFields::new(le_u16(local, 8).unwrap(), flags, le_u32(local, 14).unwrap(), lf.compressed, lf.uncompressed);
-    if central_variable[..central_name] != local_variable[..local_name] || expected != actual {
-        return Err(PreparedStatus::new("invalid_volume_evidence", "ZIP directory and local entry contradict each other"));
+    let lf = zip64::central_entry_values(&local_sizes, &local_variable[local_name_len..]).ok_or_else(invalid_password_directory)?;
+    let method = le_u16(local, 8).unwrap();
+    let central_method = le_u16(central, 10).unwrap();
+    let crc = le_u32(local, 14).unwrap();
+    let central_crc = le_u32(central, 16).unwrap();
+    let expected = RelationLocalFields::new(central_method, central_flags, central_crc, sizes.compressed, sizes.uncompressed);
+    let actual = RelationLocalFields::new(method, flags, crc, lf.compressed, lf.uncompressed);
+    if central_name == local_name && expected == actual {
+        return Ok(());
     }
-    Ok(())
+    // Some writers differ in encoding, slashes, nonessential flags or omit
+    // the central CRC. Those differences alone cannot rule out a layout.
+    let required_fields_conflict = method != central_method || (flags ^ central_flags) & 0x0041 != 0
+        || ((flags | central_flags) & 8 == 0 && (lf.compressed != sizes.compressed
+            || lf.uncompressed != sizes.uncompressed || (central_crc != 0 && central_crc != crc)));
+    let names_conflict = || {
+        let legacy_name_encoding = central[5] == 0 && (25..=40).contains(&central[4]);
+        let normalized = |byte| if byte == b'\\' { b'/' } else { byte };
+        central_name != local_name && !legacy_name_encoding
+            && central_name.is_ascii() && !central_name.contains(&0)
+            && local_name.is_ascii() && !local_name.contains(&0)
+            && !central_name.iter().copied().map(normalized).eq(local_name.iter().copied().map(normalized))
+    };
+    let status = if known_anchor || (required_fields_conflict && ambiguous(false))
+        || (names_conflict() && ambiguous(true)) {
+        "invalid_volume_evidence"
+    } else {
+        "unknown_needs_final_verifier"
+    };
+    Err(PreparedStatus::new(status, "ZIP directory and local entry differ"))
 }
 
 // The directory parser works in disk coordinates for both concrete volumes
@@ -403,6 +439,7 @@ fn compare_zip_entry(central: &[u8], central_variable: &[u8], sizes: &zip64::Cen
 trait ZipVolumeReader {
     fn len(&self) -> usize;
     fn volume_len(&self, disk: usize) -> Option<u64>;
+    fn range_is_ambiguous(&self, _disk: usize, _offset: u64, _size: u64) -> bool { false }
     fn read_disk_spanning_field(&self, disk: usize, offset: u64, size: usize,
         field: &'static str, location: FieldLocation) -> Result<Vec<u8>, ReadFault>;
     fn read_proof_field(&self, disk: usize, offset: u64, size: usize,
@@ -471,6 +508,11 @@ impl CertainZipVolumes<'_, '_> {
 }
 impl ZipVolumeReader for CertainZipVolumes<'_, '_> {
     fn len(&self) -> usize { self.count }
+    fn range_is_ambiguous(&self, disk: usize, offset: u64, size: u64) -> bool {
+        let reader = self.reader.borrow();
+        if self.spanned { reader.disk_range_is_ambiguous(disk, offset, size) }
+        else { reader.range_is_ambiguous(offset, size) }
+    }
     fn advance_disk_offset(&self, disk: usize, offset: u64, amount: u64) -> Option<(usize, u64)> {
         if !self.spanned {
             let end = offset.checked_add(amount)?;
@@ -667,13 +709,13 @@ fn prepare_zip_volume_directory(
                 // ZIP members can use different passwords. The directory may
                 // only refine a shared anchor by describing that same member.
                 if anchor.is_some() && !same_anchor_position(entry) { return Ok(None); }
-                prepare_zip_volume_entry_checked(volumes, entry.0, entry.1, Some((&fixed, &variable, values)), anchor)
-                    .map(Some)
+                let central = ZipDirectoryEntry { fixed: &fixed, variable: &variable, sizes: values, disk, offset };
+                prepare_zip_volume_entry_checked(volumes, entry.0, entry.1, Some(&central), anchor).map(Some)
             })();
             match context {
                 Ok(Some(context)) => return Ok(context),
                 Ok(None) => {}
-                Err(error @ PreparedStatus::Status("invalid_volume_evidence", _)) if anchor.is_some() => return Err(error),
+                Err(error @ PreparedStatus::Status("invalid_volume_evidence", _)) => return Err(error),
                 Err(error) => { unavailable.get_or_insert(error); }
             }
         }
@@ -695,7 +737,7 @@ fn prepare_zip_volume_entry_checked(
     volumes: &impl ZipVolumeReader,
     disk: usize,
     local_offset: u64,
-    central: Option<(&[u8], &[u8], zip64::CentralValues)>,
+    central: Option<&ZipDirectoryEntry<'_>>,
     anchor: Option<&ZipAnchor>,
 ) -> Result<ZipPasswordContext, PreparedStatus> {
     let fixed = match volumes.read_proof_field(
@@ -742,14 +784,27 @@ fn prepare_zip_volume_entry_checked(
         Ok(data) => data,
         Err(fault) => return Err(fault.into()),
     };
-    let central_extra = central.as_ref().map(|(fixed, variable, _)| {
-        &variable[usize::from(le_u16(fixed, 28).unwrap())..]
+    let central_extra = central.map(|entry| {
+        &entry.variable[usize::from(le_u16(entry.fixed, 28).unwrap())..]
     });
-    let sizes_and_crc = if let Some((central, central_variable, sizes)) = central {
-        compare_zip_entry(central, central_variable, &sizes, &fixed, &variable)?;
-        Some((sizes, le_u32(central, 16).unwrap()))
+    let local_sizes;
+    let sizes_and_crc = if let Some(entry) = central {
+        compare_zip_entry(entry, &fixed, &variable, anchor.is_some(), |names| {
+            let central_len = if names || le_u32(entry.fixed, 20) == Some(u32::MAX)
+                || le_u32(entry.fixed, 24) == Some(u32::MAX) {
+                46 + entry.variable.len() as u64
+            } else { 46 };
+            let local_len = if names || le_u32(&fixed, 18) == Some(u32::MAX)
+                || le_u32(&fixed, 22) == Some(u32::MAX) {
+                30 + variable.len() as u64
+            } else { 30 };
+            volumes.range_is_ambiguous(entry.disk, entry.offset, central_len)
+                || volumes.range_is_ambiguous(disk, local_offset, local_len)
+        })?;
+        Some((&entry.sizes, le_u32(entry.fixed, 16).unwrap()))
     } else {
-        local_zip_sizes(&fixed, &variable[name_len as usize..]).map(|sizes| (sizes, le_u32(&fixed, 14).unwrap()))
+        local_sizes = local_zip_sizes(&fixed, &variable[name_len as usize..]);
+        local_sizes.as_ref().map(|sizes| (sizes, le_u32(&fixed, 14).unwrap()))
     };
     if let Some(anchor) = anchor.filter(|anchor| !anchor.context.needs_read()) {
         return Ok(anchor.context.clone());
@@ -764,7 +819,6 @@ fn prepare_zip_volume_entry_checked(
             "zip encrypted data starts beyond available volumes",
         ));
     };
-    let sizes_and_crc = sizes_and_crc.as_ref().map(|(sizes, crc)| (sizes, *crc));
     let read = |relative, size, field| {
         let (disk, offset) = if relative == 0 { (data_disk, data_offset) } else {
             volumes.advance_disk_offset(data_disk, data_offset, relative).ok_or_else(invalid_password_directory)?

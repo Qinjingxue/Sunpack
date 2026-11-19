@@ -14,7 +14,7 @@ fn foreground_output_reservation_survives_scheduler_replacement_and_is_published
     let leaf = output.join("leaf");
     fs::create_dir(&leaf).unwrap();
     let work = root.join("flatten-work");
-    watch.prepare_external_flatten(&output, &work, &leaf).unwrap();
+    watch.prepare_external_flatten(&output, &work, &leaf, &output).unwrap();
     let scope = NativeDiscoveryScope::new(root.to_string_lossy().into_owned(), None, Vec::new());
     let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
     for generation in 0..2 {
@@ -420,7 +420,7 @@ fn flatten_recovery_keeps_intent_after_local_probe_failure() {
         let mut operations = crate::watch_store::NativeWatchOperations::empty();
         operations.set_runtime(record_key.clone(), Some(json!({
             "owner":"owner","root":root,"work":work,"work_paths":[work],
-            "leaf":root.join("leaf"),"old_identity":"old","new_identity":"new",
+            "leaf":root.join("leaf"),"destination":root,"old_identity":"old","new_identity":"new",
         })));
         Ok(operations)
     }).unwrap();
@@ -1942,7 +1942,7 @@ fn flatten_recovery_rebases_durable_output_identities() {
                     .unwrap())
             })
             .unwrap();
-        prepare_flatten(&journal, owner, &root, &work, &leaf).unwrap();
+        prepare_flatten(&journal, owner, &root, &work, &leaf, &root).unwrap();
         assert_eq!(journal.state().active_output_keys().len(), 4);
         fs::rename(&root, &work).unwrap();
         journal.flush().unwrap();
@@ -1993,7 +1993,7 @@ fn flatten_keeps_physical_work_when_its_literal_junction_disappears() {
         .args(["/d", "/c", "mklink", "/J"]).arg(&alias).arg(&real).output().unwrap();
     assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
     let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
-    prepare_flatten(&journal, "", &root, &work, &leaf).unwrap();
+    prepare_flatten(&journal, "", &root, &work, &leaf, &root).unwrap();
     fs::rename(&root, &work).unwrap();
     fs::rename(physical_work.join("leaf"), &root).unwrap();
     fs::remove_dir(alias).unwrap();

@@ -302,7 +302,7 @@ fn double_encrypted_header_uses_both_ivs_and_checks_the_header_crc() {
             Ok(())
         };
         let result = structure.check_successor(0, first, &prefix[..len], &keys[0], &keys[1..],
-            &mut read, &SevenZipPayloadSource::Fixed(Arc::new([]))).unwrap();
+            &mut read, &|_, _| false).unwrap();
         assert_eq!(result == SevenZipPrefixCheck::Reject, next != 0);
     }
 }
@@ -416,7 +416,7 @@ fn delta_successor_uses_only_readable_headers_with_full_packed_bounds() {
         };
         assert_eq!(
             structure.check_successor(0, first, &prefix[..len], &key, &[], &mut read,
-                &SevenZipPayloadSource::Fixed(Arc::new([]))).unwrap(),
+                &|_, _| false).unwrap(),
             expected
         );
         assert_eq!(did_read, distance > 20);
@@ -456,7 +456,7 @@ fn deflate_successor_reads_only_its_cbc_window_and_respects_delta_boundary() {
             Ok(())
         };
         assert_eq!(structure.check_successor(0, first, &prefix[..len], &key, &[], &mut read,
-            &SevenZipPayloadSource::Fixed(Arc::new([]))).unwrap(), expected);
+            &|_, _| false).unwrap(), expected);
         assert_eq!(did_read, readable > 135);
     }
 }

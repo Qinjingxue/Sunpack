@@ -22,3 +22,5 @@ inline constexpr UInt64 SunpackAesCopyReadStart(UInt64 offset) {
 // Archive-open callback property for a bounded member proof.
 inline constexpr PROPID kpidSunpackBoundedPasswordProbe = kpidUserDefined + 262;
 inline constexpr Int32 kSunpackVerifyMember = 2;
+// The bounded ZIP handler read a local header that contradicts its directory.
+inline constexpr Int32 kSunpackZipLocalHeaderConflict = 0x100;

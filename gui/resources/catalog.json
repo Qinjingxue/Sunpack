@@ -1030,6 +1030,28 @@
         "en": "Flatten single subfolder"
       }
     },
+    "/post_extract/flatten_directory_name": {
+      "label": {
+        "zh": "压平后的目录名",
+        "en": "Folder name after flattening"
+      },
+      "options": [
+        {
+          "value": "outer",
+          "label": {
+            "zh": "外层目录名",
+            "en": "Outer folder name"
+          }
+        },
+        {
+          "value": "inner",
+          "label": {
+            "zh": "内层目录名",
+            "en": "Inner folder name"
+          }
+        }
+      ]
+    },
     "/filesystem/scan_filters_enabled": {
       "label": {
         "zh": "扫描筛选器整体开关",

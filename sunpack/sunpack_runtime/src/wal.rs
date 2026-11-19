@@ -26,7 +26,12 @@ pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {
 pub(crate) fn file_header(kind: Kind) -> [u8; 16] {
     let mut header = [0; 16];
     header[..4].copy_from_slice(b"SPWL");
-    header[4..6].copy_from_slice(&1u16.to_le_bytes());
+    // Task persistence includes the flatten intent and relocation payload.
+    let version: u16 = match kind {
+        Kind::TaskWal | Kind::TaskSnapshot => 2,
+        _ => 1,
+    };
+    header[4..6].copy_from_slice(&version.to_le_bytes());
     header[6..8].copy_from_slice(&(kind as u16).to_le_bytes());
     header
 }

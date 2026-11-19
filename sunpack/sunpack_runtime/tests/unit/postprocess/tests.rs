@@ -128,6 +128,7 @@ fn flatten_moves_directories_beyond_win32_max_path() {
 fn flatten_publish_failure_reports_retained_payload_without_touching_collision() {
     let container = TestDirectory::new("publish_failure");
     let output = container.path().join("output");
+    let destination = container.path().join("inner");
     fs::create_dir_all(output.join("outer/inner")).unwrap();
     fs::write(output.join("outer/inner/payload.txt"), b"payload").unwrap();
     let mut stats = FlattenStats::default();
@@ -136,12 +137,13 @@ fn flatten_publish_failure_reports_retained_payload_without_touching_collision()
         &mut stats,
         &container.path().join("flatten-work"),
         FlattenLeaf::Prepared(&output.join("outer/inner")),
+        &destination,
         |leaf, root| {
             fs::create_dir(root)?;
             fs::write(root.join("unrelated.txt"), b"unrelated")?;
             rename_no_replace(leaf, root)
         },
-        |_, _, _| Ok(()),
+        || Ok(()),
     );
     let retained = stats.output_dir.as_ref().unwrap();
     assert_ne!(retained, &output);
@@ -151,7 +153,7 @@ fn flatten_publish_failure_reports_retained_payload_without_touching_collision()
         b"payload"
     );
     assert_eq!(
-        fs::read(output.join("unrelated.txt")).unwrap(),
+        fs::read(destination.join("unrelated.txt")).unwrap(),
         b"unrelated"
     );
     assert_eq!(stats.moved, 0);

@@ -100,6 +100,77 @@ fn sized_local_walk_uses_later_proof_despite_unreadable_member_bytes() {
     assert_eq!(anchor.local_offset, next as u64);
 }
 
+#[test]
+fn projected_directory_conflict_survives_later_usable_entry_without_a_shared_anchor() {
+    fn add_directory_entry(out: &mut Vec<u8>, local: &[u8], name: &[u8], disk: u16, offset: usize) {
+        let mut entry = [0; 46];
+        entry[..4].copy_from_slice(ZIP_CENTRAL);
+        entry[4..8].copy_from_slice(&[20, 0, 20, 0]);
+        entry[8..28].copy_from_slice(&local[6..26]);
+        entry[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        entry[34..36].copy_from_slice(&disk.to_le_bytes());
+        entry[42..46].copy_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&entry);
+        out.extend_from_slice(name);
+    }
+
+    let mut head = local_crypto_header()[..31].to_vec();
+    head[6] = 8;
+    head[17] = 0;
+    head.extend_from_slice(b"PK\x07\x08");
+    head.extend([0; 12]);
+    let mut first = local_crypto_header();
+    first[18..22].copy_from_slice(&12u32.to_le_bytes());
+    first[26] = 3;
+    first.splice(30..31, *b"a\\b");
+    let mut second = local_crypto_header();
+    second[18..22].copy_from_slice(&12u32.to_le_bytes());
+    second[30] = b'z';
+
+    for spanned in [false, true] {
+        let disk = if spanned { 1u16 } else { 0 };
+        let base = if spanned { 0 } else { head.len() };
+        let mut central = Vec::new();
+        add_directory_entry(&mut central, &head, b"a", 0, 0);
+        let entry = central.len();
+        add_directory_entry(&mut central, &first, b"a/b", disk, base);
+        central[entry + 9] |= 8; // UTF-8 only in central directory.
+        central[entry + 16..entry + 20].fill(0); // Some writers omit the central CRC.
+        add_directory_entry(&mut central, &second, b"z", disk, base + first.len());
+        let mut good = first.clone();
+        good.extend_from_slice(&second);
+        good.extend_from_slice(&central);
+        good.extend_from_slice(ZIP_EOCD);
+        good.extend_from_slice(&disk.to_le_bytes());
+        good.extend_from_slice(&disk.to_le_bytes());
+        good.extend_from_slice(&[3, 0, 3, 0]);
+        good.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        good.extend_from_slice(&((base + first.len() + second.len()) as u32).to_le_bytes());
+        good.extend_from_slice(&[0, 0]);
+        let mut bad = good.clone();
+        bad[8] = 8; // Local method differs from the first encrypted directory entry.
+
+        let (paths, mut sources, mut plan) = volume_alternatives(&head, &bad, &good);
+        let mut bad_name = good.clone();
+        bad_name[30] = b'q';
+        let name_path = crate::test_support::temp_file("zip_local_name_conflict", &bad_name);
+        sources.push(InputExtent {
+            path: name_path.to_string_lossy().into_owned(), start: 0, end: Some(bad_name.len() as u64),
+        });
+        let plan_mut = Arc::make_mut(&mut plan);
+        plan_mut.sources = sources.clone().into_boxed_slice();
+        Arc::make_mut(&mut plan_mut.domains[1].choices).push(3);
+        assert!(prepare_zip_attempt_anchor(&sources[0], &plan, &[]).is_none());
+        let (context, _) = prepare_zip_attempts(&sources[0], &plan, spanned, None, &[], None)
+            .ok().expect("the compatible alternative still has a usable member");
+        let result = context.verify(&[], None).unwrap();
+        assert_eq!(&*result.volume_attempts.expect("Rust prunes the conflicting layout").sources,
+            &[sources[0].clone(), sources[2].clone()]);
+        drop(context);
+        for path in paths.into_iter().chain([name_path]) { std::fs::remove_file(path).unwrap(); }
+    }
+}
+
 // Covers all three verifier block positions, unsupported AE versions,
 // and the strong-encryption flag on both local and directory-selected paths.
 #[test]
@@ -224,7 +295,10 @@ fn winzip_aes_deflate_skips_stored_blocks_to_check_a_later_volume() {
         let mut good = payload[split..].to_vec();
         good.extend([0; 10]);
         let mut bad = good.clone();
-        bad[3] ^= 1;
+        // Keep LEN and NLEN consistent. Only the declared output size
+        // rules out a final block that produces one fewer byte.
+        bad[1] ^= 4 ^ 3;
+        bad[3] ^= 4 ^ 3;
         assert_aes_member_scope(&local, &bad, &good);
     }
 }

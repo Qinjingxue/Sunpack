@@ -33,7 +33,7 @@ fn recovery_receipts_preserve_pre_cleanup_facts_and_relocate_only_outputs() {
     assert!(Arc::ptr_eq(&checkpoint.sources, &recovery.inputs[0].sources));
     assert!(Arc::ptr_eq(checkpoint.failure.as_ref().unwrap(), recovery.inputs[0].failure.as_ref().unwrap()));
     let mut output_only = checkpoint.clone();
-    output_only.relocate_flatten(&output, output.parent().unwrap());
+    output_only.relocate_flatten(output.parent().unwrap(), &output, output.parent().unwrap());
     assert!(Arc::ptr_eq(&checkpoint.input, &output_only.input));
     assert!(Arc::ptr_eq(&checkpoint.sources, &output_only.sources));
     let render = |failure: &Failure| serde_json::json!({"kind": format!("{:?}", failure.kind)});
@@ -99,7 +99,7 @@ fn recovery_receipts_preserve_pre_cleanup_facts_and_relocate_only_outputs() {
     assert_ne!(changed_report["inputs"][0]["input_id"], changed_report["inputs"][1]["input_id"]);
     let mut relocated = recovery.as_ref().clone();
     let parent = output.parent().unwrap();
-    relocated.relocate_flatten(&output, parent);
+    relocated.relocate_flatten(parent, &output, parent);
     let relocated_report = relocated.report(render);
     let relocated_output = relocated_report["inputs"][0]["output_dir"].as_str().unwrap();
     assert_eq!(Path::new(relocated_output), parent);

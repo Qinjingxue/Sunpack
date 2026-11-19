@@ -633,9 +633,9 @@ impl TaskCompletion {
         }
     }
 
-    pub(crate) fn relocate_output(&mut self, old: &Path, new: &Path) {
+    pub(crate) fn relocate_output(&mut self, root: &Path, old: &Path, new: &Path) {
         if let Some(output) = &mut self.output {
-            relocate_flatten_output(output, old, new);
+            relocate_flatten_output(output, root, old, new);
         }
     }
 
@@ -654,12 +654,15 @@ impl TaskCompletion {
     }
 }
 
-pub(crate) fn relocate_flatten_output(path: &mut PathBuf, old: &Path, new: &Path) {
+pub(crate) fn relocate_flatten_output(path: &mut PathBuf, root: &Path, old: &Path, new: &Path) -> bool {
     if let Ok(suffix) = path.strip_prefix(old) {
-        *path = new.join(suffix);
-    } else if old.starts_with(&*path) && path.starts_with(new) {
-        // A carrier segment may own a wrapper above the flattened leaf.
+        *path = if suffix.as_os_str().is_empty() { new.to_path_buf() } else { new.join(suffix) };
+        true
+    } else if old.starts_with(&*path) && path.starts_with(root) {
         *path = new.to_path_buf();
+        true
+    } else {
+        false
     }
 }
 
@@ -712,7 +715,7 @@ pub enum Event {
         id: TaskId,
     },
     /// Ordered display update after a task's output subtree was flattened.
-    OutputsRelocated { id: TaskId, old: PathBuf, new: PathBuf },
+    OutputsRelocated { id: TaskId, root: PathBuf, old: PathBuf, new: PathBuf },
 }
 
 /// Publication callbacks form the durable boundary for Watch. A failed callback
@@ -804,11 +807,11 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
-    fn before_flatten(&self, _output: &Path, _work: &Path, _leaf: &Path) -> io::Result<()> {
+    fn before_flatten(&self, _root: &Path, _work: &Path, _leaf: &Path, _destination: &Path) -> io::Result<()> {
         Ok(())
     }
 
-    fn after_flatten(&self, _id: TaskId, _old: &Path, _output: &Path) -> io::Result<()> {
+    fn after_flatten(&self, _id: TaskId, _root: &Path, _old: &Path, _output: &Path) -> io::Result<()> {
         Ok(())
     }
 

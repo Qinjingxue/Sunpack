@@ -160,7 +160,7 @@ PasswordTestResult test_password_batch(
     bool scan_only = false, bool final_read_only = false,
     const std::size_t* candidate_indices = nullptr,
     const VolumeAttemptPlan* volume_plan = nullptr,
-    bool leave_last_candidate = false
+    bool leave_last_candidate = false, bool password_verified = false
 );
 
 ExtractArchiveResult extract_archive(

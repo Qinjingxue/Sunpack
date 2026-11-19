@@ -30,7 +30,8 @@
   },
   "post_extract": {
     "archive_cleanup_mode": "r",
-    "flatten_single_directory": true
+    "flatten_single_directory": true,
+    "flatten_directory_name": "outer"
   },
   "filesystem": {
     "scan_filters_enabled": true,

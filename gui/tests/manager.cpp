@@ -266,6 +266,13 @@ void editing(Fixture& f) {
     assert(conf["filters"][0]["rules"]==Json::array({"x]}","y\"[{",3}));
     fails([&]{save_config_field(c,"/watch/out_dir","\".\"","string","stale",false);});
     fails([&]{validate_setting("/runtime/process_mode",Json("typo"));});
+    const auto flatten="/post_extract/flatten_directory_name";
+    auto flatten_settings=describe_setting(flatten,"","zh");
+    assert(flatten_settings["known"]==true && flatten_settings["options"].size()==2);
+    atomic_write(c,R"({"post_extract":{"flatten_directory_name":"outer"}})");
+    save_config_field(c,flatten,"\"outer\"","string","inner",false);
+    assert(read_json(c)["post_extract"]["flatten_directory_name"]=="inner");
+    fails([&]{save_config_field(c,flatten,"\"inner\"","string","unknown",false);});
     for(auto mode:{"none","file_id","hash"}) validate_setting("/watch/deduplication",Json(mode));
     fails([&]{validate_setting("/watch/deduplication",Json("sha256"));});
     for(auto scope:{"root","global"}) validate_setting("/watch/deduplication_scope",Json(scope));

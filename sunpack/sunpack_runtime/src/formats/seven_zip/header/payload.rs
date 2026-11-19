@@ -23,6 +23,24 @@ pub(crate) struct SevenZipPayloadPrefix {
     pub(crate) check: SevenZipPrefixCheck,
 }
 
+pub(crate) struct SevenZipPayloadFollowup<'a> {
+    successors: Vec<SevenZipPayloadSuccessor<'a>>,
+    fault: Option<String>,
+}
+
+impl SevenZipPayloadFollowup<'_> {
+    pub(crate) fn prefix_result(self, check: SevenZipPrefixCheck) -> Result<SevenZipPrefixCheck, String> {
+        self.fault.map_or(Ok(check), Err)
+    }
+}
+
+struct SevenZipPayloadSuccessor<'a> {
+    plan: &'a SevenZipPayloadPlan,
+    encrypted: [u8; 16],
+    prefix: SevenZipPayloadPrefix,
+    key: SevenZipAesKey,
+}
+
 pub(crate) enum SevenZipPayloadSource {
     Fixed(Arc<[RangeSpec]>),
     Projected(DeferredReads),
@@ -38,6 +56,21 @@ pub(crate) struct SevenZipPayloadProbes {
 type SevenZipRead<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), DeferredReadError> + 'a;
 
 impl SevenZipPayloadSource {
+    fn read_single<T>(&self, check: impl FnOnce(&mut SevenZipRead<'_>) -> T) -> T {
+        match self {
+            Self::Fixed(ranges) => {
+                let mut reader = VirtualRangeReader::new(ranges);
+                check(&mut |offset, bytes| {
+                    reader.seek(std::io::SeekFrom::Start(offset)).map_err(DeferredReadError::Io)?;
+                    reader.read_exact(bytes).map_err(DeferredReadError::Io)
+                })
+            }
+            Self::Projected(ranges) => {
+                ranges.read_single(|reader| check(&mut |offset, bytes| reader.read_into(offset, bytes)))
+            }
+        }
+    }
+
     fn range_is_ambiguous(&self, offset: u64, size: u64) -> bool {
         matches!(self, Self::Projected(reads) if reads.range_is_ambiguous(offset, size))
     }
@@ -49,13 +82,7 @@ impl SevenZipPayloadSource {
     ) -> Result<SevenZipPrefixCheck, String> {
         use SevenZipPrefixCheck::{Reject, Weak};
         match self {
-            Self::Fixed(ranges) => {
-                let mut reader = VirtualRangeReader::new(ranges);
-                check(&mut |offset, bytes| {
-                    reader.seek(std::io::SeekFrom::Start(offset)).map_err(DeferredReadError::Io)?;
-                    reader.read_exact(bytes).map_err(DeferredReadError::Io)
-                })
-            }
+            Self::Fixed(_) => self.read_single(check),
             Self::Projected(ranges) => {
                 let outcomes = ranges.evaluate(|reader| check(&mut |offset, bytes| reader.read_into(offset, bytes)))
                     .map_err(resource_error)?;
@@ -103,13 +130,33 @@ impl SevenZipPayloadProbes {
         self.source.is_some() && (!self.rest.is_empty() || self.first.kind.has_successor())
     }
 
-    pub(crate) fn has_ambiguous_followup(&self) -> bool {
-        self.source.as_ref().is_some_and(|source| {
-            let span = self.first.kind.followup_span();
-            (span != 0 && source.range_is_ambiguous(self.first.offset, span))
-            || self.rest.iter().any(|plan| source.range_is_ambiguous(
-                plan.offset, plan.kind.followup_span().max(16),
-            ))
+    pub(crate) fn can_stage_followup(&self) -> bool {
+        !self.rest.is_empty() && match &self.source {
+            Some(SevenZipPayloadSource::Fixed(_)) => true,
+            Some(SevenZipPayloadSource::Projected(reads)) => reads.has_single_path(),
+            None => false,
+        }
+    }
+
+    pub(crate) fn prepare_followup<'a>(
+        &'a self,
+        key: impl FnMut(&'a [u8]) -> Result<SevenZipAesKey, String>,
+    ) -> Result<Option<SevenZipPayloadFollowup<'a>>, String> {
+        self.source.as_ref().unwrap().read_single(|read| {
+            self.check_other_prefixes(read, |_| Some(true), key)
+        })
+    }
+
+    pub(crate) fn verify_prepared_followup(
+        &self, first_key: &SevenZipAesKey, prefix: SevenZipPayloadPrefix,
+        ready: SevenZipPayloadFollowup<'_>,
+    ) -> Result<SevenZipPrefixCheck, String> {
+        let first_successor = self.first.kind.has_successor();
+        if !first_successor && ready.successors.is_empty() {
+            return ready.prefix_result(prefix.check);
+        }
+        self.source.as_ref().unwrap().read_single(|read| {
+            self.check_successors(first_key, &prefix, ready, first_successor, read, &|_, _| false)
         })
     }
 
@@ -118,63 +165,110 @@ impl SevenZipPayloadProbes {
         first_key: &SevenZipAesKey,
         prefix: SevenZipPayloadPrefix,
         narrow_volumes_only: bool,
+        shared_projection: bool,
         mut key: impl FnMut(&'a [u8]) -> Result<SevenZipAesKey, String>,
         mut reject: impl FnMut(Arc<VolumeProjection>),
     ) -> Result<SevenZipPrefixCheck, String> {
-        use SevenZipPrefixCheck::Reject;
         let Some(source) = &self.source else { return Ok(prefix.check); };
-        let has_useful_successor = |kind: &SevenZipPayloadEvidence, offset| {
-            let span = kind.followup_span();
-            span != 0 && (!narrow_volumes_only || source.range_is_ambiguous(offset, span))
+        let active = match source {
+            SevenZipPayloadSource::Projected(reads) if narrow_volumes_only && shared_projection =>
+                Some(reads.active_range_filter()),
+            _ => None,
         };
+        // Use the prepared projection on every replay. Once a deferred read
+        // branches, both choices still need their own checks.
+        let ambiguous = |offset, size| match &active {
+            Some(overlaps) => overlaps(offset, size),
+            None => source.range_is_ambiguous(offset, size),
+        };
+        let span = self.first.kind.followup_span();
+        // The first AES block is already shared inside a prepared projection;
+        // across prepared alternatives its different bytes can still matter.
+        let known = if shared_projection { 16 } else { 0 };
+        let first_successor = span != 0 && (!narrow_volumes_only
+            || (span > known && ambiguous(self.first.offset + known, span - known)));
+        let useful_plan = |plan: &SevenZipPayloadPlan| !narrow_volumes_only
+            || ambiguous(plan.offset, plan.kind.followup_span().max(16));
+        if !first_successor && !self.rest.iter().any(useful_plan) {
+            return Ok(prefix.check);
+        }
         source.validate(|read| {
-            let mut fault = None;
-            let mut successors = Vec::new();
-            for plan in &self.rest {
-                check_password_cancellation()?;
-                // Load before deriving a key for a stream that may cross a hole.
-                let mut encrypted = [0u8; 16];
-                if let Err(error) = read(plan.offset, &mut encrypted) {
-                    if matches!(error, DeferredReadError::Truncated) {
-                        return Ok(Reject);
-                    }
-                    if matches!(error, DeferredReadError::Pending | DeferredReadError::Cancelled) {
-                        return Err(seven_zip_deferred_error(error));
-                    }
+            // A sibling descriptor can interpret the same ciphertext using
+            // different keys or sizes. Keep its short checks once we enter.
+            let stage = |plan: &SevenZipPayloadPlan| {
+                if shared_projection {
+                    useful_plan(plan).then_some(true)
+                } else {
+                    Some(plan.kind.has_successor() && useful_plan(plan))
+                }
+            };
+            let Some(ready) = self.check_other_prefixes(read, stage, &mut key)? else {
+                return Ok(SevenZipPrefixCheck::Reject);
+            };
+            self.check_successors(first_key, &prefix, ready, first_successor, read, &ambiguous)
+        }, &mut reject)
+    }
+
+    fn check_other_prefixes<'a>(
+        &'a self, read: &mut SevenZipRead<'_>,
+        stage: impl Fn(&SevenZipPayloadPlan) -> Option<bool>,
+        mut key: impl FnMut(&'a [u8]) -> Result<SevenZipAesKey, String>,
+    ) -> Result<Option<SevenZipPayloadFollowup<'a>>, String> {
+        let mut fault = None;
+        let mut successors = Vec::new();
+        for (plan, follow) in self.rest.iter().filter_map(|plan| stage(plan).map(|follow| (plan, follow))) {
+            check_password_cancellation()?;
+            // Load before deriving a key for a stream that may cross a hole.
+            let mut encrypted = [0u8; 16];
+            match read(plan.offset, &mut encrypted) {
+                Ok(()) => {}
+                Err(DeferredReadError::Truncated) => return Ok(None),
+                Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
+                    return Err(seven_zip_deferred_error(error)),
+                Err(error) => {
                     fault.get_or_insert_with(|| seven_zip_deferred_error(error));
                     continue;
                 }
-                let candidate = key(&plan.properties)?;
-                let inner_keys = plan.inner_aes.iter().map(Vec::as_slice).map(&mut key)
-                    .collect::<Result<Vec<_>, _>>()?;
-                let (plaintext, length) = plan.kind.decrypt_prefix_with_inner(
-                    &encrypted, &candidate, &inner_keys,
-                )?;
-                if plan.kind.check_prefix(&plaintext[..length]) == Reject {
-                    return Ok(Reject);
-                }
-                if has_useful_successor(&plan.kind, plan.offset) {
-                    successors.push((plan, encrypted, plaintext, length, candidate, inner_keys));
-                }
             }
-            let first = (&self.first.kind, self.first.offset, &self.first.encrypted,
-                &prefix.plaintext[..prefix.len], first_key, prefix.inner_keys.as_slice());
-            let rest = successors.iter().map(|(plan, encrypted, plaintext, length, key, inner)| {
-                (&plan.kind, plan.offset, encrypted, &plaintext[..*length], key, inner.as_slice())
-            });
-            let first = has_useful_successor(&self.first.kind, self.first.offset).then_some(first);
-            for (kind, offset, encrypted, plaintext, key, inner) in first.into_iter().chain(rest) {
-                match kind.check_successor(offset, encrypted, plaintext, key, inner, read, source) {
-                    Ok(Reject) => return Ok(Reject),
-                    Err(DeferredReadError::Truncated) => return Ok(Reject),
-                    Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
-                        return Err(seven_zip_deferred_error(error)),
-                    Err(error) => { fault.get_or_insert_with(|| seven_zip_deferred_error(error)); }
-                    _ => {}
-                }
+            let key_outer = key(&plan.properties)?;
+            let inner_keys = plan.inner_aes.iter().map(Vec::as_slice).map(&mut key)
+                .collect::<Result<Vec<_>, _>>()?;
+            let (plaintext, len) = plan.kind.decrypt_prefix_with_inner(&encrypted, &key_outer, &inner_keys)?;
+            let check = plan.kind.check_prefix(&plaintext[..len]);
+            if check == SevenZipPrefixCheck::Reject {
+                return Ok(None);
             }
-            fault.map_or(Ok(prefix.check), Err)
-        }, &mut reject)
+            if follow && plan.kind.has_successor() {
+                successors.push(SevenZipPayloadSuccessor {
+                    plan, encrypted, prefix: SevenZipPayloadPrefix { plaintext, len, inner_keys, check },
+                    key: key_outer,
+                });
+            }
+        }
+        Ok(Some(SevenZipPayloadFollowup { successors, fault }))
+    }
+
+    fn check_successors(
+        &self, first_key: &SevenZipAesKey, prefix: &SevenZipPayloadPrefix,
+        ready: SevenZipPayloadFollowup<'_>, first_successor: bool,
+        read: &mut SevenZipRead<'_>, ambiguous: &impl Fn(u64, u64) -> bool,
+    ) -> Result<SevenZipPrefixCheck, String> {
+        use SevenZipPrefixCheck::Reject;
+        let SevenZipPayloadFollowup { successors, mut fault } = ready;
+        let first = (&self.first.kind, self.first.offset, &self.first.encrypted, first_key, prefix);
+        let rest = successors.iter().map(|item| {
+            (&item.plan.kind, item.plan.offset, &item.encrypted, &item.key, &item.prefix)
+        });
+        for (kind, offset, encrypted, key, prefix) in first_successor.then_some(first).into_iter().chain(rest) {
+            match kind.check_successor(offset, encrypted, &prefix.plaintext[..prefix.len], key, &prefix.inner_keys, read, ambiguous) {
+                Ok(Reject) | Err(DeferredReadError::Truncated) => return Ok(Reject),
+                Err(error @ (DeferredReadError::Pending | DeferredReadError::Cancelled)) =>
+                    return Err(seven_zip_deferred_error(error)),
+                Err(error) => { fault.get_or_insert_with(|| seven_zip_deferred_error(error)); }
+                _ => {}
+            }
+        }
+        fault.map_or(Ok(prefix.check), Err)
     }
 }
 
@@ -309,7 +403,7 @@ impl SevenZipPayloadEvidence {
     fn check_successor(
         &self, offset: u64, first_encrypted: &[u8; 16], plaintext: &[u8],
         material: &SevenZipAesKey, inner: &[SevenZipAesKey],
-        read: &mut SevenZipRead<'_>, source: &SevenZipPayloadSource,
+        read: &mut SevenZipRead<'_>, range_is_ambiguous: &impl Fn(u64, u64) -> bool,
     ) -> Result<SevenZipPrefixCheck, DeferredReadError> {
         let SevenZipPayloadVerifier::Compressed { method, unpack_size } = &self.verifier else {
             return Ok(SevenZipPrefixCheck::Weak);
@@ -378,13 +472,8 @@ impl SevenZipPayloadEvidence {
             if next >= readable {
                 return false;
             }
-            match source {
-                SevenZipPayloadSource::Projected(reads) => {
-                    let window = (next & !15u64).saturating_sub(16 * (1 + inner.len()) as u64);
-                    reads.range_is_ambiguous(offset + window, ciphertext_span - window)
-                }
-                SevenZipPayloadSource::Fixed(_) => false,
-            }
+            let window = (next & !15u64).saturating_sub(16 * (1 + inner.len()) as u64);
+            range_is_ambiguous(offset + window, ciphertext_span - window)
         };
         if seven_zip_is_deflate(method) {
             let check = deflate_prefix::check_successors(

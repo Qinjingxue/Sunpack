@@ -1,4 +1,7 @@
 #include "sevenzip_status.hpp"
+#ifdef _WIN32
+#include "password_proof_property.hpp"
+#endif
 
 namespace sunpack::sevenzip
 {
@@ -19,7 +22,8 @@ namespace sunpack::sevenzip
     bool looks_damaged(Int32 op_res)
     {
 
-        return op_res == kOpUnexpectedEnd || op_res == kOpHeadersError || op_res == kOpIsNotArc || op_res == kOpUnavailable;
+        return op_res == kOpUnexpectedEnd || op_res == kOpHeadersError || op_res == kOpIsNotArc ||
+               op_res == kOpUnavailable || op_res == kSunpackZipLocalHeaderConflict;
     }
 
     const char *operation_result_name(Int32 op_res)
@@ -63,6 +67,10 @@ namespace sunpack::sevenzip
         case kOpHeadersError:
 
             return "headers_error";
+
+        case kSunpackZipLocalHeaderConflict:
+
+            return "zip_local_central_conflict";
 
         case kOpWrongPassword:
 

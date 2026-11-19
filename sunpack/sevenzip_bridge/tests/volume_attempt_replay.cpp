@@ -291,6 +291,13 @@ void scan_confirms_only_unproven_password(const std::filesystem::path& archive) 
         verified.response.find(confirmed) != std::string::npos && verified.response.find(matched) == std::string::npos,
         "Scan probed the proven password again or lost the sole composition");
 
+    plan.layouts[0][1].number = 3;
+    const auto incomplete = run_request(request);
+    require(incomplete.code == 1 && incomplete.response.find(wire::text("structured_volume_gap")) != std::string::npos &&
+        incomplete.response.find(selected) == std::string::npos,
+        "Scan reported a gapped singleton as a complete composition");
+    plan.layouts[0][1].number = 2;
+
     request.password_verified = false;
     const auto unverified = run_request(request);
     require(unverified.code == 0 && unverified.response.find(confirmed) != std::string::npos &&
@@ -427,12 +434,27 @@ void unavailable_member_is_not_reprobed_for_an_unread_slice(
     cursor.reserve(plan);
     VolumeProbeCache cache(plan);
     auto lookahead = cursor;
-    const auto cold = probe_volume_wave(request, lookahead, nullptr, cache);
-    require(cold.size() == 1 && cold.front().probe &&
-        cold.front().probe->status == PasswordTestStatus::Unsupported &&
-        cold.front().probe->password_independent_failure &&
-        cold.front().probe->observed_volume_slots && cold.front().probe->observed_volume_slots->empty(),
-        "unavailable ZIP member did not preserve its read dependencies");
+    std::deque<PreparedAttempt> cold;
+    {
+        // CPU credits collect both compositions. The memory arbiter defers
+        // thread creation so the second lane observes the completed first.
+        NativeMemoryManager manager(0, [] { return -1; });
+        NativeMemoryJob memory(manager);
+        NativeCpuBudget budget(2);
+        NativeCpuJobContext job(budget);
+        NativeCpuContextScope cpu_scope(&job);
+        NativeMemoryScope memory_scope(&memory);
+        cold = probe_volume_wave(request, lookahead, nullptr, cache);
+        require(cold.size() == (std::thread::hardware_concurrency() > 1 ? 2 : 1) &&
+            (cold.size() == 1 || (memory.denied.load() && cold.front().sources != cold.back().sources)) &&
+            cache.scheduled_probes == 1,
+            "a deferred lane repeated the finished proof in the same wave");
+    }
+    for (const auto& attempt : cold)
+        require(attempt.probe && attempt.probe->status == PasswordTestStatus::Unsupported &&
+            attempt.probe->password_independent_failure &&
+            attempt.probe->observed_volume_slots && attempt.probe->observed_volume_slots->empty(),
+            "unavailable ZIP member did not preserve its read dependencies");
     require(cursor.next(plan) && cursor.selected == cold.front().sources, "unexpected first slice choice");
     lookahead = cursor;
     const auto warm = probe_volume_wave(request, lookahead, nullptr, cache);
@@ -458,7 +480,9 @@ void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {
     constexpr std::size_t start = 48, end = 98;
     std::string damaged(zip + start, zip + end);
     damaged.back() ^= 1;
-    { std::ofstream file(carrier, std::ios::binary); file.write(zip, length); file << damaged; }
+    std::string conflicting(zip + start, zip + end);
+    conflicting[8] = 8; // The second local entry declares Deflate, while its CD says Stored.
+    { std::ofstream file(carrier, std::ios::binary); file.write(zip, length); file << damaged << conflicting; }
 
     const auto path = carrier.wstring();
     const std::vector<ExtractInputRange> ranges = {
@@ -478,6 +502,78 @@ void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {
     require(rejected.status == PasswordTestStatus::WrongPassword && !rejected.rejects_fixed_geometry &&
         accepted.status == PasswordTestStatus::Ok && accepted.matched_index == 0,
         "the fixed member masked a bad volume that the second CRC can reject");
+
+    const std::wstring candidates[]{L"incorrect", password};
+    wrong[1] = {path, length + damaged.size(), length + damaged.size() + conflicting.size(), true};
+    plan.sources[3] = wrong[1];
+    plan.prepare();
+    const auto header_conflict = test_password_batch(
+        path, {}, wrong, L"zip", candidates, 2, {}, true, false, nullptr, &plan);
+    require(header_conflict.status == PasswordTestStatus::Damaged &&
+        header_conflict.operation_result == kSunpackZipLocalHeaderConflict &&
+        header_conflict.password_independent_failure && header_conflict.possible_candidates.empty() &&
+        header_conflict.matched_index == -1 && !header_conflict.rejects_fixed_geometry &&
+        header_conflict.observed_volume_slots == std::optional(std::vector<std::size_t>{1}),
+        "the ZIP local/CD contradiction was not returned as a scoped layout failure");
+
+    WorkerRequest scan;
+    scan.scan_only = true;
+    scan.encrypted = 1;
+    scan.password_candidates = {candidates[0], candidates[1]};
+    scan.archive_input.archive_path = path;
+    scan.archive_input.format_hint = L"zip";
+    scan.archive_input.volume_attempts = plan;
+    scan.archive_input.volume_attempts.layouts[0][0].name = L"carrier.zip";
+    auto remaining = wire::key("first_remaining_volume");
+    append_volume_selection(remaining, 0, {0, 1, 2});
+    const auto scanned = run_request(scan);
+    require(scanned.code == 0 && scanned.response.find(remaining) != std::string::npos &&
+        scanned.response.find(wire::key("matched_index") + wire::number(1)) != std::string::npos,
+        "Scan kept the contradictory ZIP composition or lost the correct password");
+
+    auto verified_scan = scan;
+    verified_scan.password_candidates = {password};
+    verified_scan.password_verified = true;
+    auto& verified_plan = verified_scan.archive_input.volume_attempts;
+    verified_plan.prepare();
+    for (const std::size_t credits : {1, 2}) {
+        NativeCpuBudget budget(credits);
+        NativeCpuJobContext job(budget);
+        NativeCpuContextScope cpu(&job);
+        VolumeProbeCache cache(verified_plan);
+        VolumeAttemptCursor cursor;
+        cursor.reserve(verified_plan);
+        auto wave = probe_volume_wave(verified_scan, cursor, nullptr, cache);
+        require(!wave.empty() && wave.front().probe && rejects_volume_attempt(*wave.front().probe),
+            "verified Scan failed to discard the contradictory first composition");
+        if (wave.size() == 1) wave = probe_volume_wave(verified_scan, cursor, nullptr, cache);
+        require(!wave.empty() && wave.back().sources == std::vector<std::size_t>({0, 1, 2}) &&
+            !wave.back().probe && cache.scheduled_probes == 1,
+            "verified Scan decoded the last composition after rejecting every earlier one");
+
+        VolumeProbeCache pending(verified_plan);
+        PasswordTestResult unavailable;
+        unavailable.status = PasswordTestStatus::Unsupported;
+        unavailable.observed_volume_slots = std::vector<std::size_t>{1};
+        require(pending.remember(verified_plan, {0, {0, 3, 2}, unavailable}, credits),
+            "could not prepare an inconclusive preceding scan layout");
+        VolumeAttemptCursor unresolved;
+        unresolved.reserve(verified_plan);
+        wave = probe_volume_wave(verified_scan, unresolved, nullptr, pending);
+        if (wave.size() == 1) wave = probe_volume_wave(verified_scan, unresolved, nullptr, pending, false);
+        require(!wave.empty() && wave.back().probe && pending.scheduled_probes == 1,
+            "verified Scan skipped the final composition despite an earlier unresolved one");
+    }
+
+    auto& failed_plan = scan.archive_input.volume_attempts;
+    failed_plan.sources.push_back({path, length, length + damaged.size(), true});
+    failed_plan.domains[1] = {3, 4};
+    auto conflict_prefix = wire::key("discarded_volume_prefixes") + wire::array();
+    append_volume_selection(conflict_prefix, 0, {0, 3});
+    const auto mixed = run_request(scan);
+    require(mixed.code == 1 && mixed.response.find(conflict_prefix) != std::string::npos &&
+        mixed.response.find(wire::key("failure_kind") + wire::text("password_or_volume_inconclusive")) != std::string::npos,
+        "an inconclusive scan restored a proven ZIP contradiction or discarded a password alternative");
 
     // Place the second local record away from both Open's head read and the
     // central directory. It can be indexed but its member data cannot open.
@@ -509,7 +605,6 @@ void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {
     plan.sources = locked_ranges;
     plan.sources.push_back({path, gap, gap + end - start, true});
     plan.prepare();
-    const std::wstring candidates[]{L"incorrect", password};
     const auto recovered = test_password_batch(
         path, {}, locked_ranges, L"zip", candidates, 2, {}, true, false, nullptr, &plan);
     const auto inconclusive_volume = test_password_batch(

@@ -37,13 +37,16 @@ fn check_header(
             let &[lo, hi, inverse_lo, inverse_hi] = bytes.get(1..)?.first_chunk()?;
             let len = u16::from_le_bytes([lo, hi]);
             let inverse = u16::from_le_bytes([inverse_lo, inverse_hi]);
+            let last = first & 1 != 0;
             if len != !inverse || packed_size.is_some_and(|size| u64::from(len) + 5 > size)
-                || unpack_size.is_some_and(|size| u64::from(len) > size) {
+                || unpack_size.is_some_and(|size| {
+                    if last { u64::from(len) != size } else { u64::from(len) > size }
+                }) {
                 Header::Invalid
-            } else if first & 1 == 0 {
-                Header::Stored(len)
-            } else {
+            } else if last {
                 Header::Checked
+            } else {
+                Header::Stored(len)
             }
         }
         1 => Header::Checked,

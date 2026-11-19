@@ -130,6 +130,20 @@ def test_flat_output_with_long_name_does_not_need_flatten_work_path(package, tmp
     assert (output / source.stem / "item.txt").read_bytes() == b"payload"
 
 
+def test_extract_uses_deepest_flattened_directory_name_from_config(package, tmp_path):
+    # Exercise the real CLI config-to-publish path with an ordinary ZIP.
+    source = tmp_path / "Archive.zip"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("Wrapper/项目名/asset.txt", b"payload")
+
+    package.configure(post_extract={"flatten_directory_name": "inner"})
+    output = tmp_path / "out"
+    report = package.json("extract", "-r", "1", "-o", output, source)
+    assert report["summary"]["cleanup_results"] == []
+    assert {path.name for path in output.iterdir()} == {"项目名"}
+    assert (output / "项目名" / "asset.txt").read_bytes() == b"payload"
+
+
 def test_carrier_retains_both_branches_while_nested_password_is_missing(package, tmp_path):
     (tmp_path / "secret.txt").write_text("secret", encoding="utf-8")
     locked = tmp_path / "locked.zip"

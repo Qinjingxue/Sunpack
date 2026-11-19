@@ -1440,17 +1440,17 @@ impl Observer for Progress {
         self.watch.reuse_external_output(output)
     }
 
-    fn before_flatten(&self, output: &Path, work: &Path, leaf: &Path) -> io::Result<()> {
-        self.watch.prepare_external_flatten(output, work, leaf)
+    fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path, destination: &Path) -> io::Result<()> {
+        self.watch.prepare_external_flatten(root, work, leaf, destination)
     }
 
-    fn after_flatten(&self, id: TaskId, old: &Path, output: &Path) -> io::Result<()> {
-        self.watch.finish_external_flatten(output)?;
+    fn after_flatten(&self, id: TaskId, root: &Path, old: &Path, output: &Path) -> io::Result<()> {
+        if old != root { self.watch.finish_external_flatten(root)?; }
         if self.visible {
             // Keep relocation in the same ordered stream as registration and
             // Finished, so buffered results cannot restore stale output paths.
             self.reporting.notify(Event::OutputsRelocated {
-                id, old: old.to_owned(), new: output.to_owned(),
+                id, root: root.to_owned(), old: old.to_owned(), new: output.to_owned(),
             });
         }
         Ok(())

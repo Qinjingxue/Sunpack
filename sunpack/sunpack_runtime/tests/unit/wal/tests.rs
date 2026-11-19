@@ -6,6 +6,9 @@ use super::*;
 #[test]
 fn frames_reject_corruption_and_recover_only_incomplete_tails() {
     let mut bytes = file_header(Kind::TaskWal).to_vec();
+    let mut previous_header = file_header(Kind::TaskWal);
+    previous_header[4..6].copy_from_slice(&1u16.to_le_bytes());
+    assert!(Reader::new(Cursor::new(previous_header), Kind::TaskWal).is_err());
     append_frame(&mut bytes, &mut Vec::new(), 7, |out| {
         rmp_serde::encode::write(out, &vec!["雪", "payload"]).map_err(invalid)
     })

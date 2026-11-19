@@ -55,12 +55,12 @@ pub(super) struct Panel {
 impl Panel {
     pub(super) fn new(verbose: bool) -> Self { Self { verbose, ..Self::default() } }
 
-    fn relocate_outputs(&mut self, id: TaskId, old: &std::path::Path, new: &std::path::Path) {
+    fn relocate_outputs(&mut self, id: TaskId, root: &std::path::Path, old: &std::path::Path, new: &std::path::Path) {
         let mut pending = vec![id];
         while let Some(id) = pending.pop() {
             if let Some(task) = self.tasks.get_mut(&id) {
                 pending.extend(task.children.iter().copied());
-                if let Phase::Finished(result) = &mut task.phase { result.relocate_output(old, new); }
+                if let Phase::Finished(result) = &mut task.phase { result.relocate_output(root, old, new); }
             }
         }
     }
@@ -73,8 +73,8 @@ impl Panel {
         prompting: bool,
     ) {
         let (id, phase) = match event {
-            Event::OutputsRelocated { id, old, new } => {
-                self.relocate_outputs(id, &old, &new);
+            Event::OutputsRelocated { id, root, old, new } => {
+                self.relocate_outputs(id, &root, &old, &new);
                 if !prompting { self.redraw(session, language, true); }
                 return;
             }

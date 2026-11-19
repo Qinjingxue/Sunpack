@@ -152,6 +152,7 @@ enum OutputChange {
     },
     Relocate {
         source: String,
+        leaf: String,
         destination: String,
         identity: String,
     },
@@ -218,58 +219,10 @@ impl PendingRecord {
             }
             OutputChange::Relocate {
                 source,
+                leaf,
                 destination,
                 identity,
-            } => {
-                let source_key = path_key(source);
-                let source_depth = Path::new(source).components().count();
-                let relocate = |path: &str| {
-                    let key = path_key(path);
-                    if key == source_key {
-                        destination.clone()
-                    } else if is_path_under(&key, &source_key) {
-                        Path::new(destination)
-                            .join(
-                                Path::new(path)
-                                    .components()
-                                    .skip(source_depth)
-                                    .collect::<std::path::PathBuf>(),
-                            )
-                            .to_string_lossy()
-                            .into_owned()
-                    } else {
-                        path.to_owned()
-                    }
-                };
-                self.active_outputs.relocate(&relocate);
-                for path in self.committed_roots.remove_under(source) {
-                    self.committed_roots.retain_root(&relocate(&path));
-                }
-                for path in self.completed_sources.remove_under(source) {
-                    self.completed_sources.insert(relocate(&path));
-                }
-                let prefix = format!("{}\\", source.trim_end_matches('\\'));
-                let mut moved: Vec<_> = self
-                    .output_identities
-                    .range(prefix.clone()..)
-                    .take_while(|(path, _)| path.starts_with(&prefix))
-                    .map(|(path, _)| path.clone())
-                    .collect();
-                if self.output_identities.contains_key(source) {
-                    moved.push(source.clone());
-                }
-                for path in moved {
-                    if let Some(id) = self.output_identities.remove(&path) {
-                        self.output_identities.insert(relocate(&path), id);
-                    }
-                }
-                if self.committed_roots.contains(destination)
-                    || self.active_outputs.values().any(|p| p == destination)
-                {
-                    self.output_identities
-                        .insert(destination.clone(), identity.clone());
-                }
-            }
+            } => self.apply_output_relocation(source, leaf, destination, identity),
             OutputChange::Protect {
                 sources,
             } => {
@@ -289,6 +242,53 @@ impl PendingRecord {
                     }
                 }
             }
+        }
+    }
+
+    fn apply_output_relocation(&mut self, source: &str, leaf: &str, destination: &str, identity: &str) {
+        let source_key = path_key(source);
+        let leaf_key = path_key(leaf);
+        let leaf_depth = Path::new(leaf).components().count();
+        let relocate = |path: &str| {
+            let key = path_key(path);
+            if key == leaf_key {
+                destination.to_owned()
+            } else if is_path_under(&key, &leaf_key) {
+                Path::new(destination)
+                    .join(Path::new(path).components().skip(leaf_depth).collect::<std::path::PathBuf>())
+                    .to_string_lossy()
+                    .into_owned()
+            } else if (key == source_key || is_path_under(&key, &source_key))
+                && is_path_under(&leaf_key, &key)
+            {
+                destination.to_owned()
+            } else {
+                path.to_owned()
+            }
+        };
+        self.active_outputs.relocate(&relocate);
+        for path in self.committed_roots.remove_under(source) {
+            self.committed_roots.retain_root(&relocate(&path));
+        }
+        for path in self.completed_sources.remove_under(source) {
+            self.completed_sources.insert(relocate(&path));
+        }
+        // Remove the source receipts before inserting any rebased path, since
+        // a promoted child can reuse the spelling of one of the old wrappers.
+        let stem = source.trim_end_matches('\\');
+        let mut moved: Vec<_> = self.output_identities
+            .extract_if(format!("{stem}\\")..format!("{stem}]"), |_, _| true)
+            .collect();
+        if let Some(id) = self.output_identities.remove(source) {
+            moved.push((source.to_owned(), id));
+        }
+        for (path, id) in moved {
+            self.output_identities.insert(relocate(&path), id);
+        }
+        if self.committed_roots.contains(destination)
+            || self.active_outputs.values().any(|p| p == destination)
+        {
+            self.output_identities.insert(destination.to_owned(), identity.to_owned());
         }
     }
 }
@@ -586,12 +586,13 @@ impl NativeWatchOperations {
         &mut self,
         owner: &str,
         source: String,
+        leaf: String,
         destination: String,
         identity: String,
     ) {
         Arc::make_mut(&mut self.operations).0.push(Operation::Output(
             path_key(owner),
-            OutputChange::Relocate { source, destination, identity },
+            OutputChange::Relocate { source, leaf, destination, identity },
         ));
     }
 

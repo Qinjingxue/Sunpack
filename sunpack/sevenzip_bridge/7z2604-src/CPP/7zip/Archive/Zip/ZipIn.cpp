@@ -1351,9 +1351,9 @@ static bool AreItemsEqual(const CItemEx &localItem, const CItemEx &cdItem)
 }
 
 
-HRESULT CInArchive::Read_LocalItem_After_CdItem(CItemEx &item, bool &isAvail, bool &headersError)
+HRESULT CInArchive::Read_LocalItem_After_CdItem(CItemEx &item, CLocalItemRead &result, bool &headersError)
 {
-  isAvail = true;
+  result = CLocalItemRead::HeaderError;
   headersError = false;
   if (item.FromLocal)
     return S_OK;
@@ -1365,14 +1365,14 @@ HRESULT CInArchive::Read_LocalItem_After_CdItem(CItemEx &item, bool &isAvail, bo
     {
       if (item.Disk >= Vols.Streams.Size())
       {
-        isAvail = false;
+        result = CLocalItemRead::Unavailable;
         return S_FALSE;
       }
       Stream = Vols.Streams[item.Disk].Stream;
       Vols.StreamIndex = (int)item.Disk;
       if (!Stream)
       {
-        isAvail = false;
+        result = CLocalItemRead::Unavailable;
         return S_FALSE;
       }
     }
@@ -1380,7 +1380,7 @@ HRESULT CInArchive::Read_LocalItem_After_CdItem(CItemEx &item, bool &isAvail, bo
     {
       if (UseDisk_in_SingleVol && item.Disk != EcdVolIndex)
       {
-        isAvail = false;
+        result = CLocalItemRead::Unavailable;
         return S_FALSE;
       }
       Stream = StreamRef;
@@ -1388,7 +1388,7 @@ HRESULT CInArchive::Read_LocalItem_After_CdItem(CItemEx &item, bool &isAvail, bo
       offset = (UInt64)((Int64)offset + ArcInfo.Base);
       if (ArcInfo.Base < 0 && (Int64)offset < 0)
       {
-        isAvail = false;
+        result = CLocalItemRead::Unavailable;
         return S_FALSE;
       }
     }
@@ -1407,10 +1407,16 @@ HRESULT CInArchive::Read_LocalItem_After_CdItem(CItemEx &item, bool &isAvail, bo
 
     CItemEx localItem;
     if (ReadUInt32() != NSignature::kLocalFileHeader)
+    {
+      result = CLocalItemRead::Conflict;
       return S_FALSE;
+    }
     ReadLocalItem(localItem);
     if (!AreItemsEqual(localItem, item))
+    {
+      result = CLocalItemRead::Conflict;
       return S_FALSE;
+    }
     item.LocalFullHeaderSize = localItem.LocalFullHeaderSize;
     item.LocalExtra = localItem.LocalExtra;
     if (item.Crc != localItem.Crc && !localItem.HasDescriptor())
@@ -1635,9 +1641,9 @@ HRESULT CInArchive::Read_LocalItem_After_CdItem_Full(CItemEx &item)
     return S_OK;
   try
   {
-    bool isAvail = true;
+    CLocalItemRead result;
     bool headersError = false;
-    RINOK(Read_LocalItem_After_CdItem(item, isAvail, headersError))
+    RINOK(Read_LocalItem_After_CdItem(item, result, headersError))
     if (headersError)
       return S_FALSE;
     if (item.HasDescriptor())

@@ -528,7 +528,8 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
           (UInt64)((Int64)item.LocalHeaderPos + m_Archive.ArcInfo.Base);
       break;
     case kpidSunpackProofPackedSize:
-      prop = item.PackSize + item.LocalFullHeaderSize;
+      if (item.FromLocal && item.PackSize <= (UInt64)-1 - item.LocalFullHeaderSize)
+        prop = item.PackSize + item.LocalFullHeaderSize;
       break;
     
     case kpidMethod:
@@ -1692,18 +1693,19 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
     
     if (!item.FromLocal)
     {
-      bool isAvail = true;
-      const HRESULT hres = m_Archive.Read_LocalItem_After_CdItem(item, isAvail, headersError);
+      CInArchive::CLocalItemRead result;
+      const HRESULT hres = m_Archive.Read_LocalItem_After_CdItem(item, result, headersError);
       if (hres == S_FALSE)
       {
         if (item.IsDir() || realOutStream || testMode)
         {
           RINOK(extractCallback->PrepareOperation(askMode))
           realOutStream.Release();
-          RINOK(extractCallback->SetOperationResult(
-              isAvail ?
-                NExtract::NOperationResult::kHeadersError :
-                NExtract::NOperationResult::kUnavailable))
+          const Int32 failure = result == CInArchive::CLocalItemRead::Unavailable ?
+              NExtract::NOperationResult::kUnavailable :
+              (result == CInArchive::CLocalItemRead::Conflict && testMode == kSunpackVerifyMember ?
+                  kSunpackZipLocalHeaderConflict : NExtract::NOperationResult::kHeadersError);
+          RINOK(extractCallback->SetOperationResult(failure))
         }
         continue;
       }

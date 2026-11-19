@@ -16,6 +16,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         let base = PathBuf::from(base);
         let owner = base.join("carrier.bin");
         let root = base.join("output");
+        let destination = base.join("inner(1)");
         let work = base.join("work");
         let leaf = root.join("wrapper/inner");
         let nested = leaf.join("nested.zip");
@@ -35,16 +36,23 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
             ))
         }).unwrap();
         journal.commit(true, |state| {
-            Ok(state.output_operation(owner_text, owner_text.into(),
-                root.to_string_lossy().into_owned(), None, false)?.unwrap())
+            let mut operations = NativeWatchOperations::empty();
+            let wrapper = leaf.parent().unwrap();
+            let segment = base.join("segment.bin");
+            for (task, output) in [(owner.as_path(), root.as_path()),
+                (segment.as_path(), wrapper), (nested.as_path(), nested_output.as_path())] {
+                operations.extend(state.output_operation(owner_text, task.to_string_lossy().into_owned(),
+                    output.to_string_lossy().into_owned(), None, false)?.unwrap());
+            }
+            Ok(operations)
         }).unwrap();
-        prepare_flatten(&journal, owner_text, &root, &work, &leaf).unwrap();
+        prepare_flatten(&journal, owner_text, &root, &work, &leaf, &destination).unwrap();
         let phase = std::env::var(PHASE).unwrap();
         if phase != "prepared" {
             crate::io::atomic_file::rename_no_replace(&root, &work).unwrap();
         }
         if matches!(phase.as_str(), "published" | "rebased") {
-            crate::io::atomic_file::rename_no_replace(&work.join("wrapper/inner"), &root).unwrap();
+            crate::io::atomic_file::rename_no_replace(&work.join("wrapper/inner"), &destination).unwrap();
         }
         if phase == "rebased" {
             // The wrappers are still present, so the durable intent remains
@@ -87,6 +95,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         assert!(!status.success());
         let owner = base.join("carrier.bin");
         let root = base.join("output");
+        let destination = base.join("inner(1)");
         let work = base.join("work");
         let leaf = root.join("wrapper/inner");
         for reopen in 0..2 {
@@ -98,18 +107,24 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                 assert!(leaf.join("nested/payload").is_file());
                 let result = crate::postprocess::flatten_single_branch_directories(
                     &root, &work, crate::postprocess::FlattenLeaf::Prepared(&leaf),
-                    |root, work, leaf| prepare_flatten(&journal, owner.to_str().unwrap(), root, work, leaf),
+                    &destination,
+                    || prepare_flatten(&journal, owner.to_str().unwrap(), &root, &work, &leaf, &destination),
                 );
                 assert!(result.errors.is_empty(), "{:?}", result.errors);
                 finish_flatten(&journal, root.to_str().unwrap()).unwrap();
             }
-            assert_eq!(fs::read(root.join("nested/payload")).unwrap(), b"committed payload");
-            assert_eq!(output_identity(root.join("nested").to_str().unwrap()).unwrap(),
+            assert_eq!(fs::read(destination.join("nested/payload")).unwrap(), b"committed payload");
+            assert_eq!(output_identity(destination.join("nested").to_str().unwrap()).unwrap(),
                 fs::read_to_string(base.join("identity")).unwrap());
             assert!(!work.exists(), "{phase}/{reopen}");
             assert!(journal.state().runtime_keys("flatten|").is_empty());
             let pending = journal.state().pending(owner.to_str().unwrap()).unwrap();
-            assert!(recovery_output_matches(&pending, root.to_str().unwrap()));
+            assert!(recovery_output_matches(&pending, destination.to_str().unwrap()));
+            assert!(pending.active_outputs.iter().any(|(task, output)|
+                Path::new(task) == base.join("segment.bin") && Path::new(output) == destination));
+            assert!(pending.active_outputs.iter().any(|(task, output)|
+                Path::new(task) == destination.join("nested.zip") && Path::new(output) == destination.join("nested")));
+            assert!(journal.state().owned_root(root.to_str().unwrap()).is_none());
             assert!(journal.state().owned_root(work.to_str().unwrap()).is_none());
         }
         fs::remove_dir_all(&base).unwrap();

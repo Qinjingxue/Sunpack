@@ -3004,7 +3004,7 @@ fn cancellation_joins_nested_writer_then_rolls_back_only_uncommitted_trees() {
         CreatedOutputs::register(&moving, path, &ownership);
     }
     let mut moving = moving.into_inner().unwrap();
-    moving.relocate(&old, &new);
+    moving.relocate_flatten(&old, &old, &new);
     assert!(moving.0.contains_key(&output_key(&new.join("child"))));
     assert!(!moving.0.contains_key(&output_key(&old.join("child"))));
     assert!(moving.0.contains_key(&output_key(&punctuation)));
@@ -3326,7 +3326,7 @@ fn flatten_work_avoids_unmaterialized_output_claim_and_releases_its_slot() {
     struct Work(Mutex<Option<PathBuf>>);
     impl Observer for Work {
         fn notify(&self, _: Event) {}
-        fn before_flatten(&self, _: &Path, work: &Path, _: &Path) -> io::Result<()> {
+        fn before_flatten(&self, _: &Path, work: &Path, _: &Path, _: &Path) -> io::Result<()> {
             *self.0.lock().unwrap() = Some(work.to_owned());
             Ok(())
         }
@@ -3347,7 +3347,7 @@ fn flatten_work_avoids_unmaterialized_output_claim_and_releases_its_slot() {
     assert!(!reserved.exists()); // Peer has claimed but not created its output.
     let observer = Work(Mutex::default());
     let mut outcome = Outcome::default();
-    flatten_result(&observer, 1, &mut archive, &mut outcome, None, &names).unwrap();
+    flatten_result(&observer, 1, &mut archive, &mut outcome, None, &names, crate::core::config::FlattenDirectoryName::Outer).unwrap();
     let staging = observer.0.lock().unwrap().clone().unwrap();
     assert_ne!(staging, reserved);
     assert!(outcome.cleanup_results.is_empty());
@@ -3361,7 +3361,7 @@ fn flatten_work_avoids_unmaterialized_output_claim_and_releases_its_slot() {
 }
 
 #[test]
-fn flatten_rebases_rollback_receipts_when_root_spelling_is_unchanged() {
+fn flatten_inner_reserves_unique_name_and_rebases_rollback_receipts() {
     struct Discards(Mutex<Vec<PathBuf>>);
     impl Observer for Discards {
         fn notify(&self, _: Event) {}
@@ -3372,7 +3372,10 @@ fn flatten_rebases_rollback_receipts_when_root_spelling_is_unchanged() {
     }
     let source = crate::test_support::temp_file("flatten_cancel_receipts", b"input");
     let output = source.with_extension("output");
-    let leaf = output.join("wrapper");
+    let occupied = source.with_extension("inner");
+    fs::create_dir(&occupied).unwrap();
+    fs::write(occupied.join("unrelated"), b"peer").unwrap();
+    let leaf = output.join("wrapper").join(occupied.file_name().unwrap());
     let child = leaf.join("child");
     fs::create_dir_all(&child).unwrap();
     fs::write(leaf.join("ordinary.txt"), b"keep").unwrap();
@@ -3391,16 +3394,23 @@ fn flatten_rebases_rollback_receipts_when_root_spelling_is_unchanged() {
     let mut children = Outcome::default();
     children.archives.push(nested);
     let observer = Discards(Mutex::default());
-    flatten_result(&observer, 1, &mut archive, &mut children, Some(&created), &OutputReservationGuard { registry: Arc::default(), owner: 1 }).unwrap();
-    assert_eq!(archive.output.as_ref(), Some(&output));
-    assert_eq!(created.lock().unwrap().0.get(&output_key(&output)).unwrap().archive, source);
-    let published_child = output.join("child");
+    let names = OutputReservationGuard { registry: Arc::default(), owner: 1 };
+    flatten_result(&observer, 1, &mut archive, &mut children, Some(&created), &names, crate::core::config::FlattenDirectoryName::Inner).unwrap();
+    let destination = numbered(&occupied, 1);
+    assert_eq!(archive.output.as_ref(), Some(&destination));
+    assert!(names.registry.lock().unwrap().claimed.contains_key(&output_key(&destination)));
+    assert_eq!(created.lock().unwrap().0.get(&output_key(&destination)).unwrap().archive, source);
+    let published_child = destination.join("child");
+    assert_eq!(children.archives[0].output.as_ref(), Some(&published_child));
     assert!(published_child.join("payload.txt").is_file());
     created.lock().unwrap().rollback(&observer, &mut children).unwrap();
     let discarded = observer.0.lock().unwrap();
     assert!(discarded.contains(&published_child));
     assert!(!discarded.contains(&child));
     assert!(!output.exists());
+    assert!(!destination.exists());
+    assert_eq!(fs::read(occupied.join("unrelated")).unwrap(), b"peer");
+    fs::remove_dir_all(occupied).unwrap();
     fs::remove_file(source).unwrap();
 }
 
@@ -3427,7 +3437,7 @@ fn flatten_failure_keeps_extraction_successful_and_reports_output() {
     // failure, distinct from ordinary source-cleanup warnings.
     let held = fs::OpenOptions::new().access_mode(0x1).share_mode(3)
         .custom_flags(0x0200_0000).open(&output).unwrap();
-    let result = flatten_result(&|_: Event| {}, 1, &mut archive, &mut outcome, None, &OutputReservationGuard { registry: Arc::default(), owner: 1 });
+    let result = flatten_result(&|_: Event| {}, 1, &mut archive, &mut outcome, None, &OutputReservationGuard { registry: Arc::default(), owner: 1 }, crate::core::config::FlattenDirectoryName::Outer);
     let payload = fs::read(wrapper.join("payload.txt"));
     drop(held);
     fs::remove_dir_all(&output).unwrap();

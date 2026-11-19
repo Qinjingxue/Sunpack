@@ -3,10 +3,10 @@ import json
 import subprocess
 
 
-def _upgrade(repo_root, user, version, advanced=None):
+def _upgrade(repo_root, user, version, advanced=None, *, template=None):
     command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
                "-ExecutionPolicy", "Bypass", "-File", str(repo_root / "scripts/upgrade_config.ps1"),
-               "-UserConfig", str(user), "-TemplateConfig", str(repo_root / "sunpack_config.json"),
+               "-UserConfig", str(user), "-TemplateConfig", str(template or repo_root / "sunpack_config.json"),
                "-PreviousVersion", version]
     if advanced is not None:
         command += ["-AdvancedConfig", str(advanced)]
@@ -126,6 +126,9 @@ def test_legacy_filters_keep_only_active_sources_and_repeat_safely(tmp_path, rep
     # Only the installer converts legacy modules. This four-case matrix catches
     # accidental activation of disabled rules, lost legacy matching, template
     # defaults and non-idempotent rewrites; runtime matcher tests cannot do so.
+    template = json.loads((repo_root / "sunpack_config.json").read_text(encoding="utf-8"))
+    default_extensions = next(f["extensions"] for f in template["filesystem"]["scan_filters"]
+                              if f["name"] == "blacklist")
     for index, (prune, blocked) in enumerate(((True, True), (True, False), (False, True), (False, False))):
         data = tmp_path / str(index)
         data.mkdir()
@@ -148,9 +151,11 @@ def test_legacy_filters_keep_only_active_sources_and_repeat_safely(tmp_path, rep
         assert blacklist["paths"] == ([{"value": ".git", "regex": False},
             {"value": r"(?:\A|/)(?:Cache/Private)(?:/|\z)", "regex": True}] if prune or not blocked else [])
         assert blacklist["full_names"] == ([{"value": "Thumbs.db", "regex": False}] if blocked or not prune else [])
-        assert blacklist["extensions"] == ([{"value": "tmp", "regex": False},
+        migrated_extensions = ([{"value": "tmp", "regex": False},
             {"value": r"\A\z", "regex": True}, {"value": ".never", "regex": False}]
             if blocked or not prune else [])
+        assert blacklist["extensions"] == migrated_extensions + [
+            rule for rule in default_extensions if rule not in migrated_extensions]
         assert blacklist["files"] == []
         assert whitelist["enabled"] is False
         assert whitelist["paths"] == [{"value": "downloads", "regex": False}]
@@ -161,25 +166,43 @@ def test_legacy_filters_keep_only_active_sources_and_repeat_safely(tmp_path, rep
         assert {name: value[0] for name, value in _snapshot(data).items()} == before
 
 
-def test_current_filters_merge_by_name_without_adding_modules(tmp_path, repo_root):
-    # Current-format custom rule lists must not be legacy-converted, expanded
-    # with absent modules, or merged positionally. The legacy matrix cannot
-    # detect this boundary; one script invocation covers it.
-    user = tmp_path / "sunpack_config.json"
-    filters = [{"name": "size_range", "enabled": False, "min_bytes": 0},
-               {"name": "blacklist", "enabled": False, "extensions": [],
-                "paths": [{"value": r'\A"exact  [x]"\z', "regex": True}]},
-               {"name": "whitelist", "enabled": True, "extensions": [{"value": "zip", "regex": False}]}]
-    user.write_text(json.dumps({"filesystem": {"scan_filters": filters}}, indent=2), encoding="utf-8")
-    result = _upgrade(repo_root, user, "1.4.1")
-    assert result.returncode == 0, result.stdout + result.stderr
-    template = json.loads((repo_root / user.name).read_text(encoding="utf-8"))
+def test_current_filters_append_template_rules_without_adding_modules(tmp_path, repo_root):
+    # The legacy matrix does not exercise modern rule identity, custom order,
+    # or defaults in the whitelist. Two upgrades also check idempotence.
+    template = json.loads((repo_root / "sunpack_config.json").read_text(encoding="utf-8"))
     defaults = {f["name"]: f for f in template["filesystem"]["scan_filters"]}
+    common = {"value": "tmp", "regex": False}
+    local = {"value": "local", "regex": False}
+    new_extension = {"value": "new", "regex": False}
+    new_path = {"value": "cache/**", "regex": False}
+    white_rule = {"value": "zip", "regex": False}
+    white_regex = {"value": "zip", "regex": True}
+    white_file = {"value": "项目包", "regex": False}
+    defaults["blacklist"].update(extensions=[common, new_extension], paths=[new_path])
+    defaults["whitelist"].update(extensions=[white_rule, white_regex, white_regex], full_names=[white_file])
+    template_path = tmp_path / "template.json"
+    template_path.write_text(json.dumps(template), encoding="utf-8")
+    data = tmp_path / "data"
+    data.mkdir()
+    user = data / "sunpack_config.json"
+    filters = [{"name": "size_range", "enabled": False, "min_bytes": 0},
+               {"name": "blacklist", "enabled": False, "extensions": [local, common, local],
+                "paths": [{"value": r'\A"exact  [x]"\z', "regex": True}]},
+               {"name": "whitelist", "enabled": True, "extensions": [white_rule], "full_names": []}]
+    user.write_text(json.dumps({"filesystem": {"scan_filters": filters}}, indent=2), encoding="utf-8")
+    result = _upgrade(repo_root, user, "1.4.1", template=template_path)
+    assert result.returncode == 0, result.stdout + result.stderr
     expected = [dict(defaults[f["name"]], **f) for f in filters]
+    expected[1].update(extensions=[local, common, local, new_extension], paths=filters[1]["paths"] + [new_path])
+    expected[2].update(extensions=[white_rule, white_regex], full_names=[white_file])
     migrated = user.read_text(encoding="utf-8-sig")
     assert json.loads(migrated)["filesystem"]["scan_filters"] == expected
     lines = {line.strip().removesuffix(",") for line in migrated.splitlines()}
-    assert all(json.dumps(f, separators=(",", ":")) in lines for f in expected[1:])
+    assert all(json.dumps(f, separators=(",", ":"), ensure_ascii=False) in lines for f in expected[1:])
+    before = user.read_bytes()
+    result = _upgrade(repo_root, user, "1.4.1", template=template_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert user.read_bytes() == before
 
 
 def test_upgrade_boundary_and_current_projection(tmp_path, repo_root):

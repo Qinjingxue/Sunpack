@@ -70,6 +70,23 @@ if ($AdvancedConfig -and (Test-Path -LiteralPath $AdvancedConfig -PathType Leaf)
     $advanced = Read-Config $AdvancedConfig
 }
 
+function Unique-Rules($Rules, $Existing = @()) {
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($rule in $Existing) {
+        if ($rule -is [pscustomobject]) {
+            $value = $rule.PSObject.Properties['value']
+            $regex = $rule.PSObject.Properties['regex']
+            if ($value -and $value.Value -is [string] -and $regex -and $regex.Value -is [bool]) {
+                [void]$seen.Add(([string]$regex.Value + ':' + $value.Value))
+            }
+        }
+        $rule
+    }
+    foreach ($rule in $Rules) {
+        if ($seen.Add(([string]$rule.regex + ':' + $rule.value))) { $rule }
+    }
+}
+
 if ($retainInputs -and $version -lt [Version]'1.4.0') {
 function Escape-RuleLiteral([string]$Value) {
     $builder = [Text.StringBuilder]::new()
@@ -114,13 +131,6 @@ function Convert-PathRule([string]$Value, [bool]$DirectoryName) {
         else { $null = $body.Append((Escape-RuleLiteral ([string]$c))) }
     }
     [pscustomobject]@{ value = ('(?:\A|/)(?:' + $body.ToString() + ')(?:/|\z)'); regex = $true }
-}
-
-function Unique-Rules($Rules) {
-    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($rule in $Rules) {
-        if ($seen.Add(([string]$rule.regex + ':' + $rule.value))) { $rule }
-    }
 }
 
 $hasFilters = $user.PSObject.Properties['filesystem'] -and $null -ne $user.filesystem -and $user.filesystem.PSObject.Properties['scan_filters']
@@ -226,15 +236,20 @@ foreach ($field in @(
 }
 
 # The current ordinary template is the schema: new keys get their default and
-# retired keys disappear. Test presence, never truthiness; null/false/0/""/[]
-# are explicit values. Only scan_filters is a named-record array.
-function Merge-OrdinaryConfig($Defaults, $Previous, [string]$Key = '') {
+# retired keys disappear. Preserve explicit values. For black/white list rule
+# arrays, append missing template rules after the user's entries.
+function Merge-OrdinaryConfig($Defaults, $Previous, [string]$Key = '', [switch]$AppendRules) {
     if ($Defaults -is [pscustomobject] -and $Previous -is [pscustomobject]) {
         $result = [ordered]@{}
         foreach ($property in $Defaults.PSObject.Properties) {
             $old = $Previous.PSObject.Properties[$property.Name]
             if ($null -ne $old) {
-                $result[$property.Name] = Merge-OrdinaryConfig $property.Value $old.Value $property.Name
+                if ($AppendRules -and $property.Name -in @('paths', 'full_names', 'files', 'extensions') -and
+                    $old.Value -is [array] -and $property.Value -is [array] -and $property.Value.Length -gt 0) {
+                    $result[$property.Name] = @(Unique-Rules $property.Value $old.Value)
+                } else {
+                    $result[$property.Name] = Merge-OrdinaryConfig $property.Value $old.Value $property.Name
+                }
             } else { $result[$property.Name] = $property.Value }
         }
         return [pscustomobject]$result
@@ -242,7 +257,9 @@ function Merge-OrdinaryConfig($Defaults, $Previous, [string]$Key = '') {
     if ($Key -eq 'scan_filters' -and $Previous -is [array]) {
         $result = @(foreach ($filter in $Previous) {
             $current = $Defaults | Where-Object { $_.name -eq $filter.name } | Select-Object -First 1
-            if ($null -ne $current) { Merge-OrdinaryConfig $current $filter }
+            if ($null -ne $current) {
+                Merge-OrdinaryConfig $current $filter -AppendRules:($current.name -in @('blacklist', 'whitelist'))
+            }
         })
         return ,$result
     }

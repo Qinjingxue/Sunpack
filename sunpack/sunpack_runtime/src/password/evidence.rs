@@ -428,9 +428,17 @@ impl EvidenceContext {
         cancellation.check_io()?;
         let public_plan = self.public_plan()?;
         let plan = public_plan.as_deref().unwrap_or(&self.plan);
-        let unique_volume = matches!(&*plan.layouts, [layout] if
+        use super::seven_zip::SevenZipVolumeScope;
+        let seven_zip_scope = if matches!(&*plan.layouts, [layout] if
             (layout.minimum_slots == 0 || layout.minimum_slots == layout.slots.len()) &&
-            layout.slots.iter().all(|slot| plan.domains[slot.domain].choices.len() == 1));
+            layout.slots.iter().all(|slot| plan.domains[slot.domain].choices.len() == 1))
+        {
+            SevenZipVolumeScope::Unique
+        } else if self.alternatives.len() == 1 && self.unresolved.is_none() {
+            SevenZipVolumeScope::SharedProjection
+        } else {
+            SevenZipVolumeScope::SeparateProjections
+        };
         let keys = SharedCandidateKeys::new(&self.alternatives, |context| {
             let context = match context {
                 PasswordContext::SevenZip(context) => Some(context),
@@ -451,7 +459,7 @@ impl EvidenceContext {
             .map(|(context, _)| {
                 cancellation.run(|| match context {
                     PasswordContext::SevenZip(context) => context
-                        .verify_cached(candidates, Some(&keys), unique_volume),
+                        .verify_cached(candidates, Some(&keys), seven_zip_scope),
                     PasswordContext::Zip(context) => context.verify_cached(
                         candidates,
                         zip_keys,

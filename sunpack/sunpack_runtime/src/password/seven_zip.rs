@@ -82,6 +82,13 @@ pub(crate) use crate::formats::seven_zip::SevenZipPasswordContext;
 type SevenZipKeyCache<'a> =
     super::evidence::SharedCandidateKeys<(u8, &'a [u8]), Result<SevenZipAesKey, String>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SevenZipVolumeScope {
+    Unique,
+    SharedProjection,
+    SeparateProjections,
+}
+
 impl SevenZipPasswordContext {
     pub(super) fn kdf_parameters(&self) -> impl Iterator<Item = (u8, &[u8])> + '_ {
         let (header, payload) = match self {
@@ -98,14 +105,14 @@ impl SevenZipPasswordContext {
     }
 
     pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
-        self.verify_cached(candidates, None, true)
+        self.verify_cached(candidates, None, SevenZipVolumeScope::Unique)
     }
 
     pub(super) fn verify_cached<'a>(
         &'a self,
         candidates: &[Arc<str>],
         cache: Option<&SevenZipKeyCache<'a>>,
-        unique_volume: bool,
+        volume_scope: SevenZipVolumeScope,
     ) -> std::io::Result<PasswordVerification> {
         if matches!(self, Self::MemberOnly) {
             return Ok(PasswordVerification::status(
@@ -175,7 +182,7 @@ impl SevenZipPasswordContext {
         })?;
         let mut result = candidate_result(&matches, candidates.len(), evidence, true);
         let narrow_volumes_only = result.matched_indices.len() == 1;
-        if narrow_volumes_only && (unique_volume || !probe.has_ambiguous_followup()) {
+        if narrow_volumes_only && volume_scope == SevenZipVolumeScope::Unique {
             return Ok(result);
         }
         let followups = matches.iter().filter(|(_, check)| check.is_ok())
@@ -184,11 +191,56 @@ impl SevenZipPasswordContext {
             return Ok(result);
         }
         let cancellation = Cancellation::current();
+        let mut outcomes = Vec::new();
+        let mut remaining = matches.into_iter();
+        if volume_scope == SevenZipVolumeScope::Unique && probe.can_stage_followup() {
+            let mut pending = Vec::with_capacity(2);
+            let mut viable = 0;
+            for (index, check) in remaining.by_ref() {
+                if let Ok((_, (first_key, prefix))) = check {
+                    let staged = cancellation.run(|| probe.prepare_followup(|properties| {
+                        key(index, &candidates[index], properties)
+                    }));
+                    match staged {
+                        Ok(Some(prepared)) => {
+                            pending.push((index, first_key, prefix, prepared));
+                            viable += 1;
+                        }
+                        Ok(None) => outcomes.push((index, Ok(SevenZipPrefixCheck::Reject), Vec::new())),
+                        Err(error) => {
+                            viable += 1;
+                            outcomes.push((index, Err(error), Vec::new()));
+                        }
+                    }
+                } else {
+                    viable += 1;
+                }
+                // Buffer at most two states. As soon as another candidate
+                // remains viable, the successor checks can narrow the result.
+                if viable >= 2 && !pending.is_empty() {
+                    break;
+                }
+            }
+            viable += remaining.len();
+            for (index, first_key, prefix, prepared) in pending {
+                let proof = if viable == 1 {
+                    prepared.prefix_result(prefix.check)
+                } else {
+                    cancellation.run(|| probe.verify_prepared_followup(&first_key, prefix, prepared))
+                };
+                if proof == Ok(SevenZipPrefixCheck::Reject) {
+                    viable -= 1;
+                }
+                let at = outcomes.partition_point(|(checked, _, _)| *checked < index);
+                outcomes.insert(at, (index, proof, Vec::new()));
+            }
+        }
         let test = |(index, check): CheckedCandidate<_>| {
             let (_, (first_key, prefix)) = check.ok()?;
             Some(cancellation.run(|| {
                 let mut rejected = Vec::new();
-                let proof = probe.verify_followup(&first_key, prefix, narrow_volumes_only, |properties| {
+                let proof = probe.verify_followup(&first_key, prefix, narrow_volumes_only,
+                    volume_scope == SevenZipVolumeScope::SharedProjection, |properties| {
                     key(index, &candidates[index], properties)
                 }, |projection| rejected.push((projection, index)));
                 (index, proof, rejected)
@@ -196,13 +248,14 @@ impl SevenZipPasswordContext {
         };
         // Both collections follow input order. The candidate item carries its
         // own follow-up data across the two phases.
-        let outcomes: Vec<_> = if followups >= PARALLEL_PASSWORD_THRESHOLD {
-            matches.into_par_iter().map(test).collect()
+        if followups >= PARALLEL_PASSWORD_THRESHOLD && remaining.len() >= PARALLEL_PASSWORD_THRESHOLD {
+            let remaining: Vec<_> = remaining.collect();
+            outcomes.par_extend(remaining.into_par_iter().filter_map(test));
         } else {
-            matches.into_iter().map(test).collect()
-        };
+            outcomes.extend(remaining.filter_map(test));
+        }
         cancellation.check_io()?;
-        let mut outcomes = outcomes.into_iter().flatten().peekable();
+        let mut outcomes = outcomes.into_iter().peekable();
         let mut message = None;
         result.matched_indices.retain(|&index| {
             if outcomes.peek().is_none_or(|(tested, _, _)| *tested != index) {

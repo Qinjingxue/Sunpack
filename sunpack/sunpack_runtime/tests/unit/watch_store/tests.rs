@@ -85,7 +85,7 @@ fn carrier_outputs_survive_snapshot_and_incremental_replay() {
     append(4, vec![OutputChange::Finish {
         task: task.clone(), output: second.clone(), keep: false, identity: None,
     }, OutputChange::Relocate {
-        source: container.clone(), destination: moved.clone(), identity: "moved-id".into(),
+        source: container.clone(), leaf: container.clone(), destination: moved.clone(), identity: "moved-id".into(),
     }]);
     resumed.replay_segment(journal.to_string_lossy().into_owned(), 3, 4).unwrap();
     let pending = resumed.pending(&owner).unwrap();

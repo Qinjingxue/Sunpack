@@ -372,16 +372,22 @@ impl InputCheckpoint {
         changed
     }
 
-    pub(super) fn relocate_flatten(&mut self, leaf: &Path, root: &Path) -> bool {
-        let wrapper = self.has_output() && leaf.starts_with(&self.output) && self.output.starts_with(root);
-        let changed = self.relocate(leaf, root);
-        if wrapper { self.output = root.to_path_buf(); }
-        if let Some(report) = &mut self.report {
-            if !report.output.as_os_str().is_empty() && leaf.starts_with(&report.output) && report.output.starts_with(root) {
-                report.output = root.to_path_buf();
+    pub(super) fn relocate_flatten(&mut self, root: &Path, leaf: &Path, destination: &Path) -> bool {
+        // Only directory receipts can refer to wrappers that disappear entirely.
+        let mut wrapper = false;
+        let mut relocate_wrapper = |path: &mut PathBuf| {
+            if path != leaf && leaf.starts_with(&*path) && path.starts_with(root) {
+                *path = destination.to_path_buf();
+                wrapper = true;
             }
+        };
+        if self.has_output() { relocate_wrapper(&mut self.output); }
+        if let Some(planned) = &mut self.planned_output { relocate_wrapper(planned); }
+        if let Some(container) = &mut self.container { relocate_wrapper(container); }
+        if let Some(report) = &mut self.report {
+            relocate_wrapper(&mut report.output);
         }
-        changed || wrapper
+        self.relocate(leaf, destination) || wrapper
     }
 
     pub(crate) fn has_output(&self) -> bool { !self.output.as_os_str().is_empty() }
@@ -488,12 +494,11 @@ impl InputRecovery {
         serde_json::to_value(self.report_view(failure)).expect("recovery report serializes")
     }
 
-    pub(super) fn relocate_flatten(&mut self, leaf: &Path, root: &Path) {
-        if let Ok(relative) = self.output.strip_prefix(leaf) { self.output = root.join(relative); }
-        else if leaf.starts_with(&self.output) && self.output.starts_with(root) { self.output = root.to_path_buf(); }
+    pub(super) fn relocate_flatten(&mut self, root: &Path, leaf: &Path, destination: &Path) {
+        super::relocate_flatten_output(&mut self.output, root, leaf, destination);
         for input in &mut self.inputs {
             if !input.report.output.as_os_str().is_empty() {
-                super::relocate_flatten_output(&mut input.report.output, leaf, root);
+                super::relocate_flatten_output(&mut input.report.output, root, leaf, destination);
             }
         }
     }

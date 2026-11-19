@@ -869,14 +869,15 @@ impl Watch {
     }
 
     pub(super) fn prepare_external_flatten(
-        &self, output: &Path, work: &Path, leaf: &Path,
+        &self, output: &Path, work: &Path, leaf: &Path, destination: &Path,
     ) -> io::Result<()> {
         let external = self.external.current.write().unwrap();
         if let Some(journal) = external.as_ref().and_then(|external| external.journal.upgrade()) {
-            prepare_flatten(&journal, "", output, work, leaf)?;
+            prepare_flatten(&journal, "", output, work, leaf, destination)?;
         } else {
             let mut paths = crate::path_keys::output_path_aliases(output)?;
             paths.extend(crate::path_keys::output_path_aliases(work)?);
+            if key(output) != key(destination) { paths.extend(crate::path_keys::output_path_aliases(destination)?); }
             crate::watch_store::active_outputs::register(&self.external.reservations, &paths,
                 &[&output_identity(&output.to_string_lossy())?, &output_identity(&leaf.to_string_lossy())?]);
         }
@@ -6598,13 +6599,32 @@ impl From<BTreeMap<String, String>> for ObservedOutputs {
 impl ObservedOutputs {
     fn insert(&mut self, path: String, owner: String) {
         if let Some(previous) = self.paths.insert(path.clone(), owner.clone()) {
-            let previous = watch_path_key(&previous);
-            if let Some(paths) = self.owners.get_mut(&previous) {
-                paths.remove(&path);
-                if paths.is_empty() { self.owners.remove(&previous); }
-            }
+            self.remove_owner_path(&path, &previous);
         }
         self.owners.entry(watch_path_key(&owner)).or_default().insert(path);
+    }
+
+    fn remove(&mut self, path: &str) {
+        if let Some(owner) = self.paths.remove(path) {
+            self.remove_owner_path(path, &owner);
+        }
+    }
+
+    fn remove_owner_path(&mut self, path: &str, owner: &str) {
+        let owner = watch_path_key(owner);
+        if let Some(paths) = self.owners.get_mut(&owner) {
+            paths.remove(path);
+            if paths.is_empty() { self.owners.remove(&owner); }
+        }
+    }
+
+    fn replace_tree(&mut self, root: &str, output: String, owner: String) {
+        let prefix = format!("{}\\", root.trim_end_matches('\\'));
+        let children: Vec<_> = self.paths.range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix)).map(|(path, _)| path.clone()).collect();
+        self.remove(root);
+        for path in children { self.remove(&path); }
+        self.insert(output, owner);
     }
 
     fn take_owners(&mut self, owners: &HashSet<String>) -> BTreeMap<String, String> {
@@ -6844,17 +6864,27 @@ impl Observer for WatchObserver {
         self.publish_output(archive, path, false)
     }
 
-    fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path) -> io::Result<()> {
+    fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path, destination: &Path) -> io::Result<()> {
         let owner = self.owner_for_path(root).unwrap_or_default();
-        prepare_flatten(&self.journal, &owner, root, work, leaf)?;
+        prepare_flatten(&self.journal, &owner, root, work, leaf, destination)?;
         if !owner.is_empty() {
             self.outputs.lock().unwrap().insert(key(work), owner);
         }
         Ok(())
     }
 
-    fn after_flatten(&self, _id: crate::pipeline::TaskId, _old: &Path, output: &Path) -> io::Result<()> {
-        finish_flatten(&self.journal, &output.to_string_lossy())
+    fn after_flatten(&self, _id: crate::pipeline::TaskId, root: &Path, old: &Path, output: &Path) -> io::Result<()> {
+        if old != root {
+            finish_flatten(&self.journal, &root.to_string_lossy())?;
+            if root != output && key(root) != key(output) {
+                let root_key = key(root);
+                let mut outputs = self.outputs.lock().unwrap();
+                if let Some(owner) = output_owner(&outputs.paths, &root_key).map(str::to_owned) {
+                    outputs.replace_tree(&root_key, key(output), owner);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
@@ -6897,18 +6927,26 @@ fn prepare_flatten(
     root: &Path,
     work: &Path,
     leaf: &Path,
+    destination: &Path,
 ) -> io::Result<()> {
     journal.commit(true, |state| {
         use crate::watch_store::NativeWatchOperations;
         let old = output_identity(&root.to_string_lossy())?;
         let new = output_identity(&leaf.to_string_lossy())?;
-        let root_paths = crate::path_keys::output_path_aliases(root)?;
+        let mut paths = crate::path_keys::output_path_aliases(root)?;
         let work_paths = crate::path_keys::output_path_aliases(work)?;
-        let mut operations = NativeWatchOperations::empty();
-        operations.set_runtime(format!("flatten|{}", key(root)), Some(json!({
+        let mut record = json!({
             "owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,
-            "new_identity":new,"work_paths":work_paths,
-        })));
+            "new_identity":new,"work_paths":work_paths,"destination":destination,
+        });
+        if root != destination && key(root) != key(destination) {
+            let destination_paths = crate::path_keys::output_path_aliases(destination)?;
+            record["root_paths"] = json!(paths);
+            record["destination_paths"] = json!(destination_paths);
+            paths.extend(destination_paths);
+        }
+        let mut operations = NativeWatchOperations::empty();
+        operations.set_runtime(format!("flatten|{}", key(root)), Some(record));
         if !owner.is_empty() {
             if let Some(checkpoint) = state.protect_output_operation(
                 owner, vec![root.to_string_lossy().into_owned()],
@@ -6916,7 +6954,6 @@ fn prepare_flatten(
                 operations.extend(checkpoint);
             }
         }
-        let mut paths = root_paths;
         paths.extend(work_paths);
         state.register_output_paths(&paths, &[&old, &new]);
         Ok(operations)
@@ -6947,24 +6984,31 @@ fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root:
     let Some(record) = state.runtime_record(&record_key) else {
         return Ok(NativeWatchOperations::empty());
     };
-    let (Some(work), Some(leaf)) = (record["work"].as_str(), record["leaf"].as_str()) else {
+    let (Some(work), Some(leaf), Some(destination)) =
+        (record["work"].as_str(), record["leaf"].as_str(), record["destination"].as_str())
+    else {
         return Ok(NativeWatchOperations::empty());
     };
     let work_paths = flatten_work_paths(&record)?;
-    let current = output_identity(root)?;
+    let renamed = record.get("destination_paths").is_some();
+    let old = record["old_identity"].as_str().unwrap_or_default();
+    let expected = record["new_identity"].as_str();
     let mut work_exists = false;
     for alias in work_paths.clone() {
         work_exists |= Path::new(alias).try_exists()?;
     }
-    let published = record["new_identity"].as_str() == Some(&current);
-    if !published && (work_exists || record["old_identity"].as_str() != Some(&current)) {
+    let target = output_identity(destination);
+    let published = target.as_ref().is_ok_and(|identity| Some(identity.as_str()) == expected);
+    let current = if !published && renamed && !work_exists { output_identity(root)? } else { target? };
+    if !published && (work_exists || old != current) {
         return Ok(NativeWatchOperations::empty());
     }
     let already_rebased = record["outputs_rebased"].as_bool() == Some(true);
     if work_exists && already_rebased {
         return Ok(NativeWatchOperations::empty());
     }
-    let root_paths = crate::path_keys::output_path_aliases(Path::new(root))?;
+    let live = if published { destination } else { root };
+    let mut paths = crate::path_keys::output_path_aliases(Path::new(live))?;
     let mut operations = NativeWatchOperations::empty();
     operations.set_runtime(record_key, work_exists.then(|| {
         let mut next = (*record).clone();
@@ -6975,17 +7019,19 @@ fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root:
         .as_str()
         .filter(|owner| published && !already_rebased && !owner.is_empty());
     if let Some(owner) = owner {
-        for source in [work, leaf] {
-            operations.relocate_output(owner, source.to_owned(), root.to_owned(), current.clone());
-        }
+        let relative = Path::new(leaf).strip_prefix(root).map_err(io::Error::other)?;
+        let work_leaf = Path::new(work).join(relative).to_string_lossy().into_owned();
+        operations.relocate_output(owner, root.to_owned(), leaf.to_owned(), destination.to_owned(), current.clone());
+        operations.relocate_output(owner, work.to_owned(), work_leaf, destination.to_owned(), current.clone());
     }
-    let mut paths = root_paths;
     if work_exists { paths.extend(work_paths.clone().map(str::to_owned)); }
-    state.register_output_paths(&paths, &[&current, record["old_identity"].as_str().unwrap_or_default()]);
+    state.register_output_paths(&paths, &[&current, old]);
+    let retired_aliases = if published { &record["root_paths"] } else { &record["destination_paths"] };
+    if let Some(aliases) = retired_aliases.as_array() {
+        state.remove_active_output(aliases.iter().filter_map(Value::as_str), old);
+    }
     if !work_exists {
-        if let Some(old) = record["old_identity"].as_str() {
-            state.remove_active_output(work_paths, old);
-        }
+        state.remove_active_output(work_paths, old);
     }
     Ok(operations)
 }
@@ -7040,10 +7086,11 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
         if !eligible(record["owner"].as_str().unwrap_or_default()) {
             continue;
         }
-        let (Some(root), Some(work), Some(leaf), Some(old), Some(new)) = (
+        let (Some(root), Some(work), Some(leaf), Some(destination), Some(old), Some(new)) = (
             record["root"].as_str(),
             record["work"].as_str(),
             record["leaf"].as_str(),
+            record["destination"].as_str(),
             record["old_identity"].as_str(),
             record["new_identity"].as_str(),
         ) else {
@@ -7053,25 +7100,24 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
             journal.log(json!({"event":"flatten_recovery_failed","path":root,"error":error.to_string()}));
             continue;
         }
-        let root_id = identity_if_present(root);
-        let work_id = identity_if_present(work);
-        let (Ok(root_id), Ok(work_id)) = (root_id, work_id) else {
+        let Ok(work_id) = identity_if_present(work) else {
             continue;
         };
         if work_id.as_deref().is_some_and(|id| id != old) {
             continue;
         }
-        if root_id.as_deref() == Some(old) && work_id.is_none() {
+        if work_id.is_none() && identity_if_present(root).is_ok_and(|id| id.as_deref() == Some(old)) {
             recover_finish_flatten(journal, root)?;
             if journal.state().runtime_record(&id).is_none() { settled.push(root.to_owned()); }
             continue;
         }
-        if root_id.as_deref().is_some_and(|id| id != new)
-            || (root_id.is_none() && work_id.is_none())
+        let Ok(target_id) = identity_if_present(destination) else { continue; };
+        let published = target_id.as_deref() == Some(new);
+        if !published && (target_id.is_some() || work_id.is_none())
         {
             continue;
         }
-        if root_id.is_none() {
+        if !published {
             let Ok(relative) = Path::new(leaf).strip_prefix(root) else {
                 continue;
             };
@@ -7083,12 +7129,13 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
         crate::postprocess::flatten_single_branch_directories(
             Path::new(root),
             Path::new(work),
-            crate::postprocess::FlattenLeaf::Resume(Path::new(leaf)),
-            |_, _, _| Ok(()),
+            crate::postprocess::FlattenLeaf::Resume { leaf: Path::new(leaf), published },
+            Path::new(destination),
+            || Ok(()),
         );
-        if identity_if_present(root).is_ok_and(|identity| identity.as_deref() == Some(new)) {
+        if identity_if_present(destination).is_ok_and(|identity| identity.as_deref() == Some(new)) {
             recover_finish_flatten(journal, root)?;
-            if journal.state().runtime_record(&id).is_none() { settled.push(root.to_owned()); }
+            if journal.state().runtime_record(&id).is_none() { settled.push(destination.to_owned()); }
         }
     }
     Ok(settled)

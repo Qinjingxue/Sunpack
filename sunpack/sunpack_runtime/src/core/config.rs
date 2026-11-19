@@ -133,6 +133,13 @@ pub enum CleanupMode {
 pub struct PostExtractConfig {
     pub archive_cleanup_mode: CleanupMode,
     pub flatten_single_directory: bool,
+    pub flatten_directory_name: FlattenDirectoryName,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FlattenDirectoryName {
+    Outer,
+    Inner,
 }
 
 #[derive(Clone, PartialEq)]
@@ -937,6 +944,11 @@ impl Config {
                     value,
                     &["post_extract", "flatten_single_directory"],
                 )?,
+                flatten_directory_name: match string_field(value, &["post_extract", "flatten_directory_name"]) {
+                    "outer" => FlattenDirectoryName::Outer,
+                    "inner" => FlattenDirectoryName::Inner,
+                    _ => return Err(invalid("post_extract.flatten_directory_name must be outer or inner")),
+                },
             },
             filesystem: FilesystemConfig {
                 scan_filters_enabled,

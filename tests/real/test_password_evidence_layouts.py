@@ -65,16 +65,22 @@ def _archive(tmp_path, files, *, header):
     return parts, inputs
 
 
-def _extract_exact(package, head, tmp_path, expected, *, fixed_password_evidence=False):
+def _extract_exact(package, head, tmp_path, expected, *, expected_scan_parts=None):
     candidates = ["wrong-before", PASSWORD, "wrong-after"]
-    if fixed_password_evidence:
+    if expected_scan_parts is not None:
         scan = package.json(
             "scan", "-d", "-npa",
             *[arg for password in candidates for arg in ("-p", password)], head,
         )
         assert scan["summary"]["failed_count"] == 0, scan
         assert scan["summary"]["archive_count"] == 1, scan
-        assert scan["items"][0]["password_used"] == PASSWORD, scan
+        item, = scan["items"]
+        assert item["password_used"] == PASSWORD, scan
+        if "volume_attempts" in item:
+            parts = {part["path"] for part in item["volume_attempts"]["sources"]}
+        else:
+            parts = set(item["all_parts"])
+        assert parts == set(map(str, expected_scan_parts)), scan
     output = tmp_path / "output"
     report = extract_report(
         package, head, output,
@@ -162,18 +168,20 @@ def test_7z_correct_tail_trailing_junk_and_corrupt_alternative(package, tmp_path
 
 def test_7z_fixed_header_proves_password_with_unresolved_data_middle(package, tmp_path):
     # The encrypted header and its public descriptor are wholly in the fixed
-    # tail. Alternatives in the middle affect payload extraction, not this
-    # independently sufficient password proof.
-    files = {"payload.bin": random.Random(7120).randbytes(104 * 1024)}
+    # tail. The cheap fixed member cannot distinguish the two middle volumes.
+    rng = random.Random(7120)
+    files = {"00-fixed.bin": rng.randbytes(256), "01-payload.bin": rng.randbytes(104 * 1024)}
     parts, inputs = _archive(tmp_path, files, header=True)
     head, middle, tail = parts
     delivered = inputs / head.name
     copyfile(head, delivered)
-    copyfile(tail, inputs / tail.name)
-    copyfile(middle, inputs / f"{middle.name}.图片")
+    fixed_tail = inputs / tail.name
+    correct_middle = inputs / f"{middle.name}.图片"
+    copyfile(tail, fixed_tail)
+    copyfile(middle, correct_middle)
     damaged = bytearray(middle.read_bytes())
     damaged[len(damaged) // 2] ^= 0xFF
     decoy = inputs / middle.name
     decoy.write_bytes(damaged)
-    _extract_exact(package, delivered, tmp_path, files, fixed_password_evidence=True)
+    _extract_exact(package, delivered, tmp_path, files, expected_scan_parts=[delivered, correct_middle, fixed_tail])
     assert decoy.read_bytes() == damaged
