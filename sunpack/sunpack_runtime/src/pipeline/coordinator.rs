@@ -23,7 +23,7 @@ use crate::io::reader::{
 #[cfg(test)]
 use crate::io::reader::release_reader_resources_under_roots;
 use crate::io::resource_lifecycle::Promotion;
-use crate::path_keys::{normalize_windows_extended_prefix, path_key};
+use crate::path_keys::{descendant_key_range, normalize_windows_extended_prefix, path_key};
 use crate::postprocess::{
     discover_flatten_leaf, flatten_single_branch_directories, remove_owned_file, remove_owned_tree, FlattenLeaf,
 };
@@ -285,20 +285,27 @@ impl Engine {
                     let options = if request.deep {
                         NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
                     } else { discovery::scan_options(&request.config)? };
-                    let discovered = discovery::discover(&request, &options, &candidates)?;
+                    // The dedup visitor consumes projected inputs only. Drop the
+                    // discovery inventories as each table finishes projecting.
+                    let mut discovered = discovery::discover(&request, &options, &candidates, false)?;
                     drop(candidates);
-                    let tasks: Vec<_> = discovered.tasks.into_iter().filter(|task|
-                        !task.inputs.is_empty() && task.inputs.iter().all(|input| input.failure.is_none())).collect();
-                    let expected = tasks.len();
+                    discovered.tasks.retain(|task|
+                        !task.inputs.is_empty() && task.inputs.iter().all(|input| input.failure.is_none()));
+                    let expected = discovered.tasks.len();
                     let cancel = request.cancel.clone();
                     let visit = Arc::new(visit);
-                    let results = spawner.bounded_map(tasks, move |task| {
+                    let results = spawner.bounded_map(discovered.tasks, move |task| {
                         let cancel = cancel.clone();
                         let visit = Arc::clone(&visit);
                         Box::pin(async move {
                             stage("watch_dedup", &cancel).await?;
-                            let inputs: Vec<_> = task.inputs.iter().map(|input| &input.input).collect();
-                            visit(Path::new(&task.entry().entry_path), &inputs)
+                            let path = Path::new(&task.entry().entry_path);
+                            if let [logical] = task.inputs.as_slice() {
+                                visit(path, &[&logical.input])
+                            } else {
+                                let inputs: Vec<_> = task.inputs.iter().map(|input| &input.input).collect();
+                                visit(path, &inputs)
+                            }
                         })
                     }).await;
                     request.cancel.check_io()?;
@@ -1198,7 +1205,7 @@ impl<'run, O: Observer> Run<'run, O> {
             })
         } else { None };
         self.request.cancel.check_io()?;
-        let discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates)?;
+        let discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates, true)?;
         let requested = self.watch_generations(&discovered);
         let mut watch = None;
         if let Some(members) = &requested {
@@ -4053,12 +4060,6 @@ fn namespace_key(path: &Path) -> String {
     path_key(&normalize_windows_extended_prefix(
         path.to_string_lossy().into_owned(),
     ))
-}
-
-fn descendant_key_range(key: &str) -> std::ops::Range<String> {
-    let base = key.trim_end_matches('\\');
-    // ']' immediately follows '\\' in the normalized path's byte order.
-    format!("{base}\\")..format!("{base}]")
 }
 
 fn cleanup_owned_output(path: &Path) -> io::Result<()> {

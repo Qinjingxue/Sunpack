@@ -1,6 +1,6 @@
 use super::resources::{self, FileMutex};
 use crate::{
-    fast_hash_core::{xxh64, Hash128},
+    fast_hash_core::Hash128,
     io::{
         atomic_file,
         reader::{physical_file_generation, PhysicalFileGeneration},
@@ -26,6 +26,7 @@ use std::{
         Arc, Mutex, Weak,
     },
 };
+use xxhash_rust::xxh3::xxh3_128;
 
 pub(crate) const FILENAME: &str = "builtin_passwords.json";
 const DEFAULT_DOCUMENT: &str = "{\n  \"passwords\": [],\n  \"clipboard_history\": []\n}\n";
@@ -332,7 +333,7 @@ impl<'a> Document<'a> {
 #[derive(Default)]
 struct StoreState {
     generation: Option<PhysicalFileGeneration>,
-    observed: Option<[u64; 2]>,
+    observed: Option<[u8; 16]>,
     snapshot: Arc<PasswordSnapshot>,
 }
 
@@ -361,13 +362,12 @@ impl BuiltinStore {
         if let Some(store) = existing {
             return Ok(store);
         }
-        let store = Arc::new(Self::open(cwd)?);
+        let store = Arc::new(Self::open(path)?);
         *source = Some(Arc::downgrade(&store));
         Ok(store)
     }
 
-    pub fn open(cwd: &Path) -> io::Result<Self> {
-        let path = resources::writable_data_dir(cwd)?.join(FILENAME);
+    fn open(path: PathBuf) -> io::Result<Self> {
         let absent = || {
             fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
         };
@@ -462,7 +462,7 @@ impl BuiltinStore {
         file.read_to_end(&mut text)?;
         drop(file);
         state.generation = generation;
-        let observed = [xxh64(&text, 0), xxh64(&text, 1)];
+        let observed = xxh3_128(&text).to_ne_bytes();
         if state.observed == Some(observed) {
             return Ok(state.snapshot.clone());
         }

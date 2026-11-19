@@ -136,7 +136,7 @@ fn decorated_rar_sfx_head_keeps_exe_token_before_part_marker() {
 
 #[test]
 fn structural_part_marker_outranks_numeric_camouflage_suffix() {
-    let candidates = parse_volume_candidates("payload.part2.456");
+    let candidates = parse_volume_candidates("payload.part2.photo.456");
     assert_eq!(candidates[0].prefix, "payload");
     assert_eq!(candidates[0].number, 2);
     assert_eq!(candidates[0].style, "part_numbered");
@@ -165,13 +165,6 @@ fn marker_parser_does_not_treat_partition_words_as_volumes() {
     let parsed = parse_numbered_volume_name("report.partition1.2024").unwrap();
     assert_eq!(parsed.style, "plain_numeric_suffix");
     assert_eq!(parsed.number, 2024);
-}
-
-#[test]
-fn ordinary_prefix_substrings_do_not_become_format_evidence() {
-    let parsed = parse_numbered_volume_name("example.part1.photo").unwrap();
-    assert_eq!(parsed.style, "part_numbered");
-    assert_eq!(parsed.family, "generic");
 }
 
 fn validation_with_owned_paths(status: ProposalStatus, paths: &[&str]) -> ProposalValidation {

@@ -50,6 +50,12 @@ pub(crate) fn path_ancestors(key: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+pub(crate) fn descendant_key_range(key: &str) -> std::ops::Range<String> {
+    let base = key.trim_end_matches('\\');
+    // ']' immediately follows '\\' in byte order.
+    format!("{base}\\")..format!("{base}]")
+}
+
 pub(crate) fn normalize_windows_extended_prefix(mut path: String) -> String {
     if path.starts_with(r"\\?\UNC\") {
         path.replace_range(..8, r"\\");

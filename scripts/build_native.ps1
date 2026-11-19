@@ -149,7 +149,6 @@ function Build-SevenZipWorker {
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
     $workerDebug = if ($BuildProfile -eq "ci") { "ON" } else { "OFF" }
     Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DSUP7Z_DEBUG=$workerDebug", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
-    Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
     Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
     if ($BuildProfile -eq "ci") {
         if ((Get-ProcessBuildArch) -eq $BuildArch) {

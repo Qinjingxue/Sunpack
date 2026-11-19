@@ -2060,7 +2060,7 @@ fn watch_volume_retry_waits_for_a_late_writer_to_close() {
     let engine = Engine::new(PathBuf::from("unused-worker"));
     let candidates = CandidateSet::new(Arc::from([]), None, &engine.recent_passwords, None);
     let options = discovery::scan_options(&request.config).unwrap();
-    let discovered = discovery::discover(&request, &options, &candidates).unwrap();
+    let discovered = discovery::discover(&request, &options, &candidates, true).unwrap();
     let [task] = discovered.tasks.as_slice() else {
         panic!("expected an incomplete volume group");
     };

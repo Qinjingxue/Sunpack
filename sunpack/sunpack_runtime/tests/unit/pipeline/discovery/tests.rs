@@ -97,7 +97,7 @@ fn covered_explicit_targets_keep_their_retry_boundary() {
             };
             let mut request = Request::new(inputs, super::super::Mode::Scan);
             request.recursive = true;
-            let result = discover(&request, &options, &candidates).unwrap();
+            let result = discover(&request, &options, &candidates, true).unwrap();
             assert!(result.errors.is_empty());
             assert_eq!(result.tasks.len(), 1);
             let task = &result.tasks[0];
@@ -112,6 +112,12 @@ fn covered_explicit_targets_keep_their_retry_boundary() {
             assert_eq!(retry.scope.key(), path_key(&child.to_string_lossy()));
         }
     }
+    let mut request = Request::new(vec![root.clone(), archive.clone()], super::super::Mode::Scan);
+    request.recursive = true;
+    let result = discover(&request, &options, &candidates, false).unwrap();
+    let [task] = result.tasks.as_slice() else { panic!("expected one discovered archive"); };
+    assert_eq!(Path::new(&task.entry().entry_path), archive);
+    assert!(task.context.is_none());
     std::fs::remove_dir_all(root).unwrap();
 }
 

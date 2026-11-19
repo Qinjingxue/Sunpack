@@ -660,7 +660,7 @@ int wmain(int argc,wchar_t** argv) {
         auto original=password_document["passwords"].at(0);
         Json edit={{"operation","replace"},{"original",original.dump()},{"value","perf-direct-file-write"},{"scopes",original.value("scopes",Json::array())}};
         measure("password_model_write_existing_3000_records",[&]{
-            auto result=save_changes(dir,Json::array(),Json::array({edit}),Json::array());
+            auto result=save_changes(dir,Json(),Json::array({edit}),Json::array());
             ensure(result.value("error",std::string()).empty(),"direct password write failed");
         });
         report["password_file_bytes"]=fs::file_size(dir/"builtin_passwords.json");

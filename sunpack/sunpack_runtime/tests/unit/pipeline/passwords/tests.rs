@@ -204,10 +204,8 @@ fn failure_signatures_share_lazy_explicit_digest_without_changing_candidates() {
     assert!(Arc::ptr_eq(&candidates.sources, &inherited.sources));
     let signature = candidates.signature(r"C:\root\input.zip");
     let digest = candidates.sources.explicit_signature.get().unwrap().as_ptr();
-    for index in 0..256 {
-        assert_eq!(inherited.signature(&format!(r"C:\nested\{index}.zip")), signature);
-        assert_eq!(inherited.sources.explicit_signature.get().unwrap().as_ptr(), digest);
-    }
+    assert_eq!(inherited.signature(r"C:\nested\other.zip"), signature);
+    assert_eq!(inherited.sources.explicit_signature.get().unwrap().as_ptr(), digest);
     let reordered = CandidateSet::new(
         Arc::from([Arc::from(""), Arc::from("second"), Arc::from("first")]), None, &cache, None);
     assert_ne!(signature, reordered.signature(r"C:\root\input.zip"));

@@ -269,7 +269,8 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
     manager.begin(memory, [writer] { writer->wake_waiters(); });
     void *dictionary = manager.allocate(memory, 16 * MiB);
     require(dictionary, "test dictionary was not admitted");
-    ReplayFile receipt;
+    ExtractionReplay replay;
+    auto &receipt = replay.files[0];
     receipt.path = (directory / (memory_first ? L"memory-first.bin" : L"disk-first.bin")).native();
     NativeCpuBudget cpu(2);
     require(cpu.try_acquire_base(), "base credit unavailable");
@@ -285,7 +286,7 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
         }
         writer->close_file(file, {});
         const auto result = writer->finish_job(job);
-        writer->capture_replay(file);
+        writer->capture_replay(file, replay);
         return result;
     });
     require(ready(blocked), "disk wait was not established");
@@ -323,7 +324,7 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
         writer->record_operation_result(file, 0);
         stream.Release();
         require(writer->finish_job(job) == S_OK, "recovered resources did not finish output");
-        writer->capture_replay(file);
+        writer->capture_replay(file, replay);
     }
     require(!state->space_gate->blocked() && receipt.complete, "resource gates failed to recover independently");
     state->space_gate->unregister_job("combined");

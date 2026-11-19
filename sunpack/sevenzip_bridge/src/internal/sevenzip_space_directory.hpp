@@ -91,7 +91,7 @@ namespace sunpack::sevenzip
         unsigned long failure_code = 0;
         const AttemptResult result = retry_with_space_gate(
             gate,
-            [&terminal] { return terminal; }, // 惰性：正常创建目录时根本不构造谓词
+            [&terminal]() -> const TerminalPredicate & { return terminal; },
             directory.native(),
             [&directory, &failure_code]() noexcept -> AttemptResult
             {

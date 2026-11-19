@@ -68,8 +68,8 @@ impl InputKey {
 
 pub(crate) enum PasswordContext {
     Evidence(super::evidence::EvidenceContext),
-    Reduced(
-        Box<PasswordContext>,
+    ReducedZip(
+        super::zip::ZipPasswordContext,
         Arc<crate::io::archive_state::VolumeAttemptPlan>,
     ),
     Enc(super::enc::EncPasswordContext),
@@ -85,8 +85,8 @@ impl PasswordContext {
         rar_key: Option<&mut Option<super::rar::RarProvenKey>>,
     ) -> std::io::Result<PasswordVerification> {
         match self {
-            Self::Reduced(context, plan) => {
-                let mut result = context.verify(candidates, rar_key)?;
+            Self::ReducedZip(context, plan) => {
+                let mut result = context.verify(candidates)?;
                 result.volume_attempts = Some(plan.clone());
                 Ok(result)
             }

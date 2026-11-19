@@ -117,7 +117,6 @@ struct ExtractArchiveResult {
     bool damaged = false;
     bool checksum_error = false;
     bool missing_volume = false;
-    bool missing_volume_suspected = false;
     bool wrong_password = false;
     bool password_rejected = false;
     bool password_candidates_all_rejected = false;

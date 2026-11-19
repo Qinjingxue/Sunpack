@@ -387,8 +387,6 @@ fn settled_roots_survive_sibling_cancel_or_request_error_without_duplicate_repor
             let request = &state.group.as_ref().unwrap().requests[&activity.request];
             assert!(!request.roots.contains_key(&1));
             assert!(!request.task_roots.values().any(|root| *root == 1));
-            assert!(!request.started.contains_key(&1));
-            assert!(!request.visible_roots.contains(&1));
             let report = state.group.as_ref().unwrap().report.lock().unwrap();
             assert_eq!(report.failures, 0);
             assert!(report.path.as_ref().is_none_or(|path| !path.exists()));
@@ -410,7 +408,7 @@ fn settled_roots_survive_sibling_cancel_or_request_error_without_duplicate_repor
             } else { "b.zip" }.to_owned())
         };
         let result = if cancelled { Ok(Outcome::default()) } else { Err(io::Error::other("sibling failed")) };
-        activity.record(Path::new("b.zip"), &result, cancelled, &owner);
+        activity.record([Path::new("b.zip"), Path::new("c.zip")], &result, cancelled, &owner);
         activity.finish(&result, cancelled, false, &owner);
         let state = publisher.shared.state.lock().unwrap();
         let group = state.group.as_ref().unwrap();
@@ -465,7 +463,7 @@ fn batched_top_level_tasks_keep_independent_completion_and_reports() {
     outcome.archives.push(archive("c/another.zip", Some(FailureKind::Damaged)));
     outcome.archives.push(archive("d.zip", Some(FailureKind::Damaged)));
     let result = Ok(outcome);
-    activity.record(Path::new("a.zip"), &result, false, &owner);
+    activity.record([Path::new("a.zip")], &result, false, &owner);
     activity.finish(&result, false, false, &owner);
     finish_debounce(&publisher);
     let completed = take_completed(&publisher);
@@ -511,7 +509,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
     let invisible = publisher.register(Arc::from("01"), Language::En);
     invisible.event(queued(1, "invisible.zip", None, 0));
     let error = Err(io::Error::other("pre-extraction failure"));
-    invisible.record(Path::new("invisible.zip"), &error, false, one_root);
+    invisible.record([Path::new("invisible.zip")], &error, false, one_root);
     invisible.finish(&error, false, false, one_root);
     assert!(!directory.0.exists());
     assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
@@ -526,7 +524,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
         outcome.archives.push(archive("successful-sibling.zip", None));
         outcome.archives.push(archive("retry.zip", Some(kind)));
         let result = Ok(outcome);
-        activity.record(Path::new("retry.zip"), &result, false, one_root);
+        activity.record([Path::new("retry.zip")], &result, false, one_root);
         activity.finish(&result, false, false, one_root);
         let mut state = publisher.shared.state.lock().unwrap();
         assert!(state.group.is_none());
@@ -549,7 +547,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
         outcome.archives.push(partial);
         outcome.archives.push(archive("CARRIER.bin", Some(FailureKind::Damaged)));
         let result = Ok(outcome);
-        activity.record(Path::new("carrier.bin"), &result, false, one_root);
+        activity.record([Path::new("carrier.bin")], &result, false, one_root);
         activity.finish(&result, false, false, one_root);
         assert!(publisher.shared.state.lock().unwrap().group.is_none());
         assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
@@ -583,7 +581,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
         failure: None,
     });
     let result = Ok(outcome);
-    activity.record(Path::new("terminal.zip"), &result, false, one_root);
+    activity.record([Path::new("terminal.zip")], &result, false, one_root);
     activity.finish(&result, false, false, one_root);
     finish_debounce(&publisher);
     let completed = take_completed(&publisher);
@@ -755,7 +753,7 @@ fn semantic_reload_retires_debouncing_and_in_flight_batches() {
         progress(&old, 1, 1, 2);
         let stale_progress = current(&publisher);
         let failure = Err(io::Error::other("old failure"));
-        old.record(Path::new("old.zip"), &failure, false, one_root);
+        old.record([Path::new("old.zip")], &failure, false, one_root);
         old.finish(&failure, false, false, one_root);
         let completed = if in_flight {
             finish_debounce(&publisher);
@@ -790,7 +788,7 @@ fn presenter_shutdown_discards_queued_report_and_draft_with_live_activity() {
     activity.event(queued(1, "failed.zip", None, 0));
     progress(&activity, 1, 1, 2);
     let failure = Err(io::Error::other("failure"));
-    activity.record(Path::new("failed.zip"), &failure, false, one_root);
+    activity.record([Path::new("failed.zip")], &failure, false, one_root);
     activity.finish(&failure, false, false, one_root);
     finish_debounce(&publisher);
     let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
@@ -824,7 +822,7 @@ fn stopping_remaining_work_preserves_the_batch_failure_report() {
     running.event(queued(2, "running.zip", None, 0));
     progress(&running, 2, 1, 2);
     let failure = Err(io::Error::other("archive failure before user stop"));
-    failed.record(Path::new("failed.zip"), &failure, false, one_root);
+    failed.record([Path::new("failed.zip")], &failure, false, one_root);
     failed.finish(&failure, false, false, one_root);
     let batch = current(&publisher).batch;
     assert_eq!(publisher.stop_group(&batch), vec![Arc::<str>::from("02")]);
@@ -859,7 +857,7 @@ fn report_publication_does_not_block_progress_and_reset_cancels_its_io() {
     first.event(queued(1, "first.zip", None, 0));
     progress(&first, 1, 1, 2);
     let failure = Err(io::Error::other("first failure"));
-    first.record(Path::new("first.zip"), &failure, false, one_root);
+    first.record([Path::new("first.zip")], &failure, false, one_root);
     first.finish(&failure, false, false, one_root);
     finish_debounce(&publisher);
     let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
@@ -923,7 +921,7 @@ fn new_visible_work_invalidates_in_flight_completion_without_losing_report() {
     first.event(queued(1, "first.zip", None, 0));
     progress(&first, 1, 1, 2);
     let failure = Err(io::Error::other("first failure"));
-    first.record(Path::new("first.zip"), &failure, false, one_root);
+    first.record([Path::new("first.zip")], &failure, false, one_root);
     first.finish(&failure, false, false, one_root);
     finish_debounce(&publisher);
     let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
@@ -947,7 +945,7 @@ fn new_visible_work_invalidates_in_flight_completion_without_losing_report() {
     assert_eq!(current(&publisher).batch, batch.as_ref());
     assert_eq!(current(&publisher).status, "1/2 finished");
     let failure = Err(io::Error::other("second failure"));
-    next.record(Path::new("next.zip"), &failure, false, one_root);
+    next.record([Path::new("next.zip")], &failure, false, one_root);
     next.finish(&failure, false, false, one_root);
     release.send(()).unwrap();
     thread.join().unwrap();

@@ -2,6 +2,7 @@ use super::context::{InputKey, InputMember};
 use crate::io::archive_state::{InputExtent, InputPart};
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, NativeArchiveSession};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -50,20 +51,36 @@ impl RangeSpec {
 
 // The caller already holds lifecycle borrows. Reuse their validated readers
 // instead of reopening every physical member for every password batch.
-pub(super) struct InputReaders<'a>(HashMap<&'a str, ManagedReader>);
+pub(super) struct InputReaders<'a> {
+    single: Option<&'a NativeArchiveSession>,
+    by_path: HashMap<&'a str, Cow<'a, ManagedReader>>,
+}
 
 impl<'a> InputReaders<'a> {
     pub(super) fn new(sessions: &'a [NativeArchiveSession]) -> Self {
-        Self(
-            sessions
+        if let [session] = sessions {
+            return Self { single: Some(session), by_path: HashMap::new() };
+        }
+        Self {
+            single: None,
+            by_path: sessions
                 .iter()
-                .map(|session| (session.path(), session.reader().clone()))
+                .map(|session| (session.path(), Cow::Borrowed(session.reader())))
                 .collect(),
-        )
+        }
+    }
+
+    fn get(&self, path: &str) -> Option<&ManagedReader> {
+        // Session paths use the exact extent spelling. One input can refer
+        // to distinct case-sensitive Windows names.
+        if let Some(session) = self.single.filter(|session| session.path() == path) {
+            return Some(session.reader());
+        }
+        self.by_path.get(path).map(Cow::as_ref)
     }
 
     pub(super) fn single_range(&self, range: &InputExtent) -> std::io::Result<RangeSpec> {
-        let reader = match self.0.get(range.path.as_str()) {
+        let reader = match self.get(&range.path) {
             Some(reader) => reader.clone(),
             None => ManagedReader::open(&range.path)?,
         };
@@ -71,14 +88,12 @@ impl<'a> InputReaders<'a> {
     }
 
     fn open(&mut self, path: &'a str, reuse: bool) -> std::io::Result<ManagedReader> {
-        // A case-sensitive Windows directory can contain both spellings.
-        // Sessions are opened from the same physical extent paths.
-        if let Some(reader) = self.0.get(path) {
+        if let Some(reader) = self.get(path) {
             return Ok(reader.clone());
         }
         let reader = ManagedReader::open(path)?;
         if reuse {
-            self.0.insert(path, reader.clone());
+            self.by_path.insert(path, Cow::Owned(reader.clone()));
         }
         Ok(reader)
     }

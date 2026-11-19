@@ -1,5 +1,6 @@
 use super::failure::report::{self, Report};
 use super::windows::ToastLibrary;
+use crate::collections::SmallOrderedSet;
 use crate::core::i18n::Language;
 use crate::failure_report::{append_failure_report, publish_failure_report, FailureRecord};
 use crate::pipeline::{
@@ -99,7 +100,7 @@ impl Snapshot {
                     .requests
                     .values()
                     .flat_map(|request| request.tasks.values())
-                    .find_map(|task| task.wait.volume_error)
+                    .find_map(|task| task.progress.wait.volume_error)
             };
             let status = if let Some(error) = volume_error {
                 language.translate(
@@ -388,20 +389,42 @@ impl Completed {
 #[derive(Default)]
 struct RequestProgress {
     stopping: bool,
-    tasks: HashMap<TaskId, TaskProgress>,
-    paths: HashMap<TaskId, PathBuf>,
-    started: HashMap<TaskId, HashSet<PathBuf>>,
-    roots: HashMap<TaskId, PathBuf>,
+    tasks: HashMap<TaskId, ActiveTask>,
+    roots: HashMap<TaskId, RootProgress>,
     task_roots: HashMap<TaskId, TaskId>,
-    root_tasks: HashMap<TaskId, Vec<TaskId>>,
-    visible_roots: HashSet<TaskId>,
     settled: HashSet<String>,
-    settled_tasks: HashSet<TaskId>,
-    pending_reports: HashSet<TaskId>,
     name: Option<(TaskId, String)>,
     visible: bool,
+}
+
+#[derive(Default)]
+struct ActiveTask {
+    progress: TaskProgress,
+    path: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct RootProgress {
+    path: Option<PathBuf>,
+    descendants: Vec<TaskId>,
+    started: Option<SmallOrderedSet<PathBuf>>,
+    visible: bool,
+    settlement: RootSettlement,
     done_bytes: u128,
-    root_done_bytes: HashMap<TaskId, u128>,
+}
+
+impl RootProgress {
+    fn active(&self) -> bool {
+        self.visible && self.settlement == RootSettlement::Unsettled
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum RootSettlement {
+    #[default]
+    Unsettled,
+    Settled,
+    PendingReport,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -494,45 +517,52 @@ impl Group {
         let id = match event {
             Event::Queued { id, parent, segment, path, .. } => {
                 if segment.is_some() {
-                    if let Some(parent) = parent { request.paths.remove(&parent); }
                     if let Some(task) = parent.and_then(|parent| tasks.remove(&parent)) {
-                        self.totals.remove(task, false);
+                        self.totals.remove(task.progress, false);
                     }
                 }
-                let root = parent.and_then(|parent| request.task_roots.get(&parent).copied())
-                    .unwrap_or(id);
-                request.task_roots.insert(id, root);
-                request.root_tasks.entry(root).or_default().push(id);
-                if parent.is_none() { request.roots.insert(id, path.clone()); }
-                if parent.is_none() && request.name.is_none() {
-                    let name = path.file_name().unwrap_or(path.as_os_str())
-                        .to_string_lossy().into_owned();
-                    request.name = Some((id, name));
+                let root = parent.and_then(|parent| {
+                    request.task_roots.get(&parent).copied()
+                        .or_else(|| request.roots.contains_key(&parent).then_some(parent))
+                }).unwrap_or(id);
+                let root_progress = request.roots.entry(root).or_default();
+                if parent.is_none() {
+                    root_progress.path = Some(path.clone());
+                    if request.name.is_none() {
+                        let name = path.file_name().unwrap_or(path.as_os_str())
+                            .to_string_lossy().into_owned();
+                        request.name = Some((id, name));
+                    }
+                } else {
+                    request.task_roots.insert(id, root);
+                    root_progress.descendants.push(id);
                 }
-                request.paths.insert(id, path);
-                tasks.entry(id).or_default();
+                tasks.entry(id).or_default().path = Some(path);
                 return request.visible;
             }
             Event::Replanned { id, path } => {
-                if let Some(previous) = tasks.insert(id, TaskProgress::default()) {
-                    self.totals.remove(previous, false);
+                if let Some(root_path) = request.roots.get_mut(&id).and_then(|root| root.path.as_mut()) {
+                    *root_path = path.clone();
                 }
-                if let Some(root) = request.roots.get_mut(&id) { *root = path.clone(); }
                 if request.name.as_ref().is_some_and(|(root, _)| *root == id) {
                     request.name = Some((id, path.file_name().unwrap_or(path.as_os_str())
                         .to_string_lossy().into_owned()));
                 }
-                request.paths.insert(id, path);
+                if let Some(previous) = tasks.insert(id, ActiveTask {
+                    path: Some(path),
+                    ..ActiveTask::default()
+                }) {
+                    self.totals.remove(previous.progress, false);
+                }
                 return request.visible;
             }
             Event::Finished { id, .. } | Event::Skipped { id } => {
-                request.paths.remove(&id);
                 if let Some(task) = tasks.remove(&id) {
                     let finished = matches!(event, Event::Finished { .. });
-                    self.totals.remove(task, finished);
-                    if finished && task.visible {
-                        request.done_bytes += u128::from(task.planned);
-                        *request.root_done_bytes.entry(request.task_roots[&id]).or_default() += u128::from(task.planned);
+                    self.totals.remove(task.progress, finished);
+                    if finished && task.progress.visible {
+                        let root = request.task_roots.get(&id).copied().unwrap_or(id);
+                        request.roots.get_mut(&root).unwrap().done_bytes += u128::from(task.progress.planned);
                     }
                     if tasks.capacity() > 256 {
                         crate::collections::trim_map(tasks);
@@ -550,51 +580,57 @@ impl Group {
         let Some(task) = tasks.get_mut(&id) else {
             return false;
         };
-        let before = *task;
+        let before = task.progress;
         match event {
             Event::Working { .. } => {
-                *task = TaskProgress { visible: true, ..TaskProgress::default() };
+                task.progress = TaskProgress { visible: true, ..TaskProgress::default() };
             }
             Event::Progress { completed_bytes, total_bytes, .. } => {
-                task.visible = true;
-                task.written = completed_bytes;
-                task.planned = total_bytes;
+                task.progress.visible = true;
+                task.progress.written = completed_bytes;
+                task.progress.planned = total_bytes;
             }
             Event::ResourceWait { state, .. } => {
-                task.visible |= state.disk || state.memory;
-                task.wait = state;
+                task.progress.visible |= state.disk || state.memory;
+                task.progress.wait = state;
             }
-            Event::Finalizing { .. } => task.wait = ResourceWait::default(),
+            Event::Finalizing { .. } => task.progress.wait = ResourceWait::default(),
             _ => unreachable!(),
         }
-        if task.visible && !before.visible {
-            if let Some(path) = request.paths.remove(&id) {
-                request.started.entry(request.task_roots[&id]).or_default().insert(path);
-            }
-        }
-        if task.visible && request.visible_roots.insert(request.task_roots[&id]) {
-            if !request.visible {
-                if let Some(path) = request.roots.get(&request.task_roots[&id]) {
-                    let name = path.file_name().unwrap_or(path.as_os_str())
-                        .to_string_lossy().into_owned();
-                    request.name = Some((request.task_roots[&id], name));
+        if task.progress.visible && !before.visible {
+            let root = request.task_roots.get(&id).copied().unwrap_or(id);
+            let root_progress = request.roots.get_mut(&root).unwrap();
+            if let Some(path) = task.path.take() {
+                match &mut root_progress.started {
+                    Some(started) => started.insert(path),
+                    started @ None => *started = Some(SmallOrderedSet::One(path)),
                 }
-                request.visible = true;
             }
-            self.active_roots += 1;
-            self.generation = self.generation.wrapping_add(1);
-            self.finalize_at = None;
-            if !self.visible {
-                self.began = Instant::now();
-                self.visible = true;
-            }
-            if self.summary.completed() == 0 {
-                self.name = request.name.clone();
+            if !root_progress.visible {
+                root_progress.visible = true;
+                if !request.visible {
+                    if let Some(path) = &root_progress.path {
+                        let name = path.file_name().unwrap_or(path.as_os_str())
+                            .to_string_lossy().into_owned();
+                        request.name = Some((root, name));
+                    }
+                    request.visible = true;
+                }
+                self.active_roots += 1;
+                self.generation = self.generation.wrapping_add(1);
+                self.finalize_at = None;
+                if !self.visible {
+                    self.began = Instant::now();
+                    self.visible = true;
+                }
+                if self.summary.completed() == 0 {
+                    self.name = request.name.clone();
+                }
             }
         }
-        if before != *task {
+        if before != task.progress {
             self.totals.remove(before, false);
-            self.totals.add(*task);
+            self.totals.add(task.progress);
             true
         } else {
             false
@@ -607,13 +643,16 @@ impl Group {
         };
         let accepted = summary.completed() != 0;
         for task in request.tasks.into_values() {
-            self.totals.remove(task, accepted);
+            self.totals.remove(task.progress, accepted);
         }
-        if !accepted {
-            self.totals.done_bytes -= request.done_bytes;
+        for root in request.roots.into_values() {
+            self.active_roots -= usize::from(root.active());
+            self.pending_completions -= usize::from(root.settlement == RootSettlement::PendingReport);
+            if !accepted {
+                self.totals.done_bytes -= root.done_bytes;
+            }
         }
-        self.active_roots -= request.visible_roots.difference(&request.settled_tasks).count();
-        self.pending_completions -= request.pending_reports.len() + usize::from(request.stopping);
+        self.pending_completions -= usize::from(request.stopping);
         if self.requests.capacity() > 256 {
             crate::collections::trim_map(&mut self.requests);
         }
@@ -644,7 +683,7 @@ impl State {
             let request = group.requests.keys().next().unwrap();
             let mut next = Group::new(request, group.language);
             for request in group.requests.values_mut() {
-                if request.visible_roots.iter().all(|id| request.settled_tasks.contains(id)) {
+                if !request.roots.values().any(RootProgress::active) {
                     request.visible = false;
                     request.name = None;
                 }
@@ -975,7 +1014,9 @@ impl Publisher {
         }
         let group = state.group.as_mut().unwrap();
         if let Some(previous) = group.requests.insert(Arc::clone(&request), RequestProgress::default()) {
-            group.pending_completions -= previous.pending_reports.len() + usize::from(previous.stopping);
+            group.pending_completions -= previous.roots.values()
+                .filter(|root| root.settlement == RootSettlement::PendingReport).count()
+                + usize::from(previous.stopping);
         }
         Activity { publisher: self.clone(), request }
     }
@@ -1049,7 +1090,8 @@ impl Activity {
         let state = self.publisher.shared.state.lock().unwrap();
         !state.stopping && state.group.iter()
             .filter_map(|group| group.requests.get(&self.request))
-            .any(|request| request.pending_reports.contains(&id))
+            .filter_map(|request| request.roots.get(&id))
+            .any(|root| root.settlement == RootSettlement::PendingReport)
     }
 
     pub(super) fn record_root(&self, id: TaskId, path: &Path, outcome: &Outcome) {
@@ -1058,12 +1100,12 @@ impl Activity {
             if state.stopping { return; }
             let Some(group) = state.group.iter().find(|group| group.requests.contains_key(&self.request))
                 else { return; };
-            if !group.requests[&self.request].visible_roots.contains(&id) { return; }
+            if !group.requests[&self.request].roots.get(&id).is_some_and(|root| root.visible) { return; }
             (Arc::clone(&group.id), group.language, Arc::clone(&group.report))
         };
         let key = crate::path_keys::path_key(&path.to_string_lossy());
         if let Err(error) = self.publisher.reports.append_data(&group_id, language, &report,
-            path, Ok(outcome), &|_| Some(key.clone()), None)
+            [path], Ok(outcome), &|_| Some(key.clone()), None)
         {
             if !self.publisher.reports.cancellation.cancelled() {
                 eprintln!("SunPack toast failure report: {error}");
@@ -1072,22 +1114,35 @@ impl Activity {
     }
 
     pub(super) fn root_finished(&self, id: TaskId, outcome: &Outcome) {
+        let (key, visible) = {
+            let state = self.publisher.shared.state.lock().unwrap();
+            if state.stopping { return; }
+            let Some(request) = state.group.as_ref().and_then(|group| group.requests.get(&self.request))
+                else { return; };
+            let Some(root) = request.roots.get(&id) else { return; };
+            let Some(path) = &root.path else { return; };
+            let key = crate::path_keys::path_key(&path.to_string_lossy());
+            if request.settled.contains(&key) { return; }
+            (key, root.visible)
+        };
+        // A root has emitted its terminal task events. Output probes and the
+        // outcome walk can run while other roots still publish progress.
+        let summary = Summary::for_outcome(outcome, false, visible, &|_| Some(key.clone()), None);
         let mut state = self.publisher.shared.state.lock().unwrap();
         if state.stopping { return; }
         let Some(group) = state.group.iter_mut()
             .find(|group| group.requests.contains_key(&self.request)) else { return; };
         let request = group.requests.get_mut(&self.request).unwrap();
-        let Some(path) = request.roots.get(&id) else { return; };
-        let key = crate::path_keys::path_key(&path.to_string_lossy());
-        if !request.settled.insert(key.clone()) { return; }
-        request.done_bytes -= request.root_done_bytes.remove(&id).unwrap_or(0);
-        let visible = request.visible_roots.contains(&id);
-        request.settled_tasks.insert(id);
-        if visible { group.active_roots -= 1; }
-        let summary = Summary::for_outcome(outcome, false, visible, &|_| Some(key.clone()), None);
-        if summary.failed != 0 && request.pending_reports.insert(id) {
+        let Some(root) = request.roots.get_mut(&id) else { return; };
+        if !request.settled.insert(key) { return; }
+        root.done_bytes = 0;
+        if root.visible { group.active_roots -= 1; }
+        root.settlement = if summary.failed != 0 {
             group.pending_completions += 1;
-        }
+            RootSettlement::PendingReport
+        } else {
+            RootSettlement::Settled
+        };
         group.summary.merge(summary);
         group.generation = group.generation.wrapping_add(1);
         state.dirty = true;
@@ -1101,18 +1156,23 @@ impl Activity {
             .find(|group| group.requests.contains_key(&self.request))
         {
             let request = group.requests.get_mut(&self.request).unwrap();
-            if request.pending_reports.remove(&id) {
-                group.pending_completions -= 1;
-                group.summary.report_failed |= failed;
-            }
-            if request.settled_tasks.remove(&id) {
-                if let Some(path) = request.roots.remove(&id) {
+            if request.roots.get(&id).is_some_and(|root| root.settlement != RootSettlement::Unsettled) {
+                let root = request.roots.remove(&id).unwrap();
+                if root.settlement == RootSettlement::PendingReport {
+                    group.pending_completions -= 1;
+                    group.summary.report_failed |= failed;
+                }
+                if let Some(path) = root.path {
                     request.settled.remove(&crate::path_keys::path_key(&path.to_string_lossy()));
                 }
-                request.started.remove(&id);
-                request.visible_roots.remove(&id);
-                for task in request.root_tasks.remove(&id).into_iter().flatten() {
+                for task in root.descendants {
                     request.task_roots.remove(&task);
+                }
+                if request.roots.capacity() > 256 {
+                    crate::collections::trim_map(&mut request.roots);
+                }
+                if request.task_roots.capacity() > 256 {
+                    crate::collections::trim_map(&mut request.task_roots);
                 }
                 if request.name.as_ref().is_some_and(|(root, _)| *root == id) { request.name = None; }
             }
@@ -1140,8 +1200,9 @@ impl Activity {
                 return None;
             };
             let request = &group.requests[&self.request];
-            (request.visible, if cancelled { request.roots.values().cloned().collect::<HashSet<_>>() }
-                else { request.started.values().flatten().cloned().collect() }, request.settled.clone())
+            (request.visible, if cancelled { request.roots.values().filter_map(|root| root.path.clone()).collect::<HashSet<_>>() }
+                else { request.roots.values().filter_map(|root| root.started.as_ref())
+                    .flat_map(SmallOrderedSet::iter).cloned().collect() }, request.settled.clone())
         };
         // Receipt projection can be large. It must not hold the presentation
         // gate or prevent disable from cancelling an active report writer.
@@ -1158,18 +1219,11 @@ impl Activity {
         if let Some(finish) = self.prepare_finish(result, cancelled, output_cleanup_failed, owner) { finish.publish(); }
     }
 
-    pub(super) fn record(
+    pub(super) fn record<'a>(
         &self,
-        path: &Path,
+        paths: impl IntoIterator<Item = &'a Path>,
         result: &io::Result<Outcome>,
         ignore_request_error: bool,
-        owner: impl Fn(&Path) -> Option<String>,
-    ) {
-        self.record_data(path, result.as_ref(), ignore_request_error, owner);
-    }
-
-    pub(super) fn record_data(
-        &self, path: &Path, result: Result<&Outcome, &io::Error>, ignore_request_error: bool,
         owner: impl Fn(&Path) -> Option<String>,
     ) {
         let (id, language, report, started, settled) = {
@@ -1187,15 +1241,17 @@ impl Activity {
                 return;
             }
             (Arc::clone(&group.id), group.language, Arc::clone(&group.report),
-                request.visible_roots.iter().filter_map(|id| request.roots.get(id).cloned()).collect::<Vec<_>>(),
+                request.roots.values().filter(|root| root.visible).filter_map(|root| root.path.clone()).collect::<Vec<_>>(),
                 request.settled.clone())
         };
         let started: HashMap<_, _> = started.into_iter().filter_map(|path| {
             let root = result_owner(&path, &owner);
             (!settled.contains(&root)).then_some((root, path))
         }).collect();
-        if result.is_err() && !started.contains_key(&result_owner(path, &owner)) { return; }
-        if let Err(error) = self.publisher.reports.append_data(&id, language, &report, path, result,
+        let paths = paths.into_iter().filter(|path| {
+            result.is_ok() || started.contains_key(&result_owner(path, &owner))
+        });
+        if let Err(error) = self.publisher.reports.append_data(&id, language, &report, paths, result.as_ref(),
             &owner, Some(&started)) {
             if !self.publisher.reports.cancellation.cancelled() {
                 eprintln!("SunPack toast failure report: {error}");
@@ -1337,14 +1393,17 @@ impl Reports {
         owner: &impl Fn(&Path) -> Option<String>,
         started: Option<&HashMap<String, PathBuf>>,
     ) -> io::Result<()> {
-        self.append_data(id, language, report, path, result.as_ref(), owner, started)
+        self.append_data(id, language, report, [path], result.as_ref(), owner, started)
     }
 
-    fn append_data(
-        &self, id: &str, language: Language, report: &Mutex<ReportDraft>, path: &Path,
+    fn append_data<'a>(
+        &self, id: &str, language: Language, report: &Mutex<ReportDraft>,
+        paths: impl IntoIterator<Item = &'a Path>,
         result: Result<&Outcome, &io::Error>, owner: &impl Fn(&Path) -> Option<String>,
         started: Option<&HashMap<String, PathBuf>>,
     ) -> io::Result<()> {
+        let mut paths = paths.into_iter();
+        let Some(path) = paths.next() else { return Ok(()); };
         self.cancellation.check_io()?;
         let mut roots = HashMap::<String, RootFailures<'_>>::new();
         let visible = |root: &str| started.is_none_or(|started| started.contains_key(root));
@@ -1390,7 +1449,10 @@ impl Reports {
             failures,
         };
         let written = match result {
-            Err(error) => spool.append(path, &[error.to_string()], None),
+            Err(error) => {
+                let errors = [error.to_string()];
+                std::iter::once(path).chain(paths).try_for_each(|path| spool.append(path, &errors, None))
+            }
             Ok(_) => roots.into_iter().try_for_each(|(key, root)| {
                 let source = started.and_then(|paths| paths.get(&key)).map_or(path, PathBuf::as_path);
                 let report = RootFailureReport {

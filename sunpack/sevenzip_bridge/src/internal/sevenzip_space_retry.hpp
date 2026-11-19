@@ -55,7 +55,7 @@ namespace sunpack::sevenzip
     //   4. 终态自作：调用方已要求终止时，必须在产生任何副作用之前返回 Terminal。
     //
     // make_terminal 的契约：产出一个供 gate 使用的终态谓词，只在第一次真实空间失败之后被
-    // 调用一次（惰性），因此热路径上根本不会构造 std::function。
+    // 调用一次（惰性）。可返回现有谓词的引用，或按需构造一个谓词。
     template <typename TerminalFactory, typename AttemptFn>
     AttemptResult retry_with_space_gate(VolumeSpaceGate *gate,
                                         TerminalFactory &&make_terminal,
@@ -77,7 +77,7 @@ namespace sunpack::sevenzip
         // 失败证据必须先于 wait() 上报：wait() 只做裁决，不产生证据。
         report_retry_space_failure(gate, result.win32_error, failed_path);
 
-        const TerminalPredicate terminal = make_terminal();
+        const auto &terminal = make_terminal();
 
         for (;;)
         {

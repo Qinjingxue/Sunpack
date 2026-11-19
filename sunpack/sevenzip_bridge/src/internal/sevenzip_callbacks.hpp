@@ -895,10 +895,12 @@ namespace sunpack::sevenzip
                 is_memory_hresult(writer_error) || (memory && (memory->revoked.load() || memory->denied.load())))) {
                 replay_->initialized = true;
                 output_paths_->preserve_replay();
-                for (const auto &state : async_files_) async_writer_->capture_replay(state, replay_);
+                for (const auto &state : async_files_) async_writer_->capture_replay(state, *replay_);
                 for (const auto &item : output_trace_.items)
-                    if (!item.is_dir && item.done && !item.output_path.empty() && replay_->files.find(item.index) == replay_->files.end()) {
-                        auto &receipt = replay_->files[item.index];
+                    if (!item.is_dir && item.done && !item.output_path.empty()) {
+                        auto [entry, inserted] = replay_->files.try_emplace(item.index);
+                        if (!inserted) continue;
+                        auto &receipt = entry->second;
                         receipt.path = (output_root_ / item.output_path).make_preferred().native();
                         receipt.created = receipt.complete = true;
                         receipt.written.add(0, item.bytes_written);
@@ -1554,12 +1556,10 @@ namespace sunpack::sevenzip
         // gate 的终态谓词：显式取消或 writer 整体停止，只读 atomic。
         TerminalPredicate space_terminal_predicate() const
         {
-            const auto token = cancel_token_;
-            const auto writer = async_writer_;
-            return [token, writer]
+            return [this]
             {
-                return (token && token->load(std::memory_order_acquire)) ||
-                    writer->stopping();
+                return (cancel_token_ && cancel_token_->load(std::memory_order_acquire)) ||
+                    async_writer_->stopping();
             };
         }
 

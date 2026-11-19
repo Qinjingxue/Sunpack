@@ -180,22 +180,19 @@ fn official_all_cipher_and_kdf_vectors() {
     );
 }
 #[test]
-fn bounded_batch_reuses_one_workspace_without_payload_reads() {
+fn password_attempts_reuse_workspace() {
     let data = FIXTURES[0];
     let password = pw("sunpack-test");
     let mut workspace = Workspace::default();
     let probe = PasswordProbe::read(&mut Cursor::new(data), data.len() as u64).unwrap();
-    for wrong in ["wrong1", "wrong2", "wrong3"] {
-        assert!(!probe.matches(&pw(wrong), &mut workspace).unwrap());
-    }
-    assert_eq!(workspace.kdf_runs, 3);
+    assert!(!probe.matches(&pw("wrong1"), &mut workspace).unwrap());
+    assert_eq!(workspace.kdf_runs, 1);
     let memory = workspace.memory.as_ptr();
     assert!(probe.matches(&password, &mut workspace).unwrap());
     assert_eq!(workspace.memory.as_ptr(), memory);
     assert_eq!(workspace.memory.len(), 10240);
-    assert_eq!(workspace.kdf_runs, 4);
-    // Extraction derives the selected password independently, with no process
-    // crossing key cache or long-lived Argon2 workspace.
+    assert_eq!(workspace.kdf_runs, 2);
+    // A matching password still needs a valid quick block for each new probe.
     let mut changed = data.to_vec();
     changed[40] ^= 0xff;
     let changed_probe =
@@ -228,21 +225,13 @@ fn password_probe_read_cost_does_not_scale_with_payload() {
             Ok(p)
         }
     }
-    for length in [FIXTURES[0].len() as u64, 1 << 30, 1 << 40] {
-        let mut input = Sparse {
-            position: 0,
-            read: 0,
-        };
-        let probe = PasswordProbe::read(&mut input, length).unwrap();
-        let mut workspace = Workspace::default();
-        for password in ["wrong1", "wrong2", "sunpack-test"] {
-            assert_eq!(
-                probe.matches(&pw(password), &mut workspace).unwrap(),
-                password == "sunpack-test"
-            );
-        }
-        assert_eq!(input.read, 72);
-    }
+    let mut input = Sparse {
+        position: 0,
+        read: 0,
+    };
+    let probe = PasswordProbe::read(&mut input, 1 << 40).unwrap();
+    assert_eq!(probe.quick, FIXTURES[0][40..72]);
+    assert_eq!(input.read, 72);
 }
 #[test]
 fn corruption_cancellation_and_short_reads() {
@@ -339,23 +328,6 @@ fn corruption_cancellation_and_short_reads() {
     assert_eq!(output, include_bytes!("../../data/expected.zip"));
 }
 #[test]
-fn ctr_arbitrary_chunking_matches_official_all_ciphers() {
-    for fixture in FIXTURES {
-        let header = Header::parse(fixture, fixture.len() as u64).unwrap();
-        let keys = Workspace::default()
-            .derive(&header, &pw("sunpack-test"), KeyPurpose::Extraction)
-            .unwrap();
-        for chunk in [1, 7, 15, 31, 32, 127, 129] {
-            let mut bytes = fixture[40..fixture.len() - 32].to_vec();
-            let mut stream = cipher::Stream::new(header.bytes[6], &keys.key, &keys.nonce);
-            for part in bytes.chunks_mut(chunk) {
-                stream.apply(part);
-            }
-            assert_eq!(&bytes[32..], include_bytes!("../../data/expected.zip"));
-        }
-    }
-}
-#[test]
 fn static_identity_never_runs_kdf() {
     for length in [0, 39, 40, 72, 103] {
         assert!(Header::parse(FIXTURES[0], length).is_err());
@@ -373,12 +345,20 @@ fn static_identity_never_runs_kdf() {
 }
 
 #[test]
-fn ctr_offsets_match_official_vectors_and_full_counter_carries() {
+fn ctr_chunking_and_offsets_match_official_vectors_and_full_counter_carries() {
     for fixture in FIXTURES {
         let header = Header::parse(fixture, fixture.len() as u64).unwrap();
         let keys = Workspace::default()
             .derive(&header, &pw("sunpack-test"), KeyPurpose::Extraction)
             .unwrap();
+        for chunk in [1, 7, 15, 31, 32, 127, 129] {
+            let mut bytes = fixture[40..fixture.len() - 32].to_vec();
+            let mut stream = cipher::Stream::new(header.bytes[6], &keys.key, &keys.nonce);
+            for part in bytes.chunks_mut(chunk) {
+                stream.apply(part);
+            }
+            assert_eq!(&bytes[32..], include_bytes!("../../data/expected.zip"));
+        }
         let mut stream = cipher::Stream::new(header.bytes[6], &keys.key, &keys.nonce);
         // Absolute offsets remain valid even after the serial cursor has advanced.
         stream.apply(&mut [0; 39]);

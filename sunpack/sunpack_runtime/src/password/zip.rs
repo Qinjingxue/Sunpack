@@ -124,7 +124,7 @@ pub(crate) fn zip_fast_verify_passwords_from_attempts(
                 result.restore_indices(indices, candidates.len());
                 Ok(result)
             }
-            Ok(PasswordContext::Reduced(_, plan)) => Ok(PasswordVerification {
+            Ok(PasswordContext::ReducedZip(_, plan)) => Ok(PasswordVerification {
                 volume_attempts: Some(plan.clone()), ..early
             }),
             Ok(_) => Ok(early),
@@ -217,8 +217,13 @@ fn prepare_zip_attempts(
         }
     })?;
     match anchor {
-        Some(anchor) if evidence.alternatives.iter().all(|(context, _)| context == &anchor.context) =>
-            evidence.with_anchor(PasswordContext::Zip(anchor.context.clone())),
+        Some(anchor) if evidence.alternatives.iter().all(|(context, _)| context == &anchor.context) => {
+            let context = anchor.context.clone();
+            Ok(match evidence.reduced_plan()? {
+                Some(plan) => PasswordContext::ReducedZip(context, plan),
+                None => PasswordContext::Zip(context),
+            })
+        }
         _ => Ok(evidence.into_context(PasswordContext::Zip)),
     }
 }

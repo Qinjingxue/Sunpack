@@ -419,20 +419,14 @@ pub(crate) struct PreparedEvidence<T> {
 }
 
 impl<T> PreparedEvidence<T> {
-    pub(crate) fn with_anchor(
-        self,
-        anchor: crate::password::context::PasswordContext,
-    ) -> Result<crate::password::context::PasswordContext, PreparedStatus> {
+    pub(crate) fn reduced_plan(&self) -> Result<Option<Arc<VolumeAttemptPlan>>, PreparedStatus> {
         if self.rejected.is_empty() {
-            return Ok(anchor);
+            return Ok(None);
         }
         let paths = self.rejected.iter().map(Arc::as_ref).collect::<Vec<_>>();
-        let plan = super::super::evidence::remove_paths(&self.plan, &paths)
-            .map_err(|error| unknown(error.to_string()))?;
-        Ok(crate::password::context::PasswordContext::Reduced(
-            Box::new(anchor),
-            Arc::new(plan),
-        ))
+        super::super::evidence::remove_paths(&self.plan, &paths)
+            .map(|plan| Some(Arc::new(plan)))
+            .map_err(|error| unknown(error.to_string()))
     }
 
     pub(crate) fn into_context(

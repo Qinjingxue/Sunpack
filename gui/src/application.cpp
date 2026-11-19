@@ -223,7 +223,7 @@ void Application::save_field(const std::string& id,Json draft) {
             edit["text"]=range_configuration(draft["range"],(*field)["editor"]=="datetime_range").dump();
             edit["draftText"]=std::move(draft_text);
         }
-        queue_save(Json{{"kind","config"},{"key",id},{"fields",Json::array({std::move(edit)})}});
+        queue_save(Json{{"kind","config"},{"key",id},{"field",std::move(edit)}});
     } catch(const std::exception& e) { save_error(id,e.what()); }
 }
 void Application::queue_save(Json job) {
@@ -394,7 +394,7 @@ void Application::acknowledge_save(const Json& ack) {
     }
     save_error(job["key"].get_ref<const std::string&>(),ack.at("error"));
     if(ok) {
-        const auto& edit=job["fields"][0]; auto id=edit["pointer"].get<std::string>();
+        const auto& edit=job["field"]; auto id=edit["pointer"].get<std::string>();
         const auto& draft_text=edit.contains("draftText")?edit["draftText"]:edit["text"];
         auto original=edit["type"]=="string"?Json(edit["text"]).dump():edit["type"]=="boolean"?Json(edit["boolean"]).dump():edit["text"].get<std::string>();
         for(auto name:{"drafts","toggleDrafts"}) {
@@ -409,8 +409,8 @@ void Application::acknowledge_save(const Json& ack) {
             }
             auto text=drafts.dump(); ui_page_set_json(page_,name,text.c_str());
         }
-        for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"] && queued["fields"][0]["original"]==edit["original"]) {
-            queued["fields"][0]["original"]=original;
+        for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"] && queued["field"]["original"]==edit["original"]) {
+            queued["field"]["original"]=original;
         }
     }
     active_save_.reset();
@@ -1174,20 +1174,23 @@ void Application::work() {
                         passwords_changed=true;
                     } else if(op=="commit") {
                         auto kind=p.at("kind").get<std::string>();
-                        if(kind=="config") for(const auto& edit:p.at("fields")) {
-                            auto pointer=edit.at("pointer").get<std::string>();
-                            auto slash=pointer.find_last_of('/');
-                            auto field=pointer.substr(slash+1);
-                            if(pointer.rfind("/filesystem/scan_filters/",0)!=0 || (field!="paths" && field!="files" && field!="extensions" && field!="full_names")) continue;
-                            if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
-                            auto input=Json{{field,parse_json(edit.at("text").get<std::string>())}}.dump(-1,' ',true)+"\n";
-                            auto check=run_cli(options_.cli,{L"config",L"validate",L"-srs",L"-j"},stop_,&input);
-                            if(check.code!=0) {
-                                auto report=Json::parse(check.output,nullptr,false);
-                                auto errors=report.is_object()?report.value("errors",Json::array()):Json::array();
-                                std::string message;
-                                for(const auto& error:errors) { if(!message.empty()) message+='\n'; message+=error.get<std::string>(); }
-                                throw std::runtime_error(message.empty()?"validation":message);
+                        const Json empty;
+                        const auto& config_edit=kind=="config"?p.at("field"):empty;
+                        if(!config_edit.is_null()) {
+                            const auto& pointer=config_edit.at("pointer").get_ref<const std::string&>();
+                            auto field=std::string_view(pointer).substr(pointer.find_last_of('/')+1);
+                            if(pointer.rfind("/filesystem/scan_filters/",0)==0 &&
+                               (field=="paths" || field=="files" || field=="extensions" || field=="full_names")) {
+                                if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
+                                auto input=Json{{std::string(field),parse_json(config_edit.at("text").get_ref<const std::string&>())}}.dump(-1,' ',true)+"\n";
+                                auto check=run_cli(options_.cli,{L"config",L"validate",L"-srs",L"-j"},stop_,&input);
+                                if(check.code!=0) {
+                                    auto report=Json::parse(check.output,nullptr,false);
+                                    auto errors=report.is_object()?report.value("errors",Json::array()):Json::array();
+                                    std::string message;
+                                    for(const auto& error:errors) { if(!message.empty()) message+='\n'; message+=error.get<std::string>(); }
+                                    throw std::runtime_error(message.empty()?"validation":message);
+                                }
                             }
                         }
                         PasswordSaveSnapshot saved_passwords;
@@ -1201,8 +1204,7 @@ void Application::work() {
                             }
                         }
                         const Json no_edits=Json::array();
-                        const auto fields=p.find("fields");
-                        auto result=save_changes(dir,fields!=p.end()?*fields:no_edits,
+                        auto result=save_changes(dir,config_edit,
                             password_edits,
                             kind=="roots"?p.at("edits"):no_edits,
                             &saved_passwords,last_passwords);

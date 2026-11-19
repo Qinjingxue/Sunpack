@@ -1207,10 +1207,9 @@ fn primary_numbered_volume(filename: &str, regexes: &RelationRegexes) -> Option<
     parse_volume_candidates_with_regexes(filename, regexes)
         .into_iter()
         .find(|candidate| {
+            // Only the marker parser emits these styles with decoration.
             !candidate.decorated
-                || (candidate.family == "rar"
-                    && matches!(candidate.style, "rar_part" | "rar_sfx_part")
-                    && regexes.parse_marker_numbered_re().is_match(filename))
+                || matches!(candidate.style, "rar_part" | "rar_sfx_part")
         })
 }
 

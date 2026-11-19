@@ -39,15 +39,15 @@ void require_save(const Json& result) {
 void save_config_field(const fs::path& path,const std::string& pointer,const std::string& original,
     const std::string& type,const std::string& text,bool boolean) {
     Json edit={{"pointer",pointer},{"original",original},{"type",type},{"text",text},{"boolean",boolean}};
-    require_save(save_changes(path.parent_path(),Json::array({edit}),Json::array(),Json::array()));
+    require_save(save_changes(path.parent_path(),edit,Json::array(),Json::array()));
 }
 void save_password_edit(const fs::path& path,Json edit,PasswordSaveSnapshot* snapshot=nullptr) {
-    require_save(save_changes(path.parent_path(),Json::array(),Json::array({std::move(edit)}),Json::array(),snapshot));
+    require_save(save_changes(path.parent_path(),Json(),Json::array({std::move(edit)}),Json::array(),snapshot));
 }
 void edit_root(const fs::path& path,const std::string& op,const std::string& original,
     const std::string& input,const std::string& output,bool deep) {
     Json edit={{"operation",op},{"original",original},{"input",input},{"output",output},{"deep",deep}};
-    require_save(save_changes(path.parent_path(),Json::array(),Json::array(),Json::array({edit})));
+    require_save(save_changes(path.parent_path(),Json(),Json::array(),Json::array({edit})));
 }
 std::string event(const std::string& type,const fs::path& p,int ts) {
     return Json({{"event",type},{"path",utf8(p.wstring())},{"ts",ts}}).dump()+"\n";
@@ -419,41 +419,40 @@ void batch_editing(Fixture& fixture) {
     Json old={{"value","old"},{"scopes",{utf8(dir.wstring())}}};
     atomic_write(passwords,Json{{"passwords",{old}},{"clipboard_history",{"latest background history"}}}.dump());
     atomic_write(roots,"# retained\n"+utf8(dir.wstring())+"\n");
-    Json fields=Json::array({Json{{"pointer","/watch/out_dir"},{"original","\".\""},{"type","string"},{"text","output"},{"boolean",false}},
-        Json{{"pointer","/watch/toast_enabled"},{"original","true"},{"type","boolean"},{"text",""},{"boolean",false}}});
+    Json field={{"pointer","/watch/toast_enabled"},{"original","true"},{"type","boolean"},{"text",""},{"boolean",false}};
     Json pwd=Json::array({Json{{"operation","replace"},{"original",old.dump()},{"value","changed"},{"scopes",{utf8(dir.wstring())}}}});
     Json root=Json::array({Json{{"operation","save"},{"original",utf8(dir.wstring())},{"input",utf8(dir.wstring())},{"output","new"},{"deep",true},{"expected",{{"output",""},{"deep",false}}}}});
     auto before_config=read_file(config), before_passwords=read_file(passwords), before_roots=read_file(roots);
-    auto invalid=fields; invalid.push_back({{"pointer","/watch/clipboard_builtin_max_entries"},{"original","1"},{"type","number"},{"text","0"},{"boolean",false}});
+    Json invalid={{"pointer","/watch/clipboard_builtin_max_entries"},{"original","1"},{"type","number"},{"text","0"},{"boolean",false}};
     auto rejected=save_changes(dir,invalid,pwd,root);
     assert(rejected["saved"].empty() && rejected["error"]!="");
     assert(read_file(config)==before_config && read_file(passwords)==before_passwords && read_file(roots)==before_roots);
     atomic_write(roots,utf8(dir.wstring())+" | external\n");
-    rejected=save_changes(dir,fields,pwd,root); assert(rejected["saved"].empty() && rejected["error"]=="rootConflict");
+    rejected=save_changes(dir,field,pwd,root); assert(rejected["saved"].empty() && rejected["error"]=="rootConflict");
     assert(read_file(config)==before_config && read_file(passwords)==before_passwords);
     atomic_write(roots,before_roots);
     {
         // Preflight can read this file, but Windows denies its replacement.
         Handle held(CreateFileW(roots.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));
         assert(held.value!=INVALID_HANDLE_VALUE);
-        auto partial=save_changes(dir,fields,pwd,root);
+        auto partial=save_changes(dir,field,pwd,root);
         assert(partial["saved"]==Json::array({"config","passwords"}) && partial["error"]!="");
         assert(read_file(roots)==before_roots);
     }
-    auto retry=save_changes(dir,Json::array(),Json::array(),root);
+    auto retry=save_changes(dir,Json(),Json::array(),root);
     assert(retry["error"]=="" && retry["saved"]==Json::array({"roots"}));
     // Successful commits expose their already-validated on-disk snapshot.
     // A failed preflight must never report a committed snapshot.
     PasswordSaveSnapshot failed_snapshot;
     Json bad_password=Json::array({Json{{"operation","replace"},{"original","{\"value\":\"not found\"}"},{"value","bad"},{"scopes",Json::array()}}});
-    auto rejected_password=save_changes(dir,Json::array(),bad_password,Json::array(),&failed_snapshot);
+    auto rejected_password=save_changes(dir,Json(),bad_password,Json::array(),&failed_snapshot);
     assert(rejected_password["saved"].empty() && failed_snapshot.document.is_null());
     PasswordSaveSnapshot snapshot;
     Json updated_password=Json::array({Json{{"operation","replace"},
         {"original",Json{{"value","changed"},{"scopes",{utf8(dir.wstring())}}}.dump()},
         {"value","fast-delta"},{"scopes",{utf8(dir.wstring())}}}});
     // Equal row count cannot make an older file snapshot a valid delta base.
-    auto committed=save_changes(dir,Json::array(),updated_password,Json::array(),&snapshot,before_passwords);
+    auto committed=save_changes(dir,Json(),updated_password,Json::array(),&snapshot,before_passwords);
     assert(committed["error"]=="" && committed["saved"]==Json::array({"passwords"}));
     assert(!snapshot.delta_base_matches);
     assert(snapshot.document==read_json(passwords) && snapshot.file_text==read_file(passwords));
@@ -465,7 +464,7 @@ void batch_editing(Fixture& fixture) {
     assert(read_roots(roots)[0].deep && read_file(roots).find("# retained")!=std::string::npos);
     PasswordSaveSnapshot joined;
     auto previous_record=snapshot.record.dump(),joined_scope=utf8((dir.parent_path()/L"joined-scope").wstring());
-    auto joined_result=save_changes(dir,Json::array(),Json::array({Json{{"operation","addMany"},{"values",{"fast-delta"}},{"scopes",{joined_scope}}}}),Json::array(),&joined,snapshot.file_text);
+    auto joined_result=save_changes(dir,Json(),Json::array({Json{{"operation","addMany"},{"values",{"fast-delta"}},{"scopes",{joined_scope}}}}),Json::array(),&joined,snapshot.file_text);
     assert(joined_result["error"]=="" && joined.delta_base_matches);
     assert(joined.document["passwords"].size()==1 && joined.record["scopes"].size()==2);
     assert(joined.rebases.size()==1 && joined.rebases[0]["originals"]==Json::array({previous_record}) && joined.rebases[0]["record"]==joined.record);
@@ -474,10 +473,10 @@ void batch_editing(Fixture& fixture) {
     auto first=dir/"first", second=dir/"second"; fs::create_directory(first); fs::create_directory(second);
     Json batch=Json::array({Json{{"operation","addMany"},{"inputs",{utf8(first.wstring()),utf8((dir/"missing").wstring())}},{"output",""},{"deep",true}}});
     auto before=read_file(roots);
-    auto bad=save_changes(dir,Json::array(),Json::array(),batch);
+    auto bad=save_changes(dir,Json(),Json::array(),batch);
     assert(!bad["error"].get<std::string>().empty() && read_file(roots)==before);
     batch[0]["inputs"]=Json::array({utf8(first.wstring()),utf8(second.wstring()),utf8(first.wstring())});
-    assert(save_changes(dir,Json::array(),Json::array(),batch)["error"]=="");
+    assert(save_changes(dir,Json(),Json::array(),batch)["error"]=="");
     auto saved_roots=read_roots(roots);
     assert(saved_roots.size()==3 && saved_roots.back().deep);
     View view;
@@ -505,12 +504,12 @@ void batch_editing(Fixture& fixture) {
     {
         Handle held(CreateFileW(roots.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));
         PasswordSaveSnapshot rolled_back;
-        auto failure=save_changes(dir,Json::array(),Json::array(),deletion,&rolled_back);
+        auto failure=save_changes(dir,Json(),Json::array(),deletion,&rolled_back);
         assert(failure["error"]!="" && failure["saved"].empty() && rolled_back.document.is_null());
         assert(read_file(roots)==roots_before && read_file(passwords)==passwords_before);
     }
     PasswordSaveSnapshot cleaned;
-    auto removed=save_changes(dir,Json::array(),Json::array(),deletion,&cleaned);
+    auto removed=save_changes(dir,Json(),Json::array(),deletion,&cleaned);
     cleanup["passwords"].erase(cleanup["passwords"].begin());
     cleanup["passwords"][0]["scopes"]=Json::array({utf8(second.wstring())});
     assert(removed["error"]=="" && removed["saved"]==Json::array({"passwords","roots"}));

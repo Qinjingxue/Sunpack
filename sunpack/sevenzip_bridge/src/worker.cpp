@@ -1293,7 +1293,8 @@ RequestOutcome run_request(
         std::all_of(request.archive_input.volume_attempts.layouts[0].begin(), request.archive_input.volume_attempts.layouts[0].end(),
             [&](const auto& slot) { return request.archive_input.volume_attempts.domains[slot.domain].size() == 1; });
     std::optional<PasswordTestResult> selected_probe;
-    VolumeProbeCache proof_cache(request.archive_input.volume_attempts);
+    std::optional<VolumeProbeCache> proof_cache;
+    if (volume_trials) proof_cache.emplace(request.archive_input.volume_attempts);
     auto extract_with_password = [&](const std::wstring& selected_password) {
         if (volume_trials) volume_replay->volume_output_started = true;
         // The callback is synchronous and its emit() serializes calls. Each
@@ -1315,12 +1316,12 @@ RequestOutcome run_request(
                     request.password_count(request.passwords_for_layout(0)) <= 1)) {
                     if (request.report_progress) progress({"total", 0, 0, 0});
                     lookahead = cursor;
-                    prepared_attempts = probe_volume_wave(request, lookahead, cancel_token.get(), proof_cache);
+                    prepared_attempts = probe_volume_wave(request, lookahead, cancel_token.get(), *proof_cache);
                     // Consume in relation order while releasing each result.
                     std::reverse(prepared_attempts.begin(), prepared_attempts.end());
 #ifdef SUP7Z_DEBUG
-                    volume_replay->scheduled_volume_probes += proof_cache.scheduled_probes;
-                    proof_cache.scheduled_probes = 0;
+                    volume_replay->scheduled_volume_probes += proof_cache->scheduled_probes;
+                    proof_cache->scheduled_probes = 0;
 #endif
                 }
                 const bool found = cursor.next(request.archive_input.volume_attempts, cancel_token.get());
@@ -1331,7 +1332,6 @@ RequestOutcome run_request(
                     result.missing_volume = !ambiguous;
                     result.damaged = true;
                     result.wrong_password = result.password_rejected = result.password_candidates_all_rejected = false;
-                    result.missing_volume_suspected = false;
                     result.missing_volume_evidence = ambiguous ? "" : "volume_attempts_exhausted";
                     if (result.failure_stage.empty()) result.failure_stage = "archive_open";
                     result.failure_kind = ambiguous ? "password_or_volume_inconclusive" : "missing_volume";
@@ -1394,7 +1394,7 @@ RequestOutcome run_request(
                 auto& cursor = volume_replay->volumes;
                 const auto& plan = request.archive_input.volume_attempts;
                 const auto prefix = observed_prefix_size(*selected_probe, cursor.selected.size());
-                if ((selected_probe->rejects_fixed_geometry || prefix) && proof_cache.can_skip_suffix(plan, cursor.layout)) {
+                if ((selected_probe->rejects_fixed_geometry || prefix) && proof_cache->can_skip_suffix(plan, cursor.layout)) {
                     if (selected_probe->rejects_fixed_geometry) {
                         while (!prepared_attempts.empty() && prepared_attempts.back().layout == cursor.layout)
                             prepared_attempts.pop_back();
@@ -1457,7 +1457,6 @@ RequestOutcome run_request(
             result.status = PasswordTestStatus::Damaged;
             result.damaged = true;
             result.missing_volume = true;
-            result.missing_volume_suspected = false;
             result.missing_volume_evidence = "structured_volume_gap";
             result.failure_stage = "archive_open";
             result.failure_kind = "missing_volume";
@@ -1644,7 +1643,6 @@ RequestOutcome run_request(
             result.status = PasswordTestStatus::Damaged;
             result.damaged = true;
             result.missing_volume = true;
-            result.missing_volume_suspected = false;
             result.missing_volume_evidence = archive_input.analyzed_missing_volume_evidence;
             result.failure_kind = "missing_volume";
             result.message = "archive split volume appears incomplete";
@@ -1692,7 +1690,6 @@ RequestOutcome run_request(
         wire::key("damaged") + wire::boolean(result.damaged) +
         wire::key("checksum_error") + wire::boolean(result.checksum_error) +
         wire::key("missing_volume") + wire::boolean(result.missing_volume) +
-        wire::key("missing_volume_suspected") + wire::boolean(result.missing_volume_suspected) +
         wire::key("missing_volume_evidence") + wire::text(result.missing_volume_evidence) +
         wire::key("missing_volume_name") + wire::text(wide_to_utf8(result.missing_volume_name)) +
         wire::key("wrong_password") + wire::boolean(result.wrong_password) +

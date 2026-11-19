@@ -436,11 +436,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        void capture_replay(const FileStatePtr &file, ExtractionReplay *saved = nullptr) {
-            if (!file || (!file->replay && !saved)) return;
+        void capture_replay(const FileStatePtr &file, ExtractionReplay &saved) {
             std::lock_guard<std::mutex> lock(mutex_);
-            auto &receipt = saved ? saved->files[file->item_index] : *file->replay;
-            save_file_receipt(*file, receipt);
+            save_file_receipt(*file, saved.files[file->item_index]);
         }
 
         std::size_t idle_memory_bytes() noexcept {
@@ -1462,7 +1460,8 @@ namespace sunpack::sevenzip
         // gate 的终态谓词：只读 atomic，并在冷路径上才被求值。
         TerminalPredicate writer_terminal_predicate(const JobStatePtr &job) const
         {
-            return [this, job]
+            // try_wait evaluates this synchronously while its caller owns job.
+            return [this, &job]
             {
                 return stopping_.load(std::memory_order_acquire) || !job ||
                        job->first_error.load(std::memory_order_acquire) != S_OK ||

@@ -197,15 +197,21 @@ pub(super) fn discover(
     request: &Request,
     options: &NativeDirectoryScanOptions,
     candidates: &CandidateSet,
+    retain_task_context: bool,
 ) -> io::Result<Discovered> {
     let mut result = Discovered::default();
     let mut prepared = HashSet::new();
     let mut prepared_tasks = Vec::new();
     for plan in &request.prepared_volumes {
         let plan = plan.0.lock().unwrap().take();
-        if let Some(plan) = plan.filter(|plan| plan.generations.iter().all(|(path, before)|
+        if let Some(mut plan) = plan.filter(|plan| plan.generations.iter().all(|(path, before)|
             crate::io::reader::capture_file_generation(Path::new(path)).is_ok_and(|now| now == *before))) {
             prepared.insert(plan.path);
+            if !retain_task_context {
+                for task in &mut plan.tasks {
+                    task.context = None;
+                }
+            }
             prepared_tasks.extend(plan.tasks);
         }
     }
@@ -262,10 +268,11 @@ pub(super) fn discover(
     drop(seen_roots);
     // Enumeration may be covered by an ancestor target; main still retains
     // every explicitly selected boundary for missing-volume replacement.
-    let mut logical_scopes: BTreeMap<_, _> = scopes
-        .iter()
-        .map(|scope| (scope.key().to_owned(), scope.clone()))
-        .collect();
+    let mut logical_scopes = retain_task_context.then(|| {
+        scopes.iter()
+            .map(|scope| (scope.key().to_owned(), scope.clone()))
+            .collect::<BTreeMap<_, _>>()
+    });
     if request.recursive && scopes.len() > 1 {
         let roots: HashMap<_, _> = scopes.iter().map(|scope| (scope.key(), scope)).collect();
         let covered: Vec<_> = scopes
@@ -293,7 +300,9 @@ pub(super) fn discover(
     let mut retry_scopes = Vec::new();
     let mut by_parent = BTreeMap::<_, (_, Vec<_>)>::new();
     let requested_scope = request.discovery_scope.as_ref();
-    if let Some(scope) = requested_scope.filter(|_| !files.is_empty()) {
+    if let (Some(logical_scopes), Some(scope)) =
+        (&mut logical_scopes, requested_scope.filter(|_| !files.is_empty()))
+    {
         logical_scopes
             .entry(scope.key().to_owned())
             .or_insert_with(|| scope.clone());
@@ -306,9 +315,11 @@ pub(super) fn discover(
             let parent = path.parent().unwrap_or(path).to_string_lossy();
             let mut key = path_key(&parent);
             key.truncate(key.trim_end_matches('\\').len());
-            if !logical_scopes.contains_key(&key) {
-                let scope = NativeDiscoveryScope::new(parent.as_ref().to_owned(), max_depth, Vec::new());
-                logical_scopes.insert(key.clone(), scope);
+            if let Some(logical_scopes) = &mut logical_scopes {
+                if !logical_scopes.contains_key(&key) {
+                    let scope = NativeDiscoveryScope::new(parent.as_ref().to_owned(), max_depth, Vec::new());
+                    logical_scopes.insert(key.clone(), scope);
+                }
             }
             (key, parent)
         };
@@ -367,11 +378,13 @@ pub(super) fn discover(
         }
         let table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
         tables.push(table);
-        retry_scopes.push(Arc::new(RetryScope {
-            scope: Arc::new(scope.clone()),
-            snapshot: raw,
-            bucket: String::new(),
-        }));
+        if retain_task_context {
+            retry_scopes.push(Arc::new(RetryScope {
+                scope: Arc::new(scope.clone()),
+                snapshot: raw,
+                bucket: String::new(),
+            }));
+        }
     }
     for ((_, bucket), (parent, targets)) in by_parent {
         request.cancel.check_io()?;
@@ -417,15 +430,18 @@ pub(super) fn discover(
             }
             Err(error) => return Err(error),
         }
-        retry_scopes.push(Arc::new(RetryScope {
-            scope: Arc::new(scope),
-            snapshot: raw,
-            bucket,
-        }));
+        if retain_task_context {
+            retry_scopes.push(Arc::new(RetryScope {
+                scope: Arc::new(scope),
+                snapshot: raw,
+                bucket,
+            }));
+        }
     }
     for (filtered, _) in shared_snapshots.values() {
         result.scan_errors.extend(filtered.scan_errors());
     }
+    drop(shared_snapshots);
     // Main resolves one combined candidate table. Watch batches already
     // partition file targets by catalog bucket, which stays the read boundary.
     if request.watch_catalog.is_none() {
@@ -437,8 +453,10 @@ pub(super) fn discover(
         }
     }
     result.project(&mut tables, candidates, &verified, request, false)?;
-    retain_logical_retry_scopes(logical_scopes.into_values(), &mut retry_scopes);
-    assign_retry_scopes(&mut result.tasks, &retry_scopes);
+    if let Some(logical_scopes) = logical_scopes {
+        retain_logical_retry_scopes(logical_scopes.into_values(), &mut retry_scopes);
+        assign_retry_scopes(&mut result.tasks, &retry_scopes);
+    }
     if !prepared_tasks.is_empty() {
         suppress_prepared_continuations(&prepared_tasks, &mut result.tasks);
         // Preserve the prepared retry scopes, and coalesce a peer admitted in
@@ -831,27 +849,50 @@ fn probe_relations(
     if request.deep { return Ok(()); }
     let pending = table.encrypted_rar_anchors();
     if pending.is_empty() { return Ok(()); }
-    let resolved = pending.into_par_iter().map(|anchor| request.cancel.run(|| {
+    enum Change {
+        Unchanged,
+        Updated,
+        Departed,
+    }
+    let mut resolved = pending.into_par_iter().map(|anchor| request.cancel.run(|| {
         // Open even without password candidates, so a departed member refreshes the family.
         let resolved = NativeArchiveSession::new(anchor.path.clone())
             .and_then(|session| candidates.resolve_relation(&anchor, &session, &request.cancel));
         match resolved {
-            Ok((anchor, password)) => Ok((anchor, password, false)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((anchor, None, true)),
+            Ok((updated, password)) => {
+                let change = if updated == anchor { Change::Unchanged } else { Change::Updated };
+                Ok((updated, password, change))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((anchor, None, Change::Departed)),
             Err(error) => Err(error),
         }
     })).collect::<io::Result<Vec<_>>>()?;
-    let mut anchors = Vec::with_capacity(resolved.len());
-    let mut refresh = Vec::new();
-    for (anchor, password, departed) in resolved {
-        if departed { refresh.push(anchor.path.clone()); }
-        if let Some(password) = password {
+    let mut changed = false;
+    let mut departed = HashSet::new();
+    for (anchor, password, change) in &mut resolved {
+        if let Some(password) = password.take() {
             candidates.remember_verified(password.clone());
             verified.insert((path_key(&anchor.path), anchor.structure_offset.unwrap_or(0)), password);
         }
-        anchors.push(anchor);
+        match change {
+            Change::Unchanged => {}
+            Change::Updated => changed = true,
+            // The probe may have raced consumption by another request. Drop
+            // only proven departures, keeping the original snapshot for peers.
+            Change::Departed => {
+                if std::fs::metadata(&anchor.path)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                {
+                    departed.insert(path_key(&anchor.path));
+                }
+            }
+        }
     }
-    table.retry_relations(raw, filtered, targets, anchors, refresh);
+    // Seeing an encrypted anchor is not evidence of a changed family.
+    if changed || !departed.is_empty() {
+        let anchors = resolved.into_iter().map(|(anchor, _, _)| anchor);
+        table.retry_relations(raw, filtered, targets, anchors, &departed);
+    }
     Ok(())
 }
 

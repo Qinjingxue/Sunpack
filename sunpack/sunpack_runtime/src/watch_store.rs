@@ -5,6 +5,7 @@
 
 use crate::collections::trim_map;
 use crate::io::resource_lifecycle::TrackedFile;
+use crate::path_keys::descendant_key_range;
 use crate::wal::{self, Kind};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
@@ -62,17 +63,15 @@ impl PathSet {
     }
     fn remove_under(&mut self, path: &str) -> Vec<String> {
         let key = path_key(path);
-        let prefix = format!("{}\\", key.trim_end_matches('\\'));
-        let mut keys: Vec<_> = self
+        let mut removed: Vec<_> = self
             .0
-            .range(prefix.clone()..)
-            .take_while(|(k, _)| k.starts_with(&prefix))
-            .map(|(k, _)| k.clone())
+            .extract_if(descendant_key_range(&key), |_, _| true)
+            .map(|(_, path)| path)
             .collect();
-        if self.0.contains_key(&key) {
-            keys.push(key);
+        if let Some(path) = self.0.remove(&key) {
+            removed.push(path);
         }
-        keys.into_iter().filter_map(|k| self.0.remove(&k)).collect()
+        removed
     }
     fn insert(&mut self, path: String) {
         self.0.insert(path_key(&path), path);
@@ -275,9 +274,8 @@ impl PendingRecord {
         }
         // Remove the source receipts before inserting any rebased path, since
         // a promoted child can reuse the spelling of one of the old wrappers.
-        let stem = source.trim_end_matches('\\');
         let mut moved: Vec<_> = self.output_identities
-            .extract_if(format!("{stem}\\")..format!("{stem}]"), |_, _| true)
+            .extract_if(descendant_key_range(source), |_, _| true)
             .collect();
         if let Some(id) = self.output_identities.remove(source) {
             moved.push((source.to_owned(), id));

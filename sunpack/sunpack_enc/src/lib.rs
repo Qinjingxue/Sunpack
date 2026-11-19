@@ -52,7 +52,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
 pub struct Header {
     bytes: [u8; 40],
 }
@@ -97,7 +96,7 @@ enum KeyPurpose {
     Extraction,
 }
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct Keys {
     key: Vec<u8>,
     nonce: Vec<u8>,

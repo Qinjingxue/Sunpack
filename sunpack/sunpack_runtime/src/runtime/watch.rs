@@ -3552,10 +3552,11 @@ impl Scheduler {
                 self.dedup.lock().unwrap().invalidate(&changed)?;
             }
             let mut stems = HashSet::new();
+            let mut root_available = None;
             for path in paths {
                 let source = path.to_string_lossy();
                 if !scope.contains(&source) || self.catalog.is_owned(&source) { continue; }
-                if departed.contains(path) && Path::new(&scope.root).is_dir() {
+                if departed.contains(path) && *root_available.get_or_insert_with(|| Path::new(&scope.root).is_dir()) {
                     // Like main's file departure, update only the named path.
                     // A missing Broker must not turn a delete into a root scan.
                     self.scan_options(deep)?.catalog_update(&self.catalog, &scope, Some(&source))?;
@@ -4547,14 +4548,15 @@ impl Scheduler {
         roots: Option<&HashSet<String>>, event: &'static str,
     ) -> io::Result<()> {
         for entry in self.journal.state().entry_items("password") {
-            self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
-            if self.journal.state().entry(&entry.path).is_none() { continue; }
-            let Some((root, recovery)) = self.blocker_route(&entry) else {
-                continue;
-            };
-            if roots.is_some_and(|roots| !roots.contains(&root)) {
+            let route = self.blocker_route(&entry);
+            if roots.is_some_and(|roots| !route.as_ref().is_some_and(|(root, _)| roots.contains(root))) {
                 continue;
             }
+            self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
+            if self.journal.state().entry(&entry.path).is_none() { continue; }
+            let Some((root, recovery)) = route else {
+                continue;
+            };
             let directory = candidate_password_scope(self.journal.state(), &entry.path, recovery.as_deref());
             if entry
                 .failure_payload
@@ -4578,16 +4580,21 @@ impl Scheduler {
             if let Some(entry) = self.journal.state().entry_by_key(&id)
                 .filter(|entry| entry.is_missing_volume()) {
                 retried.insert(id);
-                self.check_missing_volume(&entry, false)?;
+                self.check_missing_volume(&entry, None)?;
             }
         }
         Ok(())
     }
 
-    fn check_missing_volume(&mut self, entry: &crate::watch_store::EntryRecord, retry_incomplete: bool) -> io::Result<()> {
+    fn check_missing_volume(
+        &mut self,
+        entry: &crate::watch_store::EntryRecord,
+        reconciled_route: Option<(String, Option<Arc<Recovery>>)>,
+    ) -> io::Result<()> {
         self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
         if self.journal.state().entry(&entry.path).is_none() { return Ok(()); }
-        let Some((root, recovery)) = self.blocker_route(entry) else { return Ok(()); };
+        let retry_incomplete = reconciled_route.is_some();
+        let Some((root, recovery)) = reconciled_route.or_else(|| self.blocker_route(entry)) else { return Ok(()); };
         let id = watch_path_key(&entry.path);
         if self.defer_claimed_path(&id) { return Ok(()); }
         let (policy, watched) = &self.roots[&root];
@@ -4630,11 +4637,11 @@ impl Scheduler {
 
     fn retry_missing_volumes(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
         for entry in self.journal.state().entry_items("missing_volume") {
-            let Some((root, _)) = self.blocker_route(&entry) else { continue; };
-            if roots.is_none_or(|roots| roots.contains(&root)) {
+            let Some(route) = self.blocker_route(&entry) else { continue; };
+            if roots.is_none_or(|roots| roots.contains(&route.0)) {
                 // Startup/policy reconciliation deliberately retries incomplete
                 // inputs too: a changed content policy may accept retained work.
-                self.check_missing_volume(&entry, true)?;
+                self.check_missing_volume(&entry, Some(route))?;
             }
         }
         self.persist_candidates(BTreeMap::new(), true)
@@ -5362,20 +5369,19 @@ impl Scheduler {
                 let outputs = observer.outputs.lock().unwrap();
                 if result.is_err() {
                     let mut reported = HashSet::new();
-                    for (source_key, source) in &observer.owners {
-                        if claimed.finished.contains(source_key) { continue; }
+                    let sources = observer.owners.iter().filter_map(|(source_key, source)| {
+                        if claimed.finished.contains(source_key) { return None; }
                         let source = groups.get(source_key).map_or(Path::new(source), |group| group.path.as_path());
-                        if reported.insert(key(source)) {
-                            toast.record(source, &result, cancelled,
-                                |path| completion_owner(path, &outputs.paths, &groups));
-                        }
-                    }
+                        reported.insert(key(source)).then_some(source)
+                    });
+                    toast.record(sources, &result, cancelled,
+                        |path| completion_owner(path, &outputs.paths, groups));
                 } else {
                     toast.record(
-                        path.as_path(),
+                        [path.as_path()],
                         &result,
                         cancelled,
-                        |path| completion_owner(path, &outputs.paths, &groups),
+                        |path| completion_owner(path, &outputs.paths, groups),
                     );
                 }
             }
@@ -5649,7 +5655,7 @@ impl Scheduler {
                 let tracker = quiet.remove(&path);
                 if let Some(entry) = self.journal.state().entry(&path)
                     .filter(|entry| entry.is_missing_volume()) {
-                    self.check_missing_volume(&entry, false)?;
+                    self.check_missing_volume(&entry, None)?;
                     continue;
                 }
                 let admission = CandidateAdmission::Observe;
@@ -6135,12 +6141,12 @@ impl Scheduler {
         for candidate in &active.inputs {
             if let Some(entry) = self.journal.state().entry(&candidate.path)
                 .filter(|entry| entry.is_missing_volume()) {
-                self.check_missing_volume(&entry, false)?;
+                self.check_missing_volume(&entry, None)?;
             }
         }
         for (path, admission) in retry {
             if admission == CandidateAdmission::Retry {
-                if let Some(entry) = self.journal.state().entry(&path) { self.check_missing_volume(&entry, false)?; }
+                if let Some(entry) = self.journal.state().entry(&path) { self.check_missing_volume(&entry, None)?; }
                 continue;
             }
             if let Some((root, recovery)) = self.journal.state().entry(&path)

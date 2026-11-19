@@ -76,7 +76,6 @@ namespace sunpack::sevenzip
             result.status = PasswordTestStatus::Damaged;
             result.damaged = true;
             result.missing_volume = true;
-            result.missing_volume_suspected = false;
             result.missing_volume_evidence = evidence;
             result.missing_volume_name = requested_name;
             set_failure(result, stage, "missing_volume", hr);
@@ -256,7 +255,7 @@ namespace sunpack::sevenzip
             }
             // 终态谓词：显式取消（executor stop() 会置真 cancel_tokens_）或
             // writer 整体停止（registry shutdown → AsyncFileWriter::finish()）。
-            const TerminalPredicate space_terminal = [cancel_token, shared_writer]
+            const TerminalPredicate space_terminal = [&cancel_token, &shared_writer]
             {
                 if (cancel_token && cancel_token->load(std::memory_order_acquire))
                 {
@@ -575,7 +574,6 @@ namespace sunpack::sevenzip
             if (!read_failed && hr == S_OK && last_op_res == kOpOk)
             {
                 result.status = PasswordTestStatus::Ok;
-                result.missing_volume_suspected = false;
                 result.message = "archive extracted";
                 return result;
             }

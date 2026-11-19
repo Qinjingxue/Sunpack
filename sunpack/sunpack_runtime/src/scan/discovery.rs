@@ -1013,16 +1013,16 @@ impl NativeCandidateTable {
     /// read, an encrypted RAR5 file can be either the entry or a continuation.
     /// Keep the resulting byte facts in the same request-local relation cache.
     pub(crate) fn encrypted_rar_anchors(&self) -> Vec<crate::analysis_native::volume_anchor::VolumeAnchor> {
-        let stems: HashSet<_> = self.rows.iter().filter_map(|row| match row {
-            Candidate::Relation(group) => group.entry_anchor()
-                .filter(|a| a.format == "rar" && a.needs_password && !a.standalone)
-                .map(|a| catalog_stem(&a.path)),
-            _ => None,
-        }).collect();
+        let mut stems = HashSet::new();
         let mut anchors: HashMap<_, _> = self.rows.iter().filter_map(|row| match row {
             Candidate::Relation(group) => group.entry_anchor()
                 .filter(|a| a.format == "rar" && a.needs_password)
-                .map(|a| (path_key(&a.path), a.clone())),
+                .map(|a| {
+                    if !a.standalone {
+                        stems.insert(catalog_stem(&a.path));
+                    }
+                    (path_key(&a.path), a.clone())
+                }),
             _ => None,
         }).collect();
         if stems.is_empty() { return anchors.into_values().collect(); }
@@ -1045,26 +1045,18 @@ impl NativeCandidateTable {
         raw_snapshot: &NativeDirectorySnapshot,
         filtered_snapshot: &NativeDirectorySnapshot,
         targets: Option<&FileTargets>,
-        anchors: Vec<crate::analysis_native::volume_anchor::VolumeAnchor>,
-        refresh_paths: Vec<String>,
+        anchors: impl IntoIterator<Item = crate::analysis_native::volume_anchor::VolumeAnchor>,
+        departed: &HashSet<String>,
     ) {
         let mut cached = self.relation_cache();
         let mut previous: HashSet<_> = cached.anchors.iter()
             .filter(|(_, a)| a.needs_password && a.rar5_encryption.is_some())
             .map(|(path, _)| path.clone()).collect();
         cached.anchors.extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
-        // A short password probe may start after another request consumed its
-        // inputs. Drop only proven departures from that proposal, sharing the
-        // original snapshot and surviving anchors instead of scanning again.
-        let departed: HashSet<String> = refresh_paths.into_iter()
-            .filter(|path| std::fs::metadata(path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
-            .map(|path| path_key(&path))
-            .collect();
         let current_snapshots = (!departed.is_empty()).then(|| {
             (
-                raw_snapshot.without_path_keys(&departed),
-                filtered_snapshot.without_path_keys(&departed),
+                raw_snapshot.without_path_keys(departed),
+                filtered_snapshot.without_path_keys(departed),
             )
         });
         let (raw, filtered) = current_snapshots

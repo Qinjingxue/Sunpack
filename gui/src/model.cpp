@@ -191,49 +191,34 @@ void validate_passwords(const Json& j) {
         for (const auto& item : j["clipboard_history"]) validate_password_text(item);
     }
 }
-namespace {
-struct ConfigEditError:std::runtime_error {
-    std::string pointer;
-    ConfigEditError(std::string pointer,const std::string& message):std::runtime_error(message),pointer(std::move(pointer)) {}
-};
-}
-static std::string patch_config(std::string source,const Json& edits) {
+static std::string patch_config(std::string source,const Json& edit) {
     Json j=parse_json(source); JsonTokens tokens(source);
-    for(auto& edit:edits) tokens.select(edit.at("pointer").get_ref<const std::string&>());
+    const auto& pointer=edit.at("pointer").get_ref<const std::string&>();
+    tokens.select(pointer);
     tokens.scan();
-    struct Change { size_t start,length; std::string value; };
-    std::vector<Change> changes;
-    for(auto& edit:edits) {
-        std::string pointer=edit.at("pointer"), original=edit.at("original"), type=edit.at("type"), text=edit.at("text");
-        bool boolean=edit.at("boolean");
-        try {
-        Json::json_pointer target(pointer);
-        if (!j.contains(target)) throw std::runtime_error("settingChanged");
-        const auto& range=tokens.ranges.at(pointer);
-        if(tokens.text(range)!=original) throw std::runtime_error("settingChanged");
-        Json replacement = type == "string" ? Json(text) : type == "boolean" ? Json(boolean) : parse_json(text);
-        if ((type == "number" && !replacement.is_number()) || (type == "array" && !replacement.is_array()) ||
-            (type == "object" && !replacement.is_object())) throw std::runtime_error("settingTypeMismatch");
-        std::string module;
-        auto parent=pointer.substr(0,pointer.find_last_of('/'));
-        if(j.contains(Json::json_pointer(parent))) {
-            const auto& owner=j.at(Json::json_pointer(parent));
-            if(owner.is_object() && owner.contains("name") && owner["name"].is_string()) module=owner["name"].get<std::string>();
-        }
-        if(module=="size_range" || module=="mtime_range") throw std::runtime_error("rangeAtomic");
-        const auto& current=j.at(target);
-        if(current.is_object() && current.contains("name") && (current["name"]=="size_range" || current["name"]=="mtime_range"))
-            validate_range_module(replacement,current["name"]=="mtime_range");
-        else validate_setting(pointer,replacement,module);
-        changes.push_back({range.start,range.length,type=="string" || type=="boolean"?replacement.dump():text});
-        } catch(const std::exception& error) { throw ConfigEditError(pointer,error.what()); }
+    const auto& original=edit.at("original").get_ref<const std::string&>();
+    const auto& type=edit.at("type").get_ref<const std::string&>();
+    const auto& text=edit.at("text").get_ref<const std::string&>();
+    Json::json_pointer target(pointer);
+    if(!j.contains(target)) throw std::runtime_error("settingChanged");
+    const auto& range=tokens.ranges.at(pointer);
+    if(tokens.text(range)!=original) throw std::runtime_error("settingChanged");
+    Json replacement=type=="string"?Json(text):type=="boolean"?Json(edit.at("boolean").get<bool>()):parse_json(text);
+    if((type=="number" && !replacement.is_number()) || (type=="array" && !replacement.is_array()) ||
+       (type=="object" && !replacement.is_object())) throw std::runtime_error("settingTypeMismatch");
+    std::string module;
+    const auto parent=Json::json_pointer(pointer.substr(0,pointer.find_last_of('/')));
+    if(j.contains(parent)) {
+        const auto& owner=j.at(parent);
+        if(owner.is_object() && owner.contains("name") && owner["name"].is_string()) module=owner["name"].get<std::string>();
     }
-    std::sort(changes.begin(),changes.end(),[](const Change& a,const Change& b){return a.start>b.start;});
-    size_t boundary=source.size();
-    for(auto& change:changes) {
-        if(change.start+change.length>boundary) throw std::runtime_error("validation");
-        source.replace(change.start,change.length,change.value); boundary=change.start;
-    }
+    if(module=="size_range" || module=="mtime_range") throw std::runtime_error("rangeAtomic");
+    const auto& current=j.at(target);
+    if(current.is_object() && current.contains("name") && (current["name"]=="size_range" || current["name"]=="mtime_range"))
+        validate_range_module(replacement,current["name"]=="mtime_range");
+    else validate_setting(pointer,replacement,module);
+    if(type=="string" || type=="boolean") source.replace(range.start,range.length,replacement.dump());
+    else source.replace(range.start,range.length,text);
     return source;
 }
 // Scope identity and ancestry match the runtime's directory-scoped lookup.
@@ -491,9 +476,9 @@ static void append_roots(std::string& content,const WatchRoots& roots) {
     for(const auto& r:roots) content+=utf8(r.input.wstring())+
         " | "+r.output+" | "+(r.deep?"true":"false")+" | "+(r.initial_scanned?"true":"false")+" | "+(r.recursive?"true":"false")+"\n";
 }
-Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,const Json& roots,
+Json save_changes(const fs::path& dir,const Json& field,const Json& passwords,const Json& roots,
     PasswordSaveSnapshot* password_snapshot,std::string_view password_baseline) {
-    Json result={{"saved",Json::array()},{"error",""},{"section",""}};
+    Json result={{"saved",Json::array()},{"error",""}};
     struct Write { std::string section; fs::path path; std::string text; };
     std::vector<Write> writes;
     Json committed_passwords;
@@ -504,16 +489,14 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
     std::unordered_set<std::wstring> removed_scopes;
     std::string root_text,original_password_text;
     std::unique_ptr<FileMutex> config_lock,password_lock,roots_lock;
-    std::string section;
     try {
         // Keep GUI writers in a fixed acquisition order. Runtime writers keep
         // using their existing individual file locks.
-        if(!fields.empty()) config_lock=std::make_unique<FileMutex>(dir/"sunpack_config.json");
+        if(!field.is_null()) config_lock=std::make_unique<FileMutex>(dir/"sunpack_config.json");
         if(!passwords.empty() || deleting_roots) password_lock=std::make_unique<FileMutex>(dir/"builtin_passwords.json");
         if(!roots.empty()) roots_lock=std::make_unique<FileMutex>(dir/"sunpack_watch_roots.txt",L"SunPackWatchRoots");
-        if(!fields.empty()) { section="config"; auto path=dir/"sunpack_config.json"; writes.push_back({section,path,patch_config(read_file(path),fields)}); }
+        if(!field.is_null()) { auto path=dir/"sunpack_config.json"; writes.push_back({"config",path,patch_config(read_file(path),field)}); }
         if(!roots.empty()) {
-            section="roots";
             auto updated=read_roots(dir/"sunpack_watch_roots.txt",&root_text);
             apply_root_changes(updated,dir,roots);
             if(deleting_roots) {
@@ -528,7 +511,7 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
             append_roots(root_text,updated);
         }
         if(!passwords.empty() || (!removed_scopes.empty() && fs::exists(dir/"builtin_passwords.json"))) {
-            section="passwords"; auto path=dir/"builtin_passwords.json";
+            auto path=dir/"builtin_passwords.json";
             original_password_text=read_file(path);
             auto current=parse_json(original_password_text); validate_passwords(current);
             auto count=current["passwords"].size();
@@ -589,11 +572,11 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
                 }
             }
             delta_base_matches=count==committed_passwords["passwords"].size() && original_password_text==password_baseline;
-            if(!passwords.empty() || cleaned) writes.push_back({section,path,committed_passwords.dump(2)+"\n"});
+            if(!passwords.empty() || cleaned) writes.push_back({"passwords",path,committed_passwords.dump(2)+"\n"});
         }
         if(!roots.empty()) writes.push_back({"roots",dir/"sunpack_watch_roots.txt",std::move(root_text)});
         for(auto& write:writes) {
-            section=write.section;
+            const auto& section=write.section;
             try { atomic_write(write.path,write.text); }
             catch(...) {
                 if(section=="roots" && deleting_roots && std::find(result["saved"].begin(),result["saved"].end(),"passwords")!=result["saved"].end()) {
@@ -612,8 +595,7 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
                 password_snapshot->delta_base_matches=delta_base_matches;
             }
         }
-    } catch(const ConfigEditError& error) { result["error"]=error.what(); result["section"]=section; result["field"]=error.pointer; }
-    catch(const std::exception& error) { result["error"]=error.what(); result["section"]=section; }
+    } catch(const std::exception& error) { result["error"]=error.what(); }
     return result;
 }
 void EventLog::set_path(const fs::path& p) {

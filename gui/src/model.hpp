@@ -24,7 +24,7 @@ WatchRoots read_roots(const fs::path& path, std::string* comments = nullptr);
 struct PasswordSaveSnapshot { Json document; std::string file_text; Json record, rebases; bool delta_base_matches = false; };
 // Preflight every file under the existing locks, then replace each file once.
 // A write failure reports completed sections so remaining drafts can be retried.
-Json save_changes(const fs::path& directory, const Json& fields, const Json& passwords,
+Json save_changes(const fs::path& directory, const Json& field, const Json& passwords,
     const Json& roots, PasswordSaveSnapshot* password_snapshot = nullptr, std::string_view password_baseline = {});
 class EventLog {
     fs::path path_;
