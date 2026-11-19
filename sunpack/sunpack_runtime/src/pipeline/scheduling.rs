@@ -724,6 +724,15 @@ impl Wake for TaskWake {
 
 pub(crate) type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+// Keep the concrete phase type out of the awaiting frame. The caller retains
+// only the boxed future while suspended.
+pub(super) fn boxed_phase<'a, F>(create: impl FnOnce() -> F) -> Task<'a, F::Output>
+where
+    F: Future + Send + 'a,
+{
+    Box::pin(create())
+}
+
 #[derive(Clone)]
 pub(crate) struct Spawner<'a> {
     tx: mpsc::Sender<Task<'a, ()>>,
@@ -809,11 +818,12 @@ impl<'a> Spawner<'a> {
     /// in its parent, so parents never wait for admission held by themselves.
     /// Each consumer takes the next item immediately after finishing its own;
     /// a slow early item cannot stall admission of the rest of the batch.
-    pub(crate) fn bounded_map<I, T, F>(&self, items: Vec<I>, operation: F) -> Task<'a, Vec<T>>
+    pub(crate) fn bounded_map<I, T, F>(&self, items: I, operation: F) -> Task<'a, Vec<T>>
     where
-        I: Send + 'a,
+        I: ExactSizeIterator + Send + 'a,
+        I::Item: Send + 'a,
         T: Send + 'a,
-        F: Fn(I) -> Task<'a, T> + Send + Sync + 'a,
+        F: Fn(I::Item) -> Task<'a, T> + Send + Sync + 'a,
     {
         let spawner = self.clone();
         Box::pin(async move {
@@ -839,7 +849,7 @@ impl<'a> Spawner<'a> {
             let results = Arc::new(Mutex::new(
                 std::iter::repeat_with(|| None).take(items.len()).collect::<Vec<Option<T>>>(),
             ));
-            let remaining = Arc::new(Mutex::new(items.into_iter().enumerate()));
+            let remaining = Arc::new(Mutex::new(items.enumerate()));
             let operation = Arc::new(operation);
             let mut consumers = Vec::with_capacity(count);
             for _ in 0..count {
@@ -860,6 +870,8 @@ impl<'a> Spawner<'a> {
                     }
                 })));
             }
+            drop(remaining);
+            drop(operation);
             for consumer in consumers {
                 consumer.wait().await;
             }

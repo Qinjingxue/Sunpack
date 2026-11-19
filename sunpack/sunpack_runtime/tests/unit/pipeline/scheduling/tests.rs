@@ -300,7 +300,7 @@ fn bounded_consumers_drain_past_slow_items_and_recurse_inline() {
             spawner.consumers.store(2, Ordering::Release);
             let gate = Arc::new(Mutex::new((false, None::<Waker>)));
             let children = spawner.clone();
-            let results = spawner.bounded_map((0..8).collect(), move |item| {
+            let results = spawner.bounded_map(0..8, move |item| {
                 let gate = Arc::clone(&gate);
                 let children = children.clone();
                 Box::pin(async move {
@@ -314,7 +314,7 @@ fn bounded_consumers_drain_past_slow_items_and_recurse_inline() {
                             }
                         }).await;
                     } else if item == 1 {
-                        let nested = children.bounded_map(vec![10, 11], |value| {
+                        let nested = children.bounded_map(10..12, |value| {
                             Box::pin(async move { value })
                         }).await;
                         assert_eq!(nested, [10, 11]);
@@ -343,7 +343,7 @@ fn cancelled_batches_stop_the_tail_and_join_started_consumers() {
             Box::pin(async move {
                 spawner.consumers.store(capacity, Ordering::Release);
                 let gate = Arc::new(Mutex::new((false, None::<Waker>)));
-                let results = spawner.bounded_map((0..100).collect(), move |item| {
+                let results = spawner.bounded_map(0..100, move |item| {
                     let gate = Arc::clone(&gate);
                     let token = token.clone();
                     Box::pin(async move {
@@ -406,7 +406,7 @@ fn stage_pool_keeps_main_minimum_capacity_and_nested_rayon_progress() {
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let held = Arc::clone(&gate);
     let request = scheduler.submit(1, Origin::Watch, &Cancellation::new(), |spawner| Box::pin(async move {
-        spawner.bounded_map(vec![0, 1, 2, 3], move |index| {
+        spawner.bounded_map(0..4, move |index| {
             let gate = Arc::clone(&held);
             let entered = entered.clone();
             Box::pin(async move {

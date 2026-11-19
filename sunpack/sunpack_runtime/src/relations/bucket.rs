@@ -16,18 +16,10 @@ impl BucketIndex {
     }
 
     pub fn build(rows: &[RelationInput], filtered_keys: Option<&HashSet<String>>) -> Self {
-        let selected: Option<HashSet<_>> = filtered_keys.map(|keys| {
-            rows.iter()
-                .filter(|r| keys.contains(&r.path_key))
-                .map(|r| case_key(first_dot_stem(r.name())))
-                .collect()
-        });
         let mut out = Self::default();
-        for row in rows.iter().filter(|r| r.anchor.as_ref().is_some_and(Self::has_seed)) {
+        for row in rows.iter().filter(|r| r.anchor.as_deref().is_some_and(Self::has_seed)) {
             let stem = case_key(first_dot_stem(row.name()));
-            if selected.as_ref().is_none_or(|set| set.contains(&stem)) {
-                out.rows_by_stem.entry(stem).or_default();
-            }
+            out.rows_by_stem.entry(stem).or_default();
         }
         if out.rows_by_stem.is_empty() {
             return out;
@@ -37,6 +29,11 @@ impl BucketIndex {
             if let Some(bucket) = out.rows_by_stem.get_mut(&stem) {
                 bucket.push(i);
             }
+        }
+        if let Some(keys) = filtered_keys {
+            out.rows_by_stem.retain(|_, bucket| {
+                bucket.iter().any(|&row| keys.contains(&rows[row].path_key))
+            });
         }
         out
     }

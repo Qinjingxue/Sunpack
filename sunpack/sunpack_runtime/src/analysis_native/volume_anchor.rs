@@ -176,6 +176,10 @@ impl CheapAnchor {
     }
 
     pub(crate) fn anchor(&self) -> Option<&VolumeAnchor> {
+        self.shared_anchor().map(Arc::as_ref)
+    }
+
+    pub(crate) fn shared_anchor(&self) -> Option<&Arc<VolumeAnchor>> {
         match self {
             Self::Full(anchor) => Some(anchor),
             Self::Negative { .. } => None,

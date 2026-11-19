@@ -1,4 +1,5 @@
 use super::*;
+
 use crate::analysis_native::volume_anchor::probe_volume_anchor_path_cheap;
 
 #[test]
@@ -229,7 +230,7 @@ fn parsed_rar_head_extent_keeps_native_volume_scan_layout() {
     let anchor = upgrade_relation_rar_end(&anchor);
     assert_eq!(anchor.proven_extent_end(), Some(end));
     let mut validation = validation_with_owned_paths(ProposalStatus::Valid, &[&path_string]);
-    Arc::make_mut(&mut validation.facts).anchors.insert(path_key(&path_string), anchor);
+    Arc::make_mut(&mut validation.facts).anchors.insert(path_key(&path_string), Arc::new(anchor));
     let mut input = ArchiveInput::file(path_string, "rar".into(), "test".into());
     input.analysis.origin = AnalysisOrigin::Relations;
     project_proposal(&validation, &mut input);
@@ -250,11 +251,11 @@ fn encrypted_relations_require_readable_anchors_even_with_existing_failure() {
         validation.reason = reason;
         Arc::make_mut(&mut validation.facts).anchors.insert(
             path.into(),
-            VolumeAnchor {
+            Arc::new(VolumeAnchor {
                 format: "rar",
                 needs_password: true,
                 ..Default::default()
-            },
+            }),
         );
         validate::validate(&mut validation);
         assert_eq!(validation.status, ProposalStatus::NeedsPassword);
@@ -262,17 +263,14 @@ fn encrypted_relations_require_readable_anchors_even_with_existing_failure() {
             validate::assignment_status(
                 "rar",
                 false,
-                [(1, validation.facts.anchors.get(path))].into_iter()
+                [(1, validation.facts.anchors.get(path).map(Arc::as_ref))].into_iter()
             ),
             ProposalStatus::NeedsPassword,
         );
 
         validation.reason = reason;
-        Arc::make_mut(&mut validation.facts)
-            .anchors
-            .get_mut(path)
-            .unwrap()
-            .error = "input could not be read".into();
+        let anchor = Arc::make_mut(&mut validation.facts).anchors.get_mut(path).unwrap();
+        Arc::make_mut(anchor).error = "input could not be read".into();
         validate::validate(&mut validation);
         assert_eq!(validation.status, ProposalStatus::Reject);
         assert_eq!(
@@ -283,7 +281,7 @@ fn encrypted_relations_require_readable_anchors_even_with_existing_failure() {
             validate::assignment_status(
                 "rar",
                 false,
-                [(1, validation.facts.anchors.get(path))].into_iter()
+                [(1, validation.facts.anchors.get(path).map(Arc::as_ref))].into_iter()
             ),
             ProposalStatus::Reject,
         );

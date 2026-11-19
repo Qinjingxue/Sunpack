@@ -2,7 +2,7 @@ use super::results::RunOutcome as Outcome;
 use super::checkpoint::{CheckpointKey, InputCheckpoint, InputRecovery, GeneratedSource, ReportState};
 use super::discovery::{self, Discovered, LogicalInput, Task};
 use super::passwords::{CandidateSet, RecentPasswords};
-use super::scheduling::{stage, Scheduler, Spawner};
+use super::scheduling::{boxed_phase, stage, Scheduler, Spawner};
 use super::shell_updates::{ShellNotifier, ShellUpdates};
 use super::worker::{self, Process};
 use super::{
@@ -295,7 +295,7 @@ impl Engine {
                     let expected = discovered.tasks.len();
                     let cancel = request.cancel.clone();
                     let visit = Arc::new(visit);
-                    let results = spawner.bounded_map(discovered.tasks, move |task| {
+                    let results = spawner.bounded_map(discovered.tasks.into_iter(), move |task| {
                         let cancel = cancel.clone();
                         let visit = Arc::clone(&visit);
                         Box::pin(async move {
@@ -1223,6 +1223,11 @@ struct Executed {
     input: Arc<ArchiveInput>,
 }
 
+enum ExecutedTask<'a> {
+    Complete(Outcome),
+    Finalize(super::scheduling::Task<'a, io::Result<Outcome>>),
+}
+
 enum BatchTaskResult {
     Completed(Outcome),
     Cancelled(TaskId, ArchiveResult),
@@ -1424,14 +1429,17 @@ impl<'run, O: Observer> Run<'run, O> {
             }));
         }
         // Register every planned consumer before any one of them can finish.
-        let tasks = batch.tasks.into_iter().map(|task| {
-            let sources = self.cleanup_owner(&task);
+        let mut sources = (self.request.mode == Mode::Extract).then(|| {
+            batch.tasks.iter().map(|task| CleanupOwner::new(&self.cleanup_refs, &task.owned_paths))
+                .collect::<Vec<_>>().into_iter()
+        });
+        let tasks = batch.tasks.into_iter().map(move |task| {
+            let sources = sources.as_mut().and_then(Iterator::next);
+            (task, sources)
+        });
+        let executed = spawner.bounded_map(tasks, move |(task, sources)| {
             let keys = (!resolved_paths.is_empty()).then(|| source_lease_keys(&task, &resolved_paths));
             let requested = requested.as_ref().filter(|_| task.owned_paths.len() > 1).cloned();
-            (task, sources, keys, requested)
-        }).collect();
-        drop(resolved_paths);
-        let executed = spawner.bounded_map(tasks, move |(task, sources, keys, requested)| {
             let root_errors = has_root_errors
                 .then(|| root_errors.lock().unwrap().remove(&task.entry().entry_path))
                 .flatten();
@@ -1465,7 +1473,12 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     (_, errors) => errors,
                 };
-                let result = if depth == 1 { this.finish_root(id, &path, result).await } else { result };
+                let result = if depth == 1 && (this.request.mode == Mode::Extract || O::PUBLISHES_ROOTS) {
+                    let publication = boxed_phase(|| this.finish_root(id, &path, result));
+                    publication.await
+                } else {
+                    result
+                };
                 let result = match result {
                     Ok(outcome) => BatchTaskResult::Completed(outcome),
                     Err(error) if is_cancellation(&error) => BatchTaskResult::Cancelled(
@@ -1629,6 +1642,7 @@ impl<'run, O: Observer> Run<'run, O> {
         true
     }
 
+    #[cfg(test)]
     fn cleanup_owner(&self, task: &Task) -> Option<CleanupOwner> {
         (self.request.mode == Mode::Extract).then(|| CleanupOwner::new(&self.cleanup_refs, &task.owned_paths))
     }
@@ -1663,892 +1677,905 @@ impl<'run, O: Observer> Run<'run, O> {
             } else {
                 stage("preflight", cancel).await?;
             }
-            let mut outcome = Outcome::default();
-            let mut shell = this.engine.shell.branch();
-            let (mut generations, missing) = this.capture_generations(&task);
-            let (discovery_scope, retry) = task.take_context(this.request.mode == Mode::Extract);
-            let admission = this.task_admission(&task, &generations, &missing, watch_root,
-                |path| requested.as_ref().and_then(|members| members.get(path))
-                    .or_else(|| captured.as_ref().and_then(|members| members.get(path))))?;
-            drop((requested, captured));
-            let mut completed_family = match admission {
-                TaskAdmission::Execute(family) => family,
-                TaskAdmission::Departed => {
-                    this.notify(|| Event::Skipped { id: task_id });
-                    return Ok(outcome);
-                }
-                TaskAdmission::Completed(output) => {
-                    this.reuse_completed_task(&task, task_id, depth, output, &mut outcome);
-                    return Ok(outcome);
-                }
-            };
-            if watch_root && this.observer.input_admission_enabled() && !task.inputs.is_empty()
-                && task.inputs.iter().all(|input| input.failure.is_none())
-            {
-                let inputs: Vec<_> = task.inputs.iter().map(|input| &input.input).collect();
-                if !this.observer.admit_inputs(Path::new(&task.entry().entry_path),
-                    &inputs, &task.owned_paths, depth)?
+            // Stage and lease waiters keep the planned input, without the execution frame.
+            let execution = boxed_phase(move || async move {
+                let mut outcome = Outcome::default();
+                let mut shell = this.engine.shell.branch();
+                let (mut generations, missing) = this.capture_generations(&task);
+                let (discovery_scope, retry) = task.take_context(this.request.mode == Mode::Extract);
+                let admission = this.task_admission(&task, &generations, &missing, watch_root,
+                    |path| requested.as_ref().and_then(|members| members.get(path))
+                        .or_else(|| captured.as_ref().and_then(|members| members.get(path))))?;
+                drop((requested, captured));
+                let mut completed_family = match admission {
+                    TaskAdmission::Execute(family) => family,
+                    TaskAdmission::Departed => {
+                        this.notify(|| Event::Skipped { id: task_id });
+                        return Ok(ExecutedTask::Complete(outcome));
+                    }
+                    TaskAdmission::Completed(output) => {
+                        this.reuse_completed_task(&task, task_id, depth, output, &mut outcome);
+                        return Ok(ExecutedTask::Complete(outcome));
+                    }
+                };
+                if watch_root && this.observer.input_admission_enabled() && !task.inputs.is_empty()
+                    && task.inputs.iter().all(|input| input.failure.is_none())
                 {
-                    this.notify(|| Event::Skipped { id: task_id });
-                    return Ok(outcome);
+                    let inputs: Vec<_> = task.inputs.iter().map(|input| &input.input).collect();
+                    if !this.observer.admit_inputs(Path::new(&task.entry().entry_path),
+                        &inputs, &task.owned_paths, depth)?
+                    {
+                        this.notify(|| Event::Skipped { id: task_id });
+                        return Ok(ExecutedTask::Complete(outcome));
+                    }
                 }
-            }
-            this.notify(|| Event::Started { id: task_id });
-            let preflight_failures = if task.inputs.len() > 1
-                && !missing.is_empty() {
-                task.inputs.iter().map(|logical| logical.failure.clone()).collect::<Vec<_>>()
-            } else { Vec::new() };
-            this.admit_missing_inputs(&mut task, &missing);
-            this.observer.claim_sources(
-                Path::new(&task.entry().entry_path),
-                &task.owned_paths,
-                depth,
-            )?;
-            let owner_path = PathBuf::from(&task.entry().entry_path);
-            let source_scope = inherited_scope.as_ref().and_then(|scope| scope.password.as_deref())
-                .or_else(|| owner_path.parent());
-            // Task preflight precedes segment queueing. Keep single missing-
-            // volume failures on the existing one-replacement retry path.
-            let admission = task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
-                matches!(failure.context.as_deref(), Some(super::FailureContext::InputAdmission { .. }))));
-            let discovery_blocked = task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
-                matches!(failure.context.as_deref(), Some(super::FailureContext::Discovery { .. }))));
-            let single_volume_retry = task.inputs.len() == 1 && task.inputs[0].failure.as_ref()
-                .is_some_and(|failure| failure.kind == FailureKind::MissingVolume);
-            if !single_volume_retry && (admission || discovery_blocked) {
-                let failure = task.inputs[0].failure.as_ref().expect("task preflight failure");
-                // task_started in main registers segment rows even when task
-                // preflight prevents execution. Queued here only registers the
-                // observer row; no segment is submitted to the scheduler.
-                if task.inputs.len() > 1 {
-                    for (index, id) in this.queue_inputs(&task, task_id, &[], false).into_iter().enumerate() {
-                        let logical = &task.inputs[index];
-                        let original = if discovery_blocked { logical.failure.as_ref() }
-                            else { preflight_failures.get(index).and_then(Option::as_ref) };
-                        this.notify(|| Event::Finished {
-                            id,
-                            result: original.map_or_else(|| super::TaskCompletion {
-                                discovery: None, status: super::TaskStatus::Skipped, failure: None, output: None,
-                            }, super::TaskCompletion::failed),
+                this.notify(|| Event::Started { id: task_id });
+                let preflight_failures = if task.inputs.len() > 1
+                    && !missing.is_empty() {
+                    task.inputs.iter().map(|logical| logical.failure.clone()).collect::<Vec<_>>()
+                } else { Vec::new() };
+                this.admit_missing_inputs(&mut task, &missing);
+                this.observer.claim_sources(
+                    Path::new(&task.entry().entry_path),
+                    &task.owned_paths,
+                    depth,
+                )?;
+                let owner_path = PathBuf::from(&task.entry().entry_path);
+                let source_scope = inherited_scope.as_ref().and_then(|scope| scope.password.as_deref())
+                    .or_else(|| owner_path.parent());
+                // Task preflight precedes segment queueing. Keep single missing-
+                // volume failures on the existing one-replacement retry path.
+                let admission = task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
+                    matches!(failure.context.as_deref(), Some(super::FailureContext::InputAdmission { .. }))));
+                let discovery_blocked = task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
+                    matches!(failure.context.as_deref(), Some(super::FailureContext::Discovery { .. }))));
+                let single_volume_retry = task.inputs.len() == 1 && task.inputs[0].failure.as_ref()
+                    .is_some_and(|failure| failure.kind == FailureKind::MissingVolume);
+                if !single_volume_retry && (admission || discovery_blocked) {
+                    let failure = task.inputs[0].failure.as_ref().expect("task preflight failure");
+                    // task_started in main registers segment rows even when task
+                    // preflight prevents execution. Queued here only registers the
+                    // observer row; no segment is submitted to the scheduler.
+                    if task.inputs.len() > 1 {
+                        for (index, id) in this.queue_inputs(&task, task_id, &[], false).into_iter().enumerate() {
+                            let logical = &task.inputs[index];
+                            let original = if discovery_blocked { logical.failure.as_ref() }
+                                else { preflight_failures.get(index).and_then(Option::as_ref) };
+                            this.notify(|| Event::Finished {
+                                id,
+                                result: original.map_or_else(|| super::TaskCompletion {
+                                    discovery: None, status: super::TaskStatus::Skipped, failure: None, output: None,
+                                }, super::TaskCompletion::failed),
+                            });
+                        }
+                    }
+                    let mut completed: Vec<_> = if this.request.mode == Mode::Scan || discovery_blocked {
+                        // main scan_items still projects every original descriptor.
+                        task.inputs.iter().enumerate().map(|(index, logical)| {
+                            let mut result = receipt(&logical.input, task.source, depth);
+                            if this.request.mode == Mode::Scan {
+                                result.scan_layout = super::ScanLayout::from_input(&logical.input);
+                            }
+                            result.password = logical.password.as_deref().map(str::to_owned);
+                            result.volume_attempts = logical.input.volume_attempts.clone();
+                            // scan_items gives the original node failure precedence
+                            // over the terminal task's admission failure.
+                            result.failure = if discovery_blocked { logical.failure.clone() }
+                                else { preflight_failures.get(index).cloned().flatten() };
+                            result
+                        }).collect()
+                    } else {
+                        vec![receipt(task.entry(), task.source, depth)]
+                    };
+                    let discovery_scope = discovery_scope.as_deref()
+                        .filter(|_| this.request.mode == Mode::Extract)
+                        .map(|scope| Arc::new(super::FailureScope::from_scope(scope)));
+                    for result in &mut completed {
+                        result.failure.get_or_insert_with(|| failure.clone());
+                        if this.request.mode == Mode::Extract {
+                            if admission { result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect(); }
+                            if let Some(scope) = &discovery_scope {
+                                result.failure.as_mut().unwrap().discovery_scope = Some(Arc::clone(scope));
+                            }
+                        }
+                    }
+                    outcome.generated_sources.extend(task.owned_paths.iter().filter_map(|path|
+                        this.generated_source(path, &generations, watch_root, depth)));
+                    drop(lease);
+                    this.notify(|| {
+                        let mut completion = if discovery_blocked {
+                            super::TaskCompletion::from_group(&completed)
+                        } else { super::TaskCompletion::from_result(&completed[0]) };
+                        if admission && this.request.mode == Mode::Scan { completion.failure = Some(failure.clone()); }
+                        Event::Finished { id: task_id, result: completion }
+                    });
+                    if this.request.mode == Mode::Scan {
+                        outcome.scan_failures.push(ScanTaskFailure {
+                            path: owner_path,
+                            archives: 0..completed.len(),
+                            preflight: Some(Box::new(failure.clone())),
                         });
                     }
-                }
-                let mut completed: Vec<_> = if this.request.mode == Mode::Scan || discovery_blocked {
-                    // main scan_items still projects every original descriptor.
-                    task.inputs.iter().enumerate().map(|(index, logical)| {
-                        let mut result = receipt(&logical.input, task.source, depth);
-                        if this.request.mode == Mode::Scan {
-                            result.scan_layout = super::ScanLayout::from_input(&logical.input);
-                        }
-                        result.password = logical.password.as_deref().map(str::to_owned);
-                        result.volume_attempts = logical.input.volume_attempts.clone();
-                        // scan_items gives the original node failure precedence
-                        // over the terminal task's admission failure.
-                        result.failure = if discovery_blocked { logical.failure.clone() }
-                            else { preflight_failures.get(index).cloned().flatten() };
-                        result
-                    }).collect()
-                } else {
-                    vec![receipt(task.entry(), task.source, depth)]
-                };
-                let discovery_scope = discovery_scope.as_deref()
-                    .filter(|_| this.request.mode == Mode::Extract)
-                    .map(|scope| Arc::new(super::FailureScope::from_scope(scope)));
-                for result in &mut completed {
-                    result.failure.get_or_insert_with(|| failure.clone());
-                    if this.request.mode == Mode::Extract {
-                        if admission { result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect(); }
-                        if let Some(scope) = &discovery_scope {
-                            result.failure.as_mut().unwrap().discovery_scope = Some(Arc::clone(scope));
-                        }
+                    outcome.archives = completed.into();
+                    if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
+                        this.observer.scope_finished(task_id, outcome.archives.iter()).await?;
                     }
+                    return Ok(ExecutedTask::Complete(outcome));
                 }
-                outcome.generated_sources.extend(task.owned_paths.iter().filter_map(|path|
-                    this.generated_source(path, &generations, watch_root, depth)));
-                drop(lease);
-                this.notify(|| {
-                    let mut completion = if discovery_blocked {
-                        super::TaskCompletion::from_group(&completed)
-                    } else { super::TaskCompletion::from_result(&completed[0]) };
-                    if admission && this.request.mode == Mode::Scan { completion.failure = Some(failure.clone()); }
-                    Event::Finished { id: task_id, result: completion }
-                });
-                if this.request.mode == Mode::Scan {
-                    outcome.scan_failures.push(ScanTaskFailure {
-                        path: owner_path,
-                        archives: 0..completed.len(),
-                        preflight: Some(Box::new(failure.clone())),
-                    });
-                }
-                outcome.archives = completed.into();
-                if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
-                    this.observer.scope_finished(task_id, outcome.archives.iter()).await?;
-                }
-                return Ok(outcome);
-            }
-            let candidates = this.candidates.with_scope(source_scope);
-            let multi = task.inputs.len() > 1;
-            let preferred_carrier = (this.request.mode == Mode::Extract && (multi || !this.checkpoints.is_empty()))
-                .then(|| this.preferred_output(task.entry(), depth));
-            let report_previous = this.select_checkpoints(&owner_path, &task.inputs);
-            let retained: Vec<_> = task
-                .inputs
-                .iter().zip(&report_previous)
-                .map(|(logical, previous)| {
-                    if this.request.mode != Mode::Extract || logical.failure.as_ref().is_some_and(|failure|
-                        matches!(failure.context.as_deref(), Some(super::FailureContext::InputAdmission { .. })))
-                    { None } else {
-                        previous.and_then(|previous| this.checkpoint_for(&logical.input, Some(previous), &generations,
-                            preferred_carrier.as_deref().expect("extract recovery has a preferred output"), depth, &candidates))
-                    }
-                })
-                .collect();
-            let mut split_input = task.entry().mode.structured() || task.entry().physical_paths().nth(1).is_some();
-            let count = task.inputs.len();
-            let mut had_checkpoints = report_previous.iter().any(Option::is_some);
-            let continued_output = retained.iter().flatten().any(|checkpoint| checkpoint.continuable_output());
-            let report_count = if continued_output {
-                report_previous.iter().flatten().map(|checkpoint| checkpoint.report_input_count())
-                    .max().unwrap_or(0).max(count)
-            } else { count };
-            let ids = this.queue_inputs(&task, task_id, &report_previous, retained.iter().any(Option::is_some));
-            let mut carrier = if this.request.mode == Mode::Extract && multi {
-                let existing = retained
-                    .iter()
-                    .flatten()
-                    .find_map(|checkpoint| checkpoint.retained_container())
-                    .map(Path::to_path_buf);
-                match existing {
-                    Some(path) => Some(path),
-                    None if task.inputs.iter().enumerate()
-                        .any(|(index, input)| retained.get(index).is_none_or(Option::is_none) && input.failure.is_none()) => {
-                        let receipt = receipt(task.entry(), task.source, depth);
-                        match this.reserve_output(preferred_carrier.expect("carrier has a preferred output"), &receipt, None)? {
-                            Ok(path) => {
-                                shell.output(&path);
-                                Some(path)
-                            }
-                            Err(failure) => {
-                                for logical in &mut task.inputs {
-                                    logical.failure.get_or_insert_with(|| failure.clone());
+                let candidates = this.candidates.with_scope(source_scope);
+                let multi = task.inputs.len() > 1;
+                let preferred_carrier = (this.request.mode == Mode::Extract && (multi || !this.checkpoints.is_empty()))
+                    .then(|| this.preferred_output(task.entry(), depth));
+                let report_previous = this.select_checkpoints(&owner_path, &task.inputs);
+                let retained: Vec<_> = task
+                    .inputs
+                    .iter().zip(&report_previous)
+                    .map(|(logical, previous)| {
+                        if this.request.mode != Mode::Extract || logical.failure.as_ref().is_some_and(|failure|
+                            matches!(failure.context.as_deref(), Some(super::FailureContext::InputAdmission { .. })))
+                        { None } else {
+                            previous.and_then(|previous| this.checkpoint_for(&logical.input, Some(previous), &generations,
+                                preferred_carrier.as_deref().expect("extract recovery has a preferred output"), depth, &candidates))
+                        }
+                    })
+                    .collect();
+                let mut split_input = task.entry().mode.structured() || task.entry().physical_paths().nth(1).is_some();
+                let count = task.inputs.len();
+                let mut had_checkpoints = report_previous.iter().any(Option::is_some);
+                let continued_output = retained.iter().flatten().any(|checkpoint| checkpoint.continuable_output());
+                let report_count = if continued_output {
+                    report_previous.iter().flatten().map(|checkpoint| checkpoint.report_input_count())
+                        .max().unwrap_or(0).max(count)
+                } else { count };
+                let ids = this.queue_inputs(&task, task_id, &report_previous, retained.iter().any(Option::is_some));
+                let mut carrier = if this.request.mode == Mode::Extract && multi {
+                    let existing = retained
+                        .iter()
+                        .flatten()
+                        .find_map(|checkpoint| checkpoint.retained_container())
+                        .map(Path::to_path_buf);
+                    match existing {
+                        Some(path) => Some(path),
+                        None if task.inputs.iter().enumerate()
+                            .any(|(index, input)| retained.get(index).is_none_or(Option::is_none) && input.failure.is_none()) => {
+                            let receipt = receipt(task.entry(), task.source, depth);
+                            match this.reserve_output(preferred_carrier.expect("carrier has a preferred output"), &receipt, None)? {
+                                Ok(path) => {
+                                    shell.output(&path);
+                                    Some(path)
                                 }
-                                None
+                                Err(failure) => {
+                                    for logical in &mut task.inputs {
+                                        logical.failure.get_or_insert_with(|| failure.clone());
+                                    }
+                                    None
+                                }
                             }
                         }
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            };
-            // A retry can invalidate the old result without invalidating its
-            // output slot. Main keeps those slots only inside a carrier whose
-            // unchanged siblings already justified retaining the root.
-            let retry_slots: Vec<_> = task.inputs.iter().zip(&retained).zip(&report_previous)
-                .map(|((logical, checkpoint), previous)| {
-                    checkpoint.is_none().then(|| carrier.as_deref()
-                        .and_then(|root| this.retry_slot_for(&logical.input, *previous, root))).flatten()
-                })
-                .collect();
-            // Reserve logical names in input order before discovery/password
-            // failures can return. A planned slot is not a physical output.
-            let mut planned_slots = Vec::new();
-            if let Some(root) = carrier.as_deref() {
-                planned_slots.reserve_exact(count);
-                for (index, logical) in task.inputs.iter_mut().enumerate() {
-                    let previous = retained.get(index).copied().flatten()
-                        .or_else(|| retry_slots.get(index).copied().flatten())
-                        .filter(|checkpoint| checkpoint.container() == Some(root))
-                        .and_then(InputCheckpoint::output_slot);
-                    let slot = previous.filter(|path| OutputNames::retain(&this.output_names.registry,
-                        path, this.output_names.owner, Path::new(&logical.input.entry_path), Some(root),
-                    ));
-                    let slot = if let Some(slot) = slot {
-                        Some(slot.to_owned())
-                    } else {
-                        match OutputNames::plan(&this.output_names.registry, root.join(archive_name(&logical.input)), Path::new(&logical.input.entry_path),
-                            this.output_names.owner, Some(root))?
-                        {
-                            Ok(slot) => Some(slot),
-                            Err(failure) => {
-                                logical.failure.get_or_insert(failure);
-                                None
-                            }
-                        }
-                    };
-                    planned_slots.push(slot);
-                }
-            }
-            let mut parent_outputs = Vec::with_capacity(count);
-            let report_enabled = this.request.mode == Mode::Extract && task.owned_paths.iter()
-                .all(|path| generations.contains_key(&path_key(path)));
-            let mut report_states = Vec::new();
-            let mut replacement_retained = None;
-            let mut replacement_rows = None;
-            let mut retry = retry.filter(|_| !multi);
-            let mut physical_sources = task.owned_paths;
-            let mut superseded_candidates = HashSet::new();
-            for (index, (logical, &original_id)) in task.inputs.into_iter().zip(&ids).enumerate() {
-                let checkpoint = retained.get(index).copied().flatten();
-                let retry_slot = retry_slots.get(index).copied().flatten();
-                let previous = report_previous.get(index).copied().flatten();
-                let planned_slot = planned_slots.get(index).and_then(Option::as_deref);
-                let mut id = original_id;
-                if multi {
-                    this.notify(|| Event::Started { id });
-                }
-                let before_worker = logical.failure.is_some();
-                let mut attempted = logical.input.volume_attempts.as_ref().map(|_| {
-                    logical
-                        .input
-                        .physical_paths()
-                        .map(path_key)
-                        .collect::<Vec<_>>()
-                });
-                let mut executed = if let Some(checkpoint) = checkpoint {
-                    let input = checkpoint.shared_input();
-                    let mut result = checkpoint.result(depth);
-                    if multi && checkpoint.container() != carrier.as_deref() && result.failure.is_some() {
-                        // A purely failed old carrier is not a reusable output
-                        // root. Carry its logical failure, not its output slot.
-                        result.output = None;
-                    }
-                    if let Some(failure) = result.failure.as_ref() {
-                        // Receipts preserve extraction facts, not the old policy's
-                        // acceptance decision. Main reevaluates retained results
-                        // after a content-policy reload in either direction.
-                        result.partial = result.output.is_some()
-                            && accepts_partial_content(
-                                this.request.config.extraction.content_requirement,
-                                failure.kind, result.recovered_complete_files,
-                            );
-                    }
-                    // Main never rediscovers retained outputs on a sibling retry.
-                    // The previous attempt already owned their recursive work.
-                    Executed {
-                        planned_output: result.output.clone(),
-                        input,
-                        result,
-                        inventory: None,
+                        None => None,
                     }
                 } else {
-                    let retry_output = if let Some(previous) = retry_slot {
-                        stage("preflight", cancel).await?;
-                        let result = previous.result(depth);
-                        let slot = previous.output_slot().expect("selected retry slot");
-                        let cleared = !previous.has_output()
-                            || this.discard_failed_output(&result, slot, &mut outcome)?;
-                        // Main records cleanup errors but still executes this
-                        // selected input in its fixed slot. Never turn the old
-                        // result into a receipt for the changed dependencies.
-                        Some(if cleared { RetryOutput::Recreate(slot) }
-                             else { RetryOutput::Existing(slot) })
-                    } else { planned_slot.map(RetryOutput::Recreate) };
-                    this.execute_input(
-                        logical,
-                        id,
-                        task.source,
-                        depth,
-                        carrier.as_deref(),
-                        retry_output,
-                        &candidates,
-                        &mut shell,
-                        &mut outcome,
-                    )
-                    .await?
+                    None
                 };
-                let mut replacement_checkpoint = None;
-                if let Some(context) = retry.take().filter(|_| {
-                    !cancel.cancelled()
-                        && !multi
-                        && (before_worker || this.request.mode == Mode::Extract)
-                        && executed
-                            .result
+                // A retry can invalidate the old result without invalidating its
+                // output slot. Main keeps those slots only inside a carrier whose
+                // unchanged siblings already justified retaining the root.
+                let retry_slots: Vec<_> = task.inputs.iter().zip(&retained).zip(&report_previous)
+                    .map(|((logical, checkpoint), previous)| {
+                        checkpoint.is_none().then(|| carrier.as_deref()
+                            .and_then(|root| this.retry_slot_for(&logical.input, *previous, root))).flatten()
+                    })
+                    .collect();
+                // Reserve logical names in input order before discovery/password
+                // failures can return. A planned slot is not a physical output.
+                let mut planned_slots = Vec::new();
+                if let Some(root) = carrier.as_deref() {
+                    planned_slots.reserve_exact(count);
+                    for (index, logical) in task.inputs.iter_mut().enumerate() {
+                        let previous = retained.get(index).copied().flatten()
+                            .or_else(|| retry_slots.get(index).copied().flatten())
+                            .filter(|checkpoint| checkpoint.container() == Some(root))
+                            .and_then(InputCheckpoint::output_slot);
+                        let slot = previous.filter(|path| OutputNames::retain(&this.output_names.registry,
+                            path, this.output_names.owner, Path::new(&logical.input.entry_path), Some(root),
+                        ));
+                        let slot = if let Some(slot) = slot {
+                            Some(slot.to_owned())
+                        } else {
+                            match OutputNames::plan(&this.output_names.registry, root.join(archive_name(&logical.input)), Path::new(&logical.input.entry_path),
+                                this.output_names.owner, Some(root))?
+                            {
+                                Ok(slot) => Some(slot),
+                                Err(failure) => {
+                                    logical.failure.get_or_insert(failure);
+                                    None
+                                }
+                            }
+                        };
+                        planned_slots.push(slot);
+                    }
+                }
+                let mut parent_outputs = Vec::with_capacity(count);
+                let report_enabled = this.request.mode == Mode::Extract && task.owned_paths.iter()
+                    .all(|path| generations.contains_key(&path_key(path)));
+                let mut report_states = Vec::new();
+                let mut replacement_retained = None;
+                let mut replacement_rows = None;
+                let mut retry = retry.filter(|_| !multi);
+                let mut physical_sources = task.owned_paths;
+                let mut superseded_candidates = HashSet::new();
+                for (index, (logical, &original_id)) in task.inputs.into_iter().zip(&ids).enumerate() {
+                    let checkpoint = retained.get(index).copied().flatten();
+                    let retry_slot = retry_slots.get(index).copied().flatten();
+                    let previous = report_previous.get(index).copied().flatten();
+                    let planned_slot = planned_slots.get(index).and_then(Option::as_deref);
+                    let mut id = original_id;
+                    if multi {
+                        this.notify(|| Event::Started { id });
+                    }
+                    let before_worker = logical.failure.is_some();
+                    let mut attempted = logical.input.volume_attempts.as_ref().map(|_| {
+                        logical
+                            .input
+                            .physical_paths()
+                            .map(path_key)
+                            .collect::<Vec<_>>()
+                    });
+                    let mut executed = if let Some(checkpoint) = checkpoint {
+                        let input = checkpoint.shared_input();
+                        let mut result = checkpoint.result(depth);
+                        if multi && checkpoint.container() != carrier.as_deref() && result.failure.is_some() {
+                            // A purely failed old carrier is not a reusable output
+                            // root. Carry its logical failure, not its output slot.
+                            result.output = None;
+                        }
+                        if let Some(failure) = result.failure.as_ref() {
+                            // Receipts preserve extraction facts, not the old policy's
+                            // acceptance decision. Main reevaluates retained results
+                            // after a content-policy reload in either direction.
+                            result.partial = result.output.is_some()
+                                && accepts_partial_content(
+                                    this.request.config.extraction.content_requirement,
+                                    failure.kind, result.recovered_complete_files,
+                                );
+                        }
+                        // Main never rediscovers retained outputs on a sibling retry.
+                        // The previous attempt already owned their recursive work.
+                        Executed {
+                            planned_output: result.output.clone(),
+                            input,
+                            result,
+                            inventory: None,
+                        }
+                    } else {
+                        let retry_output = if let Some(previous) = retry_slot {
+                            stage("preflight", cancel).await?;
+                            let result = previous.result(depth);
+                            let slot = previous.output_slot().expect("selected retry slot");
+                            let cleared = !previous.has_output()
+                                || this.discard_failed_output(&result, slot, &mut outcome)?;
+                            // Main records cleanup errors but still executes this
+                            // selected input in its fixed slot. Never turn the old
+                            // result into a receipt for the changed dependencies.
+                            Some(if cleared { RetryOutput::Recreate(slot) }
+                                 else { RetryOutput::Existing(slot) })
+                        } else { planned_slot.map(RetryOutput::Recreate) };
+                        this.execute_input(
+                            logical,
+                            id,
+                            task.source,
+                            depth,
+                            carrier.as_deref(),
+                            retry_output,
+                            &candidates,
+                            &mut shell,
+                            &mut outcome,
+                        )
+                        .await?
+                    };
+                    let mut replacement_checkpoint = None;
+                    if let Some(context) = retry.take().filter(|_| {
+                        !cancel.cancelled()
+                            && !multi
+                            && (before_worker || this.request.mode == Mode::Extract)
+                            && executed
+                                .result
+                                .failure
+                                .as_ref()
+                                .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
+                    }) {
+                        this.notify(|| Event::ResolvingVolumes { id });
+                        stage("missing_volume", cancel).await?;
+                        let replacement = discovery::retry_volume(
+                            &executed.result,
+                            &missing,
+                            &context,
+                            this.options_at(depth)?,
+                            &candidates,
+                            &this.request,
+                        )?;
+                        drop(context);
+                        if let Some(mut replacement) = replacement {
+                            // Main replaces the whole single-input extraction only
+                            // after resolving a usable physical family. Until then,
+                            // its damaged payload remains available for recovery.
+                            let retry_output = executed.planned_output.clone();
+                            // checkpoint_inputs runs before the replacement callback
+                            // in main. Capture the first attempt with its own lease
+                            // generation, not the generation of the replacement.
+                            let first_checkpoint = if report_enabled && !before_worker {
+                                InputCheckpoint::create(&owner_path, Arc::clone(&executed.input), &executed.result, &generations, carrier.as_deref())
+                                    .and_then(|mut checkpoint| {
+                                        let state = InputCheckpoint::report_state(&executed.input,
+                                            &executed.result, retry_output.as_deref(),
+                                            previous, index + 1, report_count)?;
+                                        checkpoint.install_report(Some(state));
+                                        Some(checkpoint)
+                                    })
+                            } else { None };
+                            let cleaned = match retry_output.as_deref() {
+                                Some(output) => this.discard_failed_output(&executed.result, output, &mut outcome)?,
+                                None => true,
+                            };
+                            if cleaned {
+                                replacement_checkpoint = first_checkpoint;
+                                had_checkpoints |= replacement_checkpoint.is_some();
+                                executed.result.output = None;
+                                this.observer.after_output(&executed.result)?;
+                                if let Some(sources) = &mut sources { sources.refresh(&replacement.owned_paths); }
+                                drop(lease);
+                                let requested = this.requested_generation(&replacement, watch_root);
+                                lease = this.claim_task(&replacement, None).await?;
+                                stage("preflight", cancel).await?;
+                                let (current_generations, missing) = this.capture_generations(&replacement);
+                                generations = current_generations;
+                                let admission = this.task_admission(&replacement, &generations, &missing, watch_root,
+                                    |path| requested.as_ref().and_then(|members| members.get(path)))?;
+                                drop(requested);
+                                completed_family = match admission {
+                                    TaskAdmission::Execute(family) => family,
+                                    TaskAdmission::Departed => {
+                                        this.notify(|| Event::Skipped { id: task_id });
+                                        return Ok(ExecutedTask::Complete(outcome));
+                                    }
+                                    TaskAdmission::Completed(output) => {
+                                        this.reuse_completed_task(&replacement, task_id, depth, output, &mut outcome);
+                                        return Ok(ExecutedTask::Complete(outcome));
+                                    }
+                                };
+                                this.admit_missing_inputs(&mut replacement, &missing);
+                                this.observer.claim_sources(
+                                    Path::new(&replacement.entry().entry_path),
+                                    &replacement.owned_paths,
+                                    depth,
+                                )?;
+                                attempted = replacement.entry().volume_attempts.as_ref().map(|_| {
+                                    replacement
+                                        .entry()
+                                        .physical_paths()
+                                        .map(path_key)
+                                        .collect::<Vec<_>>()
+                                });
+                                split_input = replacement.entry().mode.structured()
+                                    || replacement.entry().physical_paths().nth(1).is_some();
+                                physical_sources = std::mem::take(&mut replacement.owned_paths);
+                                let (active, retained) = this.replan_input(task_id,
+                                    replacement.entry(), replacement_checkpoint.as_ref());
+                                id = active;
+                                replacement_rows = retained.map(|retained| (active, retained));
+                                let logical = replacement
+                                    .inputs
+                                    .into_iter()
+                                    .next()
+                                    .expect("volume retry has one logical input");
+                                executed = this
+                                    .execute_input(
+                                        logical,
+                                        id,
+                                        replacement.source,
+                                        depth,
+                                        None,
+                                        retry_output.as_deref().map(RetryOutput::Recreate),
+                                        &candidates,
+                                        &mut shell,
+                                        &mut outcome,
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                    let Executed {
+                        planned_output,
+                        mut result,
+                        inventory,
+                        mut input,
+                    } = executed;
+                    if this.request.mode == Mode::Scan {
+                        result.scan_layout = super::ScanLayout::from_input(&input);
+                        result.volume_attempts = Arc::make_mut(&mut input).volume_attempts.take();
+                        if result
                             .failure
                             .as_ref()
                             .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
-                }) {
-                    this.notify(|| Event::ResolvingVolumes { id });
-                    stage("missing_volume", cancel).await?;
-                    let replacement = discovery::retry_volume(
-                        &executed.result,
-                        &missing,
-                        &context,
-                        this.options_at(depth)?,
-                        &candidates,
-                        &this.request,
-                    )?;
-                    drop(context);
-                    if let Some(mut replacement) = replacement {
-                        // Main replaces the whole single-input extraction only
-                        // after resolving a usable physical family. Until then,
-                        // its damaged payload remains available for recovery.
-                        let retry_output = executed.planned_output.clone();
-                        // checkpoint_inputs runs before the replacement callback
-                        // in main. Capture the first attempt with its own lease
-                        // generation, not the generation of the replacement.
-                        let first_checkpoint = if report_enabled && !before_worker {
-                            InputCheckpoint::create(&owner_path, Arc::clone(&executed.input), &executed.result, &generations, carrier.as_deref())
-                                .and_then(|mut checkpoint| {
-                                    let state = InputCheckpoint::report_state(&executed.input,
-                                        &executed.result, retry_output.as_deref(),
-                                        previous, index + 1, report_count)?;
-                                    checkpoint.install_report(Some(state));
-                                    Some(checkpoint)
-                                })
-                        } else { None };
-                        let cleaned = match retry_output.as_deref() {
-                            Some(output) => this.discard_failed_output(&executed.result, output, &mut outcome)?,
-                            None => true,
-                        };
-                        if cleaned {
-                            replacement_checkpoint = first_checkpoint;
-                            had_checkpoints |= replacement_checkpoint.is_some();
-                            executed.result.output = None;
-                            this.observer.after_output(&executed.result)?;
-                            if let Some(sources) = &mut sources { sources.refresh(&replacement.owned_paths); }
-                            drop(lease);
-                            let requested = this.requested_generation(&replacement, watch_root);
-                            lease = this.claim_task(&replacement, None).await?;
-                            stage("preflight", cancel).await?;
-                            let (current_generations, missing) = this.capture_generations(&replacement);
-                            generations = current_generations;
-                            let admission = this.task_admission(&replacement, &generations, &missing, watch_root,
-                                |path| requested.as_ref().and_then(|members| members.get(path)))?;
-                            drop(requested);
-                            completed_family = match admission {
-                                TaskAdmission::Execute(family) => family,
-                                TaskAdmission::Departed => {
-                                    this.notify(|| Event::Skipped { id: task_id });
-                                    return Ok(outcome);
-                                }
-                                TaskAdmission::Completed(output) => {
-                                    this.reuse_completed_task(&replacement, task_id, depth, output, &mut outcome);
-                                    return Ok(outcome);
-                                }
-                            };
-                            this.admit_missing_inputs(&mut replacement, &missing);
-                            this.observer.claim_sources(
-                                Path::new(&replacement.entry().entry_path),
-                                &replacement.owned_paths,
-                                depth,
-                            )?;
-                            attempted = replacement.entry().volume_attempts.as_ref().map(|_| {
-                                replacement
-                                    .entry()
-                                    .physical_paths()
-                                    .map(path_key)
-                                    .collect::<Vec<_>>()
-                            });
-                            split_input = replacement.entry().mode.structured()
-                                || replacement.entry().physical_paths().nth(1).is_some();
-                            physical_sources = std::mem::take(&mut replacement.owned_paths);
-                            let (active, retained) = this.replan_input(task_id,
-                                replacement.entry(), replacement_checkpoint.as_ref());
-                            id = active;
-                            replacement_rows = retained.map(|retained| (active, retained));
-                            let logical = replacement
-                                .inputs
-                                .into_iter()
-                                .next()
-                                .expect("volume retry has one logical input");
-                            executed = this
-                                .execute_input(
-                                    logical,
-                                    id,
-                                    replacement.source,
-                                    depth,
-                                    None,
-                                    retry_output.as_deref().map(RetryOutput::Recreate),
-                                    &candidates,
-                                    &mut shell,
-                                    &mut outcome,
-                                )
-                                .await?;
+                        {
+                            result.volume_completeness = Some(VolumeCompleteness::Missing);
                         }
                     }
-                }
-                let Executed {
-                    planned_output,
-                    mut result,
-                    inventory,
-                    mut input,
-                } = executed;
-                if this.request.mode == Mode::Scan {
-                    result.scan_layout = super::ScanLayout::from_input(&input);
-                    result.volume_attempts = Arc::make_mut(&mut input).volume_attempts.take();
-                    if result
-                        .failure
-                        .as_ref()
-                        .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
-                    {
-                        result.volume_completeness = Some(VolumeCompleteness::Missing);
+                    if result.failure.is_none() {
+                        superseded_candidates.extend(attempted.into_iter().flatten());
                     }
-                }
-                if result.failure.is_none() {
-                    superseded_candidates.extend(attempted.into_iter().flatten());
-                }
-                let replacement_matches = replacement_checkpoint.as_ref()
-                    .is_some_and(|previous| previous.same_report_input(&input));
-                let state_previous = if replacement_checkpoint.is_some() {
-                    replacement_checkpoint.as_ref().filter(|_| replacement_matches)
-                } else { previous.or(checkpoint).or(retry_slot) };
-                let keeps_replaced = replacement_checkpoint.is_some() && !replacement_matches;
-                if report_enabled && (multi || result.failure.is_some() || keeps_replaced) {
-                    // An ordinary successful input cannot be retried from its
-                    // own receipt. Nested blockers keep their own checkpoints.
-                    let mut state = InputCheckpoint::report_state(&input, &result,
-                        planned_output.as_deref().or(planned_slot),
-                        state_previous, index + 1, report_count);
-                    if result.retained && result.output.is_none() && checkpoint.is_some_and(|checkpoint| checkpoint.has_output()) {
-                        InputCheckpoint::clear_report_output(&mut state);
-                    }
-                    report_states.push(state);
-                }
-                if keeps_replaced {
-                    // A different logical ID leaves the failed first attempt
-                    // in the carrier result even when its replacement succeeds.
-                    replacement_retained = replacement_checkpoint;
-                }
-                // Segment progress ends with its own extraction, as main's
-                // input_finished does. Physical root completion still waits
-                // for every recursive subtree and the final source cleanup.
-                if multi || replacement_rows.is_some() {
-                    this.notify(|| Event::Finished {
-                    id,
-                        result: super::TaskCompletion::from_result(&result),
-                    });
-                }
-                parent_outputs.push((result, inventory, input, id));
-            }
-            this.apply_complete_content_policy(&mut parent_outputs, &mut report_states,
-                replacement_retained.as_mut(), &mut outcome)?;
-            // Settle physical ownership before any successful sibling descends.
-            // Promoted retryable sources remain failures, but no longer block
-            // flattening the independent retained output subtree.
-            let mut parent_checkpoints: Vec<_> = if this.request.mode == Mode::Extract
-                && (multi || parent_outputs.first().is_some_and(|(result, ..)| result.failure.is_some())
-                    || replacement_retained.is_some())
-            {
-                parent_outputs.iter().enumerate().map(|(index, (result, _, input, _))| {
-                    let mut checkpoint = InputCheckpoint::create(&owner_path, Arc::clone(input),
-                        result, &generations, carrier.as_deref())?;
-                    checkpoint.install_report(report_states.get_mut(index).and_then(Option::take));
-                    checkpoint.set_planned_output(planned_slots.get(index).and_then(Option::as_deref));
-                    checkpoint.set_password_signature(|| candidates.signature(&input.entry_path));
-                    Some(checkpoint)
-                }).collect()
-            } else {
-                Vec::new()
-            };
-            let replacement_result = replacement_retained.map(|checkpoint| {
-                let mut retained = checkpoint.result(depth);
-                // First-attempt history precedes the replacement and its children.
-                outcome.checkpoints.push(checkpoint);
-                // These are two logical input IDs of the same replanned carrier,
-                // not two independent top-level paths in the result tree.
-                if let Some((current, ..)) = parent_outputs.first() { retained.path = current.path.clone(); }
-                retained.partial = retained.failure.as_ref().is_some_and(|failure|
-                    accepts_partial_content(this.request.config.extraction.content_requirement,
-                        failure.kind, retained.recovered_complete_files));
-                retained
-            });
-            let settled = || parent_outputs.iter().map(|(result, ..)| result)
-                .chain(replacement_result.iter());
-            if !superseded_candidates.is_empty() {
-                let retained: HashSet<_> = settled()
-                    .flat_map(|result| {
-                        result
-                            .source_paths
-                            .iter()
-                            .map(|path| path_key(&path.to_string_lossy()))
-                    })
-                    .collect();
-                physical_sources.retain(|path| {
-                    let key = path_key(path);
-                    !superseded_candidates.contains(&key) || retained.contains(&key)
-                });
-                if let Some(sources) = &mut sources { sources.refresh(&physical_sources); }
-            }
-            // A replaced attempt is report history after successful cleanup,
-            // not a failed input of the replacement's physical execution.
-            let physical_complete = parent_outputs.iter()
-                .all(|(result, ..)| result.failure.is_none() && !result.partial);
-            let parent_outputs = parent_outputs.into_iter()
-                .map(|(result, inventory, _input, id)| (result, inventory, id));
-            // Finish every logical parent before prompting or descending into
-            // any segment. Independent output trees share the existing request
-            // consumer budget rather than serializing behind the first subtree.
-            let parent_output_count = parent_outputs.len();
-            let mut recursive = Vec::new();
-            let mut descendants = Vec::with_capacity(count);
-            for (index, (result, inventory, id)) in parent_outputs.enumerate() {
-                if let Some(inventory) = inventory.filter(|_| depth <= this.request.max_depth && !cancel.cancelled()) {
-                    recursive.push(((index, result, id), inventory));
-                } else {
-                    descendants.push((index, Ok((result, Outcome::default(), false))));
-                }
-            }
-            let recursive_spawner = spawner.clone();
-            let scope = if recursive.is_empty() {
-                None
-            } else {
-                inherited_scope.clone().or_else(|| Some(Arc::new(RecursiveScope {
-                    password: source_scope.map(Arc::from),
-                })))
-            };
-            if !recursive.is_empty() {
-                let candidates = this.candidates.with_scope(scope.as_ref().and_then(|scope| scope.password.as_deref()));
-                let recursive = this.discover_children_many(recursive.into_iter(), depth, &candidates).await?;
-                let descendant_owner = Arc::clone(this);
-                let descend = move |((index, result, id), nested, scanned)| -> super::scheduling::Task<'_, _> {
-                    let this = Arc::clone(&descendant_owner);
-                    let spawner = recursive_spawner.clone();
-                    let scope = scope.clone();
-                    Box::pin(async move {
-                        let branch = if scanned {
-                            this.execute_batch(nested, depth + 1, scope, Some(id), spawner, None)
-                                .await.map(|descendants| (result, descendants, true))
-                        } else {
-                            let descendants = Outcome {
-                                errors: nested.errors.into(),
-                                scan_incomplete: this.record_scan_errors(nested.scan_errors),
-                                ..Outcome::default()
-                            };
-                            Ok((result, descendants, false))
-                        };
-                        (index, branch)
-                    })
-                };
-                // Single-output archives keep their consumer. Carrier branches
-                // share the request's existing recursive consumer budget.
-                if recursive.len() == 1 {
-                    descendants.push(descend(recursive.into_iter().next().unwrap()).await);
-                } else {
-                    descendants.extend(spawner.bounded_map(recursive, descend).await);
-                }
-            }
-            // Cancellation may leave recursive outputs undispatched. Their
-            // existing carrier receipts must stay owned for request rollback.
-            // Join every writer before committing or cleaning up, then restore
-            // logical segment order, including segments with no recursive work.
-            descendants.sort_unstable_by_key(|(index, _)| *index);
-            let mut completed = Vec::with_capacity(count);
-            let mut outputs_committed = descendants.len() == parent_output_count;
-            let mut carrier_children_complete = outputs_committed;
-            let mut children = Outcome::default();
-            for (index, descendant) in descendants {
-                let (mut result, mut descendants, ran_recursive_children) = descendant?;
-                stage("output_state", &Cancellation::default()).await?;
-                let mut children_complete = !cancel.cancelled() && descendants.subtree_complete();
-                if result.failure.is_none() && children_complete && !cancel.cancelled()
-                {
-                    if let Some(output) = result.output.as_deref() {
-                        if ran_recursive_children {
-                            this.drain_cleanup(Some(output), &mut descendants).await;
-                            stage("postprocess", cancel).await?;
+                    let replacement_matches = replacement_checkpoint.as_ref()
+                        .is_some_and(|previous| previous.same_report_input(&input));
+                    let state_previous = if replacement_checkpoint.is_some() {
+                        replacement_checkpoint.as_ref().filter(|_| replacement_matches)
+                    } else { previous.or(checkpoint).or(retry_slot) };
+                    let keeps_replaced = replacement_checkpoint.is_some() && !replacement_matches;
+                    if report_enabled && (multi || result.failure.is_some() || keeps_replaced) {
+                        // An ordinary successful input cannot be retried from its
+                        // own receipt. Nested blockers keep their own checkpoints.
+                        let mut state = InputCheckpoint::report_state(&input, &result,
+                            planned_output.as_deref().or(planned_slot),
+                            state_previous, index + 1, report_count);
+                        if result.retained && result.output.is_none() && checkpoint.is_some_and(|checkpoint| checkpoint.has_output()) {
+                            InputCheckpoint::clear_report_output(&mut state);
                         }
-                        if output_is_gone(output, ran_recursive_children) {
-                            this.observer.discard_output(&result.path, &result.source_paths, output)?;
-                            CreatedOutputs::commit(&this.created_outputs, output);
-                            result.output = None;
-                        }
+                        report_states.push(state);
                     }
-                }
-                // A carrier's segments are independent output trees. Their
-                // containers must keep the original layout for continuation.
-                if !multi
-                    && !result.retained
-                    && result.failure.is_none()
-                    && this.request.config.post_extract.flatten_single_directory
-                    && children_complete
-                    && !cancel.cancelled()
-                {
-                    if !ran_recursive_children {
-                        if let Some(output) = result.output.as_deref() {
-                            this.drain_cleanup(Some(output), &mut descendants).await;
-                        }
-                        stage("postprocess", cancel).await?;
+                    if keeps_replaced {
+                        // A different logical ID leaves the failed first attempt
+                        // in the carrier result even when its replacement succeeds.
+                        replacement_retained = replacement_checkpoint;
                     }
-                    flatten_result(
-                        &*this.observer, task_id, &mut result, &mut descendants, Some(&this.created_outputs), &this.output_names,
-                        this.request.config.post_extract.flatten_directory_name,
-                    )?;
-                    children_complete &= descendants.subtree_complete();
-                }
-                carrier_children_complete &= children_complete;
-                let mut checkpoint = parent_checkpoints.get_mut(index).and_then(Option::take);
-                if let Some(checkpoint) = &mut checkpoint { checkpoint.settle_result(&result); }
-                // A cancelled newly created root remains uncommitted until
-                // request-level rollback has joined all recursive writers.
-                let commit_completed = !cancel.cancelled();
-                outputs_committed &= commit_completed || result.retained || result.output.is_none();
-                if commit_completed || result.retained {
-                    this.observer.after_output(&result)?;
-                    // Cancellation after this durable commit must not roll it
-                    // back. Match main's commit/check then retire ordering.
-                    if commit_completed && !multi && physical_complete {
-                        if let Some(output) = result.output.as_deref() {
-                            CreatedOutputs::commit_if_unowned(&this.created_outputs, output);
-                        }
-                    }
-                }
-                if let Some(checkpoint) = checkpoint {
-                    outcome.checkpoints.push(checkpoint);
-                }
-                children.checkpoints.append(&mut descendants.checkpoints);
-                outcome
-                    .generated_sources
-                    .append(&mut descendants.generated_sources);
-                children.archives.append(&mut descendants.archives);
-                children.errors.append(&mut descendants.errors);
-                children.scan_incomplete |= descendants.scan_incomplete;
-                children.uncommitted |= descendants.uncommitted;
-                children
-                    .cleanup_results
-                    .append(&mut descendants.cleanup_results);
-                completed.push(result);
-            }
-            if let Some(retained) = replacement_result { completed.push(retained); }
-            // Only the final carrier namespace is flattened. Individual segment
-            // layouts remain intact while any input or recursive subtree may resume.
-            if multi && outputs_committed && carrier_children_complete
-                && completed.iter().all(|result| result.failure.is_none())
-                && !continued_output
-                && this.request.config.post_extract.flatten_single_directory
-                && !cancel.cancelled()
-            {
-                if let Some(root) = carrier.clone().filter(|_| completed.iter().any(|result| result.output.is_some())) {
-                    this.drain_cleanup(Some(&root), &mut children).await;
-                    stage("postprocess", cancel).await?;
-                    children.archives.append(&mut std::mem::take(&mut completed).into());
-                    let has_local_checkpoints = outcome.checkpoints.len() != 0;
-                    children.checkpoints.append(&mut outcome.checkpoints);
-                    let input = ArchiveInput::file(owner_path.to_string_lossy().into_owned(), String::new(), String::new());
-                    let mut container = receipt(&input, task.source, depth);
-                    container.output = Some(root.clone());
-                    let flattened = flatten_result(
-                        &*this.observer, task_id, &mut container, &mut children, Some(&this.created_outputs), &this.output_names,
-                        this.request.config.post_extract.flatten_directory_name,
-                    );
-                    completed = children.archives.take_tail();
-                    if has_local_checkpoints {
-                        outcome.checkpoints = children.checkpoints.take_tail().into();
-                    }
-                    carrier = container.output;
-                    flattened?;
-                }
-            }
-            if multi && outputs_committed && children.settled()
-                && completed.iter().all(|result| !result.failure.as_ref()
-                    .is_some_and(|failure| failure.kind == FailureKind::Cancelled))
-            {
-                if let Some(root) = carrier.as_ref().filter(|_| {
-                    completed.iter().any(|result| result.output.is_some())
-                }) {
-                    // The segments have separate receipts. Retire the carrier
-                    // registration too, before its ancestors can commit and
-                    // source cleanup can consume the archive.
-                    // An accepted segment keeps the shared container's Watch
-                    // receipt. A purely failed carrier retains bytes only.
-                    let accepted = completed.iter().position(|result|
-                        result.output.is_some() && (result.failure.is_none() || result.partial));
-                    let index = accepted.or_else(|| completed.iter().position(|result| result.output.is_some()))
-                        .expect("carrier has a retained output");
-                    let first = &mut completed[index];
-                    let segment = first.output.replace(root.clone());
-                    let published = this.observer.after_output(first);
-                    first.output = segment;
-                    published?;
-                }
-                // Only physical complete success retires rollback ownership
-                // early. Accepted partial/salvage bytes survive normal request
-                // completion, but a later cancelled sibling must discard them.
-                if physical_complete {
-                    if let Some(root) = carrier.as_deref() {
-                        CreatedOutputs::commit_if_unowned(&this.created_outputs, root);
-                    }
-                    for output in completed.iter().filter_map(|result| result.output.as_deref()) {
-                        CreatedOutputs::commit_if_unowned(&this.created_outputs, output);
-                    }
-                }
-            }
-            if let Some(root) = &carrier {
-                if completed.iter().all(|entry| entry.output.is_none()) {
-                    if output_is_gone(root, true) {
-                        if let Some(result) = completed.first() {
-                            this.observer.discard_output(&result.path, &result.source_paths, root)?;
-                            CreatedOutputs::commit(&this.created_outputs, root);
-                        }
-                    }
-                }
-            }
-            if this.request.mode == Mode::Extract {
-                if let Some(scope) = discovery_scope.as_deref() {
-                    let mut report_scope = None;
-                    for failure in completed.iter_mut().filter_map(|result| result.failure.as_mut()) {
-                        failure.discovery_scope.get_or_insert_with(|| Arc::clone(
-                            report_scope.get_or_insert_with(|| Arc::new(super::FailureScope::from_scope(scope)))
-                        ));
-                    }
-                }
-            }
-            if this.request.mode == Mode::Extract && completed.iter().any(|result| result.failure.is_some()) {
-                // Receipts have already followed flattening. Preserve the
-                // pre-cleanup facts, but do not reconstruct them from final IO.
-                let retry_output = continued_output || ((multi || had_checkpoints) && completed.iter().any(|result|
-                    result.output.is_some() && (result.failure.is_none() || result.partial)));
-                if let Some(recovery) = InputRecovery::capture(&outcome.checkpoints,
-                    &owner_path, completed.first().map(|result| result.path.as_path()),
-                    carrier.as_deref(), report_count, had_checkpoints, retry_output)
-                {
-                    for failure in completed.iter_mut().filter_map(|result| result.failure.as_mut()) {
-                        failure.recovery = Some(Arc::clone(&recovery));
-                    }
-                }
-            }
-            // Cleanup belongs to this physical source family, not its output
-            // descendants. A failed/partial inner archive must keep its own
-            // source, but does not revoke a fully extracted outer source.
-            let sources_complete = completed
-                .iter()
-                .all(|result| result.failure.is_none() && !result.partial)
-                && !cancel.cancelled();
-            let mut root_cleanup = None;
-            if let Some(sources) = sources.as_mut().filter(|_| sources_complete) {
-                if let Some(family) = completed_family {
-                    stage("output_state", &Cancellation::default()).await?;
-                    this.observer.sources_processed(family,
-                        carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
-                }
-                let cleanup_paths = sources.release(true);
-                let mode = if depth > 1 { CleanupMode::Delete }
-                    else { this.request.config.post_extract.archive_cleanup_mode };
-                let mut deletes = Vec::new();
-                let mut recycles = Vec::new();
-                for path in &physical_sources {
-                    if !cleanup_paths.contains(&namespace_key(Path::new(path))) { continue; }
-                    // Generated Watch inputs still belong to the pipeline
-                    // under Keep/Recycle. Probe only when this changes which
-                    // cleanup to run for the leased path.
-                    if mode == CleanupMode::Delete || this.generated_source(path, &generations, watch_root, depth).is_some() {
-                        deletes.push(PathBuf::from(path));
-                    } else if mode == CleanupMode::Recycle {
-                        recycles.push(PathBuf::from(path));
-                    }
-                }
-                dedup_paths(&mut deletes);
-                dedup_paths(&mut recycles);
-                if deletes.is_empty() && recycles.is_empty() {
-                    drop(lease);
-                } else {
-                    let paths = (!watch_root).then(|| deletes.iter().chain(&recycles)
-                        .map(|path| Arc::from(namespace_key(path))).collect());
-                    let cleanup = Arc::clone(this);
-                    let work = async move {
-                        // Keep other requests off these sources until cleanup
-                        // finishes. CleanupRefs has already released the last
-                        // planned owner of each path in this request.
-                        let _sources = lease;
-                        let mut failures = Vec::new();
-                        if stage("background_source_cleanup", &cleanup.request.cancel).await.is_ok() {
-                            let mut shell = cleanup.engine.shell.branch();
-                            cleanup.cleanup_sources(&recycles, CleanupMode::Recycle, &mut failures, &mut shell);
-                            cleanup.cleanup_sources(&deletes, CleanupMode::Delete, &mut failures, &mut shell);
-                        }
-                        failures
-                    };
-                    if let Some(paths) = paths {
-                        // Register under the same lock used by retirement.
-                        let mut tasks = this.cleanup_tasks.lock().unwrap();
-                        let id = tasks.next_id;
-                        tasks.next_id += 1;
-                        let cleanup = Arc::clone(this);
-                        let task = spawner.spawn(Box::pin(async move {
-                            let failures = work.await;
-                            cleanup.cleanup_tasks.lock().unwrap().retire(id, failures)
-                        }));
-                        tasks.register(id, paths, task);
-                    } else {
-                        root_cleanup = Some(spawner.spawn(Box::pin(work)));
-                    }
-                }
-            } else {
-                outcome.generated_sources.extend(physical_sources.iter().filter_map(|path|
-                    this.generated_source(path, &generations, watch_root, depth)));
-                drop(lease);
-            }
-            if this.request.mode == Mode::Extract {
-                project_possible_missing_volume(&mut completed, split_input);
-            }
-            // Refresh segment rows after carrier policy and flattening,
-            // just as main's task_finished refreshes its input_results.
-            if multi {
-                for (&id, result) in ids.iter().zip(&completed) {
-                    this.notify(|| Event::Finished {
+                    // Segment progress ends with its own extraction, as main's
+                    // input_finished does. Physical root completion still waits
+                    // for every recursive subtree and the final source cleanup.
+                    if multi || replacement_rows.is_some() {
+                        this.notify(|| Event::Finished {
                         id,
-                        result: super::TaskCompletion::from_result(result),
+                            result: super::TaskCompletion::from_result(&result),
+                        });
+                    }
+                    parent_outputs.push((result, inventory, input, id));
+                }
+                // Reserve post-processing state only after every logical input finishes.
+                let postprocess = boxed_phase(move || async move {
+                    let _shell = shell;
+                    this.apply_complete_content_policy(&mut parent_outputs, &mut report_states,
+                        replacement_retained.as_mut(), &mut outcome)?;
+                    // Settle physical ownership before any successful sibling descends.
+                    // Promoted retryable sources remain failures, but no longer block
+                    // flattening the independent retained output subtree.
+                    let mut parent_checkpoints: Vec<_> = if this.request.mode == Mode::Extract
+                        && (multi || parent_outputs.first().is_some_and(|(result, ..)| result.failure.is_some())
+                            || replacement_retained.is_some())
+                    {
+                        parent_outputs.iter().enumerate().map(|(index, (result, _, input, _))| {
+                            let mut checkpoint = InputCheckpoint::create(&owner_path, Arc::clone(input),
+                                result, &generations, carrier.as_deref())?;
+                            checkpoint.install_report(report_states.get_mut(index).and_then(Option::take));
+                            checkpoint.set_planned_output(planned_slots.get(index).and_then(Option::as_deref));
+                            checkpoint.set_password_signature(|| candidates.signature(&input.entry_path));
+                            Some(checkpoint)
+                        }).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let replacement_result = replacement_retained.map(|checkpoint| {
+                        let mut retained = checkpoint.result(depth);
+                        // First-attempt history precedes the replacement and its children.
+                        outcome.checkpoints.push(checkpoint);
+                        // These are two logical input IDs of the same replanned carrier,
+                        // not two independent top-level paths in the result tree.
+                        if let Some((current, ..)) = parent_outputs.first() { retained.path = current.path.clone(); }
+                        retained.partial = retained.failure.as_ref().is_some_and(|failure|
+                            accepts_partial_content(this.request.config.extraction.content_requirement,
+                                failure.kind, retained.recovered_complete_files));
+                        retained
                     });
-                }
-            }
-            if let Some((active, retained)) = replacement_rows {
-                // The execution result stays first and the retained first
-                // attempt is appended to the physical result group.
-                for (id, result) in [active, retained].into_iter().zip(&completed) {
-                    this.notify(|| Event::Finished { id,
-                        result: super::TaskCompletion::from_result(result) });
-                }
-            }
-            if let Some(result) = completed.first() {
-                if this.request.mode == Mode::Scan && completed.iter().any(|result| result.failure.is_some()) {
-                    outcome.scan_failures.push(ScanTaskFailure {
-                        path: if multi { owner_path.clone() } else { result.path.clone() },
-                        archives: 0..completed.len(),
-                        preflight: None,
-                    });
-                }
-                this.notify(|| Event::Finished {
-                    id: task_id,
-                    result: {
-                        let mut completion = super::TaskCompletion::from_group(&completed);
-                        // A carrier's physical container is not derivable from
-                        // the surviving segment paths when only one succeeded.
-                        if multi && completion.output.is_some() {
-                            completion.output = carrier.clone();
+                    let settled = || parent_outputs.iter().map(|(result, ..)| result)
+                        .chain(replacement_result.iter());
+                    if !superseded_candidates.is_empty() {
+                        let retained: HashSet<_> = settled()
+                            .flat_map(|result| {
+                                result
+                                    .source_paths
+                                    .iter()
+                                    .map(|path| path_key(&path.to_string_lossy()))
+                            })
+                            .collect();
+                        physical_sources.retain(|path| {
+                            let key = path_key(path);
+                            !superseded_candidates.contains(&key) || retained.contains(&key)
+                        });
+                        if let Some(sources) = &mut sources { sources.refresh(&physical_sources); }
+                    }
+                    // A replaced attempt is report history after successful cleanup,
+                    // not a failed input of the replacement's physical execution.
+                    let physical_complete = parent_outputs.iter()
+                        .all(|(result, ..)| result.failure.is_none() && !result.partial);
+                    let parent_outputs = parent_outputs.into_iter()
+                        .map(|(result, inventory, _input, id)| (result, inventory, id));
+                    // Finish every logical parent before prompting or descending into
+                    // any segment. Independent output trees share the existing request
+                    // consumer budget rather than serializing behind the first subtree.
+                    let parent_output_count = parent_outputs.len();
+                    let mut recursive = Vec::new();
+                    let mut descendants = Vec::with_capacity(count);
+                    for (index, (result, inventory, id)) in parent_outputs.enumerate() {
+                        if let Some(inventory) = inventory.filter(|_| depth <= this.request.max_depth && !cancel.cancelled()) {
+                            recursive.push(((index, result, id), inventory));
+                        } else {
+                            descendants.push((index, Ok((result, Outcome::default(), false))));
                         }
-                        completion
-                    },
+                    }
+                    let recursive_spawner = spawner.clone();
+                    let scope = if recursive.is_empty() {
+                        None
+                    } else {
+                        inherited_scope.clone().or_else(|| Some(Arc::new(RecursiveScope {
+                            password: owner_path.parent().map(Arc::from),
+                        })))
+                    };
+                    if !recursive.is_empty() {
+                        let candidates = this.candidates.with_scope(scope.as_ref().and_then(|scope| scope.password.as_deref()));
+                        let recursive = this.discover_children_many(recursive.into_iter(), depth, &candidates).await?;
+                        let descendant_owner = Arc::clone(this);
+                        let descend = move |((index, result, id), nested, scanned)| -> super::scheduling::Task<'_, _> {
+                            let this = Arc::clone(&descendant_owner);
+                            let spawner = recursive_spawner.clone();
+                            let scope = scope.clone();
+                            Box::pin(async move {
+                                let branch = if scanned {
+                                    this.execute_batch(nested, depth + 1, scope, Some(id), spawner, None)
+                                        .await.map(|descendants| (result, descendants, true))
+                                } else {
+                                    let descendants = Outcome {
+                                        errors: nested.errors.into(),
+                                        scan_incomplete: this.record_scan_errors(nested.scan_errors),
+                                        ..Outcome::default()
+                                    };
+                                    Ok((result, descendants, false))
+                                };
+                                (index, branch)
+                            })
+                        };
+                        // Single-output archives keep their consumer. Carrier branches
+                        // share the request's existing recursive consumer budget.
+                        if recursive.len() == 1 {
+                            descendants.push(descend(recursive.into_iter().next().unwrap()).await);
+                        } else {
+                            descendants.extend(spawner.bounded_map(recursive.into_iter(), descend).await);
+                        }
+                    }
+                    // Cancellation may leave recursive outputs undispatched. Their
+                    // existing carrier receipts must stay owned for request rollback.
+                    // Join every writer before committing or cleaning up, then restore
+                    // logical segment order, including segments with no recursive work.
+                    descendants.sort_unstable_by_key(|(index, _)| *index);
+                    let mut completed = Vec::with_capacity(count);
+                    let mut outputs_committed = descendants.len() == parent_output_count;
+                    let mut carrier_children_complete = outputs_committed;
+                    let mut children = Outcome::default();
+                    for (index, descendant) in descendants {
+                        let (mut result, mut descendants, ran_recursive_children) = descendant?;
+                        stage("output_state", &Cancellation::default()).await?;
+                        let mut children_complete = !cancel.cancelled() && descendants.subtree_complete();
+                        if result.failure.is_none() && children_complete && !cancel.cancelled()
+                        {
+                            if let Some(output) = result.output.as_deref() {
+                                if ran_recursive_children {
+                                    this.drain_cleanup(Some(output), &mut descendants).await;
+                                    stage("postprocess", cancel).await?;
+                                }
+                                if output_is_gone(output, ran_recursive_children) {
+                                    this.observer.discard_output(&result.path, &result.source_paths, output)?;
+                                    CreatedOutputs::commit(&this.created_outputs, output);
+                                    result.output = None;
+                                }
+                            }
+                        }
+                        // A carrier's segments are independent output trees. Their
+                        // containers must keep the original layout for continuation.
+                        if !multi
+                            && !result.retained
+                            && result.failure.is_none()
+                            && this.request.config.post_extract.flatten_single_directory
+                            && children_complete
+                            && !cancel.cancelled()
+                        {
+                            if !ran_recursive_children {
+                                if let Some(output) = result.output.as_deref() {
+                                    this.drain_cleanup(Some(output), &mut descendants).await;
+                                }
+                                stage("postprocess", cancel).await?;
+                            }
+                            flatten_result(
+                                &*this.observer, task_id, &mut result, &mut descendants, Some(&this.created_outputs), &this.output_names,
+                                this.request.config.post_extract.flatten_directory_name,
+                            )?;
+                            children_complete &= descendants.subtree_complete();
+                        }
+                        carrier_children_complete &= children_complete;
+                        let mut checkpoint = parent_checkpoints.get_mut(index).and_then(Option::take);
+                        if let Some(checkpoint) = &mut checkpoint { checkpoint.settle_result(&result); }
+                        // A cancelled newly created root remains uncommitted until
+                        // request-level rollback has joined all recursive writers.
+                        let commit_completed = !cancel.cancelled();
+                        outputs_committed &= commit_completed || result.retained || result.output.is_none();
+                        if commit_completed || result.retained {
+                            this.observer.after_output(&result)?;
+                            // Cancellation after this durable commit must not roll it
+                            // back. Match main's commit/check then retire ordering.
+                            if commit_completed && !multi && physical_complete {
+                                if let Some(output) = result.output.as_deref() {
+                                    CreatedOutputs::commit_if_unowned(&this.created_outputs, output);
+                                }
+                            }
+                        }
+                        if let Some(checkpoint) = checkpoint {
+                            outcome.checkpoints.push(checkpoint);
+                        }
+                        children.checkpoints.append(&mut descendants.checkpoints);
+                        outcome
+                            .generated_sources
+                            .append(&mut descendants.generated_sources);
+                        children.archives.append(&mut descendants.archives);
+                        children.errors.append(&mut descendants.errors);
+                        children.scan_incomplete |= descendants.scan_incomplete;
+                        children.uncommitted |= descendants.uncommitted;
+                        children
+                            .cleanup_results
+                            .append(&mut descendants.cleanup_results);
+                        completed.push(result);
+                    }
+                    if let Some(retained) = replacement_result { completed.push(retained); }
+                    // Only the final carrier namespace is flattened. Individual segment
+                    // layouts remain intact while any input or recursive subtree may resume.
+                    if multi && outputs_committed && carrier_children_complete
+                        && completed.iter().all(|result| result.failure.is_none())
+                        && !continued_output
+                        && this.request.config.post_extract.flatten_single_directory
+                        && !cancel.cancelled()
+                    {
+                        if let Some(root) = carrier.clone().filter(|_| completed.iter().any(|result| result.output.is_some())) {
+                            this.drain_cleanup(Some(&root), &mut children).await;
+                            stage("postprocess", cancel).await?;
+                            children.archives.append(&mut std::mem::take(&mut completed).into());
+                            let has_local_checkpoints = outcome.checkpoints.len() != 0;
+                            children.checkpoints.append(&mut outcome.checkpoints);
+                            let input = ArchiveInput::file(owner_path.to_string_lossy().into_owned(), String::new(), String::new());
+                            let mut container = receipt(&input, task.source, depth);
+                            container.output = Some(root.clone());
+                            let flattened = flatten_result(
+                                &*this.observer, task_id, &mut container, &mut children, Some(&this.created_outputs), &this.output_names,
+                                this.request.config.post_extract.flatten_directory_name,
+                            );
+                            completed = children.archives.take_tail();
+                            if has_local_checkpoints {
+                                outcome.checkpoints = children.checkpoints.take_tail().into();
+                            }
+                            carrier = container.output;
+                            flattened?;
+                        }
+                    }
+                    if multi && outputs_committed && children.settled()
+                        && completed.iter().all(|result| !result.failure.as_ref()
+                            .is_some_and(|failure| failure.kind == FailureKind::Cancelled))
+                    {
+                        if let Some(root) = carrier.as_ref().filter(|_| {
+                            completed.iter().any(|result| result.output.is_some())
+                        }) {
+                            // The segments have separate receipts. Retire the carrier
+                            // registration too, before its ancestors can commit and
+                            // source cleanup can consume the archive.
+                            // An accepted segment keeps the shared container's Watch
+                            // receipt. A purely failed carrier retains bytes only.
+                            let accepted = completed.iter().position(|result|
+                                result.output.is_some() && (result.failure.is_none() || result.partial));
+                            let index = accepted.or_else(|| completed.iter().position(|result| result.output.is_some()))
+                                .expect("carrier has a retained output");
+                            let first = &mut completed[index];
+                            let segment = first.output.replace(root.clone());
+                            let published = this.observer.after_output(first);
+                            first.output = segment;
+                            published?;
+                        }
+                        // Only physical complete success retires rollback ownership
+                        // early. Accepted partial/salvage bytes survive normal request
+                        // completion, but a later cancelled sibling must discard them.
+                        if physical_complete {
+                            if let Some(root) = carrier.as_deref() {
+                                CreatedOutputs::commit_if_unowned(&this.created_outputs, root);
+                            }
+                            for output in completed.iter().filter_map(|result| result.output.as_deref()) {
+                                CreatedOutputs::commit_if_unowned(&this.created_outputs, output);
+                            }
+                        }
+                    }
+                    if let Some(root) = &carrier {
+                        if completed.iter().all(|entry| entry.output.is_none()) {
+                            if output_is_gone(root, true) {
+                                if let Some(result) = completed.first() {
+                                    this.observer.discard_output(&result.path, &result.source_paths, root)?;
+                                    CreatedOutputs::commit(&this.created_outputs, root);
+                                }
+                            }
+                        }
+                    }
+                    if this.request.mode == Mode::Extract {
+                        if let Some(scope) = discovery_scope.as_deref() {
+                            let mut report_scope = None;
+                            for failure in completed.iter_mut().filter_map(|result| result.failure.as_mut()) {
+                                failure.discovery_scope.get_or_insert_with(|| Arc::clone(
+                                    report_scope.get_or_insert_with(|| Arc::new(super::FailureScope::from_scope(scope)))
+                                ));
+                            }
+                        }
+                    }
+                    if this.request.mode == Mode::Extract && completed.iter().any(|result| result.failure.is_some()) {
+                        // Receipts have already followed flattening. Preserve the
+                        // pre-cleanup facts, but do not reconstruct them from final IO.
+                        let retry_output = continued_output || ((multi || had_checkpoints) && completed.iter().any(|result|
+                            result.output.is_some() && (result.failure.is_none() || result.partial)));
+                        if let Some(recovery) = InputRecovery::capture(&outcome.checkpoints,
+                            &owner_path, completed.first().map(|result| result.path.as_path()),
+                            carrier.as_deref(), report_count, had_checkpoints, retry_output)
+                        {
+                            for failure in completed.iter_mut().filter_map(|result| result.failure.as_mut()) {
+                                failure.recovery = Some(Arc::clone(&recovery));
+                            }
+                        }
+                    }
+                    // Cleanup belongs to this physical source family, not its output
+                    // descendants. A failed/partial inner archive must keep its own
+                    // source, but does not revoke a fully extracted outer source.
+                    let sources_complete = completed
+                        .iter()
+                        .all(|result| result.failure.is_none() && !result.partial)
+                        && !cancel.cancelled();
+                    let mut root_cleanup = None;
+                    if let Some(sources) = sources.as_mut().filter(|_| sources_complete) {
+                        if let Some(family) = completed_family {
+                            stage("output_state", &Cancellation::default()).await?;
+                            this.observer.sources_processed(family,
+                                carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
+                        }
+                        let cleanup_paths = sources.release(true);
+                        let mode = if depth > 1 { CleanupMode::Delete }
+                            else { this.request.config.post_extract.archive_cleanup_mode };
+                        let mut deletes = Vec::new();
+                        let mut recycles = Vec::new();
+                        for path in &physical_sources {
+                            if !cleanup_paths.contains(&namespace_key(Path::new(path))) { continue; }
+                            // Generated Watch inputs still belong to the pipeline
+                            // under Keep/Recycle. Probe only when this changes which
+                            // cleanup to run for the leased path.
+                            if mode == CleanupMode::Delete || this.generated_source(path, &generations, watch_root, depth).is_some() {
+                                deletes.push(PathBuf::from(path));
+                            } else if mode == CleanupMode::Recycle {
+                                recycles.push(PathBuf::from(path));
+                            }
+                        }
+                        dedup_paths(&mut deletes);
+                        dedup_paths(&mut recycles);
+                        if deletes.is_empty() && recycles.is_empty() {
+                            drop(lease);
+                        } else {
+                            let paths = (!watch_root).then(|| deletes.iter().chain(&recycles)
+                                .map(|path| Arc::from(namespace_key(path))).collect());
+                            let cleanup = Arc::clone(this);
+                            let work = async move {
+                                // Keep other requests off these sources until cleanup
+                                // finishes. CleanupRefs has already released the last
+                                // planned owner of each path in this request.
+                                let _sources = lease;
+                                let mut failures = Vec::new();
+                                if stage("background_source_cleanup", &cleanup.request.cancel).await.is_ok() {
+                                    let mut shell = cleanup.engine.shell.branch();
+                                    cleanup.cleanup_sources(&recycles, CleanupMode::Recycle, &mut failures, &mut shell);
+                                    cleanup.cleanup_sources(&deletes, CleanupMode::Delete, &mut failures, &mut shell);
+                                }
+                                failures
+                            };
+                            if let Some(paths) = paths {
+                                // Register under the same lock used by retirement.
+                                let mut tasks = this.cleanup_tasks.lock().unwrap();
+                                let id = tasks.next_id;
+                                tasks.next_id += 1;
+                                let cleanup = Arc::clone(this);
+                                let task = spawner.spawn(Box::pin(async move {
+                                    let failures = work.await;
+                                    cleanup.cleanup_tasks.lock().unwrap().retire(id, failures)
+                                }));
+                                tasks.register(id, paths, task);
+                            } else {
+                                root_cleanup = Some(spawner.spawn(Box::pin(work)));
+                            }
+                        }
+                    } else {
+                        outcome.generated_sources.extend(physical_sources.iter().filter_map(|path|
+                            this.generated_source(path, &generations, watch_root, depth)));
+                        drop(lease);
+                    }
+                    if this.request.mode == Mode::Extract {
+                        project_possible_missing_volume(&mut completed, split_input);
+                    }
+                    // Refresh segment rows after carrier policy and flattening,
+                    // just as main's task_finished refreshes its input_results.
+                    if multi {
+                        for (&id, result) in ids.iter().zip(&completed) {
+                            this.notify(|| Event::Finished {
+                                id,
+                                result: super::TaskCompletion::from_result(result),
+                            });
+                        }
+                    }
+                    if let Some((active, retained)) = replacement_rows {
+                        // The execution result stays first and the retained first
+                        // attempt is appended to the physical result group.
+                        for (id, result) in [active, retained].into_iter().zip(&completed) {
+                            this.notify(|| Event::Finished { id,
+                                result: super::TaskCompletion::from_result(result) });
+                        }
+                    }
+                    if let Some(result) = completed.first() {
+                        if this.request.mode == Mode::Scan && completed.iter().any(|result| result.failure.is_some()) {
+                            outcome.scan_failures.push(ScanTaskFailure {
+                                path: if multi { owner_path.clone() } else { result.path.clone() },
+                                archives: 0..completed.len(),
+                                preflight: None,
+                            });
+                        }
+                        this.notify(|| Event::Finished {
+                            id: task_id,
+                            result: {
+                                let mut completion = super::TaskCompletion::from_group(&completed);
+                                // A carrier's physical container is not derivable from
+                                // the surviving segment paths when only one succeeded.
+                                if multi && completion.output.is_some() {
+                                    completion.output = carrier.clone();
+                                }
+                                completion
+                            },
+                        });
+                    }
+                    // Recovery is local to a physical carrier. Successful, committed
+                    // subtrees need no input plans retained by their ancestors; blocked
+                    // descendants and same-carrier success siblings still keep theirs.
+                    if outputs_committed && !cancel.cancelled()
+                        && completed.iter().all(|result| result.failure.is_none() && !result.partial)
+                        && children.subtree_complete() && children.checkpoints.len() == 0
+                    {
+                        outcome.checkpoints = Default::default();
+                    }
+                    // Capture above visits only this carrier's receipts, never its
+                    // descendant tree. Splice outstanding descendant ownership last.
+                    outcome.checkpoints.append(&mut children.checkpoints);
+                    outcome.archives.append(&mut completed.into());
+                    outcome.archives.append(&mut children.archives);
+                    outcome.errors.append(&mut children.errors);
+                    outcome.scan_incomplete |= children.scan_incomplete;
+                    outcome
+                        .cleanup_results
+                        .append(&mut children.cleanup_results);
+                    outcome.uncommitted = !outputs_committed || children.uncommitted;
+                    // Watch releases this root's admission claim after publication.
+                    // Its source cleanup shares the task lease until it has finished.
+                    if let Some(cleanup) = root_cleanup {
+                        outcome.cleanup_results.append(&mut cleanup.wait().await.into());
+                    }
+                    if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
+                        this.observer.scope_finished(task_id, outcome.archives.iter()).await?;
+                    }
+                    Ok(outcome)
                 });
+                Ok::<_, io::Error>(ExecutedTask::Finalize(postprocess))
+            });
+            // Finishing execution releases its frame before scheduling post-processing.
+            match execution.await? {
+                ExecutedTask::Complete(outcome) => Ok(outcome),
+                ExecutedTask::Finalize(postprocess) => postprocess.await,
             }
-            // Recovery is local to a physical carrier. Successful, committed
-            // subtrees need no input plans retained by their ancestors; blocked
-            // descendants and same-carrier success siblings still keep theirs.
-            if outputs_committed && !cancel.cancelled()
-                && completed.iter().all(|result| result.failure.is_none() && !result.partial)
-                && children.subtree_complete() && children.checkpoints.len() == 0
-            {
-                outcome.checkpoints = Default::default();
-            }
-            // Capture above visits only this carrier's receipts, never its
-            // descendant tree. Splice outstanding descendant ownership last.
-            outcome.checkpoints.append(&mut children.checkpoints);
-            outcome.archives.append(&mut completed.into());
-            outcome.archives.append(&mut children.archives);
-            outcome.errors.append(&mut children.errors);
-            outcome.scan_incomplete |= children.scan_incomplete;
-            outcome
-                .cleanup_results
-                .append(&mut children.cleanup_results);
-            outcome.uncommitted = !outputs_committed || children.uncommitted;
-            // Watch releases this root's admission claim after publication.
-            // Its source cleanup shares the task lease until it has finished.
-            if let Some(cleanup) = root_cleanup {
-                outcome.cleanup_results.append(&mut cleanup.wait().await.into());
-            }
-            if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
-                this.observer.scope_finished(task_id, outcome.archives.iter()).await?;
-            }
-            Ok(outcome)
         })
     }
 
@@ -2713,11 +2740,12 @@ impl<'run, O: Observer> Run<'run, O> {
         // from a missing generation entry or rechecked later with another stat.
         let mut generations = HashMap::new();
         let mut missing = Vec::new();
+        let retain_generations = self.request.mode == Mode::Extract || !self.generated_sources.is_empty();
         for path in &task.owned_paths {
             match capture_file_generation(Path::new(path)) {
-                Ok(generation) => { generations.insert(path_key(path), generation); }
+                Ok(generation) if retain_generations => { generations.insert(path_key(path), generation); }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(PathBuf::from(path)),
-                Err(_) => {}
+                _ => {}
             }
         }
         // Standalone SFX launchers can belong to cleanup without being read.

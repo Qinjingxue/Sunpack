@@ -1,5 +1,5 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_reader_at_offset, CheapAnchorCell, VolumeAnchor, EMBEDDED_VOLUME, FIRST,
+    probe_volume_anchor_reader_at_offset, CheapAnchor, CheapAnchorCell, VolumeAnchor, EMBEDDED_VOLUME, FIRST,
     MEMBER, RAR_END_CHECKED, RAR_OLD_NUMBERING, RAR_PART_NUMBERING, SEVEN_ZIP_NEXT_HEADER_CRC,
     SEVEN_ZIP_STUB, SFX_CHECKED, TERMINAL, UNRESOLVED_VOLUME, WINRAR_STUB, ZIP_CARRIER_CHECKED,
     ZIP_DIRECTORY_MEMBER, ZIP_EOCD_HEAD, ZIP_LOCAL_HEADER, ZIP_SINGLE_DISK, ZIP_SPLIT_END,
@@ -36,13 +36,18 @@ pub(crate) struct RelationInput {
     pub(crate) path_key: String,
     size: Option<u64>,
     relation_member_eligible: bool,
-    anchor: Option<VolumeAnchor>,
+    // Refine only the facts changed by this relation scope.
+    anchor: Option<Arc<VolumeAnchor>>,
     anchor_cell: Option<CheapAnchorCell>,
 }
 
 impl RelationInput {
     fn name(&self) -> &str {
         physical_filename(&self.path)
+    }
+
+    fn anchor_mut(&mut self) -> Option<&mut VolumeAnchor> {
+        self.anchor.as_mut().map(Arc::make_mut)
     }
 }
 
@@ -117,14 +122,15 @@ impl ProposalValidation {
 /// Structural facts shared by proposals and reused during the same scan.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RelationCache {
-    pub(crate) anchors: HashMap<String, VolumeAnchor>,
+    pub(crate) anchors: HashMap<String, Arc<VolumeAnchor>>,
     names: HashMap<String, filename::NameFeatures>,
 }
 
 #[derive(Debug)]
 pub(crate) enum NativeRelationGroup {
-    Ordinary(RelationInput, bool),
-    Proposal(ProposalValidation),
+    // The discovery table can store either group beside a file row.
+    Ordinary(Box<RelationInput>, bool),
+    Proposal(Box<ProposalValidation>),
 }
 
 pub(crate) struct RelationCandidateData<'a> {
@@ -204,7 +210,7 @@ impl NativeRelationGroup {
     pub(crate) fn part_paths(&self) -> impl Iterator<Item = &str> {
         let (ordinary, proposal) = match self {
             Self::Ordinary(row, _) => (Some(row.path.as_str()), None),
-            Self::Proposal(validation) => (None, Some(validation)),
+            Self::Proposal(validation) => (None, Some(validation.as_ref())),
         };
         ordinary.into_iter().chain(
             proposal.into_iter().flat_map(ProposalValidation::part_paths),
@@ -240,11 +246,12 @@ impl NativeRelationGroup {
 
     pub(crate) fn entry_anchor(&self) -> Option<&VolumeAnchor> {
         match self {
-            Self::Ordinary(row, _) => row.anchor.as_ref(),
+            Self::Ordinary(row, _) => row.anchor.as_deref(),
             Self::Proposal(validation) => validation
                 .facts
                 .anchors
-                .get(&path_key(validation.proposal.entry_path())),
+                .get(&path_key(validation.proposal.entry_path()))
+                .map(Arc::as_ref),
         }
     }
 
@@ -379,7 +386,7 @@ impl NativeRelationGroup {
     pub(crate) fn candidate_data(&self) -> RelationCandidateData<'_> {
         match self {
             Self::Ordinary(row, confirmed) => {
-                let anchor = row.anchor.as_ref();
+                let anchor = row.anchor.as_deref();
                 let parsed = (!confirmed && anchor.is_some_and(anchor_has_split_identity))
                     .then(|| parse_relation_numbered_volume(row.name()))
                     .flatten();
@@ -495,7 +502,7 @@ pub(crate) fn collect_relation_cache<'a>(
 /// scope and verified anchors. No directory enumeration or Embedded scan.
 pub(crate) fn resolve_embedded_volumes(
     snapshots: &[NativeDirectorySnapshot],
-    anchors: Vec<VolumeAnchor>,
+    anchors: Vec<Arc<VolumeAnchor>>,
     excluded: &HashSet<String>,
     mut cache: RelationCache,
 ) -> Vec<NativeRelationGroup> {
@@ -537,11 +544,11 @@ pub(crate) fn resolve_embedded_volumes(
 /// sharing. Conflicting source extents remain speculative until execution.
 fn resolve_shared_carrier_volumes(
     snapshots: &[NativeDirectorySnapshot],
-    anchors: Vec<VolumeAnchor>,
+    anchors: Vec<Arc<VolumeAnchor>>,
     excluded: &HashSet<String>,
     mut cache: RelationCache,
 ) -> Vec<NativeRelationGroup> {
-    let mut by_path: HashMap<String, Vec<&VolumeAnchor>> = HashMap::new();
+    let mut by_path: HashMap<String, Vec<&Arc<VolumeAnchor>>> = HashMap::new();
     for anchor in &anchors {
         by_path
             .entry(path_key(&anchor.path))
@@ -637,7 +644,7 @@ fn resolve_shared_carrier_volumes(
                     .map(|source| (path_key(&source.path), Some(source.start))),
             );
         }
-        output.push(NativeRelationGroup::Proposal(validation));
+        output.push(NativeRelationGroup::Proposal(Box::new(validation)));
     }
     for mut anchor in anchors {
         if covered.contains(&(path_key(&anchor.path), anchor.structure_offset)) {
@@ -647,7 +654,7 @@ fn resolve_shared_carrier_volumes(
             continue;
         };
         let needs_password = anchor.needs_password || anchor.wrong_password;
-        anchor.flags |= UNRESOLVED_VOLUME;
+        Arc::make_mut(&mut anchor).flags |= UNRESOLVED_VOLUME;
         // Only an entry can retain an unresolved logical input. Orphan slices
         // remain available in the source snapshot for a later entry.
         let path = anchor.path.clone();
@@ -662,7 +669,7 @@ fn resolve_shared_carrier_volumes(
             "zip" => "zip_spanned",
             _ => "numeric_suffix",
         };
-        output.push(NativeRelationGroup::Proposal(ProposalValidation {
+        output.push(NativeRelationGroup::Proposal(Box::new(ProposalValidation {
             attempts: None,
             status: if needs_password {
                 ProposalStatus::NeedsPassword
@@ -687,7 +694,7 @@ fn resolve_shared_carrier_volumes(
                 RelationFailureReason::MissingVolume
             }),
             unresolved: Vec::new(),
-        }));
+        })));
     }
     output
 }
@@ -811,7 +818,7 @@ fn build_candidate_groups(
     output.extend(
         selected_groups
             .into_iter()
-            .map(|index| NativeRelationGroup::Proposal(validations[index].take().unwrap())),
+            .map(|index| NativeRelationGroup::Proposal(Box::new(validations[index].take().unwrap()))),
     );
 
     for row in directory_rows.into_iter().filter(|row| {
@@ -823,8 +830,8 @@ fn build_candidate_groups(
                     && (a.multivolume || a.continuation_from_previous)
             })
     }) {
-        let confirmed = row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
-        output.push(NativeRelationGroup::Ordinary(row, confirmed));
+        let confirmed = row.anchor.as_deref().is_some_and(anchor_is_relation_archive);
+        output.push(NativeRelationGroup::Ordinary(Box::new(row), confirmed));
     }
     output
 }
@@ -845,7 +852,7 @@ fn promote_sfx_archive_anchor(
     row: &RelationInput,
     reader: &crate::io::reader::ManagedReader,
 ) -> Option<VolumeAnchor> {
-    let Some(facts) = row.anchor.as_ref() else {
+    let Some(facts) = row.anchor.as_deref() else {
         return None;
     };
     if facts.pe_state != PeState::Confirmed {
@@ -877,7 +884,7 @@ fn promote_sfx_archive_anchor(
             "winrar_sfx" => WINRAR_STUB,
             _ => return None,
         };
-        let mut anchor = row.anchor.clone().unwrap_or_default();
+        let mut anchor = facts.clone();
         anchor.pe_state = PeState::Confirmed;
         anchor.pe_image_end = Some(image_end);
         anchor.sfx = true;
@@ -1124,7 +1131,7 @@ fn canonical_volume_name(
 
 fn proposal_logical_size(
     proposal: &RelationProposal,
-    anchors: &HashMap<String, VolumeAnchor>,
+    anchors: &HashMap<String, Arc<VolumeAnchor>>,
 ) -> Option<u64> {
     proposal.volumes.iter().try_fold(0u64, |total, (path, _)| {
         anchors
@@ -1140,7 +1147,7 @@ fn proposal_logical_size(
 /// `x.rar`/`x.r00`, and `x.rar`/`x.r00` files of a new-numbering set as parts.
 fn proposal_split_family(
     proposal: &RelationProposal,
-    anchors: &HashMap<String, VolumeAnchor>,
+    anchors: &HashMap<String, Arc<VolumeAnchor>>,
 ) -> Cow<'static, str> {
     let style = proposal.style;
     if proposal.format == "rar" && style != "rar_sfx_part" {

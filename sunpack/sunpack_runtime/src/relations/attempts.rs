@@ -568,7 +568,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
                                     represented.insert(i);
                                     let size = view.rows[i]
                                         .anchor
-                                        .as_ref()
+                                        .as_deref()
                                         .map_or(0, VolumeAnchor::payload_size);
                                     smallest = smallest.min(size);
                                     if size >= largest {

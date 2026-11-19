@@ -7,11 +7,11 @@ fn row(path: &str, seed: bool, eligible: bool) -> RelationInput {
         size: Some(17),
         relation_member_eligible: eligible,
         anchor_cell: None,
-        anchor: seed.then(|| VolumeAnchor {
+        anchor: seed.then(|| Arc::new(VolumeAnchor {
             multivolume: true,
             internal_volume_number: Some(1),
             ..VolumeAnchor::default()
-        }),
+        })),
     }
 }
 
@@ -65,7 +65,7 @@ fn standalone_anchor_does_not_activate_siblings() {
         row(r"C:\game\payload.zip", true, true),
         row(r"C:\game\payload.001", false, true),
     ];
-    rows[0].anchor.as_mut().unwrap().standalone = true;
+    rows[0].anchor_mut().unwrap().standalone = true;
     assert_eq!(scope(&rows, &[0]).rows, vec![0]);
     assert!(scope(&rows, &[]).rows.is_empty());
 }

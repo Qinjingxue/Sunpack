@@ -143,14 +143,14 @@ pub(super) fn collect(
                 // A transient read error is not evidence against PE identity.
                 continue;
             };
-            let anchor = rows[i].anchor.as_mut().unwrap();
+            let anchor = rows[i].anchor_mut().unwrap();
             anchor.pe_state = probe.state();
             anchor.pe_image_end = probe.image_end();
         }
         if let Some(anchor) = promote_sfx_archive_anchor(&rows[i], &reader) {
-            rows[i].anchor = Some(anchor);
+            rows[i].anchor = Some(Arc::new(anchor));
         }
-        if let Some(anchor) = rows[i].anchor.as_mut() {
+        if let Some(anchor) = rows[i].anchor_mut() {
             anchor.flags |= SFX_CHECKED;
         }
         remember_tail_facts(&rows[i], rows[i].anchor.as_ref().unwrap());
@@ -205,8 +205,8 @@ pub(super) fn collect(
         }))
         .collect::<Vec<_>>();
     for (i, anchor) in updates {
-        remember_tail_facts(&rows[i], &anchor);
-        rows[i].anchor = Some(anchor);
+        rows[i].anchor = Some(Arc::new(anchor));
+        remember_tail_facts(&rows[i], rows[i].anchor.as_ref().unwrap());
     }
     for indexes in index.rows_by_stem.values() {
         let zip_bucket = indexes.iter().any(|&i| {
@@ -247,8 +247,8 @@ pub(super) fn collect(
                 })
                 .collect();
             for (i, anchor) in updates {
-                remember_tail_facts(&rows[i], &anchor);
-                rows[i].anchor = Some(anchor);
+                rows[i].anchor = Some(Arc::new(anchor));
+                remember_tail_facts(&rows[i], rows[i].anchor.as_ref().unwrap());
             }
         }
         refine_zip_members(rows, indexes);
@@ -263,11 +263,12 @@ pub(super) fn collect(
         });
         if !raw_head {
             for &i in indexes {
-                if let Some(a) = rows[i].anchor.as_mut().filter(|a| {
+                if rows[i].anchor.as_ref().is_some_and(|a| {
                     a.has_any(ZIP_EOCD_HEAD)
                         && a.has_any(ZIP_SINGLE_DISK)
                         && a.expected_logical_size == Some(a.size)
                 }) {
+                    let a = rows[i].anchor_mut().unwrap();
                     a.standalone = true;
                     a.multivolume = false;
                     a.structure_offset = Some(0);
@@ -280,7 +281,7 @@ pub(super) fn collect(
 /// Only byte facts enter the existing generation cell, before any peer-based
 /// inference. Embedded offsets and decrypted headers must not replace a cheap
 /// head, and concurrent requests must never downgrade a more complete tail.
-fn remember_tail_facts(row: &RelationInput, anchor: &VolumeAnchor) {
+fn remember_tail_facts(row: &RelationInput, anchor: &Arc<VolumeAnchor>) {
     let checks = SFX_CHECKED | RAR_END_CHECKED | ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED;
     if !anchor.error.is_empty()
         || anchor.encrypted
@@ -321,9 +322,7 @@ fn remember_tail_facts(row: &RelationInput, anchor: &VolumeAnchor) {
     {
         return;
     }
-    *cached = Some(crate::analysis_native::volume_anchor::CheapAnchor::Full(
-        Arc::new(anchor.clone()),
-    ));
+    *cached = Some(CheapAnchor::Full(Arc::clone(anchor)));
 }
 
 fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
@@ -490,9 +489,9 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                 })
         });
         if let Some((i, end, size)) = carrier_extent {
-            rows[terminal].anchor.as_mut().unwrap().zip_head_size = Some(size);
+            rows[terminal].anchor_mut().unwrap().zip_head_size = Some(size);
             if unique_directory {
-                rows[i].anchor.as_mut().unwrap().payload_end = Some(end);
+                rows[i].anchor_mut().unwrap().payload_end = Some(end);
             }
         }
         // Terminal directory geometry independently locates its disk base even
@@ -503,7 +502,7 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                 .checked_sub(directory.size)
                 .and_then(|n| n.checked_sub(directory.offset))
             {
-                rows[terminal].anchor.as_mut().unwrap().structure_offset = Some(base);
+                rows[terminal].anchor_mut().unwrap().structure_offset = Some(base);
             }
         }
         if !unique_directory {
@@ -511,7 +510,7 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
         }
         for (i, slot) in matches {
             if let Some((slot, base)) = slot {
-                let a = rows[i].anchor.as_mut().unwrap();
+                let a = rows[i].anchor_mut().unwrap();
                 a.internal_volume_number = Some(slot);
                 a.structure_offset = Some(base);
                 a.strong = true;
@@ -560,7 +559,7 @@ fn refine_seven_zip_terminal(rows: &mut [RelationInput], indexes: &[usize]) {
         }
     }
     if let Some(i) = terminal {
-        let a = rows[i].anchor.as_mut().unwrap();
+        let a = rows[i].anchor_mut().unwrap();
         a.format = "7z";
         a.strong = true;
         a.multivolume = true;

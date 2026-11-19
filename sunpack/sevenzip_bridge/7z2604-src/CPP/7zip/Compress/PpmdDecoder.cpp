@@ -41,7 +41,10 @@ Z7_COM7F_IMF(CDecoder::SetDecoderProperties2(const Byte *props, UInt32 size))
     return E_NOTIMPL;
   if (!_inStream.Alloc(1 << 20))
     return E_OUTOFMEMORY;
-  if (!Ppmd7_Alloc(&_ppmd, memSize, &g_BigAlloc))
+  const BoolInt allocated = memSize < SUNPACK_LARGE_ALLOCATION
+      ? Ppmd7_Alloc(&_ppmd, memSize, &g_BigAlloc)
+      : Ppmd7_AllocReserved(&_ppmd, memSize, &g_BigAlloc, &sunpack_memory_reservation_ops);
+  if (!allocated)
     return E_OUTOFMEMORY;
   return S_OK;
 }
@@ -73,6 +76,8 @@ HRESULT CDecoder::CodeSpec(Byte *memStream, UInt32 size)
       CHECK_EXTRA_ERROR
       _status = kStatus_Normal;
       Ppmd7_Init(&_ppmd, _order);
+      if (_ppmd.CommitFailed)
+        return (_res = E_OUTOFMEMORY);
       break;
     default: break;
   }
@@ -91,7 +96,7 @@ HRESULT CDecoder::CodeSpec(Byte *memStream, UInt32 size)
     for (; buf != lim; buf++)
     {
       sym = Ppmd7z_DecodeSymbol(&_ppmd);
-      if (_inStream.Extra || sym < 0)
+      if (_inStream.Extra || sym < 0 || _ppmd.CommitFailed)
         break;
       *buf = (Byte)sym;
     }
@@ -102,6 +107,8 @@ HRESULT CDecoder::CodeSpec(Byte *memStream, UInt32 size)
     _processedSize += (size_t)(buf - memStream);
   }
 
+  if (_ppmd.CommitFailed)
+    return (_res = E_OUTOFMEMORY);
   CHECK_EXTRA_ERROR
   
   if (sym >= 0)
@@ -173,6 +180,7 @@ Z7_COM7F_IMF(CDecoder::SetOutStreamSize(const UInt64 *outSize))
   if (_outSizeDefined)
     _outSize = *outSize;
   _processedSize = 0;
+  _ppmd.CommitFailed = False;
   _status = kStatus_NeedInit;
   _res = SZ_OK;
   return S_OK;

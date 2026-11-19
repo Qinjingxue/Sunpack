@@ -33,14 +33,14 @@ impl<'a> RelationSource<'a> {
         }
     }
 
-    fn anchor(&self, row: usize) -> Option<&'a VolumeAnchor> {
+    fn anchor(&self, row: usize) -> Option<&'a Arc<VolumeAnchor>> {
         match self {
             Self::Snapshot(snapshot, cached) => cached
                 .filter(|cache| !cache.anchors.is_empty())
                 .and_then(|cache| cache.anchors.get(&path_key(self.path(row))))
                 .or(snapshot.table.relation_anchors[row]
                     .as_ref()
-                    .and_then(|fact| fact.anchor())),
+                    .and_then(CheapAnchor::shared_anchor)),
             #[cfg(test)]
             Self::Physical(rows) => rows[row].anchor.as_ref(),
         }
@@ -63,7 +63,7 @@ impl<'a> RelationSource<'a> {
             anchor: self.anchor(row).cloned().or_else(|| match self {
                 Self::Snapshot(snapshot, _) => snapshot.table.relation_anchors[row]
                     .as_ref()
-                    .map(|fact| fact.materialize(self.path(row), size.unwrap_or(0))),
+                    .map(|fact| Arc::new(fact.materialize(self.path(row), size.unwrap_or(0)))),
                 #[cfg(test)]
                 Self::Physical(_) => None,
             }),
@@ -152,7 +152,7 @@ impl RelationScopeIndex {
         // parsing filenames. With overrides, first narrow the scope by name
         // to avoid a path-key lookup for unrelated rows.
         let direct_anchors = !matches!(source, RelationSource::Snapshot(_, Some(cache)) if !cache.anchors.is_empty());
-        let has_seed = |row| source.anchor(row).is_some_and(BucketIndex::has_seed);
+        let has_seed = |row| source.anchor(row).is_some_and(|anchor| BucketIndex::has_seed(anchor));
         for row in source.indices() {
             if direct_anchors && !has_seed(row) {
                 continue;

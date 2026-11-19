@@ -7,7 +7,7 @@ fn row(name: &str, format: &'static str, slot: Option<u32>, terminal: bool) -> R
         size: Some(100),
         relation_member_eligible: true,
         anchor_cell: None,
-        anchor: Some(VolumeAnchor {
+        anchor: Some(Arc::new(VolumeAnchor {
             path: name.into(),
             size: 100,
             format,
@@ -23,7 +23,7 @@ fn row(name: &str, format: &'static str, slot: Option<u32>, terminal: bool) -> R
                     _ => 0,
                 },
             ..Default::default()
-        }),
+        })),
     }
 }
 
@@ -39,11 +39,11 @@ fn slots(validation: &ProposalValidation) -> Vec<u32> {
 fn shared_carrier_keeps_unique_terminal_and_fixed_heads_in_either_slice_order() {
     for reverse in [false, true] {
         let mut shared_head = row("same.shared", "rar", Some(1), false);
-        shared_head.anchor.as_mut().unwrap().structure_offset = Some(10);
-        shared_head.anchor.as_mut().unwrap().payload_end = Some(30);
+        shared_head.anchor_mut().unwrap().structure_offset = Some(10);
+        shared_head.anchor_mut().unwrap().payload_end = Some(30);
         let mut shared_tail = row("same.shared", "rar", Some(3), true);
-        shared_tail.anchor.as_mut().unwrap().structure_offset = Some(40);
-        shared_tail.anchor.as_mut().unwrap().payload_end = Some(60);
+        shared_tail.anchor_mut().unwrap().structure_offset = Some(40);
+        shared_tail.anchor_mut().unwrap().payload_end = Some(60);
         let mut shared = vec![shared_head, shared_tail];
         if reverse { shared.reverse(); }
         let mut rows = vec![row("same.game.part1.rar", "rar", Some(1), false),
@@ -127,14 +127,14 @@ fn competing_terminal_numbers_retain_each_structurally_legal_length() {
 #[test]
 fn spanned_carrier_keeps_ordered_disk_sizes_and_nonuniform_fallback() {
     let mut head = row("same.head", "zip", Some(1), false);
-    let anchor = head.anchor.as_mut().unwrap();
+    let anchor = head.anchor_mut().unwrap();
     anchor.size = 200;
     anchor.structure_offset = Some(10);
     anchor.carrier_limit = Some(180);
     let middle = |name, size| {
         let mut row = row(name, "zip", Some(2), false);
         row.size = Some(size);
-        let anchor = row.anchor.as_mut().unwrap();
+        let anchor = row.anchor_mut().unwrap();
         anchor.size = size;
         anchor.flags = MEMBER | ZIP_DIRECTORY_MEMBER;
         row
@@ -293,7 +293,7 @@ fn optional_numeric_slots_do_not_force_a_gap_with_same_stem_noise() {
         row("same.z3.w0004", "", None, false),
         row("same.notes", "", None, false),
     ];
-    rows[0].anchor.as_mut().unwrap().expected_logical_size = Some(300);
+    rows[0].anchor_mut().unwrap().expected_logical_size = Some(300);
     let mut groups = resolve(&rows);
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].reason, None);
@@ -373,19 +373,19 @@ fn encrypted_rar_sfx_and_plain_members_share_one_canonical_channel() {
         row("same.part2.rar", "rar", None, false),
     ];
     for row in &mut rows {
-        let anchor = row.anchor.as_mut().unwrap();
+        let anchor = row.anchor_mut().unwrap();
         anchor.needs_password = true;
         anchor.relation_has_next = None;
         anchor.flags = RAR_VERSION_5;
     }
-    let head = rows[0].anchor.as_mut().unwrap();
+    let head = rows[0].anchor_mut().unwrap();
     head.sfx = true;
     head.pe_state = PeState::Confirmed;
     head.structure_offset = Some(128);
     assert!(resolve(&rows).is_empty());
     // Filenames alone cannot invent an entry behind encrypted headers.
     // Once common header resolution proves it, reuse the same channel.
-    rows[0].anchor.as_mut().unwrap().internal_volume_number = Some(1);
+    rows[0].anchor_mut().unwrap().internal_volume_number = Some(1);
     let mut groups = resolve(&rows);
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].reason, None);
@@ -423,7 +423,7 @@ fn complete_stronger_mapping_does_not_claim_numeric_residual_noise() {
         row("same.x3", "", None, false),
         row("same.2024.txt", "", None, false),
     ];
-    rows[0].anchor.as_mut().unwrap().expected_logical_size = Some(200);
+    rows[0].anchor_mut().unwrap().expected_logical_size = Some(200);
     let groups = resolve(&rows);
     assert_eq!(slots(&groups[0]), vec![1, 2]);
     assert_eq!(groups[0].reason, None);
@@ -438,7 +438,7 @@ fn loose_numbers_respect_format_roles_and_do_not_drop_owned_members() {
         row("same.z0.a4.b7", "zip", Some(4), true),
         row("same.unassigned", "zip", None, false),
     ];
-    rows[4].anchor.as_mut().unwrap().flags &= !ZIP_SPLIT_START;
+    rows[4].anchor_mut().unwrap().flags &= !ZIP_SPLIT_START;
     let groups = resolve(&rows);
     assert!(groups[0].attempts.is_some());
     assert!(validation_owned_paths(&groups[0]).contains(&rows[4].path));
@@ -584,15 +584,15 @@ fn lone_proven_split_member_waits_for_an_entry() {
 #[test]
 fn singleton_encrypted_rar_requires_split_structure() {
     let mut rows = vec![row("same.part1.rar", "rar", None, false)];
-    let anchor = rows[0].anchor.as_mut().unwrap();
+    let anchor = rows[0].anchor_mut().unwrap();
     anchor.multivolume = false;
     anchor.needs_password = true;
     anchor.relation_has_next = None;
     anchor.flags &= !(FIRST | MEMBER | TERMINAL);
     assert!(resolve(&rows).is_empty());
-    rows[0].anchor.as_mut().unwrap().multivolume = true;
+    rows[0].anchor_mut().unwrap().multivolume = true;
     assert!(resolve(&rows).is_empty());
-    rows[0].anchor.as_mut().unwrap().internal_volume_number = Some(1);
+    rows[0].anchor_mut().unwrap().internal_volume_number = Some(1);
     assert_eq!(resolve(&rows).len(), 1);
 }
 
@@ -626,7 +626,7 @@ fn virtual_siblings_share_padding_despite_physical_widths() {
 fn launcher_ownership_respects_the_bucket_and_logical_family() {
     for name in ["same.exe", "same.unrelated.exe", "other.exe"] {
         let mut launcher = row(name, "", None, false);
-        let anchor = launcher.anchor.as_mut().unwrap();
+        let anchor = launcher.anchor_mut().unwrap();
         anchor.sfx = true;
         anchor.pe_state = PeState::Confirmed;
         anchor.flags = SEVEN_ZIP_STUB;

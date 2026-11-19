@@ -82,7 +82,7 @@ typedef struct
   UInt32 GlueCount;
   UInt32 AlignOffset;
   Byte *Base, *LoUnit, *HiUnit, *Text, *UnitsStart;
-  /* RAR can reserve the whole model and commit the two gaps from their edges. */
+  /* Large models can reserve address space and commit the two gaps from their edges. */
   SunpackMemoryReservation Reservation;
   const SunpackMemoryReservationOps *ReservationOps;
   Byte *TextEnd, *SpillBegin, *UnitsEnd, *ContextsBegin;

@@ -47,6 +47,7 @@ fn targeted_volume_peer_scan_reuses_known_facts_and_ignores_other_stems() {
         relation_sources: vec![snapshot, other], ..Default::default()
     };
     let mut batch = NativeEmbeddedBatch::default();
+    let anchor = Arc::new(anchor);
     batch.pending_volumes.push(PendingEmbeddedVolume { index: 0, anchor: anchor.clone(), scan: None });
     batch.relation_cache.anchors.insert(path_key(&paths[3]), anchor.clone());
     batch.excluded.insert(path_key(&paths[4]));

@@ -1210,7 +1210,10 @@ fn project_segments(
             );
         }
     }
-    let mut inputs = Vec::new();
+    // The seed plan is replaced by the discovered segments. Its existing
+    // allocation already fits the common single-segment archive.
+    let mut inputs = std::mem::take(&mut task.inputs);
+    inputs.clear();
     for item in scan.candidates() {
         let resolution = resolutions.remove(&item.offset);
         let resolved_end = resolution.as_ref().and_then(|result| result.end_offset);

@@ -1,5 +1,5 @@
 use crate::analysis_native::volume_anchor::{
-    CheapAnchor, EMBEDDED_VOLUME, RAR_PASSWORD_MATCHED_INCOMPLETE, SEVEN_ZIP_CARRIER_INTERRUPTED,
+    CheapAnchor, VolumeAnchor, EMBEDDED_VOLUME, RAR_PASSWORD_MATCHED_INCOMPLETE, SEVEN_ZIP_CARRIER_INTERRUPTED,
 };
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
@@ -54,8 +54,7 @@ impl EmbeddedVolumeOutcome {
 
 enum Candidate {
     File(Arc<DirectorySnapshotTable>, usize),
-    // Keep ordinary file rows compact; relation facts live with their candidate.
-    Relation(Box<NativeRelationGroup>),
+    Relation(NativeRelationGroup),
 }
 
 impl Candidate {
@@ -84,7 +83,7 @@ pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
     // Decrypted continuations may outlive their headless proposal. Transfer
     // their existing facts to the same embedded peer frontier, without I/O.
-    volume_seeds: Vec<(Arc<DirectorySnapshotTable>, usize, crate::analysis_native::volume_anchor::VolumeAnchor)>,
+    volume_seeds: Vec<(Arc<DirectorySnapshotTable>, usize, Arc<VolumeAnchor>)>,
     volume_entry_peers: Vec<(Arc<DirectorySnapshotTable>, usize)>,
     // Shared physical facts; row indices survive only for this discovery scan.
     relation_sources: Vec<NativeDirectorySnapshot>,
@@ -224,7 +223,7 @@ impl NativeCandidateTable {
 
     fn relation_cache(&self) -> RelationCache {
         collect_relation_cache(self.rows.iter().filter_map(|row| match row {
-            Candidate::Relation(group) => Some(group.as_ref()),
+            Candidate::Relation(group) => Some(group),
             Candidate::File(..) => None,
         }))
     }
@@ -302,7 +301,7 @@ pub(crate) struct NativeEmbeddedBatch {
 
 struct PendingEmbeddedVolume {
     index: usize,
-    anchor: crate::analysis_native::volume_anchor::VolumeAnchor,
+    anchor: Arc<VolumeAnchor>,
     scan: Option<Arc<NativeScanResult>>,
 }
 
@@ -353,7 +352,7 @@ impl NativeEmbeddedBatch {
                             let retain_scan = anchor.needs_password || independent;
                             self.pending_volumes.push(PendingEmbeddedVolume {
                                 index,
-                                anchor,
+                                anchor: Arc::new(anchor),
                                 scan: retain_scan.then(|| Arc::clone(&scan)),
                             });
                         }
@@ -649,7 +648,7 @@ impl NativeEmbeddedBatch {
                 if !stems.contains(&catalog_stem(path)) {
                     continue;
                 }
-                let anchor = cache.anchors.get(&key).or(direct);
+                let anchor = cache.anchors.get(&key).map(Arc::as_ref).or(direct);
                 if anchor.is_some_and(|a| a.needs_password) {
                     requests.insert(path.as_str());
                 }
@@ -694,7 +693,7 @@ impl NativeEmbeddedBatch {
             for row in snapshot.rows() {
                 let Some(anchor) = snapshot.table.relation_anchors[row]
                     .as_ref()
-                    .and_then(CheapAnchor::anchor) else { continue; };
+                    .and_then(CheapAnchor::shared_anchor) else { continue; };
                 let key = path_key(&snapshot.table.paths[row]);
                 if external.remove(key.as_str()) {
                     cache.anchors.insert(key, anchor.clone());
@@ -733,7 +732,11 @@ impl NativeEmbeddedBatch {
                             crate::io::reader::ManagedReader::open(&anchor.path)?.probe_reader();
                         let (resolved, index) =
                             resolve_encrypted_relation_anchor(anchor, &reader, values, true, None)?;
-                        *anchor = resolved;
+                        if let Some(current) = Arc::get_mut(anchor) {
+                            *current = resolved;
+                        } else {
+                            *anchor = Arc::new(resolved);
+                        }
                         Ok(index.map(|index| {
                             (
                                 (path_key(&anchor.path), anchor.structure_offset.unwrap_or(0)),
@@ -802,7 +805,7 @@ impl NativeEmbeddedBatch {
             if !anchor.multivolume
                 || !batch.claims_offset(&key, anchor.structure_offset.unwrap_or(0))
             {
-                anchor.flags |= EMBEDDED_VOLUME;
+                Arc::make_mut(&mut anchor).flags |= EMBEDDED_VOLUME;
                 anchors.push(anchor);
             }
             // Project once after Relations; the planner combines logical inputs
@@ -948,7 +951,7 @@ impl NativeEmbeddedBatch {
                 })
                 .cloned();
             let index = table.rows.len();
-            table.rows.push(Candidate::Relation(Box::new(group)));
+            table.rows.push(Candidate::Relation(group));
             fallback.push(EmbeddedVolumeOutcome::Relation {
                 index,
                 password,
@@ -985,11 +988,18 @@ impl NativeCandidateTable {
         // Embedded is the only producer in deep mode. Keep raw peers for
         // directed volume recovery on both discovery paths.
         let selected = selected.as_ref().unwrap_or(filtered);
-        table.rows.reserve_exact(groups.len() + selected.rows().len());
-        table.rows.extend(groups.into_iter().map(|group| Candidate::Relation(Box::new(group))));
-        table.rows.extend(selected.rows()
-            .filter(|&row| !selected.table.is_dir(row)
+        let file_rows = || {
+            selected.rows().filter(|&row| !selected.table.is_dir(row)
                 && (deep || selected.table.file_route(row) != FILE_ROUTE_RELATIONS))
+        };
+        let file_capacity = if groups.is_empty() {
+            selected.rows().len()
+        } else {
+            file_rows().count()
+        };
+        table.rows.reserve_exact(groups.len() + file_capacity);
+        table.rows.extend(groups.into_iter().map(Candidate::Relation));
+        table.rows.extend(file_rows()
             .map(|row| Candidate::File(Arc::clone(&selected.table), row)));
         if let Some(targets) = targets {
             targets.retain(&mut table.rows);
@@ -1076,7 +1086,7 @@ impl NativeCandidateTable {
         let mut previous: HashSet<_> = cached.anchors.iter()
             .filter(|(_, a)| a.needs_password && a.rar5_encryption.is_some())
             .map(|(path, _)| path.clone()).collect();
-        cached.anchors.extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
+        cached.anchors.extend(anchors.into_iter().map(|a| (path_key(&a.path), Arc::new(a))));
         let current_snapshots = (!departed.is_empty()).then(|| {
             (
                 raw_snapshot.without_path_keys(departed),
@@ -1111,11 +1121,7 @@ impl NativeCandidateTable {
         }
         self.rows.retain(|row| matches!(row, Candidate::File(..)));
         let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());
-        replacement.extend(
-            groups
-                .into_iter()
-                .map(|group| Candidate::Relation(Box::new(group))),
-        );
+        replacement.extend(groups.into_iter().map(Candidate::Relation));
         replacement.append(&mut self.rows);
         self.rows = replacement;
         if let Some(targets) = targets {
@@ -1226,11 +1232,7 @@ impl NativeCandidateTable {
         let cancellation = crate::io::cancellation::Cancellation::current();
         cancellation.check_io()?;
         let mut routes = NativeDiscoveryRoutes::default();
-        let mut claimed: HashSet<String> = HashSet::new();
-        let mut speculative = HashSet::new();
-        let mut blocked: HashSet<String> = HashSet::new();
         let mut relation_residual = Vec::new();
-        let mut detection_residual = Vec::new();
         for (index, row) in self.rows.iter().enumerate() {
             let Candidate::Relation(group) = row else {
                 continue;
@@ -1240,19 +1242,36 @@ impl NativeCandidateTable {
                 && (data.needs_password
                     || (data.multivolume && (data.is_split || data.structural_non_head)))
             {
-                blocked.extend(group.related_paths().map(path_key));
                 routes.relations.push((index, false));
             } else if data.relation_confirmed && matches!(data.format_hint, "rar" | "7z" | "zip") {
-                claimed.extend(group.owned_paths().map(path_key));
-                speculative.extend(
-                    group
-                        .speculative_paths()
-                        .filter(|path| *path != data.entry_path)
-                        .map(path_key),
-                );
                 routes.relations.push((index, true));
             } else {
                 relation_residual.push(index);
+            }
+        }
+        cancellation.check_io()?;
+        if routes.relations.len() == self.rows.len() {
+            return Ok(routes);
+        }
+        // Only other discovery routes consume the path claims. When Relations
+        // covers the entire batch, no normalized path copies are needed here.
+        let mut claimed: HashSet<String> = HashSet::new();
+        let mut speculative = HashSet::new();
+        let mut blocked: HashSet<String> = HashSet::new();
+        let mut detection_residual = Vec::new();
+        for &(index, confirmed) in &routes.relations {
+            let Candidate::Relation(group) = &self.rows[index] else {
+                unreachable!();
+            };
+            if confirmed {
+                claimed.extend(group.owned_paths().map(path_key));
+                speculative.extend(
+                    group.speculative_paths()
+                        .filter(|path| *path != group.entry_path())
+                        .map(path_key),
+                );
+            } else {
+                blocked.extend(group.related_paths().map(path_key));
             }
         }
         // Ordinary detection uses only the leading structure already read by

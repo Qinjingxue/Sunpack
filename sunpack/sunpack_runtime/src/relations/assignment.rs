@@ -104,7 +104,7 @@ impl BucketView<'_> {
                 fixed
                     .slots
                     .iter()
-                    .map(|(&n, &i)| (n, self.rows[i].anchor.as_ref())),
+                    .map(|(&n, &i)| (n, self.rows[i].anchor.as_deref())),
             ) == ProposalStatus::Valid
     }
 
@@ -954,7 +954,7 @@ pub(super) fn materialize(
 ) -> Option<ProposalValidation> {
     let rows = view.rows;
     if !assignment.slots.values().any(|i| {
-        rows[*i].anchor.as_ref().is_some_and(VolumeAnchor::is_volume_entry)
+        rows[*i].anchor.as_deref().is_some_and(VolumeAnchor::is_volume_entry)
     }) {
         return None;
     }

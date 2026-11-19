@@ -28,7 +28,7 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
     }
     let proposal = &validation.proposal;
     let unresolved_head = proposal.head_path()
-        .and_then(|path| validation.facts.anchors.get(&path_key(path)))
+        .and_then(|path| validation.facts.anchors.get(&path_key(path)).map(Arc::as_ref))
         .is_some_and(VolumeAnchor::has_unresolved_carrier_extent);
     if let Some((key, end)) = mapped_carrier_end(
         proposal.format,
@@ -36,18 +36,15 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         proposal
             .volumes
             .iter()
-            .map(|p| (p.1, validation.facts.anchors.get(&path_key(&p.0)))),
+            .map(|p| (p.1, validation.facts.anchors.get(&path_key(&p.0)).map(Arc::as_ref))),
     )
     .map(|(head, end)| (path_key(&head.path), end))
     {
-        Arc::make_mut(&mut validation.facts)
-            .anchors
-            .get_mut(&key)
-            .unwrap()
-            .payload_end = Some(end);
+        let anchor = Arc::make_mut(&mut validation.facts).anchors.get_mut(&key).unwrap();
+        Arc::make_mut(anchor).payload_end = Some(end);
     }
     let anchors = &validation.facts.anchors;
-    let get = |path: &str| anchors.get(&path_key(path));
+    let get = |path: &str| anchors.get(&path_key(path)).map(Arc::as_ref);
     if proposal
         .volumes
         .iter()
@@ -83,7 +80,7 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
                     // publishing the speculative trim as a physical boundary.
                     if let Some(head) = Arc::make_mut(&mut validation.facts).anchors
                         .get_mut(&path_key(&proposal.volumes[0].0)) {
-                        head.payload_end = None;
+                        Arc::make_mut(head).payload_end = None;
                     }
                     validation.status = ProposalStatus::Inconclusive;
                     validation.reason = Some(RelationFailureReason::MissingVolume);

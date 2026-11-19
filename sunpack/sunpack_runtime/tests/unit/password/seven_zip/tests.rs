@@ -392,24 +392,28 @@ fn encrypted_external_names_supply_password_proof_for_clear_members() {
 
 #[test]
 fn ppmd_encoded_header_confirms_password_from_decoder_output_crc() {
-    // NanaZip PPMd order 6 with a 64 KiB model. The decoded header is
-    // [Header, FilesInfo, number of files = 0, End, End].
+    // NanaZip PPMd order 6. The header is [Header, FilesInfo, 0 files, End, End].
+    // It fits without a model restart at either declared size. The maximum
+    // size exercises both the unaligned model extent and 4 GiB reservation.
     let packed = [0, 0x01, 0x07, 0xd0, 0xcd, 0x32, 0x9f, 0x4e];
     let encrypted = direct_key_ciphertext(&packed);
-    let mut header = vec![
-        0x17, 6, 0, 1, 9, 16, 0,
-        7, 11, 1, 0, 2, 0x24, 6, 0xf1, 7, 1, 1, 0x3f,  // AES
-        0x23, 3, 4, 1, 5, 6, 0, 0, 1, 0,             // PPMd
-        1, 0, 12, packed.len() as u8, 5, 10, 1,
-    ];
-    header.extend(crc32fast::hash(&[1, 5, 0, 0, 0]).to_le_bytes());
-    header.extend([0, 0]);
-    let archive = archive_with_descriptor(&encrypted, &header);
-    let context = prepare_seven_zip(std::io::Cursor::new(&archive), archive.len() as u64, &())
-        .unwrap_or_else(|_| panic!("PPMd encoded header descriptor"));
-    let proof = context.verify(&[Arc::from("wrong"), Arc::from("secret")]).unwrap();
-    assert_eq!(proof.matched_indices, [1]);
-    assert_eq!(proof.final_confirmation_required, Some(false));
+    for memory in [1_u32 << 16, u32::MAX - 36] {
+        let mut header = vec![
+            0x17, 6, 0, 1, 9, 16, 0,
+            7, 11, 1, 0, 2, 0x24, 6, 0xf1, 7, 1, 1, 0x3f, // AES
+            0x23, 3, 4, 1, 5, 6, // PPMd
+        ];
+        header.extend(memory.to_le_bytes());
+        header.extend([1, 0, 12, packed.len() as u8, 5, 10, 1]);
+        header.extend(crc32fast::hash(&[1, 5, 0, 0, 0]).to_le_bytes());
+        header.extend([0, 0]);
+        let archive = archive_with_descriptor(&encrypted, &header);
+        let context = prepare_seven_zip(std::io::Cursor::new(&archive), archive.len() as u64, &())
+            .unwrap_or_else(|_| panic!("PPMd encoded header descriptor"));
+        let proof = context.verify(&[Arc::from("wrong"), Arc::from("secret")]).unwrap();
+        assert_eq!(proof.matched_indices, [1]);
+        assert_eq!(proof.final_confirmation_required, Some(false));
+    }
 }
 
 #[test]

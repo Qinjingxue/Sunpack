@@ -715,6 +715,7 @@ struct CommandResult {
     errors: Vec<String>,
     items: Vec<Value>,
     password_sources: Option<Box<PasswordSources>>,
+    scan_report: Option<Box<json::ScanReport>>,
     tasks: Vec<Value>,
     logs: Vec<String>,
 }
@@ -728,6 +729,7 @@ impl CommandResult {
             errors: Vec::new(),
             items: Vec::new(),
             password_sources: None,
+            scan_report: None,
             tasks: Vec::new(),
             logs: Vec::new(),
         }
@@ -2009,16 +2011,28 @@ fn report_scan(
             result.errors.push(format!("{}: {}", task.path.display(), failure_message(failure, language)));
         }
     }
-    let mut rows: Vec<_> = outcome
-        .archives
-        .into_iter()
-        .map(|entry| (path_key(&entry.path), entry))
+    let mut rows: Vec<_> = outcome.archives.iter().enumerate()
+        .map(|(index, entry)| (path_key(&entry.path), index))
         .collect();
     rows.sort_unstable_by(|(ka, a), (kb, b)| {
-        ka.cmp(kb)
-            .then(a.offset.cmp(&b.offset))
-            .then(a.format.cmp(&b.format))
+        ka.cmp(kb).then_with(|| {
+            let a = &outcome.archives[*a];
+            let b = &outcome.archives[*b];
+            a.offset.cmp(&b.offset).then_with(|| a.format.cmp(&b.format))
+        })
     });
+    let code = i32::from(!outcome.scan_failures.is_empty() || !result.errors.is_empty());
+    if options.json {
+        result.inputs = json!({"paths": inputs, "deep_detect": options.deep});
+        result.summary = json!({
+            "archive_count": rows.len(), "failed_count": failed,
+            "scan_error_count": scan_errors, "input_error_count": input_errors + archive_input_errors,
+        });
+        result.scan_report = Some(Box::new(json::ScanReport {
+            archives: outcome.archives, rows, language, verbose: options.verbose,
+        }));
+        return Ok((code, result));
+    }
     let mut start = 0;
     while start < rows.len() {
         let key = &rows[start].0;
@@ -2028,156 +2042,108 @@ fn report_scan(
                 .take_while(|(path, _)| path == key)
                 .count();
         let group = &rows[start..end];
-        if !options.json {
-            line(session, Stream::Out, &group[0].1.path.to_string_lossy())?;
-        }
-        for (index, (_, entry)) in group.iter().enumerate() {
+        line(session, Stream::Out, &outcome.archives[group[0].1].path.to_string_lossy())?;
+        for (index, &(_, row)) in group.iter().enumerate() {
+            let entry = &outcome.archives[row];
             let embedded = entry.scan_layout.range;
             let show_password = entry.encrypted == Some(true)
                 || entry.password.is_some()
                 || password_failure(entry);
             let plan = entry.volume_attempts.as_deref();
             let (show_parts, completeness) = entry.scan_layout.volumes(entry);
-            if options.json {
-                let input_id = format!(
-                    "{}|{}|{}",
-                    key,
-                    entry.format,
-                    entry.offset
-                );
-                let mut item = json!({"main_path": entry.path, "input_id": input_id});
-                let obj = item.as_object_mut().unwrap();
-                if !entry.format.is_empty() {
-                    obj.insert("format".into(), json!(entry.format));
-                }
-                if embedded {
-                    obj.insert("offset".into(), json!(entry.offset));
-                    obj.insert("end_offset".into(), json!(entry.end_offset));
-                }
-                if show_password {
-                    obj.insert("password_used".into(), json!(entry.password));
-                }
-                if let Some(plan) = plan {
-                    obj.insert("volume_attempts".into(), json!(plan));
-                } else if show_parts {
-                    obj.insert("all_parts".into(), json!(entry.source_paths));
-                }
-                if let Some(value) = completeness {
-                    obj.insert("volume_completeness".into(), json!(value));
-                }
-                if options.verbose {
-                    obj.insert("discovery_source".into(), json!(entry.discovery_source));
-                }
-                if let Some(failure) = &entry.failure {
-                    obj.insert("error".into(), json!(failure_message(failure, language)));
-                    obj.insert("error_kind".into(), json!(failure.kind));
-                }
-                result.items.push(item);
+            let multiple = group.len() > 1;
+            let last = index + 1 == group.len();
+            let (edge, continuation) = if multiple {
+                tree_edge(session.unicode(), last)
             } else {
-                let multiple = group.len() > 1;
-                let last = index + 1 == group.len();
-                let (edge, continuation) = if multiple {
-                    tree_edge(session.unicode(), last)
+                ("", "")
+            };
+            let prefix = format!("{continuation}  ");
+            let prefix = prefix.as_str();
+            if multiple {
+                let text = language
+                    .translate("cli.scan.segment", &[("index", &(index + 1).to_string())]);
+                let range = if embedded {
+                    format!(": [{}, {})", entry.offset, end_offset(entry))
                 } else {
-                    ("", "")
+                    String::new()
                 };
-                let prefix = format!("{continuation}  ");
-                let prefix = prefix.as_str();
-                if multiple {
-                    let text = language
-                        .translate("cli.scan.segment", &[("index", &(index + 1).to_string())]);
-                    let range = if embedded {
-                        format!(": [{}, {})", entry.offset, end_offset(entry))
+                line(session, Stream::Out, &format!("{edge}{text}{range}"))?;
+            } else if embedded {
+                let text = language.translate(
+                    "cli.scan.range",
+                    &[
+                        ("start", &entry.offset.to_string()),
+                        ("end", &end_offset(entry)),
+                    ],
+                );
+                line(session, Stream::Out, &format!("{prefix}{text}"))?;
+            }
+            if let Some(failure) = &entry.failure {
+                if !(failure.kind == FailureKind::WrongPassword && entry.password.is_none())
+                    && !(failure.kind == FailureKind::MissingVolume
+                        && entry.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing))
+                {
+                    let error = language.translate("cli.scan.error", &[
+                        ("error", &failure_message(failure, language)),
+                    ]);
+                    let text = if embedded {
+                        format!("{}: [{}, {}): {error}",
+                            entry.path.display(), entry.offset, end_offset(entry))
                     } else {
-                        String::new()
+                        format!("{}: {error}", entry.path.display())
                     };
-                    line(session, Stream::Out, &format!("{edge}{text}{range}"))?;
-                } else if embedded {
-                    let text = language.translate(
-                        "cli.scan.range",
-                        &[
-                            ("start", &entry.offset.to_string()),
-                            ("end", &end_offset(entry)),
-                        ],
-                    );
-                    line(session, Stream::Out, &format!("{prefix}{text}"))?;
+                    line(session, Stream::Err, &text)?;
                 }
-                if let Some(failure) = &entry.failure {
-                    if !(failure.kind == FailureKind::WrongPassword && entry.password.is_none())
-                        && !(failure.kind == FailureKind::MissingVolume
-                            && entry.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing))
-                    {
-                        let error = language.translate("cli.scan.error", &[
-                            ("error", &failure_message(failure, language)),
-                        ]);
-                        let text = if embedded {
-                            format!("{}: [{}, {}): {error}",
-                                entry.path.display(), entry.offset, end_offset(entry))
-                        } else {
-                            format!("{}: {error}", entry.path.display())
-                        };
-                        line(session, Stream::Err, &text)?;
-                    }
-                }
-                if !entry.format.is_empty() {
-                    let format = language.translate("cli.scan.format", &[("format", &entry.format)]);
-                    line(session, Stream::Out, &format!("{prefix}{format}"))?;
-                }
-                if let Some(plan) = plan {
-                    report_volume_plan(plan, prefix, language, session)?;
-                } else if show_parts {
-                    let parts = entry
-                        .source_paths
-                        .iter()
-                        .map(|path| {
-                            path.file_name()
-                                .unwrap_or(path.as_os_str())
-                                .to_string_lossy()
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let text = language.translate("cli.scan.parts", &[("parts", &parts)]);
-                    line(session, Stream::Out, &format!("{prefix}{text}"))?;
-                }
-                if let Some(completeness) = completeness {
-                    let key = format!("cli.scan.volumes.{completeness}");
-                    let state = language.text(&key);
-                    let text = language.translate("cli.scan.volumes", &[("state", state)]);
-                    line(session, Stream::Out, &format!("{prefix}{text}"))?;
-                }
-                if show_password {
-                    let value = entry
-                        .password
-                        .as_deref()
-                        .map(|password| if password.is_empty() { "''" } else { password })
-                        .unwrap_or(language.text("cli.scan.password_unknown"));
-                    let text = language.translate("cli.scan.password", &[("password", value)]);
-                    line(session, Stream::Out, &format!("{prefix}{text}"))?;
-                }
-                if options.verbose {
-                    let source = match entry.discovery_source {
-                        crate::pipeline::DiscoverySource::Relations => "relations",
-                        crate::pipeline::DiscoverySource::Detection => "detection",
-                        crate::pipeline::DiscoverySource::Embedded => "embedded",
-                    };
-                    let text = language.translate("cli.scan.source", &[("source", source)]);
-                    line(session, Stream::Out, &format!("{prefix}{text}"))?;
-                }
+            }
+            if !entry.format.is_empty() {
+                let format = language.translate("cli.scan.format", &[("format", &entry.format)]);
+                line(session, Stream::Out, &format!("{prefix}{format}"))?;
+            }
+            if let Some(plan) = plan {
+                report_volume_plan(plan, prefix, language, session)?;
+            } else if show_parts {
+                let parts = entry
+                    .source_paths
+                    .iter()
+                    .map(|path| {
+                        path.file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let text = language.translate("cli.scan.parts", &[("parts", &parts)]);
+                line(session, Stream::Out, &format!("{prefix}{text}"))?;
+            }
+            if let Some(completeness) = completeness {
+                let key = format!("cli.scan.volumes.{completeness}");
+                let state = language.text(&key);
+                let text = language.translate("cli.scan.volumes", &[("state", state)]);
+                line(session, Stream::Out, &format!("{prefix}{text}"))?;
+            }
+            if show_password {
+                let value = entry
+                    .password
+                    .as_deref()
+                    .map(|password| if password.is_empty() { "''" } else { password })
+                    .unwrap_or(language.text("cli.scan.password_unknown"));
+                let text = language.translate("cli.scan.password", &[("password", value)]);
+                line(session, Stream::Out, &format!("{prefix}{text}"))?;
+            }
+            if options.verbose {
+                let source = match entry.discovery_source {
+                    crate::pipeline::DiscoverySource::Relations => "relations",
+                    crate::pipeline::DiscoverySource::Detection => "detection",
+                    crate::pipeline::DiscoverySource::Embedded => "embedded",
+                };
+                let text = language.translate("cli.scan.source", &[("source", source)]);
+                line(session, Stream::Out, &format!("{prefix}{text}"))?;
             }
         }
         start = end;
     }
-    if options.json {
-        result.inputs = json!({"paths": inputs, "deep_detect": options.deep});
-        result.summary = json!({
-            "archive_count": rows.len(), "failed_count": failed,
-            "scan_error_count": scan_errors, "input_error_count": input_errors + archive_input_errors,
-        });
-    }
-    Ok((
-        i32::from(!outcome.scan_failures.is_empty() || !result.errors.is_empty()),
-        result,
-    ))
+    Ok((code, result))
 }
 
 fn report_volume_plan(

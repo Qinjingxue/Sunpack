@@ -1103,7 +1103,7 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
 }
 
 #[test]
-fn partial_departure_is_an_admission_failure_and_keeps_surviving_generation() {
+fn partial_departure_fails_admission_and_keeps_generations_for_extraction() {
     let path = crate::test_support::temp_file("partial_departure", b"archive");
     let missing = path.with_extension("missing");
     for (mode, count) in [Mode::Scan, Mode::Extract].into_iter()
@@ -1133,8 +1133,13 @@ fn partial_departure_is_an_admission_failure_and_keeps_surviving_generation() {
         };
         let (generations, absent) = run.capture_generations(&task);
         assert_eq!(absent, vec![missing.clone()]);
-        assert_eq!(generations.len(), 1);
-        assert_eq!(generations[&path_key(&path.to_string_lossy())], capture_file_generation(&path).unwrap());
+        match mode {
+            Mode::Scan => assert!(generations.is_empty()),
+            Mode::Extract => {
+                assert_eq!(generations.len(), 1);
+                assert_eq!(generations[&path_key(&path.to_string_lossy())], capture_file_generation(&path).unwrap());
+            }
+        }
         assert!(matches!(run.task_admission(&task, &generations, &absent, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
         task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
             .with_context(super::super::FailureContext::Discovery {
@@ -1905,7 +1910,7 @@ fn recursive_prompt_parks_siblings_and_shares_each_depth_decision() {
                     || scheduler.run(1, Origin::Foreground, &request.cancel, |spawner| {
                         let run = &run;
                         Box::pin(async move {
-                            let results = spawner.bounded_map(vec![(); 8], move |_| {
+                            let results = spawner.bounded_map([(); 8].into_iter(), move |_| {
                                 Box::pin(run.allow_recursive(2, 1))
                             }).await;
                             assert_eq!(run.allow_recursive(2, 1).await, answer);
@@ -1964,7 +1969,7 @@ fn cancelled_or_panicking_prompt_wakes_siblings_and_joins_its_callback() {
                         let cancel = &cancel;
                         let finished = &finished;
                         Box::pin(async move {
-                            let results = spawner.bounded_map(vec![(); 8], move |_| {
+                            let results = spawner.bounded_map([(); 8].into_iter(), move |_| {
                                 Box::pin(prompts.allow(2, 1, cancel, None::<fn(usize, usize) -> std::future::Ready<bool>>))
                             }).await;
                             finished.send(()).unwrap();

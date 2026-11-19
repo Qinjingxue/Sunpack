@@ -113,8 +113,9 @@ BoolInt Ppmd7_Alloc(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc)
 }
 
 /* Grow in batches to keep OS calls and budget locking off the per-symbol path.
-   RAR model sizes are whole MiB, and the reservation is 64 KiB aligned. */
-#define PPMD7_COMMIT_CHUNK ((UInt32)1 << 16)
+   The reservation is aligned at both ends so commits never share a page. */
+#define PPMD7_COMMIT_CHUNK ((size_t)1 << 16)
+#define PPMD7_COMMIT_MASK (PPMD7_COMMIT_CHUNK - 1)
 #define PPMD7_UNITS_START(end, size) ((end) - (size) / 8 / UNIT_SIZE * 7 * UNIT_SIZE)
 
 BoolInt Ppmd7_AllocReserved(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc,
@@ -123,30 +124,38 @@ BoolInt Ppmd7_AllocReserved(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc,
   p->CommitFailed = False;
   if (p->ReservationOps != ops || p->Size != size)
   {
-    Byte *end;
+    const UInt32 align = (4 - size) & 3;
+    const size_t extent = (size_t)size + align;
+    size_t reserved;
+    Byte *unitsStart;
     Ppmd7_Free(p, alloc);
-    if (!ops->reserve(&p->Reservation, size))
+    if (extent > (size_t)-1 - PPMD7_COMMIT_MASK)
+      return False;
+    reserved = (extent + PPMD7_COMMIT_MASK) & ~PPMD7_COMMIT_MASK;
+    if (!ops->reserve(&p->Reservation, reserved))
       return False;
     p->ReservationOps = ops;
     p->Base = (Byte *)p->Reservation.base;
     p->Size = size;
-    p->AlignOffset = 0;
-    end = p->Base + size;
+    p->AlignOffset = align;
+    unitsStart = PPMD7_UNITS_START(p->Base + extent, size);
     /* Partition at the chunk containing the initial UnitsStart. Its first
        chunk is committed with the root states, also covering any text or
        spill allocations that reach across this split. */
     p->TextEnd = p->Base;
     p->SpillBegin = p->UnitsEnd = p->Base +
-        ((UInt32)(PPMD7_UNITS_START(end, size) - p->Base) & ~(PPMD7_COMMIT_CHUNK - 1));
-    p->ContextsBegin = end;
+        ((size_t)(unitsStart - p->Base) & ~PPMD7_COMMIT_MASK);
+    p->ContextsBegin = p->Base + reserved;
   }
   return True;
 }
 
 static Z7_NO_INLINE BoolInt Ppmd7_Commit(CPpmd7 *p, Byte *target, Byte **lo, Byte **hi, BoolInt up)
 {
-  const UInt32 offset = (UInt32)(target - p->Base);
-  Byte *edge = p->Base + ((offset + (up ? PPMD7_COMMIT_CHUNK - 1 : 0)) & ~(PPMD7_COMMIT_CHUNK - 1));
+  const size_t offset = (size_t)(target - p->Base);
+  const size_t rounded = up ? ((offset + PPMD7_COMMIT_MASK) & ~PPMD7_COMMIT_MASK)
+                            : (offset & ~PPMD7_COMMIT_MASK);
+  Byte *edge = p->Base + rounded;
   Byte *start = (up || edge < *lo) ? *lo : edge;
   Byte *end = (!up || edge > *hi) ? *hi : edge;
   if (!p->ReservationOps->commit(&p->Reservation, start, (size_t)(end - start)))
@@ -157,7 +166,7 @@ static Z7_NO_INLINE BoolInt Ppmd7_Commit(CPpmd7 *p, Byte *target, Byte **lo, Byt
   if (start == *lo && end == *hi)
   {
     /* A closed gap can no longer require commitment, even after restart. */
-    *lo = p->Base + p->Size;
+    *lo = p->Base + p->AlignOffset + p->Size;
     *hi = p->Base;
   }
   else if (up)
