@@ -16,6 +16,12 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifdef SUP7Z_DEBUG
+namespace sunpack::sevenzip {
+    extern thread_local std::size_t observed_read_only_gate_entries;
+}
+#endif
+
 namespace {
 
 bool check_probe_cancellation_lifetime() {
@@ -172,6 +178,15 @@ bool check_rar5_password_probe_with_unknown_unpacked_size() {
         file.write(damaged.data(), damaged.size());
         file.write(archive + end_header, sizeof(archive) - 1 - end_header);
     }
+#ifdef SUP7Z_DEBUG
+    observed_read_only_gate_entries = 0;
+#endif
+    const auto verified_tail = test_password_batch(path.wstring(), {}, {}, L"rar", candidates + 2, 1, {}, false, true);
+#ifdef SUP7Z_DEBUG
+    const bool first_member_opens_final_gate = observed_read_only_gate_entries == 1;
+#else
+    const bool first_member_opens_final_gate = true;
+#endif
     auto output = path;
     output.replace_extension(L".out");
     const auto extracted = extract_archive(path.wstring(), {}, {}, L"rar", candidates[2], output.wstring(), L"");
@@ -184,6 +199,7 @@ bool check_rar5_password_probe_with_unknown_unpacked_size() {
         deferred.status == PasswordTestStatus::Unsupported && deferred.matched_index == -1 &&
         deferred.possible_candidates == std::vector<std::size_t>{2} && read_only_rejected_candidate &&
         accepted.status == PasswordTestStatus::Ok && accepted.matched_index == 2 && !accepted.weak_match &&
+        first_member_opens_final_gate && verified_tail.status == PasswordTestStatus::WrongPassword &&
         extracted.status == PasswordTestStatus::Damaged && extracted.password_crc_proven_items == 1;
 }
 

@@ -1,5 +1,5 @@
 use super::PasswordVerification;
-use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
+use crate::formats::rar::{rar4_end_volume, rar5_common_fields, rar5_header_len, read_vint};
 use crate::io::archive_state::{InputExtent, InputPart, VolumeAttemptPlan};
 use crate::io::cancellation::{is_cancellation, Cancellation};
 use crate::io::read_fault::{FieldLocation, ReadFault};
@@ -395,11 +395,9 @@ where
         if let Some(facts) = facts.as_deref_mut() {
             facts.version = Some(5);
             if fields.kind == 4 { facts.header_encrypted = true; }
-            if fields.kind == 1 {
-                if let Some((flags, number)) = rar5_main_volume(&header, 0) {
-                    facts.native = flags & 1 != 0;
-                    if facts.native { facts.number = Some(number.unwrap_or(0) + 1); }
-                }
+            if let Some((flags, number)) = fields.main_volume(&header) {
+                facts.native = flags & 1 != 0;
+                if facts.native { facts.number = Some(number.unwrap_or(0) + 1); }
             }
             if fields.kind == 2 {
                 if let Some(file) = &file {
@@ -1748,36 +1746,21 @@ fn rar4_file_header_crc_end(header: &[u8]) -> Option<usize> {
     Some(end)
 }
 
-/// Verify a RAR4 `-hp` password against the first encrypted block header.
-///
-/// In the normal RAR4 layout the Main Header remains plaintext and carries
-/// MHD_PASSWORD; the salt is immediately after that header and all following
-/// block headers are AES-CBC encrypted.
-struct Rar4HeaderMatch {
-    header: Vec<u8>,
-}
-
-// Both native password plans and embedded boundary discovery use the same
-// bounded material and ordered parallel candidate search. Only a successful
-// header owns plaintext; implausible type/size rejects before allocating a header.
+// Embedded boundary discovery shares its ciphertext across candidate lanes.
 fn find_rar4_header(
     candidates: &[Arc<str>],
     salt: &[u8],
     encrypted: &[u8],
-    known_key: Option<([u8; 16], [u8; 16])>,
-    accept: impl Fn(&[u8]) -> bool + Sync,
-) -> Option<(usize, Rar4HeaderMatch)> {
+) -> Option<(usize, Vec<u8>)> {
     let salt: &[u8; 8] = salt.try_into().ok()?;
     if encrypted.len() < 16 { return None; }
     let cancellation = Cancellation::current();
     let check = |(index, password): (usize, &Arc<str>)| {
         if cancellation.cancelled() { return None; }
         cancellation.run(|| {
-            let (key, iv) = if index == 0 {
-                known_key.or_else(|| derive_rar3_key_iv(password, Some(salt)))?
-            } else { derive_rar3_key_iv(password, Some(salt))? };
+            let (key, iv) = derive_rar3_key_iv(password, Some(salt))?;
             let header = decrypt_rar4_header(encrypted, key, iv)??;
-            accept(&header).then_some((index, Rar4HeaderMatch { header }))
+            Some((index, header))
         })
     };
     if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
@@ -2042,34 +2025,6 @@ pub(crate) fn rar5_encryption_identity(data: &[u8], body: usize, end: usize) -> 
     parse_rar5_encryption_body(data, body, end, false, false)
 }
 
-struct Rar5CommonFields {
-    kind: u64,
-    flags: u64,
-    extra_size: u64,
-    data_size: u64,
-    body: usize,
-}
-
-fn rar5_common_fields(header: &[u8], start: usize) -> Option<Rar5CommonFields> {
-    let (kind, cursor) = read_vint(header, start)?;
-    let (flags, mut body) = read_vint(header, cursor)?;
-    let extra_size = if flags & 1 != 0 {
-        let (size, next) = read_vint(header, body)?;
-        body = next;
-        size
-    } else {
-        0
-    };
-    let data_size = if flags & 2 != 0 {
-        let (size, next) = read_vint(header, body)?;
-        body = next;
-        size
-    } else {
-        0
-    };
-    Some(Rar5CommonFields { kind, flags, extra_size, data_size, body })
-}
-
 struct Rar5FileFields<'a> {
     name: &'a [u8], compression: u64, crc: Option<u32>, empty_stored: bool, directory: bool,
 }
@@ -2284,22 +2239,26 @@ pub(crate) fn probe_header_passwords(
         let Some(offset) = prepare_rar4_encrypted_headers(reader, start_offset)? else {
             return Ok(HeaderPassword::Inconclusive);
         };
-        // RAR4's u16 header length needs at most 65536 encrypted bytes.
-        // Read once, not once per candidate; short or damaged material remains
-        // inconclusive rather than a confirmed password rejection.
-        let material = reader.read_at(offset, 8 + 65536)?;
-        if material.len() < 24 { return Ok(HeaderPassword::Inconclusive); }
-        let (salt, encrypted) = material.split_at(8);
-        let known_key = match proven_key {
-            Some(RarProvenKey::Rar4 { salt: identity, key, iv })
-                if passwords.len() == 1 && identity == salt => Some((*key, *iv)),
-            _ => None,
+        let matched = if let [password] = passwords {
+            // A single candidate only needs the actual header extent.
+            read_rar4_encrypted_header(offset, |at, size| reader.read_at(at, size), |actual| {
+                match proven_key {
+                    Some(RarProvenKey::Rar4 { salt, key, iv }) if actual == salt => Some((*key, *iv)),
+                    _ => derive_rar3_key_iv(password, Some(actual)),
+                }
+            })?.map(|header| (0, header))
+        } else {
+            // Several candidates share one ciphertext window. RAR4's u16
+            // header length needs at most 65536 encrypted bytes.
+            let material = reader.read_at(offset, 8 + 65536)?;
+            if material.len() < 24 { return Ok(HeaderPassword::Inconclusive); }
+            let (salt, encrypted) = material.split_at(8);
+            find_rar4_header(passwords, salt, encrypted)
         };
-        let matched = find_rar4_header(passwords, salt, encrypted, known_key, |_| true);
         Cancellation::check_current_io()?;
-        if let Some((index, matched)) = matched {
+        if let Some((index, header)) = matched {
             let proof = walk_rar4_encrypted_headers(reader, offset, &passwords[index],
-                max_blocks, matched.header)?;
+                max_blocks, header)?;
             return Ok(HeaderPassword::Matched(index, proof));
         }
     }
@@ -2426,7 +2385,7 @@ fn walk_rar5_encrypted_headers(
         if proof.main_volume.is_none() {
             // Retain the same decrypted main-header facts for Embedded and
             // Relations, so neither derives the key or parses this header again.
-            let Some(main) = rar5_main_volume(&full, 0) else {
+            let Some(main) = fields.main_volume(&full) else {
                 return Ok(proof);
             };
             proof.main_volume = Some(main);

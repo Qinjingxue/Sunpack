@@ -26,6 +26,10 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
+#ifdef SUP7Z_DEBUG
+    thread_local std::size_t observed_read_only_gate_entries = 0;
+#endif
+
     namespace
     {
 
@@ -246,9 +250,18 @@ namespace sunpack::sevenzip
             }
         };
 
+        struct PasswordProbeFrontier {
+            const std::atomic<std::size_t>* earliest = nullptr;
+            std::size_t index = 0;
+
+            bool passed() const {
+                return earliest && index >= earliest->load(std::memory_order_relaxed);
+            }
+        };
+
         BoundedPasswordProbeSelection bounded_password_probe_selection(IInArchive *archive, const std::wstring &format,
             bool header_password, const ProbeVolumeRanges& volumes, bool final_read_only,
-            bool fixed_members_irrelevant,
+            bool fixed_members_irrelevant, PasswordProbeFrontier frontier,
             std::vector<MemberProof>* alternatives = nullptr)
         {
             BoundedPasswordProbeSelection selection;
@@ -274,7 +287,8 @@ namespace sunpack::sevenzip
             else if (seven_zip) selection.member_mode = MemberMode::SevenZip;
             PROPVARIANT archive_value;
             PropVariantInit(&archive_value);
-            const bool solid = archive->GetArchiveProperty(kpidSolid, &archive_value) == S_OK && prop_bool(archive_value);
+            const bool solid = !final_read_only &&
+                archive->GetArchiveProperty(kpidSolid, &archive_value) == S_OK && prop_bool(archive_value);
             clear_prop(archive_value);
 
             std::optional<MemberProof> regular, best;
@@ -285,11 +299,15 @@ namespace sunpack::sevenzip
             std::optional<MemberVolumeMatch> folder_overlap;
             for (UInt32 index = 0; index < selection.item_count; ++index)
             {
+                if (frontier.passed()) return {};
+#ifdef SUP7Z_DEBUG
+                if (final_read_only) ++observed_read_only_gate_entries;
+#endif
                 PROPVARIANT value{};
                 const bool is_encrypted = get_item_property(archive, index, kpidEncrypted, value) && prop_bool(value);
                 clear_prop(value);
                 selection.encrypted |= is_encrypted;
-                if (!solid && selection.encrypted && !is_encrypted) continue;
+                if (!solid && !is_encrypted && (selection.encrypted || (final_read_only && regular))) continue;
                 const bool is_dir = get_item_property(archive, index, kpidIsDir, value) && prop_bool(value);
                 clear_prop(value);
                 if (is_dir) continue;
@@ -297,7 +315,7 @@ namespace sunpack::sevenzip
                 // or the unpacked CRC span. Only solid cost accumulation and
                 // the ordinary fallback need a separate size in that format.
                 UInt64 size = 0;
-                if (solid || !zip || !is_encrypted) {
+                if (!final_read_only && (solid || !zip || !is_encrypted)) {
                     get_item_property(archive, index, kpidSize, value);
                     size = prop_u64(value);
                     clear_prop(value);
@@ -346,6 +364,12 @@ namespace sunpack::sevenzip
                 // Do not add evidence across members: different folders may
                 // repeat the same encrypted bytes, IV and contents.
                 if (!authenticated && !coverage) continue;
+                if (final_read_only) {
+                    // The full test uses all items. Finding one viable member
+                    // meets its proof gate without ranking the directory.
+                    selection.index = index;
+                    return selection;
+                }
                 auto volume = MemberVolumeMatch::Possible;
                 if (copy_start && coverage == size) {
                     const auto offset = solid_prefix - size;
@@ -376,7 +400,7 @@ namespace sunpack::sevenzip
                         cost += (std::min)(prop_u64(value), UINT64_MAX - cost);
                     clear_prop(value);
                 }
-                const bool auxiliary = !final_read_only && rar5 && index + 1 == selection.item_count &&
+                const bool auxiliary = rar5 && index + 1 == selection.item_count &&
                     get_item_property(archive, index, kpidIsAux, value) && prop_bool(value);
                 clear_prop(value);
                 const bool weak = !authenticated && (measured || !strong_member_crc(coverage));
@@ -474,7 +498,8 @@ namespace sunpack::sevenzip
             return error;
         }
 
-        std::optional<std::pair<UInt32, UInt64>> next_copy_crc(IInArchive* archive, UInt32 index, UInt32 count)
+        std::optional<std::pair<UInt32, UInt64>> next_copy_crc(
+            IInArchive* archive, UInt32 index, UInt32 count, PasswordProbeFrontier frontier)
         {
             PROPVARIANT value{};
             if (index + 1 >= count || !get_item_property(archive, index, kpidBlock, value)) return {};
@@ -488,6 +513,7 @@ namespace sunpack::sevenzip
             // Streamless items within this folder share its block index but
             // cannot contribute any plaintext checksum evidence.
             for (++index; index < count; ++index) {
+                if (frontier.passed()) return {};
                 const bool same_folder = get_item_property(archive, index, kpidBlock, value) &&
                     value.vt == VT_UI4 && prop_u32(value) == folder;
                 clear_prop(value);
@@ -528,7 +554,7 @@ namespace sunpack::sevenzip
         void probe_available_member(
             IInArchive* archive, BoundedPasswordProbeSelection& selection, OpenCallback& open,
             PasswordProbeCache& cache, const std::wstring& format, const ProbeVolumeRanges& volumes,
-            const std::wstring& password, bool& encrypted, bool final_read_only,
+            const std::wstring& password, bool& encrypted, bool final_read_only, PasswordProbeFrontier frontier,
             HRESULT& hr, Int32& operation)
         {
             HRESULT read_error = S_OK;
@@ -560,7 +586,7 @@ namespace sunpack::sevenzip
                 }
             };
             const auto interrupted = [&] {
-                return native_job_cancelled() || hr == E_ABORT || hr == E_OUTOFMEMORY;
+                return frontier.passed() || native_job_cancelled() || hr == E_ABORT || hr == E_OUTOFMEMORY;
             };
             const auto accepted = [&] { return hr == S_OK && operation == kOpOk; };
             const auto can_try_another = [&] {
@@ -570,6 +596,7 @@ namespace sunpack::sevenzip
                         operation == kOpUnavailable || operation == kOpUnexpectedEnd ||
                         (operation == kOpHeadersError && format == L"zip")));
             };
+            if (frontier.passed()) return;
             probe();
             if (final_read_only || !selection.index || selection.item_count <= 1 || interrupted()) return;
 
@@ -577,13 +604,13 @@ namespace sunpack::sevenzip
             std::optional<BoundedPasswordProbeSelection> weak_match;
             std::optional<UInt32> copy_checked;
             const auto retain_weak = [&](std::size_t tried) {
-                if (weak_match || !accepted() || !selection.weak) return;
+                if (interrupted() || weak_match || !accepted() || !selection.weak) return;
                 weak_match = selection;
                 if (selection.member_mode != MemberMode::SevenZip || volumes.password_verified) return;
                 // The companion shares this AES/Copy folder's key and can
                 // contribute a rejection without decoding its solid prefix.
-                const auto companion = next_copy_crc(archive, *selection.index, selection.item_count);
-                if (!companion || companion->first == *first.index ||
+                const auto companion = next_copy_crc(archive, *selection.index, selection.item_count, frontier);
+                if (frontier.passed() || !companion || companion->first == *first.index ||
                     std::any_of(cache.alternatives.end() - tried, cache.alternatives.end(),
                         [&](const auto& member) { return member.index == companion->first; })) return;
                 copy_checked = companion->first;
@@ -605,7 +632,8 @@ namespace sunpack::sevenzip
                 (weak_match ? !first.can_strengthen : !can_try_another())) return;
             if (!cache.alternatives_heap) {
                 bounded_password_probe_selection(archive, format, open.password_requested(), volumes, false,
-                    first.fixed_members_irrelevant, &cache.alternatives);
+                    first.fixed_members_irrelevant, frontier, &cache.alternatives);
+                if (interrupted()) return;
                 cache.order_alternatives(volumes.password_verified);
             }
             auto failure = selection;
@@ -614,6 +642,7 @@ namespace sunpack::sevenzip
             const bool can_disprove_weak = volumes.fixed_member_crc(format) && !cache.open_incomplete;
             bool stronger_rejection = false;
             for (std::size_t order = 0; order < cache.alternatives.size(); ++order) {
+                if (frontier.passed()) return;
                 const auto& member = cache.alternative_at(order, volumes.password_verified);
                 if (member.index == *first.index || member.index == copy_checked ||
                     (weak_match && member.weak && member.coverage != kSunpackUnknownProofSize)) continue;
@@ -676,7 +705,7 @@ namespace sunpack::sevenzip
         const std::wstring &format_hint,
         PasswordProbeCache &cache,
         bool scan_only, bool final_read_only, const ProbeVolumeRanges& volumes,
-        bool* defer_small_zip = nullptr
+        bool* defer_small_zip = nullptr, PasswordProbeFrontier frontier = {}
 
     )
     {
@@ -694,7 +723,8 @@ namespace sunpack::sevenzip
             Int32 operation = kOpOk;
             auto selection = cache.selection;
             probe_available_member(cache.archive, selection, *cache.callback_state, cache, result.archive_type, volumes,
-                password, encrypted, final_read_only, hr, operation);
+                password, encrypted, final_read_only, frontier, hr, operation);
+            if (frontier.passed()) return {};
             result.operation_result = operation;
             result.missing_volume = cache.callback_state->missing_volume_requested();
             if (cache.callback_state->missing_volume_requested() && (hr != S_OK || operation != kOpOk) &&
@@ -750,6 +780,7 @@ namespace sunpack::sevenzip
         const UInt64 start_only = 0;
         for (std::size_t attempt_index = 0; attempt_index < formats.size() * 2; ++attempt_index)
         {
+            if (frontier.passed()) return {};
             if (native_job_cancelled()) {
                 result.status = PasswordTestStatus::Error;
                 result.message = "password probe cancelled";
@@ -840,6 +871,11 @@ namespace sunpack::sevenzip
                 continue;
             }
 
+            if (frontier.passed()) {
+                archive->Close();
+                return {};
+            }
+
             any_opened = true;
             cache.clear_alternatives();
             result.archive_type = canonical_archive_type_for_guid(format);
@@ -847,7 +883,11 @@ namespace sunpack::sevenzip
                 !raw_open_callback->missing_volume_requested() && volumes.observed_layout(cache.open_incomplete) &&
                 !volumes.observer()->uncertain_read.load(std::memory_order_relaxed);
             auto selection = bounded_password_probe_selection(archive, result.archive_type,
-                raw_open_callback->password_requested(), volumes, final_read_only, fixed_members_irrelevant);
+                raw_open_callback->password_requested(), volumes, final_read_only, fixed_members_irrelevant, frontier);
+            if (frontier.passed()) {
+                archive->Close();
+                return {};
+            }
             if (final_read_only && !raw_open_callback->missing_volume_requested() && selection.item_count_known && rar4_rejected_empty_encrypted_headers(
                     archive.Interface(), format, selection.item_count, raw_open_callback->password_requested()))
             {
@@ -889,7 +929,11 @@ namespace sunpack::sevenzip
             Int32 last_op_res = kOpOk;
             const auto initial_selection = selection;
             probe_available_member(archive, selection, *raw_open_callback, cache, result.archive_type, volumes,
-                password, last_encryption_evidence, final_read_only, hr, last_op_res);
+                password, last_encryption_evidence, final_read_only, frontier, hr, last_op_res);
+            if (frontier.passed()) {
+                archive->Close();
+                return {};
+            }
             result.operation_result = last_op_res;
             result.missing_volume = raw_open_callback->missing_volume_requested();
             // RAR's handler may request the next volume during Open, having
@@ -1130,10 +1174,12 @@ namespace sunpack::sevenzip
           bool use_deferred = lane == 0 && deferred;
           for (;;) {
             const auto index = std::exchange(use_deferred, false) ? 0 : next.fetch_add(1, std::memory_order_relaxed);
-            if (index >= probe_end || index >= earliest.load(std::memory_order_relaxed) || native_job_cancelled()) break;
+            const PasswordProbeFrontier frontier{&earliest, index};
+            if (index >= probe_end || frontier.passed() || native_job_cancelled()) break;
             auto current = test_one_password(archive_path, candidates[global_index(index)],
-                part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes);
-            if (native_job_cancelled() || record(lane, index, std::move(current), cache.open_incomplete)) break;
+                part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only, final_read_only, volumes,
+                nullptr, frontier);
+            if (frontier.passed() || native_job_cancelled() || record(lane, index, std::move(current), cache.open_incomplete)) break;
           }
         });
         parallel.limit(1);

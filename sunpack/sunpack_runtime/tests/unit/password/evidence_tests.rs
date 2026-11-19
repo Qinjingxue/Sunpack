@@ -211,6 +211,17 @@ fn candidate_removal_preserves_correlations_order_and_unrelated_domains() {
             .filter(|p| p.len() < 4 || p[1] != "1" || p[2] != "3")
             .collect::<Vec<_>>()
     );
+    let mut projection = projection;
+    // A geometry branch may reach several states for the same source.
+    // Either state can reject its own continuation without cross-pairing.
+    projection.edges.extend([[1, 5, 1], [5, 6, 4], [6, 4, 5]]);
+    let remaining = remove_paths(&variable, &[&projection]).unwrap();
+    assert_eq!(
+        enumerate(&remaining),
+        enumerate(&variable).into_iter()
+            .filter(|p| p.len() < 4 || p[1] != "1" || (p[2] == "4" && p[3] != "5"))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

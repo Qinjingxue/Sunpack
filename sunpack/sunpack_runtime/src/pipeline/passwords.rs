@@ -351,11 +351,6 @@ impl CandidateSet {
                 "no supplied volume candidate satisfies the archive evidence",
             )));
         }
-        // An independently opened source vanishes with this plan. Memoize
-        // only when another caller already owns the source or supplied it.
-        let attempts = (borrowed || sessions.iter().any(NativeArchiveSession::shares_source))
-            .then(|| Key::for_input(input, sessions))
-            .flatten();
         let mut fixed_plan = |password: Arc<str>,
                               preparation: &mut password::context::Preparation<'_>|
          -> io::Result<Result<PasswordPlan, Failure>> {
@@ -385,6 +380,11 @@ impl CandidateSet {
         if let Some(password) = known {
             return fixed_plan(password, preparation);
         }
+        // An independently opened source vanishes with this plan. Memoize
+        // only when another caller already owns the source or supplied it.
+        let attempts = (borrowed || sessions.iter().any(NativeArchiveSession::shares_source))
+            .then(|| Key::for_input(input, sessions))
+            .flatten();
         if let Some(proof) = attempts.as_ref().and_then(|(key, cache)| cache.proof(key)) {
             match proof {
                 None => return Ok(Ok(PasswordPlan::clear())),

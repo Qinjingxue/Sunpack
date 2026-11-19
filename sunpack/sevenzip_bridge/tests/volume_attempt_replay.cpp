@@ -493,7 +493,7 @@ void unavailable_member_is_not_reprobed_for_an_unread_slice(
     cursor.reserve(plan);
     VolumeProbeCache cache(plan);
     auto lookahead = cursor;
-    std::deque<PreparedAttempt> cold;
+    std::vector<PreparedAttempt> cold;
     {
         // CPU credits collect both compositions. The memory arbiter defers
         // thread creation so the second lane observes the completed first.
@@ -530,6 +530,21 @@ void unavailable_member_is_not_reprobed_for_an_unread_slice(
         scan.response.find(wire::key("discarded_volume_layouts")) == std::string::npos &&
         scan.response.find(wire::key("password_verified") + wire::boolean(false)) != std::string::npos,
         "Scan discarded a composition when its member proof was unavailable");
+
+    if (std::thread::hardware_concurrency() > 1) {
+        request.password_verified = true;
+        request.password_candidates.resize(1);
+        NativeCpuBudget budget(2);
+        NativeCpuJobContext job(budget);
+        NativeCpuContextScope cpu(&job);
+        VolumeAttemptCursor verified;
+        verified.reserve(plan);
+        VolumeProbeCache verified_cache(plan);
+        const auto wave = probe_volume_wave(request, verified, nullptr, verified_cache);
+        require(wave.size() == 2 && wave.back().probe && unavailable_volume_probe(*wave.back().probe) &&
+            verified_cache.scheduled_probes == 1,
+            "verified Scan repeated an unavailable proof on its reserved last composition");
+    }
 }
 
 void member_crc_rejects_a_bad_volume(const std::filesystem::path& carrier) {

@@ -761,6 +761,7 @@ class VolumeProbeCache {
     };
     std::deque<Entry> entries_;
     bool fixed_;
+    std::mutex geometry_mutex_;
 
     static unsigned long long trim_total(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt) {
         const auto tail_total = plan.tail_totals.empty() ? 0 : plan.tail_totals[attempt.sources.back()];
@@ -792,10 +793,20 @@ public:
         return nullptr;
     }
 
-    bool remember(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt, std::size_t capacity) {
+    bool remember(const sunpack::sevenzip::VolumeAttemptPlan& plan, const PreparedAttempt& attempt,
+        std::size_t capacity, std::mutex* publication_mutex = nullptr) {
         if (!attempt.probe) return false;
         const auto& observed = attempt.probe->observed_volume_slots;
-        if (!observed || find(plan, attempt) || !geometry.known(plan, attempt.layout)) return false;
+        if (!observed) return false;
+        {
+            // Filesystem queries must not block lookups of published proofs.
+            std::unique_lock lock(geometry_mutex_, std::defer_lock);
+            if (publication_mutex) lock.lock();
+            if (!geometry.known(plan, attempt.layout)) return false;
+        }
+        std::unique_lock<std::mutex> publication;
+        if (publication_mutex) publication = std::unique_lock(*publication_mutex);
+        if (find(plan, attempt)) return false;
         while (entries_.size() >= capacity) entries_.pop_front();
         Entry entry{attempt.layout, {}, *attempt.probe, {}, 0};
         entry.sources.reserve(observed->size());
@@ -864,12 +875,12 @@ std::size_t observed_prefix_size(const sunpack::sevenzip::PasswordTestResult& pr
     return count < slots ? count : 0;
 }
 
-std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
+std::vector<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
     sunpack::sevenzip::VolumeAttemptCursor& next, const std::atomic<bool>* cancel, VolumeProbeCache& cache,
     bool preceding_rejected = true) {
     using namespace sunpack::sevenzip;
     const auto& plan = request.archive_input.volume_attempts;
-    std::deque<PreparedAttempt> prepared_attempts;
+    std::vector<PreparedAttempt> prepared_attempts;
     PasswordParallelism parallel((std::max)(std::thread::hardware_concurrency(), 1u));
     std::vector<std::size_t> pending;
     bool exhausted = false;
@@ -877,6 +888,8 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
     for (std::size_t i = 0; i < parallel.size(); ++i) {
         if (!next.next(plan, cancel)) { exhausted = true; break; }
         if (cancel && cancel->load()) break;
+        if (i && i == prepared_attempts.capacity())
+            prepared_attempts.reserve((std::min)(i * 2, parallel.size()));
         prepared_attempts.push_back({next.layout, next.selected, {}});
         auto& prepared = prepared_attempts.back();
         if (!request.scan_only && plan.layouts[prepared.layout][prepared.sources.size() - 1].number != prepared.sources.size()) {
@@ -961,12 +974,8 @@ std::deque<PreparedAttempt> probe_volume_wave(const WorkerRequest& request,
         }
         if (decoded && !native_job_cancelled() && lane <= earliest.load(std::memory_order_relaxed) &&
             reusable_volume_probe(plan, prepared)) {
-            if (!concurrent) {
-                cache.remember(plan, prepared, capacity);
-            } else {
-                std::lock_guard lock(cache_mutex);
-                if (cache.remember(plan, prepared, capacity)) published.store(true, std::memory_order_relaxed);
-            }
+            if (cache.remember(plan, prepared, capacity, concurrent ? &cache_mutex : nullptr))
+                published.store(true, std::memory_order_relaxed);
         }
     };
     parallel.run(pending.size(), [&](std::size_t task, std::size_t) { probe_lane(pending[task]); });
@@ -1275,7 +1284,7 @@ RequestOutcome run_request(
         }
     }
     const auto& archive_input = volume_trials ? selected_input : request.archive_input;
-    std::deque<PreparedAttempt> prepared_attempts;
+    std::vector<PreparedAttempt> prepared_attempts;
     VolumeAttemptCursor lookahead;
     const bool unique_volume_choice = volume_trials && request.archive_input.volume_attempts.layouts.size() == 1 &&
         request.archive_input.volume_attempts.minimum_slots_for(0) == request.archive_input.volume_attempts.layouts[0].size() &&
@@ -1305,6 +1314,8 @@ RequestOutcome run_request(
                     if (request.report_progress) progress({"total", 0, 0, 0});
                     lookahead = cursor;
                     prepared_attempts = probe_volume_wave(request, lookahead, cancel_token.get(), proof_cache);
+                    // Consume in relation order while releasing each result.
+                    std::reverse(prepared_attempts.begin(), prepared_attempts.end());
 #ifdef SUP7Z_DEBUG
                     volume_replay->scheduled_volume_probes += proof_cache.scheduled_probes;
                     proof_cache.scheduled_probes = 0;
@@ -1329,10 +1340,10 @@ RequestOutcome run_request(
                 cursor.discard_pending = cursor.attempts > 1;
                 result = ExtractArchiveResult{};
                 selected_probe.reset();
-                if (!prepared_attempts.empty() && prepared_attempts.front().layout == cursor.layout &&
-                    prepared_attempts.front().sources == cursor.selected) {
-                    selected_probe = std::move(prepared_attempts.front().probe);
-                    prepared_attempts.pop_front();
+                if (!prepared_attempts.empty() && prepared_attempts.back().layout == cursor.layout &&
+                    prepared_attempts.back().sources == cursor.selected) {
+                    selected_probe = std::move(prepared_attempts.back().probe);
+                    prepared_attempts.pop_back();
                 } else prepared_attempts.clear();
             }
             if (cursor.discard_pending) {
@@ -1383,13 +1394,13 @@ RequestOutcome run_request(
                 const auto prefix = observed_prefix_size(*selected_probe, cursor.selected.size());
                 if ((selected_probe->rejects_fixed_geometry || prefix) && proof_cache.can_skip_suffix(plan, cursor.layout)) {
                     if (selected_probe->rejects_fixed_geometry) {
-                        while (!prepared_attempts.empty() && prepared_attempts.front().layout == cursor.layout)
-                            prepared_attempts.pop_front();
+                        while (!prepared_attempts.empty() && prepared_attempts.back().layout == cursor.layout)
+                            prepared_attempts.pop_back();
                         cursor.skip_layout();
                     } else {
-                        while (!prepared_attempts.empty() && prepared_attempts.front().layout == cursor.layout &&
-                            same_volume_prefix(cursor.selected, prepared_attempts.front().sources, prefix))
-                            prepared_attempts.pop_front();
+                        while (!prepared_attempts.empty() && prepared_attempts.back().layout == cursor.layout &&
+                            same_volume_prefix(cursor.selected, prepared_attempts.back().sources, prefix))
+                            prepared_attempts.pop_back();
                         cursor.skip_suffix(plan, prefix - 1);
                     }
                 }
@@ -1516,7 +1527,7 @@ RequestOutcome run_request(
                         continue;
                     }
                     if (cancel_token && cancel_token->load(std::memory_order_acquire)) break;
-                    // A complete member proof skips earlier rejected passwords.
+                    // A complete member proof makes further candidate trials unnecessary.
                     if (selected_probe && selected_probe->status == PasswordTestStatus::Ok &&
                         selected_probe->matched_index > static_cast<int>(index)) {
                         index = static_cast<std::size_t>(selected_probe->matched_index);

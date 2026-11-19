@@ -725,6 +725,27 @@ enum Rule<'a> {
 type State = Vec<(usize, usize)>;
 type Ends<'a> = HashMap<(usize, usize), Rule<'a>>;
 
+enum EdgeTargets {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl EdgeTargets {
+    fn push(&mut self, target: usize) {
+        match self {
+            Self::One(first) => *self = Self::Many(vec![*first, target]),
+            Self::Many(targets) => targets.push(target),
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::One(target) => std::slice::from_ref(target),
+            Self::Many(targets) => targets,
+        }
+    }
+}
+
 fn remove_terminal(state: &State, ends: &Ends) -> Option<usize> {
     (!state.iter().any(|node| ends.contains_key(node))).then_some(0)
 }
@@ -738,12 +759,14 @@ fn partition_from(
 ) -> std::io::Result<(VolumeAttemptPlan, Vec<usize>)> {
     let tracks_domains = rules.iter().any(|(_, rule)| matches!(rule, Rule::Domain(_) | Rule::Reject(_)));
     let removes_prefixes = rules.iter().any(|(_, rule)| *rule == Rule::RemovePrefix);
-    let mut edges: HashMap<(usize, usize, usize), Vec<usize>> = HashMap::new();
+    let mut edges = HashMap::new();
     let mut ends = HashMap::new();
     let mut roots = HashMap::<(usize, usize), State>::new();
     for (proof, &(projection, group)) in rules.iter().enumerate() {
         for &[from, to, source] in &projection.edges {
-            edges.entry((proof, from, source)).or_default().push(to);
+            edges.entry((proof, from, source))
+                .and_modify(|targets: &mut EdgeTargets| targets.push(to))
+                .or_insert(EdgeTargets::One(to));
         }
         ends.extend(projection.ends.iter().map(|&node| ((proof, node), group)));
         for &[layout, count, node] in &projection.roots {
@@ -759,7 +782,7 @@ fn partition_from(
     fn subtract(
         choices: &[Arc<Vec<usize>>],
         root: State,
-        edges: &HashMap<(usize, usize, usize), Vec<usize>>,
+        edges: &HashMap<(usize, usize, usize), EdgeTargets>,
         ends: &Ends,
         removes_prefixes: bool,
         terminal: &mut impl FnMut(&State, &Ends) -> Option<usize>,
@@ -768,12 +791,14 @@ fn partition_from(
             return Ok(vec![(choices.to_vec(), 0)]);
         }
         let cancel = Cancellation::current();
+        // A choice which left every proof can never enter one again.
+        const UNCONSTRAINED: usize = usize::MAX;
         let mut layer = vec![root];
         let mut layers = Vec::with_capacity(choices.len());
         for domain in choices {
             cancel.check_io()?;
-            let mut next = Vec::new();
-            let mut ids = HashMap::new();
+            let mut ids = HashMap::<State, usize>::new();
+            let mut target = Vec::new();
             let mut steps = Vec::with_capacity(layer.len());
             for state in layer {
                 // A worker prefix rejects every continuation. Empty targets,
@@ -782,30 +807,41 @@ fn partition_from(
                     steps.push(None);
                     continue;
                 }
-                let mut targets = Vec::new();
-                if !state.is_empty() {
-                    for &source in domain.iter() {
-                        #[cfg(test)]
-                        PARTITION_EDGE_VISITS.with(|count| count.set(count.get() + state.len()));
-                        let mut target = Vec::new();
-                        for &(proof, node) in &state {
-                            if let Some(nodes) = edges.get(&(proof, node, source)) {
-                                target.extend(nodes.iter().map(|&n| (proof, n)));
-                            }
+                let mut targets = Vec::with_capacity(domain.len());
+                for &source in domain.iter() {
+                    #[cfg(test)]
+                    PARTITION_EDGE_VISITS.with(|count| count.set(count.get() + state.len()));
+                    target.clear();
+                    for &(proof, node) in &state {
+                        if let Some(nodes) = edges.get(&(proof, node, source)) {
+                            target.extend(nodes.as_slice().iter().map(|&n| (proof, n)));
                         }
-                        target.sort_unstable();
-                        target.dedup();
-                        targets.push(*ids.entry(target.clone()).or_insert_with(|| {
-                            let id = next.len();
-                            next.push(target);
-                            id
-                        }));
                     }
+                    if target.is_empty() {
+                        targets.push(UNCONSTRAINED);
+                        continue;
+                    }
+                    target.sort_unstable();
+                    target.dedup();
+                    // Equivalent transitions can reuse the scratch buffer.
+                    // Unique targets move directly into the next layer.
+                    let id = match ids.get(target.as_slice()) {
+                        Some(&id) => id,
+                        None => {
+                            let id = ids.len();
+                            ids.insert(std::mem::take(&mut target), id);
+                            id
+                        }
+                    };
+                    targets.push(id);
                 }
                 steps.push(Some(targets));
             }
             layers.push(steps);
-            layer = next;
+            layer = vec![Vec::new(); ids.len()];
+            for (state, id) in ids {
+                layer[id] = state;
+            }
         }
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         enum Suffix {
@@ -835,7 +871,8 @@ fn partition_from(
                     id
                 })
             };
-            unconstrained = node(domain.clone(), unconstrained);
+            let unconstrained_tail = unconstrained;
+            unconstrained = node(domain.clone(), unconstrained_tail);
             suffixes = steps
                 .into_iter()
                 .map(|targets| {
@@ -847,11 +884,15 @@ fn partition_from(
                     let mut group = Vec::new();
                     let mut common = Suffix::Group(0);
                     for (&source, target) in domain.iter().zip(targets) {
-                        let tails = &suffixes[target];
+                        let tails = if target == UNCONSTRAINED {
+                            std::slice::from_ref(&unconstrained_tail)
+                        } else {
+                            &suffixes[target]
+                        };
                         if tails.is_empty() {
                             continue;
                         }
-                        if !group.is_empty() && tails.as_slice() != [common] {
+                        if !group.is_empty() && tails != [common] {
                             output.push(node(Arc::new(std::mem::take(&mut group)), common));
                         }
                         if let [tail] = tails[..] {

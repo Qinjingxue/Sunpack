@@ -77,8 +77,12 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     let mut proof = None;
     assert_eq!(context.verify(&passwords, Some(&mut proof)).unwrap().matched_index, Some(0));
     assert!(matches!(proof, Some(RarProvenKey::Rar4 { .. })));
-    assert!(matches!(probe_header_passwords(&reader, 37, &passwords, true, proof.as_ref()).unwrap(),
+    let mut carrier = data.clone();
+    carrier.resize(96 * 1024, 0x77);
+    let carrier = ManagedReader::from_bytes(carrier, Default::default());
+    assert!(matches!(probe_header_passwords(&carrier, 37, &passwords, true, proof.as_ref()).unwrap(),
         HeaderPassword::Matched(0, RarTerminalProof { terminal: Some(_), .. })));
+    assert!(carrier.stats().read_bytes < 128, "verified key should read only the header");
     drop(context);
     drop(ranges);
     std::fs::remove_file(path).unwrap();

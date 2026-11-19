@@ -48,35 +48,57 @@ pub(crate) fn rar5_main_volume(data: &[u8], offset: usize) -> Option<(u64, Optio
         return None;
     }
     let (_, start) = read_vint(header, 4)?;
-    let (kind, cursor) = read_vint(header, start)?;
-    if kind != 1 {
-        return None;
+    rar5_common_fields(header, start)?.main_volume(header)
+}
+
+pub(crate) struct Rar5CommonFields {
+    pub(crate) kind: u64,
+    pub(crate) flags: u64,
+    pub(crate) extra_size: u64,
+    pub(crate) data_size: u64,
+    pub(crate) body: usize,
+}
+
+impl Rar5CommonFields {
+    /// Reads main-header fields from a complete, CRC-checked header.
+    pub(crate) fn main_volume(&self, header: &[u8]) -> Option<(u64, Option<u32>)> {
+        if self.kind != 1 {
+            return None;
+        }
+        let extra = usize::try_from(self.extra_size).ok()?;
+        let fields = header.get(..header.len().checked_sub(extra)?)?;
+        let (archive_flags, cursor) = read_vint(fields, self.body)?;
+        let number = if archive_flags & 2 != 0 {
+            let n = u32::try_from(read_vint(fields, cursor)?.0).ok()?;
+            if archive_flags & 1 == 0 || n == 0 || n.checked_add(1).is_none() {
+                return None;
+            }
+            Some(n)
+        } else {
+            None
+        };
+        Some((archive_flags, number))
     }
-    let (flags, mut cursor) = read_vint(header, cursor)?;
-    let extra = if flags & 1 != 0 {
-        let (n, next) = read_vint(header, cursor)?;
-        cursor = next;
-        usize::try_from(n).ok()?
+}
+
+pub(crate) fn rar5_common_fields(header: &[u8], start: usize) -> Option<Rar5CommonFields> {
+    let (kind, cursor) = read_vint(header, start)?;
+    let (flags, mut body) = read_vint(header, cursor)?;
+    let extra_size = if flags & 1 != 0 {
+        let (size, next) = read_vint(header, body)?;
+        body = next;
+        size
     } else {
         0
     };
-    if flags & 2 != 0 {
-        cursor = read_vint(header, cursor)?.1;
-    }
-    // The extra area is not part of the main fields, even though its bytes
-    // are covered by the same CRC.
-    let fields = header.get(..end.checked_sub(extra)?)?;
-    let (archive_flags, cursor) = read_vint(fields, cursor)?;
-    let number = if archive_flags & 2 != 0 {
-        let n = u32::try_from(read_vint(fields, cursor)?.0).ok()?;
-        if archive_flags & 1 == 0 || n == 0 || n.checked_add(1).is_none() {
-            return None;
-        }
-        Some(n)
+    let data_size = if flags & 2 != 0 {
+        let (size, next) = read_vint(header, body)?;
+        body = next;
+        size
     } else {
-        None
+        0
     };
-    Some((archive_flags, number))
+    Some(Rar5CommonFields { kind, flags, extra_size, data_size, body })
 }
 
 /// ENDARC optional data CRC precedes the zero-based current volume number.
