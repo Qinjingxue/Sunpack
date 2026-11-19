@@ -791,8 +791,8 @@ export default {
      must not reserve an additional row below the navigation. */
   .nav-items { height:172px; gap:4px; flex-shrink:0; }
   .nav-indicator { position:absolute; left:4px; top:12px; width:3px; height:16px; border-radius:2px; background:var(--accent-text); }
-  .light .nav-indicator { background:#0067c0; }
-  .dark .nav-indicator { background:#60cdff; }
+  .light .nav-indicator, .light .password-tab-line { background:#0067c0; }
+  .dark .nav-indicator, .dark .password-tab-line { background:#60cdff; }
   .spacer { flex:1; }
   .body { flex:1; flex-direction:row; }
   .sidebar { flex:1; padding:20px 8px 0px; gap:8px; }
@@ -862,6 +862,8 @@ export default {
   toggle { flex-shrink:0; }
   .action-row { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
   .password-toolbar { flex-direction:row; flex-wrap:wrap; align-items:center; gap:16px; }
+  .password-tabs > div { display:flex; height:32px; gap:0px; }
+  .password-tab-line { position:absolute; left:0px; bottom:0.5px; width:100%; height:1px; border-radius:1px; }
   .password-tabs { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
   .management-search { width:220px; flex-shrink:0; }
   input, select { height:32px; }
@@ -1136,8 +1138,14 @@ export default {
           <button id="openPasswordsRecord" @click="send('openRecord',{roots:false})">{{ texts.openRecord }}</button>
         </div>
         <div class="password-tabs">
-          <button id="savedPasswords" :class="!passwordHistoryTarget?'on':''" @click="selectPasswordView(false)">{{ texts.savedPasswords }}</button>
-          <button id="clipboardHistory" :class="passwordHistoryTarget?'on':''" @click="selectPasswordView(true)">{{ texts.history }}</button>
+          <div>
+            <button id="savedPasswords" :class="passwordHistoryTarget?'on':''" @click="selectPasswordView(false)">{{ texts.savedPasswords }}</button>
+            <div class="password-tab-line" v-show="!passwordHistoryTarget"/>
+          </div>
+          <div>
+            <button id="clipboardHistory" :class="!passwordHistoryTarget?'on':''" @click="selectPasswordView(true)">{{ texts.history }}</button>
+            <div class="password-tab-line" v-show="passwordHistoryTarget"/>
+          </div>
         </div>
         <div class="password-table">
         <ScrollView id="passwordListScroll"><div id="passwordBody" class="column">
