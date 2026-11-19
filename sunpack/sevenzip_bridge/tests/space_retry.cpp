@@ -170,7 +170,7 @@ struct Harness {
         return issued && ready;
     }
 
-    // 恢复失败时不能直接 finish_job：那会等 pending_jobs == 0 而永久阻塞
+    // 恢复失败时先取消，否则 finish_job 会一直等卷恢复和文件关闭。
     // （暂停期间 buffer 一直由 writer 线程持有 —— 这是设计要求的语义）。
     void cancel_and_finish(const AsyncFileWriter::JobStatePtr &job) {
         writer->cancel_job(job);
@@ -621,7 +621,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
         check(issued, "R-16: 回收后必须仍能发放许可");
         check(ready, "R-16: 回收后必须仍能恢复（gate 未被毒死）");
         if (!issued || !ready) {
-            // 恢复失败时不能直接 finish_job（它会等 pending_jobs == 0 而永久阻塞）。
+            // 恢复失败时先取消，否则 finish_job 会一直等卷恢复和文件关闭。
             writer.cancel_job(job);
             writer.finish_job(job);
             registry->shutdown();
@@ -1207,8 +1207,6 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
                            &processed) == S_OK &&
                   processed == payload.size(),
               "R-23: ① 写入必须全部被接受");
-        // 必须先 close_file 再 finish_job：pending_jobs 是在 close_file 里递增的，
-        // 漏掉它 finish_job 会立刻返回（还没 drain），内容比对必然失败。
         writer.record_operation_result(file, 0);
         writer.close_file(file, {});
         check(writer.finish_job(job) == S_OK, "R-23: ① 干净写入必须成功");

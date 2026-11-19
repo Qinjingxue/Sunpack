@@ -285,6 +285,8 @@ void last_password_extracts_into_existing_destination(const std::filesystem::pat
     require(outcome.code == 0 && replay.screened_candidates == std::vector<std::size_t>{1} &&
         replay.candidate_index == 1 && !replay.candidates_started,
         "the last password repeated read-only confirmation before extraction");
+    require(outcome.response.find(wire::key("verified_manifest")) == std::string::npos,
+        "existing output returned a manifest that excludes preexisting files");
     std::ifstream member(destination / L"ok.txt", std::ios::binary), sentinel(destination / L"keep.txt");
     require(std::string((std::istreambuf_iterator<char>(member)), {}) == "cursor replay" &&
         std::string((std::istreambuf_iterator<char>(sentinel)), {}) == "existing output",

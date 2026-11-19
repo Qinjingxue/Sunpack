@@ -9,8 +9,19 @@
 
 namespace spg {
 class FindController {
-    struct Target { std::string id; int row=-1, tag=-1; std::vector<ui::TextHighlight> ranges; };
-    struct Source { std::vector<size_t> targets; float offset=0; };
+    struct Source {
+        size_t first;
+        std::vector<size_t> remaining;
+        float offset=0;
+        explicit Source(size_t index):first(index) {}
+    };
+    using Sources=std::unordered_map<std::string,Source>;
+    struct Target {
+        // A map node owns the widget ID for all its targets and survives rehashing.
+        const Sources::value_type* widget;
+        int row, tag;
+        std::vector<ui::TextHighlight> ranges;
+    };
     struct Hit { size_t target=0, range=0; };
     struct Selection { std::string id; int tag=-1; uint32_t start=0; };
     struct Match { std::string text; std::vector<ui::TextHighlight> ranges; size_t bytes; };
@@ -18,7 +29,7 @@ class FindController {
         const char *scope, *list, *scroll;
         std::wstring query;
         std::vector<Target> targets;
-        std::unordered_map<std::string,Source> byId;
+        Sources byId;
         std::vector<float> ticks;
         Hit current;
         Selection saved;
@@ -31,13 +42,13 @@ class FindController {
         std::list<Match> matches;
         std::unordered_map<std::string_view,std::list<Match>::iterator> matchIndex;
         size_t matchBytes=0;
+        std::weak_ptr<ui::VirtualListWidget> hooked_list;
+        std::function<void()> previous_on_range_changed;
     };
     UiPage page_;
     UiWindow window_;
     uint64_t revision_=0;
     std::array<Search,5> searches_{{{"directory","directoryItems","directoryListScroll"},{"task","taskItems","taskListScroll"},{"config","configItems","configListScroll"},{"root","rootItems","rootListScroll"},{"password","passwordItems","passwordListScroll"}}};
-    struct Hook { std::weak_ptr<ui::VirtualListWidget> list; std::function<void()> previous; };
-    std::vector<Hook> hooks_;
     ui::Widget* root() const;
     bool visible(const Search& search) const;
     void refresh(Search& search);
@@ -54,6 +65,8 @@ class FindController {
     void Move(const std::string& scope,int direction);
 public:
     FindController(UiPage page,UiWindow window);
+    FindController(const FindController&)=delete;
+    FindController& operator=(const FindController&)=delete;
     ~FindController();
     void Refresh(const char* scope=nullptr);
     void Decorate();

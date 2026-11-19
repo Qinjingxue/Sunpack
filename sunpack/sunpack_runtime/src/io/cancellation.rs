@@ -75,10 +75,6 @@ impl Cancellation {
         }
     }
 
-    pub(crate) fn check(&self) -> io::Result<()> {
-        self.check_io()
-    }
-
     pub(crate) fn check_io(&self) -> io::Result<()> {
         if self.cancelled() {
             Err(cancelled_io())

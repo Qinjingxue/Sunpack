@@ -197,16 +197,18 @@ pub(crate) fn verify(
             };
         }
     };
-    let reader = sessions
-        .iter()
-        .find(|session| session.path() == path)
-        .map(|session| session.borrowed_reader().1)
-        .map_or_else(|| ManagedReader::open(path), Ok)?;
+    let opened;
+    let reader = if let Some(session) = sessions.iter().find(|session| session.path() == path) {
+        session.reader()
+    } else {
+        opened = ManagedReader::open(path)?;
+        &opened
+    };
     match format {
-        "enc" => enc::enc_fast_verify_passwords_with_reader(preparation, &reader, passwords),
-        "rar" => rar::rar_fast_verify_passwords_with_reader(preparation, &reader, passwords),
-        "7z" => seven_zip::seven_zip_fast_verify_passwords_with_reader(preparation, &reader, passwords),
-        "zip" => zip::zip_fast_verify_passwords_with_reader(preparation, &reader, passwords, eocd_offset),
+        "enc" => enc::enc_fast_verify_passwords_with_reader(preparation, reader, passwords),
+        "rar" => rar::rar_fast_verify_passwords_with_reader(preparation, reader, passwords),
+        "7z" => seven_zip::seven_zip_fast_verify_passwords_with_reader(preparation, reader, passwords),
+        "zip" => zip::zip_fast_verify_passwords_with_reader(preparation, reader, passwords, eocd_offset),
         _ => Ok(unsupported()),
     }
 }

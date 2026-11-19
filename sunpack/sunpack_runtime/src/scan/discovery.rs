@@ -381,7 +381,7 @@ fn scan_embedded_jobs(
     jobs: &[(usize, usize)],
 ) -> std::io::Result<Vec<(usize, usize, EmbeddedOutcome)>> {
     let cancellation = crate::io::cancellation::Cancellation::current();
-    cancellation.check()?;
+    cancellation.check_io()?;
     let outcomes = (|| {
         // File producers also own per-file validation state. Matching jobs
         // continue to share the existing eight-thread IOCP scan pool.
@@ -431,7 +431,7 @@ fn scan_embedded_jobs(
             .map(|(_, group, index, outcome)| (group, index, outcome))
             .collect()
     })();
-    cancellation.check()?;
+    cancellation.check_io()?;
     Ok(outcomes)
 }
 
@@ -707,7 +707,7 @@ impl NativeEmbeddedBatch {
             })
             .collect();
         let cancellation = crate::io::cancellation::Cancellation::current();
-        cancellation.check()?;
+        cancellation.check_io()?;
         let matched = (|| {
             // Independent headers share the existing Rayon pool. Preserve the
             // request's cancellation on each worker, including expensive KDFs.
@@ -732,7 +732,7 @@ impl NativeEmbeddedBatch {
                 .map(|rows| rows.into_iter().flatten().collect::<HashMap<_, _>>())
         })()?;
         drop(candidates);
-        cancellation.check()?;
+        cancellation.check_io()?;
         // Own one scan reference and one sparse resolution table per physical
         // carrier. Project its hits/candidates only after every head is resolved.
         let mut fallback_scans = BTreeMap::new();
@@ -1214,7 +1214,7 @@ impl NativeCandidateTable {
 
     pub(crate) fn resolve(&self) -> std::io::Result<NativeDiscoveryRoutes> {
         let cancellation = crate::io::cancellation::Cancellation::current();
-        cancellation.check()?;
+        cancellation.check_io()?;
         let mut routes = NativeDiscoveryRoutes::default();
         let mut claimed: HashSet<String> = HashSet::new();
         let mut speculative = HashSet::new();
@@ -1252,7 +1252,7 @@ impl NativeCandidateTable {
             if table.file_route(*file_index) != FILE_ROUTE_DETECTION {
                 continue;
             }
-            cancellation.check()?;
+            cancellation.check_io()?;
             let accepted = table.relation_anchors[*file_index]
                 .as_ref()
                 .and_then(CheapAnchor::anchor)
@@ -1269,7 +1269,7 @@ impl NativeCandidateTable {
                 detection_residual.push(index);
             }
         }
-        cancellation.check()?;
+        cancellation.check_io()?;
         // Preserve the former stage order: filesystem residuals, Relations
         // residuals, then Detection residuals.
         let has_path_constraints =

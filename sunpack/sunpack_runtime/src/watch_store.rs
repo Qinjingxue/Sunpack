@@ -1120,11 +1120,11 @@ impl NativeWatchState {
         self.lock().pending.values().cloned().collect()
     }
 
-    pub(crate) fn entry_items(&self, blocker: Option<&str>) -> Vec<Arc<EntryRecord>> {
+    pub(crate) fn entry_items(&self, blocker: &str) -> Vec<Arc<EntryRecord>> {
         self.lock()
             .entries
             .values()
-            .filter(|value| blocker.is_none_or(|blocker| value.blocks(blocker)))
+            .filter(|value| value.blocks(blocker))
             .cloned()
             .collect()
     }
@@ -1134,7 +1134,7 @@ impl NativeWatchState {
         &self,
         scopes: &[crate::scan::scope::NativeDiscoveryScope],
     ) -> NativeWatchOperations {
-        let scope_roots: HashSet<_> = scopes.iter().map(|scope| path_key(&scope.root)).collect();
+        let scope_roots: HashMap<_, _> = scopes.iter().map(|scope| (scope.key(), scope)).collect();
         let (mut operations, cursor_check) = {
             let data = self.lock();
             let recovery_roots: HashSet<_> = data
@@ -1157,13 +1157,15 @@ impl NativeWatchState {
                 .entries
                 .iter()
                 .filter(|(key, record)| {
-                    !scopes.iter().any(|scope| scope.contains_key(key))
+                    !crate::path_keys::path_ancestors(key).any(|ancestor| {
+                        scope_roots.get(ancestor).is_some_and(|scope| scope.contains_key(key))
+                    })
                         && !record
                             .failure_payload
                             .get("source_input_root")
                             .and_then(Value::as_str)
                             .filter(|_| record.failure_payload.contains_key("discovery_scope"))
-                            .is_some_and(|root| scope_roots.contains(&path_key(root)))
+                            .is_some_and(|root| scope_roots.contains_key(path_key(root).trim_end_matches('\\')))
                         && !data.pending.contains_key(*key)
                         && !crate::path_keys::path_ancestors(key)
                             .any(|ancestor| recovery_roots.contains(ancestor))

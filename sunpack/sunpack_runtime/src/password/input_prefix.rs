@@ -1,6 +1,6 @@
 //! Common evidence prefix using only the head file length and layout metadata. This is not a complete input layout.
 use crate::io::archive_state::{InputExtent, VolumeAttemptPlan};
-use crate::io::reader::NativeArchiveSession;
+use crate::io::reader::{ManagedReader, NativeArchiveSession};
 
 pub(crate) fn common_attempt_prefix(
     head: &InputExtent,
@@ -10,10 +10,14 @@ pub(crate) fn common_attempt_prefix(
     if plan.head_size_from_total.is_some() || !plan.tail_totals.is_empty() {
         return Vec::new();
     }
-    let Ok(reader) = super::InputReaders::new(sessions).open(&head.path, false) else {
+    let head_len = sessions.iter().rev()
+        .find(|session| session.path() == head.path)
+        .map_or_else(|| ManagedReader::open(&head.path).map(|reader| reader.len()),
+            |session| Ok(session.reader().len()));
+    let Ok(head_len) = head_len else {
         return Vec::new();
     };
-    common_prefix_with_head_len(head, plan, reader.len())
+    common_prefix_with_head_len(head, plan, head_len)
 }
 
 fn common_prefix_with_head_len(
@@ -21,9 +25,6 @@ fn common_prefix_with_head_len(
     plan: &VolumeAttemptPlan,
     head_file_len: u64,
 ) -> Vec<InputExtent> {
-    if plan.head_size_from_total.is_some() || !plan.tail_totals.is_empty() {
-        return Vec::new();
-    }
     let end = |extent: &InputExtent| {
         if extent.path == head.path {
             Some(extent.end.unwrap_or(head_file_len).min(head_file_len))
@@ -196,8 +197,6 @@ mod tests {
             common_prefix_with_head_len(&plan.sources[0], &plan, 110),
             plan.sources[..3]
         );
-        plan.head_size_from_total = Some(200);
-        assert!(common_prefix_with_head_len(&plan.sources[0], &plan, 110).is_empty());
     }
     #[test]
     fn missing_disk_stops_before_gap_even_for_early_tail() {
@@ -237,6 +236,8 @@ mod tests {
         let mut expected = plan.sources[..3].to_vec();
         expected[0].end = Some(110);
         assert_eq!(common_attempt_prefix(&head, &plan, &[]), expected);
+        plan.head_size_from_total = Some(200);
+        assert!(common_attempt_prefix(&head, &plan, &[]).is_empty());
         std::fs::remove_file(path).unwrap();
     }
 }

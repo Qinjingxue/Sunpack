@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -71,7 +72,8 @@ namespace sunpack::sevenzip
         };
 
         explicit VolumeWriterRegistry(AsyncWriterConfig config,
-                                      VolumeSpaceChangeSink sink = {});
+                                      VolumeSpaceChangeSink sink = {},
+                                      std::function<void()> on_reap_change = {});
         ~VolumeWriterRegistry();
 
         VolumeWriterRegistry(const VolumeWriterRegistry &) = delete;
@@ -111,10 +113,12 @@ namespace sunpack::sevenzip
         };
 
         void release(const std::string &key) noexcept;
+        bool index_needs_compaction_locked() const noexcept;
 
         const AsyncWriterConfig config_;
         // gate 只在新建 entry 时创建并注入 sink；已有 entry 的 gate 不得重设。
         const VolumeSpaceChangeSink sink_;
+        const std::function<void()> on_reap_change_;
         mutable std::mutex mutex_;
         std::condition_variable writer_ready_;
         std::unordered_map<std::string, Entry> entries_;

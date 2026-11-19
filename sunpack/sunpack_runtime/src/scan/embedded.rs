@@ -349,7 +349,7 @@ fn scan_embedded_archives_with_reader(
     iocp_workers: usize,
 ) -> io::Result<NativeScanResult> {
     let cancellation = crate::io::cancellation::Cancellation::current();
-    cancellation.check()?;
+    cancellation.check_io()?;
     let reader = reader.clone();
     let scan = (move || {
         scan_embedded_archives_native_with_iocp(
@@ -359,7 +359,7 @@ fn scan_embedded_archives_with_reader(
             iocp_workers,
         )
     })();
-    cancellation.check()?;
+    cancellation.check_io()?;
     scan
 }
 

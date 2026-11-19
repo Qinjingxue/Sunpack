@@ -29,9 +29,11 @@ namespace sunpack::sevenzip
     }
 
     VolumeWriterRegistry::VolumeWriterRegistry(AsyncWriterConfig config,
-                                               VolumeSpaceChangeSink sink)
+                                               VolumeSpaceChangeSink sink,
+                                               std::function<void()> on_reap_change)
         : config_(config),
-          sink_(std::move(sink)) {}
+          sink_(std::move(sink)),
+          on_reap_change_(std::move(on_reap_change)) {}
 
     VolumeWriterRegistry::~VolumeWriterRegistry() { shutdown(); }
 
@@ -101,18 +103,26 @@ namespace sunpack::sevenzip
             {
                 // The caller still owns the writer until Lease::reset returns.
                 entries_.erase(found);
-                return;
+                if (!index_needs_compaction_locked()) return;
             }
-            if (config_.idle_timeout == std::chrono::milliseconds::zero())
+            else if (config_.idle_timeout == std::chrono::milliseconds::zero())
             {
                 // Keep the physical volume's gate history with no warm writer.
                 entry.writer.reset();
-                return;
             }
-            entry.reap_deadline = std::chrono::steady_clock::now() + config_.idle_timeout;
-            writer = entry.writer;
+            else
+            {
+                entry.reap_deadline = std::chrono::steady_clock::now() + config_.idle_timeout;
+                writer = entry.writer;
+            }
         }
-        writer->trim_completed_batch();
+        if (writer) writer->trim_completed_batch();
+        if (on_reap_change_) on_reap_change_();
+    }
+
+    bool VolumeWriterRegistry::index_needs_compaction_locked() const noexcept
+    {
+        return entries_.bucket_count() > (std::max)(kMaxRetainedVolumeStates, entries_.size() * 4);
     }
 
     void VolumeWriterRegistry::reap_idle()
@@ -163,7 +173,7 @@ namespace sunpack::sevenzip
                 }
             }
             // Synthetic entries disappear in release(), before this pass.
-            if (entries_.bucket_count() > (std::max)(kMaxRetainedVolumeStates, entries_.size() * 4))
+            if (index_needs_compaction_locked())
             {
                 try
                 {
@@ -219,9 +229,9 @@ namespace sunpack::sevenzip
         std::vector<VolumeStatePtr> blocked;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            blocked.reserve(entries_.size());
             for (const auto &item : entries_)
             {
+                if (require_affected_jobs && item.second.leases == 0) continue;
                 const VolumeStatePtr &state = item.second.state;
                 // 锁内只取 shared_ptr 快照，绝不调用 gate（blocked() 自身要取 gate mutex_）。
                 if (state && state->space_gate)
@@ -236,9 +246,7 @@ namespace sunpack::sevenzip
             std::remove_if(blocked.begin(), blocked.end(),
                            [require_affected_jobs](const VolumeStatePtr &state)
                            {
-                               return !state->space_gate->blocked() ||
-                                      (require_affected_jobs &&
-                                       !state->space_gate->has_affected_jobs());
+                               return !state->space_gate->blocked(require_affected_jobs);
                            }),
             blocked.end());
         return blocked;

@@ -760,7 +760,8 @@ namespace sunpack::sevenzip
             std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
 
             std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
-            bool output_inventory = true
+            bool output_inventory = true,
+            const std::wstring *archive_path = nullptr
 #ifdef SUP7Z_DEBUG
             , PipelineTiming *pipeline_timing = nullptr
 #endif
@@ -769,6 +770,7 @@ namespace sunpack::sevenzip
 
                 password_(std::move(password)),
 
+                archive_path_(archive_path),
 
                 progress_(std::move(progress)),
 
@@ -816,20 +818,6 @@ namespace sunpack::sevenzip
         }
 
         ~ExtractToDiskCallback() { finalize_output(); }
-
-        void set_input_file(const std::wstring &path)
-        {
-            default_input_name_ = std::filesystem::path(path).stem().wstring();
-            // Same fallback as 7z.exe for disk input. The canonical entry path
-            // already comes from the input plan; do not inspect/reclassify parts.
-            WIN32_FILE_ATTRIBUTE_DATA data{};
-            if (GetFileAttributesExW(win32_extended_path(path).c_str(),
-                    GetFileExInfoStandard, &data))
-            {
-                archive_mtime_ = data.ftLastWriteTime;
-                has_archive_mtime_ = true;
-            }
-        }
 
         Int32 operation_result() const { return operation_result_; }
         bool encrypted() const { return encrypted_; }
@@ -1448,7 +1436,7 @@ namespace sunpack::sevenzip
             std::vector<HardLink>{}.swap(hard_links_);
         }
 
-        ArchiveItemMetadata read_item_metadata(UInt32 index, bool is_dir) const
+        ArchiveItemMetadata read_item_metadata(UInt32 index, bool is_dir)
         {
             ArchiveItemMetadata metadata;
             PROPVARIANT value{};
@@ -1464,10 +1452,21 @@ namespace sunpack::sevenzip
             read_time(kpidCTime, metadata.creation, ArchiveItemMetadata::Creation);
             read_time(kpidATime, metadata.access, ArchiveItemMetadata::Access);
             read_time(kpidMTime, metadata.modification, ArchiveItemMetadata::Modification);
-            if (!(metadata.defined & ArchiveItemMetadata::Modification) && has_archive_mtime_)
+            if (!(metadata.defined & ArchiveItemMetadata::Modification) && archive_path_)
             {
-                metadata.modification = archive_mtime_;
-                metadata.defined |= ArchiveItemMetadata::Modification;
+                if (!archive_mtime_queried_)
+                {
+                    const auto path = win32_extended_path(*archive_path_);
+                    WIN32_FILE_ATTRIBUTE_DATA data{};
+                    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+                        archive_mtime_ = data.ftLastWriteTime;
+                    archive_mtime_queried_ = true;
+                }
+                if (archive_mtime_)
+                {
+                    metadata.modification = *archive_mtime_;
+                    metadata.defined |= ArchiveItemMetadata::Modification;
+                }
             }
             if (get_item_property(archive_, index, kpidAttrib, value) && value.vt == VT_UI4)
             {
@@ -1526,8 +1525,10 @@ namespace sunpack::sevenzip
             std::vector<DirectoryMetadata>{}.swap(directory_metadata_);
         }
 
-        std::wstring default_item_name(UInt32 index) const
+        std::wstring default_item_name(UInt32 index)
         {
+            if (default_input_name_.empty() && archive_path_)
+                default_input_name_ = std::filesystem::path(*archive_path_).stem().wstring();
             const std::wstring &leaf = default_input_name_;
             if (leaf.empty() || leaf == L"." || leaf == L"..")
             {
@@ -1670,9 +1671,11 @@ namespace sunpack::sevenzip
 
         std::wstring password_;
 
+        // The input path belongs to extract_archive and outlives the callback.
+        const std::wstring *archive_path_;
         std::wstring default_input_name_;
-        FILETIME archive_mtime_{};
-        bool has_archive_mtime_ = false;
+        std::optional<FILETIME> archive_mtime_;
+        bool archive_mtime_queried_ = false;
         std::vector<DirectoryMetadata> directory_metadata_;
 
         ExtractProgressCallback progress_;

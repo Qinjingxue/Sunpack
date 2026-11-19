@@ -124,6 +124,23 @@ fn root_scopes(entries: &[Root], metadata: &[String]) -> BTreeMap<String, (Root,
     }).collect()
 }
 
+fn containing_root<'a>(
+    roots: &'a BTreeMap<String, (Root, NativeDiscoveryScope)>,
+    path_key: &str,
+) -> Option<(&'a String, &'a (Root, NativeDiscoveryScope))> {
+    if roots.len() <= 1 {
+        return roots.first_key_value().filter(|(_, (_, scope))| scope.contains_key(path_key));
+    }
+    // Keep outermost-first precedence. A drive or share root can have a
+    // trailing separator in the Watch map while scope keys omit it.
+    crate::path_keys::path_ancestors(path_key).filter_map(|ancestor| {
+        roots.get_key_value(ancestor).or_else(|| {
+            let prefix = path_key.get(..ancestor.len() + 1)?;
+            prefix.ends_with('\\').then(|| roots.get_key_value(prefix)).flatten()
+        }).filter(|(_, (_, scope))| scope.contains_key(path_key))
+    }).last()
+}
+
 fn key(path: &Path) -> String {
     watch_path_key(&path.to_string_lossy())
 }
@@ -439,7 +456,7 @@ impl Watch {
         });
         poll_fn(|cx| {
             *wake.lock().unwrap() = Some(cx.waker().clone());
-            if let Err(error) = cancel.check() { return Poll::Ready(Err(error)); }
+            if let Err(error) = cancel.check_io() { return Poll::Ready(Err(error)); }
             let mut waiters = self.status.waiters.lock().unwrap();
             if self.status_revision() != revision { return Poll::Ready(Ok(())); }
             waiters.insert(guard.id, cx.waker().clone());
@@ -3324,7 +3341,7 @@ impl Scheduler {
                 self.arm_idle_cleanup();
             } else if signals.password_changed && self.cache_deadline.is_none() {
                 let path = self.passwords.path().to_string_lossy();
-                if self.roots.values().any(|(_, scope)| scope.contains(&path)) {
+                if containing_root(&self.roots, &crate::path_keys::path_key(&path)).is_some() {
                     self.arm_idle_cleanup();
                 }
             }
@@ -4040,10 +4057,9 @@ impl Scheduler {
             .entries_in_scope(path_key, recursive)
             .into_iter()
             .filter_map(|entry| {
-                let root = self
-                    .roots
-                    .values()
-                    .find_map(|(root, scope)| scope.contains(&entry.path).then_some(&root.path))
+                let id = crate::path_keys::path_key(&entry.path);
+                let root = containing_root(&self.roots, &id)
+                    .map(|(_, (root, _))| &root.path)
                     .or_else(|| {
                         let source = entry.failure_payload.get("source_input_root")?.as_str()?;
                         self.roots
@@ -4530,7 +4546,7 @@ impl Scheduler {
         snapshot: &crate::core::passwords::PasswordSnapshot,
         roots: Option<&HashSet<String>>, event: &'static str,
     ) -> io::Result<()> {
-        for entry in self.journal.state().entry_items(Some("password")) {
+        for entry in self.journal.state().entry_items("password") {
             self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
             if self.journal.state().entry(&entry.path).is_none() { continue; }
             let Some((root, recovery)) = self.blocker_route(&entry) else {
@@ -4613,7 +4629,7 @@ impl Scheduler {
     }
 
     fn retry_missing_volumes(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
-        for entry in self.journal.state().entry_items(Some("missing_volume")) {
+        for entry in self.journal.state().entry_items("missing_volume") {
             let Some((root, _)) = self.blocker_route(&entry) else { continue; };
             if roots.is_none_or(|roots| roots.contains(&root)) {
                 // Startup/policy reconciliation deliberately retries incomplete
@@ -4668,16 +4684,15 @@ impl Scheduler {
                 continue;
             }
             let original = watch_path_key(&pending.source_input_root);
+            let path_key = crate::path_keys::path_key(&pending.path);
             let root = self
                 .roots
                 .get(&original)
                 .and_then(|(_, scope)| {
-                    (pending.internal_recovery || scope.contains(&pending.path)).then_some(original)
+                    (pending.internal_recovery || scope.contains_key(&path_key)).then_some(original)
                 })
                 .or_else(|| {
-                    self.roots.iter().find_map(|(id, (_, scope))| {
-                        scope.contains(&pending.path).then(|| id.clone())
-                    })
+                    containing_root(&self.roots, &path_key).map(|(id, _)| id.clone())
                 });
             let Some(root) = root else {
                 continue;
@@ -6303,9 +6318,7 @@ fn route_blocker(
             }
         }
     }
-    roots
-        .iter()
-        .find_map(|(id, (_, scope))| scope.contains(&entry.path).then(|| (id.clone(), None)))
+    containing_root(roots, &crate::path_keys::path_key(&entry.path)).map(|(id, _)| (id.clone(), None))
 }
 
 fn completion_owner(

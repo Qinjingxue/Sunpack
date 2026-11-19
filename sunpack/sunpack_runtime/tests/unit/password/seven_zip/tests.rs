@@ -279,7 +279,7 @@ fn projected_lzma2_successor_removes_bad_cbc_source_after_prefix_survives() {
     input.domains = domains.into_boxed_slice();
 
     let session = NativeArchiveSession::new(sources.last().unwrap().path.clone()).unwrap();
-    let (_, fixed_tail) = session.borrowed_reader();
+    let fixed_tail = session.reader();
     let context = prepare_seven_zip_attempts(&sources[0], &plan, std::slice::from_ref(&session), None)
         .unwrap_or_else(|_| panic!("LZMA2 projected header"));
     let PasswordContext::Evidence(evidence) = context else {
@@ -291,7 +291,6 @@ fn projected_lzma2_successor_removes_bad_cbc_source_after_prefix_survives() {
     assert!(!proof.volume_attempts.unwrap().sources.iter().any(|source| source.path == sources[1].path));
     assert_eq!(fixed_tail.stats().direct_read_bytes, before);
     drop(evidence);
-    drop(fixed_tail);
     drop(session);
     for path in paths { std::fs::remove_file(path).unwrap(); }
 }

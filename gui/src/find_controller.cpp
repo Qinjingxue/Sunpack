@@ -19,9 +19,9 @@ FindController::FindController(UiPage page,UiWindow window):page_(page),window_(
     owner->onAfterLayout=[this]{Decorate();};
     for(auto& s:searches_) {
         if(auto* list=dynamic_cast<ui::VirtualListWidget*>(root()->FindById(s.list))) {
-            hooks_.push_back({std::static_pointer_cast<ui::VirtualListWidget>(list->shared_from_this()),list->onRangeChanged});
-            auto previous=list->onRangeChanged;
-            list->onRangeChanged=[this,previous]{if(previous) previous(); Decorate();};
+            s.hooked_list=std::static_pointer_cast<ui::VirtualListWidget>(list->shared_from_this());
+            s.previous_on_range_changed=std::move(list->onRangeChanged);
+            list->onRangeChanged=[this,&s]{if(s.previous_on_range_changed) s.previous_on_range_changed(); Decorate();};
         }
         if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll)))
             scroll->onDrawSearchMarkers=[this,&s](ui::Renderer& r){markers(s,r);};
@@ -29,10 +29,11 @@ FindController::FindController(UiPage page,UiWindow window):page_(page),window_(
 }
 FindController::~FindController() {
     auto* owner=ui::GetContext().GetWindow(window_);
-    if(!owner) return;
-    owner->onAfterLayout={};
-    for(auto& hook:hooks_) if(auto list=hook.list.lock()) list->onRangeChanged=std::move(hook.previous);
-    for(auto& s:searches_) if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll))) scroll->onDrawSearchMarkers={};
+    if(owner) owner->onAfterLayout={};
+    for(auto& s:searches_) {
+        if(auto list=s.hooked_list.lock()) list->onRangeChanged=std::move(s.previous_on_range_changed);
+        if(owner) if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll))) scroll->onDrawSearchMarkers={};
+    }
 }
 void FindController::Refresh(const char* scope) {
     for(auto& s:searches_) {
@@ -53,7 +54,7 @@ void FindController::Refresh(const char* scope) {
 FindController::Selection FindController::selection(const Search& s) {
     const auto& hit=s.current;
     const auto& target=s.targets[hit.target];
-    return {target.id,target.tag,target.ranges[hit.range].start};
+    return {target.widget->first,target.tag,target.ranges[hit.range].start};
 }
 bool FindController::at_edge(const Search& s,int direction) {
     const auto [target,range]=s.current;
@@ -123,16 +124,18 @@ void FindController::refresh(Search& s) {
     s.query=std::move(query); s.targets.clear(); s.byId.clear(); s.ticks.clear();
     s.current={}; s.geometry=~uint64_t(0); s.extent=-1; s.revision=++revision_;
     if(!s.query.empty()) for(auto& source:snapshot.at("targets")) {
-        Target target{source.at("id").get<std::string>(),source.at("row").get<int>(),source.at("tag").get<int>()};
-        target.ranges=match(s,source.at("text").get_ref<const std::string&>());
-        if(target.ranges.empty()) continue;
-        if(!changed && target.id==old.id && target.tag==old.tag) {
+        auto ranges=match(s,source.at("text").get_ref<const std::string&>());
+        if(ranges.empty()) continue;
+        const auto& id=source.at("id").get_ref<const std::string&>();
+        auto [widget,inserted]=s.byId.try_emplace(id,s.targets.size());
+        if(!inserted) widget->second.remaining.push_back(s.targets.size());
+        Target target{&*widget,source.at("row").get<int>(),source.at("tag").get<int>(),std::move(ranges)};
+        if(!changed && id==old.id && target.tag==old.tag) {
             const auto found=std::lower_bound(target.ranges.begin(),target.ranges.end(),old.start,
                 [](const ui::TextHighlight& range,uint32_t start){return range.start<start;});
             if(found!=target.ranges.end() && found->start==old.start)
                 s.current={s.targets.size(),size_t(found-target.ranges.begin())};
         }
-        s.byId[target.id].targets.push_back(s.targets.size());
         s.targets.push_back(std::move(target));
     }
     if(!s.targets.empty()) {
@@ -178,9 +181,13 @@ void FindController::decorate(Search& s) {
             w->textHighlightRevision=s.revision;
             if(auto* collection=dynamic_cast<TagCollection*>(w)) {
                 std::map<size_t,std::vector<ui::TextHighlight>> tags;
-                if(found!=s.byId.end()) for(size_t index:found->second.targets) {
-                    auto& t=s.targets[index];
-                    if(t.tag>=0) tags[size_t(t.tag)]=t.ranges;
+                if(found!=s.byId.end()) {
+                    auto add=[&](size_t index) {
+                        const auto& target=s.targets[index];
+                        if(target.tag>=0) tags.insert_or_assign(size_t(target.tag),target.ranges);
+                    };
+                    add(found->second.first);
+                    for(size_t index:found->second.remaining) add(index);
                 }
                 const bool has_tags=!tags.empty();
                 collection->SetHighlights(std::move(tags));
@@ -192,7 +199,10 @@ void FindController::decorate(Search& s) {
                         scroll->onDrawSearchMarkers=[weak,scroll](ui::Renderer& r){if(auto item=weak.lock()) item->DrawSearchMarkers(r,*scroll);};
                     }
                 }
-            } else if(found!=s.byId.end()) w->textHighlights=s.targets[found->second.targets.back()].ranges;
+            } else if(found!=s.byId.end()) {
+                const auto& source=found->second;
+                w->textHighlights=s.targets[source.remaining.empty()?source.first:source.remaining.back()].ranges;
+            }
             else if(w->textHighlights.capacity()) decltype(w->textHighlights)().swap(w->textHighlights);
         }
         for(auto& child:w->Children()) visit(child.get(),row);
@@ -210,7 +220,7 @@ void FindController::reveal(Search& s) {
         if(top<scroll->rect.top || top>=scroll->rect.bottom)
             owner->ScrollWithMeasureContext(scroll,scroll->ScrollY()+top-scroll->rect.top);
     }
-    auto* widget=root()->FindById(target.id);
+    auto* widget=root()->FindById(target.widget->first);
     if(!widget) return;
     auto box=[&]{auto* tags=dynamic_cast<TagCollection*>(widget);return tags && target.tag>=0?tags->TagBounds(size_t(target.tag)):widget->rect;};
     // Inner to outer; clamp the exposed rectangle to each inner viewport before
@@ -242,7 +252,7 @@ void FindController::Move(const std::string& scope,int direction) {
 }
 void FindController::activate(Search& s,const Hit& h,bool active) {
     auto& t=s.targets[h.target]; t.ranges[h.range].active=active;
-    auto* widget=root()->FindById(t.id);
+    auto* widget=root()->FindById(t.widget->first);
     if(auto* tags=dynamic_cast<TagCollection*>(widget)) tags->SetActiveHighlight(size_t(t.tag),h.range,active);
     else if(widget && h.range<widget->textHighlights.size()) widget->textHighlights[h.range].active=active;
 }
@@ -265,7 +275,7 @@ void FindController::markers(Search& s,ui::Renderer& r) {
     const float extent=std::max(1.0f,scroll->ContentHeight()),height=b.bottom-b.top;
     const float offset=list->rect.top-scroll->rect.top+scroll->ScrollY()+list->padT;
     auto position=[&](const Source& source) {
-        const auto row=s.targets[source.targets.front()].row;
+        const auto row=s.targets[source.first].row;
         return std::clamp((row<0?0.0f:offset+list->RowOffset(size_t(row)))+source.offset,0.0f,extent)/extent*std::max(0.0f,height-3);
     };
     if(s.geometry!=list->GeometryRevision() || s.extent!=extent || std::abs(s.offset-offset)>0.5f || s.height!=height) {
@@ -282,7 +292,7 @@ void FindController::markers(Search& s,ui::Renderer& r) {
         }
     }
     for(float tick:s.ticks) r.FillRoundedRect({b.left,b.top+tick,b.right,b.top+tick+2},1,1,D2D1::ColorF(0xd2ad22));
-    float at=b.top+position(s.byId.at(s.targets[s.current.target].id));
+    float at=b.top+position(s.targets[s.current.target].widget->second);
     r.FillRoundedRect({b.left,at,b.right,at+3},1,1,D2D1::ColorF(0xef8c22));
 }
 }

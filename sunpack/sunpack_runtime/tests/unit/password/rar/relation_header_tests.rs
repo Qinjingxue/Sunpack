@@ -600,7 +600,7 @@ fn rar5_successor_blocks_and_first_level_table_filter_different_sources() {
             let sessions: Vec<_> = parts.iter().map(|part|
                 NativeArchiveSession::new(part.extent.path.clone()).unwrap()).collect();
             let volumes = VolumeSet::new(parse_volumes(&parts, &sessions).unwrap());
-            let head = sessions[0].borrowed_reader().1;
+            let head = sessions[0].reader();
             let before = head.stats().direct_read_bytes;
             let context = native_volumes::prepare_fixed(&volumes, &parts, &sessions)
                 .unwrap_or_else(|_| panic!("fixed native split block context"));

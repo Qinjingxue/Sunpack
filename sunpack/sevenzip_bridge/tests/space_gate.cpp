@@ -312,32 +312,6 @@ void g5_probe_success_resumes_everyone() {
           "G-5: space_resumed 必须扇出给 affected job");
 }
 
-// probe 失败后，同一个正数空间采样可再次试探
-void g6_failed_probe_retries_same_positive_space() {
-    auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g6", log);
-    const auto path = unresolved_failed_path();
-    gate->report_space_failure(ERROR_DISK_FULL, path);
-    const auto blocked_count = log->count(VolumeSpaceTransition::Kind::Blocked);
-    check(gate->poll(500 * kMib), "G-6: initial positive-space probe");
-    {
-        auto result = gate->try_wait({});
-        result.lease.report_space_failure(ERROR_DISK_FULL, path);
-    }
-    check(gate->phase() == VolumeSpacePhase::Blocked, "G-6: failure returns Blocked");
-    check(gate->poll(500 * kMib), "G-6: same positive space can retry");
-    check(!gate->poll(500 * kMib), "G-6: no second lease while Probing");
-    {
-        auto result = gate->try_wait({});
-        result.lease.report_space_failure(ERROR_DISK_FULL, path);
-    }
-    check(gate->poll(1), "G-6: smaller positive space can retry");
-    check(log->count(VolumeSpaceTransition::Kind::Blocked) == blocked_count,
-          "G-6: multiple failures still one blocked event");
-    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
-          "G-6: failed probes never resume");
-}
-
 // 前次 lease 未结算时不得再发放许可
 void g7_no_second_permit_while_probing() {
     auto log = std::make_shared<SinkLog>();
@@ -1089,6 +1063,8 @@ void g30_positive_samples_retry_after_failure() {
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
         check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: failed probe remains Blocked");
     }
+    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
+          "G-30: failed probes never emit a resumed event");
     check(!gate->poll(0), "G-30: zero space remains blocked");
     check(gate->poll(1), "G-30: positive space resumes probing");
     {
@@ -1412,7 +1388,6 @@ int main(int argc, char **argv) {
         {"G-3  zero space blocks probes", g3_zero_space_blocks_probe},
         {"G-4  positive space issues single probe", g4_positive_space_issues_single_probe},
         {"G-5  probe success resumes everyone", g5_probe_success_resumes_everyone},
-        {"G-6  failed probe retries with positive space", g6_failed_probe_retries_same_positive_space},
         {"G-7  no second permit while probing", g7_no_second_permit_while_probing},
         {"G-8  concurrent failures open one episode", g8_concurrent_failures_open_one_episode},
         {"G-9  wake_waiters does not change state", g9_wake_waiters_does_not_change_state},

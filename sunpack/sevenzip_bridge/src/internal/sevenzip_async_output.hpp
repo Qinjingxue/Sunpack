@@ -126,6 +126,8 @@ namespace sunpack::sevenzip
     public:
         struct JobState
         {
+            static constexpr std::size_t kUnregistered = static_cast<std::size_t>(-1);
+
             explicit JobState(
                 std::size_t budget,
                 std::shared_ptr<std::atomic<bool>> external_cancel,
@@ -145,7 +147,9 @@ namespace sunpack::sevenzip
             // Written under the writer mutex; the space gate reads it without that lock.
             std::atomic<HRESULT> first_error{S_OK};
             std::size_t inflight_bytes = 0;
-            std::size_t pending_jobs = 0;
+            // A file stays pending until its writes drain and its handle closes.
+            std::size_t pending_files = 0;
+            std::size_t active_index = kUnregistered;
             const std::size_t max_inflight_bytes;
             std::shared_ptr<std::atomic<bool>> cancel_token;
             const bool capture_inventory;
@@ -389,6 +393,7 @@ namespace sunpack::sevenzip
             std::lock_guard<std::mutex> lock(mutex_);
             synchronize_cancellation_locked(job);
             active_jobs_.push_back(job);
+            job->active_index = active_jobs_.size() - 1;
             return job;
         }
 
@@ -415,6 +420,7 @@ namespace sunpack::sevenzip
             std::lock_guard<std::mutex> lock(mutex_);
             file->active_index = active_files_.size();
             active_files_.push_back(file);
+            ++file->job->pending_files;
             return file;
         }
 
@@ -602,7 +608,6 @@ namespace sunpack::sevenzip
                         buffer->size = previous_size + chunk;
                         if (previous_size == 0)
                         {
-                            ++job->pending_jobs;
                             ++file->outstanding_data;
                         }
                         file->new_writes = true;
@@ -664,10 +669,6 @@ namespace sunpack::sevenzip
                 synchronize_cancellation_locked(file->job);
                 file->close_requested = true;
                 file->magic = std::move(magic);
-                if (file->job)
-                {
-                    ++file->job->pending_jobs;
-                }
                 if (terminal_result_locked(file->job) != S_OK)
                 {
                     discard_staging_locked(file);
@@ -694,21 +695,20 @@ namespace sunpack::sevenzip
             {
                 return E_FAIL;
             }
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                synchronize_cancellation_locked(job);
-            }
+            std::unique_lock<std::mutex> lock(mutex_);
+            synchronize_cancellation_locked(job);
             // Seal all files even if an error arrives after this call starts,
             // or the caller never reached the stream's Close().
-            seal_job_files(job);
-            drain_cancelled_retries();
-            if (job->first_error.load(std::memory_order_acquire) != S_OK && state_->space_gate)
-                state_->space_gate->wake_waiters();
-
-            std::unique_lock<std::mutex> lock(mutex_);
-
-            producer_cv_.wait(lock, [&job]
-                              { return job->pending_jobs == 0; });
+            if (job->pending_files != 0)
+            {
+                lock.unlock();
+                seal_job_files(job);
+                drain_cancelled_retries();
+                if (job->first_error.load(std::memory_order_acquire) != S_OK && state_->space_gate)
+                    state_->space_gate->wake_waiters();
+                lock.lock();
+                producer_cv_.wait(lock, [&job] { return job->pending_files == 0; });
+            }
 
             const HRESULT result = terminal_result_locked(job);
             unregister_job_locked(job);
@@ -745,16 +745,16 @@ namespace sunpack::sevenzip
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                for (auto it = active_jobs_.begin(); it != active_jobs_.end();)
+                for (std::size_t index = 0; index < active_jobs_.size();)
                 {
-                    if (const auto job = it->lock())
+                    if (const auto job = active_jobs_[index].lock())
                     {
                         synchronize_cancellation_locked(job);
-                        ++it;
+                        ++index;
                     }
                     else
                     {
-                        it = active_jobs_.erase(it);
+                        erase_active_job_locked(index);
                     }
                 }
             }
@@ -1029,18 +1029,21 @@ namespace sunpack::sevenzip
 
         void unregister_job_locked(const JobStatePtr &job) noexcept
         {
-            for (auto it = active_jobs_.begin(); it != active_jobs_.end();)
+            const auto index = job->active_index;
+            if (index == JobState::kUnregistered) return;
+            assert(index < active_jobs_.size() && active_jobs_[index].lock() == job);
+            job->active_index = JobState::kUnregistered;
+            erase_active_job_locked(index);
+        }
+
+        void erase_active_job_locked(std::size_t index) noexcept
+        {
+            if (index + 1 != active_jobs_.size())
             {
-                const auto candidate = it->lock();
-                if (!candidate || candidate.get() == job.get())
-                {
-                    it = active_jobs_.erase(it);
-                }
-                else
-                {
-                    ++it;
-                }
+                active_jobs_[index] = std::move(active_jobs_.back());
+                if (const auto moved = active_jobs_[index].lock()) moved->active_index = index;
             }
+            active_jobs_.pop_back();
         }
 
         void seal_job_files(const JobStatePtr &job) noexcept
@@ -1107,10 +1110,6 @@ namespace sunpack::sevenzip
                     else
                     {
                         file->job->inflight_bytes = 0;
-                    }
-                    if (file->job->pending_jobs != 0)
-                    {
-                        --file->job->pending_jobs;
                     }
                 }
             }
@@ -1729,10 +1728,8 @@ namespace sunpack::sevenzip
                     test_completed_files_.fetch_add(1, std::memory_order_relaxed);
                 }
 #endif
-                if (job && job->pending_jobs != 0)
-                {
-                    --job->pending_jobs;
-                }
+                assert(job->pending_files != 0);
+                --job->pending_files;
                 unregister_file_locked(file);
             }
             producer_cv_.notify_all();
@@ -1762,10 +1759,6 @@ namespace sunpack::sevenzip
                 if (job)
                 {
                     job->inflight_bytes -= buffer->size;
-                    if (job->pending_jobs != 0)
-                    {
-                        --job->pending_jobs;
-                    }
                 }
                 buffer->file.reset();
                 buffer->size = 0;

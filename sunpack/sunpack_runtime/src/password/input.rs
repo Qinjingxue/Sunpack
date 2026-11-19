@@ -57,7 +57,7 @@ impl<'a> InputReaders<'a> {
         Self(
             sessions
                 .iter()
-                .map(NativeArchiveSession::borrowed_reader)
+                .map(|session| (session.path(), session.reader().clone()))
                 .collect(),
         )
     }

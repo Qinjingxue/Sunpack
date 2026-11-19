@@ -272,7 +272,7 @@ impl<'a> Preparation<'a> {
         prepare: impl FnOnce() -> Prepared + Send,
     ) -> std::io::Result<PasswordVerification> {
         let cancellation = Cancellation::current();
-        cancellation.check()?;
+        cancellation.check_io()?;
         let mut prepare = Some(prepare);
         loop {
             if self.slot.as_ref().is_none_or(|slot| slot.key != key) {
@@ -287,7 +287,7 @@ impl<'a> Preparation<'a> {
                 // The initializing borrower was cancelled. Waiters can take
                 // over without retiring a still-current file generation.
                 self.release(true);
-                cancellation.check()?;
+                cancellation.check_io()?;
                 continue;
             };
             let result = Self::verify_material(
@@ -315,7 +315,7 @@ impl<'a> Preparation<'a> {
         fixed_password: bool,
         other_password_batches: bool,
     ) -> std::io::Result<PasswordVerification> {
-        cancellation.check()?;
+        cancellation.check_io()?;
         if slot.is_some_and(|slot| slot.retired.load(Ordering::Acquire)) {
             return Err(input_changed());
         }
@@ -326,7 +326,7 @@ impl<'a> Preparation<'a> {
             Ok(context) => context.verify(candidates, rar_key),
             Err(status) => Ok(status.verification()),
         };
-        cancellation.check()?;
+        cancellation.check_io()?;
         if slot.is_some_and(|slot| slot.retired.load(Ordering::Acquire)) {
             return Err(input_changed());
         }
@@ -369,20 +369,22 @@ fn borrow(key: &InputKey) -> Arc<PreparedSlot> {
     if let Some(slot) = active.iter().find(|slot| slot.key == *key) {
         return Arc::clone(slot);
     }
-    let generations: HashMap<_, _> = key
-        .members
-        .iter()
-        .map(|member| (&member.generation.path, &member.generation))
-        .collect();
-    let retired = retire_where(&mut active, |old| {
-        // Different volume snapshots can share unchanged members. Only
-        // (re)opening a changed member invalidates its existing preparations.
-        old.members.iter().any(|left| {
-            generations
-                .get(&left.generation.path)
-                .is_some_and(|right| left.generation != **right)
-        })
-    });
+    // Different volume snapshots can share unchanged members. Only reopening
+    // a changed member invalidates its existing preparations.
+    let retired = if active.is_empty() {
+        Vec::new()
+    } else if let [member] = key.members.as_slice() {
+        retire_where(&mut active, |old| old.members.iter().any(|left| {
+            left.generation.path == member.generation.path && left.generation != member.generation
+        }))
+    } else {
+        let generations: HashMap<_, _> = key.members.iter()
+            .map(|member| (&member.generation.path, &member.generation))
+            .collect();
+        retire_where(&mut active, |old| old.members.iter().any(|left| {
+            generations.get(&left.generation.path).is_some_and(|right| left.generation != **right)
+        }))
+    };
     let slot = Arc::new(PreparedSlot {
         key: key.clone(),
         value: CancellableOnce::default(),
@@ -420,6 +422,9 @@ pub(crate) fn release_under_roots(roots: &[PathBuf]) {
                 .any(|root| member.generation.path.starts_with(root))
         })
     });
+    if active.capacity() > 256.max(active.len().saturating_mul(4)) {
+        active.shrink_to_fit();
+    }
     drop(active);
     drop(retired);
 }

@@ -284,11 +284,10 @@ impl CandidateSet {
             .as_ref()
             .map(std::slice::from_ref)
             .unwrap_or(&plan.candidates);
-        let (_, reader) = session.borrowed_reader();
         let (out, matched) =
             crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor(
                 anchor,
-                &reader,
+                session.reader(),
                 passwords,
                 offset != 0 || anchor.carrier_limit.is_some(),
                 key.as_ref(),

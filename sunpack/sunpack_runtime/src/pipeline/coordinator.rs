@@ -2597,10 +2597,11 @@ impl<'run, O: Observer> Run<'run, O> {
             for (owner, group) in &self.checkpoints {
                 for &position in group.values() {
                     let input = self.request.checkpoints[position].input();
-                    if !index.contains_key(&input.format_hint) {
-                        index.insert(input.format_hint.clone(), HashMap::new());
-                    }
-                    let anchors = index.get_mut(&input.format_hint).unwrap();
+                    let anchors = if let Some(anchors) = index.get_mut(&input.format_hint) {
+                        anchors
+                    } else {
+                        index.entry(input.format_hint.clone()).or_default()
+                    };
                     for anchor in recovery_anchors(input) {
                         anchors.entry(anchor).or_default().push((Arc::clone(owner), position));
                     }
@@ -2623,9 +2624,12 @@ impl<'run, O: Observer> Run<'run, O> {
                 let input = &logical.input;
                 let Some(anchors) = index.get(&input.format_hint) else { continue; };
                 for anchor in recovery_anchors(input) {
-                    for (candidate_owner, _) in anchors.get(&anchor).into_iter().flatten() {
-                        if owner.is_some_and(|owner| owner != candidate_owner) { return None; }
-                        owner = Some(candidate_owner);
+                    if let Some(matches) = anchors.get(&anchor) {
+                        // Each carrier contributes one contiguous run to this anchor.
+                        let first = &matches.first().unwrap().0;
+                        let last = &matches.last().unwrap().0;
+                        if first != last || owner.is_some_and(|owner| owner != first) { return None; }
+                        owner = Some(first);
                     }
                 }
             }
@@ -3361,9 +3365,7 @@ impl<'run, O: Observer> Run<'run, O> {
             Ok(promotion) => promotion,
             Err(error) => {
                 for path in existing {
-                    let copy = error.raw_os_error().map(io::Error::from_raw_os_error)
-                        .unwrap_or_else(|| io::Error::new(error.kind(), error.to_string()));
-                    failures.extend(cleanup_failure(path, mode, Err(copy)));
+                    failures.extend(cleanup_failure(path, mode, Err(copy_io_error(&error))));
                 }
                 return;
             }
@@ -3377,7 +3379,8 @@ impl<'run, O: Observer> Run<'run, O> {
             if removed.is_ok() {
                 shell.parent(path);
                 if let Some(parent) = path.parent().filter(|parent| parent.parent().is_some()) {
-                    let protected = self.cleanup_boundaries.contains(&resolved_key(parent));
+                    let protected = !self.cleanup_boundaries.is_empty()
+                        && self.cleanup_boundaries.contains(&resolved_key(parent));
                     // RemoveDirectory checks emptiness atomically. Never recurse:
                     // a concurrent arrival, retained sibling or output protects itself.
                     if !protected && fs::remove_dir(parent).is_ok() { shell.parent(parent); }
@@ -3539,9 +3542,7 @@ fn complete_verified_scan_layout(input: &mut ArchiveInput, result: &mut ArchiveR
 fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> ArchiveResult {
     let extent = input.physical_extents().next();
     let mut source_paths: Vec<_> = input.physical_paths().map(PathBuf::from).collect();
-    if source_paths.len() > 1 {
-        dedup_paths(&mut source_paths);
-    }
+    dedup_paths(&mut source_paths);
     ArchiveResult {
         path: PathBuf::from(&input.entry_path),
         format: input.format_hint.clone(),
@@ -3982,6 +3983,7 @@ fn numbered_suffix(name: &str) -> Option<(&str, usize)> {
 }
 
 fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    if paths.len() < 2 { return; }
     let mut seen = HashSet::new();
     paths.retain(|path| seen.insert(path_key(&path.to_string_lossy())));
 }
@@ -4000,7 +4002,15 @@ fn source_lease_keys(task: &Task, resolved: &HashMap<String, Arc<str>>) -> HashS
 }
 
 fn cleanup_boundaries(request: &Request) -> HashSet<String> {
-    if request.mode == Mode::Scan { return HashSet::new(); }
+    // Nested inputs and generated Watch sources can still be deleted in Keep mode.
+    if request.mode == Mode::Scan
+        || (request.origin == Origin::Foreground
+            && request.max_depth == 0
+            && request.generated_sources.is_empty()
+            && request.config.post_extract.archive_cleanup_mode == CleanupMode::Keep)
+    {
+        return HashSet::new();
+    }
     request.cleanup_boundaries.iter().chain(request.inputs.iter().filter(|path| path.is_dir()))
         .map(|path| resolved_key(path)).collect()
 }

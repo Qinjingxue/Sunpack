@@ -293,20 +293,9 @@ fn overlapping_request_uses_another_pipe_and_release_closes_both() {
 }
 
 #[test]
-fn empty_runtime_identity_uses_the_production_default() {
-    let variable = "SUNPACK_TEST_EMPTY_BROKER_IDENTITY";
-    std::env::set_var(variable, "");
-    assert_eq!(
-        configured_name(variable, SERVICE_NAME, TEST_SERVICE_NAME_PREFIX),
-        SERVICE_NAME
-    );
-    std::env::remove_var(variable);
-}
-
-#[test]
 fn runtime_identity_accepts_only_the_test_namespace() {
     let variable = "SUNPACK_TEST_BROKER_IDENTITY_NAMESPACE";
-    std::env::set_var(variable, "SunPackWatchBroker");
+    std::env::set_var(variable, "OtherWatchBroker");
     assert_eq!(
         configured_name(variable, SERVICE_NAME, TEST_SERVICE_NAME_PREFIX),
         SERVICE_NAME

@@ -11,7 +11,7 @@ fn cancellation_marker_preserves_io_errors_and_stops_read_retry_helpers() {
     let cancel = Cancellation::new();
     cancel.cancel();
     for error in [
-        cancel.check().unwrap_err(),
+        cancel.check_io().unwrap_err(),
         cancel.check_io().unwrap_err(),
         cancel.run(Cancellation::check_current_io).unwrap_err(),
     ] {

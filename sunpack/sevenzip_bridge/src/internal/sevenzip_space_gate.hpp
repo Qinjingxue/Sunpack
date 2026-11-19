@@ -362,10 +362,9 @@ namespace sunpack::sevenzip
         // 唤醒目录等待者并通知 IOCP 重新裁决排队请求；不改变状态。
         void wake_waiters() noexcept;
 
-        bool blocked() const noexcept; // Blocked || Probing
+        bool blocked(bool require_affected_jobs = false) const noexcept;
         std::uint64_t episode_id() const noexcept;
         std::vector<std::string> affected_job_ids() const;
-        bool has_affected_jobs() const noexcept;
 #ifdef SUP7Z_DEBUG
         VolumeSpacePhase phase() const noexcept;
         std::size_t waiter_count() const noexcept;
@@ -812,10 +811,10 @@ namespace sunpack::sevenzip
         wake_waiters();
     }
 
-    inline bool VolumeSpaceGate::blocked() const noexcept
+    inline bool VolumeSpaceGate::blocked(bool require_affected_jobs) const noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return phase_ != VolumeSpacePhase::Ready;
+        return phase_ != VolumeSpacePhase::Ready && (!require_affected_jobs || !affected_jobs_.empty());
     }
 
     
@@ -832,12 +831,6 @@ namespace sunpack::sevenzip
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return affected_jobs_;
-    }
-
-    inline bool VolumeSpaceGate::has_affected_jobs() const noexcept
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return !affected_jobs_.empty();
     }
 
 #ifdef SUP7Z_DEBUG

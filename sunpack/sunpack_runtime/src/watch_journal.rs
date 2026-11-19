@@ -47,39 +47,22 @@ impl Shared {
     fn wait_for(&self, id: &Arc<StreamId>, seq: u64, goal: TicketGoal) -> Result<(), String> {
         let mut state = lock_state(self);
         loop {
-            match state.streams.get(id.key.as_ref()) {
-                Some(stream) if Arc::ptr_eq(&stream.id, id) => {
-                    if let Some(error) = &stream.error {
-                        return Err(error.clone());
-                    }
-                    let done = match goal {
-                        TicketGoal::Written => stream.written_seq >= seq,
-                        TicketGoal::Durable => stream.durable_seq >= seq,
-                        TicketGoal::Sealed => stream.sealed_seq >= seq,
-                    };
-                    if done {
-                        return Ok(());
-                    }
-                }
-                _ => {
-                    let frontier = id
-                        .retired
-                        .get()
-                        .ok_or("Watch journal stream is unavailable")?;
-                    if let Some(error) = &frontier.error {
-                        return Err(error.clone());
-                    }
-                    let done = match goal {
-                        TicketGoal::Written => frontier.written >= seq,
-                        TicketGoal::Durable => frontier.durable >= seq,
-                        TicketGoal::Sealed => frontier.sealed >= seq,
-                    };
-                    return if done {
-                        Ok(())
-                    } else {
-                        Err("Watch journal stream closed before the requested frontier".to_string())
-                    };
-                }
+            let live = state.streams.get(id.key.as_ref()).filter(|stream| Arc::ptr_eq(&stream.id, id));
+            let frontier = live.map(|stream| &stream.frontier).or_else(|| id.retired.get())
+                .ok_or("Watch journal stream is unavailable")?;
+            if let Some(error) = &frontier.error {
+                return Err(error.clone());
+            }
+            let reached = match goal {
+                TicketGoal::Written => frontier.written_seq,
+                TicketGoal::Durable => frontier.durable_seq,
+                TicketGoal::Sealed => frontier.sealed_seq,
+            };
+            if reached >= seq {
+                return Ok(());
+            }
+            if live.is_none() {
+                return Err("Watch journal stream closed before the requested frontier".to_string());
             }
             state = self
                 .cv
@@ -89,10 +72,11 @@ impl Shared {
     }
 }
 
+#[derive(Default)]
 struct StreamFrontier {
-    written: u64,
-    durable: u64,
-    sealed: u64,
+    written_seq: u64,
+    durable_seq: u64,
+    sealed_seq: u64,
     error: Option<String>,
 }
 
@@ -237,12 +221,9 @@ struct SegmentState {
 struct StreamState {
     owners: usize,
     id: Arc<StreamId>,
-    written_seq: u64,
-    durable_seq: u64,
+    frontier: StreamFrontier,
     requested_seq: u64,
-    sealed_seq: u64,
     segments: BTreeMap<u64, SegmentState>,
-    error: Option<String>,
     has_written: bool,
     #[cfg(test)]
     write_calls: u64,
@@ -258,12 +239,9 @@ impl StreamState {
                 key,
                 retired: OnceLock::new(),
             }),
-            written_seq: 0,
-            durable_seq: 0,
+            frontier: StreamFrontier::default(),
             requested_seq: 0,
-            sealed_seq: 0,
             segments: BTreeMap::new(),
-            error: None,
             has_written: false,
             #[cfg(test)]
             write_calls: 0,
@@ -444,8 +422,10 @@ impl JournalRuntime {
             .get_mut(stream.key.as_ref())
             .filter(|state| Arc::ptr_eq(&state.id, stream))
             .ok_or("Watch journal stream is unavailable")?;
-        stream_state.requested_seq = stream_state.requested_seq.max(target_seq);
-        self.shared.cv.notify_all();
+        if target_seq > stream_state.requested_seq {
+            stream_state.requested_seq = target_seq;
+            self.shared.cv.notify_all();
+        }
         Ok(NativeJournalTicket::new(
             self.shared.clone(),
             stream.clone(),
@@ -462,13 +442,13 @@ impl JournalRuntime {
             .filter(|stream| stream.owners != 0)
             .ok_or("Watch journal stream is unavailable")?;
         if !stream_state.has_written && stream_state.segments.is_empty() {
-            stream_state.written_seq = stream_state.written_seq.max(seq);
-            stream_state.durable_seq = stream_state.durable_seq.max(seq);
-            stream_state.requested_seq = stream_state.requested_seq.max(stream_state.durable_seq);
-        } else if seq > stream_state.written_seq {
+            stream_state.frontier.written_seq = stream_state.frontier.written_seq.max(seq);
+            stream_state.frontier.durable_seq = stream_state.frontier.durable_seq.max(seq);
+            stream_state.requested_seq = stream_state.requested_seq.max(stream_state.frontier.durable_seq);
+        } else if seq > stream_state.frontier.written_seq {
             return Err(format!(
                 "cannot seed active Watch journal stream to {seq} past written frontier {}",
-                stream_state.written_seq
+                stream_state.frontier.written_seq
             ));
         }
         self.shared.cv.notify_all();
@@ -492,7 +472,7 @@ impl JournalRuntime {
             let mut state = lock_state(&self.shared);
             let mut targets = Vec::with_capacity(state.streams.len());
             for stream in state.streams.values_mut() {
-                let target = stream.written_seq;
+                let target = stream.frontier.written_seq;
                 stream.requested_seq = stream.requested_seq.max(target);
                 targets.push((stream.id.clone(), target));
             }
@@ -525,7 +505,7 @@ fn lock_state(shared: &Shared) -> MutexGuard<'_, RuntimeState> {
 fn fail_stream(shared: &Shared, stream: &str, error: impl Into<String>) {
     let mut state = lock_state(shared);
     if let Some(stream_state) = state.streams.get_mut(stream) {
-        stream_state.error.get_or_insert_with(|| error.into());
+        stream_state.frontier.error.get_or_insert_with(|| error.into());
     }
     retire_closed_stream(&mut state, stream);
     shared.cv.notify_all();
@@ -535,18 +515,16 @@ fn retire_closed_stream(state: &mut RuntimeState, key: &str) {
     let ready = state
         .streams
         .get(key)
-        .is_some_and(|s| s.owners == 0 && (s.error.is_some() || s.durable_seq >= s.written_seq));
+        .is_some_and(|stream| {
+            let frontier = &stream.frontier;
+            stream.owners == 0 && (frontier.error.is_some() || frontier.durable_seq >= frontier.written_seq)
+        });
     if !ready {
         return;
     }
     let stream = state.streams.remove(key).expect("checked stream");
     // Removal uniquely owns publication; tickets only read this terminal state.
-    let _ = stream.id.retired.set(StreamFrontier {
-        written: stream.written_seq,
-        durable: stream.durable_seq,
-        sealed: stream.sealed_seq,
-        error: stream.error,
-    });
+    let _ = stream.id.retired.set(stream.frontier);
     crate::collections::trim_map(&mut state.streams);
 }
 
@@ -662,10 +640,10 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
             .streams
             .get(first.stream.key.as_ref())
             .ok_or_else(|| io::Error::other("Watch journal stream is unavailable"))?;
-        if stream.error.is_some() {
+        if stream.frontier.error.is_some() {
             return Ok(());
         }
-        stream.written_seq
+        stream.frontier.written_seq
     };
     let mut payload = crate::io::scratch::Spool::default();
     let mut frame_buffer = Vec::new();
@@ -720,7 +698,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
             })?;
         segment.last_seq = last_seq;
     }
-    stream_state.written_seq = last_seq;
+    stream_state.frontier.written_seq = last_seq;
     stream_state.has_written = true;
     #[cfg(test)]
     {
@@ -758,7 +736,7 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                 let mut state = lock_state(&shared);
                 let mut target = 0;
                 if let Some(entry) = state.streams.get_mut(stream.key.as_ref()) {
-                    target = entry.written_seq;
+                    target = entry.frontier.written_seq;
                     entry.requested_seq = entry.requested_seq.max(target);
                     entry.owners = entry.owners.saturating_sub(1);
                 }
@@ -811,10 +789,11 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                 let Some(stream_state) = state
                     .streams
                     .get_mut(stream.key.as_ref())
-                    .filter(|stream| stream.error.is_none())
+                    .filter(|stream| stream.frontier.error.is_none())
                 else {
                     continue;
                 };
+                let frontier = &mut stream_state.frontier;
                 if let Some(segment) = stream_state.segments.get_mut(&old_start) {
                     if segment.path != old_path {
                         drop(state);
@@ -827,16 +806,16 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                     }
                     segment.sealed_end = Some(boundary);
                     let required = segment.last_seq.max(boundary);
-                    if required <= stream_state.durable_seq {
+                    if required <= frontier.durable_seq {
                         stream_state.segments.remove(&old_start);
-                        stream_state.sealed_seq = stream_state.sealed_seq.max(boundary);
+                        frontier.sealed_seq = frontier.sealed_seq.max(boundary);
                     } else {
                         stream_state.requested_seq = stream_state.requested_seq.max(required);
                     }
-                } else if stream_state.durable_seq >= boundary {
+                } else if frontier.durable_seq >= boundary {
                     // A segment loaded from a previous process has no native handle;
                     // startup seeding already establishes that prefix as durable.
-                    stream_state.sealed_seq = stream_state.sealed_seq.max(boundary);
+                    frontier.sealed_seq = frontier.sealed_seq.max(boundary);
                 } else {
                     drop(state);
                     fail_stream(
@@ -865,12 +844,13 @@ struct FlushWork {
 }
 
 fn close_ready_segments(stream: &mut StreamState) {
+    let frontier = &mut stream.frontier;
     stream.segments.retain(|_, segment| {
         let ready = segment
             .sealed_end
-            .filter(|&boundary| segment.last_seq.max(boundary) <= stream.durable_seq);
+            .filter(|&boundary| segment.last_seq.max(boundary) <= frontier.durable_seq);
         if let Some(boundary) = ready {
-            stream.sealed_seq = stream.sealed_seq.max(boundary);
+            frontier.sealed_seq = frontier.sealed_seq.max(boundary);
             return false;
         }
         true
@@ -884,24 +864,26 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
             .streams
             .values_mut()
             .find(|stream| {
-                stream.error.is_none()
-                    && stream.requested_seq > stream.durable_seq
-                    && stream.written_seq >= stream.requested_seq
+                let frontier = &stream.frontier;
+                frontier.error.is_none()
+                    && stream.requested_seq > frontier.durable_seq
+                    && frontier.written_seq >= stream.requested_seq
             });
 
         if let Some(stream) = candidate {
-            let target = stream.written_seq;
+            let frontier = &mut stream.frontier;
+            let target = frontier.written_seq;
             // Coalesce the records already written through this snapshot.
             // Appends published during I/O have a higher sequence than target.
             let files: Vec<_> = stream
                 .segments
                 .values()
-                .filter(|segment| segment.last_seq > stream.durable_seq)
+                .filter(|segment| segment.last_seq > frontier.durable_seq)
                 .map(|segment| segment.file.clone())
                 .collect();
 
             if files.is_empty() {
-                stream.durable_seq = stream.durable_seq.max(target);
+                frontier.durable_seq = frontier.durable_seq.max(target);
                 close_ready_segments(stream);
                 let key = Arc::clone(&stream.id.key);
                 retire_closed_stream(&mut state, &key);
@@ -945,6 +927,7 @@ fn flusher_loop(shared: Arc<Shared>) {
         }
         if let Err(error) = result {
             stream_state
+                .frontier
                 .error
                 .get_or_insert_with(|| format!("native Watch journal flush failed: {error}"));
             retire_closed_stream(&mut state, &stream.key);
@@ -955,7 +938,7 @@ fn flusher_loop(shared: Arc<Shared>) {
         {
             stream_state.flush_calls += flush_calls;
         }
-        stream_state.durable_seq = stream_state.durable_seq.max(target);
+        stream_state.frontier.durable_seq = stream_state.frontier.durable_seq.max(target);
         close_ready_segments(stream_state);
         retire_closed_stream(&mut state, &stream.key);
         shared.cv.notify_all();

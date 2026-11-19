@@ -484,12 +484,12 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
     let mut files: HashMap<_, _> = sessions
         .iter()
         .map(|session| {
-            let (path, reader) = session.borrowed_reader();
+            let path = session.path();
             (
                 path,
                 Arc::new(AttemptFile {
                     path: path.to_owned(),
-                    reader: OnceLock::from(Ok(reader)),
+                    reader: OnceLock::from(Ok(session.reader().clone())),
                 }),
             )
         })

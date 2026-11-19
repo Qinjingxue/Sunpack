@@ -507,7 +507,8 @@ namespace sunpack::sevenzip
                     num_items,
                     shared_writer,
                     cancel_token,
-                    output_inventory
+                    output_inventory,
+                    &archive_path
 #ifdef SUP7Z_DEBUG
                     , pipeline_timing.get()
 #endif
@@ -515,7 +516,6 @@ namespace sunpack::sevenzip
             }
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
-            raw_extract_callback->set_input_file(archive_path);
 
 #ifdef SUP7Z_DEBUG
             if (pipeline_timing) pipeline_timing->start_pipeline();

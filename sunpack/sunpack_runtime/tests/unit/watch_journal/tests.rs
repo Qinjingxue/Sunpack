@@ -48,7 +48,7 @@ fn global_flush_keeps_the_original_stream_outcome_after_retirement() {
                 key.clone(),
                 StreamState {
                     owners: 1,
-                    written_seq: 1,
+                    frontier: StreamFrontier { written_seq: 1, ..Default::default() },
                     ..StreamState::new(key.clone())
                 },
             );
@@ -65,9 +65,9 @@ fn global_flush_keeps_the_original_stream_outcome_after_retirement() {
             let stream = state.streams.get_mut("stream").unwrap();
             stream.owners = 0;
             if failed {
-                stream.error = Some("old stream failed".to_string());
+                stream.frontier.error = Some("old stream failed".to_string());
             } else {
-                stream.durable_seq = 1;
+                stream.frontier.durable_seq = 1;
             }
             retire_closed_stream(&mut state, "stream");
             if reopen {
@@ -75,9 +75,12 @@ fn global_flush_keeps_the_original_stream_outcome_after_retirement() {
                     key.clone(),
                     StreamState {
                         owners: 1,
-                        written_seq: 1,
-                        durable_seq: 1,
-                        error: (!failed).then(|| "new stream failed".to_string()),
+                        frontier: StreamFrontier {
+                            written_seq: 1,
+                            durable_seq: 1,
+                            error: (!failed).then(|| "new stream failed".to_string()),
+                            ..Default::default()
+                        },
                         ..StreamState::new(key)
                     },
                 );
@@ -163,8 +166,8 @@ fn seal_waits_for_durable_boundary_and_releases_segment() {
     seal.wait_for(TicketGoal::Sealed).unwrap();
     let state = lock_state(&runtime.shared);
     let stream_state = state.streams.get(stream.as_str()).unwrap();
-    assert!(stream_state.durable_seq >= 1);
-    assert!(stream_state.sealed_seq >= 1);
+    assert!(stream_state.frontier.durable_seq >= 1);
+    assert!(stream_state.frontier.sealed_seq >= 1);
     assert!(!stream_state.segments.contains_key(&1));
     drop(state);
     owner.close().unwrap();
@@ -199,7 +202,7 @@ fn writer_batches_already_queued_appends_without_waiting() {
 
     let state = lock_state(&shared);
     let stream_state = state.streams.get(stream.as_ref()).unwrap();
-    assert_eq!(stream_state.written_seq, 32);
+    assert_eq!(stream_state.frontier.written_seq, 32);
     assert_eq!(stream_state.write_calls, 1);
     drop(state);
     let _ = fs::remove_file(path);

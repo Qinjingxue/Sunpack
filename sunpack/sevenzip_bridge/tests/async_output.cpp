@@ -386,13 +386,15 @@ bool quiescence_tracks_jobs_and_files(const std::filesystem::path& directory) {
         std::cerr << "writer with a live file reported quiescent\n";
         return false;
     }
+    const auto sibling = writer.make_job();
     std::uint32_t processed = 0;
     if (writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed) != S_OK) {
         return false;
     }
     writer.record_operation_result(file, 0);
-    writer.close_file(file, {});
-    if (writer.finish_job(job) != S_OK) {
+    // finish_job must seal a file even when its stream did not close it.
+    if (writer.finish_job(job) != S_OK || !writer.take_file_snapshot(file).closed ||
+        writer.is_quiescent() || writer.finish_job(sibling) != S_OK) {
         return false;
     }
     // Once the job drained and no file is live, the facility is reclaimable.
@@ -710,7 +712,8 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
 bool registry_trims_payloads_at_completion(const std::filesystem::path& directory) {
     AsyncWriterConfig config;
     config.buffer_count = 16;
-    VolumeWriterRegistry registry(config);
+    std::size_t reap_changes = 0;
+    VolumeWriterRegistry registry(config, {}, [&] { ++reap_changes; });
     auto lease = registry.acquire("batch-volume");
     auto overlapping = registry.acquire("batch-volume");
     auto writer = lease.writer_pointer();
@@ -730,10 +733,11 @@ bool registry_trims_payloads_at_completion(const std::filesystem::path& director
     }
     if (writer->finish_job(job) != S_OK || writer->idle_memory_bytes() != (12U << 20)) return false;
     lease.reset();
-    if (writer->idle_memory_bytes() != (12U << 20)) return false;
+    if (writer->idle_memory_bytes() != (12U << 20) || reap_changes != 0) return false;
     overlapping.reset();
     auto reused = registry.acquire("batch-volume");
-    return &reused.writer() == writer.get() && writer->idle_memory_bytes() == AsyncFileWriter::kDefaultFileInFlightBytes;
+    return &reused.writer() == writer.get() && writer->idle_memory_bytes() == AsyncFileWriter::kDefaultFileInFlightBytes &&
+        reap_changes == 1;
 }
 
 }  // namespace

@@ -673,8 +673,8 @@ impl NativeArchiveSession {
         Ok(Self { path, reader })
     }
 
-    pub(crate) fn borrowed_reader(&self) -> (&str, ManagedReader) {
-        (&self.path, self.reader.clone())
+    pub(crate) fn reader(&self) -> &ManagedReader {
+        &self.reader
     }
 
     pub(crate) fn path(&self) -> &str { &self.path }

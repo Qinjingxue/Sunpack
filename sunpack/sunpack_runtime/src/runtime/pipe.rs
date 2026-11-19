@@ -770,7 +770,7 @@ impl Server {
             if header.argv.as_slice() == ["--watch-status-follow"] {
                 let _observer = StatusObserver::new(self);
                 loop {
-                    cancel.check()?;
+                    cancel.check_io()?;
                     crate::pipeline::stage("cli", &cancel).await?;
                     let revision = self.host.watch.status_revision();
                     let status = self.host.watch.status(&header.cwd)?;

@@ -377,7 +377,7 @@ fn root_policy_normalizes_only_equivalent_nonrecursive_output_layouts() {
 
 #[test]
 fn root_scopes_route_nested_descendants_and_keep_prefix_siblings() {
-    let roots: Vec<_> = [r"C:\watch", r"C:\watch\sub", r"C:\watch\sub\deep", r"C:\watch\sub-old"]
+    let roots: Vec<_> = [r"C:\", r"C:\watch", r"C:\watch\sub", r"C:\watch\sub\deep", r"C:\watch\sub-old"]
         .into_iter().map(|path| Root {
             path: PathBuf::from(path), output: None, recursive: true, deep: false, scanned: false,
         }).collect();
@@ -393,6 +393,15 @@ fn root_scopes_route_nested_descendants_and_keep_prefix_siblings() {
     assert!(!child.contains(nested_archive));
     assert!(grandchild.contains(nested_archive));
     assert_eq!(root.excluded_subtrees().len(), 2);
+    for (path, expected) in [
+        (nested_archive, r"c:\watch\sub\deep"),
+        (r"C:\watch\sub-backup\a.zip", r"c:\watch"),
+        (r"C:\watch\sub-old\a.zip", r"c:\watch\sub-old"),
+        (r"C:\outside\a.zip", r"c:\"),
+    ] {
+        let path_key = crate::path_keys::path_key(path);
+        assert_eq!(containing_root(&scopes, &path_key).unwrap().0, expected);
+    }
 }
 
 #[test]

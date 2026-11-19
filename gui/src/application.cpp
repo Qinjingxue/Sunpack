@@ -222,10 +222,24 @@ void Application::queue_save(Json job) {
     if(previous!=saves_.end() && kind=="roots") {
         // A later edit to the first row must not drop the other rows of an
         // already queued atomic paste. Replace only overlapping row values.
-        for(auto pair:{std::pair<const char*,const char*>{"edits","row"},{"snapshot","id"}}) for(auto& item:job[pair.first]) {
-            auto& items=(*previous)[pair.first];
-            auto found=std::find_if(items.begin(),items.end(),[&](const Json& old){return old[pair.second]==item[pair.second];});
-            if(found==items.end()) items.push_back(item); else *found=item;
+        for(auto [field,id]:{std::pair<const char*,const char*>{"edits","row"},{"snapshot","id"}}) {
+            auto& items=(*previous)[field];
+            auto& updates=job[field];
+            // A single edited row only needs one scan of the queued paste.
+            if(updates.size()==1) {
+                auto& update=updates.front();
+                const auto& row_key=update.at(id);
+                auto found=std::find_if(items.begin(),items.end(),[&](const Json& item){return item.at(id)==row_key;});
+                if(found==items.end()) items.push_back(std::move(update)); else *found=std::move(update);
+                continue;
+            }
+            std::unordered_map<std::string,size_t> positions;
+            positions.reserve(items.size()+updates.size());
+            for(size_t i=0;i<items.size();++i) positions.try_emplace(items[i].at(id).get_ref<const std::string&>(),i);
+            for(auto& update:updates) {
+                auto [position,inserted]=positions.try_emplace(update.at(id).get_ref<const std::string&>(),items.size());
+                if(inserted) items.push_back(std::move(update)); else items[position->second]=std::move(update);
+            }
         }
     } else if(previous!=saves_.end()) *previous=std::move(job); else saves_.push_back(std::move(job));
     start_save();
@@ -276,22 +290,28 @@ void Application::acknowledge_save(const Json& ack) {
                 ++it;
             }
         }
-        for(auto& edit:job.at("edits")) {
-            auto id=edit.at("row").get<std::string>();
-            if(!ok) continue;
+        std::unordered_multimap<std::string_view,Json*> queued_rows;
+        for(auto& queued:saves_) if(queued["kind"]==kind) for(auto& edit:queued["edits"]) {
+            const auto& id=edit.at("row");
+            pending.push_back(id);
+            if(ok) queued_rows.emplace(id.get_ref<const std::string&>(),&edit);
+        }
+        if(ok) for(auto& edit:job.at("edits")) {
+            const auto& id=edit.at("row").get_ref<const std::string&>();
             bool remove=edit.at("operation")=="delete";
             auto input=remove?std::string():utf8(resolve_path(wide(edit.at("input").get<std::string>()),options_.data_dir).wstring());
             auto output=edit.at("output").get<std::string>(); auto first=output.find_first_not_of(" \t\r\n");
             output=first==std::string::npos?"":output.substr(first,output.find_last_not_of(" \t\r\n")-first+1);
             records.push_back({{"id",id},{"input",input},{"identity",remove?std::string():utf8(path_key(wide(input)))},{"output",output},{"deep",edit.at("deep")},{"recursive",edit.value("recursive",false)},{"remove",remove}});
-            for(auto& queued:saves_) if(queued["kind"]==kind) for(auto& next:queued["edits"]) if(next["row"]==id) {
+            auto [first_match,end]=queued_rows.equal_range(id);
+            for(auto match=first_match;match!=end;++match) {
+                auto& next=*match->second;
                 next["original"]=input;
                 next["expected"]=remove?Json():Json{{"output",output},{"deep",edit["deep"]},{"recursive",edit.value("recursive",false)}};
                 if(next["operation"]=="delete") next["input"]=input;
                 else next["operation"]=remove?"addMany":"save";
             }
         }
-        for(auto& queued:saves_) if(queued["kind"]==kind) for(auto& edit:queued["edits"]) pending.push_back(edit["row"]);
         auto reply=Json{{"snapshot",job.at("snapshot")},{"ok",ok},{"error",localized_error(ack.at("error").get_ref<const std::string&>())},
             {"records",std::move(records)},{"pending",std::move(pending)}};
         reply["removedPasswordScopes"]=std::move(removed_scopes);

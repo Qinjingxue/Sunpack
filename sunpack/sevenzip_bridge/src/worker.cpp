@@ -526,12 +526,12 @@ std::string pipeline_timing_wire(const sunpack::sevenzip::ExtractPipelineTiming&
 
 std::string verified_manifest_wire(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result, bool include_rows) {
     std::optional<WorkerChunks> chunks;
-    if (include_rows && result.output_inventory_complete) {
+    if (include_rows) {
         chunks.emplace(job_id, "manifest_chunk", "rows");
     }
     unsigned int file_count = 0;
     unsigned long long total_size = 0;
-    bool complete = result.output_inventory_complete;
+    bool complete = true;
     std::string row;
     if (chunks) row.reserve(256);
     for (const auto& item : result.output_trace.items) {
@@ -1661,7 +1661,8 @@ RequestOutcome run_request(
         for (const auto source : cursor.selected) wire::append_number(volume_selection, source);
         volume_selection += wire::end() + wire::end();
     }
-    const std::string manifest_field = ok
+    // A preexisting output root needs a directory scan to include its old files.
+    const std::string manifest_field = ok && result.output_inventory_complete
         ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result, request.output_inventory) : "";
     const auto complete_files = !ok ? std::count_if(
         result.output_trace.items.begin(), result.output_trace.items.end(),
@@ -1758,7 +1759,8 @@ public:
               writer_config_,
               [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
                   on_space_transition(transition);
-              }),
+              },
+              [this] { request_monitor_recheck(); }),
           memory_(memory_reserve_bytes, [this] { writer_registry_.reclaim_idle_memory(); }),
           space_monitor_(
               sunpack::sevenzip::VolumeSpaceMonitor::Options{
@@ -2286,7 +2288,6 @@ private:
                 job.execution = std::make_unique<JobExecution>(memory_, job.request);
             }
             RequestOutcome outcome{-100, {}};
-            bool monitor_recheck_needed = false;
             const std::string& job_id = job.request.job_id;
             auto &memory_job = job.execution->memory;
             memory_.begin(memory_job);
@@ -2310,7 +2311,6 @@ private:
                     } else if (!job.request.scan_only && !interrupted) {
                         const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
                         auto lease = writer_registry_.acquire(key);
-                        monitor_recheck_needed = true;
                         register_cancel_writer(job_id, lease.writer_pointer());
                         const auto weak = std::weak_ptr<sunpack::sevenzip::AsyncFileWriter>(lease.writer_pointer());
                         memory_.set_wake(memory_job, [weak] { if (auto writer = weak.lock()) writer->wake_waiters(); });
@@ -2319,8 +2319,6 @@ private:
                         outcome = run_request(job.request, lease.writer_pointer(), memory_job.cancel, [&] {
                             registration.reset();
                             lease.reset();
-                            request_monitor_recheck();
-                            monitor_recheck_needed = false;
                         });
                     } else outcome = run_request(job.request, nullptr, memory_job.cancel);
                     if (outcome.response.size() > UINT32_MAX) {
@@ -2348,13 +2346,14 @@ private:
             // retain neither dictionaries, writer leases nor execution threads.
             cpu_budget_.release(1);
             memory_.end(memory_job);
+            bool key_cache_armed;
             if (outcome.code == kMemoryRetry) {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    monitor_recheck_needed = finish_attempt_locked() || monitor_recheck_needed;
+                    key_cache_armed = finish_attempt_locked();
                     ++parked_jobs_;
                 }
-                if (monitor_recheck_needed) request_monitor_recheck();
+                if (key_cache_armed) request_monitor_recheck();
 #ifdef SUP7Z_DEBUG
                 print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(job_id) +
                     (wire::key("event") + wire::text("memory_reclaimed") + wire::key("required_bytes")) + wire::number(memory_job.required) + wire::end());
@@ -2388,14 +2387,14 @@ private:
             bool drained = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                monitor_recheck_needed = finish_attempt_locked() || monitor_recheck_needed;
+                key_cache_armed = finish_attempt_locked();
                 drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
                 any_job_failed_ = any_job_failed_ || outcome.code != 0;
             }
             if (!job_id.empty()) erase_cancel_token(job_id);
             const auto finished_job_id = std::move(job.request.job_id);
             job = {};
-            if (monitor_recheck_needed) request_monitor_recheck();
+            if (key_cache_armed) request_monitor_recheck();
 
             // cpu_budget_.release(1) wakes at most one queued admission waiter.
             // Drain waiters use a separate condition variable, while the
