@@ -41,9 +41,59 @@ function Assert-PrivateDirectory([string]$Directory) {
     }
 }
 
+function Write-UpgradeFile([string]$Path, [string]$Text) {
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+    $temporary = $Path + '.upgrade-' + [Guid]::NewGuid().ToString('N')
+    try {
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+        finally { $stream.Dispose() }
+        if ([IO.File]::Exists($Path)) {
+            [IO.File]::Replace($temporary, $Path, [System.Management.Automation.Language.NullString]::Value, $false)
+        } else { [IO.File]::Move($temporary, $Path) }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Get-CompactPasswordDocument([string]$Path) {
+    if (-not [IO.File]::Exists($Path)) { return }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    try {
+        $source = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        $bom = $source.StartsWith([string][char]0xfeff, [StringComparison]::Ordinal)
+        $json = if ($bom) { $source.Substring(1) } else { $source }
+        $document = ConvertFrom-Json -InputObject $json
+    } catch {
+        # Preserve an invalid file and keep its contents out of setup output.
+        return
+    }
+    if ($document -isnot [pscustomobject] -or -not $document.PSObject.Properties['passwords']) { return }
+
+    # Keep the original JSON tokens. PowerShell can coerce date-like strings
+    # when parsing, so the parsed object is only used to validate the input.
+    $text = [Text.StringBuilder]::new($source.Length)
+    if ($bom) { [void]$text.Append([char]0xfeff) }
+    $depth = 0
+    foreach ($token in [regex]::Matches($json, '"(?:[^"\\]|\\.)*"|[{}\[\],:]|[^"{}\[\],: \t\r\n]+')) {
+        $part = $token.Value
+        switch -Exact ($part) {
+            '{' { if ($depth -eq 0) { $part = "{`n  " }; ++$depth }
+            '[' { ++$depth }
+            '}' { --$depth; if ($depth -eq 0) { $part = "`n}`n" } }
+            ']' { --$depth }
+            ',' { if ($depth -eq 1) { $part = ",`n  " } }
+            ':' { if ($depth -eq 1) { $part = ': ' } }
+        }
+        [void]$text.Append($part)
+    }
+    $updated = $text.ToString()
+    if (-not [string]::Equals($updated, $source, [StringComparison]::Ordinal)) { $updated }
+}
+
 # Installation owns compatibility: v1.2.6 introduced the retained input formats.
-# All other managed state is rebuilt; roots (including initial_scanned) and
-# passwords are left in place, byte for byte, for compatible installations.
+# Compatible upgrades retain roots and password contents while rebuilding
+# managed state. Password documents may be compacted during publication.
 $dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
 Assert-PlainPath $dataDirectory
 Assert-PrivateDirectory $dataDirectory
@@ -330,24 +380,15 @@ if ($advanced.PSObject.Properties['watch'] -and $advanced.watch -is [pscustomobj
     }
 }
 
-# Only ordinary configuration needs rewriting. Publish it before any cleanup;
-# a failed replace leaves roots, passwords and old runtime state untouched.
+# Publish retained documents before starting cleanup.
 if ($retainInputs) {
+    $passwordFile = Join-Path $dataDirectory 'builtin_passwords.json'
+    $passwordText = Get-CompactPasswordDocument $passwordFile
     $text = (ConvertTo-OrdinaryConfigJson $user) + [Environment]::NewLine
     $null = $text | ConvertFrom-Json
-    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
     $null = [IO.Directory]::CreateDirectory($dataDirectory)
-    $temporary = $UserConfig + '.upgrade-' + [Guid]::NewGuid().ToString('N')
-    try {
-        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
-        finally { $stream.Dispose() }
-        if ([IO.File]::Exists($UserConfig)) {
-            [IO.File]::Replace($temporary, $UserConfig, [System.Management.Automation.Language.NullString]::Value, $false)
-        } else { [IO.File]::Move($temporary, $UserConfig) }
-    } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-    }
+    Write-UpgradeFile $UserConfig $text
+    if ($null -ne $passwordText) { Write-UpgradeFile $passwordFile $passwordText }
 }
 foreach ($record in $customRecords) {
     if (Test-Path -LiteralPath $record.FullName) {

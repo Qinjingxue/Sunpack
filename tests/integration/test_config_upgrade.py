@@ -20,7 +20,7 @@ def _snapshot(directory):
 
 def test_compatible_upgrade_retains_inputs_and_retires_state(tmp_path, repo_root):
     # Only this real script transaction covers template projection, advanced
-    # promotion, byte-exact retained inputs and selective state deletion together.
+    # promotion, lossless password formatting, intact roots and selective state deletion together.
     # Removing it loses the on-disk contract; one process plus retry is cheap.
     data, custom = tmp_path / "data ' [old]", tmp_path / "custom ' [watch]"
     data.mkdir()
@@ -46,9 +46,12 @@ def test_compatible_upgrade_retains_inputs_and_retires_state(tmp_path, repo_root
                        'C:\\Downloads | D:\\输出 | true | true | false\r'
                        'C:\\Other | | false | true | true\n').encode())
     passwords = data / "builtin_passwords.json"
-    good_lines = [b'\xef\xbb\xbf{', '  "passwords": [{"value": " 密码\\r\\n ", "scopes": ["D:/工作"]}],'.encode(),
-                  '  "clipboard_history": ["历史"]'.encode(), b'}']
-    passwords.write_bytes(b'\r' * 100 + b'\n \t\r\n'.join(good_lines) + b'\r\n\r\n')
+    password_document = {
+        "passwords": [{"value": ' 密码\r\n "]  ", ', "scopes": ["D:/工作"]}],
+        "clipboard_history": ["历史", "/Date(1)/", "  2025-01-01T00:00:00Z  "],
+    }
+    expanded = json.dumps(password_document, indent=2, ensure_ascii=False).replace("/", r"\/")
+    passwords.write_bytes(b'\xef\xbb\xbf' + expanded.replace("\n", "\r\n").encode("utf-8"))
     for directory in (data / ".sunpack_watch", data / "unknown", custom):
         directory.mkdir(exist_ok=True)
         (directory / "state.snapshot").write_bytes(b"old continuation")
@@ -56,7 +59,7 @@ def test_compatible_upgrade_retains_inputs_and_retires_state(tmp_path, repo_root
         (directory / "catalog.wal.bin").write_bytes(b"old catalog")
         (directory / "unrelated.txt").write_bytes(b"user owned")
     advanced_before = advanced.read_bytes()
-    inputs_before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)}
+    roots_before = roots.read_bytes(), roots.stat().st_mtime_ns
     result = _upgrade(repo_root, user, "v1.3.5-2-gabcdef0", advanced)
     assert result.returncode == 0, result.stdout + result.stderr
     migrated = json.loads(user.read_text(encoding="utf-8-sig"))
@@ -72,14 +75,24 @@ def test_compatible_upgrade_retains_inputs_and_retires_state(tmp_path, repo_root
     expected["filesystem"]["scan_filters"] = []
     assert migrated == expected
     assert {p.name for p in data.iterdir()} == {user.name, roots.name, passwords.name}
-    assert {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)} == inputs_before
+    assert (roots.read_bytes(), roots.stat().st_mtime_ns) == roots_before
+    password_text = passwords.read_bytes()
+    assert password_text.startswith(b'\xef\xbb\xbf')
+    assert json.loads(password_text) == password_document
+    compact_lines = [
+        f'  "{key}": ' + json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("/", r"\/")
+        for key, value in password_document.items()
+    ]
+    assert password_text.decode("utf-8-sig") == "{\n" + ",\n".join(compact_lines) + "\n}\n"
     assert {p.name for p in custom.iterdir()} == {"unrelated.txt"}
     assert (custom / "unrelated.txt").read_bytes() == b"user owned"
     assert advanced.read_bytes() == advanced_before
     before = {name: value[0] for name, value in _snapshot(data).items()}
+    password_mtime = passwords.stat().st_mtime_ns
     result = _upgrade(repo_root, user, "v1.3.5-2-gabcdef0", advanced)
     assert result.returncode == 0, result.stdout + result.stderr
     assert {name: value[0] for name, value in _snapshot(data).items()} == before
+    assert passwords.stat().st_mtime_ns == password_mtime
 
 
 def test_version_gate_and_failed_preflight_leave_all_data_untouched(tmp_path, repo_root):
@@ -217,7 +230,7 @@ def test_upgrade_boundary_and_current_projection(tmp_path, repo_root):
                                    "verification": {"enabled": False}, "obsolete": 3}), encoding="utf-8")
         roots, passwords = data / "sunpack_watch_roots.txt", data / "builtin_passwords.json"
         roots.write_bytes(b"C:\\input | D:\\out | true | true | false\r\n")
-        passwords.write_bytes(b'{"passwords": ["  keep  "], "clipboard_history": ["old"]}')
+        passwords.write_bytes(b'{\n  "passwords": ["  keep  "],\n  "clipboard_history": ["old"]\n}\n')
         (data / "state.snapshot").write_bytes(b"discard")
         before_inputs = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (roots, passwords)}
         result = _upgrade(repo_root, user, version)

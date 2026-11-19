@@ -191,6 +191,16 @@ void validate_passwords(const Json& j) {
         for (const auto& item : j["clipboard_history"]) validate_password_text(item);
     }
 }
+static std::string format_password_document(const Json& document) {
+    std::string text="{\n";
+    for(auto it=document.begin();it!=document.end();++it) {
+        if(it!=document.begin()) text+=",\n";
+        text.append("  \"").append(it.key()).append("\": ").append(it->dump());
+    }
+    text+="\n}\n";
+    return text;
+}
+
 static std::string patch_config(std::string source,const Json& edit) {
     Json j=parse_json(source); JsonTokens tokens(source);
     const auto& pointer=edit.at("pointer").get_ref<const std::string&>();
@@ -584,7 +594,7 @@ Json save_changes(const fs::path& dir,const Json& field,const Json& passwords,co
                 }
             }
             delta_base_matches&=count==committed_passwords["passwords"].size();
-            if(!passwords.empty() || cleaned) writes.push_back({"passwords",path,committed_passwords.dump(2)+"\n"});
+            if(!passwords.empty() || cleaned) writes.push_back({"passwords",path,format_password_document(committed_passwords)});
         }
         if(!roots.empty()) writes.push_back({"roots",dir/"sunpack_watch_roots.txt",std::move(root_text)});
         for(auto& write:writes) {

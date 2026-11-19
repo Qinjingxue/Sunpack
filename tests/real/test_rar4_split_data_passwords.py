@@ -96,3 +96,25 @@ def test_rar4_tiny_crc_collision_requires_later_member_confirmation(package, tmp
             assert [path.read_bytes() for path in output.rglob(name)] == [expected]
         if existing:
             assert sentinel.read_text(encoding="utf-8") == "user content"
+
+
+def test_rar4_encrypted_solid_ppmd_extracts_across_model_growth(package, tmp_path):
+    require_generator("rar")
+    source = tmp_path / "source"
+    source.mkdir()
+    rng = random.Random(4108)
+    words = [f"{rng.getrandbits(40):010x}" for _ in range(8192)]
+    payloads = {
+        name: ("\n".join(" ".join(rng.choices(words, k=32)) for _ in range(3000)) + "\n").encode()
+        for name in ("a.txt", "b.txt")
+    }
+    for name, payload in payloads.items():
+        (source / name).write_bytes(payload)
+    archive = tmp_path / "solid-text.rar"
+    run_cmd([str(get_optional_rar()), "a", "-ma4", "-m5", "-mc8:1t+", "-s",
+             "-psecret", "-ep", "-y", str(archive), *payloads], source)
+    output = tmp_path / "output"
+    report = extract_report(package, archive, output, passwords=["wrong", "secret"])
+    assert report["summary"]["success_count"] == 1, report
+    for name, payload in payloads.items():
+        assert [path.read_bytes() for path in output.rglob(name)] == [payload]

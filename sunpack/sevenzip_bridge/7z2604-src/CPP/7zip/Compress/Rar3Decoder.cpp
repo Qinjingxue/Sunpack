@@ -428,9 +428,11 @@ HRESULT CDecoder::InitPPM()
       Ppmd7_Free(&_ppmd, &g_BigAlloc);
       return S_FALSE;
     }
-    if (!Ppmd7_Alloc(&_ppmd, (maxMB + 1) << 20, &g_BigAlloc))
+    if (!Ppmd7_AllocReserved(&_ppmd, (maxMB + 1) << 20, &g_BigAlloc))
       return E_OUTOFMEMORY;
     Ppmd7_Init(&_ppmd, maxOrder);
+    if (_ppmd.CommitFailed)
+      return E_OUTOFMEMORY;
     PpmError = false;
   }
   return S_OK;
@@ -893,6 +895,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     if (_isSolid && !_solidAllowed)
       return S_FALSE;
     _solidAllowed = false;
+    _ppmd.CommitFailed = false;
 
     if (!_vmData)
     {
@@ -920,7 +923,13 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
    
     // CCoderReleaser coderReleaser(this);
     _unpackSize = outSize ? *outSize : (UInt64)(Int64)-1;
-    return CodeReal(progress);
+    const HRESULT result = CodeReal(progress);
+    if (_ppmd.CommitFailed)
+    {
+      _solidAllowed = false;
+      return E_OUTOFMEMORY;
+    }
+    return result;
   }
   catch(const CInBufferException &e)  { /* _errorMode = true; */ return e.ErrorCode; }
   catch(...) { /* _errorMode = true; */ return S_FALSE; }

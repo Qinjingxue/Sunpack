@@ -4,6 +4,8 @@
 #include "internal/native_memory.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/sevenzip_callbacks.hpp"
+#include "../7z2604-src/C/Alloc.h"
+#include "../7z2604-src/C/Ppmd7.h"
 #include "7zip/Common/StreamObjects.h"
 #include "7zip/Compress/BZip2Decoder.h"
 #include "7zip/Compress/BZip2Encoder.h"
@@ -92,6 +94,36 @@ void admission_and_recovery() {
     auto late = stopped.get_future();
     manager.park(large, cancel, [&](bool value) { stopped.set_value(value); });
     require(!ready(late), "shutdown stranded a late memory waiter");
+}
+
+void rar_ppmd_growth_under_pressure() {
+    constexpr std::int64_t chunk = 64 * 1024;
+    NativeMemoryJob *active = nullptr;
+    NativeMemoryManager manager(0, {}, [&] {
+        return 2 * chunk - static_cast<std::int64_t>(active->committed);
+    });
+    NativeMemoryJob job(manager);
+    active = &job;
+    manager.begin(job);
+    NativeMemoryScope scope(&job);
+    CPpmd7 model;
+    Ppmd7_Construct(&model);
+    require(Ppmd7_AllocReserved(&model, 128 * MiB, &g_BigAlloc) && !job.committed,
+            "PPMd charged its full virtual workspace");
+    Ppmd7_Init(&model, 8);
+    require(!model.CommitFailed && job.committed == 2 * chunk,
+            "PPMd did not commit the two root state ranges");
+
+    // A valid first symbol updates the model and needs a new text chunk.
+    const IByteIn input{[](IByteInPtr) -> Byte { return 0; }};
+    model.rc.dec.Stream = &input;
+    require(Ppmd7a_RangeDec_Init(&model.rc.dec), "PPMd test range did not initialize");
+    require(Ppmd7a_DecodeSymbol(&model) == PPMD7_SYM_ERROR && model.CommitFailed && job.denied,
+            "PPMd did not propagate a denied growth allocation");
+    Ppmd7_Free(&model, &g_BigAlloc);
+    require(!job.committed, "PPMd did not refund its partial commitment");
+    manager.end(job);
+    manager.stop();
 }
 
 void simultaneous_scaled_machine_budgets() {
@@ -386,6 +418,7 @@ int main() {
     auto directory = std::filesystem::temp_directory_path() / (L"sunpack-memory-" + std::to_wstring(GetCurrentProcessId()));
     std::filesystem::create_directories(directory);
     admission_and_recovery();
+    rar_ppmd_growth_under_pressure();
     simultaneous_scaled_machine_budgets();
     batched_waiter_admission();
     restart_working_set();

@@ -21,6 +21,15 @@ int sunpack_memory_may_start_thread(void *context);
 void *sunpack_memory_alloc(size_t size);
 /* Refusal must not mark a job for replay when its base workspace can proceed. */
 void *sunpack_memory_try_alloc(size_t size);
+/* A private, page-aligned address range. Commit only disjoint subranges. */
+typedef struct SunpackMemoryReservation {
+    void *base;
+    void *owner;
+    size_t committed;
+} SunpackMemoryReservation;
+int sunpack_memory_reserve(SunpackMemoryReservation *reservation, size_t size);
+int sunpack_memory_commit(SunpackMemoryReservation *reservation, void *address, size_t size);
+void sunpack_memory_release(SunpackMemoryReservation *reservation);
 int sunpack_memory_free(void *address);
 size_t sunpack_memory_size(void *address);
 void *sunpack_decoder_allocate(void *opaque, size_t size);

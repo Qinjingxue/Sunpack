@@ -269,7 +269,7 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 
 ## Known Issue
 
-- Not found so far. Welcome to report！
+- For some archives, limited information prevents passwords from being tried quickly at low cost. With many password candidates, extraction may remain at 0% and appear unresponsive for a long time. Stop extraction manually and reduce the number of password candidates.
 
 ## Contributing
 

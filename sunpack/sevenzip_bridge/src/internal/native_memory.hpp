@@ -66,7 +66,8 @@ public:
               std::function<void(bool)> ready, WaitNotice notice = {});
     void changed() noexcept;
     void stop() noexcept;
-    void *allocate(NativeMemoryJob &job, std::size_t size, bool optional = false) noexcept;
+    void *allocate(NativeMemoryJob &job, std::size_t size, bool optional = false,
+                   void *commit_address = nullptr) noexcept;
     bool may_start_thread(NativeMemoryJob &job) noexcept;
     void released(NativeMemoryJob &job, void *address, std::size_t size) noexcept;
     static std::int64_t query_windows(std::uint64_t reserve_bytes) noexcept;

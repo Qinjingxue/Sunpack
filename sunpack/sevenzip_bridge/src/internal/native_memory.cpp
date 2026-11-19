@@ -189,7 +189,8 @@ void NativeMemoryManager::retry(NativeMemoryJob &job) {
     revoke_locked(job);
     SetEvent(change_);
 }
-void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool optional) noexcept {
+void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool optional,
+                                    void *commit_address) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         if (job.revoked.load(std::memory_order_acquire)) return nullptr;
@@ -217,7 +218,8 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool
         }
         // Serialize only large commitments: no stale availability snapshot can
         // admit several simultaneous dictionaries against the same free bytes.
-        void *result = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        const DWORD type = commit_address ? MEM_COMMIT : MEM_RESERVE | MEM_COMMIT;
+        void *result = VirtualAlloc(commit_address, size, type, PAGE_READWRITE);
         if (!result) {
             // Freeing this attempt is not evidence of external recovery. Wait
             // for capacity beyond its fully-refunded budget, avoiding a rapid
@@ -233,11 +235,13 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool
             changed();
             return nullptr;
         }
-        try {
-            std::lock_guard<std::mutex> allocation_lock(allocations_mutex);
-            BookkeepingScope bookkeeping_scope;
-            allocations.emplace(result, Allocation{&job, size});
-        } catch (...) { VirtualFree(result, 0, MEM_RELEASE); throw; }
+        if (!commit_address) {
+            try {
+                std::lock_guard<std::mutex> allocation_lock(allocations_mutex);
+                BookkeepingScope bookkeeping_scope;
+                allocations.emplace(result, Allocation{&job, size});
+            } catch (...) { VirtualFree(result, 0, MEM_RELEASE); throw; }
+        }
         set_admission_locked(job, job.admission - credit);
         job.committed += wanted;
         if (optional) job.peak = (std::max)(job.peak, total);
@@ -429,6 +433,26 @@ void *sunpack_memory_alloc(size_t size) {
 void *sunpack_memory_try_alloc(size_t size) {
     auto *job = static_cast<sunpack::sevenzip::NativeMemoryJob *>(sunpack_memory_current_context());
     return job ? job->owner.allocate(*job, size, true) : nullptr;
+}
+int sunpack_memory_reserve(SunpackMemoryReservation *reservation, size_t size) {
+    void *base = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+    if (!base) return 0;
+    *reservation = {base, sunpack_memory_current_context(), 0};
+    return 1;
+}
+int sunpack_memory_commit(SunpackMemoryReservation *reservation, void *address, size_t size) {
+    auto *job = static_cast<sunpack::sevenzip::NativeMemoryJob *>(reservation->owner);
+    void *result = job ? job->owner.allocate(*job, size, false, address)
+                       : VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE);
+    if (!result) return 0;
+    reservation->committed += size;
+    return 1;
+}
+void sunpack_memory_release(SunpackMemoryReservation *reservation) {
+    auto *job = static_cast<sunpack::sevenzip::NativeMemoryJob *>(reservation->owner);
+    if (job) job->owner.released(*job, reservation->base, reservation->committed);
+    else VirtualFree(reservation->base, 0, MEM_RELEASE);
+    *reservation = {};
 }
 size_t sunpack_memory_size(void *address) {
     if ((reinterpret_cast<std::uintptr_t>(address) & 65535) != 0 || !address ||

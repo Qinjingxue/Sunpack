@@ -520,8 +520,9 @@ impl BuiltinStore {
                 (start, start + history.get().len(), "")
             }
             None => {
-                let end = original.rfind('}').expect("validated password document");
-                (end, end, ", \"clipboard_history\": ")
+                let passwords = document.passwords.get();
+                let end = passwords.as_ptr() as usize - original.as_ptr() as usize + passwords.len();
+                (end, end, ",\n  \"clipboard_history\": ")
             }
         };
         publish(&self.path, atomic_file::replace_once, |file| {

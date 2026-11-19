@@ -742,6 +742,8 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     finish_input(app);
     auto history=read_json(passwords_path);
     assert(history["passwords"].back()["value"]=="history" && history["clipboard_history"]==Json::array({"history"}));
+    assert(read_file(passwords_path)=="{\n  \"passwords\": "+history["passwords"].dump()+
+        ",\n  \"clipboard_history\": "+history["clipboard_history"].dump()+"\n}\n");
     screenshot(app.window(),L"clipboard-history.png");
 
     navigate(app,"tabRoots","roots");

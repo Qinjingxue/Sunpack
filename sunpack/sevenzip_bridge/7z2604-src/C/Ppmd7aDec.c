@@ -85,7 +85,7 @@ int Ppmd7a_DecodeSymbol(CPpmd7 *p)
       p->FoundState = s;
       sym = s->Symbol;
       Ppmd7_Update1_0(p);
-      return sym;
+      return p->CommitFailed ? PPMD7_SYM_ERROR : sym;
     }
   
     p->PrevSuccess = 0;
@@ -100,7 +100,7 @@ int Ppmd7a_DecodeSymbol(CPpmd7 *p)
         p->FoundState = s;
         sym = s->Symbol;
         Ppmd7_Update1(p);
-        return sym;
+        return p->CommitFailed ? PPMD7_SYM_ERROR : sym;
       }
     }
     while (--i);
@@ -164,7 +164,7 @@ int Ppmd7a_DecodeSymbol(CPpmd7 *p)
         else
           Ppmd7_UpdateModel(p);
       }
-      return sym;
+      return p->CommitFailed ? PPMD7_SYM_ERROR : sym;
     }
 
     *prob = (UInt16)pr;
@@ -255,7 +255,7 @@ int Ppmd7a_DecodeSymbol(CPpmd7 *p)
       p->FoundState = s;
       sym = s->Symbol;
       Ppmd7_Update2(p);
-      return sym;
+      return p->CommitFailed ? PPMD7_SYM_ERROR : sym;
     }
 
     if (count >= freqSum)

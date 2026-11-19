@@ -63,6 +63,20 @@ fn clipboard_merge_moves_repeated_values_to_the_end_in_copy_order() {
 }
 
 #[test]
+fn first_clipboard_save_keeps_password_arrays_on_separate_lines() {
+    use super::BuiltinStore;
+    let path = crate::test_support::temp_file(
+        "first_clipboard_save",
+        b"{\n  \"passwords\": [{\"value\":\"configured\"}]\n}\n",
+    );
+    let store = BuiltinStore { path: path.clone(), state: Default::default(), dirty: Default::default() };
+    assert!(store.merge_clipboard(&[" new password ".to_owned()], 3).unwrap());
+    assert_eq!(fs::read_to_string(&path).unwrap(),
+        "{\n  \"passwords\": [{\"value\":\"configured\"}],\n  \"clipboard_history\": [\" new password \"]\n}\n");
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn default_password_publication_preserves_concurrent_edit() {
     let path = crate::test_support::temp_file("builtin_password_creation", b"");
     fs::remove_file(&path).unwrap();

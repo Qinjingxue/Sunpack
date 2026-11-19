@@ -54,6 +54,8 @@ void Ppmd7_Construct(CPpmd7 *p)
   unsigned i, k, m;
 
   p->Base = NULL;
+  p->Reservation.base = NULL;
+  p->CommitFailed = False;
 
   for (i = 0, k = 0; i < PPMD_NUM_INDEXES; i++)
   {
@@ -83,7 +85,10 @@ void Ppmd7_Construct(CPpmd7 *p)
 
 void Ppmd7_Free(CPpmd7 *p, ISzAllocPtr alloc)
 {
-  ISzAlloc_Free(alloc, p->Base);
+  if (p->Reservation.base)
+    sunpack_memory_release(&p->Reservation);
+  else
+    ISzAlloc_Free(alloc, p->Base);
   p->Size = 0;
   p->Base = NULL;
 }
@@ -91,16 +96,77 @@ void Ppmd7_Free(CPpmd7 *p, ISzAllocPtr alloc)
 
 BoolInt Ppmd7_Alloc(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc)
 {
-  if (!p->Base || p->Size != size)
+  if (!p->Base || p->Size != size || p->Reservation.base)
   {
     Ppmd7_Free(p, alloc);
     p->AlignOffset = (4 - size) & 3;
     if ((p->Base = (Byte *)ISzAlloc_Alloc(alloc, p->AlignOffset + size)) == NULL)
       return False;
     p->Size = size;
+    p->TextEnd = p->UnitsEnd = p->Base + p->AlignOffset + size;
+    p->SpillBegin = p->ContextsBegin = p->Base;
   }
   return True;
 }
+
+/* Grow in batches to keep OS calls and budget locking off the per-symbol path.
+   RAR model sizes are whole MiB, and the reservation is 64 KiB aligned. */
+#define PPMD7_COMMIT_CHUNK ((UInt32)1 << 16)
+#define PPMD7_UNITS_START(end, size) ((end) - (size) / 8 / UNIT_SIZE * 7 * UNIT_SIZE)
+
+BoolInt Ppmd7_AllocReserved(CPpmd7 *p, UInt32 size, ISzAllocPtr alloc)
+{
+  p->CommitFailed = False;
+  if (!p->Reservation.base || p->Size != size)
+  {
+    Byte *end;
+    Ppmd7_Free(p, alloc);
+    if (!sunpack_memory_reserve(&p->Reservation, size))
+      return False;
+    p->Base = (Byte *)p->Reservation.base;
+    p->Size = size;
+    p->AlignOffset = 0;
+    end = p->Base + size;
+    /* Partition at the chunk containing the initial UnitsStart. Its first
+       chunk is committed with the root states, also covering any text or
+       spill allocations that reach across this split. */
+    p->TextEnd = p->Base;
+    p->SpillBegin = p->UnitsEnd = p->Base +
+        ((UInt32)(PPMD7_UNITS_START(end, size) - p->Base) & ~(PPMD7_COMMIT_CHUNK - 1));
+    p->ContextsBegin = end;
+  }
+  return True;
+}
+
+static Z7_NO_INLINE BoolInt Ppmd7_Commit(CPpmd7 *p, Byte *target, Byte **lo, Byte **hi, BoolInt up)
+{
+  const UInt32 offset = (UInt32)(target - p->Base);
+  Byte *edge = p->Base + ((offset + (up ? PPMD7_COMMIT_CHUNK - 1 : 0)) & ~(PPMD7_COMMIT_CHUNK - 1));
+  Byte *start = (up || edge < *lo) ? *lo : edge;
+  Byte *end = (!up || edge > *hi) ? *hi : edge;
+  if (!sunpack_memory_commit(&p->Reservation, start, (size_t)(end - start)))
+  {
+    p->CommitFailed = True;
+    return False;
+  }
+  if (start == *lo && end == *hi)
+  {
+    /* A closed gap can no longer require commitment, even after restart. */
+    *lo = p->Base + p->Size;
+    *hi = p->Base;
+  }
+  else if (up)
+    *lo = end;
+  else
+    *hi = start;
+  return True;
+}
+
+/* Each pair delimits one uncommitted gap until it closes. */
+#define Ppmd7_EnsureUp(p, target, lo, hi) \
+    ((target) <= (p)->lo || Ppmd7_Commit(p, target, &(p)->lo, &(p)->hi, True))
+#define Ppmd7_EnsureDown(p, target, lo, hi) \
+    ((target) >= (p)->hi || Ppmd7_Commit(p, target, &(p)->lo, &(p)->hi, False))
 
 
 
@@ -176,7 +242,11 @@ static void Ppmd7_GlueFreeBlocks(CPpmd7 *p)
   
   /* we set guard NODE at LoUnit */
   if (p->LoUnit != p->HiUnit)
+  {
+    if (!Ppmd7_EnsureUp(p, p->LoUnit + UNIT_SIZE, UnitsEnd, ContextsBegin))
+      return;
     ((CPpmd7_Node *)(void *)p->LoUnit)->Stamp = 1;
+  }
 
   {
     /* Create list of free blocks.
@@ -258,6 +328,8 @@ static void *Ppmd7_AllocUnitsRare(CPpmd7 *p, unsigned indx)
   if (p->GlueCount == 0)
   {
     Ppmd7_GlueFreeBlocks(p);
+    if (p->CommitFailed)
+      return NULL;
     if (p->FreeList[indx] != 0)
       return Ppmd7_RemoveNode(p, indx);
   }
@@ -271,7 +343,12 @@ static void *Ppmd7_AllocUnitsRare(CPpmd7 *p, unsigned indx)
       UInt32 numBytes = U2B(I2U(indx));
       Byte *us = p->UnitsStart;
       p->GlueCount--;
-      return ((UInt32)(us - p->Text) > numBytes) ? (p->UnitsStart = us - numBytes) : NULL;
+      if ((UInt32)(us - p->Text) <= numBytes)
+        return NULL;
+      us -= numBytes;
+      if (!Ppmd7_EnsureDown(p, us, TextEnd, SpillBegin))
+        return NULL;
+      return (p->UnitsStart = us);
     }
   }
   while (p->FreeList[i] == 0);
@@ -293,6 +370,8 @@ static void *Ppmd7_AllocUnits(CPpmd7 *p, unsigned indx)
     Byte *lo = p->LoUnit;
     if ((UInt32)(p->HiUnit - lo) >= numBytes)
     {
+      if (!Ppmd7_EnsureUp(p, lo + numBytes, UnitsEnd, ContextsBegin))
+        return NULL;
       p->LoUnit = lo + numBytes;
       return lo;
     }
@@ -349,11 +428,13 @@ void Ppmd7_RestartModel(CPpmd7 *p)
 {
   unsigned i, k;
 
+  if (p->CommitFailed)
+    return;
   memset(p->FreeList, 0, sizeof(p->FreeList));
   
   p->Text = p->Base + p->AlignOffset;
   p->HiUnit = p->Text + p->Size;
-  p->LoUnit = p->UnitsStart = p->HiUnit - p->Size / 8 / UNIT_SIZE * 7 * UNIT_SIZE;
+  p->LoUnit = p->UnitsStart = PPMD7_UNITS_START(p->HiUnit, p->Size);
   p->GlueCount = 0;
 
   p->OrderFall = p->MaxOrder;
@@ -365,6 +446,9 @@ void Ppmd7_RestartModel(CPpmd7 *p)
     CPpmd_State *s = (CPpmd_State *)p->LoUnit; /* Ppmd7_AllocUnits(p, PPMD_NUM_INDEXES - 1); */
     
     p->LoUnit += U2B(256 / 2);
+    if (!Ppmd7_EnsureDown(p, p->HiUnit, UnitsEnd, ContextsBegin) ||
+        !Ppmd7_EnsureUp(p, p->LoUnit, UnitsEnd, ContextsBegin))
+      return;
     p->MaxContext = p->MinContext = mc;
     p->FoundState = s;
 
@@ -534,7 +618,11 @@ static PPMD7_CTX_PTR Ppmd7_CreateSuccessors(CPpmd7 *p)
     PPMD7_CTX_PTR c1;
     /* = AllocContext(p); */
     if (p->HiUnit != p->LoUnit)
+    {
+      if (!Ppmd7_EnsureDown(p, p->HiUnit - UNIT_SIZE, UnitsEnd, ContextsBegin))
+        return NULL;
       c1 = (PPMD7_CTX_PTR)(void *)(p->HiUnit -= UNIT_SIZE);
+    }
     else if (p->FreeList[0] != 0)
       c1 = (PPMD7_CTX_PTR)Ppmd7_RemoveNode(p, 0);
     else
@@ -634,6 +722,9 @@ void Ppmd7_UpdateModel(CPpmd7 *p)
   
   {
     Byte *text = p->Text;
+    /* A raw successor may read the byte at the new Text boundary. */
+    if (!Ppmd7_EnsureUp(p, text + 2, TextEnd, SpillBegin))
+      return;
     *text++ = p->FoundState->Symbol;
     p->Text = text;
     if (text >= p->UnitsStart)
