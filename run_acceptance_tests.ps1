@@ -362,11 +362,18 @@ function Ensure-AcceptanceEnvironment {
     foreach ($reason in $reasons) {
         Write-Host "      - $reason" -ForegroundColor Yellow
     }
-    Invoke-Native -FilePath "powershell" -Arguments @(
-        "-ExecutionPolicy", "Bypass",
-        "-File", (Join-Path $RepoRoot "scripts\setup_windows_dev.ps1"),
-        "-Arch", $Arch, "-BuildProfile", $BuildProfile
-    )
+    $originalOutputEncoding = [Console]::OutputEncoding
+    try {
+        # Match the UTF-8 native build output forwarded by the setup subprocess.
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        Invoke-Native -FilePath "powershell" -Arguments @(
+            "-ExecutionPolicy", "Bypass",
+            "-File", (Join-Path $RepoRoot "scripts\setup_windows_dev.ps1"),
+            "-Arch", $Arch, "-BuildProfile", $BuildProfile
+        )
+    } finally {
+        [Console]::OutputEncoding = $originalOutputEncoding
+    }
 
     # Verify persistence immediately; a successful setup subprocess is not
     # sufficient evidence that every artifact was refreshed.

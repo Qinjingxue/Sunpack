@@ -472,8 +472,15 @@ foreach ($artifact in @($runtimePath, $watchBrokerBuildPath, $fixtureBuildPath))
 
 $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts
 $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
-Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -BuildArch $buildArch -BuildProfile $BuildProfile
-Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -BuildArch $buildArch -BuildProfile $BuildProfile
+$originalOutputEncoding = [Console]::OutputEncoding
+try {
+    # CMake forwards localized MSBuild output as UTF-8.
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -BuildArch $buildArch -BuildProfile $BuildProfile
+    Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -BuildArch $buildArch -BuildProfile $BuildProfile
+} finally {
+    [Console]::OutputEncoding = $originalOutputEncoding
+}
 Write-Host ""
 Write-Host "Local development environment is ready" -ForegroundColor Green
 Write-Host "Runtime: $runtimePath"
