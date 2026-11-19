@@ -910,8 +910,8 @@ export default {
   .tag-setting .setting-copy .tag-regex-check { width:24px; height:24px; flex-shrink:0; }
   .tag-region { height:112px; min-width:0px; padding:6px 18px 6px 6px; border:1px solid var(--card-border); border-radius:6px; }
   .history-entry { gap:0px; padding:0px 12px; border:1px solid var(--card-border); border-radius:8px; }
-  .history-entry.light, .light .history-entry, .light .root-header { background:var(--card-bg); }
-  .history-entry.dark, .dark .history-entry, .dark .root-header { background:#2b2b2b; }
+  .history-entry.light, .light .root-header { background:var(--card-bg); }
+  .history-entry.dark, .dark .root-header { background:#2b2b2b; }
   .history-entry > .action-row { padding-bottom:10px; }
   .record-switch { width:48px; flex-shrink:0; }
   .password-table-row { flex-direction:row; align-items:center; gap:12px; }
@@ -1106,7 +1106,7 @@ export default {
               <div class="record-remove"/>
             </div>
           </div>
-          <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="62px" style="gap:8px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" class="history-entry">
+          <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="62px" style="gap:8px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" :class="'history-entry '+appearance">
             <div v-show="rootCell!==r.id" class="root-columns root-row"><input type="checkbox" class="record-check" :id="'select-root-'+r.id" :checked="!!rootChecked[r.id]" @change="v=>setChecked('root',r.id,v)"/>
               <div class="root-path-column"><div class="root-path-cell">
                 <button :id="'root-input-text-'+r.id" class="password-text" @mousedown="e=>rememberCellPointer(r.id,'input',e)" @click="beginRoot(r,'input')"><label :id="'root-input-value-'+r.id" :class="rootDraft(r).input?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).input||texts.recordEditHint }}</label><div class="password-hover-line"/></button>

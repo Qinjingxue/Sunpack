@@ -698,6 +698,9 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     navigate(app,"tabRoots","roots");
     click(app,"batchAddRoot");
     auto new_root=state(app.page(),"rootCell").get<std::string>();
+    auto* new_card=window(app).Root()->FindById("root-row-"+new_root);
+    assert(new_card);
+    gui_test::same_color(new_card->bgColor,window(app).Root()->FindById("rootTableHeader")->bgColor);
     focus(app,"root-input-input-"+new_root);
     assert(ui_debug_type_text(app.window(),root.c_str())==0);
     finish_input(app);
