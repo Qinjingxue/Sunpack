@@ -36,94 +36,31 @@ fn embedded_pages_cross_scope_boundaries_without_losing_ownership() {
     );
     let mut request = Request::new(inputs, super::super::Mode::Scan);
     request.deep = true;
-    let result = discover(&request, &options, &candidates).unwrap();
-    assert!(result.errors.is_empty());
-    assert!(result.blocked_paths.is_empty());
-    assert_eq!(result.tasks.len(), expected.len());
-    for task in result.tasks {
-        assert_eq!(task.inputs.len(), 1);
-        assert_eq!(task.owned_paths.len(), 1);
-        assert!(expected.remove(&path_key(&task.entry().entry_path)));
-        let Some(TaskContext::Retry(retry)) = &task.context else {
-            panic!("expected a retained volume resolution context");
-        };
-        assert_eq!(
-            retry.scope.key(),
-            path_key(
-                &Path::new(&task.entry().entry_path)
-                    .parent()
-                    .unwrap()
-                    .to_string_lossy()
-            )
-        );
-    }
-    assert!(expected.is_empty());
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-#[ignore = "manual actual-scope batching measurement"]
-fn measure_many_small_output_scopes() {
-    let root = std::env::temp_dir().join(format!(
-        "sunpack-pages-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let mut carrier = vec![0x41; 17];
-    carrier.extend_from_slice(b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00");
-    let mut inputs = Vec::new();
-    let mut expected = HashSet::new();
-    // A page crosses roots and then splits inside the last root; the empty
-    // middle root must not shift the group IDs used for result projection.
-    for (scope, count) in [4; 32].into_iter().enumerate() {
-        let directory = root.join(scope.to_string());
-        std::fs::create_dir_all(&directory).unwrap();
-        for index in 0..count {
-            let path = directory.join(format!("archive{index}.bin"));
-            std::fs::write(&path, &carrier).unwrap();
-            expected.insert(path_key(&path.to_string_lossy()));
-        }
-        inputs.push(directory);
-    }
-    let options =
-        NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            .unwrap();
-    let candidates = CandidateSet::new(
-        Arc::from([]),
-        None,
-        &super::super::passwords::RecentPasswords::default(),
-        None,
-    );
-    let mut request = Request::new(inputs, super::super::Mode::Scan);
-    request.deep = true;
     let config = Arc::make_mut(&mut request.config);
     config.recursive_authorization.enabled = false;
-    config.embedded_scan.enabled = true;
-    config.embedded_scan.recursive_candidate_ratio = 0.2;
-    let separate = std::env::var_os("SUNPACK_MEASURE_SEPARATE").is_some();
-    MEASURED_EMBEDDED_PAGES.with(|pages| pages.set(0));
-    let began = std::time::Instant::now();
-    for _ in 0..10 {
-        let outputs = request.inputs.iter().map(|path| OutputDiscovery::prepare(
-            crate::scan::directory::scan_output_stats(&path.to_string_lossy(), true).inventory.unwrap(), &options
-        ).unwrap()).collect::<Vec<_>>();
-        let results = if separate {
-            outputs.into_iter().map(|output| {
-                OutputDiscovery::discover_many(vec![output], &candidates, &request).unwrap().pop().unwrap()
-            }).collect()
-        } else { OutputDiscovery::discover_many(outputs, &candidates, &request).unwrap() };
-        let mut actual = HashSet::new();
-        for result in results {
-            assert!(result.errors.is_empty());
-            for task in result.tasks { assert!(actual.insert(path_key(&task.entry().entry_path))); }
+    config.embedded_scan.recursive_candidate_ratio = 0.0;
+    let outputs = request.inputs.iter().map(|path| {
+        let inventory = crate::scan::directory::scan_output_stats(&path.to_string_lossy(), true)
+            .inventory.unwrap();
+        OutputDiscovery::prepare(inventory, &options).unwrap()
+    }).collect();
+    let results = OutputDiscovery::discover_many(outputs, &candidates, &request).unwrap();
+    assert_eq!(results.len(), request.inputs.len());
+    for (result, scope) in results.into_iter().zip(&request.inputs) {
+        assert!(result.errors.is_empty());
+        assert!(result.blocked_paths.is_empty());
+        for task in result.tasks {
+            assert_eq!(task.inputs.len(), 1);
+            assert_eq!(task.owned_paths.len(), 1);
+            assert!(expected.remove(&path_key(&task.entry().entry_path)));
+            assert_eq!(Path::new(&task.entry().entry_path).parent(), Some(scope.as_path()));
+            let Some(TaskContext::Retry(retry)) = &task.context else {
+                panic!("expected a retained volume resolution context");
+            };
+            assert_eq!(retry.scope.key(), path_key(&scope.to_string_lossy()));
         }
-        assert_eq!(actual, expected);
     }
-    eprintln!("scope_measure separate={separate} outputs=32 files=128 iterations=10 pages={} wall_ms={}",
-        MEASURED_EMBEDDED_PAGES.with(|pages| pages.get()), began.elapsed().as_millis());
+    assert!(expected.is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
 

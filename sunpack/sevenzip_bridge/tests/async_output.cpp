@@ -218,13 +218,15 @@ bool timestamp_failure_does_not_fail_content(const std::filesystem::path& direct
         snapshot.written_bytes != sizeof(payload) || std::filesystem::file_size(path) != sizeof(payload))
         return false;
 
-    const auto next_job = writer.make_job();
+    const auto next_job = writer.make_job(0, nullptr, false);
     const auto next_path = directory / L"valid-time.bin";
     const auto next = writer.make_file(next_job, next_path.wstring(), 1, 1, historical_times());
     writer.record_operation_result(next, 0);
     writer.close_file(next, {});
-    return writer.finish_job(next_job) == S_OK &&
-        !writer.take_file_snapshot(next).metadata_errors.first_error() && file_times_match(next_path, historical_times());
+    if (writer.finish_job(next_job) != S_OK) return false;
+    const auto next_snapshot = writer.take_file_snapshot(next);
+    return !next_snapshot.metadata_errors.first_error() && !next_snapshot.has_mtime_ns &&
+        file_times_match(next_path, historical_times());
 }
 
 bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {

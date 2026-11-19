@@ -1076,7 +1076,7 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
         journal.commit(true, |_| {
             let mut operations = NativeWatchOperations::empty();
             operations.put_entry(Arc::new(blocker));
-            operations.extend(NativeWatchOperations::finish_pending(owner_text, None));
+            operations.finish_pending(owner_text, None);
             Ok(operations)
         }).unwrap();
         journal.flush().unwrap();

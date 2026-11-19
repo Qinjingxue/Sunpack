@@ -222,8 +222,9 @@ fn cpp_query_recovers_durable_blocker_after_writer_death() {
         journal.log(json!({"event":"processing_started","path":dir.join("interrupted.zip"),"owner":"interrupted"}));
         journal.event_log().flush().unwrap();
         let live = project(&binary, &path, "", "", "", "");
-        assert_eq!(live["total"], 3);
-        assert!(live["rows"].as_array().unwrap().iter().any(|row| row["status"] == "taskProcessing"));
+        let rows = live["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row["statusText"] == "处理中"));
 
         // Freeze publication at the old manifest. The production commit
         // path still fsyncs its WAL when the display writer cannot publish.
@@ -262,9 +263,9 @@ fn cpp_query_recovers_durable_blocker_after_writer_death() {
     journal.event_log().flush().unwrap();
     drop(journal);
     let previous = project(&binary, &path, "", "", "", "");
-    assert_eq!(previous["total"], 2);
-    let completed = previous["rows"].as_array().unwrap().iter()
-        .find(|row| row["status"] == "taskSucceeded").unwrap();
+    let earlier_rows = previous["rows"].as_array().unwrap();
+    assert_eq!(earlier_rows.len(), 2);
+    let completed = earlier_rows.iter().find(|row| row["statusText"] == "成功").unwrap();
     assert_eq!(completed["name"], "disguised.bin");
     assert_eq!(completed["parts"], json!(["disguised.bin", "disguised.002"]));
     assert_eq!(completed["outputs"], json!(["previous-output"]));
@@ -292,12 +293,12 @@ fn cpp_query_recovers_durable_blocker_after_writer_death() {
     let journal = Journal::open(&dir.0, 7).unwrap();
     journal.event_log().flush().unwrap();
     let restored = project(&binary, &path, "", "", "", "");
-    assert_eq!(restored["total"], 3);
     let rows = restored["rows"].as_array().unwrap();
-    for earlier in previous["rows"].as_array().unwrap() {
+    assert_eq!(rows.len(), 3);
+    for earlier in earlier_rows {
         assert!(rows.contains(earlier), "historical row changed across recovery: {earlier}");
     }
-    let waiting = rows.iter().find(|row| row["status"] == "taskWaiting").unwrap();
+    let waiting = rows.iter().find(|row| row["statusTone"] == "waiting").unwrap();
     assert_eq!(waiting["path"], completed["path"]);
     assert_ne!(waiting["id"], completed["id"]);
     assert_eq!(waiting["statusText"], "等待分卷");

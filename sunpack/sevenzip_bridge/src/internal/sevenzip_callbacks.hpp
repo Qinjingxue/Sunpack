@@ -423,10 +423,10 @@ namespace sunpack::sevenzip
     public:
         AsyncFileOutStream(
             std::shared_ptr<AsyncFileWriter> writer,
-            AsyncFileWriter::FileStatePtr file,
-            bool capture_magic = true) : writer_(std::move(writer)),
-                                         file_(std::move(file)),
-                                         prefix_limit_(capture_magic ? 512 : 0)
+            AsyncFileWriter::FileStatePtr file)
+            : writer_(std::move(writer)),
+              file_(std::move(file)),
+              prefix_limit_(file_ && file_->captures_inventory() ? 512 : 0)
         {}
 
         ~AsyncFileOutStream()
@@ -783,7 +783,6 @@ namespace sunpack::sevenzip
                 replay_(current_extraction_replay),
                 output_root_initially_empty_(
                     replay_ && replay_->initialized ? replay_->root_was_empty : directory_is_empty_or_missing(output_root_)),
-                capture_magic_(output_inventory && output_root_initially_empty_),
                 output_paths_(std::in_place, output_root_, replay_)
         {
             if (replay_ && !replay_->initialized)
@@ -809,7 +808,7 @@ namespace sunpack::sevenzip
             // Register only after callback setup succeeds. A failed
             // constructor cannot unregister a writer job in its destructor.
             if (!async_writer_) async_writer_ = std::make_shared<AsyncFileWriter>();
-            async_job_ = async_writer_->make_job(0, cancel_token_
+            async_job_ = async_writer_->make_job(0, cancel_token_, output_inventory && output_root_initially_empty_
 #ifdef SUP7Z_DEBUG
                 , pipeline_timing
 #endif
@@ -1209,7 +1208,7 @@ namespace sunpack::sevenzip
                                                            );
             async_files_.push_back(current_async_file_);
 
-            CMyComPtr<ISequentialOutStream> stream_owner(new AsyncFileOutStream(async_writer_, current_async_file_, capture_magic_));
+            CMyComPtr<ISequentialOutStream> stream_owner(new AsyncFileOutStream(async_writer_, current_async_file_));
             *outStream = stream_owner.Detach();
 
             return S_OK;
@@ -1713,7 +1712,6 @@ namespace sunpack::sevenzip
         ExtractionReplay *replay_ = nullptr;
 
         bool output_root_initially_empty_ = false;
-        const bool capture_magic_;
 
         std::optional<OutputPathAllocator> output_paths_;
 

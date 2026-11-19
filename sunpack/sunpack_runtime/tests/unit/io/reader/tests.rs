@@ -48,19 +48,6 @@ fn short_and_exact_reads_preserve_eof_semantics() {
 }
 
 #[test]
-fn request_cache_preserves_hit_stats() {
-    let path = temp_file("managed_reader_stats", b"abcdefgh");
-    let reader =
-        ManagedReader::open_with_config(&path, ReaderConfig { cache_bytes: 8 }).unwrap();
-    assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
-    assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
-    let stats = reader.stats();
-    assert_eq!(stats.read_bytes, 4);
-    assert_eq!(stats.cache_hits, 1);
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
 fn independent_reads_enter_the_source_concurrently_with_and_without_request_cache() {
     // Block each source read until every reader can enter. Existing block
     // block-cache tests do not cover serializing the ManagedReader itself.
@@ -418,19 +405,20 @@ fn probe_request_cache_reuses_direct_windows_and_survives_release() {
 }
 
 #[test]
-fn read_into_preserves_request_cache_semantics() {
+fn owned_and_buffered_reads_share_the_request_cache() {
     let path = temp_file("managed_reader_into_stats", b"abcdefgh");
     let reader =
         ManagedReader::open_with_config(&path, ReaderConfig { cache_bytes: 8 }).unwrap();
     let mut buffer = [0u8; 4];
     assert_eq!(reader.read_into_at(0, &mut buffer).unwrap(), 4);
     assert_eq!(&buffer, b"abcd");
+    assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
     buffer.fill(0);
     assert_eq!(reader.read_into_at(0, &mut buffer).unwrap(), 4);
     assert_eq!(&buffer, b"abcd");
     let stats = reader.stats();
     assert_eq!(stats.read_bytes, 4);
-    assert_eq!(stats.cache_hits, 1);
+    assert_eq!(stats.cache_hits, 2);
     let _ = std::fs::remove_file(path);
 }
 

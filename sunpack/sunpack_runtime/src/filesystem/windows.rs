@@ -103,18 +103,19 @@ pub(super) fn watch_file_observation_known_kind(
     Ok(finish_watch_observation(file, volume.as_deref(), since_usn))
 }
 
-pub(crate) struct WatchFileSnapshot {
+pub(crate) struct WatchFileSnapshot<T> {
     pub(crate) metadata: std::fs::Metadata,
-    pub(crate) generation: crate::io::reader::PhysicalFileGeneration,
     pub(crate) observation: WatchFileObservation,
+    pub(crate) captured: T,
 }
 
 /// Sample one file object while its sharing mode excludes writers and renames.
-pub(crate) fn watch_ready_file_snapshot(
+pub(crate) fn watch_ready_file_snapshot<T>(
     path: &Path,
     since_usn: Option<i64>,
-) -> io::Result<Option<WatchFileSnapshot>> {
-    let (metadata, generation, file, volume) = {
+    capture: impl FnOnce(&File, &std::fs::Metadata) -> io::Result<T>,
+) -> io::Result<Option<WatchFileSnapshot<T>>> {
+    let (metadata, captured, file, volume) = {
         let handle = match open_path(path, GENERIC_READ, FILE_SHARE_READ, false) {
             Ok(handle) => handle,
             Err(error) if matches!(
@@ -127,16 +128,14 @@ pub(crate) fn watch_ready_file_snapshot(
         if !metadata.is_file() || metadata.len() == 0 {
             return Ok(None);
         }
-        let generation = crate::io::reader::physical_file_generation_from_metadata(
-            &handle.file, &metadata,
-        )?;
+        let captured = capture(&handle.file, &metadata)?;
         let (file, volume) = read_watch_observation(&handle.file, path, since_usn)?;
-        (metadata, generation, file, volume)
+        (metadata, captured, file, volume)
     };
     Ok(Some(WatchFileSnapshot {
         metadata,
-        generation,
         observation: finish_watch_observation(file, volume.as_deref(), since_usn),
+        captured,
     }))
 }
 

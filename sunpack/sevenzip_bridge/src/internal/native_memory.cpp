@@ -370,6 +370,13 @@ void NativeMemoryManager::monitor() {
                 }
             }
             waiters_.erase(kept, waiters_.end());
+            if (jobs_.empty() && waiters_.empty()) {
+                // A burst of withdrawals can grow both vectors to the
+                // admission queue's size. Keep a small reusable allocation.
+                constexpr std::size_t warm_capacity = 64;
+                if (jobs_.capacity() > warm_capacity) decltype(jobs_){}.swap(jobs_);
+                if (waiters_.capacity() > warm_capacity) decltype(waiters_){}.swap(waiters_);
+            }
         }
         for (auto &callback : callbacks) callback();
         if (stopped) return;

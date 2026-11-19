@@ -58,6 +58,7 @@ impl DirectorySnapshotTable {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct NativeDirectorySnapshot {
     pub(crate) table: Arc<DirectorySnapshotTable>,
     pub(crate) rows: Arc<Vec<usize>>,
@@ -68,13 +69,6 @@ impl NativeDirectorySnapshot {
         Self {
             table: Arc::clone(&self.table),
             rows: Arc::new(rows),
-        }
-    }
-
-    pub(crate) fn share_rows(&self) -> Self {
-        Self {
-            table: Arc::clone(&self.table),
-            rows: Arc::clone(&self.rows),
         }
     }
 
@@ -152,7 +146,7 @@ impl NativeDirectorySnapshot {
 
     pub(crate) fn without_path_keys(&self, excluded: &HashSet<String>) -> Self {
         if excluded.is_empty() {
-            return self.share_rows();
+            return self.clone();
         }
         self.view(
             self.rows

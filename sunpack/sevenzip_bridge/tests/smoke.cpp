@@ -483,10 +483,9 @@ bool check_cpu_budget_tracks_decoder_thread_lifetimes() {
             return false;
         }
 
-        // Each successful internal decoder-thread admission consumes one
-        // credit. Exercise both C ABI entry points used by the decoders.
+        // Each successful internal decoder-thread admission consumes one credit.
         if (sunpack_cpu_acquire_extra_for_context(&job, 1, 1) != 1 ||
-            sunpack_cpu_acquire_extra(1, 1) != 1 ||
+            sunpack_cpu_acquire_extra_for_context(&job, 1, 1) != 1 ||
             sunpack_cpu_acquire_extra_for_context(&job, 1, 1) != 1 ||
             budget.reserved_credits() != 4 ||
             job.snapshot().current_extra_credits != 3 ||
@@ -495,14 +494,14 @@ bool check_cpu_budget_tracks_decoder_thread_lifetimes() {
         }
 
         // A fourth decoder thread cannot start without an uncharged credit.
-        if (sunpack_cpu_acquire_extra(1, 1) != 0 ||
+        if (sunpack_cpu_acquire_extra_for_context(&job, 1, 1) != 0 ||
             budget.reserved_credits() != 4 ||
             job.snapshot().current_extra_credits != 3) {
             return false;
         }
 
         // Ending each decoder thread returns exactly its credit.
-        sunpack_cpu_release_extra(1);
+        sunpack_cpu_release_extra_for_context(&job, 1);
         if (budget.reserved_credits() != 3 ||
             job.snapshot().current_extra_credits != 2) {
             return false;
@@ -566,36 +565,6 @@ bool check_cpu_context_exchange_propagates_and_restores() {
     return sunpack_cpu_current_job_context() == nullptr;
 }
 
-bool check_cpu_budget_acquire_all_available() {
-    using namespace sunpack::sevenzip;
-    NativeCpuBudget budget(8);
-    if (!budget.try_acquire_base() || !budget.try_acquire_base()) {
-        return false;
-    }
-
-    NativeCpuJobContext first(budget);
-    NativeCpuJobContext second(budget);
-
-    if (sunpack_cpu_acquire_all_available_for_context(&first) != 6 ||
-        budget.reserved_credits() != 8 ||
-        first.snapshot().current_extra_credits != 6) {
-        return false;
-    }
-
-    first.release_extra(2);
-    if (budget.reserved_credits() != 6 ||
-        sunpack_cpu_acquire_all_available_for_context(&second) != 2 ||
-        budget.reserved_credits() != 8 ||
-        second.snapshot().current_extra_credits != 2) {
-        return false;
-    }
-
-    first.release_extra(4);
-    second.release_extra(2);
-    budget.release(2);
-    return budget.reserved_credits() == 0;
-}
-
 }  // namespace
 #endif
 
@@ -649,10 +618,6 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_cpu_budget_tracks_decoder_thread_lifetimes()) {
         std::cerr << "CPU decoder-thread lifetime credit check failed\n";
         return 28;
-    }
-    if (!check_cpu_budget_acquire_all_available()) {
-        std::cerr << "CPU acquire-all credit check failed\n";
-        return 31;
     }
     if (!check_cpu_context_exchange_propagates_and_restores()) {
         std::cerr << "CPU context exchange check failed\n";

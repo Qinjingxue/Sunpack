@@ -35,7 +35,7 @@ def test_encrypted_rar5_recovery_keeps_one_gui_card(package, tmp_path, repo_root
         rows = json.loads(result.stdout)["tasks"]["rows"]
         assert len(rows) == 1, rows
         row = rows[0]
-        assert row["status"] == ("taskSucceeded" if phase == "done" else "taskWaiting"), row
+        assert row["statusTone"] == ("success" if phase == "done" else "waiting"), row
         assert row["statusText"] == {"password": "等待密码", "volumes": "等待分卷", "done": "成功"}[phase], row
         assert set(row["parts"]) == {part.name for part in parts}, row
         if head:

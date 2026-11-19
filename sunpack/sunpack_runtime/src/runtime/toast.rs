@@ -346,6 +346,8 @@ struct Group {
     visible: bool,
     requests: HashMap<Arc<str>, RequestProgress>,
     active_roots: usize,
+    // Reports and stopping requests can keep a batch open after its last active root.
+    pending_completions: usize,
     finalize_at: Option<Instant>,
     finalizing: bool,
     generation: u64,
@@ -473,6 +475,7 @@ impl Group {
             visible: false,
             requests: HashMap::new(),
             active_roots: 0,
+            pending_completions: 0,
             finalize_at: None,
             finalizing: false,
             generation: 0,
@@ -565,8 +568,8 @@ impl Group {
             _ => unreachable!(),
         }
         if task.visible && !before.visible {
-            if let Some(path) = request.paths.get(&id) {
-                request.started.entry(request.task_roots[&id]).or_default().insert(path.clone());
+            if let Some(path) = request.paths.remove(&id) {
+                request.started.entry(request.task_roots[&id]).or_default().insert(path);
             }
         }
         if task.visible && request.visible_roots.insert(request.task_roots[&id]) {
@@ -610,6 +613,7 @@ impl Group {
             self.totals.done_bytes -= request.done_bytes;
         }
         self.active_roots -= request.visible_roots.difference(&request.settled_tasks).count();
+        self.pending_completions -= request.pending_reports.len() + usize::from(request.stopping);
         if self.requests.capacity() > 256 {
             crate::collections::trim_map(&mut self.requests);
         }
@@ -627,8 +631,7 @@ impl Group {
     }
 
     fn pending(&self) -> bool {
-        self.active_roots != 0 || self.requests.values().any(|request| !request.pending_reports.is_empty())
-            || self.requests.values().any(|request| request.stopping)
+        self.active_roots != 0 || self.pending_completions != 0
     }
 }
 
@@ -971,7 +974,9 @@ impl Publisher {
             state.group = Some(Group::new(&request, language));
         }
         let group = state.group.as_mut().unwrap();
-        group.requests.insert(Arc::clone(&request), RequestProgress::default());
+        if let Some(previous) = group.requests.insert(Arc::clone(&request), RequestProgress::default()) {
+            group.pending_completions -= previous.pending_reports.len() + usize::from(previous.stopping);
+        }
         Activity { publisher: self.clone(), request }
     }
 
@@ -1001,7 +1006,11 @@ impl Publisher {
         };
         // Stopping extraction keeps this batch valid: earlier failures still
         // need their final report. Only reset/disable invalidates report I/O.
-        for request in group.requests.values_mut() { request.stopping = true; }
+        for request in group.requests.values_mut() {
+            if !std::mem::replace(&mut request.stopping, true) {
+                group.pending_completions += 1;
+            }
+        }
         group.generation = group.generation.wrapping_add(1);
         group.finalize_at = None;
         let requests = group.requests.keys().cloned().collect();
@@ -1076,7 +1085,9 @@ impl Activity {
         request.settled_tasks.insert(id);
         if visible { group.active_roots -= 1; }
         let summary = Summary::for_outcome(outcome, false, visible, &|_| Some(key.clone()), None);
-        if summary.failed != 0 { request.pending_reports.insert(id); }
+        if summary.failed != 0 && request.pending_reports.insert(id) {
+            group.pending_completions += 1;
+        }
         group.summary.merge(summary);
         group.generation = group.generation.wrapping_add(1);
         state.dirty = true;
@@ -1091,6 +1102,7 @@ impl Activity {
         {
             let request = group.requests.get_mut(&self.request).unwrap();
             if request.pending_reports.remove(&id) {
+                group.pending_completions -= 1;
                 group.summary.report_failed |= failed;
             }
             if request.settled_tasks.remove(&id) {

@@ -5,10 +5,10 @@
 
 #ifdef SUP7Z_DEBUG
 #include "worker_pipeline_timing.hpp"
+#include <cstdlib>
 #endif
 
 #include "sevenzip_sdk.hpp"
-#include <cstdlib>
 
 #ifdef _WIN32
 
@@ -27,6 +27,7 @@
 #include <new>
 
 #include <string>
+#include <string_view>
 
 #include <utility>
 
@@ -51,39 +52,25 @@ namespace sunpack::sevenzip
         UInt32 window_bytes = 512 * 1024;
     };
 
-    inline InputPrefetchConfig input_prefetch_config() noexcept
+    inline InputPrefetchConfig input_prefetch_config(
+        std::wstring_view format_hint = {}, bool native_volume_input = false) noexcept
     {
-        static const InputPrefetchConfig config = []
-        {
-            InputPrefetchConfig value;
-            if (const char *enabled = std::getenv("SUNPACK_SEVENZIP_PREFETCH"))
-            {
-                value.enabled = enabled[0] != '0';
-            }
-            return value;
-        }();
-        return config;
-    }
+        InputPrefetchConfig config;
+#ifdef SUP7Z_DEBUG
+        if (const char *enabled = std::getenv("SUNPACK_SEVENZIP_PREFETCH"))
+            return InputPrefetchConfig{enabled[0] != '0'};
+#endif
 
-    inline InputPrefetchConfig input_prefetch_config_for_archive(
-        const std::wstring &format_hint,
-        bool native_volume_input) noexcept
-    {
-        InputPrefetchConfig config = input_prefetch_config();
-        // Explicit process-level overrides are also used by paired benchmarks.
-        if (!config.enabled || format_hint.empty() || std::getenv("SUNPACK_SEVENZIP_PREFETCH"))
+        // The format tags below have at most four characters.
+        std::array<wchar_t, 4> folded;
+        if (format_hint.empty() || format_hint.size() > folded.size()) return config;
+        for (std::size_t index = 0; index < format_hint.size(); ++index)
         {
-            return config;
+            const auto character = format_hint[index];
+            folded[index] = character >= L'A' && character <= L'Z'
+                ? static_cast<wchar_t>(character - L'A' + L'a') : character;
         }
-
-        std::wstring normalized = format_hint;
-        for (wchar_t &character : normalized)
-        {
-            if (character >= L'A' && character <= L'Z')
-            {
-                character = static_cast<wchar_t>(character - L'A' + L'a');
-            }
-        }
+        const std::wstring_view normalized(folded.data(), format_hint.size());
         // Cached-read A/B: these formats do not consistently recover the cost
         // of speculative reads/copies. Keep their direct input path by default.
         if (normalized == L"gz" || normalized == L"gzip" || normalized == L"xz" ||
@@ -271,6 +258,7 @@ namespace sunpack::sevenzip
                 if (slot.handle != INVALID_HANDLE_VALUE) CloseHandle(slot.handle);
                 slot.handle = INVALID_HANDLE_VALUE;
                 slot.path = nullptr;
+                slot.bytes.reset();
             }
             enabled_ = false;
         }

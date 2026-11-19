@@ -78,7 +78,7 @@ fn rust_writer_cpp_query_preserves_oversized_diagnostics() {
     log.flush().unwrap();
     let failed = project(&binary, &path, "large.zip", "", "", "");
     assert_eq!(failed["rows"][0]["error"].as_str(), Some(message.as_str()));
-    assert_eq!(project(&binary, &path, "after.zip", "", "", "")["total"], 1);
+    assert_eq!(rows(&binary, &path, "after.zip", "", "").len(), 1);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn rust_writer_cpp_query_publication_conflict() {
     });
     log.flush().unwrap();
     assert!(log.error().is_none());
-    assert_eq!(project(&binary, &path, "staged.zip", "", "", "")["total"], 1);
+    assert_eq!(rows(&binary, &path, "staged.zip", "", "").len(), 1);
     let healed = project(&binary, &path, "carrier.001", "", "", "");
     assert_eq!(healed["rows"][0]["statusText"], "等待分卷");
     assert_eq!(healed["rows"][0]["id"], waiting["rows"][0]["id"]);
@@ -136,7 +136,7 @@ fn rust_writer_cpp_query_publication_conflict() {
     log.flush().unwrap();
     drop(log);
     let offline = project(&binary, &path, "carrier.001", "", "", "");
-    assert_eq!(offline["rows"][0]["status"], "taskSucceeded");
+    assert_eq!(offline["rows"][0]["statusText"], "成功");
     assert_eq!(offline["rows"][0]["outputs"], json!(["retained-output"]));
     assert!(!root.0.join("events.json.tmp").exists());
 }
@@ -211,7 +211,7 @@ fn rust_writer_cpp_query_lifecycle() {
     log.flush().unwrap();
     let completed = rows(&binary, &path, "", "", "");
     assert_eq!(completed.len(), 251);
-    assert!(completed.values().all(|row| row["status"] == "taskSucceeded"));
+    assert!(completed.values().all(|row| row["statusText"] == "成功"));
     drop(log);
     // Reopen the real producer, then close it before offline C++ reads.
     let log = NativeEventLog::new(path.clone(), 7, true).unwrap();
@@ -244,12 +244,11 @@ fn rust_writer_cpp_query_deduplicated_is_green_named_success_without_outputs() {
     log.write(json!({"event":"pipeline_sources_released","owner":"dedup-run","ts":ts})).unwrap();
     log.flush().unwrap();
     let result = project(&binary, &path, "copy.zip", "", "", "");
-    assert_eq!(result["total"], 1);
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
     let row = &result["rows"][0];
-    assert_eq!(row["status"], "taskSucceeded");
     assert_eq!(row["statusText"], "去重跳过");
     assert_eq!(row["statusTone"], "success");
     assert!(row["outputs"].as_array().unwrap().is_empty());
     let filtered = project(&binary, &path, "copy.zip", "", "", "taskSucceeded");
-    assert_eq!(filtered["total"], 1);
+    assert_eq!(filtered["rows"], result["rows"]);
 }

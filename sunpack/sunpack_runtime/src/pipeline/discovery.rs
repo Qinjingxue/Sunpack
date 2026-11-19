@@ -13,7 +13,8 @@ use crate::scan::directory::{
     NativeDirectorySnapshot, NativeOutputInventory,
 };
 use crate::scan::discovery::{
-    CandidateProjection, EmbeddedPageRow, FileTargets, NativeCandidateTable, NativeEmbeddedBatch,
+    CandidateProjection, EmbeddedPageRow, EmbeddedVolumeOutcome, FileTargets, NativeCandidateTable,
+    NativeEmbeddedBatch,
 };
 use crate::scan::embedded::{NativeScanResult, RarInputResolution};
 use crate::scan::nested_authorization::authorize_nested_candidates;
@@ -157,7 +158,7 @@ fn scan_discovery_scope(
     }
     let (filtered, raw) = &snapshots[root];
     if scope.key() == path_key(root).trim_end_matches('\\') {
-        return Ok((filtered.share_rows(), raw.share_rows()));
+        return Ok((filtered.clone(), raw.clone()));
     }
     Ok((scope_view(filtered, scope), scope_view(raw, scope)))
 }
@@ -637,7 +638,7 @@ fn retain_logical_retry_scopes(
         let retry = Arc::new(RetryScope {
             // Retry takes a fresh inventory within scope. It uses the old
             // snapshot only to reuse anchors for paths in that inventory.
-            snapshot: source.snapshot.share_rows(),
+            snapshot: source.snapshot.clone(),
             scope: Arc::new(scope),
             bucket: source.bucket.clone(),
         });
@@ -855,9 +856,6 @@ fn probe_relations(
     Ok(())
 }
 
-#[cfg(test)]
-thread_local! { static MEASURED_EMBEDDED_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-
 impl Discovered {
     fn project(
         &mut self,
@@ -896,9 +894,11 @@ impl Discovered {
         const PAGE_SIZE: usize = 256;
         let mut first = 0;
         while first < scopes.len() {
-            if scopes[first].1.len() == 0 { first += 1; continue; }
-            #[cfg(test)]
-            MEASURED_EMBEDDED_PAGES.with(|pages| pages.set(pages.get() + 1));
+            if scopes[first].1.len() == 0 {
+                scopes[first].1.release_after_pages(&mut tables[first]);
+                first += 1;
+                continue;
+            }
             request.cancel.check_io()?;
             let mut last = first;
             let mut count = scopes[first].1.len();
@@ -1007,36 +1007,39 @@ impl Discovered {
         candidates: &CandidateSet,
         verified: &VerifiedPasswords,
     ) -> io::Result<()> {
-        let volumes = batch.resolve_volumes(table, |path| candidates.for_embedded(path))?;
+        let volumes = batch.resolve_volumes(table, candidates.embedded_scope_passwords())?;
         let mut replaced = HashSet::new();
         let mut shared_inputs = false;
         // The volume pass can add logical inputs backed by sources that
         // Embedded already projected. Ordinary candidates have been deduped.
         for row in volumes {
-            if let Some(scan) = row.scan {
-                let task = project_task(
-                    table.project(row.index)?,
-                    DiscoverySource::Embedded,
-                    verified,
-                );
-                if let Some(task) =
-                    project_segments(task, &scan.scan, scan.resolutions, candidates)?
-                {
+            match row {
+                EmbeddedVolumeOutcome::Embedded { index, scan } => {
+                    let task = project_task(
+                        table.project(index)?,
+                        DiscoverySource::Embedded,
+                        verified,
+                    );
+                    if let Some(task) =
+                        project_segments(task, &scan.scan, scan.resolutions, candidates)?
+                    {
+                        embedded_tasks.push(task);
+                    }
+                }
+                EmbeddedVolumeOutcome::Relation { index, password } => {
+                    let mut task = project_task(
+                        table.project(index)?,
+                        DiscoverySource::Relations,
+                        verified,
+                    );
+                    if let Some(password) = password {
+                        task.inputs[0].password = Some(password);
+                    }
+                    for path in &task.owned_paths {
+                        self.blocked_paths.remove(&path_key(path));
+                    }
                     embedded_tasks.push(task);
                 }
-            } else if row.status != 0 {
-                let mut task = project_task(
-                    table.project(row.index)?,
-                    DiscoverySource::Relations,
-                    verified,
-                );
-                if let Some(password) = row.password {
-                    task.inputs[0].password = Some(password);
-                }
-                for path in &task.owned_paths {
-                    self.blocked_paths.remove(&path_key(path));
-                }
-                embedded_tasks.push(task);
             }
         }
         for task in embedded_tasks.iter() {

@@ -2,7 +2,7 @@
 use super::dedup_hash::StreamHash;
 use crate::core::config::{WatchDeduplication, WatchDeduplicationScope};
 use crate::io::archive_state::{ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection};
-use crate::io::reader::PhysicalFileGeneration;
+use crate::io::reader::{physical_file_generation_from_metadata, PhysicalFileGeneration};
 use crate::collections::{trim_map, SmallOrderedSet};
 use crate::path_keys::{path_ancestors, path_key};
 use crate::postprocess::{mtime_seconds, watch_observed_content_changed};
@@ -20,11 +20,15 @@ use std::sync::{Arc, Mutex};
 struct Identity { volume: u64, file: [u8; 16], start: u64, len: u64 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Source { path: String, generation: PhysicalFileGeneration, size: u64, mtime: f64, file_id: String, usn: i64 }
+type SourceSnapshot = crate::filesystem::WatchFileSnapshot<PhysicalFileGeneration>;
+
 impl Source {
-    fn current_snapshot(&self) -> Option<crate::filesystem::WatchFileSnapshot> {
-        crate::filesystem::watch_ready_file_snapshot(Path::new(&self.path), Some(self.usn))
+    fn current_snapshot(&self) -> Option<SourceSnapshot> {
+        crate::filesystem::watch_ready_file_snapshot(
+            Path::new(&self.path), Some(self.usn), physical_file_generation_from_metadata,
+        )
             .ok().flatten().filter(|snapshot| {
-                snapshot.generation.object_id() == self.generation.object_id()
+                snapshot.captured.object_id() == self.generation.object_id()
                     && snapshot.observation.change_usn >= self.usn
                     && !watch_observed_content_changed(
                         self.size, self.mtime, &self.file_id, self.usn, snapshot.metadata.len(),
@@ -33,14 +37,14 @@ impl Source {
             })
     }
 
-    fn hash_snapshot(&self) -> io::Result<crate::filesystem::WatchFileSnapshot> {
+    fn hash_snapshot(&self) -> io::Result<SourceSnapshot> {
         self.current_snapshot().ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "deduplication input changed or is being written")
         })
     }
 
-    fn update_snapshot(&mut self, snapshot: crate::filesystem::WatchFileSnapshot) {
-        self.generation = snapshot.generation;
+    fn update_snapshot(&mut self, snapshot: SourceSnapshot) {
+        self.generation = snapshot.captured;
         self.mtime = mtime_seconds(&snapshot.metadata);
         self.usn = snapshot.observation.change_usn;
     }
@@ -80,7 +84,7 @@ impl Record {
                     // renames. Consult the USN journal only on a changed generation.
                     if opened == &source.generation { return Ok(()); }
                     let snapshot = source.hash_snapshot()?;
-                    if opened == &snapshot.generation {
+                    if opened == &snapshot.captured {
                         refreshed = Some(snapshot);
                         return Ok(());
                     }
@@ -698,11 +702,13 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
                 }
             };
             let source = if let Some(id) = existing { id } else {
-                let Some(snapshot) = crate::filesystem::watch_ready_file_snapshot(Path::new(path), None)? else { return Ok(false); };
+                let Some(snapshot) = crate::filesystem::watch_ready_file_snapshot(
+                    Path::new(path), None, physical_file_generation_from_metadata,
+                )? else { return Ok(false); };
                 let id = sources.len() as u32;
                 sources.push(Source {
                     path: path.into(),
-                    generation: snapshot.generation,
+                    generation: snapshot.captured,
                     size: snapshot.metadata.len(),
                     mtime: mtime_seconds(&snapshot.metadata),
                     file_id: snapshot.observation.file_id,

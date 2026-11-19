@@ -2,8 +2,6 @@
 #include "decoder_cpu_budget.h"
 
 #include <algorithm>
-#include <limits>
-#include <utility>
 
 namespace sunpack::sevenzip
 {
@@ -57,11 +55,6 @@ std::size_t NativeCpuBudget::acquire_up_to(
     }
 }
 
-std::size_t NativeCpuBudget::acquire_all_available() noexcept
-{
-    return acquire_up_to((std::numeric_limits<std::size_t>::max)(), 1);
-}
-
 void NativeCpuBudget::release(std::size_t count) noexcept
 {
     if (count == 0)
@@ -102,7 +95,7 @@ bool NativeCpuBudget::can_acquire_base() const noexcept
 
 NativeCpuJobContext::NativeCpuJobContext(
     NativeCpuBudget &budget) noexcept
-    : budget_(&budget)
+    : budget_(budget)
 {
 }
 
@@ -115,22 +108,18 @@ NativeCpuJobContext::~NativeCpuJobContext()
 
     const std::size_t remaining =
         current_extra_.exchange(0, std::memory_order_relaxed);
-    if (remaining != 0 && budget_)
-        budget_->release(remaining);
+    budget_.release(remaining);
 }
 
 std::size_t NativeCpuJobContext::acquire_extra(
     std::size_t wanted,
     std::size_t minimum_grant) noexcept
 {
-    if (!budget_)
-        return 0;
-
-    const std::size_t granted =
-        budget_->acquire_up_to(wanted, minimum_grant);
+    const std::size_t granted = budget_.acquire_up_to(wanted, minimum_grant);
     if (granted == 0)
         return 0;
 
+#ifdef SUP7Z_DEBUG
     const std::size_t current =
         current_extra_.fetch_add(granted, std::memory_order_relaxed) + granted;
 
@@ -143,36 +132,15 @@ std::size_t NativeCpuJobContext::acquire_extra(
                std::memory_order_relaxed))
     {
     }
-    return granted;
-}
-
-std::size_t NativeCpuJobContext::acquire_all_available() noexcept
-{
-    if (!budget_)
-        return 0;
-
-    const std::size_t granted = budget_->acquire_all_available();
-    if (granted == 0)
-        return 0;
-
-    const std::size_t current =
-        current_extra_.fetch_add(granted, std::memory_order_relaxed) + granted;
-
-    std::size_t peak = peak_extra_.load(std::memory_order_relaxed);
-    while (peak < current &&
-           !peak_extra_.compare_exchange_weak(
-               peak,
-               current,
-               std::memory_order_relaxed,
-               std::memory_order_relaxed))
-    {
-    }
+#else
+    current_extra_.fetch_add(granted, std::memory_order_relaxed);
+#endif
     return granted;
 }
 
 void NativeCpuJobContext::release_extra(std::size_t count) noexcept
 {
-    if (count == 0 || !budget_)
+    if (count == 0)
         return;
 
     std::size_t current = current_extra_.load(std::memory_order_relaxed);
@@ -187,9 +155,10 @@ void NativeCpuJobContext::release_extra(std::size_t count) noexcept
                 std::memory_order_relaxed))
             break;
     }
-    budget_->release(released);
+    budget_.release(released);
 }
 
+#ifdef SUP7Z_DEBUG
 NativeCpuJobSnapshot NativeCpuJobContext::snapshot() const noexcept
 {
     return {
@@ -197,6 +166,7 @@ NativeCpuJobSnapshot NativeCpuJobContext::snapshot() const noexcept
         peak_extra_.load(std::memory_order_relaxed),
     };
 }
+#endif
 
 NativeCpuJobContext *exchange_native_cpu_job_context(
     NativeCpuJobContext *context) noexcept
@@ -252,15 +222,6 @@ unsigned sunpack_cpu_acquire_extra_for_context(
         job->acquire_extra(wanted, minimum_grant));
 }
 
-unsigned sunpack_cpu_acquire_all_available_for_context(
-    void *context)
-{
-    auto *job = static_cast<sunpack::sevenzip::NativeCpuJobContext *>(context);
-    if (!job)
-        return 0;
-    return static_cast<unsigned>(job->acquire_all_available());
-}
-
 void sunpack_cpu_release_extra_for_context(
     void *context,
     unsigned count)
@@ -268,29 +229,6 @@ void sunpack_cpu_release_extra_for_context(
     auto *job = static_cast<sunpack::sevenzip::NativeCpuJobContext *>(context);
     if (job)
         job->release_extra(count);
-}
-
-unsigned sunpack_cpu_acquire_extra(
-    unsigned wanted,
-    unsigned minimum_grant)
-{
-    return sunpack_cpu_acquire_extra_for_context(
-        sunpack_cpu_current_job_context(),
-        wanted,
-        minimum_grant);
-}
-
-unsigned sunpack_cpu_acquire_all_available(void)
-{
-    return sunpack_cpu_acquire_all_available_for_context(
-        sunpack_cpu_current_job_context());
-}
-
-void sunpack_cpu_release_extra(unsigned count)
-{
-    sunpack_cpu_release_extra_for_context(
-        sunpack_cpu_current_job_context(),
-        count);
 }
 
 } // extern "C"

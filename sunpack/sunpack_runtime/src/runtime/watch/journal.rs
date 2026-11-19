@@ -245,6 +245,7 @@ impl Journal {
             if operations.is_empty() {
                 return Ok(());
             }
+            let operations = Arc::new(operations);
             let seq = frontier
                 .seq
                 .checked_add(1)
@@ -254,7 +255,7 @@ impl Journal {
                 segment_path(self.snapshot.parent().unwrap(), segment),
                 segment,
                 seq,
-                &operations,
+                Arc::clone(&operations),
                 durable,
             )?;
             self.state.apply(&operations);

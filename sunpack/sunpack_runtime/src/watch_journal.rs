@@ -1,6 +1,6 @@
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::wal::{self, Kind};
-use crate::watch_store::{NativeWatchOperations, Operations};
+use crate::watch_store::NativeWatchOperations;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
@@ -124,7 +124,7 @@ impl NativeJournalStream {
         path: PathBuf,
         segment_start: u64,
         seq: u64,
-        operations: &NativeWatchOperations,
+        operations: Arc<NativeWatchOperations>,
         durable: bool,
     ) -> io::Result<NativeJournalTicket> {
         self.runtime
@@ -133,7 +133,7 @@ impl NativeJournalStream {
                 path,
                 segment_start,
                 seq,
-                JournalPayload::Task(Arc::clone(&operations.operations)),
+                JournalPayload::Task(operations),
                 durable,
             )
             .map_err(io::Error::other)
@@ -624,7 +624,7 @@ fn segment_file(
 }
 
 enum JournalPayload {
-    Task(Arc<Operations>),
+    Task(Arc<NativeWatchOperations>),
     Catalog(crate::io::scratch::Blob),
 }
 impl JournalPayload {

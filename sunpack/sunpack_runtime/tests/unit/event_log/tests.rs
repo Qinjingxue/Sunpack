@@ -111,6 +111,28 @@ fn queued_groups_survive_live_mutation_and_release_after_completion() {
 }
 
 #[test]
+fn expired_processing_row_releases_payload_and_still_routes_completion() {
+    let mut projection = Projection::default();
+    let path = "C:/archive.fake";
+    let member = "C:/archive.002";
+    projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"run",
+        "processing":true,"ts":1,"groups":[{"path":path,"members":[path,member]}]}));
+    let (id, row) = projection.updates(false).0.pop().unwrap();
+    let lifetime = Arc::downgrade(&row.unwrap().0);
+    assert!(lifetime.upgrade().is_some());
+
+    projection.expire_live(vec![Arc::clone(&id)], 1_000_000);
+    assert!(lifetime.upgrade().is_none());
+    assert!(projection.updates(true).0[0].1.is_none());
+
+    projection.apply(&mut json!({"event":"candidate_departed","path":member}));
+    let mut completion = json!({"event":"done","path":member,"owner":"run","ts":2});
+    assert!(projection.apply(&mut completion));
+    assert_eq!(completion["task_id"], id.as_ref());
+    assert_eq!(completion["path"], path);
+}
+
+#[test]
 fn completed_families_leave_no_resident_history_or_aliases() {
     // Disk/GUI checks cannot see producer references. Removing this test
     // loses detection of retained completed families; no disk I/O is needed.
@@ -139,7 +161,7 @@ fn completed_families_leave_no_resident_history_or_aliases() {
         json!({"event":"suspended_missing_volume","path":"C:/abandoned.002","ts":1});
     projection.apply(&mut waiting);
     let id = projection.tasks.keys().next().unwrap().clone();
-    projection.expire_live(vec![id.into()], 2_000_000);
+    projection.expire_live(vec![id], 2_000_000);
     assert!(projection.tasks.is_empty() && projection.aliases.is_empty());
 }
 

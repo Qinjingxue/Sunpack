@@ -39,11 +39,17 @@ pub(crate) struct EmbeddedPageRow {
     pub(crate) result: Result<Arc<NativeScanResult>, Arc<io::Error>>,
 }
 
-pub(crate) struct EmbeddedVolumeOutcome {
-    pub(crate) index: usize,
-    pub(crate) status: u8,
-    pub(crate) scan: Option<ResolvedEmbeddedScan>,
-    pub(crate) password: Option<Arc<str>>,
+pub(crate) enum EmbeddedVolumeOutcome {
+    Embedded { index: usize, scan: ResolvedEmbeddedScan },
+    Relation { index: usize, password: Option<Arc<str>> },
+}
+
+impl EmbeddedVolumeOutcome {
+    fn index(&self) -> usize {
+        match self {
+            Self::Embedded { index, .. } | Self::Relation { index, .. } => *index,
+        }
+    }
 }
 
 enum Candidate {
@@ -453,6 +459,16 @@ impl NativeEmbeddedBatch {
         self.ids.len() - self.cursor
     }
 
+    pub(crate) fn release_after_pages(&mut self, table: &mut NativeCandidateTable) {
+        debug_assert_eq!(self.len(), 0);
+        if self.pending_volumes.is_empty() {
+            // Rows have been projected, and no volume resolution needs them.
+            // Release candidates and relation evidence while other roots scan.
+            *table = NativeCandidateTable::default();
+            *self = Self::default();
+        }
+    }
+
     /// Process selected jobs across roots.
     /// Root-local policy, relation ownership and password evidence stay in each batch.
     pub(crate) fn scan_pages(
@@ -639,11 +655,11 @@ impl NativeEmbeddedBatch {
     }
 
     /// One directed Relations call per source scope, using native scan facts.
-    /// Status 0 returns standalone/sibling scan facts to Embedded.
+    /// Standalone and sibling scan facts return to Embedded.
     pub(crate) fn resolve_volumes(
         &mut self,
         table: &mut NativeCandidateTable,
-        mut passwords: impl FnMut(&str) -> Vec<Arc<str>>,
+        mut passwords: impl FnMut(&str) -> Arc<[Arc<str>]>,
     ) -> io::Result<Vec<EmbeddedVolumeOutcome>> {
         use crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor;
         let mut batch = std::mem::take(self);
@@ -654,6 +670,7 @@ impl NativeEmbeddedBatch {
             .into_iter()
             .map(|path| (path_key(path), passwords(path)))
             .collect();
+        drop(passwords);
         let mut cache = std::mem::take(&mut batch.relation_cache);
         let mut pending = std::mem::take(&mut batch.pending_volumes);
         let pending_keys: HashSet<_> = pending
@@ -724,6 +741,7 @@ impl NativeEmbeddedBatch {
                 .collect::<io::Result<Vec<_>>>()
                 .map(|rows| rows.into_iter().flatten().collect::<HashMap<_, _>>())
         })()?;
+        drop(candidates);
         cancellation.check()?;
         // Own one scan reference and one sparse resolution table per physical
         // carrier. Project its hits/candidates only after every head is resolved.
@@ -796,15 +814,13 @@ impl NativeEmbeddedBatch {
         }
         let mut fallback: Vec<_> = fallback_scans
             .into_iter()
-            .map(|(index, (scan, resolutions))| EmbeddedVolumeOutcome {
+            .map(|(index, (scan, resolutions))| EmbeddedVolumeOutcome::Embedded {
                 index,
-                status: 0,
-                scan: Some(ResolvedEmbeddedScan { scan, resolutions }),
-                password: None,
+                scan: ResolvedEmbeddedScan { scan, resolutions },
             })
             .collect();
         if anchors.is_empty() {
-            fallback.retain(|row| !batch.supplemental.contains(&row.index));
+            fallback.retain(|row| !batch.supplemental.contains(&row.index()));
             return Ok(fallback);
         }
         let sources = &table.relation_sources;
@@ -897,8 +913,8 @@ impl NativeEmbeddedBatch {
             }
             let mut index = 0;
             groups.retain(|_| { let retain = keep[index]; index += 1; retain });
-            fallback.retain(|row| !batch.supplemental.contains(&row.index)
-                || owned.contains(&path_key(table.rows[row.index].path())));
+            fallback.retain(|row| !batch.supplemental.contains(&row.index())
+                || owned.contains(&path_key(table.rows[row.index()].path())));
         }
         let mut grouped_ranges = HashMap::new();
         let mut seen_facts = HashSet::new();
@@ -909,8 +925,8 @@ impl NativeEmbeddedBatch {
             ranges.sort_unstable();
         }
         for row in &mut fallback {
-            if let Some(scan) = &mut row.scan {
-                let key = path_key(table.rows[row.index].path());
+            if let EmbeddedVolumeOutcome::Embedded { index, scan } = row {
+                let key = path_key(table.rows[*index].path());
                 if let Some(ranges) = grouped_ranges.get(&key) {
                     scan.resolutions.retain(|offset, _| {
                         ranges.binary_search_by_key(offset, |(start, _)| *start).is_err()
@@ -929,10 +945,8 @@ impl NativeEmbeddedBatch {
                 .cloned();
             let index = table.rows.len();
             table.rows.push(Candidate::Relation(Box::new(group)));
-            fallback.push(EmbeddedVolumeOutcome {
+            fallback.push(EmbeddedVolumeOutcome::Relation {
                 index,
-                status: 1,
-                scan: None,
                 password,
             });
         }
@@ -978,7 +992,7 @@ impl NativeCandidateTable {
         if !deep {
             table.append_speculative_files(raw);
         }
-        table.relation_sources.push(raw.share_rows());
+        table.relation_sources.push(raw.clone());
         table
     }
 

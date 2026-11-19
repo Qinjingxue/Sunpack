@@ -128,13 +128,15 @@ namespace sunpack::sevenzip
         {
             explicit JobState(
                 std::size_t budget,
-                std::shared_ptr<std::atomic<bool>> external_cancel = nullptr
+                std::shared_ptr<std::atomic<bool>> external_cancel,
+                bool record_inventory
 #ifdef SUP7Z_DEBUG
                 , PipelineTiming *pipeline_timing = nullptr
 #endif
                 )
                 : max_inflight_bytes(budget),
-                  cancel_token(std::move(external_cancel))
+                  cancel_token(std::move(external_cancel)),
+                  capture_inventory(record_inventory)
 #ifdef SUP7Z_DEBUG
                   , pipeline_timing(pipeline_timing)
 #endif
@@ -146,6 +148,7 @@ namespace sunpack::sevenzip
             std::size_t pending_jobs = 0;
             const std::size_t max_inflight_bytes;
             std::shared_ptr<std::atomic<bool>> cancel_token;
+            const bool capture_inventory;
 #ifdef SUP7Z_DEBUG
             PipelineTiming *pipeline_timing = nullptr;
 #endif
@@ -257,6 +260,7 @@ namespace sunpack::sevenzip
             // 本文件所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
             // 在 make_file() 时快照进来，writer 线程不再取 state_。
             VolumeSpaceGate *volume_space_gate() const noexcept { return space_gate.get(); }
+            bool captures_inventory() const noexcept { return job->capture_inventory; }
             const WrittenRanges &previous_writes() const noexcept {
                 static const WrittenRanges empty;
                 return replay ? replay->written : empty;
@@ -369,7 +373,8 @@ namespace sunpack::sevenzip
 
         JobStatePtr make_job(
             std::size_t max_inflight_bytes = 0,
-            std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+            std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+            bool capture_inventory = true
 #ifdef SUP7Z_DEBUG
             , PipelineTiming *pipeline_timing = nullptr
 #endif
@@ -381,7 +386,8 @@ namespace sunpack::sevenzip
             }
             auto job = std::make_shared<JobState>(
                 max_inflight_bytes,
-                std::move(cancel_token)
+                std::move(cancel_token),
+                capture_inventory
 #ifdef SUP7Z_DEBUG
                 , pipeline_timing
 #endif
@@ -1702,7 +1708,7 @@ namespace sunpack::sevenzip
                     );
                 }
                 FILETIME last_write{};
-                if (GetFileTime(handle, nullptr, nullptr, &last_write))
+                if (job->capture_inventory && GetFileTime(handle, nullptr, nullptr, &last_write))
                 {
                     ULARGE_INTEGER ticks{};
                     ticks.LowPart = last_write.dwLowDateTime;

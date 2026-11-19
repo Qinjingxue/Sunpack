@@ -574,7 +574,7 @@ impl Store {
     }
     pub(crate) fn update_live(
         &mut self,
-        rows: impl ExactSizeIterator<Item = io::Result<(String, Option<LiveEvent>)>>,
+        rows: impl ExactSizeIterator<Item = io::Result<(Arc<str>, Option<LiveEvent>)>>,
         reset: bool,
         cutoff: i64,
     ) -> io::Result<()> {
@@ -598,7 +598,7 @@ impl Store {
                     live.remove(&id)?;
                 }
                 if expired {
-                    self.expired_live.push(Arc::from(id));
+                    self.expired_live.push(id);
                 }
                 continue;
             };
@@ -606,14 +606,14 @@ impl Store {
                 self.live = Some(self.new_live()?);
             }
             let live = self.live.as_mut().unwrap();
-            let (id, slot) = if let Some((id, row)) = live.rows.remove_entry(id.as_str()) {
+            let slot = if let Some(row) = live.rows.remove(id.as_ref()) {
                 // Readers already reject this revision. Overwrite the index slot
                 // directly and reclaim only the old record's data.
                 let slot = row.slot;
                 live.release_data(row)?;
-                (id, slot)
+                slot
             } else {
-                (Arc::from(id), live.free.pop().unwrap_or(live.run.count))
+                live.free.pop().unwrap_or(live.run.count)
             };
             let mut raw = super::scratch::Spool::default();
             let group = group.as_deref();

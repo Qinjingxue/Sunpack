@@ -10,7 +10,7 @@ fn unique_path(label: &str) -> PathBuf {
 }
 
 fn empty_operations() -> JournalPayload {
-    JournalPayload::Task(Arc::new(Operations::default()))
+    JournalPayload::Task(Arc::new(NativeWatchOperations::empty()))
 }
 
 #[test]

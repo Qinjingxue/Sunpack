@@ -256,15 +256,16 @@ fn scoped_recent_priority_reuses_global_lookup_and_preserves_order() {
     let snapshot = PasswordSnapshot::from_test_document(&serde_json::json!({"passwords": records}).to_string());
     let candidates = CandidateSet::new(Arc::from([Arc::from("item-0"), Arc::from("explicit")]), Some(Arc::new(snapshot)), &recent, None);
     PRIORITY_CANDIDATES.set(0);
-    for index in 0..16 {
-        let scoped = candidates.for_embedded(&format!(r"C:\parent\nested\{index}.zip"));
-        let unscoped = candidates.for_embedded(&format!(r"C:\other\{index}.zip"));
-        assert_eq!(scoped.len(), 1026);
-        assert_eq!(unscoped.len(), 1025);
-        assert!(scoped[..6].iter().map(AsRef::as_ref).eq(["item-800", "scoped", "item-900", "item-0", "explicit", "item-1"]));
-        assert!(unscoped[..5].iter().map(AsRef::as_ref).eq(["item-800", "item-900", "item-0", "explicit", "item-1"]));
-    }
-    assert_eq!(PRIORITY_CANDIDATES.get(), 1026 + 16 * 3);
+    let mut passwords = candidates.embedded_scope_passwords();
+    let scoped = passwords(r"C:\parent\nested\first.zip");
+    let unscoped = passwords(r"C:\other\first.zip");
+    assert_eq!(scoped.len(), 1026);
+    assert_eq!(unscoped.len(), 1025);
+    assert!(scoped[..6].iter().map(AsRef::as_ref).eq(["item-800", "scoped", "item-900", "item-0", "explicit", "item-1"]));
+    assert!(unscoped[..5].iter().map(AsRef::as_ref).eq(["item-800", "item-900", "item-0", "explicit", "item-1"]));
+    assert!(Arc::ptr_eq(&scoped, &passwords(r"C:\parent\another\second.zip")));
+    assert!(Arc::ptr_eq(&unscoped, &passwords(r"C:\elsewhere\second.zip")));
+    assert_eq!(PRIORITY_CANDIDATES.get(), 1026 + 3);
 }
 
 #[test]

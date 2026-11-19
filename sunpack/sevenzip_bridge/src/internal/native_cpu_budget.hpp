@@ -20,7 +20,6 @@ public:
     std::size_t acquire_up_to(
         std::size_t wanted,
         std::size_t minimum_grant = 1) noexcept;
-    std::size_t acquire_all_available() noexcept;
     void release(std::size_t count) noexcept;
 
     std::size_t reserved_credits() const noexcept;
@@ -33,11 +32,13 @@ private:
     void *capacity_available_context_;
 };
 
+#ifdef SUP7Z_DEBUG
 struct NativeCpuJobSnapshot
 {
     std::size_t current_extra_credits = 0;
     std::size_t peak_extra_credits = 0;
 };
+#endif
 
 class NativeCpuJobContext final
 {
@@ -49,14 +50,17 @@ public:
     std::size_t acquire_extra(
         std::size_t wanted,
         std::size_t minimum_grant = 1) noexcept;
-    std::size_t acquire_all_available() noexcept;
     void release_extra(std::size_t count) noexcept;
+#ifdef SUP7Z_DEBUG
     NativeCpuJobSnapshot snapshot() const noexcept;
+#endif
 
 private:
-    NativeCpuBudget *budget_;
+    NativeCpuBudget &budget_;
     std::atomic<std::size_t> current_extra_{0};
+#ifdef SUP7Z_DEBUG
     std::atomic<std::size_t> peak_extra_{0};
+#endif
 };
 
 class NativeCpuContextScope final

@@ -72,7 +72,7 @@ fn admission_candidate(mut candidate: WatchCandidateRow, since_usn: i64) -> io::
     #[cfg(test)]
     if let Some(readable) = quiet_replay::readable(&candidate.path) { return Ok((candidate, readable)); }
     let Some(snapshot) = filesystem::watch_ready_file_snapshot(
-        Path::new(&candidate.path), Some(since_usn))? else { return Ok((candidate, false)); };
+        Path::new(&candidate.path), Some(since_usn), |_, _| Ok(()))? else { return Ok((candidate, false)); };
     candidate.size = snapshot.metadata.len();
     candidate.mtime = crate::postprocess::mtime_seconds(&snapshot.metadata);
     candidate.observation = snapshot.observation;
@@ -3503,7 +3503,7 @@ impl Scheduler {
             if let Some(pending) = self.pending.remove(&id) { self.due.remove(&(pending.due, id.clone())); }
             self.unpublished.remove(&id);
             self.volume_checks.remove(&id);
-            operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&path, None));
+            operations.finish_pending(&path, None);
             retired.push(path);
         }
         if retired.is_empty() { return Ok(()); }
@@ -4131,11 +4131,9 @@ impl Scheduler {
         self.journal.commit(false, |state| {
             use crate::watch_store::NativeWatchOperations;
             let recoverable = state.pending(path).is_some_and(|record| record.has_output_work());
-            Ok(if recoverable {
-                NativeWatchOperations::empty()
-            } else {
-                NativeWatchOperations::finish_pending(path, None)
-            })
+            let mut operations = NativeWatchOperations::empty();
+            if !recoverable { operations.finish_pending(path, None); }
+            Ok(operations)
         })
     }
 
@@ -4480,10 +4478,7 @@ impl Scheduler {
                 ));
             }
             if let Some(owner) = retire {
-                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                    owner,
-                    state.entry(owner),
-                ));
+                operations.finish_pending(owner, state.entry(owner));
             }
             Ok(operations)
         })?;
@@ -4777,10 +4772,9 @@ impl Scheduler {
             });
             if let Some(entry) = interrupted {
                 self.journal.commit(true, |_| {
-                    Ok(crate::watch_store::NativeWatchOperations::finish_pending(
-                        &pending.path,
-                        Some(entry),
-                    ))
+                    let mut operations = crate::watch_store::NativeWatchOperations::empty();
+                    operations.finish_pending(&pending.path, Some(entry));
+                    Ok(operations)
                 })?;
                 continue;
             }
@@ -5202,13 +5196,13 @@ impl Scheduler {
             self.volume_checks.remove(id);
         }
         self.journal.commit(false, |state| {
-            Ok(if state.pending(&pending.candidate.path).is_some_and(|record| {
+            let mut operations = crate::watch_store::NativeWatchOperations::empty();
+            if state.pending(&pending.candidate.path).is_some_and(|record| {
                 record.matches_observation(&pending.candidate) && !record.has_output_work()
             }) {
-                crate::watch_store::NativeWatchOperations::retire_pending(id.to_owned())
-            } else {
-                crate::watch_store::NativeWatchOperations::empty()
-            })
+                operations.retire_pending(id.to_owned());
+            }
+            Ok(operations)
         })?;
         self.journal.log(json!({"event":"task_retired","path":pending.candidate.path}));
         Ok(true)
@@ -5657,10 +5651,14 @@ impl Scheduler {
     }
 
     fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, completed: Completed, quiet: &mut HashMap<String, quiet::Activity>) -> io::Result<(Outcome, Option<super::toast::Finish>)> {
-        let scopes: Vec<_> = self.roots.values().map(|(_, scope)| scope.clone()).collect();
-        let paths: Vec<_> = completed.outputs.keys().cloned().collect();
-        self.ensure_dependency_observers(&active.root, paths.iter().map(PathBuf::from))?;
-        let published_outputs = self.catalog.publish_outputs(&paths, &scopes, &self.deep_options, Some(&active.root))?;
+        let published_outputs = if completed.outputs.is_empty() {
+            Vec::new()
+        } else {
+            let paths: Vec<_> = completed.outputs.keys().cloned().collect();
+            self.ensure_dependency_observers(&active.root, paths.iter().map(PathBuf::from))?;
+            let scopes: Vec<_> = self.roots.values().map(|(_, scope)| scope.clone()).collect();
+            self.catalog.publish_outputs(&paths, &scopes, &self.deep_options, Some(&active.root))?
+        };
         let coalesced_from = completed.result.as_ref().ok().and_then(|outcome| outcome.coalesced_from);
         let mut unfinished = HashSet::new();
         if completed.cancelled && coalesced_from.is_none() {
@@ -5730,7 +5728,7 @@ impl Scheduler {
                     if !self.pending.contains_key(&id) && state.pending(&input.path)
                         .is_some_and(|record| record.matches_observation(input) && !record.has_output_work())
                     {
-                        operations.extend(NativeWatchOperations::retire_pending(id));
+                        operations.retire_pending(id);
                     }
                 }
                 Ok(operations)
@@ -5837,7 +5835,7 @@ impl Scheduler {
                 continue;
             }
             if self.hub.completed_families.covers(&archive.path, active.deep) {
-                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&candidate.path, None));
+                operations.finish_pending(&candidate.path, None);
                 continue;
             }
             let regroup = failure.kind == FailureKind::MissingVolume;
@@ -5901,10 +5899,7 @@ impl Scheduler {
                 self.unpublished.insert(id.clone());
                 operations.put_entry(entry);
             } else {
-                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                    &candidate.path,
-                    Some(entry),
-                ));
+                operations.finish_pending(&candidate.path, Some(entry));
             }
             if (regroup && !self.pending.contains_key(&id)) || password_updated {
                 retry.push((candidate.path.clone(), if password_updated {
@@ -5942,9 +5937,7 @@ impl Scheduler {
             // the other volumes, retire only their physical pending records.
             if !completed.cancelled {
                 if id != canonical_id {
-                    operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                        &candidate.path, None,
-                    ));
+                    operations.finish_pending(&candidate.path, None);
                 }
                 if self.pending.contains_key(&canonical_id)
                     || !projected_groups.insert(canonical_id.clone())
@@ -6005,15 +5998,12 @@ impl Scheduler {
                 let entry = (canonical != candidate.path)
                     .then(|| self.journal.state().entry(&candidate.path))
                     .flatten();
-                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                    &candidate.path,
-                    entry,
-                ));
+                operations.finish_pending(&candidate.path, entry);
                 continue;
             }
             if (retryable || discovery_failure.is_some_and(|failure| failure.kind == FailureKind::MissingVolume || failure.is_password_retry()))
                 && self.hub.completed_families.covers(Path::new(&canonical), active.deep) {
-                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&candidate.path, None));
+                operations.finish_pending(&candidate.path, None);
                 continue;
             }
             // An ordinary arrival can resolve to a generated head. That is a
@@ -6106,10 +6096,7 @@ impl Scheduler {
                 }
                 self.journal.log(event);
             }
-            operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                &candidate.path,
-                record,
-            ));
+            operations.finish_pending(&candidate.path, record);
         }
         if !completed.cancelled {
             for error in &outcome.errors {
@@ -6204,7 +6191,7 @@ impl Scheduler {
         let id = watch_path_key(path);
         if self.pending.contains_key(&id) { return Ok(()); }
         if recorded_file_is_absent(path) {
-            operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(path, None));
+            operations.finish_pending(path, None);
             return Ok(());
         }
         // Main re-admits an infrastructure/read exception, unlike a

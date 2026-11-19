@@ -37,13 +37,11 @@ fn carrier_outputs_survive_snapshot_and_incremental_replay() {
         identity: "container-id".into(),
     });
     let state = NativeWatchState::new();
-    state.apply(&NativeWatchOperations {
-        operations: Arc::new(Operations(vec![Operation::PutPending(path_key(&owner), Arc::new(pending))])),
-    });
+    state.apply(&NativeWatchOperations(vec![Operation::PutPending(path_key(&owner), Arc::new(pending))]));
     assert!(state.pending(&owner).unwrap().active_outputs.contains(&task, &container));
     fs::write(&journal, wal::file_header(Kind::TaskWal)).unwrap();
     let append = |seq, changes: Vec<OutputChange>| {
-        let operations = Operations(changes.into_iter()
+        let operations = NativeWatchOperations(changes.into_iter()
             .map(|change| Operation::Output(path_key(&owner), change)).collect());
         let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
         wal::append_frame(&mut file, &mut Vec::new(), seq, |out| {
@@ -94,7 +92,9 @@ fn carrier_outputs_survive_snapshot_and_incremental_replay() {
     assert_eq!(pending.output_identities[&moved], "moved-id");
     assert!(!pending.output_identities.contains_key(&second));
     drop(pending);
-    resumed.apply(&NativeWatchOperations::finish_pending(&owner, None));
+    let mut operations = NativeWatchOperations::empty();
+    operations.finish_pending(&owner, None);
+    resumed.apply(&operations);
     assert_eq!(resumed.lock().pending.capacity(), 0);
     fs::remove_file(snapshot).unwrap();
     fs::remove_file(journal).unwrap();
@@ -114,7 +114,7 @@ fn recovery_publication_orders_concurrent_blocker_changes() {
         }))
         .unwrap();
         let key = path_key(&record.path);
-        state.apply_operations(&Operations(vec![Operation::PutEntry(
+        state.apply(&NativeWatchOperations(vec![Operation::PutEntry(
             key.clone(),
             Arc::new(record.clone()),
         )]));
@@ -130,7 +130,7 @@ fn recovery_publication_orders_concurrent_blocker_changes() {
                 record.status = "suspended_missing_volume".into();
                 Operation::PutEntry(key, Arc::new(record))
             };
-            worker_state.apply_operations(&Operations(vec![operation]));
+            worker_state.apply(&NativeWatchOperations(vec![operation]));
             finished.send(()).unwrap();
         });
         state.with_event_projection(|rows| {

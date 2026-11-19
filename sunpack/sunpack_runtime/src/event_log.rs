@@ -63,12 +63,19 @@ fn state_event(event: &str) -> bool {
 }
 
 #[derive(Default)]
+enum TaskStatus {
+    #[default]
+    Unpublished,
+    Published(Record),
+    Expired,
+}
+
+#[derive(Default)]
 struct Task {
     group: Option<Arc<Value>>,
     members: HashSet<String>,
-    status: Option<Record>,
+    status: TaskStatus,
     stamp: i64,
-    expired: bool,
     blocked: bool,
     owner: String,
     owners: HashSet<String>,
@@ -76,7 +83,7 @@ struct Task {
 }
 impl Task {
     fn processing(&self) -> bool {
-        self.status.is_some() && !self.blocked
+        !matches!(self.status, TaskStatus::Unpublished) && !self.blocked
     }
 }
 struct Retiring {
@@ -85,22 +92,23 @@ struct Retiring {
 }
 #[derive(Default)]
 struct Projection {
+    // Routing indexes and the writer share each task ID's allocation.
     // Completion removes the live task; only routing metadata may retire later.
-    tasks: HashMap<String, Task>,
-    retiring: HashMap<String, Retiring>,
-    owner_tasks: HashMap<String, HashSet<String>>,
-    aliases: HashMap<String, String>,
+    tasks: HashMap<Arc<str>, Task>,
+    retiring: HashMap<Arc<str>, Retiring>,
+    owner_tasks: HashMap<String, HashSet<Arc<str>>>,
+    aliases: HashMap<String, Arc<str>>,
     order: u64,
-    dirty: HashSet<String>,
+    dirty: HashSet<Arc<str>>,
     dirty_bytes: usize,
     full_dirty: bool,
 }
 impl Projection {
-    fn mark(&mut self, id: &str) {
+    fn mark(&mut self, id: &Arc<str>) {
         if self.full_dirty {
             return;
         }
-        if self.dirty.insert(id.to_owned()) {
+        if self.dirty.insert(Arc::clone(id)) {
             self.dirty_bytes += id.len();
         }
         if self.dirty_bytes > 1024 * 1024 {
@@ -128,7 +136,9 @@ impl Projection {
                 if self
                     .tasks
                     .get(&id)
-                    .is_some_and(|task| task.expired && task.owners.is_empty())
+                    .is_some_and(|task| {
+                        matches!(task.status, TaskStatus::Expired) && task.owners.is_empty()
+                    })
                 {
                     self.drop_expired(&id);
                 }
@@ -158,7 +168,7 @@ impl Projection {
                 if task.stamp > cutoff {
                     continue;
                 }
-                task.expired = true;
+                task.status = TaskStatus::Expired;
                 if task.owners.is_empty() {
                     self.drop_expired(&id);
                 }
@@ -167,29 +177,29 @@ impl Projection {
         self.trim();
     }
     fn remove(&mut self, id: &str) -> Option<Task> {
-        let task = self.tasks.remove(id)?;
-        if !task.expired {
-            self.mark(id);
+        let (owned_id, task) = self.tasks.remove_entry(id)?;
+        if !matches!(task.status, TaskStatus::Expired) {
+            self.mark(&owned_id);
         }
         self.unbind(id, &task.owners);
         for member in &task.members {
             if self
                 .aliases
                 .get(member)
-                .is_some_and(|current| current == id)
+                .is_some_and(|current| current.as_ref() == id)
             {
                 self.aliases.remove(member);
             }
         }
         if let Some(group) = &task.group {
             let path = key(field(group, "path"));
-            if self.aliases.get(&path).is_some_and(|current| current == id) {
+            if self.aliases.get(&path).is_some_and(|current| current.as_ref() == id) {
                 self.aliases.remove(&path);
             }
         }
         Some(task)
     }
-    fn insert(&mut self, id: String, task: Task) {
+    fn insert(&mut self, id: Arc<str>, task: Task) {
         self.mark(&id);
         for owner in &task.owners {
             self.owner_tasks
@@ -211,29 +221,29 @@ impl Projection {
         crate::collections::trim_map(&mut self.retiring);
         crate::collections::trim_map(&mut self.owner_tasks);
     }
-    fn resolve(&self, value: &Value, physical: &str) -> String {
+    fn resolve(&self, value: &Value, physical: &str) -> Arc<str> {
         let explicit = field(value, "task_id");
         if !explicit.is_empty() {
-            return explicit.to_owned();
+            return self.tasks.get_key_value(explicit)
+                .map_or_else(|| Arc::from(explicit), |(id, _)| Arc::clone(id));
         }
         self.aliases
             .get(physical)
             .cloned()
-            .unwrap_or_else(|| physical.to_owned())
+            .unwrap_or_else(|| Arc::from(physical))
     }
-    fn instance_id(&self, owner: &str, physical: &str) -> String {
+    fn instance_id(&self, owner: &str, physical: &str) -> Arc<str> {
         // Watch supplies a UUID per submission. Ownerless recovery must also
         // avoid IDs already present in history from an earlier writer.
-        let owner = if owner.is_empty() {
+        if owner.is_empty() {
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            format!("@{epoch}:{}", self.order)
+            format!("@{epoch}:{}|{physical}", self.order).into()
         } else {
-            owner.to_owned()
-        };
-        format!("{}|{}", owner, physical)
+            format!("{owner}|{physical}").into()
+        }
     }
     /// Update the live projection and report whether to persist this event in history.
     fn apply(&mut self, value: &mut Value) -> bool {
@@ -245,7 +255,7 @@ impl Projection {
             let ts = value["ts"].clone();
             if let Some(groups) = value["groups"].as_array_mut() {
                 for group in groups {
-                    let path = field(group, "path").to_owned();
+                    let path = field(group, "path");
                     if path.is_empty() {
                         continue;
                     }
@@ -260,33 +270,31 @@ impl Projection {
                     if members.is_empty() {
                         continue;
                     }
-                    let explicit = field(group, "task_id").to_owned();
-                    let mut previous: HashSet<_> = members
-                        .iter()
-                        .map(|m| self.aliases.get(m).unwrap_or(m).clone())
-                        .filter(|id| {
-                            self.tasks.contains_key(id) && (explicit.is_empty() || *id == explicit)
-                        })
-                        .collect();
-                    if !explicit.is_empty() && self.tasks.contains_key(&explicit) {
-                        previous.insert(explicit.clone());
-                    }
+                    let explicit = (!field(group, "task_id").is_empty())
+                        .then(|| self.resolve(group, path));
+                    let previous: HashSet<_> = if explicit.is_none() {
+                        members
+                            .iter()
+                            .map(|m| self.aliases.get(m).map_or(m.as_str(), |id| id.as_ref()))
+                            .filter_map(|id| self.tasks.get_key_value(id).map(|(key, _)| Arc::clone(key)))
+                            .collect()
+                    } else {
+                        HashSet::new()
+                    };
                     // Keep an established group's ID across first-volume
                     // arrival; a provisional request card can be absorbed.
-                    let id = if !explicit.is_empty() {
-                        explicit
-                    } else {
+                    let id = explicit.clone().unwrap_or_else(|| {
                         previous
                             .iter()
                             .filter(|id| self.tasks[*id].group.is_some())
                             .min()
                             .cloned()
                             .or_else(|| previous.iter().min().cloned())
-                            .unwrap_or_else(|| self.instance_id(&owner, &key(&path)))
-                    };
+                            .unwrap_or_else(|| self.instance_id(&owner, &key(path)))
+                    });
                     let mut task = Task::default();
                     let mut owners = HashSet::new();
-                    for old in previous {
+                    for old in previous.into_iter().chain(explicit) {
                         if let Some(mut candidate) = self.remove(&old) {
                             owners.extend(candidate.owners.drain());
                             if candidate.order > task.order {
@@ -304,12 +312,12 @@ impl Projection {
                         // The first group can absorb a provisional member card.
                         // Its status must address the canonical path before that
                         // member retires, otherwise a snapshot resurrects it.
-                        if let Some(status) = &task.status {
+                        if let TaskStatus::Published(status) = &task.status {
                             let mut value: Value =
                                 serde_json::from_slice(status).expect("encoded status");
                             value["path"] = group["path"].clone();
                             value["task_id"] = json!(id);
-                            task.status = Some(encode(&value));
+                            task.status = TaskStatus::Published(encode(&value));
                         }
                     }
                     if !owner.is_empty() {
@@ -317,16 +325,15 @@ impl Projection {
                         task.owner = owner.clone();
                     }
                     task.members = members;
-                    task.group = Some(Arc::new(group.clone()));
                     if processing {
                         task.stamp = (ts.as_f64().unwrap_or(0.0) * 1_000_000.0) as i64;
-                        task.expired = false;
                         task.status =
-                            Some(encode(&json!({"event":"processing_started","path":path,
+                            TaskStatus::Published(encode(&json!({"event":"processing_started","path":group["path"],
                         "ts":ts,"owner":task.owner,"task_id":id})));
                         task.order = self.order;
                         task.blocked = false;
                     }
+                    task.group = Some(Arc::new(std::mem::take(group)));
                     self.insert(id, task);
                 }
             }
@@ -342,7 +349,7 @@ impl Projection {
                 .filter_map(Value::as_str)
                 .chain((!path.is_empty()).then_some(path))
                 .map(key)
-                .map(|p| self.aliases.get(&p).unwrap_or(&p).clone())
+                .map(|p| self.aliases.get(&p).cloned().unwrap_or_else(|| p.into()))
                 .collect();
             for id in ids {
                 if self
@@ -488,7 +495,6 @@ impl Projection {
                 value["path"] = group["path"].clone();
             }
             task.stamp = timestamp(value);
-            task.expired = false;
             task.blocked = blocked;
             if !field(value, "owner").is_empty() {
                 task.owners.insert(field(value, "owner").to_owned());
@@ -523,7 +529,7 @@ impl Projection {
                 }
                 return true;
             }
-            task.status = Some(encode(value));
+            task.status = TaskStatus::Published(encode(value));
             self.insert(id, task);
             return false;
         }
@@ -532,14 +538,13 @@ impl Projection {
     fn updates(
         &mut self,
         mut reset: bool,
-    ) -> (Vec<(String, Option<(Record, Option<Arc<Value>>)>)>, bool) {
+    ) -> (Vec<(Arc<str>, Option<(Record, Option<Arc<Value>>)>)>, bool) {
         reset |= std::mem::take(&mut self.full_dirty);
         self.dirty_bytes = 0;
         let dirty = std::mem::take(&mut self.dirty);
-        let project_status = |task: &Task| {
-            task.status
-                .as_ref()
-                .map(|status| (status.clone(), task.group.clone()))
+        let project_status = |task: &Task| match &task.status {
+            TaskStatus::Published(status) => Some((Arc::clone(status), task.group.clone())),
+            TaskStatus::Unpublished | TaskStatus::Expired => None,
         };
         let rows = if reset {
             drop(dirty);

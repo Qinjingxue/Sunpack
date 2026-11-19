@@ -560,26 +560,18 @@ impl StateData {
 
 }
 
-#[derive(Default, Serialize, Clone)]
+/// A batch of decoded operations, shared with the WAL writer at submission.
+#[derive(Default, Serialize)]
 #[serde(transparent)]
-pub(crate) struct Operations(Vec<Operation>);
-
-/// Decoded journal operations, validated before their WAL record is submitted.
-pub(crate) struct NativeWatchOperations {
-    pub(crate) operations: Arc<Operations>,
-}
+pub(crate) struct NativeWatchOperations(Vec<Operation>);
 
 impl NativeWatchOperations {
     pub(crate) fn empty() -> Self {
-        Self {
-            operations: Arc::new(Operations::default()),
-        }
+        Self::default()
     }
 
     pub(crate) fn set_runtime(&mut self, key: String, value: Option<Value>) {
-        Arc::make_mut(&mut self.operations)
-            .0
-            .push(Operation::Runtime(key, value.map(Arc::new)));
+        self.0.push(Operation::Runtime(key, value.map(Arc::new)));
     }
 
     pub(crate) fn relocate_output(
@@ -590,63 +582,45 @@ impl NativeWatchOperations {
         destination: String,
         identity: String,
     ) {
-        Arc::make_mut(&mut self.operations).0.push(Operation::Output(
+        self.0.push(Operation::Output(
             path_key(owner),
             OutputChange::Relocate { source, leaf, destination, identity },
         ));
     }
 
     pub(crate) fn put_entry(&mut self, entry: Arc<EntryRecord>) {
-        Arc::make_mut(&mut self.operations)
-            .0
-            .push(Operation::PutEntry(path_key(&entry.path), entry));
+        self.0.push(Operation::PutEntry(path_key(&entry.path), entry));
     }
 
-    pub(crate) fn finish_pending(path: &str, entry: Option<Arc<EntryRecord>>) -> Self {
+    pub(crate) fn finish_pending(&mut self, path: &str, entry: Option<Arc<EntryRecord>>) {
         let key = path_key(path);
         let retry = match entry {
             Some(entry) => Operation::PutEntry(key.clone(), entry),
             None => Operation::Delete(Collection::Entries, key.clone()),
         };
-        Self {
-            operations: Arc::new(Operations(vec![
-                retry,
-                Operation::Delete(Collection::Pending, key),
-            ])),
-        }
+        self.0.push(retry);
+        self.retire_pending(key);
     }
 
-    pub(crate) fn retire_pending(key: String) -> Self {
-        Self {
-            operations: Arc::new(Operations(vec![Operation::Delete(Collection::Pending, key)])),
-        }
+    pub(crate) fn retire_pending(&mut self, key: String) {
+        self.0.push(Operation::Delete(Collection::Pending, key));
     }
 
     pub(crate) fn retire_entries(keys: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            operations: Arc::new(Operations(
-                keys.into_iter()
-                    .map(|key| Operation::Delete(Collection::Entries, key))
-                    .collect(),
-            )),
-        }
+        Self(keys.into_iter()
+            .map(|key| Operation::Delete(Collection::Entries, key))
+            .collect())
     }
 
     pub(crate) fn password_generation(generation: i64, signature: String) -> Self {
-        Self {
-            operations: Arc::new(Operations(vec![Operation::SetMetadata(
-                generation, signature,
-            )])),
-        }
+        Self(vec![Operation::SetMetadata(generation, signature)])
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
-        Arc::make_mut(&mut self.operations)
-            .0
-            .extend(Arc::unwrap_or_clone(other.operations).0);
+        self.0.extend(other.0);
     }
     pub(crate) fn is_empty(&self) -> bool {
-        self.operations.0.is_empty()
+        self.0.is_empty()
     }
 }
 
@@ -843,7 +817,7 @@ impl NativeWatchState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-    fn apply_operations(&self, operations: &Operations) {
+    pub(crate) fn apply(&self, operations: &NativeWatchOperations) {
         let publication = self.events.lock().unwrap();
         let events = publication.as_ref().and_then(std::sync::Weak::upgrade);
         let mut notifications = Vec::new();
@@ -967,9 +941,7 @@ impl NativeWatchState {
             merged.extend(cursors);
             operations.push(Operation::SetCursors(merged));
         }
-        NativeWatchOperations {
-            operations: Arc::new(Operations(operations)),
-        }
+        NativeWatchOperations(operations)
     }
 
     pub(crate) fn protect_output_operation(
@@ -981,14 +953,10 @@ impl NativeWatchState {
         self.lock()
             .pending
             .contains_key(&key)
-            .then(|| NativeWatchOperations {
-                operations: Arc::new(Operations(vec![Operation::Output(
-                    key,
-                    OutputChange::Protect {
-                                sources,
-                    },
-                )])),
-            })
+            .then(|| NativeWatchOperations(vec![Operation::Output(
+                key,
+                OutputChange::Protect { sources },
+            )]))
     }
     /// Build a bounded WAL delta without exporting a growing pending record.
     pub(crate) fn output_operation(
@@ -1020,11 +988,7 @@ impl NativeWatchState {
                             return Ok(None);
                         }
                     } else if !record.committed_roots.contains(&output) {
-                        return Ok(record.committed_roots.covers(&output).then(|| {
-                            NativeWatchOperations {
-                                operations: Arc::new(Operations::default()),
-                            }
-                        }));
+                        return Ok(record.committed_roots.covers(&output).then(NativeWatchOperations::empty));
                     }
                 }
                 keep && (!active || !record.output_identities.contains_key(&output))
@@ -1080,9 +1044,7 @@ impl NativeWatchState {
                         && record.output_identities.get(&output) == Some(&identity)
                 })
             {
-                return Ok(Some(NativeWatchOperations {
-                    operations: Arc::new(Operations::default()),
-                }));
+                return Ok(Some(NativeWatchOperations::empty()));
             }
             if register {
                 self.register_output_paths(&owned_paths, &[&identity]);
@@ -1094,9 +1056,7 @@ impl NativeWatchState {
             }
         };
         operations.push(Operation::Output(key, change));
-        Ok(Some(NativeWatchOperations {
-            operations: Arc::new(Operations(operations)),
-        }))
+        Ok(Some(NativeWatchOperations(operations)))
     }
 
     pub(crate) fn runtime_record(&self, key: &str) -> Option<Arc<Value>> {
@@ -1242,9 +1202,7 @@ impl NativeWatchState {
                 }
             }
         }
-        NativeWatchOperations {
-            operations: Arc::new(Operations(operations)),
-        }
+        NativeWatchOperations(operations)
     }
 
     pub(crate) fn entries_in_scope(
@@ -1270,10 +1228,6 @@ impl NativeWatchState {
 
     pub(crate) fn watch_cursor(&self, volume_key: &str) -> Option<Cursor> {
         self.lock().cursors.get(&volume_key.to_lowercase()).copied()
-    }
-
-    pub(crate) fn apply(&self, operations: &NativeWatchOperations) {
-        self.apply_operations(&operations.operations);
     }
 
     pub(crate) fn capture(&self, checkpoint_seq: u64) -> NativeWatchSnapshot {

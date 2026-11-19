@@ -310,7 +310,7 @@ namespace sunpack::sevenzip
 #else
         const auto formats = extraction_formats_for_hint(format_hint).handlers;
 #endif
-        const auto prefetch_config = input_prefetch_config_for_archive(format_hint, native_volume_input);
+        const auto prefetch_config = input_prefetch_config(format_hint, native_volume_input);
 
         // Try each handler at the canonical input start before allowing
         // signature search. A wrong handler must not scan the whole archive

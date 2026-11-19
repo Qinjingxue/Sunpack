@@ -165,17 +165,25 @@ impl CandidateSet {
 
     fn for_path<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
         let recent = self.sources.recent.snapshot();
-        let scoped: Vec<_> = self.sources.snapshot.scoped(self.scope(path)).collect();
+        let scoped = self.sources.snapshot.scoped(self.scope(path)).collect();
+        self.for_scope(scoped, &recent)
+    }
+
+    fn for_scope<'b>(
+        &'b self,
+        scoped: Vec<&'b [Arc<str>]>,
+        recent: &RecentOrder,
+    ) -> impl Iterator<Item = &'b Arc<str>> + 'b {
         let global = self.sources.snapshot.global();
         let explicit = &self.sources.explicit;
         let priority = if recent.is_empty() {
             Vec::new()
         } else if explicit.len() + global.len() >= BATCH_SIZE {
-            let base = self.sources.recent_indices(&recent);
+            let base = self.sources.recent_indices(recent);
             let mut ranked: Vec<_> = if scoped.is_empty() {
                 Vec::new()
             } else {
-                prioritize(&recent, scoped.iter().flat_map(|bucket| bucket.iter()).map(|value| (value, value)))
+                prioritize(recent, scoped.iter().flat_map(|bucket| bucket.iter()).map(|value| (value, value)))
             };
             // An applicable scoped entry has precedence over the shared base.
             // Only merge recent entries, regardless of dictionary size.
@@ -187,7 +195,7 @@ impl CandidateSet {
             ranked
         } else {
             let values = scoped.iter().flat_map(|bucket| bucket.iter()).chain(explicit.iter()).chain(global);
-            prioritize(&recent, values.map(|value| (value, value)))
+            prioritize(recent, values.map(|value| (value, value)))
         };
         let mut seen: HashSet<&str> = priority.iter().map(|&(_, value)| value.as_ref()).collect();
         let prefix = scoped.into_iter().flatten().chain(explicit.iter()).map(|value| (value, true));
@@ -204,6 +212,22 @@ impl CandidateSet {
 
     pub(super) fn for_embedded(&self, path: &str) -> Vec<Arc<str>> {
         self.for_path(path).cloned().collect()
+    }
+
+    pub(super) fn embedded_scope_passwords(&self) -> impl FnMut(&str) -> Arc<[Arc<str>]> + '_ {
+        let mut by_scope = HashMap::new();
+        let mut recent = None;
+        move |path| {
+            let scoped: Vec<_> = self.sources.snapshot.scoped(self.scope(path)).collect();
+            // The snapshot owns immutable buckets for this entire pass. The
+            // ordered slice identities also match descendants with the same
+            // inherited buckets and paths with only global passwords.
+            let key: Vec<_> = scoped.iter().map(|bucket| (bucket.as_ptr().addr(), bucket.len())).collect();
+            Arc::clone(by_scope.entry(key).or_insert_with(|| {
+                let recent = recent.get_or_insert_with(|| self.sources.recent.snapshot());
+                self.for_scope(scoped, recent).cloned().collect::<Vec<_>>().into()
+            }))
+        }
     }
 
     pub(super) fn remember_verified(&self, password: Arc<str>) {
