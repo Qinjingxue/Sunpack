@@ -79,17 +79,9 @@ distributed at [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt).
 zlib-ng source and releases are available from
 [github.com/zlib-ng/zlib-ng](https://github.com/zlib-ng/zlib-ng/).
 
-## 7-Zip runtime binaries and development assets
+## 7-Zip development assets
 
-Depending on the build context, SunPack can also stage or redistribute 7-Zip
-runtime binaries and development assets, including:
-
-- 7z.dll
-- 7z.exe
-- 7z.sfx
-- 7zCon.sfx
-- 7-zip.dll
-- 7-zip32.dll (x64 development assets)
+The development setup prepares the 7-Zip fixture tools `7z.exe`, `7z.dll`, and `7zCon.sfx`.
 
 Those components remain subject to the 7-Zip binary distribution terms
 reproduced in [licenses/7zip-license.txt](licenses/7zip-license.txt).

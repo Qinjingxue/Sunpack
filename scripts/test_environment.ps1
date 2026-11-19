@@ -54,9 +54,14 @@ function Get-SunPackRuntimeBuildPath {
     return Join-Path (Get-RustBuildDirectory -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile) "sunpack-runtime.exe"
 }
 
+function Get-ArchiveFixtureToolsRoot {
+    param([string]$RepoRoot, [ValidateSet("x64", "arm64")][string]$Arch)
+    return Join-Path $RepoRoot $(if ($Arch -eq "arm64") { "tools\arm64" } else { "tools" })
+}
+
 function Get-ArchiveFixtureToolRefreshReasons {
     param([string]$RepoRoot, [ValidateSet("x64", "arm64")][string]$Arch)
-    $toolsRoot = Join-Path $RepoRoot $(if ($Arch -eq "arm64") { "tools\arm64" } else { "tools" })
+    $toolsRoot = Get-ArchiveFixtureToolsRoot -RepoRoot $RepoRoot -Arch $Arch
     foreach ($name in @("7z.exe", "7z.dll", "7zCon.sfx")) {
         if (-not (Test-Path -LiteralPath (Join-Path $toolsRoot $name) -PathType Leaf)) {
             "Required archive fixture generator is missing: $name"

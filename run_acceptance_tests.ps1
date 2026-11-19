@@ -52,50 +52,6 @@ function Invoke-TestArtifactCleanup {
     }
 }
 
-function Initialize-ExitCodeProbe {
-    if ("SunPack.ProcessExit" -as [type]) {
-        return
-    }
-    Add-Type -Namespace SunPack -Name ProcessExit -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool GetExitCodeProcess(System.IntPtr hProcess, out uint lpExitCode);
-
-public static bool TryGetExitCode(System.IntPtr hProcess, ref int exitCode) {
-    uint code;
-    if (!GetExitCodeProcess(hProcess, out code)) {
-        return false;
-    }
-    exitCode = unchecked((int)code);
-    return true;
-}
-'@
-}
-
-function Get-ChildExitCode {
-    param(
-        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
-        $ProcessHandle = $null
-    )
-
-    # Windows PowerShell 5.1 can leave Start-Process -PassThru ExitCode unset ($null), and
-    # [int]$null silently becomes 0, which would report a failing pytest run as exit 0.
-    if ($null -ne $Process.ExitCode) {
-        return [int]$Process.ExitCode
-    }
-    if ($ProcessHandle -is [IntPtr] -and $ProcessHandle -ne [IntPtr]::Zero) {
-        try {
-            Initialize-ExitCodeProbe
-            $code = 0
-            # 259 is STILL_ACTIVE: the handle outlived the process without an exit code.
-            if ([SunPack.ProcessExit]::TryGetExitCode($ProcessHandle, [ref]$code) -and $code -ne 259) {
-                return [int]$code
-            }
-        } catch {
-        }
-    }
-    return $null
-}
-
 function ConvertTo-WindowsCommandLineArgument {
     param([AllowEmptyString()][string]$Value)
     # Start-Process joins ArgumentList without quoting. Follow CommandLineToArgvW
@@ -127,15 +83,12 @@ function Invoke-TestStep {
     $joinedCommand = $Command -join " "
     $junitReportPath = $null
     $diagnosticStep = $null
-    $stdoutPath = $null
-    $stderrPath = $null
-    $retainOutput = $false
-    $showOutput = $VerboseOutput.IsPresent
 
     if ($Command.Length -ge 3 -and $Command[1] -eq "-m" -and $Command[2] -eq "pytest") {
         $junitReportPath = Join-Path ([System.IO.Path]::GetTempPath()) (
             "sunpack-acceptance-{0}-{1}.xml" -f $PID, [guid]::NewGuid().ToString("N")
         )
+        $argsList = @("-u") + $argsList
         $argsList += "--junitxml=$junitReportPath"
         if ($env:SUNPACK_ACCEPTANCE_DIAGNOSTICS_DIR) {
             $diagnosticStep = Join-Path $env:SUNPACK_ACCEPTANCE_DIAGNOSTICS_DIR ($Label -replace '[^a-zA-Z0-9]+', '-')
@@ -148,46 +101,40 @@ function Invoke-TestStep {
         Write-Host ("    " + $joinedCommand) -ForegroundColor DarkGray
     }
 
-    $runnerArguments = @()
-    $runnerExecutable = $python
+    # The acceptance script needs elevation for the temporary Watch Broker.
+    # Ordinary tests and their descendants still run with the interactive token.
+    $captureOption = "--output-directory"
     if ($KeepElevationIfAdministrator -and $script:AcceptanceProcessIsAdministrator) {
         Write-Host "    Running this step with the acceptance process administrator token" -ForegroundColor DarkGray
-        $runnerExecutable = $Command[0]
-        $runnerArguments = $argsList
-        if ($diagnosticStep) {
-            $stdoutPath = Join-Path $diagnosticStep "stdout.bin"
-            $stderrPath = Join-Path $diagnosticStep "stderr.bin"
-            $retainOutput = $true
-        }
-    } else {
-        # The acceptance script may itself require elevation to install the temporary
-        # Watch Broker service. Keep ordinary test/smoke commands behind the existing
-        # token-switching helper so pytest and its descendants use the normal token.
-        $runnerArguments = @(
-            $unelevatedRunner,
-            "--cwd", $repoRoot,
-            "--timeout-seconds", [string]$TimeoutSeconds
-        )
-        if ($diagnosticStep) { $runnerArguments += @("--output-directory", $diagnosticStep) }
-        $runnerArguments += @("--", $Command[0])
-        $runnerArguments += $argsList
+        $captureOption = "--capture-directory"
     }
 
     $process = $null
+    $outputDirectory = $diagnosticStep
+    $outputPaths = @()
     try {
-        if (-not $retainOutput) {
-            $stdoutPath = [System.IO.Path]::GetTempFileName()
-            $stderrPath = [System.IO.Path]::GetTempFileName()
+        if (-not $outputDirectory) {
+            $outputDirectory = Join-Path ([IO.Path]::GetTempPath()) ("sunpack-test-" + [guid]::NewGuid().ToString("N"))
+            $null = [IO.Directory]::CreateDirectory($outputDirectory)
         }
-        # Native children bypass the PowerShell streams captured by the UAC relaunch.
+        $outputPaths = @("stdout.bin", "stderr.bin", "runner-stderr.bin" | ForEach-Object {
+            Join-Path $outputDirectory $_
+        })
+        foreach ($outputPath in $outputPaths) {
+            [IO.File]::WriteAllBytes($outputPath, [byte[]]@())
+        }
+        $runnerArguments = @(
+            $unelevatedRunner, "--cwd", $repoRoot, "--timeout-seconds", [string]$TimeoutSeconds,
+            $captureOption, $outputDirectory, "--", $Command[0]
+        ) + $argsList
         $startProcessArgs = @{
-            FilePath = $runnerExecutable
+            FilePath = $python
             ArgumentList = @($runnerArguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument $_ })
             NoNewWindow = $true
             PassThru = $true
-            RedirectStandardOutput = $stdoutPath
-            RedirectStandardError = $stderrPath
+            RedirectStandardError = $outputPaths[2]
         }
+        Initialize-TestProcessOutput
         $process = Start-Process @startProcessArgs
 
         # Windows PowerShell 5.1 builds the -PassThru wrapper lazily and only binds a real
@@ -200,9 +147,8 @@ function Invoke-TestStep {
             $processHandle = $null
         }
 
-        $timeoutMs = [Math]::Max(1, $TimeoutSeconds) * 1000
-        if (-not $process.WaitForExit($timeoutMs)) {
-            $showOutput = $true
+        $timeoutMs = [Math]::Min([int]::MaxValue, [Math]::Max(1, $TimeoutSeconds) * 1000)
+        $finished = Receive-TestProcessOutput -Process $process -Paths $outputPaths -TimeoutMilliseconds $timeoutMs -OnTimeout {
             $terminated = $false
             try {
                 # taskkill follows detached descendants that Process.Kill($true) can miss.
@@ -218,6 +164,8 @@ function Invoke-TestStep {
                 }
             }
             $process.WaitForExit()
+        }
+        if (-not $finished) {
             $duration = ((Get-Date) - $startTime).TotalSeconds
             $script:StepResults += [pscustomobject]@{
                 Label = $Label
@@ -286,10 +234,8 @@ function Invoke-TestStep {
 
         Write-Host ("    FAIL ({0:N2}s)" -f $duration) -ForegroundColor Red
         Write-Host ("    Command: " + $joinedCommand) -ForegroundColor DarkGray
-        $showOutput = $true
         return
     } catch {
-        $showOutput = $true
         $duration = ((Get-Date) - $startTime).TotalSeconds
         $script:StepResults += [pscustomobject]@{
             Label = $Label
@@ -307,33 +253,13 @@ function Invoke-TestStep {
         if ($junitReportPath -and (Test-Path -LiteralPath $junitReportPath)) {
             Remove-Item -LiteralPath $junitReportPath -Force
         }
-        foreach ($outputPath in @($stdoutPath, $stderrPath)) {
-            if ($outputPath -and (Test-Path -LiteralPath $outputPath)) {
-                if ($showOutput -or $retainOutput) {
-                    Get-Content -LiteralPath $outputPath -Encoding UTF8 | ForEach-Object { Write-Host $_ }
-                }
-                if (-not $retainOutput) {
-                    Remove-Item -LiteralPath $outputPath -Force
-                }
+        if (-not $diagnosticStep -and $outputDirectory -and [IO.Directory]::Exists($outputDirectory)) {
+            foreach ($outputPath in $outputPaths) {
+                [IO.File]::Delete($outputPath)
             }
+            [IO.Directory]::Delete($outputDirectory)
         }
     }
-}
-
-function Get-UvBootstrapPythonCommand {
-    foreach ($candidate in @("python", "py")) {
-        try {
-            $resolvedPython = & $candidate -c "import sys; print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                $resolvedPython = @($resolvedPython | Where-Object { $_ }) | Select-Object -Last 1
-                if ($resolvedPython) {
-                    return ([string]$resolvedPython).Trim()
-                }
-            }
-        } catch {
-        }
-    }
-    throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
 }
 
 function Invoke-Native {
@@ -400,7 +326,7 @@ function Get-EnvironmentRefreshReasons {
     foreach ($reason in @(Get-ArchiveFixtureToolRefreshReasons -RepoRoot $RepoRoot -Arch $Arch)) {
         $reasons.Add($reason)
     }
-    $generatorErrors = & $VenvPython -m tests.helpers.tool_config 2>&1
+    $generatorErrors = & $VenvPython -m tests.helpers.tool_config --arch $Arch.ToLowerInvariant() 2>&1
     if ($LASTEXITCODE -ne 0) {
         $reasons.Add(($generatorErrors | Out-String).Trim())
     }
@@ -499,10 +425,9 @@ trap {
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 Ensure-AcceptanceEnvironment -RepoRoot $repoRoot -VenvPython $venvPython
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    $bootstrapPython = Get-UvBootstrapPythonCommand
-    Write-Host "==> Preparing .venv with uv" -ForegroundColor Cyan
-    Invoke-Native -FilePath "uv" -Arguments @(
-        "sync", "--locked", "--extra", "dev", "--python", $bootstrapPython
+    Invoke-Native -FilePath "powershell" -Arguments @(
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $repoRoot "scripts\setup_windows_dev.ps1"), "-Arch", $Arch, "-BootstrapOnly"
     )
 }
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
@@ -511,7 +436,7 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
 $python = $venvPython
 # Never let SkipEnvironmentRefresh turn a reduced real-format matrix into a pass.
 # This is the same configured-tool capability check used by setup.
-Invoke-Native -FilePath $python -Arguments @("-m", "tests.helpers.tool_config")
+Invoke-Native -FilePath $python -Arguments @("-m", "tests.helpers.tool_config", "--arch", $Arch.ToLowerInvariant())
 $env:PYTHONPATH = $repoRoot
 
 $brokerPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $Arch -BuildProfile $BuildProfile
@@ -560,12 +485,16 @@ try {
 
     # Use the optimized CI profile for the harness, even when the public CLI
     # and its fixtures below are tested from the release build.
-    Invoke-TestStep -Label "Rust correctness tests" -Command @(
-        "cargo", "test", "--quiet", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
+    $rustTests = @(
+        "cargo", "test", "--locked", "--manifest-path", (Join-Path $repoRoot "sunpack\Cargo.toml"),
         "--workspace", "--profile", "ci", "--target", $target
     )
+    if (-not $VerboseOutput) { $rustTests += "--quiet" }
+    Invoke-TestStep -Label "Rust correctness tests" -Command $rustTests
+
+    $pytestVerbosity = if ($VerboseOutput) { "-v" } else { "-q" }
     Invoke-TestStep -Label "CLI and Watch acceptance tests" -Command @(
-        $python, "-m", "pytest", "-q", "-rs", "-n", [string]$ParallelWorkers,
+        $python, "-m", "pytest", $pytestVerbosity, "-rs", "-n", [string]$ParallelWorkers,
         "--dist", "worksteal", "tests/blackbox", "tests/unit", "tests/integration", "tests/real",
         "--ignore=tests/integration/test_disk_full_pause_resume.py"
     )
@@ -573,7 +502,7 @@ try {
     # Missing elevation or any prerequisite skip is an incomplete acceptance run.
     $diskTestWorkers = if ($ParallelWorkers -gt 1) { [Math]::Min(3, $ParallelWorkers) } else { 0 }
     Invoke-TestStep -Label "Real disk-full recovery tests" -KeepElevationIfAdministrator -RequireExecutedTests -Command @(
-        $python, "-m", "pytest", "-q", "-rs", "-n", [string]$diskTestWorkers,
+        $python, "-m", "pytest", $pytestVerbosity, "-rs", "-n", [string]$diskTestWorkers,
         "tests/integration/test_disk_full_pause_resume.py"
     )
 } finally {
@@ -632,3 +561,4 @@ if (-not $NoWait) {
 if ($failedResults.Count -gt 0) {
     exit 1
 }
+exit 0

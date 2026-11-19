@@ -178,19 +178,26 @@ See the [configuration guide](docs/configuration.md) for common settings and exa
 
 ### Development
 
-Prepare the development environment:
+Prepare the following before running the development setup script.
+
+- Windows 10/11 x64 or Windows 11 ARM64, with PowerShell 5.1 or later.
+- Git for Windows, uv 0.12 or later, and a Rust MSVC toolchain managed by rustup. Make `git`, `uv`, `rustup`, and `cargo` available on PATH.
+- Visual Studio Build Tools 2022 or Visual Studio 2022 with the **Desktop development with C++** workload, MSVC tools, and a Windows SDK. ARM64 builds also require the MSVC ARM64 tools and **C++ Clang tools for Windows** (`clang-cl`).
+- Network access for the first Python, Cargo dependency, and fixture tool setup. The script prepares Python, `.venv`, and CMake with uv and adds the selected Rust target with rustup.
 
 ```powershell
 .\scripts\setup_windows_dev.ps1
 ```
 
-Build the project:
+Use `-Arch arm64` on Windows 11 ARM64 for native development and acceptance tests. Use `-Arch arm64 -SkipAcceptanceTestTools` to cross-build ARM64 on an x64 host.
+
+Install Inno Setup 6 before building the Windows installer.
 
 ```powershell
 .\scripts\build_windows.ps1
 ```
 
-See [the documentation](docs/development_setup.md) for development environment and build instructions.
+See the [development guide](docs/development_setup.md) for script options, testing, and release builds.
 See [the documentation](docs/development_boundaries.md) for development boundaries.
 Developers using AI must ensure that the AI reads the repository's AGENTS.md before making any changes and follows the development guidelines specified therein.
 

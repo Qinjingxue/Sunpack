@@ -177,19 +177,26 @@ sunpack config validate
 
 ### 开发相关
 
-准备开发环境：
+运行开发脚本前，请准备以下环境。
+
+- Windows 10/11 x64 或 Windows 11 ARM64，使用 PowerShell 5.1 或更新版本。
+- Git for Windows、uv 0.12 或更新版本、rustup，以及 rustup 管理的 Rust MSVC 工具链。确保 `git`、`uv`、`rustup`、`cargo` 在 PATH 中。
+- Visual Studio Build Tools 2022 或 Visual Studio 2022，安装 **使用 C++ 的桌面开发** 工作负载、MSVC 工具集及 Windows SDK。构建 ARM64 时还需要 MSVC ARM64 构建工具和 **C++ Clang tools for Windows**（`clang-cl`）。
+- 首次准备 Python、Cargo 依赖和测试工具需要联网。脚本通过 uv 准备 Python、`.venv` 和 CMake，并通过 rustup 补齐所选架构的 Rust target。
 
 ```powershell
 .\scripts\setup_windows_dev.ps1
 ```
 
-构建项目：
+在 Windows 11 ARM64 上使用 `-Arch arm64` 准备原生开发和验收环境。在 x64 上交叉构建 ARM64 时使用 `-Arch arm64 -SkipAcceptanceTestTools`。
+
+生成 Windows 安装包前，另外安装 Inno Setup 6。
 
 ```powershell
 .\scripts\build_windows.ps1
 ```
 
-开发环境和构建说明见 [文档](docs/zh-CN/development_setup.md)。
+脚本选项、测试和发布流程见 [开发文档](docs/zh-CN/development_setup.md)。
 开发边界见文档 [文档](docs/zh-CN/development_boundaries.md)
 使用AI开发者务必使AI阅读仓库内的AGENTS.md进行开发，并遵守开发规范
 

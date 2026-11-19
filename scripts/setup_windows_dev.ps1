@@ -18,29 +18,13 @@ $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "build_native.ps1")
 
-function Get-UvBootstrapPythonCommand {
-    foreach ($candidate in @("python", "py")) {
-        try {
-            $resolvedPython = & $candidate -c "import sys; print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                $resolvedPython = @($resolvedPython | Where-Object { $_ }) | Select-Object -Last 1
-                if ($resolvedPython) {
-                    return ([string]$resolvedPython).Trim()
-                }
-            }
-        } catch {
-        }
-    }
-    throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
-}
-
 function Assert-CommandExists {
     param(
         [string]$Command,
         [string]$Description
     )
-    if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
-        throw "$Description not found in PATH: $Command"
+    if (-not (Get-Command $Command -CommandType Application -ErrorAction SilentlyContinue)) {
+        throw "$Description is required. Install it and make $Command available in PATH. See the development requirements in README.md."
     }
 }
 
@@ -111,31 +95,6 @@ function Invoke-FileDownload {
     }
 }
 
-function Get-7ZipWindowsDownloadInfo {
-    param([string]$BuildArch = "x64")
-
-    $releaseApiUri = "https://api.github.com/repos/ip7z/7zip/releases/latest"
-    $client = New-Object System.Net.WebClient
-    try {
-        $client.Headers["User-Agent"] = "SunPack dev bootstrap"
-        $client.Headers["Accept"] = "application/vnd.github+json"
-        $release = $client.DownloadString($releaseApiUri) | ConvertFrom-Json
-    } finally {
-        $client.Dispose()
-    }
-
-    $sevenZipArch = if ($BuildArch -eq "arm64") { "arm64" } else { "x64" }
-    $installerPattern = '^7z\d+-' + [regex]::Escape($sevenZipArch) + '\.exe$'
-    $installer = $release.assets | Where-Object { $_.name -match $installerPattern } | Select-Object -First 1
-    if (-not $installer) {
-        throw "Could not locate a 7-Zip $sevenZipArch installer in GitHub release $($release.tag_name) from $releaseApiUri"
-    }
-
-    return @{
-        InstallerUri = $installer.browser_download_url
-    }
-}
-
 function Ensure-Bundled7ZipAssets {
     param(
         [Parameter(Mandatory = $true)]
@@ -149,24 +108,15 @@ function Ensure-Bundled7ZipAssets {
     # SunPack's embedded 7-Zip backend no longer needs 7z.dll at runtime,
     # but tools\7z.exe is still used by tests/benchmarks as a fixture tool and
     # requires its companion codec module beside the executable.
-    $requiredToolFiles = @(
-        "7z.exe",
-        "7z.dll",
-        "7z.sfx",
-        "7zCon.sfx",
-        "7-zip.dll"
-    )
-    if ($BuildArch -eq "x64") {
-        $requiredToolFiles += "7-zip32.dll"
-    }
+    $requiredToolFiles = @("7z.exe", "7z.dll", "7zCon.sfx")
 
     $missingToolFiles = @(
         $requiredToolFiles | Where-Object {
-            -not (Test-Path -LiteralPath (Join-Path $ToolsRoot $_))
+            -not (Test-Path -LiteralPath (Join-Path $ToolsRoot $_) -PathType Leaf)
         }
     )
 
-    $licenseMissing = -not (Test-Path -LiteralPath $LicenseDestinationPath)
+    $licenseMissing = -not (Test-Path -LiteralPath $LicenseDestinationPath -PathType Leaf)
     if ($missingToolFiles.Count -eq 0 -and -not $licenseMissing) {
         Write-Host "Bundled 7-Zip files are already present" -ForegroundColor Green
         return
@@ -180,40 +130,31 @@ function Ensure-Bundled7ZipAssets {
         Write-Host "Missing 7-Zip license file" -ForegroundColor Yellow
     }
 
-    $downloadInfo = Get-7ZipWindowsDownloadInfo -BuildArch $BuildArch
-    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sunpack-dev-7zip-" + [guid]::NewGuid().ToString("N"))
+    $releaseUrl = "https://github.com/ip7z/7zip/releases/download/26.04"
+    $tempRoot = Join-Path $toolsCacheRoot ("7zip-" + [guid]::NewGuid().ToString("N"))
     $installerPath = Join-Path $tempRoot ("7zip-" + $BuildArch + "-installer.exe")
-    $installRoot = Join-Path $tempRoot "installed"
+    $extractorPath = Join-Path $tempRoot "7zr.exe"
+    $extractRoot = Join-Path $tempRoot "extracted"
+    $archiveFiles = $requiredToolFiles + @("License.txt")
 
     try {
-        New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
-        Invoke-FileDownload -Uri $downloadInfo.InstallerUri -DestinationPath $installerPath -Description "7-Zip $BuildArch installer"
-
-        Write-Host "Installing 7-Zip into temporary workspace $installRoot" -ForegroundColor Yellow
-        $process = Start-Process -FilePath $installerPath -ArgumentList @("/S", "/D=$installRoot") -WindowStyle Hidden -Wait -PassThru
-        if ($process.ExitCode -ne 0) {
-            throw "7-Zip installer exited with code $($process.ExitCode)"
+        # The standalone x86 extractor can unpack both installers on either host.
+        Invoke-FileDownload -Uri "$releaseUrl/7zr.exe" -DestinationPath $extractorPath -Description "7-Zip standalone extractor"
+        Invoke-FileDownload -Uri "$releaseUrl/7z2604-$BuildArch.exe" -DestinationPath $installerPath -Description "7-Zip $BuildArch fixture archive"
+        Invoke-Native -FilePath $extractorPath -Arguments (@("e", $installerPath, "-o$extractRoot", "-y") + $archiveFiles)
+        foreach ($fileName in $archiveFiles) {
+            Assert-PathExists -LiteralPath (Join-Path $extractRoot $fileName) -Description "Downloaded 7-Zip component $fileName"
         }
 
         New-Item -ItemType Directory -Path $ToolsRoot -Force | Out-Null
         foreach ($fileName in $requiredToolFiles) {
-            $sourcePath = Join-Path $installRoot $fileName
-            Assert-PathExists -LiteralPath $sourcePath -Description "Downloaded 7-Zip component $fileName"
-            Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $ToolsRoot $fileName) -Force
+            Copy-Item -LiteralPath (Join-Path $extractRoot $fileName) -Destination $ToolsRoot -Force
         }
 
-        $optionalFiles = @("descript.ion")
-        foreach ($fileName in $optionalFiles) {
-            $sourcePath = Join-Path $installRoot $fileName
-            if (Test-Path -LiteralPath $sourcePath) {
-                Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $ToolsRoot $fileName) -Force
-            }
+        if ($licenseMissing) {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $LicenseDestinationPath) -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $extractRoot "License.txt") -Destination $LicenseDestinationPath
         }
-
-        $licenseSourcePath = Join-Path $installRoot "License.txt"
-        Assert-PathExists -LiteralPath $licenseSourcePath -Description "Downloaded 7-Zip license file"
-        New-Item -ItemType Directory -Path (Split-Path -Parent $LicenseDestinationPath) -Force | Out-Null
-        Copy-Item -LiteralPath $licenseSourcePath -Destination $LicenseDestinationPath -Force
     } finally {
         Remove-IfExists -LiteralPath $tempRoot
     }
@@ -253,30 +194,30 @@ function Invoke-VerifiedFileDownload {
 function Ensure-AcceptanceTestTools {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ToolsRoot
+        [string]$ToolsRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$SevenZipPath
     )
 
-    $testToolsRoot = $ToolsRoot
-    $rarRoot = Join-Path $testToolsRoot "winrar"
+    $rarRoot = Join-Path $ToolsRoot "winrar"
     $rarPath = Join-Path $rarRoot "Rar.exe"
-    $rarSfxPath = Join-Path $rarRoot "Default.SFX"
-    $winrarPath = Join-Path $rarRoot "WinRAR.exe"
+    $rarFixtureFiles = @("Rar.exe", "WinRAR.exe", "Default.SFX", "License.txt")
     $requiredRarVersion = "6.22"
-    $zstdRoot = Join-Path $testToolsRoot "zstd"
+    $zstdRoot = Join-Path $ToolsRoot "zstd"
     $zstdPath = Join-Path $zstdRoot "zstd.exe"
-    $sevenZipZstdRoot = Join-Path $testToolsRoot "7zip-zstd"
+    $sevenZipZstdRoot = Join-Path $ToolsRoot "7zip-zstd"
     $sevenZipZstdPath = Join-Path $sevenZipZstdRoot "7z.exe"
-    New-Item -ItemType Directory -Path $testToolsRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $ToolsRoot -Force | Out-Null
 
-    $rarReady = (Test-Path -LiteralPath $rarPath) -and
-        (Test-Path -LiteralPath $rarSfxPath) -and
-        (Test-Path -LiteralPath $winrarPath) -and
+    $missingRarFiles = @($rarFixtureFiles | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $rarRoot $_) -PathType Leaf)
+    })
+    $rarReady = $missingRarFiles.Count -eq 0 -and
         (Test-RarGeneratorVersion -FilePath $rarPath -RequiredVersion $requiredRarVersion)
     $zstdReady = (Test-Path -LiteralPath $zstdPath) -and
         (Test-CommandRuns -FilePath $zstdPath -Arguments @("--version"))
     $sevenZipZstdReady = Test-SevenZipZstdGenerator -FilePath $sevenZipZstdPath
     if ($rarReady -and $zstdReady -and $sevenZipZstdReady) {
-        Invoke-Native -FilePath $venvPython -Arguments @("-m", "tests.helpers.tool_config")
         Write-Host "Acceptance archive generator tools are already present" -ForegroundColor Green
         return
     }
@@ -308,39 +249,31 @@ function Ensure-AcceptanceTestTools {
     # Pin the independent LZ4 fixture writer; keep its companion codec DLL.
     $sevenZipZstdInstallerUri = "https://github.com/mcmilk/7-Zip-zstd/releases/download/v25.01-v1.5.7-R4/7z25.01-zstd-x64.exe"
 
-    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sunpack-test-tools-" + [guid]::NewGuid().ToString("N"))
+    $tempRoot = Join-Path $toolsCacheRoot ("acceptance-" + [guid]::NewGuid().ToString("N"))
     $rarInstallerPath = Join-Path $tempRoot "winrar-x64-installer.exe"
     $zstdArchivePath = Join-Path $tempRoot "zstd-win64.zip"
-    $rarInstallRoot = Join-Path $tempRoot "winrar"
+    $rarExtractRoot = Join-Path $tempRoot "winrar"
     $zstdExtractRoot = Join-Path $tempRoot "zstd"
     $sevenZipZstdInstallerPath = Join-Path $tempRoot "7zip-zstd-x64.exe"
     $sevenZipZstdExtractRoot = Join-Path $tempRoot "7zip-zstd"
     try {
         New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 
-    if (-not $rarReady) {
+        if (-not $rarReady) {
             Invoke-VerifiedFileDownload `
                 -Uri $rarInstallerUri `
                 -DestinationPath $rarInstallerPath `
                 -Description "WinRAR x64 test generator" `
                 -Sha256 $rarInstallerSha256
 
-            Remove-IfExists -LiteralPath $rarRoot
-            New-Item -ItemType Directory -Path $rarInstallRoot -Force | Out-Null
-            Write-Host "Installing WinRAR test generator into temporary workspace $rarInstallRoot" -ForegroundColor Yellow
-            $installer = Start-Process `
-                -FilePath $rarInstallerPath `
-                -ArgumentList @("/s", ("/d" + $rarInstallRoot)) `
-                -WindowStyle Hidden `
-                -Wait `
-                -PassThru
-            if ($installer.ExitCode -ne 0) {
-                throw "WinRAR installer exited with code $($installer.ExitCode)"
+            Invoke-Native -FilePath $SevenZipPath -Arguments (@("e", $rarInstallerPath, "-o$rarExtractRoot", "-y", "-bso0") + $rarFixtureFiles)
+            $rarFiles = foreach ($name in $rarFixtureFiles) {
+                $sourcePath = Join-Path $rarExtractRoot $name
+                Assert-PathExists -LiteralPath $sourcePath -Description "Extracted WinRAR fixture component"
+                $sourcePath
             }
-            Assert-PathExists -LiteralPath (Join-Path $rarInstallRoot "Rar.exe") -Description "Installed Rar.exe"
-            Assert-PathExists -LiteralPath (Join-Path $rarInstallRoot "Default.SFX") -Description "Installed Default.SFX"
-            Assert-PathExists -LiteralPath (Join-Path $rarInstallRoot "WinRAR.exe") -Description "Installed WinRAR.exe"
-            Move-Item -LiteralPath $rarInstallRoot -Destination $rarRoot -Force
+            New-Item -ItemType Directory -Path $rarRoot -Force | Out-Null
+            Copy-Item -LiteralPath $rarFiles -Destination $rarRoot -Force
         }
 
         if (-not $zstdReady) {
@@ -350,13 +283,8 @@ function Ensure-AcceptanceTestTools {
                 -Description "zstd Windows x64 test generator" `
                 -Sha256 $zstdArchiveSha256
 
-            $sevenZipPath = Join-Path $ToolsRoot "7z.exe"
-            $sevenZipCliDllPath = Join-Path $ToolsRoot "7z.dll"
-            Assert-PathExists -LiteralPath $sevenZipPath -Description "7-Zip extractor for acceptance test tools"
-            Assert-PathExists -LiteralPath $sevenZipCliDllPath -Description "7-Zip CLI companion DLL for acceptance test tools"
-            Remove-IfExists -LiteralPath $zstdRoot
             New-Item -ItemType Directory -Path $zstdExtractRoot -Force | Out-Null
-            Invoke-Native -FilePath $sevenZipPath -Arguments @(
+            Invoke-Native -FilePath $SevenZipPath -Arguments @(
                 "x",
                 $zstdArchivePath,
                 ("-o" + $zstdExtractRoot),
@@ -376,10 +304,7 @@ function Ensure-AcceptanceTestTools {
                 -DestinationPath $sevenZipZstdInstallerPath `
                 -Description "7-Zip-Zstandard x64 LZ4 test generator"
 
-            $sevenZipPath = Join-Path $ToolsRoot "7z.exe"
-            Assert-PathExists -LiteralPath $sevenZipPath -Description "7-Zip extractor for acceptance test tools"
-            Assert-PathExists -LiteralPath (Join-Path $ToolsRoot "7z.dll") -Description "7-Zip CLI companion DLL for acceptance test tools"
-            Invoke-Native -FilePath $sevenZipPath -Arguments @(
+            Invoke-Native -FilePath $SevenZipPath -Arguments @(
                 "x", $sevenZipZstdInstallerPath, ("-o" + $sevenZipZstdExtractRoot), "-y"
             )
             if (-not (Test-SevenZipZstdGenerator -FilePath (Join-Path $sevenZipZstdExtractRoot "7z.exe"))) {
@@ -396,9 +321,6 @@ function Ensure-AcceptanceTestTools {
     } finally {
         Remove-IfExists -LiteralPath $tempRoot
     }
-
-    Invoke-Native -FilePath $venvPython -Arguments @("-m", "tests.helpers.tool_config")
-    Write-Host "Acceptance archive generator tools are ready" -ForegroundColor Green
 }
 
 function Test-SevenZipZstdGenerator {
@@ -441,12 +363,16 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
 $rustTarget = Get-RustTarget -BuildArch $buildArch
+$hostArch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 
 Write-Step "Environment preflight"
 if ($env:OS -ne "Windows_NT") {
     throw "This setup script only supports Windows."
 }
 Write-Host "Requested architecture: $buildArch"
+if ($buildArch -eq "arm64" -and $hostArch -ne "Arm64" -and -not ($SkipAcceptanceTestTools -or $BootstrapOnly)) {
+    throw "ARM64 acceptance requires Windows 11 on Arm. Pass -SkipAcceptanceTestTools to cross-build on this host."
+}
 
 $venvPath = Join-Path $repoRoot ".venv"
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
@@ -461,14 +387,23 @@ $sevenZipWrapperRoot = Join-Path $repoRoot "sunpack\sevenzip_bridge"
 $sevenZipWrapperBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile -Component sevenzip_bridge
 $toastHostRoot = Join-Path $repoRoot "sunpack\toast_host"
 $toastHostBuildDir = Get-NativeBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile -Component toast_host
-$toolsRoot = Join-Path $repoRoot $(if ($buildArch -eq "arm64") { "tools\arm64" } else { "tools" })
+$toolsRoot = Join-Path $repoRoot "tools"
+$toolsCacheRoot = Join-Path $repoRoot ".cache\dev-tools"
+$sevenZipToolsRoot = Get-ArchiveFixtureToolsRoot -RepoRoot $repoRoot -Arch $buildArch
 $sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
 
 Assert-PathExists -LiteralPath $projectPath -Description "pyproject.toml"
 Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_runtime Cargo manifest"
 Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust workspace lockfile"
-Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 Assert-CommandExists -Command "uv" -Description "uv dependency manager"
+if (-not $AcceptanceTestDependenciesOnly) {
+    Assert-CommandExists -Command "git" -Description "Git for Windows"
+    Assert-CommandExists -Command "rustup" -Description "Rust toolchain manager"
+    Assert-CommandExists -Command "cargo" -Description "Cargo from rustup"
+
+    Write-Step "Preparing Rust MSVC target $rustTarget"
+    Invoke-Native -FilePath "rustup" -Arguments @("target", "add", $rustTarget)
+}
 if ($Clean -and -not $AcceptanceTestDependenciesOnly) {
     Write-Step "Cleaning native build outputs"
     $rustBuildDir = Get-RustBuildDirectory -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
@@ -490,11 +425,13 @@ if (Test-Path -LiteralPath $venvConfigPath) {
         [IO.File]::WriteAllText($venvConfigPath, ($venvConfig -replace "include-system-site-packages\s*=\s*true", "include-system-site-packages = false"), [Text.UTF8Encoding]::new($false))
     }
 }
-$syncArguments = @("sync", "--locked", "--extra", "dev")
-if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    $syncArguments += @("--python", (Get-UvBootstrapPythonCommand))
+$pythonRequest = $venvPython
+if (-not (Test-Path -LiteralPath $venvPath)) {
+    $pythonRequest = if ($hostArch -eq "Arm64") { "3.12" } else { "3.11" }
+} elseif (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    throw "The Python interpreter is missing from the existing environment at $venvPython. Repair it before running setup."
 }
-Invoke-Native -FilePath "uv" -Arguments $syncArguments
+Invoke-Native -FilePath "uv" -Arguments @("sync", "--locked", "--extra", "dev", "--python", $pythonRequest)
 Assert-PathExists -LiteralPath $venvPython -Description "Project virtual environment Python"
 
 $env:Path = "$venvScripts;$env:Path"
@@ -505,9 +442,10 @@ if ($BootstrapOnly) {
     Write-Host "Bootstrap complete; native compilation is deferred to build_windows.ps1" -ForegroundColor Green
     return
 }
-Ensure-Bundled7ZipAssets -ToolsRoot $toolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
-if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
-    Ensure-AcceptanceTestTools -ToolsRoot $toolsRoot
+Ensure-Bundled7ZipAssets -ToolsRoot $sevenZipToolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
+if (-not $SkipAcceptanceTestTools) {
+    Ensure-AcceptanceTestTools -ToolsRoot $toolsRoot -SevenZipPath (Join-Path $sevenZipToolsRoot "7z.exe")
+    Invoke-Native -FilePath $venvPython -Arguments @("-m", "tests.helpers.tool_config", "--arch", $buildArch)
 }
 if ($AcceptanceTestDependenciesOnly) {
     return
@@ -541,4 +479,4 @@ Write-Host "Local development environment is ready" -ForegroundColor Green
 Write-Host "Runtime: $runtimePath"
 Write-Host "CLI: $(Join-Path $sevenZipWrapperBuildDir 'Release\sunpack_launcher.exe')"
 Write-Host "Test virtual env: $venvPath"
-Write-Host "Activate: $venvPath\\Scripts\\Activate.ps1"
+Write-Host "Activate: $(Join-Path $venvScripts 'Activate.ps1')"

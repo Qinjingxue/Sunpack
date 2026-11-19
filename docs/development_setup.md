@@ -4,16 +4,9 @@
 
 SunPack is a Windows-only project. Cargo builds the Rust runtime and Watch Broker. CMake builds the native worker, launcher, GUI, and toast DLL. `uv.lock` pins the Python test dependencies.
 
-## Requirements
+## Directories and build artifacts
 
-- Windows 10/11
-- PowerShell 5.1 or newer
-- Python 3.10 or newer for boundary tests and development scripts
-- `uv` 0.12 or newer
-- Rust MSVC toolchain, providing `cargo`
-- Visual Studio Build Tools 2022, including a C++17 compiler
-- ARM64 optimized builds additionally require the Visual Studio **C++ Clang tools for Windows** component (`clang-cl`), used only for upstream 7-Zip `LzmaDecOpt.S`
-- Network access for the first dependency install and for preparing the 7-Zip test files
+See the [README development requirements](../README.en.md#development) for the toolchain needed to run setup.
 
 Main project directories:
 
@@ -21,10 +14,10 @@ Main project directories:
 sunpack/sunpack_runtime/      Rust orchestration and computation, CLI and Watch
 sunpack/sunpack_usn_core/     Shared NTFS/ReFS USN Rust core
 sunpack/sunpack_watch_broker/ Windows Watch Broker service
-sunpack/sevenzip_bridge/      Windows 7z.dll bridge and worker
+sunpack/sevenzip_bridge/      CLI launcher and embedded 7-Zip worker
 sunpack/toast_host/           Windows toast DLL
 tools/                        Shared external fixture tools
-tools/arm64/                  ARM64 archive fixture tools
+tools/arm64/                  ARM64 7-Zip fixture tools
 .cache/rust-target/            Shared Cargo build tree
 .cache/native/                 CMake trees for the launcher, worker and toast
 .cache/gui-x64/                x64 GUI CMake tree
@@ -50,7 +43,7 @@ uv sync --locked --extra test
 uv sync --locked --extra dev
 ```
 
-The development environment directory is `.venv`. If that environment has global site-packages enabled, the setup script disables that option.
+When creating `.venv`, the setup script asks uv for Python 3.11 on an x64 host or Python 3.12 on an ARM64 host. uv can download the interpreter on demand. Setup keeps the interpreter in an existing `.venv` and syncs its locked dependencies. It disables access to global site-packages if enabled.
 
 ## One-step development environment setup
 
@@ -60,13 +53,10 @@ The development environment directory is `.venv`. If that environment has global
 
 The script will:
 
-1. Prepare an isolated `.venv` with `uv sync --locked --extra dev`
-2. Build the Rust runtime and native fixture generator
-3. Build `sunpack-watch-broker.exe`
-4. Prepare `7z.exe`, `7z.dll`, and the license for the matching architecture
-5. Build `sunpack_sevenzip_worker.exe` and `sunpack_toast.dll`
-6. Copy the native artifacts into the tools directory
-7. Run the worker and toast CTest suites
+1. Add the selected Rust MSVC target with rustup and sync `.venv` with `uv sync --locked --extra dev`.
+2. Prepare and check the acceptance fixture generators.
+3. Build the Rust runtime, Watch Broker, native fixture generator, CLI launcher, worker, and toast DLL under `.cache`.
+4. Run the worker and toast CTest suites for the `ci` profile when the build matches the current PowerShell process architecture.
 
 Options:
 
@@ -74,9 +64,12 @@ Options:
 .\scripts\setup_windows_dev.ps1 -Clean
 .\scripts\setup_windows_dev.ps1 -Arch arm64
 .\scripts\setup_windows_dev.ps1 -SkipAcceptanceTestTools
+.\scripts\setup_windows_dev.ps1 -Arch arm64 -SkipAcceptanceTestTools
 ```
 
-On x64, setup also prepares the acceptance fixture generators under `tools/`: WinRAR 6.22, zstd 1.5.7, and [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4). The LZ4 writer is installed at `tools/7zip-zstd/7z.exe` with its companion `7z.dll`; setup checks that it runs and exposes the LZ4 encoder. These tools are excluded from release packages. `-SkipAcceptanceTestTools` skips their preparation.
+Setup prepares 7-Zip for the selected architecture, using 26.04 for a fresh download and keeping `7z.exe`, `7z.dll`, and `7zCon.sfx`. Full acceptance on either architecture also uses WinRAR 6.22, zstd 1.5.7, and [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4), shared under `tools/`. Setup extracts only the two WinRAR writers, RAR SFX module, and license. It keeps the 7-Zip-Zstandard LZ4 writer, its companion DLL, and its license. These tools are for development and testing only.
+
+On Windows 11 ARM64, run `.\run_acceptance_tests.ps1 -Arch arm64 -NoWait`. Windows runs the shared x64 generators under emulation. Use `-SkipAcceptanceTestTools` to skip preparing and checking the shared generators for a build-only run or an ARM64 cross-build on x64.
 
 ## USN Watch Broker
 

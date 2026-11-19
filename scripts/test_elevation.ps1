@@ -1,3 +1,5 @@
+. (Join-Path $PSScriptRoot "test_process_output.ps1")
+
 function ConvertTo-PowerShellSingleQuotedLiteral {
     param([Parameter(Mandatory = $true)][string]$Value)
 
@@ -69,15 +71,33 @@ function Invoke-TestScriptElevated {
         "sunpack-elevated-test-{0}-{1}.log" -f $PID, [guid]::NewGuid().ToString("N")
     )
     $diagnosticLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $diagnosticPath
-    $elevatedCommand = (
-        '$ErrorActionPreference = ''Stop''; ' +
-        'try { ' +
-        ($commandParts -join " ") + ' *>&1 | Out-File -LiteralPath ' + $diagnosticLiteral + ' -Encoding UTF8; ' +
-        'if (-not $?) { exit 1 } ' +
-        '} catch { ($_ | Format-List * -Force | Out-String) | Out-File -LiteralPath ' +
-        $diagnosticLiteral + ' -Append -Encoding UTF8; exit 1 }; ' +
-        '; exit 0'
-    )
+    $scriptCommand = $commandParts -join " "
+    $elevatedCommand = @"
+`$ErrorActionPreference = 'Stop'
+`$path = $diagnosticLiteral
+`$file = [IO.File]::Open(`$path, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+`$writer = [IO.StreamWriter]::new(`$file, [Text.UTF8Encoding]::new(`$false))
+`$writer.AutoFlush = `$true
+function Write-TestDiagnostic(`$message) {
+    if (`$message -is [System.Management.Automation.InformationRecord] -and `$message.MessageData.NoNewLine) {
+        `$writer.Write([string]`$message)
+    } else {
+        `$writer.WriteLine([string]`$message)
+    }
+    # Publish a metadata change while the log is still open.
+    [IO.File]::SetLastWriteTimeUtc(`$path, [DateTime]::UtcNow)
+}
+try {
+    `$LASTEXITCODE = 0
+    $scriptCommand *>&1 | ForEach-Object { Write-TestDiagnostic `$_ }
+    exit `$LASTEXITCODE
+} catch {
+    Write-TestDiagnostic (`$_ | Format-List * -Force | Out-String)
+    exit 1
+} finally {
+    `$writer.Dispose()
+}
+"@
     $encodedCommand = [Convert]::ToBase64String(
         [Text.Encoding]::Unicode.GetBytes($elevatedCommand)
     )
@@ -93,29 +113,37 @@ function Invoke-TestScriptElevated {
             -WorkingDirectory (Split-Path -Parent $ScriptPath) `
             -Verb RunAs `
             -WindowStyle Hidden `
-            -Wait `
+            -Wait:(-not $ShowOutput) `
             -PassThru
-        $exitCode = [int]$process.ExitCode
+        $processHandle = $null
+        try {
+            $processHandle = $process.Handle
+        } catch {
+        }
+        if ($ShowOutput) {
+            $null = Receive-TestProcessOutput -Process $process -Paths $diagnosticPath
+        }
+        $exitCode = Get-ChildExitCode -Process $process -ProcessHandle $processHandle
+        if ($null -eq $exitCode) {
+            throw "The elevated test process exit code is unavailable on this PowerShell host."
+        }
         if ($exitCode -ne 0) {
             [Console]::Error.WriteLine("Elevated test process failed. Diagnostic log: {0}", $diagnosticPath)
-            if (Test-Path -LiteralPath $diagnosticPath -PathType Leaf) {
-                foreach ($line in Get-Content -LiteralPath $diagnosticPath) {
+            if (-not (Test-Path -LiteralPath $diagnosticPath -PathType Leaf)) {
+                [Console]::Error.WriteLine("The elevated process did not produce its diagnostic log.")
+            } elseif (-not $ShowOutput) {
+                foreach ($line in Get-Content -LiteralPath $diagnosticPath -Encoding UTF8) {
                     [Console]::Error.WriteLine([string]$line)
                 }
-            } else {
-                [Console]::Error.WriteLine("The elevated process did not produce its diagnostic log.")
             }
         } elseif (Test-Path -LiteralPath $diagnosticPath) {
-            if ($ShowOutput) {
-                Get-Content -LiteralPath $diagnosticPath | ForEach-Object { Write-Host $_ }
-            }
             Remove-Item -LiteralPath $diagnosticPath -Force
         }
         return $exitCode
     } catch {
         [Console]::Error.WriteLine("Failed to launch or wait for elevated test process: {0}", $_.Exception.Message)
         if (Test-Path -LiteralPath $diagnosticPath -PathType Leaf) {
-            foreach ($line in Get-Content -LiteralPath $diagnosticPath) {
+            foreach ($line in Get-Content -LiteralPath $diagnosticPath -Encoding UTF8) {
                 [Console]::Error.WriteLine([string]$line)
             }
         }

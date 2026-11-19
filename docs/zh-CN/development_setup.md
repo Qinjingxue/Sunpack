@@ -4,16 +4,9 @@
 
 SunPack 是 Windows-only 项目。Cargo 构建 Rust 运行时和 Watch Broker，CMake 构建原生 worker、启动器、GUI 与通知 DLL。Python 测试依赖由 `uv.lock` 锁定。
 
-## 环境要求
+## 目录和构建产物
 
-- Windows 10/11
-- PowerShell 5.1 或更新版本
-- Python 3.10 或更新版本，用于黑盒测试和辅助脚本
-- `uv` 0.12 或更新版本
-- Rust MSVC toolchain，提供 `cargo`
-- Visual Studio Build Tools 2022，包含 C++17 编译器
-- ARM64 优化构建还需要 Visual Studio **C++ Clang tools for Windows** 组件（`clang-cl`），仅用于上游 7-Zip `LzmaDecOpt.S`
-- 首次安装依赖和准备 7-Zip 测试文件所需的网络连接
+运行开发脚本所需的工具链见 [README 的开发环境要求](../../README.md#开发相关)。
 
 项目主要目录：
 
@@ -21,10 +14,10 @@ SunPack 是 Windows-only 项目。Cargo 构建 Rust 运行时和 Watch Broker，
 sunpack/sunpack_runtime/      Rust 调度与计算核心、CLI 和 Watch
 sunpack/sunpack_usn_core/     NTFS/ReFS USN 共用 Rust 核心
 sunpack/sunpack_watch_broker/ Windows Watch Broker 服务
-sunpack/sevenzip_bridge/      Windows 7z.dll bridge 与 worker
+sunpack/sevenzip_bridge/      CLI 启动器与内嵌 7-Zip worker
 sunpack/toast_host/           Windows toast DLL
 tools/                        共享的外部归档工具
-tools/arm64/                  ARM64 归档生成工具
+tools/arm64/                  ARM64 版 7-Zip 测试工具
 .cache/rust-target/            共用的 Cargo 构建目录
 .cache/native/                 启动器、worker 和 Toast 的 CMake 构建目录
 .cache/gui-x64/                x64 GUI 的 CMake 构建目录
@@ -50,7 +43,7 @@ uv sync --locked --extra test
 uv sync --locked --extra dev
 ```
 
-开发环境目录为 `.venv`。如果该环境启用了全局 site-packages，准备脚本会关闭该选项，避免全局包影响依赖解析。
+首次创建 `.venv` 时，脚本通过 uv 选择 Python，x64 主机使用 3.11，ARM64 主机使用 3.12。uv 可以按需下载解释器。已有 `.venv` 会保留其解释器并同步锁定的依赖。如果该环境启用了全局 site-packages，脚本会关闭该选项。
 
 ## 一键准备开发环境
 
@@ -60,13 +53,10 @@ uv sync --locked --extra dev
 
 脚本会：
 
-1. 用 `uv sync --locked --extra dev` 准备隔离的 `.venv`
-2. 构建 Rust 运行时和测试数据生成器
-3. 构建 `sunpack-watch-broker.exe`
-4. 准备对应架构的 `7z.exe`、`7z.dll` 和 license
-5. 构建 `sunpack_sevenzip_worker.exe` 和 `sunpack_toast.dll`
-6. 把原生产物复制到工具目录
-7. 运行 worker 与 toast 的 CTest 用例
+1. 用 rustup 补齐所选架构的 Rust MSVC target，并用 `uv sync --locked --extra dev` 同步 `.venv`。
+2. 准备并检查验收归档生成器。
+3. 构建 Rust runtime、Watch Broker、测试数据生成器、CLI 启动器、worker 和 Toast DLL，产物留在 `.cache`。
+4. 使用 `ci` profile 且构建架构与当前 PowerShell 进程架构相同时，运行 worker 与 Toast 的 CTest 用例。
 
 选项：
 
@@ -74,9 +64,12 @@ uv sync --locked --extra dev
 .\scripts\setup_windows_dev.ps1 -Clean
 .\scripts\setup_windows_dev.ps1 -Arch arm64
 .\scripts\setup_windows_dev.ps1 -SkipAcceptanceTestTools
+.\scripts\setup_windows_dev.ps1 -Arch arm64 -SkipAcceptanceTestTools
 ```
 
-x64 环境还会在 `tools/` 下准备验收测试的压缩包生成器：WinRAR 6.22、zstd 1.5.7 和 [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4)。LZ4 生成器安装在 `tools/7zip-zstd/7z.exe`，同时保留配套的 `7z.dll`；脚本检查工具能够运行并提供 LZ4 编码器。这些工具不进入发行包。`-SkipAcceptanceTestTools` 会跳过它们的准备。
+x64 和 ARM64 都会准备对应架构的 7-Zip 测试工具，首次下载使用 26.04，只保留 `7z.exe`、`7z.dll` 和 `7zCon.sfx`。完整验收另外使用 `tools/` 下共享的 WinRAR 6.22、zstd 1.5.7 和 [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4)。WinRAR 只提取两个生成器、RAR SFX 模块和许可证，7-Zip-Zstandard 保留 LZ4 生成器及配套 DLL 和许可证。这些工具都只供开发和测试使用。
+
+在 Windows 11 ARM64 上运行 `.\run_acceptance_tests.ps1 -Arch arm64 -NoWait`。共享的 x64 生成器由 Windows 仿真运行。`-SkipAcceptanceTestTools` 跳过共享生成器的准备和检查，适用于仅构建或在 x64 主机上交叉构建 ARM64。
 
 ## USN Watch Broker
 

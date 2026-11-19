@@ -4,7 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
-import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from unelevated_windows import is_process_elevated, launch_unelevated
@@ -14,8 +14,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a command with the interactive shell's normal user token.")
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--capture-directory", help=argparse.SUPPRESS)
-    parser.add_argument("--output-directory", help=argparse.SUPPRESS)
+    output = parser.add_mutually_exclusive_group(required=True)
+    output.add_argument("--capture-directory", help=argparse.SUPPRESS)
+    output.add_argument("--output-directory", help=argparse.SUPPRESS)
     parser.add_argument("--env", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -39,71 +40,53 @@ def _child_environment(args: argparse.Namespace) -> dict[str, str]:
     return environment
 
 
-def _run_captured_child(args: argparse.Namespace, cwd: str) -> int:
-    capture_root = Path(args.capture_directory)
+def _capture_stream(source, path: Path) -> None:
+    with source, path.open("wb", buffering=0) as output:
+        while chunk := source.read1(64 * 1024):
+            output.write(chunk)
+            # NTFS can defer write notifications until the handle closes.
+            os.utime(path, None)
+
+
+def _run_captured_child(args: argparse.Namespace, cwd: str, capture_root: Path) -> int:
     capture_root.mkdir(parents=True, exist_ok=True)
-    try:
-        with (capture_root / "stdout.bin").open("wb") as stdout, (
-            capture_root / "stderr.bin"
-        ).open("wb") as stderr:
-            completed = subprocess.run(
-                args.command,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                env=_child_environment(args),
-                timeout=max(0.1, args.timeout_seconds),
-                check=False,
-            )
-        return int(completed.returncode)
-    except subprocess.TimeoutExpired:
-        with (capture_root / "stderr.bin").open("ab") as stderr:
-            stderr.write(
-                f"Unelevated process timed out after {args.timeout_seconds:.1f}s\n".encode("utf-8")
-            )
-        return 124
-
-
-def _replay(path: Path, stream) -> None:
-    if path.is_file():
-        stream.buffer.write(path.read_bytes())
-        stream.flush()
+    environment = _child_environment(args)
+    environment.setdefault("PYTHONIOENCODING", "utf-8")
+    with subprocess.Popen(
+        args.command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+    ) as child, ThreadPoolExecutor(max_workers=2) as executor:
+        stdout = executor.submit(_capture_stream, child.stdout, capture_root / "stdout.bin")
+        stderr = executor.submit(_capture_stream, child.stderr, capture_root / "stderr.bin")
+        timed_out = False
+        try:
+            exit_code = child.wait(timeout=max(0.1, args.timeout_seconds))
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+            timed_out = True
+            exit_code = 124
+        stdout.result()
+        stderr.result()
+        if timed_out:
+            with (capture_root / "stderr.bin").open("ab") as output:
+                output.write(f"Test process timed out after {args.timeout_seconds:.1f}s\n".encode("utf-8"))
+        return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cwd = str(Path(args.cwd).resolve())
     if args.capture_directory:
-        return _run_captured_child(args, cwd)
+        return _run_captured_child(args, cwd, Path(args.capture_directory))
+    capture_root = Path(args.output_directory).resolve()
     if not is_process_elevated():
-        if args.output_directory:
-            args.capture_directory = args.output_directory
-            exit_code = _run_captured_child(args, cwd)
-            _replay(Path(args.output_directory) / "stdout.bin", sys.stdout)
-            _replay(Path(args.output_directory) / "stderr.bin", sys.stderr)
-            return exit_code
-        try:
-            return int(
-                subprocess.run(
-                    args.command,
-                    cwd=cwd,
-                    env=_child_environment(args),
-                    timeout=max(0.1, args.timeout_seconds),
-                    check=False,
-                ).returncode
-            )
-        except subprocess.TimeoutExpired:
-            print(f"Unelevated process timed out after {args.timeout_seconds:.1f}s", file=sys.stderr)
-            return 124
+        return _run_captured_child(args, cwd, capture_root)
 
-    temporary = None
-    if args.output_directory:
-        capture_root = Path(args.output_directory).resolve()
-        capture_root.mkdir(parents=True, exist_ok=True)
-    else:
-        temporary = tempfile.TemporaryDirectory(prefix="sunpack-unelevated-output-")
-        capture_root = Path(temporary.name)
     helper_command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -132,15 +115,11 @@ def main(argv: list[str] | None = None) -> int:
             process.wait(timeout=5.0)
             print(f"Unelevated process timed out after {args.timeout_seconds:.1f}s", file=sys.stderr)
             return 124
-        _replay(capture_root / "stdout.bin", sys.stdout)
-        _replay(capture_root / "stderr.bin", sys.stderr)
         return int(exit_code)
     finally:
         close = getattr(process, "close", None)
         if callable(close):
             close()
-        if temporary is not None:
-            temporary.cleanup()
 
 
 if __name__ == "__main__":

@@ -97,16 +97,17 @@ def test_plan7_lz4_wrapped_volumes(package, tmp_path, format, mode, cleanup, ord
     def family_completed():
         failure = watch.event("failed_terminal", path=case.entry_path.name)
         assert failure is None, failure
-        # All generated members are nested sources, including raw tails found
-        # later through catalog. Keep mode applies only to the LZ4 inputs.
-        if any(path.name in part_names and path.is_file() for path in watch.root.rglob("*")):
-            return False
         try:
+            # All generated members are nested sources, including raw tails found
+            # later through catalog. Keep mode applies only to the LZ4 inputs.
+            if any(path.name in part_names and path.is_file() for path in watch.root.rglob("*")):
+                return False
             return all(
                 any(path.stat().st_size == member["size"] for path in watch.output.rglob(name))
                 for name, member in case.metadata["expected_files"].items()
             )
         except FileNotFoundError:
+            # Watch can remove an empty wrapper directory during either traversal.
             return False
 
     wait_for(family_completed, "verified output and cleanup of all generated volumes")

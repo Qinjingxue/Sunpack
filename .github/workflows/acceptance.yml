@@ -58,14 +58,11 @@ jobs:
           path: |
             tools/7z.exe
             tools/7z.dll
-            tools/7z.sfx
             tools/7zCon.sfx
-            tools/7-zip.dll
-            tools/7-zip32.dll
             tools/7zip-zstd
             tools/winrar
             tools/zstd
-          key: acceptance-tools-v2-${{ runner.os }}-x64-${{ hashFiles('scripts/setup_windows_dev.ps1') }}
+          key: acceptance-tools-v3-${{ runner.os }}-x64-${{ hashFiles('scripts/setup_windows_dev.ps1') }}
 
       - name: Prepare acceptance environment
         shell: pwsh

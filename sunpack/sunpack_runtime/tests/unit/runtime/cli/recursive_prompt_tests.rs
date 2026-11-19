@@ -346,8 +346,10 @@ fn scan_keeps_inconclusive_errors_without_changing_retry_or_json() {
                 let session = Input::default();
                 let (_, result) = report_scan(outcome, vec![], &options, &session, language).unwrap();
                 if json {
-                    assert_eq!(result.items[0]["error"], message);
-                    assert_eq!(result.items[0]["error_kind"], serde_json::to_value(kind).unwrap());
+                    let report = serde_json::to_value(result).unwrap();
+                    let item = report["items"].get(0).unwrap();
+                    assert_eq!(item["error"], message);
+                    assert_eq!(item["error_kind"], serde_json::to_value(kind).unwrap());
                 } else {
                     let text = String::from_utf8(session.combined.lock().unwrap().clone()).unwrap();
                     let error_line = language.translate("cli.scan.error", &[("error", &message)]);
@@ -581,8 +583,10 @@ fn scan_json_keeps_main_sparse_fields_without_internal_failure_evidence() {
         format!("a-first-in-sorted-items.zip [{}]", Language::En.text("failure.unsupported")),
     ]);
     assert_eq!(report.summary, json!({"archive_count": 3, "failed_count": 2, "scan_error_count": 1, "input_error_count": 0}));
-    assert_eq!(report.items[0]["main_path"], "a-first-in-sorted-items.zip");
-    let item = &report.items[1];
+    let report = serde_json::to_value(report).unwrap();
+    let items = report["items"].as_array().unwrap();
+    assert_eq!(items[0]["main_path"], "a-first-in-sorted-items.zip");
+    let item = &items[1];
     assert!(item.get("format").is_none());
     assert!(item.get("damage_flags").is_none());
     assert!(item.get("failure").is_none());
@@ -625,7 +629,8 @@ fn scan_sparse_layout_is_shared_by_text_and_json() {
             let session = Input::default();
             let (_, result) = report_scan(outcome, vec![], &options, &session, Language::En).unwrap();
             if json {
-                let item = &result.items[0];
+                let report = serde_json::to_value(result).unwrap();
+                let item = report["items"].get(0).unwrap();
                 assert_eq!(item.get("offset").is_some(), show_range, "{mode:?}");
                 assert_eq!(item.get("end_offset").is_some(), show_range, "{mode:?}");
                 assert_eq!(item.get("all_parts").is_some(), show_parts, "{mode:?}");

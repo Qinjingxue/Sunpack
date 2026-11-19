@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -199,6 +200,11 @@ def acceptance_generator_errors() -> list[str]:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Check the required acceptance fixture generators.")
+    parser.add_argument("--arch", choices=("x64", "arm64"), help="Select the build architecture for fixture paths.")
+    arguments = parser.parse_args()
+    if arguments.arch is not None:
+        os.environ["SUNPACK_TEST_ARCH"] = arguments.arch
     errors = acceptance_generator_errors()
     if errors:
         print("Acceptance generator preflight failed:\n  - " + "\n  - ".join(errors))

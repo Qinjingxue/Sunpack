@@ -39,11 +39,12 @@ def test_acceptance_runs_native_commands_and_rejects_incomplete_reports(tmp_path
     harness = directory / "harness.ps1"
     harness.write_text(f"""
 $ErrorActionPreference = 'Stop'
+. {literal(repo_root / 'scripts/test_process_output.ps1')}
 $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile({literal(repo_root / 'run_acceptance_tests.ps1')}, [ref]$tokens, [ref]$errors)
 if ($errors.Count) {{ throw ($errors | Out-String) }}
-$names = @('Initialize-ExitCodeProbe', 'Get-ChildExitCode', 'ConvertTo-WindowsCommandLineArgument', 'Invoke-TestStep')
+$names = @('ConvertTo-WindowsCommandLineArgument', 'Invoke-TestStep')
 $definitions = $ast.FindAll({{ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names }}, $true)
 foreach ($definition in $definitions) {{ . ([scriptblock]::Create($definition.Extent.Text)) }}
 $python = {literal(sys.executable)}

@@ -76,12 +76,11 @@ zlib license. The release copy is stored at:
 Keep the upstream copyright and permission notice with redistributed source and
 binary packages.
 
-## 7-Zip runtime binaries and development assets
+## 7-Zip development assets
 
-Some development or release workflows can also stage or redistribute 7-Zip
-runtime binaries such as `7z.dll`, `7z.exe`, `7z.sfx`, `7zCon.sfx`,
-`7-zip.dll`, or `7-zip32.dll`. Those binaries remain subject to the 7-Zip
-binary distribution terms summarized in `licenses/7zip-license.txt`.
+Development setup stages `7z.exe`, `7z.dll`, and `7zCon.sfx` for generating
+test fixtures. Those binaries remain subject to the 7-Zip binary distribution
+terms summarized in `licenses/7zip-license.txt`.
 
 ## Release packaging requirements
 
