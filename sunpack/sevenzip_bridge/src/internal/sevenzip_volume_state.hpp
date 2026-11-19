@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace sunpack::sevenzip
 {
@@ -13,27 +14,18 @@ namespace sunpack::sevenzip
     using VolumeKey = std::string;
     struct VolumeState
     {
-        explicit VolumeState(VolumeKey volume_key, bool is_persistent)
-            : key(std::move(volume_key)), persistent(is_persistent) {}
+        explicit VolumeState(VolumeKey volume_key, bool is_persistent,
+                             std::shared_ptr<VolumeSpaceGate> gate = {})
+            : key(std::move(volume_key)), persistent(is_persistent), space_gate(std::move(gate)) {}
 
         const VolumeKey key;
         const bool persistent = true;
 
-        // 没有卷身份的 writer 不创建空间 gate。
-        // （key 为空），此时 gate 保持 nullptr，让这些路径语义完全不变。
-        //
-        // 生命周期：gate 的存活期 = VolumeState 的存活期，长于 writer facility，因此 gate 里
-        // 绝不能保存任何指向 writer 成员的指针/引用，AsyncFileWriter 也绝不持有 / 重设
-        // ChangeSink（否则 facility 被 reap / 重建时会覆盖 persistent gate 的回调）。
-        std::shared_ptr<VolumeSpaceGate> space_gate;
+        // The gate belongs to the volume and can outlive a writer facility.
+        const std::shared_ptr<VolumeSpaceGate> space_gate;
     };
 
     using VolumeStatePtr = std::shared_ptr<VolumeState>;
-
-    inline VolumeStatePtr make_volume_state(VolumeKey key, bool persistent)
-    {
-        return std::make_shared<VolumeState>(std::move(key), persistent);
-    }
 
 }
 

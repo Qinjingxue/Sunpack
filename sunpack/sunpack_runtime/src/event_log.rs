@@ -47,7 +47,6 @@ fn state_event(event: &str) -> bool {
     matches!(
         event,
         "pipeline_sources_claimed"
-            | "processing_started"
             | "failed_password"
             | "suspended_missing_volume"
             | "done"
@@ -125,44 +124,66 @@ impl Projection {
             self.dirty_bytes += id.len();
         }
         if self.dirty_bytes > 1024 * 1024 {
-            self.dirty = HashSet::new();
-            self.dirty_bytes = 0;
-            self.full_dirty = true;
+            self.mark_all();
         }
     }
+    fn mark_all(&mut self) {
+        self.dirty = HashSet::new();
+        self.dirty_bytes = 0;
+        self.full_dirty = true;
+    }
+    fn changed(&self) -> bool {
+        self.full_dirty || !self.dirty.is_empty()
+    }
     fn unbind(&mut self, id: &str, owners: &HashSet<String>) {
-        let retiring = self.retiring.get(id);
         for owner in owners {
-            if retiring.is_some_and(|task| task.owners.contains(owner)) {
-                continue;
-            }
-            if let Some(ids) = self.owner_tasks.get_mut(owner) {
-                ids.remove(id);
-                if ids.is_empty() {
-                    self.owner_tasks.remove(owner);
-                }
+            self.unbind_owner(id, owner);
+        }
+    }
+    fn unbind_owner(&mut self, id: &str, owner: &str) {
+        if self.retiring.get(id).is_some_and(|task| task.owners.contains(owner)) {
+            return;
+        }
+        if let Some(ids) = self.owner_tasks.get_mut(owner) {
+            ids.remove(id);
+            if ids.is_empty() {
+                self.owner_tasks.remove(owner);
             }
         }
     }
     fn release_owner(&mut self, owner: &str) {
         if let Some(ids) = self.owner_tasks.remove(owner) {
             for id in ids {
-                if self.tasks.get_mut(&id).is_some_and(|task| {
-                    task.owners.remove(owner);
-                    matches!(task.status, TaskStatus::Expired) && task.owners.is_empty()
-                }) {
-                    self.drop_expired(&id);
-                }
-                if let Some(retiring) = self.retiring.get_mut(&id) {
-                    retiring.owners.remove(owner);
-                    if retiring.owners.is_empty() {
-                        let retiring = self.retiring.remove(&id).unwrap();
-                        for member in retiring.members.iter() {
-                            self.unbind_alias(member, &id, true);
-                        }
+                self.release_task_owner(&id, owner, None);
+            }
+        }
+    }
+    fn release_task_owner(&mut self, id: &Arc<str>, owner: &str, path: Option<&str>) {
+        if let Some(task) = self.tasks.get_mut(id) {
+            if path.is_none_or(|path| task.group.as_ref().is_some_and(|group| key(field(group, "path")) == path))
+                && task.owners.remove(owner)
+            {
+                if matches!(task.status, TaskStatus::Expired) {
+                    if task.owners.is_empty() {
+                        self.drop_expired(id);
                     }
+                } else if !task.blocked && task.owner == owner {
+                    self.remove(id);
                 }
             }
+        }
+        if let Some(retiring) = self.retiring.get_mut(id) {
+            if path.is_none_or(|path| retiring.members[0].as_ref() == path)
+                && retiring.owners.remove(owner) && retiring.owners.is_empty()
+            {
+                let retiring = self.retiring.remove(id).unwrap();
+                for member in retiring.members.iter() {
+                    self.unbind_alias(member, id, true);
+                }
+            }
+        }
+        if path.is_some() && !self.tasks.get(id).is_some_and(|task| task.owners.contains(owner)) {
+            self.unbind_owner(id, owner);
         }
     }
     fn alias_id(&self, path: &str) -> Option<&Arc<str>> {
@@ -237,16 +258,6 @@ impl Projection {
         crate::collections::trim_map(&mut self.retiring);
         crate::collections::trim_map(&mut self.owner_tasks);
     }
-    fn resolve(&self, value: &Value, physical: &str) -> Arc<str> {
-        let explicit = field(value, "task_id");
-        if !explicit.is_empty() {
-            return self.tasks.get_key_value(explicit)
-                .map_or_else(|| Arc::from(explicit), |(id, _)| Arc::clone(id));
-        }
-        self.alias_id(physical)
-            .cloned()
-            .unwrap_or_else(|| Arc::from(physical))
-    }
     fn instance_id(&self, owner: &str, physical: &str) -> Arc<str> {
         // Watch supplies a UUID per submission. Ownerless recovery must also
         // avoid IDs already present in history from an earlier writer.
@@ -286,31 +297,24 @@ impl Projection {
                     if members.is_empty() {
                         continue;
                     }
-                    let explicit = (!field(group, "task_id").is_empty())
-                        .then(|| self.resolve(group, path));
-                    let previous: HashSet<_> = if explicit.is_none() {
-                        members
-                            .iter()
-                            .map(|m| self.alias_id(m).map_or(m.as_ref(), |id| id.as_ref()))
-                            .filter_map(|id| self.tasks.get_key_value(id).map(|(key, _)| Arc::clone(key)))
-                            .collect()
-                    } else {
-                        HashSet::new()
-                    };
+                    let previous: HashSet<_> = members
+                        .iter()
+                        .filter_map(|member| self.alias_id(member))
+                        .filter(|id| self.tasks.contains_key(*id))
+                        .cloned()
+                        .collect();
                     // Keep an established group's ID across first-volume
                     // arrival; a provisional request card can be absorbed.
-                    let id = explicit.clone().unwrap_or_else(|| {
-                        previous
-                            .iter()
-                            .filter(|id| self.tasks[*id].group.is_some())
-                            .min()
-                            .cloned()
-                            .or_else(|| previous.iter().min().cloned())
-                            .unwrap_or_else(|| self.instance_id(&owner, &key(path)))
-                    });
+                    let id = previous
+                        .iter()
+                        .filter(|id| self.tasks[*id].group.is_some())
+                        .min()
+                        .or_else(|| previous.iter().min())
+                        .cloned()
+                        .unwrap_or_else(|| self.instance_id(&owner, &key(path)));
                     let mut task = Task::default();
                     let mut owners = HashSet::new();
-                    for old in previous.into_iter().chain(explicit) {
+                    for old in previous {
                         if let Some(mut candidate) = self.remove(&old) {
                             owners.extend(candidate.owners.drain());
                             if candidate.order > task.order {
@@ -357,23 +361,20 @@ impl Projection {
         }
         let path = field(value, "path");
         if event == "pipeline_sources_released" {
-            self.release_owner(field(value, "owner"));
-            let ids: HashSet<_> = value["paths"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .chain((!path.is_empty()).then_some(path))
-                .map(key)
-                .map(|p| self.alias_id(&p).cloned().unwrap_or_else(|| p.into()))
-                .collect();
-            for id in ids {
-                if self
-                    .tasks
-                    .get(&id)
-                    .is_some_and(|t| !t.blocked && t.owner == field(value, "owner"))
-                {
-                    self.remove(&id);
+            let owner = field(value, "owner");
+            if path.is_empty() {
+                self.release_owner(owner);
+                return false;
+            }
+            // A root completion can arrive while sibling roots still own
+            // claims. Find the routes by canonical path before releasing them.
+            let physical = key(path);
+            if let Some(alias) = self.aliases.get(physical.as_str()) {
+                let current = alias.current.clone();
+                let retired: Vec<_> = alias.retiring.iter().flat_map(|ids| ids.iter())
+                    .filter(|id| current.as_ref() != Some(*id)).cloned().collect();
+                for id in current.into_iter().chain(retired) {
+                    self.release_task_owner(&id, owner, Some(&physical));
                 }
             }
             return false;
@@ -384,18 +385,14 @@ impl Projection {
             } else {
                 field(value, "task_path")
             };
-            let id = self.resolve(value, &key(path));
-            if self.tasks.get(&id).is_some_and(|t| t.blocked) {
-                self.remove(&id);
+            if let Some(id) = self.alias_id(&key(path)).cloned() {
+                if self.tasks.get(&id).is_some_and(|t| t.blocked) {
+                    self.remove(&id);
+                }
             }
             return false;
         }
         let physical = key(path);
-        let mut id = self.resolve(value, &physical);
-        if event == "task_retired" && field(value, "scope") == "task" {
-            self.remove(&id);
-            return false;
-        }
         if event == "candidate_departed" || event == "task_retired" {
             // Source cleanup does not end an in-flight execution. Its original
             // members still route completion until the request releases them.
@@ -412,11 +409,11 @@ impl Projection {
                     .map(|(id, _)| id.clone())
                     .collect()
             } else {
-                self.tasks
-                    .get(&id)
-                    .filter(|t| !t.processing())
-                    .map(|_| vec![id])
-                    .unwrap_or_default()
+                self.alias_id(&physical)
+                    .filter(|id| self.tasks.get(*id).is_some_and(|task| !task.processing()))
+                    .cloned()
+                    .into_iter()
+                    .collect()
             };
             for id in affected {
                 let mut task = self.remove(&id).unwrap();
@@ -440,22 +437,23 @@ impl Projection {
             return false;
         }
         if event == "no_tasks_found" || event == "pipeline_request_coalesced" {
-            if self.tasks.get(&id).is_some_and(|t| {
-                (field(value, "owner").is_empty() || t.owner == field(value, "owner"))
-                    && (t.group.is_none()
-                        || (event == "no_tasks_found"
-                            && (t.members.len() == 1
-                                || value["retire_group"].as_bool().unwrap_or(false))))
-            }) {
-                self.remove(&id);
+            if let Some(id) = self.alias_id(&physical).cloned() {
+                if self.tasks.get(&id).is_some_and(|t| {
+                    (field(value, "owner").is_empty() || t.owner == field(value, "owner"))
+                        && (t.group.is_none()
+                            || (event == "no_tasks_found"
+                                && (t.members.len() == 1
+                                    || value["retire_group"].as_bool().unwrap_or(false))))
+                }) {
+                    self.remove(&id);
+                }
             }
             return false;
         }
         if !path.is_empty()
             && matches!(
                 event,
-                "processing_started"
-                    | "failed_password"
+                "failed_password"
                     | "suspended_missing_volume"
                     | "done"
                     | "watch_deduplicated"
@@ -469,24 +467,20 @@ impl Projection {
             );
             let owner = field(value, "owner");
             if terminal
-                && (self.aliases.get(physical.as_str()).and_then(|alias| alias.retiring.as_ref())
+                && self.aliases.get(physical.as_str()).and_then(|alias| alias.retiring.as_ref())
                     .is_some_and(|ids| ids.iter().any(|id| self.retiring[id].owners.contains(owner)))
-                    || self
-                    .retiring
-                    .get(&id)
-                    .is_some_and(|task| task.owners.contains(owner)))
             {
                 // A transferred request can finish after the real owner. Keep
                 // only routing metadata until those in-flight owners release.
                 return false;
             }
-            if field(value, "task_id").is_empty() && !self.tasks.contains_key(&id) {
-                id = self.instance_id(owner, &physical);
-            }
+            let id = self.alias_id(&physical)
+                .filter(|id| self.tasks.contains_key(*id))
+                .cloned()
+                .unwrap_or_else(|| self.instance_id(owner, &physical));
             // A transferred family may still receive an older request's
             // completion. It cannot overwrite the current owner's result.
-            if event != "processing_started"
-                && !owner.is_empty()
+            if !owner.is_empty()
                 && self
                     .tasks
                     .get(&id)
@@ -508,12 +502,12 @@ impl Projection {
             }
             task.stamp = timestamp(value);
             task.blocked = blocked;
-            if !field(value, "owner").is_empty() {
-                task.owners.insert(field(value, "owner").to_owned());
+            if !terminal && !field(value, "owner").is_empty() {
                 task.owner = field(value, "owner").to_owned();
             }
             task.order = self.order;
             if terminal {
+                // Only a source claim owns a route that can receive a later completion.
                 if !task.owners.is_empty() {
                     if let Some(previous) = self.retiring.remove(&id) {
                         self.unbind(&id, &previous.owners);
@@ -521,9 +515,10 @@ impl Projection {
                             self.unbind_alias(path, &id, true);
                         }
                     }
-                    let primary = task.additional_group_path();
-                    let members: Box<[_]> = task.members.into_iter()
-                        .chain(primary.map(Arc::from))
+                    let primary = key(field(value, "path"));
+                    let primary = task.members.take(primary.as_str()).unwrap_or_else(|| primary.into());
+                    // Store the canonical route first for a scoped release.
+                    let members: Box<[_]> = std::iter::once(primary).chain(task.members)
                         .collect();
                     for member in members.iter() {
                         let alias = self.aliases.entry(member.clone()).or_default();
@@ -558,11 +553,8 @@ impl Projection {
         }
         true
     }
-    fn updates(
-        &mut self,
-        mut reset: bool,
-    ) -> (Vec<(Arc<str>, Option<(Record, Option<Arc<Value>>)>)>, bool) {
-        reset |= std::mem::take(&mut self.full_dirty);
+    fn updates(&mut self) -> (Vec<(Arc<str>, Option<(Record, Option<Arc<Value>>)>)>, bool) {
+        let reset = std::mem::take(&mut self.full_dirty);
         self.dirty_bytes = 0;
         let dirty = std::mem::take(&mut self.dirty);
         let project_status = |task: &Task| match &task.status {
@@ -592,8 +584,6 @@ struct State {
     projection: Projection,
     queue: Vec<HistoryRecord>,
     queue_bytes: usize,
-    live_dirty: bool,
-    reset_live: bool,
     rebuild: bool,
     revision: u64,
     published: u64,
@@ -650,8 +640,7 @@ impl Shared {
         let mut history = true;
         if self.stateful && state_event(field(&value, "event")) {
             history = state.projection.apply(&mut value);
-            let changed = !state.projection.dirty.is_empty() || state.projection.full_dirty;
-            state.live_dirty |= changed;
+            let changed = state.projection.changed();
             state.projection.trim();
             if !history && !changed {
                 return Ok(());
@@ -734,22 +723,15 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 continue;
             }
             state.working = true;
-            if state.rebuild {
+            let rebuild = std::mem::take(&mut state.rebuild);
+            if rebuild && shared.stateful {
                 // Recovery initializes the projection from WAL before work
                 // starts. Online mutations already update this same projection
                 // synchronously, including processing groups and owner routes.
                 // Publish it at this queue boundary; never rescan/retry on traffic.
-                state.live_dirty = shared.stateful;
-                state.reset_live = true;
+                state.projection.mark_all();
             }
-            let rebuild = std::mem::take(&mut state.rebuild);
-            let live = if state.live_dirty {
-                state.live_dirty = false;
-                let reset = std::mem::take(&mut state.reset_live);
-                Some(state.projection.updates(reset))
-            } else {
-                None
-            };
+            let live = state.projection.changed().then(|| state.projection.updates());
             if std::mem::take(&mut state.queue_bytes) >= QUEUE_BYTES {
                 shared.drained.notify_all();
             }
@@ -815,8 +797,6 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
         if state.error.is_some() && !publication_blocked {
             deadline = None;
             store = None;
-            state.live_dirty = true;
-            state.reset_live = true;
             state.rebuild = true;
             // Try recovery once for this operation. A failed rebuild stays
             // pending until the next operation, never an idle retry loop.
@@ -851,11 +831,9 @@ impl NativeEventLog {
         }
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                projection: Projection::default(),
+                projection: Projection { full_dirty: stateful, ..Projection::default() },
                 queue: Vec::new(),
                 queue_bytes: 0,
-                live_dirty: stateful,
-                reset_live: stateful,
                 rebuild: false,
                 revision: 1,
                 published: 0,
@@ -893,12 +871,10 @@ impl NativeEventLog {
         watch.with_event_projection(|rows| {
             let shared = self.shared();
             let mut state = shared.state.lock().unwrap();
-            state.reset_live = true;
-            state.projection = Projection::default();
+            state.projection = Projection { full_dirty: true, ..Projection::default() };
             for mut value in rows {
                 let _ = state.projection.apply(&mut value);
             }
-            state.live_dirty = true;
             shared.schedule(&mut state);
         });
     }

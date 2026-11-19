@@ -74,6 +74,7 @@ class Application {
     void queue_save(Json job);
     void start_save();
     void acknowledge_save(const Json& ack);
+    Json localized_error(const std::string& message) const;
     void save_error(const std::string& key, const std::string& message);
     void set_error(const char* field, const std::string& message);
     void refresh_error_texts();

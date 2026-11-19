@@ -45,11 +45,8 @@ namespace sunpack::sevenzip
             if (new_volume)
             {
                 const bool persistent = !key.empty() && key.rfind("job:", 0) != 0;
-                auto state = make_volume_state(key, persistent);
-                if (!key.empty())
-                {
-                    state->space_gate = std::make_shared<VolumeSpaceGate>(key, std::string{}, sink_);
-                }
+                auto gate = key.empty() ? nullptr : std::make_shared<VolumeSpaceGate>(key, std::string{}, sink_);
+                auto state = std::make_shared<VolumeState>(key, persistent, std::move(gate));
                 found = entries_.emplace(key, Entry{std::move(state)}).first;
             }
             Entry &entry = found->second;

@@ -246,12 +246,17 @@ void search_config(Application& app,const wchar_t* query) {
     ui_window_relayout(app.window());
 }
 
-void finish_input(Application& app) {
+void finish_input(Application& app,bool expect_success=true) {
     ui_window_focus_widget(app.window(),0);
     ui_debug_pump();
     pump([&]{return state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false && state(app.page(),"saving")==false && state(app.page(),"pendingFields").empty();},"Automatic writes");
+    if(!expect_success) return;
     auto errors=state(app.page(),"saveErrors");
     if(!errors.empty()) throw std::runtime_error(errors.dump());
+    for(auto kind:{"rootDrafts","passwordDrafts"}) for(const auto& draft:state(app.page(),kind)) {
+        auto error=draft.find("error");
+        if(error!=draft.end() && *error!="") throw std::runtime_error(error->dump());
+    }
 }
 
 ui::UiWindowImpl& window(Application& app) {
@@ -663,7 +668,14 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     click(app,"addRoot");
     auto new_root=state(app.page(),"rootCell").get<std::string>();
     focus(app,"root-input-input-"+new_root);
-    assert(ui_debug_type_text(app.window(),root.c_str())==0);
+    auto missing=dir/"missing-root";
+    assert(ui_debug_type_text(app.window(),missing.c_str())==0);
+    finish_input(app,false);
+    auto error=state(app.page(),"rootDrafts").at(new_root).at("error");
+    assert(error.at("source")=="rootMissing" && !error.at("text").get<std::string>().empty());
+    click(app,("root-input-text-"+new_root).c_str());
+    focus(app,"root-input-input-"+new_root);
+    replace_text(app.window(),root.c_str());
     finish_input(app);
     assert(disk_root({}));
 

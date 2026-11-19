@@ -32,7 +32,7 @@ using sunpack::sevenzip::AttemptResult;
 using sunpack::sevenzip::ExtractOutputTrace;
 using sunpack::sevenzip::ExtractProgressCallback;
 using sunpack::sevenzip::ExtractToDiskCallback;
-using sunpack::sevenzip::make_volume_state;
+using sunpack::sevenzip::VolumeState;
 using sunpack::sevenzip::ProbeLease;
 using sunpack::sevenzip::SpaceJobRegistration;
 using sunpack::sevenzip::TerminalPredicate;
@@ -137,13 +137,12 @@ struct Harness {
         config.threads_per_volume = threads;
         config.buffer_count = buffers;
         config.write_through = write_through;
-        state = make_volume_state("volume:retry", true);
         // 先取一份本地 sink：C++17 的 lambda 捕获列表不能直接命名非静态数据成员。
         const auto sink = log;
         gate = std::make_shared<VolumeSpaceGate>(
             "volume:retry", to_ascii(query_root.wstring()),
             [sink](const VolumeSpaceTransition &transition) { sink->record(transition); });
-        state->space_gate = gate;
+        state = std::make_shared<VolumeState>("volume:retry", true, gate);
         writer = std::make_unique<AsyncFileWriter>(state, config);
     }
 
@@ -394,7 +393,7 @@ void r11a_no_volume_gate_data_failure(const std::filesystem::path &directory) {
     config.threads_per_volume = 1;
     config.buffer_count = 8;
 
-    auto state = make_volume_state("volume:off", true);
+    auto state = std::make_shared<VolumeState>("volume:off", true);
     check(!state->space_gate, "R-11a: 无卷 gate 时 VolumeState 不得有 gate");
     AsyncFileWriter writer(state, config);
 
@@ -913,7 +912,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         config.threads_per_volume = 1;
         config.buffer_count = 4;
 
-        auto state = make_volume_state("volume:off-open", true);
+        auto state = std::make_shared<VolumeState>("volume:off-open", true);
         AsyncFileWriter writer(state, config);
         check(!state->space_gate, "R-11b: 无卷 gate 时不得有 gate");
 
@@ -956,7 +955,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         config.buffer_count = 4;
         config.write_through = true;
 
-        auto state = make_volume_state("volume:off-flush", true);
+        auto state = std::make_shared<VolumeState>("volume:off-flush", true);
         AsyncFileWriter writer(state, config);
 
         constexpr std::size_t kPayload = 1 * kMib;
@@ -998,13 +997,11 @@ void r11c_no_volume_gate_directory(const std::filesystem::path &directory) {
     std::error_code reference;
     std::filesystem::create_directories(blocked_path, reference);
 
-    std::atomic<int> attempts{0};
     // 直接观察"只尝试一次"：用一个会失败一次后即可成功的路径不行（没有 gate 就没有
     // 重试），因此这里断言错误码原样外泄 + 目录确实没有被创建。
     std::error_code helper_error;
     const bool ready =
         create_directories_with_space_gate(blocked_path, nullptr, TerminalPredicate{}, &helper_error);
-    (void)attempts;
     check(!ready, "R-11c: 目录创建失败必须返回 false");
     check(helper_error == reference,
           "R-11c: 必须返回**原始** std::error_code（不是 E_FAIL / PATH_NOT_FOUND）");

@@ -65,9 +65,15 @@ void projection(Fixture& f) {
     publish_events(p,history[1],read_json(p).at("runs"));
     publish_events(p,history[2],read_json(p).at("runs"),true);
     EventLog log; log.set_path(p); assert(log.refresh()); assert(!log.refresh());
+    const auto cold_name=log.manifest["runs"][0]["name"].get<std::string>();
+    const auto cold_index=p.parent_path()/L"events.json.store"/(cold_name+".index");
+    auto moved_index=cold_index; moved_index+=L".away";
+    // An older run outside the newest page must not block that page's query.
+    fs::rename(cold_index,moved_index);
     View view; int next=349; size_t pages=0;
     for(;;) {
         auto result=log.query({},view);
+        if(!pages) fs::rename(moved_index,cold_index);
         assert(result["rows"].size()<=100);
         for(auto& row:result["rows"]) assert(row["name"]=="carrier-"+std::to_string(next--)+".001");
         ++pages;

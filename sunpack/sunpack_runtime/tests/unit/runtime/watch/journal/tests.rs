@@ -219,7 +219,9 @@ fn cpp_query_recovers_durable_blocker_after_writer_death() {
         let journal = Journal::open(&dir, 7).unwrap();
         let path = dir.join("events.json");
         let source = dir.join("disguised.bin");
-        journal.log(json!({"event":"processing_started","path":dir.join("interrupted.zip"),"owner":"interrupted"}));
+        let interrupted = dir.join("interrupted.zip");
+        journal.log(json!({"event":"pipeline_sources_claimed","owner":"interrupted",
+            "processing":true,"groups":[{"path":interrupted,"members":[interrupted]}]}));
         journal.event_log().flush().unwrap();
         let live = project(&binary, &path, "", "", "", "");
         let rows = live["rows"].as_array().unwrap();

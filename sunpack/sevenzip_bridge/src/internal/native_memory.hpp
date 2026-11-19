@@ -32,8 +32,10 @@ struct NativeMemoryJob final {
 // One arbitrator per worker. No Python scheduling or per-codec memory policy.
 class NativeMemoryManager final {
 public:
-    using Query = std::function<std::int64_t()>; // headroom after reserve and unresident commitment
     using WaitNotice = std::function<void(bool, std::int64_t, std::uint64_t)>;
+#ifdef SUP7Z_DEBUG
+    using Query = std::function<std::int64_t()>; // headroom after reserve and unresident commitment
+#endif
     static constexpr std::uint64_t small_workspace_bytes_per_credit = 16ULL << 20;
     // Fixed recovery room plus the measured small-workspace growth per CPU
     // credit. Use nominal capacity, not live credits: releasing an attempt
@@ -44,8 +46,12 @@ public:
         const auto maximum = (std::uint64_t{INT64_MAX} - base) / per_credit;
         return base + (credits > maximum ? maximum : credits) * per_credit;
     }
-    explicit NativeMemoryManager(std::uint64_t reserve_bytes = default_reserve_bytes(), Query query = {},
-                                 std::function<void()> reclaim = {});
+    explicit NativeMemoryManager(std::uint64_t reserve_bytes = default_reserve_bytes(),
+                                 std::function<void()> reclaim = {}
+#ifdef SUP7Z_DEBUG
+                                 , Query query = {}
+#endif
+                                 );
     ~NativeMemoryManager();
     NativeMemoryManager(const NativeMemoryManager &) = delete;
     NativeMemoryManager &operator=(const NativeMemoryManager &) = delete;
@@ -73,8 +79,10 @@ private:
     void revoke_locked(NativeMemoryJob &job);
     void monitor();
     const std::uint64_t reserve_bytes_;
-    Query query_;
     std::function<void()> reclaim_;
+#ifdef SUP7Z_DEBUG
+    Query query_;
+#endif
     std::mutex mutex_;
     std::vector<NativeMemoryJob *> jobs_;
     struct Waiter {

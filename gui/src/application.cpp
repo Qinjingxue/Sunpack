@@ -164,15 +164,17 @@ void Application::publish(Json patch) {
     for(auto it=patch.begin();it!=patch.end();++it) pending_[it.key()].swap(it.value());
     if(!notified_) { notified_=true; PostMessageW(hwnd_,Update,0,0); }
 }
+Json Application::localized_error(const std::string& message) const {
+    if(message.empty()) return "";
+    return {{"source",message},{"text",translated_error(message,page_value(page_,"language").get<std::string>())}};
+}
 void Application::set_error(const char* field,const std::string& message) {
-    Json value="";
-    if(!message.empty()) value={{"source",message},{"text",translated_error(message,page_value(page_,"language").get<std::string>())}};
-    auto encoded=value.dump(); ui_page_set_json(page_,field,encoded.c_str());
+    auto encoded=localized_error(message).dump(); ui_page_set_json(page_,field,encoded.c_str());
 }
 void Application::save_error(const std::string& key,const std::string& message) {
     auto errors=page_value(page_,"saveErrors");
     if(message.empty()) errors.erase(key);
-    else errors[key]={{"source",message},{"text",translated_error(message,page_value(page_,"language").get<std::string>())}};
+    else errors[key]=localized_error(message);
     auto encoded=errors.dump(); ui_page_set_json(page_,"saveErrors",encoded.c_str());
 }
 void Application::refresh_error_texts() {
@@ -214,9 +216,8 @@ void Application::save_field(const std::string& id,Json draft) {
 void Application::queue_save(Json job) {
     const auto kind=job.at("kind").get<std::string>();
     if(kind!="config" && kind!="passwords" && kind!="roots") return;
-    auto key=job.at("key");
-    if(kind=="roots") for(auto& edit:job.at("edits")) save_error("@root:"+edit.at("row").get<std::string>(),"");
-    else save_error(kind=="passwords"?"@password:"+key.get<std::string>():key.get<std::string>(),"");
+    const auto& key=job.at("key");
+    if(kind=="config") save_error(key.get_ref<const std::string&>(),"");
     auto previous=std::find_if(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==key;});
     if(previous!=saves_.end() && kind=="roots") {
         // A later edit to the first row must not drop the other rows of an
@@ -268,7 +269,6 @@ void Application::acknowledge_save(const Json& ack) {
                 auto& edit=(*it)["edit"];
                 auto scope=edit.value("scope",std::string());
                 if(!scope.empty() && removed.count(path_key(wide(scope)))) {
-                    save_error("@password:"+(*it)["key"].get<std::string>(),"");
                     it=saves_.erase(it); continue;
                 }
                 auto found=rebased.find(edit.value("original",std::string()));
@@ -278,7 +278,6 @@ void Application::acknowledge_save(const Json& ack) {
         }
         for(auto& edit:job.at("edits")) {
             auto id=edit.at("row").get<std::string>();
-            save_error("@root:"+id,ack.at("error"));
             if(!ok) continue;
             bool remove=edit.at("operation")=="delete";
             auto input=remove?std::string():utf8(resolve_path(wide(edit.at("input").get<std::string>()),options_.data_dir).wstring());
@@ -293,15 +292,14 @@ void Application::acknowledge_save(const Json& ack) {
             }
         }
         for(auto& queued:saves_) if(queued["kind"]==kind) for(auto& edit:queued["edits"]) pending.push_back(edit["row"]);
-        auto reply=Json{{"snapshot",job.at("snapshot")},{"ok",ok},{"error",ack.at("error")},{"records",std::move(records)},{"pending",std::move(pending)}};
+        auto reply=Json{{"snapshot",job.at("snapshot")},{"ok",ok},{"error",localized_error(ack.at("error").get_ref<const std::string&>())},
+            {"records",std::move(records)},{"pending",std::move(pending)}};
         reply["removedPasswordScopes"]=std::move(removed_scopes);
         reply["passwordRebases"]=ack.value("passwordRebases",Json::array());
-        if(!ok) reply["error"]=page_value(page_,"saveErrors")["@root:"+job["edits"][0]["row"].get<std::string>()];
         auto encoded=reply.dump();
         if(ui_page_call_json(page_,"rootSaved",encoded.c_str())!=0) throw std::runtime_error("uiBindingFailed");
         active_save_.reset(); return;
     }
-    save_error(kind=="passwords"?"@password:"+job["key"].get<std::string>():job["key"].get<std::string>(),ack.at("error"));
     if(kind=="passwords") {
         const auto& edit=job.at("edit");
         const bool removed=ok && ack.at("passwordOriginal").get<std::string>().empty();
@@ -358,15 +356,15 @@ void Application::acknowledge_save(const Json& ack) {
             }
         }
         bool pending=std::any_of(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==job["key"];});
-        auto reply=Json{{"key",job["key"]},{"snapshot",job["snapshot"]},{"ok",ok},{"error",ack["error"]},
+        auto reply=Json{{"key",job["key"]},{"snapshot",job["snapshot"]},{"ok",ok},{"error",localized_error(ack.at("error").get_ref<const std::string&>())},
             {"original",original},{"pending",pending},{"removed",removed},{"rebases",std::move(rebases)},{"rowRebases",std::move(row_rebases)}};
-        if(!ok) reply["error"]=page_value(page_,"saveErrors")["@password:"+job["key"].get<std::string>()];
         auto encoded=reply.dump();
         if(ui_page_call_json(page_,"passwordSaved",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
         active_save_.reset();
         return;
     }
-    if(ok && kind=="config") {
+    save_error(job["key"].get_ref<const std::string&>(),ack.at("error"));
+    if(ok) {
         const auto& edit=job["fields"][0]; auto id=edit["pointer"].get<std::string>();
         auto original=edit["type"]=="string"?Json(edit["text"]).dump():edit["type"]=="boolean"?Json(edit["boolean"]).dump():edit["text"].get<std::string>();
         for(auto name:{"drafts","toggleDrafts"}) {
@@ -714,7 +712,6 @@ void Application::handle_command(Json command) {
         if(scroll) scroll_top(window_,scroll);
         return;
     }
-    if(op=="clearRootError") { save_error("@root:"+p.at("id").get<std::string>(),""); return; }
     if(op=="blurRoot") {
         if(choosing_directory_ || page_value(page_,"rootCell")!=p.at("id") || page_value(page_,"rootPart")!=p.at("part")) return;
         auto* focused=ui::GetContext().GetWindow(window_)->FocusedWidget();
@@ -722,7 +719,6 @@ void Application::handle_command(Json command) {
         if(focused && focused->id=="browse-root-"+suffix) return;
         ui_page_call_json(page_,"finishRootCell","{}"); return;
     }
-    if(op=="clearPasswordError") { save_error("@password:"+p.at("id").get<std::string>(),""); return; }
     if(op=="discardPassword") {
         auto encoded=p.at("id").dump();
         if(ui_page_call_json(page_,"discardPassword",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
@@ -1308,7 +1304,9 @@ void Application::work() {
                 }
                 errors["events.json"]=error.what(); rebuild_log=true;
             };
-            if((flags&Log) || task_query_pending || tasks_changed) {
+            // Page and filter changes can reuse the manifest already read by
+            // the directory observer. A publication conflict still forces refresh.
+            if((flags&Log) || task_query_pending) {
                 try {
                     bool refreshed=log.refresh();
                     retries.erase(Log);

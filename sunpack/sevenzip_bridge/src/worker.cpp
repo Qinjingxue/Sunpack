@@ -1759,7 +1759,7 @@ public:
               [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
                   on_space_transition(transition);
               }),
-          memory_(memory_reserve_bytes, {}, [this] { writer_registry_.reclaim_idle_memory(); }),
+          memory_(memory_reserve_bytes, [this] { writer_registry_.reclaim_idle_memory(); }),
           space_monitor_(
               sunpack::sevenzip::VolumeSpaceMonitor::Options{
                   writer_config_.space_poll_interval,

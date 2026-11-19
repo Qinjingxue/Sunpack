@@ -231,9 +231,9 @@ fn prepare_zip_attempts(
     })?;
     // The planner already orders contexts by relation. Keep the first
     // directory fault as a diagnostic without marking the anchor unresolved.
-    let fallback = evidence.contexts.iter_mut().find_map(|(_, fallback)| fallback.take());
+    let fallback = evidence.alternatives.iter_mut().find_map(|((_, fallback), _)| fallback.take());
     let context = match anchor {
-        Some(anchor) if evidence.contexts.iter().all(|(context, _)| context == &anchor.context) =>
+        Some(anchor) if evidence.alternatives.iter().all(|((context, _), _)| context == &anchor.context) =>
             evidence.with_anchor(PasswordContext::Zip(anchor.context.clone()))?,
         _ => evidence.into_context(|(context, _)| PasswordContext::Zip(context)),
     };

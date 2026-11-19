@@ -121,7 +121,7 @@ void operator delete(void* value, std::size_t) noexcept { std::free(value); }
 
 void request_recovery(const std::filesystem::path& archive, const std::filesystem::path& destination,
                       bool after_failure, bool user_cancel) {
-    NativeMemoryManager manager(0, [] { return 1LL << 30; });
+    NativeMemoryManager manager(0, {}, [] { return 1LL << 30; });
     NativeMemoryJob job(manager);
     manager.begin(job);
     NativeMemoryScope memory(&job);
@@ -497,7 +497,7 @@ void unavailable_member_is_not_reprobed_for_an_unread_slice(
     {
         // CPU credits collect both compositions. The memory arbiter defers
         // thread creation so the second lane observes the completed first.
-        NativeMemoryManager manager(0, [] { return -1; });
+        NativeMemoryManager manager(0, {}, [] { return -1; });
         NativeMemoryJob memory(manager);
         NativeCpuBudget budget(2);
         NativeCpuJobContext job(budget);

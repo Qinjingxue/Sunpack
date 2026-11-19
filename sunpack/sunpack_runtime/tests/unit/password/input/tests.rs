@@ -207,9 +207,7 @@ fn tail_total_table_prefers_source_then_falls_back_to_global_trim() {
         },
     )
     .unwrap_or_else(|_| panic!("tail-specific geometry"));
-    assert_eq!(values.len(), 2);
-    assert!(values.contains(&b"aX".to_vec()));
-    assert!(values.contains(&b"abY".to_vec()));
+    assert_eq!(values, [b"aX".to_vec(), b"abY".to_vec()]);
     let disks = prepare_attempt_evidence(
         &sources[0],
         &plan,

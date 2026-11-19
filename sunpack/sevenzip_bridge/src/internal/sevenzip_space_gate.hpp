@@ -428,7 +428,7 @@ namespace sunpack::sevenzip
         // synthetic 卷的查询根解析：锁外做 Win32 调用，锁内只提交结果。
         // GetVolumePathNameW 绝不能在 gate mutex_ 内执行：对失联 UNC / 坏盘的一次慢解析会
         // 堵住同卷的 wait() / wake_waiters()，而那是取消与关停的必经路径。
-        void resolve_query_root_outside_lock(const std::wstring &failed_path) noexcept
+        void resolve_query_root_outside_lock(std::wstring_view failed_path) noexcept
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -442,7 +442,7 @@ namespace sunpack::sevenzip
                 return;
             }
             std::wstring resolved;
-            if (!resolve_query_root_from_path(failed_path, &resolved))
+            if (!resolve_query_root_from_path(std::wstring(failed_path), &resolved))
             {
                 return;
             }
@@ -576,7 +576,7 @@ namespace sunpack::sevenzip
         std::optional<VolumeSpaceTransition> transition;
         bool opened_episode = false;
 
-        resolve_query_root_outside_lock(std::wstring(failed_path));
+        resolve_query_root_outside_lock(failed_path);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -744,11 +744,14 @@ namespace sunpack::sevenzip
         std::lock_guard<std::mutex> lock(mutex_);
         // Serialize with the predicate check and its handoff to cv_.wait().
         cv_.notify_all();
-        for (auto it = wake_targets_.begin(); it != wake_targets_.end();)
-        {
-            if (auto target = it->lock()) { target->wake(); ++it; }
-            else it = wake_targets_.erase(it);
-        }
+        wake_targets_.erase(std::remove_if(wake_targets_.begin(), wake_targets_.end(), [](const auto &weak) {
+            if (auto target = weak.lock())
+            {
+                target->wake();
+                return false;
+            }
+            return true;
+        }), wake_targets_.end());
     }
 
     inline void VolumeSpaceGate::settle_success(std::uint64_t token) noexcept
@@ -776,7 +779,7 @@ namespace sunpack::sevenzip
     inline void VolumeSpaceGate::settle_space_failure(
         std::uint64_t token, [[maybe_unused]] unsigned long win32_error, std::wstring_view failed_path) noexcept
     {
-        resolve_query_root_outside_lock(std::wstring(failed_path));
+        resolve_query_root_outside_lock(failed_path);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);

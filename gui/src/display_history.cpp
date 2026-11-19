@@ -7,7 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <optional>
-#include <queue>
+#include <memory>
 #include <string_view>
 #include <tuple>
 #include <streambuf>
@@ -77,8 +77,8 @@ Handle open_reader(const fs::path& path) {
     auto file=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
     if(file==INVALID_HANDLE_VALUE) win_error("opReadEventLog"); return Handle(file);
 }
-std::string run_name(const Json& run) {
-    auto name=run.at("name").get<std::string>();
+std::string_view run_name(const Json& run) {
+    const auto& name=run.at("name").get_ref<const std::string&>();
     if(name.empty() || name.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-")!=std::string::npos)
         throw std::runtime_error("logRecordTooLarge");
     return name;
@@ -106,7 +106,7 @@ struct RecordBuffer : std::streambuf {
     }
 };
 struct RunReader {
-    std::string name;
+    std::string_view name;
     fs::path data_path;
     Handle index;
     std::optional<Handle> data;
@@ -117,8 +117,8 @@ struct RunReader {
     bool unordered=false, filtered=false;
     std::vector<Entry> selected;
     uint64_t cache_start=0;
-    RunReader(const fs::path& folder,const Json& run,const std::optional<Cursor>& before,uint64_t revision,bool read_ahead):name(run_name(run)),
-        data_path(folder/(name+".data")),index(open_reader(folder/(name+".index"))),revision(revision) {
+    RunReader(const fs::path& folder,const Json& run,std::string_view name,const std::optional<Cursor>& before,uint64_t revision,bool read_ahead):
+        name(name),data_path(folder/(std::string(name)+".data")),index(open_reader(folder/(std::string(name)+".index"))),revision(revision) {
         head=run.at("head").get<uint64_t>(); count=run.at("count").get<uint64_t>();
         unordered=run.value("unordered",false);
         validate();
@@ -296,12 +296,22 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     }
     auto revision=manifest.value("task_revision",uint64_t(0));
     const auto& historical=manifest.at("runs");
-    std::vector<RunReader> runs;
-    runs.reserve(historical.size()+1);
+    struct HistoryHead {
+        Cursor key;
+        const Json* run;
+        std::unique_ptr<RunReader> reader;
+    };
+    const auto earlier=[](const HistoryHead& a,const HistoryHead& b) { return a.key<b.key; };
+    std::vector<HistoryHead> history;
+    history.reserve(historical.size());
     for(const auto& run:historical) {
         if(before && !run.value("unordered",false) && run.at("first").get<int64_t>()>std::get<0>(*before)) continue;
-        runs.emplace_back(folder,run,before,revision,historical.size()==1);
+        // Use the manifest's upper bound until this run can contribute a row.
+        // The name view remains valid after an exhausted reader is destroyed.
+        auto key=Cursor{run.at("last").get<int64_t>(),run_name(run),UINT64_MAX};
+        history.push_back({before?std::min(key,*before):key,&run,{}});
     }
+    std::make_heap(history.begin(),history.end(),earlier);
     auto query=folded(view.task_query); auto bits=filter(query);
     // UTC microseconds are already indexed, including in old stores. Check
     // local display time before rejecting the path bloom, decode candidates
@@ -340,8 +350,10 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         return matches(value,query,time_query) && matches_root(value);
     };
     const bool filter_values=!query.empty() || !view.task_root.empty();
+    std::optional<RunReader> live_reader;
     if(manifest.contains("live") && manifest["live"].is_object()) {
-        auto& live=runs.emplace_back(folder,manifest["live"],before,revision,true);
+        const auto& run=manifest["live"];
+        auto& live=live_reader.emplace(folder,run,run_name(run),before,revision,true);
         if(live.unordered) {
             // Keep at most one page of live candidates. Only filters on record
             // contents need decoding before the merge with historical runs.
@@ -368,28 +380,38 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
             if(live.position>=0) live.current=live.selected.back();
         }
     }
-    const auto earlier=[](const RunReader* a,const RunReader* b) { return a->key()<b->key(); };
-    std::vector<RunReader*> heads;
-    heads.reserve(runs.size());
-    for(auto& run:runs) if(run.position>=0) heads.push_back(&run);
-    std::priority_queue merge(earlier,std::move(heads));
-    const auto advance=[&](RunReader* run) {
-        run->previous();
-        if(run->position>=0) merge.push(run);
-    };
-    while(!merge.empty()) {
+    while(!history.empty() || (live_reader && live_reader->position>=0)) {
         if((++scanned&63)==0 && cancelled && cancelled()) return Json();
-        auto* selected=merge.top();
-        merge.pop();
+        const bool take_live=live_reader && live_reader->position>=0 &&
+            (history.empty() || history.front().key<live_reader->key());
+        RunReader* selected;
+        if(take_live) selected=&*live_reader;
+        else {
+            std::pop_heap(history.begin(),history.end(),earlier);
+            auto& head=history.back();
+            if(!head.reader) {
+                head.reader=std::make_unique<RunReader>(folder,*head.run,run_name(*head.run),before,revision,historical.size()==1);
+                if(head.reader->position<0) history.pop_back();
+                else { head.key=head.reader->key(); std::push_heap(history.begin(),history.end(),earlier); }
+                continue;
+            }
+            selected=head.reader.get();
+        }
+        const auto advance=[&] {
+            selected->previous();
+            if(take_live) return;
+            if(selected->position<0) history.pop_back();
+            else { history.back().key=selected->key(); std::push_heap(history.begin(),history.end(),earlier); }
+        };
         auto cursor=selected->key(); auto record=selected->current;
         // The unordered live run already applied both filters in its bounded
         // selection. Decode again only when the row fits on the page.
-        if(!selected->filtered && !matches_entry(record)) { advance(selected); continue; }
+        if(!selected->filtered && !matches_entry(record)) { advance(); continue; }
         const bool check_value=filter_values && !selected->filtered;
         Json value;
         if(check_value) {
             value=selected->value(packed,raw);
-            if(!matches_value(value)) { advance(selected); continue; }
+            if(!matches_value(value)) { advance(); continue; }
         }
         if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
         // These are independent snapshots. Keep the first card for each ID.
@@ -400,12 +422,12 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
             previous_timestamp=row.timestamp;
             projected.push_back(std::move(row));
         }
-        bytes+=record.raw?record.raw:PageBytes; last=std::move(cursor); advance(selected);
+        bytes+=record.raw?record.raw:PageBytes; last=cursor; advance();
     }
     if(cancelled && cancelled()) return Json();
     // Even an empty/filtered page can have crossed a live-slot mutation.
     // Reuse the GUI's existing observed-conflict retry, retaining its last page.
-    for(const auto& run:runs) run.validate();
+    if(live_reader) live_reader->validate();
     // The disk index already orders by microseconds. Distinct display
     // timestamps in the same index tick can still require a page-local sort.
     if(needs_sort) std::stable_sort(projected.begin(),projected.end(),[](const TaskRow& a,const TaskRow& b) {

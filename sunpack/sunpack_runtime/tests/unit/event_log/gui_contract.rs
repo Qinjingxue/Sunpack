@@ -89,7 +89,8 @@ fn rust_writer_cpp_query_publication_conflict() {
     let path = root.0.join("events.json");
     let source = root.0.join("carrier.001");
     let log = NativeEventLog::new(path.clone(), 7, true).unwrap();
-    log.write(json!({"event":"processing_started","owner":"test","path":source})).unwrap();
+    log.write(json!({"event":"pipeline_sources_claimed","owner":"test","processing":true,
+        "groups":[{"path":source,"members":[source]}]})).unwrap();
     log.flush().unwrap();
 
     // A live GUI reader shares DELETE. Replacement must let its old handle
@@ -187,15 +188,16 @@ fn rust_writer_cpp_query_lifecycle() {
     // Force the real live-store compaction threshold via retired slots, not
     // by rewriting its manifest or constructing a parallel index implementation.
     for index in 0..260 {
-        log.write(json!({"event":"processing_started","owner":format!("transient-{index}"),
-            "path":root.0.join(format!("transient-{index}.zip"))})).unwrap();
+        let source = root.0.join(format!("transient-{index}.zip"));
+        log.write(json!({"event":"pipeline_sources_claimed","owner":format!("transient-{index}"),
+            "processing":true,"groups":[{"path":source,"members":[source]}]})).unwrap();
     }
     log.flush().unwrap();
     let before = manifest(&path)["live"]["name"].clone();
     assert!(before.is_string());
     log.write(json!({"event":"task_retired","path":c})).unwrap();
     for index in 0..260 {
-        log.write(json!({"event":"task_retired","scope":"task",
+        log.write(json!({"event":"pipeline_sources_released","owner":format!("transient-{index}"),
             "path":root.0.join(format!("transient-{index}.zip"))})).unwrap();
     }
     log.flush().unwrap();
@@ -206,7 +208,8 @@ fn rust_writer_cpp_query_lifecycle() {
     assert!(rows(&binary, &path, "retired.part", "", "").is_empty());
     assert_eq!(rows(&binary, &path, "", "", "taskSucceeded"), history);
 
-    log.write(json!({"event":"processing_started","owner":"active","path":a})).unwrap();
+    log.write(json!({"event":"pipeline_sources_claimed","owner":"active","processing":true,
+        "groups":[{"path":a,"members":[a,b]}]})).unwrap();
     log.write(json!({"event":"done","owner":"active","path":b,"output_dirs":["new-output"]})).unwrap();
     log.flush().unwrap();
     let completed = rows(&binary, &path, "", "", "");

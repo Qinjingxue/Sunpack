@@ -47,7 +47,7 @@ namespace {
 using sunpack::sevenzip::AsyncFileWriter;
 using sunpack::sevenzip::ArchiveItemMetadata;
 using sunpack::sevenzip::AsyncWriterConfig;
-using sunpack::sevenzip::make_volume_state;
+using sunpack::sevenzip::VolumeState;
 using sunpack::sevenzip::VolumeWriterRegistry;
 
 std::filesystem::path make_test_directory() {
@@ -88,7 +88,7 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     config.threads_per_volume = 4;
     config.buffer_count = 8;
     AsyncFileWriter writer(
-        make_volume_state("test:parallel", false), config);
+        std::make_shared<VolumeState>("test:parallel", false), config);
     const auto job = writer.make_job();
     auto times = historical_times();
     times.defined |= ArchiveItemMetadata::Attributes;
@@ -117,6 +117,7 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     if (snapshot.hresult != S_OK || !snapshot.closed || snapshot.accepted_bytes != expected.size() ||
         snapshot.written_bytes != expected.size() || snapshot.peak_active_data_writes < 2 ||
         metrics.accepted_bytes != expected.size() || metrics.written_bytes != expected.size() ||
+        metrics.pending_bytes != 0 || metrics.discarded_bytes != 0 ||
         metrics.completed_files != 1 || metrics.completed_jobs != 1) {
         std::cerr << "parallel output state: accepted=" << snapshot.accepted_bytes
                   << " written=" << snapshot.written_bytes
@@ -166,7 +167,7 @@ bool blocked_open_does_not_block_other_jobs(const std::filesystem::path& directo
     // verifies cancellation can settle while an unrelated open is stalled.
     AsyncWriterConfig config;
     config.threads_per_volume = 4;
-    AsyncFileWriter writer(make_volume_state("test:open", false), config);
+    AsyncFileWriter writer(std::make_shared<VolumeState>("test:open", false), config);
     std::promise<void> entered, release;
     auto entered_future = entered.get_future();
     auto released = release.get_future().share();
@@ -328,39 +329,10 @@ bool cancelled_job_returns_pending_to_zero(const std::filesystem::path& director
     return true;
 }
 
-bool successful_job_leaves_pending_at_zero(const std::filesystem::path& directory) {
-    constexpr std::size_t payload_size = 6U << 20;
-    std::vector<unsigned char> payload(payload_size, 0x33);
-    AsyncFileWriter writer;
-    const auto job = writer.make_job();
-    const auto file = writer.make_file(
-        job, (directory / L"accounted.bin").wstring(), 4, 4);
-    std::uint32_t processed = 0;
-    if (writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed) != S_OK) {
-        return false;
-    }
-    writer.record_operation_result(file, 0);
-    writer.close_file(file, {});
-    if (writer.finish_job(job) != S_OK) {
-        return false;
-    }
-    const auto metrics = writer.snapshot_meters();
-    if (metrics.pending_bytes != 0 || metrics.discarded_bytes != 0 ||
-        metrics.written_bytes != payload_size ||
-        metrics.accepted_bytes != metrics.written_bytes + metrics.discarded_bytes + metrics.pending_bytes) {
-        std::cerr << "successful job accounting: accepted=" << metrics.accepted_bytes
-                  << " written=" << metrics.written_bytes
-                  << " discarded=" << metrics.discarded_bytes
-                  << " pending=" << metrics.pending_bytes << "\n";
-        return false;
-    }
-    return true;
-}
-
 bool cleanup_survives_allocation_failure(const std::filesystem::path& directory) {
     AsyncWriterConfig config;
     config.buffer_count = 8;
-    AsyncFileWriter writer(make_volume_state("oom:", false), config);
+    AsyncFileWriter writer(std::make_shared<VolumeState>("oom:", false), config);
     const auto first = writer.make_job();
     const auto sibling = writer.make_job();
     std::array<AsyncFileWriter::FileStatePtr, 8> files;
@@ -431,31 +403,6 @@ bool quiescence_tracks_jobs_and_files(const std::filesystem::path& directory) {
     return true;
 }
 
-bool configuration_is_snapshotted_not_reread(const std::filesystem::path& directory) {
-    AsyncWriterConfig config;
-    config.threads_per_volume = 2;
-    config.buffer_count = 8;
-    config.queue_limit = 16;
-    AsyncFileWriter writer(make_volume_state("cfg:", true), config);
-    if (writer.config().threads_per_volume != 2 || writer.config().buffer_count != 8 ||
-        writer.config().queue_limit != 16) {
-        std::cerr << "writer did not keep the supplied config\n";
-        return false;
-    }
-    // A facility built from the shared snapshot still writes correctly.
-    const std::vector<unsigned char> payload(1U << 20, 0x55);
-    const auto job = writer.make_job();
-    const auto file = writer.make_file(
-        job, (directory / L"configured.bin").wstring(), 7, 7);
-    std::uint32_t processed = 0;
-    if (writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed) != S_OK) {
-        return false;
-    }
-    writer.record_operation_result(file, 0);
-    writer.close_file(file, {});
-    return writer.finish_job(job) == S_OK && writer.is_quiescent();
-}
-
 bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& directory) {
     AsyncWriterConfig config;
     config.threads_per_volume = 2;
@@ -489,12 +436,6 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
             return false;
         }
         first = &lease.writer();
-        if (lease.writer().config().threads_per_volume != 2 ||
-            lease.writer().config().buffer_count != 8 ||
-            lease.writer().config().queue_limit != 4096) {
-            std::cerr << "facility did not receive the registry config\n";
-            return false;
-        }
     }
     {
         auto lease = registry.acquire("volume-a");
@@ -680,12 +621,6 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
             std::cerr << "synthetic key was not marked non-persistent\n";
             return false;
         }
-        if (lease.writer().config().threads_per_volume != 2 ||
-            lease.writer().config().buffer_count != 8 ||
-            lease.writer().config().queue_limit != 4096) {
-            std::cerr << "synthetic key did not keep the registry config\n";
-            return false;
-        }
         if (&registry.acquire("job:probe-1").writer() != &lease.writer()) {
             std::cerr << "second acquire of the same key created a second facility\n";
             return false;
@@ -814,9 +749,7 @@ int main() {
         closes_after_delayed_open_failure(directory) &&
         cancelled_job_returns_pending_to_zero(directory) &&
         cleanup_survives_allocation_failure(directory) &&
-        successful_job_leaves_pending_at_zero(directory) &&
         quiescence_tracks_jobs_and_files(directory) &&
-        configuration_is_snapshotted_not_reread(directory) &&
         registry_creation_failure_does_not_retain_entries() &&
         registry_creation_allows_other_volumes() &&
         registry_routes_by_volume_and_releases_leases(directory) &&

@@ -211,7 +211,7 @@ void check_completed_outputs_release_past_decoder_failure()
     {
         AsyncWriterConfig config;
         config.threads_per_volume = 1;
-        auto writer = std::make_shared<AsyncFileWriter>(make_volume_state("", false), config);
+        auto writer = std::make_shared<AsyncFileWriter>(nullptr, config);
         CMyComPtr<IInArchive> archive(new EntryArchive(L"entry", false));
         ExtractOutputTrace trace;
         auto *raw = new ExtractToDiskCallback(

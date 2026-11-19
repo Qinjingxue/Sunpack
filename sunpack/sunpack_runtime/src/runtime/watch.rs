@@ -5484,6 +5484,7 @@ impl Scheduler {
             // on another scheduler turn. Preserve all durable recovery intent.
             let _ = active.request.join();
         }
+        self.release_request_display_claims(batch);
     }
 
     fn complete_roots(&mut self, roots: Vec<RootCompleted>) -> io::Result<()> {
@@ -5545,13 +5546,18 @@ impl Scheduler {
             if let Some(input) = active.inputs.remove(member) { inputs.push(input); }
         }
         let quiet = members.iter().filter_map(|path| active.quiet.remove(path).map(|tracker| (path.clone(), tracker))).collect();
+        let group = root.groups.values().next().cloned();
         let context = CompletionContext {
             max_depth: active.max_depth,
             deep: active.deep,
             root: active.root.clone(), recovery: active.recovery.clone(), password_scope: active.password_scope.clone(), passwords: Arc::clone(&active.passwords),
             inputs, quiet, dirty, claimed: Arc::clone(&active.claimed), groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
         };
-        let (outcome, _) = self.apply_completion(&root.batch, context, root.completed)?;
+        let result = self.apply_completion(&root.batch, context, root.completed);
+        if let Some(group) = group {
+            self.journal.log(json!({"event":"pipeline_sources_released","owner":root.batch,"path":group.path}));
+        }
+        let (outcome, _) = result?;
         let groups = self.active.get(&root.batch).map(|active| active.groups.lock().unwrap());
         let mut retired = members;
         if let Some(groups) = groups {
@@ -5592,49 +5598,51 @@ impl Scheduler {
 
     fn complete(&mut self, batch: &str) -> io::Result<Option<super::toast::Finish>> {
         let Some(active) = self.active.remove(batch) else { return Ok(None); };
-        let mut completed = active.request.join()
-            .map_err(|_| io::Error::other("Watch extraction request failed"))?;
-        completed.cancelled |= active.cancel.cancelled();
-        let groups = std::mem::take(&mut *active.groups.lock().unwrap()).into_aliases();
-        self.apply_completion(batch, CompletionContext {
-            max_depth: active.max_depth,
-            deep: active.deep,
-            root: active.root, recovery: active.recovery, password_scope: active.password_scope, passwords: active.passwords,
-            inputs: active.inputs.into_values().collect(), quiet: active.quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
-        }, completed).map(|(_, finish)| finish)
+        let result = active.request.join()
+            .map_err(|_| io::Error::other("Watch extraction request failed"))
+            .and_then(|mut completed| {
+                completed.cancelled |= active.cancel.cancelled();
+                let groups = std::mem::take(&mut *active.groups.lock().unwrap()).into_aliases();
+                self.apply_completion(batch, CompletionContext {
+                    max_depth: active.max_depth,
+                    deep: active.deep,
+                    root: active.root, recovery: active.recovery, password_scope: active.password_scope, passwords: active.passwords,
+                    inputs: active.inputs.into_values().collect(), quiet: active.quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
+                }, completed).map(|(_, finish)| finish)
+            });
+        self.release_request_display_claims(batch);
+        result
     }
 
     fn apply_completion(&mut self, batch: &str, mut active: CompletionContext, completed: Completed) -> io::Result<(Outcome, Option<super::toast::Finish>)> {
-        let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_complete_state", Origin::Watch, || {
-            consume_claimed_pending(
-                &mut self.pending, &mut self.due, &mut self.unpublished,
-                &active.groups, &active.claimed.lock().unwrap().candidates, &mut active.inputs, &mut active.quiet,
-            );
-            let mut quiet = std::mem::take(&mut active.quiet);
-            let dirty = std::mem::take(&mut active.dirty);
-            let root = active.root.clone();
-            let recovery = active.recovery.clone();
-            let claimed = Arc::clone(&active.claimed);
-            let result = self.apply_completion_blocking(batch, active, completed, &mut quiet)?;
-            // Publish the old generation first. An interrupted blocker then
-            // suppresses only that generation, not a replacement during claim.
-            for path in dirty {
-                if !self.pending.contains_key(&path) {
-                    let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
-                    let tracker = quiet.remove(&path);
-                    if let Some(entry) = self.journal.state().entry(&path)
-                        .filter(|entry| entry.is_missing_volume()) {
-                        self.check_missing_volume(&entry, false)?;
-                        continue;
-                    }
-                    let admission = CandidateAdmission::Observe;
-                    self.observe_candidate_with_event(&root, path, admission, recovery.clone(), captured.as_ref(), tracker,
-                        Some(&CandidateEvent::Business("pipeline_claim_released")), None)?;
+        // Root and request completion already run on the shared blocking stage.
+        consume_claimed_pending(
+            &mut self.pending, &mut self.due, &mut self.unpublished,
+            &active.groups, &active.claimed.lock().unwrap().candidates, &mut active.inputs, &mut active.quiet,
+        );
+        let mut quiet = std::mem::take(&mut active.quiet);
+        let dirty = std::mem::take(&mut active.dirty);
+        let root = active.root.clone();
+        let recovery = active.recovery.clone();
+        let claimed = Arc::clone(&active.claimed);
+        let result = self.apply_completion_blocking(batch, active, completed, &mut quiet)?;
+        // Publish the old generation first. An interrupted blocker then
+        // suppresses only that generation, not a replacement during claim.
+        for path in dirty {
+            if !self.pending.contains_key(&path) {
+                let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
+                let tracker = quiet.remove(&path);
+                if let Some(entry) = self.journal.state().entry(&path)
+                    .filter(|entry| entry.is_missing_volume()) {
+                    self.check_missing_volume(&entry, false)?;
+                    continue;
                 }
+                let admission = CandidateAdmission::Observe;
+                self.observe_candidate_with_event(&root, path, admission, recovery.clone(), captured.as_ref(), tracker,
+                    Some(&CandidateEvent::Business("pipeline_claim_released")), None)?;
             }
-            Ok(result)
-        })?
+        }
+        Ok(result)
     }
 
     fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, completed: Completed, quiet: &mut HashMap<String, quiet::Activity>) -> io::Result<(Outcome, Option<super::toast::Finish>)> {
@@ -5731,7 +5739,6 @@ impl Scheduler {
             Ok(outcome) => outcome,
             Err(error) if completed.cancelled => {
                 self.journal.log(json!({"event":"pipeline_request_interrupted","owner":batch,"error":error.to_string()}));
-                self.release_display_claims(batch, &groups);
                 self.arm_idle_cleanup();
                 return Ok((Outcome::default(), finish));
             }
@@ -5744,7 +5751,6 @@ impl Scheduler {
                 }
                 self.journal.commit(true, |_| Ok(absent))?;
                 self.persist_candidates(BTreeMap::new(), true)?;
-                self.release_display_claims(batch, &groups);
                 self.arm_idle_cleanup();
                 return Ok((Outcome::default(), finish));
             }
@@ -6090,7 +6096,7 @@ impl Scheduler {
                 let Some(failure) = error.failure.as_deref() else { continue; };
                 // Top-level discovery can fail on a peer that was never
                 // admitted as a task. Its request still has a terminal failure.
-                if !reported_discovery.contains(error.path.as_path()) {
+                if reported_discovery.insert(error.path.as_path()) {
                     self.journal.log(json!({
                         "event":"failed_terminal","path":error.path,"owner":batch,
                         "error":super::failure::message(failure, self.settings.cli.language),
@@ -6108,7 +6114,6 @@ impl Scheduler {
                 .filter(|_| active.recovery.is_some()).map(|candidate| candidate.path.clone())))?;
         }
         self.retire_dependency_observers();
-        self.release_display_claims(batch, &groups);
         if !published_outputs.is_empty() {
             self.hub.update(|signals| signals.published_outputs.extend(published_outputs));
         }
@@ -6191,15 +6196,8 @@ impl Scheduler {
         )
     }
 
-    fn release_display_claims(&self, batch: &str, groups: &HashMap<String, Arc<SourceGroup>>) {
-        if !groups.is_empty() {
-            let paths = groups
-                .values()
-                .map(|group| &group.path)
-                .collect::<HashSet<_>>();
-            self.journal
-                .log(json!({"event":"pipeline_sources_released","owner":batch,"paths":paths}));
-        }
+    fn release_request_display_claims(&self, batch: &str) {
+        self.journal.log(json!({"event":"pipeline_sources_released","owner":batch}));
     }
 }
 
@@ -6564,9 +6562,11 @@ struct ObservedOutputs {
 
 impl From<BTreeMap<String, String>> for ObservedOutputs {
     fn from(paths: BTreeMap<String, String>) -> Self {
-        let mut outputs = Self::default();
-        for (path, owner) in paths { outputs.insert(path, owner); }
-        outputs
+        let mut owners = HashMap::<_, HashSet<_>>::new();
+        for (path, owner) in &paths {
+            owners.entry(watch_path_key(owner)).or_default().insert(path.clone());
+        }
+        Self { paths, owners }
     }
 }
 

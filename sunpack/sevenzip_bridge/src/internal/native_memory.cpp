@@ -64,8 +64,16 @@ std::int64_t NativeMemoryManager::query_windows(std::uint64_t reserve) noexcept 
     return room;
 }
 
-NativeMemoryManager::NativeMemoryManager(std::uint64_t reserve, Query query, std::function<void()> reclaim)
-    : reserve_bytes_(reserve), query_(std::move(query)), reclaim_(std::move(reclaim)) {
+NativeMemoryManager::NativeMemoryManager(std::uint64_t reserve, std::function<void()> reclaim
+#ifdef SUP7Z_DEBUG
+                                         , Query query
+#endif
+    )
+    : reserve_bytes_(reserve), reclaim_(std::move(reclaim))
+#ifdef SUP7Z_DEBUG
+    , query_(std::move(query))
+#endif
+{
     change_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!change_) throw std::bad_alloc();
     low_ = CreateMemoryResourceNotification(LowMemoryResourceNotification);
@@ -100,7 +108,11 @@ std::int64_t NativeMemoryManager::sample_locked(bool fresh) {
     // ledger under the same mutex; concurrent dictionaries cannot spend it twice.
     const bool requested = resample_.exchange(false, std::memory_order_acq_rel);
     if (fresh || requested || now - sampled_at_ >= 250) {
-        cached_headroom_ = query_ ? query_() : query_windows(reserve_bytes_);
+#ifdef SUP7Z_DEBUG
+        if (query_) cached_headroom_ = query_();
+        else
+#endif
+            cached_headroom_ = query_windows(reserve_bytes_);
         sampled_at_ = now;
     }
     return cached_headroom_ - static_cast<std::int64_t>(reserved_bytes_);
@@ -248,7 +260,9 @@ void NativeMemoryManager::released(NativeMemoryJob &job, void *address, std::siz
     const auto bytes = commitment(size);
     job.committed -= bytes;
     cached_headroom_ += static_cast<std::int64_t>(bytes);
-    SetEvent(change_);
+    // A refund needs an immediate recheck only for parked jobs or live pressure.
+    if (!waiters_.empty() || cached_headroom_ < static_cast<std::int64_t>(reserved_bytes_))
+        SetEvent(change_);
 }
 bool NativeMemoryManager::may_start_thread(NativeMemoryJob &job) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -434,6 +448,11 @@ int sunpack_memory_free(void *address) {
         if (found == allocations.end()) return 0;
         allocation = found->second;
         allocations.erase(found);
+        // MSVC keeps the bucket array after the last managed allocation drains.
+        if (allocations.empty() && allocations.bucket_count() > 256) {
+            try { decltype(allocations){}.swap(allocations); }
+            catch (const std::bad_alloc &) { /* Keep the reusable empty table under pressure. */ }
+        }
     }
     allocation.job->owner.released(*allocation.job, address, allocation.size);
     return 1;

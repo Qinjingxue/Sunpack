@@ -842,8 +842,7 @@ void g24_sticky_hint_survives_recovery() {
     auto gate = make_gate("job:g24", log);
 
     auto states = std::make_shared<std::vector<VolumeStatePtr>>();
-    auto state = sunpack::sevenzip::make_volume_state("job:g24", false);
-    state->space_gate = gate;
+    auto state = std::make_shared<sunpack::sevenzip::VolumeState>("job:g24", false, gate);
     states->push_back(state);
 
     // 统计 provider 被调用的次数，用于测出"未满盘时 monitor 零开销"。
@@ -896,10 +895,8 @@ void g25_two_volumes_recover_independently() {
     auto gate_a = make_gate("job:g25-a", log_a);
     auto gate_b = make_gate("job:g25-b", log_b);
 
-    auto state_a = sunpack::sevenzip::make_volume_state("job:g25-a", false);
-    auto state_b = sunpack::sevenzip::make_volume_state("job:g25-b", false);
-    state_a->space_gate = gate_a;
-    state_b->space_gate = gate_b;
+    auto state_a = std::make_shared<sunpack::sevenzip::VolumeState>("job:g25-a", false, gate_a);
+    auto state_b = std::make_shared<sunpack::sevenzip::VolumeState>("job:g25-b", false, gate_b);
 
     auto blocked = std::make_shared<std::vector<VolumeStatePtr>>();
     blocked->push_back(state_a);
@@ -1111,8 +1108,7 @@ void g31_monitor_drops_episode_history_after_recovery() {
     auto gate = make_gate("job:g31", log);
 
     auto blocked = std::make_shared<std::vector<VolumeStatePtr>>();
-    auto state = sunpack::sevenzip::make_volume_state("job:g31", false);
-    state->space_gate = gate;
+    auto state = std::make_shared<sunpack::sevenzip::VolumeState>("job:g31", false, gate);
 
     auto status_calls = std::make_shared<std::atomic<int>>(0);
     int snapshots = 0;
@@ -1154,8 +1150,8 @@ void g31_monitor_drops_episode_history_after_recovery() {
     // 一个卷持续阻塞，其他卷被 registry 回收后又以相同 key 创建。
     // 旧实现只在 provider 全空时清理，既会残留历史，也会吞掉新对象的首次诊断。
     for (int index = 0; index < 8; ++index) {
-        auto transient = sunpack::sevenzip::make_volume_state("job:g31-transient", false);
-        transient->space_gate = make_gate("job:g31-transient", log);
+        auto transient = std::make_shared<sunpack::sevenzip::VolumeState>(
+            "job:g31-transient", false, make_gate("job:g31-transient", log));
         transient->space_gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
         blocked->push_back(transient);
         monitor.note_blocked();
@@ -1341,8 +1337,7 @@ void vhd_recovery(const std::filesystem::path &root, const std::filesystem::path
         });
     gate->register_job("cancelled");
     gate->register_job("survivor");
-    auto state = sunpack::sevenzip::make_volume_state("job:vhd-recovery", false);
-    state->space_gate = gate;
+    auto state = std::make_shared<sunpack::sevenzip::VolumeState>("job:vhd-recovery", false, gate);
     bool stale_empty_snapshot = true;
     int provider_calls = 0;
     VolumeSpaceMonitor monitor({1ms, 1ms}, [&] {

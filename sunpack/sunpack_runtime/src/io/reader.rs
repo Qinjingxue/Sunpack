@@ -1316,14 +1316,15 @@ impl CacheShard {
     }
 
     fn compact_stale_orders(&mut self) {
-        // Cache payloads and byte counters are removed synchronously. Only
-        // obsolete LRU queue keys are compacted amortized so targeted release
-        // does not turn back into a full-cache scan.
+        // Payloads are freed immediately. Rebuild the order only when enough
+        // obsolete keys can pay for visiting the live keys too.
         for queue in [&mut self.hot, &mut self.general] {
             if queue.order.len() == queue.stale {
                 queue.order.clear();
                 queue.stale = 0;
-            } else if queue.stale >= CACHE_ORDER_COMPACT_STALE_MIN {
+            } else if queue.stale >= CACHE_ORDER_COMPACT_STALE_MIN
+                && queue.stale >= queue.order.len() - queue.stale
+            {
                 queue.order.retain(|(key, generation)| {
                     self.entries
                         .get(key)
@@ -1370,6 +1371,9 @@ impl ReaderManager {
                 .iter()
                 .filter_map(|(&id, source)| path_is_under_roots(&source.path, roots).then_some(id))
                 .collect::<Vec<_>>();
+            if source_ids.is_empty() {
+                continue;
+            }
             for source_id in source_ids {
                 shard.remove_source(source_id);
             }
@@ -1458,6 +1462,9 @@ impl ReaderManager {
             .is_some_and(|current| Arc::ptr_eq(current, load))
         {
             loads.remove(&index);
+            if loads.capacity() > 256 {
+                crate::collections::trim_map(&mut loads);
+            }
         }
         // Keep the registry locked until waiters are notified so a failed load
         // cannot be immediately re-observed as the same completed entry.

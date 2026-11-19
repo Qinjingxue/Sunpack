@@ -598,6 +598,14 @@ fn targeted_cache_cleanup_drops_peak_allocations_and_keeps_live_borrows() {
         keys.push(key);
     }
     let live = keys.pop().unwrap();
+    // A small invalidation against a densely populated shard should free
+    // its payloads without visiting the entire queue under the reader lock.
+    for key in keys.drain(..2 * CACHE_ORDER_COMPACT_STALE_MIN) {
+        assert!(shard.remove_source(key.source_id));
+    }
+    shard.compact_stale_orders();
+    assert_eq!(shard.hot.stale, CACHE_ORDER_COMPACT_STALE_MIN);
+    assert_eq!(shard.general.stale, CACHE_ORDER_COMPACT_STALE_MIN);
     for key in keys {
         assert!(shard.remove_source(key.source_id));
     }

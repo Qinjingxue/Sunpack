@@ -379,7 +379,7 @@ export default {
     discardRoot(id) {
       if(this.rootCell===id) { this.rootCell=''; this.rootPart=''; }
       let drafts=Object.assign({},this.rootDrafts); delete drafts[id]; this.rootDrafts=drafts;
-      this.rootNew=this.rootNew.filter(r=>r.id!==id); this.send('clearRootError',{id:id});
+      this.rootNew=this.rootNew.filter(r=>r.id!==id);
     },
     rebaseRootRequests(records) {
       let index=new Map(records.map(r=>[r.id,r]));
@@ -590,7 +590,6 @@ export default {
       if(this.passwordCell===id) this.passwordCell='';
       let drafts=Object.assign({},this.passwordDrafts); delete drafts[id]; this.passwordDrafts=drafts;
       this.passwordNew=this.passwordNew.filter(p=>p.id!==id);
-      this.send('clearPasswordError',{id:id});
     },
     rebasePasswordRequests(id,previous,original,removed,sent) {
       let pending=false,requests=[];

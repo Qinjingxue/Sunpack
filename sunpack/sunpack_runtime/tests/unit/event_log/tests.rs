@@ -73,7 +73,7 @@ fn queued_groups_survive_live_mutation_and_release_after_completion() {
     projection.apply(&mut json!({"event":"suspended_missing_volume",
         "path":path,"owner":"run","ts":1}));
     let old = projection
-        .updates(false)
+        .updates()
         .0
         .pop()
         .unwrap()
@@ -85,7 +85,7 @@ fn queued_groups_survive_live_mutation_and_release_after_completion() {
 
     projection.apply(&mut json!({"event":"candidate_departed","path":member}));
     let current = projection
-        .updates(false)
+        .updates()
         .0
         .pop()
         .unwrap()
@@ -117,13 +117,14 @@ fn expired_processing_row_releases_payload_and_still_routes_completion() {
     let member = "C:/archive.002";
     projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"run",
         "processing":true,"ts":1,"groups":[{"path":path,"members":[path,member]}]}));
-    let (id, row) = projection.updates(false).0.pop().unwrap();
+    let (id, row) = projection.updates().0.pop().unwrap();
     let lifetime = Arc::downgrade(&row.unwrap().0);
     assert!(lifetime.upgrade().is_some());
 
     projection.expire_live(vec![Arc::clone(&id)], 1_000_000);
     assert!(lifetime.upgrade().is_none());
-    assert!(projection.updates(true).0[0].1.is_none());
+    projection.mark_all();
+    assert!(projection.updates().0[0].1.is_none());
 
     projection.apply(&mut json!({"event":"candidate_departed","path":member}));
     let mut completion = json!({"event":"done","path":member,"owner":"run","ts":2});
@@ -137,6 +138,21 @@ fn completed_families_leave_no_resident_history_or_aliases() {
     // Disk/GUI checks cannot see producer references. Removing this test
     // loses detection of retained completed families; no disk I/O is needed.
     let mut projection = Projection::default();
+    let first = "C:/first.zip";
+    let sibling = "C:/sibling.zip";
+    let abandoned = "C:/abandoned.zip";
+    projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"parallel",
+        "processing":true,"groups":[{"path":first,"members":[first]},
+            {"path":sibling,"members":[sibling]},{"path":abandoned,"members":[abandoned]}]}));
+    assert!(projection.apply(&mut json!({"event":"done","path":first,"owner":"parallel"})));
+    projection.apply(&mut json!({"event":"pipeline_sources_released","owner":"parallel","path":first}));
+    assert!(projection.alias_id(&key(first)).is_none());
+    assert!(projection.apply(&mut json!({"event":"done","path":sibling,"owner":"parallel"})));
+    assert!(!projection.apply(&mut json!({"event":"done","path":sibling,"owner":"parallel"})));
+    projection.apply(&mut json!({"event":"pipeline_sources_released","owner":"parallel"}));
+    assert!(projection.tasks.is_empty() && projection.owner_tasks.is_empty()
+        && projection.aliases.is_empty() && projection.retiring.is_empty());
+
     for index in 0..64 {
         let path = format!("C:/carrier-{index}.fake");
         let sibling = format!("C:/opaque-{index}.002");
@@ -152,25 +168,26 @@ fn completed_families_leave_no_resident_history_or_aliases() {
             .apply(&mut json!({"event":"done","path":path,"owner":"batch","ts":2})));
     }
     // A later request can claim the same member before the old batch
-    // releases. A delayed old result must still be suppressed by path,
-    // including when its explicit task ID differs from both recorded IDs.
+    // releases. A delayed old result must still be suppressed by path.
     let path = "C:/opaque-0.002";
     projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"next",
-        "processing":true,"ts":3,"groups":[{"task_id":"next-id","path":path,"members":[path]}]}));
+        "processing":true,"ts":3,"groups":[{"path":path,"members":[path]}]}));
+    let next_id = projection.alias_id(&key(path)).unwrap().clone();
     assert!(!projection.apply(
-        &mut json!({"event":"done","task_id":"late-id","path":path,"owner":"batch","ts":4}),
+        &mut json!({"event":"done","path":path,"owner":"batch","ts":4}),
     ));
     projection.apply(&mut json!({"event":"pipeline_sources_released","owner":"batch"}));
     assert_eq!(projection.aliases.len(), 1);
     assert!(projection.retiring.is_empty() && !projection.owner_tasks.contains_key("batch"));
     let mut completion = json!({"event":"done","path":path,"owner":"next","ts":5});
     assert!(projection.apply(&mut completion));
-    assert_eq!(completion["task_id"], "next-id");
-    let other = "C:/other.zip";
-    projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"next",
-        "groups":[{"task_id":"next-id","path":other,"members":[other]}]}));
-    projection.apply(&mut json!({"event":"task_retired","scope":"task","task_id":"next-id","path":other}));
+    assert_eq!(completion["task_id"], next_id.as_ref());
     projection.apply(&mut json!({"event":"pipeline_sources_released","owner":"next"}));
+    assert!(projection.aliases.is_empty() && projection.retiring.is_empty() && projection.owner_tasks.is_empty());
+    // Discovery can emit a terminal failure before it has claimed a source.
+    // Publishing that result never creates an outstanding completion route.
+    assert!(projection.apply(&mut json!({"event":"failed_terminal",
+        "path":"C:/unclaimed.zip","owner":"failed-discovery","ts":6})));
     assert!(projection.aliases.is_empty() && projection.retiring.is_empty() && projection.owner_tasks.is_empty());
     let mut waiting =
         json!({"event":"suspended_missing_volume","path":"C:/abandoned.002","ts":1});
@@ -185,8 +202,7 @@ fn deduplicated_proposal_retires_live_owner_and_preserves_named_history() {
     let mut projection = Projection::default();
     let source = "C:/watch/copy.zip";
     projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"dedup-run",
-        "groups":[{"path":source,"members":[source]}]}));
-    projection.apply(&mut json!({"event":"processing_started","owner":"dedup-run","path":source,"ts":1}));
+        "processing":true,"ts":1,"groups":[{"path":source,"members":[source]}]}));
     let mut terminal = json!({"event":"watch_deduplicated","owner":"dedup-run","path":source,
         "ts":2,"retire_group":true,"output_dirs":[]});
     assert!(state_event("watch_deduplicated"));

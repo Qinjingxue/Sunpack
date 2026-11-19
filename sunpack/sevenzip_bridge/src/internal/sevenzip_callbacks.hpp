@@ -918,7 +918,7 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE SetTotal(UInt64 total) SUP7Z_NOEXCEPT override
         {
-
+            if (!progress_) return is_cancelled() ? E_ABORT : S_OK;
             std::lock_guard<std::recursive_mutex> lock(state_mutex_);
 
             if (is_cancelled())
@@ -935,7 +935,7 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *completeValue) SUP7Z_NOEXCEPT override
         {
-
+            if (!progress_ || !completeValue) return is_cancelled() ? E_ABORT : S_OK;
             std::lock_guard<std::recursive_mutex> lock(state_mutex_);
 
             if (is_cancelled())
@@ -943,14 +943,8 @@ namespace sunpack::sevenzip
                 return E_ABORT;
             }
 
-            if (completeValue)
-            {
-
-                completed_bytes_ = *completeValue;
-
-                emit("progress");
-            }
-
+            completed_bytes_ = *completeValue;
+            emit("progress");
             return S_OK;
         }
 

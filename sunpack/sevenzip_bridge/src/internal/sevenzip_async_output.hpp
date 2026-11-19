@@ -198,7 +198,6 @@ namespace sunpack::sevenzip
                     test_completed_jobs_.load(std::memory_order_relaxed)};
         }
 
-        const AsyncWriterConfig &config() const noexcept { return config_; }
 #endif
 
         const VolumeStatePtr &volume_state() const noexcept { return state_; }
@@ -257,9 +256,6 @@ namespace sunpack::sevenzip
             const UInt32 item_index = 0;
             const std::size_t trace_index = 0;
 
-            // 本文件所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
-            // 在 make_file() 时快照进来，writer 线程不再取 state_。
-            VolumeSpaceGate *volume_space_gate() const noexcept { return space_gate.get(); }
             bool captures_inventory() const noexcept { return job->capture_inventory; }
             const WrittenRanges &previous_writes() const noexcept {
                 static const WrittenRanges empty;
@@ -272,7 +268,6 @@ namespace sunpack::sevenzip
             JobStatePtr job;
             std::wstring path;
             const ArchiveItemMetadata metadata;
-            std::shared_ptr<VolumeSpaceGate> space_gate;
             UInt64 next_write_offset = 0;
             std::mutex producer_mutex;
             Buffer *staging_buffer = nullptr;
@@ -352,18 +347,17 @@ namespace sunpack::sevenzip
         AsyncFileWriter(
             VolumeStatePtr state,
             AsyncWriterConfig config = {})
-            : state_(state ? std::move(state) : make_volume_state(std::string{}, false)),
-              config_(config),
+            : state_(state ? std::move(state) : std::make_shared<VolumeState>(std::string{}, false)),
               writer_count_((std::max)(std::size_t{1}, config.threads_per_volume)),
-              buffer_count_((std::max)(std::size_t{4}, config.buffer_count)),
-              queue_limit_((std::max)(std::size_t{1}, config.queue_limit))
+              queue_limit_((std::max)(std::size_t{1}, config.queue_limit)),
+              write_through_(config.write_through)
         {
-            initialize();
+            initialize((std::max)(std::size_t{4}, config.buffer_count));
         }
 
         AsyncFileWriter()
             : AsyncFileWriter(
-                  make_volume_state(std::string{}, false),
+                  nullptr,
                   configured_async_writer_config()) {}
 
         ~AsyncFileWriter() { finish(); }
@@ -419,8 +413,6 @@ namespace sunpack::sevenzip
                 file->mtime_ns = replay->mtime;
             }
             std::lock_guard<std::mutex> lock(mutex_);
-            // 快照本卷的空间 gate；功能关闭 / 空 key 时为 nullptr。
-            file->space_gate = state_ ? state_->space_gate : nullptr;
             file->active_index = active_files_.size();
             active_files_.push_back(file);
             return file;
@@ -729,6 +721,7 @@ namespace sunpack::sevenzip
             return result;
         }
 
+#ifdef SUP7Z_DEBUG
         void cancel_job(const JobStatePtr &job) noexcept
         {
             if (!job)
@@ -746,6 +739,7 @@ namespace sunpack::sevenzip
             seal_job_files(job);
             drain_cancelled_retries();
         }
+#endif
 
         void wake_waiters() noexcept
         {
@@ -766,7 +760,7 @@ namespace sunpack::sevenzip
             }
             drain_cancelled_retries();
             // 取消必须能穿透"因满盘而暂停"：卷 gate 的等待者也要被唤醒。
-            if (state_ && state_->space_gate)
+            if (state_->space_gate)
             {
                 state_->space_gate->wake_waiters();
             }
@@ -861,7 +855,7 @@ namespace sunpack::sevenzip
             producer_cv_.notify_all();
             if (state_->space_gate) state_->space_gate->wake_waiters();
             seal_job_files(nullptr);
-            if (state_ && state_->space_gate) state_->space_gate->wake_waiters();
+            if (state_->space_gate) state_->space_gate->wake_waiters();
             producer_cv_.notify_all();
             drain_cancelled_retries();
             {
@@ -919,11 +913,11 @@ namespace sunpack::sevenzip
             active_files_.pop_back();
         }
 
-        void initialize()
+        void initialize(std::size_t buffer_count)
         {
-            buffers_.reserve(buffer_count_);
-            free_buffers_.reserve(buffer_count_);
-            for (std::size_t index = 0; index < buffer_count_; ++index)
+            buffers_.reserve(buffer_count);
+            free_buffers_.reserve(buffer_count);
+            for (std::size_t index = 0; index < buffer_count; ++index)
             {
                 auto buffer = std::make_unique<Buffer>();
                 free_buffers_.push_back(buffer.get());
@@ -934,8 +928,11 @@ namespace sunpack::sevenzip
             if (!completion_port_) throw std::bad_alloc();
             try
             {
-                space_wake_ = std::make_shared<CompletionWake>(completion_port_);
-                if (state_->space_gate) state_->space_gate->subscribe(space_wake_);
+                if (state_->space_gate)
+                {
+                    space_wake_ = std::make_shared<CompletionWake>(completion_port_);
+                    state_->space_gate->subscribe(space_wake_);
+                }
                 workers_.reserve(writer_count_);
                 for (std::size_t index = 0; index < writer_count_; ++index)
                 {
@@ -969,10 +966,8 @@ namespace sunpack::sevenzip
         {
             if (!space_wake_) return;
             space_wake_->disable();
-            if (state_->space_gate) state_->space_gate->unsubscribe(space_wake_);
+            state_->space_gate->unsubscribe(space_wake_);
         }
-
-        bool write_through() const noexcept { return config_.write_through; }
 
 #ifdef SUP7Z_DEBUG
         void account_discarded(std::size_t bytes) noexcept
@@ -1294,7 +1289,7 @@ namespace sunpack::sevenzip
             const auto file = buffer->file;
             const bool held_probe = buffer->probe_lease.valid();
             settle_space_attempt(buffer->probe_lease, result, file->path);
-            if (result.kind == AttemptResult::Kind::SpaceFailure && file->space_gate)
+            if (result.kind == AttemptResult::Kind::SpaceFailure && state_->space_gate)
             {
                 auto item = WorkItem::data(buffer, buffer->output_offset);
                 item.retry_error = held_probe ? 0 : result.win32_error;
@@ -1347,7 +1342,7 @@ namespace sunpack::sevenzip
         {
             const auto file = item.kind == WorkItem::Kind::Data ? item.buffer->file : item.file;
             if (item.retry_error)
-                report_retry_space_failure(file->space_gate.get(), item.retry_error, file->path);
+                report_retry_space_failure(state_->space_gate.get(), item.retry_error, file->path);
             try
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1376,7 +1371,7 @@ namespace sunpack::sevenzip
                     {
                         const auto file = it->kind == WorkItem::Kind::Data ? it->buffer->file : it->file;
                         synchronize_cancellation_locked(file->job);
-                        auto decision = file->space_gate->try_wait(writer_terminal_predicate(file->job));
+                        auto decision = state_->space_gate->try_wait(writer_terminal_predicate(file->job));
                         if (decision.kind == VolumeSpaceGate::WaitResult::Kind::Pending) continue;
                         lease = std::move(decision.lease);
                         item = std::move(*it);
@@ -1428,7 +1423,7 @@ namespace sunpack::sevenzip
             }
 
             DWORD creation_flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
-            if (write_through())
+            if (write_through_)
             {
                 creation_flags |= FILE_FLAG_WRITE_THROUGH;
             }
@@ -1455,7 +1450,7 @@ namespace sunpack::sevenzip
                 const DWORD error = open_error;
                 if (is_output_space_failure(error))
                 {
-                    if (!file->space_gate)
+                    if (!state_->space_gate)
                     {
                         // gate 关闭时任何错误都置 open_attempted = true，即不再尝试。
                         file->open_attempted = true;
@@ -1651,7 +1646,7 @@ namespace sunpack::sevenzip
                 std::lock_guard<std::mutex> lock(mutex_);
                 handle = file->handle;
             }
-            if (result.kind == AttemptResult::Kind::Succeeded && handle != INVALID_HANDLE_VALUE && write_through())
+            if (result.kind == AttemptResult::Kind::Succeeded && handle != INVALID_HANDLE_VALUE && write_through_)
             {
                 DWORD error = ERROR_SUCCESS;
                 if (!flush_file(handle, error))
@@ -1664,7 +1659,7 @@ namespace sunpack::sevenzip
             // A terminal job cannot prove recovery even if its cleanup flush succeeds.
             if (current_error(job) != S_OK) result = {AttemptResult::Kind::Terminal, 0};
             settle_space_attempt(lease, result, file->path);
-            if (result.kind == AttemptResult::Kind::SpaceFailure && file->space_gate)
+            if (result.kind == AttemptResult::Kind::SpaceFailure && state_->space_gate)
             {
                 auto item = WorkItem::close(file);
                 item.retry_error = held_probe ? 0 : result.win32_error;
@@ -1793,7 +1788,7 @@ namespace sunpack::sevenzip
                 std::lock_guard<std::mutex> lock(mutex_);
                 fail_file_locked(file, hr);
             }
-            if (file && file->space_gate) file->space_gate->wake_waiters();
+            if (file && state_->space_gate) state_->space_gate->wake_waiters();
             producer_cv_.notify_all();
         }
 
@@ -1818,10 +1813,9 @@ namespace sunpack::sevenzip
         std::deque<WorkItem> retry_queue_;
         std::shared_ptr<CompletionWake> space_wake_;
         const VolumeStatePtr state_;
-        const AsyncWriterConfig config_;
         const std::size_t writer_count_;
-        const std::size_t buffer_count_;
         const std::size_t queue_limit_;
+        const bool write_through_;
         // 必须是 atomic：gate 的 terminal predicate 会无锁读它。
         std::atomic<bool> stopping_{false};
 

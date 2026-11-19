@@ -164,13 +164,4 @@ private:
 
 } // namespace sunpack::sevenzip
 
-#else
-
-namespace sunpack::sevenzip
-{
-
-inline bool pipeline_timing_enabled() noexcept { return false; }
-
-} // namespace sunpack::sevenzip
-
 #endif

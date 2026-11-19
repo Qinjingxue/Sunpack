@@ -99,10 +99,8 @@ struct Edge {
 struct Topology {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
-    roots: Vec<usize>,
+    roots: Vec<[usize; 3]>,
     ends: Vec<(usize, u64, usize, usize)>,
-    cases: usize,
-    case_layouts: Vec<(usize, usize)>,
     ambiguous_ranges: std::sync::OnceLock<Vec<(u64, u64)>>,
     disk_mappings: OnceLock<BTreeMap<usize, DiskMapping>>,
 }
@@ -240,15 +238,7 @@ impl Projection {
     fn proof(&self) -> Arc<crate::password::evidence::VolumeProjection> {
         let graph = &self.topology;
         Arc::new(crate::password::evidence::VolumeProjection {
-            roots: graph
-                .roots
-                .iter()
-                .enumerate()
-                .map(|(case, &root)| {
-                    let (layout, count) = graph.case_layouts[case];
-                    [layout, count, root]
-                })
-                .collect(),
+            roots: graph.roots.clone(),
             edges: graph
                 .edges
                 .iter()
@@ -266,46 +256,37 @@ impl Projection {
         })
     }
 
-    fn order(&self, plan: &VolumeAttemptPlan) -> Vec<usize> {
+    fn order(&self, plan: &VolumeAttemptPlan) -> Option<Vec<usize>> {
         // Only the first injective path is needed for ordered commit. Do not
         // materialize the Cartesian product represented by this projection.
         let graph = &self.topology;
-        let mut best = vec![usize::MAX];
-        for (case, &root) in graph.roots.iter().enumerate() {
-            let (layout, count) = graph.case_layouts[case];
-            let mut stack = vec![(root, 0usize)];
-            let mut selected = Vec::new();
-            let mut used = vec![false; plan.sources.len()];
+        let mut best: Option<Vec<usize>> = None;
+        let mut stack = Vec::new();
+        let mut selected = Vec::new();
+        let mut used = vec![false; plan.sources.len()];
+        for &[layout, count, root] in &graph.roots {
+            let slots = &plan.layouts[layout].slots;
+            let omitted = slots.len() - count;
+            // Roots follow layout order and decreasing slot count. Only other
+            // terminal totals of the same layout and count can beat a match.
+            if best.as_ref().is_some_and(|order| (layout, omitted) > (order[0], order[1])) {
+                break;
+            }
+            stack.push((root, 0usize));
             while let Some((node, next)) = stack.last_mut() {
                 if selected.len() == count {
-                    if graph
-                        .ends
-                        .iter()
-                        .enumerate()
-                        .any(|(i, &(end, _, _, _))| self.ends[i] && end == *node)
-                    {
-                        let mut order = vec![layout, plan.layouts[layout].slots.len() - count];
-                        for (slot, &source) in selected.iter().enumerate() {
-                            let slots = &plan.layouts[layout].slots;
-                            let domain = slots[if slot + 1 == count {
-                                slots.len() - 1
-                            } else {
-                                slot
-                            }]
-                            .domain;
-                            order.push(
-                                plan.domains[domain]
-                                    .choices
-                                    .iter()
-                                    .position(|&s| s == source)
-                                    .unwrap(),
-                            );
-                        }
-                        if order < best {
-                            best = order;
-                        }
-                        break;
+                    // The last active edge reaches a terminal kept by prune().
+                    let mut order = vec![layout, omitted];
+                    for (slot, source) in selected.drain(..).enumerate() {
+                        used[source] = false;
+                        let domain = slots[if slot + 1 == count { slots.len() - 1 } else { slot }].domain;
+                        order.push(plan.domains[domain].choices.iter().position(|&s| s == source).unwrap());
                     }
+                    if best.as_ref().is_none_or(|best| order < *best) {
+                        best = Some(order);
+                    }
+                    stack.clear();
+                    break;
                 } else if let Some(&index) = graph.nodes[*node].outgoing.get(*next) {
                     *next += 1;
                     let edge = &graph.edges[index];
@@ -329,7 +310,7 @@ impl Projection {
         let graph = &self.topology;
         let mut forward = vec![false; graph.nodes.len()];
         let mut queue = VecDeque::new();
-        for &root in &graph.roots {
+        for &[_, _, root] in &graph.roots {
             forward[root] = true;
             queue.push_back(root);
         }
@@ -366,20 +347,22 @@ impl Projection {
     }
     fn select_disk(&self, all: &[usize], keep: &[usize], missing_cases: &[usize]) -> Option<Arc<Self>> {
         let mut result = self.clone();
-        let mut cases = std::collections::HashSet::new();
-        cases.extend(missing_cases.iter().copied());
-        cases.extend(keep.iter().map(|&edge| result.topology.edges[edge].case));
+        let mut cases = vec![false; result.topology.roots.len()];
+        for &case in missing_cases {
+            cases[case] = true;
+        }
         for &index in all {
             result.active[index] = false;
         }
         for &index in keep {
             result.active[index] = true;
+            cases[result.topology.edges[index].case] = true;
         }
         for (index, edge) in result.topology.edges.iter().enumerate() {
-            result.active[index] &= cases.contains(&edge.case);
+            result.active[index] &= cases[edge.case];
         }
         for (index, &(_, _, case, _)) in result.topology.ends.iter().enumerate() {
-            result.ends[index] &= cases.contains(&case);
+            result.ends[index] &= cases[case];
         }
         result.prune().then(|| Arc::new(result))
     }
@@ -430,8 +413,7 @@ fn read_unavailable(error: io::Error) -> PreparedStatus {
 
 pub(crate) struct PreparedEvidence<T> {
     plan: Arc<VolumeAttemptPlan>,
-    pub(crate) contexts: Vec<T>,
-    projections: Vec<Arc<crate::password::evidence::VolumeProjection>>,
+    pub(in crate::password) alternatives: Vec<(T, Arc<crate::password::evidence::VolumeProjection>)>,
     rejected: Vec<Arc<crate::password::evidence::VolumeProjection>>,
     pub(crate) unresolved: Option<PreparedStatus>,
 }
@@ -465,10 +447,9 @@ impl<T> PreparedEvidence<T> {
                 rar_anchor: None,
                 independent_rar: Vec::new(),
                 alternatives: self
-                    .contexts
+                    .alternatives
                     .into_iter()
-                    .map(map)
-                    .zip(self.projections)
+                    .map(|(context, projection)| (map(context), projection))
                     .collect(),
                 rejected: self.rejected,
                 unresolved: self.unresolved,
@@ -488,7 +469,7 @@ pub(crate) fn prepare_attempt_evidence<T: Send>(
     let prepared = prepare_attempt_evidence_partial(head, &Arc::new(plan.clone()), sessions, geometry, prepare)?;
     match prepared.unresolved {
         Some(error) => Err(error),
-        None => Ok(prepared.contexts),
+        None => Ok(prepared.alternatives.into_iter().map(|(context, _)| context).collect()),
     }
 }
 
@@ -612,9 +593,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                 terminal_groups.entry(total).or_default().push(source);
             }
             for (trim_total, terminal_choices) in terminal_groups {
-                let case = graph.cases;
-                graph.cases += 1;
-                graph.case_layouts.push((layout_index, count));
+                let case = graph.roots.len();
                 let disk_number =
                     |slot: usize| layout.slots[slot].number.saturating_sub(1) as usize;
                 let last_disk = disk_number(count - 1);
@@ -648,7 +627,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                 match trim_total {
                     None => {
                         let root = graph.node();
-                        graph.roots.push(root);
+                        graph.roots.push([layout_index, count, root]);
                         let mut layer = BTreeMap::from([(0u64, root)]);
                         for slot in 0..count {
                             let mut next = BTreeMap::new();
@@ -703,14 +682,16 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                         let mut layer = BTreeMap::from([(total, end)]);
                         for slot in (1..count).rev() {
                             let mut next = BTreeMap::new();
-                            for (&offset, &node) in &layer {
-                                for &source in choices(slot)? {
-                                    let range = sources
-                                        .get(source)
-                                        .ok_or_else(|| unknown("invalid volume source"))?;
-                                    let Some(length) = range.len else {
-                                        continue;
-                                    };
+                            // Append outgoing edges in domain order, even
+                            // though their origins are built from the tail.
+                            for &source in choices(slot)? {
+                                let range = sources
+                                    .get(source)
+                                    .ok_or_else(|| unknown("invalid volume source"))?;
+                                let Some(length) = range.len else {
+                                    continue;
+                                };
+                                for (&offset, &node) in &layer {
                                     let Some(start) = offset.checked_sub(length) else {
                                         continue;
                                     };
@@ -730,17 +711,15 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                             layer = next;
                         }
                         let root = graph.node();
-                        graph.roots.push(root);
-                        for (length, node) in layer {
-                            for &source in choices(0)? {
-                                if !is_head(source)
-                                    || length == 0
-                                    || sources[source]
-                                        .len
-                                        .is_none_or(|available| available < length)
-                                {
-                                    continue;
-                                }
+                        graph.roots.push([layout_index, count, root]);
+                        for &source in choices(0)? {
+                            if !is_head(source) {
+                                continue;
+                            }
+                            let Some(available) = sources[source].len.filter(|&len| len != 0) else {
+                                continue;
+                            };
+                            for (&length, &node) in layer.range(1..=available) {
                                 graph.edge(
                                     root,
                                     node,
@@ -768,34 +747,6 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
     // These are completed paths, not partially selected slot prefixes. Short
     // files retain declared extent lengths above and fail as real I/O on read.
     graph.ends.retain(|&(_, length, _, _)| length >= minimum);
-    // Reverse-built carrier edges are inserted by offset. Restore relation
-    // choice order before searching for the first injective evidence path.
-    if matches!(
-        geometry,
-        AttemptGeometry::TrimmedHead { .. } | AttemptGeometry::TailTotals
-    ) {
-        let ranks: Vec<HashMap<_, _>> = plan
-            .domains
-            .iter()
-            .map(|d| d.choices.iter().enumerate().map(|(i, &s)| (s, i)).collect())
-            .collect();
-        for node in &mut graph.nodes {
-            node.outgoing.sort_by_key(|&index| {
-                let edge = &graph.edges[index];
-                let (layout, count) = graph.case_layouts[edge.case];
-                let slots = &plan.layouts[layout].slots;
-                let slot = slots[..count]
-                    .binary_search_by_key(&(edge.disk as u32 + 1), |s| s.number)
-                    .unwrap();
-                let domain = if slot + 1 == count {
-                    slots.last().unwrap().domain
-                } else {
-                    slots[slot].domain
-                };
-                ranks[domain][&edge.source]
-            });
-        }
-    }
     let graph = Arc::new(graph);
     let mut lengths: BTreeMap<u64, Option<Vec<usize>>> = BTreeMap::new();
     match geometry {
@@ -881,8 +832,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
             }
             match result {
                 Ok(Some(context)) => {
-                    let order = reader.projection.order(plan);
-                    if order.first() != Some(&usize::MAX) {
+                    if let Some(order) = reader.projection.order(plan) {
                         prepared_contexts.push((order, context, reader.projection.proof()));
                     }
                 }
@@ -903,14 +853,10 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
     if prepared_contexts.is_empty() && rejected.is_empty() && unresolved.is_none() {
         return Err(unknown("no usable volume password evidence"));
     }
-    let (contexts, projections) = prepared_contexts
-        .into_iter()
-        .map(|(_, context, projection)| (context, projection))
-        .unzip();
     Ok(PreparedEvidence {
         plan: Arc::clone(plan),
-        contexts,
-        projections,
+        alternatives: prepared_contexts.into_iter()
+            .map(|(_, context, projection)| (context, projection)).collect(),
         rejected,
         unresolved,
     })
@@ -971,7 +917,7 @@ impl DeferredReads {
         let mut ends = graph.ends.iter().zip(&self.projection.ends).filter(|(_, active)| **active);
         let Some((&(_, _, case, _), _)) = ends.next() else { return false; };
         ends.next().is_none() &&
-            self.projection.active.iter().filter(|&&active| active).count() == graph.case_layouts[case].1
+            self.projection.active.iter().filter(|&&active| active).count() == graph.roots[case][1]
     }
 
     pub(crate) fn read_single<T>(&self, read: impl FnOnce(&mut DeferredReader<'_>) -> T) -> T {
@@ -1193,89 +1139,63 @@ impl AttemptReader<'_> {
         identify: impl Fn(usize) -> Option<usize>,
     ) -> io::Result<Option<usize>> {
         self.metadata_ready()?;
-        let mut groups = BTreeMap::<Option<usize>, Vec<usize>>::new();
-        let mut all = Vec::new();
-        let mut present = vec![false; self.projection.topology.cases];
-        for (i, edge) in self.projection.topology.disk_edges(disk) {
-            if self.projection.active[i] {
-                all.push(i);
-                present[edge.case] = true;
-                groups.entry(identify(edge.source)).or_default().push(i);
-            }
+        let topology = &self.projection.topology;
+        if topology.roots.len() == 1 && topology.disk_mappings().get(&disk).is_none_or(|m| !m.different_source) {
+            return Ok(topology.disk_edges(disk).find(|(index, _)| self.projection.active[*index])
+                .and_then(|(_, edge)| identify(edge.source)));
         }
-        let missing: Vec<_> = self
-            .projection
-            .topology
-            .ends
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &(_, _, case, _))| {
-                (self.projection.ends[i] && !present[case]).then_some(case)
-            })
-            .collect();
-        if !missing.is_empty() {
-            groups.entry(None).or_default();
-        }
-        if groups.len() <= 1 {
-            return Ok(groups.into_keys().next().flatten());
-        }
-        let branches = groups
-            .into_iter()
-            .filter_map(|(id, edges)| {
-                self.projection
-                    .select_disk(&all, &edges, if id.is_none() { &missing } else { &[] })
-            })
-            .collect();
-        self.pending = Some(branches);
-        Err(io::Error::other("native evidence projection pending"))
+        self.partition_disk(disk, None, |edge| identify(edge.source)).map(Option::flatten)
     }
 
     pub(crate) fn volume_len(&mut self, disk: usize) -> io::Result<Option<u64>> {
         self.metadata_ready()?;
         let topology = &self.projection.topology;
-        if topology.cases == 1 && topology.disk_mappings().get(&disk).is_none_or(|m| !m.different_length) {
+        if topology.roots.len() == 1 && topology.disk_mappings().get(&disk).is_none_or(|m| !m.different_length) {
             return Ok(topology.disk_edges(disk).find(|(index, _)| self.projection.active[*index])
                 .map(|(_, edge)| edge.end - edge.start));
         }
-        let mut groups = BTreeMap::<u64, Vec<usize>>::new();
+        // Ok sorts before Err so a missing volume keeps its previous priority.
+        self.partition_disk(disk, Err(()), |edge| Ok(edge.end - edge.start))
+            .map(|length| length.and_then(Result::ok))
+    }
+
+    fn partition_disk<K: Ord + Copy>(
+        &mut self,
+        disk: usize,
+        missing_key: K,
+        identify: impl Fn(&Edge) -> K,
+    ) -> io::Result<Option<K>> {
+        let projection = &self.projection;
+        let topology = &projection.topology;
+        let mut groups = BTreeMap::<K, Vec<usize>>::new();
         let mut all = Vec::new();
-        let mut present = std::collections::HashSet::new();
-        for (index, edge) in self.projection.topology.disk_edges(disk) {
-            if self.projection.active[index] {
+        let mut present = vec![false; topology.roots.len()];
+        for (index, edge) in topology.disk_edges(disk) {
+            if projection.active[index] {
                 all.push(index);
-                present.insert(edge.case);
-                groups.entry(edge.end - edge.start).or_default().push(index);
+                present[edge.case] = true;
+                groups.entry(identify(edge)).or_default().push(index);
             }
         }
-        let missing: Vec<_> = self
-            .projection
-            .topology
-            .ends
-            .iter()
-            .enumerate()
-            .filter(|(index, (_, _, case, _))| {
-                self.projection.ends[*index] && !present.contains(case)
-            })
-            .map(|(_, &(_, _, case, _))| case)
-            .collect();
         if groups.is_empty() {
             return Ok(None);
         }
-        if groups.len() == 1 && missing.is_empty() {
-            return Ok(groups.keys().next().copied());
-        }
-        let mut branches = Vec::new();
-        for (_, edges) in groups {
-            if let Some(projection) = self.projection.select_disk(&all, &edges, &[]) {
-                branches.push(projection);
+        let mut missing = Vec::new();
+        for (&(_, _, case, _), &active) in topology.ends.iter().zip(&projection.ends) {
+            if active && !present[case] {
+                missing.push(case);
+                present[case] = true;
             }
         }
         if !missing.is_empty() {
-            if let Some(projection) = self.projection.select_disk(&all, &[], &missing) {
-                branches.push(projection);
-            }
+            groups.entry(missing_key).or_default();
         }
-        self.pending = Some(branches);
+        if groups.len() == 1 {
+            return Ok(groups.into_keys().next());
+        }
+        self.pending = Some(groups.into_iter().filter_map(|(key, edges)| {
+            projection.select_disk(&all, &edges, if key == missing_key { &missing } else { &[] })
+        }).collect());
         Err(io::Error::other("volume evidence projection pending"))
     }
 

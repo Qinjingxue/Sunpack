@@ -28,7 +28,7 @@ template<class T> T ready(std::future<T> &future) {
 void admission_and_recovery() {
     std::atomic<std::int64_t> capacity{64 * MiB};
     std::vector<NativeMemoryJob *> jobs;
-    NativeMemoryManager manager(0, [&] {
+    NativeMemoryManager manager(0, {}, [&] {
         auto room = capacity.load();
         for (auto *job : jobs) room -= job->committed;
         return room;
@@ -103,7 +103,7 @@ void simultaneous_scaled_machine_budgets() {
         const auto reserve = NativeMemoryManager::default_reserve_bytes(gib == 8 ? 2 : gib == 16 ? 16 : 128) / 256;
         const auto budget = total - reserve;
         std::vector<std::unique_ptr<NativeMemoryJob>> jobs;
-        NativeMemoryManager manager(reserve, [&] {
+        NativeMemoryManager manager(reserve, {}, [&] {
             std::int64_t room = budget;
             for (const auto &job : jobs) room -= job->committed;
             return room;
@@ -125,7 +125,7 @@ void simultaneous_scaled_machine_budgets() {
 
 void batched_waiter_admission() {
     std::atomic<std::int64_t> capacity{0};
-    NativeMemoryManager manager(0, [&] { return capacity.load(); });
+    NativeMemoryManager manager(0, {}, [&] { return capacity.load(); });
     NativeMemoryJob first(manager), second(manager);
     first.required = second.required = 24 * MiB;
     std::atomic<bool> cancel{false};
@@ -151,7 +151,7 @@ void batched_waiter_admission() {
 void restart_working_set() {
     std::atomic<std::int64_t> capacity{128 * MiB};
     NativeMemoryJob *active = nullptr;
-    NativeMemoryManager manager(0, [&] {
+    NativeMemoryManager manager(0, {}, [&] {
         return capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0);
     });
     NativeMemoryJob job(manager);
@@ -253,16 +253,16 @@ void sparse_replay(const std::filesystem::path &directory) {
 void disk_and_memory(const std::filesystem::path &directory, bool memory_first) {
     std::atomic<std::int64_t> capacity{64 * MiB};
     NativeMemoryJob *active = nullptr;
-    NativeMemoryManager manager(0, [&] { return capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0); });
+    NativeMemoryManager manager(0, {}, [&] { return capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0); });
     NativeMemoryJob memory(manager);
     active = &memory;
-    auto state = make_volume_state("memory-disk", true);
     std::promise<bool> full;
     auto blocked = full.get_future();
     std::atomic<bool> reported{false};
-    state->space_gate = std::make_shared<VolumeSpaceGate>(state->key, "", [&](const auto &event) {
+    auto gate = std::make_shared<VolumeSpaceGate>("memory-disk", "", [&](const auto &event) {
         if (event.kind == VolumeSpaceTransition::Kind::Blocked && !reported.exchange(true)) full.set_value(true);
     });
+    auto state = std::make_shared<VolumeState>("memory-disk", true, std::move(gate));
     auto writer = std::make_shared<AsyncFileWriter>(state);
     state->space_gate->register_job("combined");
     writer->set_write_fault_for_test(ERROR_DISK_FULL, 1000, 1);
@@ -348,7 +348,7 @@ void bzip2_optional_workspace() {
             "BZip2 fixture compression failed");
 
     std::atomic<NativeMemoryJob *> active{nullptr};
-    NativeMemoryManager manager(0, [&] {
+    NativeMemoryManager manager(0, {}, [&] {
         const auto *job = active.load();
         return static_cast<std::int64_t>(6 * MiB) -
                static_cast<std::int64_t>(job ? job->committed : 0);
