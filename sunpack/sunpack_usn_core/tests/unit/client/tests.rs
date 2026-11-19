@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::{DIRECTORY_QUERY_HEADER_BYTES, REQUEST_BYTES};
+use crate::protocol::MAX_VOLUME_GUID_BYTES;
 use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
 use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
 use windows_sys::Win32::System::Pipes::{
@@ -133,6 +133,27 @@ fn replay_only_transport_failures_not_permission_or_protocol_failures() {
         io::ErrorKind::InvalidData,
         "invalid reply",
     )));
+}
+
+#[test]
+fn invalid_local_request_keeps_the_idle_lease() {
+    let _test_client = TEST_CLIENT.lock().unwrap();
+    let name = wide(&format!(
+        r"\\.\pipe\SunPack.WatchBroker.Test.invalid-request.{}",
+        std::process::id()
+    ));
+    let server = listen(&name, 1);
+    let client = open_pipe(&name).unwrap();
+    accept(&server);
+    let handle = client.0;
+    seed_lease(client);
+
+    let result = broker_volume_cursor(&"x".repeat(MAX_VOLUME_GUID_BYTES + 1));
+    let idle = ClientState::lock().unwrap().idle.as_ref().map(|pipe| pipe.0);
+    broker_release().unwrap();
+
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(idle, Some(handle));
 }
 
 #[test]

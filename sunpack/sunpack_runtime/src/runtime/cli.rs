@@ -885,7 +885,6 @@ pub(super) async fn run(
             session.pause_on_exit(language.text("cli.press_enter")).await?;
         }
     }
-    session.drain().await?;
     Ok(code)
 }
 

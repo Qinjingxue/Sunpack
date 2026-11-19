@@ -292,32 +292,59 @@ fn dispatcher_reuses_volume_contexts_and_allows_overlapping_reads() {
 
 #[test]
 fn dispatcher_schedules_expiry_and_preserves_in_use_readers() {
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
     let dispatcher = JournalDispatcher::new().unwrap();
     let now = Instant::now();
+    let step = Duration::from_secs(1);
     let deadline = now + VOLUME_CONTEXT_IDLE_TTL;
     let reader = dispatcher
         .reader_for(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}")
         .unwrap();
     let key = Arc::clone(reader.lock().unwrap().volume_guid());
-    assert!(dispatcher.entries.lock().unwrap().is_empty());
     dispatcher.update_cache(&key, &reader, false, now).unwrap();
-    assert!(dispatcher.entries.lock().unwrap().is_empty());
-    dispatcher.update_cache(&key, &reader, true, now).unwrap();
-    assert_eq!(dispatcher.reap_idle(now).unwrap(), Some(deadline));
-    assert_eq!(dispatcher.reap_idle(deadline).unwrap(), None);
-    assert_eq!(dispatcher.entries.lock().unwrap().capacity(), 0);
-    assert_eq!(Arc::strong_count(&reader), 1);
-    dispatcher
-        .update_cache(&key, &reader, true, deadline)
+    assert!(dispatcher.volumes.lock().unwrap().entries.is_empty());
+    let other = dispatcher
+        .reader_for(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}")
         .unwrap();
+    let other_key = Arc::clone(other.lock().unwrap().volume_guid());
+    let wake = || unsafe { WaitForSingleObject(dispatcher.state_changed.raw(), 0) };
+    dispatcher
+        .update_cache(&key, &reader, true, now + step)
+        .unwrap();
+    assert_eq!(wake(), WAIT_OBJECT_0);
+    assert_eq!(dispatcher.reap_idle(now).unwrap(), Some(deadline + step));
+
+    dispatcher.update_cache(&other_key, &other, true, now).unwrap();
+    assert_eq!(wake(), WAIT_OBJECT_0);
+    dispatcher
+        .update_cache(&other_key, &other, true, now + 2 * step)
+        .unwrap();
+    assert_eq!(wake(), WAIT_TIMEOUT);
+    assert_eq!(dispatcher.reap_idle(now).unwrap(), Some(deadline));
     assert_eq!(
         dispatcher.reap_idle(deadline).unwrap(),
-        Some(deadline + VOLUME_CONTEXT_IDLE_TTL)
+        Some(deadline + step)
+    );
+    assert_eq!(
+        dispatcher.reap_idle(deadline + step).unwrap(),
+        Some(deadline + 2 * step)
+    );
+    assert_eq!(Arc::strong_count(&reader), 1);
+    assert_eq!(dispatcher.reap_idle(deadline + 2 * step).unwrap(), None);
+    assert_eq!(dispatcher.volumes.lock().unwrap().entries.capacity(), 0);
+    dispatcher
+        .update_cache(&key, &reader, true, deadline + 2 * step)
+        .unwrap();
+    assert_eq!(
+        dispatcher.reap_idle(deadline + 2 * step).unwrap(),
+        Some(deadline + 2 * step + VOLUME_CONTEXT_IDLE_TTL)
     );
     dispatcher
-        .update_cache(&key, &reader, false, deadline)
+        .update_cache(&key, &reader, false, deadline + 2 * step)
         .unwrap();
-    assert_eq!(dispatcher.entries.lock().unwrap().capacity(), 0);
+    assert_eq!(dispatcher.reap_idle(deadline + 2 * step).unwrap(), None);
+    assert_eq!(dispatcher.volumes.lock().unwrap().entries.capacity(), 0);
 }
 
 #[test]

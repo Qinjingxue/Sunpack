@@ -193,12 +193,8 @@ namespace sunpack::sevenzip
 
         WriterMeterSnapshot snapshot_meters() const noexcept
         {
-            return {test_accepted_bytes_.load(std::memory_order_relaxed),
-                    test_written_bytes_.load(std::memory_order_relaxed),
-                    test_discarded_bytes_.load(std::memory_order_relaxed),
-                    test_pending_bytes_.load(std::memory_order_relaxed),
-                    test_completed_files_.load(std::memory_order_relaxed),
-                    test_completed_jobs_.load(std::memory_order_relaxed)};
+            std::lock_guard<std::mutex> lock(mutex_);
+            return test_meters_;
         }
 
 #endif
@@ -601,8 +597,8 @@ namespace sunpack::sevenzip
                         file->new_writes = true;
 #ifdef SUP7Z_DEBUG
                         file->accepted_bytes += chunk;
-                        test_accepted_bytes_.fetch_add(chunk, std::memory_order_relaxed);
-                        test_pending_bytes_.fetch_add(chunk, std::memory_order_relaxed);
+                        test_meters_.accepted_bytes += chunk;
+                        test_meters_.pending_bytes += chunk;
 #endif
                         consumed += chunk;
                         if (buffer->size == kBufferSize && !enqueue_staging_locked(file, false))
@@ -633,7 +629,7 @@ namespace sunpack::sevenzip
 
         void close_file(
             const FileStatePtr &file,
-            std::vector<unsigned char> magic) noexcept
+            std::vector<unsigned char> *magic = nullptr) noexcept
         {
             if (!file)
             {
@@ -650,7 +646,7 @@ namespace sunpack::sevenzip
                 }
                 synchronize_cancellation_locked(file->job);
                 file->close_requested = true;
-                file->magic = std::move(magic);
+                if (magic) file->magic = std::move(*magic);
                 if (terminal_result_locked(file->job) != S_OK)
                 {
                     discard_staging_locked(file);
@@ -697,7 +693,7 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
             if (result == S_OK)
             {
-                test_completed_jobs_.fetch_add(1, std::memory_order_relaxed);
+                ++test_meters_.completed_jobs;
             }
 #endif
             return result;
@@ -946,10 +942,10 @@ namespace sunpack::sevenzip
         }
 
 #ifdef SUP7Z_DEBUG
-        void account_discarded(std::size_t bytes) noexcept
+        void account_discarded_locked(std::size_t bytes) noexcept
         {
-            test_discarded_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-            test_pending_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+            test_meters_.discarded_bytes += bytes;
+            test_meters_.pending_bytes -= bytes;
         }
 #endif
 
@@ -1043,7 +1039,7 @@ namespace sunpack::sevenzip
                 if (!file) return;
                 // Callers need not have reached Close(). Keep the file alive
                 // until submitted I/O drains and its handle closes.
-                close_file(file, {});
+                close_file(file);
             }
         }
 
@@ -1058,7 +1054,7 @@ namespace sunpack::sevenzip
             if (buffer->size != 0)
             {
 #ifdef SUP7Z_DEBUG
-                account_discarded(buffer->size);
+                account_discarded_locked(buffer->size);
 #endif
                 if (file->inflight_bytes >= buffer->size)
                 {
@@ -1264,11 +1260,7 @@ namespace sunpack::sevenzip
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure)
                 record_failure(file, HRESULT_FROM_WIN32(result.win32_error));
-#ifdef SUP7Z_DEBUG
-            if (result.kind != AttemptResult::Kind::Succeeded && buffer->size > buffer->transferred)
-                account_discarded(buffer->size - buffer->transferred);
-#endif
-            release_buffer(buffer);
+            release_buffer(buffer, file, result.kind);
         }
 
         void complete_data_write(Buffer *buffer, DWORD bytes, DWORD error) noexcept
@@ -1491,13 +1483,13 @@ namespace sunpack::sevenzip
         }
 #endif
 
-        void add_written_bytes(const FileStatePtr &file, DWORD written, UInt64 offset = 0) noexcept
+        void add_written_bytes(const FileStatePtr &file, DWORD written, UInt64 offset) noexcept
         {
-#ifdef SUP7Z_DEBUG
-            test_written_bytes_.fetch_add(written, std::memory_order_relaxed);
-            test_pending_bytes_.fetch_sub(written, std::memory_order_relaxed);
-#endif
             std::lock_guard<std::mutex> lock(mutex_);
+#ifdef SUP7Z_DEBUG
+            test_meters_.written_bytes += written;
+            test_meters_.pending_bytes -= written;
+#endif
             if (file)
             {
                 file->written_bytes += written;
@@ -1705,7 +1697,7 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
                 if (file->hresult == S_OK)
                 {
-                    test_completed_files_.fetch_add(1, std::memory_order_relaxed);
+                    ++test_meters_.completed_files;
                 }
 #endif
                 assert(job->pending_files != 0);
@@ -1715,35 +1707,24 @@ namespace sunpack::sevenzip
             producer_cv_.notify_all();
         }
 
-        void release_buffer(Buffer *buffer) noexcept
+        void release_buffer(Buffer *buffer, const FileStatePtr &file,
+                            [[maybe_unused]] AttemptResult::Kind result) noexcept
         {
-            if (!buffer)
-            {
-                return;
-            }
-            const auto file = buffer->file;
-            const auto job = file ? file->job : nullptr;
             bool direct_close = false;
             {
-
                 std::lock_guard<std::mutex> lock(mutex_);
-
-                if (file)
-                {
-                    file->inflight_bytes -= buffer->size;
-                    if (file->outstanding_data != 0)
-                    {
-                        --file->outstanding_data;
-                    }
-                }
-                if (job)
-                {
-                    job->inflight_bytes -= buffer->size;
-                }
+#ifdef SUP7Z_DEBUG
+                if (result != AttemptResult::Kind::Succeeded && buffer->size > buffer->transferred)
+                    account_discarded_locked(buffer->size - buffer->transferred);
+#endif
+                file->inflight_bytes -= buffer->size;
+                if (file->outstanding_data != 0)
+                    --file->outstanding_data;
+                file->job->inflight_bytes -= buffer->size;
                 buffer->file.reset();
                 buffer->size = 0;
                 free_buffers_.push_back(buffer);
-                if (file && file->close_requested && file->outstanding_data == 0)
+                if (file->close_requested && file->outstanding_data == 0)
                 {
                     enqueue_close_locked(file, &direct_close);
                 }
@@ -1793,12 +1774,7 @@ namespace sunpack::sevenzip
         std::atomic<bool> stopping_{false};
 
 #ifdef SUP7Z_DEBUG
-        std::atomic<std::uint64_t> test_accepted_bytes_{0};
-        std::atomic<std::uint64_t> test_written_bytes_{0};
-        std::atomic<std::uint64_t> test_discarded_bytes_{0};
-        std::atomic<std::uint64_t> test_pending_bytes_{0};
-        std::atomic<std::uint64_t> test_completed_files_{0};
-        std::atomic<std::uint64_t> test_completed_jobs_{0};
+        WriterMeterSnapshot test_meters_{};
 
     public:
         // 测试专用：

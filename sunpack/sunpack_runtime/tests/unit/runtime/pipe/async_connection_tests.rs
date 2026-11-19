@@ -78,6 +78,21 @@ fn command_request(server: &Server, flags: u32, args: &[&str]) -> Vec<u8> {
 }
 
 #[test]
+fn shutdown_flushes_its_status_before_stopping_the_server() {
+    let server = server();
+    let (mut client, request) = connect(&server);
+    client.write_all(&command_request(&server, SHUTDOWN, &[])).unwrap();
+    let mut handshake = [0; 20];
+    client.read_exact(&mut handshake).unwrap();
+    assert_eq!(&handshake[..4], b"SPS2");
+    let mut response = [0; 9];
+    client.read_exact(&mut response).unwrap();
+    assert_eq!(response, [0, 0, 0, 0, 4, 0, 0, 0, 0]);
+    request.join().unwrap().unwrap();
+    assert!(server.shutdown.cancelled());
+}
+
+#[test]
 fn internal_toast_request_waits_for_the_next_pipe_instance() {
     let identity = format!("busy-test-{}", hex(&windows::random_bytes::<16>().unwrap()));
     let name = format!(r"\\.\pipe\SunPack-{identity}");

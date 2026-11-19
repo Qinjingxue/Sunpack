@@ -1,7 +1,7 @@
 //! Compact resident rows. Accepted file baselines are durable; scan anchors are disposable.
 use super::directory::DirectoryEntryRecord;
 use crate::analysis_native::volume_anchor::CheapAnchorCell;
-use crate::path_keys::path_key;
+use serde::ser::SerializeMap;
 use serde::Serialize;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -223,17 +223,20 @@ pub(super) struct CatalogRowView<'a>(pub &'a CatalogRow, pub Option<&'a Generate
 
 impl Serialize for CatalogRowView<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Row<'a> {
-            #[serde(flatten)]
-            record: DirectoryEntryRecord,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            observed: Option<(u64, f64, String, i64)>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            generated: Option<&'a GeneratedBaseline>,
+        let Self(row, generated) = *self;
+        let len = 4 + usize::from(row.observation.is_some()) + usize::from(generated.is_some());
+        let mut map = serializer.serialize_map(Some(len))?;
+        map.serialize_entry("path", &row.path())?;
+        map.serialize_entry("is_dir", &row.is_dir())?;
+        map.serialize_entry("size", &row.size())?;
+        map.serialize_entry("mtime_ns", &row.mtime_ns())?;
+        if let Some(o) = &row.observation {
+            map.serialize_entry("observed", &(o.size, o.mtime, o.file_id(), o.change_usn))?;
         }
-        Row { record: self.0.record(), observed: self.0.observation.as_ref().map(|o|
-            (o.size, o.mtime, o.file_id(), o.change_usn)), generated: self.1 }.serialize(serializer)
+        if let Some(baseline) = generated {
+            map.serialize_entry("generated", baseline)?;
+        }
+        map.end()
     }
 }
 
@@ -337,9 +340,6 @@ impl ScopeCatalog {
 
     pub fn touch(&mut self, path: &str) {
         if let Some(bucket) = self.buckets.get_mut(catalog_stem(path).as_str()) { bucket.touch(); }
-    }
-    pub fn insert(&mut self, row: DirectoryEntryRecord) {
-        self.insert_key(Arc::from(path_key(&row.path)), row);
     }
     pub fn insert_key(&mut self, key: Arc<str>, record: DirectoryEntryRecord) {
         self.insert_row(key, record, false);

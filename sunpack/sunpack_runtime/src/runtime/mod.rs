@@ -99,9 +99,6 @@ trait Session: Send + Sync {
     fn awrite<'a>(&'a self, stream: Stream, data: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
         Box::pin(async move { self.write(stream, data) })
     }
-    fn drain(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + '_>> {
-        Box::pin(async { Ok(()) })
-    }
     fn aread_line<'a>(&'a self, prompt: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Option<String>>> + Send + 'a>> {
         Box::pin(async move { self.read_line(prompt) })
     }

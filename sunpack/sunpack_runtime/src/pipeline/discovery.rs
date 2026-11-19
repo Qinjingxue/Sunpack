@@ -230,6 +230,8 @@ pub(super) fn discover(
             }
         }
     }
+    drop(seen);
+    drop(prepared);
     let (kinds, errors) = classify_scan_targets(&paths);
     result.scan_errors = errors;
     let mut directories = Vec::new();
@@ -288,7 +290,11 @@ pub(super) fn discover(
         let mut covered = covered.into_iter();
         scopes.retain(|_| !covered.next().unwrap());
     }
-    let roots: HashMap<_, _> = scopes.iter().map(|scope| (scope.key(), scope)).collect();
+    let roots: HashMap<_, _> = if files.is_empty() {
+        HashMap::new()
+    } else {
+        scopes.iter().map(|scope| (scope.key(), scope)).collect()
+    };
     let covering_root = |key: &str| {
         path_ancestors(key).any(|parent| {
             roots
@@ -307,11 +313,11 @@ pub(super) fn discover(
             .entry(scope.key().to_owned())
             .or_insert_with(|| scope.clone());
     }
-    for path in &files {
+    for path in files {
         let (key, root) = if let Some(scope) = requested_scope {
             (scope.key().to_owned(), std::borrow::Cow::Borrowed(scope.root.as_str()))
         } else {
-            let path = Path::new(path);
+            let path = Path::new(&path);
             let parent = path.parent().unwrap_or(path).to_string_lossy();
             let mut key = path_key(&parent);
             key.truncate(key.trim_end_matches('\\').len());
@@ -323,20 +329,22 @@ pub(super) fn discover(
             }
             (key, parent)
         };
-        if !roots.is_empty() && covering_root(&path_key(path)) {
+        if !roots.is_empty() && covering_root(&path_key(&path)) {
             continue;
         }
         let bucket = if request.watch_catalog.is_some() {
-            crate::scan::catalog::catalog_stem(path)
+            crate::scan::catalog::catalog_stem(&path)
         } else {
             String::new()
         };
+        let name = filesystem_logical_name(&path);
         by_parent
             .entry((key, bucket))
             .or_insert_with(|| (root.into_owned(), Vec::new()))
             .1
-            .push((path.clone(), filesystem_logical_name(path)));
+            .push((path, name));
     }
+    drop(roots);
     // Share physical enumeration, never the logical relation boundary. Each
     // selected file keeps its original parent scope, including replacement retry.
     let mut shared_roots = HashMap::new();

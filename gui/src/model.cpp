@@ -225,25 +225,26 @@ static std::string patch_config(std::string source,const Json& edit) {
 // Only values touched by this edit are normalized; unrelated entries
 // and significant password whitespace remain intact.
 static Json deduplicate_passwords(Json& records, const std::unordered_set<std::string>& values, size_t target, size_t existing_count) {
-    struct Scope { Json path; bool other = false; };
+    struct Scope { const Json* path; bool other; };
     struct Group {
         std::vector<size_t> rows;
         std::map<std::wstring,Scope> scopes;
         bool global = false, other_global = false;
     };
-    std::unordered_map<std::string,Group> groups;
+    std::unordered_map<std::string_view,Group> groups;
     for(size_t i=0;i<records.size();++i) {
         const auto& value=records[i]["value"].get_ref<const std::string&>();
-        if(!values.count(value)) continue;
-        auto& group=groups[value]; group.rows.push_back(i);
+        const auto touched=values.find(value);
+        if(touched==values.end()) continue;
+        auto& group=groups[*touched]; group.rows.push_back(i);
         const bool other=i!=target && i<existing_count;
         if(!records[i].contains("scopes")) { group.global=true; if(other) group.other_global=true; }
-        else for(auto& path:records[i]["scopes"]) {
-            auto entry=group.scopes.try_emplace(scope_key(wide(path.get<std::string>())),Scope{path}).first;
-            if(other) { if(!entry->second.other) entry->second.path=path; entry->second.other=true; }
+        else for(const auto& path:records[i]["scopes"]) {
+            auto entry=group.scopes.try_emplace(scope_key(wide(path.get_ref<const std::string&>())),Scope{&path,other}).first;
+            if(other && !entry->second.other) entry->second={&path,true};
         }
     }
-    std::vector<bool> keep(records.size(),true);
+    std::vector<bool> keep;
     Json saved;
     for(auto& [value,group]:groups) {
         auto covered=[&](std::wstring key,bool other) {
@@ -264,7 +265,7 @@ static Json deduplicate_passwords(Json& records, const std::unordered_set<std::s
         if(selected) {
             if(!records[target].contains("scopes")) { contributes=!group.other_global; visible=true; }
             else if(!group.global) for(auto& path:records[target]["scopes"]) {
-                auto key=scope_key(wide(path.get<std::string>()));
+                auto key=scope_key(wide(path.get_ref<const std::string&>()));
                 if(!group.other_global && !covered(key,true)) contributes=true;
                 if(!inherited(key)) visible=true;
             }
@@ -275,13 +276,17 @@ static Json deduplicate_passwords(Json& records, const std::unordered_set<std::s
         Json record={{"value",value}};
         if(!group.global) {
             Json paths=Json::array();
-            for(auto& [key,scope]:group.scopes) if(!inherited(key)) paths.push_back(std::move(scope.path));
+            for(const auto& [key,scope]:group.scopes) if(!inherited(key)) paths.push_back(*scope.path);
             record["scopes"]=std::move(paths);
         }
         records[canonical]=std::move(record);
-        for(auto i:group.rows) if(i!=canonical) keep[i]=false;
+        if(group.rows.size()>1) {
+            if(keep.empty()) keep.resize(records.size(),true);
+            for(auto i:group.rows) if(i!=canonical) keep[i]=false;
+        }
         if(selected && contributes && visible) saved=records[canonical];
     }
+    if(keep.empty()) return saved;
     size_t out=0;
     for(size_t i=0;i<records.size();++i) if(keep[i]) { if(out!=i) records[out]=std::move(records[i]); ++out; }
     records.erase(records.begin()+out,records.end());
@@ -513,7 +518,10 @@ Json save_changes(const fs::path& dir,const Json& field,const Json& passwords,co
         if(!passwords.empty() || (!removed_scopes.empty() && fs::exists(dir/"builtin_passwords.json"))) {
             auto path=dir/"builtin_passwords.json";
             original_password_text=read_file(path);
-            auto current=parse_json(original_password_text); validate_passwords(current);
+            delta_base_matches=original_password_text==password_baseline;
+            auto current=parse_json(original_password_text);
+            if(!deleting_roots) std::string().swap(original_password_text);
+            validate_passwords(current);
             auto count=current["passwords"].size();
             struct RebaseRows { std::vector<std::string> before; const Json* after = nullptr; };
             std::unordered_map<std::string,RebaseRows> rebases;
@@ -571,7 +579,7 @@ Json save_changes(const fs::path& dir,const Json& field,const Json& passwords,co
                     if(!previous.empty()) password_rebases.push_back({{"originals",std::move(previous)},{"record",rebase.after?*rebase.after:Json()}});
                 }
             }
-            delta_base_matches=count==committed_passwords["passwords"].size() && original_password_text==password_baseline;
+            delta_base_matches&=count==committed_passwords["passwords"].size();
             if(!passwords.empty() || cleaned) writes.push_back({"passwords",path,committed_passwords.dump(2)+"\n"});
         }
         if(!roots.empty()) writes.push_back({"roots",dir/"sunpack_watch_roots.txt",std::move(root_text)});

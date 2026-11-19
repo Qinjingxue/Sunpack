@@ -2,6 +2,7 @@
 use super::catalog::{CatalogRowView, GeneratedBaseline, ScopeCatalog};
 use super::directory::DirectoryEntryRecord;
 use crate::io::scratch::Spool;
+use crate::path_keys::path_key;
 use crate::wal::{self, Kind};
 use crate::watch_journal::NativeJournalStream;
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -10,6 +11,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct Stamp {
@@ -27,23 +29,30 @@ struct Delta {
 }
 #[derive(Deserialize)]
 struct StoredRow {
-    #[serde(flatten)]
-    record: DirectoryEntryRecord,
-    #[serde(default)]
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+    mtime_ns: Option<u64>,
     observed: Option<(u64, f64, String, i64)>,
     generated: Option<Box<GeneratedBaseline>>,
 }
 impl StoredRow {
     fn insert(self, catalog: &mut ScopeCatalog) {
-        let key = crate::path_keys::path_key(&self.record.path);
-        catalog.insert(self.record);
+        let key: Arc<str> = Arc::from(path_key(&self.path));
+        catalog.insert_key(Arc::clone(&key), DirectoryEntryRecord {
+            path: self.path,
+            is_dir: self.is_dir,
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            ..DirectoryEntryRecord::default()
+        });
         if let Some(baseline) = self.generated {
             catalog.set_generated(&key, *baseline);
         } else {
-            catalog.generated.remove(key.as_str());
+            catalog.generated.remove(key.as_ref());
         }
         if let Some((size, mtime, id, usn)) = self.observed {
-            let row = catalog.rows.get_mut(key.as_str()).unwrap();
+            let row = catalog.rows.get_mut(key.as_ref()).unwrap();
             row.remember_observation(size, mtime, &id, usn, true);
         }
     }
@@ -374,3 +383,7 @@ fn replace(source: &Path, destination: &Path) -> io::Result<()> {
 fn replace(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/scan/catalog_store/tests.rs"]
+mod tests;

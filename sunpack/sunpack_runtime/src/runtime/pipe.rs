@@ -36,6 +36,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 const MAX_FIELD: usize = 16 * 1024 * 1024;
+const SHUTDOWN: u32 = 1;
 const TERMINAL_SIZE_FIELD: u32 = 32;
 const RESIZE: u32 = u32::MAX - 1;
 const CANCEL: u32 = u32::MAX;
@@ -528,11 +529,16 @@ impl Connection {
         // main flushes output in finally, including a failed request. Keep
         // control reads alive during drain so disconnect cancels blocked IO.
         self.output.drain().await;
+        let output_failed = self.flags & SHUTDOWN == 0 && self.output.closed();
         self.finishing.store(true, Ordering::Release);
         self.close();
         if let Some(control) = control { control.wait().await; }
         output.wait().await;
-        match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
+        match result {
+            Ok(Ok(())) if output_failed => Err(io::ErrorKind::ConnectionAborted.into()),
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     async fn pump_output(&self) {
@@ -627,9 +633,6 @@ impl Session for Connection {
             let result = self.frame(stream as u8, data).await;
             if self.output.closed() { Ok(()) } else { result }
         })
-    }
-    fn drain(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
-        Box::pin(async { self.output.drain().await; Ok(()) })
     }
     fn read_line(&self, prompt: &str) -> io::Result<Option<String>> { block_on(self.read_line_async(prompt)) }
     fn aread_line<'a>(&'a self, prompt: &'a str) -> Pin<Box<dyn Future<Output = io::Result<Option<String>>> + Send + 'a>> {
@@ -747,7 +750,8 @@ impl Server {
             let connection = Arc::clone(&connection);
             spawner.spawn(Box::pin(async move { connection.pump_output().await }))
         };
-        let control = if header.flags & 1 == 0 {
+        let shutdown = header.flags & SHUTDOWN != 0;
+        let control = if !shutdown {
             let connection = Arc::clone(&connection);
             Some(spawner.spawn(Box::pin(async move {
                 if connection.read_control(reader).await.is_err()
@@ -761,14 +765,9 @@ impl Server {
         let mut served_cli = false;
         let result = connection.finish_request(async {
             connection.output.enqueue([b"SPS2".as_slice(), &self.build_id].concat()).await?;
-            if header.flags & 1 != 0 {
+            if shutdown {
                 connection.finishing.store(true, Ordering::Release);
-                connection.frame(0, &0_i32.to_be_bytes()).await?;
-                connection.output.drain().await;
-                self.activity.lock().unwrap().shutting_down = true;
-                self.shutdown.cancel();
-                self.wake.signal();
-                return Ok(());
+                return connection.frame(0, &0_i32.to_be_bytes()).await;
             }
             if header.argv.as_slice() == ["--watch-status-follow"] {
                 let _observer = StatusObserver::new(self);
@@ -802,13 +801,13 @@ impl Server {
             // The launcher closes as soon as it reads the status frame. Its
             // control EOF can arrive before the completed write is observed.
             connection.finishing.store(true, Ordering::Release);
-            connection.frame(0, &code.to_be_bytes()).await?;
-            connection.output.drain().await;
-            if connection.output.closed() {
-                return Err(io::ErrorKind::ConnectionAborted.into());
-            }
-            Ok(())
+            connection.frame(0, &code.to_be_bytes()).await
         }, control, output).await;
+        if shutdown && result.is_ok() {
+            self.activity.lock().unwrap().shutting_down = true;
+            self.shutdown.cancel();
+            self.wake.signal();
+        }
         if served_cli {
             let mut activity = self.activity.lock().unwrap();
             let now = Instant::now();

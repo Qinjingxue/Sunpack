@@ -37,3 +37,15 @@ fn shared_progress_service_coalesces_events_and_wakes_without_a_private_thread()
     output.join().unwrap();
     assert!(received.try_recv().is_err());
 }
+
+#[test]
+fn sparse_progress_after_a_burst_releases_the_large_buffer() {
+    let reports = Reports::default();
+    for id in 0..4_096 {
+        reports.notify(Event::Working { id });
+    }
+    assert_eq!(reports.take_events().len(), 4_096);
+    reports.notify(Event::Working { id: 7 });
+    assert!(matches!(reports.take_events().as_slice(), [Event::Working { id: 7 }]));
+    assert!(reports.state.lock().unwrap().events.capacity() < 1_024);
+}

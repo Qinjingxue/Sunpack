@@ -414,26 +414,37 @@ fn request_shape_is_valid(request: &Request<'_>) -> bool {
 }
 
 struct JournalDispatcher {
-    entries: Mutex<VolumeTable>,
+    volumes: Mutex<VolumeTable>,
     state_changed: OwnedHandle,
 }
 
 type SharedJournalReader = Arc<Mutex<JournalReader>>;
-type VolumeTable = HashMap<Arc<str>, (SharedJournalReader, Instant)>;
+type VolumeEntries = HashMap<Arc<str>, (SharedJournalReader, Instant)>;
+
+#[derive(Default)]
+struct VolumeTable {
+    entries: VolumeEntries,
+    next_reap: Option<Instant>,
+}
 
 impl JournalDispatcher {
     fn new() -> io::Result<Self> {
         Ok(Self {
-            entries: Mutex::default(),
+            volumes: Mutex::default(),
             state_changed: OwnedHandle::auto_reset_event()?,
         })
     }
 
     fn reap_idle(&self, now: Instant) -> io::Result<Option<Instant>> {
-        let mut entries = self
-            .entries
+        let mut volumes = self
+            .volumes
             .lock()
             .map_err(|_| io::Error::other("volume table poisoned"))?;
+        let VolumeTable { entries, next_reap } = &mut *volumes;
+        if next_reap.is_none_or(|deadline| now < deadline) {
+            return Ok(*next_reap);
+        }
+        let previous_len = entries.len();
         let mut next_deadline: Option<Instant> = None;
         entries.retain(|_, (_, deadline)| {
             if *deadline <= now {
@@ -444,7 +455,10 @@ impl JournalDispatcher {
             next_deadline = Some(next_deadline.map_or(*deadline, |next| next.min(*deadline)));
             true
         });
-        trim_volume_table(&mut entries);
+        if entries.len() != previous_len {
+            trim_volume_table(entries);
+        }
+        *next_reap = next_deadline;
         Ok(next_deadline)
     }
 
@@ -457,14 +471,14 @@ impl JournalDispatcher {
         } else {
             volume_guid
         };
-        let entries = self
-            .entries
+        let volumes = self
+            .volumes
             .lock()
             .map_err(|_| io::Error::other("volume table poisoned"))?;
-        if let Some((reader, _)) = entries.get(volume_guid) {
+        if let Some((reader, _)) = volumes.entries.get(volume_guid) {
             return Ok(Arc::clone(reader));
         }
-        drop(entries);
+        drop(volumes);
         Ok(Arc::new(Mutex::new(JournalReader::new(
             volume_guid.into(),
         )?)))
@@ -477,10 +491,11 @@ impl JournalDispatcher {
         has_volume: bool,
         now: Instant,
     ) -> io::Result<()> {
-        let mut entries = self
-            .entries
+        let mut volumes = self
+            .volumes
             .lock()
             .map_err(|_| io::Error::other("volume table poisoned"))?;
+        let VolumeTable { entries, next_reap } = &mut *volumes;
         let deadline = now + VOLUME_CONTEXT_IDLE_TTL;
         if let Some((cached, previous_deadline)) = entries.get_mut(key) {
             // A concurrent first touch may have already admitted its reader.
@@ -488,15 +503,15 @@ impl JournalDispatcher {
                 return Ok(());
             }
             if has_volume {
-                let expired = *previous_deadline <= now;
                 *previous_deadline = deadline;
-                if !expired {
-                    return Ok(());
-                }
-            } else {
-                entries.remove(key);
-                trim_volume_table(&mut entries);
+                return Ok(());
             }
+            entries.remove(key);
+            trim_volume_table(entries);
+            if !entries.is_empty() {
+                return Ok(());
+            }
+            *next_reap = None;
         } else if has_volume {
             if entries.len() >= MAX_VOLUME_CONTEXTS {
                 let lru = entries
@@ -509,10 +524,14 @@ impl JournalDispatcher {
             }
             // Only a successfully opened volume can consume cache capacity.
             entries.insert(Arc::clone(key), (Arc::clone(reader), deadline));
+            if next_reap.is_some_and(|scheduled| scheduled <= deadline) {
+                return Ok(());
+            }
+            *next_reap = Some(deadline);
         } else {
             return Ok(());
         }
-        drop(entries);
+        drop(volumes);
         self.state_changed.signal();
         Ok(())
     }
@@ -545,7 +564,7 @@ impl JournalDispatcher {
     }
 }
 
-fn trim_volume_table(entries: &mut VolumeTable) {
+fn trim_volume_table(entries: &mut VolumeEntries) {
     if entries.is_empty() || entries.capacity() / 4 > entries.len() {
         entries.shrink_to_fit();
     }

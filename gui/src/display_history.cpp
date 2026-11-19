@@ -85,12 +85,23 @@ std::string_view run_name(const Json& run) {
         throw std::runtime_error("logRecordTooLarge");
     return name;
 }
+struct DecodeBuffers {
+    std::vector<char> packed,raw;
+    void read(HANDLE file,uint64_t offset,uint32_t packed_size,uint32_t raw_size) {
+        if(packed.size()<packed_size) packed.resize(packed_size);
+        if(raw.size()<raw_size) raw.resize(raw_size);
+        read_at(file,offset,packed.data(),packed_size);
+        if(LZ4_decompress_safe(packed.data(),raw.data(),int(packed_size),int(raw_size))!=int(raw_size))
+            throw std::runtime_error("logRecordTooLarge");
+    }
+};
 // Large records stream through the same MessagePack reader, one LZ4 block at
 // a time. The fixed-width index retains its original size and ordering fields.
 struct RecordBuffer : std::streambuf {
     HANDLE file; uint64_t cursor, packed_remaining, raw_remaining;
-    std::vector<char> packed,raw;
-    RecordBuffer(HANDLE f,uint64_t at,uint64_t packed_size,uint64_t raw_size):file(f),cursor(at),packed_remaining(packed_size),raw_remaining(raw_size) {}
+    DecodeBuffers& buffers;
+    RecordBuffer(HANDLE f,uint64_t at,uint64_t packed_size,uint64_t raw_size,DecodeBuffers& buffers)
+        :file(f),cursor(at),packed_remaining(packed_size),raw_remaining(raw_size),buffers(buffers) {}
     int_type underflow() override {
         if(gptr() && gptr()<egptr()) return traits_type::to_int_type(*gptr());
         if(!raw_remaining) {
@@ -101,10 +112,10 @@ struct RecordBuffer : std::streambuf {
         std::array<uint32_t,2> sizes{}; read_at(file,cursor,sizes.data(),8); cursor+=8;packed_remaining-=8;
         if(!sizes[1] || sizes[1]>1024*1024 || sizes[1]>raw_remaining || !sizes[0] || sizes[0]>uint32_t(LZ4_compressBound(int(sizes[1]))) || sizes[0]>packed_remaining)
             throw std::runtime_error("logRecordTooLarge");
-        packed.resize(sizes[0]);raw.resize(sizes[1]);read_at(file,cursor,packed.data(),packed.size());
-        if(LZ4_decompress_safe(packed.data(),raw.data(),int(packed.size()),int(raw.size()))!=int(raw.size())) throw std::runtime_error("logRecordTooLarge");
-        cursor+=packed.size();packed_remaining-=packed.size();raw_remaining-=raw.size();
-        setg(raw.data(),raw.data(),raw.data()+raw.size());return traits_type::to_int_type(*gptr());
+        buffers.read(file,cursor,sizes[0],sizes[1]);
+        cursor+=sizes[0];packed_remaining-=sizes[0];raw_remaining-=sizes[1];
+        auto* raw=buffers.raw.data();
+        setg(raw,raw,raw+sizes[1]);return traits_type::to_int_type(*gptr());
     }
 };
 struct RunReader {
@@ -167,8 +178,8 @@ struct RunReader {
             current=filtered?selected[size_t(position)]:at(uint64_t(position),cache.empty()?PageRows:IndexBlockRows);
         }
     }
-    Json value(std::vector<char>& packed,std::vector<char>& raw) {
-        try { return decode_value(packed,raw); }
+    Json value(DecodeBuffers& buffers) {
+        try { return decode_value(buffers); }
         catch(...) {
             validate();
             Entry after{};
@@ -179,7 +190,7 @@ struct RunReader {
             throw;
         }
     }
-    Json decode_value(std::vector<char>& packed,std::vector<char>& raw) {
+    Json decode_value(DecodeBuffers& buffers) {
         if(!data) data.emplace(open_reader(data_path));
         if(!current.raw && !current.compressed) {
             std::array<char,24> header{};read_at(*data,current.offset,header.data(),header.size());
@@ -187,18 +198,14 @@ struct RunReader {
             LARGE_INTEGER file_size{};if(!GetFileSizeEx(*data,&file_size)) win_error("opReadEventLog");
             if(std::memcmp(header.data(),"SPDC",4) || size<24 || !raw_size || current.offset>uint64_t(file_size.QuadPart) || size>uint64_t(file_size.QuadPart)-current.offset)
                 throw std::runtime_error("logRecordTooLarge");
-            RecordBuffer buffer(*data,current.offset+24,size-24,raw_size);std::istream stream(&buffer);
+            RecordBuffer buffer(*data,current.offset+24,size-24,raw_size,buffers);std::istream stream(&buffer);
             stream.exceptions(std::ios::badbit);
             return Json::from_msgpack(stream);
         }
         if(!current.raw || !current.compressed || current.raw>uint32_t(INT_MAX) || current.compressed>uint32_t(LZ4_compressBound(int(current.raw))))
             throw std::runtime_error("logRecordTooLarge");
-        if(packed.size()<current.compressed) packed.resize(current.compressed);
-        if(raw.size()<current.raw) raw.resize(current.raw);
-        read_at(*data,current.offset,packed.data(),current.compressed);
-        if(LZ4_decompress_safe(packed.data(),raw.data(),int(current.compressed),int(current.raw))!=int(current.raw))
-            throw std::runtime_error("logRecordTooLarge");
-        return Json::from_msgpack(raw.data(),raw.data()+current.raw);
+        buffers.read(*data,current.offset,current.compressed,current.raw);
+        return Json::from_msgpack(buffers.raw.data(),buffers.raw.data()+current.raw);
     }
 };
 bool matches(const Json& value,const std::wstring& query,const std::string& time_query) {
@@ -348,7 +355,7 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
             indexed_root(wide(path->get_ref<const std::string&>()),root_index)==view.task_root;
     };
     std::optional<Cursor> last;
-    std::vector<char> packed,raw;
+    DecodeBuffers buffers;
     size_t bytes=0,scanned=0;
     bool more=false;
     const uint32_t desired=view.task_status=="taskSucceeded"?4:view.task_status=="taskFailed"?5:view.task_status=="taskProcessing"?1:0;
@@ -374,7 +381,7 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
                 if((++scanned&63)==0 && cancelled && cancelled()) return Json();
                 auto key=live.key(); auto row=live.current;
                 if((!before || key<*before) && (live.selected.size()<PageRows+1 || newer(row,live.selected.front())) && matches_entry(row)) {
-                    if(!filter_values || matches_value(live.value(packed,raw))) {
+                    if(!filter_values || matches_value(live.value(buffers))) {
                         if(live.selected.size()==PageRows+1) {
                             std::pop_heap(live.selected.begin(),live.selected.end(),newer);
                             live.selected.pop_back();
@@ -421,12 +428,12 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         const bool check_value=filter_values && !selected->filtered;
         Json value;
         if(check_value) {
-            value=selected->value(packed,raw);
+            value=selected->value(buffers);
             if(!matches_value(value)) { advance(); continue; }
         }
         if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
         // These are independent snapshots. Keep the first card for each ID.
-        if(!check_value) value=selected->value(packed,raw);
+        if(!check_value) value=selected->value(buffers);
         auto row=project_task(value,root_index,language,labels,ids);
         if(!row.value.is_null()) {
             needs_sort|=row.timestamp>previous_timestamp;

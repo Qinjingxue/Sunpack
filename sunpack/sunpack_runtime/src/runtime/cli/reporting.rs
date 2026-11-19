@@ -152,9 +152,17 @@ impl Reports {
 
     pub(crate) fn take_events(&self) -> Vec<Event> {
         let mut state = self.state.lock().unwrap();
-        let mut events = Vec::with_capacity(state.events.len() + state.relocations.len());
+        let coalesced = state.events.len();
+        let relocations = state.relocations.len();
+        let mut events = Vec::with_capacity(coalesced + relocations);
         events.extend(state.events.drain().map(|(_, event)| event));
         events.append(&mut state.relocations);
+        if state.events.capacity() > 256.max(coalesced.saturating_mul(4)) {
+            state.events.shrink_to(256);
+        }
+        if state.relocations.capacity() > 256.max(relocations.saturating_mul(4)) {
+            state.relocations.shrink_to(256);
+        }
         drop(state);
         events.sort_unstable_by_key(|(sequence, _)| *sequence);
         events.into_iter().map(|(_, event)| event).collect()

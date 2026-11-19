@@ -417,7 +417,7 @@ namespace sunpack::sevenzip
             if (writer_ && file_)
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                writer_->close_file(file_, std::move(magic_));
+                writer_->close_file(file_, &magic_);
             }
         }
 
@@ -523,11 +523,13 @@ namespace sunpack::sevenzip
 
         // The callback supplies a sanitized relative path. Keep names relative
         // to this allocator's root until they reach the filesystem.
-        std::filesystem::path allocate(const std::filesystem::path &requested, bool initially_empty, bool is_directory = false)
+        std::filesystem::path allocate(std::filesystem::path requested, bool initially_empty, bool is_directory = false)
         {
             if (is_directory) { return directory(requested, initially_empty); }
-            const auto parent = directory(requested.parent_path(), initially_empty);
-            return allocate_name(parent / requested.filename(), initially_empty, false);
+            if (!requested.has_parent_path()) return allocate_name(std::move(requested), initially_empty, false);
+            auto resolved = directory(requested.parent_path(), initially_empty);
+            resolved /= requested.filename();
+            return allocate_name(std::move(resolved), initially_empty, false);
         }
 
     private:
@@ -557,7 +559,7 @@ namespace sunpack::sevenzip
             return parent;
         }
 
-        std::filesystem::path allocate_name(const std::filesystem::path &requested, bool initially_empty, bool is_directory)
+        std::filesystem::path allocate_name(std::filesystem::path requested, bool initially_empty, bool is_directory)
         {
             auto key = normalized_output_path_key(requested);
             // Keep the common empty-output case to one hash-set insertion.
@@ -584,7 +586,7 @@ namespace sunpack::sevenzip
             const auto extension = is_directory ? std::wstring{} : requested.extension().wstring();
             for (;;)
             {
-                const auto candidate = parent / (stem + L"(" + std::to_wstring(next++) + L")" + extension);
+                auto candidate = parent / (stem + L"(" + std::to_wstring(next++) + L")" + extension);
                 auto candidate_key = normalized_output_path_key(candidate);
                 if (available(candidate, candidate_key))
                 {
@@ -1080,7 +1082,7 @@ namespace sunpack::sevenzip
                 return S_OK;
             }
 
-            const auto safe_path = safe_relative_item_path(member_name);
+            auto safe_path = safe_relative_item_path(member_name);
 
             if (!safe_path.has_value())
             {
@@ -1114,7 +1116,7 @@ namespace sunpack::sevenzip
                 }
                 else
                 {
-                    relative = output_paths_->allocate(*safe_path, output_root_initially_empty_, is_dir);
+                    relative = output_paths_->allocate(std::move(*safe_path), output_root_initially_empty_, is_dir);
                     target = output_root_ / relative;
                     if (receipt) receipt->path = target.native();
                 }

@@ -1,6 +1,7 @@
 use crate::protocol::{
     DirectoryQueryHeader, Opcode, Request, Response, Status, DIRECTORY_QUERY_HEADER_BYTES,
-    FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES, MAX_DIRECTORY_RESPONSE_BYTES, RESPONSE_BYTES,
+    FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES, MAX_DIRECTORY_RESPONSE_BYTES, REQUEST_BYTES,
+    RESPONSE_BYTES,
 };
 use crate::{
     ChangeReasons, PIPE_NAME, PIPE_NAME_ENV, SERVICE_NAME, SERVICE_NAME_ENV, TEST_PIPE_NAME_PREFIX,
@@ -107,14 +108,12 @@ impl Drop for BrokerConnection {
 impl BrokerConnection {
     fn transact(
         &mut self,
-        request: &Request<'_>,
+        request_id: u64,
+        request: &[u8; REQUEST_BYTES],
         query: Option<DirectoryQuery<'_>>,
         payload: &mut Vec<u8>,
     ) -> io::Result<Response> {
-        let request_id = request.request_id;
-        let payload_response = request.opcode == Opcode::ReadDirectoriesChanges;
-        let request = request.encode()?;
-        write_exact(self.0, &request)?;
+        write_exact(self.0, request)?;
         if let Some(query) = query {
             write_exact(self.0, &query.header)?;
             write_exact(self.0, query.ids)?;
@@ -128,7 +127,7 @@ impl BrokerConnection {
                 "broker response request ID mismatch",
             ));
         }
-        let payload_len = if payload_response && response.status == Status::Ok {
+        let payload_len = if query.is_some() && response.status == Status::Ok {
             response.reasons_all as usize
         } else {
             0
@@ -290,16 +289,18 @@ fn transact_request(
         request.opcode,
         Opcode::ProbeVolume | Opcode::ReadChangeReasons
     );
-    let (generation, mut idle) = {
+    let encoded = request.encode();
+    let (generation, frame, mut idle) = {
         let mut state = ClientState::lock()?;
-        (state.generation()?, state.idle.take())
+        let generation = state.generation()?;
+        (generation, encoded?, state.idle.take())
     };
     loop {
         let mut connection = match idle.take() {
             Some(connection) => connection,
             None => connect_and_hello(Some(generation))?,
         };
-        match connection.transact(request, query, payload) {
+        match connection.transact(request.request_id, &frame, query, payload) {
             Ok(response) => {
                 // Keep one idle pipe to preserve the broker lease. Surplus
                 // connections release their server threads when work ends.
@@ -360,11 +361,9 @@ fn connect_and_hello(generation: Option<u64>) -> io::Result<BrokerConnection> {
         }
         match open_pipe(&pipe_name) {
             Ok(mut connection) => {
-                match connection.transact(
-                    &Request::simple(Opcode::Hello, next_request_id()),
-                    None,
-                    &mut Vec::new(),
-                ) {
+                let request_id = next_request_id();
+                let hello = Request::simple(Opcode::Hello, request_id).encode()?;
+                match connection.transact(request_id, &hello, None, &mut Vec::new()) {
                     Ok(response) => {
                         ensure_ok(response)?;
                         return Ok(connection);
