@@ -410,6 +410,10 @@ impl Engine {
     }
 
     pub(crate) fn clear_idle_caches(&self) {
+        #[cfg(windows)]
+        crate::io::iocp::clear_scan_pool();
+        crate::analysis_native::volume_anchor::clear_cheap_probe_pool();
+        crate::password::seven_zip::clear_password_pool();
         crate::relations::clear_regex_caches();
         self.output_names.lock().unwrap().clear_history();
         self.recent_passwords.clear();
@@ -1761,7 +1765,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             this.notify(|| Event::Finished {
                                 id,
                                 result: original.map_or_else(|| super::TaskCompletion {
-                                    discovery: None, status: super::TaskStatus::Skipped, failure: None, output: None,
+                                    status: super::TaskStatus::Skipped, failure: None, output: None,
                                 }, super::TaskCompletion::failed),
                             });
                         }
@@ -3664,8 +3668,10 @@ fn recovery_anchors(input: &ArchiveInput) -> impl Iterator<Item = (String, u64)>
 
 fn output_create_failure(error: io::Error, path: &Path) -> Failure {
     let mut failure = file_failure(error);
-    if let Some(super::FailureContext::OutputCreate { path: attempted, .. }) = failure.context.as_deref_mut() {
-        *attempted = Some(path.to_owned());
+    if let Some(context) = &mut failure.context {
+        if let super::FailureContext::OutputCreate { path: attempted, .. } = Arc::make_mut(context) {
+            *attempted = Some(path.to_owned());
+        }
     }
     failure
 }

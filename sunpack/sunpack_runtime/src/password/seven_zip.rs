@@ -8,20 +8,25 @@ use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
+use crate::io::resource_lifecycle::IdleRayonPool;
 use crate::password::context::{InputKey, PasswordContext, Preparation, PreparedStatus};
 use crate::password::input::{parse_ranges, ranges_key, RangeSpec, VirtualRangeReader};
 use rayon::prelude::*;
 use sevenz_rust2::{Archive, EncoderMethod, Error as SevenZipError, Password};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 const PARALLEL_PASSWORD_THRESHOLD: usize = 4;
 const MAX_PASSWORD_WORKERS: usize = 64;
 
-fn seven_zip_password_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| {
+static PASSWORD_POOL: IdleRayonPool = IdleRayonPool::new();
+
+pub(crate) fn clear_password_pool() {
+    PASSWORD_POOL.clear();
+}
+
+fn seven_zip_password_pool() -> Option<Arc<rayon::ThreadPool>> {
+    PASSWORD_POOL.acquire(|| {
         let available = std::thread::available_parallelism().ok()?.get();
         let workers = std::env::var("SUNPACK_7Z_PASSWORD_WORKERS")
             .ok()
@@ -34,7 +39,6 @@ fn seven_zip_password_pool() -> Option<&'static rayon::ThreadPool> {
             .build()
             .ok()
     })
-    .as_ref()
 }
 
 pub(crate) fn seven_zip_fast_verify_passwords_with_reader(

@@ -59,6 +59,7 @@ void update_tags(TagCollection& tags,const std::string& id,const std::string& te
 // Keep host messages outside Core UI's startup/render message range.
 constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403, TaskRange = WM_APP + 0x404;
 constexpr unsigned Config = 1, Passwords = 2, Roots = 4, Log = 8, Startup = 16, ContextMenu = 32;
+constexpr unsigned Runtime = 64;
 using Clock=std::chrono::steady_clock;
 using motion::VisualBatch;
 struct ReadRetry {
@@ -163,7 +164,12 @@ Options parse_options(const std::vector<std::wstring>& args) {
 }
 Application::Application(Options options):options_(std::move(options)) {}
 void Application::changed(unsigned flags) {
-    { std::lock_guard<std::mutex> lock(mutex_); if(stopping_) return; dirty_|=flags; }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(!tasks_visible_.load(std::memory_order_relaxed)) flags&=~Log;
+        if(stopping_ || !(flags&~dirty_)) return;
+        dirty_|=flags;
+    }
     cv_.notify_one();
 }
 void Application::request_stop() {
@@ -550,13 +556,14 @@ void Application::navigate(const std::string& tab) {
     ui_page_set_json(page_,"tagInputs","{}");
     ui_page_set_json(page_,"tagModes","{}");
     ui_page_set_json(page_,"tagEdits","{}");
+    tasks_visible_.store(tab=="tasks",std::memory_order_relaxed);
     set_text(page_,"tab",tab);
     if(ui_page_call_json(page_,"syncDirectoryView","{}")!=0) throw std::runtime_error("uiBindingFailed");
     set_text(page_,"actionError","");
     // Tab targets retain fixed sidebar geometry; reactive tab visibility already
     // schedules layout. Avoid forcing an extra full-tree layout on every switch.
     motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
-    if(tab=="tasks") schedule_task_range();
+    if(tab=="tasks") { changed(Log); schedule_task_range(); }
     if(tab=="config") changed(ContextMenu);
 }
 void Application::sync_toggles() {
@@ -1126,21 +1133,21 @@ void Application::work() {
         const auto log_dir=dir/".sunpack_watch";
         const auto dir_key=path_key(dir);
         const auto log_key=path_key(log_dir);
-        auto on_data=[this,dir_key,config_key=path_key(dir/"sunpack_config.json"),
+        auto classify_data=[dir_key,config_key=path_key(dir/"sunpack_config.json"),
             passwords_key=path_key(dir/"builtin_passwords.json"),roots_key=path_key(dir/"sunpack_watch_roots.txt")](const fs::path& path){
-            if(path.empty()) {
-                SetEvent(service_refresh_); changed(Config|Passwords|Roots); return;
-            }
+            if(path.empty()) return Config|Passwords|Roots|Runtime;
             const auto key=path_key(path);
             // An ancestor notification can make the whole data directory appear.
-            if(is_under(dir_key,key)) {
-                SetEvent(service_refresh_); changed(Config|Passwords|Roots); return;
-            }
+            if(is_under(dir_key,key)) return Config|Passwords|Roots|Runtime;
+            if(key==config_key) return Config;
+            if(key==passwords_key) return Passwords;
+            if(key==roots_key) return Roots;
             const auto name=path.filename().wstring();
-            if(name.rfind(L"runtime-",0)==0 && path.extension()==L".state") SetEvent(service_refresh_);
-            if(key==config_key) changed(Config);
-            else if(key==passwords_key) changed(Passwords);
-            else if(key==roots_key) changed(Roots);
+            return name.rfind(L"runtime-",0)==0 && path.extension()==L".state"?Runtime:0u;
+        };
+        auto notify_changes=[this](unsigned flags) {
+            if(flags&Runtime) SetEvent(service_refresh_);
+            if(flags&~Runtime) changed(flags&~Runtime);
         };
         std::unique_ptr<DirectoryWatcher> data_watcher;
         std::unique_ptr<DirectoryWatcher> log_watcher;
@@ -1166,7 +1173,7 @@ void Application::work() {
             return true;
         };
         for(;;) {
-            unsigned flags; std::deque<Command> commands; uint64_t query_generation;
+            unsigned flags; std::deque<Command> commands; uint64_t query_generation; bool tasks_visible;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 auto deadline=Clock::time_point::max();
@@ -1176,6 +1183,7 @@ void Application::work() {
                 else cv_.wait_until(lock,deadline,awake);
                 if(stopping_) break;
                 flags=dirty_; dirty_=0; commands.swap(commands_); query_generation=task_query_generation_.load();
+                tasks_visible=tasks_visible_.load(std::memory_order_relaxed);
             }
             for(auto& retry:retries) {
                 if(flags&retry.first) { retry.second=ReadRetry{}; }
@@ -1187,7 +1195,8 @@ void Application::work() {
             Json edit_feedback=Json::object();
             if(!data_watcher || !data_watcher->alive() || (!data_watcher->direct() && fs::is_directory(dir))) {
                 try {
-                    data_watcher=std::make_unique<DirectoryWatcher>(dir,on_data); errors.erase("fileObserver");
+                    data_watcher=std::make_unique<DirectoryWatcher>(dir,classify_data,notify_changes);
+                    errors.erase("fileObserver");
                     SetEvent(service_refresh_); // Close the initial subscribe/connect race.
                 }
                 catch(const std::exception& e) { errors["fileObserver"]=e.what(); }
@@ -1350,11 +1359,12 @@ void Application::work() {
             if(!log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
                 log_watcher.reset();
                 try {
-                    log_watcher=std::make_unique<DirectoryWatcher>(log_dir,[this,log_key,manifest_key=path_key(log_dir/"events.json")](const fs::path& path){
-                        if(path.empty()) { changed(Log); return; }
+                    log_watcher=std::make_unique<DirectoryWatcher>(log_dir,[log_key,manifest_key=path_key(log_dir/"events.json")](const fs::path& path){
+                        if(path.empty()) return Log;
                         const auto key=path_key(path);
-                        if(key==manifest_key || is_under(log_key,key)) changed(Log);
-                    }); errors.erase("logObserver");
+                        return key==manifest_key || is_under(log_key,key)?Log:0u;
+                    },notify_changes);
+                    errors.erase("logObserver");
                 } catch(const std::exception& e) { errors["logObserver"]=e.what(); }
                 log.set_path(log_dir/"events.json"); flags|=Log; tasks_changed=true;
                 task_window={""}; view.task_cursor.clear(); task_window_reset=true;
@@ -1379,7 +1389,9 @@ void Application::work() {
             };
             // Page and filter changes can reuse the manifest already read by
             // the directory observer. A publication conflict still forces refresh.
-            if((flags&Log) || task_query_pending) {
+            // The watcher keeps the subscription while tasks are hidden.
+            // Returning to the tab refreshes the latest manifest once.
+            if(tasks_visible && ((flags&Log) || task_query_pending)) {
                 try {
                     bool refreshed=log.refresh();
                     retries.erase(Log);
@@ -1395,8 +1407,11 @@ void Application::work() {
             bool language_changed=language!=next_language || !previous_patch.contains("language");
             language=std::move(next_language);
             if(language_changed) { patch["language"]=language; patch["texts"]=interface_texts(language); }
-            if(!log_unavailable && (tasks_changed || language_changed || !previous_patch.contains("tasks"))) {
-                log.cancelled=[this,query_generation]{return task_query_generation_.load()!=query_generation;};
+            if(!tasks_visible) task_query_pending|=tasks_changed || language_changed;
+            if(tasks_visible && !log_unavailable && (tasks_changed || language_changed || !previous_patch.contains("tasks"))) {
+                log.cancelled=[this,query_generation]{
+                    return !tasks_visible_.load(std::memory_order_relaxed) || task_query_generation_.load()!=query_generation;
+                };
                 try {
                     // Replaced/expired runs cannot keep old disk cursors alive.
                     if(!log.manifest.is_null()) for(const auto& cursor:task_window) if(!cursor.empty()) {

@@ -28,7 +28,7 @@ mod structural;
 mod validate;
 use assignment::RelationFailureReason;
 use bucket::BucketIndex;
-use scope::{RelationScopeIndex, RelationSource};
+use scope::{CaseKey, RelationScopeIndex, RelationSource};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RelationInput {
@@ -507,12 +507,12 @@ pub(crate) fn resolve_embedded_volumes(
     mut cache: RelationCache,
 ) -> Vec<NativeRelationGroup> {
     let mut remaining = HashSet::new();
-    if anchors.iter().any(|a| !remaining.insert(path_key(&a.path))) {
+    if anchors.iter().any(|a| !remaining.insert(CaseKey::new(&a.path))) {
         return resolve_shared_carrier_volumes(snapshots, anchors, excluded, cache);
     }
     cache
         .anchors
-        .extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
+        .extend(anchors.iter().map(|a| (path_key(&a.path), Arc::clone(a))));
     let mut output = Vec::new();
     for snapshot in snapshots {
         if remaining.is_empty() {
@@ -520,8 +520,9 @@ pub(crate) fn resolve_embedded_volumes(
         }
         let mut keys = HashSet::new();
         for row in snapshot.rows() {
-            if let Some(key) = remaining.take(&path_key(&snapshot.table.paths[row])) {
-                keys.insert(key);
+            let path = &snapshot.table.paths[row];
+            if remaining.remove(&CaseKey::new(path)) {
+                keys.insert(path_key(path));
                 if remaining.is_empty() {
                     break;
                 }

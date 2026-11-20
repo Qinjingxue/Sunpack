@@ -100,15 +100,6 @@ impl NativeDiscoveryScope {
         self.contains_key(&path_key(path))
     }
 
-    pub fn intersects_output(&self, path: &str) -> bool {
-        let key = path_key(path);
-        self.contains_key(&key)
-            || self
-                .key
-                .strip_prefix(key.trim_end_matches('\\'))
-                .is_some_and(|relative| relative.starts_with('\\'))
-    }
-
     pub fn excludes(&self, path: &str) -> bool {
         self.has_exclusions() && self.excludes_key(&path_key(path))
     }

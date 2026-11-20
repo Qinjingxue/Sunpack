@@ -991,8 +991,10 @@ void task_history(Application& app,const fs::path& dir) {
 
     auto manifest=read_json(history_path);
     auto boundary=rows()[99]["id"];
+    navigate(app,"tabPasswords","passwords");
     publish_events(history_path,Json{{"event","done"},{"path",utf8((dir/"newest.001").wstring())},
         {"ts",1792402000}}.dump()+"\n",manifest["runs"]);
+    navigate(app,"tabTasks","tasks");
     pump([&]{return !rows().empty() && rows()[0]["name"]=="newest.001";},"Refresh loaded history");
     assert(rows().size()==200 && rows()[100]["id"]==boundary);
 

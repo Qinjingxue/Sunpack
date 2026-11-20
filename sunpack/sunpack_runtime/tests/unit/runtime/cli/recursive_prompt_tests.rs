@@ -715,7 +715,7 @@ fn completed_scope_releases_only_its_panel_tree() {
         progress.notify(Event::Queued { id: 1, parent: None, path: parent.path.clone(), segment: None });
         progress.notify(Event::Queued { id: 2, parent: Some(1), path: child.path.clone(), segment: None });
         progress.notify(Event::Finished { id: 2,
-            result: crate::pipeline::TaskCompletion { discovery: None, status: TaskStatus::Skipped,
+            result: crate::pipeline::TaskCompletion { status: TaskStatus::Skipped,
                 failure: None, output: None } });
         progress.finish_scope(1, &[parent, child]).unwrap();
         let mut display = progress.display.lock().unwrap();

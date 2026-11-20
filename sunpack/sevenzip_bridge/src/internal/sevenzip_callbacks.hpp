@@ -47,45 +47,6 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-    // Only the first callback I/O failure is published to the open callback.
-    class VolumeInStream final : public CMyUnknownImp, public IInStream {
-        Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
-    public:
-        VolumeInStream(const std::wstring& path, const ExtractInputRange* range,
-                       InputPrefetchConfig prefetch, std::shared_ptr<std::atomic<HRESULT>> error)
-            : error_(std::move(error)) {
-            if (range) {
-                auto* stream = new MultiRangeInStream({*range}, nullptr, prefetch, true);
-                stream_ = stream;
-                opened_ = stream->is_open();
-                if (!opened_) record(stream->open_hresult());
-            } else {
-                auto* stream = new FileInStream(path, nullptr, prefetch);
-                stream_ = stream;
-                opened_ = stream->is_open();
-                if (!opened_) record(stream->open_hresult());
-            }
-        }
-        bool is_open() const { return opened_; }
-        HRESULT STDMETHODCALLTYPE Read(void* data, UInt32 size, UInt32* processed) SUP7Z_NOEXCEPT override {
-            return record(stream_->Read(data, size, processed));
-        }
-        HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 origin, UInt64* position) SUP7Z_NOEXCEPT override {
-            return record(stream_->Seek(offset, origin, position));
-        }
-    private:
-        HRESULT record(HRESULT hr) {
-            if (FAILED(hr) && hr != E_ABORT) {
-                HRESULT expected = S_OK;
-                error_->compare_exchange_strong(expected, hr, std::memory_order_relaxed);
-            }
-            return hr;
-        }
-        std::shared_ptr<std::atomic<HRESULT>> error_;
-        CMyComPtr<IInStream> stream_;
-        bool opened_ = false;
-    };
-
     class OpenCallback final : public CMyUnknownImp, public IArchiveOpenCallback, public IArchiveOpenVolumeCallback, public ICryptoGetTextPassword
     {
         Z7_COM_UNKNOWN_IMP_3(IArchiveOpenCallback, IArchiveOpenVolumeCallback, ICryptoGetTextPassword)
@@ -195,20 +156,23 @@ namespace sunpack::sevenzip
                 const auto &path = range ? range->path : part_paths_ && *index < part_paths_->size()
                     ? (*part_paths_)[*index] : archive_path_;
                 if (!input_error_) input_error_ = std::make_shared<std::atomic<HRESULT>>(S_OK);
-                auto *stream = new VolumeInStream(path, range, volume_prefetch_config_, input_error_);
-                CMyComPtr<IInStream> stream_holder(stream);
-                if (!stream->is_open())
-                {
+                const auto finish_open = [&](auto *stream) -> HRESULT {
+                    CMyComPtr<IInStream> stream_holder(stream);
+                    if (stream->is_open())
+                    {
+                        *inStream = stream_holder.Detach();
+                        return S_OK;
+                    }
                     volume_open_failed_ = true;
+                    publish_named_volume_error(input_error_, stream->open_hresult());
 #ifndef SUP7Z_DEBUG
                     if (is_missing_input_file(input_error()))
 #endif
-                    failed_volume_name_ = std::filesystem::path(path).filename().wstring();
+                        failed_volume_name_ = std::filesystem::path(path).filename().wstring();
                     return E_FAIL;
-                }
-
-                *inStream = stream_holder.Detach();
-                return S_OK;
+                };
+                if (range) return finish_open(new MultiRangeInStream(*range, volume_prefetch_config_, input_error_));
+                return finish_open(new FileInStream(path, nullptr, volume_prefetch_config_, input_error_));
             }
             catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
         }
@@ -291,7 +255,7 @@ namespace sunpack::sevenzip
         std::shared_ptr<std::atomic<bool>> cancel_token_;
 
         std::optional<std::unordered_map<std::wstring, std::size_t>> volume_paths_;
-        std::shared_ptr<std::atomic<HRESULT>> input_error_;
+        NamedVolumeError input_error_;
         bool missing_volume_requested_ = false;
         bool volume_open_failed_ = false;
         bool password_requested_ = false;
@@ -850,6 +814,9 @@ namespace sunpack::sevenzip
             // Decoder callbacks are over. Directory reservations survive until
             // the final snapshot, so a late interruption can replay collisions.
             created_directories_.reset();
+            decltype(last_created_directory_){}.swap(last_created_directory_);
+            // Archives without hard links have no further use for member names.
+            if (hard_links_.empty()) decltype(hard_link_names_){}.swap(hard_link_names_);
             const HRESULT writer_error = async_writer_->finish_job(async_job_);
             bool has_failed_file = false;
             for (const auto &state : async_files_)
@@ -871,8 +838,7 @@ namespace sunpack::sevenzip
             {
                 operation_result_ = kOpDataError;
             }
-            if (hard_links_.empty()) decltype(hard_link_names_){}.swap(hard_link_names_);
-            else finalize_hard_links();
+            if (!hard_links_.empty()) finalize_hard_links();
             restore_directory_metadata();
             const auto *memory = current_native_memory_job();
             if (replay_ && (is_cancelled() || std::uncaught_exceptions() ||

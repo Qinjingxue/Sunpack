@@ -86,9 +86,7 @@ namespace sunpack::sevenzip
         std::size_t volume_bucket_count() const noexcept;
 #endif
 
-        void reap_idle(std::chrono::steady_clock::time_point now);
-
-        std::optional<std::chrono::steady_clock::time_point> next_reap_deadline() const;
+        std::optional<std::chrono::steady_clock::time_point> reap_idle(std::chrono::steady_clock::time_point now);
 
         // 默认只返回仍有 affected job 的 Blocked / Probing 卷，供空间监控采样。
         // 关停路径可传 false，以便唤醒没有 job id 的 gate waiter。

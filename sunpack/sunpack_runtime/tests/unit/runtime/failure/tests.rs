@@ -35,10 +35,11 @@ fn human_projection_keeps_distinct_causes_and_raw_diagnostics() {
         ("ambiguous_volume_mapping", FailureKind::MissingVolume, "压缩包内容不完整，可能缺少分卷", "Archive is incomplete and may be missing volumes"),
         ("needs_volume_or_tail_damaged", FailureKind::Damaged, "分卷缺失，或尾部偏移/结构字段已损坏", "Missing split volume or damaged tail offset/structure"),
     ] {
-        let mut failure = Failure::new(kind, "raw native diagnosis");
-        failure.evidence = Some(Box::new(FailureEvidence {
-            native_kind: Some(reason.into()), ..Default::default()
-        }));
+        let failure = Failure::new(kind, "raw native diagnosis")
+            .with_context(FailureContext::Discovery {
+                discovery: crate::pipeline::DiscoverySource::Relations,
+                reason: reason.into(), path: "input.zip".into(),
+            });
         assert_eq!(message(&failure, Language::Zh), zh);
         assert_eq!(message(&failure, Language::En), en);
         assert_eq!(serde_json::to_value(&failure).unwrap()["message"], "raw native diagnosis");

@@ -4,7 +4,51 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+
+pub(crate) struct IdleRayonPool(Mutex<RayonPoolState>);
+
+enum RayonPoolState {
+    Empty,
+    Retained(Option<Arc<rayon::ThreadPool>>),
+    Retiring(Weak<rayon::ThreadPool>),
+}
+
+impl IdleRayonPool {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(RayonPoolState::Empty))
+    }
+
+    pub(crate) fn acquire(&self, build: impl FnOnce() -> Option<rayon::ThreadPool>) -> Option<Arc<rayon::ThreadPool>> {
+        let mut state = self.0.lock().unwrap();
+        match &*state {
+            RayonPoolState::Retained(pool) => return pool.clone(),
+            RayonPoolState::Retiring(pool) => {
+                if let Some(pool) = pool.upgrade() {
+                    return Some(pool);
+                }
+            }
+            RayonPoolState::Empty => {}
+        }
+        // Cache a failed build until the next idle cleanup. Borrowers hold
+        // their own reference and run work after releasing this mutex.
+        let pool = build().map(Arc::new);
+        *state = RayonPoolState::Retained(pool.clone());
+        pool
+    }
+
+    pub(crate) fn clear(&self) {
+        let mut state = self.0.lock().unwrap();
+        let RayonPoolState::Retained(pool) = &mut *state else { return; };
+        let retired = pool.take();
+        // An overlapping scan can reuse a borrowed generation without
+        // retaining it again. The last borrower releases the pool.
+        *state = retired.as_ref()
+            .map_or(RayonPoolState::Empty, |pool| RayonPoolState::Retiring(Arc::downgrade(pool)));
+        drop(state);
+        drop(retired);
+    }
+}
 
 #[derive(Default)]
 struct NativeRegistry {

@@ -38,6 +38,7 @@ class Application {
     bool render_failed_ = false;
     void schedule_task_range();
     unsigned dirty_ = 15;
+    std::atomic<bool> tasks_visible_{true};
     std::atomic<uint64_t> task_query_generation_{0};
     std::thread worker_, registry_, runtime_;
     struct ControlBinding {

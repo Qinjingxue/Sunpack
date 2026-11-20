@@ -57,7 +57,7 @@ struct Record {
     scope: Arc<str>,
     bytes: u64,
     admitted: bool,
-    sources: Box<[Source]>,
+    sources: Arc<[Source]>,
     range_sources: Box<[u32]>,
     identities: Arc<[Identity]>,
     digest: Option<[u8; 16]>,
@@ -71,13 +71,14 @@ impl Record {
         if !short {
             // Long IOCP reads share writes and renames. Confirm readiness
             // once per source before opening those streams.
-            for source in &mut self.sources {
+            for source in Arc::make_mut(&mut self.sources) {
                 source.update_snapshot(source.hash_snapshot()?);
             }
         }
         let mut hash = StreamHash::new();
         for (&source, extent) in self.range_sources.iter().zip(self.identities.iter()) {
-            let source = &mut self.sources[source as usize];
+            let source_index = source as usize;
+            let source = &self.sources[source_index];
             let mut refreshed = None;
             hash.read(Path::new(&source.path), extent.start, extent.len, |opened| {
                 if short {
@@ -95,7 +96,7 @@ impl Record {
                 Err(io::Error::other("file changed before streaming range"))
             })?;
             if let Some(snapshot) = refreshed {
-                source.update_snapshot(snapshot);
+                Arc::make_mut(&mut self.sources)[source_index].update_snapshot(snapshot);
             }
         }
         self.digest = Some(hash.finish());
@@ -178,6 +179,61 @@ pub(super) fn consider(
         };
         admission = index.lock().unwrap().advance(prepared)?;
     }
+}
+
+pub(super) fn invalidate<'a>(
+    index: &Mutex<Index>,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> io::Result<()> {
+    invalidate_records(index, None, |index| {
+        paths.into_iter()
+            .filter_map(|path| index.paths.get(path_key(path).as_str()))
+            .flat_map(RecordIds::iter).copied().collect()
+    })
+}
+
+pub(super) fn invalidate_tree(index: &Mutex<Index>, path: &str) -> io::Result<()> {
+    let key = path_key(path);
+    let range = crate::path_keys::descendant_key_range(&key);
+    use std::ops::Bound::{Excluded, Included};
+    invalidate_records(index, Some(Path::new(path)), |index| {
+        let descendants = index.paths.range::<str, _>((Included(range.start.as_str()), Excluded(range.end.as_str())))
+            .map(|(_, ids)| ids);
+        index.paths.get(key.as_str()).into_iter().chain(descendants)
+            .flat_map(RecordIds::iter).copied().collect()
+    })
+}
+
+fn invalidate_records(
+    index: &Mutex<Index>,
+    subtree: Option<&Path>,
+    matching: impl FnOnce(&Index) -> HashSet<u64>,
+) -> io::Result<()> {
+    let records: Vec<_> = {
+        let index = index.lock().unwrap();
+        matching(&index).into_iter()
+            .filter_map(|id| index.records.get(&id).map(|record| (id, Arc::clone(&record.sources))))
+            .collect()
+    };
+    if records.is_empty() { return Ok(()); }
+    let missing = subtree.filter(|path| matches!(path.try_exists(), Ok(false)));
+    let stale: Vec<_> = records.into_iter().filter(|(_, sources)| {
+        // A missing directory proves absence only for its literal children.
+        // The key index also includes case-folded spellings.
+        missing.is_some_and(|path| sources.iter().any(|source| {
+            Path::new(&source.path).strip_prefix(path).is_ok_and(|tail| {
+                tail.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+            })
+        })) || sources.iter().any(|source| source.current_snapshot().is_none())
+    }).collect();
+    if stale.is_empty() { return Ok(()); }
+    let mut index = index.lock().unwrap();
+    // Hash publication can refresh an existing ID, and a reset can recycle
+    // IDs. Retire only the source snapshot actually checked outside the lock.
+    let ids = stale.into_iter().filter_map(|(id, sources)| {
+        index.records.get(&id).is_some_and(|record| Arc::ptr_eq(&record.sources, &sources)).then_some(id)
+    }).collect();
+    index.remove_ids(ids)
 }
 
 type Signature = (u64, u64);
@@ -460,14 +516,6 @@ impl Index {
         self.compact()?;
         Ok(Admission::Finished(duplicate))
     }
-    pub(super) fn invalidate(&mut self, paths: &[String]) -> io::Result<()> {
-        let ids = paths.iter()
-            .filter_map(|path| self.paths.get(path_key(path).as_str()))
-            .flat_map(RecordIds::iter)
-            .copied()
-            .collect();
-        self.invalidate_ids(ids, None)
-    }
     /// The scheduler supplies its already queried per-volume cursors. USNs are
     /// comparable only within the same journal incarnation.
     pub(super) fn reconcile_journals(&mut self, stamps: &[(String, String, u64)]) -> io::Result<bool> {
@@ -541,38 +589,6 @@ impl Index {
         self.domains.retain(|key, _| scopes.contains_key(key.as_ref()));
         trim_map(&mut self.domains);
         Ok(())
-    }
-    pub(super) fn invalidate_tree(&mut self, path: &str) -> io::Result<()> {
-        let key = path_key(path);
-        let prefix = format!("{}\\", key.trim_end_matches('\\'));
-        let descendants = self.paths.range(Arc::from(prefix.as_str())..)
-            .take_while(|(path, _)| path.starts_with(&prefix))
-            .map(|(_, ids)| ids);
-        let ids: HashSet<_> = self.paths.get(key.as_str()).into_iter()
-            .chain(descendants)
-            .flat_map(RecordIds::iter)
-            .copied()
-            .collect();
-        if ids.is_empty() { return Ok(()); }
-        // An absent directory proves its lexical children are absent too.
-        // The index folds case, so still validate paths with a different spelling.
-        let subtree = Path::new(path);
-        let missing = matches!(subtree.try_exists(), Ok(false)).then_some(subtree);
-        self.invalidate_ids(ids, missing)
-    }
-    fn invalidate_ids(&mut self, ids: HashSet<u64>, missing_subtree: Option<&Path>) -> io::Result<()> {
-        let stale = ids.into_iter()
-            .filter(|id| self.records.get(id).is_some_and(|record| {
-                missing_subtree.is_some_and(|path| {
-                    record.sources.iter().any(|source| {
-                        Path::new(&source.path).strip_prefix(path).is_ok_and(|tail| {
-                            tail.components().all(|part| matches!(part, std::path::Component::Normal(_)))
-                        })
-                    })
-                }) || !record.current()
-            }))
-            .collect();
-        self.remove_ids(stale)
     }
     fn remove_ids(&mut self, ids: Vec<u64>) -> io::Result<()> {
         if ids.is_empty() { return Ok(()); }
@@ -762,7 +778,7 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
         bytes: identities.iter().try_fold(0u64, |total, range| total.checked_add(range.len))
             .ok_or_else(|| io::Error::other("deduplication byte length overflow"))?,
         admitted: false,
-        sources: sources.into_boxed_slice(),
+        sources: sources.into(),
         range_sources: range_sources.into_boxed_slice(),
         identities: identities.into(),
         digest: None,

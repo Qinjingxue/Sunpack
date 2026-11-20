@@ -16,6 +16,7 @@ use crate::core::{config::Config, passwords::PasswordSnapshot};
 use crate::io::archive_state::VolumeCompleteness;
 use crate::io::reader::PhysicalFileGeneration;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -168,7 +169,7 @@ pub enum FailureKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum FailureContext {
-    Discovery { discovery: DiscoverySource, reason: String, path: PathBuf, error: String },
+    Discovery { discovery: DiscoverySource, reason: Cow<'static, str>, path: PathBuf },
     InputAdmission { missing_paths: Vec<PathBuf> },
     PasswordResolution,
     Extraction,
@@ -196,7 +197,7 @@ pub struct Failure {
     pub kind: FailureKind,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<Box<FailureContext>>,
+    pub context: Option<Arc<FailureContext>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_scope: Option<Arc<FailureScope>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,7 +218,7 @@ impl Failure {
     }
 
     pub(crate) fn with_context(mut self, context: FailureContext) -> Self {
-        self.context = Some(Box::new(context));
+        self.context = Some(Arc::new(context));
         self
     }
 
@@ -588,7 +589,6 @@ impl TaskStatus {
 
 #[derive(Debug, Clone)]
 pub struct TaskCompletion {
-    pub discovery: Option<DiscoverySource>,
     pub status: TaskStatus,
     pub failure: Option<Failure>,
     pub output: Option<PathBuf>,
@@ -597,31 +597,25 @@ pub struct TaskCompletion {
 impl TaskCompletion {
     pub fn from_result(result: &ArchiveResult) -> Self {
         Self {
-            discovery: result.failure.as_ref().and_then(Self::discovery_source),
             status: TaskStatus::of(result),
-            failure: result.failure.as_ref().map(Self::display_failure),
+            failure: result.failure.as_ref().map(|failure| Self::display_failure(failure, true)),
             output: result.output.clone(),
         }
     }
 
     pub(crate) fn failed(failure: &Failure) -> Self {
-        Self { discovery: Self::discovery_source(failure), status: TaskStatus::Failed, failure: Some(Self::display_failure(failure)), output: None }
+        Self { status: TaskStatus::Failed, failure: Some(Self::display_failure(failure, true)), output: None }
     }
 
-    fn discovery_source(failure: &Failure) -> Option<DiscoverySource> {
-        match failure.context.as_deref() {
-            Some(FailureContext::Discovery { discovery, .. }) => Some(*discovery),
-            _ => None,
-        }
-    }
-
-    fn display_failure(failure: &Failure) -> Failure {
+    fn display_failure(failure: &Failure, include_discovery: bool) -> Failure {
         Failure {
             kind: failure.kind,
             message: failure.message.clone(),
-            context: failure.context.as_deref()
-                .filter(|context| matches!(context, FailureContext::WorkerWarning))
-                .map(|context| Box::new(context.clone())),
+            context: match failure.context.as_deref() {
+                Some(FailureContext::WorkerWarning) => failure.context.clone(),
+                Some(FailureContext::Discovery { .. }) if include_discovery => failure.context.clone(),
+                _ => None,
+            },
             discovery_scope: None,
             recovery: None,
             password_retry: failure.password_retry,
@@ -630,7 +624,6 @@ impl TaskCompletion {
                 possible_missing_volume: e.possible_missing_volume,
                 archive_read_fault: e.archive_read_fault.clone(),
                 native_kind: e.native_kind.clone(),
-                stage: e.stage.clone(),
                 ..FailureEvidence::default()
             })),
         }
@@ -652,8 +645,8 @@ impl TaskCompletion {
         // warning adds a separate message for the physical carrier.
         let failure = results.iter().filter_map(|result| result.failure.as_ref())
             .find(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume))
-            .map(Self::display_failure);
-        Self { discovery: None, status, failure, output: common_ancestor(results.iter().filter_map(|r| r.output.as_deref())) }
+            .map(|failure| Self::display_failure(failure, false));
+        Self { status, failure, output: common_ancestor(results.iter().filter_map(|r| r.output.as_deref())) }
     }
 }
 

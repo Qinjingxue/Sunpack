@@ -162,7 +162,8 @@ bool same_filename(std::wstring_view name, std::wstring_view expected) {
         CompareStringOrdinal(name.data(),int(name.size()),expected.data(),int(expected.size()),TRUE)==CSTR_EQUAL;
 }
 }
-DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void(const fs::path&)> changed)
+DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<unsigned(const fs::path&)> classify,
+    std::function<void(unsigned)> notify)
     : stop_(directory_watch_event()) {
     auto target = resolve_path(directory), ancestor = target;
     while (!fs::is_directory(ancestor) && ancestor != ancestor.parent_path()) ancestor = ancestor.parent_path();
@@ -173,15 +174,20 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
     if (dir == INVALID_HANDLE_VALUE) win_error("opWatchDirectory");
     const auto ready = directory_watch_event();
     thread_ = std::thread([this, dir = std::move(dir), done = directory_watch_event(), ready = ready.value,
-        ancestor = std::move(ancestor), subtree, changed = std::move(changed)] {
+        ancestor = std::move(ancestor), subtree, classify = std::move(classify), notify = std::move(notify)] {
         alignas(DWORD) char buffer[16384];
         bool armed=false;
+        const auto failed=[&] {
+            alive_=false;
+            if(!armed) SetEvent(ready);
+            else if(auto flags=classify({})) notify(flags);
+        };
         for (;;) {
             OVERLAPPED ov{}; ov.hEvent = done;
             ResetEvent(done);
             if (!ReadDirectoryChangesW(dir, buffer, sizeof(buffer), subtree,
                 FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
-                nullptr, &ov, nullptr)) { alive_=false; if(armed) changed({}); else SetEvent(ready); break; }
+                nullptr, &ov, nullptr)) { failed(); break; }
             if (!armed) { armed=true; SetEvent(ready); }
             HANDLE waits[] = {stop_, done};
             DWORD signal = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
@@ -189,8 +195,8 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
                 CancelIoEx(dir, &ov); WaitForSingleObject(done, INFINITE); break;
             }
             DWORD count = 0;
-            if (!GetOverlappedResult(dir, &ov, &count, FALSE)) { alive_=false; changed({}); break; }
-            if (!count) changed({});
+            if (!GetOverlappedResult(dir, &ov, &count, FALSE)) { failed(); break; }
+            unsigned flags=count?0:classify({});
             for (DWORD offset = 0; count && offset < count;) {
                 auto* item = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer + offset);
                 const std::wstring_view name(item->FileName,item->FileNameLength / sizeof(wchar_t));
@@ -198,10 +204,12 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
                 if (subtree || same_filename(name,L"sunpack_config.json") || same_filename(name,L"builtin_passwords.json") ||
                     same_filename(name,L"sunpack_watch_roots.txt") || same_filename(name,L"events.json") ||
                     (name.size()>=14 && same_filename(name.substr(0,8),L"runtime-") && name.substr(name.size()-6)==L".state"))
-                    changed(ancestor / name);
+                    flags|=classify(ancestor / name);
                 if (!item->NextEntryOffset) break;
                 offset += item->NextEntryOffset;
             }
+            // A single write can emit several records for the same file.
+            if(flags) notify(flags);
         }
     });
     WaitForSingleObject(ready,INFINITE);

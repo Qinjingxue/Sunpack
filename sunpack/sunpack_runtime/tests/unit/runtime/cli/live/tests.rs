@@ -154,18 +154,18 @@ fn flatten_relocates_visible_and_buffered_descendant_outputs() {
                        (4, "root/wrapper"), (5, "elsewhere/output")] {
         panel.update(&terminal, Language::En, Event::Finished {
             id,
-            result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None, output: Some(path.into()) },
+            result: TaskCompletion { status: TaskStatus::Complete, failure: None, output: Some(path.into()) },
         }, false);
     }
     reports.notify(queued(6, Some(1), "queued.zip", None));
     reports.notify(Event::Finished {
         id: 6,
-        result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None,
+        result: TaskCompletion { status: TaskStatus::Complete, failure: None,
             output: Some("root/wrapper/leaf/queued".into()) },
     });
     reports.notify(Event::Finished {
         id: 2,
-        result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None,
+        result: TaskCompletion { status: TaskStatus::Complete, failure: None,
             output: Some("root/wrapper/leaf/nested".into()) },
     });
     let root = std::path::Path::new("root");
@@ -222,7 +222,7 @@ fn task_preflight_keeps_failed_segments_and_marks_unexecuted_rows_skipped() {
         })), true);
         let result = if id == 2 {
             TaskCompletion::failed(&Failure::new(FailureKind::Damaged, "damaged"))
-        } else { TaskCompletion { discovery: None, status: TaskStatus::Skipped, failure: None, output: None } };
+        } else { TaskCompletion { status: TaskStatus::Skipped, failure: None, output: None } };
         panel.update(&terminal, Language::En, Event::Finished {
             id, result,
         }, true);
@@ -252,7 +252,7 @@ fn task_preflight_keeps_failed_segments_and_marks_unexecuted_rows_skipped() {
     let failure = Failure::new(FailureKind::WrongPassword, "password")
         .with_context(crate::pipeline::FailureContext::Discovery {
             discovery: crate::pipeline::DiscoverySource::Embedded,
-            reason: "needs_password".into(), path: "carrier.bin".into(), error: String::new(),
+            reason: "needs_password".into(), path: "carrier.bin".into(),
         });
     panel.update(&terminal, Language::En, Event::Finished {
         id: 2, result: TaskCompletion::failed(&failure),
@@ -262,7 +262,7 @@ fn task_preflight_keeps_failed_segments_and_marks_unexecuted_rows_skipped() {
     // Ordinary input aggregation does not repeat segment details at the carrier.
     panel.update(&terminal, Language::En, Event::Finished {
         id: 1,
-        result: TaskCompletion { discovery: None, status: TaskStatus::Failed, failure: None, output: None },
+        result: TaskCompletion { status: TaskStatus::Failed, failure: None, output: None },
     }, true);
     assert_eq!(panel.rows(terminal.size, true, Language::En).iter().filter(|row| row.id == Some(1)).count(), 2);
     // Parent task_finished formats an otherwise empty password error;
@@ -294,7 +294,7 @@ fn finished_rows_project_results_while_other_work_is_running() {
             }, false);
             panel.update(&terminal, Language::En, Event::Finished {
                 id,
-                result: TaskCompletion { discovery: None, status,
+                result: TaskCompletion { status,
                     failure: (status == TaskStatus::Partial).then(|| Failure::new(FailureKind::Damaged, "raw")),
                     output: Some(format!("output-{id}").into()),
                 },
@@ -302,7 +302,7 @@ fn finished_rows_project_results_while_other_work_is_running() {
         }
         panel.update(&terminal, Language::En, Event::Finished {
             id: 3,
-            result: TaskCompletion { discovery: None, status: TaskStatus::Failed,
+            result: TaskCompletion { status: TaskStatus::Failed,
                 failure: Some(Failure::new(FailureKind::Cancelled, "raw")), output: None },
         }, false);
         let rows = panel.rows(terminal.size, true, Language::En);
@@ -318,7 +318,7 @@ fn finished_rows_project_results_while_other_work_is_running() {
         // Authoritative carrier finalization can change a segment's output.
         panel.update(&terminal, Language::En, Event::Finished {
             id: 4,
-            result: TaskCompletion { discovery: None, status: TaskStatus::Failed,
+            result: TaskCompletion { status: TaskStatus::Failed,
                 failure: Some(Failure::new(FailureKind::Damaged, "raw")), output: None },
         }, false);
         let text = panel.rows(terminal.size, true, Language::En).into_iter()

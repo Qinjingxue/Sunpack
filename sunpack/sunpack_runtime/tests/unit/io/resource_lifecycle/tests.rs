@@ -1,5 +1,25 @@
 use super::*;
 
+#[test]
+fn idle_pool_releases_its_owner_without_interrupting_borrowers() {
+    let cache = IdleRayonPool::new();
+    let build = || rayon::ThreadPoolBuilder::new().num_threads(1).build().ok();
+    let pool = cache.acquire(build).unwrap();
+    assert!(Arc::ptr_eq(&pool, &cache.acquire(|| panic!("existing pool")).unwrap()));
+    let retired = Arc::downgrade(&pool);
+
+    pool.install(|| cache.clear());
+    let overlap = cache.acquire(|| panic!("borrowed pool")).unwrap();
+    assert!(Arc::ptr_eq(&pool, &overlap));
+    drop(pool);
+    assert_eq!(overlap.install(rayon::current_num_threads), 1);
+    drop(overlap);
+    assert!(retired.upgrade().is_none());
+
+    let rebuilt = cache.acquire(build).unwrap();
+    assert_eq!(rebuilt.current_num_threads(), 1);
+}
+
 // File-only guards do not cover shared batch lifetime or redirected opens.
 // One scope checks close ordering and the existing per-file fallback.
 #[test]

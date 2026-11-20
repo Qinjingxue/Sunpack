@@ -408,7 +408,7 @@ impl Panel {
                     task, width.saturating_sub(display_width(&detail_prefix)), language,
                 )))?;
                 if let Phase::Finished(result) = &task.phase {
-                    let detail = super::task_detail(result.status, result.failure.as_ref(), result.discovery.map(|source| (source, task.path.as_path())), task.segment, self.verbose, language);
+                    let detail = super::task_detail(result.status, result.failure.as_ref(), task.segment, self.verbose, language);
                     let output = result.output.as_ref().filter(|_| self.verbose).map(|output| language.translate(
                         "report.detail.output", &[("output", &output.to_string_lossy())],
                     ));

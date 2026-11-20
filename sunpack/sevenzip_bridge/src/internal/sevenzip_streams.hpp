@@ -88,6 +88,19 @@ namespace sunpack::sevenzip
         return hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     }
 
+    // Named streams share the first I/O error with their open callback.
+    using NamedVolumeError = std::shared_ptr<std::atomic<HRESULT>>;
+
+    inline HRESULT publish_named_volume_error(const NamedVolumeError &error, HRESULT hr) noexcept
+    {
+        if (error && FAILED(hr) && hr != E_ABORT)
+        {
+            HRESULT expected = S_OK;
+            error->compare_exchange_strong(expected, hr, std::memory_order_relaxed);
+        }
+        return hr;
+    }
+
     inline void record_input_error(ExtractInputTrace *trace, const std::wstring &path,
                                    HRESULT hr, [[maybe_unused]] UInt64 offset = 0,
                                    [[maybe_unused]] UInt64 source = 0,
@@ -360,11 +373,12 @@ namespace sunpack::sevenzip
         explicit FileInStream(
             const std::wstring &path,
             ExtractInputTrace *trace = nullptr,
-            InputPrefetchConfig prefetch_config = input_prefetch_config())
+            InputPrefetchConfig prefetch_config = input_prefetch_config(),
+            NamedVolumeError volume_error = {})
 
             : path_(path),
 
-              trace_(trace),
+              trace_(trace), volume_error_(std::move(volume_error)),
 
               handle_(CreateFileW(win32_extended_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 
@@ -448,7 +462,7 @@ namespace sunpack::sevenzip
                     const DWORD error = GetLastError();
                     const HRESULT hr = HRESULT_FROM_WIN32(error);
                     record_input_error(trace_, path_, hr, read_start, read_start, size);
-                    return hr;
+                    return publish_named_volume_error(volume_error_, hr);
                 }
                 file_pointer_dirty_ = false;
             }
@@ -474,7 +488,7 @@ namespace sunpack::sevenzip
 
                 record_input_error(trace_, path_, hr, read_start, read_start, size);
 
-                return hr;
+                return publish_named_volume_error(volume_error_, hr);
             }
 
             position_ += read;
@@ -517,7 +531,7 @@ namespace sunpack::sevenzip
             if (positioned)
                 positioned = SetFilePointerEx(handle_, distance, &new_pos, seekOrigin);
 
-            if (!positioned) return HRESULT_FROM_WIN32(GetLastError());
+            if (!positioned) return publish_named_volume_error(volume_error_, HRESULT_FROM_WIN32(GetLastError()));
 
             const UInt64 prior_position = position_;
             position_ = static_cast<UInt64>(new_pos.QuadPart);
@@ -543,6 +557,7 @@ namespace sunpack::sevenzip
         std::wstring path_;
 
         ExtractInputTrace *trace_ = nullptr;
+        NamedVolumeError volume_error_;
 
         HANDLE handle_ = INVALID_HANDLE_VALUE;
         HRESULT open_hresult_ = S_OK;
@@ -600,17 +615,27 @@ namespace sunpack::sevenzip
             const std::vector<ExtractInputRange> &ranges,
             ExtractInputTrace *trace = nullptr,
             InputPrefetchConfig prefetch_config = InputPrefetchConfig{false, 512 * 1024},
-            bool physical_volume = false, VolumeReadUncertainty* probe_reads = nullptr)
+            VolumeReadUncertainty *probe_reads = nullptr)
+            : MultiRangeInStream(ranges.data(), ranges.size(), trace, prefetch_config, false, probe_reads, {}) {}
 
-            : trace_(trace), physical_volume_(physical_volume), probe_reads_(probe_reads)
+        MultiRangeInStream(const ExtractInputRange &range, InputPrefetchConfig prefetch_config,
+                           NamedVolumeError volume_error)
+            : MultiRangeInStream(&range, 1, nullptr, prefetch_config, true, nullptr, std::move(volume_error)) {}
+
+    private:
+        MultiRangeInStream(const ExtractInputRange *ranges, std::size_t count,
+                           ExtractInputTrace *trace, InputPrefetchConfig prefetch_config,
+                           bool physical_volume, VolumeReadUncertainty *probe_reads, NamedVolumeError volume_error)
+            : probe_reads_(probe_reads), trace_(trace), volume_error_(std::move(volume_error)),
+              physical_volume_(physical_volume)
         {
-
-            ranges_.reserve(ranges.size());
+            ranges_.reserve(count);
             const std::wstring* sized_path = nullptr;
             UInt64 file_size = 0;
 
-            for (const auto &input : ranges)
+            for (std::size_t index = 0; index < count; ++index)
             {
+                const auto &input = ranges[index];
 
                 if (input.path.empty())
                 {
@@ -661,6 +686,7 @@ namespace sunpack::sevenzip
             initialize(prefetch_config);
         }
 
+    public:
         ~MultiRangeInStream()
         {
             prefetch_.reset();
@@ -685,8 +711,7 @@ namespace sunpack::sevenzip
 
             if (!is_open() || !data)
             {
-
-                return E_FAIL;
+                return publish_named_volume_error(volume_error_, E_FAIL);
             }
 
             auto *out = static_cast<unsigned char *>(data);
@@ -730,7 +755,7 @@ namespace sunpack::sevenzip
                 if (open_result != S_OK)
                 {
                     record_input_error(trace_, range->path, open_result, position_, source_offset, want);
-                    return open_result;
+                    return publish_named_volume_error(volume_error_, open_result);
                 }
 
                 if (cached_handle_position_ != source_offset)
@@ -751,7 +776,7 @@ namespace sunpack::sevenzip
 
                         record_input_error(trace_, range->path, hr, position_, source_offset, want);
 
-                        return hr;
+                        return publish_named_volume_error(volume_error_, hr);
                     }
 
                     cached_handle_position_ = source_offset;
@@ -781,7 +806,7 @@ namespace sunpack::sevenzip
 
                     record_input_error(trace_, range->path, hr, position_, source_offset, want);
 
-                    return hr;
+                    return publish_named_volume_error(volume_error_, hr);
                 }
 
                 if (read == 0)
@@ -831,8 +856,7 @@ namespace sunpack::sevenzip
 
             if (next < 0)
             {
-
-                return E_INVALIDARG;
+                return publish_named_volume_error(volume_error_, E_INVALIDARG);
             }
 
             const UInt64 prior_position = position_;
@@ -955,6 +979,7 @@ namespace sunpack::sevenzip
         UInt64 position_ = 0;
 
         ExtractInputTrace *trace_ = nullptr;
+        NamedVolumeError volume_error_;
         bool physical_volume_ = false;
 
         HANDLE cached_handle_ = INVALID_HANDLE_VALUE;

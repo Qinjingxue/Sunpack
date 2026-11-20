@@ -762,6 +762,9 @@ fn parent_subscription_is_shared_and_routes_only_affected_roots() {
     assert_eq!(members.len(), 3);
     assert_eq!(affected_parent_roots(members, Some(&[key(&directory.join("one"))])), vec![key(&roots[0].path)]);
     assert_eq!(affected_parent_roots(members, Some(&[key(&directory.join("missing"))])), vec![key(&roots[2].path)]);
+    assert_eq!(affected_parent_roots(members, Some(&[key(&directory.join("missing")), key(&directory.join("missing/child"))])),
+        vec![key(&roots[2].path)]);
+    assert!(affected_parent_roots(members, Some(&[key(&directory.join("miss"))])).is_empty());
     assert!(affected_parent_roots(members, Some(&[key(&directory.join("unrelated"))])).is_empty());
     assert_eq!(affected_parent_roots(members, None).len(), 3);
     assert!(parent_memberships(std::iter::empty::<&Root>()).is_empty());

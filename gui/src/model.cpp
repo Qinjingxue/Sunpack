@@ -50,11 +50,13 @@ std::wstring scope_key(const fs::path& path) {
     while(!key.empty() && (key.back()==L'\\' || key.back()==L'/')) key.pop_back();
     return key;
 }
-bool password_matches_scope_key(const Json& record,const std::wstring& selected) {
+template<typename MatchPath>
+bool matches_password_scope(const Json& record,bool global,const MatchPath& matches) {
     if(record.is_null()) return false;
-    if(selected.empty()) return !record.contains("scopes");
-    return record.contains("scopes") && std::any_of(record["scopes"].begin(),record["scopes"].end(),[&](const Json& path) {
-        return scope_key(wide(path.get<std::string>()))==selected;
+    const auto scopes=record.find("scopes");
+    if(scopes==record.end()) return global;
+    return !global && std::any_of(scopes->begin(),scopes->end(),[&](const Json& path) {
+        return matches(path.get_ref<const std::string&>());
     });
 }
 const std::string& password_text(const Json& value) {
@@ -163,7 +165,10 @@ struct JsonTokens {
 };
 }
 bool password_matches_scope(const Json& record,const std::string& scope) {
-    return password_matches_scope_key(record,scope.empty() || scope=="@all"?std::wstring():scope_key(wide(scope)));
+    const auto selected=scope.empty() || scope=="@all"?std::wstring():scope_key(wide(scope));
+    return matches_password_scope(record,selected.empty(),[&](const std::string& path) {
+        return scope_key(wide(path))==selected;
+    });
 }
 Json parse_json(const std::string& text) {
     std::vector<std::set<std::string>> fields;
@@ -684,8 +689,17 @@ Json password_rows(const Json& passwords,const View& v) {
     if(source!=passwords.end()) {
         const auto query=fold_search(v.password_query);
         const auto selected=history || v.password_scope=="@all"?std::wstring():scope_key(wide(v.password_scope));
+        // Many passwords share one directory spelling. Normalize it once for
+        // this projection, with keys borrowed from the unchanged document.
+        std::unordered_map<std::string_view,bool> scope_matches;
+        const auto matches=[&](const std::string& path) {
+            if(path==v.password_scope) return true;
+            auto [at,inserted]=scope_matches.try_emplace(path);
+            if(inserted) at->second=scope_key(wide(path))==selected;
+            return at->second;
+        };
         for(const auto& record:*source) {
-            if(!history && !password_matches_scope_key(record,selected)) continue;
+            if(!history && !matches_password_scope(record,selected.empty(),matches)) continue;
             const auto& value=history?record:record.at("value");
             if(!query.empty() && fold_search(value.get_ref<const std::string&>()).find(query)==std::wstring::npos) continue;
             if(history) rows.push_back({{"value",value}});

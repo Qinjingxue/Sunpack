@@ -135,7 +135,13 @@ fn scan_zip_names(
         {
             continue;
         }
-        if reader.read_at(candidate, super::CD_SIG.len())?.as_slice() == super::CD_SIG {
+        let has_signature = if candidate >= tail_start {
+            tail.get((candidate - tail_start) as usize..)
+                .is_some_and(|bytes| bytes.starts_with(super::CD_SIG))
+        } else {
+            reader.read_at(candidate, super::CD_SIG.len())?.as_slice() == super::CD_SIG
+        };
+        if has_signature {
             central_logical_offset = Some(candidate);
             break;
         }
@@ -151,8 +157,11 @@ fn scan_zip_names(
     let mut scoring = FilenameScoring::new();
     let mut authoritative_all = true;
     let mut ascii_only = true;
-    let mut window_start = 0u64;
-    let mut window = Vec::new();
+    // Small central directories are already in the tail read. Larger ones
+    // refill the same buffer starting at the first needed record.
+    let mut window_start = tail_start;
+    let mut window = tail;
+    window.truncate(end.saturating_sub(tail_start) as usize);
     let mut checked = 0u64;
     while checked < total_entries {
         if cursor < window_start || cursor + 46 > window_start + window.len() as u64 {
@@ -433,6 +442,19 @@ fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> i64 {
         }
         if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
             cjk += 1;
+            // The common-character lists contain only characters in this
+            // range. Apply their weights in the same pass as the range count.
+            score += match encoding {
+                EncodingKind::Cp932 => 4 * i64::from(JAPANESE_COMMON_KANJI.contains(ch)),
+                EncodingKind::Cp936 if SIMPLIFIED_COMMON_CHARS.contains(ch) => 3,
+                EncodingKind::Cp936 => {
+                    -i64::from(TRADITIONAL_COMMON_CHARS.contains(ch))
+                        - i64::from(JAPANESE_COMMON_KANJI.contains(ch))
+                }
+                EncodingKind::Cp950 if TRADITIONAL_COMMON_CHARS.contains(ch) => 3,
+                EncodingKind::Cp950 => -i64::from(SIMPLIFIED_COMMON_CHARS.contains(ch)),
+                _ => 0,
+            };
         }
         if ('\u{3040}'..='\u{30ff}').contains(&ch) {
             kana += 1;
@@ -448,50 +470,13 @@ fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> i64 {
     match encoding {
         EncodingKind::Cp932 => {
             score += cjk * 3 + kana * 6 + halfwidth_kana * 6;
-            score += decoded
-                .chars()
-                .filter(|ch| JAPANESE_COMMON_KANJI.contains(*ch))
-                .count() as i64
-                * 4;
             if kana == 0 {
                 score -= halfwidth_kana * 3;
             }
         }
-        EncodingKind::Cp936 => {
+        EncodingKind::Cp936 | EncodingKind::Cp950 => {
             score += cjk * 3;
             score -= (kana + halfwidth_kana) * 2;
-            score += decoded
-                .chars()
-                .filter(|ch| SIMPLIFIED_COMMON_CHARS.contains(*ch))
-                .count() as i64
-                * 3;
-            score -= decoded
-                .chars()
-                .filter(|ch| {
-                    TRADITIONAL_COMMON_CHARS.contains(*ch) && !SIMPLIFIED_COMMON_CHARS.contains(*ch)
-                })
-                .count() as i64;
-            score -= decoded
-                .chars()
-                .filter(|ch| {
-                    JAPANESE_COMMON_KANJI.contains(*ch) && !SIMPLIFIED_COMMON_CHARS.contains(*ch)
-                })
-                .count() as i64;
-        }
-        EncodingKind::Cp950 => {
-            score += cjk * 3;
-            score -= (kana + halfwidth_kana) * 2;
-            score += decoded
-                .chars()
-                .filter(|ch| TRADITIONAL_COMMON_CHARS.contains(*ch))
-                .count() as i64
-                * 3;
-            score -= decoded
-                .chars()
-                .filter(|ch| {
-                    SIMPLIFIED_COMMON_CHARS.contains(*ch) && !TRADITIONAL_COMMON_CHARS.contains(*ch)
-                })
-                .count() as i64;
         }
         EncodingKind::Utf8 => {
             score += (cjk + kana) * 4;

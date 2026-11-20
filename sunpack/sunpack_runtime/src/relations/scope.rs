@@ -33,11 +33,14 @@ impl<'a> RelationSource<'a> {
         }
     }
 
-    fn anchor(&self, row: usize) -> Option<&'a Arc<VolumeAnchor>> {
+    fn anchor(&self, row: usize, key: Option<&str>) -> Option<&'a Arc<VolumeAnchor>> {
         match self {
             Self::Snapshot(snapshot, cached) => cached
                 .filter(|cache| !cache.anchors.is_empty())
-                .and_then(|cache| cache.anchors.get(&path_key(self.path(row))))
+                .and_then(|cache| match key {
+                    Some(key) => cache.anchors.get(key),
+                    None => cache.anchors.get(&path_key(self.path(row))),
+                })
                 .or(snapshot.table.relation_anchors[row]
                     .as_ref()
                     .and_then(CheapAnchor::shared_anchor)),
@@ -47,6 +50,8 @@ impl<'a> RelationSource<'a> {
     }
 
     pub fn materialize(&self, row: usize) -> RelationInput {
+        let path = self.path(row);
+        let path_key = path_key(path);
         let (size, relation_member_eligible) = match self {
             Self::Snapshot(snapshot, _) => (
                 snapshot.table.sizes[row],
@@ -56,14 +61,13 @@ impl<'a> RelationSource<'a> {
             Self::Physical(rows) => (rows[row].size, rows[row].relation_member_eligible),
         };
         RelationInput {
-            path: self.path(row).to_owned(),
-            path_key: path_key(self.path(row)),
+            path: path.to_owned(),
             size,
             relation_member_eligible,
-            anchor: self.anchor(row).cloned().or_else(|| match self {
+            anchor: self.anchor(row, Some(&path_key)).cloned().or_else(|| match self {
                 Self::Snapshot(snapshot, _) => snapshot.table.relation_anchors[row]
                     .as_ref()
-                    .map(|fact| Arc::new(fact.materialize(self.path(row), size.unwrap_or(0)))),
+                    .map(|fact| Arc::new(fact.materialize(path, size.unwrap_or(0)))),
                 #[cfg(test)]
                 Self::Physical(_) => None,
             }),
@@ -77,16 +81,17 @@ impl<'a> RelationSource<'a> {
                 #[cfg(test)]
                 Self::Physical(rows) => rows[row].anchor_cell.clone(),
             },
+            path_key,
         }
     }
 }
 
 /// Keep ASCII scans allocation-free; non-ASCII names use the shared Windows map.
 #[derive(Clone, Debug)]
-struct CaseKey<'a>(Cow<'a, str>);
+pub(super) struct CaseKey<'a>(Cow<'a, str>);
 
 impl<'a> CaseKey<'a> {
-    fn new(value: &'a str) -> Self {
+    pub(super) fn new(value: &'a str) -> Self {
         Self(if value.contains('/') {
             Cow::Owned(path_key(value))
         } else if value.is_ascii() {
@@ -152,7 +157,7 @@ impl RelationScopeIndex {
         // parsing filenames. With overrides, first narrow the scope by name
         // to avoid a path-key lookup for unrelated rows.
         let direct_anchors = !matches!(source, RelationSource::Snapshot(_, Some(cache)) if !cache.anchors.is_empty());
-        let has_seed = |row| source.anchor(row).is_some_and(|anchor| BucketIndex::has_seed(anchor));
+        let has_seed = |row| source.anchor(row, None).is_some_and(|anchor| BucketIndex::has_seed(anchor));
         for row in source.indices() {
             if direct_anchors && !has_seed(row) {
                 continue;

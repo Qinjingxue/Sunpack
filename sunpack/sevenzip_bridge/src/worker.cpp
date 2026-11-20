@@ -2222,9 +2222,10 @@ private:
         // Disk-space monitoring retains its existing active-only schedule.
         // Memory notifications and commitment checks belong to memory_.
         for (;;) {
+            auto deadline = writer_registry_.reap_idle(std::chrono::steady_clock::now());
+            space_monitor_.tick(std::chrono::steady_clock::now());
             std::unique_lock<std::mutex> lock(monitor_mutex_);
             const auto now = std::chrono::steady_clock::now();
-            auto deadline = writer_registry_.next_reap_deadline();
             {
                 std::lock_guard<std::mutex> jobs_lock(mutex_);
                 if (key_cache_deadline_ && now >= *key_cache_deadline_) {
@@ -2244,9 +2245,6 @@ private:
                 [this] { return monitor_stopping_ || monitor_recheck_; });
             if (monitor_stopping_) return;
             monitor_recheck_ = false;
-            lock.unlock();
-            writer_registry_.reap_idle(std::chrono::steady_clock::now());
-            space_monitor_.tick(std::chrono::steady_clock::now());
         }
     }
 

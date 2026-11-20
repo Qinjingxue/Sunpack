@@ -171,7 +171,9 @@ void projection(Fixture& f) {
     auto file=nested/L"已删除的载体.001";
     auto sibling=f.dir/"Data2";
     WatchRoots roots={{f.dir,"",false},{monitor,"",false},{sibling,"",false}};
-    auto history_rows=Json{{"event","done"},{"path",utf8(file.wstring())},{"ts",4},
+    auto file_text=utf8(file.wstring());
+    auto history_rows=Json{{"event","done"},{"path",file_text},{"ts",4},
+        {"group",{{"path",file_text},{"members",{file_text}}}},
         {"output_dirs",{utf8((f.dir/L"missing").wstring()),utf8(output.wstring())}}}.dump()+"\n";
     // Exercise component-prefix matching through the projected rows.
     history_rows+=event("done",sibling/"part.zip",3);
@@ -184,7 +186,7 @@ void projection(Fixture& f) {
     assert(rows.at(1)["root"]==utf8(sibling.wstring()));
     assert(rows.at(2)["root"]==utf8(f.dir.wstring()));
     assert(rows.at(3)["root"]=="@other");
-    assert(row["directory"]==utf8(nested.wstring()));
+    assert(row["directory"]==utf8(nested.wstring()) && row["parts"].empty());
     assert(task_directory(row)==output);
     fs::remove(output);
     assert(task_directory(row)==monitor);

@@ -118,14 +118,12 @@ fn input_admission_receipt_preserves_missing_paths_without_guessing() {
 fn single_discovery_failure_remains_a_leaf() {
     let failure = Failure::new(FailureKind::MissingVolume, "internal discovery text")
         .with_context(FailureContext::Discovery { discovery: DiscoverySource::Embedded,
-            reason: "missing_volume".into(), path: "carrier.bin".into(), error: String::new() });
-    let mut failure = failure;
-    failure.evidence = Some(Box::new(FailureEvidence {
-        stage: Some("discovery".into()), native_kind: Some("missing_volume".into()), ..Default::default()
-    }));
+            reason: "missing_volume".into(), path: "carrier.bin".into() });
     let leaf = Report::from_failure(&failure, Language::En);
     assert_eq!(leaf.stage, "embedded_boundary");
     assert_eq!(leaf.message, Language::En.text("failure.possible_missing_volume"));
+    let display = crate::pipeline::TaskCompletion::failed(&failure).failure.unwrap();
+    assert_eq!(super::super::message(&display, Language::En), leaf.message);
     let archives = [ArchiveResult {
         path: "carrier.bin".into(), format: "zip".into(), output: None,
         failure: Some(failure), files: 0, bytes: 0, encrypted: None, depth: 0,

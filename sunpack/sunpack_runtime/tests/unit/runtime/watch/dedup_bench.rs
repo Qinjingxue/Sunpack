@@ -100,10 +100,11 @@ fn measure_watch_dedup_index() {
     let move_start = Instant::now();
     fs::rename(&subtree, &moved).unwrap();
     let move_ns = move_start.elapsed().as_nanos() as u64;
+    let index = Mutex::new(index);
     let invalidate_start = Instant::now();
-    index.invalidate_tree(&subtree.to_string_lossy()).unwrap();
+    invalidate_tree(&index, &subtree.to_string_lossy()).unwrap();
     let invalidate_ns = invalidate_start.elapsed().as_nanos() as u64;
-    let remaining_records = index.records.len();
+    let remaining_records = index.into_inner().unwrap().records.len();
     fs::rename(&moved, &subtree).unwrap();
     times.sort_unstable();
     let percentile = |p: usize| times[(times.len().saturating_sub(1) * p) / 100];

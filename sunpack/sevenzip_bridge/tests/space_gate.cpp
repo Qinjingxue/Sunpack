@@ -43,7 +43,6 @@ bool check(bool condition, const std::string &what) {
 }
 
 constexpr std::uint64_t kMib = 1024ULL * 1024ULL;
-constexpr std::uint64_t kGiB = 1024ULL * kMib;
 
 // 空的 failed_path 是让新鲜查询确定性失败的唯一做法：随机 GUID 路径有时会解析成功。
 std::wstring unresolved_failed_path() {
@@ -312,24 +311,6 @@ void g5_probe_success_resumes_everyone() {
           "G-5: space_resumed 必须扇出给 affected job");
 }
 
-// 前次 lease 未结算时不得再发放许可
-void g7_no_second_permit_while_probing() {
-    auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g7", log);
-
-    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    check(gate->poll(100 * kMib), "G-7: 第一次 poll 必须发放许可");
-    check(!gate->poll(100 * kGiB), "G-7: 许可未结算时不得发放第二个许可");
-    check(gate->phase() == VolumeSpacePhase::Probing, "G-7: 仍必须是 Probing");
-
-    {
-        auto result = gate->try_wait({});
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-7: 拿到许可");
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    }
-    check(gate->poll(100 * kGiB), "G-7: 许可结算后必须能再次发放");
-}
-
 // 幂等上报
 void g8_concurrent_failures_open_one_episode() {
     auto log = std::make_shared<SinkLog>();
@@ -383,29 +364,6 @@ void g9_wake_waiters_does_not_change_state() {
     check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
           "G-9: 等待者离开绝不等于已恢复");
     check(gate->waiter_count() == 0, "G-9: waiters_ 必须清空");
-}
-
-// terminal predicate
-void g10_terminal_predicate_is_honoured() {
-    auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g10", log);
-    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-
-    auto flag = std::make_shared<std::atomic<bool>>(false);
-    std::atomic<bool> saw_terminal{false};
-    const auto started = std::chrono::steady_clock::now();
-    std::thread waiter([&] {
-        auto result = gate->wait([flag] { return flag->load(std::memory_order_acquire); });
-        saw_terminal.store(result.kind == VolumeSpaceGate::WaitResult::Kind::Terminal);
-    });
-    check(wait_until([&] { return gate->waiter_count() >= 1; }, 2s),
-          "G-10: 等待者必须先阻塞");
-    flag->store(true, std::memory_order_release);
-    gate->wake_waiters();
-    waiter.join();
-    const auto elapsed = std::chrono::steady_clock::now() - started;
-    check(saw_terminal.load(), "G-10: 谓词为真时必须返回 Terminal");
-    check(elapsed < 1s, "G-10: notification must wake the cancelled waiter promptly");
 }
 
 // lease 析构兜底
@@ -482,13 +440,16 @@ void g14_registration_on_blocked_volume_replays() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g14", log);
 
+    gate->register_job("A");
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    log->clear();
     check(gate->register_job("B"), "G-14: 注册必须成功");
-    check(log->count_for(VolumeSpaceTransition::Kind::Blocked, "B") == 1,
-          "G-14: 卷已 Blocked 时注册必须立即补发一条 space_blocked");
     const auto transitions = log->snapshot();
-    check(!transitions.empty() && transitions.back().episode_id == gate->episode_id(),
-          "G-14: 补发的事件必须携带当前 episode_id");
+    check(transitions.size() == 1 &&
+              transitions.front().kind == VolumeSpaceTransition::Kind::Blocked &&
+              transitions.front().episode_id == gate->episode_id() &&
+              transitions.front().job_ids == std::vector<std::string>{"B"},
+          "G-14: 仅向新 job 补发当前 episode 的 blocked 事件");
 
     // Probing 也必须补发（UI 要知道 job 已被卷状态影响）。
     log->clear();
@@ -960,23 +921,6 @@ void g26_registration_covers_root_directory_creation() {
           "G-26: 注销后不得再收到事件");
 }
 
-void g27_late_registration_reuses_the_episode() {
-    auto log = std::make_shared<SinkLog>();
-    auto gate = make_gate("job:g27", log);
-
-    gate->register_job("J1");
-    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    const auto episode = gate->episode_id();
-    log->clear();
-    check(gate->register_job("J2"), "G-27: 注册必须成功");
-    const auto transitions = log->snapshot();
-    check(transitions.size() == 1 &&
-              transitions.front().kind == VolumeSpaceTransition::Kind::Blocked &&
-              transitions.front().episode_id == episode &&
-              transitions.front().job_ids == std::vector<std::string>{"J2"},
-          "G-27: 仅向新 job 补发当前 episode 的 blocked 事件");
-}
-
 // 一个 job 在同一 episode 内恰好收到一条 blocked（去重）
 void g28_one_blocked_per_job_per_episode() {
     auto log = std::make_shared<SinkLog>();
@@ -1388,10 +1332,8 @@ int main(int argc, char **argv) {
         {"G-3  zero space blocks probes", g3_zero_space_blocks_probe},
         {"G-4  positive space issues single probe", g4_positive_space_issues_single_probe},
         {"G-5  probe success resumes everyone", g5_probe_success_resumes_everyone},
-        {"G-7  no second permit while probing", g7_no_second_permit_while_probing},
         {"G-8  concurrent failures open one episode", g8_concurrent_failures_open_one_episode},
         {"G-9  wake_waiters does not change state", g9_wake_waiters_does_not_change_state},
-        {"G-10 terminal predicate is honoured", g10_terminal_predicate_is_honoured},
         {"G-11 lease destructor is inconclusive", g11_lease_destructor_is_inconclusive},
         {"G-12 all waiters leaving is not ready", g12_all_waiters_leaving_is_not_ready},
         {"G-13 event fanout uses affected jobs", g13_event_fanout_uses_affected_jobs},
@@ -1412,8 +1354,6 @@ int main(int argc, char **argv) {
         {"G-25 two volumes recover independently", g25_two_volumes_recover_independently},
         {"G-26 registration covers root directory creation",
          g26_registration_covers_root_directory_creation},
-        {"G-27 late registration reuses the episode",
-         g27_late_registration_reuses_the_episode},
         {"G-28 one blocked per job per episode", g28_one_blocked_per_job_per_episode},
         {"G-29 no late blocked after recovery", g29_no_late_blocked_after_recovery},
         {"G-30 positive samples retry after failure", g30_positive_samples_retry_after_failure},

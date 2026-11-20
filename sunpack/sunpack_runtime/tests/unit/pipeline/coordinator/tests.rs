@@ -1144,7 +1144,7 @@ fn partial_departure_fails_admission_and_keeps_generations_for_extraction() {
         task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
             .with_context(super::super::FailureContext::Discovery {
                 discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
-                path: path.clone(), error: String::new(),
+                path: path.clone(),
             }));
         run.admit_missing_inputs(&mut task, &absent);
         assert_eq!(task.inputs[0].failure.as_ref().unwrap().kind, FailureKind::Unsupported);
@@ -1161,7 +1161,7 @@ fn partial_departure_fails_admission_and_keeps_generations_for_extraction() {
             task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
                 .with_context(super::super::FailureContext::Discovery {
                     discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
-                    path: path.clone(), error: String::new(),
+                    path: path.clone(),
                 }));
         }
         let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
@@ -1229,7 +1229,7 @@ fn discovery_blocked_tasks_register_display_segments_without_executing_them() {
             failure: Some(Failure::new(if index == 0 { FailureKind::Unsupported } else { FailureKind::Damaged },
                 "discovery detail").with_context(super::super::FailureContext::Discovery {
                     discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
-                    path: path.clone(), error: "discovery detail".into(),
+                    path: path.clone(),
                 })),
         }).collect();
         let task = Task {

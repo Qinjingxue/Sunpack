@@ -10,6 +10,7 @@ use super::cancellation::Cancellation;
 use super::reader::{
     physical_file_generation, physical_file_generation_from_metadata, PhysicalFileGeneration,
 };
+use super::resource_lifecycle::IdleRayonPool;
 use super::ScanBatch;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -17,7 +18,7 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::null_mut;
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc};
 
 type Handle = *mut c_void;
 
@@ -114,15 +115,20 @@ pub(crate) struct IocpScanOutput {
     pub(crate) read_operations: u64,
 }
 
-fn scan_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
+static SCAN_POOL: IdleRayonPool = IdleRayonPool::new();
+
+pub(crate) fn clear_scan_pool() {
+    SCAN_POOL.clear();
+}
+
+fn scan_pool() -> Arc<rayon::ThreadPool> {
+    SCAN_POOL.acquire(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(rayon::current_num_threads().clamp(1, 8))
             .thread_name(|index| format!("sunpack-embedded-scan-{index}"))
             .build()
-            .expect("embedded scan thread pool can start")
-    })
+            .ok()
+    }).expect("embedded scan thread pool can start")
 }
 
 impl IocpSlot {

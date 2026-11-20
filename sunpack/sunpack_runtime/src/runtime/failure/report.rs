@@ -106,18 +106,13 @@ impl<'a> Report<'a> {
         let mut raw_message = None;
         let mut message_language = language;
         match context {
-            Some(FailureContext::Discovery { discovery, path, reason, error }) => {
+            Some(FailureContext::Discovery { discovery, path, reason }) => {
                 stage = match discovery {
                     DiscoverySource::Embedded => "embedded_boundary",
                     DiscoverySource::Relations => "relations",
                     DiscoverySource::Detection => "detection",
                 };
                 details = json!({"path": path, "reason": reason});
-                // Preflight uses the localized discovery reason when it has a
-                // message key. Native I/O diagnostics have no translation key.
-                if spec.key.is_empty() {
-                    raw_message = Some(error.clone());
-                }
             }
             Some(FailureContext::InputAdmission { missing_paths }) => {
                 stage = "input_admission";

@@ -588,7 +588,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
     }
 
     // 让 facility 进入 idle 并被回收（persistent 卷的 VolumeState 必须存活）。
-    const auto deadline = registry->next_reap_deadline();
+    const auto deadline = registry->reap_idle({});
     check(deadline.has_value(), "R-16: 空闲 facility 必须安排回收");
     if (!deadline) return;
     registry->reap_idle(*deadline);

@@ -146,6 +146,8 @@ pub(super) struct CatalogRow {
 }
 
 impl CatalogRow {
+    pub fn name(&self) -> &str { &self.name }
+
     pub fn remember_observation(
         &mut self,
         size: u64,
@@ -315,6 +317,18 @@ pub(crate) fn catalog_stem(path: &str) -> String {
 }
 
 impl ScopeCatalog {
+    pub fn rows_at_or_under(&self, key: &str) -> impl Iterator<Item = (&Arc<str>, &CatalogRow)> {
+        use std::ops::Bound::{Excluded, Included};
+        let descendants = crate::path_keys::descendant_key_range(key);
+        let first = if key == descendants.start {
+            Excluded(descendants.start.as_str())
+        } else {
+            Included(descendants.start.as_str())
+        };
+        self.rows.get_key_value(key).into_iter()
+            .chain(self.rows.range::<str, _>((first, Excluded(descendants.end.as_str()))))
+    }
+
     pub fn set_generated(&mut self, key: &str, baseline: GeneratedBaseline) {
         let (stored_key, _) = self.rows.get_key_value(key).expect("generated catalog row");
         self.generated.insert(Arc::clone(stored_key), baseline);

@@ -47,7 +47,8 @@ class DirectoryWatcher {
     bool direct_ = false;
     std::thread thread_;
 public:
-    DirectoryWatcher(const fs::path& directory, std::function<void(const fs::path&)> changed);
+    DirectoryWatcher(const fs::path& directory, std::function<unsigned(const fs::path&)> classify,
+        std::function<void(unsigned)> notify);
     ~DirectoryWatcher();
     DirectoryWatcher(const DirectoryWatcher&) = delete;
     bool alive() const { return alive_; }

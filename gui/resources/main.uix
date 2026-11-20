@@ -30,13 +30,14 @@ export default {
     shownPasswords() {
       if(this.passwordHistory) return this.passwords.rows;
       // Keep the last snapshot mounted until its replacement arrives.
-      let saved=this.passwords.scope==='@history'?[]:this.passwords.rows,ids=passwordIndexes.get(saved);
-      // Synthetic editor rows belong only to the directory where they began.
-      if(this.passwords.scope!==this.passwordScope) { saved=saved.filter(p=>p.original); ids=passwordIndexes.get(saved); }
+      let saved=this.passwords.scope==='@history'?[]:this.passwords.rows,drafts=Object.keys(this.passwordDrafts);
+      if(!this.passwordNew.length&&!drafts.length) return saved;
+      let ids=passwordIndexes.get(saved);
       if(!ids) { ids=new Set(saved.map(p=>p.id)); passwordIndexes.set(saved,ids); }
+      // Synthetic editor rows belong only to the directory where they began.
       let extra=this.passwordNew.filter(p=>p.scope===this.directorySelection&&!ids.has(p.id));
       let extraIds=extra.length?new Set(extra.map(p=>p.id)):null,retained=[];
-      for(let id of Object.keys(this.passwordDrafts)) {
+      for(let id of drafts) {
         let d=this.passwordDrafts[id];
         if((d.original||d.historyValue===undefined)&&d.scope===this.directorySelection&&!ids.has(id)&&!(extraIds&&extraIds.has(id))&&(d.pending||d.error||this.passwordCell===id)) retained.push(d);
       }
@@ -358,10 +359,19 @@ export default {
       let previous=this.rootNew.concat(this.rootRows),identities=new Map();
       for(let r of previous) if(r.original) identities.set(r.identity,r.id);
       for(let d of Object.values(this.rootDrafts)) if(d.original) identities.set(d.identity,d.id);
-      let rows=snapshot.map(d=>({id:identities.get(d.id)||'root-'+(++this.rootNext),identity:d.id,original:d.path,input:d.path,output:d.output,deep:d.deep,recursive:d.recursive,enabled:d.enabled}));
-      let order=new Map(previous.map((r,i)=>[r.id,i]));
-      rows.sort((a,b)=>(order.has(a.id)?order.get(a.id):previous.length)-(order.has(b.id)?order.get(b.id):previous.length));
-      let ids=new Set(rows.map(r=>r.id)); this.rootNew=this.rootNew.filter(r=>!ids.has(r.id)); this.rootRows=rows; this.directories=snapshot; this.pruneChecked('root',this.rootNew.concat(rows));
+      let byId=new Map(),rows=[];
+      for(let d of snapshot) {
+        let id=identities.get(d.id);
+        if(!id||byId.has(id)) id='root-'+(++this.rootNext);
+        byId.set(id,{id:id,identity:d.id,original:d.path,input:d.path,output:d.output,deep:d.deep,recursive:d.recursive,enabled:d.enabled});
+      }
+      this.rootNew=this.rootNew.filter(r=>!byId.has(r.id));
+      for(let r of previous) if(byId.has(r.id)) {
+        rows.push(byId.get(r.id));
+        byId.delete(r.id);
+      }
+      for(let r of byId.values()) rows.push(r);
+      this.rootRows=rows; this.directories=snapshot; this.pruneChecked('root',this.rootNew.concat(rows));
       if(this.directorySelection&&!snapshot.some(d=>d.path===this.directorySelection)) this.selectDirectory('');
     },
     beginRoot(r,part) {

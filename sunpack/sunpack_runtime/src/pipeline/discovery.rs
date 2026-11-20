@@ -483,7 +483,7 @@ fn suppress_prepared_continuations(prepared: &[Task], tasks: &mut Vec<Task>) {
         (task.source == DiscoverySource::Relations
             && logical.failure.as_ref().is_some_and(|failure| matches!(
                 failure.context.as_deref(),
-                Some(super::FailureContext::Discovery { reason, .. }) if reason == "missing_volume"
+                Some(super::FailureContext::Discovery { reason, .. }) if reason.as_ref() == "missing_volume"
             ))
             && input.volume_attempts.is_none()
             && !input.parts.is_empty()
@@ -1249,9 +1249,6 @@ fn project_segments(
             .and_then(|offset| offset.checked_sub(item.offset));
         let mut failure = failure.and_then(|reason| discovery_failure(reason, DiscoverySource::Embedded, &input.entry_path));
         if let (Some(failure), Some(error)) = (&mut failure, errors.remove(&item.offset)) {
-            if let Some(super::FailureContext::Discovery { error: diagnostic, .. }) = failure.context.as_deref_mut() {
-                *diagnostic = error.clone();
-            }
             failure.message = error;
         }
         inputs.push(LogicalInput {
@@ -1269,17 +1266,16 @@ fn project_segments(
 }
 
 fn embedded_read_failure(path: &str, error: String) -> Failure {
-    Failure::new(FailureKind::FilesystemError, error.clone()).with_context(
+    Failure::new(FailureKind::FilesystemError, error).with_context(
         super::FailureContext::Discovery {
             discovery: DiscoverySource::Embedded,
-            reason: "embedded_scan_io_error".to_owned(),
+            reason: "embedded_scan_io_error".into(),
             path: PathBuf::from(path),
-            error,
         },
     )
 }
 
-fn discovery_failure(reason: &str, source: DiscoverySource, path: &str) -> Option<Failure> {
+fn discovery_failure(reason: &'static str, source: DiscoverySource, path: &str) -> Option<Failure> {
     let (kind, message) = match reason {
         "needs_password" | "embedded_password_required" | "wrong_password" | "embedded_wrong_password" => (FailureKind::WrongPassword, "Password not found in the password list"),
         "missing_volume" | "ambiguous_volume_mapping" | "structural_conflict" => {
@@ -1292,15 +1288,9 @@ fn discovery_failure(reason: &str, source: DiscoverySource, path: &str) -> Optio
         "embedded_scan_io_error" => (FailureKind::FilesystemError, "Unable to read archive input"),
         _ => return None,
     };
-    let mut failure = Failure::new(kind, message).with_context(super::FailureContext::Discovery {
-        discovery: source, reason: reason.to_owned(), path: PathBuf::from(path), error: String::new(),
-    });
-    failure.evidence = Some(Box::new(super::FailureEvidence {
-        stage: Some("discovery".into()),
-        native_kind: Some(reason.to_owned()),
-        ..Default::default()
-    }));
-    Some(failure)
+    Some(Failure::new(kind, message).with_context(super::FailureContext::Discovery {
+        discovery: source, reason: reason.into(), path: PathBuf::from(path),
+    }))
 }
 
 fn merge_shared_inputs(tasks: &mut Vec<Task>, blocked_paths: &mut HashSet<String>) {

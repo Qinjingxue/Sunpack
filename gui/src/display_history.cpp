@@ -262,16 +262,19 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
     auto display_path=grouped?group->value("path",path):path;
     const fs::path source=wide(display_path);
     auto parts=Json::array();
-    if(grouped && group->contains("members") && (*group)["members"].is_array()) {
-        std::unordered_set<std::wstring> seen;
-        for(const auto& member:(*group)["members"]) if(member.is_string() && !member.get_ref<const std::string&>().empty()) {
-            const fs::path part=wide(member.get_ref<const std::string&>());
-            if(seen.insert(path_key(part)).second) parts.push_back(utf8(part.filename().wstring()));
+    const bool require_parts=event=="suspended_missing_volume" || (grouped && group->value("multipart",false));
+    if(grouped) {
+        const auto members=group->find("members");
+        if(members!=group->end() && members->is_array() && (require_parts || members->size()>1)) {
+            std::unordered_set<std::wstring> seen;
+            for(const auto& member:*members) if(member.is_string() && !member.get_ref<const std::string&>().empty()) {
+                const fs::path part=wide(member.get_ref<const std::string&>());
+                if(seen.insert(path_key(part)).second) parts.push_back(utf8(part.filename().wstring()));
+            }
         }
     }
-    if((grouped && group->value("multipart",false)) || parts.size()>1 || event=="suspended_missing_volume") {
-        if(parts.empty()) parts.push_back(utf8(fs::path(wide(path)).filename().wstring()));
-    } else parts.clear();
+    if(require_parts && parts.empty()) parts.push_back(utf8(fs::path(wide(path)).filename().wstring()));
+    else if(!require_parts && parts.size()==1) parts.clear();
 
     std::string error,error_type;
     if(failed) {

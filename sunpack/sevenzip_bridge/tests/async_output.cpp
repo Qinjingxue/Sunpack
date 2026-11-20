@@ -529,7 +529,7 @@ bool registry_creation_failure_does_not_retain_entries() {
     try {
         registry.acquire("job:failed");
     } catch (const std::length_error&) {
-        if (registry.volume_count() != 0 || registry.next_reap_deadline()) {
+        if (registry.volume_count() != 0 || registry.reap_idle({})) {
             std::cerr << "failed facility creation retained a volume\n";
             return false;
         }
@@ -636,7 +636,7 @@ bool registry_reclaims_idle_facilities() {
             return false;
         }
     }
-    if (registry.volume_count() != 0 || registry.next_reap_deadline() || !synthetic_writer.expired()) {
+    if (registry.volume_count() != 0 || registry.reap_idle({}) || !synthetic_writer.expired()) {
         std::cerr << "synthetic writer survived its last lease\n";
         return false;
     }
@@ -652,12 +652,11 @@ bool registry_reclaims_idle_facilities() {
             return false;
         }
     }
-    const auto deadline = registry.next_reap_deadline();
+    const auto deadline = registry.reap_idle({});
     if (!deadline) {
         std::cerr << "persistent facility did not arm its idle deadline\n";
         return false;
     }
-    registry.reap_idle(*deadline - config.idle_timeout);
     if (persistent_writer.expired()) {
         std::cerr << "persistent facility was reclaimed before its idle timeout\n";
         return false;
@@ -666,7 +665,10 @@ bool registry_reclaims_idle_facilities() {
         std::cerr << "persistent entry disappeared before reclamation\n";
         return false;
     }
-    registry.reap_idle(*deadline);
+    if (registry.reap_idle(*deadline)) {
+        std::cerr << "reclaimed facility still schedules idle maintenance\n";
+        return false;
+    }
     // The volume state survives facility reclamation.
     if (registry.volume_count() != 1) {
         std::cerr << "persistent volume state did not survive reclamation\n";
@@ -711,7 +713,7 @@ bool registry_reclaims_idle_facilities() {
         auto lease = immediate.acquire("volume-immediate");
         persistent_writer = lease.writer_pointer();
     }
-    if (immediate.next_reap_deadline() || immediate.volume_count() != 1 || !persistent_writer.expired()) {
+    if (immediate.reap_idle({}) || immediate.volume_count() != 1 || !persistent_writer.expired()) {
         std::cerr << "zero idle timeout retained a physical writer facility\n";
         return false;
     }

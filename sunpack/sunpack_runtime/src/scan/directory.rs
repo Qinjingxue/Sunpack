@@ -1534,28 +1534,37 @@ impl NativeWatchCatalog {
         let catalogs = tables.edit();
         let mut published = Vec::new();
         for scope in scopes {
-            let mut covered = Vec::<String>::new();
-            for (key, record) in records.iter().filter(|(path, _)| dependency_root == Some(scope.key()) || scope.intersects_output(path)) {
+            let mut covered = HashSet::new();
+            let root_key = crate::path_keys::path_key(&scope.root);
+            let dependency = dependency_root == Some(scope.key());
+            for (key, record) in &records {
+                let contained = dependency || scope.contains_key(key);
+                if !contained && !crate::watch_store::is_path_under(scope.key(), key) {
+                    continue;
+                }
                 let path = record.aliases.iter().find(|path| crate::path_keys::path_key(path) == *key).unwrap().as_str();
-                let target = if dependency_root == Some(scope.key()) || scope.contains(path) { path } else { scope.root.as_str() };
+                let (target, target_key) = if contained {
+                    (path, key.as_str())
+                } else {
+                    (scope.root.as_str(), root_key.as_str())
+                };
+                if crate::path_keys::path_ancestors(target_key).any(|parent| covered.contains(parent)) {
+                    continue;
+                }
                 // Ordinary recursive enumeration never descends through an
                 // interior junction. Publish the physical alias, not both views.
                 if Path::new(target).exists() && !walk_can_reach(scope.key(), target) {
                     // Dependency files use one canonical alias even outside ordinary enumeration.
-                    if dependency_root != Some(scope.key()) || key != &crate::path_keys::resolved_path_key(Path::new(path)) { continue; }
+                    if !dependency || key != &crate::path_keys::resolved_path_key(Path::new(path)) { continue; }
                 }
-                if covered.iter().any(|root| crate::watch_store::is_path_under(target, root) || target == root) { continue; }
                 let prepared = scan_catalog(options, self, scope, target, true)?;
                 let (errors, _) = apply_catalog_scan(self, scope, Some(target), false, true, false, prepared, catalogs)?;
                 if !errors.is_empty() { return Err(std::io::Error::other(format!("output inventory publication failed: {errors:?}"))); }
-                covered.push(target.to_owned());
+                covered.insert(target_key.trim_end_matches('\\'));
                 let mut buckets = HashSet::new();
                 if let Some(table) = catalogs.get(scope.key()) {
-                    let target_key = crate::path_keys::path_key(target);
-                    for (key, row) in table.rows.range::<str, _>((std::ops::Bound::Included(target_key.as_str()), std::ops::Bound::Unbounded)) {
-                        if !key.starts_with(&target_key) { break; }
-                        if key.as_ref() != target_key && !crate::watch_store::is_path_under(key, &target_key) { continue; }
-                        if !row.is_dir() && buckets.insert(catalog_stem(&row.path())) {
+                    for (_, row) in table.rows_at_or_under(target_key) {
+                        if !row.is_dir() && buckets.insert(catalog_stem(row.name())) {
                             published.push((scope.root.clone(), row.path()));
                         }
                     }
@@ -1573,17 +1582,11 @@ impl NativeWatchCatalog {
         &self,
         scope: &crate::scan::scope::NativeDiscoveryScope,
     ) -> Vec<String> {
-        let target = scope.key();
-        let descendants = crate::path_keys::descendant_key_range(target);
         let root = crate::path_keys::path_key(&scope.root);
         let mut paths: Vec<_> = {
             let catalogs = self.catalogs.lock().unwrap_or_else(|error| error.into_inner());
             let Some(catalog) = catalogs.scopes.get(&root) else { return Vec::new(); };
-            catalog.rows.get_key_value(target).into_iter()
-                .chain(catalog.rows.range::<str, _>((
-                    std::ops::Bound::Included(descendants.start.as_str()),
-                    std::ops::Bound::Excluded(descendants.end.as_str()),
-                )))
+            catalog.rows_at_or_under(scope.key())
                 .filter(|(key, row)| row.persistent() && !row.is_dir() && scope.contains_key(key))
                 .map(|(_, row)| row.path())
                 .collect()

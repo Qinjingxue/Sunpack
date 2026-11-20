@@ -289,6 +289,12 @@ void check_open_callback_canonical_range()
     check(single->GetStream(name.c_str(), &missing) == S_FALSE && !missing &&
           single->missing_volume_name() == name && single->input_error() == S_OK,
           "single-file callback reports an unlisted volume through missing-volume evidence");
+    if (source)
+    {
+        const auto seek_error = source->Seek(-1, FILE_BEGIN, nullptr);
+        check(FAILED(seek_error) && single->input_error() == seek_error,
+              "whole-file volume stream reports its I/O error to the callback");
+    }
 
     auto *raw = new OpenCallback(
         L"", L"archive.part1.rar", {}, canonical_names, InputPrefetchConfig{false}, {},
@@ -304,6 +310,9 @@ void check_open_callback_canonical_range()
         UInt32 read = 0;
         check(stream->Read(bytes, sizeof(bytes), &read) == S_OK && read == 1 && bytes[0] == 'Z',
               "volume callback reads only the configured range");
+        const auto seek_error = stream->Seek(-1, FILE_BEGIN, nullptr);
+        check(FAILED(seek_error) && raw->input_error() == seek_error,
+              "sliced volume stream reports its I/O error to the callback");
     }
 }
 

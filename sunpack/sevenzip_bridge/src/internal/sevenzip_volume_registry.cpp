@@ -127,9 +127,11 @@ namespace sunpack::sevenzip
         return entries_.bucket_count() > (std::max)(kMaxRetainedVolumeStates, entries_.size() * 4);
     }
 
-    void VolumeWriterRegistry::reap_idle(std::chrono::steady_clock::time_point now)
+    std::optional<std::chrono::steady_clock::time_point>
+    VolumeWriterRegistry::reap_idle(std::chrono::steady_clock::time_point now)
     {
         std::vector<std::shared_ptr<AsyncFileWriter>> retired;
+        std::optional<std::chrono::steady_clock::time_point> earliest;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             std::size_t retained_states = 0;
@@ -144,10 +146,14 @@ namespace sunpack::sevenzip
                     continue;
                 }
                 const bool armed = entry.reap_deadline != std::chrono::steady_clock::time_point{};
-                if (entry.leases != 0 || !armed ||
-                    now < entry.reap_deadline ||
-                    !entry.writer->is_quiescent())
+                if (entry.leases != 0 || !armed)
                 {
+                    ++it;
+                    continue;
+                }
+                if (now < entry.reap_deadline || !entry.writer->is_quiescent())
+                {
+                    if (!earliest || entry.reap_deadline < *earliest) earliest = entry.reap_deadline;
                     ++it;
                     continue;
                 }
@@ -189,25 +195,6 @@ namespace sunpack::sevenzip
             }
         }
 
-    }
-
-    std::optional<std::chrono::steady_clock::time_point> VolumeWriterRegistry::next_reap_deadline() const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::optional<std::chrono::steady_clock::time_point> earliest;
-        for (const auto &item : entries_)
-        {
-            const Entry &entry = item.second;
-            if (entry.leases != 0 || !entry.writer ||
-                entry.reap_deadline == std::chrono::steady_clock::time_point{})
-            {
-                continue;
-            }
-            if (!earliest || entry.reap_deadline < *earliest)
-            {
-                earliest = entry.reap_deadline;
-            }
-        }
         return earliest;
     }
 

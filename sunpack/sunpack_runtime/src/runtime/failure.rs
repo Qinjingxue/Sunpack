@@ -105,7 +105,11 @@ fn describe(failure: &Failure, language: Language, warning: bool) -> Message<'_>
             field, offset: fault.offset, requested: fault.requested, actual: fault.actual,
         } };
     }
-    let reason = evidence.and_then(|evidence| evidence.native_kind.as_deref());
+    let discovery_reason = match failure.context.as_deref() {
+        Some(FailureContext::Discovery { reason, .. }) => Some(reason.as_ref()),
+        _ => None,
+    };
+    let reason = discovery_reason.or_else(|| evidence.and_then(|evidence| evidence.native_kind.as_deref()));
     if failure.kind == FailureKind::ProcessError {
         return Message { key: "failure.worker_process_failed", raw: None, params: MessageParams::Process {
             kind: reason.filter(|kind| !kind.is_empty()).unwrap_or("process_error"),
@@ -115,7 +119,7 @@ fn describe(failure: &Failure, language: Language, warning: bool) -> Message<'_>
         } };
     }
     let key = match reason {
-        Some("missing_volume") if evidence.and_then(|e| e.stage.as_deref()) == Some("discovery") => "failure.possible_missing_volume",
+        Some("missing_volume") if discovery_reason.is_some() => "failure.possible_missing_volume",
         Some("ambiguous_volume_mapping" | "structural_conflict") => "failure.possible_missing_volume",
         Some("needs_volume_or_tail_damaged") => "failure.missing_volume_or_tail_damaged",
         _ => match failure.kind {

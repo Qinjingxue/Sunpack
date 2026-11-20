@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use crc32fast::hash as crc32;
 use memchr::memmem;
@@ -7,7 +7,7 @@ use memchr::memmem;
 use crate::analysis_native::structure::{compression_prefix_identity, unified_prefilter_mask_from_head, StructuralStreamKind};
 use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
 use crate::io::reader::ManagedReader;
-use crate::io::resource_lifecycle::{NativeReadScope, TrackedFile};
+use crate::io::resource_lifecycle::{IdleRayonPool, NativeReadScope, TrackedFile};
 use crate::password::rar::{
     rar5_archive_encryption_header, rar5_encryption_identity, Rar5EncryptionIdentity,
 };
@@ -278,14 +278,19 @@ pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) 
     )
 }
 
-pub(crate) fn cheap_fast_probe_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
+static CHEAP_PROBE_POOL: IdleRayonPool = IdleRayonPool::new();
+
+pub(crate) fn cheap_fast_probe_pool() -> Arc<rayon::ThreadPool> {
+    CHEAP_PROBE_POOL.acquire(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(CHEAP_FAST_PROBE_THREADS)
             .build()
-            .expect("cheap volume anchor probe pool must build")
-    })
+            .ok()
+    }).expect("cheap volume anchor probe pool must build")
+}
+
+pub(crate) fn clear_cheap_probe_pool() {
+    CHEAP_PROBE_POOL.clear();
 }
 
 pub(crate) fn probe_volume_anchor_path_cheap(path: &str) -> VolumeAnchor {

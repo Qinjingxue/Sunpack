@@ -509,11 +509,11 @@ int wmain(int argc,wchar_t** argv) {
             auto password_scroll=ui_widget_find_by_id(ui_page_root(app.page()),"passwordListScroll");
             if(password_scroll) { ui_debug_scroll_set(password_scroll,0); ui_widget_destroy(password_scroll); ui_window_relayout(app.window()); }
             std::atomic<bool> password_file_changed{false};
-            DirectoryWatcher password_watcher(dir,[&](const fs::path& changed){
-                if(changed.filename()==L"builtin_passwords.json") {
-                    password_file_changed.store(true,std::memory_order_release);
-                    PostMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),kBenchmarkWakeMessage,0,0);
-                }
+            DirectoryWatcher password_watcher(dir,[](const fs::path& changed){
+                return changed.filename()==L"builtin_passwords.json"?1u:0u;
+            },[&](unsigned){
+                password_file_changed.store(true,std::memory_order_release);
+                PostMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),kBenchmarkWakeMessage,0,0);
             });
             auto rows=page_state(app.page(),"passwords").at("rows");
             auto edit_id="password-text-"+rows.at(0).at("id").get<std::string>();

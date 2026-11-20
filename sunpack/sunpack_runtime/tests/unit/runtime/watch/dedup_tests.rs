@@ -27,6 +27,12 @@ fn finish(index: &mut Index, mut prepared: Prepared) -> bool {
         }
     }
 }
+fn invalidate_path(index: Index, path: &str) -> Index {
+    let index = Mutex::new(index);
+    invalidate(&index, [path]).unwrap();
+    index.into_inner().unwrap()
+}
+
 #[test]
 fn compaction_sharing_conflict_keeps_the_index_writable() {
     use std::os::windows::fs::OpenOptionsExt;
@@ -92,8 +98,10 @@ fn live_identity_alias_lifetime_and_mode_reset() {
     index.finish_rebuild().unwrap();
     assert!(!admit(&mut index, &first, false)); assert!(admit(&mut index, &alias, false));
     // Metadata-only link creation must not discard the original representative.
-    index.invalidate(&[first.entry_path.clone()]).unwrap(); assert!(admit(&mut index, &alias, false));
-    fs::remove_file(&first.entry_path).unwrap(); index.invalidate(&[first.entry_path]).unwrap();
+    index = invalidate_path(index, &first.entry_path);
+    assert!(admit(&mut index, &alias, false));
+    fs::remove_file(&first.entry_path).unwrap();
+    index = invalidate_path(index, &first.entry_path);
     assert!(!admit(&mut index, &alias, false));
     index.reconcile_scopes(&[]).unwrap();
     assert_eq!(index.records.capacity(), 0); assert!(!index.needs_rebuild());
@@ -343,7 +351,9 @@ fn root_and_global_domains_follow_live_scope_ownership() {
         assert!(admit_scope(&mut index, &alias, parent_scope.key()));
         if mode == WatchDeduplication::Hash {
             fs::rename(&nested, dir.0.join("moved-out")).unwrap();
-            index.invalidate_tree(nested.to_str().unwrap()).unwrap();
+            let shared = Mutex::new(index);
+            invalidate_tree(&shared, nested.to_str().unwrap()).unwrap();
+            index = shared.into_inner().unwrap();
             assert!(!index.owners.contains_key(path_key(&alias.entry_path).as_str()));
             assert!(index.owners.contains_key(path_key(&copy.entry_path).as_str()));
         }
@@ -372,7 +382,7 @@ fn lazy_baseline_exhausts_same_size_candidates_and_hardlinks_need_no_hash() {
     assert!(index.records.values().all(|r| r.digest.is_none()));
     let copy = dir.file("copy-last.zip", b"cccccc");
     assert!(admit(&mut index, &copy, false), "must reach the third pending representative");
-    index.invalidate(&[inputs[0].entry_path.clone()]).unwrap();
+    index = invalidate_path(index, &inputs[0].entry_path);
     assert_eq!(index.records.len(), 4, "unchanged source evidence remains indexed");
     let alias = ArchiveInput::file(alias_path.to_string_lossy().into_owned(), "zip".into(), "alias.zip".into());
     // A new, still-unhashed object must also bypass hash through its File ID.
@@ -417,14 +427,16 @@ fn byte_stream_identity_ignores_carrier_and_split_boundaries_but_tracks_every_so
     let prepared = index.prepare_path(&multi_owner, "scope", &[&one, &two], false).unwrap().unwrap();
     assert!(finish(&mut index, prepared));
     fs::write(&right.entry_path, b"XYZ").unwrap();
-    index.invalidate(&[right.entry_path.clone()]).unwrap();
+    index = invalidate_path(index, &right.entry_path);
     assert!(!index.owners.contains_key(path_key(&split.entry_path).as_str()));
     assert!(!index.owners.contains_key(path_key(&reversed.entry_path).as_str()));
     assert!(index.owners.contains_key(path_key(&whole.entry_path).as_str()));
-    fs::remove_file(&two.entry_path).unwrap(); index.invalidate(&[two.entry_path]).unwrap();
+    fs::remove_file(&two.entry_path).unwrap();
+    index = invalidate_path(index, &two.entry_path);
     assert!(!index.owners.contains_key(path_key(&other.entry_path).as_str()));
     assert!(!index.owners.contains_key(path_key(&multi_owner).as_str()));
-    fs::remove_file(&carrier.entry_path).unwrap(); index.invalidate(&[carrier.entry_path.clone()]).unwrap();
+    fs::remove_file(&carrier.entry_path).unwrap();
+    index = invalidate_path(index, &carrier.entry_path);
     assert!(!index.owners.contains_key(path_key(&carrier.entry_path).as_str()));
     assert_eq!(index.records.len(), 1);
 }

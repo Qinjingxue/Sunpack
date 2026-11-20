@@ -210,7 +210,7 @@ fn overlapping_requests_share_progress_stop_and_cleanup_result() {
     a.event(Event::Finalizing { id: 2 });
     a.event(Event::Finished {
         id: 2,
-        result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None },
+        result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Complete, failure: None, output: None },
     });
     let snapshot = current(&publisher);
     assert_eq!(snapshot.status, "0/2 finished");
@@ -324,7 +324,7 @@ fn failed_report_service_releases_completion_gate_without_publishing_partial_rep
     let activity = publisher.register(Arc::from("42"), Language::En);
     activity.event(queued(1, "a.zip", None, 0));
     progress(&activity, 1, 1, 2);
-    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
+    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
     let mut outcome = Outcome::default();
     outcome.archives.push(archive("a.zip", Some(FailureKind::Damaged)));
     activity.root_finished(1, &outcome);
@@ -348,7 +348,7 @@ fn later_root_uses_its_own_name_after_an_earlier_completion_is_published() {
     progress(&activity, 1, 1, 2);
     let mut outcome = Outcome::default();
     outcome.archives.push(archive("a.zip", None));
-    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
+    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
     activity.root_finished(1, &outcome);
     activity.report_finished(1, false);
     finish_debounce(&publisher);
@@ -369,7 +369,7 @@ fn settled_roots_survive_sibling_cancel_or_request_error_without_duplicate_repor
             activity.event(queued(id, path, None, 0));
             progress(&activity, id, 1, 2);
         }
-        activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
+        activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
         assert_eq!(current(&publisher).status, "0/3 finished");
         let mut done = Outcome::default();
         done.archives.push(archive("a.zip", None));
@@ -394,7 +394,7 @@ fn settled_roots_survive_sibling_cancel_or_request_error_without_duplicate_repor
         assert_eq!(current(&publisher).status, "1/3 finished");
         let mut failed = Outcome::default();
         failed.archives.push(archive("c.zip", Some(FailureKind::Damaged)));
-        activity.event(Event::Finished { id: 3, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
+        activity.event(Event::Finished { id: 3, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
         activity.root_finished(3, &failed);
         assert!(activity.needs_root_report(3));
         activity.record_root(3, Path::new("c.zip"), &failed);
@@ -437,7 +437,7 @@ fn batched_top_level_tasks_keep_independent_completion_and_reports() {
     assert_eq!(current(&publisher).label, "3 archives");
     // A root can finish before later descendants are queued. Retain its
     // scalar ancestry until the native request itself has completed.
-    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
+    activity.event(Event::Finished { id: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
     activity.event(queued(5, "a/nested.zip", Some(1), 1));
     progress(&activity, 5, 1, 2);
     assert_eq!(current(&publisher).status, "0/3 finished");

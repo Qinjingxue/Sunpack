@@ -1494,14 +1494,13 @@ fn task_status_key(status: TaskStatus) -> &'static str {
 
 fn task_detail<'a>(
     status: TaskStatus, failure: Option<&'a crate::pipeline::Failure>,
-    discovery: Option<(crate::pipeline::DiscoverySource, &'a Path)>,
     segment: bool, verbose: bool, language: Language,
 ) -> Option<Cow<'a, str>> {
     let failure = failure?;
-    let discovery = discovery.or_else(|| match failure.context.as_deref() {
+    let discovery = match failure.context.as_deref() {
         Some(crate::pipeline::FailureContext::Discovery { discovery, path, .. }) => Some((*discovery, path.as_path())),
         _ => None,
-    });
+    };
     if status != TaskStatus::Failed && !verbose { return None; }
     if segment && discovery.is_none() && failure.kind != crate::pipeline::FailureKind::FilesystemError && failure.is_password_retry() {
         return None;

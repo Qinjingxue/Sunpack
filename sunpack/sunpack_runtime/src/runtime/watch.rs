@@ -20,7 +20,7 @@ use crate::watch_store::{is_path_under, recorded_file_is_absent, watch_path_key}
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1768,30 +1768,42 @@ fn watch_scan_options(config: &Config, has_roots: bool) -> io::Result<Option<Nat
 // root observer when the fanout reaches the scheduler.
 struct ParentObserver {
     observer: RootObserver,
-    members: Arc<Mutex<HashMap<String, String>>>,
+    members: Arc<Mutex<ParentMembers>>,
 }
 
-fn parent_memberships<'a>(roots: impl Iterator<Item = &'a Root>) -> HashMap<String, (PathBuf, HashMap<String, String>)> {
-    let mut desired = HashMap::<String, (PathBuf, HashMap<String, String>)>::new();
+// Several configured paths can resolve to the same notification target.
+type ParentMembers = BTreeSet<(String, String)>;
+
+fn parent_memberships<'a>(roots: impl Iterator<Item = &'a Root>) -> HashMap<String, (PathBuf, ParentMembers)> {
+    let mut desired = HashMap::<String, (PathBuf, ParentMembers)>::new();
     for root in roots {
         if let Some(parent) = root.path.parent().and_then(nearest_directory) {
             let directory = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_owned());
             let event_path = directory.join(root.path.strip_prefix(parent).unwrap_or(&root.path));
-            desired.entry(key(&directory)).or_insert_with(|| (directory, HashMap::new()))
-                .1.insert(key(&root.path), key(&event_path));
+            desired.entry(key(&directory)).or_insert_with(|| (directory, BTreeSet::new()))
+                .1.insert((key(&event_path), key(&root.path)));
         }
     }
     desired
 }
 
-fn affected_parent_roots(members: &HashMap<String, String>, changed: Option<&[String]>) -> Vec<String> {
-    members.iter().filter(|(_, target)| changed.is_none_or(|paths| paths.iter().any(|path| {
-        path.as_str() == target.as_str() || is_path_under(target.as_str(), path.as_str())
-    }))).map(|(root, _)| root.clone()).collect()
+fn affected_parent_roots(members: &ParentMembers, changed: Option<&[String]>) -> Vec<String> {
+    let Some(changed) = changed else { return members.iter().map(|(_, root)| root.clone()).collect(); };
+    let mut affected = HashSet::new();
+    for path in changed {
+        let exact = members.range((path.clone(), String::new())..)
+            .take_while(|(target, _)| target == path);
+        // A target below a missing directory is invalidated when that
+        // ancestor appears. The range also handles names containing dots.
+        let range = crate::path_keys::descendant_key_range(path);
+        let descendants = members.range((range.start, String::new())..(range.end, String::new()));
+        affected.extend(exact.chain(descendants).map(|(_, root)| root));
+    }
+    affected.into_iter().cloned().collect()
 }
 
 impl ParentObserver {
-    fn start(directory: &Path, members: HashMap<String, String>, hub: &Arc<Hub>) -> io::Result<Self> {
+    fn start(directory: &Path, members: ParentMembers, hub: &Arc<Hub>) -> io::Result<Self> {
         let identity = output_identity(&directory.to_string_lossy())?;
         let members = Arc::new(Mutex::new(members));
         let watched_members = Arc::clone(&members);
@@ -2998,7 +3010,7 @@ impl Scheduler {
             .filter(|(id, _)| changed.is_none_or(|changed| changed.contains(*id)))
             .map(|(_, (root, _))| root));
         for parent in self.parent_observers.values() {
-            parent.members.lock().unwrap().retain(|id, _|
+            parent.members.lock().unwrap().retain(|(_, id)|
                 self.roots.contains_key(id) && changed.is_some_and(|changed| !changed.contains(id)));
         }
         for (id, (directory, mut members)) in desired {
@@ -3007,7 +3019,7 @@ impl Scheduler {
                     parent.members.lock().unwrap().extend(members);
                     continue;
                 }
-                members.extend(parent.members.lock().unwrap().clone());
+                members.extend(parent.members.lock().unwrap().iter().cloned());
                 self.parent_observers.remove(&id);
             }
             match ParentObserver::start(&directory, members, &self.hub) {
@@ -3627,7 +3639,7 @@ impl Scheduler {
                 let changed: Vec<_> = paths.iter().filter(|path| !departed.contains(*path))
                     .map(|path| path.to_string_lossy().into_owned())
                     .filter(|path| scope.contains(path) && !self.catalog.is_owned(path)).collect();
-                self.dedup.lock().unwrap().invalidate(&changed)?;
+                dedup::invalidate(&self.dedup, changed.iter().map(String::as_str))?;
             }
             let mut stems = HashSet::new();
             let mut root_available = None;
@@ -3661,9 +3673,10 @@ impl Scheduler {
 
     fn observe_root_changes(&mut self, changes: &mut RootChanges) -> io::Result<()> {
         if self.settings.watch.deduplication != config::WatchDeduplication::None {
-            let mut index = self.dedup.lock().unwrap();
             for root in &changes.topology_roots {
-                if let Some((root, _)) = self.roots.get(root) { index.invalidate_tree(&root.path.to_string_lossy())?; }
+                if let Some((root, _)) = self.roots.get(root) {
+                    dedup::invalidate_tree(&self.dedup, &root.path.to_string_lossy())?;
+                }
             }
         }
         if !self.baseline_roots.is_empty() {
@@ -3740,7 +3753,7 @@ impl Scheduler {
             if !root.path.is_dir() {
                 self.available_roots.remove(id);
                 if self.settings.watch.deduplication != config::WatchDeduplication::None {
-                    self.dedup.lock().unwrap().invalidate_tree(&scope.root)?;
+                    dedup::invalidate_tree(&self.dedup, &scope.root)?;
                 }
                 continue;
             }
@@ -3984,9 +3997,9 @@ impl Scheduler {
                     // Resume deliberately absorbs offline changes rather than
                     // returning arrivals. Retire stale indexed inputs once at
                     // that same scope boundary, without rehashing live ones.
-                    self.dedup.lock().unwrap().invalidate_tree(&scope.root)?;
+                    dedup::invalidate_tree(&self.dedup, &scope.root)?;
                 } else {
-                    self.dedup.lock().unwrap().invalidate(&paths)?;
+                    dedup::invalidate(&self.dedup, paths.iter().map(String::as_str))?;
                 }
             }
             let recovered_paths = paths.len();
@@ -4184,8 +4197,8 @@ impl Scheduler {
 
     fn departed(&mut self, path: &str, recursive: bool) -> io::Result<()> {
         if self.settings.watch.deduplication != config::WatchDeduplication::None {
-            if recursive { self.dedup.lock().unwrap().invalidate_tree(path)?; }
-            else { self.dedup.lock().unwrap().invalidate(&[path.to_owned()])?; }
+            if recursive { dedup::invalidate_tree(&self.dedup, path)?; }
+            else { dedup::invalidate(&self.dedup, [path])?; }
         }
         let path_key = watch_path_key(path);
         self.candidate_diagnostics.retire_path(&path_key, recursive);
@@ -5873,7 +5886,8 @@ impl Scheduler {
             if let Some(failure) = archive
                 .failure
                 .as_ref()
-                .filter(|failure| failure.evidence.is_some())
+                .filter(|failure| failure.evidence.is_some() || matches!(failure.context.as_deref(),
+                    Some(crate::pipeline::FailureContext::Discovery { .. })))
             {
                 // Emit once per logical archive, including carrier segments and
                 // recursive children, rather than repeating it for every volume.
