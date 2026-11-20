@@ -16,6 +16,10 @@ impl NativeDiscoveryScope {
         self.excluded.is_some()
     }
 
+    pub(crate) fn same_exclusions(&self, other: &Self) -> bool {
+        self.excluded == other.excluded
+    }
+
     pub(crate) fn key(&self) -> &str {
         &self.key
     }

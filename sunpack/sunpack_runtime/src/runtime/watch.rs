@@ -113,18 +113,42 @@ fn root_scopes(entries: &[Root], metadata: &[String]) -> BTreeMap<String, (Root,
     let roots: Vec<_> = entries.iter().map(|root| (key(&root.path), root)).collect();
     let positions: HashMap<_, _> = roots.iter().enumerate()
         .map(|(index, (id, _))| (id.trim_end_matches('\\'), index)).collect();
-    let mut excluded = vec![metadata.to_vec(); roots.len()];
+    let mut excluded: Vec<_> = roots.iter().map(|(_, root)| {
+        if root.enabled { metadata.to_vec() } else { Vec::new() }
+    }).collect();
     for (id, root) in &roots {
-        // Excluding the nearest nested root also excludes every root below it.
+        // Disabled roots still fence off their subtree. An explicitly enabled
+        // descendant of one gets its own independent scope.
         let parent = crate::path_keys::path_ancestors(id).skip(1)
             .find_map(|ancestor| positions.get(ancestor));
-        if let Some(&parent) = parent {
+        if let Some(&parent) = parent.filter(|&&index| roots[index].1.enabled) {
             excluded[parent].push(root.path.to_string_lossy().into_owned());
         }
     }
-    roots.into_iter().zip(excluded).map(|((id, root), excluded)| {
-        (id, (root.clone(), root.scope(excluded)))
+    roots.into_iter().zip(excluded).filter_map(|((id, root), excluded)| {
+        root.enabled.then(|| (id, (root.clone(), root.scope(excluded))))
     }).collect()
+}
+
+fn configured_root_scopes(cwd: &Path, entries: &[Root]) -> io::Result<BTreeMap<String, (Root, NativeDiscoveryScope)>> {
+    let dir = state_dir(cwd)?;
+    let state = dir.to_string_lossy().into_owned();
+    let resolved_state = crate::path_keys::resolved_path_key(&dir);
+    let mut metadata = Vec::with_capacity(2);
+    if crate::path_keys::path_key(&state) != resolved_state { metadata.push(resolved_state); }
+    metadata.push(state);
+    Ok(root_scopes(entries, &metadata))
+}
+
+fn root_policy_changed(
+    previous: &BTreeMap<String, (Root, NativeDiscoveryScope)>,
+    next: &BTreeMap<String, (Root, NativeDiscoveryScope)>,
+) -> bool {
+    previous.len() != next.len() || next.iter().any(|(id, (root, scope))| {
+        previous.get(id).is_none_or(|(old, old_scope)| {
+            !old.same_policy(root) || !old_scope.same_exclusions(scope)
+        })
+    })
 }
 
 fn containing_root<'a>(
@@ -957,7 +981,7 @@ impl Drop for Watch {
 }
 
 fn validate_outputs(roots: &[Root]) -> io::Result<()> {
-    let outputs: Vec<_> = roots.iter().filter_map(|root| {
+    let outputs: Vec<_> = roots.iter().filter(|root| root.enabled).filter_map(|root| {
         let output = root.output.as_deref()?;
         Some((root_key(output), &root.path, output))
     }).collect();
@@ -2432,16 +2456,15 @@ impl Scheduler {
         Ok(())
     }
 
-    fn persist_enabled(&self, enabled: bool) -> io::Result<()> {
-        self.journal.resume()?;
-        self.journal.commit(true, |_| {
+    fn persist_watch_control(journal: &journal::Journal, enabled: bool, baseline_roots: &HashSet<String>) -> io::Result<()> {
+        journal.commit(true, |_| {
             let mut operations = crate::watch_store::NativeWatchOperations::empty();
-            operations.set_runtime("watch_control".into(), Some(json!({"enabled":enabled, "baseline_roots":self.baseline_roots})));
+            operations.set_runtime("watch_control".into(), Some(json!({"enabled":enabled, "baseline_roots":baseline_roots})));
             Ok(operations)
         })?;
         // The command acknowledgement is the durable intent boundary, including
         // when the append was issued from a shared blocking-stage scope.
-        self.journal.flush()
+        journal.flush()
     }
 
     fn set_enabled(&mut self, enabled: bool) -> io::Result<bool> {
@@ -2465,7 +2488,7 @@ impl Scheduler {
                 self.password_update(true)?;
                 self.retry_missing_volumes(None)?;
                 self.root_progress.recovery = false;
-                self.persist_enabled(true)?;
+                Self::persist_watch_control(&self.journal, true, &self.baseline_roots)?;
                 self.hub.enabled.store(true, Ordering::Release);
                 Ok(())
             })();
@@ -2480,7 +2503,8 @@ impl Scheduler {
                 // Accepted work survives a pause; new arrivals after this
                 // explicit command are not turned into recovery intent.
                 self.persist_candidates(BTreeMap::new(), true)?;
-                self.persist_enabled(false)?;
+                self.journal.resume()?;
+                Self::persist_watch_control(&self.journal, false, &self.baseline_roots)?;
                 self.hub.enabled.store(false, Ordering::Release);
                 self.drain_active(&mut Ok(()))?;
                 self.persist_candidates(BTreeMap::new(), true)?;
@@ -2553,12 +2577,7 @@ impl Scheduler {
         // via its queued command; a cold disable must suppress startup recovery.
         let enabled = saved_enabled && requested != Some(false);
         if requested.is_some() && enabled != saved_enabled {
-            journal.commit(true, |_| {
-                let mut operations = crate::watch_store::NativeWatchOperations::empty();
-                operations.set_runtime("watch_control".into(), Some(json!({"enabled":enabled})));
-                Ok(operations)
-            })?;
-            journal.flush()?;
+            Self::persist_watch_control(&journal, enabled, &baseline_roots)?;
         }
         hub.enabled.store(enabled, Ordering::Release);
         let dedup = Arc::new(Mutex::new(dedup::Index::open(&dir, snapshot.config.watch.deduplication, snapshot.config.watch.deduplication_scope)?));
@@ -2812,7 +2831,7 @@ impl Scheduler {
 
     fn reconcile_roots(&mut self, restart_scheduler: bool) -> io::Result<(bool, bool)> {
         let engine = Arc::clone(&self.engine);
-        let (entries, next, policy_changed, lease) = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
+        let (next, baseline_roots, policy_changed, lease) = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
         let (entries, rejected) = {
             // Read, classify, and prune the same root policy. GUI and CLI
             // writers share this lock; pruning an older snapshot can remove a
@@ -2839,7 +2858,6 @@ impl Scheduler {
             if !rejected.is_empty() {
                 write_roots(&self.root_file, &entries)?;
             }
-            entries.retain(|root| root.enabled);
             (entries, rejected)
         };
         if !rejected.is_empty() {
@@ -2860,38 +2878,32 @@ impl Scheduler {
             }
         }
         validate_outputs(&entries)?;
+        let next = configured_root_scopes(&self.cwd, &entries)?;
         // The first root needs the broker for validation and recovery. Keep
         // this lease local until the root policy is published so a failed add
         // cannot leave the rootless service holding a connection.
-        let lease = if self.roots.is_empty() && !entries.is_empty() && self.broker_lease.is_none() {
+        let lease = if self.roots.is_empty() && !next.is_empty() && self.broker_lease.is_none() {
             Some(BrokerLease::acquire()?)
         } else {
             None
         };
-        let new_directories: HashSet<_> = entries
+        let new_directories: HashSet<_> = next
             .iter()
-            .filter(|root| !self.roots.contains_key(&key(&root.path)))
-            .filter_map(|root| nearest_directory(&root.path))
+            .filter(|(id, _)| !self.roots.contains_key(*id))
+            .filter_map(|(_, (root, _))| nearest_directory(&root.path))
             .collect();
         for directory in new_directories {
             filesystem::validate_watch_root(&directory.to_string_lossy())?;
         }
-        let dir = state_dir(&self.cwd)?;
-        let state = dir.to_string_lossy().into_owned();
-        let resolved_state = crate::path_keys::resolved_path_key(&dir);
-        let is_alias = crate::path_keys::path_key(&state) != resolved_state;
-        let mut metadata = vec![state];
-        if is_alias { metadata.push(resolved_state); }
-        let next = root_scopes(&entries, &metadata);
-        let policy_changed = self.roots.len() != next.len()
-            || next.iter().any(|(id, (root, _))| {
-                self.roots.get(id).is_none_or(|(old, _)| {
-                    !old.same_policy(root)
-                })
-            });
-            Ok((entries, next, policy_changed, lease))
+        let mut baseline_roots = self.baseline_roots.clone();
+        baseline_roots.retain(|id| next.get(id).is_some_and(|(root, _)| root.scanned));
+        baseline_roots.extend(entries.iter().filter(|root| !root.enabled && root.scanned)
+            .map(|root| key(&root.path)));
+        let policy_changed = root_policy_changed(&self.roots, &next);
+            Ok((next, baseline_roots, policy_changed, lease))
         })??;
-        if next.is_empty() && self.journal.suspended() { return Ok((false, false)); }
+        let baseline_changed = self.baseline_roots != baseline_roots;
+        if next.is_empty() && self.journal.suspended() && !baseline_changed { return Ok((false, false)); }
         if self.journal.resume()? {
             self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(),
                 Some(state_dir(&self.cwd)?.to_string_lossy().into_owned())));
@@ -2914,9 +2926,13 @@ impl Scheduler {
             }
         }
         engine.run_stage("watch_directory", Origin::Watch, || {
+        if baseline_changed {
+            // Publish disabled roots' intent before dropping their checkpoints.
+            Self::persist_watch_control(&self.journal, self.enabled(), &baseline_roots)?;
+            self.baseline_roots = baseline_roots;
+        }
         let refresh_catalog = self.root_progress.observe(policy_changed, self.roots.is_empty());
         self.available_roots.retain(|id| next.contains_key(id));
-        self.baseline_roots.retain(|id| next.contains_key(id));
         self.roots = next;
         self.root_scope_records = HashMap::new();
         if refresh_catalog && self.settings.watch.deduplication != config::WatchDeduplication::None {
@@ -2940,8 +2956,8 @@ impl Scheduler {
                 let scopes: Arc<[_]> = self.roots.values()
                     .map(|(_, scope)| scope.clone()).collect::<Vec<_>>().into();
                 let mut external = self.external.current.write().unwrap();
-                self.catalog.retain_roots(entries.iter()
-                    .map(|entry| entry.path.to_string_lossy().into_owned()).collect());
+                self.catalog.retain_roots(self.roots.values()
+                    .map(|(root, _)| root.path.to_string_lossy().into_owned()).collect());
                 *external = Some(ExternalOutputs {
                     journal: Arc::downgrade(&self.journal),
                     scopes: Arc::clone(&scopes),
@@ -3214,7 +3230,7 @@ impl Scheduler {
             let mut settings = Arc::clone(&self.settings);
             let password_path = self.passwords.path().to_owned();
             let log = Arc::clone(self.journal.event_log());
-            let roots: Vec<_> = self.roots.values().map(|(root, _)| root.clone()).collect();
+            let roots = std::mem::take(&mut self.roots);
             let tray_enabled = self.tray_enabled;
             let mut observers = std::mem::take(&mut self.config_observers);
             let mut tray = self.tray.take();
@@ -3241,10 +3257,9 @@ impl Scheduler {
                 if !signals.reload { continue; }
                 let reload = (|| {
                     let snapshot = config::reload_snapshot(&cwd)?;
-                    let next_roots = read_roots(&roots_path(&cwd)?)?;
+                    let next_roots = configured_root_scopes(&cwd, &read_root_records(&roots_path(&cwd)?)?)?;
                     let changed = scheduler_configuration_changed(&settings, &snapshot.config)
-                        || roots.len() != next_roots.len()
-                        || roots.iter().any(|root| !next_roots.iter().any(|next| key(&root.path) == key(&next.path) && root.same_policy(next)));
+                        || root_policy_changed(&roots, &next_roots);
                     let shell_changed = *settings != snapshot.config;
                     if !changed && (signals.reload_waiters.is_empty() || shell_changed) {
                         // A failed scheduler does not disable service-only policy
@@ -3711,9 +3726,6 @@ impl Scheduler {
     ) -> io::Result<()> {
         if self.options.is_none() || (!self.enabled() && !self.resuming) { return Ok(()); }
         use rayon::prelude::*;
-        let baseline = self.resuming;
-        let mut baselined = HashSet::new();
-
         let mut groups: HashMap<String, (u64, i64, i64, Vec<NativeDiscoveryScope>)> =
             HashMap::new();
         let mut probes = Vec::new();
@@ -3790,7 +3802,7 @@ impl Scheduler {
             }
             (id, root, scope, identity, current, cached)
         }).collect::<Vec<_>>();
-        if !baseline && !reopened.is_empty() {
+        if !self.resuming && !reopened.is_empty() {
             // Old snapshots can have only an outside literal name while its
             // physical watched volume is offline. Resolve those legacy names
             // once when a root returns, before catalog recovery or admission.
@@ -3831,8 +3843,16 @@ impl Scheduler {
         let retry_volumes = self.journal.state().has_missing_volume_blockers();
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
+        let mut baseline_count = 0;
         for (id, root, scope, identity, current, cached) in probes {
-            let baseline = baseline || self.baseline_roots.contains(&id);
+            let baseline = self.resuming || self.baseline_roots.contains(&id);
+            let refresh = |options: &NativeDirectoryScanOptions, catalog: &NativeWatchCatalog, path: Option<&str>| {
+                if baseline {
+                    options.catalog_baseline(catalog, &scope, path).map(|errors| (errors, Vec::new()))
+                } else {
+                    options.catalog_refresh(catalog, &scope, path)
+                }
+            };
             let range = match (&current, &cached) {
                 (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end)))
                     if volume == old_volume
@@ -3843,18 +3863,15 @@ impl Scheduler {
                 }
                 _ => None,
             };
+            baseline_count += usize::from(baseline);
             let mut paths = Vec::new();
             let mut errors = Vec::new();
-            let rebuild = !root.scanned || range.is_none_or(|entries| entries.is_err());
-            if rebuild {
-                // Only startup without a trusted persisted cursor establishes
-                // a conservative baseline. During a running session the in-memory
-                // inventory must publish arrivals even if persistence has failed.
+            if !root.scanned || range.is_none_or(|entries| entries.is_err()) {
+                // A normal live refresh reports arrivals even without a trusted
+                // cursor. Startup with no prior cursor adopts inventory quietly.
                 let options = self.scan_options(root.deep)?;
-                let scan = if baseline {
-                    options.catalog_baseline(&self.catalog, &scope, None).map(|errors| (errors, Vec::new()))
-                } else if !startup || cached.is_some() {
-                    options.catalog_refresh(&self.catalog, &scope, None)
+                let scan = if baseline || !startup || cached.is_some() {
+                    refresh(options, &self.catalog, None)
                 } else {
                     options.catalog_update(&self.catalog, &scope, None)
                         .map(|errors| (errors, Vec::new()))
@@ -3883,10 +3900,10 @@ impl Scheduler {
                             continue;
                         }
                         match fs::metadata(path.as_ref()) {
-                            Ok(metadata) if metadata.is_file() => paths.push(path.into_owned()),
+                            Ok(metadata) if metadata.is_file() && !baseline => paths.push(path.into_owned()),
                             Err(error) if missing_path(&error) => {
                                 self.departed(&path, true)?;
-                                paths.push(path.into_owned());
+                                if !baseline { paths.push(path.into_owned()); }
                             }
                             _ => {}
                         }
@@ -3922,17 +3939,11 @@ impl Scheduler {
                     if !full_refresh && !crate::path_keys::path_ancestors(path_id.as_ref())
                         .skip(1).any(|parent| covered.contains(parent)) {
                         let options = self.scan_options(root.deep)?;
-                        let refresh = if baseline {
-                            options.catalog_baseline(&self.catalog, &scope, Some(path)).map(|errors| (errors, Vec::new()))
-                        } else { options.catalog_refresh(&self.catalog, &scope, Some(path)) };
-                        match collect_catalog_arrivals(refresh, &mut paths) {
+                        match collect_catalog_arrivals(refresh(options, &self.catalog, Some(path)), &mut paths) {
                             Ok(()) => {}
                             Err(reason) => {
                                 full_refresh = true;
-                                let refresh = if baseline {
-                                    options.catalog_baseline(&self.catalog, &scope, None).map(|errors| (errors, Vec::new()))
-                                } else { options.catalog_refresh(&self.catalog, &scope, None) };
-                                match refresh {
+                                match refresh(options, &self.catalog, None) {
                                     Ok((failed, mut arrivals)) => {
                                         errors = failed;
                                         paths.append(&mut arrivals);
@@ -3969,7 +3980,7 @@ impl Scheduler {
             }
             let recovered_paths = paths.len();
             if !root.scanned {
-                paths.extend(self.catalog.candidate_paths(&scope));
+                if !baseline { paths.extend(self.catalog.candidate_paths(&scope)); }
                 // The initial scan records a completed directory enumeration.
                 // It has its own durable candidate barrier below, even when
                 // the USN cursor is temporarily unavailable.
@@ -4013,21 +4024,20 @@ impl Scheduler {
                     let changed = cached.as_ref().is_none_or(|(old_volume, old_journal, old_end)| {
                         (old_volume, *old_journal, *old_end) != (&volume, journal, end)
                     });
-                    if baseline { baselined.insert(id); }
-                    cursors.push((changed.then_some((scope, identity)), volume, journal, end));
+                    cursors.push((baseline.then_some(id), changed.then_some((scope, identity)), volume, journal, end));
                 }
                 (Ok((volume, _, _)), _) => { failures.insert(volume); }
                 (Err(error), _) => {
-                    if baseline { return Err(io::Error::new(error.kind(), error.to_string())); }
+                    if self.resuming { return Err(io::Error::new(error.kind(), error.to_string())); }
                     self.journal.log(json!({"event":"usn_cursor_unavailable","root":root.path,"error":error.to_string()}));
                 },
             }
         }
-        if baseline && !failures.is_empty() {
+        if self.resuming && !failures.is_empty() {
             return Err(io::Error::other("Cannot establish the resumed Watch baseline"));
         }
         let mut operations = BTreeMap::new();
-        for (_, volume, journal, end) in &cursors {
+        for (_, _, volume, journal, end) in &cursors {
             if failures.contains(volume) {
                 continue;
             }
@@ -4048,10 +4058,13 @@ impl Scheduler {
         // Recovery/admission owns the durable cursor, never ordinary file
         // notifications. Publish candidates and cursor in one transaction.
         self.persist_candidates(operations, true)?;
-        for (changed, volume, journal, end) in cursors {
-            if let Some((scope, identity)) = changed.filter(|_| !failures.contains(&volume)) {
+        let mut baselined = HashSet::new();
+        for (baseline, changed, volume, journal, end) in cursors {
+            if failures.contains(&volume) { continue; }
+            if let Some((scope, identity)) = changed {
                 self.catalog.set_cursor(&scope, identity, volume, journal, end);
             }
+            baselined.extend(baseline);
         }
         if !marks.is_empty() {
             // Candidate/cursor durability above is mandatory. This separate
@@ -4096,15 +4109,19 @@ impl Scheduler {
         }
         if !baselined.is_empty() {
             self.catalog.flush()?;
-            self.baseline_roots.retain(|root| !baselined.contains(root));
+            let pending = self.baseline_roots.difference(&baselined).cloned().collect();
             // Only an already-enabled scheduler publishes partial root recovery.
             // Explicit resume publishes intent once its complete barrier finishes.
-            if self.enabled() { self.persist_enabled(true)?; }
+            if self.enabled() { Self::persist_watch_control(&self.journal, true, &pending)?; }
+            self.baseline_roots = pending;
         }
         self.catalog.commit(false);
         if let Some(error) = self.catalog.error() {
-            if baseline { return Err(io::Error::other(error)); }
+            if baseline_count != 0 { return Err(io::Error::other(error)); }
             self.journal.log(json!({"event":"catalog_persistence_failed","error":error}));
+        }
+        if baselined.len() != baseline_count {
+            return Err(io::Error::other("Cannot establish the resumed Watch baseline"));
         }
         Ok(())
     }

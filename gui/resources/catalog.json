@@ -152,6 +152,10 @@
       "zh": "全选",
       "en": "Select all"
     },
+    "deselectAll": {
+      "zh": "取消全选",
+      "en": "Deselect all"
+    },
     "enableState": {
       "zh": "启用状态",
       "en": "Enabled"

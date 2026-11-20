@@ -129,4 +129,18 @@ fn persisted_password_signatures_survive_runtime_migration() {
     assert_eq!(snapshot.scope_signature(Path::new(r"C:\different")),
         changed.scope_signature(Path::new(r"C:\different")));
 
+    let disabled = PasswordSnapshot::from_test_document(&text.replace(
+        r#"{"enabled":true,"value":"child""#,
+        r#"{"enabled":false,"value":"child""#,
+    ));
+    let removed = PasswordSnapshot::from_test_document(&text.replace(
+        r#"{"enabled":true,"value":"child","scopes":["C:\\Downloads\\child"]}"#,
+        r#"{"enabled":false,"value":"child"}"#,
+    ));
+    let child = Path::new(r"C:\Downloads\child\deep");
+    assert_ne!(disabled.scope_signature(child), snapshot.scope_signature(child));
+    assert_ne!(disabled.scope_signature(child), removed.scope_signature(child));
+    assert_ne!(disabled.signature(), removed.signature());
+    let other = Path::new(r"C:\different");
+    assert_eq!(disabled.scope_signature(other), snapshot.scope_signature(other));
 }

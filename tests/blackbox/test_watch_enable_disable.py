@@ -2,11 +2,14 @@
 
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Event
 
 import psutil
 import pytest
 
+from tests.helpers.marker_utils import replace_shared_file
+from tests.helpers.native_fixture import native_fixture
 from tests.helpers.package import wait_for
 
 pytestmark = pytest.mark.requires_watch_broker
@@ -93,6 +96,56 @@ def test_disable_keeps_daemon_and_enable_skips_only_paused_arrivals(package, tmp
     )
     assert not list(output.rglob("paused.txt"))
     assert (root / "paused.zip").is_file()
+
+
+def test_directory_resume_skips_paused_files_and_parent_respects_disabled_scope(package, tmp_path):
+    parent = tmp_path / "watched"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    parent_out, child_out = tmp_path / "parent-out", tmp_path / "child-out"
+    roots = package.data / "sunpack_watch_roots.txt"
+
+    def save_child(enabled, scanned=True, *, parent_enabled=True, reload=True):
+        pending = roots.with_suffix(".tmp")
+        pending.write_text(
+            f"{parent} | {parent_out} | false | true | true | {str(parent_enabled).lower()}\n"
+            f"{child} | {child_out} | false | {str(scanned).lower()} | true | {str(enabled).lower()}\n",
+            encoding="utf-8",
+        )
+        replace_shared_file(pending, roots)
+        if reload:
+            package.json("watch", "reload")
+            _status(package, True)
+
+    _archive(child, "original")
+    save_child(True, scanned=False, reload=False)
+    with package.watch_session():
+        _output(child_out, "original")
+        package.await_watch_event("done", path="original.zip")
+        save_child(False)
+        _archive(child, "paused")
+        _archive(parent, "parent_active")
+        _output(parent_out, "parent_active")
+        save_child(True)
+        _archive(child, "live")
+        _output(child_out, "live")
+        save_child(False, parent_enabled=False)
+
+    _archive(child, "paused_offline")
+    save_child(True, reload=False)
+    with package.watch_session():
+        _archive(child, "after_restart")
+        _output(child_out, "after_restart")
+        _archive(child, "paused", "edited_after_resume")
+        _output(child_out, "edited_after_resume")
+
+    assert sorted(path.name for path in parent_out.rglob("*.txt")) == ["parent_active.txt"]
+    assert sorted(path.name for path in child_out.rglob("*.txt")) == [
+        "after_restart.txt", "edited_after_resume.txt", "live.txt", "original.txt",
+    ]
+    display = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))
+    assert sum(row["event"] == "done" and Path(row.get("path", "")).name == "original.zip"
+               for row in display["history"]) == 1
 
 
 @pytest.mark.parametrize("shutdown", ["clean", "crash"])

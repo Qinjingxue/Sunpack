@@ -32,8 +32,9 @@ pub(crate) const FILENAME: &str = "builtin_passwords.json";
 const DEFAULT_DOCUMENT: &str = "{\n  \"passwords\": [],\n  \"clipboard_history\": []\n}\n";
 
 #[derive(Clone)]
-struct Bucket {
-    values: Arc<[Arc<str>]>,
+pub(crate) struct Bucket {
+    pub(crate) values: Arc<[Arc<str>]>,
+    disabled: Option<Arc<[Arc<str>]>>,
     digest: [u8; 32],
 }
 
@@ -44,12 +45,14 @@ pub struct PasswordSnapshot {
 }
 
 impl Bucket {
-    fn new(values: Vec<Arc<str>>) -> Self {
+    fn new(values: Vec<Arc<str>>, disabled: Vec<Arc<str>>) -> Self {
         let mut hash = Hash128::new();
-        hash.update(&(values.len() as u64).to_le_bytes());
-        for value in &values {
-            hash.update(&(value.len() as u64).to_le_bytes());
-            hash.update(value.as_bytes());
+        for entries in std::iter::once(&values).chain((!disabled.is_empty()).then_some(&disabled)) {
+            hash.update(&(entries.len() as u64).to_le_bytes());
+            for value in entries {
+                hash.update(&(value.len() as u64).to_le_bytes());
+                hash.update(value.as_bytes());
+            }
         }
         let digest = hash
             .hexdigest()
@@ -58,14 +61,19 @@ impl Bucket {
             .expect("XXH128 is 32 hex digits");
         Self {
             values: Arc::from(values),
+            disabled: (!disabled.is_empty()).then(|| Arc::from(disabled)),
             digest,
         }
+    }
+
+    pub(crate) fn disabled(&self) -> &[Arc<str>] {
+        self.disabled.as_deref().unwrap_or_default()
     }
 }
 
 impl Default for PasswordSnapshot {
     fn default() -> Self {
-        Self::new(Bucket::new(Vec::new()), HashMap::new())
+        Self::new(Bucket::new(Vec::new(), Vec::new()), HashMap::new())
     }
 }
 
@@ -112,12 +120,7 @@ impl PasswordSnapshot {
         &self.global.values
     }
 
-    pub fn scoped(&self, path: &Path) -> impl Iterator<Item = &[Arc<str>]> + '_ {
-        self.scoped_buckets(path)
-            .map(|bucket| bucket.values.as_ref())
-    }
-
-    fn scoped_buckets(&self, path: &Path) -> impl Iterator<Item = &Bucket> + '_ {
+    pub(crate) fn scoped_buckets(&self, path: &Path) -> impl Iterator<Item = &Bucket> + '_ {
         // Take one normalized path key per candidate scope. Ancestors are
         // borrowed from that key and share it through the rest of this lookup.
         let key = (!self.scoped.is_empty()).then(|| scope_key(path));
@@ -201,10 +204,16 @@ fn valid_text(value: &str) -> Result<(), &'static str> {
 }
 
 #[derive(Default)]
+struct ScopeEntries {
+    values: Vec<Arc<str>>,
+    disabled: Vec<Arc<str>>,
+}
+
+#[derive(Default)]
 struct IndexBuilder {
     values: HashSet<Arc<str>>,
     global: Vec<Arc<str>>,
-    scoped: HashMap<Box<str>, Vec<Arc<str>>>,
+    scoped: HashMap<Box<str>, ScopeEntries>,
 }
 
 impl IndexBuilder {
@@ -219,18 +228,24 @@ impl IndexBuilder {
 
     fn finish(self, previous: &PasswordSnapshot) -> Option<PasswordSnapshot> {
         let mut changed = self.scoped.len() != previous.scoped.len();
-        let mut bucket = |mut values: Vec<Arc<str>>, previous: Option<&Bucket>| {
-            let mut seen = HashSet::with_capacity(values.len());
+        let mut bucket = |ScopeEntries { mut values, mut disabled }: ScopeEntries, previous: Option<&Bucket>| {
             // Every spelling already shares one interned allocation.
-            values.retain(|value| seen.insert(Arc::as_ptr(value)));
-            if let Some(previous) = previous.filter(|old| old.values.as_ref() == values) {
+            for entries in [&mut values, &mut disabled] {
+                if entries.len() > 1 {
+                    let mut seen = HashSet::with_capacity(entries.len());
+                    entries.retain(|value| seen.insert(Arc::as_ptr(value)));
+                }
+            }
+            if let Some(previous) = previous.filter(|old|
+                old.values.as_ref() == values && old.disabled() == disabled)
+            {
                 previous.clone()
             } else {
                 changed = true;
-                Bucket::new(values)
+                Bucket::new(values, disabled)
             }
         };
-        let global = bucket(self.global, Some(&previous.global));
+        let global = bucket(ScopeEntries { values: self.global, disabled: Vec::new() }, Some(&previous.global));
         let scoped = self
             .scoped
             .into_iter()
@@ -262,7 +277,7 @@ impl<'de> Visitor<'de> for Passwords<'_> {
 
     fn visit_seq<A: SeqAccess<'de>>(mut self, mut entries: A) -> Result<(), A::Error> {
         while let Some(JsonObject(record)) = entries.next_element::<JsonObject<Record<'_>>>()? {
-            if !record.enabled { continue; }
+            if !record.enabled && record.scopes.is_none() { continue; }
             valid_text(&record.value).map_err(de::Error::custom)?;
             let password = self
                 .0
@@ -286,11 +301,12 @@ impl<'de> Visitor<'de> for Passwords<'_> {
                     if let (Some(index), Some(password)) = (self.0.as_deref_mut(), &password) {
                         let mut key = scope_key(path);
                         key.truncate(key.trim_end_matches(['\\', '/']).len());
-                        index
+                        let entries = index
                             .scoped
                             .entry(key.into_boxed_str())
-                            .or_default()
-                            .push(password.clone());
+                            .or_default();
+                        let target = if record.enabled { &mut entries.values } else { &mut entries.disabled };
+                        target.push(password.clone());
                     }
                 }
             } else if let (Some(index), Some(password)) = (self.0.as_deref_mut(), password) {

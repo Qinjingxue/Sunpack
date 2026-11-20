@@ -782,6 +782,11 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     pump([&]{return state(app.page(),"passwordHistory")==true;},"Show clipboard history");
     auto selected_history=state(app.page(),"passwords")["rows"][0]["id"].get<std::string>();
     assert(state(app.page(),"passwordChecked")==Json({{selected_history,true}}));
+    auto* select_all_button=dynamic_cast<ui::ButtonWidget*>(window(app).Root()->FindById("selectAllPasswords"));
+    assert(select_all_button && select_all_button->Text()==L"取消全选");
+    click(app,"selectAllPasswords");
+    assert(state(app.page(),"passwordChecked").empty());
+    assert(select_all_button->Text()==L"全选");
     gui_test::same_color(saved_card_color(),expected);
     click(app,"savedPasswords");
     pump([&]{return state(app.page(),"passwordHistory")==false;},"Return to saved passwords");

@@ -226,7 +226,8 @@ fn large_dictionary_reuses_recent_membership_across_inputs() {
     PRIORITY_CANDIDATES.set(0);
     for index in 0..32 {
         let path = format!("archive-{index}.zip");
-        let order: Vec<_> = candidates.for_path(&path).take(3).map(AsRef::as_ref).collect();
+        let scope = ScopedCandidates::new(candidates.scope_buckets(&path));
+        let order: Vec<_> = candidates.for_scope(&scope, Some(&recent.snapshot())).take(3).map(AsRef::as_ref).collect();
         assert_eq!(order, ["item-900", "item-0", "item-1"]);
     }
     assert_eq!(PRIORITY_CANDIDATES.get(), values.len());
@@ -234,9 +235,48 @@ fn large_dictionary_reuses_recent_membership_across_inputs() {
     // The next snapshot changes priority, including across nested scopes.
     recent.remember_recent(values[800].clone());
     let nested = candidates.with_scope(Some(Path::new(r"C:\parent")));
-    let order: Vec<_> = nested.for_path(r"C:\output\inner.zip").take(3).map(AsRef::as_ref).collect();
+    let scope = ScopedCandidates::new(nested.scope_buckets(r"C:\output\inner.zip"));
+    let order: Vec<_> = nested.for_scope(&scope, Some(&recent.snapshot())).take(3).map(AsRef::as_ref).collect();
     assert_eq!(order, ["item-800", "item-900", "item-0"]);
     assert_eq!(PRIORITY_CANDIDATES.get(), values.len() * 2);
+}
+
+#[test]
+fn nearest_directory_controls_builtin_candidates_even_when_recent() {
+    let parent = r"C:\parent";
+    let child = r"C:\parent\child";
+    let history = RecentPasswords::default();
+    history.remember_recent(Arc::from("A"));
+    for global_count in [0, BATCH_SIZE] {
+        let mut records = vec![
+            serde_json::json!({"enabled":true, "value":"A"}),
+            serde_json::json!({"enabled":false, "value":"A", "scopes":[parent]}),
+            serde_json::json!({"enabled":true, "value":"A", "scopes":[child]}),
+            serde_json::json!({"enabled":false, "value":"B"}),
+            serde_json::json!({"enabled":true, "value":"B", "scopes":[parent]}),
+        ];
+        records.extend((0..global_count).map(|i| serde_json::json!({"enabled":true,"value":format!("other-{i}")})));
+        let snapshot = Arc::new(PasswordSnapshot::from_test_document(
+            &serde_json::json!({"passwords":records}).to_string(),
+        ));
+        let cli = CandidateSet::new(Arc::from([]), Some(snapshot.clone()), &history, None);
+        let mut embedded = cli.embedded_scope_passwords();
+        let path = r"C:\parent\other\archive.7z";
+        let scoped = ScopedCandidates::new(cli.scope_buckets(path));
+        assert!(!cli.for_scope(&scoped, None).any(|value| value.as_ref() == "A"));
+        let suppressed = embedded(path);
+        assert_eq!(suppressed[0].as_ref(), "B");
+        assert!(!suppressed.iter().any(|value| value.as_ref() == "A"));
+        for path in [r"C:\elsewhere\archive.7z", r"C:\parent\child\archive.7z"] {
+            let values = embedded(path);
+            assert_eq!(values[0].as_ref(), "A");
+            assert_eq!(values.iter().filter(|value| value.as_ref() == "A").count(), 1);
+        }
+        let watch = cli.with_scope(Some(Path::new(parent)));
+        assert_eq!(watch.for_embedded(r"C:\elsewhere\family.7z.001").as_slice(), suppressed.as_ref());
+        let explicit = CandidateSet::new(Arc::from([Arc::from("A")]), Some(snapshot), &history, Some(Path::new(parent)));
+        assert_eq!(explicit.for_embedded(path)[0].as_ref(), "A");
+    }
 }
 
 #[test]

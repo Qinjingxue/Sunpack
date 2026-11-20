@@ -229,70 +229,65 @@ static std::string patch_config(std::string source,const Json& edit) {
     else source.replace(range.start,range.length,text);
     return source;
 }
-// Scope identity and ancestry match the runtime's directory-scoped lookup.
-// Only values touched by this edit are normalized; unrelated entries
-// and significant password whitespace remain intact.
+static size_t password_partition(bool scoped,bool enabled) {
+    return size_t(scoped)*2+size_t(enabled);
+}
+static size_t password_partition(const Json& record) {
+    return password_partition(record.contains("scopes"),record.at("enabled").get<bool>());
+}
+
+// A scope owns its setting independently, including when it inherits the
+// same value from another directory or from the global list at runtime.
 static Json deduplicate_passwords(Json& records, const std::unordered_set<std::string>& values, size_t target, size_t existing_count) {
-    struct Scope { const Json* path; bool other; };
+    struct Scope { const Json* path; size_t row; };
     struct Group {
         std::vector<size_t> rows;
         std::map<std::wstring,Scope> scopes;
-        bool global = false, other_global = false;
     };
-    std::array<std::unordered_map<std::string_view,Group>,2> groups;
+    std::unordered_map<std::string_view,Group> groups;
+    const auto priority=[&](size_t row) { return std::pair{row==target || row>=existing_count,row}; };
     for(size_t i=0;i<records.size();++i) {
         const auto& value=records[i]["value"].get_ref<const std::string&>();
         const auto touched=values.find(value);
         if(touched==values.end()) continue;
-        auto& group=groups[records[i].at("enabled").get<bool>()][*touched]; group.rows.push_back(i);
-        const bool other=i!=target && i<existing_count;
-        if(!records[i].contains("scopes")) { group.global=true; if(other) group.other_global=true; }
-        else for(const auto& path:records[i]["scopes"]) {
-            auto entry=group.scopes.try_emplace(scope_key(wide(path.get_ref<const std::string&>())),Scope{&path,other}).first;
-            if(other && !entry->second.other) entry->second={&path,true};
-        }
+        auto& group=groups[*touched];
+        group.rows.push_back(i);
+        const auto claim=[&](std::wstring key,const Json* path) {
+            auto entry=group.scopes.try_emplace(std::move(key),Scope{path,i}).first;
+            if(priority(i)<priority(entry->second.row)) entry->second={path,i};
+        };
+        if(!records[i].contains("scopes")) claim({},nullptr);
+        else for(const auto& path:records[i]["scopes"]) claim(scope_key(wide(path.get_ref<const std::string&>())),&path);
     }
     std::vector<bool> keep;
     Json saved;
-    for(auto& partition:groups) for(auto& [value,group]:partition) {
-        auto covered=[&](std::wstring key,bool other) {
-            for(;;) {
-                auto found=group.scopes.find(key);
-                if(found!=group.scopes.end() && (!other || found->second.other)) return true;
-                auto slash=key.rfind(L'\\');
-                if(slash==std::wstring::npos) return false;
-                key.resize(slash);
+    for(auto& [value,group]:groups) {
+        std::array<Json,4> merged;
+        std::array<size_t,4> canonical;
+        canonical.fill(records.size());
+        std::array<bool,4> contributes{};
+        for(const auto& [key,scope]:group.scopes) {
+            const auto partition=password_partition(records[scope.row]);
+            auto& row=canonical[partition];
+            auto& record=merged[partition];
+            if(row==records.size()) {
+                record={{"value",value},{"enabled",records[scope.row].at("enabled")}};
+                if(scope.path) record["scopes"]=Json::array();
             }
-        };
-        auto inherited=[&](const std::wstring& key) {
-            auto slash=key.rfind(L'\\');
-            return slash!=std::wstring::npos && covered(key.substr(0,slash),false);
-        };
-        const bool selected=std::find(group.rows.begin(),group.rows.end(),target)!=group.rows.end();
-        bool contributes=false,visible=false;
-        if(selected) {
-            if(!records[target].contains("scopes")) { contributes=!group.other_global; visible=true; }
-            else if(!group.global) for(auto& path:records[target]["scopes"]) {
-                auto key=scope_key(wide(path.get_ref<const std::string&>()));
-                if(!group.other_global && !covered(key,true)) contributes=true;
-                if(!inherited(key)) visible=true;
+            if(priority(scope.row)<priority(row)) row=scope.row;
+            if(scope.path) record["scopes"].push_back(*scope.path);
+            contributes[partition]|=scope.row==target;
+        }
+        for(auto row:group.rows) {
+            const auto partition=password_partition(records[row]);
+            if(row==canonical[partition]) {
+                records[row]=std::move(merged[partition]);
+                if(contributes[partition]) saved=records[row];
+            } else {
+                if(keep.empty()) keep.resize(records.size(),true);
+                keep[row]=false;
             }
         }
-        // Keep an existing row's file position when a new scope joins it.
-        auto canonical=group.rows.front();
-        if(canonical==target) for(auto index:group.rows) if(index!=target && index<existing_count) { canonical=index; break; }
-        Json record={{"value",value},{"enabled",records[canonical].at("enabled")}};
-        if(!group.global) {
-            Json paths=Json::array();
-            for(const auto& [key,scope]:group.scopes) if(!inherited(key)) paths.push_back(*scope.path);
-            record["scopes"]=std::move(paths);
-        }
-        records[canonical]=std::move(record);
-        if(group.rows.size()>1) {
-            if(keep.empty()) keep.resize(records.size(),true);
-            for(auto i:group.rows) if(i!=canonical) keep[i]=false;
-        }
-        if(selected && contributes && visible) saved=records[canonical];
     }
     if(keep.empty()) return saved;
     size_t out=0;
@@ -554,21 +549,23 @@ Json save_changes(const fs::path& dir,const Json& field,const Json& passwords,co
             auto count=current["passwords"].size();
             struct RebaseRows { std::vector<std::string> before; const Json* after = nullptr; };
             using Rebases=std::unordered_map<std::string,RebaseRows>;
-            std::array<Rebases,2> rebases;
-            const auto affected=[&] { return !rebases[0].empty() || !rebases[1].empty(); };
+            std::array<Rebases,4> rebases;
+            size_t affected=0;
             if(password_snapshot) {
                 for(const auto& edit:passwords) {
-                    auto& group=rebases[edit.value("enabled",true)];
+                    const auto scopes=edit.find("scopes");
+                    auto& group=rebases[password_partition(scopes!=edit.end() && !scopes->empty(),edit.value("enabled",true))];
                     if(edit.contains("value")) group.try_emplace(edit.at("value").get_ref<const std::string&>());
                     if(edit.contains("values")) for(const auto& value:edit.at("values")) group.try_emplace(value.get_ref<const std::string&>());
                     auto original=edit.value("original",std::string());
                     if(!original.empty()) {
                         auto row=parse_json(original);
-                        rebases[row.at("enabled").get<bool>()].try_emplace(row.at("value").get<std::string>());
+                        rebases[password_partition(row)].try_emplace(row.at("value").get<std::string>());
                     }
                 }
-                if(affected()) for(const auto& record:current["passwords"]) {
-                    auto& group=rebases[record.at("enabled").get<bool>()];
+                for(const auto& group:rebases) affected+=group.size();
+                if(affected) for(const auto& record:current["passwords"]) {
+                    auto& group=rebases[password_partition(record)];
                     auto found=group.find(record["value"].get_ref<const std::string&>());
                     if(found!=group.end()) found->second.before.push_back(record.dump());
                 }
@@ -597,14 +594,13 @@ Json save_changes(const fs::path& dir,const Json& field,const Json& passwords,co
                 }
                 rows.erase(rows.begin()+kept,rows.end());
             }
-            if(affected()) {
-                auto remaining=rebases[0].size()+rebases[1].size();
+            if(affected) {
                 for(auto& record:committed_passwords["passwords"]) {
-                    auto& group=rebases[record.at("enabled").get<bool>()];
+                    auto& group=rebases[password_partition(record)];
                     auto found=group.find(record["value"].get_ref<const std::string&>());
                     if(found!=group.end() && !found->second.after) {
                         found->second.after=&record;
-                        if(!--remaining) break;
+                        if(!--affected) break;
                     }
                 }
                 for(auto& group:rebases) for(auto& [value,rebase]:group) {

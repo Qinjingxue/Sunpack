@@ -53,8 +53,10 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(package, tmp_p
         try:
             return pending.display()
         except subprocess.CalledProcessError as error:
-            # The manifest may be exclusively open for its atomic replacement.
-            if error.returncode != 32:  # ERROR_SHARING_VIOLATION
+            # Publication can race a read of the manifest or its data files.
+            if error.returncode != 32 and not error.stderr.startswith(
+                ("Error: Os { code: 2,", "Error: Os { code: 32,")
+            ):
                 raise
             return None
 

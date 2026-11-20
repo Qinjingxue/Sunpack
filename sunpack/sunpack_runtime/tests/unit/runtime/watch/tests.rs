@@ -385,7 +385,7 @@ fn root_policy_normalizes_only_equivalent_nonrecursive_output_layouts() {
 
 #[test]
 fn root_scopes_route_nested_descendants_and_keep_prefix_siblings() {
-    let roots: Vec<_> = [r"C:\", r"C:\watch", r"C:\watch\sub", r"C:\watch\sub\deep", r"C:\watch\sub-old"]
+    let mut roots: Vec<_> = [r"C:\", r"C:\watch", r"C:\watch\sub", r"C:\watch\sub\deep", r"C:\watch\sub-old"]
         .into_iter().map(|path| Root { enabled: true,
             path: PathBuf::from(path), output: None, recursive: true, deep: false, scanned: false,
         }).collect();
@@ -410,6 +410,20 @@ fn root_scopes_route_nested_descendants_and_keep_prefix_siblings() {
         let path_key = crate::path_keys::path_key(path);
         assert_eq!(containing_root(&scopes, &path_key).unwrap().0, expected);
     }
+    let blocked = crate::path_keys::path_key(r"C:\watch\sub\a.zip");
+    roots[2].enabled = false;
+    let disabled = root_scopes(&roots, &[]);
+    assert!(root_policy_changed(&scopes, &disabled));
+    assert!(root.same_exclusions(&disabled[r"c:\watch"].1));
+    assert!(!disabled.contains_key(r"c:\watch\sub"));
+    assert!(containing_root(&disabled, &blocked).is_none());
+    let nested = crate::path_keys::path_key(nested_archive);
+    assert_eq!(containing_root(&disabled, &nested).unwrap().0, r"c:\watch\sub\deep");
+
+    roots.remove(2);
+    let removed = root_scopes(&roots, &[]);
+    assert!(root_policy_changed(&disabled, &removed));
+    assert_eq!(containing_root(&removed, &blocked).unwrap().0, r"c:\watch");
 }
 
 #[test]

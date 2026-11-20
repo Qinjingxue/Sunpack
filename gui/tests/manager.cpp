@@ -218,30 +218,40 @@ void editing(Fixture& f) {
     assert(read_file(p)==before); // A bad record cannot commit a partial batch.
     save_password_edit(p,{{"operation","addMany"},{"values",{" # batch "," # batch ","other"}}});
     assert(read_json(p)["passwords"].size()==4 && read_json(p)["clipboard_history"].back()=="latest");
-    // Add, replacement and scope changes share runtime-compatible coverage:
-    // globals subsume scoped copies; distinct scopes share one stored record.
+    // Each exact scope keeps its own setting, including global and child scopes.
     Json scope_a={{"value","same"},{"enabled",true},{"scopes",{"C:/A"}}},scope_b={{"value","same"},{"enabled",true},{"scopes",{"D:/B"}}};
-    Json document={{"passwords",{scope_a,scope_b}},{"clipboard_history",{"retained"}}},retained;
+    Json document={{"passwords",{scope_a,scope_b}},{"clipboard_history",{"retained"}}},retained,rebases;
     atomic_write(p,document.dump());
     auto apply_edit=[&](Json edit) {
         PasswordSaveSnapshot snapshot;
         save_password_edit(p,std::move(edit),&snapshot);
         document=std::move(snapshot.document);
         retained=std::move(snapshot.record);
+        rebases=std::move(snapshot.rebases);
     };
     auto apply=[&](const char* operation,const Json& old,const char* value,Json scopes) {
         apply_edit({{"operation",operation},{"original",old.is_null()?"":old.dump()},{"value",value},{"values",{value}},{"scopes",std::move(scopes)}});
     };
     apply("addMany",Json(),"same",{"c:\\a\\child"});
-    assert(document["passwords"]==Json::array({Json{{"value","same"},{"enabled",true},{"scopes",{"C:/A","D:/B"}}}}) && retained.is_null());
+    assert(retained["scopes"]==Json::array({"C:/A","c:\\a\\child","D:/B"}));
     auto combined=document["passwords"][0];
     apply_edit({{"operation","replace"},{"original",combined.dump()},{"scope","D:/B"},{"value","same"},{"scopes",{"C:/A"}}});
-    assert(document["passwords"]==Json::array({scope_a}) && retained.is_null());
-    apply("addMany",Json(),"same",Json::array()); assert(document["passwords"]==Json::array({Json{{"value","same"},{"enabled",true}}}) && !retained.is_null());
-    apply("addMany",Json(),"same",{"D:/B"}); assert(document["passwords"].size()==1 && retained.is_null());
+    auto parent_and_child=scope_a;
+    parent_and_child["scopes"].push_back("c:\\a\\child");
+    assert(document["passwords"]==Json::array({parent_and_child}) && retained.is_null());
+    const Json global={{"value","same"},{"enabled",true}};
+    apply("addMany",Json(),"same",Json::array());
+    assert(document["passwords"]==Json::array({parent_and_child,global}) && retained==global);
+    apply("addMany",Json(),"same",{"D:/B"});
+    assert(document["passwords"]==Json::array({combined,global}) && retained==combined);
+    assert(rebases==Json::array({Json{{"originals",Json::array({parent_and_child.dump()})},{"record",combined}}}));
+    apply_edit({{"operation","replace"},{"original",combined.dump()},{"scope","D:/B"},{"value","same"},{"scopes",{"D:/B"}},{"enabled",false}});
+    auto disabled=scope_b;
+    disabled["enabled"]=false;
+    assert(document["passwords"]==Json::array({disabled,global,parent_and_child}) && retained==disabled);
     apply("addMany",Json(),"different",{"D:/B"});
     apply("replace",document["passwords"].back(),"same",{"D:/B"});
-    assert(document["passwords"].size()==1 && retained.is_null() && document["clipboard_history"][0]=="retained");
+    assert(document["passwords"]==Json::array({disabled,global,parent_and_child}) && retained.is_null() && document["clipboard_history"][0]=="retained");
     Json earlier={{"value","earlier"},{"enabled",true}},existing={{"value","same"},{"enabled",true}};
     document["passwords"]=Json::array({earlier,existing});
     atomic_write(p,document.dump());

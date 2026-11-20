@@ -1,5 +1,5 @@
 use super::{Failure, FailureKind, Mode};
-use crate::core::passwords::PasswordSnapshot;
+use crate::core::passwords::{Bucket, PasswordSnapshot};
 use crate::io::archive_state::{ArchiveInput, OpenMode};
 use crate::io::cancellation::Cancellation;
 use crate::io::reader::NativeArchiveSession;
@@ -65,6 +65,32 @@ struct CandidateSources {
 struct RecentPriority {
     recent: RecentOrder,
     indices: Arc<[(usize, usize)]>,
+}
+
+struct ScopedCandidates<'a> {
+    buckets: Vec<&'a Bucket>,
+    disabled: HashSet<&'a str>,
+}
+
+impl<'a> ScopedCandidates<'a> {
+    fn new(buckets: Vec<&'a Bucket>) -> Self {
+        let mut disabled = HashSet::new();
+        // Resolve from the farthest scope to the nearest. Track only values
+        // suppressed by a directory, even if the global dictionary is large.
+        for bucket in buckets.iter().rev() {
+            if !disabled.is_empty() {
+                for value in bucket.values.iter() {
+                    disabled.remove(value.as_ref());
+                }
+            }
+            disabled.extend(bucket.disabled().iter().map(AsRef::as_ref));
+        }
+        Self { buckets, disabled }
+    }
+
+    fn allows(&self, value: &str) -> bool {
+        self.disabled.is_empty() || !self.disabled.contains(value)
+    }
 }
 
 impl CandidateSources {
@@ -154,55 +180,49 @@ impl CandidateSet {
             .unwrap_or_else(|| Path::new(path).parent().unwrap_or_else(|| Path::new(path)))
     }
 
-    fn configured<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
-        self.sources
-            .snapshot
-            .scoped(self.scope(path))
-            .flatten()
-            .chain(self.sources.explicit.iter())
-            .chain(self.sources.snapshot.global().iter())
-    }
-
-    fn for_path<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
-        let recent = self.sources.recent.snapshot();
-        let scoped = self.sources.snapshot.scoped(self.scope(path)).collect();
-        self.for_scope(scoped, &recent)
+    fn scope_buckets(&self, path: &str) -> Vec<&Bucket> {
+        self.sources.snapshot.scoped_buckets(self.scope(path)).collect()
     }
 
     fn for_scope<'b>(
         &'b self,
-        scoped: Vec<&'b [Arc<str>]>,
-        recent: &RecentOrder,
+        scoped: &'b ScopedCandidates<'_>,
+        recent: Option<&RecentOrder>,
     ) -> impl Iterator<Item = &'b Arc<str>> + 'b {
         let global = self.sources.snapshot.global();
         let explicit = &self.sources.explicit;
-        let priority = if recent.is_empty() {
-            Vec::new()
-        } else if explicit.len() + global.len() >= BATCH_SIZE {
-            let base = self.sources.recent_indices(recent);
-            let mut ranked: Vec<_> = if scoped.is_empty() {
-                Vec::new()
-            } else {
-                prioritize(recent, scoped.iter().flat_map(|bucket| bucket.iter()).map(|value| (value, value)))
-            };
-            // An applicable scoped entry has precedence over the shared base.
-            // Only merge recent entries, regardless of dictionary size.
-            ranked.extend(base.iter().map(|&(rank, index)| (rank, self.sources.base_password(index))));
-            if !scoped.is_empty() {
-                ranked.sort_by_key(|&(rank, _)| rank);
-                ranked.dedup_by_key(|entry| entry.0);
+        let scoped_values = || scoped.buckets.iter()
+            .flat_map(|bucket| bucket.values.iter()).filter(|value| scoped.allows(value));
+        let global_values = || global.iter().filter(|value| scoped.allows(value));
+        let priority = match recent.filter(|recent| !recent.is_empty()) {
+            Some(recent) if explicit.len() + global.len() >= BATCH_SIZE => {
+                let base = self.sources.recent_indices(recent);
+                let mut ranked = if scoped.buckets.is_empty() { Vec::new() }
+                    else { prioritize(recent, scoped_values().map(|value| (value, value))) };
+                // An applicable scoped entry has precedence over the shared base.
+                // Only merge recent entries, regardless of dictionary size.
+                ranked.extend(base.iter().filter_map(|&(rank, index)| {
+                    let value = self.sources.base_password(index);
+                    (index < explicit.len() || scoped.allows(value)).then_some((rank, value))
+                }));
+                if !scoped.buckets.is_empty() {
+                    ranked.sort_by_key(|&(rank, _)| rank);
+                    ranked.dedup_by_key(|entry| entry.0);
+                }
+                ranked
             }
-            ranked
-        } else {
-            let values = scoped.iter().flat_map(|bucket| bucket.iter()).chain(explicit.iter()).chain(global);
-            prioritize(recent, values.map(|value| (value, value)))
+            Some(recent) => {
+                let values = scoped_values().chain(explicit.iter()).chain(global_values());
+                prioritize(recent, values.map(|value| (value, value)))
+            }
+            None => Vec::new(),
         };
         let mut seen: HashSet<&str> = priority.iter().map(|&(_, value)| value.as_ref()).collect();
-        let prefix = scoped.into_iter().flatten().chain(explicit.iter()).map(|value| (value, true));
+        let prefix = scoped_values().chain(explicit.iter()).map(|value| (value, true));
         priority
             .into_iter()
             .map(|(_, value)| value)
-            .chain(prefix.chain(global.iter().map(|value| (value, false))).filter_map(move |(value, track)| {
+            .chain(prefix.chain(global_values().map(|value| (value, false))).filter_map(move |(value, track)| {
                 // Global entries are already unique. Only earlier sources can
                 // duplicate them, so the set never grows with this dictionary.
                 let unique = if track { seen.insert(value.as_ref()) } else { !seen.contains(value.as_ref()) };
@@ -211,21 +231,23 @@ impl CandidateSet {
     }
 
     pub(super) fn for_embedded(&self, path: &str) -> Vec<Arc<str>> {
-        self.for_path(path).cloned().collect()
+        let scope = ScopedCandidates::new(self.scope_buckets(path));
+        self.for_scope(&scope, Some(&self.sources.recent.snapshot())).cloned().collect()
     }
 
     pub(super) fn embedded_scope_passwords(&self) -> impl FnMut(&str) -> Arc<[Arc<str>]> + '_ {
         let mut by_scope = HashMap::new();
         let mut recent = None;
         move |path| {
-            let scoped: Vec<_> = self.sources.snapshot.scoped(self.scope(path)).collect();
+            let buckets = self.scope_buckets(path);
             // The snapshot owns immutable buckets for this entire pass. The
-            // ordered slice identities also match descendants with the same
+            // ordered bucket identities also match descendants with the same
             // inherited buckets and paths with only global passwords.
-            let key: Vec<_> = scoped.iter().map(|bucket| (bucket.as_ptr().addr(), bucket.len())).collect();
+            let key: Vec<_> = buckets.iter().map(|bucket| std::ptr::from_ref(*bucket).addr()).collect();
             Arc::clone(by_scope.entry(key).or_insert_with(|| {
+                let scope = ScopedCandidates::new(buckets);
                 let recent = recent.get_or_insert_with(|| self.sources.recent.snapshot());
-                self.for_scope(scoped, recent).cloned().collect::<Vec<_>>().into()
+                self.for_scope(&scope, Some(recent)).cloned().collect::<Vec<_>>().into()
             }))
         }
     }
@@ -343,12 +365,13 @@ impl CandidateSet {
         }
         let single_enc_can_defer = mode == Mode::Extract && input.format_hint == "enc" && input.volume_attempts.is_none();
         let needs_password = input.analysis.password_required || input.format_hint == "enc";
+        let scope = ScopedCandidates::new(self.scope_buckets(&input.entry_path));
         // Discovery already identifies inputs that require a password. For the
         // rest, an empty candidate can be confirmed by the ordinary worker
         // open. With no other candidates, a Rust probe only repeats that I/O.
         if known.is_none()
             && input.volume_attempts.is_none()
-            && self.configured(&input.entry_path).next().is_none()
+            && self.for_scope(&scope, None).next().is_none()
         {
             return Ok(if needs_password {
                 Err(Failure::password())
@@ -414,7 +437,7 @@ impl CandidateSet {
                 Some(password)
                     if (!needs_password && password.is_empty())
                         || self
-                            .configured(&input.entry_path)
+                            .for_scope(&scope, None)
                             .any(|candidate| candidate == &password) =>
                 {
                     return fixed_plan(password, preparation);
@@ -423,7 +446,7 @@ impl CandidateSet {
             }
         }
         let candidates = self
-            .for_path(&input.entry_path)
+            .for_scope(&scope, Some(&recent.snapshot()))
             .filter(|value| needs_password || !value.is_empty());
         let projected = input.volume_attempts.is_some();
         let mut batch = Vec::with_capacity(BATCH_SIZE + usize::from(projected));

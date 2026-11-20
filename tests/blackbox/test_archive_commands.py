@@ -70,10 +70,11 @@ def test_lz4_carrier_boundaries_are_discovered_in_deep_mode(package, tmp_path):
 
 
 def test_password_candidates_apply_only_to_their_directory(package, tmp_path):
-    allowed = tmp_path / "allowed" / "child"
     denied = tmp_path / "denied"
+    allowed = denied / "child"
+    unscoped = tmp_path / "unscoped"
     allowed.mkdir(parents=True)
-    denied.mkdir()
+    unscoped.mkdir()
     payload = tmp_path / "payload.txt"
     payload.write_text("password probe", encoding="utf-8")
     encrypted = allowed / "hidden.wrapped"
@@ -84,8 +85,13 @@ def test_password_candidates_apply_only_to_their_directory(package, tmp_path):
     # A second name for the same file also exercises physical-generation
     # password cache reuse across directory scopes.
     (denied / encrypted.name).hardlink_to(encrypted)
+    (unscoped / encrypted.name).hardlink_to(encrypted)
     (package.data / "builtin_passwords.json").write_text(json.dumps({
-        "passwords": [{"enabled": True, "value": "pinned secret", "scopes": [str(allowed.parent)]}],
+        "passwords": [
+            {"enabled": True, "value": "pinned secret"},
+            {"enabled": False, "value": "pinned secret", "scopes": [str(denied)]},
+            {"enabled": True, "value": "pinned secret", "scopes": [str(allowed)]},
+        ],
     }), encoding="utf-8")
 
     report = package.json("scan", encrypted)
@@ -95,6 +101,7 @@ def test_password_candidates_apply_only_to_their_directory(package, tmp_path):
     rejected = json.loads(result.stdout)
     assert rejected["items"][0]["password_used"] is None
     assert not (denied / "hidden").exists()
+    assert package.json("scan", unscoped / encrypted.name)["items"][0]["password_used"] == "pinned secret"
 
 
 def test_extracts_disguised_enc_and_compressed_tar_in_one_request(package, tmp_path, repo_root):

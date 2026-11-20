@@ -43,6 +43,7 @@ export default {
       return extra.length||retained.length?extra.concat(saved,retained):saved;
     },
     allRootsChecked() { return this.shownRootRows.length>0&&this.shownRootRows.every(r=>this.rootChecked[r.id]); },
+    canDeselectAllPasswords() { return this.passwordSelectAllPending||(this.shownPasswords.length>0&&this.shownPasswords.every(p=>this.passwordChecked[p.id])); },
     categories() { let seen={}; return this.fields.filter(f=>{ if(seen[f.category]) return false; seen[f.category]=true; return true; }).map(f=>({id:f.category,label:f.categoryLabel})); },
     configBlocks() {
       let groups=[],seen={};
@@ -144,8 +145,11 @@ export default {
       if(on) for(let r of (kind==='root'?this.shownRootRows:this.shownPasswords)) checked[r.id]=true;
       this[kind+'Checked']=checked;
     },
-    selectAllPasswords() {
-      if(this.passwords.scope===this.passwordScope) this.checkAll('password',true);
+    toggleAllPasswords() {
+      if(this.canDeselectAllPasswords) {
+        this.passwordSelectAllPending=false;
+        this.checkAll('password',false);
+      } else if(this.passwords.scope===this.passwordScope) this.checkAll('password',true);
       else this.passwordSelectAllPending=true;
     },
     pruneChecked(kind,rows) {
@@ -1133,7 +1137,7 @@ export default {
           <input id="passwordSearch" type="search" class="management-search search-field" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/>
           <button id="newPassword" @click="addPassword()">{{ texts.add }}</button>
           <button id="deleteSelectedPasswords" :enabled="Object.keys(passwordChecked).length>0 &amp;&amp; !collectionPending" @click="deleteCheckedPasswords()">{{ texts.deleteSelected }}</button>
-          <button id="selectAllPasswords" @click="selectAllPasswords()">{{ texts.selectAll }}</button>
+          <button id="selectAllPasswords" @click="toggleAllPasswords()">{{ canDeselectAllPasswords?texts.deselectAll:texts.selectAll }}</button>
           <button id="openPasswordsRecord" @click="send('openRecord',{roots:false})">{{ texts.openRecord }}</button>
         </div>
         <div class="password-tabs">
