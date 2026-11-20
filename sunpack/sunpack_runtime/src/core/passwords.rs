@@ -26,6 +26,7 @@ use std::{
         Arc, Mutex, Weak,
     },
 };
+use windows_sys::Win32::Foundation::HWND;
 use xxhash_rust::xxh3::xxh3_128;
 
 pub(crate) const FILENAME: &str = "builtin_passwords.json";
@@ -576,39 +577,34 @@ fn publish(
     result
 }
 
-pub fn clipboard_passwords() -> Vec<String> {
-    let Some(text) = clipboard_text() else {
-        return Vec::new();
+pub fn clipboard_passwords(window: HWND) -> io::Result<Vec<String>> {
+    let Some(text) = clipboard_text(window)? else {
+        return Ok(Vec::new());
     };
     let mut seen = HashSet::new();
-    text.split([
-        '\n', '\r', '\u{000b}', '\u{000c}', '\u{001c}', '\u{001d}', '\u{001e}', '\u{0085}',
-        '\u{2028}', '\u{2029}',
-    ])
-    .filter(|part| {
-        !part.is_empty()
-            && part.chars().count() <= 512
-            && !part.chars().any(|ch| ch < ' ' && ch != '\t')
-    })
-    .filter(|part| seen.insert(*part))
-    .map(str::to_owned)
-    .collect()
+    let values = text
+        .split([
+            '\n', '\r', '\u{000b}', '\u{000c}', '\u{001c}', '\u{001d}', '\u{001e}', '\u{0085}',
+            '\u{2028}', '\u{2029}',
+        ])
+        .filter(|part| {
+            !part.is_empty()
+                && part.chars().count() <= 512
+                && !part.chars().any(|ch| ch < ' ' && ch != '\t')
+        })
+        .filter(|part| seen.insert(*part))
+        .map(str::to_owned)
+        .collect();
+    Ok(values)
 }
 
-fn clipboard_text() -> Option<String> {
-    use std::ffi::c_void;
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn OpenClipboard(window: *mut c_void) -> i32;
-        fn CloseClipboard() -> i32;
-        fn GetClipboardData(format: u32) -> *mut c_void;
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GlobalSize(handle: *mut c_void) -> usize;
-        fn GlobalLock(handle: *mut c_void) -> *mut c_void;
-        fn GlobalUnlock(handle: *mut c_void) -> i32;
-    }
+fn clipboard_text(window: HWND) -> io::Result<Option<String>> {
+    use windows_sys::Win32::System::{
+        DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard},
+        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+    };
+
+    const CF_UNICODETEXT: u32 = 13;
     const LIMIT: usize = 64 * 1024;
     struct Clipboard;
     impl Drop for Clipboard {
@@ -619,21 +615,24 @@ fn clipboard_text() -> Option<String> {
         }
     }
     unsafe {
-        if OpenClipboard(std::ptr::null_mut()) == 0 {
-            return None;
+        if OpenClipboard(window) == 0 {
+            return Err(io::Error::last_os_error());
         }
         let _clipboard = Clipboard;
-        let handle = GetClipboardData(13);
+        if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
+            return Ok(None);
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT);
         if handle.is_null() {
-            return None;
+            return Err(io::Error::last_os_error());
         }
         let units = GlobalSize(handle) / std::mem::size_of::<u16>();
         if units == 0 || units > LIMIT + 1 {
-            return None;
+            return Ok(None);
         }
         let data = GlobalLock(handle).cast::<u16>();
         if data.is_null() {
-            return None;
+            return Err(io::Error::last_os_error());
         }
         let text = std::slice::from_raw_parts(data, units);
         let end = text
@@ -643,7 +642,7 @@ fn clipboard_text() -> Option<String> {
             .min(LIMIT);
         let result = String::from_utf16(&text[..end]).ok();
         GlobalUnlock(handle);
-        result
+        Ok(result)
     }
 }
 

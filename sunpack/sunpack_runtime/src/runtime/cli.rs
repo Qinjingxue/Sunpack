@@ -1005,7 +1005,8 @@ fn dedupe(values: &mut Vec<Arc<str>>) {
 
 fn cli_clipboard(settings: &Config) -> Vec<Arc<str>> {
     if settings.passwords.clipboard_passwords_enabled {
-        passwords::clipboard_passwords()
+        passwords::clipboard_passwords(std::ptr::null_mut())
+            .unwrap_or_default()
             .into_iter()
             .map(Arc::from)
             .collect()

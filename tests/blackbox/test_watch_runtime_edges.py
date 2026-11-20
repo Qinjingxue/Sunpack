@@ -118,19 +118,62 @@ def test_watch_imports_clipboard_passwords_after_adding_a_root(package, tmp_path
     watched = tmp_path / "watched"
     watched.mkdir()
     output = tmp_path / "out"
-    payload = tmp_path / "secret.txt"
-    payload.write_bytes(b"clipboard password")
-    subprocess.run(
-        [str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", "-pclipboard-only-key",
-         str(watched / "secret.7z"), str(payload)],
-        check=True, capture_output=True,
-    )
+    payloads = {
+        "startup.txt": ("startup-key", b"clipboard password on startup"),
+        "secret.txt": ("clipboard-only-key", b"clipboard password after update"),
+    }
+    for name, (password, content) in payloads.items():
+        payload = tmp_path / name
+        payload.write_bytes(content)
+        subprocess.run(
+            [str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", f"-p{password}",
+             str((watched / name).with_suffix(".7z")), str(payload)],
+            check=True, capture_output=True,
+        )
     package.configure(watch={"clipboard_monitor_enabled": True, "clipboard_builtin_max_entries": 2})
     # Keep the STA owner alive while Watch reads the real clipboard, then
     # restore all formats captured before the test changed it.
     script = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class ClipboardContention {
+    [DllImport("user32.dll")]
+    public static extern bool OpenClipboard(IntPtr window);
+
+    [DllImport("user32.dll")]
+    public static extern bool CloseClipboard();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string title);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wparam,
+        IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
+
+    public static void WaitForMessagePump(uint processId) {
+        IntPtr window = IntPtr.Zero;
+        while ((window = FindWindowEx(IntPtr.Zero, window, null, null)) != IntPtr.Zero) {
+            uint owner;
+            GetWindowThreadProcessId(window, out owner);
+            if (owner != processId) continue;
+            // WM_NULL synchronizes with the window's message pump without changing the clipboard.
+            UIntPtr result;
+            if (SendMessageTimeout(window, 0, UIntPtr.Zero, IntPtr.Zero, 0, 5000, out result) != IntPtr.Zero)
+                return;
+            throw new InvalidOperationException("Watch window did not process WM_NULL");
+        }
+        throw new InvalidOperationException("Watch window was not registered");
+    }
+}
+'@
 $previous = [System.Windows.Forms.Clipboard]::GetDataObject()
 $saved = New-Object System.Windows.Forms.DataObject
 if ($null -ne $previous) {
@@ -147,14 +190,38 @@ try {
     if (@($passwords.clipboard_history).Count -gt 0 -and $null -ne $passwords.clipboard_history) {
         throw "rootless Watch imported clipboard passwords"
     }
-    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch add $env:SUNPACK_CLIPBOARD_TEST_ROOT -o $env:SUNPACK_CLIPBOARD_TEST_OUTPUT -j
-    if ($LASTEXITCODE -ne 0) { throw "watch add failed" }
-    [System.Windows.Forms.Clipboard]::SetText(("discarded", "retained", "clipboard-only-key") -join [Environment]::NewLine)
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    while (-not (Get-ChildItem $env:SUNPACK_CLIPBOARD_TEST_OUTPUT -Filter secret.txt -File -Recurse -ErrorAction SilentlyContinue)) {
-        if ([DateTime]::UtcNow -ge $deadline) { throw "Watch did not extract the clipboard-protected archive" }
-        Start-Sleep -Milliseconds 25
+    $runtimeState = Get-ChildItem -LiteralPath . -Filter 'runtime-*.state' -File
+    $runtimePid = [uint32](Get-Content -LiteralPath $runtimeState.FullName)[3]
+    [System.Windows.Forms.Clipboard]::SetText("startup-key")
+    # Hold the clipboard across Watch's startup read. Closing a read-only handle
+    # leaves the clipboard unchanged, so there is no second copy to trigger recovery.
+    $lockWindow = New-Object System.Windows.Forms.Form
+    try {
+        $lockDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not [ClipboardContention]::OpenClipboard($lockWindow.Handle)) {
+            if ([DateTime]::UtcNow -ge $lockDeadline) { throw "Could not acquire the test clipboard lock" }
+            Start-Sleep -Milliseconds 10
+        }
+        try {
+            & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch add $env:SUNPACK_CLIPBOARD_TEST_ROOT -o $env:SUNPACK_CLIPBOARD_TEST_OUTPUT -j
+            if ($LASTEXITCODE -ne 0) { throw "watch add failed" }
+            [ClipboardContention]::WaitForMessagePump($runtimePid)
+        } finally {
+            if (-not [ClipboardContention]::CloseClipboard()) { throw "Could not release the test clipboard lock" }
+        }
+    } finally {
+        $lockWindow.Dispose()
     }
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    function Wait-ForExtraction([string]$name) {
+        while (-not (Get-ChildItem $env:SUNPACK_CLIPBOARD_TEST_OUTPUT -Filter $name -File -Recurse -ErrorAction SilentlyContinue)) {
+            if ([DateTime]::UtcNow -ge $deadline) { throw "Watch did not extract $name using the clipboard" }
+            Start-Sleep -Milliseconds 25
+        }
+    }
+    Wait-ForExtraction startup.txt
+    [System.Windows.Forms.Clipboard]::SetText(("discarded", "retained", "clipboard-only-key") -join [Environment]::NewLine)
+    Wait-ForExtraction secret.txt
 } finally {
     & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER daemon stop -j
     $result = $LASTEXITCODE
@@ -173,10 +240,11 @@ exit $result
              "SUNPACK_CLIPBOARD_TEST_ROOT": str(watched),
              "SUNPACK_CLIPBOARD_TEST_OUTPUT": str(output),
              "SUNPACK_CLIPBOARD_TEST_PASSWORDS": str(package.data / "builtin_passwords.json")},
-        text=True, encoding="utf-8", capture_output=True, timeout=60,
+        text=True, encoding="utf-8", errors="backslashreplace", capture_output=True, timeout=60,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert [p.read_bytes() for p in output.rglob(payload.name)] == [payload.read_bytes()]
+    for name, (_, content) in payloads.items():
+        assert [p.read_bytes() for p in output.rglob(name)] == [content]
     document = json.loads((package.data / "builtin_passwords.json").read_text(encoding="utf-8"))
     assert document["clipboard_history"] == ["retained", "clipboard-only-key"]
 

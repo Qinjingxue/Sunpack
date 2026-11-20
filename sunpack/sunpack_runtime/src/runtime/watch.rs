@@ -2825,6 +2825,11 @@ impl Scheduler {
                                 })),
                             }
                         }
+                        crate::core::clipboard_monitor::Notification::ClipboardReadFailed(error) => {
+                            journal.log(json!({
+                                "event":"watch_clipboard_password_read_failed", "error":error.to_string(),
+                            }));
+                        }
                         crate::core::clipboard_monitor::Notification::VolumeChanged { unitmask, arrived } => {
                             hub.update(|signals| signals.volumes.add(unitmask, arrived));
                         }

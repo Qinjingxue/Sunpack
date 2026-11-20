@@ -1,6 +1,7 @@
 //! An event-driven clipboard and volume observer owned by one Watch instance.
 use super::{passwords, windows_message::pump_until_stop};
 use std::{
+    cell::Cell,
     io,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
@@ -11,23 +12,30 @@ use std::{
     thread::{self, JoinHandle},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_CLIPBOARD_NOT_OPEN, HWND, LPARAM, LRESULT, WPARAM,
+    },
     System::{
         DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener},
         LibraryLoader::GetModuleHandleW,
         Threading::{CreateEventW, SetEvent},
     },
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, PostQuitMessage,
-        RegisterClassW, SetWindowLongPtrW, UnregisterClassW, CREATESTRUCTW, DBT_DEVICEARRIVAL,
-        DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_VOLUME, DEV_BROADCAST_HDR, DEV_BROADCAST_VOLUME,
-        GWLP_USERDATA, HWND_MESSAGE, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DEVICECHANGE, WM_NCCREATE,
-        WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer,
+        PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, UnregisterClassW, CREATESTRUCTW,
+        DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_VOLUME, DEV_BROADCAST_HDR,
+        DEV_BROADCAST_VOLUME, GWLP_USERDATA, HWND_MESSAGE, WM_CLIPBOARDUPDATE, WM_CLOSE,
+        WM_DEVICECHANGE, WM_NCCREATE, WM_TIMER, WNDCLASSW,
     },
 };
 
+const CLIPBOARD_RETRY_TIMER: usize = 1;
+const FIRST_RETRY_MS: u32 = 15;
+const MAX_RETRY_DELAY_MS: u32 = 250;
+
 pub(crate) enum Notification {
     Clipboard(Vec<String>),
+    ClipboardReadFailed(io::Error),
     VolumeChanged { unitmask: u32, arrived: bool },
 }
 
@@ -35,14 +43,46 @@ struct Context {
     clipboard_enabled: bool,
     observe_volumes: bool,
     notify: Box<dyn Fn(Notification) + Send>,
+    retry_delay_ms: Cell<u32>,
 }
 
 impl Context {
-    fn clipboard_updated(&self) {
-        let values = passwords::clipboard_passwords();
-        if !values.is_empty() {
-            (self.notify)(Notification::Clipboard(values));
+    fn cancel_clipboard_retry(&self, window: HWND) -> u32 {
+        let delay = self.retry_delay_ms.replace(0);
+        if delay != 0 {
+            unsafe { KillTimer(window, CLIPBOARD_RETRY_TIMER) };
         }
+        delay
+    }
+
+    fn clipboard_updated(&self, window: HWND) {
+        let previous_delay = self.cancel_clipboard_retry(window);
+        let error = match passwords::clipboard_passwords(window) {
+            Ok(values) => {
+                if !values.is_empty() {
+                    (self.notify)(Notification::Clipboard(values));
+                }
+                return;
+            }
+            Err(error) => error,
+        };
+
+        // Clipboard updates can arrive while the writer is still using the clipboard.
+        // Arm a single retry only for outstanding work, with no timer when idle.
+        let error = if matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_ACCESS_DENIED | ERROR_BUSY | ERROR_CLIPBOARD_NOT_OPEN)
+        ) {
+            let delay = (previous_delay * 2).clamp(FIRST_RETRY_MS, MAX_RETRY_DELAY_MS);
+            if unsafe { SetTimer(window, CLIPBOARD_RETRY_TIMER, delay, None) } != 0 {
+                self.retry_delay_ms.set(delay);
+                return;
+            }
+            io::Error::last_os_error()
+        } else {
+            error
+        };
+        (self.notify)(Notification::ClipboardReadFailed(error));
     }
 }
 
@@ -62,6 +102,7 @@ impl Monitor {
             clipboard_enabled,
             observe_volumes,
             notify: Box::new(notify),
+            retry_delay_ms: Cell::new(0),
         };
         let stop = unsafe { CreateEventW(null(), 1, 0, null()) };
         if stop.is_null() {
@@ -180,7 +221,7 @@ fn run_window(
             // Read once after registration. A copy before registration leaves
             // no queued WM_CLIPBOARDUPDATE for the new window.
             if clipboard {
-                context.clipboard_updated();
+                context.clipboard_updated(window);
             }
             if context.observe_volumes {
                 (context.notify)(Notification::VolumeChanged { unitmask: 0, arrived: true });
@@ -188,6 +229,7 @@ fn run_window(
             pump_until_stop(stop.as_raw_handle())
         })();
         if clipboard {
+            context.cancel_clipboard_retry(window);
             RemoveClipboardFormatListener(window);
         }
         DestroyWindow(window);
@@ -212,7 +254,13 @@ unsafe extern "system" fn window_proc(
     if let Some(context) = context {
         match message {
             WM_CLIPBOARDUPDATE if context.clipboard_enabled => {
-                context.clipboard_updated();
+                context.clipboard_updated(window);
+                return 0;
+            }
+            WM_TIMER if wparam == CLIPBOARD_RETRY_TIMER => {
+                if context.retry_delay_ms.get() != 0 {
+                    context.clipboard_updated(window);
+                }
                 return 0;
             }
             WM_DEVICECHANGE if context.observe_volumes && lparam != 0 => {
