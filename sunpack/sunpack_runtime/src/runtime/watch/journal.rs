@@ -56,6 +56,12 @@ struct Checkpoint {
     ready: Arc<AtomicBool>,
 }
 
+impl Checkpoint {
+    fn ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire) || self.job.is_finished()
+    }
+}
+
 pub(super) struct Journal {
     state: NativeWatchState,
     // Foreground publication checks this while holding the external output
@@ -364,10 +370,18 @@ impl Journal {
         Ok(())
     }
 
+    pub(super) fn compaction_pending(&self) -> bool {
+        if self.suspended() { return false; }
+        let checkpoint = self.checkpoint.lock().unwrap();
+        if let Some(job) = checkpoint.as_ref() { return job.ready(); }
+        let frontier = self.frontier.lock().unwrap();
+        frontier.fault.is_some() || frontier.retirement.is_some() || frontier.needs_checkpoint()
+    }
+
     pub(super) fn compact(&self) -> io::Result<()> {
         if self.suspended() { return Ok(()); }
         let mut active = self.checkpoint.lock().unwrap();
-        if active.as_ref().is_some_and(|checkpoint| !checkpoint.ready.load(Ordering::Acquire) && !checkpoint.job.is_finished()) {
+        if active.as_ref().is_some_and(|checkpoint| !checkpoint.ready()) {
             return Ok(());
         }
         self.harvest_checkpoint(active.take())?;

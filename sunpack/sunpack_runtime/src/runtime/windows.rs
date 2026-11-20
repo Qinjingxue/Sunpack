@@ -161,8 +161,21 @@ pub(super) fn foreground_active() -> bool {
     process::foreground_active()
 }
 
+fn release_when_foreground_idle(release: impl FnOnce()) {
+    let _transition = crate::pipeline::block_on(PRIORITY_TRANSITION.lock());
+    if !foreground_active() {
+        release();
+    }
+}
+
+pub(super) fn retire_idle_stage_pool(engine: &Engine) {
+    if engine.stage_pool_retained() {
+        release_when_foreground_idle(|| engine.clear_idle_stage_pool());
+    }
+}
+
 pub(super) fn maintain_when_foreground_idle(
-    engine: &Engine, release: impl FnOnce(), maintain: impl FnOnce() -> io::Result<()>,
+    engine: &Engine, maintain: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     let _transition = crate::pipeline::block_on(PRIORITY_TRANSITION.lock());
     if foreground_active() { return Ok(()); }
@@ -170,9 +183,12 @@ pub(super) fn maintain_when_foreground_idle(
     let mode = process::effective_mode();
     let worker = engine.set_process_mode(mode);
     super::diagnostics::qos(mode, || engine.worker_pid(), &host, &worker);
-    release();
     drop(_transition);
-    maintain()
+    let result = maintain();
+    // Maintenance also borrows the stage pool. Retire it after that work
+    // drains, unless a foreground request began during maintenance.
+    release_when_foreground_idle(|| engine.clear_idle_caches());
+    result
 }
 
 pub(super) fn monotonic_seconds() -> f64 {

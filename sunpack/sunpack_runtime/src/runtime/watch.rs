@@ -3345,17 +3345,27 @@ impl Scheduler {
     }
 
     fn run_inner(&mut self) -> io::Result<()> {
+        self.arm_idle_cleanup();
         while !self.hub.stopped.load(Ordering::Acquire) {
             if self.enabled() && self.dedup_rebuild.is_none() { self.dispatch_ready()?; }
             self.hub
                 .pending_count
                 .store(self.pending.len(), Ordering::Relaxed);
             if self.active.is_empty() && self.pending.is_empty() {
-                self.engine.run_stage("catalog_commit", Origin::Watch, || {
-                    // A gap between bursts is not the idle-cache deadline.
-                    self.catalog.commit(false);
-                    self.journal.compact()
-                })??;
+                if self.catalog.commit_pending() || self.journal.compaction_pending() {
+                    self.engine.run_stage("catalog_commit", Origin::Watch, || {
+                        // A gap between bursts is not the idle-cache deadline.
+                        self.catalog.commit(false);
+                        self.journal.compact()
+                    })??;
+                }
+                // An idle control or maintenance wake can borrow the stage pool.
+                // Return it when the scheduler goes back to sleep.
+                if self.cache_deadline.is_none()
+                    && self.settings.watch.runtime_cache_cleanup_idle_seconds.is_finite()
+                {
+                    windows::retire_idle_stage_pool(&self.engine);
+                }
             }
             // The resident CLI delegates cache cleanup to a live Watch. Its
             // deadline remains relevant while Watch admission is paused.
@@ -3477,7 +3487,7 @@ impl Scheduler {
                 self.cache_deadline = None;
                 if self.active.is_empty() && self.pending.is_empty() {
                     let engine = Arc::clone(&self.engine);
-                    windows::maintain_when_foreground_idle(&engine, || engine.clear_idle_caches(), || {
+                    windows::maintain_when_foreground_idle(&engine, || {
                         if !enabled { return Ok(()); }
                         self.checkpoint(&HashMap::new(), true, false)?;
                         engine.run_stage("catalog_maintenance", Origin::Watch, || {
@@ -5068,8 +5078,7 @@ impl Scheduler {
         // admitted inputs, not discovered claims, and completion removes each
         // settled owner (including aliases) before its siblings finish. Failure
         // while retiring indexes stops admission rather than reusing them.
-        crate::pipeline::MAX_PENDING_JOBS.max(rayon::current_num_threads())
-            .saturating_sub(self.active_paths.len())
+        crate::pipeline::MAX_PENDING_JOBS.saturating_sub(self.active_paths.len())
     }
 
     fn next_admission(&self) -> Option<Instant> {

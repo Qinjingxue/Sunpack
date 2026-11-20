@@ -100,6 +100,8 @@ impl Host {
     pub(super) fn clear_idle_caches(&self) {
         if let Some(engine) = self.engine.get() {
             engine.clear_idle_caches();
+        } else {
+            self.scheduler.clear_idle_pool();
         }
     }
 

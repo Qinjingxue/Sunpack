@@ -143,7 +143,7 @@ impl JournalReader {
     pub fn read_directories_changes(
         &mut self,
         expected_journal: u64,
-        parents: &HashMap<[u8; FILE_ID_BYTES], u32>,
+        parents: &HashMap<[u8; FILE_ID_BYTES], u16>,
         start_usn: i64,
         end_usn: i64,
     ) -> io::Result<DirectoryChangesPage> {
@@ -407,7 +407,7 @@ impl DirectoryPageBuilder {
 // A record may yield both a directory change and a child name; keep it atomic.
 fn scan_directories_page(
     journal_id: u64,
-    parents: &HashMap<[u8; FILE_ID_BYTES], u32>,
+    parents: &HashMap<[u8; FILE_ID_BYTES], u16>,
     start_usn: i64,
     end_usn: i64,
     mut read: impl FnMut(i64, &mut [u8]) -> io::Result<usize>,
@@ -477,7 +477,7 @@ struct DirectoryRecord<'a> {
 
 fn record_directory_changes<'a>(
     record: &[u8],
-    parents: &HashMap<[u8; FILE_ID_BYTES], u32>,
+    parents: &HashMap<[u8; FILE_ID_BYTES], u16>,
     start_usn: i64,
     end_usn: i64,
     scratch: &'a mut [DirectoryChange; 2],
@@ -515,7 +515,7 @@ fn record_directory_changes<'a>(
     let parent = file_id_value(&record[8 + width..8 + 2 * width]).to_le_bytes();
     let [directory, child] = scratch;
     if let Some(index) = parents.get(&file) {
-        directory.0 = *index;
+        directory.0 = u32::from(*index);
         result.changes[0] = Some(directory);
     }
     if let Some(index) = parents.get(&parent) {
@@ -549,7 +549,7 @@ fn record_directory_changes<'a>(
         }
         // Retain scratch capacity when a journal repeats the same child name.
         // The page only allocates an owned copy for a new directory/name pair.
-        child.0 = *index;
+        child.0 = u32::from(*index);
         child.1.clear();
         child.1.reserve(length / 2);
         let units = record[offset..offset + length]

@@ -662,9 +662,16 @@ impl Drop for CloseConnection { fn drop(&mut self) { self.0.close(); } }
 struct Activity {
     last_completed: Option<Instant>,
     last_cache_use: Option<Instant>,
+    notify_watch_cache_use: bool,
     active: usize,
     observers: usize,
     shutting_down: bool,
+}
+
+impl Activity {
+    fn take_watch_cache_notice(&mut self) -> bool {
+        self.active == self.observers && std::mem::take(&mut self.notify_watch_cache_use)
+    }
 }
 
 struct Server {
@@ -693,10 +700,14 @@ impl Drop for ActiveRequest {
     fn drop(&mut self) {
         let mut activity = self.0.activity.lock().unwrap();
         activity.active -= 1;
+        let notify_watch = activity.take_watch_cache_notice();
         if activity.active == 0 {
             self.0.drained.notify_all();
         }
         drop(activity);
+        if notify_watch {
+            self.0.host.watch.foreground_finished(|| {});
+        }
         self.0.wake.signal();
     }
 }
@@ -706,7 +717,14 @@ impl Drop for ActiveRequest {
 struct StatusObserver(Arc<Server>);
 impl StatusObserver {
     fn new(server: &Arc<Server>) -> Self {
-        server.activity.lock().unwrap().observers += 1;
+        let notify_watch = {
+            let mut activity = server.activity.lock().unwrap();
+            activity.observers += 1;
+            activity.take_watch_cache_notice()
+        };
+        if notify_watch {
+            server.host.watch.foreground_finished(|| {});
+        }
         server.wake.signal();
         Self(Arc::clone(server))
     }
@@ -812,6 +830,7 @@ impl Server {
             let mut activity = self.activity.lock().unwrap();
             let now = Instant::now();
             activity.last_cache_use = Some(now);
+            activity.notify_watch_cache_use = true;
             if result.is_ok() {
                 activity.last_completed = Some(now);
             }

@@ -20,21 +20,27 @@ impl IdleRayonPool {
     }
 
     pub(crate) fn acquire(&self, build: impl FnOnce() -> Option<rayon::ThreadPool>) -> Option<Arc<rayon::ThreadPool>> {
+        self.acquire_with(|| Ok::<_, std::convert::Infallible>(build())).unwrap()
+    }
+
+    pub(crate) fn acquire_with<E>(
+        &self,
+        build: impl FnOnce() -> Result<Option<rayon::ThreadPool>, E>,
+    ) -> Result<Option<Arc<rayon::ThreadPool>>, E> {
         let mut state = self.0.lock().unwrap();
         match &*state {
-            RayonPoolState::Retained(pool) => return pool.clone(),
+            RayonPoolState::Retained(pool) => return Ok(pool.clone()),
             RayonPoolState::Retiring(pool) => {
                 if let Some(pool) = pool.upgrade() {
-                    return Some(pool);
+                    return Ok(Some(pool));
                 }
             }
             RayonPoolState::Empty => {}
         }
-        // Cache a failed build until the next idle cleanup. Borrowers hold
-        // their own reference and run work after releasing this mutex.
-        let pool = build().map(Arc::new);
+        // An optional pool can cache absence. A build error remains retryable.
+        let pool = build()?.map(Arc::new);
         *state = RayonPoolState::Retained(pool.clone());
-        pool
+        Ok(pool)
     }
 
     pub(crate) fn clear(&self) {
@@ -47,6 +53,10 @@ impl IdleRayonPool {
             .map_or(RayonPoolState::Empty, |pool| RayonPoolState::Retiring(Arc::downgrade(pool)));
         drop(state);
         drop(retired);
+    }
+
+    pub(crate) fn is_retained(&self) -> bool {
+        matches!(&*self.0.lock().unwrap(), RayonPoolState::Retained(Some(_)))
     }
 }
 

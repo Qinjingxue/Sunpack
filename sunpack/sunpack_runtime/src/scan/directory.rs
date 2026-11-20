@@ -1485,6 +1485,7 @@ pub(crate) struct NativeWatchCatalog {
 struct CatalogTables {
     scopes: HashMap<String, ScopeCatalog>,
     revision: u64,
+    committed: Option<u64>,
 }
 
 impl CatalogTables {
@@ -1514,7 +1515,7 @@ impl NativeWatchCatalog {
             }
         });
         Self {
-            catalogs: Mutex::new(CatalogTables { scopes: catalogs, revision: 0 }),
+            catalogs: Mutex::new(CatalogTables { scopes: catalogs, revision: 0, committed: None }),
             outputs: Arc::clone(&outputs.outputs),
             store: Mutex::new(store),
             error: Mutex::new(error),
@@ -2003,6 +2004,11 @@ impl NativeWatchCatalog {
         self.error.lock().unwrap().clone()
     }
 
+    pub(crate) fn commit_pending(&self) -> bool {
+        let tables = self.catalogs.lock().unwrap();
+        tables.committed != Some(tables.revision)
+    }
+
     pub(crate) fn commit(&self, idle: bool) {
         (|| {
             let mut tables = self.catalogs.lock().unwrap();
@@ -2011,6 +2017,7 @@ impl NativeWatchCatalog {
             for table in tables.scopes.values_mut() {
                 table.trim_capacity();
             }
+            tables.committed = Some(tables.revision);
             let mut slot = self.store.lock().unwrap();
             if let Some(store) = slot.as_mut() {
                 if let Err(error) = store.commit().and_then(|_| {

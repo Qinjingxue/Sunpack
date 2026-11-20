@@ -841,7 +841,9 @@ namespace sunpack::sevenzip
             if (!hard_links_.empty()) finalize_hard_links();
             restore_directory_metadata();
             const auto *memory = current_native_memory_job();
-            if (replay_ && (is_cancelled() || std::uncaught_exceptions() ||
+            // A user cancellation ends the job. Only a retryable attempt
+            // needs a new inventory of the output already written.
+            if (replay_ && (std::uncaught_exceptions() ||
                 is_memory_hresult(writer_error) || (memory && (memory->revoked.load() || memory->denied.load())))) {
                 replay_->initialized = true;
                 output_paths_->preserve_replay();

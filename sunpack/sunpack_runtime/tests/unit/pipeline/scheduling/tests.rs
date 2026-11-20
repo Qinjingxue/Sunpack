@@ -42,7 +42,7 @@ fn initialization_failure_settles_requests_and_allows_later_retry() {
     let failed = scheduler.prepare_submit().unwrap().submit(1, Origin::Watch, &cancel,
         move |_| Box::pin(async move { stage("extract", &child_cancel).await }));
     assert!(failed.join().unwrap().is_err());
-    assert!(scheduler.pool.get().is_none());
+    assert!(!scheduler.pool.is_retained());
     assert_eq!(scheduler.state.lock().unwrap().active, 0);
     assert_eq!(scheduler.state.lock().unwrap().pending, 0);
     let result = scheduler.run(2, Origin::Foreground, &cancel, |_| Box::pin(async {
@@ -64,33 +64,33 @@ fn initialization_failure_settles_requests_and_allows_later_retry() {
 #[test]
 fn concurrent_first_stage_initializes_one_shared_pool() {
     let scheduler = Scheduler::new();
-    let addresses = std::thread::scope(|scope| {
+    let pools = std::thread::scope(|scope| {
         let jobs: Vec<_> = (0..8).map(|_| {
             let scheduler = &scheduler;
-            scope.spawn(move || scheduler.pool().unwrap() as *const rayon::ThreadPool as usize)
+            scope.spawn(move || scheduler.pool().unwrap())
         }).collect();
         jobs.into_iter().map(|job| job.join().unwrap()).collect::<Vec<_>>()
     });
-    assert!(addresses.iter().all(|address| *address == addresses[0]));
-    assert_eq!(scheduler.pool().unwrap().current_num_threads(), scheduler.capacity);
+    assert!(pools.iter().all(|pool| Arc::ptr_eq(pool, &pools[0])));
+    assert_eq!(pools[0].current_num_threads(), scheduler.capacity);
 }
 
 #[test]
 fn lightweight_root_does_not_initialize_stage_pool() {
     let scheduler = Scheduler::new();
-    assert!(scheduler.pool.get().is_none());
+    assert!(!scheduler.pool.is_retained());
     let result = scheduler.run(1, Origin::Foreground, &Cancellation::new(), |_| Box::pin(async { 42 }));
     assert_eq!(result, 42);
-    assert!(scheduler.pool.get().is_none());
+    assert!(!scheduler.pool.is_retained());
     let error: Result<(), &str> = scheduler.run(2, Origin::Foreground, &Cancellation::new(),
         |_| Box::pin(async { Err("parse failure") }));
     assert_eq!(error, Err("parse failure"));
-    assert!(scheduler.pool.get().is_none());
+    assert!(!scheduler.pool.is_retained());
     let result = scheduler.run(2, Origin::Foreground, &Cancellation::new(), |_| Box::pin(async {
         stage("test", &Cancellation::new()).await.unwrap(); 43
     }));
     assert_eq!(result, 43);
-    assert!(scheduler.pool.get().is_some());
+    assert!(scheduler.pool.is_retained());
 }
 
 #[test]

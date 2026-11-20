@@ -351,9 +351,9 @@ fn dispatcher_schedules_expiry_and_preserves_in_use_readers() {
 fn directory_query_is_one_message_and_keeps_wire_indices() {
     // A body crossing a pipe fragment must preserve the full IDs and the
     // last occurrence's index. A split or oversized message must be rejected.
-    let ids = (0..2049).map(|index| {
-        let id = if index == 2048 { 42 } else { index };
-        (u128::MAX - id).to_le_bytes()
+    let ids = (0..MAX_DIRECTORY_QUERY_BYTES / FILE_ID_BYTES).map(|index| {
+        let id = if index == usize::from(u16::MAX) { 42 } else { index };
+        (u128::MAX - id as u128).to_le_bytes()
     });
     let body: Vec<u8> = ids.flatten().collect();
     let id_bytes = body.len();
@@ -391,8 +391,8 @@ fn directory_query_is_one_message_and_keeps_wire_indices() {
         if body.len() == id_bytes {
             let query = result.unwrap();
             assert_eq!(query.journal, 17);
-            assert_eq!(query.parents.len(), 2048);
-            assert_eq!(query.parents[&(u128::MAX - 42).to_le_bytes()], 2048);
+            assert_eq!(query.parents.len(), usize::from(u16::MAX));
+            assert_eq!(query.parents[&(u128::MAX - 42).to_le_bytes()], u16::MAX);
             assert_eq!(query.parents[&(u128::MAX - 1024).to_le_bytes()], 1024);
         } else {
             assert!(result.is_none());

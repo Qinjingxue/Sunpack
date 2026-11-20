@@ -2,6 +2,7 @@
 //! Async control stays outside host capacity; explicit blocking stages enter Rayon.
 
 use super::{Cancellation, Origin};
+use crate::io::resource_lifecycle::IdleRayonPool;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -58,7 +59,7 @@ pub(crate) const MAX_PENDING_JOBS: usize = 4096;
 pub(crate) struct Scheduler {
     capacity: usize,
     next_id: AtomicU64,
-    pool: OnceLock<rayon::ThreadPool>,
+    pool: IdleRayonPool,
     state: Mutex<Admission>,
     driver: OnceLock<mpsc::Sender<DriverEvent>>,
     initialize: Mutex<()>,
@@ -215,7 +216,7 @@ impl Scheduler {
         Arc::new(Self {
             capacity,
             next_id: AtomicU64::new(1),
-            pool: OnceLock::new(),
+            pool: IdleRayonPool::new(),
             state: Mutex::default(),
             driver: OnceLock::new(),
             initialize: Mutex::new(()),
@@ -226,25 +227,30 @@ impl Scheduler {
         })
     }
 
-    fn pool(&self) -> io::Result<&rayon::ThreadPool> {
-        if let Some(pool) = self.pool.get() { return Ok(pool); }
-        let _initialize = self.initialize.lock().unwrap();
-        if let Some(pool) = self.pool.get() { return Ok(pool); }
-        #[cfg(test)]
-        {
-            let mut left = self.fail_pool.load(Ordering::Relaxed);
-            while left != 0 {
-                match self.fail_pool.compare_exchange_weak(left, left - 1, Ordering::Relaxed, Ordering::Relaxed) {
-                    Ok(_) => return Err(io::Error::other("injected stage thread creation failure")),
-                    Err(current) => left = current,
+    fn pool(&self) -> io::Result<Arc<rayon::ThreadPool>> {
+        self.pool.acquire_with(|| {
+            #[cfg(test)]
+            {
+                let mut left = self.fail_pool.load(Ordering::Relaxed);
+                while left != 0 {
+                    match self.fail_pool.compare_exchange_weak(left, left - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => return Err(io::Error::other("injected stage thread creation failure")),
+                        Err(current) => left = current,
+                    }
                 }
             }
-        }
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(self.capacity)
-            .thread_name(|id| format!("sunpack-stage-{id}"))
-            .build().map_err(io::Error::other)?;
-        let _ = self.pool.set(pool);
-        Ok(self.pool.get().unwrap())
+            rayon::ThreadPoolBuilder::new().num_threads(self.capacity)
+                .thread_name(|id| format!("sunpack-stage-{id}"))
+                .build().map(Some).map_err(io::Error::other)
+        }).map(|pool| pool.expect("stage pool is required"))
+    }
+
+    pub(crate) fn clear_idle_pool(&self) {
+        self.pool.clear();
+    }
+
+    pub(crate) fn pool_retained(&self) -> bool {
+        self.pool.is_retained()
     }
 
     pub(crate) fn prepare_submit(self: &Arc<Self>) -> io::Result<PreparedSubmit<'_>> {
@@ -467,7 +473,13 @@ fn dispatch_owned(state: &mut RequestState<'static>, signal: Signal) {
     if let Some(job) = state.handle(signal) {
         if job.slot.is_some() {
             match state.scheduler.pool() {
-                Ok(pool) => pool.spawn(move || job.poll()),
+                Ok(pool) => {
+                    let active = Arc::clone(&pool);
+                    pool.spawn(move || {
+                        let _pool = active;
+                        job.poll();
+                    });
+                }
                 Err(error) => job.fail_stage(error),
             }
         } else { job.poll(); }

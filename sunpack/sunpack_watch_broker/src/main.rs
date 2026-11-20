@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sunpack_usn_core::protocol::{
     DirectoryQueryHeader, Opcode, Request, Response, Status, DIRECTORY_QUERY_HEADER_BYTES,
-    FILE_ID_BYTES, MAX_VOLUME_GUID_BYTES, REQUEST_BYTES, RESPONSE_BYTES,
+    FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES, MAX_VOLUME_GUID_BYTES, REQUEST_BYTES, RESPONSE_BYTES,
 };
 use sunpack_usn_core::{JournalReader, PIPE_NAME, SERVICE_NAME};
 use windows_service::{
@@ -50,6 +50,7 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 
 const PIPE_BUFFER_BYTES: u32 = 4096;
 const DIRECTORY_QUERY_CHUNK_BYTES: usize = 16 * 1024;
+const _: () = assert!(MAX_DIRECTORY_QUERY_BYTES / FILE_ID_BYTES <= u16::MAX as usize + 1);
 const MAX_CONNECTED_CLIENTS: u32 = 64;
 const MAX_VOLUME_CONTEXTS: usize = 64;
 const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(60);
@@ -315,7 +316,7 @@ fn serve_client(
 
 struct DirectoryQuery {
     journal: u64,
-    parents: HashMap<[u8; FILE_ID_BYTES], u32>,
+    parents: HashMap<[u8; FILE_ID_BYTES], u16>,
 }
 
 fn read_directory_query(
@@ -348,28 +349,28 @@ fn read_directory_query(
     if remaining != 0 && remaining_message_bytes()? != remaining {
         return Ok(None);
     }
-    let first_ids = first / FILE_ID_BYTES;
-    let mut parents = HashMap::with_capacity(first_ids);
-    let mut next_index = 0u32;
+    let sampled_bytes = first + remaining.min(buffer.len());
+    let mut parents = HashMap::with_capacity(sampled_bytes / FILE_ID_BYTES);
+    let mut next_index = 0usize;
     let mut insert = |parents: &mut HashMap<_, _>, bytes: &[u8]| {
         let ids = bytes.as_chunks::<FILE_ID_BYTES>().0;
         for group in ids.chunk_by(|left, right| left == right) {
-            next_index += group.len() as u32;
-            parents.insert(group[0], next_index - 1);
+            next_index += group.len();
+            parents.insert(group[0], (next_index - 1) as u16);
         }
     };
     insert(&mut parents, &buffer[..first]);
-    // A distinct first fragment is the usual path. For repeated IDs, grow
-    // with the actual distinct count while preserving the last wire index.
-    if remaining != 0 && parents.len() == first_ids {
-        parents.reserve(remaining / FILE_ID_BYTES);
-    }
     while remaining != 0 {
         let size = remaining.min(buffer.len());
         if !receive_query_fragment(read(&mut buffer[..size])?, size, remaining) {
             return Ok(None);
         }
         insert(&mut parents, &buffer[..size]);
+        // A single distinct prefix can precede runs of the same directory.
+        // Reserve for the rest only after two fragments confirm distinct IDs.
+        if remaining == id_bytes - first && parents.len() == sampled_bytes / FILE_ID_BYTES {
+            parents.reserve((remaining - size) / FILE_ID_BYTES);
+        }
         remaining -= size;
     }
     Ok(Some(DirectoryQuery { journal, parents }))

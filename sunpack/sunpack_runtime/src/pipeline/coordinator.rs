@@ -409,7 +409,18 @@ impl Engine {
         }
     }
 
+    pub(crate) fn stage_pool_retained(&self) -> bool {
+        self.scheduler.get().is_some_and(|scheduler| scheduler.pool_retained())
+    }
+
+    pub(crate) fn clear_idle_stage_pool(&self) {
+        if let Some(scheduler) = self.scheduler.get() {
+            scheduler.clear_idle_pool();
+        }
+    }
+
     pub(crate) fn clear_idle_caches(&self) {
+        self.clear_idle_stage_pool();
         #[cfg(windows)]
         crate::io::iocp::clear_scan_pool();
         crate::analysis_native::volume_anchor::clear_cheap_probe_pool();
