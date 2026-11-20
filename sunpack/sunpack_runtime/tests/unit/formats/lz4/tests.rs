@@ -52,7 +52,11 @@ fn long_streams_end_on_structure_instead_of_record_quotas() {
     let mut bytes = skip.repeat(65_537);
     bytes.extend(empty.repeat(65_537));
     let source = ManagedReader::from_bytes(bytes, ReaderConfig::default());
-    assert_eq!(identity(&source, 0), Ok(true));
+    let head = source.read_direct_at(0, 512).unwrap();
+    assert_eq!(
+        identity(&head, source.len(), |at, len| source.read_direct_at(at, len)),
+        Ok(true)
+    );
     let parsed = walk(&source, 0, source.len());
     assert!(parsed.complete);
     assert_eq!((parsed.skips, parsed.frames), (65_537, 65_537));
@@ -90,6 +94,10 @@ fn all_header_layouts_preserve_known_zero_and_descriptor_length() {
             let dict = (flags & 1 != 0).then_some(123);
             let bytes = frame(b"", flags, block << 4, size, dict);
             let header = parse_header(&bytes).unwrap();
+            assert_eq!(
+                identity(&bytes, bytes.len() as u64, |_, _| unreachable!()),
+                Ok(true)
+            );
             assert_eq!(header.content_size, size);
             assert_eq!(
                 header.len,
@@ -124,6 +132,8 @@ fn concatenated_skip_bounds_and_trailing_carrier() {
 #[test]
 fn header_corruption_truncation_and_size_limits_fail_closed() {
     let original = frame(b"hello", 0x7c, 0x40, Some(5), None);
+    let header_len = parse_header(&original).unwrap().len;
+    assert!(identity(&original, header_len as u64, |_, _| unreachable!()).is_err());
     for length in 4..original.len() {
         assert!(!index(original[..length].to_vec(), 0).complete);
     }
@@ -141,11 +151,10 @@ fn header_corruption_truncation_and_size_limits_fail_closed() {
 fn legacy_inputs_and_dictionary_descriptors_preserve_structure_identity() {
     let legacy = b"\x02\x21\x4c\x18\x06\0\0\0\x50hello";
     assert!(!leading(legacy));
-    assert!(!identity(
-        &ManagedReader::from_bytes(legacy.to_vec(), ReaderConfig::default()),
-        0
-    )
-    .unwrap());
+    assert_eq!(
+        identity(legacy, legacy.len() as u64, |_, _| unreachable!()),
+        Ok(false)
+    );
     assert_eq!(index(legacy.to_vec(), 0).error, "lz4_magic_not_found");
     for id in [0, 123, u32::MAX] {
         let bytes = frame(b"hello", 0x61, 0x40, None, Some(id));

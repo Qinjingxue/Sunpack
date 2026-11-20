@@ -160,7 +160,7 @@ fn read_watch_observation(
     let file = read_file_usn(handle.as_raw_handle())?;
     let volume = since_usn
         .filter(|previous| *previous > 0 && *previous < file.usn)
-        .and_then(|_| watch_volume_for_handle(handle, path).ok());
+        .and_then(|_| volume_for_handle(handle, path).ok());
     Ok((file, volume))
 }
 
@@ -168,7 +168,7 @@ pub(super) fn directory_file_id(path: &Path, volume: &str) -> io::Result<[u8; 16
     // Share deletion so promotion can query identity within its publication gate.
     let file = open_watch_path(path, FILE_READ_ATTRIBUTES, SHARE_ALL, true)?;
     let observation = read_file_usn(file.as_raw_handle())?;
-    if !watch_volume_for_handle(&file, path)?.eq_ignore_ascii_case(volume) {
+    if !volume_for_handle(&file, path)?.eq_ignore_ascii_case(volume) {
         return Err(io::Error::other("directory changed volume"));
     }
     Ok(observation.id)
@@ -176,12 +176,12 @@ pub(super) fn directory_file_id(path: &Path, volume: &str) -> io::Result<[u8; 16
 
 pub(super) fn watch_volume_device(path: &Path) -> io::Result<String> {
     match open_watch_path(path, 0, SHARE_ALL, true) {
-        Ok(file) => watch_volume_for_handle(&file, path),
+        Ok(file) => volume_for_handle(&file, path),
         Err(_) => volume_device(path),
     }
 }
 
-fn watch_volume_for_handle(file: &File, path: &Path) -> io::Result<String> {
+fn volume_for_handle(file: &File, path: &Path) -> io::Result<String> {
     // VOLUME_NAME_GUID returns \\?\Volume{GUID}\, including through a mount
     // point. The opened name can skip normalization because only the prefix matters.
     crate::io::resource_lifecycle::with_handle_path(
@@ -380,6 +380,11 @@ fn volume_mount_path(path: &Path) -> io::Result<Vec<u16>> {
 /// ancestor is canonicalized, which also resolves a junction or a volume mount point
 /// down to its real device.
 pub(super) fn resolve_output_volume(path: &Path) -> io::Result<String> {
+    // The extraction directory already exists. Resolve its actual device in
+    // one handle lookup, including when it is reached through a mount point.
+    if let Ok(file) = open_watch_path(path, 0, SHARE_ALL, true) {
+        return volume_for_handle(&file, path);
+    }
     let anchor = nearest_existing_ancestor(path)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no existing ancestor"))?;
     volume_device(&anchor)

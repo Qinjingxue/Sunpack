@@ -273,7 +273,6 @@ pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) 
                 };
                 reader.read_direct_at(offset, len)
             },
-            || ManagedReader::open(path).is_ok_and(|reader| crate::formats::lz4::identity(&reader, 0) == Ok(true)),
         ),
     )
 }
@@ -316,17 +315,13 @@ pub(crate) fn probe_volume_anchor_path_cheap(path: &str) -> VolumeAnchor {
     };
     result.bytes_read += prefix.len() as u64;
     result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix);
-    probe_cheap_prefix(result, &prefix,
-        |offset, len| reader.read_direct_at(offset, len),
-        || crate::formats::lz4::identity(&reader, 0) == Ok(true),
-    )
+    probe_cheap_prefix(result, &prefix, |offset, len| reader.read_direct_at(offset, len))
 }
 
 fn probe_cheap_prefix(
     mut result: VolumeAnchor,
     prefix: &[u8],
     mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
-    lz4_identity: impl FnOnce() -> bool,
 ) -> VolumeAnchor {
     let prefix = complete_anchor_prefix(prefix, &mut result, 0, &mut read);
     let prefix = prefix.as_ref();
@@ -357,7 +352,7 @@ fn probe_cheap_prefix(
     let pe = probe_pe_prefix(prefix, result.size);
     result.pe_state = pe.state();
     result.pe_image_end = pe.image_end();
-    probe_standalone_stream(prefix, &mut result, read, lz4_identity);
+    probe_standalone_stream(prefix, &mut result, read);
     result
 }
 
@@ -810,7 +805,9 @@ fn probe_zip_eocd(
 /// their bucket, so physical first/terminal disks are found before naming.
 pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
     let mut out = anchor.clone();
-    let Ok(reader) = ManagedReader::open(&anchor.path) else {
+    // Most members in a split bucket have no EOCD. Read their bounded
+    // tails directly instead of retaining the adjacent shared cache blocks.
+    let Ok(reader) = ManagedReader::open(&anchor.path).map(|reader| reader.probe_reader()) else {
         return out;
     };
     let Ok((tail, start)) =
@@ -1239,8 +1236,7 @@ fn probe_anchor_reader_prefix(
         return Ok(true);
     }
     if format.is_empty() && offset == 0 {
-        probe_standalone_stream(prefix, result, |offset, len| reader.read_direct_at(offset, len),
-            || crate::formats::lz4::identity(reader, 0) == Ok(true));
+        probe_standalone_stream(prefix, result, |offset, len| reader.read_direct_at(offset, len));
         if !result.format.is_empty() {
             return Ok(true);
         }
@@ -1264,14 +1260,13 @@ fn probe_standalone_stream(
     prefix: &[u8],
     out: &mut VolumeAnchor,
     read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
-    lz4_identity: impl FnOnce() -> bool,
 ) {
     // Confirm the prefix before ruling this file out as a possible volume.
     // Continuation bytes can coincide with a leading stream signature.
     let format = if prefix.starts_with(sunpack_enc::MAGIC) {
         sunpack_enc::Header::parse(prefix, out.size).is_ok().then_some("enc")
     } else if crate::formats::lz4::leading(prefix) {
-        lz4_identity().then_some("lz4")
+        (crate::formats::lz4::identity(prefix, out.size, read) == Ok(true)).then_some("lz4")
     } else if let Some(kind) = StructuralStreamKind::from_header(prefix) {
         compression_prefix_identity(kind, prefix, out.size, read).then_some(kind.format())
     } else if prefix.get(257..262) == Some(b"ustar") {

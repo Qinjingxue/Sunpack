@@ -31,22 +31,44 @@ pub(crate) fn leading(bytes: &[u8]) -> bool {
             .is_some_and(|p| skippable(u32::from_le_bytes(p.try_into().unwrap())))
 }
 
-pub(crate) fn identity(reader: &ManagedReader, offset: u64) -> Result<bool, &'static str> {
-    let limit = reader.len();
-    let mut input = StructureReader::new(reader, limit, 32);
-    let mut cursor = offset;
+pub(crate) fn identity(
+    prefix: &[u8],
+    limit: u64,
+    mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
+) -> Result<bool, &'static str> {
+    // A maximal frame header and its first block word fit in 23 bytes.
+    // Reuse the filesystem's prefix unless a skippable frame jumps past it.
+    let mut window;
+    let mut head = &prefix[..limit.min(prefix.len() as u64) as usize];
+    let mut offset = 0;
     loop {
-        let magic = input.word(cursor)?;
+        let needed = (limit - offset).min(23) as usize;
+        if head.len() < needed {
+            // Batch runs of short skippable headers as well as isolated ones.
+            let size = (limit - offset).min(4096) as usize;
+            window = read(offset, size).map_err(|_| "os_error")?;
+            head = &window;
+        }
+        let word = |at: usize| {
+            head.get(at..at + 4)
+                .map(|p| u32::from_le_bytes(p.try_into().unwrap()))
+                .ok_or("lz4_stream_truncated")
+        };
+        let magic = word(0)?;
         if skippable(magic) {
-            let size = input.word(cursor + 4)?;
-            advance(&mut cursor, 8 + u64::from(size), limit)?;
+            let span = 8 + u64::from(word(4)?);
+            advance(&mut offset, span, limit)?;
+            head = usize::try_from(span)
+                .ok()
+                .and_then(|span| head.get(span..))
+                .unwrap_or_default();
             continue;
         }
         if magic != 0x184d2204 {
             return Ok(false);
         }
-        let header = parse_header(input.field(cursor, ((limit - cursor).min(19)) as usize)?)?;
-        let block = input.word(cursor + header.len as u64)?;
+        let header = parse_header(head)?;
+        let block = word(header.len)?;
         return Ok(header.block_span(block).is_ok());
     }
 }
