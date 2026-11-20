@@ -1,4 +1,3 @@
-import os
 import json
 import subprocess
 import time
@@ -342,27 +341,28 @@ def test_watch_retries_unobserved_candidate_after_acl_only_recovery(package, tmp
     acl_script.write_text(r"""
 param([string]$Path, [string]$Saved, [switch]$Restore)
 $ErrorActionPreference = 'Stop'
-$acl = Get-Acl -LiteralPath $Path
+$access = [Security.AccessControl.AccessControlSections]::Access
+$acl = [IO.File]::GetAccessControl($Path, $access)
 if ($Restore) {
-    $acl.SetSecurityDescriptorSddlForm([IO.File]::ReadAllText($Saved), [Security.AccessControl.AccessControlSections]::Access)
+    $acl.SetSecurityDescriptorSddlForm([IO.File]::ReadAllText($Saved), $access)
 } else {
-    # Isolate this temporary file's DACL from inheritance. Reapplying an
-    # unprotected descriptor can merge parent ACEs during Set-Acl, preventing
-    # an exact restore even if the explicit test deny was removed.
+    # Save a protected DACL so restoring it cannot merge inherited parent ACEs.
     $acl.SetAccessRuleProtection($true, $true)
-    Set-Acl -LiteralPath $Path -AclObject $acl
-    $acl = Get-Acl -LiteralPath $Path
+    [IO.File]::SetAccessControl($Path, $acl)
+    $acl = [IO.File]::GetAccessControl($Path, $access)
     if (-not $acl.AreAccessRulesProtected) { throw "Test DACL still inherits from its parent" }
-    [IO.File]::WriteAllText($Saved, $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
+    [IO.File]::WriteAllText($Saved, $acl.GetSecurityDescriptorSddlForm($access))
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $raw = New-Object Security.AccessControl.RawSecurityDescriptor($acl.Sddl)
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor($acl.GetSecurityDescriptorSddlForm($access))
     $ace = New-Object Security.AccessControl.CommonAce([Security.AccessControl.AceFlags]::None, [Security.AccessControl.AceQualifier]::AccessDenied, 0x100000, $sid, $false, $null)
     $raw.DiscretionaryAcl.InsertAce(0, $ace)
-    $acl.SetSecurityDescriptorSddlForm($raw.GetSddlForm([Security.AccessControl.AccessControlSections]::Access), [Security.AccessControl.AccessControlSections]::Access)
+    $acl.SetSecurityDescriptorSddlForm($raw.GetSddlForm($access), $access)
 }
-Set-Acl -LiteralPath $Path -AclObject $acl
+# Persist only the modified DACL. Set-Acl can also try to write the SACL
+# when the target DACL is protected, requiring SeSecurityPrivilege.
+[IO.File]::SetAccessControl($Path, $acl)
 if ($Restore) {
-    $actual = (Get-Acl -LiteralPath $Path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+    $actual = [IO.File]::GetAccessControl($Path, $access).GetSecurityDescriptorSddlForm($access)
     if ($actual -ne [IO.File]::ReadAllText($Saved)) { throw "Original DACL was not restored" }
 }
 """, encoding="utf-8")
@@ -373,11 +373,7 @@ if ($Restore) {
                    "-Path", str(path), "-Saved", str(saved)]
         if restore:
             command.append("-Restore")
-        # Windows PowerShell must resolve its own modules, not inherit the
-        # incompatible PowerShell 7 module path from the test runner.
-        environment = {name: value for name, value in os.environ.items()
-                       if name.lower() != "psmodulepath"}
-        result = subprocess.run(command, capture_output=True, text=True, env=environment)
+        result = subprocess.run(command, capture_output=True, text=True)
         assert result.returncode == 0, (result.stdout, result.stderr)
 
     package.json("watch", "add", watched, "-R", "-o", output)
