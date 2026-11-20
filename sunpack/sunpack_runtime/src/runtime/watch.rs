@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 #[cfg(test)]
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod dedup;
 mod dedup_hash;
@@ -245,17 +245,20 @@ fn configuration_changes(
 }
 
 fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
-    let mut roots = read_root_records(path)?;
+    let mut roots = read_root_records_or_empty(path)?;
     roots.retain(|root| root.enabled);
     Ok(roots)
 }
 
+fn read_root_records_or_empty(path: &Path) -> io::Result<Vec<Root>> {
+    match read_root_records(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        result => result,
+    }
+}
+
 fn read_root_records(path: &Path) -> io::Result<Vec<Root>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let text = String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let text = fs::read_to_string(path)?;
     let mut roots: Vec<Root> = Vec::new();
     let mut positions = HashMap::new();
     let cwd = std::env::current_dir()?;
@@ -741,7 +744,7 @@ impl Watch {
         let running = self.is_running();
         {
             let _lock = FileMutex::lock(&path, ROOTS_LOCK)?;
-            let mut roots = read_root_records(&path)?;
+            let mut roots = read_root_records_or_empty(&path)?;
             let mut positions: HashMap<_, _> = roots.iter().enumerate()
                 .map(|(index, root)| (root_key(&root.path), index)).collect();
             for root in paths {
@@ -813,7 +816,7 @@ impl Watch {
         {
             let _lock = FileMutex::lock(&path, ROOTS_LOCK)?;
             let keys: HashSet<_> = paths.iter().map(|path| root_key(&configured_path(path))).collect();
-            let mut roots = read_root_records(&path)?;
+            let mut roots = read_root_records_or_empty(&path)?;
             roots.retain(|root| {
                 if keys.contains(&root_key(&root.path)) {
                     removed.push(root.path.clone());
@@ -2846,13 +2849,20 @@ impl Scheduler {
 
     fn reconcile_roots(&mut self, restart_scheduler: bool) -> io::Result<(bool, bool)> {
         let engine = Arc::clone(&self.engine);
-        let (next, baseline_roots, policy_changed, lease) = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
+        let policy = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
         let (entries, rejected) = {
             // Read, classify, and prune the same root policy. GUI and CLI
             // writers share this lock; pruning an older snapshot can remove a
             // root that has since moved back onto a supported filesystem.
             let _guard = FileMutex::lock(&self.root_file, ROOTS_LOCK)?;
-            let mut entries = read_root_records(&self.root_file)?;
+            let mut entries = match read_root_records(&self.root_file) {
+                // An absent file is normal before the first root is added. It
+                // carries no authority to retire the previous catalog or WAL.
+                Err(error) if self.roots.is_empty() && error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                result => result?,
+            };
             let mut filesystems = HashMap::new();
             let mut rejected = Vec::new();
             entries.retain(|entry| {
@@ -2915,8 +2925,11 @@ impl Scheduler {
         baseline_roots.extend(entries.iter().filter(|root| !root.enabled && root.scanned)
             .map(|root| key(&root.path)));
         let policy_changed = root_policy_changed(&self.roots, &next);
-            Ok((next, baseline_roots, policy_changed, lease))
+            Ok(Some((next, baseline_roots, policy_changed, lease)))
         })??;
+        let Some((next, baseline_roots, policy_changed, lease)) = policy else {
+            return Ok((false, false));
+        };
         let baseline_changed = self.baseline_roots != baseline_roots;
         if next.is_empty() && self.journal.suspended() && !baseline_changed { return Ok((false, false)); }
         if self.journal.resume()? {
@@ -3278,7 +3291,13 @@ impl Scheduler {
                 if !signals.reload { continue; }
                 let reload = (|| {
                     let snapshot = config::reload_snapshot(&cwd)?;
-                    let next_roots = configured_root_scopes(&cwd, &read_root_records(&roots_path(&cwd)?)?)?;
+                    let root_file = roots_path(&cwd)?;
+                    let entries = if roots.is_empty() {
+                        read_root_records_or_empty(&root_file)?
+                    } else {
+                        read_root_records(&root_file)?
+                    };
+                    let next_roots = configured_root_scopes(&cwd, &entries)?;
                     let changed = scheduler_configuration_changed(&settings, &snapshot.config)
                         || root_policy_changed(&roots, &next_roots);
                     let shell_changed = *settings != snapshot.config;
@@ -3351,6 +3370,7 @@ impl Scheduler {
 
     fn run_inner(&mut self) -> io::Result<()> {
         self.arm_idle_cleanup();
+        let mut reload_retry = None;
         while !self.hub.stopped.load(Ordering::Acquire) {
             if self.enabled() && self.dedup_rebuild.is_none() { self.dispatch_ready()?; }
             self.hub
@@ -3380,7 +3400,7 @@ impl Scheduler {
             } else {
                 self.cache_deadline
             };
-            let mut signals = self.hub.wait(deadline);
+            let mut signals = self.hub.wait(deadline.into_iter().chain(reload_retry).min());
             self.candidate_diagnostics.clear_expired(Instant::now());
             if signals.dedup_rebuild { self.rebuild_dedup(false)?; }
             for (id, result) in signals.dedup_completed.drain(..) {
@@ -3447,11 +3467,14 @@ impl Scheduler {
                     self.arm_idle_cleanup();
                 }
             }
-            if signals.reload {
+            if signals.reload || reload_retry.is_some_and(|deadline| deadline <= Instant::now()) {
                 let reload = self.reload();
+                let retry = reload.as_ref().is_err_and(crate::io::atomic_file::sharing_conflict);
                 if let Err(error) = &reload {
-                    self.journal
-                        .log(json!({"event":"watch_reload_failed","error":error.to_string()}));
+                    if reload_retry.is_none() || !retry {
+                        self.journal
+                            .log(json!({"event":"watch_reload_failed","error":error.to_string()}));
+                    }
                     if self.config_observers.iter().any(|observer| !observer.alive()) {
                         // Do not advertise a healthy Watch after a failed event
                         // subscription. Startup/restart can report the real error.
@@ -3463,6 +3486,9 @@ impl Scheduler {
                         reload.as_ref().copied().map_err(|error| io::Error::new(error.kind(), error.to_string())),
                     );
                 }
+                // The new name may be visible before the replacement writer
+                // releases its handle. Closing it need not produce an event.
+                reload_retry = retry.then(|| Instant::now() + Duration::from_millis(100));
             }
             let enabled = self.enabled();
             if enabled && !signals.volumes.is_empty() {

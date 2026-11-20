@@ -2,13 +2,14 @@
 
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from threading import Event
 
 import psutil
 import pytest
 
-from tests.helpers.marker_utils import replace_shared_file
+from tests.helpers.marker_utils import open_shared_file, replace_shared_file
 from tests.helpers.native_fixture import native_fixture
 from tests.helpers.package import wait_for
 
@@ -146,6 +147,44 @@ def test_directory_resume_skips_paused_files_and_parent_respects_disabled_scope(
     display = native_fixture("display_events", path=str(package.data / ".sunpack_watch" / "events.json"))
     assert sum(row["event"] == "done" and Path(row.get("path", "")).name == "original.zip"
                for row in display["history"]) == 1
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "sharing_violation"])
+def test_roots_reload_keeps_active_policy_until_config_is_readable(package, tmp_path, unavailable):
+    watched, added = tmp_path / "watched", tmp_path / "added"
+    output, added_output = tmp_path / "out", tmp_path / "added-out"
+    watched.mkdir()
+    added.mkdir()
+    package.json("watch", "add", watched, "-o", output)
+    roots = package.data / "sunpack_watch_roots.txt"
+
+    with package.watch_session():
+        _archive(watched, "before")
+        done = package.await_watch_event("done", path="before.zip")
+        next_policy = roots.read_text(encoding="utf-8") + (
+            f"{added} | {added_output} | false | true | false | true\n"
+        )
+        with ExitStack() as restore:
+            if unavailable == "missing":
+                pending = roots.with_suffix(".tmp")
+                pending.write_text(next_policy, encoding="utf-8")
+                roots.unlink()
+                restore.callback(replace_shared_file, pending, roots)
+            else:
+                writer = restore.enter_context(open_shared_file(roots, "w", share=0, encoding="utf-8"))
+                writer.write(next_policy)
+                writer.flush()
+            assert package.json("watch", "reload")["summary"]["reloaded"] is False
+            _archive(watched, "during")
+            _output(output, "during")
+
+        # A returning file or a released writer must apply the new policy
+        # without a second explicit reload.
+        package.await_watch_event("service_reloaded", after=done["ts"])
+        _archive(added, "after")
+        _output(added_output, "after")
+
+    assert sorted(path.name for path in output.rglob("*.txt")) == ["before.txt", "during.txt"]
 
 
 @pytest.mark.parametrize("shutdown", ["clean", "crash"])
