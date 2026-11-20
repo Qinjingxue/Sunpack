@@ -208,10 +208,6 @@
       "zh": "输出位置：",
       "en": "Output: "
     },
-    "defaultOutput": {
-      "zh": "默认输出：",
-      "en": "Default output: "
-    },
     "watchRoot": {
       "zh": "监控目录",
       "en": "Monitored folder"
@@ -1213,16 +1209,6 @@
       },
       "min": 1,
       "integer": true
-    },
-    "/watch/out_dir": {
-      "label": {
-        "zh": "默认输出目录",
-        "en": "Default output folder"
-      },
-      "description": {
-        "zh": "“.” 表示输入目录旁",
-        "en": "“.” means beside the input"
-      }
     },
     "/watch/toast_report_retention_days": {
       "label": {

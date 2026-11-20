@@ -921,8 +921,6 @@ export default {
   .root-edit-row { flex-direction:row; align-items:center; gap:8px; padding:10px 0px; }
   .root-edit-row .record-editor { flex:1; min-width:0px; }
   .record-check { width:24px; height:24px; flex-shrink:0; }
-  .record-actions { width:84px; flex-shrink:0; flex-direction:row; align-items:center; justify-content:space-between; }
-  .root-enabled-column { flex:1; align-items:center; text-align:center; }
   .record-remove { width:24px; height:24px; min-height:24px; padding:0px; border:0px; background:#00000001; color:var(--fg); }
   .record-remove:hover { background:var(--card-border); }
   .password-text { width:100%; height:32px; flex-shrink:1; background:#00000001; color:var(--fg); border:0px; padding:0px; text-align:left; cursor:text; }
@@ -937,10 +935,11 @@ export default {
   .root-columns { flex-direction:row; align-items:center; gap:8px; }
   .root-header { padding:10px 12px; margin:2px 18px 0px 2px; flex-shrink:0; border:1px solid var(--card-border); border-radius:8px; }
   .root-header .root-path-column { padding-left:11px; white-space:nowrap; }
-  .root-header .root-deep-column { text-align:center; white-space:nowrap; }
+  .root-header .root-toggle-column { text-align:center; white-space:nowrap; }
   .root-row { padding:10px 0px; min-height:52px; }
   .root-path-column { flex:1; min-width:0px; gap:0px; }
-  .root-deep-column { width:80px; flex-shrink:0; align-items:center; }
+  .root-toggle-column { width:80px; flex-shrink:0; align-items:center; }
+  .root-columns > .record-remove { flex-shrink:0; }
   .root-path-cell { width:100%; height:32px; gap:0px; }
   .root-path-cell .password-text-value { padding:0px 35px 0px 11px; }
   .root-browse { display:flex; align-items:center; justify-content:center; position:absolute; top:4px; right:4px; width:24px; height:24px; min-height:24px; padding:0px; border:0px; background:#00000001; color:var(--fg); }
@@ -1099,12 +1098,10 @@ export default {
             <input type="checkbox" class="record-check" id="selectAllRoots" :checked="allRootsChecked" @change="v=>checkAll('root',v)"/>
             <label class="root-path-column">{{ texts.roots }}</label>
             <label class="root-path-column">{{ texts.rootOutput }}</label>
-            <label class="root-deep-column">{{ texts.deep }}</label>
-            <label class="root-deep-column">{{ texts.recursiveScan }}</label>
-            <div class="record-actions">
-              <label id="rootEnabledHeading" class="root-enabled-column">{{ texts.enableState }}</label>
-              <div class="record-remove"/>
-            </div>
+            <label id="rootDeepHeading" class="root-toggle-column">{{ texts.deep }}</label>
+            <label id="rootRecursiveHeading" class="root-toggle-column">{{ texts.recursiveScan }}</label>
+            <label id="rootEnabledHeading" class="root-toggle-column">{{ texts.enableState }}</label>
+            <div class="record-remove"/>
           </div>
           <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="62px" style="gap:8px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" :class="'history-entry '+appearance">
             <div v-show="rootCell!==r.id" class="root-columns root-row"><input type="checkbox" class="record-check" :id="'select-root-'+r.id" :checked="!!rootChecked[r.id]" @change="v=>setChecked('root',r.id,v)"/>
@@ -1116,8 +1113,10 @@ export default {
                 <button :id="'root-output-text-'+r.id" class="password-text" @mousedown="e=>rememberCellPointer(r.id,'output',e)" @click="beginRoot(r,'output')"><label :id="'root-output-value-'+r.id" :class="rootDraft(r).output?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).output||texts.rootOutputHint }}</label><div class="password-hover-line"/></button>
                 <button class="root-browse" :id="'browse-root-output-'+r.id" @click="browseRoot(r,'output')"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
               </div></div>
-              <div class="root-deep-column"><toggle :id="'root-deep-'+r.id" :checked="rootDraft(r).deep" @change="v=>toggleRoot(r,'deep',v)"/></div><div class="root-deep-column"><toggle :id="'root-recursive-'+r.id" :checked="rootDraft(r).recursive" @change="v=>toggleRoot(r,'recursive',v)"/></div>
-              <div class="record-actions"><div class="root-enabled-column"><toggle :id="'enabled-root-'+r.id" :checked="rootDraft(r).enabled" @change="v=>toggleRoot(r,'enabled',v)"/></div><button class="record-remove" :id="'delete-root-'+r.id" :tooltip="texts.delete" @click="deleteListedRoot(r)">×</button></div>
+              <div class="root-toggle-column"><toggle :id="'root-deep-'+r.id" :checked="rootDraft(r).deep" @change="v=>toggleRoot(r,'deep',v)"/></div>
+              <div class="root-toggle-column"><toggle :id="'root-recursive-'+r.id" :checked="rootDraft(r).recursive" @change="v=>toggleRoot(r,'recursive',v)"/></div>
+              <div class="root-toggle-column"><toggle :id="'enabled-root-'+r.id" :checked="rootDraft(r).enabled" @change="v=>toggleRoot(r,'enabled',v)"/></div>
+              <button class="record-remove" :id="'delete-root-'+r.id" :tooltip="texts.delete" @click="deleteListedRoot(r)">×</button>
             </div>
             <div v-if="rootCell===r.id" class="root-edit-row">
               <textarea auto-grow="true" class="record-editor" :id="'root-'+rootPart+'-input-'+r.id" :value="rootDraft(r)[rootPart]" :placeholder="texts.recordEditHint" @input="v=>changeRoot(r,rootPart,v)" @blur="blurRoot(r,rootPart)" @submit="finishRootCell()"/>

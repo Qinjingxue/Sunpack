@@ -264,10 +264,10 @@ void editing(Fixture& f) {
     auto shared=std::find_if(stored.begin(),stored.end(),[](const Json& row){return row["value"]=="shared stored";});
     assert((*shared)["scopes"]==Json::array({"C:/A","D:/B"}));
     auto c=f.dir/"sunpack_config.json";
-    auto source=std::string(R"({"filters":[{"name":"x","rules":["x]}","y\"[{",3]}], "watch": {"out_dir" : "."},"unknown":{"large":9007199254740993,"huge":123456789012345678901234567890}})");
+    auto source=std::string(R"({"filters":[{"name":"x","rules":["x]}","y\"[{",3]}], "recursive_extract" : "*","unknown":{"label":"中文","large":9007199254740993,"huge":123456789012345678901234567890}})");
     atomic_write(c,source);
-    save_config_field(c,"/watch/out_dir","\".\"","string","中文",false);
-    source.replace(source.find("\".\""),3,"\"中文\"");
+    save_config_field(c,"/recursive_extract","\"*\"","string","12",false);
+    source.replace(source.find("\"*\""),3,"\"12\"");
     assert(read_file(c)==source);
     auto conf=read_json(c); assert(conf["unknown"]["large"].dump()=="9007199254740993");
     assert(read_file(c).find("123456789012345678901234567890")!=std::string::npos);
@@ -275,7 +275,7 @@ void editing(Fixture& f) {
     auto huge=std::find_if(fields.begin(),fields.end(),[](const Json& field){return field["id"]=="/unknown/huge";});
     assert((*huge)["text"]=="123456789012345678901234567890");
     assert(conf["filters"][0]["rules"]==Json::array({"x]}","y\"[{",3}));
-    fails([&]{save_config_field(c,"/watch/out_dir","\".\"","string","stale",false);});
+    fails([&]{save_config_field(c,"/recursive_extract","\"*\"","string","13",false);});
     fails([&]{validate_setting("/runtime/process_mode",Json("typo"));});
     const auto flatten="/post_extract/flatten_directory_name";
     auto flatten_settings=describe_setting(flatten,"","zh");
@@ -418,7 +418,7 @@ void roots(Fixture& f) {
 void batch_editing(Fixture& fixture) {
     auto dir=fixture.dir/"batch"; fs::create_directory(dir);
     auto config=dir/"sunpack_config.json", passwords=dir/"builtin_passwords.json", roots=dir/"sunpack_watch_roots.txt";
-    atomic_write(config,R"({"watch":{"out_dir":".","toast_enabled":true,"clipboard_builtin_max_entries":1},"large":123456789012345678901234567890})");
+    atomic_write(config,R"({"watch":{"toast_enabled":true,"clipboard_builtin_max_entries":1},"large":123456789012345678901234567890})");
     Json old={{"value","old"},{"enabled",true},{"scopes",{utf8(dir.wstring())}}};
     atomic_write(passwords,Json{{"passwords",{old}},{"clipboard_history",{"latest background history"}}}.dump());
     atomic_write(roots,"# retained\n"+utf8(dir.wstring())+" | | false | false | false | true\n");

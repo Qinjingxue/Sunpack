@@ -541,20 +541,20 @@ void config_edits(Application& app,const fs::path& dir) {
     finish_input(app);
     assert(read_json(config_path)["watch"]["toast_enabled"]==false);
 
-    const std::string output="/watch/out_dir", input="input-"+output;
-    search_setting(app,output);
-    edit_text(app,input,L"local output");
+    const std::string recursion="/recursive_extract", rounds="rounds-"+recursion;
+    search_setting(app,recursion);
+    edit_text(app,rounds,L"3");
     auto external=read_json(config_path);
-    external["watch"]["out_dir"]="external output";
+    external["recursive_extract"]="4";
     atomic_write(config_path,external.dump());
-    pump([&]{return setting(app,output)["text"]=="external output";},"Reload changed setting");
+    pump([&]{return setting(app,recursion)["text"]=="4";},"Reload changed setting");
     click(app,"configSearch");
-    pump([&]{return state(app.page(),"saveErrors").contains(output);},"Report a settings conflict");
-    assert(read_json(config_path)["watch"]["out_dir"]=="external output");
-    assert(state(app.page(),"drafts")[output]["text"]=="local output");
-    edit_text(app,input,L"resolved output");
+    pump([&]{return state(app.page(),"saveErrors").contains(recursion);},"Report a settings conflict");
+    assert(read_json(config_path)["recursive_extract"]=="4");
+    assert(state(app.page(),"drafts")[recursion]["text"]=="3");
+    edit_text(app,rounds,L"5");
     finish_input(app);
-    assert(read_json(config_path)["watch"]["out_dir"]=="resolved output");
+    assert(read_json(config_path)["recursive_extract"]=="5");
 
     search_setting(app,"/cli/language");
     select_option(app,"select-/cli/language",1);
@@ -829,9 +829,17 @@ void roots_and_passwords(Application& app,const fs::path& dir) {
     finish_input(app);
     ui_window_relayout(app.window());
     const auto card=rect(app,"root-row-"+root_id), remove=rect(app,"delete-root-"+root_id);
-    const auto heading=rect(app,"rootEnabledHeading"), toggle=rect(app,"enabled-root-"+root_id);
-    // The unlabeled switch paints its 40-DIP track two DIPs from the left.
-    assert(std::abs((heading.left+heading.right)/2-(toggle.left+22))<1);
+    const auto aligned_center=[&](const char* heading_id,const std::string& toggle_id) {
+        const auto heading=rect(app,heading_id), toggle=rect(app,toggle_id);
+        const float center=(heading.left+heading.right)/2;
+        // The unlabeled switch paints its 40-DIP track two DIPs from the left.
+        assert(std::abs(center-(toggle.left+22))<1);
+        return center;
+    };
+    const float deep=aligned_center("rootDeepHeading","root-deep-"+root_id);
+    const float recursive=aligned_center("rootRecursiveHeading","root-recursive-"+root_id);
+    const float enabled=aligned_center("rootEnabledHeading","enabled-root-"+root_id);
+    assert(std::abs((recursive-deep)-(enabled-recursive))<1);
     assert(remove.right<=card.right-12);
     auto* hit=window(app).Root()->HitTest(remove.right-2,(remove.top+remove.bottom)/2);
     assert(hit && hit->id=="delete-root-"+root_id);
@@ -1179,7 +1187,7 @@ int wmain(int argc,wchar_t** argv) {
         fs::create_directory(dir);
         auto config=parse_json(kUiDefaultsJson);
         config["cli"]["language"]="zh";
-        config["watch"]["out_dir"]=".";
+        if(mode==L"--acceptance") config["recursive_extract"]="2";
         atomic_write(dir/"sunpack_config.json",config.dump());
         atomic_write(dir/"builtin_passwords.json",R"({"passwords":[{"value":"  #中文  ","enabled":true}],"clipboard_history":["history"]})");
         atomic_write(dir/"sunpack_watch_roots.txt",utf8(dir.wstring())+" | | false | false | false | true\n");

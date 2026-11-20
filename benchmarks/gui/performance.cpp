@@ -300,7 +300,6 @@ void seed(const fs::path& dir,const RunOptions& o) {
     Json config=Json::parse(kGuiPerfDefaultsJson);
     config["cli"]["language"]="en";
     config["watch"]["state_dir"]=".sunpack_watch";
-    config["watch"]["out_dir"]=".";
     write_utf8(dir/"sunpack_config.json",config.dump(2)+"\n");
     std::string roots;
     roots+=utf8(monitored.wstring())+" | | false | false | false | true\n";
