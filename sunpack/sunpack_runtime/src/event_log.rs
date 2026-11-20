@@ -186,6 +186,8 @@ impl Projection {
             ids.remove(id);
             if ids.is_empty() {
                 self.owner_tasks.remove(owner);
+            } else if ids.capacity() > 256.max(ids.len().saturating_mul(4)) {
+                ids.shrink_to(ids.len().saturating_mul(2));
             }
         }
     }

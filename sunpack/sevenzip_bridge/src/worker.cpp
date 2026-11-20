@@ -530,7 +530,7 @@ std::string pipeline_timing_wire(const sunpack::sevenzip::ExtractPipelineTiming&
 }
 #endif
 
-std::string verified_manifest_wire(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result, bool include_rows) {
+std::string verified_manifest_wire(const std::string& job_id, sunpack::sevenzip::ExtractArchiveResult& result, bool include_rows) {
     std::optional<WorkerChunks> chunks;
     if (include_rows) {
         chunks.emplace(job_id, "manifest_chunk", "rows");
@@ -540,7 +540,8 @@ std::string verified_manifest_wire(const std::string& job_id, const sunpack::sev
     bool complete = true;
     std::string row;
     if (chunks) row.reserve(256);
-    for (const auto& item : result.output_trace.items) {
+    auto& items = result.output_trace.items;
+    for (auto& item : items) {
         if (item.is_dir) continue;
         ++file_count;
         total_size += item.bytes_written;
@@ -555,8 +556,12 @@ std::string verified_manifest_wire(const std::string& job_id, const sunpack::sev
         else row.push_back(wire::kNull);
         wire::append_text(row, std::string_view(reinterpret_cast<const char*>(item.magic.data()), item.magic.size()), wire::kBytes);
         row += wire::end();
+        // The serialized row now owns its data, even if sending the chunk blocks.
+        decltype(item.output_path){}.swap(item.output_path);
+        decltype(item.magic){}.swap(item.magic);
         chunks->append(row);
     }
+    decltype(result.output_trace.items){}.swap(items);
     const std::string chunk_count = chunks
         ? wire::key("chunk_count") + wire::number(chunks->finish()) : "";
     return wire::object() +
@@ -1683,7 +1688,7 @@ RequestOutcome run_request(
     using namespace sunpack::sevenzip;
     auto execution = execute_request(request, shared_writer, cancel_token);
     if (auto* finished = std::get_if<RequestOutcome>(&execution)) return std::move(*finished);
-    const auto& result = std::get<ExtractArchiveResult>(execution);
+    auto& result = std::get<ExtractArchiveResult>(execution);
     const auto& job_id = request.job_id;
     const bool ok = result.status == PasswordTestStatus::Ok;
     const bool include_inventory = request.output_inventory;
@@ -2342,8 +2347,9 @@ private:
                         outcome = {1, (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                             (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("input_changed") + wire::key("failure_stage") + wire::text("native_replay") + wire::key("message") + wire::text("archive input changed while waiting for memory; rescan required") + wire::end())};
                     } else if (!job.request.scan_only && !interrupted) {
-                        const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
-                        auto lease = writer_registry_.acquire(key);
+                        auto lease = job.request.output_volume_key.empty()
+                            ? writer_registry_.acquire(synthetic_volume_key(job_id))
+                            : writer_registry_.acquire(job.request.output_volume_key);
                         register_cancel_writer(job_id, lease.writer_pointer());
                         const auto weak = std::weak_ptr<sunpack::sevenzip::AsyncFileWriter>(lease.writer_pointer());
                         memory_.set_wake(memory_job, [weak] { if (auto writer = weak.lock()) writer->wake_waiters(); });

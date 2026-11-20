@@ -768,6 +768,9 @@ impl Store {
             runs.extract_if(.., |run| run.last <= cutoff)
                 .map(|run| run.name),
         );
+        if runs.capacity() > 256.max(runs.len().saturating_mul(4)) {
+            runs.shrink_to(runs.len().saturating_mul(2));
+        }
         if self.current.is_none() {
             if let Some(run) = runs.last() {
                 let (data, index) = files(&self.folder, &run.name);
@@ -818,6 +821,9 @@ impl Store {
             }
             pending
         });
+        if self.obsolete.capacity() > 256.max(self.obsolete.len().saturating_mul(4)) {
+            self.obsolete.shrink_to(self.obsolete.len().saturating_mul(2));
+        }
         cleanup_error.map_or(Ok(()), Err)
     }
 }

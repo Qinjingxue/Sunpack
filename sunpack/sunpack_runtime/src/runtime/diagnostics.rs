@@ -1,5 +1,5 @@
 //! Runtime events share the asynchronous event store used by Watch.
-use std::{io, path::PathBuf, sync::{Arc, Mutex, Weak}, time::{SystemTime, UNIX_EPOCH}};
+use std::{io, path::PathBuf, sync::{Arc, Mutex, Weak}};
 use serde_json::{json, Value};
 use crate::{core::config::ProcessMode, event_log::NativeEventLog};
 
@@ -25,7 +25,7 @@ impl Log {
         fields["event"] = json!(name);
         fields["host_pid"] = json!(std::process::id());
         fields["watch_generation"] = json!(self.watch.upgrade().map_or(0, |watch| watch.generation()));
-        fields["ts"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64());
+        // The event queue assigns time under its lock, in publication order.
         let _ = self.events.write(fields);
     }
 }

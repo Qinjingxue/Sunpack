@@ -5750,6 +5750,8 @@ impl Scheduler {
             if let Some(input) = active.inputs.remove(member) { inputs.push(input); }
             if let Some((path, tracker)) = active.quiet.remove_entry(member) { quiet.insert(path, tracker); }
         }
+        crate::collections::trim_map(&mut active.inputs);
+        crate::collections::trim_map(&mut active.quiet);
         let group = root.groups.values().next().cloned();
         let context = CompletionContext {
             max_depth: active.max_depth,
@@ -5762,10 +5764,21 @@ impl Scheduler {
             self.journal.log(json!({"event":"pipeline_sources_released","owner":root.batch,"path":group.path}));
         }
         let (outcome, _) = result?;
-        let groups = self.active.get(&root.batch).map(|active| active.groups.lock().unwrap());
+        let active = &self.active[&root.batch];
+        let mut claimed = active.claimed.lock().unwrap();
+        let groups = active.groups.lock().unwrap();
         let mut retired = members;
-        if let Some(groups) = groups {
-            retired.retain(|member| !groups.members.contains_key(member));
+        retired.retain(|member| !groups.members.contains_key(member));
+        // Completion has consumed the observations, including dirty paths.
+        // Keep a shared member's original generation until its last owner settles.
+        for member in &retired {
+            claimed.candidates.remove(member);
+            claimed.deduplicated.remove(member);
+        }
+        crate::collections::trim_map(&mut claimed.candidates);
+        if claimed.deduplicated.capacity() > 256.max(claimed.deduplicated.len().saturating_mul(4)) {
+            let remaining = claimed.deduplicated.len();
+            claimed.deduplicated.shrink_to(remaining.saturating_mul(2));
         }
         Ok((outcome, retired))
     }

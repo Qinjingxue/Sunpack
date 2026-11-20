@@ -1616,6 +1616,11 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
     assert_eq!(scheduler.admission_available(), 0, "discovered physical claims do not consume candidate slots");
     let group = Arc::new(SourceGroup { path: head.into(),
         members: vec![names[0].clone(), names[1].clone(), discovered.to_string_lossy().into_owned()] });
+    {
+        let mut claimed = scheduler.active["first"].claimed.lock().unwrap();
+        claimed.capture(&group.members).unwrap();
+        claimed.capture(&names[2..3]).unwrap();
+    }
     let root = || RootCompleted {
         request: 1,
         reply: Arc::default(), batch: "first".into(), id: 1, root_key: key(head),
@@ -1626,6 +1631,11 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
     scheduler.complete_root(root()).unwrap();
     assert_eq!(scheduler.admission_available(), 2);
     assert_eq!(scheduler.active["first"].inputs.len(), limit - 2);
+    {
+        let claimed = scheduler.active["first"].claimed.lock().unwrap();
+        assert_eq!(claimed.candidates.len(), 1);
+        assert!(claimed.candidates.contains_key(&watch_path_key(&names[2])));
+    }
     drop(block_on(scheduler.engine.reserve_foreground_async(&reserved[..2], &cancel))
         .expect("the completed root and its final alias must be immediately available to the foreground"));
     assert!(blocked(&scheduler.engine, &reserved[2]), "the other root is still active");
