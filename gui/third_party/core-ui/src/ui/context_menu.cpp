@@ -673,7 +673,7 @@ bool ContextMenu::BindPopupTarget(int widthPx, int heightPx) {
         popupD2DContext_->SetDpi(static_cast<float>(dpi), static_cast<float>(dpi));
         popupD2DContext_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         popupRenderer_.SetTarget(popupD2DContext_.Get());
-        popupRenderer_.ApplyTextRenderMode();
+        popupRenderer_.ApplyTextRenderMode(MonitorFromWindow(popupHwnd_, MONITOR_DEFAULTTONEAREST));
         popupWidthPx_ = widthPx;
         popupHeightPx_ = heightPx;
     }

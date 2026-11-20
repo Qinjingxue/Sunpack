@@ -1,9 +1,13 @@
 #pragma once
 #include "model.hpp"
+#include <string_view>
 
 namespace spg {
 std::string gui_language(const Json& config);
 std::string startup_language(const fs::path& data_dir);
+inline const wchar_t* gui_text_locale(std::string_view language) {
+    return language == "zh" ? L"zh-CN" : L"en-US";
+}
 std::string tr(const std::string& key, const std::string& language);
 // Keep keys/arguments until display. Arguments are literal; {"source": message}
 // explicitly embeds another translatable diagnostic.

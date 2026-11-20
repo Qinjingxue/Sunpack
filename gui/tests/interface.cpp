@@ -13,6 +13,7 @@
 #include <ui/ui_window.h>
 #include <ui/controls.h>
 #include <ui/ui_debug.h>
+#include <ui/overlay_service.h>
 #include <ui/uix/script_runtime.h>
 
 using namespace spg;
@@ -469,6 +470,7 @@ void range_config(Application& app,const fs::path& config_path) {
             ", root opacity="+std::to_string(live->Root()->opacity)+")");
     }
     assert(GetActiveWindow()!=popup_hwnd);
+    assert(std::wstring_view(popup->GetRenderer().TextLocale())==window(app).GetRenderer().TextLocale());
     assert(popup_text(*popup,"dateSelected")==L"2024-01-31");
     {
         // Reproduce a held modifier without changing the desktop's input.
@@ -561,8 +563,32 @@ void config_edits(Application& app,const fs::path& dir) {
     finish_input(app);
     pump([&]{return state(app.page(),"language")=="en";},"Switch interface language");
     assert(state(app.page(),"texts")["config"]=="Settings");
+    auto& renderer=window(app).GetRenderer();
+    auto layout=renderer.CreateTextLayout(L"Open setup 中文.zip",300,60,14);
+    wchar_t family[64]{}, locale[LOCALE_NAME_MAX_LENGTH]{};
+    assert(layout && SUCCEEDED(layout->GetFontFamilyName(0,family,_countof(family))));
+    assert(std::wstring_view(family)==renderer.DefaultFontFamily());
+    assert(SUCCEEDED(layout->GetLocaleName(0,locale,_countof(locale))) && _wcsicmp(locale,L"en-US")==0);
+    if(std::wstring_view(family)==theme::kVariableFontFamily) {
+        ComPtr<IDWriteTextLayout4> variable;
+        assert(SUCCEEDED(layout.As(&variable)) &&
+               (variable->GetAutomaticFontAxes() & DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE));
+    }
     search_config(app,L"");
     screenshot(app.window(),L"configuration.png");
+
+    // The toast thread owns a separate compositor. Exercise the handoff of
+    // the owner's mixed-language DirectWrite layout to that compositor.
+    const auto owner=window(app).Handle();
+    const auto toast_text=L"Copied 中文 "+std::to_wstring(GetCurrentProcessId());
+    window(app).ShowToast(toast_text,3000,0,1,0,true);
+    auto find_toast=[&]{return FindWindowW(L"UiCore_OverlayToast",toast_text.c_str());};
+    pump([&]{
+        auto toast=find_toast();
+        return toast && IsWindowVisible(toast) && GetWindow(toast,GW_OWNER)==owner;
+    },"Render mixed-language toast");
+    ui::OverlayService::Instance().DismissOwner(owner);
+    pump([&]{return !find_toast();},"Dismiss test toast");
 }
 
 void tag_config(Application& app,const fs::path& dir) {

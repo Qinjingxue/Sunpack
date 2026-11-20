@@ -45,6 +45,7 @@ DatePopup::DatePopup(UiWindow owner,UINT message,UINT_PTR generation,RECT anchor
         config.y=std::clamp<LONG>(anchor.top,monitor.rcWork.top,monitor.rcWork.bottom-1);
         window_=ui_page_prepare_window(page_,&config);
         if(!window_) throw std::runtime_error("opRangeDate");
+        ui::GetContext().GetWindow(window_)->GetRenderer().SetTextLocale(gui_text_locale(language));
         hwnd_=static_cast<HWND>(ui_window_hwnd(window_));
         ui_window_set_title(window_,wide(tr("rangeChoose",language)).c_str());
         if(!SetWindowSubclass(hwnd_,subclass,1,reinterpret_cast<DWORD_PTR>(this))) win_error("opWindowEvents");

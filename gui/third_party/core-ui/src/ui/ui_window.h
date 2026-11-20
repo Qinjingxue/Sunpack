@@ -111,7 +111,8 @@ public:
     // position: 0=top, 1=center, 2=bottom
     // icon: 0=none, 1=success(green✓), 2=error(red✕), 3=warning(yellow⚠)
     // anim: 0=slide(默认, 旧行为), 1=fade(纯渐入渐出, y 不变)
-    void ShowToast(const std::wstring& text, int durationMs = 2000, int position = 0, int icon = 0, int anim = 0);
+    void ShowToast(const std::wstring& text, int durationMs = 2000, int position = 0, int icon = 0,
+                   int anim = 0, bool closable = false);
     // Toast 由 OverlayService 的独立窗口线程承载, 主窗只发请求/销毁归属弹层.
 
     static bool RegisterWindowClass();
@@ -220,6 +221,9 @@ private:
     int         aspectLockW_ = 0, aspectLockH_ = 0;
     UINT        dpi_ = 96;
     float       dpiScale_ = 1.0f;
+    HMONITOR    textMonitor_ = nullptr;
+    uint64_t    textSettingsRevision_ = 0;
+    uint64_t    laidOutTextRevision_ = 0;
     UINT        clientWidthPx_ = 0;
     UINT        clientHeightPx_ = 0;
     float       clientWidthDip_ = 0.0f;

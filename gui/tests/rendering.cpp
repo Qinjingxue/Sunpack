@@ -181,6 +181,8 @@ ui::DisplayList scene(Surface& surface,int step) {
     base.default_font=surface.renderer.DefaultFontFamily();
     if(auto* font=surface.renderer.LatinFontFamily()) base.latin_font=font;
     if(auto* font=surface.renderer.CjkFontFamily()) base.cjk_font=font;
+    base.text_locale=surface.renderer.TextLocale();
+    base.text_monitor=MonitorFromWindow(surface.hwnd,MONITOR_DEFAULTTONEAREST);
     base.text_render_mode=int(surface.renderer.TextRenderMode());
     ui::DisplayListRecorder r(std::move(base));
     r.Clear(D2D1::ColorF(step>=14?0x202020:0xf3f3f3));
@@ -205,7 +207,7 @@ ui::DisplayList scene(Surface& surface,int step) {
         return r.Finish();
     }
     r.FillRect({0,0,96,320},D2D1::ColorF(0xdddddd));
-    ui::TextStyle text; text.font_family=L"Segoe UI"; text.font_size=14;
+    ui::TextStyle text; text.font_size=14;
     r.DrawText(L"导航 / Navigation",{3,5,94,55},text);
     ui::SvgDocumentRef icon;
     icon.viewport_w=icon.viewport_h=24;
@@ -282,6 +284,7 @@ void rendering_contracts() {
     }
     DestroyWindow(hidden);
     Surface actual(20,DXGI_ALPHA_MODE_IGNORE),reference(700);
+    for(auto* surface:{&actual,&reference}) surface->renderer.SetTextRenderMode(theme::TextRenderMode::System);
     // Existing frame-damage scenes have no find ranges. Check shaped UTF-16
     // ranges, both colors, clipped active hits, and record/replay in one scene.
     {
@@ -324,13 +327,18 @@ void rendering_contracts() {
             surface->renderer.SetTextRenderMode(theme::TextRenderMode::ClearType);
         }
         auto optimized=scene(actual,step),full=scene(reference,step);
-        actual.renderer.PrepareDisplayList(optimized);
-        actual.renderer.BeginDraw();
-        actual.renderer.RenderDisplayList(std::move(optimized),true);
+        if(step==17) {
+            // The drawing commands are identical to step 16. The new frame's
+            // font and language must still invalidate retained text and pixels.
+            optimized.default_font=L"Arial";
+            optimized.text_locale=L"zh-TW";
+            reference.renderer.SetDefaultFontFamily(L"Arial");
+            reference.renderer.SetTextLocale(L"zh-TW");
+        }
+        if(step==15) optimized.dpi_scale=full.dpi_scale=1.25f;
         actual.renderer.skipPresent=true;
-        assert(SUCCEEDED(actual.renderer.EndDraw()));
-        // Invalidate only reference caches, leaving its pixels and buffer order.
-        reference.renderer.SetDefaultFontFamily(L"Segoe UI");
+        assert(SUCCEEDED(actual.renderer.DrawDisplayListFrame(std::move(optimized),true)));
+        reference.renderer.RT()->SetDpi(96*full.dpi_scale,96*full.dpi_scale);
         reference.renderer.BeginDraw(); reference.renderer.ReplayDisplayList(full);
         reference.renderer.skipPresent=true;
         assert(SUCCEEDED(reference.renderer.EndDraw()));

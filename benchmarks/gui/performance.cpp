@@ -180,6 +180,9 @@ void append_log_lines(const fs::path& path,const std::string& text) {
     if(manifest["runs"].empty()) manifest["runs"].push_back({{"name","fixture-1"},{"head",0},{"count",0},{"unordered",false},{"first",0},{"last",0}});
     auto& run=manifest["runs"].back(); auto name=run["name"].get<std::string>();
     std::ofstream data(folder/(name+".data"),std::ios::binary|std::ios::app),index(folder/(name+".index"),std::ios::binary|std::ios::app);
+    // On MSVC, append mode moves the write to EOF but the first tellp() can still return zero.
+    data.seekp(0,std::ios::end);
+    if(!data || !index) throw std::runtime_error("Could not open log fixture for append");
     size_t at=0;
     while(at<text.size()) {
         auto end=text.find('\n',at); if(end==std::string::npos) end=text.size();
@@ -202,6 +205,7 @@ void append_log_lines(const fs::path& path,const std::string& text) {
         run["count"]=count+1;
     }
     data.close(); index.close();
+    if(!data || !index) throw std::runtime_error("Could not write log fixture");
     manifest["task_revision"]=manifest["task_revision"].get<uint64_t>()+1;
     atomic_write(path,manifest.dump());
 }

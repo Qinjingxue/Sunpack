@@ -518,9 +518,8 @@ inline const D2D1_COLOR_F& kForeground4()      { return Current().foreground4; }
 // Typography — Fluent 2 Type Ramp
 // ============================================================================
 // 全局默认字体族（进程级，新窗口 Renderer 拿这个作为初值；窗口可覆盖）。
-// 历史兼容：保留 kFontFamily 常量指向固定 "Segoe UI"，新代码统一走
-// theme::DefaultFontFamily() 或 Renderer::DefaultFontFamily() 获取当前值。
 constexpr wchar_t kFontFamily[] = L"Segoe UI";
+constexpr wchar_t kVariableFontFamily[] = L"Segoe UI Variable";
 
 // Runtime-mutable global defaults (since 1.3.0)
 // Set via ui_theme_set_default_font / ui_theme_set_cjk_font / ui_theme_set_text_render_mode.
@@ -532,15 +531,16 @@ enum class TextRenderMode {
     Sharp,            // CLEARTYPE + GDI_CLASSIC，记事本最锐
     GraySharp,        // GRAYSCALE + GDI_CLASSIC，锐但无 RGB 彩边
     Aliased,          // ALIASED，无抗锯齿 / 像素字体场景
+    System,           // DirectWrite rendering parameters for the window's monitor
 };
 
-inline std::wstring&  _defaultFontStorage() { static std::wstring s = L"Segoe UI"; return s; }
+inline std::wstring&  _defaultFontStorage() { static std::wstring s = kFontFamily; return s; }
 inline std::wstring&  _latinFontStorage()   { static std::wstring s;               return s; }
 inline std::wstring&  _cjkFontStorage()     { static std::wstring s;               return s; }
 inline TextRenderMode& _renderModeStorage() { static TextRenderMode s = TextRenderMode::Smooth; return s; }
 
 inline const wchar_t* DefaultFontFamily()                         { return _defaultFontStorage().c_str(); }
-inline void           SetDefaultFontFamily(const wchar_t* family) { _defaultFontStorage() = family ? family : L"Segoe UI"; }
+inline void           SetDefaultFontFamily(const wchar_t* family) { _defaultFontStorage() = family && *family ? family : kFontFamily; }
 inline const wchar_t* LatinFontFamily()                           { return _latinFontStorage().empty() ? nullptr : _latinFontStorage().c_str(); }
 inline const wchar_t* CjkFontFamily()                             { return _cjkFontStorage().empty()   ? nullptr : _cjkFontStorage().c_str(); }
 inline void           SetCjkFonts(const wchar_t* latin, const wchar_t* cjk) {

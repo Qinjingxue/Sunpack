@@ -22,6 +22,19 @@
 
 namespace spg {
 namespace {
+const wchar_t* system_ui_font(IDWriteFactory* factory) {
+    ComPtr<IDWriteFactory6> modern;
+    ComPtr<IDWriteFontCollection2> fonts;
+    UINT32 index = 0;
+    BOOL found = FALSE;
+    if (factory && SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&modern))) &&
+        SUCCEEDED(modern->GetSystemFontCollection(FALSE, DWRITE_FONT_FAMILY_MODEL_TYPOGRAPHIC, &fonts)) &&
+        SUCCEEDED(fonts->FindFamilyName(theme::kVariableFontFamily, &index, &found)) && found) {
+        return theme::kVariableFontFamily;
+    }
+    return theme::kFontFamily;
+}
+
 bool copy_text(HWND owner,const std::wstring& text) {
     const auto bytes=(text.size()+1)*sizeof(wchar_t);
     auto memory=GlobalAlloc(GMEM_MOVEABLE,bytes);
@@ -435,6 +448,12 @@ void Application::apply_pending() {
     auto password_delta_patch=take("passwordDelta");
     auto task_snapshot=take("tasks");
     VisualBatch visual(window_);
+    const auto language_change=patch.find("language");
+    if(language_change!=patch.end()) {
+        auto* window=ui::GetContext().GetWindow(window_);
+        if(window->GetRenderer().SetTextLocale(gui_text_locale(language_change->get_ref<const std::string&>())))
+            window->Invalidate();
+    }
     auto ack=take("saveAck");
     const bool cell_ack=!ack.is_null() && active_save_ && (*active_save_)["kind"]!="config";
     const bool config_ack=!ack.is_null() && active_save_ && !cell_ack;
@@ -720,7 +739,9 @@ void Application::handle_command(Json command) {
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
     if(op=="copyTaskText") {
         const bool copied=copy_text(hwnd_,wide(p.at("text").get_ref<const std::string&>()));
-        ui::OverlayService::Instance().ShowToast(hwnd_,wide(tr(copied?"copySucceeded":"copyFailed",page_value(page_,"language"))),3000,0,copied?1:2,0,true);
+        auto* window=ui::GetContext().GetWindow(window_);
+        window->ShowToast(wide(tr(copied?"copySucceeded":"copyFailed",page_value(page_,"language"))),
+                          3000,0,copied?1:2,0,true);
         return;
     }
     if(op=="focusTag") {
@@ -984,7 +1005,8 @@ void Application::open() {
     if(!bytes || !size) throw std::runtime_error("logoLoadFailed");
     ui_asset_register_blob("sunpack.png",bytes,size);
     stage="stageFonts";
-    ui_theme_set_cjk_font(L"Segoe UI Variable Text",L"Microsoft YaHei UI");
+    ui_theme_set_default_font(system_ui_font(ui::GetContext().DWFactory()));
+    ui_theme_set_text_render_mode(UI_TEXT_RENDER_SYSTEM);
     stage="stageLayout";
     page_=ui_page_load_string(kMainUix);
     if(!page_) throw std::runtime_error("layoutLoadFailed");
@@ -1000,6 +1022,7 @@ void Application::open() {
     if(!window_) throw std::runtime_error(ui_page_last_error(page_));
     stage="stageEvents";
     hwnd_=static_cast<HWND>(ui_window_hwnd(window_));
+    ui::GetContext().GetWindow(window_)->GetRenderer().SetTextLocale(gui_text_locale(language));
     ui_window_set_title(window_,wide(tr("title",language)).c_str());
     style_frame(hwnd_,initial_theme);
     update_icons(GetDpiForWindow(hwnd_));

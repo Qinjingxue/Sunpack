@@ -1,6 +1,8 @@
 #pragma once
 
 #include <windows.h>
+#include <dwrite.h>
+#include <wrl/client.h>
 #include <functional>
 #include <string>
 
@@ -33,8 +35,9 @@ public:
     void DestroyHostWindowSync(HWND hwnd);
     void InvokeSync(std::function<void()> fn);
 
-    void ShowToast(HWND owner, const std::wstring& text, int durationMs,
-                   int position, int icon, int anim, bool closable = false);
+    void ShowToast(HWND owner, const std::wstring& text,
+                   Microsoft::WRL::ComPtr<IDWriteTextLayout> layout,
+                   int durationMs, int position, int icon, int anim, bool closable);
     void RefreshOwner(HWND owner);
     void DismissOwner(HWND owner);
     void Stop();

@@ -3,7 +3,6 @@
 #include "easing.h"
 
 #include <d2d1.h>
-#include <dwrite.h>
 #include <dwmapi.h>
 #include <windowsx.h>
 #include <timeapi.h>
@@ -64,8 +63,6 @@ struct ToastBitmap {
     UINT dpi = 96;
     Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> target;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> background, foreground;
-    Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
-    Microsoft::WRL::ComPtr<IDWriteTextLayout> textLayout;
 
     ~ToastBitmap() {
         background.Reset(); foreground.Reset();
@@ -86,6 +83,7 @@ struct ToastOverlay {
     HWND hwnd = nullptr;
     HWND owner = nullptr;
     std::wstring text;
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> textLayout;
     int durationMs = 2000;
     int position = 0;
     int icon = 0;
@@ -142,6 +140,7 @@ struct OverlayService::Impl {
         HWND hwnd = nullptr;
         HWND owner = nullptr;
         std::wstring text;
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> textLayout;
         int durationMs = 0;
         int position = 0;
         int icon = 0;
@@ -158,7 +157,6 @@ struct OverlayService::Impl {
     bool stopping = false;
 
     Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory;
-    Microsoft::WRL::ComPtr<IDWriteFactory> dwriteFactory;
     std::unordered_map<HWND, std::unique_ptr<ToastOverlay>> toasts;
     std::unordered_map<HWND, HWND> ownerToast;
 
@@ -299,8 +297,6 @@ struct OverlayService::Impl {
         RegisterClassExW(&hostClass);
 
         D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory.GetAddressOf());
-        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                            reinterpret_cast<IUnknown**>(dwriteFactory.GetAddressOf()));
 
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -318,7 +314,6 @@ struct OverlayService::Impl {
         }
 
         DestroyAllToasts();
-        dwriteFactory.Reset();
         d2dFactory.Reset();
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -402,15 +397,18 @@ struct OverlayService::Impl {
         }
     }
 
-    void CreateToast(const Request& request) {
-        if (!request.owner || !IsWindow(request.owner) || request.text.empty()) {
+    void CreateToast(Request& request) {
+        if (!request.owner || !IsWindow(request.owner) || !request.textLayout) {
             return;
         }
         DestroyToastForOwner(request.owner);
 
         auto toast = std::make_unique<ToastOverlay>();
         toast->owner = request.owner;
-        toast->text = request.text;
+        toast->text = std::move(request.text);
+        toast->textLayout = std::move(request.textLayout);
+        toast->textLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        toast->textLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         toast->durationMs = std::max(1, request.durationMs);
         toast->position = request.position;
         toast->icon = request.icon;
@@ -458,20 +456,6 @@ struct OverlayService::Impl {
         const float clientW = std::max(1, static_cast<int>(client.right - client.left)) / toast.dpiScale;
         toast.ownerWidthPx = client.right - client.left;
 
-        Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
-        if (!dwriteFactory ||
-            FAILED(dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
-                                                   DWRITE_FONT_WEIGHT_NORMAL,
-                                                   DWRITE_FONT_STYLE_NORMAL,
-                                                   DWRITE_FONT_STRETCH_NORMAL,
-                                                   theme::kFontSizeNormal,
-                                                   L"zh-cn", format.GetAddressOf()))) {
-            return false;
-        }
-        format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
         const float iconSize = theme::kFontSizeNormal + 2.0f;
         const float iconGap = (toast.icon > 0) ? 8.0f : 0.0f;
         const float iconSpace = (toast.icon > 0) ? (iconSize + iconGap) : 0.0f;
@@ -480,19 +464,18 @@ struct OverlayService::Impl {
         const float closeSpace = toast.closable ? 32.0f : 0.0f;
         const float maxTextW = std::max(1.0f, std::min(620.0f, clientW - padH * 2.0f - iconSpace - closeSpace - 40.0f));
 
-        Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
-        if (FAILED(dwriteFactory->CreateTextLayout(
-                toast.text.c_str(), static_cast<UINT32>(toast.text.size()),
-                format.Get(), maxTextW, 80.0f, layout.GetAddressOf()))) {
-            return false;
-        }
+        auto& layout = toast.textLayout;
+        layout->SetMaxWidth(maxTextW);
+        layout->SetMaxHeight(80.0f);
         DWRITE_TEXT_METRICS metrics{};
-        layout->GetMetrics(&metrics);
+        if (FAILED(layout->GetMetrics(&metrics))) return false;
 
         const float textW = std::min(maxTextW, std::max(1.0f, metrics.widthIncludingTrailingWhitespace));
         const float textH = std::max(theme::kFontSizeNormal, metrics.height);
         toast.widthDip = std::max(96.0f, textW + iconSpace + closeSpace + padH * 2.0f);
         toast.heightDip = std::max(iconSize, textH) + padV * 2.0f;
+        layout->SetMaxWidth(std::max(1.0f, toast.widthDip - padH * 2.0f - iconSpace - closeSpace));
+        layout->SetMaxHeight(toast.heightDip);
 
         return PositionToast(toast);
     }
@@ -597,17 +580,7 @@ struct OverlayService::Impl {
             }
             target->CreateSolidColorBrush(D2D1::ColorF(0,0,0), bitmap->background.GetAddressOf());
             target->CreateSolidColorBrush(D2D1::ColorF(0,0,0), bitmap->foreground.GetAddressOf());
-            if (!bitmap->background || !bitmap->foreground || !dwriteFactory ||
-                FAILED(dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
-                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                    theme::kFontSizeNormal, L"zh-cn", bitmap->format.GetAddressOf()))) return false;
-            bitmap->format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            bitmap->format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            bitmap->format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-            const float iconSpace = toast.icon > 0 ? theme::kFontSizeNormal + 10.0f : 0.0f;
-            if (FAILED(dwriteFactory->CreateTextLayout(toast.text.c_str(), static_cast<UINT32>(toast.text.size()),
-                bitmap->format.Get(), std::max(1.0f,toast.widthDip-40.0f-iconSpace-(toast.closable?32.0f:0.0f)),
-                toast.heightDip, bitmap->textLayout.GetAddressOf()))) return false;
+            if (!bitmap->background || !bitmap->foreground) return false;
             toast.bitmap = std::move(bitmap);
         }
 
@@ -656,7 +629,7 @@ struct OverlayService::Impl {
             DrawIcon(*target.Get(), toast, bgBrush);
         }
 
-        target->DrawTextLayout(D2D1::Point2F(padH+iconSpace, 0), toast.bitmap->textLayout.Get(),
+        target->DrawTextLayout(D2D1::Point2F(padH+iconSpace, 0), toast.textLayout.Get(),
                                textBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         HRESULT hr = target->EndDraw();
@@ -966,12 +939,14 @@ void OverlayService::InvokeSync(std::function<void()> fn) {
     impl_->InvokeSync(std::move(fn));
 }
 
-void OverlayService::ShowToast(HWND owner, const std::wstring& text, int durationMs,
-                               int position, int icon, int anim, bool closable) {
+void OverlayService::ShowToast(HWND owner, const std::wstring& text,
+                               Microsoft::WRL::ComPtr<IDWriteTextLayout> layout,
+                               int durationMs, int position, int icon, int anim, bool closable) {
     auto request = std::make_unique<Impl::Request>();
     request->type = Impl::RequestType::ShowToast;
     request->owner = owner;
     request->text = text;
+    request->textLayout = std::move(layout);
     request->durationMs = durationMs;
     request->position = position;
     request->icon = icon;

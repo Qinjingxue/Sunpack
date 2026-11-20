@@ -288,6 +288,7 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
 
     dpi_ = GetDpiForWindow(hwnd_);
     dpiScale_ = (float)dpi_ / 96.0f;
+    textMonitor_ = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
     RefreshClientSizeCache();
 
     if (borderless) {
@@ -1345,6 +1346,7 @@ void UiWindowImpl::LayoutRoot() {
     root_->rect = {0, 0, size.width, size.height};
     Viewport() = root_->rect;
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+    laidOutTextRevision_ = renderer_.TextLayoutRevision();
     root_->DoLayout();
     if(onAfterLayout) onAfterLayout();
 }
@@ -1367,8 +1369,28 @@ LRESULT CALLBACK UiWindowImpl::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_PAINT:
+    case WM_WINDOWPOSCHANGED: {
+        const auto* position = reinterpret_cast<const WINDOWPOS*>(lParam);
+        if ((position->flags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE)) {
+            const HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+            if (monitor != textMonitor_) {
+                textMonitor_ = monitor;
+                Invalidate();
+            }
+        }
+        break; // DefWindowProc still dispatches WM_MOVE and WM_SIZE.
+    }
+    case WM_SETTINGCHANGE:
+        if (renderer_.TextRenderMode() == theme::TextRenderMode::System) {
+            ++textSettingsRevision_;
+            Invalidate();
+        }
+        break;
     case WM_DISPLAYCHANGE:
+        textMonitor_ = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+        ++textSettingsRevision_;
+        [[fallthrough]];
+    case WM_PAINT:
         if (visualUpdateDepth_ > 0) {
             visualPaintDirty_ = true;
             if (msg == WM_PAINT) {
@@ -2384,7 +2406,7 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
 
     // Consume any pending layout request from dynamic widget mutations
     // (v-if mount, v-for re-key, etc.) before drawing the new state.
-    if (ui::LayoutDirtyFlag()) {
+    if (ui::LayoutDirtyFlag() || laidOutTextRevision_ != renderer_.TextLayoutRevision()) {
         TraceScope scope("core_window", "paint_dirty_layout_duration");
         ui::LayoutDirtyFlag() = false;
         LayoutRoot();
@@ -2415,6 +2437,9 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         base.default_font=renderer_.DefaultFontFamily();
         if(auto* font=renderer_.LatinFontFamily()) base.latin_font=font;
         if(auto* font=renderer_.CjkFontFamily()) base.cjk_font=font;
+        base.text_locale = renderer_.TextLocale();
+        base.text_monitor = textMonitor_;
+        base.text_settings_revision = textSettingsRevision_;
         base.text_render_mode=int(renderer_.TextRenderMode());
         recorder.Reset(std::move(base));
         previousRecorder = renderer_.DisplayListRecorderTarget();
@@ -2475,28 +2500,7 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         if (ghost.size() > 32) ghost = ghost.substr(0, 31) + L"…";
         float fontSize = theme::kFontSizeSmall;
         float padH = 8.0f, padV = 4.0f;
-        float textW = fontSize * 0.65f * static_cast<float>(ghost.size());
-        {
-            IDWriteFactory* dwf = renderer_.DWFactory();
-            IDWriteTextFormat* fmt = nullptr;
-            if (dwf) {
-                dwf->CreateTextFormat(theme::kFontFamily, nullptr,
-                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL, fontSize, L"", &fmt);
-                if (fmt) {
-                    IDWriteTextLayout* layout = nullptr;
-                    dwf->CreateTextLayout(ghost.c_str(), (UINT32)ghost.size(),
-                        fmt, 1000.0f, 100.0f, &layout);
-                    if (layout) {
-                        DWRITE_TEXT_METRICS metrics = {};
-                        layout->GetMetrics(&metrics);
-                        textW = metrics.width;
-                        layout->Release();
-                    }
-                    fmt->Release();
-                }
-            }
-        }
+        float textW = renderer_.MeasureTextWidth(ghost, fontSize);
         float gw = textW + padH * 2, gh = fontSize + padV * 2 + 4.0f;
         // Centered on the cursor — matches how the user "holds" the item.
         float gx = dragX_ - gw * 0.5f, gy = dragY_ - gh * 0.5f;
@@ -3841,9 +3845,13 @@ void UiWindowImpl::DestroyToast() {
     OverlayService::Instance().DismissOwner(hwnd_);
 }
 
-void UiWindowImpl::ShowToast(const std::wstring& text, int durationMs, int position, int icon, int anim) {
-    if (!hwnd_) return;
-    OverlayService::Instance().ShowToast(hwnd_, text, durationMs, position, icon, anim);
+void UiWindowImpl::ShowToast(const std::wstring& text, int durationMs, int position, int icon,
+                             int anim, bool closable) {
+    if (!hwnd_ || text.empty()) return;
+    // Transfer this layout to the overlay thread for measurement and drawing.
+    auto layout = renderer_.CreateTextLayout(text, 1.0f, 1.0f, theme::kFontSizeNormal);
+    if (layout)
+        OverlayService::Instance().ShowToast(hwnd_, text, std::move(layout), durationMs, position, icon, anim, closable);
 }
 
 // ---- Debug: Highlight ----

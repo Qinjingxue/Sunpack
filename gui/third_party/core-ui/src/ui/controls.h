@@ -469,6 +469,7 @@ private:
      * match exactly (匹配 DirectWrite shaping/kerning, 不再有 per-substring
      * MeasureTextWidth 误差).*/
     mutable ComPtr<IDWriteTextLayout> cachedLayout_;
+    mutable uint64_t layoutTextRevision_ = 0;
     mutable bool layoutDirty_ = true;
     mutable float layoutMaxW_ = -1;
     mutable float layoutFontSize_ = -1;

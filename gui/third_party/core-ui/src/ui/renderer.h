@@ -299,7 +299,7 @@ public:
      * need to share one layout between hit-test, caret positioning,
      * selection rendering and draw (TextArea). `wrap` controls
      * DWRITE_WORD_WRAPPING_WRAP vs NO_WRAP. Returns nullptr on failure.
-     * Layout uses theme::kFontFamily (and per-window override if set). */
+     * Layout uses the same effective font and locale as DrawText. */
     ComPtr<IDWriteTextLayout> CreateTextLayout(const std::wstring& text,
                                                 float maxWidth, float maxHeight,
                                                 float fontSize,
@@ -320,14 +320,17 @@ public:
     // 空串 = 跟随 theme:: 全局默认
     void        SetDefaultFontFamily(const wchar_t* family);
     void        SetCjkFonts(const wchar_t* latin, const wchar_t* cjk);
+    bool        SetTextLocale(const wchar_t* locale);
     void        SetTextRenderMode(theme::TextRenderMode mode);
     const wchar_t* DefaultFontFamily() const;   // 实际生效的默认字体族（窗口 > theme > "Segoe UI"）
     const wchar_t* LatinFontFamily() const;     // 中英分离的拉丁字体，nullptr=未设
     const wchar_t* CjkFontFamily() const;       // 中英分离的中文字体，nullptr=未设
+    const wchar_t* TextLocale() const;
+    uint64_t TextLayoutRevision() const { return textLayoutRevision_; }
     theme::TextRenderMode TextRenderMode() const;
 
     // 应用当前文字渲染模式到 ctx_（在 BeginDraw 之前调用或 CreateRenderTarget 后立即调用）
-    void ApplyTextRenderMode();
+    void ApplyTextRenderMode(HMONITOR monitor = nullptr);
 
 private:
 
@@ -537,6 +540,10 @@ private:
     // ---- Per-window font / render 状态 (since 1.3.0) ----
     // 空串 = 跟随 theme:: 全局
     std::wstring          defaultFontOverride_;
+    std::wstring          textLocale_;
+    HMONITOR              textMonitor_ = nullptr;
+    uint64_t              textSettingsRevision_ = 0;
+    uint64_t              textLayoutRevision_ = 0;
     std::wstring          latinFontOverride_;
     std::wstring          cjkFontOverride_;
     bool                  hasRenderModeOverride_ = false;

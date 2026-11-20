@@ -210,6 +210,9 @@ public:
     int height_px = 0;
     float dpi_scale = 1.0f;
     std::wstring default_font, latin_font, cjk_font;
+    std::wstring text_locale;
+    HMONITOR text_monitor = nullptr;
+    uint64_t text_settings_revision = 0;
     int text_render_mode = -1;
 
     std::vector<DrawCommand> commands;

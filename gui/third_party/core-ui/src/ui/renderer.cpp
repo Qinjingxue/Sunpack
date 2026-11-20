@@ -72,17 +72,24 @@ static uint32_t FloatBits(float v) {
 }
 
 static const wchar_t* ResolveLocaleName() {
-    static wchar_t locale[LOCALE_NAME_MAX_LENGTH] = {};
-    static bool initialized = false;
-    if (!initialized) {
-        int n = GetUserDefaultLocaleName(locale, LOCALE_NAME_MAX_LENGTH);
-        if (n <= 0) {
-            std::wcsncpy(locale, L"en-US", _countof(locale) - 1);
-            locale[_countof(locale) - 1] = L'\0';
-        }
-        initialized = true;
+    static const auto locale = [] {
+        wchar_t name[LOCALE_NAME_MAX_LENGTH];
+        return std::wstring(GetUserDefaultLocaleName(name, _countof(name)) ? name : L"en-US");
+    }();
+    return locale.c_str();
+}
+
+static void ConfigureTextFormat(IDWriteTextFormat* format, const wchar_t* family,
+                                IDWriteFontFallback* fallback) {
+    // The typographic family supports automatic optical size. The WSS
+    // aliases ("Text", "Small", "Display") pin that axis to a named instance.
+    const bool opticalSize = std::wcscmp(family, theme::kVariableFontFamily) == 0;
+    if (!opticalSize && !fallback) return;
+    ComPtr<IDWriteTextFormat3> format3;
+    if (SUCCEEDED(format->QueryInterface(IID_PPV_ARGS(&format3)))) {
+        if (opticalSize) format3->SetAutomaticFontAxes(DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE);
+        if (fallback) format3->SetFontFallback(fallback);
     }
-    return locale;
 }
 
 ComPtr<ID2D1Brush> CreateDisplayListGradientBrush(ID2D1RenderTarget* rt,
@@ -256,7 +263,7 @@ bool Renderer::Init(ID2D1Factory1* factory, IDWriteFactory* dwFactory, IWICImagi
     dwFactory_  = dwFactory;
     wicFactory_ = wicFactory;
     brushCache_.clear();
-    ClearTextCaches();
+    RebuildFontFallback();
     return true;
 }
 
@@ -481,6 +488,8 @@ bool Renderer::CreateRenderTarget(HWND hwnd, DXGI_ALPHA_MODE compositionAlpha) {
     ctx_->SetTarget(targetBitmap_.Get());
     ctx_->SetDpi(float(dpi), float(dpi));
     ctx_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    textMonitor_ = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    textSettingsRevision_ = 0;
     ApplyTextRenderMode();
     RebuildFontFallback();
     return true;
@@ -908,6 +917,7 @@ ComPtr<ID2D1SolidColorBrush> Renderer::GetBrush(const D2D1_COLOR_F& color) {
 }
 
 void Renderer::ClearTextCaches() {
+    ++textLayoutRevision_;
     svgDocuments_.clear();
     svgDocumentBytes_=0;
     opacityCommands_.clear();
@@ -977,7 +987,7 @@ ComPtr<IDWriteTextLayout> Renderer::GetTextPaint(const std::wstring& text, D2D1_
         rect.top-=2.0f; rect.bottom+=2.0f;
     }
     origin={rect.left,rect.top};
-    auto format=GetTextFormat(size,(family && *family)?family:theme::kFontFamily,weight);
+    auto format=GetTextFormat(size,family,weight);
     if (!format) return nullptr;
     return GetDrawTextLayout(text,format.Get(),width,rect.bottom-rect.top,align,paragraph,wrap,ink);
 }
@@ -1013,8 +1023,7 @@ ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t*
                                                    DWRITE_FONT_WEIGHT weight) {
     if (!dwFactory_) return nullptr;
     /* family == nullptr → 用本 Renderer 的 default font（per-window > theme > "Segoe UI"） */
-    const wchar_t* resolvedFamily = family ? family : DefaultFontFamily();
-    if (!resolvedFamily) resolvedFamily = L"Segoe UI";
+    const wchar_t* resolvedFamily = family && *family ? family : DefaultFontFamily();
 
     TextFormatKey key;
     key.sizeBits = FloatBits(fontSize);
@@ -1029,15 +1038,9 @@ ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t*
     ComPtr<IDWriteTextFormat> fmt;
     HRESULT hr = dwFactory_->CreateTextFormat(
         resolvedFamily, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-        fontSize, ResolveLocaleName(), fmt.GetAddressOf());
+        fontSize, TextLocale(), fmt.GetAddressOf());
     if (SUCCEEDED(hr) && fmt) {
-        /* 如果有中英分离字体回退，attach 到 TextFormat3 上 */
-        if (fontFallback_) {
-            ComPtr<IDWriteTextFormat3> fmt3;
-            if (SUCCEEDED(fmt.As(&fmt3)) && fmt3) {
-                fmt3->SetFontFallback(fontFallback_.Get());
-            }
-        }
+        ConfigureTextFormat(fmt.Get(), resolvedFamily, fontFallback_.Get());
         textFormatCache_.emplace(std::move(key), fmt);
     }
     return fmt;
@@ -1048,6 +1051,10 @@ ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t*
 const wchar_t* Renderer::DefaultFontFamily() const {
     if (!defaultFontOverride_.empty()) return defaultFontOverride_.c_str();
     return theme::DefaultFontFamily();  /* 全局默认 "Segoe UI" */
+}
+
+const wchar_t* Renderer::TextLocale() const {
+    return textLocale_.empty() ? ResolveLocaleName() : textLocale_.c_str();
 }
 
 const wchar_t* Renderer::LatinFontFamily() const {
@@ -1067,33 +1074,54 @@ theme::TextRenderMode Renderer::TextRenderMode() const {
 }
 
 void Renderer::SetDefaultFontFamily(const wchar_t* family) {
-    defaultFontOverride_ = family ? family : L"";
-    ClearTextCaches();  /* 缓存失效 */
-    RebuildFontFallback();
+    const auto* requested = family ? family : L"";
+    if (defaultFontOverride_ == requested) return;
+    defaultFontOverride_ = requested;
+    ClearTextCaches();
 }
 
 void Renderer::SetCjkFonts(const wchar_t* latin, const wchar_t* cjk) {
     latinFontOverride_ = latin ? latin : L"";
     cjkFontOverride_   = cjk   ? cjk   : L"";
-    ClearTextCaches();
     RebuildFontFallback();
 }
 
-void Renderer::SetTextRenderMode(theme::TextRenderMode mode) {
-    if(!hasRenderModeOverride_ || renderModeOverride_!=mode) ClearTextCaches();
-    hasRenderModeOverride_ = true;
-    renderModeOverride_ = mode;
-    ApplyTextRenderMode();  /* 立刻应用到 ctx_（如已创建） */
+bool Renderer::SetTextLocale(const wchar_t* locale) {
+    const auto* requested = locale ? locale : L"";
+    if (textLocale_ == requested) return false;
+    textLocale_ = requested;
+    ClearTextCaches();
+    return true;
 }
 
-void Renderer::ApplyTextRenderMode() {
+void Renderer::SetTextRenderMode(theme::TextRenderMode mode) {
+    if (hasRenderModeOverride_ && renderModeOverride_ == mode) return;
+    hasRenderModeOverride_ = true;
+    renderModeOverride_ = mode;
+    previousDisplayList_.Clear();
+    previousBounds_ = {};
+    ApplyTextRenderMode();
+}
+
+void Renderer::ApplyTextRenderMode(HMONITOR monitor) {
     if (!ctx_ || !dwFactory_) return;
+
+    const auto mode = TextRenderMode();
+    ComPtr<IDWriteRenderingParams> base;
+    dwFactory_->CreateMonitorRenderingParams(monitor ? monitor : textMonitor_, &base);
+    if (mode == theme::TextRenderMode::System) {
+        // Direct2D chooses grayscale on alpha surfaces and layers. DirectWrite
+        // keeps the monitor preferences and selects grid fitting per glyph size.
+        ctx_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
+        ctx_->SetTextRenderingParams(base.Get());
+        return;
+    }
 
     D2D1_TEXT_ANTIALIAS_MODE aa = D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
     DWRITE_RENDERING_MODE    rm = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
     float gamma = 1.8f, enhancedContrast = 0.5f, clearTypeLevel = 0.0f;
 
-    switch (TextRenderMode()) {
+    switch (mode) {
     case theme::TextRenderMode::Smooth:
         aa = D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
         rm = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
@@ -1119,17 +1147,18 @@ void Renderer::ApplyTextRenderMode() {
         rm = DWRITE_RENDERING_MODE_ALIASED;
         gamma = 1.8f; enhancedContrast = 0.0f; clearTypeLevel = 0.0f;
         break;
+    case theme::TextRenderMode::System:
+        break;
     }
     ctx_->SetTextAntialiasMode(aa);
 
-    IDWriteRenderingParams* base = nullptr;
-    IDWriteRenderingParams* custom = nullptr;
-    if (SUCCEEDED(dwFactory_->CreateRenderingParams(&base))) {
+    if (!base) dwFactory_->CreateRenderingParams(&base);
+    if (base) {
+        ComPtr<IDWriteRenderingParams> custom;
         dwFactory_->CreateCustomRenderingParams(
             gamma, enhancedContrast, clearTypeLevel,
             base->GetPixelGeometry(), rm, &custom);
-        if (custom) { ctx_->SetTextRenderingParams(custom); custom->Release(); }
-        base->Release();
+        ctx_->SetTextRenderingParams(custom.Get());
     }
 }
 
@@ -1141,7 +1170,7 @@ void Renderer::RebuildFontFallback() {
     fontFallback_.Reset();
     const wchar_t* latin = LatinFontFamily();
     const wchar_t* cjk   = CjkFontFamily();
-    if (!latin && !cjk) return;
+    if (!dwFactory_ || (!latin && !cjk)) return;
 
     ComPtr<IDWriteFactory2> dwf2;
     if (FAILED(reinterpret_cast<IUnknown*>(dwFactory_)->QueryInterface(
@@ -1414,7 +1443,7 @@ ComPtr<IDWriteTextLayout> Renderer::CreateTextLayout(const std::wstring& text,
                                                        DWRITE_FONT_WEIGHT weight) {
     ComPtr<IDWriteTextLayout> layout;
     if (!dwFactory_) return layout;
-    auto fmt = GetTextFormat(fontSize, theme::kFontFamily, weight);
+    auto fmt = GetTextFormat(fontSize, nullptr, weight);
     if (!fmt) return layout;
     HRESULT hr = dwFactory_->CreateTextLayout(
         text.c_str(), (UINT32)text.length(),
@@ -1498,7 +1527,7 @@ float Renderer::MeasureTextHeight(const std::wstring& text, float maxWidth, floa
                                    DWRITE_FONT_WEIGHT weight) {
     if (text.empty() || !dwFactory_) return fontSize + 4.0f;
 
-    auto fmt = GetTextFormat(fontSize, theme::kFontFamily, weight);
+    auto fmt = GetTextFormat(fontSize, nullptr, weight);
     if (!fmt) return fontSize + 4.0f;
 
     ComPtr<IDWriteTextLayout> layout;
@@ -2577,16 +2606,27 @@ void Renderer::PrepareDisplayList(const DisplayList& list) {
     // Snapshot window-resolved fonts/mode on the UI thread. Retained layouts
     // and SVG text never outlive a fallback or rendering-parameter change.
     if(list.text_render_mode>=0) {
-        if(!frameTextEnvironment_ || defaultFontOverride_!=list.default_font ||
-           latinFontOverride_!=list.latin_font || cjkFontOverride_!=list.cjk_font) {
-            defaultFontOverride_=list.default_font;
-            latinFontOverride_=list.latin_font;
-            cjkFontOverride_=list.cjk_font;
-            frameTextEnvironment_=true;
-            ClearTextCaches(); RebuildFontFallback();
+        const bool fallbackChanged = !frameTextEnvironment_ ||
+            latinFontOverride_ != list.latin_font || cjkFontOverride_ != list.cjk_font;
+        if (fallbackChanged || defaultFontOverride_ != list.default_font || textLocale_ != list.text_locale) {
+            defaultFontOverride_ = list.default_font;
+            latinFontOverride_ = list.latin_font;
+            cjkFontOverride_ = list.cjk_font;
+            textLocale_ = list.text_locale;
+            frameTextEnvironment_ = true;
+            if (fallbackChanged) RebuildFontFallback();
+            else ClearTextCaches();
         }
-        if(!hasRenderModeOverride_ || int(renderModeOverride_)!=list.text_render_mode) {
+        const bool settingsChanged = (list.text_monitor && textMonitor_ != list.text_monitor) ||
+            textSettingsRevision_ != list.text_settings_revision;
+        if (list.text_monitor) textMonitor_ = list.text_monitor;
+        textSettingsRevision_ = list.text_settings_revision;
+        if (!hasRenderModeOverride_ || int(renderModeOverride_) != list.text_render_mode) {
             SetTextRenderMode(static_cast<theme::TextRenderMode>(list.text_render_mode));
+        } else if (settingsChanged) {
+            previousDisplayList_.Clear();
+            previousBounds_ = {};
+            ApplyTextRenderMode();
         }
     }
     nextBounds_=AnalyzeDisplayList(list,[](const DisplayList& source,size_t index,D2D1_RECT_F& ink,void* context) {
@@ -4713,24 +4753,20 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
         const std::wstring* embeddedPrimary = FirstEmbeddedAlias(embeddedFonts.get(), families);
         const wchar_t* fam = embeddedPrimary ? embeddedPrimary->c_str()
                             : (!families.empty() ? families.front().c_str() : DefaultFontFamily());
-        if (!fam || !fam[0]) fam = L"Segoe UI";
+        if (!fam || !fam[0]) fam = DefaultFontFamily();
         IDWriteFontCollection* collection =
             embeddedPrimary
                 ? embeddedFonts->collection.Get() : nullptr;
         ComPtr<IDWriteTextFormat> fmt;
         if (FAILED(dwFactory_->CreateTextFormat(fam, collection, weight, fstyle,
-                DWRITE_FONT_STRETCH_NORMAL, fontSize, ResolveLocaleName(),
+                DWRITE_FONT_STRETCH_NORMAL, fontSize, TextLocale(),
                 fmt.GetAddressOf())) || !fmt)
             return {};
         ComPtr<IDWriteFontFallback> embeddedFallback =
             embeddedFonts ? embeddedFonts->MakeFallback(dwFactory_, families, fontFallback_.Get(),
-                                                        ResolveLocaleName(), embeddedPrimary ? embeddedPrimary->c_str() : nullptr)
+                                                        TextLocale(), embeddedPrimary ? embeddedPrimary->c_str() : nullptr)
                           : nullptr;
-        if (embeddedFallback || fontFallback_) {
-            ComPtr<IDWriteTextFormat3> f3;
-            if (SUCCEEDED(fmt.As(&f3)) && f3)
-                f3->SetFontFallback(embeddedFallback ? embeddedFallback.Get() : fontFallback_.Get());
-        }
+        ConfigureTextFormat(fmt.Get(), fam, embeddedFallback ? embeddedFallback.Get() : fontFallback_.Get());
         float layoutMaxW = maxW > 1.0f ? maxW : 100000.0f;
         ComPtr<IDWriteTextLayout> layout;
         if (FAILED(dwFactory_->CreateTextLayout(txt.c_str(), (UINT32)txt.size(),
@@ -5020,23 +5056,19 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
         const wchar_t* fam = embeddedPrimary ? embeddedPrimary->c_str()
                             : (!run.style.families.empty() ? run.style.families.front().c_str()
                                                            : DefaultFontFamily());
-        if (!fam || !fam[0]) fam = L"Segoe UI";
+        if (!fam || !fam[0]) fam = DefaultFontFamily();
         IDWriteFontCollection* collection = embeddedPrimary ? embeddedFonts->collection.Get() : nullptr;
         ComPtr<IDWriteTextFormat> fmt;
         if (FAILED(dwFactory_->CreateTextFormat(fam, collection, run.style.weight,
                 run.style.fstyle, DWRITE_FONT_STRETCH_NORMAL, run.style.fontSize,
-                ResolveLocaleName(), fmt.GetAddressOf())) || !fmt)
+                TextLocale(), fmt.GetAddressOf())) || !fmt)
             return false;
         ComPtr<IDWriteFontFallback> embeddedFallback =
             embeddedFonts ? embeddedFonts->MakeFallback(dwFactory_, run.style.families,
-                                                        fontFallback_.Get(), ResolveLocaleName(),
+                                                        fontFallback_.Get(), TextLocale(),
                                                         embeddedPrimary ? embeddedPrimary->c_str() : nullptr)
                           : nullptr;
-        if (embeddedFallback || fontFallback_) {
-            ComPtr<IDWriteTextFormat3> f3;
-            if (SUCCEEDED(fmt.As(&f3)) && f3)
-                f3->SetFontFallback(embeddedFallback ? embeddedFallback.Get() : fontFallback_.Get());
-        }
+        ConfigureTextFormat(fmt.Get(), fam, embeddedFallback ? embeddedFallback.Get() : fontFallback_.Get());
         ComPtr<IDWriteTextLayout> layout;
         if (FAILED(dwFactory_->CreateTextLayout(run.text.c_str(), (UINT32)run.text.size(),
                 fmt.Get(), 100000.0f, 100000.0f, layout.GetAddressOf())) || !layout)
@@ -5563,9 +5595,7 @@ void Renderer::DrawSvgTextRuns(const std::vector<SvgTextRun>& runs,
 
     for (const auto& run : runs) {
         if (run.text.empty()) continue;
-        const wchar_t* fam = run.fontFamily.empty() ? theme::kFontFamily
-                                                     : run.fontFamily.c_str();
-        auto fmt = GetTextFormat(run.fontSize, fam, run.fontWeight);
+        auto fmt = GetTextFormat(run.fontSize, run.fontFamily.c_str(), run.fontWeight);
         if (!fmt) continue;
 
         float maxW = run.maxWidth > 1.0f ? run.maxWidth : 100000.0f;

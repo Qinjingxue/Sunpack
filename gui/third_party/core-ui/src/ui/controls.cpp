@@ -1440,8 +1440,12 @@ IDWriteTextLayout* TextAreaWidget::EnsureLayout(MeasureContext& measure, float f
     // line stays single-line; clipping is handled by the parent rect.
     float layoutW = wrap_ ? maxW : 1e6f;
 
+    auto* renderer = measure.BoundRenderer();
+    if (!renderer) return nullptr;
+    const auto textRevision = renderer->TextLayoutRevision();
     bool needRebuild = layoutDirty_
                     || !cachedLayout_
+                    || layoutTextRevision_ != textRevision
                     || layoutMaxW_     != layoutW
                     || layoutFontSize_ != fontSize
                     || layoutWrap_     != wrap_;
@@ -1459,6 +1463,7 @@ IDWriteTextLayout* TextAreaWidget::EnsureLayout(MeasureContext& measure, float f
         ? first.height : fontSize + 6.0f;
     layoutMaxW_     = layoutW;
     layoutFontSize_ = fontSize;
+    layoutTextRevision_ = textRevision;
     layoutWrap_     = wrap_;
     layoutDirty_    = false;
     return cachedLayout_.Get();

@@ -3205,6 +3205,7 @@ static theme::TextRenderMode ToThemeMode(UiTextRenderMode m) {
     case UI_TEXT_RENDER_SHARP:      return theme::TextRenderMode::Sharp;
     case UI_TEXT_RENDER_GRAY_SHARP: return theme::TextRenderMode::GraySharp;
     case UI_TEXT_RENDER_ALIASED:    return theme::TextRenderMode::Aliased;
+    case UI_TEXT_RENDER_SYSTEM:     return theme::TextRenderMode::System;
     }
     return theme::TextRenderMode::Smooth;
 }
@@ -3215,6 +3216,7 @@ static UiTextRenderMode FromThemeMode(theme::TextRenderMode m) {
     case theme::TextRenderMode::Sharp:     return UI_TEXT_RENDER_SHARP;
     case theme::TextRenderMode::GraySharp: return UI_TEXT_RENDER_GRAY_SHARP;
     case theme::TextRenderMode::Aliased:   return UI_TEXT_RENDER_ALIASED;
+    case theme::TextRenderMode::System:    return UI_TEXT_RENDER_SYSTEM;
     }
     return UI_TEXT_RENDER_SMOOTH;
 }

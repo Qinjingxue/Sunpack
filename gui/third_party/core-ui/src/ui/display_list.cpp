@@ -197,6 +197,9 @@ DisplayList::DisplayList(DisplayList&& other) noexcept
       default_font(std::move(other.default_font)),
       latin_font(std::move(other.latin_font)),
       cjk_font(std::move(other.cjk_font)),
+      text_locale(std::move(other.text_locale)),
+      text_monitor(other.text_monitor),
+      text_settings_revision(other.text_settings_revision),
       text_render_mode(other.text_render_mode),
       commands(std::move(other.commands)),
       text_pool(std::move(other.text_pool)),
@@ -221,6 +224,9 @@ DisplayList& DisplayList::operator=(DisplayList&& other) noexcept {
     default_font=std::move(other.default_font);
     latin_font=std::move(other.latin_font);
     cjk_font=std::move(other.cjk_font);
+    text_locale=std::move(other.text_locale);
+    text_monitor=other.text_monitor;
+    text_settings_revision=other.text_settings_revision;
     text_render_mode=other.text_render_mode;
     commands = std::move(other.commands);
     text_pool = std::move(other.text_pool);

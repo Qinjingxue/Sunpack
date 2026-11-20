@@ -1500,6 +1500,7 @@ typedef enum UiTextRenderMode {
     UI_TEXT_RENDER_SHARP      = 2, /* CLEARTYPE + GDI_CLASSIC（记事本最锐） */
     UI_TEXT_RENDER_GRAY_SHARP = 3, /* GRAYSCALE + GDI_CLASSIC（锐且无彩边） */
     UI_TEXT_RENDER_ALIASED    = 4, /* 无抗锯齿 / 像素字体 */
+    UI_TEXT_RENDER_SYSTEM    = 5, /* DirectWrite rendering parameters for the window's monitor. */
 } UiTextRenderMode;
 
 /* ---- 全局默认（进程级，新建窗口的初值；旧窗口已创建也会跟随，只要它自己没 override）---- */
