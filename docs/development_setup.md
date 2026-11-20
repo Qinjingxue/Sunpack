@@ -6,7 +6,7 @@ SunPack is a Windows-only project. Cargo builds the Rust runtime and Watch Broke
 
 ## Directories and build artifacts
 
-See the [README development requirements](../README.en.md#development) for the toolchain needed to run setup.
+See the [README development requirements](../README.md#development) for the toolchain needed to run setup.
 
 Main project directories:
 

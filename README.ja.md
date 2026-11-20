@@ -2,7 +2,7 @@
 <h1 align="center">SunPack</h1>
 <p align="center"><b>Windows 向けアーカイブ処理ツール。フォルダーを監視し、アーカイブをバックグラウンドで自動展開します。</b></p>
 
-<p align="center"><a href="README.md">简体中文</a> · <a href="README.en.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <b>日本語</b> · <a href="README.ko.md">한국어</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">ダウンロード</a></p>
+<p align="center"><a href="README.zh-CN.md">简体中文</a> · <a href="README.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <b>日本語</b> · <a href="README.ko.md">한국어</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">ダウンロード</a></p>
 
 <p align="center"><img src="sunpack_en.gif" width="80%" alt="SunPack のデモ（英語 UI）"></p>
 

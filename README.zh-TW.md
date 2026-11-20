@@ -4,7 +4,7 @@
 <h1 align="center">SunPack</h1>
 <p align="center"><b>適用於 Windows 的全自動壓縮檔處理工具，可在背景自動解壓縮</b><br></p>
 
-<p align="center"><a href="README.md">简体中文</a> · <a href="README.en.md">English</a> · <b>繁體中文</b> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">下載</a></p>
+<p align="center"><a href="README.zh-CN.md">简体中文</a> · <a href="README.md">English</a> · <b>繁體中文</b> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">下載</a></p>
 
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC" alt="最新版本"></a>

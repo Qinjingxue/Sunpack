@@ -2,7 +2,7 @@
 <h1 align="center">SunPack</h1>
 <p align="center"><b>Windows용 자동 압축 해제 도구입니다. 폴더를 감시하고 백그라운드에서 압축 파일을 자동으로 풉니다.</b></p>
 
-<p align="center"><a href="README.md">简体中文</a> · <a href="README.en.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.ja.md">日本語</a> · <b>한국어</b> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">다운로드</a></p>
+<p align="center"><a href="README.zh-CN.md">简体中文</a> · <a href="README.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.ja.md">日本語</a> · <b>한국어</b> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">다운로드</a></p>
 
 <p align="center"><img src="sunpack_en.gif" width="80%" alt="SunPack 데모(영어 UI)"></p>
 

@@ -6,7 +6,7 @@ SunPack 是 Windows-only 项目。Cargo 构建 Rust 运行时和 Watch Broker，
 
 ## 目录和构建产物
 
-运行开发脚本所需的工具链见 [README 的开发环境要求](../../README.md#开发相关)。
+运行开发脚本所需的工具链见 [README 的开发环境要求](../../README.zh-CN.md#开发相关)。
 
 项目主要目录：
 
