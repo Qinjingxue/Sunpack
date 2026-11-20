@@ -178,7 +178,7 @@ fn shared_walk_keeps_child_rows_and_retry_scope_local() {
         &scopes[1].snapshot.table
     ));
     let (_, refreshed) = options.refresh_relation_bucket(
-        &scopes[1].scope, &head.to_string_lossy(), &scopes[1].snapshot, None,
+        &scopes[1].scope, &head.to_string_lossy(), &scopes[1].snapshot, None, false,
     ).unwrap();
     assert!(refreshed.records().any(|(path, _, _, _)| path == head.to_string_lossy()));
     assert!(refreshed.records().all(|(path, _, _, _)| inner.contains(path)));

@@ -1,12 +1,11 @@
-import ctypes
 import io
 import json
+import msvcrt
 import os
 import subprocess
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from ctypes import wintypes
 from itertools import count
 from pathlib import Path
 from threading import Barrier
@@ -323,54 +322,34 @@ def test_resident_cli_clears_reusable_archive_state_after_idle(package, tmp_path
 
 
 def test_launcher_restarts_while_previous_runtime_drains(package):
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    kernel.CreateFileW.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
     package.configure(performance={"persistent_server_idle_seconds": 60})
     assert package.json("config", "show")["items"]
     state, = package.data.glob("runtime-*.state")
-    pipe, _, _, pid, _ = state.read_text(encoding="utf-8").splitlines()
-    owner = psutil.Process(int(pid))
-    manifest = str(state) + ".events.json"
+    owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
+    assert package.run("daemon", "stop").returncode == 0
 
-    # Deny replacement until the next launcher reaches the previous owner's
-    # teardown window. Keep reads and writes shared for the existing writer.
-    deadline = time.monotonic() + 10
-    while True:
-        handle = kernel.CreateFileW(manifest, 0x80000000, 3, None, 3, 0x80, None)
-        if handle != wintypes.HANDLE(-1).value:
-            break
-        assert ctypes.get_last_error() in (2, 32) and time.monotonic() < deadline
-        time.sleep(0.01)
-    replacement = None
-    try:
-        assert package.run("--persistent-shutdown").returncode == 0
-        deadline = time.monotonic() + 10
-        while kernel.WaitNamedPipeW(pipe, 1) or ctypes.get_last_error() != 2:
-            assert time.monotonic() < deadline, "old listener is still open"
-            time.sleep(0.01)
-        assert owner.is_running()
+    # Model the retiring runtime's ownership range after its listener closes.
+    # The replacement must acquire this range before publishing a new endpoint.
+    with open(str(state) + ".lock", "r+b") as lock:
+        lock.seek(1)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         replacement = subprocess.Popen(
             [str(package.launcher), "config", "show", "-j"], cwd=package.data,
             env=package.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        with pytest.raises(subprocess.TimeoutExpired):
-            replacement.wait(timeout=1)
-    finally:
-        assert kernel.CloseHandle(handle)
-        owner.wait(timeout=15)
-        if replacement is not None:
+        try:
             try:
-                output, error = replacement.communicate(timeout=15)
+                with pytest.raises(subprocess.TimeoutExpired):
+                    replacement.wait(timeout=0.3)
+                assert not state.exists(), "replacement published before the previous owner drained"
             finally:
-                if replacement.poll() is None:
-                    replacement.kill()
-                    replacement.communicate(timeout=10)
+                lock.seek(1)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            output, error = replacement.communicate(timeout=15)
+        finally:
+            if replacement.poll() is None:
+                replacement.kill()
+                replacement.communicate(timeout=10)
     assert replacement.returncode == 0, error
     assert json.loads(output)["items"]
     assert int(state.read_text(encoding="utf-8").splitlines()[3]) != owner.pid

@@ -516,23 +516,23 @@ impl NativeDirectoryScanOptions {
 
         state: &NativeWatchCatalog,
         scope: &crate::scan::scope::NativeDiscoveryScope,
-        seed: &str,
+        stem: &str,
+        is_target: impl Fn(&str) -> bool,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
-        let stem = catalog_stem(seed);
         state.validate_generated_keys(scope, |table| {
-            table.buckets.get(stem.as_str()).into_iter().flat_map(|bucket| bucket.iter())
+            table.buckets.get(stem).into_iter().flat_map(|bucket| bucket.iter())
                 .filter(|key| table.generated.contains_key(key.as_ref())).cloned().collect()
         }, None)?;
         let (filtered, raw) = (|| {
             let root = Path::new(&scope.root);
             let mut filter_scratch = PathFilterScratch::new(&self.options);
             let mut directory_cache = HashMap::new();
-            let (mut raw, cells): (Vec<DirectoryEntryRecord>, Vec<Option<CheapAnchorCell>>) = {
+            let (mut raw, mut cells): (Vec<_>, Vec<_>) = {
                 let mut data = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
                 let mut records = Vec::new();
                 let mut cells = Vec::new();
                 if let Some(catalog) = data.scopes.get_mut(&crate::path_keys::path_key(&scope.root)) {
-                    if let Some(bucket) = catalog.buckets.get(stem.as_str()) {
+                    if let Some(bucket) = catalog.buckets.get(stem) {
                         for key in bucket.iter() {
                             let Some(row) = catalog.rows.get_mut(key) else {
                                 continue;
@@ -558,9 +558,7 @@ impl NativeDirectoryScanOptions {
                                     record.mtime_ns,
                                 );
                                 cells.push(record.relation_member_eligible.then(|| {
-                                    Arc::clone(
-                                        row.cheap_anchor.get_or_insert_with(Default::default),
-                                    )
+                                    Arc::clone(row.cheap_anchor.get_or_insert_with(Default::default))
                                 }));
                                 records.push(record);
                             }
@@ -569,6 +567,11 @@ impl NativeDirectoryScanOptions {
                 }
                 (records, cells)
             };
+            for (record, cell) in raw.iter_mut().zip(&mut cells) {
+                if exclude_unready_watch_peer(record, &is_target) {
+                    *cell = None;
+                }
+            }
             let mut accepted = HashSet::new();
             let size_ranges = &self.options.size_ranges;
             if !size_ranges.is_empty() {
@@ -608,16 +611,23 @@ impl NativeDirectoryScanOptions {
         seed: &str,
         previous: &NativeDirectorySnapshot,
         state: Option<&NativeWatchCatalog>,
+        watch: bool,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
+        let stem = catalog_stem(seed);
+        let seed_key = watch.then(|| crate::path_keys::path_key(seed));
+        let is_target = |key: &str| seed_key.as_deref() == Some(key);
         if let Some(state) = state {
-            return self.catalog_snapshot(state, scope, seed);
+            return self.catalog_snapshot(state, scope, &stem, is_target);
         }
         let (filtered, raw) = (|| {
             let scope = scope.clone();
             let mut options = self.options.clone();
             options.scope = Some(scope.clone());
-            options.relation_stem = Some(catalog_stem(seed));
+            options.relation_stem = Some(stem);
             let mut records = scan_directory_views(&scope.root, scope.max_depth, &options)?;
+            if watch {
+                records.exclude_unready_watch_peers(&is_target);
+            }
             let live_paths: HashSet<&str> = records
                 .raw
                 .iter()
@@ -660,31 +670,50 @@ impl NativeDirectoryScanOptions {
 
     pub(crate) fn scan_scope(
         &self,
-
         scope: &crate::scan::scope::NativeDiscoveryScope,
+        watch_target: Option<&dyn Fn(&str) -> bool>,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let mut options = self.options.clone();
         options.scope = Some(scope.clone());
-        scan_snapshots_with_options(&scope.root, scope.max_depth, &options)
-    }
-}
-
-fn scan_snapshots_with_options(
-    root_path: &str,
-    max_depth: Option<usize>,
-    options: &DirectoryScanOptions,
-) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
-    let (filtered, raw) = (|| {
-        let mut records = scan_directory_views(root_path, max_depth, options)?;
-        populate_relation_anchors_cached(&mut records.raw, &[], Some(root_path));
-        Ok::<_, std::io::Error>(NativeDirectorySnapshot::from_views(
+        let mut records = scan_directory_views(&scope.root, scope.max_depth, &options)?;
+        if let Some(is_target) = watch_target {
+            records.exclude_unready_watch_peers(is_target);
+        }
+        populate_relation_anchors_cached(&mut records.raw, &[], Some(&scope.root));
+        Ok(NativeDirectorySnapshot::from_views(
             records.filtered,
             records.raw,
             records.errors,
             Vec::new(),
         ))
-    })()?;
-    Ok((filtered, raw))
+    }
+}
+
+impl DirectoryScanRecords {
+    fn exclude_unready_watch_peers(&mut self, is_target: &dyn Fn(&str) -> bool) {
+        for record in &mut self.raw {
+            exclude_unready_watch_peer(record, is_target);
+        }
+        self.filtered.retain(|&row| self.raw[row].relation_member_eligible || self.raw[row].is_dir);
+    }
+}
+
+// Peers discovered through Relations or Embedded did not pass the scheduler's
+// target readiness probe. Keep busy or departed peers out of this snapshot;
+// their close or rename can wake the existing volume recovery.
+fn exclude_unready_watch_peer(record: &mut DirectoryEntryRecord, is_target: &dyn Fn(&str) -> bool) -> bool {
+    if record.is_dir || !record.relation_member_eligible || is_target(&crate::path_keys::path_key(&record.path)) {
+        return false;
+    }
+    let unavailable = match crate::filesystem::watch_file_is_ready(&record.path) {
+        Ok(ready) => !ready,
+        Err(error) => matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory),
+    };
+    if unavailable {
+        record.relation_member_eligible = false;
+        record.relation_anchor = None;
+    }
+    unavailable
 }
 
 /// Filesystem target classification only; archive analysis remains in discovery.

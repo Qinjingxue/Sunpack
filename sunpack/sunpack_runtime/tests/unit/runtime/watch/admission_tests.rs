@@ -532,7 +532,9 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
         // Cache the native header in the checkpoint's current catalog. Hold
         // a real sharing conflict through the worker's password session open.
         let scope = &scheduler.roots[&root].1;
-        scheduler.options.as_ref().unwrap().catalog_snapshot(&scheduler.catalog, scope, failing.to_str().unwrap())?;
+        scheduler.options.as_ref().unwrap().catalog_snapshot(
+            &scheduler.catalog, scope, &crate::scan::catalog::catalog_stem(failing.to_str().unwrap()), |_| true,
+        )?;
         *hold.lock().unwrap() = Some(fs::OpenOptions::new().write(true)
             .share_mode(FILE_SHARE_WRITE | FILE_SHARE_DELETE).open(&failing)?);
         Ok(())

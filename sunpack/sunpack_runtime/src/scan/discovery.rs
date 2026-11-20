@@ -103,6 +103,10 @@ impl FileTargets {
         }
     }
 
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.names_by_path.contains_key(key)
+    }
+
     pub(crate) fn only_path(&self) -> Option<&str> {
         (self.names_by_path.len() == 1).then(|| self.names_by_path.keys().next().unwrap().as_str())
     }

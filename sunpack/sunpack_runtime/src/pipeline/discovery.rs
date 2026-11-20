@@ -1,5 +1,5 @@
 use super::passwords::CandidateSet;
-use super::{DiscoverySource, Failure, FailureKind, InputError, InputErrorKind, Request};
+use super::{DiscoverySource, Failure, FailureKind, InputError, InputErrorKind, Origin, Request};
 use crate::core::config::{Config, ScanFilterKind};
 use crate::io::archive_state::{
     AnalysisOrigin, ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
@@ -146,12 +146,12 @@ fn scan_discovery_scope(
     snapshots: &mut HashMap<String, (NativeDirectorySnapshot, NativeDirectorySnapshot)>,
 ) -> io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
     let Some(root) = shared_roots.get(scope.key()) else {
-        return options.scan_scope(scope);
+        return options.scan_scope(scope, None);
     };
     if !snapshots.contains_key(root) {
         snapshots.insert(
             root.clone(),
-            options.scan_scope(&NativeDiscoveryScope::new(root.clone(), None, Vec::new()))?,
+            options.scan_scope(&NativeDiscoveryScope::new(root.clone(), None, Vec::new()), None)?,
         );
     }
     let (filtered, raw) = &snapshots[root];
@@ -403,15 +403,17 @@ pub(super) fn discover(
                 Vec::new(),
             )
         });
+        let targets = FileTargets::new(targets);
         let (filtered, raw) = if let Some(catalog) = &request.watch_catalog {
-            options.catalog_snapshot(catalog, &scope, &targets[0].0)?
+            options.catalog_snapshot(catalog, &scope, &bucket, |key| targets.contains_key(key))?
+        } else if request.origin == Origin::Watch {
+            options.scan_scope(&scope, Some(&|key| targets.contains_key(key)))?
         } else {
             scan_discovery_scope(options, &scope, &shared_roots, &mut shared_snapshots)?
         };
         if !shared_roots.contains_key(scope.key()) {
             result.scan_errors.extend(filtered.scan_errors());
         }
-        let targets = FileTargets::new(targets);
         let mut table = NativeCandidateTable::from_directory(&raw, &filtered, Some(&targets), request.deep);
         match probe_relations(&mut table, &filtered, &raw, Some(&targets), candidates, &mut verified, request) {
             Ok(()) => tables.push(table),
@@ -747,6 +749,7 @@ pub(super) fn retry_volume(
                 .as_ref()
                 .is_some_and(|scope| path_key(&scope.root) == path_key(&context.scope.root))
         }),
+        request.origin == Origin::Watch,
     )?;
     resolve_volume(Path::new(seed.as_ref()), &filesystem_logical_name(&original.path.to_string_lossy()), &original.format, &required, &filtered, &raw, candidates, request)
 }
@@ -785,10 +788,12 @@ pub(super) fn find_watch_volume(
         return Ok(None);
     };
     let path = path.to_string_lossy();
+    let seed_key = path_key(&path);
+    let is_target = |key: &str| key == seed_key;
     let (filtered, raw) = if let Some(catalog) = &request.watch_catalog {
-        options.catalog_snapshot(catalog, scope, &path)?
+        options.catalog_snapshot(catalog, scope, &crate::scan::catalog::catalog_stem(&path), is_target)?
     } else {
-        options.scan_scope(scope)?
+        options.scan_scope(scope, Some(&is_target))?
     };
     let mut verified = HashMap::new();
     let targets = FileTargets::new(vec![(path.to_string(), filesystem_logical_name(&path))]);

@@ -1,7 +1,8 @@
 """Exercise volume relationships and the real entry points together."""
 
+from contextlib import ExitStack
 from pathlib import Path
-from shutil import copyfile
+from shutil import copyfile, copyfileobj
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
@@ -67,6 +68,31 @@ def _carrier_batch(base, *, wrap_all_rar_volumes):
     return cases, batch, arrivals, unrelated, file_inventory(sibling_dir)
 
 
+def _rename_carrier_batch(watch, parts):
+    *rar_peers, rar_head = parts[1::2]
+    with ExitStack() as writers:
+        staged = []
+        for source in rar_peers:
+            final = watch.root / source.name
+            pending = final.with_name(f"{final.name}.downloading")
+            writer = writers.enter_context(open_shared_file(pending, "wb"))
+            with source.open("rb") as reader:
+                copyfileobj(reader, writer)
+            writer.flush()
+            staged.append((writer, pending, final))
+
+        # A renamed head can start discovery while its fully written peers
+        # still belong to the downloader. They must remain unavailable.
+        head = download(watch, rar_head)
+        download_interleaved(watch, parts[::2])
+        watch.await_event("suspended_missing_volume", path=head.name)
+
+        for writer, pending, final in staged:
+            pending.replace(final)
+            writer.close()
+    return [watch.root / source.name for source in parts]
+
+
 def _assert_only_payloads(output, cases, extra):
     # Normalize away allocation/flattening of the outer task directories.
     # Count each expected member once, including the non-marker binary data.
@@ -109,7 +135,8 @@ def test_mixed_split_carriers_extract_and_clean_only_selected_sources(package, t
             unrelated = target / unrelated.name
         else:
             unrelated = unrelated.rename(watch.root / unrelated.name)
-            live_parts = download_interleaved(watch, parts, mode=delivery)
+            live_parts = (_rename_carrier_batch(watch, parts) if delivery == "rename"
+                          else download_interleaved(watch, parts, mode=delivery))
         wait_for(lambda: not any(path.exists() for path in live_parts), "cleanup of all selected carrier volumes")
         watch.stop()
         watch.assert_no_terminal_failures()

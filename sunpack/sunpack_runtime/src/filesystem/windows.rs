@@ -199,9 +199,8 @@ fn volume_for_handle(file: &File, path: &Path) -> io::Result<String> {
 }
 
 pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {
-    let metadata = std::fs::metadata(path)?;
     // Permit readers; writers and DELETE access (rename/delete) must conflict.
-    match open_path(path, GENERIC_READ, FILE_SHARE_READ, metadata.is_dir()) {
+    match open_path(path, GENERIC_READ, FILE_SHARE_READ, false) {
         Ok(_handle) => Ok(true),
         Err(error)
             if matches!(

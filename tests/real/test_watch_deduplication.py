@@ -35,7 +35,9 @@ def _duplicate(watch, path):
     assert path.is_file(), "Deduplication must not clean skipped sources"
     assert watch.event("done", path=path.name) is None
     rows = [row for row in _history(watch) if Path(row.get("path", "")) == path]
-    assert sum(row["event"] == "watch_deduplicated" for row in rows) == 1
+    # A carrier also has per-segment history. Count its physical completion.
+    assert sum(row["event"] == "watch_deduplicated" and row.get("retire_group") is True
+               for row in rows) == 1
     assert not any(row["event"] == "no_tasks_found" for row in rows)
 
 
