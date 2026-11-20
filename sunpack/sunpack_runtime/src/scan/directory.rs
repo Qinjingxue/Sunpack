@@ -698,14 +698,17 @@ impl DirectoryScanRecords {
     }
 }
 
-// Peers discovered through Relations or Embedded did not pass the scheduler's
-// target readiness probe. Keep busy or departed peers out of this snapshot;
-// their close or rename can wake the existing volume recovery.
+// A readable peer can supply bytes while its writer is still open. Leave the
+// completeness check to archive discovery. A live download under a staging
+// name can still be renamed for publication, so wait for its rename or close.
 fn exclude_unready_watch_peer(record: &mut DirectoryEntryRecord, is_target: &dyn Fn(&str) -> bool) -> bool {
     if record.is_dir || !record.relation_member_eligible || is_target(&crate::path_keys::path_key(&record.path)) {
         return false;
     }
-    let unavailable = match crate::filesystem::watch_file_is_ready(&record.path) {
+    let staging = Path::new(&record.path).extension().and_then(|value| value.to_str())
+        .is_some_and(|ext| ["crdownload", "downloading", "part", "tmp"]
+            .iter().any(|staging| ext.eq_ignore_ascii_case(staging)));
+    let unavailable = match crate::filesystem::watch_file_is_readable(&record.path, !staging) {
         Ok(ready) => !ready,
         Err(error) => matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory),
     };

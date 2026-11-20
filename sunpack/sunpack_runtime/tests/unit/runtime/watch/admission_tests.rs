@@ -1015,6 +1015,9 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             external: Arc::default(), broker_lease: None,
         };
 
+        let fail_identity = |_: &Path| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected identity observation failure"))
+        };
         let mut expected = Vec::new();
         for (name, event) in [("created.zip", CandidateEvent::Created), ("modified.zip", CandidateEvent::Modified)] {
             let path = watched.join(name);
@@ -1030,9 +1033,9 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             })]);
             // A second identity lookup would fail. The event already has the
             // matching observation, and readiness still rechecks on admission.
-            *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(path.clone());
+            *crate::postprocess::WATCH_OBSERVATION_HOOK.lock().unwrap() = Some((path.clone(), fail_identity));
             let result = scheduler.observe_root_changes(&mut signals.changes);
-            *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = None;
+            *crate::postprocess::WATCH_OBSERVATION_HOOK.lock().unwrap() = None;
             result.unwrap();
             assert!(scheduler.pending.contains_key(&key(&path)));
             expected.push((path, "candidate_active", kind, String::new()));
@@ -1049,9 +1052,9 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
                 (old.clone(), PathChange::default()),
                 (new.clone(), PathChange { event: Some(CandidateEvent::Moved(old.clone())), ..PathChange::default() }),
             ]);
-            if fail { *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(new.clone()); }
+            if fail { *crate::postprocess::WATCH_OBSERVATION_HOOK.lock().unwrap() = Some((new.clone(), fail_identity)); }
             scheduler.observe_root_changes(&mut signals.changes).unwrap();
-            *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = None;
+            *crate::postprocess::WATCH_OBSERVATION_HOOK.lock().unwrap() = None;
             assert_eq!(scheduler.pending.contains_key(&key(&new)), !fail);
             expected.push((new, if fail { "candidate_ignored" } else { "candidate_active" },
                 "moved", old.to_string_lossy().into_owned()));

@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::filesystem::{watch_file_observation_known_kind, WatchFileObservation};
+use crate::filesystem::{watch_observed_file_snapshot, WatchFileObservation};
 
 #[derive(Clone)]
 pub(crate) struct WatchCandidateRow {
@@ -77,8 +77,11 @@ pub(crate) fn remove_owned_tree(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-// Inject after successful metadata, at the identity/USN observation boundary.
-pub(crate) static WATCH_OBSERVATION_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+type WatchObservationHook = (PathBuf, fn(&Path) -> io::Result<()>);
+
+#[cfg(test)]
+pub(crate) static WATCH_OBSERVATION_HOOK: std::sync::Mutex<Option<WatchObservationHook>> =
+    std::sync::Mutex::new(None);
 
 pub(crate) fn watch_candidate_for_path(
     path: &Path,
@@ -99,39 +102,29 @@ fn watch_candidate(
     since_usn: Option<i64>,
     report_absent: bool,
 ) -> io::Result<Option<WatchCandidateRow>> {
-    // An unobservable candidate ends this admission attempt, as in main.
-    // USN and readiness failures remain separately classified below.
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if report_absent && matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
-            return Err(error);
+    let Some(snapshot) = watch_observed_file_snapshot(path, since_usn, report_absent, || {
+        #[cfg(test)]
+        {
+            let hook = WATCH_OBSERVATION_HOOK.lock().unwrap().as_ref()
+                .filter(|(target, _)| target == path).map(|(_, hook)| *hook);
+            if let Some(hook) = hook { hook(path)?; }
         }
-        Err(_) => return Ok(None),
+        Ok(())
+    })? else {
+        return Ok(None);
     };
-    if !metadata.is_file() {
-        return Ok(None);
-    }
-    watch_candidate_from_metadata(path, &metadata, since_usn)
-}
-
-fn watch_candidate_from_metadata(
-    path: &Path,
-    metadata: &fs::Metadata,
-    since_usn: Option<i64>,
-) -> io::Result<Option<WatchCandidateRow>> {
-    if metadata.len() == 0 {
-        return Ok(None);
-    }
-    #[cfg(test)]
-    if WATCH_OBSERVATION_FAILURE.lock().unwrap().as_deref() == Some(path) {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected identity observation failure"));
-    }
-    let observation = watch_file_observation_known_kind(path, since_usn, false)?;
+    // The observation belongs to the name we opened. Resolving it again
+    // after a rename can attach that observation to another Watch root.
+    let event_path = if path.is_absolute() {
+        path.to_string_lossy().into_owned()
+    } else {
+        std::path::absolute(path)?.to_string_lossy().into_owned()
+    };
     Ok(Some(WatchCandidateRow {
-        path: normalize_path(path),
-        size: metadata.len(),
-        mtime: mtime_seconds(metadata),
-        observation,
+        path: event_path,
+        size: snapshot.metadata.len(),
+        mtime: mtime_seconds(&snapshot.metadata),
+        observation: snapshot.observation(),
     }))
 }
 

@@ -121,27 +121,79 @@ impl<T> WatchFileSnapshot<T> {
     }
 }
 
+enum WatchSnapshotMode {
+    Observe { report_absent: bool },
+    Ready,
+}
+
+/// Observe a file before admission, while its writer may still be open.
+pub(crate) fn watch_observed_file_snapshot(
+    path: &Path,
+    since_usn: Option<i64>,
+    report_absent: bool,
+    before_identity: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Option<WatchFileSnapshot<()>>> {
+    watch_file_snapshot(
+        path,
+        since_usn,
+        WatchSnapshotMode::Observe { report_absent },
+        |_, _| before_identity(),
+    )
+}
+
 /// Sample one file object while its sharing mode excludes writers and renames.
 pub(crate) fn watch_ready_file_snapshot<T>(
     path: &Path,
     since_usn: Option<i64>,
     capture: impl FnOnce(&File, &std::fs::Metadata) -> io::Result<T>,
 ) -> io::Result<Option<WatchFileSnapshot<T>>> {
+    watch_file_snapshot(path, since_usn, WatchSnapshotMode::Ready, capture)
+}
+
+fn watch_file_snapshot<T>(
+    path: &Path,
+    since_usn: Option<i64>,
+    mode: WatchSnapshotMode,
+    capture: impl FnOnce(&File, &std::fs::Metadata) -> io::Result<T>,
+) -> io::Result<Option<WatchFileSnapshot<T>>> {
     let (metadata, captured, file, volume) = {
-        let handle = match open_path(path, GENERIC_READ, FILE_SHARE_READ, false) {
-            Ok(handle) => handle,
-            Err(error) if matches!(
-                error.raw_os_error(),
-                Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
-            ) => return Ok(None),
-            Err(error) => return Err(error),
+        let _resource = crate::io::resource_lifecycle::NativeResourceGuard::register(
+            [path.to_path_buf()],
+        )?;
+        let (access, share, allow_directory) = match mode {
+            WatchSnapshotMode::Observe { .. } => (FILE_READ_ATTRIBUTES, SHARE_ALL, true),
+            WatchSnapshotMode::Ready => (GENERIC_READ, FILE_SHARE_READ, false),
         };
-        let metadata = handle.file.metadata()?;
+        let handle = match open_watch_path(path, access, share, allow_directory) {
+            Ok(handle) => handle,
+            Err(error) => return match mode {
+                WatchSnapshotMode::Observe { report_absent } => {
+                    let missing = matches!(
+                        error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    );
+                    // Keep diagnostics for visible files whose identity cannot
+                    // be read. This fallback classifies the error only.
+                    if (missing && report_absent) || (!missing && std::fs::metadata(path)
+                        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0))
+                    {
+                        Err(error)
+                    } else {
+                        Ok(None)
+                    }
+                }
+                WatchSnapshotMode::Ready if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+                ) => Ok(None),
+                _ => Err(error),
+            },
+        };
+        let metadata = handle.metadata()?;
         if !metadata.is_file() || metadata.len() == 0 {
             return Ok(None);
         }
-        let captured = capture(&handle.file, &metadata)?;
-        let (file, volume) = read_watch_observation(&handle.file, path, since_usn)?;
+        let captured = capture(&handle, &metadata)?;
+        let (file, volume) = read_watch_observation(&handle, path, since_usn)?;
         (metadata, captured, file, volume)
     };
     Ok(Some(WatchFileSnapshot {
@@ -198,9 +250,9 @@ fn volume_for_handle(file: &File, path: &Path) -> io::Result<String> {
     .map_or_else(|| volume_device(path), Ok)
 }
 
-pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {
-    // Permit readers; writers and DELETE access (rename/delete) must conflict.
-    match open_path(path, GENERIC_READ, FILE_SHARE_READ, false) {
+pub(super) fn watch_file_is_readable(path: &Path, allow_writer: bool) -> io::Result<bool> {
+    let share = if allow_writer { SHARE_ALL } else { FILE_SHARE_READ };
+    match open_path(path, GENERIC_READ, share, false) {
         Ok(_handle) => Ok(true),
         Err(error)
             if matches!(

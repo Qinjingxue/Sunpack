@@ -12,7 +12,7 @@ pub(crate) struct WatchFileObservation {
 mod windows;
 
 #[cfg(windows)]
-pub(crate) use windows::{watch_ready_file_snapshot, WatchFileSnapshot};
+pub(crate) use windows::{watch_observed_file_snapshot, watch_ready_file_snapshot, WatchFileSnapshot};
 
 #[cfg(not(windows))]
 pub(crate) fn watch_file_observation(
@@ -291,13 +291,17 @@ pub(crate) fn watch_volume_cursor(volume: &str) -> std::io::Result<(u64, i64)> {
 }
 
 pub(crate) fn watch_file_is_ready(path: &str) -> std::io::Result<bool> {
+    watch_file_is_readable(path, false)
+}
+
+pub(crate) fn watch_file_is_readable(path: &str, allow_writer: bool) -> std::io::Result<bool> {
     #[cfg(windows)]
     {
-        return windows::watch_file_is_ready(Path::new(path));
+        return windows::watch_file_is_readable(Path::new(path), allow_writer);
     }
     #[cfg(not(windows))]
     {
-        let _ = path;
+        let _ = (path, allow_writer);
         Err(std::io::Error::other("watch mode requires Windows NTFS or ReFS"))
     }
 }

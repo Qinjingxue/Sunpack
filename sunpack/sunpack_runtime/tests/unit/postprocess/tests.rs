@@ -9,6 +9,38 @@ fn unobservable_metadata_retires_candidate_without_retry() {
     assert!(watch_candidate_for_path(path, None).unwrap().is_none());
 }
 
+#[test]
+fn watch_observation_keeps_its_path_and_file_identity_during_rename() {
+    let directory = TestDirectory::new("cross-root-observation");
+    let left = directory.path().join("left");
+    let right = directory.path().join("right");
+    fs::create_dir(&left).unwrap();
+    fs::create_dir(&right).unwrap();
+    let path = left.join("delivery.zip");
+    let destination = right.join("delivery.zip");
+    let replacement = left.join("replacement.zip");
+    fs::write(&path, b"original").unwrap();
+    fs::write(&replacement, b"replacement bytes").unwrap();
+    let original = watch_candidate_for_path(&path, None).unwrap().unwrap();
+
+    *WATCH_OBSERVATION_HOOK.lock().unwrap() = Some((path.clone(), |path| {
+        let left = path.parent().unwrap();
+        let new_name = left.parent().unwrap().join("right").join(path.file_name().unwrap());
+        fs::rename(path, new_name)?;
+        fs::rename(left.join("replacement.zip"), path)
+    }));
+    let sampled = watch_candidate_for_path(&path, None);
+    *WATCH_OBSERVATION_HOOK.lock().unwrap() = None;
+    let sampled = sampled.unwrap().unwrap();
+    let moved = watch_candidate_for_path(&destination, None).unwrap().unwrap();
+    let reused = watch_candidate_for_path(&path, None).unwrap().unwrap();
+
+    assert_eq!(Path::new(&sampled.path), path);
+    assert_eq!(sampled.size, original.size);
+    assert_eq!(sampled.observation.file_id, moved.observation.file_id);
+    assert_ne!(sampled.observation.file_id, reused.observation.file_id);
+}
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TestDirectory(PathBuf);
