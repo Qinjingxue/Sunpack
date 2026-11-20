@@ -756,14 +756,6 @@
       "zh": "更改右键菜单",
       "en": "Change context menu registration"
     },
-    "contextMenuScriptMissing": {
-      "zh": "SunPack 的右键菜单脚本缺失。",
-      "en": "The SunPack context menu script is missing."
-    },
-    "contextMenuScriptFailed": {
-      "zh": "右键菜单脚本执行失败（退出码 {code}）。",
-      "en": "The context menu script failed (exit code {code})."
-    },
     "opSubscribeService": {
       "zh": "订阅服务状态",
       "en": "Subscribe to service status"

@@ -1,18 +1,29 @@
 #include "application.hpp"
 #include "presentation.hpp"
+#include <algorithm>
 #include <shellapi.h>
 
 int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
     HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     int result=1;
+    bool context_menu_command=false;
     spg::fs::path data_dir;
     try {
         int count=0; auto** argv=CommandLineToArgvW(GetCommandLineW(),&count);
         if(!argv) spg::win_error("opCommandLine");
         std::vector<std::wstring> args(argv+1,argv+count); LocalFree(argv);
+        context_menu_command=std::find(args.begin(),args.end(),L"--context-menu")!=args.end();
         auto options=spg::parse_options(args); data_dir=options.data_dir;
         // Shell actions are one-shot clients, independent of the manager window.
         // Dispatch before the GUI singleton so an open manager cannot swallow them.
+        if(options.context_menu) {
+            if(!options.allow_cli) throw std::runtime_error("cliUnbound");
+            auto language=*options.context_menu==spg::ContextMenuAction::Enable
+                ?spg::startup_language(data_dir):std::string{};
+            spg::change_context_menu(options.cli,*options.context_menu,language);
+            if(SUCCEEDED(com)) CoUninitialize();
+            return 0;
+        }
         if(!options.shell_watch.empty()) {
             if(!options.allow_cli) throw std::runtime_error("cliMissing");
             options.cli.cwd=options.cli.app_root;
@@ -40,9 +51,13 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
             spg::Application app(std::move(options)); result=app.run();
         }
     } catch(const std::exception& e) {
-        auto language=data_dir.empty()?"en":spg::startup_language(data_dir);
-        auto message=spg::wide(spg::translated_error(e.what(),language));
-        MessageBoxW(nullptr,message.c_str(),spg::wide(spg::tr("title",language)).c_str(),MB_ICONERROR|MB_OK);
+        if(context_menu_command) {
+            if(const auto* error=dynamic_cast<const spg::WinError*>(&e)) result=int(error->code);
+        } else {
+            auto language=data_dir.empty()?"en":spg::startup_language(data_dir);
+            auto message=spg::wide(spg::translated_error(e.what(),language));
+            MessageBoxW(nullptr,message.c_str(),spg::wide(spg::tr("title",language)).c_str(),MB_ICONERROR|MB_OK);
+        }
     }
     if(SUCCEEDED(com)) CoUninitialize();
     return result;

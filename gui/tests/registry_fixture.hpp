@@ -4,6 +4,15 @@
 #include <cassert>
 #include <string>
 #include <utility>
+#include <vector>
+
+inline std::wstring registry_string(const std::wstring& path, const wchar_t* name = nullptr) {
+    DWORD bytes=0;
+    assert(RegGetValueW(HKEY_CURRENT_USER,path.c_str(),name,RRF_RT_REG_SZ,nullptr,nullptr,&bytes)==ERROR_SUCCESS);
+    std::vector<wchar_t> text(bytes/sizeof(wchar_t));
+    assert(RegGetValueW(HKEY_CURRENT_USER,path.c_str(),name,RRF_RT_REG_SZ,nullptr,text.data(),&bytes)==ERROR_SUCCESS);
+    return text.data();
+}
 
 // Redirect HKCU in the test process only. In particular, theme selectors and
 // simulated Windows theme changes must never touch the developer's settings.

@@ -1,6 +1,5 @@
 #include "platform.hpp"
 #include "presentation.hpp"
-#include <shellapi.h>
 #include <shobjidl.h>
 #include <shlobj.h>
 #include <xxhash.h>
@@ -92,13 +91,12 @@ std::wstring mutex_name(const fs::path& p, const std::wstring& prefix) {
     s << L"Local\\" << prefix << L"-" << std::hex << std::setfill(L'0') << std::setw(16) << XXH64(bytes.data(), bytes.size(), 0);
     return s.str();
 }
-FileMutex::FileMutex(const fs::path& p, const std::wstring& prefix)
-    : handle(CreateMutexW(nullptr, FALSE, mutex_name(p, prefix).c_str())) {
+MutexLock::MutexLock(const std::wstring& name) : handle(CreateMutexW(nullptr, FALSE, name.c_str())) {
     if (!handle.value) win_error("opCreateMutex");
     auto status = WaitForSingleObject(handle, INFINITE);
     if (status != WAIT_OBJECT_0 && status != WAIT_ABANDONED) win_error("opWaitMutex");
 }
-FileMutex::~FileMutex() { ReleaseMutex(handle); }
+MutexLock::~MutexLock() { ReleaseMutex(handle); }
 std::string read_file(const fs::path& p, size_t limit) {
     Handle f(CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
@@ -226,47 +224,6 @@ bool startup_enabled() {
     RegCloseKey(key);
     if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) { SetLastError(rc); win_error("opReadStartupValue"); }
     return rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ);
-}
-bool context_menu_enabled() {
-    // A surviving Explorer entry is enough to offer removal of a partial registration.
-    constexpr const wchar_t* keys[] = {
-        L"Software\\Classes\\Directory\\shell\\SunPack",
-        L"Software\\Classes\\Directory\\Background\\shell\\SunPack",
-        L"Software\\Classes\\*\\shell\\SunPack",
-    };
-    for (auto path : keys) {
-        HKEY key{};
-        auto rc = RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_QUERY_VALUE, &key);
-        if (rc == ERROR_SUCCESS) { RegCloseKey(key); return true; }
-        if (rc != ERROR_FILE_NOT_FOUND && rc != ERROR_PATH_NOT_FOUND) {
-            SetLastError(rc); win_error("opReadContextMenu");
-        }
-    }
-    return false;
-}
-void set_context_menu_enabled(const CliCommand& cli, bool enabled, HANDLE stop) {
-    const auto& app = cli.app_root;
-    const auto script = app / "scripts" / (enabled ? "register_context_menu.ps1" : "unregister_context_menu.ps1");
-    std::error_code ec;
-    if (!fs::is_regular_file(script, ec)) throw std::runtime_error("contextMenuScriptMissing");
-
-    wchar_t system_directory[MAX_PATH];
-    if (!GetSystemDirectoryW(system_directory, MAX_PATH)) win_error("opChangeContextMenu");
-    const auto powershell = fs::path(system_directory) / L"WindowsPowerShell\\v1.0\\powershell.exe";
-    std::vector<std::wstring> args{
-        L"-NoLogo", L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy", L"Bypass", L"-File", script.wstring()};
-    if (enabled) {
-        args.push_back(L"-AppPath");
-        args.push_back(cli.executable.wstring());
-        args.push_back(L"-GuiPath");
-        args.push_back(executable_path().wstring());
-        args.push_back(L"-ConfigPath");
-        args.push_back((cli.cwd / "sunpack_config.json").wstring());
-    }
-    auto result = run_cli({powershell, app, {}}, args, stop);
-    if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return;
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
-    if (result.code != 0) throw std::runtime_error(error_text("contextMenuScriptFailed", {{"code", result.code}}));
 }
 fs::path choose_directory(HWND owner, const fs::path& initial) {
     IFileOpenDialog* dialog = nullptr;

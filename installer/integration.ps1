@@ -1,9 +1,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('RegisterToast', 'EnableContextMenu', 'DisableContextMenu', 'EnableStartup',
-        'DisableStartup', 'StartDaemon', 'UninstallToast', 'RemoveGuiPreferences')]
+        'DisableStartup', 'StartDaemon', 'UninstallToast', 'RemoveGuiPreferences', 'GetContextMenuState')]
     [string]$Action,
-    [switch]$ShellUser
+    [switch]$ShellUser,
+    [switch]$MigrateContextMenu
 )
 
 Set-StrictMode -Version Latest
@@ -14,9 +15,32 @@ $launcher = Join-Path $app 'bin\sunpack.exe'
 $toastClsid = '{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}'
 $toastClass = "HKLM:\Software\Classes\CLSID\$toastClsid"
 $toastAppId = 'HKCU:\Software\Classes\AppUserModelId\SunPack.Watch.Toast'
+$contextMenuRoots = @('Directory\shell\SunPack', 'Directory\Background\shell\SunPack', '*\shell\SunPack')
 
 function Remove-Registration([string]$Path) {
     if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }
+}
+
+function Remove-LegacyContextMenu([string]$Hive) {
+    foreach ($key in ($contextMenuRoots + @(
+        'SunPack.FolderContextMenu', 'SunPack.BackgroundContextMenu', 'SunPack.FileContextMenu'
+    ))) {
+        Remove-Registration "$Hive\Software\Classes\$key"
+    }
+}
+
+function Invoke-ContextMenu([string]$Mode) {
+    $gui = Join-Path $app 'SunPackGUI.exe'
+    if ($Mode -eq 'enable' -and $MigrateContextMenu) {
+        if (-not (Test-Path -LiteralPath $gui -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
+            throw 'SunPack context menu executables are missing.'
+        }
+        Remove-LegacyContextMenu 'HKCU:'
+    }
+    $process = Start-Process -FilePath $gui -ArgumentList '--context-menu', $Mode -WorkingDirectory $app -WindowStyle Hidden -Wait -PassThru
+    try { return $process.ExitCode }
+    finally { $process.Dispose() }
 }
 
 function Invoke-Daemon([string[]]$Arguments) {
@@ -147,8 +171,21 @@ public static class SunPackSetupShell {
     }
 }
 '@
+    if ($UserAction -eq 'GetContextMenuState') {
+        $system = [Environment]::SystemDirectory
+        $reg = Join-Path $system 'reg.exe'
+        foreach ($key in $contextMenuRoots) {
+            $code = [SunPackSetupShell]::Run($reg, ('query "HKCU\Software\Classes\{0}"' -f $key), $system)
+            if ($code -eq 0 -or ($MigrateContextMenu -and (Test-Path -LiteralPath "HKLM:\Software\Classes\$key"))) {
+                return 0
+            }
+            if ($code -ne 1) { return $code }
+        }
+        return 10
+    }
     $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
     $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Action {1} -ShellUser' -f $PSCommandPath, $UserAction
+    if ($MigrateContextMenu) { $arguments += ' -MigrateContextMenu' }
     return [SunPackSetupShell]::Run($powershell, $arguments, $app)
 }
 
@@ -161,7 +198,7 @@ if (-not $ShellUser) {
         Set-ItemProperty -LiteralPath $server -Name 'ServerExecutable' -Value $launcher
     }
     if ($Action -in @('EnableContextMenu', 'DisableContextMenu')) {
-        & (Join-Path $PSScriptRoot 'unregister_context_menu.ps1') -Machine
+        Remove-LegacyContextMenu 'HKLM:'
     }
     if ($Action -eq 'UninstallToast') {
         try { Remove-Registration $toastClass }
@@ -183,8 +220,8 @@ switch ($Action) {
         $null = New-ItemProperty -LiteralPath $toastAppId -Name 'IconBackgroundColor' -Value 'FF0078D4' -PropertyType String -Force
         $null = New-ItemProperty -LiteralPath $toastAppId -Name 'CustomActivator' -Value $toastClsid -PropertyType String -Force
     }
-    'EnableContextMenu' { & (Join-Path $PSScriptRoot 'register_context_menu.ps1') }
-    'DisableContextMenu' { & (Join-Path $PSScriptRoot 'unregister_context_menu.ps1') }
+    'EnableContextMenu' { exit (Invoke-ContextMenu 'enable') }
+    'DisableContextMenu' { exit (Invoke-ContextMenu 'disable') }
     'EnableStartup' { Invoke-Daemon @('startup', 'enable') }
     'DisableStartup' { Invoke-Daemon @('startup', 'disable') }
     'StartDaemon' { Invoke-Daemon @('start') }

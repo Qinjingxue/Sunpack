@@ -35,10 +35,14 @@ std::wstring path_key(const fs::path& path);
 bool is_under(const std::wstring& candidate, const std::wstring& root);
 fs::path resolve_path(const fs::path& path, const fs::path& base = {});
 std::wstring mutex_name(const fs::path& path, const std::wstring& prefix = L"SunPack.EditableFile");
-struct FileMutex {
+struct MutexLock {
     Handle handle;
-    FileMutex(const fs::path& path, const std::wstring& prefix = L"SunPack.EditableFile");
-    ~FileMutex();
+    explicit MutexLock(const std::wstring& name);
+    ~MutexLock();
+};
+struct FileMutex : MutexLock {
+    FileMutex(const fs::path& path, const std::wstring& prefix = L"SunPack.EditableFile")
+        : MutexLock(mutex_name(path,prefix)) {}
 };
 // One outstanding overlapped request; cancellation joins before handles are closed.
 class DirectoryWatcher {
@@ -63,7 +67,8 @@ void save_theme_choice(ThemeChoice choice);
 fs::path choose_directory(HWND owner, const fs::path& initial = {});
 std::wstring quote_arg(const std::wstring& arg);
 struct CliCommand { fs::path executable, cwd; std::vector<std::wstring> prefix; fs::path app_root; };
-void set_context_menu_enabled(const CliCommand& cli, bool enabled, HANDLE stop);
+enum class ContextMenuAction { Enable, Disable, Refresh };
+void change_context_menu(const CliCommand& cli, ContextMenuAction action, const std::string& language);
 // Read the captured subprocess output only when it fails.
 struct CliResult { DWORD code; std::string output; };
 CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop,const std::string* input=nullptr);

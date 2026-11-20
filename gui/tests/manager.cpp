@@ -2,6 +2,8 @@
 #include "presentation.hpp"
 #include "range_editor.hpp"
 #include "event_publication.hpp"
+#include "registry_fixture.hpp"
+#include <shellapi.h>
 #include <cassert>
 #include <fstream>
 #include <iostream>
@@ -16,23 +18,82 @@ struct Fixture {
     Fixture() { GUID id{}; CoCreateGuid(&id); wchar_t token[40]; StringFromGUID2(id,token,40); dir=fs::temp_directory_path()/token; fs::create_directory(dir); }
     ~Fixture() { std::error_code ec; fs::remove_all(dir,ec); }
 };
+constexpr wchar_t context_classes[]=L"Software\\Classes\\";
+constexpr const wchar_t* menu_classes[]={L"SunPack.FolderContextMenu",L"SunPack.BackgroundContextMenu",L"SunPack.FileContextMenu"};
+constexpr const wchar_t* menu_parents[]={L"Directory\\shell\\SunPack",L"Directory\\Background\\shell\\SunPack",L"*\\shell\\SunPack"};
+constexpr const wchar_t* menu_verbs[]={L"DirectExtract",L"PromptPassword",L"RecursiveExtract",L"WatchFolder",L"WatchFolderRecursive",L"UnwatchFolder"};
+
+Json menu_commands() {
+    Json commands=Json::object();
+    for(size_t surface=0;surface<std::size(menu_classes);++surface) {
+        auto root=std::wstring(context_classes)+menu_classes[surface]+L"\\shell\\";
+        const auto parent=std::wstring(context_classes)+menu_parents[surface];
+        assert(registry_string(parent,L"ExtendedSubCommandsKey")==menu_classes[surface]);
+        for(size_t verb=0;verb<(surface==2?2:std::size(menu_verbs));++verb) {
+            const auto path=root+menu_verbs[verb];
+            commands[utf8(menu_classes[surface])][utf8(menu_verbs[verb])]={
+                {"label",utf8(registry_string(path,L"MUIVerb"))},{"command",utf8(registry_string(path+L"\\command"))}};
+        }
+    }
+    return commands;
+}
+
 void native_context_menu_entrypoint(Fixture& fixture) {
-    const auto app = fixture.dir / "checkout";
-    fs::create_directories(app / "scripts");
-    // Intercept only this test's script dispatch, never touch shell registration.
-    atomic_write(app / "scripts" / "register_context_menu.ps1",
-        "param([Parameter(Mandatory=$true)][string]$AppPath,[string]$GuiPath,[string]$ConfigPath)\n"
-        "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'enabled.txt') -Value $AppPath,$ConfigPath -Encoding UTF8");
-    atomic_write(app / "scripts" / "unregister_context_menu.ps1",
-        "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'disabled.txt') -Value 'ok' -Encoding UTF8");
-    CliCommand cli{app / "sunpack" / "sunpack_launcher.exe", fixture.dir, {}, app};
-    Handle stop(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    set_context_menu_enabled(cli, true, stop);
-    const auto enabled = read_file(app / "scripts" / "enabled.txt");
-    assert(enabled.find(utf8(cli.executable.wstring())) != std::string::npos);
-    assert(enabled.find(utf8((fixture.dir / "sunpack_config.json").wstring())) != std::string::npos);
-    set_context_menu_enabled(cli, false, stop);
-    assert(fs::is_regular_file(app / "scripts" / "disabled.txt"));
+    RegistryFixture registry;
+    const auto app=fixture.dir/L"SunPack 中文 & (test)";
+    const auto launcher=app/L"bin"/L"sunpack.exe";
+    atomic_write(launcher,"");
+    CliCommand cli{launcher,fixture.dir,{},app};
+    change_context_menu(cli,ContextMenuAction::Refresh,"zh");
+    assert(!context_menu_enabled());
+    change_context_menu(cli,ContextMenuAction::Enable,"zh");
+    assert(context_menu_enabled());
+    const auto chinese=menu_commands();
+    assert(chinese["SunPack.FolderContextMenu"]["DirectExtract"]["label"]=="解压该目录下文件");
+    assert(chinese["SunPack.BackgroundContextMenu"]["RecursiveExtract"]["label"]=="递归解压目录下文件");
+    assert(chinese["SunPack.FileContextMenu"]["PromptPassword"]["label"]=="输入密码解压该文件");
+    change_context_menu(cli,ContextMenuAction::Refresh,"en");
+    const auto english=menu_commands();
+    assert(english["SunPack.FolderContextMenu"]["DirectExtract"]["label"]=="Extract files in this folder");
+    for(size_t surface=0;surface<std::size(menu_classes);++surface) {
+        const auto name=utf8(menu_classes[surface]);
+        for(const auto& [key, entry]:english[name].items()) {
+            assert(entry["command"]==chinese[name][key]["command"]);
+            auto line=wide(entry["command"].get<std::string>());
+            auto token=surface==1?L"%V":L"%1";
+            for(auto pos=line.find(token);pos!=std::wstring::npos;pos=line.find(token,pos))
+                line.replace(pos,2,surface==2?L"D:\\file.bin":L"D:\\");
+            int argc=0;
+            auto argv=CommandLineToArgvW(line.c_str(),&argc);
+            assert(argv);
+            const std::vector<std::wstring> args(argv,argv+argc);
+            LocalFree(argv);
+            if(key.find("Watch")!=std::string::npos || key=="UnwatchFolder") {
+                assert(args[6]==(key=="UnwatchFolder"?L"remove":L"add"));
+                assert(resolve_path(args[7])==L"D:\\");
+                assert(args.size()==(key=="WatchFolderRecursive"?9:8));
+            } else if(surface==2) {
+                const auto tail=key=="PromptPassword"?std::vector<std::wstring>{L"-a",L"-d",L"-pa"}
+                    :std::vector<std::wstring>{L"-d",L"-pa"};
+                assert(args[0]==launcher && args[1]==L"extract" && args[2]==L"D:\\file.bin");
+                assert(std::vector<std::wstring>(args.begin()+3,args.end())==tail);
+            } else {
+                assert(args[0]==launcher && args[1]==L"extract" && resolve_path(args[2])==L"D:\\");
+                assert(args[3]==L"-o" && resolve_path(args[4])==L"D:\\");
+                assert(args.back()==L"-pa");
+                const auto flag=key=="PromptPassword"?L"-a":L"-R";
+                assert(key=="DirectExtract"?args.size()==6:args.size()==7 && args[5]==flag);
+            }
+        }
+    }
+    change_context_menu(cli,ContextMenuAction::Disable,{});
+    change_context_menu(cli,ContextMenuAction::Disable,{});
+    assert(!context_menu_enabled());
+    for(const auto* name:menu_classes) {
+        HKEY key{};
+        assert(RegOpenKeyExW(HKEY_CURRENT_USER,(std::wstring(context_classes)+name).c_str(),
+            0,KEY_READ,&key)==ERROR_FILE_NOT_FOUND);
+    }
 }
 
 void require_save(const Json& result) {
@@ -559,6 +620,12 @@ int wmain(int argc,wchar_t** argv) {
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
     if(argc==4 && std::wstring(argv[1])==L"--password-add") { save_password_edit(argv[2],{{"operation","add"},{"value",utf8(argv[3])}}); return 0; }
+    if(argc==4 && std::wstring(argv[1])==L"--context-menu-commands") {
+        RegistryFixture registry;
+        change_context_menu({argv[2],{}, {},argv[3]},ContextMenuAction::Enable,"en");
+        std::cout<<menu_commands().dump(-1,' ',true);
+        return 0;
+    }
     try { Fixture f; native_context_menu_entrypoint(f); projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};

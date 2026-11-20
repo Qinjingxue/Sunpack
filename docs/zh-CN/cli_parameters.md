@@ -183,7 +183,7 @@ sunpack.exe watch add D:\Downloads -d
 sunpack.exe daemon start
 ```
 
-目录对象的解压菜单为“解压该目录下文件”“输入密码解压该目录下文件”；目录空白处的解压菜单为“解压目录下文件”“输入密码解压目录下文件”。两种目录菜单还提供“监控此目录”“取消监控此目录”，这些入口不附加 `-d`。文件对象的两个解压入口默认启用 `-d`。重新运行 `scripts/register_context_menu.ps1` 会重建菜单并移除过时入口。
+目录对象和目录空白处的右键菜单都提供直接解压、递归解压、输入密码解压、监控、递归监控和取消监控。文件对象的两个解压入口默认启用 `-d`。
 
 ## daemon（简写 d）
 
@@ -273,14 +273,14 @@ sunpack.exe version
 
 ## Windows 右键菜单
 
-在普通 PowerShell 会话中运行以下脚本，管理当前用户的右键菜单。
+可在 SunPack GUI 设置中管理当前用户的资源管理器右键菜单，也可在程序目录中运行以下任一命令。
 
 ```powershell
-.\scripts\register_context_menu.ps1
-.\scripts\unregister_context_menu.ps1
+.\SunPackGUI.exe --context-menu enable
+.\SunPackGUI.exe --context-menu disable
 ```
 
-发行包内的注册脚本使用脚本父目录中的 `sunpack.exe`。从源码树运行时，脚本会识别唯一的 `dist/sunpack-*/sunpack.exe`；存在多个构建产物时使用 `-AppPath` 明确指定。
+命令以无窗口模式执行，进程退出码为零表示成功。开发构建可用 `--app-root` 和 `--cli` 指定程序目录和启动器。
 
 文件夹对象菜单提供“解压该目录下文件”“输入密码解压该目录下文件”，目录空白处菜单提供“解压目录下文件”“输入密码解压目录下文件”；两者还提供监控和取消监控动作。任意文件的菜单提供“解压该文件”“输入密码解压该文件”，对应命令分别相当于：
 

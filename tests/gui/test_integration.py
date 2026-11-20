@@ -14,7 +14,18 @@ from pathlib import Path
 import pytest
 
 from tests.helpers.installer import inno_compiler
-from tests.unit.test_context_menu_registration import _windows_argv
+
+def _windows_argv(command: str) -> list[str]:
+    parse = ctypes.windll.shell32.CommandLineToArgvW
+    parse.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    parse.restype = ctypes.POINTER(wintypes.LPWSTR)
+    count = ctypes.c_int()
+    argv = parse(command, ctypes.byref(count))
+    ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    try:
+        return [argv[index] for index in range(count.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
 
 
 @pytest.mark.requires_watch_broker
@@ -230,46 +241,38 @@ def test_rust_writer_cpp_query_contract(repo_root, contract):
 
 
 @pytest.mark.parametrize(
-    ("menu_key", "expected_args"),
+    ("surface", "verb", "expected_args"),
     [
-        ("background_watch", ["watch", "add"]),
-        ("folder_recursive_watch", ["watch", "add", "-R"]),
-        ("background_unwatch", ["watch", "remove"]),
+        ("Background", "WatchFolder", ["watch", "add"]),
+        ("Folder", "WatchFolderRecursive", ["watch", "add", "-R"]),
+        ("Background", "UnwatchFolder", ["watch", "remove"]),
     ],
 )
-def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, repo_root, menu_key, expected_args, native_argument_recorder):
+def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, repo_root, surface, verb, expected_args, native_argument_recorder):
     # Exercise Explorer command -> actual GUI -> hidden native CLI, not merely
-    # registry text. The script tests cover both surfaces for every operation.
-    scripts_dir = tmp_path / "menu scripts"
-    scripts_dir.mkdir()
-    registration_script = "register_context_menu.ps1"
-    shutil.copyfile(repo_root / "scripts" / registration_script, scripts_dir / registration_script)
+    # registry text. The probe reads production commands from redirected HKCU.
     arch = "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x64"
-    target = {"arm64": "aarch64-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc"}[arch]
-    stub = tmp_path / ".cache" / "native" / arch / "ci" / "sevenzip_bridge" / "Release" / "sunpack_launcher.exe"
+    stub = tmp_path / "bin" / "sunpack.exe"
     stub.parent.mkdir(parents=True)
     shutil.copyfile(native_argument_recorder, stub)
-    runtime = tmp_path / ".cache" / "rust-target" / target / "ci" / "sunpack-runtime.exe"
-    runtime.parent.mkdir(parents=True)
-    runtime.touch()
     probe = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"))
     gui = probe.with_name("SunPackGUI.exe")
     assert gui.is_file(), "Build scripts/build_gui.ps1 before running GUI shell integration"
-    shutil.copyfile(gui, tmp_path / "SunPackGUI.exe")
     folder = tmp_path / "WeChat's 中文 Files & (2026)"
     folder.mkdir()
     completed = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-File", str(scripts_dir / registration_script), "-DryRun"],
+        [str(probe), "--context-menu-commands", str(stub), str(tmp_path)],
         check=True, capture_output=True, text=True, encoding="utf-8-sig", timeout=30,
     )
     commands = json.loads(completed.stdout.strip().splitlines()[-1])
-    command = commands[menu_key].replace("%1", str(folder)).replace("%V", str(folder))
+    command = commands[f"SunPack.{surface}ContextMenu"][verb]["command"]
+    argv = _windows_argv(command.replace("%1", str(folder)).replace("%V", str(folder)))
+    argv[0] = str(gui)
     # Hold the real manager's singleton name on one route. Shell actions must
     # still run rather than activating the existing window and dropping work.
     mutex = None
     kernel = ctypes.windll.kernel32
-    if menu_key == "folder_recursive_watch":
+    if verb == "WatchFolderRecursive":
         names = subprocess.check_output([str(probe), "--mutex", str(tmp_path)], text=True)
         name = names.splitlines()[0].replace("SunPack.EditableFile", "SunPack.GUI")
         kernel.CreateMutexW.restype = wintypes.HANDLE
@@ -277,10 +280,10 @@ def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, repo
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         mutex = kernel.CreateMutexW(None, False, name)
         assert mutex
-        command += ' --data-dir "' + str(tmp_path) + '"'
+        argv += ["--data-dir", str(tmp_path)]
     try:
         launched = subprocess.run(
-            _windows_argv(command), capture_output=True, text=True, timeout=30,
+            argv, capture_output=True, text=True, timeout=30,
         )
     finally:
         if mutex:
@@ -295,6 +298,52 @@ def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, repo
     assert ntpath.normpath(actual[2]) == ntpath.normpath(str(folder))
     assert actual[3:] == expected_args[2:]
     assert stub.with_suffix(".console").read_text() == "False"
+
+
+def test_context_menu_installer_migrates_legacy_user_entries(tmp_path, repo_root, native_argument_recorder):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    integration = scripts / "integration.ps1"
+    shutil.copyfile(repo_root / "installer" / integration.name, integration)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "sunpack.exe").touch()
+    gui = tmp_path / "SunPackGUI.exe"
+    shutil.copyfile(native_argument_recorder, gui)
+    harness = tmp_path / "migrate.ps1"
+    harness.write_text(r"""
+param([string]$Integration)
+$ErrorActionPreference = 'Stop'
+$root = 'HKEY_CURRENT_USER\Software\SunPack.ContextMenuTest_' + [guid]::NewGuid().ToString('N')
+$isolated = "Registry::$root"
+$null = New-Item -Path $isolated -Force
+try {
+    Remove-PSDrive -Name HKCU
+    $null = New-PSDrive -Name HKCU -PSProvider Registry -Root $root
+    $legacy = @(
+        'HKCU:\Software\Classes\Directory\shell\SunPack\shell\OldCommand',
+        'HKCU:\Software\Classes\SunPack.FolderContextMenu\shell\OldCommand'
+    )
+    $unrelated = 'HKCU:\Software\Classes\Directory\shell\OtherApplication'
+    $null = New-Item -Path ($legacy + $unrelated) -Force
+    & $Integration -Action EnableContextMenu -ShellUser -MigrateContextMenu
+    if ($LASTEXITCODE -ne 0 -or @($legacy | Where-Object { Test-Path -LiteralPath $_ }).Count -ne 0 -or
+        -not (Test-Path -LiteralPath $unrelated)) { throw 'User context menu migration failed' }
+    & $Integration -Action DisableContextMenu -ShellUser
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} finally {
+    Remove-PSDrive -Name HKCU
+    Remove-Item -LiteralPath $isolated -Recurse -Force
+}
+""", encoding="ascii")
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness),
+         "-Integration", str(integration)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert gui.with_suffix(".args").read_text().strip().split("\n\n") == [
+        "--context-menu\nenable", "--context-menu\ndisable",
+    ]
 
 
 @pytest.fixture(scope="session")

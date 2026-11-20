@@ -123,6 +123,7 @@ Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:Gro
 ; Keep preparation inputs first for early extraction with solid compression.
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{tmp}"; DestName: "sunpack-config-template.json"; Flags: deleteafterinstall
 Source: "{#SourceDir}\scripts\upgrade_config.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
+Source: "integration.ps1"; DestName: "sunpack-install-integration.ps1"; Flags: dontcopy
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json,scripts\upgrade_config.ps1,scripts\initialize_config_language.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "integration.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
@@ -160,6 +161,10 @@ const
   PathMarkerName = 'PathAddedByInstaller';
   WatchBrokerServiceName = 'SunPackWatchBroker';
   WatchBrokerServiceSddl = 'D:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;LCRP;;;IU)';
+
+var
+  ContextMenuTaskDefaultApplied: Boolean;
+  MigrateLegacyContextMenu: Boolean;
 
 function RunServiceControl(const Parameters: string; var ResultCode: Integer): Boolean;
 begin
@@ -520,12 +525,16 @@ begin
 end;
 
 function RunInstallerIntegration(const Action: string; var ResultCode: Integer): Boolean;
+var
+  Parameters: string;
 begin
   ResultCode := -1;
+  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    AddQuotes(ExpandConstant('{app}\scripts\integration.ps1')) + ' -Action ' + Action;
+  if MigrateLegacyContextMenu and (Action = 'EnableContextMenu') then
+    Parameters := Parameters + ' -MigrateContextMenu';
   Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-      AddQuotes(ExpandConstant('{app}\scripts\integration.ps1')) + ' -Action ' + Action,
-    ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Parameters, ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 procedure ApplySelectedContextMenuState;
@@ -720,10 +729,53 @@ begin
   StartupTaskDefaultApplied := False;
 end;
 
+procedure ApplyContextMenuTaskDefault;
+var
+  PreviousApp, PreviousVersion, Parameters: string;
+  Version: Int64;
+  ResultCode: Integer;
+  ParsedVersion: Boolean;
+begin
+  if ContextMenuTaskDefaultApplied then
+    Exit;
+  ContextMenuTaskDefaultApplied := True;
+  PreviousVersion := Trim(InstalledVersion);
+  if Lowercase(Copy(PreviousVersion, 1, 1)) = 'v' then
+    Delete(PreviousVersion, 1, 1);
+  PreviousApp := AddBackslash(ExistingApplicationDirectory);
+  ParsedVersion := StrToVersion(PreviousVersion, Version);
+  if not ParsedVersion then
+    ParsedVersion := StrToVersion(PreviousVersion + '.0', Version);
+  if ParsedVersion then
+    MigrateLegacyContextMenu := ComparePackedVersion(Version, PackVersionComponents(1, 5, 1, 0)) < 0
+  else
+    MigrateLegacyContextMenu :=
+      FileExists(PreviousApp + 'scripts\register_context_menu.ps1') or
+      FileExists(PreviousApp + 'scripts\unregister_context_menu.ps1');
+  if HasExplicitTaskSelection or ((PreviousVersion = '') and not FileExists(ExistingLauncherPath)) then
+    Exit;
+  { The menu can be toggled in the GUI after installation, so use its live
+    state for the default, using the same desktop user as integration. }
+  ExtractTemporaryFile('sunpack-install-integration.ps1');
+  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    AddQuotes(ExpandConstant('{tmp}\sunpack-install-integration.ps1')) + ' -Action GetContextMenuState';
+  if MigrateLegacyContextMenu then Parameters := Parameters + ' -MigrateContextMenu';
+  ResultCode := -1;
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Log('Failed to launch the desktop user context menu state query.')
+  else if ResultCode = 0 then WizardSelectTasks('contextmenu')
+  else if ResultCode = 10 then WizardSelectTasks('!contextmenu')
+  else Log(Format('Desktop user context menu state query failed with exit code %d.', [ResultCode]));
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpSelectTasks then
+  begin
     ApplyStartupTaskDefault;
+    ApplyContextMenuTaskDefault;
+  end;
 end;
 
 function UpgradeConfigurationFields: Boolean;
@@ -785,6 +837,7 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   ApplyStartupTaskDefault;
+  ApplyContextMenuTaskDefault;
   { PrepareToInstall can be retried after Watch has already been stopped. }
   if not ExistingWatchStateCaptured then
   begin

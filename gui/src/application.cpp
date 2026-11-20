@@ -140,10 +140,17 @@ Options parse_options(const std::vector<std::wstring>& args) {
             if(action!=L"add" && action!=L"remove") throw std::runtime_error("guiArguments");
             result.shell_watch={L"watch",action,args[++i]};
         }
+        else if(args[i]==L"--context-menu" && i+1<args.size() && !result.context_menu) {
+            const auto& action=args[++i];
+            if(action==L"enable") result.context_menu=ContextMenuAction::Enable;
+            else if(action==L"disable") result.context_menu=ContextMenuAction::Disable;
+            else throw std::runtime_error("guiArguments");
+        }
         else if(args[i]==L"-R" && result.shell_watch.size()==3 && result.shell_watch[1]==L"add")
             result.shell_watch.push_back(L"-R");
         else throw std::runtime_error("guiArguments");
     }
+    if(result.context_menu && !result.shell_watch.empty()) throw std::runtime_error("guiArguments");
     if(result.data_dir.empty()) {
         PWSTR dir=nullptr;
         if(FAILED(SHGetKnownFolderPath(FOLDERID_ProgramData,0,nullptr,&dir))) throw std::runtime_error("programDataUnavailable");
@@ -1306,7 +1313,9 @@ void Application::work() {
                         flags|=ContextMenu;
                         edit_feedback["busy"]=false;
                         if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
-                        set_context_menu_enabled(options_.cli,p.at("enabled").get<bool>(),stop_);
+                        const auto action=p.at("enabled").get<bool>()?ContextMenuAction::Enable:ContextMenuAction::Disable;
+                        change_context_menu(options_.cli,action,action==ContextMenuAction::Enable
+                            ?startup_language(dir):std::string{});
                     } else if(op=="cli") {
                         if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
                         auto action=p.value("action",std::string());
@@ -1482,12 +1491,12 @@ void Application::work() {
                 catch(const std::exception& e){errors["startup"]=e.what();}
             }
             if(refresh_context_menu || flags&ContextMenu || !previous_patch.contains("contextMenuEnabled")) {
-                try { patch["contextMenuEnabled"]=context_menu_enabled(); errors.erase("contextMenu"); }
-                catch(const std::exception& e) { patch["contextMenuEnabled"]=false; errors["contextMenu"]=e.what(); }
-                if(refresh_context_menu && patch["contextMenuEnabled"]==true) {
-                    try { set_context_menu_enabled(options_.cli,true,stop_); }
+                if(refresh_context_menu) {
+                    try { change_context_menu(options_.cli,ContextMenuAction::Refresh,language); }
                     catch(const std::exception& e) { edit_feedback["actionError"]=e.what(); }
                 }
+                try { patch["contextMenuEnabled"]=context_menu_enabled(); errors.erase("contextMenu"); }
+                catch(const std::exception& e) { patch["contextMenuEnabled"]=false; errors["contextMenu"]=e.what(); }
             }
             auto displayed_errors=Json::object();
             for(auto it=errors.begin();it!=errors.end();++it) displayed_errors[tr(it.key(),language)]=translated_error(it.value().get<std::string>(),language);

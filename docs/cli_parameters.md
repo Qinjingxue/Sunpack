@@ -183,7 +183,7 @@ sunpack.exe watch add D:\Downloads -d
 sunpack.exe daemon start
 ```
 
-The directory and directory-background context menus contain four entries: "Extract files in this folder", "Enter password to extract files in this folder", "Watch this folder", and "Stop watching this folder". These entries do not add `-d`. The two file extraction entries enable `-d` by default. Re-run `scripts/register_context_menu.ps1` to rebuild the menus and remove obsolete entries.
+The directory and directory-background context menus offer direct extraction, recursive extraction, password-prompted extraction, watch, recursive watch, and unwatch. The two file extraction entries enable `-d` by default.
 
 ## daemon (alias d)
 
@@ -273,14 +273,14 @@ sunpack.exe version
 
 ## Windows context menu
 
-Run these scripts in a regular PowerShell session to manage the current user's context menu.
+Manage the current user's Explorer context menu from SunPack GUI settings or run either command from the application directory.
 
 ```powershell
-.\scripts\register_context_menu.ps1
-.\scripts\unregister_context_menu.ps1
+.\SunPackGUI.exe --context-menu enable
+.\SunPackGUI.exe --context-menu disable
 ```
 
-The registration script inside the distribution package uses the `sunpack.exe` in its own parent directory. When run from the source tree, the script detects the single unique `dist/sunpack-*/sunpack.exe`; when several build outputs exist, specify one explicitly with `-AppPath`.
+The command runs without opening a window. A process exit code of zero indicates success. For a development build, pass `--app-root` and `--cli` to specify the application directory and launcher.
 
 The folder and folder-background menus offer "Extract files in this folder" and "Enter password to extract files in this folder", plus watch and unwatch actions. The menu for any file offers "Extract this file" and "Enter password to extract this file", equivalent to:
 

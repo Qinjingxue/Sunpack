@@ -72,7 +72,11 @@ var
   StopStage: Integer;
   ExistingWatchStateCaptured, RestartWatchAfterUpgrade: Boolean;
   InitializeLanguageOnInstall, UpgradePrepared: Boolean;
+{{ Task defaults consult the real desktop user's registry. }}
 procedure ApplyStartupTaskDefault;
+begin
+end;
+procedure ApplyContextMenuTaskDefault;
 begin
 end;
 function QueryExistingWatchRunning: Boolean;

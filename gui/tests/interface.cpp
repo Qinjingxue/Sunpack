@@ -564,17 +564,22 @@ void config_edits(Application& app,const fs::path& dir) {
         finish_input(app);
         pump([&]{return state(app.page(),"language")==language;},"Switch interface language");
     };
-    const auto menu_log=dir/"package"/"scripts"/"menu-language.txt";
+    const std::wstring menu_path=L"Software\\Classes\\SunPack.FolderContextMenu\\shell\\DirectExtract";
     change_language(1,"en");
-    assert(!fs::exists(menu_log));
-    // Enable the menu in this process's redirected HKCU after the initial read.
-    HKEY menu{};
-    assert(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Classes\\Directory\\shell\\SunPack",
-        0,nullptr,0,KEY_READ,nullptr,&menu,nullptr)==ERROR_SUCCESS);
-    RegCloseKey(menu);
+    assert(!context_menu_enabled());
+    search_config(app,L"");
+    click(app,"contextMenuToggle");
+    pump([&]{return state(app.page(),"contextMenuEnabled")==true;},"Enable Explorer menu");
+    assert(registry_string(menu_path,L"MUIVerb")==L"Extract files in this folder");
     change_language(0,"zh");
+    assert(registry_string(menu_path,L"MUIVerb")==L"解压该目录下文件");
     change_language(1,"en");
-    assert(state(app.page(),"contextMenuEnabled")==true && read_file(menu_log)=="zh\nen\n");
+    assert(state(app.page(),"contextMenuEnabled")==true);
+    assert(registry_string(menu_path,L"MUIVerb")==L"Extract files in this folder");
+    search_config(app,L"");
+    click(app,"contextMenuToggle");
+    pump([&]{return state(app.page(),"contextMenuEnabled")==false;},"Disable Explorer menu");
+    assert(!context_menu_enabled());
     assert(state(app.page(),"texts")["config"]=="Settings");
     auto& renderer=window(app).GetRenderer();
     auto layout=renderer.CreateTextLayout(L"Open setup 中文.zip",300,60,14);
@@ -1257,12 +1262,6 @@ int wmain(int argc,wchar_t** argv) {
             const auto installed_cli=package/"bin"/"sunpack.exe";
             atomic_write(installed_cli,"");
             assert(parse_options(package_args).cli.executable==installed_cli);
-            fs::create_directory(package/"scripts");
-            atomic_write(package/"scripts"/"register_context_menu.ps1",
-                "param([string]$AppPath,[string]$GuiPath,[string]$ConfigPath)\n"
-                "$ErrorActionPreference = 'Stop'\n"
-                "$language = (Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json).cli.language\n"
-                "[IO.File]::AppendAllText((Join-Path $PSScriptRoot 'menu-language.txt'), ($language + \"`n\"))\n");
             wheel_chain_contracts();
             rendering_contracts();
         }
