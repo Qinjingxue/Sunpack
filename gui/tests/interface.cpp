@@ -558,10 +558,23 @@ void config_edits(Application& app,const fs::path& dir) {
     finish_input(app);
     assert(read_json(config_path)["recursive_extract"]=="5");
 
-    search_setting(app,"/cli/language");
-    select_option(app,"select-/cli/language",1);
-    finish_input(app);
-    pump([&]{return state(app.page(),"language")=="en";},"Switch interface language");
+    auto change_language=[&](int option,const char* language) {
+        search_setting(app,"/cli/language");
+        select_option(app,"select-/cli/language",option);
+        finish_input(app);
+        pump([&]{return state(app.page(),"language")==language;},"Switch interface language");
+    };
+    const auto menu_log=dir/"package"/"scripts"/"menu-language.txt";
+    change_language(1,"en");
+    assert(!fs::exists(menu_log));
+    // Enable the menu in this process's redirected HKCU after the initial read.
+    HKEY menu{};
+    assert(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Classes\\Directory\\shell\\SunPack",
+        0,nullptr,0,KEY_READ,nullptr,&menu,nullptr)==ERROR_SUCCESS);
+    RegCloseKey(menu);
+    change_language(0,"zh");
+    change_language(1,"en");
+    assert(state(app.page(),"contextMenuEnabled")==true && read_file(menu_log)=="zh\nen\n");
     assert(state(app.page(),"texts")["config"]=="Settings");
     auto& renderer=window(app).GetRenderer();
     auto layout=renderer.CreateTextLayout(L"Open setup 中文.zip",300,60,14);
@@ -1139,6 +1152,35 @@ int runtime_status_contract(const fs::path& directory,const fs::path& launcher) 
     CoUninitialize(); return result;
 }
 
+void root_heading_layout(Application& app) {
+    assert(state(app.page(),"language")=="en");
+    navigate(app,"tabRoots","roots");
+    auto& ui=window(app);
+    for(int width:{850,1120}) {
+        ui_window_set_size(app.window(),width,560);
+        ui_debug_pump();
+        auto* header=ui.Root()->FindById("rootTableHeader");
+        assert(header);
+        for(const auto& child:header->Children()) {
+            auto* label=dynamic_cast<ui::LabelWidget*>(child.get());
+            if(!label) continue;
+            const auto& bounds=label->rect;
+            const float text_width=bounds.right-bounds.left-label->padL-label->padR;
+            const float text_height=bounds.bottom-bounds.top-label->padT-label->padB;
+            const float font_size=label->css.fontSize>0?label->css.fontSize:theme::kFontSizeNormal;
+            auto layout=ui.GetRenderer().CreateTextLayout(label->Text(),text_width,1000,font_size,true);
+            DWRITE_TEXT_METRICS metrics{};
+            assert(layout && SUCCEEDED(layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WHOLE_WORD)));
+            assert(SUCCEEDED(layout->GetMetrics(&metrics)));
+            if(metrics.width>text_width+0.5f || metrics.height>text_height+0.5f)
+                throw std::runtime_error("Root heading does not fit: "+utf8(label->Text()));
+        }
+        screenshot(app.window(),width==850?L"roots-english-narrow.png":L"roots-english.png");
+    }
+    ui_window_set_size(app.window(),1120,720);
+    navigate(app,"tabConfig","config");
+}
+
 void acceptance_contracts(Application& app,const fs::path& dir) {
     assert(state(app.page(),"tasks")["rows"][0]["name"]=="carrier.001");
     screenshot(app.window(),L"startup.png");
@@ -1152,6 +1194,7 @@ void acceptance_contracts(Application& app,const fs::path& dir) {
     roots_and_passwords(app,dir);
     config_edits(app,dir);
     tag_config(app,dir);
+    root_heading_layout(app);
     range_config(app,dir/"sunpack_config.json");
 }
 
@@ -1214,6 +1257,12 @@ int wmain(int argc,wchar_t** argv) {
             const auto installed_cli=package/"bin"/"sunpack.exe";
             atomic_write(installed_cli,"");
             assert(parse_options(package_args).cli.executable==installed_cli);
+            fs::create_directory(package/"scripts");
+            atomic_write(package/"scripts"/"register_context_menu.ps1",
+                "param([string]$AppPath,[string]$GuiPath,[string]$ConfigPath)\n"
+                "$ErrorActionPreference = 'Stop'\n"
+                "$language = (Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json).cli.language\n"
+                "[IO.File]::AppendAllText((Join-Path $PSScriptRoot 'menu-language.txt'), ($language + \"`n\"))\n");
             wheel_chain_contracts();
             rendering_contracts();
         }
@@ -1231,6 +1280,7 @@ int wmain(int argc,wchar_t** argv) {
         options.data_dir=dir;
         options.allow_cli=true;
         options.cli={executable_path(),dir,{L"--fake-cli"}};
+        if(mode==L"--acceptance") options.cli.app_root=dir/"package";
         Application app(options);
         app.open();
         auto hwnd=window(app).Handle();

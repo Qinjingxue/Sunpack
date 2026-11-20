@@ -1191,6 +1191,7 @@ void Application::work() {
             }
             bool tasks_changed=false,passwords_changed=false,roots_changed=false,config_changed=false;
             bool task_page_requested=false;
+            bool refresh_context_menu=false;
             Json password_delta;
             Json edit_feedback=Json::object();
             if(!data_watcher || !data_watcher->alive() || (!data_watcher->direct() && fs::is_directory(dir))) {
@@ -1265,7 +1266,10 @@ void Application::work() {
                             &saved_passwords,last_passwords,options_.root_base());
                         std::string password_original;
                         for(auto& section:result["saved"]) {
-                            if(section=="config") flags|=Config;
+                            if(section=="config") {
+                                flags|=Config;
+                                refresh_context_menu|=options_.allow_cli && config_edit.at("pointer")=="/cli/language";
+                            }
                             if(section=="passwords") {
                                 // The atomic write already validated and built this snapshot.
                                 // Our own rename notification can reuse it. Concurrent changes
@@ -1477,9 +1481,13 @@ void Application::work() {
                 try { patch["startupEnabled"]=startup_enabled(); errors.erase("startup"); }
                 catch(const std::exception& e){errors["startup"]=e.what();}
             }
-            if(flags&ContextMenu || !previous_patch.contains("contextMenuEnabled")) {
+            if(refresh_context_menu || flags&ContextMenu || !previous_patch.contains("contextMenuEnabled")) {
                 try { patch["contextMenuEnabled"]=context_menu_enabled(); errors.erase("contextMenu"); }
                 catch(const std::exception& e) { patch["contextMenuEnabled"]=false; errors["contextMenu"]=e.what(); }
+                if(refresh_context_menu && patch["contextMenuEnabled"]==true) {
+                    try { set_context_menu_enabled(options_.cli,true,stop_); }
+                    catch(const std::exception& e) { edit_feedback["actionError"]=e.what(); }
+                }
             }
             auto displayed_errors=Json::object();
             for(auto it=errors.begin();it!=errors.end();++it) displayed_errors[tr(it.key(),language)]=translated_error(it.value().get<std::string>(),language);

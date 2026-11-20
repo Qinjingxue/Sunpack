@@ -193,6 +193,7 @@ def test_context_menu_registration_survives_rebuild_and_uninstalls(tmp_path):
     for name in ("register_context_menu.ps1", "unregister_context_menu.ps1"):
         shutil.copyfile(repo / "scripts" / name, scripts / name)
     (tmp_path / "sunpack_config.json").write_text('{"cli":{"language":"zh"}}', encoding="utf-8")
+    (tmp_path / "active config.json").write_text('{"cli":{"language":"en"}}', encoding="utf-8")
     harness = tmp_path / "registry_lifecycle.ps1"
     harness.write_text(r'''
 param([string]$Scripts)
@@ -210,6 +211,7 @@ try {
     $registrationArgs = @{ AppPath = $env:COMSPEC; GuiPath = $env:COMSPEC }
     $snapshots = @()
     foreach ($pass in 1..2) {
+        if ($pass -eq 2) { $registrationArgs.ConfigPath = Join-Path (Split-Path -Parent $Scripts) "active config.json" }
         $null = New-Item -Path "HKCU:\Software\Classes\SunPack.BackgroundContextMenu\shell\Obsolete" -Force
         $null = New-Item -Path "HKCU:\Software\Classes\Directory\Background\shell\SunPack\shell\Obsolete" -Force
         & (Join-Path $Scripts "register_context_menu.ps1") @registrationArgs | Out-Null
@@ -256,7 +258,13 @@ try {
     result = json.loads(completed.stdout.strip().splitlines()[-1])
     assert result["remaining"] == []
     assert len(result["snapshots"]) == 2
-    assert result["snapshots"][0] == result["snapshots"][1]
+    chinese, english = result["snapshots"]
+    for surface in ("Folder", "Background", "File"):
+        assert {entry["name"]: entry["command"] for entry in chinese[surface]} == {
+            entry["name"]: entry["command"] for entry in english[surface]
+        }
+        direct = next(entry for entry in english[surface] if entry["name"] == "DirectExtract")
+        assert direct["label"] == ("Extract this file" if surface == "File" else "Extract files in this folder")
     for surface, token in (("Folder", "%1"), ("Background", "%V")):
         entries = {entry["name"]: entry for entry in result["snapshots"][0][surface]}
         assert set(entries) == {

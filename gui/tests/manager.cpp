@@ -21,7 +21,8 @@ void native_context_menu_entrypoint(Fixture& fixture) {
     fs::create_directories(app / "scripts");
     // Intercept only this test's script dispatch, never touch shell registration.
     atomic_write(app / "scripts" / "register_context_menu.ps1",
-        "param([Parameter(Mandatory=$true)][string]$AppPath,[string]$GuiPath)\nSet-Content -LiteralPath (Join-Path $PSScriptRoot 'enabled.txt') -Value $AppPath -Encoding UTF8");
+        "param([Parameter(Mandatory=$true)][string]$AppPath,[string]$GuiPath,[string]$ConfigPath)\n"
+        "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'enabled.txt') -Value $AppPath,$ConfigPath -Encoding UTF8");
     atomic_write(app / "scripts" / "unregister_context_menu.ps1",
         "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'disabled.txt') -Value 'ok' -Encoding UTF8");
     CliCommand cli{app / "sunpack" / "sunpack_launcher.exe", fixture.dir, {}, app};
@@ -29,6 +30,7 @@ void native_context_menu_entrypoint(Fixture& fixture) {
     set_context_menu_enabled(cli, true, stop);
     const auto enabled = read_file(app / "scripts" / "enabled.txt");
     assert(enabled.find(utf8(cli.executable.wstring())) != std::string::npos);
+    assert(enabled.find(utf8((fixture.dir / "sunpack_config.json").wstring())) != std::string::npos);
     set_context_menu_enabled(cli, false, stop);
     assert(fs::is_regular_file(app / "scripts" / "disabled.txt"));
 }

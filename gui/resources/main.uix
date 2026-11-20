@@ -948,11 +948,12 @@ export default {
   .root-table { flex:1; gap:6px; }
   .root-columns { flex-direction:row; align-items:center; gap:8px; }
   .root-header { padding:10px 12px; margin:2px 18px 0px 2px; flex-shrink:0; border:1px solid var(--card-border); border-radius:8px; }
-  .root-header .root-path-column { padding-left:11px; white-space:nowrap; }
-  .root-header .root-toggle-column { text-align:center; white-space:nowrap; }
+  .root-header > label { align-self:stretch; white-space:normal; }
+  .root-header .root-path-column { padding-left:11px; }
+  .root-header .root-toggle-column { text-align:center; }
   .root-row { padding:10px 0px; min-height:52px; }
   .root-path-column { flex:1; min-width:0px; gap:0px; }
-  .root-toggle-column { width:80px; flex-shrink:0; align-items:center; }
+  .root-toggle-column { width:64px; flex-shrink:0; align-items:center; }
   .root-columns > .record-remove { flex-shrink:0; }
   .root-path-cell { width:100%; height:32px; gap:0px; }
   .root-path-cell .password-text-value { padding:0px 35px 0px 11px; }

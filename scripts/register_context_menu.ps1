@@ -3,7 +3,8 @@ param(
     [string]$GuiPath,
     [string]$MenuText,
     [string]$IconPath,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [string]$ConfigPath
 )
 
 Set-StrictMode -Version Latest
@@ -206,20 +207,22 @@ function Set-ContextMenuCommand {
 }
 
 function Get-MenuLanguage {
-    param([string]$RepoRoot)
+    param([string]$RepoRoot, [string]$ConfigPath)
 
-    $configPath = if ((Test-Path -LiteralPath (Join-Path $RepoRoot "bin\sunpack.exe") -PathType Leaf) -or
-                      (Test-Path -LiteralPath (Join-Path $RepoRoot "sunpack.exe") -PathType Leaf)) {
-        Join-Path $env:ProgramData "SunPack\sunpack_config.json"
-    } else {
-        Join-Path $RepoRoot "sunpack_config.json"
+    if (-not $ConfigPath) {
+        $ConfigPath = if ((Test-Path -LiteralPath (Join-Path $RepoRoot "bin\sunpack.exe") -PathType Leaf) -or
+                          (Test-Path -LiteralPath (Join-Path $RepoRoot "sunpack.exe") -PathType Leaf)) {
+            Join-Path $env:ProgramData "SunPack\sunpack_config.json"
+        } else {
+            Join-Path $RepoRoot "sunpack_config.json"
+        }
     }
-    if (-not (Test-Path -LiteralPath $configPath)) {
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
         return "en"
     }
 
     try {
-        $payload = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        $payload = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $language = [string]$payload.cli.language
         if ($language.Trim().ToLower().StartsWith("zh")) {
             return "zh"
@@ -286,7 +289,7 @@ $resolvedGuiPath = if ($GuiPath) { (Resolve-Path -LiteralPath $GuiPath).Path } e
     (Resolve-Path -LiteralPath $found).Path
 }
 $resolvedIconPath = if ($IconPath) { (Resolve-Path -LiteralPath $IconPath).Path } else { $launcher.IconPath }
-$menuLanguage = Get-MenuLanguage -RepoRoot $repoRoot
+$menuLanguage = Get-MenuLanguage -RepoRoot $repoRoot -ConfigPath $ConfigPath
 $resolvedMenuText = if ($MenuText) { $MenuText } else { "sunpack" }
 
 $classesKey = "HKCU:\Software\Classes"
