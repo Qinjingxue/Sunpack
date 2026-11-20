@@ -78,7 +78,10 @@ class Package:
                 display = native_fixture("display_events", path=str(events))
             except subprocess.CalledProcessError:
                 return None  # The display store can be publishing its manifest.
-            for row in (*display["live"], *display["history"]):
+            live = (row for row in display["live"]
+                    if "members" not in row or row["event"] in ("failed_password", "suspended_missing_volume"))
+            history = (row for row in display["history"] if "members" not in row)
+            for row in (*live, *history):
                 if row["event"] not in kinds or row["ts"] <= after:
                     continue
                 source = Path(row.get("path", ""))

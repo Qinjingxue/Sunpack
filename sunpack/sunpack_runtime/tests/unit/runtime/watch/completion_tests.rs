@@ -111,7 +111,7 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
             let block = &data[offset..offset + packed];
             assert_eq!(unsafe { LZ4_decompress_safe(block.as_ptr(), raw.as_mut_ptr(), packed as i32, size as i32) }, size as i32);
             let value: Value = rmp_serde::from_slice(&raw).unwrap();
-            if value["event"] != "done" { continue; }
+            if value["event"] != "done" || value.get("members").is_some() { continue; }
             recorded.insert(watch_path_key(value["path"].as_str().unwrap()), value);
         }
     }
@@ -121,4 +121,101 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
     assert_eq!(recorded[&key(other)]["success_count"], 1);
     assert_eq!(recorded[&key(other)]["partial_success_count"], 0);
     drop(scheduler);
+}
+
+#[test]
+#[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
+fn carrier_segments_keep_individual_cards_and_volume_sets() {
+    use crate::event_log::{gui_contract::{gui_binary, project, Directory}, NativeEventLog};
+    use crate::watch_store::{NativeWatchOperations, NativeWatchState};
+
+    let binary = gui_binary();
+    let root = Directory::new("gui_carrier_segments");
+    let path = root.0.join("events.json");
+    let carrier = root.0.join("carrier.bin");
+    let primary = root.0.join("first.001");
+    let tail = root.0.join("second.002");
+    let other = root.0.join("third.001");
+    for path in [&carrier, &primary, &tail, &other] {
+        fs::write(path, b"source").unwrap();
+    }
+    let group = Arc::new(SourceGroup {
+        path: primary.clone(),
+        members: [&carrier, &primary, &tail, &other].map(|path| path.to_string_lossy().into_owned()).into(),
+    });
+    let groups = [&carrier, &primary, &tail, &other].into_iter()
+        .map(|path| (key(path), Arc::clone(&group))).collect();
+    let archive = |path: &Path, extra: &Path, offset, failure| {
+        let mut result = completion_archive(path.to_str().unwrap(), 1, failure);
+        result.source_paths.push(extra.into());
+        result.offset = offset;
+        result
+    };
+    let mut outcome = Outcome::default();
+    outcome.archives = vec![
+        archive(&carrier, &primary, 10, None),
+        archive(&carrier, &tail, 100, Some(FailureKind::MissingVolume)),
+        archive(&other, &carrier, 5, Some(FailureKind::Damaged)),
+    ].into();
+    let segments = |outcome: &Outcome| {
+        let failures = outcome.input_failures();
+        let (projected, _) = completion_archives(outcome, &BTreeMap::new(), &groups, &failures);
+        let (rows, blockers) = completion_segments(&projected[&key(&primary)], 1, &failures,
+            crate::core::i18n::Language::Zh).unwrap();
+        (rows, blockers.retryable())
+    };
+    let (blocked, retryable) = segments(&outcome);
+    assert!(retryable);
+    let layouts: Vec<_> = blocked.as_array().unwrap().iter().map(|row|
+        json!({"path":row["path"],"members":row["members"],"multipart":row["multipart"]})).collect();
+    let log = NativeEventLog::new(path.clone(), 7, true).unwrap();
+    let mut claim = json!(group.record());
+    claim["segments"] = json!(layouts);
+    log.write(json!({"event":"pipeline_sources_claimed","owner":"batch","processing":true,"groups":[claim]})).unwrap();
+    log.flush().unwrap();
+    let query = |name, status| project(&binary, &path, name, "", "", status)["rows"].as_array().unwrap().clone();
+    let processing = query("", "taskProcessing");
+    assert_eq!(processing.len(), 3);
+    assert_eq!(processing.iter().filter(|row| row["name"] == "carrier.bin").count(), 2);
+    assert_eq!(query("second.002", "taskProcessing")[0]["parts"], json!(["carrier.bin", "second.002"]));
+
+    let watch = NativeWatchState::new();
+    let candidate = watch_candidate_for_path(&primary, None).unwrap().unwrap();
+    let mut entry = observed_entry(&candidate, "suspended_missing_volume");
+    entry.failure_payload.insert("source_group".into(), json!(group.record()));
+    entry.failure_payload.insert("segments".into(), blocked);
+    let mut changes = NativeWatchOperations::empty();
+    changes.put_entry(Arc::new(entry));
+    watch.apply(&changes);
+    log.recover(&watch);
+    log.flush().unwrap();
+    assert_eq!(query("", "taskWaiting")[0]["parts"], json!(["carrier.bin", "second.002"]));
+    assert_eq!(query("", "taskSucceeded")[0]["parts"], json!(["carrier.bin", "first.001"]));
+    assert_eq!(query("", "taskFailed")[0]["parts"], json!(["third.001", "carrier.bin"]));
+    assert_eq!(query("", "").len(), 3);
+
+    fs::remove_file(&tail).unwrap();
+    log.write(json!({"event":"candidate_departed","path":tail})).unwrap();
+    log.flush().unwrap();
+    assert_eq!(query("", "taskWaiting")[0]["parts"], json!(["carrier.bin"]));
+    log.recover(&watch);
+    log.flush().unwrap();
+    assert!(query("second.002", "").is_empty());
+    assert_eq!(query("", "taskWaiting")[0]["parts"], json!(["carrier.bin"]));
+    assert_eq!(query("", "taskSucceeded").len(), 1);
+
+    outcome.archives = vec![
+        archive(&carrier, &primary, 10, None),
+        archive(&carrier, &tail, 100, None),
+        archive(&other, &carrier, 5, Some(FailureKind::Damaged)),
+    ].into();
+    let (finished, retryable) = segments(&outcome);
+    assert!(!retryable);
+    log.write(json!({"event":"failed_terminal","path":primary,"segments":finished})).unwrap();
+    log.flush().unwrap();
+    drop(log);
+    assert_eq!(query("", "").len(), 3);
+    assert!(query("", "taskWaiting").is_empty());
+    assert_eq!(query("", "taskSucceeded").len(), 2);
+    assert_eq!(query("", "taskFailed").len(), 1);
 }

@@ -811,8 +811,12 @@ pub(crate) struct NativeWatchReplay {
 }
 
 fn entry_event(record: &EntryRecord) -> Value {
-    serde_json::json!({"event":record.status,"path":record.path,"ts":record.last_attempt_at,
-        "error":record.last_error,"error_kind":record.failure_kind})
+    let mut event = serde_json::json!({"event":record.status,"path":record.path,"ts":record.last_attempt_at,
+        "error":record.last_error,"error_kind":record.failure_kind});
+    if let Some(segments) = record.failure_payload.get("segments") {
+        event["segments"] = segments.clone();
+    }
+    event
 }
 
 pub(crate) struct NativeWatchState {
@@ -851,12 +855,14 @@ impl NativeWatchState {
                 .then_with(|| a.path.cmp(&b.path))
         });
         for record in &entries {
+            let mut status = entry_event(record);
             if let Some(group) = record.failure_payload.get("source_group") {
                 // A member can disappear after its blocker WAL commit (even
                 // while offline). Verify only recorded member presence; never
                 // probe or rediscover an archive for the GUI projection.
                 let mut group = group.clone();
                 if let Some(members) = group["members"].as_array_mut() {
+                    let count = members.len();
                     members.retain(|member| {
                         member.as_str().is_some_and(|member| {
                             !*member_presence
@@ -864,12 +870,16 @@ impl NativeWatchState {
                                 .or_insert_with(|| recorded_file_is_absent(member))
                         })
                     });
+                    if members.len() != count {
+                        crate::event_log::retain_waiting_members(&mut status, |member|
+                            !member_presence.get(&path_key(member)).copied().unwrap_or(false));
+                    }
                     if !members.is_empty() {
                         rows.push(serde_json::json!({"event":"pipeline_sources_claimed","groups":[group]}));
                     }
                 }
             }
-            rows.push(entry_event(record));
+            rows.push(status);
         }
         rows
     }
@@ -879,6 +889,10 @@ impl NativeWatchState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
     pub(crate) fn apply(&self, operations: &NativeWatchOperations) -> Vec<Arc<crate::pipeline::PreparedVolume>> {
+        enum Notification {
+            Blocked(Arc<EntryRecord>),
+            Cleared(Arc<EntryRecord>),
+        }
         let publication = self.events.lock().unwrap();
         let events = publication.as_ref().and_then(std::sync::Weak::upgrade);
         let mut notifications = Vec::new();
@@ -910,17 +924,16 @@ impl NativeWatchState {
                         .filter_map(|member| data.entries.get(&path_key(member)))
                         .max_by(|a, b| a.last_attempt_at.total_cmp(&b.last_attempt_at));
                     if let Some(record) = remaining {
-                        notifications.push(entry_event(record));
+                        notifications.push(Notification::Blocked(Arc::clone(record)));
                     } else {
-                        notifications.push(serde_json::json!({"event":"blocker_cleared","path":record.path,
-                        "task_path":group.and_then(|g| g["path"].as_str()).unwrap_or(&record.path)}));
+                        notifications.push(Notification::Cleared(record));
                     }
                 }
                 for operation in operations.0.iter() {
                     if let Operation::PutEntry(path, record) = operation {
                         if data.entries.get(path).is_some_and(|current| Arc::ptr_eq(current, record))
                             && matches!(record.status.as_str(), "failed_password" | "suspended_missing_volume") {
-                            notifications.push(entry_event(record));
+                            notifications.push(Notification::Blocked(Arc::clone(record)));
                         }
                     }
                 }
@@ -928,8 +941,22 @@ impl NativeWatchState {
         }
         // The authoritative map lock never covers log projection/serialization.
         if let Some(events) = events {
+            let mut published = (notifications.len() > 1).then(HashSet::new);
             for notification in notifications {
-                let _ = events.submit(notification);
+                let event = match notification {
+                    Notification::Blocked(record) => {
+                        if published.as_mut().is_some_and(|seen| !seen.insert(Arc::as_ptr(&record))) {
+                            continue;
+                        }
+                        entry_event(&record)
+                    }
+                    Notification::Cleared(record) => {
+                        let task_path = record.failure_payload.get("source_group")
+                            .and_then(|group| group["path"].as_str()).unwrap_or(&record.path);
+                        serde_json::json!({"event":"blocker_cleared","path":record.path,"task_path":task_path})
+                    }
+                };
+                let _ = events.submit(event);
             }
         }
         // Retire large prepared plans after the caller releases the WAL frontier.

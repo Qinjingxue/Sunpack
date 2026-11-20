@@ -43,6 +43,39 @@ fn field<'a>(v: &'a Value, name: &str) -> &'a str {
     v[name].as_str().unwrap_or("")
 }
 
+fn take_segments(value: &mut Value) -> Option<Vec<Value>> {
+    match value.as_object_mut()?.remove("segments")? {
+        Value::Array(segments) if !segments.is_empty() => Some(segments),
+        _ => None,
+    }
+}
+
+pub(crate) fn retain_waiting_members(value: &mut Value, mut present: impl FnMut(&str) -> bool) {
+    if let Some(segments) = value.get_mut("segments").and_then(Value::as_array_mut) {
+        for row in segments.iter_mut().filter(|row|
+            matches!(field(row, "event"), "failed_password" | "suspended_missing_volume")) {
+            if let Some(members) = row.get_mut("members").and_then(Value::as_array_mut) {
+                members.retain(|member| member.as_str().is_some_and(&mut present));
+            }
+        }
+    }
+}
+
+fn segment_id(id: &Arc<str>, index: usize) -> Arc<str> {
+    // Keep the first slot on the physical ID so retention expires the group.
+    if index == 0 { Arc::clone(id) } else { format!("{id}|segment:{index}").into() }
+}
+
+fn segment_row(parent: &Value, id: &str, mut row: Value) -> Value {
+    if row.get("event").is_none() {
+        row["event"] = parent["event"].clone();
+    }
+    row["owner"] = parent["owner"].clone();
+    row["ts"] = parent["ts"].clone();
+    row["task_id"] = json!(id);
+    row
+}
+
 fn state_event(event: &str) -> bool {
     matches!(
         event,
@@ -66,8 +99,13 @@ fn state_event(event: &str) -> bool {
 enum TaskStatus {
     #[default]
     Unpublished,
-    Published(Record),
+    Published { record: Record, segmented: bool },
     Expired,
+}
+impl TaskStatus {
+    fn publish(value: &Value) -> Self {
+        Self::Published { record: encode(value), segmented: value.get("segments").is_some() }
+    }
 }
 
 #[derive(Default)]
@@ -323,8 +361,7 @@ impl Projection {
                         }
                     }
                     task.owners = owners;
-                    group["task_id"] = json!(id);
-                    if task
+                    if !processing && task
                         .group
                         .as_ref()
                         .is_none_or(|old| old["path"] != group["path"])
@@ -332,12 +369,12 @@ impl Projection {
                         // The first group can absorb a provisional member card.
                         // Its status must address the canonical path before that
                         // member retires, otherwise a snapshot resurrects it.
-                        if let TaskStatus::Published(status) = &task.status {
+                        if let TaskStatus::Published { record, .. } = &task.status {
                             let mut value: Value =
-                                serde_json::from_slice(status).expect("encoded status");
+                                serde_json::from_slice(record).expect("encoded status");
                             value["path"] = group["path"].clone();
                             value["task_id"] = json!(id);
-                            task.status = TaskStatus::Published(encode(&value));
+                            task.status = TaskStatus::publish(&value);
                         }
                     }
                     if !owner.is_empty() {
@@ -347,9 +384,12 @@ impl Projection {
                     task.members = members;
                     if processing {
                         task.stamp = (ts.as_f64().unwrap_or(0.0) * 1_000_000.0) as i64;
-                        task.status =
-                            TaskStatus::Published(encode(&json!({"event":"processing_started","path":group["path"],
-                        "ts":ts,"owner":task.owner,"task_id":id})));
+                        let mut status = json!({"event":"processing_started","path":group["path"],
+                            "ts":ts,"owner":task.owner,"task_id":id});
+                        if let Some(segments) = take_segments(group) {
+                            status["segments"] = Value::Array(segments);
+                        }
+                        task.status = TaskStatus::publish(&status);
                         task.order = self.order;
                         task.blocked = false;
                     }
@@ -417,12 +457,18 @@ impl Projection {
             };
             for id in affected {
                 let mut task = self.remove(&id).unwrap();
-                task.members.retain(|m| {
-                    m.as_ref() != physical
+                let present = |m: &str| {
+                    m != physical
                         && !(recursive && crate::watch_store::is_path_under(m, &physical))
-                });
+                };
+                task.members.retain(|member| present(member));
                 if task.members.is_empty() {
                     continue;
+                }
+                if let TaskStatus::Published { record, segmented: true } = &task.status {
+                    let mut status: Value = serde_json::from_slice(record).expect("encoded status");
+                    retain_waiting_members(&mut status, |member| present(&key(member)));
+                    task.status = TaskStatus::publish(&status);
                 }
                 if let Some(g) = task.group.as_mut() {
                     // A queued publication may still own the previous group.
@@ -489,6 +535,7 @@ impl Projection {
                 return false;
             }
             let blocked = matches!(event, "failed_password" | "suspended_missing_volume");
+            let deduplicated = event == "watch_deduplicated";
             value["task_id"] = json!(id);
             let mut task = self.remove(&id).unwrap_or_default();
             if task.group.is_none() {
@@ -507,6 +554,14 @@ impl Projection {
             }
             task.order = self.order;
             if terminal {
+                if deduplicated {
+                    if let TaskStatus::Published { record, segmented: true } = &task.status {
+                        let mut processing: Value = serde_json::from_slice(record).expect("encoded status");
+                        if field(&processing, "event") == "processing_started" {
+                            value["segments"] = processing["segments"].take();
+                        }
+                    }
+                }
                 // Only a source claim owns a route that can receive a later completion.
                 if !task.owners.is_empty() {
                     if let Some(previous) = self.retiring.remove(&id) {
@@ -542,12 +597,12 @@ impl Projection {
                         },
                     );
                 }
-                if let Some(group) = task.group {
+                if let Some(group) = task.group.filter(|_| value.get("segments").is_none()) {
                     value["group"] = Arc::unwrap_or_clone(group);
                 }
                 return true;
             }
-            task.status = TaskStatus::Published(encode(value));
+            task.status = TaskStatus::publish(value);
             self.insert(id, task);
             return false;
         }
@@ -558,7 +613,7 @@ impl Projection {
         self.dirty_bytes = 0;
         let dirty = std::mem::take(&mut self.dirty);
         let project_status = |task: &Task| match &task.status {
-            TaskStatus::Published(status) => Some((Arc::clone(status), task.group.clone())),
+            TaskStatus::Published { record, .. } => Some((Arc::clone(record), task.group.clone())),
             TaskStatus::Unpublished | TaskStatus::Expired => None,
         };
         let rows = if reset {
@@ -647,23 +702,50 @@ impl Shared {
             }
         }
         let result = if history {
+            let segments = take_segments(&mut value);
             let ts = timestamp(&value);
-            let row = match failure {
-                Some(failure) => HistoryRecord::new(&value, ts, &EventField {
-                    fields: value.as_object().unwrap(),
-                    name: "failure",
-                    value: DiagnosticFailure(failure),
-                }),
-                None => HistoryRecord::new(&value, ts, &value),
-            };
-            row.map(|row| {
-                state.queue_bytes += row.memory_bytes();
-                state.queue.push(row);
-            })
+            if let Some(segments) = segments {
+                state.push_segment_history(&value, ts, segments)
+            } else {
+                let row = match failure {
+                    Some(failure) => HistoryRecord::new(&value, ts, &EventField {
+                        fields: value.as_object().unwrap(),
+                        name: "failure",
+                        value: DiagnosticFailure(failure),
+                    }),
+                    None => HistoryRecord::new(&value, ts, &value),
+                };
+                row.map(|row| state.push_history(row))
+            }
         } else {
             Ok(())
         };
         self.schedule(&mut state);
+        result
+    }
+}
+impl State {
+    fn push_history(&mut self, row: HistoryRecord) {
+        self.queue_bytes += row.memory_bytes();
+        self.queue.push(row);
+    }
+
+    fn push_segment_history(&mut self, summary: &Value, ts: i64, segments: Vec<Value>) -> std::io::Result<()> {
+        let id: Arc<str> = field(summary, "task_id").into();
+        let diagnostic = HistoryRecord::diagnostic(ts, summary)?;
+        let (previous_len, previous_bytes) = (self.queue.len(), self.queue_bytes);
+        self.queue.reserve(segments.len() + 1);
+        self.push_history(diagnostic);
+        let result = segments.into_iter().enumerate().try_for_each(|(index, segment)| {
+            let segment = segment_row(summary, &segment_id(&id, index), segment);
+            self.push_history(HistoryRecord::new(&segment, ts, &segment)?);
+            Ok(())
+        });
+        if result.is_err() {
+            // A partly serialized carrier must not enter the writer's batch.
+            self.queue.truncate(previous_len);
+            self.queue_bytes = previous_bytes;
+        }
         result
     }
 }
@@ -698,9 +780,45 @@ fn owners() -> &'static (Mutex<HashMap<String, Weak<Owner>>>, Condvar) {
 fn timestamp(value: &Value) -> i64 {
     (value["ts"].as_f64().unwrap_or(0.0) * 1_000_000.0) as i64
 }
+
+type LiveChange = (Arc<str>, Option<LiveEvent>);
+
+fn live_changes(
+    id: Arc<str>, row: Option<(Record, Option<Arc<Value>>)>,
+    counts: &mut HashMap<Arc<str>, usize>,
+) -> std::io::Result<impl Iterator<Item = LiveChange> + use<>> {
+    let previous = counts.remove(&id).unwrap_or(1);
+    let mut parent = row.map(|(status, group)| {
+        let value = serde_json::from_slice(&status)?;
+        Ok::<_, serde_json::Error>(LiveEvent { ts: timestamp(&value), value, group })
+    }).transpose()?;
+    let segments = parent.as_mut().and_then(|event| take_segments(&mut event.value));
+    let next = segments.as_ref().map_or(1, Vec::len);
+    if next > 1 {
+        counts.insert(Arc::clone(&id), next);
+    }
+    let split = segments.is_some();
+    let mut segments = segments.into_iter().flatten();
+    Ok((0..next.max(previous)).map(move |index| {
+        let id = segment_id(&id, index);
+        let value = if split {
+            segments.next().map(|segment| {
+                let parent = parent.as_ref().expect("segments have a task status");
+                LiveEvent { ts: parent.ts, value: segment_row(&parent.value, &id, segment), group: None }
+            })
+        } else if index == 0 {
+            parent.take()
+        } else {
+            None
+        };
+        (id, value)
+    }))
+}
+
 fn writer(shared: Arc<Shared>, path: PathBuf) {
     let mut store = None;
     let mut deadline = None;
+    let mut live_segments = HashMap::new();
     loop {
         let now = utc_us();
         let (rows, live, days, revision, rebuild) = {
@@ -760,16 +878,16 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 }
             }
             if let Some((live, reset)) = live {
-                let values = live.into_iter().map(|(id, row)| {
-                    let value = if let Some((status, group)) = row {
-                        let value = serde_json::from_slice(&status)?;
-                        Some(LiveEvent { ts: timestamp(&value), value, group })
-                    } else {
-                        None
+                if reset { live_segments = HashMap::new(); }
+                let values = live.into_iter().flat_map(|(id, row)| {
+                    let (error, rows) = match live_changes(id, row, &mut live_segments) {
+                        Ok(rows) => (None, Some(rows)),
+                        Err(error) => (Some(Err(error)), None),
                     };
-                    Ok((id, value))
+                    error.into_iter().chain(rows.into_iter().flatten().map(Ok))
                 });
                 store.update_live(values, reset, cutoff)?;
+                crate::collections::trim_map(&mut live_segments);
             }
             deadline = store.expire(cutoff)?.map(|ts| ts.saturating_add(retention));
             Ok(())
@@ -787,6 +905,8 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             .unwrap_or_default();
         let mut state = shared.state.lock().unwrap();
         if records_written && !expired.is_empty() {
+            for id in &expired { live_segments.remove(id); }
+            crate::collections::trim_map(&mut live_segments);
             state.projection.expire_live(
                 expired,
                 now.saturating_sub(i64::from(days).saturating_mul(DAY_US)),

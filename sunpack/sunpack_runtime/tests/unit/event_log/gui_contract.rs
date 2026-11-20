@@ -156,13 +156,13 @@ fn rust_writer_cpp_query_lifecycle() {
         let member = root.0.join(format!("密钥_{index}%.002"));
         let ts = base + f64::from(index / 100) * 86400.0 + f64::from(index) / 1000.0;
         log.write(json!({"event":"pipeline_sources_claimed", "owner":index.to_string(),
-            "processing":true,"ts":ts,"groups":[{"path":source,"name":"payload.rar","members":[source,member]}]})).unwrap();
+            "processing":true,"ts":ts,"groups":[{"path":source,"members":[source,member]}]})).unwrap();
         log.write(json!({"event":"done","owner":index.to_string(),"path":member,"ts":ts})).unwrap();
     }
     log.flush().unwrap();
     let history = rows(&binary, &path, "", "", "");
     assert_eq!(history.len(), 250);
-    for query in ["密", "密钥", "100%", "PAYLOAD.RAR"] {
+    for query in ["密", "密钥", "100%", ".FAKE"] {
         let selected = rows(&binary, &path, query, "", "");
         assert_eq!(selected.len(), if query == "100%" { 1 } else { 250 });
     }
@@ -180,7 +180,7 @@ fn rust_writer_cpp_query_lifecycle() {
     let b = root.0.join("other.bin");
     let c = root.0.join("retired.part");
     log.write(json!({"event":"pipeline_sources_claimed","owner":"active","processing":true,
-        "groups":[{"path":a,"name":"payload.rar","members":[a,b,c]}]})).unwrap();
+        "groups":[{"path":a,"members":[a,b,c]}]})).unwrap();
     log.write(json!({"event":"failed_password","owner":"active","path":a})).unwrap();
     log.flush().unwrap();
     assert_eq!(rows(&binary, &path, "retired.part", "", "taskWaiting").len(), 1);
@@ -239,19 +239,26 @@ fn rust_writer_cpp_query_deduplicated_is_green_named_success_without_outputs() {
     let path = root.0.join("events.json");
     let log = NativeEventLog::new(path.clone(), 7, true).unwrap();
     let source = root.0.join("copy.zip");
+    let member = root.0.join("extra.002");
     let ts = utc_us() as f64 / 1_000_000.0;
-    log.write(json!({"event":"pipeline_sources_claimed","owner":"dedup-run",
-        "groups":[{"path":source,"members":[source]}],"ts":ts})).unwrap();
+    log.write(json!({"event":"pipeline_sources_claimed","owner":"dedup-run","processing":true,
+        "groups":[{"path":source,"members":[source,member],"segments":[
+            {"path":source,"members":[source]},
+            {"path":source,"members":[source,member],"multipart":true}
+        ]}],"ts":ts})).unwrap();
     log.write(json!({"event":"watch_deduplicated","owner":"dedup-run","path":source,
         "output_dirs":[],"retire_group":true,"ts":ts})).unwrap();
     log.write(json!({"event":"pipeline_sources_released","owner":"dedup-run","ts":ts})).unwrap();
     log.flush().unwrap();
     let result = project(&binary, &path, "copy.zip", "", "", "");
-    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
-    let row = &result["rows"][0];
-    assert_eq!(row["statusText"], "去重跳过");
-    assert_eq!(row["statusTone"], "success");
-    assert!(row["outputs"].as_array().unwrap().is_empty());
+    let cards = result["rows"].as_array().unwrap();
+    assert_eq!(cards.len(), 2);
+    for row in cards {
+        assert_eq!(row["statusText"], "去重跳过");
+        assert_eq!(row["statusTone"], "success");
+        assert!(row["outputs"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(rows(&binary, &path, "extra.002", "", "").len(), 1);
     let filtered = project(&binary, &path, "copy.zip", "", "", "taskSucceeded");
     assert_eq!(filtered["rows"], result["rows"]);
 }

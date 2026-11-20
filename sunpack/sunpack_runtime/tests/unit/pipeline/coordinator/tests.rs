@@ -2009,7 +2009,9 @@ fn cancelled_batch_does_not_swallow_unrelated_journal_io_errors() {
     struct JournalFailure(Cancellation, io::ErrorKind);
     impl Observer for JournalFailure {
         fn notify(&self, _: Event) {}
-        fn claim_sources(&self, _: &Path, _: &[String], _: usize) -> io::Result<()> {
+        fn claim_sources<'a>(&self, _: &Path, _: &[String], _: usize,
+            _: impl ExactSizeIterator<Item = &'a crate::io::archive_state::ArchiveInput>,
+        ) -> io::Result<()> {
             self.0.cancel();
             Err(io::Error::new(self.1, "journal failure"))
         }

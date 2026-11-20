@@ -746,7 +746,9 @@ pub(crate) trait Observer: Send + Sync {
         async { Ok(()) }
     }
 
-    fn claim_sources(&self, _path: &Path, _members: &[String], _depth: usize) -> io::Result<()> {
+    fn claim_sources<'a>(&self, _path: &Path, _members: &[String], _depth: usize,
+        _inputs: impl ExactSizeIterator<Item = &'a crate::io::archive_state::ArchiveInput>,
+    ) -> io::Result<()> {
         Ok(())
     }
 

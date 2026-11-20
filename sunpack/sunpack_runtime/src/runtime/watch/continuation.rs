@@ -90,6 +90,27 @@ impl Continuation {
 
     pub(super) fn settle(&mut self, event: &Value, counts: CompletionSuccessCounts) {
         self.remaining -= 1;
+        if event["path"] == self.event["path"] {
+            if let Some(segments) = event.get("segments") {
+                self.event["segments"] = segments.clone();
+            }
+        } else if matches!(event["event"].as_str(), Some("failed_terminal" | "partial_rejected")) {
+            if let (Some(path), Some(segments)) =
+                (event["path"].as_str(), self.event.get_mut("segments").and_then(Value::as_array_mut))
+            {
+                let path = watch_path_key(path);
+                for segment in segments.iter_mut().filter(|segment| segment["event"] == "done") {
+                    let inside = segment["output_dirs"].as_array().into_iter().flatten().filter_map(Value::as_str)
+                        .any(|output| crate::watch_store::is_path_under(&path, &watch_path_key(output)));
+                    if inside {
+                        segment["event"] = json!("failed_terminal");
+                        segment["error"] = event["error"].clone();
+                        segment["error_kind"] = event["error_kind"].clone();
+                        break;
+                    }
+                }
+            }
+        }
         if event["event"] == "done" {
             for (field, value) in [
                 ("success_count", counts.success_count),
@@ -117,18 +138,21 @@ impl Continuation {
     }
 
     fn relocate(&mut self, from: &Path, to: Option<&Path>) {
-        let Some(outputs) = self.event["output_dirs"].as_array_mut() else {
-            return;
-        };
-        outputs.retain_mut(|output| {
-            if output.as_str().is_some_and(|path| Path::new(path) == from) {
-                let Some(to) = to else {
-                    return false;
-                };
-                *output = json!(to);
+        let relocate = |event: &mut Value| {
+            if let Some(outputs) = event.get_mut("output_dirs").and_then(Value::as_array_mut) {
+                outputs.retain_mut(|output| {
+                    if output.as_str().is_some_and(|path| Path::new(path) == from) {
+                        let Some(to) = to else { return false; };
+                        *output = json!(to);
+                    }
+                    true
+                });
             }
-            true
-        });
+        };
+        relocate(&mut self.event);
+        if let Some(segments) = self.event.get_mut("segments").and_then(Value::as_array_mut) {
+            segments.iter_mut().for_each(relocate);
+        }
     }
 }
 

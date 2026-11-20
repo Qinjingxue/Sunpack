@@ -1751,7 +1751,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 // Claims belong to the dispatched request. Archive depth still
                 // belongs to the original recursive tree.
                 let dispatch_depth = depth - this.request.start_depth + 1;
-                this.observer.claim_sources(Path::new(&task.entry().entry_path), &task.owned_paths, dispatch_depth)?;
+                this.observer.claim_sources(Path::new(&task.entry().entry_path), &task.owned_paths,
+                    dispatch_depth, task.inputs.iter().map(|logical| &logical.input))?;
                 let owner_path = PathBuf::from(&task.entry().entry_path);
                 let source_scope = inherited_scope.as_ref().and_then(|scope| scope.password.as_deref())
                     .or_else(|| owner_path.parent());
@@ -1781,7 +1782,8 @@ impl<'run, O: Observer> Run<'run, O> {
                             });
                         }
                     }
-                    let mut completed: Vec<_> = if this.request.mode == Mode::Scan || discovery_blocked {
+                    let show_segments = watch_root && task.inputs.len() > 1;
+                    let mut completed: Vec<_> = if this.request.mode == Mode::Scan || discovery_blocked || show_segments {
                         // main scan_items still projects every original descriptor.
                         task.inputs.iter().enumerate().map(|(index, logical)| {
                             let mut result = receipt(&logical.input, task.source, depth);
@@ -1805,7 +1807,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     for result in &mut completed {
                         result.failure.get_or_insert_with(|| failure.clone());
                         if this.request.mode == Mode::Extract {
-                            if admission { result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect(); }
+                            if admission && !show_segments { result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect(); }
                             if let Some(scope) = &discovery_scope {
                                 result.failure.as_mut().unwrap().discovery_scope = Some(Arc::clone(scope));
                             }
@@ -2076,7 +2078,9 @@ impl<'run, O: Observer> Run<'run, O> {
                                     }
                                 };
                                 this.admit_missing_inputs(&mut replacement, &missing);
-                                this.observer.claim_sources(Path::new(&replacement.entry().entry_path), &replacement.owned_paths, dispatch_depth)?;
+                                this.observer.claim_sources(Path::new(&replacement.entry().entry_path),
+                                    &replacement.owned_paths, dispatch_depth,
+                                    replacement.inputs.iter().map(|logical| &logical.input))?;
                                 attempted = replacement.entry().volume_attempts.as_ref().map(|_| {
                                     replacement
                                         .entry()

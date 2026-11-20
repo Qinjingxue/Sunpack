@@ -2233,20 +2233,21 @@ struct SourceGroup {
 
 impl SourceGroup {
     fn record(&self) -> impl serde::Serialize + '_ {
-        #[derive(serde::Serialize)]
-        struct Record<'a> {
-            path: &'a Path,
-            name: std::borrow::Cow<'a, str>,
-            members: &'a [String],
-            multipart: bool,
-        }
-        Record {
-            path: &self.path,
-            name: self.path.file_name().unwrap_or(self.path.as_os_str()).to_string_lossy(),
-            members: &self.members,
-            multipart: self.members.len() > 1,
-        }
+        source_group_record(&self.path, &self.members, self.members.len() > 1)
     }
+}
+
+fn source_group_record<'a, T: serde::Serialize>(
+    path: &'a Path, members: &'a [T], multipart: bool,
+) -> impl serde::Serialize + 'a {
+    #[derive(serde::Serialize)]
+    struct Record<'a, T> {
+        path: &'a Path,
+        members: &'a [T],
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        multipart: bool,
+    }
+    Record { path, members, multipart }
 }
 
 // Logical tasks own groups; physical members may have several live consumers.
@@ -6132,9 +6133,17 @@ impl Scheduler {
             let discovery_failure = input_error.and_then(|error| error.failure.as_deref());
             let failed_archive = (input_error.is_none() || discovery_failure.is_some())
                 .then(|| archives.and_then(|items| completion_failed_archive(items, &input_failures))).flatten();
-            let input_failure = failed_archive.and_then(|archive| input_failures
-                .get(&crate::path_keys::path_key(&archive.path.to_string_lossy())));
-            let failure = discovery_failure.or_else(|| input_failure.and_then(InputFailure::failure));
+            let (mut segments, segment_blockers) = archives
+                .filter(|_| group.is_some() && !completed.cancelled)
+                .and_then(|archives| completion_segments(archives, start_depth, &input_failures, self.settings.cli.language))
+                .map_or((None, InputFailure::default()), |(rows, blockers)| (Some(rows), blockers));
+            // Keep the physical claim retryable if any segment is blocked,
+            // even if another segment finished with a terminal failure.
+            let segment_blocker = segment_blockers.retryable().then_some(&segment_blockers);
+            let input_failure = segment_blocker.or_else(|| failed_archive.and_then(|archive| input_failures
+                .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))));
+            let failure = segment_blocker.and_then(InputFailure::failure).or(discovery_failure)
+                .or_else(|| input_failure.and_then(InputFailure::failure));
             let failure_message = failure.map(|failure| super::failure::message(failure, self.settings.cli.language));
             let error = failure_message.as_deref()
                 .or_else(|| input_error.map(|error| error.message.as_str()));
@@ -6239,6 +6248,9 @@ impl Scheduler {
                         recovery,
                         &active.password_scope,
                     );
+                    if let Some(segments) = segments.take() {
+                        Arc::make_mut(&mut entry).failure_payload.insert("segments".into(), segments);
+                    }
                     Arc::make_mut(&mut entry).failure_payload.insert("input_checkpoints".into(),
                         serde_json::to_value(recovery_receipts().select([Path::new(&canonical)]))
                             .expect("serializable input checkpoints"));
@@ -6260,9 +6272,20 @@ impl Scheduler {
                     retry.push((candidate.path.clone(), CandidateAdmission::PasswordRetry));
                 }
             }
+            if resumed.is_none() && deferred.is_none()
+                && record.as_ref().is_some_and(|entry| entry.failure_payload.contains_key("segments"))
+            {
+                // The entry update publishes the segment cards. No completion
+                // event or combined output list is needed for a blocked group.
+                if let Some(input_error) = input_error.filter(|_| discovery_failure.is_some()) {
+                    reported_discovery.insert(input_error.path.as_path());
+                }
+                operations.finish_pending(&candidate.path, record);
+                continue;
+            }
             let event = if completed.cancelled {
                 "pipeline_request_interrupted"
-            } else if discovery_failure.is_some() {
+            } else if discovery_failure.is_some() && segment_blocker.is_none() {
                 "failed_terminal"
             } else if let Some(record) = &record {
                 record.status.as_str()
@@ -6282,6 +6305,9 @@ impl Scheduler {
                 let mut event = json!({"event":event,"path":canonical,"owner":batch,
                     "error":error,"error_kind":failure.map(|failure| failure.kind),
                     "output_dirs":outputs,"retire_group":true});
+                if let Some(segments) = segments {
+                    event["segments"] = segments;
+                }
                 if event["event"] == "done" {
                     counts.write(&mut event);
                 }
@@ -6303,8 +6329,11 @@ impl Scheduler {
                         event["error"] = Value::Null;
                         event["error_kind"] = Value::Null;
                         counts.write(&mut event);
+                        if let Some(segments) = record.as_ref().and_then(|entry| entry.failure_payload.get("segments")) {
+                            event["segments"] = segments.clone();
+                        }
                     }
-                    if let Some(group) = group.filter(|group| group.members.len() > 1) {
+                    if let Some(group) = group.filter(|group| group.members.len() > 1 && event.get("segments").is_none()) {
                         event["group"] = json!(group.record());
                     }
                     continuation.begin(&active.root, event);
@@ -6683,6 +6712,14 @@ fn completion_archives<'a>(
             let source = key(source);
             if source != path { by_path.entry(source).or_default().push(archive); }
         }
+        if let Some(owner) = groups.get(&path).filter(|group| group.path != archive.path)
+            .map(|group| key(&group.path)).filter(|owner| *owner != path)
+        {
+            let related = by_path.entry(owner).or_default();
+            if related.last().is_none_or(|last| !std::ptr::eq(*last, archive)) {
+                related.push(archive);
+            }
+        }
         if archive.depth > 1 && !archive.partial && archive.failure.is_some() && !nested_retry(archive, failures)
         {
             // Nested retry blockers get their own durable entry below. All
@@ -6714,6 +6751,69 @@ fn completion_failed_archive<'a>(
         .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))
         .is_some_and(|input| !input.retryable()))
         .or_else(|| failures().next())
+}
+
+fn completion_segments<'a>(
+    archives: &[&'a ArchiveResult], depth: usize, failures: &HashMap<String, InputFailure<'_>>,
+    language: crate::core::i18n::Language,
+) -> Option<(Value, InputFailure<'a>)> {
+    let inputs = || archives.iter().copied().filter(|archive| archive.depth == depth);
+    if inputs().nth(1).is_none() { return None; }
+    // Use actual input layouts after selection and recovery. Recursive files
+    // keep their own Watch cards when retryable and otherwise affect their parent.
+    let mut nested = archives.iter().copied().filter(|archive|
+        archive.depth > depth && !archive.partial && archive.failure.is_some()
+            && !nested_retry(archive, failures)).peekable();
+    let mut segment_outputs = HashMap::new();
+    if nested.peek().is_some() {
+        segment_outputs.extend(inputs().filter_map(|archive| archive.output.as_ref().map(|path| (key(path), None))));
+        for child in nested {
+            let path = key(&child.path);
+            for ancestor in crate::path_keys::path_ancestors(&path).skip(1) {
+                if let Some(failure) = segment_outputs.get_mut(ancestor) {
+                    if failure.is_none() { *failure = child.failure.as_ref(); }
+                    break;
+                }
+            }
+        }
+    }
+    let mut blockers = InputFailure::default();
+    let rows = inputs().map(|archive| {
+        let failure = archive.failure.as_ref().filter(|_| !archive.partial);
+        let nested = if segment_outputs.is_empty() {
+            None
+        } else {
+            archive.output.as_ref().and_then(|path| segment_outputs.get(&key(path)).copied().flatten())
+        };
+        let event = match failure {
+            Some(failure) if failure.kind == FailureKind::MissingVolume => {
+                blockers.missing.get_or_insert(failure);
+                "suspended_missing_volume"
+            }
+            Some(failure) if failure.is_password_retry() => {
+                blockers.password.get_or_insert(failure);
+                "failed_password"
+            }
+            Some(_) => "failed_terminal",
+            None if nested.is_some() => "failed_terminal",
+            None => "done",
+        };
+        let multipart = archive.source_paths.len() > 1 || archive.volume_completeness.is_some()
+            || archive.volume_attempts.is_some();
+        let mut row = json!(source_group_record(&archive.path, &archive.source_paths, multipart));
+        row["event"] = json!(event);
+        if let Some(output) = &archive.output {
+            row["output_dirs"] = json!([output]);
+        }
+        if event == "failed_terminal" {
+            let failure = failure.or(nested).expect("terminal segment failure");
+            row["error"] = json!(super::failure::message(failure, language));
+            row["error_kind"] = json!(failure.kind);
+        }
+        row
+    }).collect();
+    blockers.failed = blockers.missing.is_some() || blockers.password.is_some();
+    Some((Value::Array(rows), blockers))
 }
 
 // Main fixes the request password directory before discovery can replace a
@@ -6938,7 +7038,7 @@ impl Observer for WatchObserver {
             // Claim the physical proposal exactly as an ordinary root does so
             // root_finished retires every pending member. No successful archive
             // result is manufactured and no extraction/cleanup is entered.
-            self.claim_sources(owner, members, depth)?;
+            self.claim_sources(owner, members, depth, inputs.iter().copied())?;
             self.claimed.lock().unwrap().deduplicated.insert(key(owner));
         }
         Ok(!duplicate)
@@ -7038,7 +7138,9 @@ impl Observer for WatchObserver {
         Ok(())
     }
 
-    fn claim_sources(&self, path: &Path, members: &[String], depth: usize) -> io::Result<()> {
+    fn claim_sources<'a>(&self, path: &Path, members: &[String], depth: usize,
+        inputs: impl ExactSizeIterator<Item = &'a crate::io::archive_state::ArchiveInput>,
+    ) -> io::Result<()> {
         if depth != 1 {
             return Ok(());
         }
@@ -7066,10 +7168,17 @@ impl Observer for WatchObserver {
         self.hub.update(|signals| {
             signals.claimed.extend(group.members.iter().map(|path| watch_path_key(path)));
         });
-        self.journal.log(
-            json!({"event":"pipeline_sources_claimed","path":path,"owner":self.batch,
-            "processing":true,"groups":[group.record()]}),
-        );
+        let mut record = json!(group.record());
+        if inputs.len() > 1 {
+            record["segments"] = Value::Array(inputs.map(|input| {
+                let path = Path::new(&input.entry_path);
+                let members: Vec<_> = input.physical_paths().collect();
+                let layout = json!(source_group_record(path, &members, input.mode.structured() || members.len() > 1));
+                layout
+            }).collect());
+        }
+        self.journal.log(json!({"event":"pipeline_sources_claimed","path":path,"owner":self.batch,
+            "processing":true,"groups":[record]}));
         Ok(())
     }
 

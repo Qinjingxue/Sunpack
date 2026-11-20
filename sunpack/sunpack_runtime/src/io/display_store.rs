@@ -277,20 +277,16 @@ fn filter(value: &Value, group: Option<&Value>) -> [u64; 4] {
     if let Some(s) = event_path {
         path(s);
     }
-    if let Some(group) = group.or_else(|| value.get("group")) {
-        let group_path = group["path"].as_str();
-        if let Some(s) = group_path.filter(|s| Some(*s) != event_path) {
-            path(s);
-        }
-        if let Some(members) = group["members"].as_array() {
-            for name in members.iter().filter_map(Value::as_str) {
-                if Some(name) != event_path && Some(name) != group_path {
-                    path(name);
-                }
+    let layout = group.or_else(|| value.get("group")).unwrap_or(value);
+    let group_path = layout["path"].as_str();
+    if let Some(s) = group_path.filter(|s| Some(*s) != event_path) {
+        path(s);
+    }
+    if let Some(members) = layout["members"].as_array() {
+        for member in members.iter().filter_map(Value::as_str) {
+            if Some(member) != event_path && Some(member) != group_path {
+                path(member);
             }
-        }
-        if let Some(s) = group["name"].as_str() {
-            add_text(&mut bits, s);
         }
     }
     bits
@@ -355,12 +351,17 @@ pub(crate) struct HistoryRecord {
 
 impl HistoryRecord {
     pub(crate) fn new(value: &Value, ts: i64, payload: &impl Serialize) -> io::Result<Self> {
+        Self::encode(RecordIndex::new(value, ts, None), payload)
+    }
+
+    pub(crate) fn diagnostic(ts: i64, payload: &impl Serialize) -> io::Result<Self> {
+        Self::encode(RecordIndex { ts, kind: 0, filter: [0; 4] }, payload)
+    }
+
+    fn encode(index: RecordIndex, payload: &impl Serialize) -> io::Result<Self> {
         let mut raw = super::scratch::Spool::default();
         rmp_serde::encode::write_named(&mut raw, payload).map_err(io::Error::other)?;
-        Ok(Self {
-            index: RecordIndex::new(value, ts, None),
-            raw: raw.finish()?,
-        })
+        Ok(Self { index, raw: raw.finish()? })
     }
 
     pub(crate) fn timestamp(&self) -> i64 { self.index.ts }
@@ -575,11 +576,12 @@ impl Store {
     }
     pub(crate) fn update_live(
         &mut self,
-        rows: impl ExactSizeIterator<Item = io::Result<(Arc<str>, Option<LiveEvent>)>>,
+        rows: impl Iterator<Item = io::Result<(Arc<str>, Option<LiveEvent>)>>,
         reset: bool,
         cutoff: i64,
     ) -> io::Result<()> {
-        if rows.len() == 0 && !reset {
+        let mut rows = rows.peekable();
+        if !reset && rows.peek().is_none() {
             return Ok(());
         }
         if reset {

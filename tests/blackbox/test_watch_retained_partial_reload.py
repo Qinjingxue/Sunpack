@@ -101,10 +101,17 @@ def test_policy_reload_accepts_retained_missing_volume_members(package, tmp_path
     events = package.data / ".sunpack_watch" / "events.json"
 
     owner = _wait_display(events, lambda display: _retained_blocker(display, head))
+    display = native_fixture("display_events", path=str(events))
+    segments = {row["event"]: row for row in display["live"]
+                if "members" in row and Path(row["path"]) == head}
+    assert set(segments) == {"done", "suspended_missing_volume"}
+    assert segments["done"]["members"] == [str(head)]
+    assert set(map(Path, segments["suspended_missing_volume"]["members"])) >= {head, parts[-1]}
+    assert segments["done"]["task_id"] != segments["suspended_missing_volume"]["task_id"]
     assert [p.read_bytes() for p in output.rglob("a.zip")] == [first]
     assert [p.read_bytes() for p in output.rglob("sibling.txt")] == [b"independent successful segment"]
     assert not any(row.get("event") == "done" and row.get("owner") == owner
-                   for row in native_fixture("display_events", path=str(events))["history"])
+                   for row in display["history"] if "members" not in row)
     assert not list(output.rglob("nested.txt"))
     package.configure(extraction={"content_requirement": "allow_partial"})
     # The config observer may have already applied this snapshot; an explicit
@@ -113,6 +120,10 @@ def test_policy_reload_accepts_retained_missing_volume_members(package, tmp_path
 
     _wait_display(events, lambda display: _accepted(display, head, owner))
     assert package.json("daemon", "stop")["summary"]["running"] is False
+    completed = native_fixture("display_events", path=str(events))["history"]
+    siblings = [row for row in completed if "members" in row and row["event"] == "done"
+                and Path(row["path"]) == head]
+    assert len({row["task_id"] for row in siblings}) == 2
     # Main re-evaluates retained members against the new content policy without
     # recursively scanning those unchanged outputs again.
     assert [p.read_bytes() for p in output.rglob("a.zip")] == [first]

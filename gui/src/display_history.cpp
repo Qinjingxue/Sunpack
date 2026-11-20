@@ -208,6 +208,10 @@ struct RunReader {
         return Json::from_msgpack(buffers.raw.data(),buffers.raw.data()+current.raw);
     }
 };
+const Json& task_layout(const Json& value) {
+    const auto group=value.find("group");
+    return group!=value.end() && group->is_object()?*group:value;
+}
 bool matches(const Json& value,const std::wstring& query,const std::string& time_query) {
     if(query.empty()) return true;
     auto contains=[&](const Json& v) { return v.is_string() && folded(v.get_ref<const std::string&>()).find(query)!=std::wstring::npos; };
@@ -215,13 +219,13 @@ bool matches(const Json& value,const std::wstring& query,const std::string& time
     if(path!=value.end() && contains(*path)) return true;
     auto ts=value.find("ts");
     if(!time_query.empty() && ts!=value.end() && ts->is_number() && task_time(ts->get<double>()).find(time_query)!=std::string::npos) return true;
-    if(value.contains("group")) {
-        const auto& group=value["group"];
-        for(const char* field:{"path","name"}) if(group.contains(field) && contains(group[field])) return true;
-        if(group.contains("members")) for(const auto& member:group["members"]) {
-            if(contains(member)) return true;
-            if(member.is_string()) { auto normalized=path_key(wide(member.get<std::string>())); if(normalized.find(query)!=std::wstring::npos) return true; }
-        }
+    const auto& layout=task_layout(value);
+    const auto head=layout.find("path");
+    if(&layout!=&value && head!=layout.end() && contains(*head)) return true;
+    const auto members=layout.find("members");
+    if(members!=layout.end() && members->is_array()) for(const auto& member:*members) {
+        if(contains(member)) return true;
+        if(member.is_string() && path_key(wide(member.get_ref<const std::string&>())).find(query)!=std::wstring::npos) return true;
     }
     return false;
 }
@@ -257,20 +261,17 @@ TaskRow project_task(const Json& value,const RootIndex& roots,const std::string&
         return at->second;
     };
 
-    const auto group=value.find("group");
-    const bool grouped=group!=value.end() && group->is_object();
-    auto display_path=grouped?group->value("path",path):path;
+    const auto& layout=task_layout(value);
+    auto display_path=layout.value("path",path);
     const fs::path source=wide(display_path);
     auto parts=Json::array();
-    const bool require_parts=event=="suspended_missing_volume" || (grouped && group->value("multipart",false));
-    if(grouped) {
-        const auto members=group->find("members");
-        if(members!=group->end() && members->is_array() && (require_parts || members->size()>1)) {
-            std::unordered_set<std::wstring> seen;
-            for(const auto& member:*members) if(member.is_string() && !member.get_ref<const std::string&>().empty()) {
-                const fs::path part=wide(member.get_ref<const std::string&>());
-                if(seen.insert(path_key(part)).second) parts.push_back(utf8(part.filename().wstring()));
-            }
+    const bool require_parts=event=="suspended_missing_volume" || layout.value("multipart",false);
+    const auto members=layout.find("members");
+    if(members!=layout.end() && members->is_array() && (require_parts || members->size()>1)) {
+        std::unordered_set<std::wstring> seen;
+        for(const auto& member:*members) if(member.is_string() && !member.get_ref<const std::string&>().empty()) {
+            const fs::path part=wide(member.get_ref<const std::string&>());
+            if(seen.insert(path_key(part)).second) parts.push_back(utf8(part.filename().wstring()));
         }
     }
     if(require_parts && parts.empty()) parts.push_back(utf8(fs::path(wide(path)).filename().wstring()));
