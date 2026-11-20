@@ -7,7 +7,6 @@ license = "MIT"
 sunpack-enc = { path = "../sunpack_enc" }
 aho-corasick = "1.1"
 aes = "0.9"
-base64 = "0.22"
 bzip2 = "0.4"
 cbc = "0.2"
 flate2 = "1.0"
@@ -30,7 +29,6 @@ sha2_11 = { package = "sha2", version = "0.11" }
 sunpack-usn-core = { path = "../sunpack_usn_core", default-features = false, features = ["client"] }
 xz2 = "0.1"
 zstd = "0.13"
-unicode-normalization = "0.1"
 rmp-serde = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
