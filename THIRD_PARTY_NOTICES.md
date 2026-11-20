@@ -177,3 +177,14 @@ CTR tasks. The full notice is distributed at
 [licenses/blowfish-license.txt](licenses/blowfish-license.txt).
 
 Source: https://github.com/RustCrypto/block-ciphers/tree/blowfish-v0.9.1/blowfish
+
+## AOSP ZIP filename frequency data
+
+SunPack derives its read-only Japanese, Simplified Chinese, and Traditional
+Chinese filename scores from `CharacterEncodingDetectorTables.h`, Copyright
+(C) 2013 The Android Open Source Project, licensed under Apache License 2.0.
+`scripts/generate_zip_filename_frequencies.py` keeps only Han characters and
+quantizes their ranks into three frequency bands. The license is distributed
+at [licenses/aosp-zip-frequencies-license.txt](licenses/aosp-zip-frequencies-license.txt).
+
+Source: https://android.googlesource.com/platform/frameworks/av/+/03357add725340c290b10f50db090267bbf511b1/media/libmedia/CharacterEncodingDetectorTables.h

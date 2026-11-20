@@ -86,3 +86,13 @@ fn scoring_keeps_shift_jis_kanji_only_name() {
     let refs = [bytes.as_ref()];
     assert_eq!(select_codepage(&refs), Some("932"));
 }
+
+#[test]
+fn numbered_names_do_not_repeat_encoding_evidence() {
+    let (first, _, first_invalid) = BIG5.encode("風景_001.jpg");
+    let (second, _, second_invalid) = BIG5.encode("風景_002.jpg");
+    assert!(!first_invalid && !second_invalid);
+    let single = select_codepage(&[first.as_ref()]);
+    assert!(matches!(single, None | Some("950")));
+    assert_eq!(select_codepage(&[first.as_ref(), second.as_ref()]), single);
+}

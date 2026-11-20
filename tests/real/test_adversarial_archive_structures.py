@@ -87,6 +87,27 @@ def test_zip_renamed_member_ignores_stale_unicode_path_extra_field(package, tmp_
     assert _files_under(output / source.stem) == entries
 
 
+@pytest.mark.parametrize(
+    ("codec", "legacy_name"),
+    [("cp932", "操作手順.txt"), ("gbk", "数据.txt"), ("cp950", "財務報表.txt")],
+)
+def test_zip_guesses_legacy_filename_encoding(package, tmp_path, codec, legacy_name):
+    class LegacyZipInfo(zipfile.ZipInfo):
+        def _encodeFilenameFlags(self):
+            return self.filename.encode(codec), self.flag_bits
+
+    source = tmp_path / "legacy.zip"
+    entries = {legacy_name: b"legacy name", "Unicode/例.txt": b"explicit UTF-8 name"}
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(LegacyZipInfo(legacy_name), entries[legacy_name])
+        archive.writestr("Unicode/例.txt", entries["Unicode/例.txt"])
+
+    output = tmp_path / "output"
+    report = extract_report(package, source, output, recur="1", deep=False)
+    assert report["summary"]["success_count"] == 1, report
+    assert _files_under(output / source.stem) == entries
+
+
 def _old_gnu_sparse_tar(filename, trailer):
     # Old GNU TAR holds four pairs in the header and 21 pairs per extension.
     # A terminal zero-length extent preserves the trailing hole.
