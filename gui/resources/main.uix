@@ -113,7 +113,7 @@ export default {
       add(f.label,'field-title-'+f.id);add(f.description,'field-description-'+f.id);add(f.categoryLabel);
       f.options.forEach((o,i)=>add(o.label,i===d.choice?'select-'+f.id:''));
       if(this.isRuleList(f)) {
-        if(f.editor==='rule_list') add(t.regexMode,'tag-regex-label-'+f.id);
+        add(t.regexMode,'tag-regex-label-'+f.id);
         add(this.tagInputs[f.id],'tag-input-'+f.id);
         this.tagValues(f).forEach((v,j)=>add(this.entryLabel(v.value),'tags-'+f.id,j));
       } else if(f.editor==='text') add(d.text,'input-'+f.id);
@@ -594,8 +594,9 @@ export default {
     },
     changeField(f,value) {
       f=this.configField(f.id)||f;
-      let d=this.drafts[f.id]||{original:f.original,text:f.text,boolean:f.boolean,choice:f.choice,baselineText:f.text,baselineBoolean:f.boolean};
-      if(this.saveErrors[f.id]&&this.pendingFields.indexOf(f.id)<0) { d.original=f.original; d.baselineText=f.text; d.baselineBoolean=f.boolean; }
+      let text=this.isRuleList(f)?f.original:f.text;
+      let d=this.drafts[f.id]||{original:f.original,text:text,boolean:f.boolean,choice:f.choice,baselineText:text,baselineBoolean:f.boolean};
+      if(this.saveErrors[f.id]&&this.pendingFields.indexOf(f.id)<0) { d.original=f.original; d.baselineText=text; d.baselineBoolean=f.boolean; }
       d.text=value;
       delete d.range;
       let next=Object.assign({},this.drafts);

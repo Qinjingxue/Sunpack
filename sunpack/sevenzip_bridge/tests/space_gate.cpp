@@ -127,7 +127,7 @@ struct SinkLog {
 std::shared_ptr<VolumeSpaceGate> make_gate(const std::string &key,
                                            const std::shared_ptr<SinkLog> &log) {
     return std::make_shared<VolumeSpaceGate>(
-        key, std::string{},
+        key,
         [log](const VolumeSpaceTransition &transition) { log->record(transition); });
 }
 
@@ -1196,7 +1196,7 @@ void g34_iocp_admission_and_weak_wake_lifetime() {
         unsigned calls = 0;
         void wake() noexcept override { ++calls; }
     };
-    auto gate = std::make_shared<VolumeSpaceGate>("iocp:test", "", nullptr);
+    auto gate = std::make_shared<VolumeSpaceGate>("iocp:test", nullptr);
     auto target = std::make_shared<Wake>();
     std::weak_ptr<Wake> weak = target;
     gate->subscribe(target);
@@ -1250,7 +1250,7 @@ void vhd_recovery(const std::filesystem::path &root, const std::filesystem::path
 
     VolumeSpaceMonitor *monitor_ptr = nullptr;
     int resumed = 0;
-    auto gate = std::make_shared<VolumeSpaceGate>("job:vhd-recovery", std::string{},
+    auto gate = std::make_shared<VolumeSpaceGate>("job:vhd-recovery",
         [&](const VolumeSpaceTransition &transition) {
             if (transition.kind == VolumeSpaceTransition::Kind::Blocked) monitor_ptr->note_blocked();
             else ++resumed;

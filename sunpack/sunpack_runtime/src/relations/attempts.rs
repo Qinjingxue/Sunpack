@@ -287,23 +287,37 @@ fn head_geometry(head: &VolumeAnchor, format: &str) -> (Option<u64>, Option<u64>
 }
 
 pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<ProposalValidation> {
+    let Some(first) = view.indexes.iter().position(|index| view.facts[index].exact_slot == Some(1)) else {
+        return Vec::new();
+    };
+    let mut heads = vec![(view.indexes[first], first)];
+    let mut indexes = view.indexes[..first].to_vec();
+    for &index in &view.indexes[first + 1..] {
+        if view.facts[&index].exact_slot == Some(1) {
+            heads.push((index, indexes.len()));
+        } else {
+            indexes.push(index);
+        }
+    }
+    if indexes.is_empty() {
+        return Vec::new();
+    }
+    heads.sort_by(|(a, _), (b, _)| view.rows[*a].path_key.cmp(&view.rows[*b].path_key));
+    // Keep one slot for the current head. Moving it preserves the source
+    // order used by the layout builder without scanning the other heads.
+    let mut head_position = indexes.len();
+    indexes.push(heads[0].0);
     let spanned = view.spanned();
-    let mut heads: Vec<_> = view
-        .indexes
-        .iter()
-        .copied()
-        .filter(|i| view.facts[i].exact_slot == Some(1))
-        .collect();
-    heads.sort_by(|a, b| view.rows[*a].path_key.cmp(&view.rows[*b].path_key));
     let mut output = Vec::new();
     let mut shared_facts = None;
-    for head in heads {
-        let indexes: Vec<_> = view
-            .indexes
-            .iter()
-            .copied()
-            .filter(|i| *i == head || view.facts[i].exact_slot != Some(1))
-            .collect();
+    for (head, position) in heads {
+        if position < head_position {
+            indexes[position..=head_position].rotate_right(1);
+        } else if position > head_position {
+            indexes[head_position..=position].rotate_left(1);
+        }
+        head_position = position;
+        indexes[position] = head;
         let profile = NameProfile::new(indexes.iter().filter_map(|i| view.features.get(i)));
         let mut fixed = BTreeMap::<u32, Vec<usize>>::new();
         for &i in &indexes {

@@ -58,11 +58,16 @@ struct Record {
     bytes: u64,
     admitted: bool,
     sources: Arc<[Source]>,
+    // All extents use source zero when there is only one physical source.
     range_sources: Box<[u32]>,
     identities: Arc<[Identity]>,
     digest: Option<[u8; 16]>,
 }
 impl Record {
+    fn source_index(&self, range: usize) -> usize {
+        if self.range_sources.is_empty() { 0 } else { self.range_sources[range] as usize }
+    }
+
     fn current(&self) -> bool {
         self.sources.iter().all(|s| s.current_snapshot().is_some())
     }
@@ -76,8 +81,8 @@ impl Record {
             }
         }
         let mut hash = StreamHash::new();
-        for (&source, extent) in self.range_sources.iter().zip(self.identities.iter()) {
-            let source_index = source as usize;
+        for (range, extent) in self.identities.iter().enumerate() {
+            let source_index = self.source_index(range);
             let source = &self.sources[source_index];
             let mut refreshed = None;
             hash.read(Path::new(&source.path), extent.start, extent.len, |opened| {
@@ -106,9 +111,14 @@ impl Record {
     // The physical index has already matched the ordered extents. Compare
     // their sampled versions before reusing a digest through another name.
     fn same_source_versions(&self, other: &Self) -> bool {
-        self.range_sources.iter().zip(other.range_sources.iter()).all(|(&left, &right)| {
-            let left = &self.sources[left as usize];
-            let right = &other.sources[right as usize];
+        let ranges = if self.range_sources.is_empty() && other.range_sources.is_empty() {
+            1
+        } else {
+            self.identities.len()
+        };
+        (0..ranges).all(|range| {
+            let left = &self.sources[self.source_index(range)];
+            let right = &other.sources[other.source_index(range)];
             left.usn == right.usn && left.generation == right.generation
         })
     }
@@ -525,19 +535,23 @@ impl Index {
         Ok(changed)
     }
     fn apply_journals(&mut self, stamps: &[(String, String, u64)]) -> bool {
-        if stamps.is_empty() { return false; }
+        // Every previously reconciled scope on a volume already shares its
+        // journal ID. A normal checkpoint therefore needs only exact lookups.
+        let mut changed: HashSet<&str> = stamps.iter()
+            .filter(|(scope, volume, journal)| self.journals.get(scope).is_none_or(|old| old.0 != *volume || old.1 != *journal))
+            .map(|(scope, _, _)| scope.as_str()).collect();
+        if changed.is_empty() { return false; }
         let volumes: HashMap<_, _> = stamps.iter().filter(|(_, volume, _)| !volume.is_empty()).map(|(_, volume, journal)| (volume.as_str(), *journal)).collect();
-        let mut changed: HashSet<String> = stamps.iter().filter(|(scope, volume, journal)| self.journals.get(scope).is_none_or(|old| old.0 != *volume || old.1 != *journal)).map(|(scope, _, _)| scope.clone()).collect();
         // A journal belongs to a volume, not to a monitored root. A checkpoint
         // may probe just one root; invalidate every old incarnation on that
         // volume before Global comparisons can observe another root's record.
         for (scope, (volume, old_journal)) in &mut self.journals {
             if let Some(&journal) = volumes.get(volume.as_str()) {
-                if *old_journal != journal { changed.insert(scope.clone()); *old_journal = journal; }
+                if *old_journal != journal { changed.insert(scope.as_str()); *old_journal = journal; }
             }
         }
-        if changed.is_empty() { return false; }
         let ids: Vec<_> = self.records.values().filter(|r| changed.contains(r.scope.as_ref())).map(|r| r.id).collect();
+        drop(changed);
         for id in ids { self.remove(id); }
         self.trim_record_indices();
         for (scope, volume, journal) in stamps { self.domain(scope); self.journals.insert(scope.clone(), (volume.clone(), *journal)); }
@@ -753,12 +767,15 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
             if len == 0 || end > size { return Ok(false); }
             // Physical segmentation is not content identity. Adjacent extents
             // of the same opened source can share one read and identity range.
-            if range_sources.last() == Some(&source)
+            if range_sources.last().copied().unwrap_or(0) == source
                 && identities.last().is_some_and(|last: &Identity| last.start + last.len == start) {
                 identities.last_mut().unwrap().len += len;
             } else {
+                if source != 0 && range_sources.is_empty() {
+                    range_sources.resize(identities.len(), 0);
+                }
+                if !range_sources.is_empty() { range_sources.push(source); }
                 identities.push(Identity { volume, file, start, len });
-                range_sources.push(source);
             }
             Ok(true)
         };

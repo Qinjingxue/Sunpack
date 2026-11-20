@@ -110,16 +110,6 @@ struct SinkLog {
 bool release_permit(const std::shared_ptr<VolumeSpaceGate> &gate) {
     return gate->poll(1);
 }
-// 把 std::string 里的 ASCII 还原成宽字符（测试路径都是 ASCII）。
-std::string to_ascii(const std::wstring &text) {
-    std::string ascii;
-    ascii.reserve(text.size());
-    for (const wchar_t value : text) {
-        ascii.push_back(static_cast<char>(value & 0x7F));
-    }
-    return ascii;
-}
-
 std::vector<unsigned char> make_payload(std::size_t size) {
     std::vector<unsigned char> payload(size);
     for (std::size_t index = 0; index < size; ++index) {
@@ -140,7 +130,7 @@ struct Harness {
         // 先取一份本地 sink：C++17 的 lambda 捕获列表不能直接命名非静态数据成员。
         const auto sink = log;
         gate = std::make_shared<VolumeSpaceGate>(
-            "volume:retry", to_ascii(query_root.wstring()),
+            "volume:retry", query_root.wstring(),
             [sink](const VolumeSpaceTransition &transition) { sink->record(transition); });
         state = std::make_shared<VolumeState>("volume:retry", true, gate);
         writer = std::make_unique<AsyncFileWriter>(state, config);
@@ -849,7 +839,7 @@ void r10_directory_retry_and_memo(const std::filesystem::path &directory) {
 
     auto log = std::make_shared<SinkLog>();
     auto gate = std::make_shared<VolumeSpaceGate>(
-        "volume:r10", to_ascii(directory.wstring()),
+        "volume:r10", directory.wstring(),
         [log](const VolumeSpaceTransition &transition) { log->record(transition); });
 
     std::error_code retry_error;
@@ -1014,7 +1004,7 @@ void r11c_no_volume_gate_directory(const std::filesystem::path &directory) {
     // （gate == nullptr 时骨架按定义只尝试一次、不求值谓词 —— 见 error_code_contract 的
     // 四态语义断言。）
     auto terminal_gate = std::make_shared<VolumeSpaceGate>(
-        "volume:r11c", to_ascii(directory.wstring()), VolumeSpaceGate::ChangeSink{});
+        "volume:r11c", directory.wstring(), VolumeSpaceGate::ChangeSink{});
     terminal_gate->report_space_failure(ERROR_DISK_FULL, std::wstring_view{});
     const auto terminal_dir = directory / L"r11c-terminal-dir";
     std::error_code terminal_error;

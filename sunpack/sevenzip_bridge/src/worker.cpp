@@ -2007,6 +2007,7 @@ private:
             bool present = false;
         };
         JobExecution(sunpack::sevenzip::NativeMemoryManager &manager, const WorkerRequest &request) : memory(manager) {
+            if (!request.scan_only) replay.emplace();
             std::wstring_view first_path;
             std::optional<std::unordered_set<std::wstring_view>> additional_paths;
             const auto remember = [&](const std::wstring &path) {
@@ -2039,7 +2040,7 @@ private:
             return true;
         }
         sunpack::sevenzip::NativeMemoryJob memory;
-        std::optional<sunpack::sevenzip::ExtractionReplay> replay{std::in_place};
+        std::optional<sunpack::sevenzip::ExtractionReplay> replay;
         std::vector<InputStamp> inputs;
         std::uint64_t memory_episode = 0;
     };
@@ -2332,7 +2333,8 @@ private:
                 sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_);
                 sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
                 sunpack::sevenzip::NativeMemoryScope memory_scope(&memory_job);
-                sunpack::sevenzip::ExtractionReplayScope replay_scope(&*job.execution->replay);
+                auto& replay = job.execution->replay;
+                sunpack::sevenzip::ExtractionReplayScope replay_scope(replay ? &*replay : nullptr);
                 try {
                     const bool interrupted = memory_job.cancel->load(std::memory_order_acquire);
                     if (replaying && !interrupted && !job.execution->inputs_unchanged()) {
@@ -2351,7 +2353,7 @@ private:
                             registration.reset();
                             lease.reset();
                             replay_scope.restore();
-                            job.execution->replay.reset();
+                            replay.reset();
                             decltype(job.execution->inputs){}.swap(job.execution->inputs);
                             WorkerRequest terminal;
                             terminal.job_id = std::move(job.request.job_id);
@@ -2363,7 +2365,7 @@ private:
                     }
                 } catch (const std::bad_alloc&) {
                     // A terminal manifest may already have reached the client.
-                    if (job.execution->replay) {
+                    if (job.request.scan_only || replay) {
                         memory_.retry(memory_job);
                         outcome.code = kMemoryRetry;
                     }
@@ -2371,7 +2373,7 @@ private:
                     // MSVC std::thread reports _beginthreadex exhaustion as
                     // EAGAIN, including a failed small stack/CRT allocation.
                     // Writer-facility threads do not use the SDK allocator.
-                    if (job.execution->replay && error.code() == std::errc::resource_unavailable_try_again) {
+                    if ((job.request.scan_only || replay) && error.code() == std::errc::resource_unavailable_try_again) {
                         memory_.retry(memory_job);
                         outcome.code = kMemoryRetry;
 #ifdef SUP7Z_DEBUG

@@ -696,23 +696,6 @@ HRESULT sunpack_toast_activate() noexcept {
     });
 }
 
-HRESULT sunpack_toast_self_test() noexcept {
-    return protect([] {
-        WinrtApartmentScope apartment;
-        // Probe COM activation without registering the extension's live CLSID.
-        CLSID probe_clsid{};
-        winrt::check_hresult(CoCreateGuid(&probe_clsid));
-        ActivationRegistration activation(probe_clsid);
-        winrt::com_ptr<IClassFactory> factory;
-        winrt::check_hresult(CoGetClassObject(probe_clsid, CLSCTX_LOCAL_SERVER, nullptr, IID_PPV_ARGS(factory.put())));
-        winrt::com_ptr<INotificationActivationCallback> callback;
-        winrt::check_hresult(factory->CreateInstance(nullptr, IID_PPV_ARGS(callback.put())));
-        winrt::check_hresult(callback->Activate(kAppId, L"noop", nullptr, 0));
-        XmlDocument document;
-        document.LoadXml(L"<toast/>");
-    });
-}
-
 HRESULT sunpack_toast_cancel_batch(wchar_t* target, std::uint32_t capacity) noexcept {
     return protect([&] {
         std::lock_guard lock(g_activation_mutex);

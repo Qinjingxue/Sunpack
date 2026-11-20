@@ -122,7 +122,8 @@ void projection(Fixture& f) {
     std::array<std::string,3> history;
     constexpr int records=420;
     for(int i=0;i<records;++i) {
-        auto run=i%2==0?2:i<records/2?0:1;
+        // Interleave the runs, with the oldest page entirely before the live window.
+        auto run=i>=records/4 && i%2==0?2:i<records/2?0:1;
         history[run]+=event("done",f.dir/("carrier-"+std::to_string(i)+".001"),i+1);
     }
     publish_events(p,history[0]);
@@ -456,13 +457,13 @@ void localization(Fixture& fixture) {
     assert(translated_error(literal,"en")=="The path does not currently exist.\ntaskFailed {code}");
     auto data=fixture.dir/"locale"; fs::create_directory(data);
     assert(startup_language(data)=="en");
-    struct LocaleCase { const char* input; const char* code; const char* title; const char* label; };
+    struct LocaleCase { const char* input; const char* code; const char* title; const char* label; const char* menu; const wchar_t* locale; };
     for(const auto& test:std::initializer_list<LocaleCase>{
-        {"zh","zh","SunPack 管理面板","简体中文"},
-        {"  ZH-tw  ","zh-TW","SunPack 管理介面","繁體中文"},
-        {"JA","ja","SunPack マネージャー","日本語"},
-        {"ko","ko","SunPack 관리자","한국어"},
-        {"unsupported","en","SunPack Manager","English"},
+        {"zh","zh","SunPack 管理面板","简体中文","解压该目录下文件",L"zh-CN"},
+        {"  ZH-tw  ","zh-TW","SunPack 管理介面","繁體中文","解壓縮此資料夾中的檔案",L"zh-TW"},
+        {"JA","ja","SunPack マネージャー","日本語","このフォルダー内のファイルを展開",L"ja-JP"},
+        {"ko","ko","SunPack 관리자","한국어","이 폴더의 파일 압축 풀기",L"ko-KR"},
+        {"unsupported","en","SunPack Manager","English","Extract files in this folder",L"en-US"},
     }) {
         const Json canonical={{"cli",{{"language",test.input}}}};
         const auto source=canonical.dump();
@@ -474,6 +475,8 @@ void localization(Fixture& fixture) {
         validate_setting("/cli/language",selected["value"]);
         const auto texts=interface_texts(test.code);
         assert(texts["title"]==test.title && !texts.contains("shellExtractFolder"));
+        assert(tr("shellExtractFolder",test.code)==test.menu);
+        assert(std::wstring_view(gui_text_locale(test.code))==test.locale);
     }
     fails([]{validate_setting("/cli/language",Json("unsupported"));});
     atomic_write(data/"sunpack_config.json","{"); assert(startup_language(data)=="en");

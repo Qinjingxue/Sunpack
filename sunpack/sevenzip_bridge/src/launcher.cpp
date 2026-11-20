@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -255,14 +256,6 @@ std::wstring program_data_dir() {
     return std::wstring(program_data.data(), length) + L"\\SunPack";
 }
 
-std::wstring first_existing_config(const std::vector<std::wstring>& roots, const wchar_t* filename) {
-    for (const auto& root : roots) {
-        const std::wstring path = join_config_path(root, filename);
-        if (file_exists(path)) return path;
-    }
-    return {};
-}
-
 enum class Language { En, Zh, ZhTw, Ja, Ko };
 
 Language normalize_language(const std::string& raw) {
@@ -338,12 +331,13 @@ std::string localized_value(Language language, const Translations& messages,
 
 // Use the same data and application roots as the installed or source runtime.
 Language cli_language_from_config(const InstallContext& context) {
-    const std::wstring simple_path = context.data_dir.empty() ? std::wstring()
-        : first_existing_config({context.data_dir}, L"sunpack_config.json");
-    const std::wstring advanced_path = first_existing_config({context.directory}, L"sunpack_advanced_config.json");
     std::string language;
-    if (!simple_path.empty()) language = config_language(simple_path);
-    if (language.empty() && !advanced_path.empty()) language = config_language(advanced_path);
+    if (!context.data_dir.empty()) {
+        language = config_language(join_config_path(context.data_dir, L"sunpack_config.json"));
+    }
+    if (language.empty()) {
+        language = config_language(join_config_path(context.directory, L"sunpack_advanced_config.json"));
+    }
     return normalize_language(language);
 }
 
@@ -408,11 +402,13 @@ bool parse_state(const InstallContext& context, std::wstring& pipe_name,
         build_id.size() != 16 || pid_text.empty() ||
         binary_stamp != runtime_binary_stamp(context.runtime)) return false;
     try {
-        runtime_build_id = build_id;
+        runtime_build_id = std::move(build_id);
         pipe_name = wide_utf8(pipe_text);
         if (pipe_name.rfind(L"\\\\.\\pipe\\SunPack-", 0) != 0) return false;
         for (std::size_t index = 0; index < token.size(); ++index) {
-            token[index] = static_cast<unsigned char>(std::stoul(token_text.substr(index * 2, 2), nullptr, 16));
+            const char* first = token_text.data() + index * 2;
+            const auto parsed = std::from_chars(first, first + 2, token[index], 16);
+            if (parsed.ptr != first + 2 || parsed.ec != std::errc{}) return false;
         }
         return true;
     } catch (...) {
@@ -671,13 +667,6 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     }
     if (startup) startup->release();
 
-    const std::string cwd = utf8(request_cwd);
-    if (cwd.empty() || cwd.size() > kMaxFieldBytes) {
-        return RequestOutcome::NotDelivered;
-    }
-    std::string wire(kRequestMagic, 4);
-    wire.append(runtime_build_id);
-    wire.append(reinterpret_cast<const char*>(token.data()), token.size());
     const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD console_mode = 0;
     const bool stdout_tty = GetConsoleMode(output, &console_mode) &&
@@ -693,25 +682,28 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     DWORD input_mode = 0;
     const bool stdin_tty = GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_mode) != 0;
     const bool terminal_resize = stdout_tty && stdin_tty;
-    append_u32(wire, (shutdown ? 1u : 0u) | (stdout_tty ? 2u : 0u) | (stdin_tty ? 4u : 0u) |
-                     (terminal_resize ? 8u : 0u) | 16u | (!terminal_size.empty() ? 32u : 0u));
-    // Bit 16 advertises WriteConsoleW or redirected UTF-8, independent of VT.
-    // Bit 32 marks the final field as terminal metadata rather than a user argument.
-    append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
-    append_u32(wire, static_cast<std::uint32_t>(arguments.size() + !terminal_size.empty()));
-    wire.append(cwd);
-    auto append_argument = [&](const std::string& encoded) {
-        append_u32(wire, static_cast<std::uint32_t>(encoded.size()));
-        wire.append(encoded);
-    };
-    // Windows bounds argv and the working directory. Send one request buffer
-    // so the server can read the fixed header without waiting for three more writes.
-    for (const auto& argument : arguments) {
-        append_argument(utf8(argument));
-    }
-    if (!terminal_size.empty()) append_argument(terminal_size);
-    if (!write_all(pipe, wire.data(), wire.size())) {
-        return RequestOutcome::DeliveryUncertain;
+    {
+        const std::string cwd = utf8(request_cwd);
+        if (cwd.empty() || cwd.size() > kMaxFieldBytes) return RequestOutcome::NotDelivered;
+        std::string wire(kRequestMagic, 4);
+        wire.append(runtime_build_id);
+        wire.append(reinterpret_cast<const char*>(token.data()), token.size());
+        // Bit 16 advertises WriteConsoleW or redirected UTF-8, independent of VT.
+        // Bit 32 marks the final field as terminal metadata rather than a user argument.
+        append_u32(wire, (shutdown ? 1u : 0u) | (stdout_tty ? 2u : 0u) | (stdin_tty ? 4u : 0u) |
+                         (terminal_resize ? 8u : 0u) | 16u | (!terminal_size.empty() ? 32u : 0u));
+        append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
+        append_u32(wire, static_cast<std::uint32_t>(arguments.size() + !terminal_size.empty()));
+        wire.append(cwd);
+        auto append_argument = [&](const std::string& encoded) {
+            append_u32(wire, static_cast<std::uint32_t>(encoded.size()));
+            wire.append(encoded);
+        };
+        // Windows bounds argv and the working directory. Send one request buffer
+        // so the server can read the fixed header without waiting for three more writes.
+        for (const auto& argument : arguments) append_argument(utf8(argument));
+        if (!terminal_size.empty()) append_argument(terminal_size);
+        if (!write_all(pipe, wire.data(), wire.size())) return RequestOutcome::DeliveryUncertain;
     }
     std::array<char, 20> handshake{};
     if (!read_all(pipe, handshake.data(), handshake.size()) ||
@@ -720,14 +712,18 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         return RequestOutcome::DeliveryUncertain;
     }
     ConsoleCancellation controls(pipe, supports_cancellation(arguments), terminal_resize);
+    std::array<char, 4096> inline_payload;
     while (true) {
         std::array<char, 5> header{};
         if (!read_all(pipe, header.data(), header.size())) break;
         const unsigned char kind = static_cast<unsigned char>(header[0]);
         const std::uint32_t size = read_u32(header.data() + 1);
         if (size > kMaxFieldBytes) break;
-        std::string payload(size, '\0');
-        if (!read_all(pipe, payload.data(), payload.size())) break;
+        std::unique_ptr<char[]> large_payload;
+        if (size > inline_payload.size()) large_payload.reset(new char[size]);
+        char* data = large_payload ? large_payload.get() : inline_payload.data();
+        if (!read_all(pipe, data, size)) break;
+        const std::string_view payload(data, size);
         if (kind == 0) {
             if (size != 4) break;
             exit_code = static_cast<std::int32_t>(read_u32(payload.data()));

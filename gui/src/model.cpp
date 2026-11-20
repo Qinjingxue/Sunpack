@@ -755,7 +755,8 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
         if(!range.length) throw std::out_of_range("settingChanged");
         const auto raw=tokens.text(range);
         field["original"]=std::string(raw);
-        if(field["type"]!="string") field["text"]=std::string(raw);
+        if(field["editor"]=="rule_list") field.erase("text");
+        else if(field["type"]!="string") field["text"]=std::string(raw);
     }
     return rows;
 }

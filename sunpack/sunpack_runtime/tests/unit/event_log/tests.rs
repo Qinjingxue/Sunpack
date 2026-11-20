@@ -25,6 +25,36 @@ fn history_expiration_trims_overlapping_runs_and_reopens_the_surviving_run() {
 }
 
 #[test]
+fn history_cleanup_retries_a_locked_run_without_pinning_other_runs() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = gui_contract::Directory::new("history_cleanup");
+    let mut store = Store::open(root.0.join("events.json")).unwrap();
+    let row = json!({"event":"done","path":"archive.zip"});
+    for ts in [2000, 1000] {
+        store.append(&HistoryRecord::new(&row, ts, &row).unwrap()).unwrap();
+    }
+    store.publish().unwrap();
+
+    let folder = root.0.join("events.json.store");
+    let [first, second] = store.manifest.runs.as_slice() else {
+        panic!("expected two runs");
+    };
+    let locked = folder.join(format!("{}.index", first.name));
+    let other = folder.join(format!("{}.index", second.name));
+    let handle = std::fs::OpenOptions::new().read(true).share_mode(3).open(&locked).unwrap();
+
+    store.expire(2000).unwrap();
+    assert!(crate::io::atomic_file::sharing_conflict(&store.publish().unwrap_err()));
+    assert!(locked.exists());
+    assert!(!other.exists());
+    drop(handle);
+
+    store.publish().unwrap();
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+}
+
+#[test]
 fn archive_diagnostics_do_not_expand_or_change_shared_recovery_receipts() {
     let input = crate::io::archive_state::ArchiveInput::file("C:/input.zip".into(), "zip".into(), "input.zip".into());
     let checkpoint = json!({"input":input,"sources":[],

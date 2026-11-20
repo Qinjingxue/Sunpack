@@ -673,7 +673,7 @@ impl Store {
         for ((ts, _), id) in &old.time {
             let row = &old.rows[id];
             let mut bytes = entry(&mut old.index, row.slot)?;
-            let position = new.data.stream_position()?;
+            let position = new.bytes;
             old.data.seek(SeekFrom::Start(row.offset))?;
             let mut remaining = row.size;
             while remaining != 0 {
@@ -802,11 +802,22 @@ impl Store {
             let _ = fs::remove_file(&temp);
             return Err(error);
         }
-        for name in self.obsolete.drain(..) {
-            let (data, index) = files(&self.folder, &name);
-            fs::remove_file(data)?;
-            fs::remove_file(index)?;
-        }
-        Ok(())
+        let mut cleanup_error = None;
+        // The manifest is committed. A reader can still hold an obsolete run;
+        // keep its name for the next publication and retire other runs now.
+        self.obsolete.retain(|name| {
+            let (data, index) = files(&self.folder, name);
+            let mut pending = false;
+            for path in [data, index] {
+                if let Err(error) = fs::remove_file(path) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        cleanup_error.get_or_insert(error);
+                        pending = true;
+                    }
+                }
+            }
+            pending
+        });
+        cleanup_error.map_or(Ok(()), Err)
     }
 }

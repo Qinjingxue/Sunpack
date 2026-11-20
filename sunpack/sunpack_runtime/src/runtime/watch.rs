@@ -452,10 +452,17 @@ impl WatchStatus {
         let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
         for wake in waiters.into_values() { wake.wake(); }
     }
+
+    fn remove_waiter(&self, id: u64) -> Option<Waker> {
+        let mut waiters = self.waiters.lock().unwrap();
+        let wake = waiters.remove(&id);
+        if waiters.capacity() > 256 { crate::collections::trim_map(&mut waiters); }
+        wake
+    }
 }
 struct StatusWait<'a> { status: &'a WatchStatus, id: u64 }
 impl Drop for StatusWait<'_> {
-    fn drop(&mut self) { self.status.waiters.lock().unwrap().remove(&self.id); }
+    fn drop(&mut self) { self.status.remove_waiter(self.id); }
 }
 
 pub(super) struct Watch {
@@ -474,6 +481,19 @@ pub(super) struct Watch {
 struct OutputPublications {
     current: RwLock<Option<ExternalOutputs>>,
     reservations: crate::watch_store::active_outputs::OutputReservations,
+}
+
+impl OutputPublications {
+    fn retire(&self, journal: &Arc<journal::Journal>) {
+        let retired = {
+            let mut current = self.current.write().unwrap_or_else(|error| error.into_inner());
+            if !current.as_ref().is_some_and(|outputs| outputs.journal.as_ptr() == Arc::as_ptr(journal)) {
+                return;
+            }
+            current.take()
+        };
+        drop(retired);
+    }
 }
 
 struct ExternalOutputs {
@@ -515,17 +535,21 @@ impl Watch {
     pub(super) fn shutdown_requested(&self) -> bool { self.status.shutdown.load(Ordering::Acquire) }
     pub(super) async fn wait_status_change(&self, revision: u64, cancel: &Cancellation) -> io::Result<()> {
         let guard = StatusWait { status: &self.status, id: self.status.next.fetch_add(1, Ordering::Relaxed) };
-        let wake = Arc::new(Mutex::new(None::<Waker>));
-        let cancelled_wake = Arc::clone(&wake);
+        let status = Arc::downgrade(&self.status);
+        let id = guard.id;
         let _subscription = cancel.subscribe(move || {
-            if let Some(waker) = cancelled_wake.lock().unwrap().as_ref() { waker.wake_by_ref(); }
+            if let Some(waker) = status.upgrade().and_then(|status| status.remove_waiter(id)) {
+                waker.wake();
+            }
         });
         poll_fn(|cx| {
-            *wake.lock().unwrap() = Some(cx.waker().clone());
-            if let Err(error) = cancel.check_io() { return Poll::Ready(Err(error)); }
+            // Cancellation removes its waiter under this same lock. It
+            // either sees the registration or is visible to this check.
             let mut waiters = self.status.waiters.lock().unwrap();
+            if let Err(error) = cancel.check_io() { return Poll::Ready(Err(error)); }
             if self.status_revision() != revision { return Poll::Ready(Ok(())); }
-            waiters.insert(guard.id, cx.waker().clone());
+            waiters.entry(id).and_modify(|wake| wake.clone_from(cx.waker()))
+                .or_insert_with(|| cx.waker().clone());
             Poll::Pending
         }).await
     }
@@ -2396,34 +2420,48 @@ struct Scheduler {
     broker_lease: Option<Arc<BrokerLease>>,
 }
 
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        // Startup can fail after installing the catalog for foreground work.
+        self.external.retire(&self.journal);
+    }
+}
+
 impl Scheduler {
     fn enabled(&self) -> bool { self.hub.enabled.load(Ordering::Acquire) }
 
     /// A mode/scope rebuild uses the ordinary executor, not the service thread.
     /// Pending proposals keep collecting USN/quiet evidence until this baseline
     /// has been indexed, and control/configuration commands remain responsive.
-    fn rebuild_dedup(&mut self, scopes_changed: bool) -> io::Result<()> {
+    fn rebuild_dedup(&mut self, scopes_changed: bool, refresh_journals: bool) -> io::Result<()> {
         if self.settings.watch.deduplication == config::WatchDeduplication::None { return Ok(()); }
-        // Query each volume once at startup/configuration changes. Routine
-        // checkpoints below reuse their already-read journal boundaries.
-        self.engine.run_stage("watch_dedup_journal", Origin::Watch, || {
-            let mut volumes = HashMap::new();
-            let stamps = self.roots.values().map(|(_, scope)| {
-                let stamp = filesystem::watch_volume_device(&scope.root).ok().and_then(|volume| {
-                    let cursor = volumes.entry(volume.clone()).or_insert_with(|| filesystem::watch_volume_cursor(&volume).ok());
-                    cursor.map(|(journal, _)| (volume, journal))
-                }).unwrap_or_default();
-                (scope.key().to_owned(), stamp.0, stamp.1)
-            }).collect::<Vec<_>>();
-            self.dedup.lock().unwrap().reconcile_journals(&stamps)
-        })??;
-        if !scopes_changed && !self.dedup.lock().unwrap().needs_rebuild() { return Ok(()); }
-        self.dedup_rebuild.take();
-        self.dedup.lock().unwrap().begin_rebuild()?;
+        if refresh_journals {
+            self.engine.run_stage("watch_dedup_journal", Origin::Watch, || {
+                let mut volumes = HashMap::new();
+                let stamps = self.roots.values().map(|(_, scope)| {
+                    let stamp = filesystem::watch_volume_device(&scope.root).ok().and_then(|volume| {
+                        let cursor = volumes.entry(volume.clone()).or_insert_with(|| filesystem::watch_volume_cursor(&volume).ok());
+                        cursor.map(|(journal, _)| (volume, journal))
+                    }).unwrap_or_default();
+                    (scope.key().to_owned(), stamp.0, stamp.1)
+                }).collect::<Vec<_>>();
+                self.dedup.lock().unwrap().reconcile_journals(&stamps)
+            })??;
+        }
+        let generation = {
+            let mut index = self.dedup.lock().unwrap();
+            if !scopes_changed && (!index.needs_rebuild()
+                || self.dedup_rebuild.as_ref().is_some_and(|job| job.generation == index.generation()))
+            {
+                return Ok(());
+            }
+            index.begin_rebuild()?;
+            index.generation()
+        };
         self.dedup_job_id += 1;
         self.dedup_rebuild = Some(DedupRebuild {
             id: self.dedup_job_id,
-            generation: self.dedup.lock().unwrap().generation(),
+            generation,
             cancel: Cancellation::new(), handle: None,
             roots: self.roots.values().cloned().collect(),
         });
@@ -2641,7 +2679,7 @@ impl Scheduler {
         scheduler.reconcile_roots(false)?;
         scheduler.activate_scan_options()?;
         scheduler.retire_missing_entries(None, true)?;
-        scheduler.rebuild_dedup(false)?;
+        scheduler.rebuild_dedup(false, true)?;
         scheduler.reconcile_shell();
         if enabled {
             scheduler.recover_pending(None)?;
@@ -2674,7 +2712,7 @@ impl Scheduler {
         // the next scheduler, not to an idle service with no roots.
         self.stop_watch_sources();
         self.toast.take();
-        *self.external.current.write().unwrap() = None;
+        self.external.retire(&self.journal);
         self.broker_lease.take();
         self.commit_idle_catalog();
         self.journal.suspend()?;
@@ -3125,7 +3163,10 @@ impl Scheduler {
                 self.dedup_rebuild.take();
                 self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope)?;
             }
-            self.rebuild_dedup(roots_changed)?;
+            // A no-op reload can retry an abandoned rebuild, but a running
+            // baseline and a ready index already have their journal stamps.
+            let retry_dedup = self.dedup_rebuild.is_none() && self.dedup.lock().unwrap().needs_rebuild();
+            self.rebuild_dedup(roots_changed, roots_changed || dedup_changed || retry_dedup)?;
             if !self.enabled() { return Ok(()); }
             if scheduler_changed { self.recover_pending(None)?; }
             self.checkpoint_reload(scheduler_changed || roots_changed)?;
@@ -3150,7 +3191,7 @@ impl Scheduler {
                 if dedup_changed {
                     self.dedup_rebuild.take();
                     self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope)?;
-                    self.rebuild_dedup(false)?;
+                    self.rebuild_dedup(false, true)?;
                 }
                 let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots(false)?;
                 self.activate_scan_options()?;
@@ -3357,7 +3398,7 @@ impl Scheduler {
         for waiter in signals.rebuild {
             waiter.send(Err(io::ErrorKind::Interrupted.into()));
         }
-        *self.external.current.write().unwrap() = None;
+        self.external.retire(&self.journal);
         *self.hub.claims.lock().unwrap() = HashMap::new();
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_close", Origin::Watch, || {
@@ -3403,7 +3444,8 @@ impl Scheduler {
             };
             let mut signals = self.hub.wait(deadline.into_iter().chain(reload_retry).min());
             self.candidate_diagnostics.clear_expired(Instant::now());
-            if signals.dedup_rebuild { self.rebuild_dedup(false)?; }
+            // The checkpoint already reconciled the journal stamps.
+            if signals.dedup_rebuild { self.rebuild_dedup(false, false)?; }
             for (id, result) in signals.dedup_completed.drain(..) {
                 if !self.dedup_rebuild.as_ref().is_some_and(|job| job.id == id) { continue; }
                 match result {

@@ -291,7 +291,7 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
     std::promise<bool> full;
     auto blocked = full.get_future();
     std::atomic<bool> reported{false};
-    auto gate = std::make_shared<VolumeSpaceGate>("memory-disk", "", [&](const auto &event) {
+    auto gate = std::make_shared<VolumeSpaceGate>("memory-disk", [&](const auto &event) {
         if (event.kind == VolumeSpaceTransition::Kind::Blocked && !reported.exchange(true)) full.set_value(true);
     });
     auto state = std::make_shared<VolumeState>("memory-disk", true, std::move(gate));

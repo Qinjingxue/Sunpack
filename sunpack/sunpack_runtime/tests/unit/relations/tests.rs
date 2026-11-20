@@ -289,43 +289,27 @@ fn encrypted_relations_require_readable_anchors_even_with_existing_failure() {
 }
 
 #[test]
-fn inverted_conflict_index_preserves_status_scoping() {
+fn conflict_index_marks_all_shared_owners_in_the_selected_status() {
     let validations = vec![
         validation_with_owned_paths(
-            ProposalStatus::Valid,
+            ProposalStatus::NeedsPassword,
             &[r"C:\case.part1.rar", r"C:\case.part2.rar"],
         ),
         validation_with_owned_paths(
-            ProposalStatus::Valid,
+            ProposalStatus::NeedsPassword,
             &[r"C:\case.part2.rar", r"C:\case.part3.rar"],
         ),
-        validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\other.part1.rar"]),
         validation_with_owned_paths(ProposalStatus::NeedsPassword, &[r"C:\case.part2.rar"]),
+        validation_with_owned_paths(ProposalStatus::NeedsPassword, &[r"C:\other.part1.rar"]),
+        validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\case.part2.rar"]),
     ];
     let owned_paths: Vec<HashSet<String>> =
         validations.iter().map(validation_owned_paths).collect();
-
-    let valid_conflicts =
-        conflicting_proposal_indexes(&validations, &owned_paths, ProposalStatus::Valid);
-    let password_conflicts =
-        conflicting_proposal_indexes(&validations, &owned_paths, ProposalStatus::NeedsPassword);
-
-    assert_eq!(valid_conflicts, HashSet::from([0, 1]));
-    assert!(password_conflicts.is_empty());
-}
-
-#[test]
-fn inverted_conflict_index_marks_every_candidate_sharing_a_path() {
-    let validations = vec![
-        validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\shared.bin"]),
-        validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\shared.bin"]),
-        validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\shared.bin"]),
-    ];
-    let owned_paths: Vec<HashSet<String>> =
-        validations.iter().map(validation_owned_paths).collect();
-
-    let conflicts =
-        conflicting_proposal_indexes(&validations, &owned_paths, ProposalStatus::Valid);
-
-    assert_eq!(conflicts, HashSet::from([0, 1, 2]));
+    let password_indexes = validations.iter().enumerate().filter_map(|(index, validation)| {
+        (validation.status == ProposalStatus::NeedsPassword).then_some(index)
+    });
+    assert_eq!(
+        conflicting_indexes_among(&owned_paths, password_indexes),
+        HashSet::from([0, 1, 2])
+    );
 }

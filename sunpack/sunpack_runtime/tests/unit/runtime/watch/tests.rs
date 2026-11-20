@@ -1,6 +1,38 @@
 use super::*;
 use crate::io::reader::capture_file_generation;
 use crate::watch_store::{NativeWatchOperations, PendingObservation};
+
+#[test]
+fn cancelling_watch_status_removes_only_the_cancelled_waiter() {
+    use std::future::Future;
+    use std::task::{Context, Wake};
+
+    #[derive(Default)]
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    let watch = Watch::new(Arc::new(|| {}));
+    let cancelled = Cancellation::new();
+    let retry = Cancellation::new();
+    let revision = watch.status_revision();
+    let mut first = std::pin::pin!(watch.wait_status_change(revision, &cancelled));
+    let mut second = std::pin::pin!(watch.wait_status_change(revision, &retry));
+    let wake_count = Arc::new(Count::default());
+    let waker = Waker::from(Arc::clone(&wake_count));
+    let mut cx = Context::from_waker(&waker);
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    cancelled.cancel();
+    assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+    assert_eq!(watch.status.waiters.lock().unwrap().len(), 1);
+    assert!(matches!(first.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+    watch.status.notify();
+    assert_eq!(wake_count.0.load(Ordering::Relaxed), 2);
+    assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+}
+
 #[test]
 fn foreground_output_reservation_survives_scheduler_replacement_and_is_published_once() {
     let marker = crate::test_support::temp_file("output_publication_handoff", b"");
@@ -720,9 +752,14 @@ fn published_policy_keeps_full_scan_obligation_across_retirement_and_scan_failur
 fn reload_scheduler_policy_excludes_only_tray_and_process_priority() {
     let previous = Config::parse(&json!({})).unwrap();
     let mut next = previous.clone();
-    next.watch.tray_enabled = !previous.watch.tray_enabled;
-    next.runtime.process_mode = config::ProcessMode::Background;
+    next.runtime.process_mode = if previous.runtime.process_mode == config::ProcessMode::Normal {
+        config::ProcessMode::Background
+    } else {
+        config::ProcessMode::Normal
+    };
     assert!(previous != next);
+    assert!(!scheduler_configuration_changed(&previous, &next));
+    next.watch.tray_enabled = !previous.watch.tray_enabled;
     assert!(!scheduler_configuration_changed(&previous, &next));
     next.watch.toast_enabled = !previous.watch.toast_enabled;
     assert!(scheduler_configuration_changed(&previous, &next));

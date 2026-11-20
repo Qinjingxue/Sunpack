@@ -91,17 +91,14 @@ namespace sunpack::sevenzip
         return true;
     }
 
-    inline std::wstring space_query_path(const std::wstring &volume_key) noexcept
+    inline std::wstring space_query_path(std::wstring volume_key)
     {
         if (!is_volume_guid_key(volume_key))
         {
-            return std::wstring{};
+            return {};
         }
-        if (!volume_key.empty() && volume_key.back() == L'\\')
-        {
-            return volume_key;
-        }
-        return volume_key + L'\\';
+        if (volume_key.back() != L'\\') volume_key.push_back(L'\\');
+        return volume_key;
     }
 
     // synthetic / unknown 卷：用引致失败的实际路径就地解析查询根。
@@ -264,20 +261,18 @@ namespace sunpack::sevenzip
         using ChangeSink = VolumeSpaceChangeSink;
 
         // volume_key：身份键（= \\?\Volume{GUID}，小写无尾反斜杠）。
-        // query_root_hint：resolved 卷可省略（构造时自动补尾反斜杠）；
-        //                  synthetic 卷留空，首次空间失败时用 failed_path 就地解析。
-        VolumeSpaceGate(const std::string &volume_key,
-                        const std::string &query_root_hint,
-                        ChangeSink sink)
-            : query_root_(widen_ascii(query_root_hint)),
+        // Synthetic keys resolve via the real output path on the first space failure.
+        VolumeSpaceGate(const std::string &volume_key, ChangeSink sink)
+            : query_root_(space_query_path(widen_ascii(volume_key))),
 #ifdef SUP7Z_DEBUG
               volume_key_(volume_key),
 #endif
-              sink_(std::move(sink))
-        {
-            if (query_root_.empty())
-                query_root_ = space_query_path(widen_ascii(volume_key));
-        }
+              sink_(std::move(sink)) {}
+
+#ifdef SUP7Z_DEBUG
+        VolumeSpaceGate(const std::string &volume_key, std::wstring query_root, ChangeSink sink)
+            : query_root_(std::move(query_root)), volume_key_(volume_key), sink_(std::move(sink)) {}
+#endif
 
         // 由 job 的 volume lease scope 调用（不是 make_job / finish_job）：根输出目录创建
         // 是最常见的满盘入口，那时它还没发生，space_blocked 会发给 0 个 job。

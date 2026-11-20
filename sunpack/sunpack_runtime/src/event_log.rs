@@ -894,8 +894,8 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
         })();
         let records_written = result.is_ok();
         let result = result.and_then(|()| store.as_mut().unwrap().publish());
-        // A sharing conflict at publication leaves the written records and
-        // pending manifest intact. Retry on the next event or explicit flush.
+        // Retry a sharing conflict during manifest replacement or obsolete-run
+        // cleanup on the next event or explicit flush.
         let publication_blocked = records_written && result.as_ref().is_err_and(|error| {
             crate::io::atomic_file::sharing_conflict(error)
         });

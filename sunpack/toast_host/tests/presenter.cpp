@@ -76,6 +76,23 @@ struct TestToastNotificationManager {
 #undef ToastNotifier
 
 namespace {
+void check_com_activation() {
+    // Probe the production class factory without registering the live CLSID.
+    CLSID probe_clsid{};
+    winrt::check_hresult(CoCreateGuid(&probe_clsid));
+    {
+        ActivationRegistration activation(probe_clsid);
+        winrt::com_ptr<IClassFactory> factory;
+        winrt::check_hresult(CoGetClassObject(probe_clsid, CLSCTX_LOCAL_SERVER, nullptr, IID_PPV_ARGS(factory.put())));
+        winrt::com_ptr<INotificationActivationCallback> callback;
+        winrt::check_hresult(factory->CreateInstance(nullptr, IID_PPV_ARGS(callback.put())));
+        winrt::check_hresult(callback->Activate(kAppId, L"noop", nullptr, 0));
+    }
+    winrt::com_ptr<IClassFactory> factory;
+    toast_test::require(FAILED(CoGetClassObject(
+        probe_clsid, CLSCTX_LOCAL_SERVER, nullptr, IID_PPV_ARGS(factory.put()))));
+}
+
 void check_snapshot_and_actions() {
     using toast_test::require;
     const std::wstring original = L"C:\\测试\\failed & log.txt";
@@ -125,6 +142,7 @@ void check_snapshot_and_actions() {
 int main() {
     try {
         WinrtApartmentScope apartment;
+        check_com_activation();
         check_snapshot_and_actions();
         Snapshot snapshot;
         snapshot.kind = SnapshotKind::progress;

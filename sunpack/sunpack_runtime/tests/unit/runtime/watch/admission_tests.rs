@@ -49,6 +49,64 @@ pub(super) fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
 }
 
 #[test]
+fn dropping_scheduler_releases_published_catalog_for_only_its_journal() {
+    let marker = crate::test_support::temp_file("watch_failed_start_catalog", b"");
+    let base = marker.with_extension("watch");
+    let mut old = audit_scheduler(&base.join("old"), base.join("unused-worker.exe"));
+    let next = audit_scheduler(&base.join("next"), base.join("unused-worker.exe"));
+    old.external = Arc::clone(&next.external);
+    let external = Arc::clone(&next.external);
+    let catalog = Arc::downgrade(&next.catalog);
+    *external.current.write().unwrap() = Some(ExternalOutputs {
+        journal: Arc::downgrade(&next.journal), catalog: Arc::clone(&next.catalog),
+        scopes: Arc::from([]), options: next.deep_options.clone(), hub: Arc::downgrade(&next.hub),
+    });
+    drop(old);
+    assert!(external.current.read().unwrap().is_some());
+    // Opening can return after publishing this route, before run owns cleanup.
+    drop(next);
+    assert!(external.current.read().unwrap().is_none());
+    assert!(catalog.upgrade().is_none());
+    fs::remove_dir_all(base).unwrap();
+    fs::remove_file(marker).unwrap();
+}
+
+#[test]
+fn dedup_rebuild_keeps_current_baseline_and_replaces_stale_generation() {
+    let marker = crate::test_support::temp_file("watch_dedup_generation", b"");
+    let base = marker.with_extension("watch");
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    let mode = config::WatchDeduplication::FileId;
+    Arc::make_mut(&mut scheduler.settings).watch.deduplication = mode;
+    scheduler.roots.clear();
+    let stamps = |generation| [("scope".into(), "volume".into(), generation)];
+    let generation = {
+        let mut index = scheduler.dedup.lock().unwrap();
+        index.reset(mode, config::WatchDeduplicationScope::Root).unwrap();
+        assert!(index.reconcile_journals(&stamps(1)).unwrap());
+        index.begin_rebuild().unwrap();
+        index.generation()
+    };
+    let cancel = Cancellation::new();
+    scheduler.dedup_job_id = 1;
+    scheduler.dedup_rebuild = Some(DedupRebuild {
+        id: 1, generation, cancel: cancel.clone(), handle: None, roots: VecDeque::new(),
+    });
+    scheduler.rebuild_dedup(false, false).unwrap();
+    assert_eq!(scheduler.dedup_rebuild.as_ref().unwrap().generation, generation);
+    assert!(!cancel.cancelled());
+
+    assert!(scheduler.dedup.lock().unwrap().reconcile_journals(&stamps(2)).unwrap());
+    scheduler.rebuild_dedup(false, false).unwrap();
+    assert!(cancel.cancelled());
+    assert!(scheduler.dedup_rebuild.is_none());
+    assert!(!scheduler.dedup.lock().unwrap().needs_rebuild());
+    drop(scheduler);
+    fs::remove_dir_all(base).unwrap();
+    fs::remove_file(marker).unwrap();
+}
+
+#[test]
 fn ordinary_commit_keeps_usn_identity_cache_until_idle_commit() {
     const CHILD: &str = "SUNPACK_USN_CACHE_LIFETIME_TEST";
     let Some(base) = std::env::var_os(CHILD) else {
@@ -1098,17 +1156,6 @@ fn scheduler_fault_keeps_reload_control_and_reopens_the_store() {
         return;
     }
     run_isolated("scheduler_fault_keeps_reload_control_and_reopens_the_store", CHILD);
-}
-
-#[test]
-fn process_mode_only_change_is_shell_policy_not_scheduler_policy() {
-    let previous = Config::default();
-    let mut next = previous.clone();
-    next.runtime.process_mode = if previous.runtime.process_mode == crate::core::config::ProcessMode::Normal {
-        crate::core::config::ProcessMode::Background
-    } else { crate::core::config::ProcessMode::Normal };
-    assert!(!scheduler_configuration_changed(&previous, &next));
-    assert!(previous != next, "shell changes must not be reported as no-op");
 }
 
 #[test]

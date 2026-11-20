@@ -119,7 +119,8 @@ namespace sunpack::sevenzip
         const std::function<void()> on_reap_change_;
         mutable std::mutex mutex_;
         std::condition_variable writer_ready_;
-        std::unordered_map<std::string, Entry> entries_;
+        // Each key views the immutable string owned by its Entry's VolumeState.
+        std::unordered_map<std::string_view, Entry> entries_;
     };
 
     // The writer lease and the immutable job ID outlive this registration.

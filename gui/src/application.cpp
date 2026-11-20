@@ -52,9 +52,9 @@ bool copy_text(HWND owner,const std::wstring& text) {
     return copied;
 }
 bool rule_editor(std::string_view editor) { return editor=="rule_list"; }
-void update_tags(TagCollection& tags,const std::string& id,const std::string& text,const Json& drafts) {
+void update_tags(TagCollection& tags,const std::string& id,const std::string& original,const Json& drafts) {
     auto draft=drafts.find(id);
-    tags.SetItems(draft==drafts.end()?text:(*draft)["text"].get_ref<const std::string&>());
+    tags.SetItems(draft==drafts.end()?original:(*draft)["text"].get_ref<const std::string&>());
 }
 // Keep host messages outside Core UI's startup/render message range.
 constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403, TaskRange = WM_APP + 0x404;
@@ -588,7 +588,7 @@ void Application::sync_tags(const std::string& id) {
     auto sync=[&](const auto& binding) {
         if(rule_editor(binding.second->editor)) {
             if(auto* tags=dynamic_cast<TagCollection*>(root->FindById("tags-"+binding.first)))
-                update_tags(*tags,binding.first,binding.second->text,drafts);
+                update_tags(*tags,binding.first,binding.second->original,drafts);
         }
     };
     if(id.empty()) {
@@ -601,20 +601,26 @@ void Application::bind_controls(const Json& fields) {
     for(auto& binding:controls_) binding.second->pending_removal=true;
     for(auto& field:fields) {
         auto editor=field.value("editor",std::string());
-        if(editor!="choice" && editor!="recursive" && editor!="toggle" && !rule_editor(editor)) continue;
+        const bool tags=rule_editor(editor);
+        if(editor!="choice" && editor!="recursive" && editor!="toggle" && !tags) continue;
         auto it=controls_.try_emplace(field["id"].get_ref<const std::string&>()).first;
         const auto& id=it->first;
         auto& binding=it->second;
+        const bool same_editor=binding && binding->editor==editor;
         if(!binding) binding=std::make_unique<ControlBinding>(ControlBinding{this,id});
         binding->pending_removal=false;
         binding->editor=editor;
         binding->type=editor=="recursive"?"string":field["type"].get<std::string>();
-        binding->text=field["text"].get<std::string>();
-        binding->original=rule_editor(editor)?std::string():field["original"].get<std::string>();
+        binding->text=tags?std::string():field["text"].get<std::string>();
+        const auto& original=field["original"].get_ref<const std::string&>();
+        if(binding->original!=original) binding->original=std::string(original);
         binding->options=editor=="choice" || editor=="recursive"?field["options"]:Json();
         binding->boolean=field["boolean"].get<bool>();
         binding->choice=field["choice"].get<int>();
-        auto host=(editor=="toggle"?"toggle-host-":rule_editor(editor)?"tags-host-":"choice-")+id;
+        // Existing hooks already reference this binding, including after a
+        // virtual row unmounts and later comes back into view.
+        if(same_editor) continue;
+        auto host=(editor=="toggle"?"toggle-host-":tags?"tags-host-":"choice-")+id;
         ui_page_on_widget_mount(page_,host.c_str(),[](UiPage,UiWidget parent,void* context){
             auto* binding=static_cast<ControlBinding*>(context); auto* self=binding->owner;
             const auto& id=binding->id;
@@ -631,7 +637,7 @@ void Application::bind_controls(const Json& fields) {
                     auto payload=Json{{"id",id},{"index",index},{"value",utf8(value)},{"regex",regex}}.dump();
                     if(ui_page_call_json(self->page_,"editTag",payload.c_str())!=0) self->set_error("actionError","uiBindingFailed");
                 };
-                update_tags(*tags,id,binding->text,page_value(self->page_,"drafts"));
+                update_tags(*tags,id,binding->original,page_value(self->page_,"drafts"));
                 host->AddChild(tags); return;
             }
             // Nested scope mounting visits descendants again when its parent
@@ -1472,8 +1478,8 @@ void Application::work() {
                     if(options_.allow_cli) run_cli(options_.cli,{L"watch",L"relog"},stop_);
                 } catch(...) {} // A later log operation can request recovery again.
             }
-            if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {
-                bool send_delta=!password_delta.is_null() && !language_changed && previous_patch.contains("passwords");
+            if(passwords_changed || !previous_patch.contains("passwords")) {
+                bool send_delta=!password_delta.is_null() && previous_patch.contains("passwords");
                 if(send_delta) {
                     // This worker is the sole password publisher. An earlier full
                     // snapshot can only be drained between here and publication.

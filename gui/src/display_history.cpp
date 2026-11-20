@@ -135,6 +135,9 @@ struct RunReader {
         head=run.at("head").get<uint64_t>(); count=run.at("count").get<uint64_t>();
         unordered=run.value("unordered",false);
         validate();
+        // The timestamp is an inclusive lower bound, including for unordered
+        // live slots. Keep the revision check even on pages older than the run.
+        if(before && run.at("first").get<int64_t>()>std::get<0>(*before)) return;
         LARGE_INTEGER size{}; if(!GetFileSizeEx(index,&size)) win_error("opReadEventLog");
         count=std::min(count,uint64_t(size.QuadPart)/EntryBytes);
         if(head>=count) return;
@@ -376,7 +379,7 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     if(manifest.contains("live") && manifest["live"].is_object()) {
         const auto& run=manifest["live"];
         auto& live=live_reader.emplace(folder,run,run_name(run),before,revision,true);
-        if(live.unordered) {
+        if(live.unordered && live.position>=0) {
             // Keep at most one page of live candidates. Only filters on record
             // contents need decoding before the merge with historical runs.
             auto newer=[](const Entry& a,const Entry& b) { return std::tie(a.time,a.offset)>std::tie(b.time,b.offset); };

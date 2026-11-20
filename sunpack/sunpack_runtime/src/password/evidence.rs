@@ -496,8 +496,9 @@ impl EvidenceContext {
                         complete && viable.len() <= usize::from(viable.contains(hit))
                     }))
         });
+        let selected = confirmed.or_else(|| fixed.then_some(0));
         let mut removed: Vec<&VolumeProjection> = Vec::new();
-        if let Some(index) = confirmed.or_else(|| fixed.then_some(0)) {
+        if let Some(index) = selected {
             // The plan has one confirmed password. Remove volume paths that
             // contradict it; there is no password/volume rule to carry onward.
             for ((_, projection), result) in self.alternatives.iter().zip(&results) {
@@ -510,7 +511,7 @@ impl EvidenceContext {
                 }
             }
         }
-        let native_rejections = if let Some(index) = confirmed.or_else(|| fixed.then_some(0)) {
+        let native_rejections = if let Some(index) = selected.filter(|_| !self.independent_rar.is_empty()) {
             let screened: HashMap<_, _> = self.alternatives.iter().zip(&results)
                 .filter_map(|((context, _), result)| match context {
                     PasswordContext::Rar(context) => Some((Arc::as_ptr(context) as usize, survivors(result).contains(index))),

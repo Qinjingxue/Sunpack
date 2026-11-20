@@ -571,18 +571,12 @@ void config_edits(Application& app,const fs::path& dir) {
     click(app,"contextMenuToggle");
     pump([&]{return state(app.page(),"contextMenuEnabled")==true;},"Enable Explorer menu");
     assert(registry_string(menu_path,L"MUIVerb")==L"Extract files in this folder");
-    struct LanguageCase { int option; const char* code; const wchar_t* menu; const wchar_t* locale; };
-    for(const auto& test:std::initializer_list<LanguageCase>{
-        {0,"zh",L"解压该目录下文件",L"zh-CN"},
-        {2,"zh-TW",L"解壓縮此資料夾中的檔案",L"zh-TW"},
-        {3,"ja",L"このフォルダー内のファイルを展開",L"ja-JP"},
-        {4,"ko",L"이 폴더의 파일 압축 풀기",L"ko-KR"},
-    }) {
-        change_language(test.option,test.code);
-        assert(read_json(config_path)["cli"]["language"]==test.code);
-        assert(registry_string(menu_path,L"MUIVerb")==test.menu);
-        assert(std::wstring_view(window(app).GetRenderer().TextLocale())==test.locale);
-    }
+    // A single native round trip covers the save, renderer and shell bindings.
+    // The model tests check the locale and shell strings for every language.
+    change_language(2,"zh-TW");
+    assert(read_json(config_path)["cli"]["language"]=="zh-TW");
+    assert(registry_string(menu_path,L"MUIVerb")==L"解壓縮此資料夾中的檔案");
+    assert(std::wstring_view(window(app).GetRenderer().TextLocale())==L"zh-TW");
     change_language(1,"en");
     assert(state(app.page(),"contextMenuEnabled")==true);
     assert(registry_string(menu_path,L"MUIVerb")==L"Extract files in this folder");

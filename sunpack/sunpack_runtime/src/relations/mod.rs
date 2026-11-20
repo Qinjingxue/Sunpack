@@ -734,10 +734,11 @@ fn build_candidate_groups(
     // including competitors whose head was not selected by the caller.
     let validation_owned_paths: Vec<HashSet<String>> =
         validations.iter().map(validation_owned_paths).collect();
-    let password_conflicted = conflicting_proposal_indexes(
-        &validations,
+    let password_conflicted = conflicting_indexes_among(
         &validation_owned_paths,
-        ProposalStatus::NeedsPassword,
+        validations.iter().enumerate().filter_map(|(index, validation)| {
+            (validation.status == ProposalStatus::NeedsPassword).then_some(index)
+        }),
     );
 
     let mut claimed_paths = HashSet::new();
@@ -924,36 +925,22 @@ fn validation_owned_paths(validation: &ProposalValidation) -> HashSet<String> {
         .collect()
 }
 
-fn conflicting_proposal_indexes(
-    validations: &[ProposalValidation],
+fn conflicting_indexes_among(
     owned_paths: &[HashSet<String>],
-    status: ProposalStatus,
-) -> HashSet<usize> {
-    debug_assert_eq!(validations.len(), owned_paths.len());
-
-    conflicting_indexes_among(
-        owned_paths,
-        validations
-            .iter()
-            .enumerate()
-            .filter(|(_, validation)| validation.status == status)
-            .map(|(index, _)| index),
-    )
-}
-
-fn conflicting_indexes_among<T: AsRef<str>>(
-    owned_paths: &[HashSet<T>],
     indexes: impl Iterator<Item = usize>,
 ) -> HashSet<usize> {
     let mut owner_by_path: HashMap<&str, usize> = HashMap::new();
     let mut conflicted = HashSet::new();
     for index in indexes {
         for path in &owned_paths[index] {
-            if let Some(previous_index) = owner_by_path.get(path.as_ref()).copied() {
-                conflicted.insert(previous_index);
-                conflicted.insert(index);
-            } else {
-                owner_by_path.insert(path.as_ref(), index);
+            match owner_by_path.entry(path) {
+                std::collections::hash_map::Entry::Occupied(first) => {
+                    conflicted.insert(*first.get());
+                    conflicted.insert(index);
+                }
+                std::collections::hash_map::Entry::Vacant(first) => {
+                    first.insert(index);
+                }
             }
         }
     }
