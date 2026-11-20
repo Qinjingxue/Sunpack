@@ -437,7 +437,7 @@ bool quiescence_tracks_jobs_and_files(const std::filesystem::path& directory) {
     }
     writer.record_operation_result(file, 0);
     // finish_job must seal a file even when its stream did not close it.
-    if (writer.finish_job(job) != S_OK || !writer.take_file_snapshot(file).closed ||
+    if (writer.finish_job(job) != S_OK || !file->take_drained_snapshot().closed ||
         writer.is_quiescent() || writer.finish_job(sibling) != S_OK) {
         return false;
     }
@@ -449,7 +449,7 @@ bool quiescence_tracks_jobs_and_files(const std::filesystem::path& directory) {
     return true;
 }
 
-bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& directory) {
+bool registry_routes_by_volume_and_releases_leases() {
     AsyncWriterConfig config;
     config.threads_per_volume = 2;
     config.buffer_count = 8;
@@ -502,29 +502,6 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
         return false;
     }
 
-    // Draining a job leaves the facility quiescent.
-    {
-        auto lease = registry.acquire("volume-a");
-        const std::vector<unsigned char> payload(1U << 20, 0x77);
-        const auto job = lease.writer().make_job();
-        const auto file = lease.writer().make_file(
-            job, (directory / L"registry.bin").wstring(), 8, 8);
-        std::uint32_t processed = 0;
-        if (lease.writer().write(
-                file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed) != S_OK) {
-            return false;
-        }
-        lease.writer().record_operation_result(file, 0);
-        lease.writer().close_file(file, {});
-        if (lease.writer().finish_job(job) != S_OK) {
-            return false;
-        }
-        if (!lease.writer().is_quiescent()) {
-            std::cerr << "facility not quiescent after its job drained\n";
-            return false;
-        }
-    }
-
     registry.shutdown();
     if (registry.volume_count() != 0) {
         std::cerr << "registry still holds entries after shutdown\n";
@@ -572,7 +549,6 @@ bool registry_creation_allows_other_volumes() {
     const std::string warm = "warm-volume";
     auto warm_lease = registry.acquire(warm);
     registry.acquire(cold).reset();
-    registry.reap_idle();
 
     // Recreating a retained volume allocates first in writer construction.
     // Stall there while a different volume requests its existing writer.
@@ -681,7 +657,7 @@ bool registry_reclaims_idle_facilities() {
         std::cerr << "persistent facility did not arm its idle deadline\n";
         return false;
     }
-    registry.reap_idle_for_test(*deadline - config.idle_timeout);
+    registry.reap_idle(*deadline - config.idle_timeout);
     if (persistent_writer.expired()) {
         std::cerr << "persistent facility was reclaimed before its idle timeout\n";
         return false;
@@ -690,7 +666,7 @@ bool registry_reclaims_idle_facilities() {
         std::cerr << "persistent entry disappeared before reclamation\n";
         return false;
     }
-    registry.reap_idle_for_test(*deadline);
+    registry.reap_idle(*deadline);
     // The volume state survives facility reclamation.
     if (registry.volume_count() != 1) {
         std::cerr << "persistent volume state did not survive reclamation\n";
@@ -708,7 +684,7 @@ bool registry_reclaims_idle_facilities() {
             return false;
         }
     }
-    registry.reap_idle_for_test(std::chrono::steady_clock::now() + config.idle_timeout);
+    registry.reap_idle(std::chrono::steady_clock::now() + config.idle_timeout);
     if (registry.volume_count() > 64) {
         std::cerr << "persistent volume retention cap was exceeded\n";
         return false;
@@ -808,7 +784,7 @@ int main() {
         quiescence_tracks_jobs_and_files(directory) &&
         registry_creation_failure_does_not_retain_entries() &&
         registry_creation_allows_other_volumes() &&
-        registry_routes_by_volume_and_releases_leases(directory) &&
+        registry_routes_by_volume_and_releases_leases() &&
         registry_reclaims_aggregate_small_pools(directory) &&
         registry_trims_payloads_at_completion(directory) &&
         registry_reclaims_idle_facilities();

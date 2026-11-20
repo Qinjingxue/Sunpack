@@ -2245,7 +2245,7 @@ private:
             if (monitor_stopping_) return;
             monitor_recheck_ = false;
             lock.unlock();
-            writer_registry_.reap_idle();
+            writer_registry_.reap_idle(std::chrono::steady_clock::now());
             space_monitor_.tick(std::chrono::steady_clock::now());
         }
     }
@@ -2494,7 +2494,7 @@ private:
     bool stopping_ = false;
 };
 
-int run_message(
+void run_message(
     WorkerRequest request,
     NativeJobExecutor& executor
 ) {
@@ -2504,7 +2504,7 @@ int run_message(
         const bool accepted = executor.cancel(job_id);
         print_frame((wire::object() + wire::key("type") + wire::text("cancel_ack") + wire::key("job_id")) + wire::text(job_id) +
             wire::key("accepted") + wire::boolean(accepted) + wire::end());
-        return accepted ? 0 : 1;
+        return;
     }
     if (command == "set_process_mode") {
         std::string mode = request.process_mode;
@@ -2514,14 +2514,10 @@ int run_message(
         const bool applied = apply_native_process_mode(mode);
         print_frame((wire::object() + wire::key("type") + wire::text("process_mode_ack") + wire::key("mode")) + wire::text(mode) +
             wire::key("applied") + wire::boolean(applied) + wire::end());
-        return applied ? 0 : 1;
-    }
-    if (command == "shutdown") {
-        return 0;
+        return;
     }
     // Native owns queued work and completion is reported through native events/results.
     executor.submit(std::move(request));
-    return 0;
 }
 
 int main() {
@@ -2556,12 +2552,11 @@ int main() {
                 reader.retire_request();
                 continue;
             }
-            const bool shutdown = request.worker_command == "shutdown";
-            const int code = run_message(std::move(request), executor);
-            if (shutdown) {
+            if (request.worker_command == "shutdown") {
                 executor.stop(/*cancel_pending_jobs=*/false);
-                return code;
+                return 0;
             }
+            run_message(std::move(request), executor);
         }
     } catch (const std::exception& error) {
         try {

@@ -25,7 +25,7 @@ pub(crate) use crate::io::cancellation::Cancellation;
 pub use checkpoint::InputCheckpoint;
 pub(crate) use checkpoint::{InputRecovery, GeneratedSource};
 pub use coordinator::Engine;
-pub(crate) use coordinator::{common_ancestor, common_output_base};
+pub(crate) use coordinator::{CommonAncestor, common_ancestor, common_output_base};
 pub(crate) use discovery::scan_options;
 pub(crate) use scheduling::{AsyncGate, block_on, in_control_poll, stage, Join as RequestHandle, Scheduler, MAX_PENDING_JOBS};
 

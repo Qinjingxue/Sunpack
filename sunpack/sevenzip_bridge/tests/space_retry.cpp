@@ -591,7 +591,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
     const auto deadline = registry->next_reap_deadline();
     check(deadline.has_value(), "R-16: 空闲 facility 必须安排回收");
     if (!deadline) return;
-    registry->reap_idle_for_test(*deadline);
+    registry->reap_idle(*deadline);
     check(first_writer.expired(), "R-16: 空闲 facility 必须被回收");
     check(registry->volume_count() == 1, "R-16: persistent 卷状态必须存活");
 

@@ -361,14 +361,20 @@ static Json apply_password_changes(Json& document,const Json& edits) {
             const auto directory=edit.value("scope",std::string());
             const auto scope=history || directory.empty()?std::wstring():scope_key(wide(directory));
             const auto& originals=edit.at("originals");
-            std::unordered_multiset<std::string> selected(originals.begin(),originals.end());
+            std::unordered_multiset<std::string_view> selected;
+            selected.reserve(originals.size());
+            for(const auto& original:originals) selected.insert(original.get_ref<const std::string&>());
             size_t kept=0;
             for(size_t i=0;i<rows.size();++i) {
                 auto& row=rows[i];
-                auto found=selected.find(history?row.get_ref<const std::string&>():row.dump());
-                if(found!=selected.end()) {
-                    selected.erase(found);
-                    if(history || scope.empty() || remove_password_scope(row,scope)) continue;
+                if(!selected.empty()) {
+                    std::string encoded;
+                    const auto& key=history?row.get_ref<const std::string&>():(encoded=row.dump());
+                    auto found=selected.find(key);
+                    if(found!=selected.end()) {
+                        selected.erase(found);
+                        if(history || scope.empty() || remove_password_scope(row,scope)) continue;
+                    }
                 }
                 if(kept!=i) rows[kept]=std::move(row);
                 ++kept;

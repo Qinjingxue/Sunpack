@@ -1332,14 +1332,13 @@ fn merge_shared_inputs(tasks: &mut Vec<Task>, blocked_paths: &mut HashSet<String
             std::collections::btree_map::Entry::Occupied(mut slot) => {
                 let (combined, shared) = slot.get_mut();
                 *shared = true;
-                if combined.primary.is_none() {
-                    combined.primary = Some(Box::new(combined.entry().clone()));
-                }
                 if task.source == DiscoverySource::Relations
                     && combined.source != DiscoverySource::Relations
                 {
                     combined.primary = Some(Box::new(task.entry().clone()));
                     combined.source = DiscoverySource::Relations;
+                } else if combined.primary.is_none() {
+                    combined.primary = Some(Box::new(combined.entry().clone()));
                 }
                 combined.inputs.extend(task.inputs);
                 combined.owned_paths.extend(task.owned_paths);

@@ -84,10 +84,9 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
         std::size_t volume_count() const noexcept;
         std::size_t volume_bucket_count() const noexcept;
-        void reap_idle_for_test(std::chrono::steady_clock::time_point now) { reap_idle_at(now); }
 #endif
 
-        void reap_idle();
+        void reap_idle(std::chrono::steady_clock::time_point now);
 
         std::optional<std::chrono::steady_clock::time_point> next_reap_deadline() const;
 
@@ -114,7 +113,6 @@ namespace sunpack::sevenzip
         };
 
         void release(const std::string &key) noexcept;
-        void reap_idle_at(std::optional<std::chrono::steady_clock::time_point> cutoff);
         bool index_needs_compaction_locked() const noexcept;
 
         const AsyncWriterConfig config_;

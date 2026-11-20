@@ -272,7 +272,7 @@ void sparse_replay(const std::filesystem::path &directory) {
         writer->record_operation_result(file, 0);
     }
     require(writer->finish_job(job) == S_OK, "replay completion failed");
-    const auto settled = writer->take_file_snapshot(file, true);
+    const auto settled = writer->try_take_completed_snapshot(*file);
     require(settled.closed && settled.written_bytes == expected.size(),
         "settled replay file could not be released before the rest of extraction finishes");
     std::ifstream input(receipt.path, std::ios::binary);
@@ -318,7 +318,7 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
         }
         writer->close_file(file, {});
         const auto result = writer->finish_job(job);
-        writer->capture_replay(file, replay);
+        AsyncFileWriter::save_drained_receipt(*file, replay);
         return result;
     });
     require(ready(blocked), "disk wait was not established");
@@ -356,7 +356,7 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
         writer->record_operation_result(file, 0);
         stream.Release();
         require(writer->finish_job(job) == S_OK, "recovered resources did not finish output");
-        writer->capture_replay(file, replay);
+        AsyncFileWriter::save_drained_receipt(*file, replay);
     }
     require(!state->space_gate->blocked() && receipt.complete, "resource gates failed to recover independently");
     state->space_gate->unregister_job("combined");

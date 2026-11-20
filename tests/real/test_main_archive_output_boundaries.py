@@ -141,12 +141,22 @@ def test_tar_windows_projection_collisions_preserve_all_members(package, tmp_pat
     source = tmp_path / "映射.图片"
     expected = {}
     with tarfile.open(source, "w") as archive:
+        forward = tarfile.TarInfo("forward-link.txt")
+        forward.type = tarfile.LNKTYPE
+        forward.linkname = "same.txt"
+        archive.addfile(forward)
         for index, (name, projected) in enumerate(entries):
             payload = f"member-{index}".encode()
             member = tarfile.TarInfo(name)
             member.size = len(payload)
             archive.addfile(member, io.BytesIO(payload))
             expected[projected] = payload
+        latest = tarfile.TarInfo("latest-link.txt")
+        latest.type = tarfile.LNKTYPE
+        latest.linkname = "same.txt"
+        archive.addfile(latest)
+    expected[forward.name] = expected["same.txt"]
+    expected[latest.name] = expected["same(1).txt"]
 
     output = tmp_path / "out"
     if entry_mode == "cli":
@@ -162,6 +172,8 @@ def test_tar_windows_projection_collisions_preserve_all_members(package, tmp_pat
     actual = {path.relative_to(target).as_posix(): path.read_bytes()
               for path in target.rglob("*") if path.is_file()}
     assert actual == expected
+    assert (target / forward.name).samefile(target / "same.txt")
+    assert (target / latest.name).samefile(target / "same(1).txt")
     assert not source.exists()
 
 

@@ -91,6 +91,10 @@ impl<'a> ScopedCandidates<'a> {
     fn allows(&self, value: &str) -> bool {
         self.disabled.is_empty() || !self.disabled.contains(value)
     }
+
+    fn enabled(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.buckets.iter().flat_map(|bucket| &*bucket.values).filter(|value| self.allows(value))
+    }
 }
 
 impl CandidateSources {
@@ -184,45 +188,50 @@ impl CandidateSet {
         self.sources.snapshot.scoped_buckets(self.scope(path)).collect()
     }
 
+    fn configured<'b>(
+        &'b self,
+        scoped: &'b ScopedCandidates<'_>,
+    ) -> impl Iterator<Item = (&'b Arc<str>, bool)> + 'b {
+        let prefix = scoped.enabled().chain(self.sources.explicit.iter()).map(|value| (value, true));
+        let global = self.sources.snapshot.global().iter()
+            .filter(|value| scoped.allows(value)).map(|value| (value, false));
+        prefix.chain(global)
+    }
+
     fn for_scope<'b>(
         &'b self,
         scoped: &'b ScopedCandidates<'_>,
-        recent: Option<&RecentOrder>,
+        recent: &RecentOrder,
     ) -> impl Iterator<Item = &'b Arc<str>> + 'b {
-        let global = self.sources.snapshot.global();
-        let explicit = &self.sources.explicit;
-        let scoped_values = || scoped.buckets.iter()
-            .flat_map(|bucket| bucket.values.iter()).filter(|value| scoped.allows(value));
-        let global_values = || global.iter().filter(|value| scoped.allows(value));
-        let priority = match recent.filter(|recent| !recent.is_empty()) {
-            Some(recent) if explicit.len() + global.len() >= BATCH_SIZE => {
-                let base = self.sources.recent_indices(recent);
-                let mut ranked = if scoped.buckets.is_empty() { Vec::new() }
-                    else { prioritize(recent, scoped_values().map(|value| (value, value))) };
-                // An applicable scoped entry has precedence over the shared base.
-                // Only merge recent entries, regardless of dictionary size.
-                ranked.extend(base.iter().filter_map(|&(rank, index)| {
-                    let value = self.sources.base_password(index);
-                    (index < explicit.len() || scoped.allows(value)).then_some((rank, value))
-                }));
-                if !scoped.buckets.is_empty() {
-                    ranked.sort_by_key(|&(rank, _)| rank);
-                    ranked.dedup_by_key(|entry| entry.0);
-                }
-                ranked
+        let explicit_len = self.sources.explicit.len();
+        let priority = if recent.is_empty() {
+            Vec::new()
+        } else if explicit_len + self.sources.snapshot.global().len() >= BATCH_SIZE {
+            let base = self.sources.recent_indices(recent);
+            let mut ranked = if scoped.buckets.is_empty() {
+                Vec::new()
+            } else {
+                prioritize(recent, scoped.enabled().map(|value| (value, value)))
+            };
+            // An applicable scoped entry has precedence over the shared base.
+            // Only merge recent entries, regardless of dictionary size.
+            ranked.extend(base.iter().filter_map(|&(rank, index)| {
+                let value = self.sources.base_password(index);
+                (index < explicit_len || scoped.allows(value)).then_some((rank, value))
+            }));
+            if !scoped.buckets.is_empty() {
+                ranked.sort_by_key(|&(rank, _)| rank);
+                ranked.dedup_by_key(|entry| entry.0);
             }
-            Some(recent) => {
-                let values = scoped_values().chain(explicit.iter()).chain(global_values());
-                prioritize(recent, values.map(|value| (value, value)))
-            }
-            None => Vec::new(),
+            ranked
+        } else {
+            prioritize(recent, self.configured(scoped).map(|(value, _)| (value, value)))
         };
         let mut seen: HashSet<&str> = priority.iter().map(|&(_, value)| value.as_ref()).collect();
-        let prefix = scoped_values().chain(explicit.iter()).map(|value| (value, true));
         priority
             .into_iter()
             .map(|(_, value)| value)
-            .chain(prefix.chain(global_values().map(|value| (value, false))).filter_map(move |(value, track)| {
+            .chain(self.configured(scoped).filter_map(move |(value, track)| {
                 // Global entries are already unique. Only earlier sources can
                 // duplicate them, so the set never grows with this dictionary.
                 let unique = if track { seen.insert(value.as_ref()) } else { !seen.contains(value.as_ref()) };
@@ -232,7 +241,7 @@ impl CandidateSet {
 
     pub(super) fn for_embedded(&self, path: &str) -> Vec<Arc<str>> {
         let scope = ScopedCandidates::new(self.scope_buckets(path));
-        self.for_scope(&scope, Some(&self.sources.recent.snapshot())).cloned().collect()
+        self.for_scope(&scope, &self.sources.recent.snapshot()).cloned().collect()
     }
 
     pub(super) fn embedded_scope_passwords(&self) -> impl FnMut(&str) -> Arc<[Arc<str>]> + '_ {
@@ -247,7 +256,7 @@ impl CandidateSet {
             Arc::clone(by_scope.entry(key).or_insert_with(|| {
                 let scope = ScopedCandidates::new(buckets);
                 let recent = recent.get_or_insert_with(|| self.sources.recent.snapshot());
-                self.for_scope(&scope, Some(recent)).cloned().collect::<Vec<_>>().into()
+                self.for_scope(&scope, recent).cloned().collect::<Vec<_>>().into()
             }))
         }
     }
@@ -371,7 +380,7 @@ impl CandidateSet {
         // open. With no other candidates, a Rust probe only repeats that I/O.
         if known.is_none()
             && input.volume_attempts.is_none()
-            && self.for_scope(&scope, None).next().is_none()
+            && self.configured(&scope).next().is_none()
         {
             return Ok(if needs_password {
                 Err(Failure::password())
@@ -437,8 +446,8 @@ impl CandidateSet {
                 Some(password)
                     if (!needs_password && password.is_empty())
                         || self
-                            .for_scope(&scope, None)
-                            .any(|candidate| candidate == &password) =>
+                            .configured(&scope)
+                            .any(|(candidate, _)| candidate == &password) =>
                 {
                     return fixed_plan(password, preparation);
                 }
@@ -446,7 +455,7 @@ impl CandidateSet {
             }
         }
         let candidates = self
-            .for_scope(&scope, Some(&recent.snapshot()))
+            .for_scope(&scope, &recent.snapshot())
             .filter(|value| needs_password || !value.is_empty());
         let projected = input.volume_attempts.is_some();
         let mut batch = Vec::with_capacity(BATCH_SIZE + usize::from(projected));

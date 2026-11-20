@@ -1300,24 +1300,3 @@ fn readiness_seals_post_close_usn_before_discovery_without_reauthorizing_recover
     assert!(READINESS_HOOK.lock().unwrap().is_none());
     assert!(scheduler.journal.state().entry(source.to_str().unwrap()).is_none());
 }
-
-#[test]
-#[ignore = "explicit benchmark: compare boolean readiness and same-handle observation"]
-fn measure_readiness_snapshot_cost() {
-    let source = crate::test_support::temp_file("readiness_snapshot_bench", b"ready bytes");
-    let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
-    let mut before = Vec::new(); let mut after = Vec::new(); let mut delta = Vec::new();
-    for i in 0..5000 {
-        let row = candidate.clone();
-        let old = || { let at = Instant::now(); assert!(admission_readable(&candidate.path).unwrap()); at.elapsed().as_nanos() as i64 };
-        let new = || { let at = Instant::now(); assert!(admission_candidate(row, candidate.observation.change_usn).unwrap().1); at.elapsed().as_nanos() as i64 };
-        let (a,b) = if i % 2 == 0 { let a=old(); (a,new()) } else { let b=new(); (old(),b) };
-        before.push(a); after.push(b); delta.push(b-a);
-    }
-    before.sort_unstable(); after.sort_unstable(); delta.sort_unstable();
-    println!("SUNPACK_ADMISSION_SNAPSHOT_BENCH {}", json!({"count":5000,
-        "old_p50_ns":before[2500],"old_p95_ns":before[4750],
-        "new_p50_ns":after[2500],"new_p95_ns":after[4750],
-        "paired_delta_p50_ns":delta[2500],"paired_delta_p95_ns":delta[4750]}));
-    fs::remove_file(source).unwrap();
-}

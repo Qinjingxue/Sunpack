@@ -1270,7 +1270,7 @@ struct Display {
     panel: Option<live::Panel>,
     prompting: bool,
     deferred_scopes: Vec<(TaskId, bool)>,
-    outputs: Vec<PathBuf>,
+    output_location: crate::pipeline::CommonAncestor,
 }
 
 impl Progress {
@@ -1355,13 +1355,13 @@ impl Progress {
     }
 
     fn write_scope(&self, display: &mut Display, id: TaskId, accepted: bool) -> io::Result<()> {
-        let Display { panel, outputs, .. } = display;
+        let Display { panel, output_location, .. } = display;
         let Some(panel) = panel else { return Ok(()); };
         let mut writer = BufWriter::new(SessionWriter(self.session.as_ref()));
         panel.write_scope(id, self.session.unicode(), self.language, &mut writer)?;
         writer.flush()?;
         if accepted {
-            if let Some(output) = panel.take_scope_output(id) { outputs.push(output); }
+            if let Some(output) = panel.take_scope_output(id) { output_location.include(&output); }
         }
         panel.remove(id);
         Ok(())
@@ -1773,8 +1773,8 @@ async fn archives(
             )));
             return Ok((i32::from(!result.errors.is_empty()), result));
         }
-        let outputs = std::mem::take(&mut progress.display.lock().unwrap().outputs);
-        report_extract_round(&current, &outputs, began.elapsed().as_secs(), session, language)?;
+        let output_location = std::mem::take(&mut progress.display.lock().unwrap().output_location);
+        report_extract_round(&current, output_location, began.elapsed().as_secs(), session, language)?;
         checkpoints = current.checkpoints;
         generated_sources = current.generated_sources;
         // Retry inputs are physical paths. Replace every segment for a path
@@ -1785,7 +1785,6 @@ async fn archives(
         drop(current.archives);
         drop(current.errors);
         drop(current.cleanup_results);
-        drop(outputs);
         drop(_report_close);
         drop(progress);
         if candidate_paths.is_empty() {
@@ -1829,7 +1828,7 @@ async fn archives(
 }
 
 fn report_extract_round(
-    current: &Outcome, outputs: &[PathBuf], elapsed: u64,
+    current: &Outcome, output_location: crate::pipeline::CommonAncestor, elapsed: u64,
     session: &dyn Session, language: Language,
 ) -> io::Result<()> {
     let counts = ArchiveSummary::collect(&current.archives, language, false);
@@ -1891,13 +1890,12 @@ fn report_extract_round(
             ),
         )?;
     }
-    let mut outputs = outputs.iter().peekable();
-    if outputs.peek().is_some() {
-        let location = crate::pipeline::common_ancestor(outputs);
-        let display = location.as_deref().map_or_else(
-            || Cow::Borrowed(language.text("report.multiple_locations")),
-            Path::to_string_lossy,
-        );
+    use crate::pipeline::CommonAncestor;
+    if !matches!(output_location, CommonAncestor::Empty) {
+        let display = match &output_location {
+            CommonAncestor::Shared(path) => path.to_string_lossy(),
+            _ => Cow::Borrowed(language.text("report.multiple_locations")),
+        };
         line(
             session,
             Stream::Out,

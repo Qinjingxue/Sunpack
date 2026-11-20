@@ -3990,18 +3990,50 @@ pub(crate) fn common_output_base(inputs: &[PathBuf]) -> Option<PathBuf> {
 pub(crate) fn common_ancestor(
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
 ) -> Option<PathBuf> {
-    let mut paths = paths
-        .into_iter()
-        .filter_map(|path| std::path::absolute(path).ok());
-    let mut base = paths.next()?;
+    let mut location = CommonAncestor::default();
     for path in paths {
-        while relative_to(&path, &base).is_none() {
+        location.include(path.as_ref());
+        if matches!(location, CommonAncestor::Disjoint) {
+            break;
+        }
+    }
+    match location {
+        CommonAncestor::Shared(path) => Some(path),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+pub(crate) enum CommonAncestor {
+    #[default]
+    Empty,
+    Unresolved,
+    Shared(PathBuf),
+    Disjoint,
+}
+
+impl CommonAncestor {
+    pub(crate) fn include(&mut self, path: &Path) {
+        if matches!(self, Self::Disjoint) {
+            return;
+        }
+        let Ok(path) = std::path::absolute(path) else {
+            if matches!(self, Self::Empty) {
+                *self = Self::Unresolved;
+            }
+            return;
+        };
+        let Self::Shared(base) = self else {
+            *self = Self::Shared(path);
+            return;
+        };
+        while relative_to(&path, base).is_none() {
             if !base.pop() || !base.is_absolute() {
-                return None;
+                *self = Self::Disjoint;
+                break;
             }
         }
     }
-    Some(base)
 }
 
 fn relative_to<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {

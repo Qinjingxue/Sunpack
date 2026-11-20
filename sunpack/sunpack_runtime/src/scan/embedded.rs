@@ -110,8 +110,6 @@ const fn simd_prefix_tables() -> [[u8; 32]; 6] {
 static EMBEDDED_MATCHER: OnceLock<AhoCorasick> = OnceLock::new();
 static EMBEDDED_PACKED_MATCHER: OnceLock<Option<packed::Searcher>> = OnceLock::new();
 
-#[cfg(test)]
-const DEFAULT_IOCP_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 // Discovery shares one byte budget over all file producers, independent of
 // root count. Account for both read slots and outstanding matching jobs.
 const DISCOVERY_IOCP_BYTE_BUDGET: usize = 4 * 1024 * 1024;
@@ -307,6 +305,7 @@ impl NativeScanResult {
     }
 }
 
+/// Scan one physical byte stream and validate each supported archive signature.
 pub(crate) fn scan_embedded_path(
     path: &str,
     parallel_files: usize,
@@ -325,44 +324,6 @@ pub(crate) fn scan_embedded_path(
     scan_embedded_archives_native_with_iocp(reader, chunk_bytes, DEFAULT_IOCP_BUFFERS, workers)
 }
 
-/// Scan one physical byte stream once for every supported embedded format.
-///
-/// Raw signatures are never returned directly: each hit must pass the format's
-/// structural header checks. The scan deliberately has no hit or byte budget;
-/// callers select which files receive this reliable pass before invoking it.
-#[cfg(test)]
-fn scan_embedded_archives(path: &str) -> io::Result<NativeScanResult> {
-    let reader = ManagedReader::open(path)?;
-    scan_embedded_archives_with_reader(
-        &reader,
-        DEFAULT_IOCP_CHUNK_SIZE,
-        DEFAULT_IOCP_BUFFERS,
-        DEFAULT_IOCP_WORKERS,
-    )
-}
-
-#[cfg(test)]
-fn scan_embedded_archives_with_reader(
-    reader: &ManagedReader,
-    iocp_chunk_bytes: usize,
-    iocp_buffers: usize,
-    iocp_workers: usize,
-) -> io::Result<NativeScanResult> {
-    let cancellation = crate::io::cancellation::Cancellation::current();
-    cancellation.check_io()?;
-    let reader = reader.clone();
-    let scan = (move || {
-        scan_embedded_archives_native_with_iocp(
-            reader,
-            iocp_chunk_bytes,
-            iocp_buffers,
-            iocp_workers,
-        )
-    })();
-    cancellation.check_io()?;
-    scan
-}
-
 fn embedded_matcher() -> &'static AhoCorasick {
     EMBEDDED_MATCHER.get_or_init(|| {
         AhoCorasick::new(PATTERNS.iter().map(|(magic, _, _)| *magic))
@@ -374,16 +335,6 @@ fn embedded_packed_matcher() -> Option<&'static packed::Searcher> {
     EMBEDDED_PACKED_MATCHER
         .get_or_init(|| packed::Searcher::new(PATTERNS.iter().map(|(magic, _, _)| *magic)))
         .as_ref()
-}
-
-#[cfg(test)]
-fn scan_embedded_archives_native(reader: ManagedReader) -> io::Result<NativeScanResult> {
-    scan_embedded_archives_native_with_iocp(
-        reader,
-        DEFAULT_IOCP_CHUNK_SIZE,
-        DEFAULT_IOCP_BUFFERS,
-        DEFAULT_IOCP_WORKERS,
-    )
 }
 
 fn scan_embedded_archives_native_with_iocp(

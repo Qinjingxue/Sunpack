@@ -486,14 +486,18 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
                     continue;
                 }
                 let mut ordered_domains = HashMap::new();
+                let mut unnamed_interior = None;
                 for (&number, choices) in &mut slots {
                     let fixed = fixed_numbers.contains(&number);
+                    let first = number == 1;
+                    let terminal = candidate_terminal == Some(number);
+                    let width_number = width_numbers.contains(&number).then_some(number);
                     let key = (
                         Arc::as_ptr(choices),
-                        number == 1,
-                        candidate_terminal == Some(number),
+                        first,
+                        terminal,
                         fixed,
-                        width_numbers.contains(&number).then_some(number),
+                        width_number,
                     );
                     if let Some((_, ordered)) = ordered_domains.get(&key) {
                         *choices = Arc::clone(ordered);
@@ -504,37 +508,34 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
                     let mut ordered = (**choices).clone();
                     if channel.is_none() && !fixed {
                         // Structurally owned unnamed members remain candidates.
-                        ordered.extend(indexes.iter().copied().filter(|i| {
+                        let unnamed = || indexes.iter().copied().filter(|i| {
                             view.facts[i].owned
                                 && view.facts[i].exact_slot.is_none()
                                 && view.legal(*i, number, candidate_terminal)
-                        }));
+                        });
+                        if first || terminal {
+                            ordered.extend(unnamed());
+                        } else {
+                            // Slots were already bounded by the candidate end.
+                            // All interior slots share the same unnamed domain.
+                            let candidates = unnamed_interior.get_or_insert_with(|| unnamed().collect::<Vec<_>>());
+                            ordered.extend_from_slice(candidates);
+                        }
                     }
-                    ordered.sort_by(|a, b| {
-                        let local =
-                            |i: &usize| Path::new(&view.rows[*i].path).parent() == head_parent;
-                        let width = |i: &usize| {
-                            view.features
-                                .get(i)
-                                .and_then(|f| {
-                                    f.numbers
-                                        .iter()
-                                        .filter(|n| n.value == number && profile.active(n))
-                                        .map(|n| n.width)
-                                        .min()
-                                })
-                                .unwrap_or(usize::MAX)
-                        };
-                        local(b)
-                            .cmp(&local(a))
-                            .then_with(|| {
-                                if channel.is_none() {
-                                    width(a).cmp(&width(b))
-                                } else {
-                                    std::cmp::Ordering::Equal
-                                }
-                            })
-                            .then(view.rows[*a].path_key.cmp(&view.rows[*b].path_key))
+                    ordered.sort_by(|&a, &b| {
+                        let remote = |i: usize| Path::new(&view.rows[i].path).parent() != head_parent;
+                        remote(a).cmp(&remote(b)).then_with(|| {
+                            let Some(number) = width_number else {
+                                return std::cmp::Ordering::Equal;
+                            };
+                            let width = |i: usize| view.features.get(&i).and_then(|features| {
+                                features.numbers.iter()
+                                    .filter(|n| n.value == number && profile.active(n))
+                                    .map(|n| n.width)
+                                    .min()
+                            }).unwrap_or(usize::MAX);
+                            width(a).cmp(&width(b))
+                        }).then_with(|| view.rows[a].path_key.cmp(&view.rows[b].path_key))
                     });
                     ordered.dedup();
                     let ordered = domains.intern(ordered);

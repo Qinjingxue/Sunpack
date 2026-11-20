@@ -711,7 +711,7 @@ impl Watch {
         Ok(Some(wait.wait().await))
     }
 
-    // Compatibility for non-driver shutdown and existing synchronous tests.
+    // Final shutdown can run after the control driver has stopped.
     pub(super) fn stop(&self) -> io::Result<Value> { block_on(self.stop_async()) }
     #[cfg(test)]
     pub(super) fn reload(&self) -> io::Result<Value> { block_on(self.reload_async()) }
@@ -2462,9 +2462,8 @@ impl Scheduler {
             operations.set_runtime("watch_control".into(), Some(json!({"enabled":enabled, "baseline_roots":baseline_roots})));
             Ok(operations)
         })?;
-        // The command acknowledgement is the durable intent boundary, including
-        // when the append was issued from a shared blocking-stage scope.
-        journal.flush()
+        // A deferred stage must reach the same WAL boundary as a direct commit.
+        journal.wait_before_mutation()
     }
 
     fn set_enabled(&mut self, enabled: bool) -> io::Result<bool> {
@@ -2567,10 +2566,11 @@ impl Scheduler {
             NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?;
         let passwords = BuiltinStore::shared(&cwd)?;
         let config_observers = Self::observe_config(&cwd, &snapshot, &root_file, passwords.path(), &hub)?;
-        let baseline_roots = journal.state().runtime_record("watch_control")
-            .and_then(|record| record.get("baseline_roots").and_then(Value::as_array).cloned())
-            .unwrap_or_default().into_iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
-        let saved_enabled = journal.state().runtime_record("watch_control")
+        let control = journal.state().runtime_record("watch_control");
+        let baseline_roots = control.as_ref()
+            .and_then(|record| record.get("baseline_roots").and_then(Value::as_array))
+            .into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+        let saved_enabled = control.as_ref()
             .and_then(|record| record.get("enabled").and_then(Value::as_bool)).unwrap_or(true);
         let requested = hub.initial_enabled.lock().unwrap().take();
         // A cold enable still has to cross the paused baseline barrier below
@@ -2933,8 +2933,14 @@ impl Scheduler {
         }
         let refresh_catalog = self.root_progress.observe(policy_changed, self.roots.is_empty());
         self.available_roots.retain(|id| next.contains_key(id));
+        if refresh_catalog {
+            self.root_scope_records = HashMap::new();
+        } else {
+            self.root_scope_records.retain(|id, _| {
+                self.roots.get(id).zip(next.get(id)).is_some_and(|(old, next)| old.1.root == next.1.root)
+            });
+        }
         self.roots = next;
-        self.root_scope_records = HashMap::new();
         if refresh_catalog && self.settings.watch.deduplication != config::WatchDeduplication::None {
             self.dedup.lock().unwrap().reconcile_scopes(self.roots.values().map(|(_, scope)| scope))?;
         }
@@ -3818,15 +3824,22 @@ impl Scheduler {
             (volume, range, cache)
         }).collect();
         let catalog = &self.catalog;
+        let roots = &self.roots;
         let recovered: Vec<_> = jobs.into_par_iter().map(|(volume, (journal, start, end, scopes), mut cache)| {
             let changed = catalog
                 .recover_changes(&scopes, &volume, journal, start, end, &mut cache)
-                .map(|mut paths| {
-                    paths.sort_unstable_by_key(String::len);
-                    paths.into_iter().map(|path| {
-                        let id = crate::path_keys::path_key(&path);
-                        (path, id)
-                    }).collect::<Vec<_>>()
+                .map(|paths| {
+                    // One volume replay serves several disjoint configured scopes.
+                    let mut routed = HashMap::<String, Vec<_>>::new();
+                    for (path, path_id) in paths {
+                        let Some((root, _)) = containing_root(roots, &path_id) else { continue; };
+                        if let Some(changes) = routed.get_mut(root) { changes.push((path, path_id)); }
+                        else { routed.insert(root.clone(), vec![(path, path_id)]); }
+                    }
+                    for changes in routed.values_mut() {
+                        changes.sort_unstable_by_key(|(path, _)| path.len());
+                    }
+                    routed
                 });
             (volume, changed, cache)
         }).collect();
@@ -3916,17 +3929,17 @@ impl Scheduler {
                 // becomes readable. Visit both sources through the same catalog.
                 let mut named = changed.get(&id).into_iter().flatten().collect::<Vec<_>>();
                 named.sort_unstable_by_key(|path| path.as_os_str().len());
-                let recovered = changes.iter().map(|(path, id)| {
+                let recovered = changes.get(&id).into_iter().flatten().map(|(path, id)| {
                     (std::borrow::Cow::Borrowed(path.as_str()), std::borrow::Cow::Borrowed(id.as_str()))
                 });
                 let named = named.into_iter().map(|path| {
                     let path = path.to_string_lossy();
                     let id = crate::path_keys::path_key(&path);
                     (path, std::borrow::Cow::Owned(id))
-                });
+                }).filter(|(_, id)| scope.contains_key(id));
                 for (path, path_id) in recovered.chain(named) {
                     let path = path.as_ref();
-                    if !scope.contains_key(path_id.as_ref()) || covered.contains(path_id.as_ref()) {
+                    if covered.contains(path_id.as_ref()) {
                         continue;
                     }
                     if self.catalog.is_owned(path) {
@@ -3960,10 +3973,10 @@ impl Scheduler {
                         }
                     }
                     covered.insert(path_id);
-                    if metadata.is_ok_and(|metadata| metadata.is_file()) {
-                        paths.push(path.to_owned());
-                    } else if missing {
+                    if missing {
                         self.departed(path, recursive_departure)?;
+                    }
+                    if !baseline && (missing || metadata.is_ok_and(|metadata| metadata.is_file())) {
                         paths.push(path.to_owned());
                     }
                 }
@@ -3988,7 +4001,6 @@ impl Scheduler {
                     marks.insert(id.clone());
                 }
             }
-            if baseline { paths.clear(); }
             let mut stems = HashSet::new();
             for (index, path) in paths.into_iter().enumerate() {
                 // Initial inventory is not an explicit retry. Only paths

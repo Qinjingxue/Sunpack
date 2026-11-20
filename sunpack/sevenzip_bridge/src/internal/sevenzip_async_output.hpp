@@ -258,8 +258,34 @@ namespace sunpack::sevenzip
                 return replay ? &replay->written : nullptr;
             }
 
+            // finish_job synchronizes with the last close. Once the decoder
+            // has returned, the caller owns the finalized output state.
+            FileSnapshot take_drained_snapshot() noexcept
+            {
+                assert(closed);
+                return take_snapshot();
+            }
+
         private:
             friend class AsyncFileWriter;
+
+            FileSnapshot take_snapshot() noexcept
+            {
+                FileSnapshot snapshot;
+                snapshot.written_bytes = written_bytes;
+                snapshot.hresult = hresult;
+                snapshot.decoder_succeeded = decoder_succeeded;
+                snapshot.has_mtime_ns = has_mtime_ns;
+                snapshot.mtime_ns = mtime_ns;
+                snapshot.magic = std::move(magic);
+                snapshot.closed = closed;
+#ifdef SUP7Z_DEBUG
+                snapshot.metadata_errors = metadata_errors;
+                snapshot.accepted_bytes = accepted_bytes;
+                snapshot.peak_active_data_writes = peak_active_data_writes;
+#endif
+                return snapshot;
+            }
 
             JobStatePtr job;
             std::wstring path;
@@ -432,9 +458,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        void capture_replay(const FileStatePtr &file, ExtractionReplay &saved) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            save_file_receipt(*file, saved.files[file->item_index]);
+        static void save_drained_receipt(FileState &file, ExtractionReplay &saved) {
+            assert(file.closed);
+            save_file_receipt(file, saved.files[file.item_index]);
         }
 
         std::size_t idle_memory_bytes() noexcept {
@@ -792,40 +818,24 @@ namespace sunpack::sevenzip
             return operation_result != 0 && (file->new_writes || file->next_write_offset != 0);
         }
 
-        FileSnapshot take_file_snapshot(const FileStatePtr &file, bool completed_only = false) const noexcept
+        FileSnapshot try_take_completed_snapshot(FileState &file) const noexcept
         {
-            FileSnapshot snapshot;
-            if (!file)
-            {
-                return snapshot;
-            }
-            std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
-            if (completed_only)
-            {
-                // Reconcile existing receipts before releasing a settled file.
-                // A later withdrawal can use the newly finished ranges too.
-                if (!lock.try_lock() || !file->closed || file->hresult != S_OK || !file->decoder_succeeded)
-                    return snapshot;
-                if (file->replay) save_file_receipt(*file, *file->replay);
-            }
-            else
-            {
-                lock.lock();
-            }
-            snapshot.written_bytes = file->written_bytes;
-            snapshot.hresult = file->hresult;
-            snapshot.decoder_succeeded = file->decoder_succeeded;
-            snapshot.has_mtime_ns = file->has_mtime_ns;
-            snapshot.mtime_ns = file->mtime_ns;
-            snapshot.magic = std::move(file->magic);
-            snapshot.closed = file->closed;
-#ifdef SUP7Z_DEBUG
-            snapshot.metadata_errors = file->metadata_errors;
-            snapshot.accepted_bytes = file->accepted_bytes;
-            snapshot.peak_active_data_writes = file->peak_active_data_writes;
-#endif
-            return snapshot;
+            std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+            if (!lock || !file.closed || file.hresult != S_OK || !file.decoder_succeeded)
+                return {};
+            // Keep newly confirmed ranges in the receipt even if the caller
+            // releases this file and a later item triggers another retry.
+            if (file.replay) save_file_receipt(file, *file.replay);
+            return file.take_snapshot();
         }
+
+#ifdef SUP7Z_DEBUG
+        FileSnapshot take_file_snapshot(const FileStatePtr &file) const noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return file->take_snapshot();
+        }
+#endif
 
         void finish() noexcept
         {

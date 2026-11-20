@@ -14,15 +14,13 @@ use crate::analysis_native::volume_anchor::{
 };
 use crate::io::resource_lifecycle::{NativeReadScope, PromotionCompletion};
 
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct DirectoryEntryRecord {
     pub(crate) path: String,
     pub(super) is_dir: bool,
     pub(super) size: Option<u64>,
     pub(super) mtime_ns: Option<u64>,
-    #[serde(skip)]
     pub(super) relation_member_eligible: bool,
-    #[serde(skip)]
     pub(super) relation_anchor: Option<CheapAnchor>,
 }
 
@@ -1958,7 +1956,7 @@ impl NativeWatchCatalog {
         start_usn: i64,
         end_usn: i64,
         cache: &mut crate::filesystem::DirectoryRecoveryCache,
-    ) -> std::io::Result<Vec<String>> {
+    ) -> std::io::Result<Vec<(String, String)>> {
         if start_usn == end_usn || scopes.is_empty() {
             return Ok(Vec::new());
         }

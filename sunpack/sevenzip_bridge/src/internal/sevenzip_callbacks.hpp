@@ -854,7 +854,7 @@ namespace sunpack::sevenzip
             bool has_failed_file = false;
             for (const auto &state : async_files_)
             {
-                auto snapshot = async_writer_->take_file_snapshot(state);
+                auto snapshot = state->take_drained_snapshot();
                 has_failed_file |= snapshot.hresult != S_OK;
                 apply_file_snapshot(state->trace_index, std::move(snapshot));
             }
@@ -871,15 +871,15 @@ namespace sunpack::sevenzip
             {
                 operation_result_ = kOpDataError;
             }
-            finalize_hard_links();
-            decltype(hard_link_names_){}.swap(hard_link_names_);
+            if (hard_links_.empty()) decltype(hard_link_names_){}.swap(hard_link_names_);
+            else finalize_hard_links();
             restore_directory_metadata();
             const auto *memory = current_native_memory_job();
             if (replay_ && (is_cancelled() || std::uncaught_exceptions() ||
                 is_memory_hresult(writer_error) || (memory && (memory->revoked.load() || memory->denied.load())))) {
                 replay_->initialized = true;
                 output_paths_->preserve_replay();
-                for (const auto &state : async_files_) async_writer_->capture_replay(state, *replay_);
+                for (const auto &state : async_files_) AsyncFileWriter::save_drained_receipt(*state, *replay_);
                 for (const auto &item : output_trace_.items)
                     if (!item.is_dir && item.done && !item.output_path.empty()) {
                         auto [entry, inserted] = replay_->files.try_emplace(item.index);
@@ -977,7 +977,7 @@ namespace sunpack::sevenzip
             {
                 async_files_.erase(std::remove_if(async_files_.begin(), async_files_.end(),
                     [this](const AsyncFileWriter::FileStatePtr &file) {
-                        auto snapshot = async_writer_->take_file_snapshot(file, true);
+                        auto snapshot = async_writer_->try_take_completed_snapshot(*file);
                         if (!snapshot.closed) return false;
                         apply_file_snapshot(file->trace_index, std::move(snapshot));
                         return true;
@@ -1285,9 +1285,10 @@ namespace sunpack::sevenzip
 
         struct HardLink
         {
+            static constexpr auto kNoSource = static_cast<std::size_t>(-1);
             std::size_t trace;
             std::wstring target;
-            std::size_t source = static_cast<std::size_t>(-1);
+            std::size_t source = kNoSource;
             unsigned char state = 0;
         };
 
@@ -1313,9 +1314,43 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
+        void resolve_hard_link_sources()
+        {
+            // Release the archive names and occurrence index before creating
+            // links, since those filesystem operations may wait for space.
+            const auto names = std::move(hard_link_names_);
+            struct TargetOccurrences
+            {
+                std::size_t first = HardLink::kNoSource;
+                std::size_t last = HardLink::kNoSource;
+            };
+            std::unordered_map<std::wstring_view, TargetOccurrences> targets;
+            for (const auto &link : hard_links_) targets.try_emplace(link.target);
+            std::size_t next_link = 0;
+            for (std::size_t i = 0; i < names.size(); ++i)
+            {
+                if (next_link < hard_links_.size() && hard_links_[next_link].trace == i)
+                {
+                    // Read before publishing this item as the latest occurrence.
+                    auto &link = hard_links_[next_link++];
+                    link.source = targets.at(link.target).last;
+                }
+                if (names[i].empty()) continue;
+                const auto found = targets.find(archive_path_key(names[i]));
+                if (found == targets.end()) continue;
+                auto &target = found->second;
+                if (target.first == HardLink::kNoSource) target.first = i;
+                target.last = i;
+            }
+            for (auto &link : hard_links_)
+            {
+                // Without a preceding version, resolve to the first occurrence.
+                if (link.source == HardLink::kNoSource) link.source = targets.at(link.target).first;
+            }
+        }
+
         void finalize_hard_links() noexcept
         {
-            if (hard_links_.empty()) return;
             auto &items = output_trace_.items;
             const auto fail = [&](HardLink &link, DWORD error, bool output_failure)
             {
@@ -1334,29 +1369,12 @@ namespace sunpack::sevenzip
             };
             try
             {
-                // Allocate only for names actually referenced by hard links.
-                std::unordered_map<std::wstring, std::vector<std::size_t>> targets;
+                resolve_hard_link_sources();
                 std::unordered_map<std::size_t, std::size_t> links;
                 for (std::size_t i = 0; i < hard_links_.size(); ++i)
                 {
-                    targets.try_emplace(hard_links_[i].target);
                     links.emplace(hard_links_[i].trace, i);
                     items[hard_links_[i].trace].done = false;
-                }
-                for (std::size_t i = 0; i < hard_link_names_.size(); ++i)
-                {
-                    if (hard_link_names_[i].empty()) continue;
-                    const auto found = targets.find(archive_path_key(hard_link_names_[i]));
-                    if (found != targets.end()) found->second.push_back(i);
-                }
-                for (auto &link : hard_links_)
-                {
-                    const auto &candidates = targets.at(link.target);
-                    const auto next = std::lower_bound(candidates.begin(), candidates.end(), link.trace);
-                    // Repeated archive names refer to their latest preceding
-                    // version; otherwise allow a forward reference.
-                    if (next != candidates.begin()) link.source = *std::prev(next);
-                    else if (next != candidates.end()) link.source = *next;
                 }
                 std::vector<std::size_t> chain;
                 for (std::size_t start = 0; start < hard_links_.size(); ++start)

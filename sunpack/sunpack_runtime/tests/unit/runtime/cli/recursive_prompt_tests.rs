@@ -455,7 +455,8 @@ fn summary_output_requires_an_accepted_root_input_but_verbose_keeps_failure_outp
         progress.finish_scope(1, &archives).unwrap();
         assert!(String::from_utf8(session.stdout.lock().unwrap().clone()).unwrap().contains("rescued-output"));
         let display = progress.display.lock().unwrap();
-        assert_eq!(display.outputs.len(), usize::from(accepted_sibling || accepted_partial));
+        assert_eq!(matches!(display.output_location, crate::pipeline::CommonAncestor::Shared(_)),
+            accepted_sibling || accepted_partial);
     }
 }
 
@@ -463,6 +464,7 @@ fn summary_output_requires_an_accepted_root_input_but_verbose_keeps_failure_outp
 // counts and durations must not inherit a preceding attempt or prompt time.
 #[test]
 fn extract_round_summaries_keep_counts_times_and_cleanup_local() {
+    use crate::pipeline::CommonAncestor;
     let input = Input::default();
     let mut first = Outcome::default();
     first.archives.push(report_archive("good.zip", 0));
@@ -473,11 +475,18 @@ fn extract_round_summaries_keep_counts_times_and_cleanup_local() {
         path: "good.zip".into(), mode: "delete", status: CleanupStatus::Failed,
         error_code: 5, message: "locked".into(),
     });
-    report_extract_round(&first, &[PathBuf::from("carrier-output")], 1, &input, Language::En).unwrap();
+    let mut first_location = CommonAncestor::default();
+    first_location.include(Path::new(r"C:\carrier-output\first"));
+    first_location.include(Path::new(r"C:\carrier-output\second"));
+    report_extract_round(&first, first_location, 1, &input, Language::En).unwrap();
     line(&input, Stream::Out, Language::En.text("cli.password_retry_prompt")).unwrap();
     let mut second = Outcome::default();
     second.archives.push(report_archive("locked.zip", 0));
-    report_extract_round(&second, &[], 2, &input, Language::En).unwrap();
+    let mut second_location = CommonAncestor::default();
+    for path in [r"C:\a", r"D:\b", r"C:\c"] {
+        second_location.include(Path::new(path));
+    }
+    report_extract_round(&second, second_location, 2, &input, Language::En).unwrap();
     let text = String::from_utf8(input.combined.lock().unwrap().clone()).unwrap();
     let prompt = text.find(Language::En.text("cli.password_retry_prompt")).unwrap();
     for (elapsed, failed, slice) in [("1", "1", &text[..prompt]), ("2", "0", &text[prompt..])] {
@@ -489,7 +498,8 @@ fn extract_round_summaries_keep_counts_times_and_cleanup_local() {
     }
     assert!(text[..prompt].contains("good.zip: locked"));
     assert!(!text[prompt..].contains("good.zip: locked"));
-    assert!(text[..prompt].contains("carrier-output"));
+    assert!(text[..prompt].contains(&Language::En.translate("report.output", &[("output", r"C:\carrier-output")])));
+    assert!(text[prompt..].contains(Language::En.text("report.multiple_locations")));
 }
 
 #[test]
@@ -527,7 +537,7 @@ fn partial_recovery_warning_reuses_full_carrier_report_and_omits_confirmed_missi
         let summary = ArchiveSummary::collect(&outcome.archives, Language::En, true);
         assert_eq!(summary.recovered[0].warning.is_some(), !confirmed);
         let input = Input::default();
-        report_extract_round(&outcome, &[], 0, &input, Language::En).unwrap();
+        report_extract_round(&outcome, crate::pipeline::CommonAncestor::default(), 0, &input, Language::En).unwrap();
         let text = String::from_utf8(input.combined.lock().unwrap().clone()).unwrap();
         assert_eq!(text.contains(&Language::En.translate("report.partial_warning", &[("warning", &message)])), !confirmed);
     }

@@ -227,7 +227,7 @@ fn large_dictionary_reuses_recent_membership_across_inputs() {
     for index in 0..32 {
         let path = format!("archive-{index}.zip");
         let scope = ScopedCandidates::new(candidates.scope_buckets(&path));
-        let order: Vec<_> = candidates.for_scope(&scope, Some(&recent.snapshot())).take(3).map(AsRef::as_ref).collect();
+        let order: Vec<_> = candidates.for_scope(&scope, &recent.snapshot()).take(3).map(AsRef::as_ref).collect();
         assert_eq!(order, ["item-900", "item-0", "item-1"]);
     }
     assert_eq!(PRIORITY_CANDIDATES.get(), values.len());
@@ -236,7 +236,7 @@ fn large_dictionary_reuses_recent_membership_across_inputs() {
     recent.remember_recent(values[800].clone());
     let nested = candidates.with_scope(Some(Path::new(r"C:\parent")));
     let scope = ScopedCandidates::new(nested.scope_buckets(r"C:\output\inner.zip"));
-    let order: Vec<_> = nested.for_scope(&scope, Some(&recent.snapshot())).take(3).map(AsRef::as_ref).collect();
+    let order: Vec<_> = nested.for_scope(&scope, &recent.snapshot()).take(3).map(AsRef::as_ref).collect();
     assert_eq!(order, ["item-800", "item-900", "item-0"]);
     assert_eq!(PRIORITY_CANDIDATES.get(), values.len() * 2);
 }
@@ -263,7 +263,7 @@ fn nearest_directory_controls_builtin_candidates_even_when_recent() {
         let mut embedded = cli.embedded_scope_passwords();
         let path = r"C:\parent\other\archive.7z";
         let scoped = ScopedCandidates::new(cli.scope_buckets(path));
-        assert!(!cli.for_scope(&scoped, None).any(|value| value.as_ref() == "A"));
+        assert!(!cli.configured(&scoped).any(|(value, _)| value.as_ref() == "A"));
         let suppressed = embedded(path);
         assert_eq!(suppressed[0].as_ref(), "B");
         assert!(!suppressed.iter().any(|value| value.as_ref() == "A"));

@@ -152,7 +152,7 @@ pub(crate) fn watch_directories_changes_cached_impl(
     start_usn: i64,
     end_usn: i64,
     cache: &mut DirectoryRecoveryCache,
-) -> std::io::Result<Vec<String>> {
+) -> std::io::Result<Vec<(String, String)>> {
     #[cfg(windows)]
     {
         if start_usn == end_usn {
@@ -233,24 +233,23 @@ pub(crate) fn watch_directories_changes_cached_impl(
         }
         drop(ids);
         drop(live);
-        for path in &paths {
-            let key = crate::path_keys::path_key(path);
+        let changes = paths.into_iter().map(|path| {
+            let key = crate::path_keys::path_key(&path);
             retained.remove(&key);
-            let prefix = format!("{}\\", key.trim_end_matches('\\'));
             let removed: Vec<_> = retained
-                .range(prefix.clone()..)
-                .take_while(|(key, _)| key.starts_with(&prefix))
+                .range(crate::path_keys::descendant_key_range(&key))
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in removed {
                 retained.remove(&key);
             }
-        }
+            (path, key)
+        }).collect();
         cache.ids = retained;
         cache.journal = journal;
         cache.next_usn = end_usn;
         cache.roots = fresh;
-        Ok(paths.into_iter().collect())
+        Ok(changes)
     }
     #[cfg(not(windows))]
     {

@@ -335,41 +335,48 @@ void Application::acknowledge_save(const Json& ack) {
         if(ok) {
             struct Rebase { const Json* record; std::string original; };
             std::vector<Rebase> records;
-            std::unordered_map<std::string,size_t> changed;
+            std::unordered_map<std::string_view,size_t> changed;
             for(auto& group:ack.at("passwordRebases")) {
                 const auto& record=group.at("record");
                 const auto index=records.size();
                 records.push_back({&record,record.is_null()?std::string():record.dump()});
-                for(auto& previous:group.at("originals")) changed.emplace(previous.get<std::string>(),index);
+                for(auto& previous:group.at("originals")) changed.emplace(previous.get_ref<const std::string&>(),index);
             }
             // Merging another directory into a shared password also changes
             // the baseline of already queued edits in its other directories.
-            for(auto it=saves_.begin();it!=saves_.end();) {
-                auto& queued=*it;
-                if(queued["kind"]!=kind || queued["key"]==job["key"]) { ++it; continue; }
-                auto found=changed.find(queued["edit"]["original"].get<std::string>());
-                if(found==changed.end()) { ++it; continue; }
-                auto& rebase=records[found->second];
-                bool missing=!password_matches_scope(*rebase.record,queued["edit"].value("scope",std::string()));
-                auto& operation=queued["edit"]["operation"];
-                if(missing && (operation=="delete" || operation=="removeScope")) { it=saves_.erase(it); continue; }
-                queued["edit"]["original"]=missing?std::string():rebase.original;
-                if(missing) operation="addMany";
-                ++it;
+            if(!changed.empty()) {
+                for(auto it=saves_.begin();it!=saves_.end();) {
+                    auto& queued=*it;
+                    if(queued["kind"]!=kind || queued["key"]==job["key"]) { ++it; continue; }
+                    auto& pending_edit=queued["edit"];
+                    auto found=changed.find(pending_edit["original"].get_ref<const std::string&>());
+                    if(found==changed.end()) { ++it; continue; }
+                    auto& rebase=records[found->second];
+                    bool missing=!password_matches_scope(*rebase.record,pending_edit.value("scope",std::string()));
+                    auto& operation=pending_edit["operation"];
+                    if(missing && (operation=="delete" || operation=="removeScope")) { it=saves_.erase(it); continue; }
+                    pending_edit["original"]=missing?std::string():rebase.original;
+                    if(missing) operation="addMany";
+                    ++it;
+                }
+                std::unordered_set<std::string_view> pending_keys;
+                for(const auto& queued:saves_) if(queued["kind"]==kind)
+                    pending_keys.insert(queued["key"].get_ref<const std::string&>());
+                auto drafts=page_value(page_,"passwordDrafts");
+                const auto& active_key=job.at("key").get_ref<const std::string&>();
+                for(auto it=drafts.begin();it!=drafts.end();++it) {
+                    if(it.key()==active_key) continue;
+                    const auto& previous=it.value().at("original").get_ref<const std::string&>();
+                    auto found=changed.find(previous); if(found==changed.end()) continue;
+                    auto& rebase=records[found->second];
+                    bool missing=!password_matches_scope(*rebase.record,it.value().value("scope",std::string()));
+                    rebases.push_back({{"key",it.key()},{"previous",previous},{"original",missing?std::string():rebase.original},
+                        {"removed",missing},{"pending",pending_keys.count(it.key())!=0}});
+                }
+                auto scope=page_value(page_,"passwordScope").get<std::string>();
+                if(scope!="@history") for(size_t i=0;i<records.size();++i) if(password_matches_scope(*records[i].record,scope))
+                    row_rebases.push_back({{"originals",ack["passwordRebases"][i]["originals"]},{"original",records[i].original}});
             }
-            auto drafts=page_value(page_,"passwordDrafts");
-            for(auto it=drafts.begin();it!=drafts.end();++it) {
-                if(it.key()==job["key"].get<std::string>()) continue;
-                auto previous=it.value().at("original").get<std::string>();
-                auto found=changed.find(previous); if(found==changed.end()) continue;
-                auto& rebase=records[found->second];
-                bool missing=!password_matches_scope(*rebase.record,it.value().value("scope",std::string()));
-                bool pending=std::any_of(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==it.key();});
-                rebases.push_back({{"key",it.key()},{"previous",previous},{"original",missing?std::string():rebase.original},{"removed",missing},{"pending",pending}});
-            }
-            auto scope=page_value(page_,"passwordScope").get<std::string>();
-            if(scope!="@history") for(size_t i=0;i<records.size();++i) if(password_matches_scope(*records[i].record,scope))
-                row_rebases.push_back({{"originals",ack["passwordRebases"][i]["originals"]},{"original",records[i].original}});
             original=ack.at("passwordOriginal").get<std::string>();
             if(removed) saves_.erase(std::remove_if(saves_.begin(),saves_.end(),[&](const Json& queued) {
                 return queued["kind"]==kind && queued["key"]==job["key"] && (queued["edit"]["operation"]=="delete" || queued["edit"]["operation"]=="removeScope");

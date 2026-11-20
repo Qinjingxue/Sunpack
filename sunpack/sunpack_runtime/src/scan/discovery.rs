@@ -676,14 +676,14 @@ impl NativeEmbeddedBatch {
         drop(passwords);
         let mut cache = std::mem::take(&mut batch.relation_cache);
         let mut pending = std::mem::take(&mut batch.pending_volumes);
-        let pending_keys: HashSet<_> = pending
-            .iter()
-            .map(|item| path_key(&item.anchor.path))
-            .collect();
+        let mut path_counts = HashMap::new();
+        for item in &pending {
+            *path_counts.entry(path_key(&item.anchor.path)).or_insert(0usize) += 1;
+        }
         // Pending anchors and overrides already own their facts. Only look
         // through raw rows for peer anchors that still need to be imported.
         let mut external: HashSet<&str> = candidates.keys()
-            .filter(|key| !pending_keys.contains(*key) && !cache.anchors.contains_key(*key))
+            .filter(|key| !path_counts.contains_key(*key) && !cache.anchors.contains_key(*key))
             .map(String::as_str)
             .collect();
         'sources: for snapshot in &table.relation_sources {
@@ -706,18 +706,19 @@ impl NativeEmbeddedBatch {
         let encrypted: Vec<_> = pending
             .iter_mut()
             .map(|item| &mut item.anchor)
-            .chain(
-                cache
-                    .anchors
-                    .iter_mut()
-                    .filter_map(|(key, anchor)| (!pending_keys.contains(key)).then_some(anchor)),
-            )
             .filter(|anchor| anchor.needs_password)
             .filter_map(|anchor| {
                 candidates
                     .get(&path_key(&anchor.path))
                     .map(|values| (anchor, values))
             })
+            .chain(cache.anchors.iter_mut().filter_map(|(key, anchor)| {
+                if anchor.needs_password && !path_counts.contains_key(key) {
+                    candidates.get(key).map(|values| (anchor, values))
+                } else {
+                    None
+                }
+            }))
             .collect();
         let cancellation = crate::io::cancellation::Cancellation::current();
         cancellation.check_io()?;
@@ -755,12 +756,6 @@ impl NativeEmbeddedBatch {
         let mut fallback_scans = BTreeMap::new();
         let mut anchors = Vec::new();
         let mut projected = HashSet::new();
-        let mut path_counts = HashMap::new();
-        for item in &pending {
-            *path_counts
-                .entry(path_key(&item.anchor.path))
-                .or_insert(0usize) += 1;
-        }
         for item in pending {
             let key = path_key(&item.anchor.path);
             let mut anchor = item.anchor;
