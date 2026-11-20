@@ -1,6 +1,6 @@
 # Development environment and build instructions
 
-**English** | [简体中文](zh-CN/development_setup.md)
+[简体中文](zh-CN/development_setup.md) | **English** | [繁體中文](zh-TW/development_setup.md) | [日本語](ja/development_setup.md) | [한국어](ko/development_setup.md)
 
 SunPack is a Windows-only project. Cargo builds the Rust runtime and Watch Broker. CMake builds the native worker, launcher, GUI, and toast DLL. `uv.lock` pins the Python test dependencies.
 

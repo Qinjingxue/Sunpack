@@ -571,8 +571,18 @@ void config_edits(Application& app,const fs::path& dir) {
     click(app,"contextMenuToggle");
     pump([&]{return state(app.page(),"contextMenuEnabled")==true;},"Enable Explorer menu");
     assert(registry_string(menu_path,L"MUIVerb")==L"Extract files in this folder");
-    change_language(0,"zh");
-    assert(registry_string(menu_path,L"MUIVerb")==L"解压该目录下文件");
+    struct LanguageCase { int option; const char* code; const wchar_t* menu; const wchar_t* locale; };
+    for(const auto& test:std::initializer_list<LanguageCase>{
+        {0,"zh",L"解压该目录下文件",L"zh-CN"},
+        {2,"zh-TW",L"解壓縮此資料夾中的檔案",L"zh-TW"},
+        {3,"ja",L"このフォルダー内のファイルを展開",L"ja-JP"},
+        {4,"ko",L"이 폴더의 파일 압축 풀기",L"ko-KR"},
+    }) {
+        change_language(test.option,test.code);
+        assert(read_json(config_path)["cli"]["language"]==test.code);
+        assert(registry_string(menu_path,L"MUIVerb")==test.menu);
+        assert(std::wstring_view(window(app).GetRenderer().TextLocale())==test.locale);
+    }
     change_language(1,"en");
     assert(state(app.page(),"contextMenuEnabled")==true);
     assert(registry_string(menu_path,L"MUIVerb")==L"Extract files in this folder");

@@ -1,5 +1,7 @@
 # 可复现的 worker 与 7-Zip 对比测试
 
+**简体中文** | [English](../benchmark_worker_vs_7z_300m.md) | [繁體中文](../zh-TW/benchmark_worker_vs_7z_300m.md) | [日本語](../ja/benchmark_worker_vs_7z_300m.md) | [한국어](../ko/benchmark_worker_vs_7z_300m.md)
+
 本文是根目录 README 简表对应的详细测试记录，说明 SunPack 原生 worker
 与配套命令行 `7z.exe` 在所有生成格式上的端到端对比方法。
 

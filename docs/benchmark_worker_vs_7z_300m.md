@@ -1,5 +1,7 @@
 # Reproducible 300 MiB worker versus 7-Zip benchmark
 
+[简体中文](zh-CN/benchmark_worker_vs_7z_300m.md) | **English** | [繁體中文](zh-TW/benchmark_worker_vs_7z_300m.md) | [日本語](ja/benchmark_worker_vs_7z_300m.md) | [한국어](ko/benchmark_worker_vs_7z_300m.md)
+
 This document contains the detailed protocol behind the short result table in
 the root README. The benchmark compares the SunPack native worker with the
 bundled command-line `7z.exe` across the supported generated formats.

@@ -4,7 +4,7 @@
 <h1 align="center">SunPack</h1>
 <p align="center"><b>面向 Windows 的全自动化压缩包处理工具，后台自动处理压缩包，无需手动解压</b><br></p>
 
-<p align="center"><b>简体中文</b> · <a href="README.en.md">English</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">下载</a></p>
+<p align="center"><b>简体中文</b> · <a href="README.en.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">下载</a></p>
 
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC" alt="最新版本"></a>

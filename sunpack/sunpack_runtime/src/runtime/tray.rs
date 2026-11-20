@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc,
     },
     thread::{self, JoinHandle},
@@ -51,7 +51,7 @@ pub(super) enum Action {
 
 pub(super) struct Tray {
     stop: Arc<windows::Event>,
-    chinese: Arc<AtomicBool>,
+    language: Arc<AtomicU8>,
     enabled: Arc<AtomicBool>,
     window: usize,
     thread: Option<JoinHandle<io::Result<()>>>,
@@ -66,8 +66,8 @@ impl Tray {
     ) -> io::Result<Self> {
         let stop = Arc::new(windows::Event::new(true)?);
         let event = stop.clone();
-        let chinese = Arc::new(AtomicBool::new(language == Language::Zh));
-        let language = chinese.clone();
+        let selected_language = Arc::new(AtomicU8::new(language as u8));
+        let tray_language = Arc::clone(&selected_language);
         let enabled = Arc::new(AtomicBool::new(true));
         let monitor = Arc::clone(&enabled);
         let cwd = cwd.to_owned();
@@ -76,10 +76,10 @@ impl Tray {
             .name("sunpack-tray".into())
             .spawn(move || {
                 let mut ready = Some(ready);
-                let result = run_tray(cwd, language, monitor, Box::new(notify), Box::new(report_error), &event, &mut ready);
+                let result = run_tray(cwd, tray_language, monitor, Box::new(notify), Box::new(report_error), &event, &mut ready);
                 if let Some(ready) = ready {
                     let error = result.as_ref().err().map_or_else(
-                        || io::Error::other("Tray exited before startup"),
+                        || io::Error::other(language.text("tray.exit_before_start")),
                         |error| io::Error::new(error.kind(), error.to_string()),
                     );
                     let _ = ready.send(Err(error));
@@ -89,7 +89,7 @@ impl Tray {
         match receive.recv() {
             Ok(Ok(window)) => Ok(Self {
                 stop,
-                chinese,
+                language: selected_language,
                 enabled,
                 window,
                 thread: Some(thread),
@@ -98,7 +98,7 @@ impl Tray {
                 let _ = thread.join();
                 match failure {
                     Ok(Err(error)) => Err(error),
-                    _ => Err(io::Error::other("Tray did not start")),
+                    _ => Err(io::Error::other(language.text("tray.start_failed"))),
                 }
             }
         }
@@ -107,8 +107,7 @@ impl Tray {
     pub(super) fn set_enabled(&self, enabled: bool) { self.enabled.store(enabled, Ordering::Release); }
 
     pub(super) fn set_language(&self, language: Language) {
-        self.chinese
-            .store(language == Language::Zh, Ordering::Relaxed);
+        self.language.store(language as u8, Ordering::Relaxed);
     }
 }
 
@@ -121,7 +120,8 @@ impl Drop for Tray {
         }
         if let Some(thread) = self.thread.take() {
             if let Ok(Err(error)) = thread.join() {
-                eprintln!("SunPack tray: {error}");
+                let language = Language::from_index(self.language.load(Ordering::Relaxed));
+                eprintln!("{}", language.translate("tray.thread_error", &[("error", &error.to_string())]));
             }
         }
     }
@@ -129,7 +129,7 @@ impl Drop for Tray {
 
 struct Context {
     cwd: PathBuf,
-    chinese: Arc<AtomicBool>,
+    language: Arc<AtomicU8>,
     enabled: Arc<AtomicBool>,
     notify: Box<dyn Fn(Action) + Send>,
     report_error: Box<dyn Fn(Option<u32>, &io::Error) + Send>,
@@ -139,7 +139,7 @@ struct Context {
 
 fn run_tray(
     cwd: PathBuf,
-    chinese: Arc<AtomicBool>,
+    language: Arc<AtomicU8>,
     enabled: Arc<AtomicBool>,
     notify: Box<dyn Fn(Action) + Send>,
     report_error: Box<dyn Fn(Option<u32>, &io::Error) + Send>,
@@ -156,7 +156,7 @@ fn run_tray(
     }
     let mut context = Context {
         cwd,
-        chinese,
+        language,
         enabled,
         notify,
         report_error,
@@ -253,11 +253,7 @@ fn load_icon() -> (HICON, bool) {
 
 impl Context {
     fn language(&self) -> Language {
-        if self.chinese.load(Ordering::Relaxed) {
-            Language::Zh
-        } else {
-            Language::En
-        }
+        Language::from_index(self.language.load(Ordering::Relaxed))
     }
 
     fn allow_taskbar_message(&self, window: HWND) {

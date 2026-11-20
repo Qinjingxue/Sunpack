@@ -1,4 +1,5 @@
 #include "platform.hpp"
+#include "presentation.hpp"
 #include <shlobj.h>
 
 namespace spg {
@@ -8,19 +9,20 @@ struct Menu {
     const wchar_t* parent;
     const wchar_t* verbs;
     const wchar_t* target;
-    const wchar_t* subject_en;
-    const wchar_t* subject_zh;
+    const char* extract_label;
+    const char* prompt_label;
+    const char* recursive_label;
     bool directory;
 };
 // A drive or UNC root can end in a backslash. Appending \. keeps that
 // backslash away from the closing quote after Explorer expands the token.
 constexpr Menu menus[] = {
     {L"Directory\\shell\\SunPack", L"SunPack.FolderContextMenu", L"%1\\.",
-        L"files in this folder", L"该目录下文件", true},
+        "shellExtractFolder", "shellPromptFolder", "shellRecursiveFolder", true},
     {L"Directory\\Background\\shell\\SunPack", L"SunPack.BackgroundContextMenu", L"%V\\.",
-        L"files in this folder", L"目录下文件", true},
+        "shellExtractBackground", "shellPromptBackground", "shellRecursiveBackground", true},
     {L"*\\shell\\SunPack", L"SunPack.FileContextMenu", L"%1",
-        L"this file", L"该文件", false},
+        "shellExtractFile", "shellPromptFile", nullptr, false},
 };
 
 bool missing(LSTATUS result) {
@@ -63,25 +65,19 @@ void write_command(HKEY shell, const wchar_t* name, const std::wstring& label,
 }
 
 void write_menu_commands(const Menu& menu, const std::wstring& extract,
-    const std::wstring& watch, const std::wstring& icon, bool chinese) {
+    const std::wstring& watch, const std::wstring& icon, const std::string& language) {
+    const auto label = [&](const char* key) { return wide(tr(key,language)); };
     const auto target = quote_arg(menu.target);
-    const auto subject = chinese ? menu.subject_zh : menu.subject_en;
     const auto command = extract + target + (menu.directory ? L" -o " + target : L" -d");
     MenuKey shell(HKEY_CURRENT_USER, std::wstring(classes) + menu.verbs + L"\\shell");
-    write_command(shell.handle, L"DirectExtract", std::wstring(chinese ? L"解压" : L"Extract ") + subject,
-        icon, command + L" -pa");
+    write_command(shell.handle, L"DirectExtract", label(menu.extract_label), icon, command + L" -pa");
     const auto prompt = menu.directory ? command + L" -a -pa" : extract + target + L" -a -d -pa";
-    write_command(shell.handle, L"PromptPassword",
-        std::wstring(chinese ? L"输入密码解压" : L"Enter password to extract ") + subject, icon, prompt);
+    write_command(shell.handle, L"PromptPassword", label(menu.prompt_label), icon, prompt);
     if (!menu.directory) return;
-    write_command(shell.handle, L"RecursiveExtract",
-        std::wstring(chinese ? L"递归解压" : L"Recursively extract ") + subject, icon, command + L" -R -pa");
-    write_command(shell.handle, L"WatchFolder", chinese ? L"监控此目录" : L"Watch this folder",
-        icon, watch + L"add " + target);
-    write_command(shell.handle, L"WatchFolderRecursive",
-        chinese ? L"递归监控此目录" : L"Watch this folder recursively", icon, watch + L"add " + target + L" -R");
-    write_command(shell.handle, L"UnwatchFolder", chinese ? L"取消监控此目录" : L"Stop watching this folder",
-        icon, watch + L"remove " + target);
+    write_command(shell.handle, L"RecursiveExtract", label(menu.recursive_label), icon, command + L" -R -pa");
+    write_command(shell.handle, L"WatchFolder", label("shellWatchFolder"), icon, watch + L"add " + target);
+    write_command(shell.handle, L"WatchFolderRecursive", label("shellWatchRecursive"), icon, watch + L"add " + target + L" -R");
+    write_command(shell.handle, L"UnwatchFolder", label("shellUnwatchFolder"), icon, watch + L"remove " + target);
 }
 
 bool delete_menu_tree(const wchar_t* path) {
@@ -122,7 +118,7 @@ void change_context_menu(const CliCommand& cli, ContextMenuAction action, const 
         const auto watch = quote_arg(executable_path().wstring()) + L" --cli " + launcher
             + L" --app-root " + quote_arg(cli.app_root.wstring()) + L" --shell-watch ";
         // Publish the Explorer parents after all their commands are ready.
-        for (const auto& menu : menus) write_menu_commands(menu, extract, watch, icon, language == "zh");
+        for (const auto& menu : menus) write_menu_commands(menu, extract, watch, icon, language);
         for (const auto& menu : menus) {
             MenuKey parent(HKEY_CURRENT_USER, std::wstring(classes) + menu.parent);
             parent.set(L"ExtendedSubCommandsKey", menu.verbs);

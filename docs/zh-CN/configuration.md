@@ -1,6 +1,6 @@
 # 配置指南
 
-[English](../configuration.md) | **简体中文**
+**简体中文** | [English](../configuration.md) | [繁體中文](../zh-TW/configuration.md) | [日本語](../ja/configuration.md) | [한국어](../ko/configuration.md)
 
 日常设置请修改 `sunpack_config.json`。开发构建使用项目根目录中的文件；安装版使用 `%ProgramData%\SunPack\sunpack_config.json`。`sunpack_advanced_config.json` 提供其余默认值。
 
@@ -17,7 +17,7 @@ sunpack.exe config show
 
 | 配置项                                  | 如何设置                                                                                    |
 | --------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `cli.language`                          | `zh` 为中文，`en` 为英文。                                                                  |
+| `cli.language` | `zh` 简体中文、`en` 英语、`zh-TW` 繁体中文、`ja` 日语、`ko` 韩语。未知值回退到英语。 |
 | `recursive_extract`                     | `"*"` 持续处理嵌套归档；正整数指定轮数；`"?"` 每轮后询问。                                  |
 | `recursive_authorization.enabled`       | `true` 启用嵌套归档筛选策略；`false` 跳过该策略。                                           |
 | `post_extract.archive_cleanup_mode`     | 完整成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。                                 |

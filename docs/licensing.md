@@ -1,5 +1,7 @@
 # Licensing and third-party compliance
 
+**English** | [繁體中文](zh-TW/licensing.md) | [日本語](ja/licensing.md) | [한국어](ko/licensing.md)
+
 This document summarizes how licenses are scoped in the SunPack repository and
 what must be preserved when distributing SunPack. The original license texts
 control if this summary differs from them.

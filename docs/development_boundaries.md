@@ -1,6 +1,6 @@
 # Development boundaries
 
-**English** | [简体中文](zh-CN/development_boundaries.md)
+[简体中文](zh-CN/development_boundaries.md) | **English** | [繁體中文](zh-TW/development_boundaries.md) | [日本語](ja/development_boundaries.md) | [한국어](ko/development_boundaries.md)
 
 The Windows runtime lives in `sunpack/sunpack_runtime`. Its dependency direction is `runtime → pipeline → core`. Both the pipeline and core use the existing archive analysis, I/O, and filesystem modules.
 

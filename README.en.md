@@ -4,7 +4,7 @@
 <h1 align="center">SunPack</h1>
 <p align="center"><b>A fully automated archive processing tool for Windows that handles compressed files in the background—no manual extraction required.</b><br></p>
 
-<p align="center"><a href="README.md">简体中文</a> · <b>English</b> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">Downloads</a></p>
+<p align="center"><a href="README.md">简体中文</a> · <b>English</b> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">Downloads</a></p>
 
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=Latest%20release" alt="Latest release"></a>

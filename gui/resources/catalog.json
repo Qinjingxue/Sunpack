@@ -1,1408 +1,294 @@
 {
-  "ui": {
-    "showInFolder": {
-      "zh": "在文件夹中显示",
-      "en": "Show in folder"
-    },
-    "copyTag": {
-      "zh": "点击复制",
-      "en": "Click to copy"
-    },
-    "copySucceeded": {
-      "zh": "已复制到剪贴板",
-      "en": "Copied to clipboard"
-    },
-    "copyFailed": {
-      "zh": "复制失败，请重试",
-      "en": "Could not copy. Try again."
-    },
-    "rangeEnable": {
-      "zh": "启用此过滤器",
-      "en": "Enable this filter"
-    },
-    "rangeFormat": {
-      "zh": "范围配置只能包含启用状态和结构化上下限。",
-      "en": "Range configuration accepts only enabled state and structured bounds."
-    },
-    "rangeAtomic": {
-      "zh": "范围过滤器必须作为完整模块保存。",
-      "en": "Save the range filter as a complete module."
-    },
-    "opRangeDate": {
-      "zh": "打开日期时间选择器",
-      "en": "Open date/time picker"
-    },
-    "rangeMin": {
-      "zh": "最小文件大小",
-      "en": "Minimum file size"
-    },
-    "rangeMax": {
-      "zh": "最大文件大小",
-      "en": "Maximum file size"
-    },
-    "rangeStart": {
-      "zh": "开始时间（包含）",
-      "en": "Start time (inclusive)"
-    },
-    "rangeEnd": {
-      "zh": "结束时间（不包含）",
-      "en": "End time (exclusive)"
-    },
-    "rangeChoose": {
-      "zh": "选择日期时间",
-      "en": "Choose date/time"
-    },
-    "rangePick": {
-      "zh": "选择",
-      "en": "Choose"
-    },
-    "rangePrevious": {
-      "zh": "上个月",
-      "en": "Previous month"
-    },
-    "rangeNext": {
-      "zh": "下个月",
-      "en": "Next month"
-    },
-    "rangeToday": {
-      "zh": "今天",
-      "en": "Today"
-    },
-    "rangeClock": {
-      "zh": "时间",
-      "en": "Time"
-    },
-    "rangePopupTimeHint": {
-      "zh": "本地时间，精确到分钟",
-      "en": "Local time to the minute"
-    },
-    "rangeConfirm": {
-      "zh": "确认",
-      "en": "Confirm"
-    },
-    "rangeCalendarKeys": {
-      "zh": "方向键选日 · Enter 确认 · Esc 取消",
-      "en": "Arrows: date · Enter: confirm · Esc: cancel"
-    },
-    "rangeNumber": {
-      "zh": "请输入非负数，换算后的整数字节不能超过 18446744073709551615。",
-      "en": "Enter a nonnegative value whose integer byte count does not exceed 18446744073709551615."
-    },
-    "rangeDate": {
-      "zh": "请输入有效的本地日期和时间（YYYY-MM-DD HH:mm）。",
-      "en": "Enter a valid local date and time (YYYY-MM-DD HH:mm)."
-    },
-    "rangeOrder": {
-      "zh": "最小大小不能超过最大大小；开始时间必须早于结束时间。",
-      "en": "Minimum size must not exceed maximum size; start time must precede end time."
-    },
-    "title": {
-      "zh": "SunPack 管理面板",
-      "en": "SunPack Manager"
-    },
-    "manager": {
-      "zh": "管理面板",
-      "en": "Manager"
-    },
-    "tasks": {
-      "zh": "任务状态",
-      "en": "Tasks"
-    },
-    "config": {
-      "zh": "配置管理",
-      "en": "Settings"
-    },
-    "passwords": {
-      "zh": "密码管理",
-      "en": "Passwords"
-    },
-    "roots": {
-      "zh": "监控目录",
-      "en": "Monitored folders"
-    },
-    "rootManagement": {
-      "zh": "监控目录管理",
-      "en": "Monitored folders"
-    },
-    "recordEditHint": {
-      "zh": "一行一个，Ctrl+S或失焦保存",
-      "en": "One per line, Ctrl+S or leave the field to save"
-    },
-    "rootOutputHint": {
-      "zh": "同归档所在文件夹",
-      "en": "Same as archive folder"
-    },
-    "searchDirectory": {
-      "zh": "搜索目录",
-      "en": "Search folders"
-    },
-    "allDirectories": {
-      "zh": "全部目录",
-      "en": "All folders"
-    },
-    "add": {
-      "zh": "添加",
-      "en": "Add"
-    },
-    "batchAdd": {
-      "zh": "批量添加",
-      "en": "Bulk add"
-    },
-    "selectAll": {
-      "zh": "全选",
-      "en": "Select all"
-    },
-    "deselectAll": {
-      "zh": "取消全选",
-      "en": "Deselect all"
-    },
-    "enableState": {
-      "zh": "启用状态",
-      "en": "Enabled"
-    },
-    "deleteSelected": {
-      "zh": "删除所选项",
-      "en": "Delete selected"
-    },
-    "openRecord": {
-      "zh": "打开原始记录",
-      "en": "Open raw record"
-    },
-    "recordOpenFailed": {
-      "zh": "无法使用默认文本编辑器打开记录",
-      "en": "Could not open the record in the default text editor."
-    },
-    "recordEnabledRequired": {
-      "zh": "每条记录的 enabled 字段必须为 true 或 false",
-      "en": "Each record requires a boolean enabled field."
-    },
-    "history": {
-      "zh": "剪贴板历史",
-      "en": "Clipboard history"
-    },
-    "savePassword": {
-      "zh": "保存密码",
-      "en": "Save password"
-    },
-    "savedPasswords": {
-      "zh": "密码列表",
-      "en": "Saved passwords"
-    },
-    "allFolders": {
-      "zh": "全部目录",
-      "en": "All folders"
-    },
-    "rootsEmpty": {
-      "zh": "请至少输入一个目录。",
-      "en": "Enter at least one folder."
-    },
-    "edit": {
-      "zh": "编辑",
-      "en": "Edit"
-    },
-    "delete": {
-      "zh": "删除",
-      "en": "Delete"
-    },
-    "open": {
-      "zh": "打开",
-      "en": "Open"
-    },
-    "output": {
-      "zh": "输出位置：",
-      "en": "Output: "
-    },
-    "watchRoot": {
-      "zh": "监控目录",
-      "en": "Monitored folder"
-    },
-    "taskFolder": {
-      "zh": "监控目录：",
-      "en": "Monitored folder: "
-    },
-    "scopeDirectory": {
-      "zh": "密码适用目录",
-      "en": "Password folder"
-    },
-    "watchHint": {
-      "zh": "监控目录中的直接文件。",
-      "en": "Monitors files directly inside each folder."
-    },
-    "allSettings": {
-      "zh": "全部配置",
-      "en": "All settings"
-    },
-    "startWatch": {
-      "zh": "启用监控",
-      "en": "Enable Watch"
-    },
-    "stopWatch": {
-      "zh": "禁用监控",
-      "en": "Disable Watch"
-    },
-    "taskSearch": {
-      "zh": "搜索任务",
-      "en": "Search tasks"
-    },
-    "allStatus": {
-      "zh": "全部状态",
-      "en": "All statuses"
-    },
-    "back": {
-      "zh": "返回",
-      "en": "Back"
-    },
-    "rootOutput": {
-      "zh": "输出目录",
-      "en": "Output folder"
-    },
-    "recursiveScan": {
-      "zh": "递归发现",
-      "en": "Recursive discovery"
-    },
-    "deep": {
-      "zh": "深度检测",
-      "en": "Deep detection"
-    },
-    "taskCount": {
-      "zh": "个任务",
-      "en": "tasks"
-    },
-    "startup": {
-      "zh": "开机启动",
-      "en": "Start at sign-in"
-    },
-    "enabled": {
-      "zh": "已启用",
-      "en": "On"
-    },
-    "disabled": {
-      "zh": "未启用",
-      "en": "Off"
-    },
-    "startupOff": {
-      "zh": "关闭开机自启",
-      "en": "Turn off"
-    },
-    "startupOn": {
-      "zh": "开启开机自启",
-      "en": "Turn on"
-    },
-    "theme": {
-      "zh": "界面主题",
-      "en": "App theme"
-    },
-    "contextMenu": {
-      "zh": "右键菜单",
-      "en": "Context menu"
-    },
-    "contextMenuOn": {
-      "zh": "开启",
-      "en": "Enable"
-    },
-    "contextMenuOff": {
-      "zh": "关闭",
-      "en": "Disable"
-    },
-    "system": {
-      "zh": "跟随系统",
-      "en": "Use system setting"
-    },
-    "light": {
-      "zh": "浅色",
-      "en": "Light"
-    },
-    "dark": {
-      "zh": "深色",
-      "en": "Dark"
-    },
-    "programSettings": {
-      "zh": "程序配置",
-      "en": "Program settings"
-    },
-    "settingSearch": {
-      "zh": "搜索配置名称或说明",
-      "en": "Search settings and descriptions"
-    },
-    "rounds": {
-      "zh": "轮数（正整数）",
-      "en": "Rounds (positive integer)"
-    },
-    "passwordSearch": {
-      "zh": "搜索密码",
-      "en": "Search passwords"
-    },
-    "passwordText": {
-      "zh": "密码",
-      "en": "Password"
-    },
-    "entries": {
-      "zh": "条",
-      "en": "entries"
-    },
-    "cancelEntries": {
-      "zh": "取消",
-      "en": "Cancel"
-    },
-    "operationFailed": {
-      "zh": "操作未完成",
-      "en": "Could not complete the action"
-    },
-    "fileProblems": {
-      "zh": "部分数据暂时无法读取",
-      "en": "Some data could not be read"
-    },
-    "cliFailed": {
-      "zh": "命令执行失败（退出码 {code}）。",
-      "en": "The command failed (exit code {code})."
-    },
-    "cliEncoding": {
-      "zh": "命令输出不是有效的 UTF-8。",
-      "en": "The command output is not valid UTF-8."
-    },
-    "readOnly": {
-      "zh": "由外部配置管理",
-      "en": "Managed in the configuration file"
-    },
-    "unknownDescription": {
-      "zh": "附加配置，保留原值",
-      "en": "Additional setting; original value preserved"
-    },
-    "validation": {
-      "zh": "输入值不符合此项说明。",
-      "en": "Enter a value within the limits described above."
-    },
-    "conflict": {
-      "zh": "该项已被其他程序修改。刷新后重新编辑。",
-      "en": "This setting changed in another program. Refresh and edit it again."
-    },
-    "batchEmpty": {
-      "zh": "请至少输入一个密码。",
-      "en": "Enter at least one password."
-    },
-    "recursiveFixed": {
-      "zh": "指定轮数",
-      "en": "Fixed number of rounds"
-    },
-    "recursiveInfinite": {
-      "zh": "无限递归",
-      "en": "Unlimited recursion"
-    },
-    "recursivePrompt": {
-      "zh": "每轮询问",
-      "en": "Ask after each round"
-    },
-    "taskProcessing": {
-      "zh": "处理中",
-      "en": "Processing"
-    },
-    "taskWaiting": {
-      "zh": "等待中",
-      "en": "Waiting"
-    },
-    "taskSucceeded": {
-      "zh": "成功",
-      "en": "Succeeded"
-    },
-    "taskDeduplicated": {
-      "zh": "去重跳过",
-      "en": "Duplicate skipped"
-    },
-    "taskFailed": {
-      "zh": "失败",
-      "en": "Failed"
-    },
-    "taskErrorType": {
-      "zh": "错误类型：",
-      "en": "Error type: "
-    },
-    "taskErrorMessage": {
-      "zh": "错误信息：",
-      "en": "Error message: "
-    },
-    "taskError_invalid_input": {
-      "zh": "无效输入",
-      "en": "Invalid input"
-    },
-    "taskError_wrong_password": {
-      "zh": "密码错误",
-      "en": "Wrong password"
-    },
-    "taskError_password_inconclusive": {
-      "zh": "密码无法确认",
-      "en": "Password inconclusive"
-    },
-    "taskError_damaged": {
-      "zh": "压缩数据损坏",
-      "en": "Damaged archive data"
-    },
-    "taskError_missing_volume": {
-      "zh": "缺少分卷",
-      "en": "Missing volume"
-    },
-    "taskError_unsupported": {
-      "zh": "不支持的格式",
-      "en": "Unsupported format"
-    },
-    "taskError_backend_unavailable": {
-      "zh": "解压后端不可用",
-      "en": "Extraction backend unavailable"
-    },
-    "taskError_filesystem_error": {
-      "zh": "文件系统错误",
-      "en": "Filesystem error"
-    },
-    "taskError_process_error": {
-      "zh": "解压进程错误",
-      "en": "Extraction process error"
-    },
-    "taskError_embedded_segments_failed": {
-      "zh": "内嵌压缩包处理失败",
-      "en": "Embedded archive processing failed"
-    },
-    "taskError_unknown": {
-      "zh": "未知错误",
-      "en": "Unknown error"
-    },
-    "taskWaitingPassword": {
-      "zh": "等待密码",
-      "en": "Waiting for password"
-    },
-    "taskWaitingVolumes": {
-      "zh": "等待分卷",
-      "en": "Waiting for volumes"
-    },
-    "fileObserver": {
-      "zh": "文件观察器",
-      "en": "File observer"
-    },
-    "logObserver": {
-      "zh": "日志观察器",
-      "en": "Log observer"
-    },
-    "runtimeRunning": {"zh":"正在监控","en":"Monitoring"},
-    "runtimeStopped": {"zh":"未运行","en":"Not running"},
-    "runtimeDisabled": {"zh":"未启用监控","en":"Monitoring disabled"},
-    "runtimeSyncError": {"zh":"无法同步监控状态。","en":"Unable to synchronize monitoring status."},
-    "rootConflict": {
-      "zh": "此监控目录已被其他程序修改，请放弃更改后重新编辑。",
-      "en": "This monitored folder changed in another program. Discard changes and edit it again."
-    },
-    "configConflict": {
-      "zh": "配置已在外部删除，请放弃更改后重新编辑。",
-      "en": "A setting was removed externally. Discard changes and edit it again."
-    },
-    "settingChanged": {
-      "zh": "该字段已被外部修改，请重新选择后保存",
-      "en": "This setting changed in another program. Review the latest value and edit it again."
-    },
-    "settingTypeMismatch": {
-      "zh": "输入类型与字段类型不一致",
-      "en": "The value has the wrong type for this setting."
-    },
-    "passwordChanged": {
-      "zh": "密码记录已被外部修改，请重新选择",
-      "en": "This password changed in another program. Open it again to edit the latest value."
-    },
-    "passwordScopeAbsolute": {
-      "zh": "密码作用域必须是 Windows 绝对目录",
-      "en": "Password folders must use absolute Windows paths."
-    },
-    "rootInvalid": {
-      "zh": "目录不能为空且不能包含分隔符或换行",
-      "en": "The folder must not be empty or contain separators or line breaks."
-    },
-    "rootDuplicate": {
-      "zh": "监控目录已存在",
-      "en": "This folder is already monitored."
-    },
-    "rootRemoved": {
-      "zh": "监控目录已被外部删除",
-      "en": "This monitored folder was removed in another program."
-    },
-    "pathMissing": {
-      "zh": "路径当前不存在",
-      "en": "The path does not currently exist."
-    },
-    "explorerFailed": {
-      "zh": "无法在资源管理器中打开路径",
-      "en": "Could not open the path in Explorer."
-    },
-    "cliMissing": {
-      "zh": "未找到 SunPack CLI；请安装完整发行包或传入 --cli",
-      "en": "SunPack CLI was not found. Install the complete package or specify --cli."
-    },
-    "cliUnbound": {
-      "zh": "测试数据目录未绑定 CLI；请显式传入 --cli",
-      "en": "This data folder has no CLI configured. Specify --cli."
-    },
-    "configObjectRequired": {
-      "zh": "配置顶层必须是 JSON 对象",
-      "en": "The configuration must be a JSON object."
-    },
-    "jsonDuplicateKey": {
-      "zh": "JSON 包含重复字段",
-      "en": "The JSON contains duplicate properties."
-    },
-    "fileTooLarge": {
-      "zh": "文件超过可编辑大小限制",
-      "en": "The file exceeds the editable size limit."
-    },
-    "watchNotificationsUnsupported": {
-      "zh": "目录不支持文件变化通知",
-      "en": "The folder does not support file change notifications."
-    },
-    "folderPickerFailed": {
-      "zh": "无法打开目录选择器",
-      "en": "Could not open the folder picker."
-    },
-    "logRecordTooLarge": {
-      "zh": "日志单行超过大小限制",
-      "en": "A log entry exceeds the size limit."
-    },
-    "passwordScopesEmpty": {
-      "zh": "目录密码的 scopes 不能为空",
-      "en": "A folder password needs at least one folder."
-    },
-    "passwordUnicodeRequired": {
-      "zh": "密码及作用域必须是无 NUL 的有效 Unicode 字符串",
-      "en": "Passwords and folders must be valid Unicode without NUL characters."
-    },
-    "passwordArrayRequired": {
-      "zh": "密码文件必须包含 passwords 数组",
-      "en": "The password file must contain a passwords array."
-    },
-    "passwordFileUnknownField": {
-      "zh": "密码文件含未知字段",
-      "en": "The password file contains an unknown property."
-    },
-    "passwordValueRequired": {
-      "zh": "密码记录缺少 value",
-      "en": "A password record is missing its value."
-    },
-    "passwordRecordUnknownField": {
-      "zh": "密码记录含未知字段",
-      "en": "A password record contains an unknown property."
-    },
-    "clipboardArrayRequired": {
-      "zh": "clipboard_history 必须为数组",
-      "en": "Clipboard history must be an array."
-    },
-    "scopeNotDirect": {
-      "zh": "只能移除直接绑定的作用域",
-      "en": "Only directly assigned folders can be removed."
-    },
-    "scopeInherited": {
-      "zh": "当前目录不是直接作用域",
-      "en": "This folder is inherited and cannot be removed here."
-    },
-    "rootsLineInvalid": {
-      "zh": "监控目录格式为 输入 | 输出 | deep_detect | initial_scanned | recursive | enabled",
-      "en": "Expected input | output | deep_detect | initial_scanned | recursive | enabled."
-    },
-    "deepDetectInvalid": {
-      "zh": "deep_detect 只能是 true 或 false",
-      "en": "Deep detection must be true or false."
-    },
-    "passwordOperationUnknown": {
-      "zh": "未知密码操作",
-      "en": "Unknown password operation."
-    },
-    "guiArguments": {
-      "zh": "参数：--data-dir <目录> --cli <可执行文件> [--app-root <应用目录>] [--cli-prefix <单个参数>]...",
-      "en": "Arguments: --data-dir <folder> --cli <executable> [--app-root <application folder>] [--cli-prefix <argument>]..."
-    },
-    "programDataUnavailable": {
-      "zh": "无法确定 ProgramData",
-      "en": "Could not locate ProgramData."
-    },
-    "uiBindingFailed": {
-      "zh": "界面数据绑定失败",
-      "en": "Could not update the interface data."
-    },
-    "taskBindingFailed": {
-      "zh": "任务列表更新失败",
-      "en": "Could not update the task list."
-    },
-    "logoLoadFailed": {
-      "zh": "无法加载 SunPack 图标资源",
-      "en": "Could not load the SunPack logo."
-    },
-    "layoutLoadFailed": {
-      "zh": "无法加载管理面板布局",
-      "en": "Could not load the manager layout."
-    },
-    "cliOperationUnknown": {
-      "zh": "不支持的 CLI 操作",
-      "en": "Unsupported CLI operation."
-    },
-    "uiOperationUnknown": {
-      "zh": "未知界面操作",
-      "en": "Unknown interface operation."
-    },
-    "stageRenderer": {
-      "zh": "初始化渲染器",
-      "en": "Initialize renderer"
-    },
-    "stageLogo": {
-      "zh": "加载图标",
-      "en": "Load logo"
-    },
-    "stageFonts": {
-      "zh": "设置字体",
-      "en": "Set up fonts"
-    },
-    "stageLayout": {
-      "zh": "加载布局",
-      "en": "Load layout"
-    },
-    "stageWindow": {
-      "zh": "创建窗口",
-      "en": "Create window"
-    },
-    "stageEvents": {
-      "zh": "绑定窗口事件",
-      "en": "Bind window events"
-    },
-    "stageWatchers": {
-      "zh": "启动文件观察器",
-      "en": "Start file observers"
-    },
-    "startupFailure": {
-      "zh": "启动失败（{stage}）：{detail}",
-      "en": "Startup failed ({stage}): {detail}"
-    },
-    "firstFrameFailed": {
-      "zh": "窗口首帧渲染失败，无法显示界面。",
-      "en": "The first window frame could not be rendered."
-    },
-    "windowsFailure": {
-      "zh": "{operation}失败（Windows 错误 {code}）：{detail}",
-      "en": "{operation} failed (Windows error {code}): {detail}"
-    },
-    "windowsMessageUnavailable": {
-      "zh": "系统未提供此错误的说明",
-      "en": "No system message is available for this error."
-    },
-    "invalidJson": {
-      "zh": "JSON 格式无效，请检查第 {byte} 字节附近",
-      "en": "Invalid JSON near byte {byte}."
-    },
-    "cliFailureOutput": {
-      "zh": "{failure}\n{output}",
-      "en": "{failure}\n{output}"
-    },
-    "opEncodeUtf8": {
-      "zh": "编码 UTF-8",
-      "en": "Encode UTF-8"
-    },
-    "opDecodeUtf8": {
-      "zh": "解码 UTF-8",
-      "en": "Decode UTF-8"
-    },
-    "opCreateMutex": {
-      "zh": "创建文件锁",
-      "en": "Create file lock"
-    },
-    "opWaitMutex": {
-      "zh": "等待文件锁",
-      "en": "Wait for file lock"
-    },
-    "opReadFile": {
-      "zh": "读取文件",
-      "en": "Read file"
-    },
-    "opFileSize": {
-      "zh": "读取文件大小",
-      "en": "Read file size"
-    },
-    "opCreateTemp": {
-      "zh": "创建临时文件",
-      "en": "Create temporary file"
-    },
-    "opWriteFile": {
-      "zh": "写入文件",
-      "en": "Write file"
-    },
-    "opFlushFile": {
-      "zh": "刷新文件",
-      "en": "Flush file"
-    },
-    "opReplaceFile": {
-      "zh": "替换文件",
-      "en": "Replace file"
-    },
-    "opWatchDirectory": {
-      "zh": "监控目录",
-      "en": "Watch folder"
-    },
-    "opReadStartupRegistry": {
-      "zh": "读取启动项注册表",
-      "en": "Read startup registry"
-    },
-    "opSaveTheme": {
-      "zh": "保存界面主题",
-      "en": "Save GUI theme"
-    },
-    "opReadStartupValue": {
-      "zh": "读取启动项",
-      "en": "Read startup entry"
-    },
-    "opReadContextMenu": {
-      "zh": "读取右键菜单状态",
-      "en": "Read context menu registration"
-    },
-    "opChangeContextMenu": {
-      "zh": "更改右键菜单",
-      "en": "Change context menu registration"
-    },
-    "opSubscribeService": {
-      "zh": "订阅服务状态",
-      "en": "Subscribe to service status"
-    },
-    "opServiceNotification": {
-      "zh": "接收服务状态通知",
-      "en": "Receive service status notification"
-    },
-    "opOpenServiceManager": {
-      "zh": "打开服务管理器",
-      "en": "Open service manager"
-    },
-    "opOpenWatchService": {
-      "zh": "打开监控服务",
-      "en": "Open Watch Broker service"
-    },
-    "opQueryWatchStatus": {
-      "zh": "查询监控服务状态",
-      "en": "Query Watch Broker status"
-    },
-    "opCaptureCli": {
-      "zh": "捕获 CLI 输出",
-      "en": "Capture CLI output"
-    },
-    "opCliAttributes": {
-      "zh": "设置 CLI 进程属性",
-      "en": "Set CLI process attributes"
-    },
-    "opCliHandles": {
-      "zh": "设置 CLI 进程句柄",
-      "en": "Set CLI process handles"
-    },
-    "opLaunchCli": {
-      "zh": "启动 CLI",
-      "en": "Launch CLI"
-    },
-    "opReadCliOutput": {
-      "zh": "读取 CLI 输出",
-      "en": "Read CLI output"
-    },
-    "opSeekLog": {
-      "zh": "定位日志",
-      "en": "Seek log"
-    },
-    "opReadLog": {
-      "zh": "读取日志",
-      "en": "Read log"
-    },
-    "opReadEventLog": {
-      "zh": "读取事件日志",
-      "en": "Read event log"
-    },
-    "opLogIdentity": {
-      "zh": "读取日志标识",
-      "en": "Read log identity"
-    },
-    "opLogGeneration": {
-      "zh": "读取日志更新信息",
-      "en": "Read log generation"
-    },
-    "opCommandLine": {
-      "zh": "读取命令行",
-      "en": "Read command line"
-    },
-    "opGuiInstance": {
-      "zh": "创建管理面板实例",
-      "en": "Create manager instance"
-    },
-    "opFindLogo": {
-      "zh": "查找 SunPack 图标资源",
-      "en": "Find SunPack logo resource"
-    },
-    "opWindowEvents": {
-      "zh": "设置窗口事件",
-      "en": "Set up window events"
-    },
-    "opServiceRefresh": {
-      "zh": "创建服务刷新事件",
-      "en": "Create service refresh event"
-    },
-    "tagInputPlaceholder": {
-      "zh": "输入后按 Enter 添加",
-      "en": "Type a tag and press Enter"
-    },
-    "regexMode": {
-      "zh": "使用正则表达式",
-      "en": "Use regular expressions"
-    }
-  },
   "groups": {
-    "cli": {
-      "zh": "语言",
-      "en": "Language"
-    },
-    "runtime": {
-      "zh": "性能与优先级",
-      "en": "Performance and priority"
-    },
-    "recursive_extract": {
-      "zh": "递归配置",
-      "en": "Recursive extraction"
-    },
-    "recursive_authorization": {
-      "zh": "递归配置",
-      "en": "Recursive extraction"
-    },
-    "embedded_scan": {
-      "zh": "扫描内嵌压缩包",
-      "en": "Scan embedded archives"
-    },
-    "post_extract": {
-      "zh": "解压后处理",
-      "en": "After extraction"
-    },
-    "filesystem": {
-      "zh": "文件扫描",
-      "en": "File scanning"
-    },
-    "watch": {
-      "zh": "目录监控",
-      "en": "Folder monitoring"
-    },
-    "passwords": {
-      "zh": "密码来源",
-      "en": "Password sources"
-    },
-    "extraction": {
-      "zh": "解压结果",
-      "en": "Extraction results"
-    },
-    "performance": {
-      "zh": "高级性能配置",
-      "en": "Advanced performance"
-    }
+    "cli": "groups/cli",
+    "runtime": "groups/runtime",
+    "recursive_extract": "groups/recursive_extract",
+    "recursive_authorization": "groups/recursive_authorization",
+    "embedded_scan": "groups/embedded_scan",
+    "post_extract": "groups/post_extract",
+    "filesystem": "groups/filesystem",
+    "watch": "groups/watch",
+    "passwords": "groups/passwords",
+    "extraction": "groups/extraction",
+    "performance": "groups/performance"
   },
   "fields": {
     "/filesystem/scan_filters/@size_range": {
-      "label": {
-        "zh": "文件大小",
-        "en": "File size"
-      },
+      "label": "fields/filesystem/scan_filters/@size_range/label",
       "editor": "size_range"
     },
     "/filesystem/scan_filters/@mtime_range": {
-      "label": {
-        "zh": "修改时间",
-        "en": "Modification time"
-      },
+      "label": "fields/filesystem/scan_filters/@mtime_range/label",
       "editor": "datetime_range"
     },
     "/cli/language": {
-      "label": {
-        "zh": "语言",
-        "en": "Language"
-      },
-      "options": [
-        {
-          "value": "zh",
-          "label": {
-            "zh": "简体中文",
-            "en": "简体中文"
-          }
-        },
-        {
-          "value": "en",
-          "label": {
-            "zh": "English",
-            "en": "English"
-          }
-        }
-      ]
+      "label": "fields/cli/language/label"
     },
     "/recursive_extract": {
-      "label": {
-        "zh": "递归解压模式",
-        "en": "Recursive extraction mode"
-      },
+      "label": "fields/recursive_extract/label",
       "editor": "recursive",
       "options": [
         {
           "value": "*",
-          "label": {
-            "zh": "无限递归",
-            "en": "Unlimited recursion"
-          }
+          "label": "fields/recursive_extract/options/*/label"
         },
         {
           "value": "?",
-          "label": {
-            "zh": "每轮询问",
-            "en": "Ask after each round"
-          }
+          "label": "fields/recursive_extract/options/?/label"
         },
         {
           "value": "#",
-          "label": {
-            "zh": "指定轮数",
-            "en": "Fixed number of rounds"
-          }
+          "label": "fields/recursive_extract/options/#/label"
         }
       ]
     },
     "/recursive_authorization/enabled": {
-      "label": {
-        "zh": "递归筛选",
-        "en": "Nested archive selection"
-      },
-      "description": {
-        "zh": "根据压缩包占比决定是否递归解压，可避免误解压",
-        "en": "Use archive ratios to decide whether to extract recursively and avoid unintended extraction"
-      }
+      "label": "fields/recursive_authorization/enabled/label",
+      "description": "fields/recursive_authorization/enabled/description"
     },
     "/recursive_authorization/byte_ratio_exponent": {
-      "label": {
-        "zh": "压缩包字节占比权重",
-        "en": "Archive byte-ratio exponent"
-      },
+      "label": "fields/recursive_authorization/byte_ratio_exponent/label",
       "min": 0,
       "max": null,
       "exclusive": true
     },
     "/recursive_authorization/project_ratio_exponent": {
-      "label": {
-        "zh": "项目占比权重",
-        "en": "Project-ratio exponent"
-      },
+      "label": "fields/recursive_authorization/project_ratio_exponent/label",
       "min": 0,
       "max": null,
       "exclusive": true
     },
     "/recursive_authorization/minimum_authorization_score": {
-      "label": {
-        "zh": "最低评分",
-        "en": "Minimum score"
-      },
+      "label": "fields/recursive_authorization/minimum_authorization_score/label",
       "min": 0,
       "max": 1,
       "exclusive": false
     },
     "/post_extract/archive_cleanup_mode": {
-      "label": {
-        "zh": "解压文件后的处理方式",
-        "en": "Archive handling after extraction"
-      },
+      "label": "fields/post_extract/archive_cleanup_mode/label",
       "options": [
         {
           "value": "r",
-          "label": {
-            "zh": "移至回收站",
-            "en": "Move to Recycle Bin"
-          }
+          "label": "fields/post_extract/archive_cleanup_mode/options/r/label"
         },
         {
           "value": "k",
-          "label": {
-            "zh": "保留",
-            "en": "Keep"
-          }
+          "label": "fields/post_extract/archive_cleanup_mode/options/k/label"
         },
         {
           "value": "d",
-          "label": {
-            "zh": "永久删除",
-            "en": "Permanently delete"
-          }
+          "label": "fields/post_extract/archive_cleanup_mode/options/d/label"
         }
       ]
     },
     "/post_extract/flatten_single_directory": {
-      "label": {
-        "zh": "压平单子目录",
-        "en": "Flatten single subfolder"
-      }
+      "label": "fields/post_extract/flatten_single_directory/label"
     },
     "/post_extract/flatten_directory_name": {
-      "label": {
-        "zh": "压平后的目录名",
-        "en": "Folder name after flattening"
-      },
+      "label": "fields/post_extract/flatten_directory_name/label",
       "options": [
         {
           "value": "outer",
-          "label": {
-            "zh": "外层目录名",
-            "en": "Outer folder name"
-          }
+          "label": "fields/post_extract/flatten_directory_name/options/outer/label"
         },
         {
           "value": "inner",
-          "label": {
-            "zh": "内层目录名",
-            "en": "Inner folder name"
-          }
+          "label": "fields/post_extract/flatten_directory_name/options/inner/label"
         }
       ]
     },
     "/filesystem/scan_filters_enabled": {
-      "label": {
-        "zh": "扫描筛选器整体开关",
-        "en": "Master switch for scan filters"
-      },
-      "description": {
-        "zh": "禁用后所有扫描筛选均不会生效",
-        "en": "Disabling this turns off all scan filters"
-      }
+      "label": "fields/filesystem/scan_filters_enabled/label",
+      "description": "fields/filesystem/scan_filters_enabled/description"
     },
     "/filesystem/scan_filters/@whitelist/enabled": {
-      "label": {
-        "zh": "白名单",
-        "en": "Allow list"
-      }
+      "label": "fields/filesystem/scan_filters/@whitelist/enabled/label"
     },
     "/filesystem/scan_filters/@blacklist/enabled": {
-      "label": {
-        "zh": "黑名单",
-        "en": "Block list"
-      }
+      "label": "fields/filesystem/scan_filters/@blacklist/enabled/label"
     },
     "/performance/persistent_server_idle_seconds": {
-      "label": {
-        "zh": "后台服务空闲退出（秒）",
-        "en": "Service idle timeout (s)"
-      },
+      "label": "fields/performance/persistent_server_idle_seconds/label",
       "min": 0,
       "max": null
     },
     "/performance/worker/space_poll_interval_ms": {
-      "label": {
-        "zh": "磁盘空间复查间隔（毫秒）",
-        "en": "Disk space recheck interval (ms)"
-      },
-      "description": {
-        "zh": "仅在等待磁盘空间恢复时复查，范围为 50–60000 毫秒。",
-        "en": "Recheck only while waiting for disk space, between 50 and 60000 ms."
-      },
+      "label": "fields/performance/worker/space_poll_interval_ms/label",
+      "description": "fields/performance/worker/space_poll_interval_ms/description",
       "min": 50,
       "max": 60000,
       "integer": true
     },
     "/performance/worker/space_status_report_interval_ms": {
-      "label": {
-        "zh": "磁盘空间状态报告间隔（毫秒）",
-        "en": "Disk space status report interval (ms)"
-      },
+      "label": "fields/performance/worker/space_status_report_interval_ms/label",
       "min": 1000,
       "max": 600000,
       "integer": true
     },
     "/runtime/process_mode": {
-      "label": {
-        "zh": "进程优先级",
-        "en": "Process priority"
-      },
-      "description": {
-        "zh": "低优先级消耗内存等资源少，但会显著降低处理速度",
-        "en": "Lower priority uses less memory and other resources, but significantly slows down processing"
-      },
+      "label": "fields/runtime/process_mode/label",
+      "description": "fields/runtime/process_mode/description",
       "options": [
         {
           "value": "background",
-          "label": {
-            "zh": "后台",
-            "en": "Background"
-          }
+          "label": "fields/runtime/process_mode/options/background/label"
         },
         {
           "value": "normal",
-          "label": {
-            "zh": "普通",
-            "en": "Normal"
-          }
+          "label": "fields/runtime/process_mode/options/normal/label"
         },
         {
           "value": "high",
-          "label": {
-            "zh": "高优先级",
-            "en": "High"
-          }
+          "label": "fields/runtime/process_mode/options/high/label"
         }
       ]
     },
     "/watch/tray_enabled": {
-      "label": {
-        "zh": "托盘图标",
-        "en": "Tray icon"
-      }
+      "label": "fields/watch/tray_enabled/label"
     },
     "/watch/toast_enabled": {
-      "label": {
-        "zh": "Windows桌面通知",
-        "en": "Windows desktop notifications"
-      }
+      "label": "fields/watch/toast_enabled/label"
     },
     "/watch/deduplication": {
-      "label": { "zh": "监控去重", "en": "Watch deduplication" },
-      "description": {
-        "zh": "去重相同文件",
-        "en": "Deduplicate identical files"
-      },
+      "label": "fields/watch/deduplication/label",
+      "description": "fields/watch/deduplication/description",
       "options": [
-        { "value": "none", "label": { "zh": "无", "en": "None" } },
-        { "value": "file_id", "label": { "zh": "硬链接去重", "en": "Hard-link deduplication" } },
-        { "value": "hash", "label": { "zh": "Hash 去重", "en": "Hash" } }
+        {
+          "value": "none",
+          "label": "fields/watch/deduplication/options/none/label"
+        },
+        {
+          "value": "file_id",
+          "label": "fields/watch/deduplication/options/file_id/label"
+        },
+        {
+          "value": "hash",
+          "label": "fields/watch/deduplication/options/hash/label"
+        }
       ]
     },
     "/watch/deduplication_scope": {
-      "label": { "zh": "去重范围", "en": "Deduplication scope" },
+      "label": "fields/watch/deduplication_scope/label",
       "options": [
-        { "value": "root", "label": { "zh": "当前监控目录", "en": "Current monitored folder" } },
-        { "value": "global", "label": { "zh": "全部监控目录", "en": "All monitored folders" } }
+        {
+          "value": "root",
+          "label": "fields/watch/deduplication_scope/options/root/label"
+        },
+        {
+          "value": "global",
+          "label": "fields/watch/deduplication_scope/options/global/label"
+        }
       ]
     },
     "/watch/boundary_confirmation_seconds": {
-      "label": {
-        "zh": "写入确认间隔（秒）",
-        "en": "Write confirmation interval (s)"
-      },
-      "description": {
-        "zh": "再次确认文件已停止写入",
-        "en": "Confirm that file writing has stopped"
-      },
+      "label": "fields/watch/boundary_confirmation_seconds/label",
+      "description": "fields/watch/boundary_confirmation_seconds/description",
       "min": 0,
       "integer": false
     },
     "/watch/runtime_cache_cleanup_idle_seconds": {
-      "label": {
-        "zh": "缓存清理等待（秒）",
-        "en": "Cache cleanup delay (s)"
-      },
+      "label": "fields/watch/runtime_cache_cleanup_idle_seconds/label",
       "min": 0,
       "integer": false
     },
     "/watch/clipboard_monitor_enabled": {
-      "label": {
-        "zh": "剪贴板监听",
-        "en": "Clipboard monitoring"
-      },
-      "description": {
-        "zh": "Watch模式下自动将剪贴板历史保存到密码文件",
-        "en": "Automatically save clipboard history to the password file in Watch mode"
-      }
+      "label": "fields/watch/clipboard_monitor_enabled/label",
+      "description": "fields/watch/clipboard_monitor_enabled/description"
     },
     "/watch/clipboard_builtin_max_entries": {
-      "label": {
-        "zh": "剪贴板监听保存条目上限",
-        "en": "Clipboard history limit"
-      },
+      "label": "fields/watch/clipboard_builtin_max_entries/label",
       "min": 1,
       "integer": true
     },
     "/watch/toast_report_retention_days": {
-      "label": {
-        "zh": "Watch模式失败报告保留时间（天）",
-        "en": "Number of days to keep Watch-mode failure reports"
-      },
+      "label": "fields/watch/toast_report_retention_days/label",
       "min": 1,
       "integer": true
     },
     "/passwords/clipboard_passwords_enabled": {
-      "label": {
-        "zh": "CLI使用剪贴板密码",
-        "en": "CLI uses clipboard passwords"
-      },
-      "description": {
-        "zh": "CLI 是否读取当前剪贴板内容作为密码",
-        "en": "Whether the CLI reads the current clipboard content as a password"
-      }
+      "label": "fields/passwords/clipboard_passwords_enabled/label",
+      "description": "fields/passwords/clipboard_passwords_enabled/description"
     },
     "/extraction/content_requirement": {
-      "label": {
-        "zh": "解压完整性要求",
-        "en": "Extraction integrity requirement"
-      },
-      "description": {
-        "zh": "允许部分恢复可能误解压下载中文件，请仅在需尽力获取损坏文件的部分内容时使用",
-        "en": "Allowing partial recovery may extract unintended files from downloads. Use only when you need to recover partial content from damaged files."
-      },
+      "label": "fields/extraction/content_requirement/label",
+      "description": "fields/extraction/content_requirement/description",
       "options": [
         {
           "value": "complete",
-          "label": {
-            "zh": "仅完整结果",
-            "en": "Complete output only"
-          }
+          "label": "fields/extraction/content_requirement/options/complete/label"
         },
         {
           "value": "allow_partial",
-          "label": {
-            "zh": "允许部分恢复",
-            "en": "Allow partial recovery"
-          }
+          "label": "fields/extraction/content_requirement/options/allow_partial/label"
         }
       ]
     },
     "/embedded_scan/enabled": {
-      "label": {
-        "zh": "扫描内嵌压缩包",
-        "en": "Scan embedded archives"
-      },
-      "description": {
-        "zh": "查找嵌入文件二进制中的压缩包，例如伪装成图片的压缩包",
-        "en": "Find archives embedded in file binaries, such as archives disguised as images"
-      }
+      "label": "fields/embedded_scan/enabled/label",
+      "description": "fields/embedded_scan/enabled/description"
     },
     "/embedded_scan/recursive_candidate_ratio": {
-      "label": {
-        "zh": "递归候选比例",
-        "en": "Nested candidate ratio"
-      },
-      "description": {
-        "zh": "递归只深度扫描满足对应大小比例的文件，0表示完全扫描，1表示完全不扫描",
-        "en": "During recursion, deep-scan only files that meet the size ratio. Use 0 to scan all candidates and 1 to scan none."
-      },
+      "label": "fields/embedded_scan/recursive_candidate_ratio/label",
+      "description": "fields/embedded_scan/recursive_candidate_ratio/description",
       "min": 0,
       "max": 1
     },
     "/watch/event_log_retention_days": {
-      "label": {
-        "zh": "日志保留天数",
-        "en": "Log retention (days)"
-      },
+      "label": "fields/watch/event_log_retention_days/label",
       "min": 1,
       "integer": true,
-      "description": {
-        "zh": "保留最近指定天数的任务历史和事件",
-        "en": "Retain task history and events for this many days"
-      }
+      "description": "fields/watch/event_log_retention_days/description"
     },
     "/filesystem/scan_filters/@blacklist/paths": {
-      "label": {
-        "zh": "路径",
-        "en": "Paths"
-      },
+      "label": "fields/filesystem/scan_filters/@blacklist/paths/label",
       "editor": "rule_list"
     },
     "/filesystem/scan_filters/@blacklist/files": {
-      "label": {
-        "zh": "文件名",
-        "en": "File names"
-      },
+      "label": "fields/filesystem/scan_filters/@blacklist/files/label",
       "editor": "rule_list"
     },
     "/filesystem/scan_filters/@whitelist/paths": {
-      "label": {
-        "zh": "路径",
-        "en": "Paths"
-      },
+      "label": "fields/filesystem/scan_filters/@whitelist/paths/label",
       "editor": "rule_list"
     },
     "/filesystem/scan_filters/@blacklist/extensions": {
-      "label": {
-        "zh": "扩展名",
-        "en": "Extensions"
-      },
+      "label": "fields/filesystem/scan_filters/@blacklist/extensions/label",
       "editor": "rule_list"
     },
     "/filesystem/scan_filters/@whitelist/extensions": {
-      "label": {
-        "zh": "扩展名",
-        "en": "Extensions"
-      },
+      "label": "fields/filesystem/scan_filters/@whitelist/extensions/label",
       "editor": "rule_list"
     },
     "/filesystem/scan_filters/@blacklist/full_names": {
-      "label": {
-        "zh": "文件名+扩展名",
-        "en": "File name + extension"
-      },
+      "label": "fields/filesystem/scan_filters/@blacklist/full_names/label",
       "editor": "rule_list"
     },
     "/filesystem/scan_filters/@whitelist/full_names": {
-      "label": {
-        "zh": "文件名+扩展名",
-        "en": "File name + extension"
-      },
+      "label": "fields/filesystem/scan_filters/@whitelist/full_names/label",
       "editor": "rule_list"
     },
     "/filesystem/scan_filters/@whitelist/files": {
-      "label": {
-        "zh": "文件名",
-        "en": "File names"
-      },
+      "label": "fields/filesystem/scan_filters/@whitelist/files/label",
       "editor": "rule_list"
     }
   },
   "modules": {
-    "whitelist": {
-      "zh": "白名单",
-      "en": "Allow list"
-    },
-    "blacklist": {
-      "zh": "黑名单",
-      "en": "Block list"
-    },
-    "size_range": {
-      "zh": "文件大小",
-      "en": "File size"
-    },
-    "mtime_range": {
-      "zh": "修改时间",
-      "en": "Modification time"
-    },
-    "zip": {
-      "zh": "ZIP",
-      "en": "ZIP"
-    },
-    "rar": {
-      "zh": "RAR",
-      "en": "RAR"
-    },
-    "seven_zip": {
-      "zh": "7z",
-      "en": "7z"
-    },
-    "tar": {
-      "zh": "TAR",
-      "en": "TAR"
-    },
-    "gzip": {
-      "zh": "GZIP",
-      "en": "GZIP"
-    },
-    "bzip2": {
-      "zh": "BZIP2",
-      "en": "BZIP2"
-    },
-    "xz": {
-      "zh": "XZ",
-      "en": "XZ"
-    },
-    "lz4": {
-      "zh": "LZ4",
-      "en": "LZ4"
-    },
-    "zstd": {
-      "zh": "Zstandard",
-      "en": "Zstandard"
-    }
+    "whitelist": "modules/whitelist",
+    "blacklist": "modules/blacklist",
+    "size_range": "modules/size_range",
+    "mtime_range": "modules/mtime_range",
+    "zip": "modules/zip",
+    "rar": "modules/rar",
+    "seven_zip": "modules/seven_zip",
+    "tar": "modules/tar",
+    "gzip": "modules/gzip",
+    "bzip2": "modules/bzip2",
+    "xz": "modules/xz",
+    "lz4": "modules/lz4",
+    "zstd": "modules/zstd"
   },
   "blocks": {
-    "/recursive_authorization": {
-      "zh": "递归筛选",
-      "en": "Nested archive selection"
-    },
-    "/performance/worker": {
-      "zh": "解压任务调度",
-      "en": "Extraction scheduling"
-    }
+    "/recursive_authorization": "blocks//recursive_authorization",
+    "/performance/worker": "blocks//performance/worker"
   }
 }

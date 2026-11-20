@@ -736,7 +736,12 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
         std::string editor=field["editor"], text=item.is_string()?item.get<std::string>():std::string();
         if(editor.empty()) editor=!field["known"].get<bool>()?"readonly":!field["options"].empty()?"choice":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
         int choice=-1;
-        for(size_t i=0;i<field["options"].size();++i) if(field["options"][i]["value"]==item) choice=int(i);
+        const auto& options=field["options"];
+        const auto selected_language=pointer=="/cli/language" && type=="string"?gui_language(config):std::string();
+        for(size_t i=0;i<options.size();++i) {
+            const auto& value=options[i]["value"];
+            if(selected_language.empty()?value==item:value==selected_language) { choice=int(i); break; }
+        }
         if(editor=="recursive" && choice<0) choice=2;
         field.update(Json{{"id",pointer},{"key",pointer+"@"+language},{"type",type},{"text",std::move(text)},{"boolean",item.is_boolean()?item.get<bool>():false},
             {"editor",editor},{"choice",choice},{"items",editor=="rule_list"?item:Json::array()}});

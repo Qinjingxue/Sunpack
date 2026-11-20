@@ -1,11 +1,16 @@
 param(
     [Parameter(Mandatory = $true)][string]$UserConfig,
     [Parameter(Mandatory = $true)][string]$AdvancedConfig,
-    [Parameter(Mandatory = $true)][ValidateSet("en", "zh")][string]$Language,
+    [Parameter(Mandatory = $true)][string]$Language,
     [switch]$InitializeUserConfig
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# PowerShell hashtable keys match case-insensitively. Values keep the canonical spelling.
+$supportedLanguages = @{ en = "en"; zh = "zh"; "zh-TW" = "zh-TW"; ja = "ja"; ko = "ko" }
+$Language = $supportedLanguages[$Language.Trim()]
+if (-not $Language) { throw "Unsupported SunPack configuration language" }
 
 function Set-ConfigLanguage([string]$Path, [string]$Value) {
     # Only the packaged defaults are edited: keep the rest of the JSON byte-for-byte.
@@ -13,7 +18,7 @@ function Set-ConfigLanguage([string]$Path, [string]$Value) {
     $match = [regex]::Match($source, '("cli"\s*:\s*\{\s*"language"\s*:\s*")(?<value>[^"]*)(")')
     if (-not $match.Success) { throw "Missing cli.language in packaged configuration: $Path" }
     $token = $match.Groups["value"]
-    if ($token.Value -eq $Value) { return }
+    if ($token.Value -ceq $Value) { return }
     $updated = $source.Substring(0, $token.Index) + $Value + $source.Substring($token.Index + $token.Length)
     [IO.File]::WriteAllText($Path, $updated, (New-Object Text.UTF8Encoding($false)))
 }
@@ -25,12 +30,12 @@ if ($InitializeUserConfig) {
     # Existing users own their language setting, even when setup runs in another language.
     try {
         $config = [IO.File]::ReadAllText($UserConfig, [Text.Encoding]::UTF8) | ConvertFrom-Json
-        $stored = ([string]$config.cli.language).Trim().ToLowerInvariant()
+        $stored = ([string]$config.cli.language).Trim()
     } catch {
         exit 0
     }
-    if ($stored -ne "en" -and $stored -ne "zh") { exit 0 }
-    $Language = $stored
+    $Language = $supportedLanguages[$stored]
+    if (-not $Language) { exit 0 }
 }
 
 # The shipped advanced file is replaced on upgrades; align its language with

@@ -1011,7 +1011,7 @@ impl Recursion {
 }
 
 fn invalid_recursion() -> io::Error {
-    invalid("recursive_extract must be \"*\", \"?\", or a positive integer")
+    invalid(Language::En.text("cli.parser.invalid_recursion"))
 }
 
 // Python int accepts Unicode decimal digits and single underscores between
@@ -1089,7 +1089,7 @@ impl CleanupMode {
             "d" | "D" => Ok(Self::Delete),
             "r" | "R" => Ok(Self::Recycle),
             "k" | "K" => Ok(Self::Keep),
-            _ => Err(invalid("archive_cleanup_mode must be one of: d, r, k")),
+            _ => Err(invalid(Language::En.text("cli.parser.invalid_cleanup_mode"))),
         }
     }
 

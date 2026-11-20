@@ -70,7 +70,7 @@ fn password_display_escapes_controls_without_changing_candidates() {
 
 #[test]
 fn option_aliases_share_values_without_leaking_action_scope() {
-    let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
+    let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>(), &Language::default);
     for args in [
         vec!["e", "-vRd", "-p", "secret", "-Ppasswords.txt", "-r1", "-ck", "-odest", "-fa", "a.zip"],
         vec!["extract", "-v", "-R", "-d", "-p", "secret", "-P=passwords.txt", "-r=1", "-c=k", "-o=dest", "-f", "-a", "a.zip"],
@@ -119,7 +119,7 @@ fn option_aliases_share_values_without_leaking_action_scope() {
 // subparser boundaries; no worker/filesystem is needed for these failures.
 #[test]
 fn argparse_option_resolution_and_boundaries() {
-    let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
+    let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>(), &Language::default);
     let value = parse(&["extract", "-p", "-secret", "-o=dest", "file.zip"]).unwrap();
     assert_eq!(value.passwords[0].as_ref(), "-secret");
     assert_eq!(value.output.as_deref(), Some("dest"));
@@ -232,7 +232,7 @@ fn argparse_option_resolution_and_boundaries() {
 
 #[test]
 fn daemon_and_watch_control_have_distinct_scopes() {
-    let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
+    let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>(), &Language::default);
     assert_eq!(parse(&["d", "start", "-nt"]).unwrap().command, "daemon");
     assert_eq!(parse(&["doc"]).unwrap().command, "doctor");
     for (action, canonical) in [("enable", "enable"), ("disable", "disable"),

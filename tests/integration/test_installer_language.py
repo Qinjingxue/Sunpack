@@ -23,7 +23,7 @@ def _run_initializer(repo_root, simple, advanced, language, *, first_install):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("language", ["en", "zh"])
+@pytest.mark.parametrize("language", ["en", "zh", "zh-TW", "ja", "ko"])
 def test_first_install_localizes_both_config_files(tmp_path, repo_root, language):
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
@@ -36,10 +36,14 @@ def test_first_install_localizes_both_config_files(tmp_path, repo_root, language
         assert json.loads(path.read_text(encoding="utf-8")) == expected
 
 
-@pytest.mark.parametrize("stored_language,installer_language", [
-    ("zh", "en"), ("en", "zh"),
+@pytest.mark.parametrize("stored_language,installer_language,expected", [
+    ("zh", "en", "zh"),
+    ("en", "zh", "en"),
+    (" ZH-tw ", "ja", "zh-TW"),
+    ("ja", "ko", "ja"),
+    ("ko", "zh-TW", "ko"),
 ])
-def test_upgrade_preserves_user_language(tmp_path, repo_root, stored_language, installer_language):
+def test_upgrade_preserves_user_language(tmp_path, repo_root, stored_language, installer_language, expected):
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
     settings = json.loads((repo_root / simple.name).read_text(encoding="utf-8"))
@@ -50,7 +54,7 @@ def test_upgrade_preserves_user_language(tmp_path, repo_root, stored_language, i
     shutil.copyfile(repo_root / advanced.name, advanced)
     _run_initializer(repo_root, simple, advanced, installer_language, first_install=False)
     assert simple.read_text(encoding="utf-8") == original
-    assert json.loads(advanced.read_text(encoding="utf-8"))["cli"]["language"] == stored_language
+    assert json.loads(advanced.read_text(encoding="utf-8"))["cli"]["language"] == expected
 
 
 def test_uninstall_removes_only_gui_preferences(tmp_path, repo_root):

@@ -79,8 +79,24 @@ void development_entrypoint_contract() {
             require(state_path(context) == (root / (L"runtime-" + wide_utf8(context.runtime_id) + L".state")).wstring(),
                     "source launcher and runtime share the state directory");
             std::ofstream(root / L"sunpack_config.json") << "{\"cli\":{\"language\":\"zh\"}}";
-            require(cli_language_from_config(context) == "zh", "source writable config language");
+            require(cli_language_from_config(context) == Language::Zh, "source writable config language");
         }
+    }
+    // Launcher diagnostics also work before a runtime process exists.
+    InstallContext source;
+    source.directory = root.wstring();
+    source.data_dir = root.wstring();
+    const std::pair<const char*, std::string_view> launch_messages[] = {
+        {" ZH-tw ", "sunpack 執行階段啟動失敗（Win32 錯誤 2）"},
+        {"ja", "sunpack のランタイムを起動できませんでした（Win32 エラー 2）"},
+        {"ko", "sunpack 런타임을 시작할 수 없습니다(Win32 오류 2)"},
+        {"unknown", "sunpack runtime failed to launch (Win32 error 2)"},
+    };
+    for (const auto& [language, expected] : launch_messages) {
+        std::ofstream(root / L"sunpack_config.json") << "{\"cli\":{\"language\":\"" << language << "\"}}";
+        const auto selected = cli_language_from_config(source);
+        require(localized_value(selected, kRuntimeLaunchFailed, "{error}", 2) == expected,
+                "launch failure uses configured language and substitutes the error code");
     }
     const auto installed = root / L"package";
     fs::create_directories(installed / L"bin");
@@ -212,9 +228,9 @@ int main() {
         // This is the same final client boundary for success, cancellation and
         // startup/transport failure: no runtime response is needed to pause.
         key(input, L'\r');
-        pause_on_exit(true, "en");
+        pause_on_exit(Language::En);
         key(input, L'\r');
-        pause_on_exit(true, "zh");
+        pause_on_exit(Language::Zh);
         DWORD restored = 0;
         require(GetConsoleMode(input, &restored) && restored == mode, "restore input mode");
         CloseHandle(client);

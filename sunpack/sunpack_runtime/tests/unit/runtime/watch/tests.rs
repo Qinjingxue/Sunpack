@@ -727,10 +727,7 @@ fn reload_scheduler_policy_excludes_only_tray_and_process_priority() {
     next.watch.toast_enabled = !previous.watch.toast_enabled;
     assert!(scheduler_configuration_changed(&previous, &next));
     next = previous.clone();
-    next.cli.language = match previous.cli.language {
-        crate::core::i18n::Language::En => crate::core::i18n::Language::Zh,
-        crate::core::i18n::Language::Zh => crate::core::i18n::Language::En,
-    };
+    next.cli.language = crate::core::i18n::Language::Ko;
     assert!(scheduler_configuration_changed(&previous, &next));
 }
 

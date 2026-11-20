@@ -33,8 +33,8 @@ DatePopup::DatePopup(UiWindow owner,UINT message,UINT_PTR generation,RECT anchor
         date_.wSecond=date_.wMilliseconds=0;
         page_=ui_page_load_string(kDatePopupUix);
         if(!page_) throw std::runtime_error("layoutLoadFailed");
-        set(page_,"appearance",appearance); set(page_,"texts",interface_texts(language));
-        set(page_,"weekdays",language=="zh"?Json::array({"一","二","三","四","五","六","日"}):Json::array({"Mo","Tu","We","Th","Fr","Sa","Su"}));
+        set(page_,"appearance",appearance);
+        set(page_,"texts",interface_texts(language));
         set(page_,"time",range_datetime_text(date_).substr(11));
         render();
         UiWindowConfig config{}; config.owner=owner; config.tool_window=1; config.skip_animation=1;

@@ -37,6 +37,25 @@ def test_config_reload_and_literal_password_sources(package, tmp_path):
     assert not after["summary"]["changed"]
 
 
+def test_cli_and_watch_localization_after_config_reload(package):
+    # Use one installed launcher and resident runtime while changing the language.
+    for language, help_text, watch_text, argument_error in [
+        (" ZH-tw ", "解壓縮", "監控服務已停止", "需要一個引數值"),
+        ("ja", "アーカイブを展開", "監視サービスは停止しています", "値を 1 つ指定してください"),
+        ("ko", "압축 파일 풀기", "모니터링 서비스가 중지되었습니다", "값을 하나 지정하세요"),
+        ("unknown", "Extract archives", "Watch service is stopped", "expected one argument"),
+    ]:
+        package.configure(cli={"language": language})
+        help_result = package.run("-h")
+        assert help_result.returncode == 0 and help_text in help_result.stdout
+        invalid = package.run("scan", "input.zip", "-p")
+        assert invalid.returncode == 2 and not invalid.stdout and argument_error in invalid.stderr
+        status = package.run("watch", "status")
+        assert status.returncode == 0 and watch_text in status.stdout
+        report = package.json("watch", "status")
+        assert report["command"] == "watch" and report["summary"]["enabled"] is False
+
+
 @pytest.mark.parametrize("invalid", [
     '{"cli":',
     '{"embedded_scan":{"recursive_candidate_ratio":"many"}}',

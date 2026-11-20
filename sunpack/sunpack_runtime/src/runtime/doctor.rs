@@ -22,7 +22,7 @@ fn checked(name: &str, result: io::Result<String>) -> Value {
     }
 }
 
-pub(super) fn checks(cwd: &Path, settings: io::Result<(PathBuf, Config)>) -> Vec<Value> {
+pub(super) fn checks(cwd: &Path, settings: io::Result<(PathBuf, Config)>, language: Language) -> Vec<Value> {
     let config_check = match &settings {
         Ok((path, settings)) => {
             let errors = settings.validate_scan_filters();
@@ -58,6 +58,7 @@ pub(super) fn checks(cwd: &Path, settings: io::Result<(PathBuf, Config)>) -> Vec
                 "ImagePath",
                 &root.join("service/sunpack-watch-broker.exe"),
                 None,
+                language,
             ),
         ));
         checks.push(checked(
@@ -67,14 +68,15 @@ pub(super) fn checks(cwd: &Path, settings: io::Result<(PathBuf, Config)>) -> Vec
                 "",
                 &root.join("bin/sunpack.exe"),
                 Some("--toast-activated"),
+                language,
             ),
         ));
         checks.push(
-            machine_path(&root)
+            machine_path(&root, language)
                 .unwrap_or_else(|error| check("machine_path", "fail", error.to_string())),
         );
         checks.push(
-            context_menu(&root)
+            context_menu(&root, language)
                 .unwrap_or_else(|error| check("context_menu", "fail", error.to_string())),
         );
         checks.push(match windows::startup_status() {
@@ -85,23 +87,23 @@ pub(super) fn checks(cwd: &Path, settings: io::Result<(PathBuf, Config)>) -> Vec
                 _ => check(
                     "startup",
                     "fail",
-                    format!("startup command is stale: {command}"),
+                    language.translate("cli.doctor.detail.startup_stale", &[("command", &command)]),
                 ),
             },
-            Ok(None) => check("startup", "skip", "disabled"),
+            Ok(None) => check("startup", "skip", language.text("cli.doctor.detail.disabled")),
             Err(error) => check("startup", "fail", error.to_string()),
         });
     }
     checks.push(match settings {
-        _ if !config_valid => check("toast", "skip", "configuration is invalid"),
+        _ if !config_valid => check("toast", "skip", language.text("cli.doctor.detail.config_invalid")),
         Ok((_, settings)) if settings.watch.toast_enabled => checked(
             "toast",
             windows::ToastLibrary::load(cwd)
                 .and_then(|library| library.self_test())
                 .map(|_| String::new()),
         ),
-        Ok(_) => check("toast", "skip", "disabled"),
-        Err(_) => check("toast", "skip", "configuration is invalid"),
+        Ok(_) => check("toast", "skip", language.text("cli.doctor.detail.disabled")),
+        Err(_) => check("toast", "skip", language.text("cli.doctor.detail.config_invalid")),
     });
     match super::watch::diagnostic_roots(cwd) {
         Ok(roots) => {
@@ -110,7 +112,7 @@ pub(super) fn checks(cwd: &Path, settings: io::Result<(PathBuf, Config)>) -> Vec
                 let mut row = check(
                     "watch_root",
                     if exists { "ok" } else { "warn" },
-                    if exists { "" } else { "directory not found" },
+                    if exists { "" } else { language.text("cli.doctor.detail.root_missing") },
                 );
                 row["path"] = json!(path);
                 row
@@ -119,7 +121,7 @@ pub(super) fn checks(cwd: &Path, settings: io::Result<(PathBuf, Config)>) -> Vec
         Err(error) => checks.push(check(
             "watch_root",
             "warn",
-            format!("unable to read watch roots: {error}"),
+            language.translate("cli.doctor.detail.roots_unreadable", &[("error", &error.to_string())]),
         )),
     }
     checks
@@ -163,42 +165,44 @@ fn machine_command(
     name: &str,
     target: &Path,
     argument: Option<&str>,
+    language: Language,
 ) -> io::Result<String> {
-    registration_detail(windows::registry_text(HKEY_LOCAL_MACHINE, key, name)?, target, argument)
+    registration_detail(windows::registry_text(HKEY_LOCAL_MACHINE, key, name)?, target, argument, language)
 }
 
-fn registration_detail(text: Option<String>, target: &Path, argument: Option<&str>) -> io::Result<String> {
-    let text = text.ok_or_else(|| io::Error::other(if argument.is_some() {
-        "machine COM registration is missing"
+fn registration_detail(text: Option<String>, target: &Path, argument: Option<&str>, language: Language) -> io::Result<String> {
+    let text = text.ok_or_else(|| io::Error::other(language.text(if argument.is_some() {
+        "cli.doctor.detail.com_missing"
     } else {
-        "service is not installed"
-    }))?;
+        "cli.doctor.detail.service_missing"
+    })))?;
     let normalized = text.replace('/', "\\").to_lowercase();
     if !normalized.contains(&normalized_path(&target.to_string_lossy()))
         || argument.is_some_and(|argument| !text.contains(argument))
     {
-        return Err(io::Error::other(format!("{}: {text}", if argument.is_some() {
-            "activation command is stale"
+        let key = if argument.is_some() {
+            "cli.doctor.detail.activation_stale"
         } else {
-            "service points to"
-        })));
+            "cli.doctor.detail.service_wrong_path"
+        };
+        return Err(io::Error::other(language.translate(key, &[("command", &text)])));
     }
     Ok(if argument.is_some() { text } else { target.display().to_string() })
 }
 
-fn machine_path(root: &Path) -> io::Result<Value> {
+fn machine_path(root: &Path, language: Language) -> io::Result<Value> {
     match windows::registry_dword(
         HKEY_LOCAL_MACHINE,
         r"Software\SunPack",
         "PathAddedByInstaller",
     )? {
-        None => return Ok(check("machine_path", "skip", "not enabled by installer")),
+        None => return Ok(check("machine_path", "skip", language.text("cli.doctor.detail.not_enabled_by_installer"))),
         Some(1) => {}
         Some(value) => {
             return Ok(check(
                 "machine_path",
                 "fail",
-                format!("invalid installer marker: {value}"),
+                language.translate("cli.doctor.detail.install_marker_invalid", &[("value", &value.to_string())]),
             ))
         }
     }
@@ -207,20 +211,20 @@ fn machine_path(root: &Path) -> io::Result<Value> {
         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
         "Path",
     )?
-    .ok_or_else(|| io::Error::other("machine PATH is unavailable"))?;
+    .ok_or_else(|| io::Error::other(language.text("cli.doctor.detail.path_unavailable")))?;
     let entries: Vec<_> = path.split(';').map(normalized_path).collect();
     if entries.contains(&normalized_path(&root.to_string_lossy())) {
         return Ok(check(
             "machine_path",
             "fail",
-            "runtime directory in PATH exposes bundled DLLs",
+            language.text("cli.doctor.detail.path_exposes_dlls"),
         ));
     }
     if !entries.contains(&normalized_path(&root.join("bin").to_string_lossy())) {
         return Ok(check(
             "machine_path",
             "fail",
-            "installer marker exists but launcher directory is missing",
+            language.text("cli.doctor.detail.install_marker_missing_launcher"),
         ));
     }
     Ok(check(
@@ -230,7 +234,7 @@ fn machine_path(root: &Path) -> io::Result<Value> {
     ))
 }
 
-fn context_menu(root: &Path) -> io::Result<Value> {
+fn context_menu(root: &Path, language: Language) -> io::Result<Value> {
     let parents = [
         r"Software\Classes\Directory\shell\SunPack",
         r"Software\Classes\Directory\Background\shell\SunPack",
@@ -241,10 +245,10 @@ fn context_menu(root: &Path) -> io::Result<Value> {
         count += usize::from(windows::registry_key_exists(HKEY_LOCAL_MACHINE, parent)?);
     }
     if count == 0 {
-        return Ok(check("context_menu", "skip", "not installed"));
+        return Ok(check("context_menu", "skip", language.text("cli.doctor.detail.not_installed")));
     }
     if count != parents.len() {
-        return Ok(check("context_menu", "fail", "registration is incomplete"));
+        return Ok(check("context_menu", "fail", language.text("cli.doctor.detail.menu_incomplete")));
     }
     let target = normalized_path(&root.join("bin/sunpack.exe").to_string_lossy());
     for class in [
@@ -254,12 +258,12 @@ fn context_menu(root: &Path) -> io::Result<Value> {
     ] {
         let key = format!(r"Software\Classes\{class}\shell\DirectExtract\command");
         let command = windows::registry_text(HKEY_LOCAL_MACHINE, &key, "")?
-            .ok_or_else(|| io::Error::other(format!("missing command: {key}")))?;
+            .ok_or_else(|| io::Error::other(language.translate("cli.doctor.detail.command_missing", &[("key", &key)])))?;
         if !command.replace('/', "\\").to_lowercase().contains(&target) {
             return Ok(check(
                 "context_menu",
                 "fail",
-                format!("command points to another launcher: {command}"),
+                language.translate("cli.doctor.detail.command_wrong_launcher", &[("command", &command)]),
             ));
         }
     }
@@ -271,26 +275,8 @@ fn context_menu(root: &Path) -> io::Result<Value> {
 }
 
 pub(super) fn label(name: &str, language: Language) -> String {
-    let text = match (name, language) {
-        ("data_dir", Language::En) => "Program data",
-        ("data_dir", Language::Zh) => "程序数据目录",
-        ("broker_service", Language::En) => "Watch Broker service",
-        ("broker_service", Language::Zh) => "Watch Broker 服务",
-        ("toast_registration", Language::En) => "Toast registration",
-        ("toast_registration", Language::Zh) => "Toast 注册",
-        ("machine_path", Language::En) => "Machine PATH",
-        ("machine_path", Language::Zh) => "系统 PATH",
-        ("context_menu", Language::En) => "Explorer context menu",
-        ("context_menu", Language::Zh) => "资源管理器右键菜单",
-        ("startup", Language::En) => "Windows startup",
-        ("startup", Language::Zh) => "Windows 开机启动",
-        _ => {
-            return language
-                .text(&format!("cli.doctor.check.{name}"))
-                .to_owned()
-        }
-    };
-    text.to_owned()
+    let key = format!("cli.doctor.check.{name}");
+    language.lookup(&key).map_or(key, str::to_owned)
 }
 
 #[cfg(test)]

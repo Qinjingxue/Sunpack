@@ -1,13 +1,64 @@
 #include "presentation.hpp"
 #include "catalog_json.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <iterator>
 
 namespace spg {
 namespace {
+struct Locale {
+    std::string_view code;
+    const wchar_t* windows_name;
+    const char* label;
+};
+constexpr Locale locales[] = {
+    {"zh", L"zh-CN", "简体中文"},
+    {"en", L"en-US", "English"},
+    {"zh-TW", L"zh-TW", "繁體中文"},
+    {"ja", L"ja-JP", "日本語"},
+    {"ko", L"ko-KR", "한국어"},
+};
+constexpr size_t english_locale = 1;
+static_assert(locales[english_locale].code == "en");
+
+struct Message {
+    std::string_view key;
+    std::array<const char*, std::size(locales)> texts;
+};
+// Keep translations in read-only program data. Only the selected language is
+// copied into the page; the JSON catalog contains setting metadata.
+#include "catalog_texts.inc"
+
+template<size_t N>
+constexpr bool valid_messages(const Message (&messages)[N]) {
+    for(size_t i=0; i<N; ++i) {
+        if(i>0 && messages[i-1].key>=messages[i].key) return false;
+        for(const auto* text:messages[i].texts) if(!text || !*text) return false;
+    }
+    return true;
+}
+static_assert(valid_messages(ui_messages));
+static_assert(valid_messages(setting_messages));
+static_assert(valid_messages(native_messages));
+
+size_t locale_index(std::string_view language) {
+    for(size_t index=0; index<std::size(locales); ++index)
+        if(locales[index].code==language) return index;
+    return english_locale;
+}
+
+template<size_t N>
+const Message* find_message(const Message (&messages)[N],std::string_view key) {
+    auto found=std::lower_bound(std::begin(messages),std::end(messages),key,
+        [](const Message& message,std::string_view sought){return message.key<sought;});
+    return found!=std::end(messages) && found->key==key?found:nullptr;
+}
+
 const Json& catalog() { static const auto data=parse_json(kCatalogJson); return data; }
-std::string local(const Json& value,const std::string& language) {
-    return value.value(language,value.value("en",std::string()));
+const char* local(const Json& value,size_t locale) {
+    const auto* message=find_message(setting_messages,value.get_ref<const std::string&>());
+    return message?message->texts[locale]:"";
 }
 const Json& setting(const std::string& pointer,const std::string& module) {
     const auto& fields=catalog()["fields"];
@@ -27,17 +78,26 @@ const Json& setting(const std::string& pointer,const std::string& module) {
 }
 std::string gui_language(const Json& config) {
     if(config.contains("cli") && config["cli"].is_object() && config["cli"].contains("language") && config["cli"]["language"].is_string()) {
-        auto value=config["cli"]["language"].get<std::string>();
-        value.erase(0,value.find_first_not_of(" \t\r\n"));
-        auto end=value.find_last_not_of(" \t\r\n"); if(end!=std::string::npos) value.resize(end+1);
-        std::transform(value.begin(),value.end(),value.begin(),[](unsigned char c){return char(tolower(c));});
-        if(value=="zh") return "zh";
+        std::string_view value=config["cli"]["language"].get_ref<const std::string&>();
+        const auto first=value.find_first_not_of(" \t\r\n\f\v");
+        if(first!=std::string_view::npos) {
+            value=value.substr(first,value.find_last_not_of(" \t\r\n\f\v")-first+1);
+            const auto lower=[](char c){return c>='A' && c<='Z'?c-'A'+'a':c;};
+            for(const auto& locale:locales)
+                if(std::equal(value.begin(),value.end(),locale.code.begin(),locale.code.end(),
+                    [&](char left,char right){return lower(left)==lower(right);}))
+                    return std::string(locale.code);
+        }
     }
-    return "en"; // Same fallback as CLI normalize_language.
+    return std::string(locales[english_locale].code);
 }
-std::string tr(const std::string& key,const std::string& language) {
-    const auto& texts=catalog()["ui"];
-    return texts.contains(key)?local(texts[key],language):key;
+const wchar_t* gui_text_locale(std::string_view language) {
+    return locales[locale_index(language)].windows_name;
+}
+std::string tr(std::string_view key,std::string_view language) {
+    const auto* message=find_message(ui_messages,key);
+    if(!message) message=find_message(native_messages,key);
+    return message?std::string(message->texts[locale_index(language)]):std::string(key);
 }
 std::string startup_language(const fs::path& data_dir) {
     try { return gui_language(read_json(data_dir/"sunpack_config.json")); }
@@ -47,29 +107,39 @@ std::string error_text(const std::string& key,const Json& arguments) {
     return Json{{"$guiError",key},{"arguments",arguments}}.dump();
 }
 Json interface_texts(const std::string& language) {
+    const auto locale=locale_index(language);
     Json result=Json::object();
-    for(auto it=catalog()["ui"].begin();it!=catalog()["ui"].end();++it) result[it.key()]=local(it.value(),language);
+    auto& texts=result.get_ref<Json::object_t&>();
+    texts.reserve(std::size(ui_messages));
+    for(const auto& message:ui_messages) texts.emplace_back(message.key,message.texts[locale]);
     return result;
 }
 Json describe_setting(const std::string& pointer,const std::string& module,const std::string& language) {
     const auto& meta=setting(pointer,module);
+    const auto locale=locale_index(language);
     auto group=pointer.substr(1,pointer.find('/',1)==std::string::npos?std::string::npos:pointer.find('/',1)-1);
     auto category=group=="recursive_authorization"?"recursive_extract":group;
     auto& groups=catalog()["groups"];
-    std::string label=meta.contains("label")?local(meta["label"],language):tr("readOnly",language);
+    std::string label=meta.contains("label")?local(meta["label"],locale):tr("readOnly",language);
     auto block=pointer.substr(0,pointer.rfind('/'));
     if(block.empty()) block=pointer;
     auto& blocks=catalog()["blocks"];
     auto& modules=catalog()["modules"];
-    auto block_label=!module.empty()?(modules.contains(module)?local(modules[module],language):module):
-        blocks.contains(block)?local(blocks[block],language):groups.contains(group)?local(groups[group],language):label;
+    auto block_label=!module.empty()?(modules.contains(module)?local(modules[module],locale):module):
+        blocks.contains(block)?local(blocks[block],locale):groups.contains(group)?local(groups[group],locale):label;
     bool primary=pointer.size()>=8 && pointer.compare(pointer.size()-8,8,"/enabled")==0 && !meta.empty();
     if(primary) label=block_label;
-    Json result={{"label",label},{"category",category},{"categoryLabel",groups.contains(category)?local(groups[category],language):tr("readOnly",language)},
+    Json result={{"label",label},{"category",category},{"categoryLabel",groups.contains(category)?local(groups[category],locale):tr("readOnly",language)},
         {"block",block},{"blockLabel",block_label},{"module",module},{"primary",primary},
-        {"description",meta.contains("description")?local(meta["description"],language):meta.empty()?tr("unknownDescription",language):std::string()},
+        {"description",meta.contains("description")?local(meta["description"],locale):meta.empty()?tr("unknownDescription",language):std::string()},
         {"editor",meta.value("editor",std::string())},{"options",Json::array()},{"known",!meta.empty()}};
-    if(meta.contains("options")) for(auto& option:meta["options"]) result["options"].push_back({{"value",option["value"]},{"label",local(option["label"],language)}});
+    if(pointer=="/cli/language") {
+        for(const auto& choice:locales)
+            result["options"].push_back({{"value",choice.code},{"label",choice.label}});
+    } else if(meta.contains("options")) {
+        for(const auto& option:meta["options"])
+            result["options"].push_back({{"value",option["value"]},{"label",local(option["label"],locale)}});
+    }
     return result;
 }
 void validate_setting(const std::string& pointer,const Json& value,const std::string& module) {
@@ -80,7 +150,11 @@ void validate_setting(const std::string& pointer,const Json& value,const std::st
             !entry.contains("value") || !entry["value"].is_string() || entry["value"].get_ref<const std::string&>().empty() ||
             !entry.contains("regex") || !entry["regex"].is_boolean()) throw std::runtime_error("validation");
     }
-    if(pointer=="/recursive_extract") {
+    if(pointer=="/cli/language") {
+        if(!value.is_string() || std::none_of(std::begin(locales),std::end(locales),
+            [&](const Locale& choice){return value.get_ref<const std::string&>()==choice.code;}))
+            throw std::runtime_error("validation");
+    } else if(pointer=="/recursive_extract") {
         auto text=value.is_string()?value.get<std::string>():value.dump();
         if(text=="*" || text=="?") return;
         if(text.empty() || text.find_first_not_of("0123456789")!=std::string::npos || text.find_first_not_of('0')==std::string::npos)
@@ -97,7 +171,7 @@ void validate_setting(const std::string& pointer,const Json& value,const std::st
 namespace {
 std::string windows_message(DWORD code,const std::string& language) {
     wchar_t* buffer=nullptr;
-    auto locale=language=="zh"?MAKELANGID(LANG_CHINESE,SUBLANG_CHINESE_SIMPLIFIED):MAKELANGID(LANG_ENGLISH,SUBLANG_ENGLISH_US);
+    const auto locale=LANGIDFROMLCID(LocaleNameToLCID(gui_text_locale(language),0));
     auto size=FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER|FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr,code,locale,reinterpret_cast<wchar_t*>(&buffer),0,nullptr);
     if(!size) return tr("windowsMessageUnavailable",language);

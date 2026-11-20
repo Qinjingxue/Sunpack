@@ -5,10 +5,8 @@
 namespace spg {
 std::string gui_language(const Json& config);
 std::string startup_language(const fs::path& data_dir);
-inline const wchar_t* gui_text_locale(std::string_view language) {
-    return language == "zh" ? L"zh-CN" : L"en-US";
-}
-std::string tr(const std::string& key, const std::string& language);
+const wchar_t* gui_text_locale(std::string_view language);
+std::string tr(std::string_view key, std::string_view language);
 // Keep keys/arguments until display. Arguments are literal; {"source": message}
 // explicitly embeds another translatable diagnostic.
 std::string error_text(const std::string& key, const Json& arguments = Json::object());

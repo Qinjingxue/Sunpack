@@ -1,6 +1,6 @@
 # Configuration guide
 
-**English** | [简体中文](zh-CN/configuration.md)
+[简体中文](zh-CN/configuration.md) | **English** | [繁體中文](zh-TW/configuration.md) | [日本語](ja/configuration.md) | [한국어](ko/configuration.md)
 
 Edit `sunpack_config.json` to change everyday settings. For a development build, use the file in the project root. For an installed copy, use `%ProgramData%\SunPack\sunpack_config.json`. `sunpack_advanced_config.json` supplies the remaining defaults.
 
@@ -17,7 +17,7 @@ sunpack.exe config show
 
 | Setting                                 | What to set                                                                                                                  |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `cli.language`                          | `zh` for Chinese or `en` for English.                                                                                        |
+| `cli.language` | `zh` Simplified Chinese, `en` English, `zh-TW` Traditional Chinese, `ja` Japanese, or `ko` Korean. Unknown values fall back to English. |
 | `recursive_extract`                     | `"*"` to keep processing nested archives, a positive integer for a fixed number of rounds, or `"?"` to ask after each round. |
 | `recursive_authorization.enabled`       | `true` to apply the nested archive selection policy; `false` to skip this policy.                                            |
 | `post_extract.archive_cleanup_mode`     | `"r"` to recycle the original archive after complete success, `"k"` to keep it, or `"d"` to delete it.                       |

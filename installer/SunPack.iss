@@ -51,8 +51,13 @@ ArchitecturesInstallIn64BitMode=x64compatible
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
+; Traditional Chinese compiler messages from https://github.com/jrsoftware/issrc/blob/c34976f7d107e94d4fce8ac29f72ca33762293d7/Files/Languages/ChineseTraditional.isl
+Name: "chinesetraditional"; MessagesFile: "Languages\ChineseTraditional.isl"
+Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
+Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [CustomMessages]
+english.ConfigLanguage=en
 english.TaskAddToPath=Add sunpack to the system PATH
 english.TaskContextMenu=Register the sunpack folder context menu
 english.TaskAutostart=Start sunpack Watch when Windows starts
@@ -83,6 +88,7 @@ english.WatchRootsFileDeepDetect=# deep_detect accepts true or false; blank defa
 english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted | true | false | false | true
 english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
 english.ConfigLanguageInitializationFailed=Failed to initialize SunPack configuration language.
+chinesesimplified.ConfigLanguage=zh
 chinesesimplified.TaskAddToPath=将 sunpack 添加到系统 PATH
 chinesesimplified.TaskContextMenu=注册 sunpack 文件夹右键菜单
 chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控
@@ -113,6 +119,99 @@ chinesesimplified.WatchRootsFileDeepDetect=# deep_detect 可填写 true 或 fals
 chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted | true | false | false | true
 chinesesimplified.EditableConfigCreateFailed=无法创建初始可编辑配置文件：%s
 chinesesimplified.ConfigLanguageInitializationFailed=无法初始化 SunPack 配置语言。
+chinesetraditional.ConfigLanguage=zh-TW
+chinesetraditional.TaskAddToPath=將 sunpack 加入系統 PATH
+chinesetraditional.TaskContextMenu=註冊 sunpack 資料夾右鍵選單
+chinesetraditional.TaskAutostart=Windows 啟動時執行 sunpack 監控
+chinesetraditional.GroupShellIntegration=檔案總管整合：
+chinesetraditional.GroupBackgroundWatch=背景監控：
+chinesetraditional.WatchBrokerDisplayName=sunpack 監控代理服務
+chinesetraditional.WatchBrokerDescription=在 sunpack 監控執行期間，以最低必要權限讀取 NTFS USN 日誌。
+chinesetraditional.BrokerExecutableMissing=安裝套件缺少 Watch Broker 執行檔：%s
+chinesetraditional.BrokerCreateFailed=無法建立 %s（sc.exe 結束代碼 %d）。
+chinesetraditional.BrokerSidTypeFailed=無法設定服務 SID 類型（sc.exe 結束代碼 %d）。
+chinesetraditional.BrokerSecurityFailed=無法設定 Watch Broker 服務權限（sc.exe 結束代碼 %d）。
+chinesetraditional.StartupEnableLaunchFailed=無法執行開機啟動設定指令碼。
+chinesetraditional.StartupEnableCommandFailed=開機啟動設定指令碼執行失敗（結束代碼 %d）。
+chinesetraditional.ToastRegisterLaunchFailed=無法執行通知註冊指令碼。
+chinesetraditional.ToastRegisterCommandFailed=通知註冊指令碼執行失敗（結束代碼 %d）。
+chinesetraditional.TaskAddToPathFailed=無法將 sunpack 加入系統 PATH。
+chinesetraditional.TaskContextMenuFailed=無法註冊 sunpack 資料夾右鍵選單。
+chinesetraditional.TaskContextMenuRemoveFailed=無法移除現有的 sunpack 右鍵選單。
+chinesetraditional.PrepareRuntimeRunning=sunpack 執行階段程序仍在執行。請先停止這些程序，再重新執行安裝程式。
+chinesetraditional.PrepareBrokerRemoveFailed=無法移除現有的 sunpack Watch Broker 服務。請重新啟動 Windows，再重新執行安裝程式。
+chinesetraditional.PrepareDataUpgradeFailed=無法準備 SunPack 資料升級。請檢查設定和資料夾權限後再試一次。
+chinesetraditional.PrepareOldFilesRemoveFailed=無法移除部分舊版 sunpack 檔案。請關閉 sunpack，再重新執行安裝程式。
+chinesetraditional.UninstallStopFailed=無法停止 sunpack 執行階段程序或 Watch Broker 服務。請重新啟動 Windows，再重新執行解除安裝程式。
+chinesetraditional.DataDirectoryPermissionsFailed=無法設定 SunPack 資料目錄權限：%s
+chinesetraditional.WatchRootsFileHeader=# 監控資料夾設定，每行填寫一個監控目錄。
+chinesetraditional.WatchRootsFileMapping=# 欄位格式：輸入目錄 | 輸出目錄 | deep_detect | initial_scanned | recursive | enabled
+chinesetraditional.WatchRootsFileDeepDetect=# deep_detect 可填寫 true 或 false，空白時預設為 false。
+chinesetraditional.WatchRootsFileExample=# 例如：C:\Downloads | D:\Extracted | true | false | false | true
+chinesetraditional.EditableConfigCreateFailed=無法建立初始的可編輯設定檔：%s
+chinesetraditional.ConfigLanguageInitializationFailed=無法初始化 SunPack 的語言設定。
+japanese.ConfigLanguage=ja
+japanese.TaskAddToPath=システムの PATH に sunpack を追加する
+japanese.TaskContextMenu=フォルダーの右クリックメニューに sunpack を登録する
+japanese.TaskAutostart=Windows の起動時に sunpack の監視を開始する
+japanese.GroupShellIntegration=エクスプローラーとの統合：
+japanese.GroupBackgroundWatch=バックグラウンド監視：
+japanese.WatchBrokerDisplayName=sunpack 監視ブローカー
+japanese.WatchBrokerDescription=sunpack の監視中に、必要最小限の権限で NTFS の USN ジャーナルを読み取ります。
+japanese.BrokerExecutableMissing=インストールパッケージに Watch Broker の実行ファイルがありません：%s
+japanese.BrokerCreateFailed=%s を作成できませんでした（sc.exe の終了コード %d）。
+japanese.BrokerSidTypeFailed=サービスの SID の種類を設定できませんでした（sc.exe の終了コード %d）。
+japanese.BrokerSecurityFailed=Watch Broker サービスのアクセス権を設定できませんでした（sc.exe の終了コード %d）。
+japanese.StartupEnableLaunchFailed=自動起動を設定するスクリプトを実行できませんでした。
+japanese.StartupEnableCommandFailed=自動起動の設定に失敗しました（終了コード %d）。
+japanese.ToastRegisterLaunchFailed=通知を登録するスクリプトを実行できませんでした。
+japanese.ToastRegisterCommandFailed=通知の登録に失敗しました（終了コード %d）。
+japanese.TaskAddToPathFailed=システムの PATH に sunpack を追加できませんでした。
+japanese.TaskContextMenuFailed=フォルダーの右クリックメニューに sunpack を登録できませんでした。
+japanese.TaskContextMenuRemoveFailed=既存の sunpack の右クリックメニューを削除できませんでした。
+japanese.PrepareRuntimeRunning=sunpack のランタイムプロセスが実行中です。終了してから、インストーラーを再実行してください。
+japanese.PrepareBrokerRemoveFailed=既存の sunpack Watch Broker サービスを削除できませんでした。Windows を再起動してから、インストーラーを再実行してください。
+japanese.PrepareDataUpgradeFailed=SunPack データの更新を準備できませんでした。設定とフォルダーのアクセス権を確認してから再試行してください。
+japanese.PrepareOldFilesRemoveFailed=古い sunpack ファイルの一部を削除できませんでした。sunpack を終了してから、インストーラーを再実行してください。
+japanese.UninstallStopFailed=sunpack のランタイムプロセスまたは Watch Broker サービスを停止できませんでした。Windows を再起動してから、アンインストーラーを再実行してください。
+japanese.DataDirectoryPermissionsFailed=SunPack のデータフォルダーのアクセス権を設定できませんでした：%s
+japanese.WatchRootsFileHeader=# 監視するフォルダーを 1 行に 1 つずつ指定します。
+japanese.WatchRootsFileMapping=# 列の順序：入力フォルダー | 出力フォルダー | deep_detect | initial_scanned | recursive | enabled
+japanese.WatchRootsFileDeepDetect=# deep_detect には true または false を指定します。空欄の場合は false になります。
+japanese.WatchRootsFileExample=# 例：C:\Downloads | D:\Extracted | true | false | false | true
+japanese.EditableConfigCreateFailed=編集可能な初期設定ファイルを作成できませんでした：%s
+japanese.ConfigLanguageInitializationFailed=SunPack の言語設定を初期化できませんでした。
+korean.ConfigLanguage=ko
+korean.TaskAddToPath=시스템 PATH에 sunpack 추가
+korean.TaskContextMenu=폴더의 오른쪽 클릭 메뉴에 sunpack 등록
+korean.TaskAutostart=Windows 시작 시 sunpack 모니터링 시작
+korean.GroupShellIntegration=파일 탐색기 통합:
+korean.GroupBackgroundWatch=백그라운드 모니터링:
+korean.WatchBrokerDisplayName=sunpack 모니터링 브로커
+korean.WatchBrokerDescription=sunpack 모니터링 중에 필요한 최소 권한으로 NTFS USN 저널을 읽습니다.
+korean.BrokerExecutableMissing=설치 패키지에 Watch Broker 실행 파일이 없습니다: %s
+korean.BrokerCreateFailed=%s을(를) 만들 수 없습니다(sc.exe 종료 코드 %d).
+korean.BrokerSidTypeFailed=서비스 SID 유형을 설정할 수 없습니다(sc.exe 종료 코드 %d).
+korean.BrokerSecurityFailed=Watch Broker 서비스 권한을 설정할 수 없습니다(sc.exe 종료 코드 %d).
+korean.StartupEnableLaunchFailed=자동 시작 설정 스크립트를 실행할 수 없습니다.
+korean.StartupEnableCommandFailed=자동 시작 설정에 실패했습니다(종료 코드 %d).
+korean.ToastRegisterLaunchFailed=알림 등록 스크립트를 실행할 수 없습니다.
+korean.ToastRegisterCommandFailed=알림을 등록하지 못했습니다(종료 코드 %d).
+korean.TaskAddToPathFailed=시스템 PATH에 sunpack을 추가할 수 없습니다.
+korean.TaskContextMenuFailed=폴더의 오른쪽 클릭 메뉴에 sunpack을 등록할 수 없습니다.
+korean.TaskContextMenuRemoveFailed=기존 sunpack 오른쪽 클릭 메뉴를 제거할 수 없습니다.
+korean.PrepareRuntimeRunning=sunpack 런타임 프로세스가 실행 중입니다. 프로세스를 종료한 후 설치 프로그램을 다시 실행하세요.
+korean.PrepareBrokerRemoveFailed=기존 sunpack Watch Broker 서비스를 제거할 수 없습니다. Windows를 다시 시작한 후 설치 프로그램을 다시 실행하세요.
+korean.PrepareDataUpgradeFailed=SunPack 데이터 업그레이드를 준비할 수 없습니다. 설정과 폴더 권한을 확인한 후 다시 시도하세요.
+korean.PrepareOldFilesRemoveFailed=이전 버전의 sunpack 파일 일부를 제거할 수 없습니다. sunpack을 종료한 후 설치 프로그램을 다시 실행하세요.
+korean.UninstallStopFailed=sunpack 런타임 프로세스 또는 Watch Broker 서비스를 중지할 수 없습니다. Windows를 다시 시작한 후 제거 프로그램을 다시 실행하세요.
+korean.DataDirectoryPermissionsFailed=SunPack 데이터 폴더 권한을 설정할 수 없습니다: %s
+korean.WatchRootsFileHeader=# 모니터링할 폴더를 한 줄에 하나씩 입력합니다.
+korean.WatchRootsFileMapping=# 열 순서: 입력 폴더 | 출력 폴더 | deep_detect | initial_scanned | recursive | enabled
+korean.WatchRootsFileDeepDetect=# deep_detect에는 true 또는 false를 입력합니다. 비워 두면 false로 설정됩니다.
+korean.WatchRootsFileExample=# 예: C:\Downloads | D:\Extracted | true | false | false | true
+korean.EditableConfigCreateFailed=편집 가능한 초기 설정 파일을 만들 수 없습니다: %s
+korean.ConfigLanguageInitializationFailed=SunPack 언어 설정을 초기화할 수 없습니다.
 
 [Tasks]
 Name: "addtopath"; Description: "{cm:TaskAddToPath}"; GroupDescription: "{cm:GroupShellIntegration}"
@@ -803,16 +902,14 @@ end;
 
 procedure InitializeInstalledLanguage;
 var
-  Parameters, Language: string;
+  Parameters: string;
   ResultCode: Integer;
 begin
-  if ActiveLanguage = 'chinesesimplified' then Language := 'zh'
-  else Language := 'en';
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\initialize_config_language.ps1')) +
     ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json')) +
     ' -AdvancedConfig ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
-    ' -Language ' + Language;
+    ' -Language ' + AddQuotes(CustomMessage('ConfigLanguage'));
   if InitializeLanguageOnInstall then Parameters := Parameters + ' -InitializeUserConfig';
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
               Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then

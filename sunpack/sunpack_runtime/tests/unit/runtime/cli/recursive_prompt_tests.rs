@@ -77,7 +77,7 @@ fn interrupted_cleanup_details_reach_stderr_once_in_both_modes() {
         let input = Input::default();
         let args = if json { vec!["extract".into(), "-j".into(), "input.zip".into()] }
             else { vec!["extract".into(), "input.zip".into()] };
-        let options = Options::parse(&args).unwrap();
+        let options = Options::parse(&args, &Language::default).unwrap();
         let error = "C:\\output: access denied".to_owned();
         let (code, result) = interrupted(&options, &input, Language::En, None, vec![error.clone()]).unwrap();
         if json { write_json(&input, &result).unwrap(); }
@@ -172,7 +172,7 @@ fn disk_episode_survives_worker_and_reporting_coalescing() {
 }
 
 #[test]
-fn parser_errors_match_main_text_stream_and_exit_code() {
+fn parser_errors_preserve_english_text_and_translate_configured_language() {
     // Captured by executing main's real parser classes, registrations and
     // value converters. Usage is suppressed; diagnostics remain on stderr.
     let cases: &[(&[&str], &str)] = &[
@@ -212,16 +212,14 @@ fn parser_errors_match_main_text_stream_and_exit_code() {
         (&["daemon", "startup", "-j"], "sunpack daemon startup: error: the following arguments are required: action\n"),
         (&["daemon", "startup", "bad", "-h"], "sunpack daemon startup: error: argument action: invalid choice: 'bad' (choose from enable, disable, status)\n"),
     ];
-    let host = Host::new();
     for &(args, expected) in cases {
-        let input = Arc::new(Input::default());
-        let code = run_console(&host, Path::new("."),
-            args.iter().map(|arg| (*arg).to_owned()).collect(),
-            input.clone(), Cancellation::new()).unwrap();
-        assert_eq!(code, 2, "{args:?}");
-        assert!(input.stdout.lock().unwrap().is_empty(), "{args:?}");
-        assert_eq!(&*input.stderr.lock().unwrap(), expected.as_bytes(), "{args:?}");
+        let argv: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let error = Options::parse(&argv, &Language::default).err().expect("invalid arguments");
+        assert_eq!(format!("{error}\n"), expected, "{args:?}");
     }
+    let args = ["scan".into(), "x".into(), "-p".into()];
+    let error = Options::parse(&args, &|| Language::Ja).err().expect("missing password");
+    assert_eq!(error.to_string(), "sunpack scan：エラー：引数 -p：値を 1 つ指定してください");
 }
 
 #[test]
@@ -341,7 +339,7 @@ fn scan_keeps_inconclusive_errors_without_changing_retry_or_json() {
                 assert!(password_failure(&archive));
                 let mut outcome = Outcome::default();
                 outcome.archives.push(archive);
-                let mut options = Options::parse(&["scan".into(), "encrypted.zip".into()]).unwrap();
+                let mut options = Options::parse(&["scan".into(), "encrypted.zip".into()], &Language::default).unwrap();
                 options.json = json;
                 let session = Input::default();
                 let (_, result) = report_scan(outcome, vec![], &options, &session, language).unwrap();
@@ -407,7 +405,7 @@ fn carrier_final_and_scan_reports_keep_parent_status_and_detail_indentation() {
         let segment = Language::En.translate("cli.scan.segment", &[("index", "2")]);
         assert!(text.find("child.zip").unwrap() < text.find(&segment).unwrap(), "{text}");
         assert!(text.find(&segment).unwrap() < text.find("\nother.zip\n").unwrap(), "{text}");
-        let options = Options::parse(&["scan".into(), "carrier.bin".into()]).unwrap();
+        let options = Options::parse(&["scan".into(), "carrier.bin".into()], &Language::default).unwrap();
         input.combined.lock().unwrap().clear();
         let mut outcome = Outcome::default();
         outcome.archives = archives;
@@ -562,7 +560,7 @@ fn final_failure_summary_uses_main_names_and_keeps_carrier_status() {
 
 #[test]
 fn scan_json_keeps_main_sparse_fields_without_internal_failure_evidence() {
-    let options = Options::parse(&["scan".into(), "-j".into(), "-v".into(), "input.bin".into()]).unwrap();
+    let options = Options::parse(&["scan".into(), "-j".into(), "-v".into(), "input.bin".into()], &Language::default).unwrap();
     let mut archive = report_archive("input.bin", 0);
     archive.format.clear();
     let mut failure = crate::pipeline::Failure::new(FailureKind::Damaged, "damage");
@@ -634,7 +632,7 @@ fn scan_sparse_layout_is_shared_by_text_and_json() {
             archive.scan_layout = crate::pipeline::ScanLayout::from_input(&descriptor);
             let mut outcome = Outcome::default();
             outcome.archives.push(archive);
-            let mut options = Options::parse(&["scan".into(), "carrier.bin".into()]).unwrap();
+            let mut options = Options::parse(&["scan".into(), "carrier.bin".into()], &Language::default).unwrap();
             options.json = json;
             let session = Input::default();
             let (_, result) = report_scan(outcome, vec![], &options, &session, Language::En).unwrap();

@@ -7,7 +7,7 @@ fn invalid_window_reports_filter_and_icon_failures_without_stopping_tray() {
     let recorded = Arc::clone(&errors);
     let context = Context {
         enabled: Arc::new(AtomicBool::new(true)),
-        cwd: PathBuf::new(), chinese: Arc::new(AtomicBool::new(false)),
+        cwd: PathBuf::new(), language: Arc::new(AtomicU8::new(Language::En as u8)),
         notify: Box::new(|_| {}),
         report_error: Box::new(move |message, _| recorded.lock().unwrap().push(message)),
         taskbar_created: WM_USER + 21, icon_registered: Cell::new(false),

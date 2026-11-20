@@ -456,8 +456,26 @@ void localization(Fixture& fixture) {
     assert(translated_error(literal,"en")=="The path does not currently exist.\ntaskFailed {code}");
     auto data=fixture.dir/"locale"; fs::create_directory(data);
     assert(startup_language(data)=="en");
-    atomic_write(data/"sunpack_config.json",R"({"cli":{"language":"zh"}})");
-    assert(startup_language(data)=="zh");
+    struct LocaleCase { const char* input; const char* code; const char* title; const char* label; };
+    for(const auto& test:std::initializer_list<LocaleCase>{
+        {"zh","zh","SunPack 管理面板","简体中文"},
+        {"  ZH-tw  ","zh-TW","SunPack 管理介面","繁體中文"},
+        {"JA","ja","SunPack マネージャー","日本語"},
+        {"ko","ko","SunPack 관리자","한국어"},
+        {"unsupported","en","SunPack Manager","English"},
+    }) {
+        const Json canonical={{"cli",{{"language",test.input}}}};
+        const auto source=canonical.dump();
+        atomic_write(data/"sunpack_config.json",source);
+        assert(startup_language(data)==test.code);
+        const auto row=config_fields(canonical,source,test.code).at(0);
+        const auto selected=row["options"].at(row["choice"].get<size_t>());
+        assert(selected["value"]==test.code && selected["label"]==test.label);
+        validate_setting("/cli/language",selected["value"]);
+        const auto texts=interface_texts(test.code);
+        assert(texts["title"]==test.title && !texts.contains("shellExtractFolder"));
+    }
+    fails([]{validate_setting("/cli/language",Json("unsupported"));});
     atomic_write(data/"sunpack_config.json","{"); assert(startup_language(data)=="en");
 }
 void roots(Fixture& f) {

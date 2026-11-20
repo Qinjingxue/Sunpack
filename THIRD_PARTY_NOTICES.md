@@ -22,6 +22,16 @@ development and release workflows remain subject to their original licenses.
 See [docs/licensing.md](docs/licensing.md) for the repository's license scope
 and release-compliance guidance.
 
+## Inno Setup installer messages
+
+The Windows installer uses [Inno Setup](https://jrsoftware.org/isinfo.php).
+SunPack includes the Simplified and Traditional Chinese compiler message files
+in [installer/Languages](installer/Languages/). The Traditional Chinese file
+is imported from Inno Setup at commit
+[c34976f](https://github.com/jrsoftware/issrc/blob/c34976f7d107e94d4fce8ac29f72ca33762293d7/Files/Languages/ChineseTraditional.isl)
+with its original translator credits. See
+[licenses/inno-setup-license.txt](licenses/inno-setup-license.txt) for the terms.
+
 ## 7-Zip source code
 
 SunPack vendors a trimmed and modified 7-Zip 26.05 runtime subset at the

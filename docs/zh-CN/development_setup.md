@@ -1,6 +1,6 @@
 # 开发环境和构建说明
 
-[English](../development_setup.md) | **简体中文**
+**简体中文** | [English](../development_setup.md) | [繁體中文](../zh-TW/development_setup.md) | [日本語](../ja/development_setup.md) | [한국어](../ko/development_setup.md)
 
 SunPack 是 Windows-only 项目。Cargo 构建 Rust 运行时和 Watch Broker，CMake 构建原生 worker、启动器、GUI 与通知 DLL。Python 测试依赖由 `uv.lock` 锁定。
 

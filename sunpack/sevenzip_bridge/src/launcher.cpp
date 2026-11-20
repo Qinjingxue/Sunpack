@@ -14,6 +14,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <optional>
 #include <vector>
 #include <atomic>
 #include <mutex>
@@ -54,7 +56,7 @@ std::wstring current_directory() {
     return std::wstring(buffer.data(), size);
 }
 
-std::wstring wide_utf8(const std::string& value) {
+std::wstring wide_utf8(std::string_view value) {
     if (value.empty()) return {};
     const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
                                          static_cast<int>(value.size()), nullptr, 0);
@@ -261,22 +263,81 @@ std::wstring first_existing_config(const std::vector<std::wstring>& roots, const
     return {};
 }
 
-// Mirrors sunpack.core.i18n.context.normalize_language: only "zh" selects Chinese.
-std::string normalize_language(const std::string& raw) {
+enum class Language { En, Zh, ZhTw, Ja, Ko };
+
+Language normalize_language(const std::string& raw) {
     const std::size_t begin = raw.find_first_not_of(" \t\r\n");
     const std::size_t end = raw.find_last_not_of(" \t\r\n");
     std::string value = begin == std::string::npos ? std::string() : raw.substr(begin, end - begin + 1);
     for (char& ch : value) {
         if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + ('a' - 'A'));
     }
-    return value == "zh" ? "zh" : "en";
+    if (value == "zh") return Language::Zh;
+    if (value == "zh-tw") return Language::ZhTw;
+    if (value == "ja") return Language::Ja;
+    if (value == "ko") return Language::Ko;
+    return Language::En;
 }
 
-// Resolves cli.language the same way the Python config layer does for an
-// installed or source build: writable config and advanced config use the same
-// data/application roots as the runtime. Missing or
-// unreadable config falls back to English, matching the Python default.
-std::string cli_language_from_config(const InstallContext& context) {
+// Launcher-owned messages are needed even when the Rust runtime cannot start.
+using Translations = std::array<std::string_view, 5>;
+constexpr Translations kPressEnter = {
+    "Press Enter to continue...",
+    "按回车键继续...",
+    "按 Enter 鍵繼續...",
+    "続行するには Enter キーを押してください...",
+    "계속하려면 Enter 키를 누르세요...",
+};
+constexpr Translations kPersistentUnavailable = {
+    "SunPack persistent process is unavailable",
+    "SunPack 持久进程不可用",
+    "SunPack 背景程序無法使用",
+    "SunPack の常駐プロセスを利用できません",
+    "SunPack 상주 프로세스를 사용할 수 없습니다",
+};
+constexpr Translations kRuntimeLaunchFailed = {
+    "sunpack runtime failed to launch (Win32 error {error})",
+    "sunpack 运行时启动失败（Win32 错误 {error}）",
+    "sunpack 執行階段啟動失敗（Win32 錯誤 {error}）",
+    "sunpack のランタイムを起動できませんでした（Win32 エラー {error}）",
+    "sunpack 런타임을 시작할 수 없습니다(Win32 오류 {error})",
+};
+constexpr Translations kRuntimeExited = {
+    "sunpack runtime exited before becoming ready, exit code {code}",
+    "sunpack 运行时尚未就绪便已退出，退出码为 {code}",
+    "sunpack 執行階段在就緒前已結束，結束代碼為 {code}",
+    "sunpack のランタイムは準備が整う前に終了しました（終了コード {code}）",
+    "sunpack 런타임이 준비되기 전에 종료되었습니다(종료 코드 {code})",
+};
+constexpr Translations kDeliveryUncertain = {
+    "SunPack persistent process disconnected after the command was submitted; it was not retried to avoid running it twice",
+    "SunPack 持久进程在命令提交后断开连接；为避免重复执行，未重试该命令",
+    "命令送出後，SunPack 背景程序中斷連線。為避免重複執行，未重試此命令",
+    "コマンド送信後に SunPack の常駐プロセスとの接続が切れました。二重実行を避けるため、再試行しませんでした",
+    "명령을 제출한 후 SunPack 상주 프로세스와의 연결이 끊겼습니다. 중복 실행을 방지하기 위해 다시 시도하지 않았습니다",
+};
+constexpr Translations kShutdownWaitFailed = {
+    "Cannot wait for SunPack runtime shutdown, Win32 error {error}",
+    "无法等待 SunPack 后台进程退出，Win32 错误 {error}",
+    "無法等待 SunPack 背景程序結束，Win32 錯誤 {error}",
+    "SunPack のランタイムの終了を待機できませんでした（Win32 エラー {error}）",
+    "SunPack 런타임이 종료될 때까지 기다릴 수 없습니다(Win32 오류 {error})",
+};
+
+std::string_view localized(Language language, const Translations& messages) {
+    return messages[static_cast<std::size_t>(language)];
+}
+
+std::string localized_value(Language language, const Translations& messages,
+                            std::string_view placeholder, unsigned long value) {
+    std::string text(localized(language, messages));
+    const std::size_t offset = text.find(placeholder);
+    if (offset != std::string::npos) text.replace(offset, placeholder.size(), std::to_string(value));
+    return text;
+}
+
+// Use the same data and application roots as the installed or source runtime.
+Language cli_language_from_config(const InstallContext& context) {
     const std::wstring simple_path = context.data_dir.empty() ? std::wstring()
         : first_existing_config({context.data_dir}, L"sunpack_config.json");
     const std::wstring advanced_path = first_existing_config({context.directory}, L"sunpack_advanced_config.json");
@@ -426,7 +487,7 @@ std::uint32_t read_u32(const char* source) {
            | static_cast<std::uint32_t>(static_cast<unsigned char>(source[3]));
 }
 
-void write_stream(DWORD handle_id, const std::string& text);
+void write_stream(DWORD handle_id, std::string_view text);
 
 std::string read_input_line() {
     HANDLE handle = GetStdHandle(STD_INPUT_HANDLE);
@@ -604,10 +665,7 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
             exit_code = 3;
             const DWORD error = GetLastError();
             write_stream(STD_ERROR_HANDLE,
-                (cli_language_from_config(context) == "zh"
-                    ? "无法等待 SunPack 后台进程退出，Win32 错误 "
-                    : "Cannot wait for SunPack runtime shutdown, Win32 error ") +
-                std::to_string(error) + "\n");
+                localized_value(cli_language_from_config(context), kShutdownWaitFailed, "{error}", error) + "\n");
             return RequestOutcome::Completed;
         }
     }
@@ -757,7 +815,7 @@ bool spawn_runtime(const InstallContext& context, const std::vector<std::wstring
     return true;
 }
 
-void write_stream(DWORD handle_id, const std::string& text) {
+void write_stream(DWORD handle_id, std::string_view text) {
     if (text.empty()) return;
     HANDLE handle = GetStdHandle(handle_id);
     if (handle == nullptr || handle == INVALID_HANDLE_VALUE) return;
@@ -770,34 +828,6 @@ void write_stream(DWORD handle_id, const std::string& text) {
         DWORD written = 0;
         WriteFile(handle, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
     }
-}
-
-constexpr wchar_t kPressEnterEn[] = L"Press Enter to continue...";
-constexpr wchar_t kPressEnterZh[] = L"按回车键继续...";
-constexpr wchar_t kPersistentUnavailableEn[] = L"SunPack persistent process is unavailable";
-constexpr wchar_t kPersistentUnavailableZh[] = L"SunPack 持久进程不可用";
-constexpr wchar_t kRuntimeLaunchFailedEn[] = L"sunpack runtime failed to launch (Win32 error {error})";
-constexpr wchar_t kRuntimeLaunchFailedZh[] = L"sunpack 运行时启动失败（Win32 错误 {error}）";
-constexpr wchar_t kRuntimeExitedEn[] = L"sunpack runtime exited before becoming ready, exit code {code}";
-constexpr wchar_t kRuntimeExitedZh[] = L"sunpack 运行时尚未就绪便已退出，退出码为 {code}";
-constexpr wchar_t kDeliveryUncertainEn[] = L"SunPack persistent process disconnected after the command was submitted; it was not retried to avoid running it twice";
-constexpr wchar_t kDeliveryUncertainZh[] = L"SunPack 持久进程在命令提交后断开连接；为避免重复执行，未重试该命令";
-
-std::string localized(const std::string& language, const wchar_t* english, const wchar_t* chinese) {
-    return utf8(language == "zh" ? chinese : english);
-}
-
-std::string localized_value(
-    const std::string& language,
-    const wchar_t* english,
-    const wchar_t* chinese,
-    const std::string& placeholder,
-    const std::string& value
-) {
-    std::string text = localized(language, english, chinese);
-    const std::size_t offset = text.find(placeholder);
-    if (offset != std::string::npos) text.replace(offset, placeholder.size(), value);
-    return text;
 }
 
 // The installed launcher owns pause, as in main. Only consume actual flags:
@@ -834,13 +864,12 @@ bool consume_pause(std::vector<std::wstring>& arguments) {
     return pause;
 }
 
-void pause_on_exit(bool pause, const std::string& language) {
-    if (!pause) return;
+void pause_on_exit(Language language) {
     const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
     DWORD mode = 0;
     if (!GetConsoleMode(input, &mode)) return;
     const DWORD stream = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode) ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE;
-    write_stream(stream, localized(language, kPressEnterEn, kPressEnterZh));
+    write_stream(stream, localized(language, kPressEnter));
     wchar_t buffer[2]{};
     DWORD read = 0;
     ReadConsoleW(input, buffer, 1, &read, nullptr);
@@ -883,6 +912,11 @@ int wmain(int argc, wchar_t** argv) {
     }
     int code = 1;
     const bool pause = consume_pause(request_arguments);
+    std::optional<Language> resolved_language;
+    const auto language = [&] {
+        if (!resolved_language) resolved_language = cli_language_from_config(context);
+        return *resolved_language;
+    };
     RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd, nullptr, daemon_stop);
     if (outcome == RequestOutcome::NotDelivered && !shutdown && !status_follow) {
         RuntimeStartup startup(context);
@@ -908,53 +942,35 @@ int wmain(int argc, wchar_t** argv) {
             }
         }
         if (spawn_error != ERROR_SUCCESS) {
-            std::string startup_error = localized_value(
-                cli_language_from_config(context),
-                kRuntimeLaunchFailedEn,
-                kRuntimeLaunchFailedZh,
-                "{error}",
-                std::to_string(static_cast<unsigned long>(spawn_error))
-            ) + "\n";
-            write_stream(STD_ERROR_HANDLE, startup_error);
+            write_stream(STD_ERROR_HANDLE,
+                localized_value(language(), kRuntimeLaunchFailed, "{error}", spawn_error) + "\n");
         }
         if (runtime_failed) {
-            write_stream(
-                STD_ERROR_HANDLE,
-                localized_value(
-                    cli_language_from_config(context),
-                    kRuntimeExitedEn,
-                    kRuntimeExitedZh,
-                    "{code}",
-                    std::to_string(static_cast<unsigned long>(runtime_exit_code))
-                ) + "\n"
-            );
+            write_stream(STD_ERROR_HANDLE,
+                localized_value(language(), kRuntimeExited, "{code}", runtime_exit_code) + "\n");
         }
     }
     const bool ok = outcome == RequestOutcome::Completed;
     if (!ok) code = shutdown && outcome == RequestOutcome::NotDelivered ? 0 : 1;
     if (daemon_stop && outcome == RequestOutcome::NotDelivered && !stopped_runtime(context, true)) {
         code = 1;
-        write_stream(STD_ERROR_HANDLE, localized(cli_language_from_config(context), kPersistentUnavailableEn, kPersistentUnavailableZh) + "\n");
+        write_stream(STD_ERROR_HANDLE, std::string(localized(language(), kPersistentUnavailable)) + "\n");
     }
     if (status_follow && outcome == RequestOutcome::NotDelivered && stopped_runtime(context, false)) {
         write_stream(STD_OUTPUT_HANDLE, "{\"running\":false,\"enabled\":false,\"phase\":\"stopped\"}\n");
         code = 0;
     }
-    std::string language;
-    if (pause || (!ok && (!shutdown || outcome == RequestOutcome::DeliveryUncertain))) {
-        language = cli_language_from_config(context);
-    }
     if (outcome == RequestOutcome::NotDelivered && !shutdown && !status_follow) {
-        write_stream(STD_ERROR_HANDLE, localized(language, kPersistentUnavailableEn, kPersistentUnavailableZh) + "\n");
+        write_stream(STD_ERROR_HANDLE, std::string(localized(language(), kPersistentUnavailable)) + "\n");
     } else if (outcome == RequestOutcome::DeliveryUncertain) {
-        write_stream(STD_ERROR_HANDLE, localized(language, kDeliveryUncertainEn, kDeliveryUncertainZh) + "\n");
+        write_stream(STD_ERROR_HANDLE, std::string(localized(language(), kDeliveryUncertain)) + "\n");
     }
     if (daemon_stop && daemon_stop_json && code == 0) {
         write_stream(STD_OUTPUT_HANDLE,
             "{\"command\":\"daemon\",\"inputs\":{\"action\":\"stop\"},"
             "\"summary\":{\"running\":false},\"errors\":[],\"items\":[],\"tasks\":[],\"logs\":[]}\n");
     }
-    pause_on_exit(pause, language);
+    if (pause) pause_on_exit(language());
     return code;
 }
 

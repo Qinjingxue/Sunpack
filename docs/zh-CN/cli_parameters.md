@@ -1,6 +1,6 @@
 # CLI 参数说明
 
-[English](../cli_parameters.md) | **简体中文**
+**简体中文** | [English](../cli_parameters.md) | [繁體中文](../zh-TW/cli_parameters.md) | [日本語](../ja/cli_parameters.md) | [한국어](../ko/cli_parameters.md)
 
 ```powershell
 sunpack.exe <command> [options] [paths...]

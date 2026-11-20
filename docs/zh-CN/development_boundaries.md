@@ -1,6 +1,6 @@
 # 开发边界
 
-[English](../development_boundaries.md) | **简体中文**
+**简体中文** | [English](../development_boundaries.md) | [繁體中文](../zh-TW/development_boundaries.md) | [日本語](../ja/development_boundaries.md) | [한국어](../ko/development_boundaries.md)
 
 Windows 运行时位于 `sunpack/sunpack_runtime`。模块依赖方向为 `runtime → pipeline → core`。调度层和共享基础层使用现有归档分析、I/O 和文件系统模块。
 

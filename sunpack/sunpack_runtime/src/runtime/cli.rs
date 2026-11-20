@@ -313,25 +313,26 @@ fn short_option(letter: u8) -> Option<&'static OptionSpec> {
 }
 
 impl Options {
-    fn parse(argv: &[String]) -> io::Result<Self> {
+    fn parse(argv: &[String], load_language: &dyn Fn() -> Language) -> io::Result<Self> {
+        let root = ParserScope { command: "", action: "", load_language };
         let mut args: VecDeque<_> = argv.iter().map(|arg| Cow::Borrowed(arg.as_str())).collect();
         let mut unrecognized = Vec::new();
         let command = loop {
             let Some(arg) = args.pop_front() else {
-                if !unrecognized.is_empty() { return Err(parser_error("", "", "the following arguments are required: command")); }
+                if !unrecognized.is_empty() { return Err(root.required("command")); }
                 return Ok(Self { help: true, ..Self::default() });
             };
             if arg == "--" && args.is_empty() {
-                return Err(parser_error("", "", "the following arguments are required: command"));
+                return Err(root.required("command"));
             }
             if arg == "--" || !looks_like_option(&arg) { break arg; }
             if arg.starts_with("-h") && !arg.starts_with("--") {
-                validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), "", "")?;
+                validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), root)?;
                 return Ok(Self { help: true, ..Self::default() });
             }
             let (flag, inline) = arg.split_once('=').map_or((arg.as_ref(), None), |(f, v)| (f, Some(v)));
             if flag == "-h" {
-                if let Some(value) = inline { return Err(explicit_argument("", "", flag, value)); }
+                if let Some(value) = inline { return Err(root.explicit_argument(flag, value)); }
                 return Ok(Self { help: true, ..Self::default() });
             }
             unrecognized.push(arg.into_owned());
@@ -340,7 +341,7 @@ impl Options {
             .iter()
             .find(|(name, alias)| command.as_ref() == *name || command.as_ref() == *alias)
             .map(|(name, _)| *name)
-            .ok_or_else(|| invalid_choice("", "", "command", &command, "extract, e, watch, w, scan, s, passwords, pw, config, cfg, daemon, d, doctor, doc, version, ver"))?;
+            .ok_or_else(|| root.invalid_choice("command", &command, "extract, e, watch, w, scan, s, passwords, pw, config, cfg, daemon, d, doctor, doc, version, ver"))?;
         let mut options = Self {
             command,
             ..Self::default()
@@ -354,6 +355,7 @@ impl Options {
         // argparse reports unknown arguments only after processing actions;
         // a later help action may exit successfully first.
         while let Some(mut arg) = args.pop_front() {
+            let scope = root.with(command, &options.action);
             let from_cluster = std::mem::take(&mut in_cluster);
             supplied = true;
             if arg == "--" && !positional {
@@ -395,7 +397,7 @@ impl Options {
                         | ("daemon", "start" | "stop" | "startup")
                         | ("config", "show" | "validate"))
                     {
-                        return Err(invalid_choice(command, "", &format!("{command}_action"), &action, match command { "watch" => "enable, ea, disable, da, add, remove, rm, list, ls, reload, rl, relog, rlg, status, st", "daemon" => "start, stop, startup", _ => "show, validate" }));
+                        return Err(scope.invalid_choice(&format!("{command}_action"), &action, match command { "watch" => "enable, ea, disable, da, add, remove, rm, list, ls, reload, rl, relog, rlg, status, st", "daemon" => "start, stop, startup", _ => "show, validate" }));
                     }
                     options.action = action;
                 } else {
@@ -412,7 +414,7 @@ impl Options {
                     }
                     if command == "daemon" && options.action == "startup" {
                         if options.paths.is_empty() && !matches!(arg.as_ref(), "enable" | "disable" | "status") {
-                            return Err(invalid_choice(command, &options.action, "action", &arg, "enable, disable, status"));
+                            return Err(scope.invalid_choice("action", &arg, "enable, disable, status"));
                         }
                         if !options.paths.is_empty() {
                             unrecognized.push(arg.into_owned());
@@ -424,7 +426,7 @@ impl Options {
                 continue;
             }
             paths_closed |= !options.paths.is_empty();
-            validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), command, &options.action)?;
+            validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), scope)?;
             if !from_cluster && matches!(command, "watch" | "daemon" | "config") && options.action.is_empty() {
                 match arg.as_ref() {
                     "-j" => parent_flags.0 = true,
@@ -457,12 +459,12 @@ impl Options {
                             .filter(|value| flag == "-p" || !looks_like_option(value))
                             .map(Cow::into_owned)
                     })
-                    .ok_or_else(|| argument_error(command, &options.action, flag, "expected one argument"))
+                    .ok_or_else(|| scope.argument_error(flag, "cli.parser.expected_argument", &[]))
             };
             let selected = option_spec(flag).filter(|spec| spec.scope.accepts(command, &options.action));
             if let (Some(spec), Some(value)) = (selected, inline) {
                 if !spec.takes_value() || spec.id == OptionId::Password {
-                    return Err(explicit_argument(command, &options.action, flag, value));
+                    return Err(scope.explicit_argument(flag, value));
                 }
             }
             match selected.map(|spec| spec.id) {
@@ -473,33 +475,33 @@ impl Options {
                 Some(OptionId::Json) => options.json = true,
                 Some(OptionId::Verbose) => options.verbose = true,
                 Some(OptionId::Pause) => {
-                    if options.no_pause { return Err(argument_error(command, &options.action, "-pa", "not allowed with argument -npa")); }
+                    if options.no_pause { return Err(scope.conflict("-pa", "-npa")); }
                     options.pause = true;
                 }
                 Some(OptionId::NoPause) => {
-                    if options.pause { return Err(argument_error(command, &options.action, "-npa", "not allowed with argument -pa")); }
+                    if options.pause { return Err(scope.conflict("-npa", "-pa")); }
                     options.no_pause = true;
                 }
                 Some(OptionId::Recursive) => options.recursive = true,
                 Some(OptionId::Deep) => options.deep = true,
                 Some(OptionId::Flatten) => {
-                    if options.flatten == Some(false) { return Err(argument_error(command, &options.action, "-f", "not allowed with argument -nf")); }
+                    if options.flatten == Some(false) { return Err(scope.conflict("-f", "-nf")); }
                     options.flatten = Some(true)
                 }
                 Some(OptionId::NoFlatten) => {
-                    if options.flatten == Some(true) { return Err(argument_error(command, &options.action, "-nf", "not allowed with argument -f")); }
+                    if options.flatten == Some(true) { return Err(scope.conflict("-nf", "-f")); }
                     options.flatten = Some(false)
                 }
                 Some(OptionId::Recur) => {
                     let value = take()?.trim().to_owned();
-                    let depth = Recursion::parse(&value).map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?;
+                    let depth = Recursion::parse(&value).map_err(|_| scope.argument_error(flag, "cli.parser.invalid_recursion", &[]))?;
                     options.depth = Some((depth, value));
                     continue;
                 }
                 Some(OptionId::Cleanup) => {
                     let value = take()?.trim().to_ascii_lowercase();
                     options.cleanup = Some(CleanupMode::parse(&value)
-                        .map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?);
+                        .map_err(|_| scope.argument_error(flag, "cli.parser.invalid_cleanup_mode", &[]))?);
                     continue;
                 }
                 Some(OptionId::Output) => {
@@ -527,6 +529,7 @@ impl Options {
                 }
             }
         }
+        let scope = root.with(command, &options.action);
         let wants_paths = match (command, options.action.as_str()) {
             ("extract" | "scan", "") => true,
             ("watch", "add" | "remove") | ("daemon", "startup") => true,
@@ -534,7 +537,7 @@ impl Options {
             | ("daemon", "start" | "stop" | "")
             | ("config", "show" | "validate" | "")
             | ("passwords" | "doctor" | "version", "") => false,
-            _ => return Err(invalid(format!("invalid action: {}", options.action))),
+            _ => return Err(invalid(load_language().translate("cli.parser.invalid_action", &[("action", &options.action)]))),
         };
         if options.help {
             return Ok(options);
@@ -543,12 +546,12 @@ impl Options {
             if !supplied || (matches!(command, "watch" | "daemon") && !after_action) {
                 options.help = true;
             } else {
-                return Err(parser_error(command, &options.action, if options.action == "startup" { "the following arguments are required: action" } else { "the following arguments are required: paths" }));
+                return Err(scope.required(if options.action == "startup" { "action" } else { "paths" }));
             }
         }
         if matches!(command, "watch" | "daemon" | "config") && options.action.is_empty() {
             if supplied {
-                return Err(parser_error(command, "", format!("the following arguments are required: {command}_action")));
+                return Err(scope.required(&format!("{command}_action")));
             }
             options.help = true;
         }
@@ -556,7 +559,7 @@ impl Options {
         // unknown arguments, just like _ContextArgumentParser in main.
         if options.help { return Ok(options); }
         if !unrecognized.is_empty() {
-            return Err(parser_error("", "", format!("unrecognized arguments: {}", unrecognized.join(" "))));
+            return Err(root.error("cli.parser.unrecognized_arguments", &[("arguments", &unrecognized.join(" "))]));
         }
         options.json |= parent_flags.0;
         options.verbose |= parent_flags.1;
@@ -567,14 +570,14 @@ impl Options {
 
 // argparse validates the arity of an entire short-option cluster before
 // executing any of its actions, including help.
-fn validate_short_cluster(arg: &str, next: Option<&str>, command: &str, action: &str) -> io::Result<()> {
+fn validate_short_cluster(arg: &str, next: Option<&str>, scope: ParserScope<'_>) -> io::Result<()> {
     if !arg.starts_with('-') || arg.starts_with("--") || arg.len() <= 2 { return Ok(()); }
     for index in 1..arg.len() {
         let flag = arg.as_bytes()[index];
-        let Some(spec) = short_option(flag).filter(|spec| spec.scope.accepts(command, action)) else {
+        let Some(spec) = short_option(flag).filter(|spec| spec.scope.accepts(scope.command, scope.action)) else {
             if index >= 2 {
                 let previous = arg.as_bytes()[index - 1];
-                return Err(explicit_argument(command, action, &format!("-{}", char::from(previous)), &arg[index..]));
+                return Err(scope.explicit_argument(&format!("-{}", char::from(previous)), &arg[index..]));
             }
             break;
         };
@@ -582,13 +585,13 @@ fn validate_short_cluster(arg: &str, next: Option<&str>, command: &str, action: 
         let tail = &arg[index + 1..]; // recognized option letters are ASCII
         if takes_value {
             if tail.is_empty() && next.is_none_or(looks_like_option) {
-                return Err(argument_error(command, action, &format!("-{}", char::from(flag)), "expected one argument"));
+                return Err(scope.argument_error(&format!("-{}", char::from(flag)), "cli.parser.expected_argument", &[]));
             }
             break;
         }
         if tail.starts_with('=') || tail.starts_with('-') {
             let value = if index == 1 { tail.strip_prefix('=').unwrap_or(tail) } else { tail };
-            return Err(explicit_argument(command, action, &format!("-{}", char::from(flag)), value));
+            return Err(scope.explicit_argument(&format!("-{}", char::from(flag)), value));
         }
     }
     Ok(())
@@ -614,24 +617,56 @@ fn looks_like_option(arg: &str) -> bool {
         })
 }
 
-// main suppresses usage and lets argparse report canonical parser scope.
-fn parser_error(command: &str, action: &str, message: impl std::fmt::Display) -> io::Error {
-    let mut program = String::from("sunpack");
-    if !command.is_empty() { program.push(' '); program.push_str(command); }
-    if !action.is_empty() { program.push(' '); program.push_str(action); }
-    invalid(format!("{program}: error: {message}"))
+#[derive(Clone, Copy)]
+struct ParserScope<'a> {
+    command: &'a str,
+    action: &'a str,
+    load_language: &'a dyn Fn() -> Language,
 }
 
-fn argument_error(command: &str, action: &str, flag: &str, message: &str) -> io::Error {
-    parser_error(command, action, format!("argument {flag}: {message}"))
-}
+impl<'a> ParserScope<'a> {
+    fn with<'b>(self, command: &'b str, action: &'b str) -> ParserScope<'b> where 'a: 'b {
+        ParserScope { command, action, load_language: self.load_language }
+    }
 
-fn explicit_argument(command: &str, action: &str, flag: &str, value: &str) -> io::Error {
-    argument_error(command, action, flag, &format!("ignored explicit argument {}", password_repr(value)))
-}
+    fn required(self, arguments: &str) -> io::Error {
+        self.error("cli.parser.required_arguments", &[("arguments", arguments)])
+    }
 
-fn invalid_choice(command: &str, action: &str, name: &str, value: &str, choices: &str) -> io::Error {
-    argument_error(command, action, name, &format!("invalid choice: {} (choose from {choices})", password_repr(value)))
+    fn error(self, key: &str, params: &[(&str, &str)]) -> io::Error {
+        let language = (self.load_language)();
+        self.render_error(language, &language.translate(key, params))
+    }
+
+    fn argument_error(self, flag: &str, key: &str, params: &[(&str, &str)]) -> io::Error {
+        let language = (self.load_language)();
+        let message = language.translate(key, params);
+        self.render_error(language, &language.translate("cli.parser.argument_error", &[("flag", flag), ("message", &message)]))
+    }
+
+    fn conflict(self, flag: &str, other: &str) -> io::Error {
+        self.argument_error(flag, "cli.parser.conflicting_argument", &[("other", other)])
+    }
+
+    fn explicit_argument(self, flag: &str, value: &str) -> io::Error {
+        self.argument_error(flag, "cli.parser.explicit_argument", &[("value", &password_repr(value))])
+    }
+
+    fn invalid_choice(self, name: &str, value: &str, choices: &str) -> io::Error {
+        self.argument_error(name, "cli.parser.invalid_choice", &[("value", &password_repr(value)), ("choices", choices)])
+    }
+
+    fn render_error(self, language: Language, message: &str) -> io::Error {
+        // Keep command and action spellings in parser diagnostics.
+        let mut program = String::from("sunpack");
+        for value in [self.command, self.action] {
+            if !value.is_empty() {
+                program.push(' ');
+                program.push_str(value);
+            }
+        }
+        invalid(language.translate("cli.parser.error", &[("program", &program), ("message", message)]))
+    }
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -800,7 +835,7 @@ pub(super) async fn run(
         let [_, id] = args.as_slice() else { return Ok(2); };
         return Ok(i32::from(!host.watch.cancel_batch_async(id).await));
     }
-    let options = match Options::parse(&args) {
+    let options = match Options::parse(&args, &|| config::load_language(cwd)) {
         Ok(options) => options,
         Err(error) => {
             line(session, Stream::Err, &error.to_string())?;
@@ -2466,7 +2501,8 @@ fn doctor(
     language: Language,
 ) -> io::Result<(i32, CommandResult)> {
     let mut result = CommandResult::new("doctor");
-    result.items = super::doctor::checks(cwd, settings);
+    let detail_language = if json_output { Language::En } else { language };
+    result.items = super::doctor::checks(cwd, settings, detail_language);
     let failed = result
         .items
         .iter()

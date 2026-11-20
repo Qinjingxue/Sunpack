@@ -117,7 +117,7 @@ export default {
         add(this.tagInputs[f.id],'tag-input-'+f.id);
         this.tagValues(f).forEach((v,j)=>add(this.entryLabel(v.value),'tags-'+f.id,j));
       } else if(f.editor==='text') add(d.text,'input-'+f.id);
-      else if(f.editor==='recursive'&&d.choice===2) {add(d.text,'rounds-'+f.id);add(t.rounds,'rounds-label-'+f.id);}
+      else if(f.editor==='recursive'&&d.choice===2) add(d.text,'rounds-'+f.id);
       else if(f.editor==='readonly') add(t.readOnly,'readonly-label-'+f.id);
       if(this.isRange(f)) {
         let r=this.rangeValue(f),date=f.editor==='datetime_range';
@@ -1064,7 +1064,7 @@ export default {
                 <div v-if="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>
                 <div v-if="f.editor==='choice'||f.editor==='recursive'" :id="'choice-'+f.id" class="choice-host"/>
                 <input v-if="f.editor==='text'" :ellipsis-start="isDirectoryValue(drafts[f.id]?drafts[f.id].text:f.text)" :id="'input-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/>
-                <div v-if="f.editor==='recursive'" v-show="(drafts[f.id]?drafts[f.id].choice:f.choice)===2" class="column"><label :id="'rounds-label-'+f.id" class="muted">{{ texts.rounds }}</label><input :id="'rounds-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/></div>
+                <div v-if="f.editor==='recursive'" v-show="(drafts[f.id]?drafts[f.id].choice:f.choice)===2" class="column"><input :id="'rounds-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/></div>
                 <label :id="'readonly-label-'+f.id" v-if="f.editor==='readonly'" class="muted">{{ texts.readOnly }}</label>
               </div>
             </div>
