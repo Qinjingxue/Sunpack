@@ -96,3 +96,13 @@ fn numbered_names_do_not_repeat_encoding_evidence() {
     assert!(matches!(single, None | Some("950")));
     assert_eq!(select_codepage(&[first.as_ref(), second.as_ref()]), single);
 }
+
+#[test]
+fn scoring_distinguishes_hangul_from_cjk_decoding_collisions() {
+    let (korean, _, korean_invalid) = EUC_KR.encode("한글.txt");
+    let (chinese, _, chinese_invalid) = GBK.encode("工程进度.xlsx");
+    assert!(!korean_invalid && !chinese_invalid);
+    assert_eq!(select_codepage(&[korean.as_ref()]), Some("949"));
+    assert_eq!(select_codepage(&[chinese.as_ref()]), Some("936"));
+    assert_eq!(select_codepage(&["한글.txt".as_bytes()]), Some("65001"));
+}

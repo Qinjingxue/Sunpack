@@ -89,7 +89,12 @@ def test_zip_renamed_member_ignores_stale_unicode_path_extra_field(package, tmp_
 
 @pytest.mark.parametrize(
     ("codec", "legacy_name"),
-    [("cp932", "操作手順.txt"), ("gbk", "数据.txt"), ("cp950", "財務報表.txt")],
+    [
+        ("cp932", "操作手順.txt"),
+        ("gbk", "数据.txt"),
+        ("cp950", "財務報表.txt"),
+        ("cp949", "한글똠.txt"),
+    ],
 )
 def test_zip_guesses_legacy_filename_encoding(package, tmp_path, codec, legacy_name):
     class LegacyZipInfo(zipfile.ZipInfo):

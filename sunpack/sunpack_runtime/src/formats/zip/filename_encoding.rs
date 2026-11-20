@@ -1,6 +1,6 @@
 use crate::io::archive_state::{ArchiveInput, InputExtent};
 use crate::password::input::{parse_ranges, VirtualRangeReader};
-use encoding_rs::{DecoderResult, BIG5, GBK, SHIFT_JIS};
+use encoding_rs::{DecoderResult, BIG5, EUC_KR, GBK, SHIFT_JIS};
 use std::io;
 use std::sync::OnceLock;
 
@@ -18,8 +18,12 @@ const MAX_ZIP_COMMENT_BYTES: u64 = 65_535;
 
 // Derived from CharacterEncodingDetectorTables.h (Copyright 2013 The Android
 // Open Source Project, Apache-2.0) by scripts/generate_zip_filename_frequencies.py.
-static HAN_FREQUENCIES: &[u8; 0x5200] = include_bytes!("filename_frequencies.bin");
+const HAN_FREQUENCY_BYTES: usize = 0x5200;
+const HANGUL_FREQUENCY_BYTES: usize = (0xd7a4 - 0xac00) / 4;
+static CHARACTER_FREQUENCIES: &[u8; HAN_FREQUENCY_BYTES + HANGUL_FREQUENCY_BYTES] =
+    include_bytes!("filename_frequencies.bin");
 const HAN_RANK_BONUS: [i32; 4] = [0, 3, 4, 5];
+const HANGUL_RANK_SCORE: [i32; 4] = [-1, 7, 8, 9];
 const CP437_HIGH: &str =
     "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ";
 static CP437_TABLE: OnceLock<[char; 128]> = OnceLock::new();
@@ -32,6 +36,7 @@ enum EncodingKind {
     Cp932,
     Cp936,
     Cp950,
+    Cp949,
 }
 
 impl EncodingKind {
@@ -42,15 +47,16 @@ impl EncodingKind {
             Self::Cp936 => "936",
             Self::Cp950 => "950",
             Self::Cp932 => "932",
+            Self::Cp949 => "949",
         }
     }
 
     fn han_score(self, ch: char) -> i32 {
         match self {
-            Self::Cp437 => 0,
+            Self::Cp437 | Self::Cp949 => 0,
             Self::Utf8 => 4,
             Self::Cp932 | Self::Cp936 | Self::Cp950 => {
-                let ranks = HAN_FREQUENCIES[ch as usize - 0x4e00];
+                let ranks = CHARACTER_FREQUENCIES[ch as usize - 0x4e00];
                 let shift = 2 * (self as u8 - Self::Cp932 as u8);
                 2 + HAN_RANK_BONUS[((ranks >> shift) & 3) as usize]
             }
@@ -219,9 +225,11 @@ fn scan_zip_names(
 }
 
 struct FilenameScoring {
-    candidates: [EncodingCandidate; 5],
+    candidates: [EncodingCandidate; 6],
     evidence: CharacterEvidence,
     decoded: String,
+    previous_name: [u8; 64],
+    previous_name_len: usize,
 }
 
 impl FilenameScoring {
@@ -233,17 +241,34 @@ impl FilenameScoring {
                 EncodingKind::Cp936,
                 EncodingKind::Cp950,
                 EncodingKind::Cp932,
+                EncodingKind::Cp949,
             ]
             .map(EncodingCandidate::new),
             evidence: CharacterEvidence::new(),
             decoded: String::new(),
+            previous_name: [0; 64],
+            previous_name_len: 0,
         }
     }
 
     fn observe(&mut self, raw: &[u8]) {
+        // Plain ASCII adds no score. Retain its first byte after the last
+        // non-ASCII byte because it may complete a multibyte character.
+        // Other ASCII (including Windows filename penalties) stays in the key.
+        let last = raw.iter().rposition(|&byte| {
+            !matches!(byte, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b' ' | b'.' | b'_' | b'-' | b'/' | b'\\')
+        });
+        let name = last.map_or(raw, |index| &raw[..(index + 2).min(raw.len())]);
+        if let Some(previous) = self.previous_name.get_mut(..name.len()) {
+            if self.previous_name_len == name.len() && previous == name {
+                return;
+            }
+            previous.copy_from_slice(name);
+            self.previous_name_len = name.len();
+        }
         for candidate in &mut self.candidates {
             if candidate.valid {
-                candidate.observe(raw, &mut self.evidence, &mut self.decoded);
+                candidate.observe(name, &mut self.evidence, &mut self.decoded);
             }
         }
     }
@@ -309,7 +334,9 @@ impl EncodingCandidate {
     }
 
     fn score(&self) -> i32 {
-        if !self.valid {
+        // GBK in particular can decode as rare Hangul under CP949. Require
+        // evidence from at least two distinct ranked syllables before ranking it.
+        if !self.valid || (self.kind == EncodingKind::Cp949 && self.score < 18) {
             return i32::MIN;
         }
         // A sequence of halfwidth kana can also be two-byte Chinese text.
@@ -346,6 +373,7 @@ impl EncodingCandidate {
             EncodingKind::Cp932 => SHIFT_JIS,
             EncodingKind::Cp936 => GBK,
             EncodingKind::Cp950 => BIG5,
+            EncodingKind::Cp949 => EUC_KR,
         };
         let mut decoder = encoding.new_decoder_without_bom_handling();
         decoded.clear();
@@ -373,11 +401,21 @@ impl EncodingCandidate {
         for ch in chars {
             let score = match ch {
                 '\u{4e00}'..='\u{9fff}' => self.kind.han_score(ch),
+                '\u{ac00}'..='\u{d7a3}' => {
+                    let offset = ch as usize - 0xac00;
+                    let ranks = CHARACTER_FREQUENCIES[HAN_FREQUENCY_BYTES + offset / 4];
+                    let rank = ((ranks >> (2 * (offset % 4))) & 3) as usize;
+                    match self.kind {
+                        EncodingKind::Cp949 => HANGUL_RANK_SCORE[rank],
+                        EncodingKind::Utf8 => 4 + HAN_RANK_BONUS[rank],
+                        _ => 0,
+                    }
+                }
                 '\u{3040}'..='\u{30ff}' => match self.kind {
                     EncodingKind::Cp437 => 0,
                     EncodingKind::Utf8 => 4,
                     EncodingKind::Cp932 => 6,
-                    EncodingKind::Cp936 | EncodingKind::Cp950 => -2,
+                    EncodingKind::Cp936 | EncodingKind::Cp950 | EncodingKind::Cp949 => -2,
                 },
                 '\u{ff66}'..='\u{ff9f}' => match self.kind {
                     EncodingKind::Cp932 => {
@@ -386,7 +424,7 @@ impl EncodingCandidate {
                         }
                         continue;
                     }
-                    EncodingKind::Cp936 | EncodingKind::Cp950 => -2,
+                    EncodingKind::Cp936 | EncodingKind::Cp950 | EncodingKind::Cp949 => -2,
                     _ => 0,
                 },
                 '\u{e000}'..='\u{f8ff}' => -8,

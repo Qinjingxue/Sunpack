@@ -180,11 +180,11 @@ Source: https://github.com/RustCrypto/block-ciphers/tree/blowfish-v0.9.1/blowfis
 
 ## AOSP ZIP filename frequency data
 
-SunPack derives its read-only Japanese, Simplified Chinese, and Traditional
-Chinese filename scores from `CharacterEncodingDetectorTables.h`, Copyright
-(C) 2013 The Android Open Source Project, licensed under Apache License 2.0.
-`scripts/generate_zip_filename_frequencies.py` keeps only Han characters and
-quantizes their ranks into three frequency bands. The license is distributed
-at [licenses/aosp-zip-frequencies-license.txt](licenses/aosp-zip-frequencies-license.txt).
+SunPack derives its read-only Japanese, Simplified Chinese, Traditional
+Chinese, and Korean filename scores from `CharacterEncodingDetectorTables.h`,
+Copyright (C) 2013 The Android Open Source Project, licensed under Apache
+License 2.0. `scripts/generate_zip_filename_frequencies.py` quantizes the ranks
+of Han characters and Hangul syllables into three frequency bands. The license
+is distributed at [licenses/aosp-zip-frequencies-license.txt](licenses/aosp-zip-frequencies-license.txt).
 
 Source: https://android.googlesource.com/platform/frameworks/av/+/03357add725340c290b10f50db090267bbf511b1/media/libmedia/CharacterEncodingDetectorTables.h

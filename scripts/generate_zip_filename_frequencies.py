@@ -17,10 +17,12 @@ OUTPUT = (
 
 
 def generate(source: str) -> bytes:
-    # Each byte stores three 2-bit rank bands. Unlisted Han characters have band zero.
+    # Han ranks share one byte per character. Hangul uses four syllables per byte.
     first_han, last_han = 0x4E00, 0x9FFF
-    table = bytearray(last_han - first_han + 1)
-    for index, language in enumerate(("ja", "zhCN", "zhTW")):
+    first_hangul, last_hangul = 0xAC00, 0xD7A3
+    han = bytearray(last_han - first_han + 1)
+    hangul = bytearray((last_hangul - first_hangul + 1) // 4)
+    for index, language in enumerate(("ja", "zhCN", "zhTW", "ko")):
         match = re.search(rf"frequent_{language}\[\] = \{{(.*?)\}};", source, re.S)
         if match is None:
             raise ValueError(f"Missing AOSP frequency data for {language}")
@@ -29,10 +31,14 @@ def generate(source: str) -> bytes:
             raise ValueError(f"Expected 512 ranked AOSP characters for {language}")
         for codepoint, rank in entries:
             codepoint, rank = int(codepoint, 16), int(rank)
-            if first_han <= codepoint <= last_han:
-                band = 3 - int(rank > 128) - int(rank > 256)
-                table[codepoint - first_han] |= band << (2 * index)
-    return bytes(table)
+            band = 3 - int(rank > 128) - int(rank > 256)
+            if language == "ko":
+                if first_hangul <= codepoint <= last_hangul:
+                    offset = codepoint - first_hangul
+                    hangul[offset // 4] |= band << (2 * (offset % 4))
+            elif first_han <= codepoint <= last_han:
+                han[codepoint - first_han] |= band << (2 * index)
+    return bytes(han + hangul)
 
 
 def main() -> None:
