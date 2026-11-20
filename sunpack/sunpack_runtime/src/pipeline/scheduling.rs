@@ -840,11 +840,19 @@ impl<'a> Spawner<'a> {
         let spawner = self.clone();
         Box::pin(async move {
             if spawner.cancel.cancelled() { return Vec::new(); }
-            let available = spawner.consumers.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |available| Some(available.saturating_sub(items.len())),
-            ).unwrap();
+            let mut available = spawner.consumers.load(Ordering::Acquire);
+            loop {
+                let remaining = available.saturating_sub(items.len());
+                match spawner.consumers.compare_exchange_weak(
+                    available,
+                    remaining,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => available = current,
+                }
+            }
             let count = available.min(items.len());
             let _reservation = ConsumerReservation {
                 available: Arc::clone(&spawner.consumers),
