@@ -2115,6 +2115,36 @@ fn watch_volume_retry_waits_for_a_late_writer_to_close() {
     assert!(!output.exists());
     assert!(run.created_outputs.lock().unwrap().0.is_empty());
 
+    // A real prepared plan moves to the request once. An unsubmitted plan
+    // dies when its blocker retires, even with a checkpoint view in flight.
+    let mut lookup = Request::new(vec![first.clone()], Mode::Extract);
+    lookup.origin = Origin::Watch;
+    lookup.discovery_scope = Some(crate::scan::scope::NativeDiscoveryScope::new(
+        root.to_string_lossy().into_owned(), Some(0), Vec::new()));
+    let plan = engine.find_watch_volume(&lookup, &options, false).unwrap().unwrap();
+    let weak = Arc::downgrade(&plan);
+    let path = first.to_string_lossy();
+    let id = crate::watch_store::watch_path_key(&path);
+    let state = crate::watch_store::NativeWatchState::new();
+    let entry = Arc::new(serde_json::from_value(serde_json::json!({
+        "path":path, "size":64, "mtime":0.0, "file_id":"", "change_usn":0,
+        "status":"suspended_missing_volume", "last_error":"", "failure_kind":"missing_volume",
+        "failure_payload":{}, "last_attempt_at":0.0,
+    })).unwrap());
+    let mut operations = crate::watch_store::NativeWatchOperations::empty();
+    operations.put_entry(Arc::clone(&entry));
+    state.apply(&operations);
+    state.record_volume_check(id.clone(), &entry, 1, Some(plan));
+    let checkpoint = state.capture(1);
+    state.take_prepared_volumes(std::iter::once(path.as_ref()), &mut lookup.prepared_volumes);
+    assert_eq!(lookup.prepared_volumes.len(), 1);
+    state.take_prepared_volumes(std::iter::once(path.as_ref()), &mut lookup.prepared_volumes);
+    assert_eq!(lookup.prepared_volumes.len(), 1);
+    state.record_volume_check(id.clone(), &entry, 2, lookup.prepared_volumes.pop());
+    drop(state.apply(&crate::watch_store::NativeWatchOperations::retire_entries([id])));
+    assert!(weak.upgrade().is_none());
+    drop(checkpoint);
+
     drop(discovered);
     release_reader_resources_under_roots(vec![root.to_string_lossy().into_owned()]).unwrap();
     fs::remove_dir_all(root).unwrap();

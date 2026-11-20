@@ -26,15 +26,22 @@ if ($ApplicationOnly -and -not $SkipTests) {
     throw '-ApplicationOnly requires -SkipTests'
 }
 if (-not $TestsOnly) {
-    if ($SkipConfigure) {
-        if (-not (Test-Path -LiteralPath (Join-Path $BuildDir 'CMakeCache.txt'))) {
-            throw 'GUI build directory is not configured'
+    # CMake forwards UTF-8 MSBuild output even on consoles using a legacy code page.
+    $previousOutputEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        if ($SkipConfigure) {
+            if (-not (Test-Path -LiteralPath (Join-Path $BuildDir 'CMakeCache.txt'))) {
+                throw 'GUI build directory is not configured'
+            }
+        } else {
+            Invoke-Native -FilePath $CMakeCommand -Arguments @('-S', (Join-Path $repoRoot 'gui'), '-B', $BuildDir, '-A', $platform)
         }
-    } else {
-        Invoke-Native -FilePath $CMakeCommand -Arguments @('-S', (Join-Path $repoRoot 'gui'), '-B', $BuildDir, '-A', $platform)
+        $target = if ($ApplicationOnly) { 'SunPackGUI' } else { 'sunpack_gui_checks' }
+        Invoke-Native -FilePath $CMakeCommand -Arguments @('--build', $BuildDir, '--config', 'Release', '--target', $target, '--parallel', $Jobs)
+    } finally {
+        [Console]::OutputEncoding = $previousOutputEncoding
     }
-    $target = if ($ApplicationOnly) { 'SunPackGUI' } else { 'sunpack_gui_checks' }
-    Invoke-Native -FilePath $CMakeCommand -Arguments @('--build', $BuildDir, '--config', 'Release', '--target', $target, '--parallel', $Jobs)
 } else {
     foreach ($name in @('SunPackGUI.exe', 'sunpack_gui_tests.exe', 'sunpack_gui_ui_tests.exe')) {
         if (-not (Test-Path -LiteralPath (Join-Path $BuildDir "Release\$name"))) {

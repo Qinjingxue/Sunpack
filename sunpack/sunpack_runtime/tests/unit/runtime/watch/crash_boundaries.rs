@@ -174,7 +174,6 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
                 root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
                 parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
-                volume_checks: HashMap::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,

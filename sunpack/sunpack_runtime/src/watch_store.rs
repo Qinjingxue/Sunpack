@@ -480,11 +480,18 @@ impl<'de> Deserialize<'de> for Operation {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+struct VolumeCheck {
+    revision: u64,
+    prepared: Option<Arc<crate::pipeline::PreparedVolume>>,
+}
+
+#[derive(Default)]
 pub(crate) struct StateData {
     pending: HashMap<String, Arc<PendingRecord>>,
     entries: HashMap<String, Arc<EntryRecord>>,
     missing_volume_count: usize,
+    // Runtime cache owned by live missing-volume entries. Never checkpointed.
+    volume_checks: HashMap<String, VolumeCheck>,
     password_generation: i64,
     password_source_signature: String,
     cursors: BTreeMap<String, Cursor>,
@@ -492,16 +499,24 @@ pub(crate) struct StateData {
 }
 
 impl StateData {
+    fn owns_volume_check(&self, key: &str, entry: &EntryRecord) -> bool {
+        entry.is_missing_volume()
+            && self.entries.get(key).is_some_and(|current| std::ptr::eq(current.as_ref(), entry))
+    }
+
     fn trim_retired_storage(&mut self) {
         trim_map(&mut self.pending);
         trim_map(&mut self.entries);
+        self.trim_volume_checks();
     }
 
-    pub(crate) fn has_missing_volume(&self, path: &str) -> bool {
-        self.entries.get(path).is_some_and(|entry| entry.is_missing_volume())
+    fn trim_volume_checks(&mut self) {
+        if self.volume_checks.capacity() > 256 {
+            trim_map(&mut self.volume_checks);
+        }
     }
 
-    fn apply(&mut self, operation: &Operation) {
+    fn apply(&mut self, operation: &Operation) -> Option<Arc<crate::pipeline::PreparedVolume>> {
         match operation {
             Operation::Output(key, change) => {
                 if let Some(record) = self.pending.get_mut(key) {
@@ -549,8 +564,15 @@ impl StateData {
             }
             Operation::PutEntry(key, record) => {
                 let previous = self.entries.insert(key.clone(), Arc::clone(record));
-                self.missing_volume_count += usize::from(record.is_missing_volume());
-                self.missing_volume_count -= usize::from(previous.is_some_and(|entry| entry.is_missing_volume()));
+                let missing = record.is_missing_volume();
+                self.missing_volume_count += usize::from(missing);
+                if let Some(before) = previous.filter(|entry| entry.is_missing_volume()) {
+                    self.missing_volume_count -= 1;
+                    // Metadata refreshes can replace the Arc without changing the input.
+                    if !missing || before.file_id != record.file_id || before.size != record.size {
+                        return self.volume_checks.remove(key).and_then(|check| check.prepared);
+                    }
+                }
             }
             Operation::Delete(Collection::Pending, key) => {
                 self.pending.remove(key);
@@ -568,7 +590,10 @@ impl StateData {
                         }
                     }
                 }
-                self.missing_volume_count -= usize::from(previous.is_some_and(|entry| entry.is_missing_volume()));
+                if previous.is_some_and(|entry| entry.is_missing_volume()) {
+                    self.missing_volume_count -= 1;
+                    return self.volume_checks.remove(key).and_then(|check| check.prepared);
+                }
             }
             Operation::SetMetadata(generation, signature) => {
                 self.password_generation = *generation;
@@ -576,6 +601,7 @@ impl StateData {
             }
             Operation::SetCursors(cursors) => self.cursors = cursors.clone(),
         }
+        None
     }
 
     fn retire_continuation(&mut self, id: &str) {
@@ -852,10 +878,11 @@ impl NativeWatchState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-    pub(crate) fn apply(&self, operations: &NativeWatchOperations) {
+    pub(crate) fn apply(&self, operations: &NativeWatchOperations) -> Vec<Arc<crate::pipeline::PreparedVolume>> {
         let publication = self.events.lock().unwrap();
         let events = publication.as_ref().and_then(std::sync::Weak::upgrade);
         let mut notifications = Vec::new();
+        let mut retired_plans = Vec::new();
         {
             let mut data = self.lock();
             let mut removed = Vec::new();
@@ -865,7 +892,7 @@ impl NativeWatchState {
                         removed.push(Arc::clone(record));
                     }
                 }
-                data.apply(operation);
+                retired_plans.extend(data.apply(operation));
             }
             data.trim_retired_storage();
             // One WAL batch can replace a provisional member with its real
@@ -905,6 +932,8 @@ impl NativeWatchState {
                 let _ = events.submit(notification);
             }
         }
+        // Retire large prepared plans after the caller releases the WAL frontier.
+        retired_plans
     }
 
 }
@@ -1152,6 +1181,52 @@ impl NativeWatchState {
         self.lock().entries.get(key).cloned()
     }
 
+    pub(crate) fn volume_check_needed(&self, key: &str, entry: &EntryRecord, revision: u64, force: bool) -> bool {
+        let data = self.lock();
+        data.owns_volume_check(key, entry)
+            && (force || data.volume_checks.get(key).is_none_or(|check| check.revision != revision))
+    }
+
+    pub(crate) fn record_volume_check(&self, key: String, entry: &EntryRecord, revision: u64,
+        prepared: Option<Arc<crate::pipeline::PreparedVolume>>,
+    ) {
+        let mut data = self.lock();
+        if data.owns_volume_check(&key, entry) {
+            let old = data.volume_checks.insert(key, VolumeCheck { revision, prepared });
+            drop(data);
+            drop(old);
+        }
+    }
+
+    pub(crate) fn take_prepared_volumes<'a>(&self, paths: impl Iterator<Item = &'a str>,
+        plans: &mut Vec<Arc<crate::pipeline::PreparedVolume>>,
+    ) {
+        let mut data = self.lock();
+        if data.volume_checks.is_empty() { return; }
+        for path in paths {
+            if let Some(check) = data.volume_checks.get_mut(&path_key(path)) {
+                plans.extend(check.prepared.take());
+            }
+        }
+    }
+
+    pub(crate) fn forget_volume_checks(&self, key: &str, recursive: bool) {
+        let mut data = self.lock();
+        let own = data.volume_checks.remove(key);
+        let descendants: Vec<_> = if recursive {
+            data.volume_checks.extract_if(|path, _| is_path_under(path, key))
+                .filter_map(|(_, check)| check.prepared).collect()
+        } else { Vec::new() };
+        data.trim_volume_checks();
+        drop(data);
+        drop((own, descendants));
+    }
+
+    pub(crate) fn clear_volume_checks(&self) {
+        let retired = std::mem::take(&mut self.lock().volume_checks);
+        drop(retired);
+    }
+
     pub(crate) fn has_missing_volume_blockers(&self) -> bool {
         self.lock().missing_volume_count != 0
     }
@@ -1273,9 +1348,19 @@ impl NativeWatchState {
     }
 
     pub(crate) fn capture(&self, checkpoint_seq: u64) -> NativeWatchSnapshot {
+        let data = self.lock();
         NativeWatchSnapshot {
             checkpoint_seq,
-            data: self.lock().clone(),
+            data: StateData {
+                pending: data.pending.clone(),
+                entries: data.entries.clone(),
+                missing_volume_count: data.missing_volume_count,
+                password_generation: data.password_generation,
+                password_source_signature: data.password_source_signature.clone(),
+                cursors: data.cursors.clone(),
+                runtime: data.runtime.clone(),
+                ..StateData::default()
+            },
         }
     }
 
@@ -1361,6 +1446,7 @@ fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
             .into_iter()
             .map(|(key, cursor)| (key.to_lowercase(), cursor))
             .collect(),
+        volume_checks: HashMap::new(),
     };
     Ok((checkpoint_seq, data))
 }
@@ -1396,7 +1482,7 @@ fn replay_segment_file(
             )));
         }
         for operation in &decoded {
-            data.apply(operation);
+            let _ = data.apply(operation);
         }
         replay.applied_seq = seq;
         expected_seq = seq

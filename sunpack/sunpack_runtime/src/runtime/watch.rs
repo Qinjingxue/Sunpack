@@ -2368,7 +2368,6 @@ struct Scheduler {
     config_observers: Vec<ConfigSubscription>,
     pending: HashMap<String, Pending>,
     unpublished: HashSet<String>,
-    volume_checks: HashMap<String, (u64, Option<Arc<crate::pipeline::PreparedVolume>>)>,
     due: BTreeMap<(Instant, String), ()>,
     active: HashMap<String, Active>,
     active_paths: HashMap<String, Arc<str>>,
@@ -2611,7 +2610,6 @@ impl Scheduler {
             config_observers,
             pending: HashMap::new(),
             unpublished: HashSet::new(),
-            volume_checks: HashMap::new(),
             due: BTreeMap::new(),
             active: HashMap::new(),
             active_paths: HashMap::new(),
@@ -2685,7 +2683,7 @@ impl Scheduler {
         // history and the transient admission tables with the paused queue.
         self.pending = HashMap::new();
         self.unpublished = HashSet::new();
-        self.volume_checks = HashMap::new();
+        self.journal.state().clear_volume_checks();
         self.root_scope_records = HashMap::new();
         self.recovery_ids = HashMap::new();
         self.due.clear();
@@ -2919,7 +2917,7 @@ impl Scheduler {
             self.persist_candidates(BTreeMap::new(), true)?;
             self.pending = HashMap::new();
             self.unpublished = HashSet::new();
-            self.volume_checks = HashMap::new();
+            self.journal.state().clear_volume_checks();
             self.due.clear();
             if let Some(toast) = &self.toast {
                 toast.reset_batches();
@@ -3085,7 +3083,7 @@ impl Scheduler {
         });
 
         let apply = (|| {
-            if roots_changed || config_changed { self.volume_checks = HashMap::new(); }
+            if roots_changed || config_changed { self.journal.state().clear_volume_checks(); }
             if scheduler_changed || roots_changed {
                 self.activate_scan_options()?;
             }
@@ -3311,6 +3309,7 @@ impl Scheduler {
         if result.is_ok() { self.hub.stop(); }
         self.dedup_rebuild.take();
         let _ = self.drain_active(&mut result);
+        self.journal.state().clear_volume_checks();
         let signals = if self.hub.stopped.load(Ordering::Acquire) {
             self.hub.wait(None)
         } else { Signals::default() };
@@ -3596,7 +3595,6 @@ impl Scheduler {
                 && self.journal.state().pending(&path).is_none() { continue; }
             if let Some(pending) = self.pending.remove(&id) { self.due.remove(&(pending.due, id.clone())); }
             self.unpublished.remove(&id);
-            self.volume_checks.remove(&id);
             operations.finish_pending(&path, None);
             retired.push(path);
         }
@@ -4191,10 +4189,7 @@ impl Scheduler {
         }
         let path_key = watch_path_key(path);
         self.candidate_diagnostics.retire_path(&path_key, recursive);
-        self.volume_checks.remove(&path_key);
-        if recursive {
-            self.volume_checks.retain(|id, _| !is_path_under(id, &path_key));
-        }
+        self.journal.state().forget_volume_checks(&path_key, recursive);
         let is_missing = |pending: &Pending| {
             recorded_file_is_absent(&pending.candidate.path)
                 && self
@@ -4428,7 +4423,6 @@ impl Scheduler {
         // Retire blockers from the replaced generation before peer recovery
         // can invalidate that old input and discard this new pending arrival.
         if let Some(retired) = interrupted.or_else(|| blocked.as_ref().filter(|_| !blocked_unchanged)) {
-            self.volume_checks.remove(&id);
             self.journal.commit(false, |state| {
                 Ok(if state.entry(&candidate.path).is_some_and(|current| Arc::ptr_eq(retired, &current)) {
                     crate::watch_store::NativeWatchOperations::retire_entries(std::iter::once(id.clone()))
@@ -4612,7 +4606,7 @@ impl Scheduler {
         let signature = password_source_signature(&self.user_password_signature, snapshot.signature());
         let state = self.journal.state();
         let changed = state.password_source_signature() != signature;
-        if changed { self.volume_checks = HashMap::new(); }
+        if changed { state.clear_volume_checks(); }
         if changed || startup {
             // A prior runtime can publish the password generation before
             // scheduling every affected blocker. Reconcile entries once when
@@ -4686,7 +4680,6 @@ impl Scheduler {
         reconciled_route: Option<(String, Option<Arc<Recovery>>)>,
     ) -> io::Result<()> {
         self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
-        if self.journal.state().entry(&entry.path).is_none() { return Ok(()); }
         let retry_incomplete = reconciled_route.is_some();
         let Some((root, recovery)) = reconciled_route.or_else(|| self.blocker_route(entry)) else { return Ok(()); };
         let id = watch_path_key(&entry.path);
@@ -4697,7 +4690,7 @@ impl Scheduler {
             else if let Some(recovery) = &recovery { recovery.scope.clone() }
             else { return Ok(()); };
         let revision = if catalog_visible { self.catalog.bucket_revision(&scope, &entry.path) } else { 0 };
-        if !retry_incomplete && self.volume_checks.get(&id).is_some_and(|(before, _)| *before == revision) { return Ok(()); }
+        if !self.journal.state().volume_check_needed(&id, entry, revision, retry_incomplete) { return Ok(()); }
         let mut request = Request::with_config(vec![PathBuf::from(&entry.path)], Mode::Extract, Arc::clone(&self.settings));
         request.origin = Origin::Watch;
         request.deep = policy.deep;
@@ -4720,12 +4713,12 @@ impl Scheduler {
         if prepared.is_some() {
             // A claim or a replacement can arrive during lookup. Keep a
             // prepared plan only while there is an admission to hand it to.
-            self.volume_checks.remove(&id);
+            self.journal.state().forget_volume_checks(&id, false);
             self.observe_candidate_with_event(&root, entry.path.clone(), CandidateAdmission::Retry,
                 recovery, None, None, Some(&CandidateEvent::Business("volume_changed")), None)?;
             if !self.pending.contains_key(&id) { return Ok(()); }
         }
-        self.volume_checks.insert(id, (revision, prepared));
+        self.journal.state().record_volume_check(id, entry, revision, prepared);
         Ok(())
     }
 
@@ -5299,7 +5292,7 @@ impl Scheduler {
         // Retiring the admitted generation must not clear that update's WAL work.
         if !self.pending.contains_key(id) {
             self.unpublished.remove(id);
-            self.volume_checks.remove(id);
+            self.journal.state().forget_volume_checks(id, false);
         }
         self.journal.commit(false, |state| {
             let mut operations = crate::watch_store::NativeWatchOperations::empty();
@@ -5316,7 +5309,7 @@ impl Scheduler {
 
     fn retire_admission(&mut self, id: &str, pending: &Pending) -> io::Result<()> {
         self.unpublished.remove(id);
-        self.volume_checks.remove(id);
+        self.journal.state().forget_volume_checks(id, false);
         let path = &pending.candidate.path;
         if self
             .roots
@@ -5406,11 +5399,8 @@ impl Scheduler {
                 self.journal.state(), &candidate.path, &mut outputs,
             )?);
         }
-        for candidate in &candidates {
-            if let Some((_, plan)) = self.volume_checks.get_mut(&watch_path_key(&candidate.path)) {
-                request.prepared_volumes.extend(plan.take());
-            }
-        }
+        self.journal.state().take_prepared_volumes(candidates.iter().map(|input| input.path.as_str()),
+            &mut request.prepared_volumes);
         let engine = Arc::clone(&self.engine);
         let journal = Arc::clone(&self.journal);
         let hub = Arc::clone(&self.hub);
@@ -5970,6 +5960,7 @@ impl Scheduler {
                     let pending = self.pending.remove(&id).unwrap();
                     self.due.remove(&(pending.due, id.clone()));
                     self.unpublished.remove(&id);
+                    self.journal.state().forget_volume_checks(&id, false);
                 }
             }
             let group = SourceGroup {
@@ -6338,10 +6329,6 @@ impl Scheduler {
         let discovery_retry = outcome.errors.iter()
             .any(|error| matches!(error.kind, crate::pipeline::InputErrorKind::WatchDiscoveryIo(_)));
         self.persist_candidates(BTreeMap::new(), discovery_retry)?;
-        let state = self.journal.state().lock();
-        self.volume_checks.retain(|path, (_, plan)| state.has_missing_volume(path)
-            && (plan.is_none() || self.pending.contains_key(path)));
-        drop(state);
         self.arm_idle_cleanup();
         Ok((outcome, finish))
     }
@@ -6354,9 +6341,6 @@ impl Scheduler {
         }
         if self.unpublished.capacity() > 256.max(self.unpublished.len().saturating_mul(4)) {
             self.unpublished.shrink_to(self.unpublished.len().saturating_mul(2));
-        }
-        if self.volume_checks.capacity() > 256 {
-            crate::collections::trim_map(&mut self.volume_checks);
         }
         if self.active.capacity() > 256 {
             crate::collections::trim_map(&mut self.active);

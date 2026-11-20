@@ -48,7 +48,6 @@ fn done_counts_survive_disk_per_root_without_counting_volume_aliases_twice() {
         passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
         root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
         parent_observers: HashMap::new(), dependency_observers: HashMap::new(), config_observers: Vec::new(),
-        volume_checks: HashMap::new(),
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,

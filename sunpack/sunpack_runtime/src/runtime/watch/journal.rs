@@ -235,7 +235,7 @@ impl Journal {
         durable: bool,
         prepare: impl FnOnce(&NativeWatchState) -> io::Result<NativeWatchOperations>,
     ) -> io::Result<()> {
-        let ticket = {
+        let (ticket, retired_plans) = {
             let mut frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
             // A foreground publication captured before the final root was
@@ -258,11 +258,12 @@ impl Journal {
                 Arc::clone(&operations),
                 durable,
             )?;
-            self.state.apply(&operations);
+            let retired_plans = self.state.apply(&operations);
             frontier.seq = seq;
             frontier.records += 1;
-            ticket
+            (ticket, retired_plans)
         };
+        drop(retired_plans);
         let ticket = DEFERRED.with(|slot| {
             let mut slot = slot.borrow_mut();
             if let Some((_, tickets)) = slot.as_mut().filter(|(owner, _)| *owner == self as *const Self as usize) {

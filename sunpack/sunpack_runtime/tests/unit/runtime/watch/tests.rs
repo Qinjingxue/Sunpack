@@ -1529,7 +1529,6 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
         root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
         parent_observers: HashMap::new(),
         dependency_observers: HashMap::new(), config_observers: Vec::new(),
-        volume_checks: HashMap::new(),
         pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
         active: HashMap::new(), active_paths: HashMap::new(), tray_enabled: false,
         tray: None, monitor: None, toast: None, cache_deadline: None,
