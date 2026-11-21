@@ -304,3 +304,7 @@ The 7-Zip source license is copied at [licenses/7zip-source-license.txt](license
 
 The [input prefetch optimization experiments](docs/zh-CN/benchmark_worker_prefetch_300m.md)
 were rejected because gains did not hold across single-job and concurrent workloads.
+
+## Contact
+
+Author email: [2940293874wang@gmail.com](mailto:2940293874wang@gmail.com)

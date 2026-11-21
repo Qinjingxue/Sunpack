@@ -107,3 +107,7 @@ Rust가 검색, 형식 분석, 암호 및 볼륨 확인, 처리 계획을 담당
 모든 기여자 및 사용자와 [Core UI](https://github.com/ghboke/core-ui), [7-Zip](https://www.7-zip.org/), [zlib-ng](https://github.com/zlib-ng/zlib-ng), [LZ4](https://github.com/lz4/lz4), [RustCrypto](https://github.com/RustCrypto) 개발자에게 감사드립니다.
 
 SunPack 자체 코드는 [MIT 라이선스](LICENSE)를 따릅니다. 타사 소스와 바이너리는 각각의 원래 라이선스를 따릅니다. [타사 고지](THIRD_PARTY_NOTICES.md), [라이선스 원문](licenses/), [라이선스와 배포](docs/ko/licensing.md)를 참고하세요.
+
+## 연락처
+
+작성자 이메일: [2940293874wang@gmail.com](mailto:2940293874wang@gmail.com)

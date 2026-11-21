@@ -291,3 +291,7 @@ uv run --locked pytest
 倉程式庫包含多個第三方元件，包括位於 `sunpack/sevenzip_bridge/7z2604-src/` 的 7-Zip 26.05 裁剪定制實現（沿用原目錄名）、位於 `sunpack/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3、位於 `sunpack/third_party/lz4/` 的 LZ4 1.10.0，以及改編自 RustCrypto 的加密演算法實現。這些元件仍受各自原始授權條款約束。各元件的範圍、版權與授權條款資訊，以及發行時需要附帶的許可材料，詳見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/zh-TW/licensing.md)。
 
 其中，7-Zip 原始碼授權條款副本位於 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt)，GNU LGPL 2.1 完整文字位於 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt)；其他元件的授權條款副本見 [licenses/](licenses/)。
+
+## 聯絡方式
+
+作者電子郵件：[2940293874wang@gmail.com](mailto:2940293874wang@gmail.com)

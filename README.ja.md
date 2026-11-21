@@ -107,3 +107,7 @@ Rust は探索、フォーマット分析、パスワード・分割巻の解決
 貢献者と利用者の皆さま、ならびに [Core UI](https://github.com/ghboke/core-ui)、[7-Zip](https://www.7-zip.org/)、[zlib-ng](https://github.com/zlib-ng/zlib-ng)、[LZ4](https://github.com/lz4/lz4)、[RustCrypto](https://github.com/RustCrypto) の開発者に感謝します。
 
 SunPack が独自に作成したコードは [MIT ライセンス](LICENSE) です。サードパーティーのソースやバイナリには、それぞれの元のライセンスが適用されます。[サードパーティー告知](THIRD_PARTY_NOTICES.md)、[ライセンス原文](licenses/)、[ライセンスと配布](docs/ja/licensing.md) を参照してください。
+
+## 連絡先
+
+作者のメールアドレス：[2940293874wang@gmail.com](mailto:2940293874wang@gmail.com)
