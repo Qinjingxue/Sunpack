@@ -110,6 +110,25 @@ orders, for 7,296 traces and 76,224 physical files. It keeps per-seed and
 family/channel/width/tie summaries, confidence intervals, completion-to-proposal
 latency for logical inputs, censored inputs and invalid proposal bursts.
 
+In `lossy_reconciled`, every fourth visible mutation can deliver a directory
+event if it generated one; the last mutation has no exemption. Recovery uses
+a trace-wide one-second synthetic scan clock with a seeded phase independent
+of the writer. A scan delivers only visible files changed since its previous
+tick; it sees the latest state at the tick, not a future completion label.
+Unchanged scans do not call the scheduler and their cost is not measured.
+This models notification sensitivity, not the production broker scan cadence.
+
+To isolate the two changes, run the original final-mutation-timed recovery
+with the last-event exemption (`lossy_final_reconcile_control`), then periodic
+recovery with the exemption (`lossy_final_event_control`), then the corrected
+channel. All three share writer timelines, jitter on retained events and
+timer ordering. Pre-v4 exports used the historical recovery under the
+`lossy_reconciled` name; regenerate them with the named control before comparing.
+
+```powershell
+uv run --locked --extra test python -m benchmarks watch quiet-corpus --channels lossy_final_reconcile_control,lossy_final_event_control,lossy_reconciled
+```
+
 The test build substitutes virtual metadata, handle readability and a virtual
 clock, with immediate retirement at admission. Replay elapsed time and
 scheduler-thread CPU time exclude corpus generation, process startup and

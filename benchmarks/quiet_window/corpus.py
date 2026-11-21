@@ -7,9 +7,12 @@ from dataclasses import asdict, dataclass
 from typing import Iterator
 
 
-CONTRACT = "sunpack.writer-behaviour/3"
+CONTRACT = "sunpack.writer-behaviour/4"
 SPLITS = {"development": 0, "validation": 1_000_000, "heldout": 2_000_000}
 CHANNELS = ("immediate", "batched", "noisy", "lossy_reconciled")
+LOSSY_CONTROLS = ("lossy_final_reconcile_control", "lossy_final_event_control")
+REPLAY_CHANNELS = (*CHANNELS, *LOSSY_CONTROLS)
+SCAN_INTERVAL = 1.0
 WIDTHS = (1, 4, 8, 64)
 FAMILIES = (
     "segmented_preallocated", "segmented_sparse", "segmented_straggler",
@@ -123,7 +126,7 @@ class Trace:
         return trace
 
     def validate(self) -> None:
-        if (self.split not in SPLITS or self.family not in FAMILIES or self.channel not in CHANNELS
+        if (self.split not in SPLITS or self.family not in FAMILIES or self.channel not in REPLAY_CHANNELS
                 or self.width != len(self.files) or not self.files):
             raise ValueError(f"invalid cohort/width: {self.key}")
         keys = {file.key for file in self.files}
@@ -156,7 +159,17 @@ class Trace:
             previous = event.at
 
 
-def _observe(file: FileTruth, channel: str, rng: random.Random) -> list[Observation]:
+def _scan_changes(file: FileTruth, visible_changes: list[Mutation], phase: float) -> set[float]:
+    # Project a trace-wide scan clock onto changed files. Empty scans deliver
+    # nothing; several mutations within a tick expose only its latest snapshot.
+    def tick(at: float) -> float:
+        return phase + math.ceil((at - phase) / SCAN_INTERVAL) * SCAN_INTERVAL
+
+    return {tick(file.visible_at), *(tick(item.at) for item in visible_changes)}
+
+
+def _observe(file: FileTruth, channel: str, rng: random.Random, scan_phase: float) -> list[Observation]:
+    lossy = channel == "lossy_reconciled" or channel in LOSSY_CONTROLS
     deliveries = []
     visible_changes = [item for item in file.mutations if item.at >= file.visible_at]
     # A rename publishes the current file even when all writes happened under
@@ -167,7 +180,9 @@ def _observe(file: FileTruth, channel: str, rng: random.Random) -> list[Observat
         # writer can close without a fresh ReadDirectoryChangesW completion.
         if not item.directory_event:
             continue
-        if channel == "lossy_reconciled" and number % 4 and number != len(visible_changes) - 1:
+        if lossy and number % 4 and (
+            channel == "lossy_reconciled" or number != len(visible_changes) - 1
+        ):
             continue
         deliveries.append((item.at, "content" if item.content_usn == item.usn else "metadata"))
     if channel == "noisy":
@@ -176,11 +191,14 @@ def _observe(file: FileTruth, channel: str, rng: random.Random) -> list[Observat
     for at, kind in deliveries:
         if channel == "batched":
             at = math.ceil(at / 0.25) * 0.25 + 0.02
-        elif channel == "lossy_reconciled":
+        elif lossy:
+            # The omitted event can only be the last draw for this file.
             at += rng.uniform(0.1, 1.0)
         scheduled.append((at, kind))
-    if channel == "lossy_reconciled":
+    if channel == "lossy_final_reconcile_control":
         scheduled.append((max(file.visible_at, file.mutations[-1].at) + 1, "reconcile"))
+    elif lossy:
+        scheduled.extend((at, "reconcile") for at in _scan_changes(file, visible_changes, scan_phase))
     times = [item.at for item in file.mutations]
     last_content = last_usn = 0
     closes = [item.usn if item.change_reasons & 0x80000000 else 0 for item in file.mutations]
@@ -205,21 +223,22 @@ def _observe(file: FileTruth, channel: str, rng: random.Random) -> list[Observat
 def make_trace(family: str, split: str, seed: int, channel: str, width: int) -> Trace:
     from .writers import build_file
 
-    if family not in FAMILIES or channel not in CHANNELS or split not in SPLITS or width not in WIDTHS:
+    if family not in FAMILIES or channel not in REPLAY_CHANNELS or split not in SPLITS or width not in WIDTHS:
         raise ValueError("unsupported writer cohort")
     if family in MULTIPART and width < 4:
         raise ValueError("multipart writers require at least four volumes")
     family_index = FAMILIES.index(family)
     files, observations = [], []
+    base = (SPLITS[split] + seed) * 1_000_003 + family_index * 1009
+    scan_phase = random.Random(base + 41_021).random() * SCAN_INTERVAL
     for index in range(width):
         # Channels never affect writer randomness. Four volumes share transfer
         # scale, with a separate per-volume RNG.
-        base = (SPLITS[split] + seed) * 1_000_003 + family_index * 1009
         group_rng = random.Random(base + (index // 4) * 97)
         rng = random.Random(base + index * 97)
         file = build_file(family, index, rng, group_rng)
         files.append(file)
-        observations.extend(_observe(file, channel, random.Random(base + index * 97 + 79_919)))
+        observations.extend(_observe(file, channel, random.Random(base + index * 97 + 79_919), scan_phase))
     horizon = max(max(file.visible_at, file.actions[-1].at,
                       max((end for _, end in file.blocked), default=0)) for file in files) + 3600
     trace = Trace(f"{split}/{seed}/{family}/{channel}/{width}", split, seed, family, channel,

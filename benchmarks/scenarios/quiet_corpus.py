@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from benchmarks.harness.workspace import BenchmarkWorkspace, REPO_ROOT
-from benchmarks.quiet_window.corpus import CHANNELS, CONTRACT, FAMILIES, SPLITS, WIDTHS, Trace, generate
+from benchmarks.quiet_window.corpus import CHANNELS, CONTRACT, FAMILIES, REPLAY_CHANNELS, SPLITS, WIDTHS, Trace, generate
 from benchmarks.quiet_window.scheduler import scheduler_replay
 from benchmarks.quiet_window.statistics import BURST_WINDOWS, EVALUATION_CONTRACT, METRICS, interval, macro, paired_comparison, summarize_files
 
@@ -57,7 +57,7 @@ def main(argv=None):
     p.add_argument('--seeds', type=int, default=16)
     p.add_argument('--splits', type=lambda s: selection(s, SPLITS), default=tuple(SPLITS))
     p.add_argument('--families', type=lambda s: selection(s, FAMILIES), default=FAMILIES)
-    p.add_argument('--channels', type=lambda s: selection(s, CHANNELS), default=CHANNELS)
+    p.add_argument('--channels', type=lambda s: selection(s, REPLAY_CHANNELS), default=CHANNELS)
     p.add_argument('--widths', type=lambda s: tuple(map(int, selection(s, WIDTHS))), default=WIDTHS)
     p.add_argument('--tie-orders', type=lambda s: selection(s, ('observation_first', 'timer_first')), default=('observation_first', 'timer_first'))
     p.add_argument('--corpus', type=Path, help='Replay previously exported JSONL or JSONL.gz traces.')
