@@ -14,6 +14,12 @@ SunPack は Windows 10 バージョン 1709 以降と Windows 11 に対応しま
 2. インストーラーを実行し、UAC の確認を承認します。既定のインストール先は `C:\Program Files\SunPack` です。Watch Broker サービスのインストールには管理者権限が必要です。
 3. 必要に応じて、システムの `PATH` への追加、エクスプローラーの右クリックメニューへの登録、Windows サインイン時の Watch 起動を選びます。PATH に追加した場合は PowerShell を開き直します。
 
+WinGet でサイレントインストールするには、次のコマンドを実行します。
+
+```powershell
+winget install --id Qinjingxue.SunPack --exact --source winget --silent
+```
+
 ## 使い方
 
 | コマンド | 別名 | 用途 |

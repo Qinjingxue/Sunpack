@@ -14,6 +14,12 @@ SunPack은 Windows 10 버전 1709 이상과 Windows 11을 지원합니다. Watch
 2. 설치 프로그램을 실행하고 UAC 요청을 승인합니다. 기본 설치 경로는 `C:\Program Files\SunPack`입니다. Watch Broker 서비스를 설치하려면 관리자 권한이 필요합니다.
 3. 필요한 경우 시스템 `PATH`에 추가하거나 탐색기의 마우스 오른쪽 버튼 메뉴와 Windows 로그인 시 Watch 시작을 설정합니다. PATH에 추가했다면 PowerShell을 다시 엽니다.
 
+WinGet으로 자동 설치하려면 다음 명령을 실행합니다.
+
+```powershell
+winget install --id Qinjingxue.SunPack --exact --source winget --silent
+```
+
 ## 사용법
 
 | 명령 | 별칭 | 기능 |
