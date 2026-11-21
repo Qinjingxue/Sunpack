@@ -156,6 +156,30 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
     Ok(Some(consumed == next.size && crc.finalize() == next.crc))
 }
 
+pub(super) fn raw_zip_head_matches_directory(
+    head: &VolumeAnchor,
+    tail: &VolumeAnchor,
+    mut directory: crate::formats::zip::RelationDirectory,
+) -> bool {
+    use crate::formats::zip::{relation_local_key, visit_relation_directory, RelationLocalFields};
+    let Ok(Some(local)) = relation_local_key(&head.path, head.structure_offset.unwrap_or(0)) else {
+        return false;
+    };
+    // For byte-sliced ZIPs the saved offset is logical; the directory reader
+    // is opening only the physical tail and needs the local coordinate.
+    let Some(physical) = directory.end.checked_sub(directory.size) else { return false; };
+    directory.offset = physical;
+    let mut matched = false;
+    let complete = visit_relation_directory(&tail.path, directory, |record, values| {
+        if values.disk == 0 && values.local_offset == 0 {
+            matched |= record.name == local.name.as_slice()
+                && RelationLocalFields::new(record.method, record.flags, record.crc32,
+                    values.compressed, values.uncompressed) == local.fields;
+        }
+    });
+    complete.is_ok_and(|complete| complete && matched)
+}
+
 /// A sibling's start is only an upper bound: padding is not archive data.
 /// Solve the one carrier extent from the already collected set geometry.
 /// This is shared by assignment and final validation, with no content reads.

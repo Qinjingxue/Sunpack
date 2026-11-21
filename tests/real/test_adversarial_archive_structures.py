@@ -19,6 +19,49 @@ def _files_under(root):
     }
 
 
+@pytest.mark.parametrize("layout", ["raw-head", "embedded-head", "shared-first-chunk", "member-aligned-chunk"])
+def test_deep_zip_member_headers_do_not_compete_with_raw_split_head(package, tmp_path, layout):
+    # Each continuation starts inside the previous member, then contains
+    # another genuine local header. The end record is on the third chunk.
+    entries = {f"member-{n}.bin": bytes([65 + n]) * 16384 for n in range(5)}
+    independent = io.BytesIO()
+    with zipfile.ZipFile(independent, "w") as archive:
+        archive.writestr("independent.txt", b"independent")
+    inner = independent.getvalue()
+    prefix = b"carrier-prefix" * 211 if layout == "embedded-head" else b""
+    if layout == "shared-first-chunk":
+        original = entries["member-0.bin"]
+        entries["member-0.bin"] = original[:500] + inner + original[500 + len(inner):]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, data in entries.items():
+            archive.writestr(name, data)
+        positions = [member.header_offset for member in archive.infolist()]
+    first, second = positions[1] - (0 if layout == "member-aligned-chunk" else 37), positions[2] - 53
+    raw = buffer.getvalue()
+    source = tmp_path / "inputs"
+    source.mkdir()
+    package.configure(live=False, filesystem={"scan_filters_enabled": False})
+    slices = (prefix + raw[:first], raw[first:second], raw[second:])
+    paths = [source / f"split.part{n}.bin" for n in (1, 2, 3)]
+    for path, data in zip(paths[:2], slices[:2], strict=True):
+        path.write_bytes(data)
+    pending = package.json("scan", "-d", "-npa", source, code=1)
+    item, = [row for row in pending["items"] if row.get("error_kind") == "missing_volume"]
+    assert item["main_path"] == str(paths[0]), pending
+    paths[2].write_bytes(slices[2])
+    # A separately closed embedded ZIP must still be discovered.
+    if layout != "shared-first-chunk":
+        (source / "independent.bin").write_bytes(b"prefix" + inner + b"suffix")
+    output = tmp_path / "out"
+    report = extract_report(package, source, output, recur="1")
+    # A shared carrier is one physical task even with two logical ZIP outputs.
+    assert report["summary"]["success_count"] == (1 if layout == "shared-first-chunk" else 2), report
+    assert {p.name: p.read_bytes() for p in output.rglob("*") if p.is_file()} == {
+        **entries, "independent.txt": b"independent",
+    }
+
+
 def test_zip64_stream_descriptors_with_reverse_central_directory(package, tmp_path):
     # An empty ZIP64 member's descriptor has the same initial bytes as a
     # classic descriptor. It is physically followed by another local record,

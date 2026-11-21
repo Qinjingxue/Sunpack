@@ -545,6 +545,130 @@ impl BucketView<'_> {
     }
 }
 
+/// Embedded may find ZIP member headers inside raw continuation chunks.
+/// Try the ordinary filename solver once, using EOCD geometry to choose
+/// the only possible start, rather than treating every hit as a rival head.
+fn raw_embedded_zip(
+    view: &BucketView<'_>,
+    cached: Option<&RelationCache>,
+    features: &mut HashMap<usize, NameFeatures>,
+) -> Option<ProposalValidation> {
+    let anchor = |i: usize| view.rows[i].anchor.as_deref();
+    let weak = |a: &VolumeAnchor| {
+        a.has_any(EMBEDDED_VOLUME) && a.has_any(ZIP_LOCAL_HEADER)
+            && !a.has_any(TERMINAL)
+    };
+    let mut heads = view.indexes.iter().copied().filter(|&i| {
+        anchor(i).is_some_and(|a| a.has_any(ZIP_LOCAL_HEADER) && !a.has_any(TERMINAL))
+    });
+    let first = heads.next()?;
+    let needs_layout = anchor(first).is_some_and(|a| {
+        a.carrier_limit.is_some() && a.has_any(EMBEDDED_VOLUME)
+    }) || heads.clone().any(|i| anchor(i).is_some_and(weak));
+    if !needs_layout && !(anchor(first).is_some_and(weak) && heads.clone().next().is_some()) {
+        return None;
+    }
+    let mut heads = std::iter::once(first).chain(heads);
+
+    let parent = Path::new(&view.rows[first].path).parent();
+    let mut paths = HashSet::new();
+    let mut tail = None;
+    let mut size = 0u64;
+    for &i in view.indexes {
+        let row = &view.rows[i];
+        if Path::new(&row.path).parent() != parent || !paths.insert(&row.path_key) {
+            return None;
+        }
+        let bytes = if let Some(a) = anchor(i) {
+            if a.has_any(ZIP_SPLIT_START | ZIP_SPLIT_END | ZIP_DIRECTORY_MEMBER)
+                || a.sfx || a.payload_end.is_some()
+            {
+                return None;
+            }
+            if a.has_any(TERMINAL) {
+                let directory = a.zip_directory.as_deref()?;
+                if !a.has_any(ZIP_TAIL_WITHOUT_HEAD) || directory.disk != 0 || directory.cd_disk != 0
+                    || tail.replace((i, directory)).is_some()
+                {
+                    return None;
+                }
+                directory.end
+            } else {
+                a.size
+            }
+        } else {
+            row.size?
+        };
+        size = size.checked_add(bytes)?;
+        features.entry(i).or_insert_with(|| cached
+            .and_then(|cache| cache.names.get(&row.path_key)).cloned()
+            .unwrap_or_else(|| NameFeatures::parse(row.name())));
+    }
+    let start = match tail {
+        Some((_, directory)) => Some(size.checked_sub(directory.offset.checked_add(directory.size)?)?),
+        None => None,
+    };
+    let mut eligible = heads.clone().filter(|&i| match start {
+        Some(start) => anchor(i).is_some_and(|a| a.structure_offset == Some(start)),
+        None => features[&i].numbers.iter().any(|n| n.value == 1),
+    });
+    let first_match = eligible.next()?;
+    let tied_geometry = eligible.clone().next().is_some();
+    let head = if tied_geometry {
+        let mut numbered = std::iter::once(first_match).chain(eligible)
+            .filter(|i| features[i].numbers.iter().any(|n| n.value == 1));
+        let head = numbered.next()?;
+        if numbered.next().is_some() { return None; }
+        head
+    } else {
+        first_match
+    };
+    if heads.any(|i| i != head && !anchor(i).is_some_and(weak)) {
+        return None;
+    }
+    if view.indexes.iter().any(|&i| i != head && anchor(i).is_some_and(|a| a.carrier_limit.is_some())) {
+        return None;
+    }
+    let mut facts = view.facts.clone();
+    facts.get_mut(&head)?.exact_slot = Some(1);
+    let view = BucketView { facts: &facts, features, loose_numeric_allowed: false, ..*view };
+    let (assignment, reason) = view.solve(view.fixed());
+    if reason.is_some() || assignment.slots.len() != view.indexes.len()
+        || !assignment.slots.keys().copied().zip(1..).all(|(slot, expected)| slot == expected)
+        || tail.is_some_and(|(tail, _)| assignment.slots.last_key_value().map(|(_, i)| *i) != Some(tail))
+    {
+        return None;
+    }
+    // Only the selected layout reads the directory. Its reference to the
+    // first local header confirms the start; other local hits stay opaque.
+    if let Some((i, directory)) = tail {
+        if !validate::raw_zip_head_matches_directory(anchor(head)?, anchor(i)?, *directory) {
+            return None;
+        }
+    }
+    let extend_head = anchor(head)?.carrier_limit.is_some() && tail.is_some();
+    let logical = filename::logical_name(view.rows[head].name(), &view.features[&head], "zip");
+    let mut validation = materialize(&view, assignment, &logical, None, None)?;
+    let anchors = &mut Arc::make_mut(&mut validation.facts).anchors;
+    if extend_head {
+        // A separately closed archive inside the first chunk can give an
+        // apparent end bound. Keep its Embedded candidate, but don't cut the
+        // now-proven outer ZIP at that position.
+        let a = Arc::make_mut(anchors.get_mut(&view.rows[head].path_key)?);
+        a.payload_end = Some(a.size);
+    }
+    for &i in view.indexes {
+        if i != head && anchor(i).is_some_and(weak) {
+            // The chosen raw layout reads the continuation from byte zero.
+            // Keep the original embedded facts for other interpretations.
+            let a = Arc::make_mut(anchors.get_mut(&view.rows[i].path_key)?);
+            a.structure_offset = None;
+            a.flags &= !ZIP_LOCAL_HEADER;
+        }
+    }
+    Some(validation)
+}
+
 pub(super) fn resolve_buckets(
     rows: &[RelationInput],
     index: &BucketIndex,
@@ -657,6 +781,14 @@ pub(super) fn resolve_buckets(
                     })
                 {
                     continue;
+                }
+                if format == "zip" {
+                    let view = BucketView { rows, indexes: &members, facts: &facts,
+                        features: &HashMap::new(), format, loose_numeric_allowed: false };
+                    if let Some(validation) = raw_embedded_zip(&view, cached, &mut features) {
+                        output.push(validation);
+                        continue;
+                    }
                 }
                 // A raw ZIP first chunk is proven only by an independent terminal
                 // single-disk EOCD in this view, not by a local header alone.
