@@ -338,11 +338,23 @@ pub(crate) struct EntryRecord {
     pub(crate) failure_kind: String,
     pub(crate) failure_payload: Map<String, Value>,
     pub(crate) last_attempt_at: f64,
+    // Catalog revisions belong to the running process. Reconcile restored entries against the new catalog.
+    #[serde(skip)]
+    pub(crate) layout_checked_at: u64,
 }
 
 impl EntryRecord {
     pub(crate) fn is_missing_volume(&self) -> bool {
         self.status == "suspended_missing_volume"
+    }
+
+    pub(crate) fn waits_for_volume(&self) -> bool {
+        self.is_missing_volume() || self.waits_for_layout()
+    }
+
+    pub(crate) fn waits_for_layout(&self) -> bool {
+        matches!(self.status.as_str(), "failed_password" | "failed_terminal")
+            && self.failure_payload.get("source_group").is_some_and(|group| group["multipart"] == true)
     }
 
     pub(crate) fn continuation(&self) -> Option<&str> {
@@ -489,6 +501,7 @@ struct VolumeCheck {
 pub(crate) struct StateData {
     pending: HashMap<String, Arc<PendingRecord>>,
     entries: HashMap<String, Arc<EntryRecord>>,
+    volume_wait_count: usize,
     missing_volume_count: usize,
     // Runtime cache owned by live missing-volume entries. Never checkpointed.
     volume_checks: HashMap<String, VolumeCheck>,
@@ -500,7 +513,7 @@ pub(crate) struct StateData {
 
 impl StateData {
     fn owns_volume_check(&self, key: &str, entry: &EntryRecord) -> bool {
-        entry.is_missing_volume()
+        entry.waits_for_volume()
             && self.entries.get(key).is_some_and(|current| std::ptr::eq(current.as_ref(), entry))
     }
 
@@ -564,12 +577,14 @@ impl StateData {
             }
             Operation::PutEntry(key, record) => {
                 let previous = self.entries.insert(key.clone(), Arc::clone(record));
-                let missing = record.is_missing_volume();
-                self.missing_volume_count += usize::from(missing);
-                if let Some(before) = previous.filter(|entry| entry.is_missing_volume()) {
-                    self.missing_volume_count -= 1;
+                self.missing_volume_count += usize::from(record.is_missing_volume());
+                let waiting = record.waits_for_volume();
+                self.volume_wait_count += usize::from(waiting);
+                if let Some(before) = previous.filter(|entry| entry.waits_for_volume()) {
+                    self.volume_wait_count -= 1;
+                    self.missing_volume_count -= usize::from(before.is_missing_volume());
                     // Metadata refreshes can replace the Arc without changing the input.
-                    if !missing || before.file_id != record.file_id || before.size != record.size {
+                    if !waiting || before.is_missing_volume() != record.is_missing_volume() || before.file_id != record.file_id || before.size != record.size {
                         return self.volume_checks.remove(key).and_then(|check| check.prepared);
                     }
                 }
@@ -590,8 +605,9 @@ impl StateData {
                         }
                     }
                 }
-                if previous.is_some_and(|entry| entry.is_missing_volume()) {
-                    self.missing_volume_count -= 1;
+                if let Some(before) = previous.filter(|entry| entry.waits_for_volume()) {
+                    self.volume_wait_count -= 1;
+                    self.missing_volume_count -= usize::from(before.is_missing_volume());
                     return self.volume_checks.remove(key).and_then(|check| check.prepared);
                 }
             }
@@ -1227,14 +1243,19 @@ impl NativeWatchState {
 
     pub(crate) fn take_prepared_volumes<'a>(&self, paths: impl Iterator<Item = &'a str>,
         plans: &mut Vec<Arc<crate::pipeline::PreparedVolume>>,
-    ) {
+    ) -> u64 {
+        let mut revision = crate::scan::catalog::current_revision();
         let mut data = self.lock();
-        if data.volume_checks.is_empty() { return; }
+        if data.volume_checks.is_empty() { return revision; }
         for path in paths {
             if let Some(check) = data.volume_checks.get_mut(&path_key(path)) {
-                plans.extend(check.prepared.take());
+                if let Some(plan) = check.prepared.take() {
+                    revision = revision.min(check.revision);
+                    plans.push(plan);
+                }
             }
         }
+        revision
     }
 
     pub(crate) fn forget_volume_checks(&self, key: &str, recursive: bool) {
@@ -1256,6 +1277,10 @@ impl NativeWatchState {
 
     pub(crate) fn has_missing_volume_blockers(&self) -> bool {
         self.lock().missing_volume_count != 0
+    }
+
+    pub(crate) fn has_volume_waiters(&self) -> bool {
+        self.lock().volume_wait_count != 0
     }
 
     pub(crate) fn pending_items(&self) -> Vec<Arc<PendingRecord>> {
@@ -1381,6 +1406,7 @@ impl NativeWatchState {
             data: StateData {
                 pending: data.pending.clone(),
                 entries: data.entries.clone(),
+                volume_wait_count: data.volume_wait_count,
                 missing_volume_count: data.missing_volume_count,
                 password_generation: data.password_generation,
                 password_source_signature: data.password_source_signature.clone(),
@@ -1465,6 +1491,7 @@ fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
         runtime: snapshot.runtime,
         pending: snapshot.pending_work,
         missing_volume_count: snapshot.entries.values().filter(|entry| entry.is_missing_volume()).count(),
+        volume_wait_count: snapshot.entries.values().filter(|entry| entry.waits_for_volume()).count(),
         entries: snapshot.entries,
         password_generation,
         password_source_signature: snapshot.password_source_signature,

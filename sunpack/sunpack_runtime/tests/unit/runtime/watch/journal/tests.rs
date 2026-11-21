@@ -246,6 +246,7 @@ fn cpp_query_recovers_durable_blocker_after_writer_death() {
                 last_error: String::new(),
                 failure_kind: String::new(),
                 failure_payload: Default::default(),
+                layout_checked_at: 0,
                 last_attempt_at: crate::io::display_store::utc_us() as f64 / 1_000_000.0,
             }));
             Ok(operations)

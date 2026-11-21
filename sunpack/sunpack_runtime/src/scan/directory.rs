@@ -1836,10 +1836,11 @@ impl NativeWatchCatalog {
         quiet_seconds: Option<f64>,
         last_content_event_at: Option<f64>,
         cadence_seconds: f64,
-        pending_interval_seconds: f64,
-    ) {
+        pending_interval_seconds: f64, newly_available: bool,
+    ) -> bool {
         (|| {
             let key = crate::path_keys::path_key(path);
+            let mut added = false;
             let mut tables = self.catalogs.lock().unwrap();
             for table in tables.edit().values_mut() {
                 if let Some(row) = table.rows.get_mut(key.as_str()) {
@@ -1855,8 +1856,10 @@ impl NativeWatchCatalog {
                         observation.cadence_seconds = cadence_seconds;
                         observation.pending_interval_seconds = pending_interval_seconds;
                     }
+                    added |= table.admit_member(&key, newly_available);
                 }
             }
+            added
         })()
     }
 
@@ -1930,9 +1933,15 @@ impl NativeWatchCatalog {
                 .flatten()
         })()
     }
-    pub(crate) fn bucket_revision(&self, scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str) -> u64 {
+    pub(crate) fn bucket_revisions(&self, scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str) -> (u64, u64) {
         self.catalogs.lock().unwrap().scopes.get(scope.key())
-            .and_then(|table| table.buckets.get(catalog_stem(seed).as_str())).map_or(0, |bucket| bucket.revision)
+            .and_then(|table| table.buckets.get(catalog_stem(seed).as_str())).map_or((0, 0), |bucket| (bucket.revision, bucket.last_addition))
+    }
+
+    pub(crate) fn peer_needs_inventory(&self, scope: &crate::scan::scope::NativeDiscoveryScope, key: &str, path: &str) -> bool {
+        self.catalogs.lock().unwrap().scopes.get(scope.key()).is_some_and(|table|
+            table.rows.get(key).is_none_or(|row| !row.persistent())
+                && table.buckets.contains_key(catalog_stem(path).as_str()))
     }
 
     pub(crate) fn bucket_keys(
@@ -2325,6 +2334,7 @@ fn apply_catalog_scan(
                 changed_keys.push(Arc::clone(&key));
             }
             catalog.insert_key(Arc::clone(&key), record);
+            if baseline { catalog.admit_member(&key, true); }
             if let Some((size, mtime, observed)) = observation {
                 if baseline { catalog.set_generated(&key, GeneratedBaseline::new(size, mtime, &observed.file_id, observed.change_usn)); }
                 let row = catalog.rows.get_mut(key.as_ref()).unwrap();

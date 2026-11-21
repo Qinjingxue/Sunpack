@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn only_a_new_ready_peer_advances_the_layout_revision() {
+    let mut table = ScopeCatalog::default();
+    let file = |name: &str| DirectoryEntryRecord { path: name.to_owned(), ..Default::default() };
+    let head = r"C:\in\beta.part1.bin";
+    let middle = r"C:\in\beta.part02.bin";
+    table.insert_key(head.into(), file(head));
+    assert!(!table.admit_member(head, false));
+    let started = current_revision();
+    table.insert_key(middle.into(), file(middle));
+    assert!(table.buckets["beta"].last_addition <= started);
+    assert!(table.admit_member(middle, true));
+    let ready = table.buckets["beta"].last_addition;
+    assert!(ready > started);
+    table.insert_key(middle.into(), file(middle));
+    assert!(!table.admit_member(middle, true));
+    assert!(!table.admit_member(head, true));
+    assert_eq!(table.buckets["beta"].last_addition, ready);
+}
+
+#[test]
 fn unchanged_close_still_ends_saved_phase_without_relearning_cadence() {
     let mut observation = NativeWatchObservation::new(42, 10.0, FileId::new("file"), 7);
     observation.quiet_seconds = 2.0;

@@ -11,6 +11,7 @@ const DIRECTORY: u8 = 1;
 const HAS_SIZE: u8 = 2;
 const HAS_MTIME: u8 = 4;
 const TRANSIENT: u8 = 8;
+const READY_MEMBER: u8 = 16;
 
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(from = "String", into = "String")]
@@ -284,13 +285,20 @@ impl BucketRows {
 pub(super) struct CatalogBucket {
     rows: BucketRows,
     pub revision: u64,
+    pub last_addition: u64,
+}
+static NEXT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+pub(crate) fn current_revision() -> u64 {
+    NEXT_REVISION.load(std::sync::atomic::Ordering::Relaxed) - 1
 }
 fn next_revision() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    NEXT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 impl CatalogBucket {
-    fn new(key: Arc<str>) -> Self { Self { rows: BucketRows::One(key), revision: next_revision() } }
+    fn new(key: Arc<str>) -> Self {
+        let revision = next_revision();
+        Self { rows: BucketRows::One(key), revision, last_addition: 0 }
+    }
     pub fn iter(&self) -> std::slice::Iter<'_, Arc<str>> { self.rows.iter() }
     fn touch(&mut self) { self.revision = next_revision(); }
     fn push(&mut self, key: Arc<str>) { self.rows.push(key); self.touch(); }
@@ -355,6 +363,18 @@ impl ScopeCatalog {
     pub fn touch(&mut self, path: &str) {
         if let Some(bucket) = self.buckets.get_mut(catalog_stem(path).as_str()) { bucket.touch(); }
     }
+    // Content changes preserve membership. Only the first ready observation of a
+    // new pathname can expand the set of usable layouts.
+    pub fn admit_member(&mut self, key: &str, newly_available: bool) -> bool {
+        let Some(row) = self.rows.get_mut(key) else { return false; };
+        if !row.persistent() || row.flags & (DIRECTORY | READY_MEMBER) != 0 { return false; }
+        row.flags |= READY_MEMBER;
+        if !newly_available { return false; }
+        let stem = catalog_stem(row.name());
+        self.buckets.get_mut(stem.as_str()).expect("indexed file").last_addition = next_revision();
+        true
+    }
+
     pub fn insert_key(&mut self, key: Arc<str>, record: DirectoryEntryRecord) {
         self.insert_row(key, record, false);
     }
@@ -374,7 +394,7 @@ impl ScopeCatalog {
                 }
                 old.size = record.size.unwrap_or(0);
                 old.mtime_ns = record.mtime_ns.unwrap_or(0);
-                old.flags = u8::from(record.is_dir) * DIRECTORY
+                old.flags = (old.flags & READY_MEMBER) | u8::from(record.is_dir) * DIRECTORY
                     | u8::from(record.size.is_some()) * HAS_SIZE
                     | u8::from(record.mtime_ns.is_some()) * HAS_MTIME;
                 if !record.is_dir {
@@ -410,6 +430,7 @@ impl ScopeCatalog {
             row.observation = old.observation.take();
             reuse_indexes = old.persistent() && row.persistent() && old.is_dir() == row.is_dir();
             if reuse_indexes {
+                row.flags |= old.flags & READY_MEMBER;
                 self.release_parent(&old);
             } else {
                 self.remove_indexes(&key, &old, None);

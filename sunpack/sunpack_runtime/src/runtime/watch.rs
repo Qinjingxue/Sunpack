@@ -2145,6 +2145,7 @@ fn scope_record(scope: &NativeDiscoveryScope) -> serde_json::Map<String, Value> 
 
 #[derive(Default)]
 struct ClaimedSources {
+    layout_checked_at: u64,
     cancelled: bool,
     coalesced: bool,
     deduplicated: HashSet<String>,
@@ -3485,7 +3486,7 @@ impl Scheduler {
                 // Reuse service repair rather than advertising an inactive model.
                 if let Some(error) = failure { return Err(error); }
             }
-            if self.enabled() && !signals.published_outputs.is_empty() && self.journal.state().has_missing_volume_blockers() {
+            if self.enabled() && !signals.published_outputs.is_empty() && self.journal.state().has_volume_waiters() {
                 let buckets: HashSet<_> = signals.published_outputs.into_iter().map(|(root, output)|
                     (watch_path_key(&root), crate::scan::catalog::catalog_stem(&output))).collect();
                 let mut retried = HashSet::new();
@@ -4106,7 +4107,7 @@ impl Scheduler {
                     // checking identity; a replaced parent can reuse every name.
                     if self.catalog.observation(&path).is_some()
                         || self.journal.state().entry(&path).is_some_and(|entry| {
-                            matches!(entry.status.as_str(), "failed_password" | "suspended_missing_volume")
+                            entry.status == "failed_password" || entry.waits_for_volume()
                         })
                     {
                         CandidateAdmission::Observe
@@ -4763,31 +4764,36 @@ impl Scheduler {
         for id in self.catalog.bucket_keys(scope, stem) {
             if retried.contains(&id) { continue; }
             if let Some(entry) = self.journal.state().entry_by_key(&id)
-                .filter(|entry| entry.is_missing_volume()) {
+                .filter(|entry| entry.waits_for_volume()) {
                 retried.insert(id);
-                self.check_missing_volume(&entry, None)?;
+                self.check_volume_waiter(&entry, None)?;
             }
         }
         Ok(())
     }
 
-    fn check_missing_volume(
+    fn check_volume_waiter(
         &mut self,
         entry: &crate::watch_store::EntryRecord,
         reconciled_route: Option<(String, Option<Arc<Recovery>>)>,
     ) -> io::Result<()> {
-        self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
         let retry_incomplete = reconciled_route.is_some();
         let Some((root, recovery)) = reconciled_route.or_else(|| self.blocker_route(entry)) else { return Ok(()); };
         let id = watch_path_key(&entry.path);
-        if self.defer_claimed_path(&id) { return Ok(()); }
-        let (policy, watched) = &self.roots[&root];
+        let watched = &self.roots[&root].1;
         let catalog_visible = self.catalog.dependency_contains(watched, &entry.path) && !self.catalog.is_owned(&entry.path);
         let scope = if catalog_visible { watched.clone() }
             else if let Some(recovery) = &recovery { recovery.scope.clone() }
             else { return Ok(()); };
-        let revision = if catalog_visible { self.catalog.bucket_revision(&scope, &entry.path) } else { 0 };
+        let (modified, added) = if catalog_visible { self.catalog.bucket_revisions(&scope, &entry.path) } else { (0, 0) };
+        let revision = if entry.is_missing_volume() { modified } else {
+            if added <= entry.layout_checked_at || self.pending.contains_key(&id) { return Ok(()); }
+            added
+        };
         if !self.journal.state().volume_check_needed(&id, entry, revision, retry_incomplete) { return Ok(()); }
+        self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
+        if self.journal.state().entry_by_key(&id).is_none() || self.defer_claimed_path(&id) { return Ok(()); }
+        let policy = &self.roots[&root].0;
         let mut request = Request::with_config(vec![PathBuf::from(&entry.path)], Mode::Extract, Arc::clone(&self.settings));
         request.origin = Origin::Watch;
         request.deep = policy.deep;
@@ -4825,7 +4831,7 @@ impl Scheduler {
             if roots.is_none_or(|roots| roots.contains(&route.0)) {
                 // Startup/policy reconciliation deliberately retries incomplete
                 // inputs too: a changed content policy may accept retained work.
-                self.check_missing_volume(&entry, Some(route))?;
+                self.check_volume_waiter(&entry, Some(route))?;
             }
         }
         self.persist_candidates(BTreeMap::new(), true)
@@ -5058,10 +5064,8 @@ impl Scheduler {
             let saved_recovery = std::cell::OnceCell::new();
             for (id, path) in revisit {
                 if state.entry_by_key(&id).is_some_and(|entry| {
-                    matches!(
-                        entry.status.as_str(),
-                        "failed_password" | "suspended_missing_volume"
-                    )
+                    (entry.status == "failed_password" || entry.waits_for_volume())
+                        && !(id == owner && pending.force && entry.waits_for_layout())
                 }) {
                     continue;
                 }
@@ -5322,6 +5326,8 @@ impl Scheduler {
         #[cfg(test)]
         if let Some(check) = self.admission_checkpoint.take() { check(self)?; }
         let mut groups = BTreeMap::new();
+        let mut arrivals = HashSet::new();
+        let retry_volumes = self.journal.state().has_volume_waiters();
         for (id, pending) in prepared {
             // main's submit still checks output ownership and active claims;
             // these are not a second quiet/readiness decision.
@@ -5333,7 +5339,16 @@ impl Scheduler {
                 self.due.insert((pending.due, id), ());
                 continue;
             }
-            self.retire_admitted_observation(&pending);
+            if (retry_volumes || !self.active.is_empty()) && pending.recovery.is_none() {
+                // A named arrival can be ready before its USN record is visible.
+                let (policy, scope) = &self.roots[&pending.root];
+                if self.catalog.peer_needs_inventory(scope, &id, &pending.candidate.path) {
+                    self.scan_options(policy.deep)?.catalog_update(&self.catalog, scope, Some(&pending.candidate.path))?;
+                }
+            }
+            if self.retire_admitted_observation(&id, &pending) && retry_volumes {
+                arrivals.insert((pending.root.clone(), crate::scan::catalog::catalog_stem(&pending.candidate.path)));
+            }
             let password_scope = candidate_password_scope(self.journal.state(),
                 &pending.candidate.path, pending.recovery.as_deref());
             let source = (pending.candidate, pending.quiet);
@@ -5344,6 +5359,11 @@ impl Scheduler {
                 .entry((pending.root, password_scope, recovery_owner))
                 .or_insert_with(|| (pending.recovery, Vec::new()));
             candidates.push(source);
+        }
+        let mut retried = HashSet::new();
+        for (root, stem) in arrivals {
+            let scope = self.roots[&root].1.clone();
+            self.retry_volume_peers(&scope, &stem, &mut retried)?;
         }
         if groups.is_empty() {
             self.arm_idle_cleanup();
@@ -5363,21 +5383,17 @@ impl Scheduler {
     }
 
     #[inline]
-    fn retire_admitted_observation(&self, pending: &Pending) {
+    fn retire_admitted_observation(&self, id: &str, pending: &Pending) -> bool {
         let (seconds, last, cadence, tentative) = pending.quiet.summary();
         self.journal.log(json!({
             "event":"candidate_quiet", "path":pending.candidate.path,
             "quiet_seconds":seconds,
         }));
-        if pending.recovery.is_none() {
-            self.catalog.retire_observation(
-                &pending.candidate.path,
-                Some(seconds),
-                last,
-                cadence,
-                tentative,
-            );
-        }
+        // A restored blocker already proves that its own head was admitted.
+        let newly_available = !pending.force || !self.journal.state().entry_by_key(id).is_some_and(|e| e.waits_for_volume());
+        pending.recovery.is_none() && self.catalog.retire_observation(
+            &pending.candidate.path, Some(seconds), last, cadence, tentative, newly_available,
+        )
     }
 
     fn retire_owned_admission(&mut self, id: &str, pending: &Pending) -> io::Result<bool> {
@@ -5495,7 +5511,7 @@ impl Scheduler {
                 self.journal.state(), &candidate.path, &mut outputs,
             )?);
         }
-        self.journal.state().take_prepared_volumes(candidates.iter().map(|input| input.path.as_str()),
+        let layout_checked_at = self.journal.state().take_prepared_volumes(candidates.iter().map(|input| input.path.as_str()),
             &mut request.prepared_volumes);
         let engine = Arc::clone(&self.engine);
         let journal = Arc::clone(&self.journal);
@@ -5519,7 +5535,7 @@ impl Scheduler {
             .map(|candidate| PathBuf::from(&candidate.path));
         let groups = Arc::new(Mutex::new(SourceGroups::default()));
         let worker_groups = Arc::clone(&groups);
-        let claimed = Arc::new(Mutex::new(ClaimedSources::default()));
+        let claimed = Arc::new(Mutex::new(ClaimedSources { layout_checked_at, ..ClaimedSources::default() }));
         let worker_claimed = Arc::clone(&claimed);
         let worker_cancel = cancel.clone();
         self.journal
@@ -5850,8 +5866,8 @@ impl Scheduler {
                 let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
                 let tracker = quiet.remove(&path);
                 if let Some(entry) = self.journal.state().entry(&path)
-                    .filter(|entry| entry.is_missing_volume()) {
-                    self.check_missing_volume(&entry, None)?;
+                    .filter(|entry| entry.waits_for_volume()) {
+                    self.check_volume_waiter(&entry, None)?;
                     continue;
                 }
                 let admission = CandidateAdmission::Observe;
@@ -6034,6 +6050,7 @@ impl Scheduler {
         let mut parents = HashMap::<String, (String, continuation::Continuation)>::new();
         let mut continuations = Vec::new();
         let generated = std::cell::OnceCell::new();
+        let layout_checked_at = active.claimed.lock().unwrap().layout_checked_at;
         let recovery_receipts = std::cell::OnceCell::new();
         let recovery_receipts = || recovery_receipts.get_or_init(|| RecoveryReceipts::new(&outcome.checkpoints));
         for archive in outcome
@@ -6061,7 +6078,7 @@ impl Scheduler {
                 operations.finish_pending(&candidate.path, None);
                 continue;
             }
-            let regroup = failure.kind == FailureKind::MissingVolume;
+            let regroup = failure.kind == FailureKind::MissingVolume || archive.source_paths.len() > 1;
             if let Some(pending) = self.pending.get(&id) {
                 if quiet::changed(&candidate, &pending.candidate) {
                     continue;
@@ -6109,6 +6126,7 @@ impl Scheduler {
                 Some(&recovery),
                 &active.password_scope,
             );
+            Arc::make_mut(&mut entry).layout_checked_at = layout_checked_at;
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
             payload.insert("input_checkpoints".into(), serde_json::to_value(
                 recovery_receipts().select(archive.source_paths.iter().map(PathBuf::as_path)))?);
@@ -6202,7 +6220,9 @@ impl Scheduler {
             let failure_message = failure.map(|failure| super::failure::message(failure, self.settings.cli.language));
             let error = failure_message.as_deref()
                 .or_else(|| input_error.map(|error| error.message.as_str()));
-            let blocker = input_failure.filter(|input| input.retryable());
+            let multipart_failure = failed_archive.is_some_and(|archive| archive.depth == start_depth)
+                && group.is_some_and(|group| group.members.len() > 1);
+            let blocker = input_failure.filter(|input| watch_retryable(input, multipart_failure));
             let retryable = blocker.is_some();
             let candidate = if completed.cancelled || id == canonical_id {
                 std::borrow::Cow::Borrowed(candidate)
@@ -6303,6 +6323,7 @@ impl Scheduler {
                         recovery,
                         &active.password_scope,
                     );
+                    Arc::make_mut(&mut entry).layout_checked_at = layout_checked_at;
                     if let Some(segments) = segments.take() {
                         Arc::make_mut(&mut entry).failure_payload.insert("segments".into(), segments);
                     }
@@ -6325,6 +6346,10 @@ impl Scheduler {
             if let Some(record) = &record {
                 if password_updated(record, &self.user_password_signature) {
                     retry.push((candidate.path.clone(), CandidateAdmission::PasswordRetry));
+                } else if record.waits_for_layout() {
+                    // The canonical head can differ from the physical input that
+                    // started this request. Reconcile additions during either claim.
+                    retry.push((record.path.clone(), CandidateAdmission::Retry));
                 }
             }
             if resumed.is_none() && deferred.is_none()
@@ -6446,12 +6471,12 @@ impl Scheduler {
         for candidate in &active.inputs {
             if let Some(entry) = self.journal.state().entry(&candidate.path)
                 .filter(|entry| entry.is_missing_volume()) {
-                self.check_missing_volume(&entry, None)?;
+                self.check_volume_waiter(&entry, None)?;
             }
         }
         for (path, admission) in retry {
             if admission == CandidateAdmission::Retry {
-                if let Some(entry) = self.journal.state().entry(&path) { self.check_missing_volume(&entry, None)?; }
+                if let Some(entry) = self.journal.state().entry(&path) { self.check_volume_waiter(&entry, None)?; }
                 continue;
             }
             if let Some((root, recovery)) = self.journal.state().entry(&path)
@@ -6609,10 +6634,14 @@ impl<'a> RecoveryReceipts<'a> {
     }
 }
 
+fn watch_retryable(input: &InputFailure<'_>, multipart: bool) -> bool {
+    input.retryable() || (multipart && input.failure().is_some_and(|failure| failure.kind == FailureKind::Damaged))
+}
+
 fn nested_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailure<'_>>) -> bool {
     archive.depth > 1 && !archive.partial && failures
         .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))
-        .is_some_and(InputFailure::retryable)
+        .is_some_and(|input| watch_retryable(input, archive.source_paths.len() > 1))
 }
 
 // Completion and persisted retry admission share the Watch boundary. Keep
@@ -6879,7 +6908,7 @@ fn candidate_password_scope(
     if let Some(recovery) = recovery { return recovery.password_dir(Path::new(path)).to_owned(); }
     let entry = state.entry(path);
     let scope = if let Some(entry) = entry.as_ref().filter(|entry|
-        matches!(entry.status.as_str(), "failed_password" | "suspended_missing_volume")) {
+        entry.status == "failed_password" || entry.waits_for_volume()) {
         entry.failure_payload.get("password_scope_dir").and_then(Value::as_str)
             .filter(|scope| !scope.is_empty()).map(PathBuf::from)
     } else {
@@ -6899,14 +6928,15 @@ fn make_blocker(
     recovery: Option<&Recovery>,
     password_scope: &Path,
 ) -> Arc<crate::watch_store::EntryRecord> {
-    debug_assert!(failure.retryable());
+    debug_assert!(watch_retryable(failure, group.is_some_and(|g| g.members.len() > 1)));
     let kind = failure.failure().map(|failure| failure.kind);
     let password = failure.password.is_some();
     let missing = failure.missing.is_some();
-    let status = if missing { "suspended_missing_volume" } else { "failed_password" };
+    let status = if missing { "suspended_missing_volume" } else if password { "failed_password" } else { "failed_terminal" };
     let mut blockers = Vec::new();
     if missing { blockers.push("missing_volume"); }
     if password { blockers.push("password"); }
+    if !missing && group.is_some_and(|group| group.members.len() > 1) { blockers.push("volume_candidate"); }
     let mut payload = serde_json::Map::new();
     payload.insert("blockers".into(), json!(blockers));
     if let Some(group) = group {
@@ -6942,6 +6972,7 @@ fn observed_entry(
         last_error: String::new(),
         failure_kind: String::new(),
         failure_payload: serde_json::Map::new(),
+        layout_checked_at: 0,
         last_attempt_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -7078,7 +7109,8 @@ impl Observer for WatchObserver {
         // password/output recovery. A merely incomplete new family has no
         // retained work and may still deduplicate once its layout becomes fixed.
         let owner_path = owner.to_string_lossy();
-        if self.journal.state().entry(&owner_path).is_some_and(|entry| entry.status == "failed_password")
+        if self.journal.state().entry(&owner_path).is_some_and(|entry| entry.status == "failed_password"
+            || (entry.status == "failed_terminal" && entry.waits_for_volume()))
             || self.journal.state().pending(&owner_path).is_some_and(|pending| pending.has_output_work()) {
             return Ok(true);
         }

@@ -291,7 +291,7 @@ fn replay(base: &Path, input: Replay) -> Value {
             for (id, pending) in scheduler.prepare_ready_blocking(at, usize::MAX).unwrap() {
                 let index = VIRTUAL.with_borrow(|state| state.as_ref().unwrap().indices[&id]);
                 proposals[index].push(at.duration_since(epoch).as_secs_f64());
-                scheduler.retire_admitted_observation(&pending);
+                scheduler.retire_admitted_observation(&id, &pending);
                 scheduler.unpublished.remove(&id);
             }
             skip_busy(&mut scheduler, at, epoch);

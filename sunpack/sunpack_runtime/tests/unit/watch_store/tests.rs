@@ -8,7 +8,7 @@ fn replayed_entry_event_keeps_business_failure_kind_and_message() {
         failure_kind: "wrong_password".into(),
         last_error: format!("{}末尾诊断", "密码不在密码列表中".repeat(512)),
         size: 0, mtime: 0.0, file_id: String::new(), change_usn: 0,
-        failure_payload: Map::new(), last_attempt_at: 0.0
+        failure_payload: Map::new(), layout_checked_at: 0, last_attempt_at: 0.0
     };
     let event = entry_event(&entry);
     assert_eq!(event["error_kind"], "wrong_password");
@@ -162,7 +162,7 @@ fn missing_volume_retry_gate_follows_entry_replacement_removal_and_snapshot() {
     let record = |path: &str, status: &str, size| Arc::new(EntryRecord {
         path: path.into(), status: status.into(), size, mtime: 1.0, file_id: String::new(),
         change_usn: 0, last_error: String::new(), failure_kind: String::new(),
-        failure_payload: Map::new(), last_attempt_at: 1.0,
+        failure_payload: Map::new(), layout_checked_at: 0, last_attempt_at: 1.0,
     });
     let set = |path, status, size| {
         let record = record(path, status, size);
@@ -172,23 +172,34 @@ fn missing_volume_retry_gate_follows_entry_replacement_removal_and_snapshot() {
         record
     };
     set(path, "failed_password", 1);
-    assert!(!state.has_missing_volume_blockers());
+    assert!(!state.has_volume_waiters());
     let first = set(path, "suspended_missing_volume", 1);
     let key = path_key(path);
     state.record_volume_check(key.clone(), &first, 1, None);
     let refreshed = set(path, "suspended_missing_volume", 1);
     assert!(!state.volume_check_needed(&key, &refreshed, 1, false));
     assert!(state.volume_check_needed(&key, &refreshed, 2, false));
-    assert!(state.has_missing_volume_blockers());
+    assert!(state.has_volume_waiters());
 
     let snapshot = crate::test_support::temp_file("missing_volume_retry_gate", b"");
+    let mut damaged = (*record(r"C:\input\multipart.bin", "failed_terminal", 3)).clone();
+    damaged.failure_payload.insert("source_group".into(), serde_json::json!({"multipart":true}));
+    damaged.layout_checked_at = 42;
+    let mut operations = NativeWatchOperations::empty();
+    operations.put_entry(Arc::new(damaged));
+    state.apply(&operations);
     state.capture(1).write(&snapshot).unwrap();
     let resumed = NativeWatchState::new();
     resumed.load_snapshot(snapshot.to_string_lossy().into_owned()).unwrap();
-    assert!(resumed.has_missing_volume_blockers());
+    assert!(resumed.has_volume_waiters());
     assert!(resumed.volume_check_needed(&key, &resumed.entry(path).unwrap(), 1, false));
     resumed.apply(&NativeWatchOperations::retire_entries([path_key(path)]));
-    assert!(!resumed.has_missing_volume_blockers());
+    let restored = resumed.entry(r"C:\input\multipart.bin").unwrap();
+    assert!(restored.waits_for_volume());
+    assert_eq!(restored.layout_checked_at, 0);
+    resumed.apply(&NativeWatchOperations::retire_entries([path_key(&restored.path)]));
+    state.apply(&NativeWatchOperations::retire_entries([path_key(&restored.path)]));
+    assert!(!resumed.has_volume_waiters());
 
     let other = set(r"C:\input\other.bin", "suspended_missing_volume", 1);
     let other_key = path_key(&other.path);
@@ -202,7 +213,7 @@ fn missing_volume_retry_gate_follows_entry_replacement_removal_and_snapshot() {
     assert!(!state.lock().volume_checks.contains_key(&key));
     assert!(!state.volume_check_needed(&other_key, &other, 1, false));
     set(&other.path, "failed_password", 1);
-    assert!(!state.has_missing_volume_blockers());
+    assert!(!state.has_volume_waiters());
     assert!(state.lock().volume_checks.is_empty());
     std::fs::remove_file(snapshot).unwrap();
 }

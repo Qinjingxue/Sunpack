@@ -930,7 +930,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             .catalog_update(&scheduler.catalog, scope, None).unwrap();
         scheduler.catalog.remember_observation(path, candidate.size, candidate.mtime,
             &candidate.observation.file_id, candidate.observation.change_usn, false);
-        scheduler.catalog.retire_observation(path, Some(10.0), Some(2.0), 1.0, 0.0);
+        scheduler.catalog.retire_observation(path, Some(10.0), Some(2.0), 1.0, 0.0, true);
         assert_eq!(scheduler.catalog.observation(path).unwrap().quiet_seconds, 10.0);
         scheduler.journal.commit(true, |_| {
             let mut entry = observed_entry(&candidate, "suspended_missing_volume");

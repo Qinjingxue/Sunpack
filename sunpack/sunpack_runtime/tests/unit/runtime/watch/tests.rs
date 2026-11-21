@@ -1184,6 +1184,7 @@ fn nested_retry_handoff_keeps_descendant_checkpoints_after_owner_retirement() {
             change_usn: 0, status: "failed_password".into(), last_error: "blocked".into(),
             failure_kind: "wrong_password".into(),
             failure_payload: json!({"blockers":["password"]}).as_object().unwrap().clone(),
+            layout_checked_at: 0,
             last_attempt_at: 1.0,
         };
         blocker.failure_payload.insert("input_checkpoints".into(), serde_json::to_value(

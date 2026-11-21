@@ -1,3 +1,6 @@
+import io
+import zipfile
+
 import pytest
 
 from tests.real.archive_boundary import require_generator
@@ -65,6 +68,28 @@ def test_plan7_replacement_and_reappearance(package, tmp_path):
     watch.stop()
     for case in cases:
         assert_once(watch, case)
+
+
+def test_watch_retries_damaged_split_zip_when_another_middle_arrives(package, tmp_path):
+    payload = bytes(range(256)) * 240
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as writer:
+        writer.writestr("payload.dat", payload)
+    raw = archive.getvalue()
+    watch = watch_setup(package, tmp_path, start=False)
+    head = watch.root / "item.part1.bin"
+    head.write_bytes(raw[:20000])
+    (watch.root / "item.part3.bin").write_bytes(raw[40000:])
+    watch.start()
+    watch.await_event("suspended_missing_volume", path=head.name)
+    decoy = watch.root / "item.part02.bin"
+    decoy.write_bytes(bytes(20000))
+    watch.await_event("failed_terminal", path=head.name)
+    (watch.root / "item.part2.bin").write_bytes(raw[20000:40000])
+    watch.await_event("done", path=head.name)
+    watch.stop()
+    assert decoy.read_bytes() == bytes(20000)
+    assert [p.read_bytes() for p in watch.output.rglob("payload.dat")] == [payload]
 
 
 @pytest.mark.parametrize("archive_format", [
