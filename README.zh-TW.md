@@ -59,10 +59,10 @@ SunPack 僅支援 Windows 10 版本 1709 及更高版本和 Windows 11。其中W
    - 註冊檔案總管中的資料夾、資料夾背景右鍵選單。
    - 隨 Windows 啟動 SunPack Watch（預設不啟用）。
 
-也可以在 PowerShell 中執行以下命令，自動下載並安裝適用於目前系統架構的最新版：
+也可以透過 WinGet 靜默安裝：
 
 ```powershell
-$r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases/latest'; $arch = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }; $a = $r.assets | Where-Object name -eq "sunpack-windows-$arch-$($r.tag_name)-setup.exe"; if (-not $a) { throw "Installer not found for $arch" }; $p = Join-Path $env:TEMP $a.name; Invoke-WebRequest $a.browser_download_url -OutFile $p; Start-Process $p -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+winget install --id Qinjingxue.SunPack --exact --source winget --silent
 ```
 
 ---
