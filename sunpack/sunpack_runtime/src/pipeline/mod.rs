@@ -1,7 +1,8 @@
 //! Shared archive orchestration for CLI requests and the Watch service.
 
 mod checkpoint;
-mod cleanup;
+pub(crate) mod cleanup;
+pub(crate) use coordinator::resolved_key as cleanup_boundary_key;
 mod coordinator;
 mod discovery;
 mod passwords;
@@ -793,7 +794,7 @@ pub(crate) trait Observer: Send + Sync {
         std::fs::create_dir_all(output).map_err(OutputCreateError::wrap)
     }
 
-    fn after_output(&self, _archive: &ArchiveResult) -> io::Result<()> {
+    fn after_output(&self, _archive: &ArchiveResult, _cleanup: Option<cleanup::DeleteReceipt<'_>>) -> io::Result<()> {
         Ok(())
     }
 
@@ -805,9 +806,12 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
-    fn before_flatten(&self, _root: &Path, _work: &Path, _leaf: &Path, _destination: &Path) -> io::Result<()> {
+    fn before_flatten(&self, _root: &Path, _work: &Path, _leaf: &Path, _destination: &Path,
+        _cleanup: Option<cleanup::DeleteReceipt<'_>>) -> io::Result<()> {
         Ok(())
     }
+
+    fn source_cleanup_done(&self, _id: TaskId) {}
 
     fn after_flatten(&self, _id: TaskId, _root: &Path, _old: &Path, _output: &Path) -> io::Result<()> {
         Ok(())

@@ -273,6 +273,7 @@ impl Observer for FlattenPublication<'_> {
         work: &Path,
         leaf: &Path,
         destination: &Path,
+        _: Option<DeleteReceipt<'_>>,
     ) -> io::Result<()> {
         prepare_flatten(
             self.journal,
@@ -282,6 +283,7 @@ impl Observer for FlattenPublication<'_> {
             leaf,
             destination,
             Some(self.continuation),
+            None,
         )
     }
 

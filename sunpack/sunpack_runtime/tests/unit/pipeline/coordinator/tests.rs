@@ -862,6 +862,7 @@ fn test_run<'a, O: Observer>(
         scan_errors: Mutex::new(DirectoryReadErrors::report()),
         cleanup_tasks: Mutex::default(),
         cleanup_refs: Arc::default(),
+        shared_source_publication: Mutex::default(),
     })
 }
 
@@ -997,7 +998,7 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
         fn reuse_output(&self, _: &ArchiveResult, _: &Path) -> io::Result<()> {
             panic!("completed output must not acquire a second durable owner")
         }
-        fn after_output(&self, _: &ArchiveResult) -> io::Result<()> {
+        fn after_output(&self, _: &ArchiveResult, _: Option<DeleteReceipt<'_>>) -> io::Result<()> {
             panic!("completed output must not be republished")
         }
     }
@@ -3428,7 +3429,7 @@ fn flatten_work_avoids_unmaterialized_output_claim_and_releases_its_slot() {
     struct Work(Mutex<Option<PathBuf>>);
     impl Observer for Work {
         fn notify(&self, _: Event) {}
-        fn before_flatten(&self, _: &Path, work: &Path, _: &Path, _: &Path) -> io::Result<()> {
+        fn before_flatten(&self, _: &Path, work: &Path, _: &Path, _: &Path, _: Option<DeleteReceipt<'_>>) -> io::Result<()> {
             *self.0.lock().unwrap() = Some(work.to_owned());
             Ok(())
         }
@@ -3449,7 +3450,7 @@ fn flatten_work_avoids_unmaterialized_output_claim_and_releases_its_slot() {
     assert!(!reserved.exists()); // Peer has claimed but not created its output.
     let observer = Work(Mutex::default());
     let mut outcome = Outcome::default();
-    flatten_result(&observer, 1, &mut archive, &mut outcome, None, &names, crate::core::config::FlattenDirectoryName::Outer).unwrap();
+    flatten_result(&observer, 1, &mut archive, &mut outcome, None, &names, crate::core::config::FlattenDirectoryName::Outer, None).unwrap();
     let staging = observer.0.lock().unwrap().clone().unwrap();
     assert_ne!(staging, reserved);
     assert!(outcome.cleanup_results.is_empty());
@@ -3497,7 +3498,7 @@ fn flatten_inner_reserves_unique_name_and_rebases_rollback_receipts() {
     children.archives.push(nested);
     let observer = Discards(Mutex::default());
     let names = OutputReservationGuard { registry: Arc::default(), owner: 1 };
-    flatten_result(&observer, 1, &mut archive, &mut children, Some(&created), &names, crate::core::config::FlattenDirectoryName::Inner).unwrap();
+    flatten_result(&observer, 1, &mut archive, &mut children, Some(&created), &names, crate::core::config::FlattenDirectoryName::Inner, None).unwrap();
     let destination = numbered(&occupied, 1);
     assert_eq!(archive.output.as_ref(), Some(&destination));
     assert!(names.registry.lock().unwrap().claimed.contains_key(&output_key(&destination)));
@@ -3539,7 +3540,7 @@ fn flatten_failure_keeps_extraction_successful_and_reports_output() {
     // failure, distinct from ordinary source-cleanup warnings.
     let held = fs::OpenOptions::new().access_mode(0x1).share_mode(3)
         .custom_flags(0x0200_0000).open(&output).unwrap();
-    let result = flatten_result(&|_: Event| {}, 1, &mut archive, &mut outcome, None, &OutputReservationGuard { registry: Arc::default(), owner: 1 }, crate::core::config::FlattenDirectoryName::Outer);
+    let result = flatten_result(&|_: Event| {}, 1, &mut archive, &mut outcome, None, &OutputReservationGuard { registry: Arc::default(), owner: 1 }, crate::core::config::FlattenDirectoryName::Outer, None);
     let payload = fs::read(wrapper.join("payload.txt"));
     drop(held);
     fs::remove_dir_all(&output).unwrap();

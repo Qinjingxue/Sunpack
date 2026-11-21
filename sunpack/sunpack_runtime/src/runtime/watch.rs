@@ -9,6 +9,7 @@ use crate::core::resources::{self, FileMutex};
 use crate::filesystem;
 use crate::io::config_changes::{DirectoryChange, NativeConfigChanges};
 use crate::io::reader::PhysicalFileGeneration;
+use crate::pipeline::cleanup::{DeleteReceipt, DeleteSource};
 use crate::pipeline::{
     ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
     GeneratedSource, Request, InputFailure,
@@ -16,7 +17,7 @@ use crate::pipeline::{
 use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
 use crate::scan::directory::{NativeDirectoryScanOptions, NativeWatchCatalog};
 use crate::scan::scope::NativeDiscoveryScope;
-use crate::watch_store::{is_path_under, recorded_file_is_absent, watch_path_key};
+use crate::watch_store::{is_path_under, recorded_file_is_absent, watch_path_key, SOURCE_DELETE_PREFIX};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::borrow::Cow;
@@ -980,7 +981,7 @@ impl Watch {
     ) -> io::Result<()> {
         let external = self.external.current.write().unwrap();
         if let Some(journal) = external.as_ref().and_then(|external| external.journal.upgrade()) {
-            prepare_flatten(&journal, "", output, work, leaf, destination, None)?;
+            prepare_flatten(&journal, "", output, work, leaf, destination, None, None)?;
         } else {
             let mut paths = crate::path_keys::output_path_aliases(output)?;
             paths.extend(crate::path_keys::output_path_aliases(work)?);
@@ -4858,6 +4859,7 @@ impl Scheduler {
                         .contains_key(&watch_path_key(owner))
             })
         })?;
+        self.recover_source_cleanup(roots)?;
         self.recover_continuations(roots)?;
         let scopes = self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>();
         let published = self.catalog.publish_outputs(&settled, &scopes, &self.deep_options, None)?;
@@ -5112,6 +5114,64 @@ impl Scheduler {
         self.persist_candidates(BTreeMap::new(), true)?;
         Ok(())
     }
+
+    fn recover_source_cleanup(&self, roots: Option<&HashSet<String>>) -> io::Result<()> {
+        recover_source_cleanup(&self.journal, &self.engine,
+            self.roots.values().map(|(root, _)| root.path.as_path()),
+            |batch, record| {
+                !self.active.contains_key(batch)
+                    && roots.is_none_or(|roots| {
+                        containing_root(&self.roots, &watch_path_key(&record.owner))
+                            .is_some_and(|(root, _)| roots.contains(root))
+                    })
+                    && !record.sources.iter().any(|source| {
+                        let key = key(&source.path);
+                        self.active_paths.contains_key(&key) || self.hub.claims.lock().unwrap().contains_key(&key)
+                    })
+            },
+        )
+    }
+}
+
+fn recover_source_cleanup<'a>(
+    journal: &journal::Journal,
+    engine: &Engine,
+    roots: impl Iterator<Item = &'a Path>,
+    eligible: impl Fn(&str, &SourceCleanupPublication) -> bool,
+) -> io::Result<()> {
+    let state = journal.state();
+    let ids = state.runtime_keys(SOURCE_DELETE_PREFIX);
+    if ids.is_empty() { return Ok(()); }
+    let boundaries: HashSet<_> = roots.map(crate::pipeline::cleanup_boundary_key).collect();
+    for id in ids {
+        if journal.source_cleanup_retired(&id) { continue; }
+        let Some((batch, _)) = id[SOURCE_DELETE_PREFIX.len()..].split_once('|') else { continue; };
+        let Some(value) = state.runtime_record(&id) else { continue; };
+        let record = SourceCleanupPublication::deserialize(&*value).map_err(io::Error::other)?;
+        if !eligible(batch, &record) { continue; }
+        if record.alternate.is_some()
+            && state.runtime_record(&format!("flatten|{}", watch_path_key(&record.output.0))).is_some()
+        { continue; }
+        let mut verified = false;
+        let mut inaccessible = false;
+        for (path, expected) in std::iter::once(&record.output).chain(record.alternate.as_ref()) {
+            match identity_if_present(path) {
+                Ok(Some(actual)) if actual == *expected => { verified = true; break; }
+                Ok(_) => {}
+                Err(error) if missing_path(&error) || error.kind() == io::ErrorKind::InvalidData => {}
+                Err(_) => inaccessible = true,
+            }
+        }
+        if !verified && inaccessible { continue; }
+        if !verified || engine.recover_delete_sources(
+            &record.sources,
+            |parent| !boundaries.is_empty() && boundaries.contains(&crate::pipeline::cleanup_boundary_key(parent)),
+            |path, error| journal.log(json!({"event":"crash_source_cleanup","path":path,"error":error.to_string()})),
+        ) {
+            journal.retire_source_cleanup(id);
+        }
+    }
+    Ok(())
 }
 
 fn missing_path(error: &io::Error) -> bool {
@@ -7285,9 +7345,11 @@ impl Observer for WatchObserver {
         self.publish_output(archive, path, false)
     }
 
-    fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path, destination: &Path) -> io::Result<()> {
+    fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path, destination: &Path,
+        cleanup: Option<DeleteReceipt<'_>>) -> io::Result<()> {
         let owner = self.owner_for_path(root).unwrap_or_default();
-        prepare_flatten(&self.journal, &owner, root, work, leaf, destination, None)?;
+        prepare_flatten(&self.journal, &owner, root, work, leaf, destination, None,
+            Some((self.batch.as_ref(), cleanup)))?;
         if !owner.is_empty() {
             self.outputs.lock().unwrap().insert(key(work), owner);
         }
@@ -7308,7 +7370,7 @@ impl Observer for WatchObserver {
         Ok(())
     }
 
-    fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
+    fn after_output(&self, archive: &ArchiveResult, cleanup: Option<DeleteReceipt<'_>>) -> io::Result<()> {
         let Some(output) = &archive.output else {
             return Ok(());
         };
@@ -7319,14 +7381,29 @@ impl Observer for WatchObserver {
         finish_flatten(&self.journal, &output)?;
         let task = archive.path.to_string_lossy().into_owned();
         self.journal.commit(true, |state| {
-            Ok(state
-                .output_operation(
-                    &owner,
-                    task,
-                    output,
-                    Some(archive.failure.is_none() || archive.partial), false)?
-                .unwrap_or_else(crate::watch_store::NativeWatchOperations::empty))
+            use crate::watch_store::NativeWatchOperations;
+            let keep = archive.failure.is_none() || archive.partial;
+            let intent = cleanup.filter(|_| keep).and_then(|receipt| {
+                let id = source_cleanup_id(&self.batch, receipt.id);
+                state.runtime_record(&id).is_none().then(|| (id, receipt))
+            });
+            let proof = intent.map(|(id, receipt)| (id, receipt, output.clone()));
+            let mut operations = state.output_operation(&owner, task, output, Some(keep), false)?
+                .unwrap_or_else(NativeWatchOperations::empty);
+            if let Some((id, receipt, output)) = proof.filter(|_| !operations.is_empty()) {
+                    let identity = operations.finished_output_identity().map(str::to_owned).or_else(|| {
+                        state.pending(&owner)?.output_identities.get(&output).cloned()
+                    });
+                    if let Some(identity) = identity {
+                        store_source_cleanup(&mut operations, id, &owner, (&output, &identity), None, receipt.sources);
+                    }
+            }
+            Ok(operations)
         })
+    }
+
+    fn source_cleanup_done(&self, id: crate::pipeline::TaskId) {
+        self.journal.retire_source_cleanup(source_cleanup_id(&self.batch, id));
     }
 
     fn discard_output(&self, archive: &Path, sources: &[PathBuf], output: &Path) -> io::Result<()> {
@@ -7342,6 +7419,25 @@ impl Observer for WatchObserver {
     }
 }
 
+#[derive(serde::Serialize, Deserialize)]
+struct SourceCleanupPublication {
+    owner: String,
+    output: (String, String),
+    alternate: Option<(String, String)>,
+    sources: Vec<DeleteSource>,
+}
+
+fn source_cleanup_id(batch: &str, id: crate::pipeline::TaskId) -> String {
+    format!("{SOURCE_DELETE_PREFIX}{batch}|{id}")
+}
+
+fn store_source_cleanup(operations: &mut crate::watch_store::NativeWatchOperations, id: String, owner: &str,
+    output: (&str, &str), alternate: Option<(&str, &str)>, sources: &[DeleteSource]) {
+    operations.set_runtime(id, Some(json!({
+        "owner":owner, "output":output, "alternate":alternate, "sources":sources,
+    })));
+}
+
 fn prepare_flatten(
     journal: &journal::Journal,
     owner: &str,
@@ -7350,6 +7446,7 @@ fn prepare_flatten(
     leaf: &Path,
     destination: &Path,
     continuation: Option<&str>,
+    publication: Option<(&str, Option<DeleteReceipt<'_>>)>,
 ) -> io::Result<()> {
     journal.commit(true, |state| {
         use crate::watch_store::NativeWatchOperations;
@@ -7362,6 +7459,7 @@ fn prepare_flatten(
             "new_identity":new,"work_paths":work_paths,"destination":destination,
         });
         if let Some(id) = continuation { record["continuation"] = json!(id); }
+        if let Some((batch, _)) = publication { record["cleanup_batch"] = json!(batch); }
         if root != destination && key(root) != key(destination) {
             let destination_paths = crate::path_keys::output_path_aliases(destination)?;
             record["root_paths"] = json!(paths);
@@ -7375,6 +7473,10 @@ fn prepare_flatten(
                 owner, vec![root.to_string_lossy().into_owned()],
             ) {
                 operations.extend(checkpoint);
+                if let Some((batch, Some(receipt))) = publication {
+                    store_source_cleanup(&mut operations, source_cleanup_id(batch, receipt.id), owner,
+                        (&root.to_string_lossy(), &old), Some((&destination.to_string_lossy(), &new)), receipt.sources);
+                }
             }
         }
         paths.extend(work_paths);
@@ -7450,6 +7552,9 @@ fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root:
         operations.relocate_output(owner, work.to_owned(), work_leaf, destination.to_owned(), current.clone());
     }
     if published && !already_rebased {
+        if let Some(batch) = record["cleanup_batch"].as_str() {
+            rebase_cleanup_sources(state, batch, Path::new(leaf), Path::new(destination), &mut operations)?;
+        }
         if let Some(id) = record["continuation"].as_str() {
             continuation::relocate_output(state, id, Path::new(root), Path::new(destination), &mut operations)?;
         }
@@ -7464,6 +7569,34 @@ fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root:
         state.remove_active_output(work_paths, old);
     }
     Ok(operations)
+}
+
+fn rebase_cleanup_sources(
+    state: &crate::watch_store::NativeWatchState,
+    batch: &str,
+    leaf: &Path,
+    destination: &Path,
+    operations: &mut crate::watch_store::NativeWatchOperations,
+) -> io::Result<()> {
+    // Descendant deletions have joined before the parent moves; only a
+    // pending retry whose delivered output moves with the leaf needs rebasing.
+    let prefix = format!("{SOURCE_DELETE_PREFIX}{batch}|");
+    for id in state.runtime_keys(&prefix) {
+        let Some(value) = state.runtime_record(&id) else { continue; };
+        let moved = |path: &Path| path.strip_prefix(leaf).ok().map(|suffix| destination.join(suffix));
+        if ![&value["output"][0], &value["alternate"][0]].iter().any(|path| {
+            path.as_str().is_some_and(|path| Path::new(path).starts_with(leaf))
+        }) { continue; }
+        let mut record = SourceCleanupPublication::deserialize(&*value).map_err(io::Error::other)?;
+        for (path, _) in std::iter::once(&mut record.output).chain(record.alternate.as_mut()) {
+            if let Some(next) = moved(Path::new(path)) { *path = next.to_string_lossy().into_owned(); }
+        }
+        for source in &mut record.sources {
+            if let Some(next) = moved(&source.path) { source.path = next; }
+        }
+        operations.set_runtime(id, Some(serde_json::to_value(&record).map_err(io::Error::other)?));
+    }
+    Ok(())
 }
 
 fn flatten_work_paths(record: &Value) -> io::Result<impl Iterator<Item = &str> + Clone> {

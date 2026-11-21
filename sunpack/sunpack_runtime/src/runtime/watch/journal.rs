@@ -69,6 +69,7 @@ pub(super) struct Journal {
     suspended: AtomicBool,
     log: Arc<NativeEventLog>,
     frontier: Mutex<Frontier>,
+    retired_source_cleanup: Mutex<std::collections::HashSet<String>>,
     checkpoint: Mutex<Option<Checkpoint>>,
     maintenance: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     snapshot: PathBuf,
@@ -102,6 +103,7 @@ impl Journal {
             suspended: AtomicBool::new(false),
             log,
             frontier: Mutex::new(frontier),
+            retired_source_cleanup: Mutex::default(),
             checkpoint: Mutex::default(),
             maintenance: Mutex::default(),
             snapshot,
@@ -163,6 +165,11 @@ impl Journal {
         self.frontier.lock().unwrap().fault = Some("injected unavailable WAL".into());
     }
 
+    #[cfg(test)]
+    pub(super) fn frontier_seq_for_test(&self) -> u64 {
+        self.frontier.lock().unwrap().seq
+    }
+
     pub(super) fn suspended(&self) -> bool {
         self.suspended.load(Ordering::Acquire)
     }
@@ -206,6 +213,16 @@ impl Journal {
         &self.state
     }
 
+    pub(super) fn retire_source_cleanup(&self, id: String) {
+        if self.state.runtime_record(&id).is_some() {
+            self.retired_source_cleanup.lock().unwrap().insert(id);
+        }
+    }
+
+    pub(super) fn source_cleanup_retired(&self, id: &str) -> bool {
+        self.retired_source_cleanup.lock().unwrap().contains(id)
+    }
+
     pub(super) fn event_log(&self) -> &Arc<NativeEventLog> {
         &self.log
     }
@@ -247,9 +264,14 @@ impl Journal {
             // A foreground publication captured before the final root was
             // removed no longer belongs to an active Watch scheduler.
             let Some(stream) = frontier.stream.as_ref() else { return Ok(()); };
-            let operations = prepare(&self.state)?;
+            let mut operations = prepare(&self.state)?;
             if operations.is_empty() {
                 return Ok(());
+            }
+            // Settling an idempotent deletion never needs its own append.
+            // Until the next ordinary transaction, a crash may replay it.
+            for id in self.retired_source_cleanup.lock().unwrap().drain() {
+                operations.set_runtime(id, None);
             }
             let operations = Arc::new(operations);
             let seq = frontier

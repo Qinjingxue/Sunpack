@@ -1,5 +1,6 @@
 use super::results::RunOutcome as Outcome;
 use super::checkpoint::{CheckpointKey, InputCheckpoint, InputRecovery, GeneratedSource, ReportState};
+use super::cleanup::{DeleteReceipt, DeleteSource};
 use super::discovery::{self, Discovered, LogicalInput, Task};
 use super::passwords::{CandidateSet, RecentPasswords};
 use super::scheduling::{boxed_phase, stage, Scheduler, Spawner};
@@ -25,7 +26,7 @@ use crate::io::reader::release_reader_resources_under_roots;
 use crate::io::resource_lifecycle::Promotion;
 use crate::path_keys::{descendant_key_range, normalize_windows_extended_prefix, path_key};
 use crate::postprocess::{
-    discover_flatten_leaf, flatten_single_branch_directories, remove_owned_file, remove_owned_tree,
+    discover_flatten_leaf, flatten_single_branch_directories, remove_owned_tree,
     FlattenLeaf, FlattenOutcome,
 };
 use crate::scan::directory::{
@@ -159,7 +160,7 @@ impl Engine {
         let names = OutputReservationGuard { registry: Arc::clone(&self.output_names), owner: id };
         let mut result = ArchiveResult { path: source.to_owned(), output: Some(output), ..ArchiveResult::default() };
         let mut outcome = Outcome::default();
-        flatten_result(observer, id, &mut result, &mut outcome, None, &names, naming)?;
+        flatten_result(observer, id, &mut result, &mut outcome, None, &names, naming, None)?;
         Ok((result.output, outcome.cleanup_results.into_vec()))
     }
 
@@ -272,6 +273,7 @@ impl Engine {
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
             cleanup_refs: Arc::default(),
+            shared_source_publication: Mutex::default(),
         }))
     }
 
@@ -482,13 +484,14 @@ struct Run<'a, O> {
     scan_errors: Mutex<DirectoryReadErrors>,
     cleanup_tasks: Mutex<CleanupTasks>,
     cleanup_refs: Arc<Mutex<CleanupRefs>>,
+    shared_source_publication: Mutex<()>,
 }
 
 // Request-local cleanup ownership follows the planned consumers, not the
 // duration of an individual worker lease. A failed owner vetoes shared deletion.
 #[derive(Default)]
 struct CleanupRefs {
-    paths: HashMap<String, (usize, bool)>,
+    paths: HashMap<String, (usize, bool, bool)>,
 }
 
 struct CleanupOwner {
@@ -513,7 +516,9 @@ impl CleanupOwner {
             if entry.0 == 0 { refs.paths.remove(key); }
         }
         for key in paths.difference(&self.paths) {
-            refs.paths.entry(key.clone()).or_default().0 += 1;
+            let entry = refs.paths.entry(key.clone()).or_default();
+            entry.0 += 1;
+            entry.2 |= entry.0 > 1;
         }
         self.paths = paths;
     }
@@ -532,6 +537,31 @@ impl CleanupOwner {
             }
         }
         allowed
+    }
+
+    fn overlaps(&self) -> bool {
+        let refs = self.registry.lock().unwrap();
+        self.paths.iter().any(|key| refs.paths[key].2)
+    }
+
+    fn allowed(&self) -> HashSet<String> {
+        let refs = self.registry.lock().unwrap();
+        self.paths.iter().filter(|&key| {
+            let (count, veto, _) = refs.paths[key];
+            count == 1 && !veto
+        }).cloned().collect()
+    }
+}
+
+#[derive(Default)]
+struct SourceCleanup {
+    deletes: Vec<DeleteSource>,
+    recycles: Vec<PathBuf>,
+}
+
+impl SourceCleanup {
+    fn receipt(&self, id: TaskId) -> Option<DeleteReceipt<'_>> {
+        (!self.deletes.is_empty()).then_some(DeleteReceipt { id, sources: &self.deletes })
     }
 }
 
@@ -2055,7 +2085,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                 replacement_checkpoint = first_checkpoint;
                                 had_checkpoints |= replacement_checkpoint.is_some();
                                 executed.result.output = None;
-                                this.observer.after_output(&executed.result)?;
+                                this.observer.after_output(&executed.result, None)?;
                                 if let Some(sources) = &mut sources { sources.refresh(&replacement.owned_paths); }
                                 drop(lease);
                                 let requested = this.requested_generation(&replacement, watch_root);
@@ -2225,6 +2255,11 @@ impl<'run, O: Observer> Run<'run, O> {
                     // not a failed input of the replacement's physical execution.
                     let physical_complete = parent_outputs.iter()
                         .all(|(result, ..)| result.failure.is_none() && !result.partial);
+                    let cleanup_eligible = physical_complete && replacement_result.as_ref()
+                        .is_none_or(|result| result.failure.is_none() && !result.partial);
+                    let cleanup_mode = if dispatch_depth > 1 { CleanupMode::Delete }
+                        else { this.request.config.post_extract.archive_cleanup_mode };
+                    let mut cleanup_plan = None;
                     let parent_outputs = parent_outputs.into_iter()
                         .map(|(result, inventory, _input, id)| (result, inventory, id));
                     // Finish every logical parent before prompting or descending into
@@ -2320,9 +2355,17 @@ impl<'run, O: Observer> Run<'run, O> {
                                 }
                                 stage("postprocess", cancel).await?;
                             }
+                        }
+                        let source = sources.as_mut().filter(|_| !multi && cleanup_eligible && !cancel.cancelled());
+                        let _sharing = source.as_ref().filter(|s| s.overlaps())
+                            .map(|_| this.shared_source_publication.lock().unwrap());
+                        let plan = source.as_ref().map(|s| this.plan_cleanup(s, &physical_sources,
+                            &generations, cleanup_mode, watch_root, depth));
+                        let delete_receipt = plan.as_ref().and_then(|p| p.receipt(task_id));
+                        if flatten && children_complete {
                             flatten_result(
                                 &*this.observer, task_id, &mut result, &mut descendants, Some(&this.created_outputs), &this.output_names,
-                                this.request.config.post_extract.flatten_directory_name,
+                                this.request.config.post_extract.flatten_directory_name, delete_receipt,
                             )?;
                             children_complete &= descendants.subtree_complete();
                         } else if flatten && this.request.origin == Origin::Watch {
@@ -2337,7 +2380,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         let commit_completed = !cancel.cancelled();
                         outputs_committed &= commit_completed || result.retained || result.output.is_none();
                         if commit_completed || result.retained {
-                            this.observer.after_output(&result)?;
+                            this.observer.after_output(&result, delete_receipt)?;
                             // Cancellation after this durable commit must not roll it
                             // back. Match main's commit/check then retire ordering.
                             if commit_completed && !multi && physical_complete {
@@ -2345,6 +2388,10 @@ impl<'run, O: Observer> Run<'run, O> {
                                     CreatedOutputs::commit_if_unowned(&this.created_outputs, output);
                                 }
                             }
+                        }
+                        if let Some(source) = source {
+                            source.release(commit_completed);
+                            if commit_completed { cleanup_plan = plan; }
                         }
                         if let Some(checkpoint) = checkpoint {
                             outcome.checkpoints.push(checkpoint);
@@ -2370,10 +2417,21 @@ impl<'run, O: Observer> Run<'run, O> {
                         && !continued_output
                         && this.request.config.post_extract.flatten_single_directory
                         && !cancel.cancelled();
-                    if flatten && carrier_children_complete {
-                        if let Some(root) = carrier.clone().filter(|_| completed.iter().any(|result| result.output.is_some())) {
-                            this.drain_cleanup(Some(&root), &mut children).await;
-                            stage("postprocess", cancel).await?;
+                    let flatten_root = if flatten && carrier_children_complete {
+                        carrier.clone().filter(|_| completed.iter().any(|result| result.output.is_some()))
+                    } else { None };
+                    if let Some(root) = &flatten_root {
+                        this.drain_cleanup(Some(root), &mut children).await;
+                        stage("postprocess", cancel).await?;
+                    }
+                    {
+                    let source = sources.as_mut().filter(|_| multi && cleanup_eligible && !cancel.cancelled());
+                    let _sharing = source.as_ref().filter(|s| s.overlaps())
+                        .map(|_| this.shared_source_publication.lock().unwrap());
+                    let plan = source.as_ref().map(|s| this.plan_cleanup(s, &physical_sources,
+                        &generations, cleanup_mode, watch_root, depth));
+                    let delete_receipt = plan.as_ref().and_then(|p| p.receipt(task_id));
+                    if let Some(root) = flatten_root {
                             children.archives.append(&mut std::mem::take(&mut completed).into());
                             let has_local_checkpoints = outcome.checkpoints.len() != 0;
                             children.checkpoints.append(&mut outcome.checkpoints);
@@ -2382,7 +2440,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             container.output = Some(root.clone());
                             let flattened = flatten_result(
                                 &*this.observer, task_id, &mut container, &mut children, Some(&this.created_outputs), &this.output_names,
-                                this.request.config.post_extract.flatten_directory_name,
+                                this.request.config.post_extract.flatten_directory_name, delete_receipt,
                             );
                             completed = children.archives.take_tail();
                             if has_local_checkpoints {
@@ -2390,7 +2448,6 @@ impl<'run, O: Observer> Run<'run, O> {
                             }
                             carrier = container.output;
                             flattened?;
-                        }
                     } else if flatten && this.request.origin == Origin::Watch {
                         if let Some(root) = &carrier { outcome.deferred_flatten.push_back(root.clone()); }
                     }
@@ -2412,7 +2469,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                 .expect("carrier has a retained output");
                             let first = &mut completed[index];
                             let segment = first.output.replace(root.clone());
-                            let published = this.observer.after_output(first);
+                            let published = this.observer.after_output(first, delete_receipt);
                             first.output = segment;
                             published?;
                         }
@@ -2427,6 +2484,11 @@ impl<'run, O: Observer> Run<'run, O> {
                                 CreatedOutputs::commit_if_unowned(&this.created_outputs, output);
                             }
                         }
+                    }
+                    if let Some(source) = source {
+                        source.release(!cancel.cancelled());
+                        if !cancel.cancelled() { cleanup_plan = plan; }
+                    }
                     }
                     if let Some(root) = &carrier {
                         if completed.iter().all(|entry| entry.output.is_none()) {
@@ -2476,28 +2538,16 @@ impl<'run, O: Observer> Run<'run, O> {
                             this.observer.sources_processed(family,
                                 carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
                         }
-                        let cleanup_paths = sources.release(true);
-                        let mode = if dispatch_depth > 1 { CleanupMode::Delete }
-                            else { this.request.config.post_extract.archive_cleanup_mode };
-                        let mut deletes = Vec::new();
-                        let mut recycles = Vec::new();
-                        for path in &physical_sources {
-                            if !cleanup_paths.contains(&namespace_key(Path::new(path))) { continue; }
-                            // Generated Watch inputs still belong to the pipeline
-                            // under Keep/Recycle. Probe only when this changes which
-                            // cleanup to run for the leased path.
-                            if mode == CleanupMode::Delete || this.generated_source(path, &generations, watch_root, depth).is_some() {
-                                deletes.push(PathBuf::from(path));
-                            } else if mode == CleanupMode::Recycle {
-                                recycles.push(PathBuf::from(path));
-                            }
-                        }
-                        dedup_paths(&mut deletes);
-                        dedup_paths(&mut recycles);
+                        let SourceCleanup { deletes, recycles } = cleanup_plan.unwrap_or_else(|| {
+                            let plan = this.plan_cleanup(sources, &physical_sources, &generations,
+                                cleanup_mode, watch_root, depth);
+                            sources.release(true);
+                            plan
+                        });
                         if deletes.is_empty() && recycles.is_empty() {
                             drop(lease);
                         } else {
-                            let paths = (!watch_root).then(|| deletes.iter().chain(&recycles)
+                            let paths = (!watch_root).then(|| deletes.iter().map(|source| &source.path).chain(&recycles)
                                 .map(|path| Arc::from(namespace_key(path))).collect());
                             let cleanup = Arc::clone(this);
                             let work = async move {
@@ -2508,8 +2558,14 @@ impl<'run, O: Observer> Run<'run, O> {
                                 let mut failures = Vec::new();
                                 if stage("background_source_cleanup", &cleanup.request.cancel).await.is_ok() {
                                     let mut shell = cleanup.engine.shell.branch();
-                                    cleanup.cleanup_sources(&recycles, CleanupMode::Recycle, &mut failures, &mut shell);
-                                    cleanup.cleanup_sources(&deletes, CleanupMode::Delete, &mut failures, &mut shell);
+                                    cleanup.recycle_sources(&recycles, &mut failures, &mut shell);
+                                    if cleanup.engine.delete_sources(&deletes,
+                                        |parent| !cleanup.cleanup_boundaries.is_empty()
+                                            && cleanup.cleanup_boundaries.contains(&resolved_key(parent)), &mut shell,
+                                        |path, error| failures.extend(cleanup_failure(path, "delete", Err(error))),
+                                    ) && !deletes.is_empty() {
+                                        cleanup.observer.source_cleanup_done(task_id);
+                                    }
                                 }
                                 failures
                             };
@@ -3437,18 +3493,38 @@ impl<'run, O: Observer> Run<'run, O> {
         Ok(reserved)
     }
 
-    fn cleanup_sources(
+    fn plan_cleanup(
+        &self,
+        owner: &CleanupOwner,
+        paths: &[String],
+        generations: &SourceGenerations,
+        mode: CleanupMode,
+        watch_root: bool,
+        depth: usize,
+    ) -> SourceCleanup {
+        let mut allowed = owner.allowed();
+        let mut plan = SourceCleanup::default();
+        for path in paths {
+            let source = Path::new(path);
+            if !allowed.remove(&namespace_key(source)) { continue; }
+            if mode == CleanupMode::Delete || self.generated_source(path, generations, watch_root, depth).is_some() {
+                if let Some(generation) = generations.get(&path_key(path)) {
+                    plan.deletes.push(DeleteSource { path: source.to_owned(), generation: generation.clone() });
+                }
+            } else if mode == CleanupMode::Recycle {
+                plan.recycles.push(source.to_owned());
+            }
+        }
+        plan
+    }
+
+    fn recycle_sources(
         &self,
         paths: &[PathBuf],
-        cleanup: CleanupMode,
         failures: &mut Vec<CleanupResult>,
         shell: &mut ShellUpdates<'_>,
     ) {
-        let mode = match cleanup {
-            CleanupMode::Keep => unreachable!("keep needs no source cleanup"),
-            CleanupMode::Delete => "delete",
-            CleanupMode::Recycle => "recycle",
-        };
+        let mode = "recycle";
         let mut existing = Vec::new();
         for path in paths {
             match path.try_exists() {
@@ -3470,23 +3546,86 @@ impl<'run, O: Observer> Run<'run, O> {
             }
         };
         for path in existing {
-            let removed = match cleanup {
-                CleanupMode::Delete => remove_owned_file(path),
-                CleanupMode::Recycle => super::cleanup::recycle(path),
-                CleanupMode::Keep => unreachable!("keep produced receipts without filesystem work"),
-            };
+            let removed = super::cleanup::recycle(path);
             if removed.is_ok() {
-                shell.parent(path);
-                if let Some(parent) = path.parent().filter(|parent| parent.parent().is_some()) {
-                    let protected = !self.cleanup_boundaries.is_empty()
-                        && self.cleanup_boundaries.contains(&resolved_key(parent));
-                    // RemoveDirectory checks emptiness atomically. Never recurse:
-                    // a concurrent arrival, retained sibling or output protects itself.
-                    if !protected && fs::remove_dir(parent).is_ok() { shell.parent(parent); }
-                }
+                source_removed(path, |parent| !self.cleanup_boundaries.is_empty()
+                    && self.cleanup_boundaries.contains(&resolved_key(parent)), shell);
             }
             failures.extend(cleanup_failure(path, mode, removed));
         }
+    }
+}
+
+impl Engine {
+    pub(crate) fn recover_delete_sources(
+        &self,
+        sources: &[DeleteSource],
+        protected: impl Fn(&Path) -> bool,
+        failure: impl FnMut(&Path, io::Error),
+    ) -> bool {
+        // Recovery runs outside a pipeline request. Take the same namespace
+        // and request claims, but never wait behind a live consumer.
+        let mut request = RequestClaim::new(Origin::Watch);
+        let mut keys = HashSet::with_capacity(sources.len());
+        for source in sources {
+            let key = resolved_key(&source.path);
+            keys.insert(Arc::from(key.as_str()));
+            request.add(ClaimedInput {
+                path: source.path.clone(), key, directory: false, alias: false,
+                object: source.generation.object_id(),
+            });
+        }
+        let id = self.next_id();
+        let (_claim, _lease) = {
+            let mut state = self.leases.state.lock().unwrap();
+            if keys.iter().any(|key| state.active.contains_key(key))
+                || state.requests.values().any(|active| request.overlaps(active))
+            { return false; }
+            state.requests.insert(id, request);
+            for key in &keys { state.active.insert(Arc::clone(key), (None, 1)); }
+            (
+                RequestClaimGuard { registry: Arc::clone(&self.leases), id },
+                Lease { owner: Arc::clone(&self.leases), keys },
+            )
+        };
+        self.delete_sources(sources, protected, &mut self.shell.branch(), failure)
+    }
+
+    fn delete_sources(
+        &self,
+        sources: &[DeleteSource],
+        protected: impl Fn(&Path) -> bool,
+        shell: &mut ShellUpdates<'_>,
+        mut failure: impl FnMut(&Path, io::Error),
+    ) -> bool {
+        if sources.is_empty() { return true; }
+        let _promotion = match Promotion::begin(sources.iter().map(|source| source.path.clone())) {
+            Ok(promotion) => promotion,
+            Err(error) => {
+                for source in sources { failure(&source.path, copy_io_error(&error)); }
+                return false;
+            }
+        };
+        let mut settled = true;
+        for source in sources {
+            match super::cleanup::delete_source(source) {
+                Ok(true) => source_removed(&source.path, &protected, shell),
+                Ok(false) => {}
+                Err(error) => {
+                    settled = false;
+                    failure(&source.path, error);
+                }
+            }
+        }
+        settled
+    }
+}
+
+fn source_removed(path: &Path, protected: impl FnOnce(&Path) -> bool, shell: &mut ShellUpdates<'_>) {
+    shell.parent(path);
+    if let Some(parent) = path.parent().filter(|parent| parent.parent().is_some()) {
+        // RemoveDirectory checks emptiness atomically. Never recurse.
+        if !protected(parent) && fs::remove_dir(parent).is_ok() { shell.parent(parent); }
     }
 }
 
@@ -3498,6 +3637,7 @@ fn flatten_result(
     created: Option<&Mutex<CreatedOutputs>>,
     names: &OutputReservationGuard,
     naming: crate::core::config::FlattenDirectoryName,
+    cleanup: Option<DeleteReceipt<'_>>,
 ) -> io::Result<()> {
     let Some(output) = result.output.as_ref() else {
         return Ok(());
@@ -3535,7 +3675,7 @@ fn flatten_result(
                 &available,
                 FlattenLeaf::Prepared(&leaf),
                 destination,
-                || observer.before_flatten(output, &available, &leaf, destination),
+                || observer.before_flatten(output, &available, &leaf, destination, cleanup),
             ))
         })();
         names.registry.lock().unwrap().release_path(&available_key, names.owner);
@@ -4127,7 +4267,7 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
     paths.retain(|path| seen.insert(path_key(&path.to_string_lossy())));
 }
 
-fn resolved_key(path: &Path) -> String {
+pub(crate) fn resolved_key(path: &Path) -> String {
     match fs::canonicalize(path) {
         Ok(canonical) => namespace_key(&canonical),
         Err(_) => namespace_key(path),

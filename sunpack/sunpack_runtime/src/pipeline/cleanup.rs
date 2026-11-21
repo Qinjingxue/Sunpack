@@ -1,4 +1,59 @@
-use std::{io, path::Path};
+use std::{io, path::{Path, PathBuf}};
+
+use crate::io::reader::PhysicalFileGeneration;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeleteSource {
+    pub(crate) path: PathBuf,
+    pub(crate) generation: PhysicalFileGeneration,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DeleteReceipt<'a> {
+    pub(crate) id: super::TaskId,
+    pub(crate) sources: &'a [DeleteSource],
+}
+
+// Ok(false) settles an absent or replaced source without touching its namespace.
+// Open without write sharing, then validate and unlink the very same handle.
+#[cfg(windows)]
+pub(crate) fn delete_source(source: &DeleteSource) -> io::Result<bool> {
+    use std::os::windows::{fs::{MetadataExt, OpenOptionsExt}, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+    let file = match std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&source.path)
+    {
+        Ok(file) => file,
+        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0
+        || crate::io::reader::physical_file_generation_from_metadata(&file, &metadata)? != source.generation
+    {
+        return Ok(false);
+    }
+    let info = FILE_DISPOSITION_INFO_EX { Flags: FILE_DISPOSITION_FLAG_DELETE
+        | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE };
+    if unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfoEx,
+        (&raw const info).cast(), std::mem::size_of_val(&info) as u32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn delete_source(_: &DeleteSource) -> io::Result<bool> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "generation-checked deletion requires Windows"))
+}
 
 #[cfg(windows)]
 pub(super) fn recycle(path: &Path) -> io::Result<()> {

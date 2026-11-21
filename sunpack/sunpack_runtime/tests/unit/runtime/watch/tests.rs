@@ -2003,7 +2003,7 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
         observer.register_output(&failed, &failed_output).unwrap();
         fs::write(failed_output.join("unverified.zip"), b"damaged bytes").unwrap();
         failed.output = Some(failed_output.clone());
-        observer.after_output(&failed).unwrap();
+        observer.after_output(&failed, None).unwrap();
         assert!(failed_output.join("unverified.zip").is_file());
         let pending = journal.state().pending(owner).unwrap();
         assert!(!pending.active_outputs.values().any(|path| key(Path::new(path)) == key(&failed_output)));
@@ -2068,7 +2068,7 @@ fn flatten_recovery_rebases_durable_output_identities() {
                     .unwrap())
             })
             .unwrap();
-        prepare_flatten(&journal, owner, &root, &work, &leaf, &root, None).unwrap();
+        prepare_flatten(&journal, owner, &root, &work, &leaf, &root, None, None).unwrap();
         assert_eq!(journal.state().active_output_keys().len(), 4);
         fs::rename(&root, &work).unwrap();
         journal.flush().unwrap();
@@ -2119,7 +2119,7 @@ fn flatten_keeps_physical_work_when_its_literal_junction_disappears() {
         .args(["/d", "/c", "mklink", "/J"]).arg(&alias).arg(&real).output().unwrap();
     assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
     let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
-    prepare_flatten(&journal, "", &root, &work, &leaf, &root, None).unwrap();
+    prepare_flatten(&journal, "", &root, &work, &leaf, &root, None, None).unwrap();
     fs::rename(&root, &work).unwrap();
     fs::rename(physical_work.join("leaf"), &root).unwrap();
     fs::remove_dir(alias).unwrap();

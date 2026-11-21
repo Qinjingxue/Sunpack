@@ -389,6 +389,7 @@ enum Collection {
 
 pub(crate) const CONTINUATION_PREFIX: &str = "continuation|";
 pub(crate) const CONTINUATION_OUTPUT_PREFIX: &str = "continuation-output|";
+pub(crate) const SOURCE_DELETE_PREFIX: &str = "delete-source|";
 
 #[derive(Debug, Clone)]
 enum Operation {
@@ -474,6 +475,7 @@ impl<'de> Deserialize<'de> for Operation {
                         let key: String = field(&mut seq)?;
                         if key != "watch_control" && !key.starts_with("flatten|")
                             && !key.starts_with(CONTINUATION_PREFIX) && !key.starts_with(CONTINUATION_OUTPUT_PREFIX)
+                            && !key.starts_with(SOURCE_DELETE_PREFIX)
                         {
                             return Err(A::Error::custom("unknown runtime record"));
                         }
@@ -641,6 +643,13 @@ impl NativeWatchOperations {
 
     pub(crate) fn set_runtime(&mut self, key: String, value: Option<Value>) {
         self.0.push(Operation::Runtime(key, value.map(Arc::new)));
+    }
+
+    pub(crate) fn finished_output_identity(&self) -> Option<&str> {
+        match self.0.last()? {
+            Operation::Output(_, OutputChange::Finish { identity, keep: true, .. }) => identity.as_deref(),
+            _ => None,
+        }
     }
 
     pub(crate) fn relocate_output(

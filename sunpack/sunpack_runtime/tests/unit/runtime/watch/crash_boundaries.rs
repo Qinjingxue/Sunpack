@@ -20,10 +20,12 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         let work = base.join("work");
         let leaf = root.join("wrapper/inner");
         let nested = leaf.join("nested.zip");
+        let settled_child = leaf.join("settled.zip");
         let nested_output = leaf.join("nested");
         fs::create_dir_all(&nested_output).unwrap();
         fs::write(&owner, b"carrier input").unwrap();
         fs::write(&nested, b"nested archive").unwrap();
+        fs::write(&settled_child, b"completed child archive").unwrap();
         fs::write(nested_output.join("payload"), b"committed payload").unwrap();
         let payload_identity = output_identity(nested_output.to_str().unwrap()).unwrap();
         fs::write(base.join("identity"), payload_identity).unwrap();
@@ -44,9 +46,14 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                 operations.extend(state.output_operation(owner_text, task.to_string_lossy().into_owned(),
                     output.to_string_lossy().into_owned(), None, false)?.unwrap());
             }
+            store_source_cleanup(&mut operations, source_cleanup_id("crashed", 2), owner_text,
+                (nested_output.to_str().unwrap(), &fs::read_to_string(base.join("identity"))?),
+                None, &[DeleteSource { path: settled_child.clone(), generation: capture_file_generation(&settled_child)? }]);
             Ok(operations)
         }).unwrap();
-        prepare_flatten(&journal, owner_text, &root, &work, &leaf, &destination, None).unwrap();
+        let deletes = [DeleteSource { path: owner.clone(), generation: capture_file_generation(&owner).unwrap() }];
+        prepare_flatten(&journal, owner_text, &root, &work, &leaf, &destination, None,
+            Some(("crashed", Some(DeleteReceipt { id: 1, sources: &deletes })))).unwrap();
         let phase = std::env::var(PHASE).unwrap();
         if phase != "prepared" {
             crate::io::atomic_file::rename_no_replace(&root, &work).unwrap();
@@ -101,6 +108,13 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         for reopen in 0..2 {
             let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
             recover_flattens(&journal, |_| true).unwrap();
+            recover_source_cleanup(&journal, &Engine::new(base.join("unused-worker.exe")),
+                std::iter::once(base.as_path()), |_, _| true).unwrap();
+            assert!(!owner.exists(), "{phase}/{reopen}: committed carrier was not cleaned up");
+            assert!(!leaf.join("settled.zip").exists() && !destination.join("settled.zip").exists(),
+                "{phase}/{reopen}: pending child cleanup did not follow its output");
+            assert_eq!(fs::read(leaf.join("nested.zip")).or_else(|_| fs::read(destination.join("nested.zip"))).unwrap(),
+                b"nested archive", "the pending child was not an authorized cleanup member");
             if phase == "prepared" && reopen == 0 {
                 // No filesystem move occurred. Recovery retires the untouched
                 // intent; the resumed pipeline can perform the same operation.
@@ -108,7 +122,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                 let result = crate::postprocess::flatten_single_branch_directories(
                     &root, &work, crate::postprocess::FlattenLeaf::Prepared(&leaf),
                     &destination,
-                    || prepare_flatten(&journal, owner.to_str().unwrap(), &root, &work, &leaf, &destination, None),
+                    || prepare_flatten(&journal, owner.to_str().unwrap(), &root, &work, &leaf, &destination, None, None),
                 );
                 assert!(matches!(result, crate::postprocess::FlattenOutcome::Published { cleanup_error: None }), "{result:?}");
                 finish_flatten(&journal, root.to_str().unwrap()).unwrap();
@@ -126,6 +140,124 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                 Path::new(task) == destination.join("nested.zip") && Path::new(output) == destination.join("nested")));
             assert!(!journal.state().owns_path(root.to_str().unwrap()));
             assert!(!journal.state().owns_path(work.to_str().unwrap()));
+        }
+        fs::remove_dir_all(&base).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+}
+
+#[test]
+fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replacements() {
+    const CHILD: &str = "SUNPACK_DELETE_CRASH_CHILD";
+    const CASE: &str = "SUNPACK_DELETE_CRASH_CASE";
+    const READY: &str = "sunpack-delete-crash-ready";
+    let id = source_cleanup_id("crashed", 1);
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        let source = base.join("archive.zip");
+        let output = base.join("output");
+        let path = source.to_str().unwrap();
+        let target = output.to_str().unwrap();
+        fs::write(&source, b"archive").unwrap();
+        let deletes = [DeleteSource { path: source.clone(), generation: capture_file_generation(&source).unwrap() }];
+        let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
+        journal.commit(true, |state| Ok(state.pending_operations(
+            [(PendingObservation(path.into(), 7, 1.0, String::new(), 0), String::new(), None)],
+            false, "", false, None,
+        ))).unwrap();
+        let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
+        let observer = WatchObserver {
+            deep: false, dedup_enabled: false,
+            dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"),
+                config::WatchDeduplication::None, config::WatchDeduplicationScope::Root).unwrap())),
+            dedup_scope: NativeDiscoveryScope::new(base.to_string_lossy().into_owned(), None, Vec::new()),
+            catalog, journal: Arc::clone(&journal), owners: HashMap::from([(key(&source), path.into())]),
+            outputs: Mutex::new(ObservedOutputs::from(BTreeMap::new())),
+            batch: Arc::from("crashed"), toast: None, hub: Arc::new(Hub::new()),
+            groups: Arc::default(), claimed: Arc::default(),
+        };
+        let mut archive = super::tests::completion_archive(path, 1, None);
+        observer.register_output(&archive, &output).unwrap();
+        fs::write(output.join("payload"), b"delivered").unwrap();
+        fs::write(base.join("output_identity"), output_identity(target).unwrap()).unwrap();
+        archive.output = Some(output);
+        let before = journal.frontier_seq_for_test();
+        observer.after_output(&archive, Some(DeleteReceipt { id: 1, sources: &deletes })).unwrap();
+        assert_eq!(journal.frontier_seq_for_test(), before + 1);
+        assert!(journal.state().runtime_record(&id).is_some());
+        if std::env::var(CASE).unwrap() == "after_delete" {
+            assert!(crate::pipeline::cleanup::delete_source(&deletes[0]).unwrap());
+            observer.source_cleanup_done(1);
+        }
+        println!("{READY}");
+        io::stdout().flush().unwrap();
+        io::stdin().read_exact(&mut [0]).unwrap();
+        panic!("parent must terminate owner without unwinding");
+    }
+
+    use std::os::windows::fs::OpenOptionsExt;
+    for case in ["ordinary", "busy", "changed_in_place", "replace_source", "replace_output", "after_delete"] {
+        let marker = crate::test_support::temp_file("delete_hard_death", b"");
+        let base = marker.with_extension("case");
+        fs::create_dir(&base).unwrap();
+        let test = format!("{}::hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replacements",
+            module_path!().split_once("::").unwrap().1);
+        let mut child = Command::new(std::env::current_exe().unwrap()).args(["--exact", &test, "--nocapture"])
+            .env(CHILD, &base).env(CASE, case)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, ready) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            for line in io::BufReader::new(stdout).lines() {
+                if line.unwrap().contains(READY) { let _ = send.send(()); return; }
+            }
+        });
+        let reached = ready.recv_timeout(Duration::from_secs(30));
+        let killed = child.kill();
+        let status = child.wait().unwrap();
+        reader.join().unwrap();
+        reached.expect("delete owner did not reach the durable boundary");
+        killed.unwrap();
+        assert!(!status.success());
+        let output = base.join("output");
+        let source = base.join("archive.zip");
+        if case == "replace_source" { fs::rename(&source, base.join("original.zip")).unwrap(); }
+        if matches!(case, "replace_source" | "after_delete") { fs::write(&source, b"replacement").unwrap(); }
+        if case == "replace_output" {
+            fs::rename(&output, base.join("original_output")).unwrap();
+            fs::create_dir(&output).unwrap();
+            fs::write(output.join("payload"), b"replacement").unwrap();
+        }
+        let held = matches!(case, "busy" | "changed_in_place").then(|| {
+            fs::OpenOptions::new().write(true).share_mode(7).open(&source).unwrap()
+        });
+        let engine = Engine::new(base.join("unused-worker.exe"));
+        let state_dir = base.join("state");
+        {
+            let journal = journal::Journal::open(&state_dir, 7).unwrap();
+            let before = journal.frontier_seq_for_test();
+            recover_source_cleanup(&journal, &engine, std::iter::once(base.as_path()), |_, _| true).unwrap();
+            assert_eq!(journal.frontier_seq_for_test(), before, "{case}: replay appended a WAL record");
+            assert_eq!(journal.source_cleanup_retired(&id), held.is_none(), "{case}: incorrect receipt status");
+            if held.is_some() { assert!(source.exists()); }
+        }
+        if case == "changed_in_place" { held.as_ref().unwrap().set_len(1).unwrap(); }
+        drop(held);
+        for _ in 0..2 {
+            let journal = journal::Journal::open(&state_dir, 7).unwrap();
+            recover_source_cleanup(&journal, &engine, std::iter::once(base.as_path()), |_, _| true).unwrap();
+            assert!(journal.source_cleanup_retired(&id), "{case}: did not settle the original receipt");
+            if case != "replace_output" {
+                assert_eq!(output_identity(output.to_str().unwrap()).unwrap(),
+                    fs::read_to_string(base.join("output_identity")).unwrap());
+            }
+            if matches!(case, "ordinary" | "busy") { assert!(!source.exists()); }
+            if matches!(case, "replace_source" | "after_delete") { assert_eq!(fs::read(&source).unwrap(), b"replacement"); }
+            if case == "changed_in_place" { assert_eq!(fs::read(&source).unwrap(), b"a"); }
+            if case == "replace_output" {
+                assert_eq!(fs::read(&source).unwrap(), b"archive");
+                assert_eq!(fs::read(output.join("payload")).unwrap(), b"replacement");
+            }
         }
         fs::remove_dir_all(&base).unwrap();
         fs::remove_file(marker).unwrap();
