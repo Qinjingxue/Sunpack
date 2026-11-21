@@ -43,6 +43,7 @@
 - [Contributing](#contributing)
 - [Acknowledgements](#acknowledgements)
 - [License](#license)
+- [Contact](#contact)
 
 ## Installation
 

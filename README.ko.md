@@ -4,7 +4,36 @@
 
 <p align="center"><a href="README.zh-CN.md">简体中文</a> · <a href="README.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.ja.md">日本語</a> · <b>한국어</b> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">다운로드</a></p>
 
+<p align="center">
+  <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=Latest%20release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%20only-2f6070" alt="Windows only">
+  <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT License"></a>
+</p>
+
 <p align="center"><img src="sunpack_en.gif" width="80%" alt="SunPack 데모(영어 UI)"></p>
+
+## 목차
+
+- [설치](#설치)
+- [사용법](#사용법)
+  - [관리 화면과 암호](#관리-화면과-암호)
+- [주요 기능](#주요-기능)
+  - [압축 파일 식별](#압축-파일-식별)
+  - [재귀 처리](#재귀-처리)
+  - [후처리](#후처리)
+  - [Watch 감시](#watch-감시)
+  - [안정성과 WAL 복구](#안정성과-wal-복구)
+  - [동시 처리와 속도 최적화](#동시-처리와-속도-최적화)
+  - [유휴 상태의 자원 사용](#유휴-상태의-자원-사용)
+- [설정](#설정)
+- [개발 및 테스트](#개발-및-테스트)
+  - [아키텍처 개요](#아키텍처-개요)
+  - [재현 가능한 worker와 7-Zip 비교](#재현-가능한-worker와-7-zip-비교)
+- [알려진 문제](#알려진-문제)
+- [기여](#기여)
+- [감사의 말](#감사의-말)
+- [라이선스](#라이선스)
+- [연락처](#연락처)
 
 ## 설치
 
@@ -55,15 +84,37 @@ CLI의 `-p`, `-P`, 대화형 입력 및 현재 클립보드도 후보가 될 수
 
 ## 주요 기능
 
-- **압축 파일 식별**. 바이너리 내용을 기준으로 확장자가 위장된 파일, 다른 파일에 내장된 압축 데이터, 분할 압축 파일을 식별합니다. ZIP, ZIPX, RAR3/4/5, 7z(Zstandard 및 LZ4 포함), Zstandard, gzip, bzip2, TAR, XZ, LZ4와 독립 ENC v4 파일을 지원합니다. WinZip 전용 ZIPX JPEG·MP3·WavPack 방식과 레거시 또는 사전을 사용하는 LZ4는 지원 대상에서 제외됩니다.
-- **재귀 압축 해제와 후처리**. 압축을 푼 결과에 포함된 압축 파일도 이어서 처리할 수 있습니다. 완전히 성공하면 기본적으로 원본을 휴지통으로 보냅니다. 시딩 등으로 원본을 유지해야 할 경우 `post_extract.archive_cleanup_mode`를 `k`로 설정하세요.
-- **Watch**. 쓰기가 안정된 파일을 처리합니다. 누락된 볼륨이 도착하거나 암호 후보가 변경되면 관련 작업을 다시 시도합니다. 감시 루트별 출력 위치를 지정하고 Windows 알림에서 진행률을 확인할 수 있습니다.
-- **장애 복구**. 디스크 공간이 부족하면 일시 중지하고 공간이 확보되면 다시 시작합니다. WAL 체크포인트를 사용해 종료 후 복구할 수 있습니다. 부분 결과를 허용하면 파일 손상이나 누락된 볼륨이 있더라도 쓰기가 완료된 파일을 유지할 수 있습니다.
-- **동시 처리와 자원 관리**. Rust와 C++ 네이티브 코드 및 중첩 I/O로 여러 압축 파일을 처리합니다. 유휴 상태는 이벤트 기반으로 대기하며, 작업 이후 불필요한 캐시를 해제합니다.
+### 압축 파일 식별
+
+바이너리 데이터를 분석하여 확장자가 위장된 파일, 다른 파일에 내장된 압축 파일 및 분할 압축 파일을 식별합니다. ZIP, ZIPX, RAR3/4/5, 7z, Zstandard, Gzip, TAR, TBZ2, XZ, LZ4, ENC v4를 지원합니다. WinZip 전용 ZIPX JPEG·MP3·WavPack 방식과 레거시 또는 사전 사용 LZ4는 지원하지 않습니다.
+
+### 재귀 처리
+
+압축 해제 후 결과 폴더에서 추가로 풀어야 할 압축 파일을 기본적으로 재귀 검색하고 처리합니다. 불필요한 재압축 해제를 피하도록 판별합니다.
+
+### 후처리
+
+성공 후 의미 없는 단일 하위 디렉터리의 중첩을 평탄화하고 최상위 폴더를 유지합니다. 원본 압축 파일은 기본적으로 휴지통으로 이동하며 설정에 따라 삭제하거나 유지할 수 있습니다. 실패 시 출력물을 정리하고 오류를 보고합니다. BitTorrent 시딩 등으로 원본이 필요하면 `post_extract.archive_cleanup_mode`를 `k`로 변경하세요.
+
+### Watch 감시
+
+감시 폴더에 추가된 압축 파일을 식별하고 다른 파일은 처리하지 않습니다. 볼륨이나 암호가 부족하면 볼륨 또는 암호 후보가 변경된 후 다시 시도합니다. Windows 알림으로 진행률을 표시하며 감시 폴더마다 출력 경로를 설정할 수 있습니다. 자세한 내용은 [CLI 옵션 설명](docs/ko/cli_parameters.md)을 참고하세요.
+
+### 안정성과 WAL 복구
+
+디스크 공간이 부족하면 일시 중지하고 공간이 확보되면 재개합니다. worker가 완료한 파일을 이용한 선택적 부분 복구를 지원하며, 전체·부분 결과와 원본 정리는 공통 정책을 따릅니다. WAL을 사용해 충돌이나 정전 후 복구하며 복잡한 형식, 동시 처리 및 복구를 테스트합니다.
+
+### 동시 처리와 속도 최적화
+
+여러 압축 파일을 동시에 처리하고 Rust와 C++의 계산·I/O 및 중첩 I/O를 활용합니다. 7-Zip의 Deflate 압축 해제에는 zlib-ng를 사용하고 RAR 및 BZip2 디코딩도 병렬화합니다. 다양한 시나리오의 벤치마크를 바탕으로 최적화합니다.
+
+### 유휴 상태의 자원 사용
+
+처리 후 불필요한 캐시를 해제합니다. 유휴 상태에서는 이벤트 알림으로 대기하여 폴링에 CPU를 사용하지 않습니다.
 
 ## 설정
 
-설치 버전에서는 보통 `%ProgramData%\SunPack\sunpack_config.json`을 편집합니다. `sunpack_advanced_config.json`은 나머지 기본값을 제공합니다. 두 파일에 같은 설정이 있으면 일반 설정이 우선합니다. Watch는 변경 사항을 자동으로 다시 읽습니다.
+설치 버전에서는 보통 `%ProgramData%\SunPack\sunpack_config.json`을 편집합니다. `sunpack_advanced_config.json`은 나머지 기본값을 제공합니다. 두 파일에 같은 설정이 있으면 일반 설정이 우선하며 설정 항목을 두 파일 사이에서 자유롭게 옮길 수 있습니다. Watch는 변경 사항을 자동으로 다시 읽습니다.
 
 ```powershell
 sunpack config validate
@@ -86,7 +137,47 @@ uv run --locked pytest
 
 ARM64 네이티브 개발과 인수 테스트에는 `-Arch arm64`를, x64에서의 ARM64 교차 빌드에는 `-Arch arm64 -SkipAcceptanceTestTools`를 사용합니다.
 
-Rust가 검색, 형식 분석, 암호 및 볼륨 확인, 처리 계획을 담당하고 7-Zip 소스를 내장한 C++ worker가 압축을 풉니다. [개발 환경과 빌드](docs/ko/development_setup.md), [개발 계층의 책임 범위](docs/ko/development_boundaries.md), [worker와 7-Zip의 재현 가능한 비교](docs/ko/benchmark_worker_vs_7z_300m.md)를 참고하세요. 저장소를 수정할 때는 [AGENTS.md](AGENTS.md)의 개발 규칙을 따르세요.
+Rust가 검색, 형식 분석, 암호 및 볼륨 확인, 처리 계획을 담당하고 7-Zip 소스를 내장한 C++ worker가 압축을 풉니다. [개발 환경과 빌드](docs/ko/development_setup.md), [개발 계층의 책임 범위](docs/ko/development_boundaries.md), [worker와 7-Zip의 재현 가능한 비교](docs/ko/benchmark_worker_vs_7z_300m.md)를 참고하세요. 저장소를 수정할 때는 [AGENTS.md](AGENTS.md)의 개발 규칙을 따르세요. AI를 사용하는 개발자는 변경 전에 AI가 AGENTS.md를 읽고 해당 규칙을 따르도록 해야 합니다. 최초 설정 시 Python, Cargo 의존성과 테스트 도구를 받으려면 네트워크 연결이 필요합니다.
+
+### 아키텍처 개요
+
+```text
+CLI / Watch / Explorer (runtime)
+  -> pipeline coordinator
+     -> filesystem routing
+        +-- Relations (RAR / 7z / ZIP, 분할 볼륨 포함)
+        +-- Detection (TAR 및 압축 스트림)
+        +-- Embedded discovery (미해결 파일)
+     -> 재귀 처리 판정 -> 암호 처리 -> 압축 해제
+     -> 완료 -> 후처리
+```
+
+### 재현 가능한 worker와 7-Zip 비교
+
+[벤치마크 문서](docs/ko/benchmark_worker_vs_7z_300m.md)에 환경, 압축 파일 생성 방법, 압축 방식과 재현 절차가 있습니다.
+
+아래 결과는 SunPack **v0.7.9**, 커밋 `b9fdfa6d` 기준입니다. 2026-10-03에 18개 사례를 워밍업 없이 각각 5회 측정했으며 시간과 프로세스 트리의 최대 RSS 중앙값을 표시합니다. 원본 데이터는 `benchmarks/results/worker-vs-7z-300m-v0.7.9-b9fdfa6-rss-20261003.json`입니다. 시간 및 RSS 비율은 worker / `7z.exe`입니다.
+
+| Format / variant | Worker time (ms) | `7z.exe` time (ms) | Time ratio | Worker peak RSS (MiB) | `7z.exe` peak RSS (MiB) | RSS ratio |
+| ---------------- | :--------------- | :----------------- | :--------- | :-------------------- | :---------------------- | :-------- |
+| 7z split         | 141.886          | 203.605            | 0.697      | 476.199               | 458.379                 | 1.039     |
+| 7z non-solid     | 188.029          | 250.020            | 0.752      | 324.137               | 308.047                 | 1.052     |
+| 7z solid         | 142.802          | 204.641            | 0.698      | 475.652               | 458.309                 | 1.038     |
+| BZip2            | 1,670.859        | 2,914.191          | 0.573      | 43.289                | 12.625                  | 3.429     |
+| Gzip             | 81.731           | 209.743            | 0.390      | 25.188                | 8.215                   | 3.066     |
+| RAR5 split       | 172.453          | 768.066            | 0.225      | 54.242                | 40.516                  | 1.339     |
+| RAR4 non-solid   | 80.926           | 185.464            | 0.436      | 27.488                | 11.598                  | 2.370     |
+| RAR4 solid       | 539.789          | 652.330            | 0.827      | 28.211                | 12.348                  | 2.285     |
+| RAR5 non-solid   | 95.293           | 186.992            | 0.510      | 56.250                | 39.605                  | 1.420     |
+| RAR5 solid       | 168.938          | 745.597            | 0.227      | 57.289                | 40.477                  | 1.415     |
+| TAR              | 76.350           | 120.331            | 0.634      | 24.031                | 7.297                   | 3.293     |
+| TBZ2             | 1,663.736        | 2,890.008          | 0.576      | 44.141                | 12.625                  | 3.496     |
+| TGZ              | 84.974           | 213.233            | 0.399      | 25.215                | 8.219                   | 3.068     |
+| TXZ              | 156.893          | 181.328            | 0.865      | 474.617               | 458.523                 | 1.035     |
+| TZST             | 100.259          | 188.752            | 0.531      | 23.012                | 9.789                   | 2.351     |
+| XZ               | 169.011          | 183.459            | 0.921      | 474.621               | 458.520                 | 1.035     |
+| ZIP              | 76.254           | 198.892            | 0.383      | 25.289                | 7.984                   | 3.167     |
+| ZST              | 104.599          | 181.936            | 0.575      | 23.039                | 9.789                   | 2.354     |
 
 ## 알려진 문제
 
@@ -102,11 +193,15 @@ Rust가 검색, 형식 분석, 암호 및 볼륨 확인, 처리 계획을 담당
 
 내역 매니페스트와 이에 대응하는 `.store`를 함께 첨부하세요. 공유하기 전에 암호와 개인 경로를 제거하세요.
 
-## 감사의 말과 라이선스
+## 감사의 말
 
-모든 기여자 및 사용자와 [Core UI](https://github.com/ghboke/core-ui), [7-Zip](https://www.7-zip.org/), [zlib-ng](https://github.com/zlib-ng/zlib-ng), [LZ4](https://github.com/lz4/lz4), [RustCrypto](https://github.com/RustCrypto) 개발자에게 감사드립니다.
+모든 기여자와 사용자, [Core UI](https://github.com/ghboke/core-ui), [7-Zip](https://www.7-zip.org/), [zlib-ng](https://github.com/zlib-ng/zlib-ng), [LZ4](https://github.com/lz4/lz4), [RustCrypto](https://github.com/RustCrypto) 개발자에게 감사드립니다.
 
-SunPack 자체 코드는 [MIT 라이선스](LICENSE)를 따릅니다. 타사 소스와 바이너리는 각각의 원래 라이선스를 따릅니다. [타사 고지](THIRD_PARTY_NOTICES.md), [라이선스 원문](licenses/), [라이선스와 배포](docs/ko/licensing.md)를 참고하세요.
+## 라이선스
+
+SunPack 자체 코드에는 [MIT 라이선스](LICENSE)가 적용됩니다. 7-Zip, zlib-ng, LZ4, RustCrypto에서 가져온 구현 등 타사 코드와 바이너리에는 각각의 원래 라이선스가 적용됩니다. 구성 요소, 저작권 및 배포에 필요한 자료는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), [라이선스와 배포](docs/ko/licensing.md)를 참고하세요. 7-Zip 소스 라이선스는 [7zip-source-license.txt](licenses/7zip-source-license.txt), LGPL 2.1 전문은 [LGPL-2.1.txt](licenses/LGPL-2.1.txt)에 있습니다.
+
+입력 프리페치 최적화는 단일 및 동시 작업 모두에서 효과가 유지되지 않아 채택하지 않았습니다.
 
 ## 연락처
 
