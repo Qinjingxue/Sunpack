@@ -59,10 +59,10 @@ SunPack 仅支持 Windows 10 版本 1709 及更高版本和 Windows 11。其中W
    - 注册资源管理器中的文件夹、文件夹背景右键菜单。
    - 随 Windows 启动 SunPack Watch（默认不启用）。
 
-也可以通过 WinGet 静默安装：
+也可以通过 WinGet 安装：
 
 ```powershell
-winget install --id Qinjingxue.SunPack --exact --source winget --silent
+winget install sunpack
 ```
 
 ---

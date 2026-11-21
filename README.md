@@ -59,10 +59,10 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
    - Register the Explorer context menu for folders and folder backgrounds.
    - Start SunPack Watch with Windows (disabled by default).
 
-To install silently from the WinGet catalog, run:
+To install with WinGet, run:
 
 ```powershell
-winget install --id Qinjingxue.SunPack --exact --source winget --silent
+winget install sunpack
 ```
 
 ---
