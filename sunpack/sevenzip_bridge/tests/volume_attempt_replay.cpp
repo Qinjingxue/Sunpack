@@ -4,6 +4,7 @@
 #define main sunpack_worker_main
 #include "../src/worker.cpp"
 #undef main
+#include <cstring>
 #include <fstream>
 #include <future>
 #include <sstream>
@@ -791,6 +792,77 @@ void disjoint_layouts_do_not_repeat_comparisons() {
         "complete layouts still scanned disjoint predecessors or missed a duplicate");
 }
 
+FILE_ID_INFO output_directory_id(const std::filesystem::path& path) {
+    const auto handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    require(handle != INVALID_HANDLE_VALUE, "could not open output directory for identity check");
+    FILE_ID_INFO id{};
+    const auto ok = GetFileInformationByHandleEx(handle, FileIdInfo, &id, sizeof(id));
+    CloseHandle(handle);
+    require(ok, "could not read output directory identity");
+    return id;
+}
+
+bool same_directory(const FILE_ID_INFO& before, const FILE_ID_INFO& after) {
+    return before.VolumeSerialNumber == after.VolumeSerialNumber &&
+        std::memcmp(before.FileId.Identifier, after.FileId.Identifier, sizeof(before.FileId.Identifier)) == 0;
+}
+
+void rollback_keeps_registered_root(const std::filesystem::path& destination) {
+    require(!discard_candidate_output(destination.wstring()), "missing output rollback is not idempotent");
+    const auto nested = destination / L"nested";
+    std::filesystem::create_directories(nested);
+    const auto id = output_directory_id(destination);
+    const auto readonly = nested / L"readonly";
+    { std::ofstream file(readonly); file << "failed attempt"; }
+    { std::ofstream file(destination / L"plain"); file << "failed attempt"; }
+    require(SetFileAttributesW(readonly.c_str(), FILE_ATTRIBUTE_READONLY), "could not mark fixture readonly");
+    require(!discard_candidate_output(destination.wstring()), "rollback could not remove candidate children");
+    require(same_directory(id, output_directory_id(destination)), "rollback replaced the registered root");
+    require(std::filesystem::is_empty(destination), "rollback left candidate output behind");
+    require(!discard_candidate_output(destination.wstring()), "empty output rollback is not idempotent");
+}
+
+void competing_volume_keeps_registered_root(const std::filesystem::path& archive,
+                                            const std::filesystem::path& destination) {
+    // Keep the stored ZIP structure and sizes valid, but corrupt one member
+    // byte in the first composition so real extraction reaches rollback.
+    std::string decoy;
+    {
+        std::ifstream file(archive, std::ios::binary);
+        decoy.assign(std::istreambuf_iterator<char>(file), {});
+    }
+    constexpr std::size_t split = 40;
+    const auto length = decoy.size();
+    decoy[split] ^= 1;
+    const auto alternate = archive.parent_path() / L"volume-decoy.zip";
+    { std::ofstream file(alternate, std::ios::binary); file.write(decoy.data(), decoy.size()); }
+
+    std::filesystem::create_directory(destination);
+    const auto id = output_directory_id(destination);
+    ExtractionReplay replay;
+    ExtractionReplayScope scope(&replay);
+    WorkerRequest request;
+    request.job_id = "competing-volume-root-identity";
+    request.output_dir = destination.wstring();
+    request.archive_input.archive_path = archive.wstring();
+    request.archive_input.format_hint = L"zip";
+    auto& plan = request.archive_input.volume_attempts;
+    plan.sources = {{archive.wstring(), 0, split, true}, {alternate.wstring(), split, length, true},
+        {archive.wstring(), split, length, true}};
+    plan.domains = {{0}, {1, 2}};
+    plan.layouts = {{{1, L"v1", 0}, {2, L"v2", 1}}};
+
+    const auto result = run_request(request);
+    require(result.code == 0 && replay.volumes.attempts == 2 &&
+        replay.volumes.selected == std::vector<std::size_t>{0, 2}, "worker did not replace the damaged candidate");
+    require(same_directory(id, output_directory_id(destination)), "candidate switch replaced the registered root");
+    std::ifstream member(destination / L"ok.txt", std::ios::binary);
+    require(std::string(std::istreambuf_iterator<char>(member), {}) == "cursor replay",
+        "successful fallback wrote incorrect output");
+}
+
 int main() {
     // Tiny stored ZIP: ok.txt contains "cursor replay". Split through the
     // member's data so success requires both chosen ranges in the right order.
@@ -804,6 +876,8 @@ int main() {
     const auto archive = root / L"input.zip";
     { std::ofstream file(archive, std::ios::binary); file.write(zip, sizeof(zip) - 1); }
     check_chunked_request(archive);
+    rollback_keeps_registered_root(root / L"rollback");
+    competing_volume_keeps_registered_root(archive, root / L"competing");
     warm_volume_waves_reuse_proofs(archive);
     carrier_slices_share_open_file(archive);
     unavailable_member_is_not_reprobed_for_an_unread_slice(archive, root / L"unsupported-carrier.zip");

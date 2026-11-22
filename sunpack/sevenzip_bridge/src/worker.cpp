@@ -606,27 +606,51 @@ RequestOutcome interrupted_result(const std::string& job_id) {
 }
 
 // Called only for a candidate transaction whose output was initially empty.
-// Extraction has already drained and closed every writer before this point.
+// Extraction has drained and closed every writer. Keep the root object: Watch
+// may already have journaled its file ID before handing the path to this job.
 std::error_code discard_candidate_output(const std::wstring& output_dir) {
     const std::filesystem::path root(sunpack::sevenzip::win32_extended_path(output_dir));
-    std::error_code error;
-    std::filesystem::remove_all(root, error);
-    if (!error || error != std::errc::permission_denied) return error;
-    // Archive metadata can make a successfully written plain sibling readonly.
-    // Match the ordinary output cleanup policy, without following reparse dirs.
-    const auto writable = [](const std::filesystem::path& path) {
-        const auto attributes = GetFileAttributesW(path.c_str());
-        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY))
-            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+    // Open the root itself (not a junction target) and deny rename/delete
+    // while rolling back its children. The successful extraction path does
+    // not take this handle.
+    const auto handle = CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const std::error_code error(static_cast<int>(GetLastError()), std::system_category());
+        return error == std::errc::no_such_file_or_directory ? std::error_code{} : error;
+    }
+    const std::unique_ptr<void, decltype(&CloseHandle)> keep_root(handle, &CloseHandle);
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &info, sizeof(info)))
+        return {static_cast<int>(GetLastError()), std::system_category()};
+    if (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        return std::make_error_code(std::errc::operation_not_permitted);
+    if (!(info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return std::make_error_code(std::errc::not_a_directory);
+
+    const auto remove_children = [&] {
+        std::error_code error;
+        std::filesystem::directory_iterator it(root, error), end;
+        while (!error && it != end) {
+            std::filesystem::remove_all(it->path(), error);
+            if (!error) it.increment(error);
+        }
+        return error;
     };
-    writable(root);
+    auto error = remove_children();
+    if (error != std::errc::permission_denied) return error;
+    // Archive metadata can make a successfully written plain sibling readonly.
+    // Clear attributes on children only and do not follow reparse directories.
     std::filesystem::recursive_directory_iterator it(root, error), end;
     while (!error && it != end) {
-        writable(it->path());
+        const auto child = GetFileAttributesW(it->path().c_str());
+        if (child != INVALID_FILE_ATTRIBUTES && (child & FILE_ATTRIBUTE_REPARSE_POINT))
+            it.disable_recursion_pending();
+        else if (child != INVALID_FILE_ATTRIBUTES && (child & FILE_ATTRIBUTE_READONLY))
+            SetFileAttributesW(it->path().c_str(), child & ~FILE_ATTRIBUTE_READONLY);
         it.increment(error);
     }
-    if (!error) std::filesystem::remove_all(root, error);
-    return error;
+    return error ? error : remove_children();
 }
 
 struct SelectedVolumeGeometry {
