@@ -4786,11 +4786,12 @@ impl Scheduler {
         let scope = if catalog_visible { watched.clone() }
             else if let Some(recovery) = &recovery { recovery.scope.clone() }
             else { return Ok(()); };
-        let (modified, added) = if catalog_visible { self.catalog.bucket_revisions(&scope, &entry.path) } else { (0, 0) };
-        let revision = if entry.is_missing_volume() { modified } else {
-            if added <= entry.layout_checked_at || self.pending.contains_key(&id) { return Ok(()); }
-            added
-        };
+        let revision = if catalog_visible { self.catalog.bucket_ready_revision(&scope, &entry.path) } else { 0 };
+        if !retry_incomplete
+            && (catalog_visible || !entry.is_missing_volume())
+            && revision <= entry.layout_checked_at
+        { return Ok(()); }
+        if !entry.is_missing_volume() && self.pending.contains_key(&id) { return Ok(()); }
         if !self.journal.state().volume_check_needed(&id, entry, revision, retry_incomplete) { return Ok(()); }
         self.invalidate_recovery(std::iter::once(entry.path.clone()))?;
         if self.journal.state().entry_by_key(&id).is_none() || self.defer_claimed_path(&id) { return Ok(()); }
@@ -5308,8 +5309,11 @@ impl Scheduler {
                 self.pending.insert(id, pending);
                 continue;
             }
-            if quiet::changed(&pending.candidate, &current) && !captured {
+            let content_changed = quiet::changed(&pending.candidate, &current);
+            if content_changed {
                 self.catalog.content_changed(&current.path);
+            }
+            if content_changed && !captured {
                 let boundary = quiet::is_boundary(&current);
                 pending.quiet.boundary_observation(&current, observed_now, observed_at,
                     self.settings.watch.boundary_confirmation_seconds);
@@ -5386,7 +5390,7 @@ impl Scheduler {
         #[cfg(test)]
         if let Some(check) = self.admission_checkpoint.take() { check(self)?; }
         let mut groups = BTreeMap::new();
-        let mut arrivals = HashSet::new();
+        let mut changed_buckets = HashSet::new();
         let retry_volumes = self.journal.state().has_volume_waiters();
         for (id, pending) in prepared {
             // main's submit still checks output ownership and active claims;
@@ -5406,8 +5410,12 @@ impl Scheduler {
                     self.scan_options(policy.deep)?.catalog_update(&self.catalog, scope, Some(&pending.candidate.path))?;
                 }
             }
-            if self.retire_admitted_observation(&id, &pending) && retry_volumes {
-                arrivals.insert((pending.root.clone(), crate::scan::catalog::catalog_stem(&pending.candidate.path)));
+            // A newer content observation at the checkpoint owns the ready
+            // transition. Submitting the prepared request must not consume it.
+            if !self.pending.contains_key(&id)
+                && self.retire_admitted_observation(&id, &pending) && retry_volumes
+            {
+                changed_buckets.insert((pending.root.clone(), crate::scan::catalog::catalog_stem(&pending.candidate.path)));
             }
             let password_scope = candidate_password_scope(self.journal.state(),
                 &pending.candidate.path, pending.recovery.as_deref());
@@ -5421,7 +5429,7 @@ impl Scheduler {
             candidates.push(source);
         }
         let mut retried = HashSet::new();
-        for (root, stem) in arrivals {
+        for (root, stem) in changed_buckets {
             let scope = self.roots[&root].1.clone();
             self.retry_volume_peers(&scope, &stem, &mut retried)?;
         }
@@ -6408,7 +6416,7 @@ impl Scheduler {
                     retry.push((candidate.path.clone(), CandidateAdmission::PasswordRetry));
                 } else if record.waits_for_layout() {
                     // The canonical head can differ from the physical input that
-                    // started this request. Reconcile additions during either claim.
+                    // started this request. Reconcile peer changes during either claim.
                     retry.push((record.path.clone(), CandidateAdmission::Retry));
                 }
             }

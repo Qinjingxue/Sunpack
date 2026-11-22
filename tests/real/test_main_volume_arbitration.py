@@ -1,6 +1,9 @@
 """Main's volume arbitration and recovery cases through the public runtime."""
 
+import os
+import random
 import struct
+import subprocess
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -8,6 +11,7 @@ import pytest
 
 from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree
 from tests.helpers.real_archives import create_encrypted_rar_archive, create_zip_multidisk_archive
+from tests.helpers.tool_config import require_7z
 from tests.real.archive_boundary import assert_extracted, extract_report, require_generator
 from tests.real.plan7_watch_downloads.plan7_support import (
     FACTORY, download, source_directory_cleaned, wait_for, watch_setup,
@@ -201,3 +205,80 @@ def test_pkzip_terminal_disk_with_long_trailer_and_disguised_names(package, tmp_
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
     assert not any(path.exists() for path in parts)
+
+
+@pytest.mark.requires_watch_broker
+@pytest.mark.parametrize("change", ["append", "replace", "overwrite"])
+def test_watch_retries_failed_split_when_tail_content_becomes_ready(package, tmp_path, change):
+    # The weak ZipCrypto header is complete across the first three pieces.
+    # A damaged byte farther into the final piece leaves the key or layout
+    # inconclusive. Both numbering columns still describe a candidate layout.
+    secret = "known-split-key"
+    member = tmp_path / "body.dat"
+    truth = random.Random(401).randbytes(47_000)
+    member.write_bytes(truth)
+    archive = tmp_path / "fixture.zip"
+    subprocess.run([str(require_7z()), "a", "-tzip", "-mx=0", f"-p{secret}",
+                    str(archive), member.name], cwd=tmp_path, check=True, capture_output=True)
+    raw = archive.read_bytes()
+    lengths = struct.unpack_from("<HH", raw, 26)
+    start = 30 + sum(lengths)
+    cuts = [start + 2, start + 7, start + 12]
+    pieces = [raw[a:b] for a, b in zip([0, *cuts], [*cuts, len(raw)])]
+    corrupt = bytearray(pieces[-1])
+    corrupt[len(truth) // 2] ^= 1
+    names = ["shared.build1.chunk1.bin", "shared.build2.chunk3.bin",
+             "shared.build3.chunk2.bin", "shared.build4.chunk4.bin"]
+    package.configure(filesystem={"scan_filters_enabled": False})
+    watch = watch_setup(package, tmp_path, passwords=["wrong", secret], start=False)
+
+    def publish(name, data):
+        staged = tmp_path / "incoming"
+        staged.write_bytes(data)
+        staged.replace(watch.root / name)
+
+    with package.watch_session():
+        for name, data in zip(names[:3], pieces[:3]):
+            publish(name, data)
+        watch.await_event("suspended_missing_volume", path=names[0])
+        publish(names[-1], corrupt)
+        blocker = watch.await_event("failed_password", path=names[0])
+        assert blocker["error_kind"] == "password_inconclusive", blocker
+        assert not list(watch.output.rglob(member.name))
+
+        tail = watch.root / names[-1]
+        if change == "overwrite":
+            # Metadata-only changes must not wake the failed head. A completed
+            # unrelated archive marks progress through the same Watch session.
+            previous = tail.stat()
+            os.utime(tail, ns=(previous.st_atime_ns, previous.st_mtime_ns - 2_000_000_000))
+            unrelated = tmp_path / "barrier.zip"
+            with ZipFile(unrelated, "w") as z:
+                z.writestr("barrier.txt", "Watch processed the next arrival")
+            unrelated.replace(watch.root / unrelated.name)
+            watch.await_event("done", path=unrelated.name)
+            events = watch.display()
+            assert not any(
+                row["event"] == "pipeline_request_started"
+                and Path(row.get("path", "")).name == names[0]
+                and row["ts"] > blocker["ts"]
+                for row in (*events["history"], *events["live"])
+            ), events
+        before = tail.stat()
+        if change == "append":
+            publish("shared.build04.chunk04.bin", pieces[-1])
+            assert tail.read_bytes() == corrupt and tail.stat().st_ino == before.st_ino
+        elif change == "replace":
+            staged = tmp_path / "incoming"
+            staged.write_bytes(pieces[-1])
+            os.utime(staged, ns=(before.st_atime_ns, before.st_mtime_ns))
+            staged.replace(tail)
+            assert tail.stat().st_ino != before.st_ino
+        else:
+            tail.write_bytes(pieces[-1])
+            os.utime(tail, ns=(before.st_atime_ns, before.st_mtime_ns))
+            assert tail.stat().st_ino == before.st_ino
+        package.await_watch_event("done", path=names[0], root=watch.root, after=blocker["ts"])
+
+    delivered, = watch.output.rglob(member.name)
+    assert delivered.read_bytes() == truth

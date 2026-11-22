@@ -1725,7 +1725,7 @@ impl NativeWatchCatalog {
             }
             if scope.contains_key(&key) {
                 table.generated.remove(key.as_ref());
-                table.touch(&path);
+                table.invalidate_member(&key);
                 changed.push(key);
             } else {
                 removed.push(key.to_string());
@@ -1825,7 +1825,7 @@ impl NativeWatchCatalog {
         let key = crate::path_keys::path_key(path);
         for table in self.catalogs.lock().unwrap().edit().values_mut() {
             table.generated.remove(key.as_str());
-            table.touch(path);
+            table.invalidate_member(&key);
         }
     }
 
@@ -1840,7 +1840,7 @@ impl NativeWatchCatalog {
     ) -> bool {
         (|| {
             let key = crate::path_keys::path_key(path);
-            let mut added = false;
+            let mut changed = false;
             let mut tables = self.catalogs.lock().unwrap();
             for table in tables.edit().values_mut() {
                 if let Some(row) = table.rows.get_mut(key.as_str()) {
@@ -1856,10 +1856,10 @@ impl NativeWatchCatalog {
                         observation.cadence_seconds = cadence_seconds;
                         observation.pending_interval_seconds = pending_interval_seconds;
                     }
-                    added |= table.admit_member(&key, newly_available);
+                    changed |= table.admit_member(&key, newly_available);
                 }
             }
-            added
+            changed
         })()
     }
 
@@ -1933,9 +1933,9 @@ impl NativeWatchCatalog {
                 .flatten()
         })()
     }
-    pub(crate) fn bucket_revisions(&self, scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str) -> (u64, u64) {
+    pub(crate) fn bucket_ready_revision(&self, scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str) -> u64 {
         self.catalogs.lock().unwrap().scopes.get(scope.key())
-            .and_then(|table| table.buckets.get(catalog_stem(seed).as_str())).map_or((0, 0), |bucket| (bucket.revision, bucket.last_addition))
+            .and_then(|table| table.buckets.get(catalog_stem(seed).as_str())).map_or(0, |bucket| bucket.ready_revision)
     }
 
     pub(crate) fn peer_needs_inventory(&self, scope: &crate::scan::scope::NativeDiscoveryScope, key: &str, path: &str) -> bool {

@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn only_a_new_ready_peer_advances_the_layout_revision() {
+fn only_ready_peer_set_or_content_changes_advance_the_layout_revision() {
     let mut table = ScopeCatalog::default();
     let file = |name: &str| DirectoryEntryRecord { path: name.to_owned(), ..Default::default() };
     let head = r"C:\in\beta.part1.bin";
@@ -10,14 +10,29 @@ fn only_a_new_ready_peer_advances_the_layout_revision() {
     assert!(!table.admit_member(head, false));
     let started = current_revision();
     table.insert_key(middle.into(), file(middle));
-    assert!(table.buckets["beta"].last_addition <= started);
+    assert!(table.buckets["beta"].ready_revision <= started);
     assert!(table.admit_member(middle, true));
-    let ready = table.buckets["beta"].last_addition;
+    let ready = table.buckets["beta"].ready_revision;
     assert!(ready > started);
-    table.insert_key(middle.into(), file(middle));
+
+    // Refreshing inventory or replaying admission is not a new generation.
+    let mut metadata = file(middle);
+    metadata.mtime_ns = Some(100);
+    table.insert_key(middle.into(), metadata);
     assert!(!table.admit_member(middle, true));
     assert!(!table.admit_member(head, true));
-    assert_eq!(table.buckets["beta"].last_addition, ready);
+    assert_eq!(table.buckets["beta"].ready_revision, ready);
+
+    // A Watch content change does not wake peers until the member is ready.
+    table.invalidate_member(middle);
+    assert_eq!(table.buckets["beta"].ready_revision, ready);
+    table.insert_key(middle.into(), file(middle));
+    assert!(table.admit_member(middle, true));
+    let updated = table.buckets["beta"].ready_revision;
+    assert!(updated > ready);
+    assert!(!table.admit_member(middle, true));
+    table.remove(middle);
+    assert!(table.buckets["beta"].ready_revision > updated);
 }
 
 #[test]

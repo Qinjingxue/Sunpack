@@ -284,8 +284,7 @@ impl BucketRows {
 
 pub(super) struct CatalogBucket {
     rows: BucketRows,
-    pub revision: u64,
-    pub last_addition: u64,
+    pub ready_revision: u64,
 }
 static NEXT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 pub(crate) fn current_revision() -> u64 {
@@ -296,14 +295,13 @@ fn next_revision() -> u64 {
 }
 impl CatalogBucket {
     fn new(key: Arc<str>) -> Self {
-        let revision = next_revision();
-        Self { rows: BucketRows::One(key), revision, last_addition: 0 }
+        Self { rows: BucketRows::One(key), ready_revision: 0 }
     }
     pub fn iter(&self) -> std::slice::Iter<'_, Arc<str>> { self.rows.iter() }
-    fn touch(&mut self) { self.revision = next_revision(); }
-    fn push(&mut self, key: Arc<str>) { self.rows.push(key); self.touch(); }
-    fn remove(&mut self, key: &str) -> bool { self.touch(); self.rows.remove(key) }
-    fn retain(&mut self, keep: impl FnMut(&Arc<str>) -> bool) -> bool { self.touch(); self.rows.retain(keep) }
+    fn advance(&mut self) { self.ready_revision = next_revision(); }
+    fn push(&mut self, key: Arc<str>) { self.rows.push(key); }
+    fn remove(&mut self, key: &str) -> bool { self.rows.remove(key) }
+    fn retain(&mut self, keep: impl FnMut(&Arc<str>) -> bool) -> bool { self.rows.retain(keep) }
 }
 
 #[derive(Default)]
@@ -360,18 +358,19 @@ impl ScopeCatalog {
         self.rows.get(key).map(|row| CatalogRowView(row, self.generated.get(key)))
     }
 
-    pub fn touch(&mut self, path: &str) {
-        if let Some(bucket) = self.buckets.get_mut(catalog_stem(path).as_str()) { bucket.touch(); }
+    pub fn invalidate_member(&mut self, key: &str) {
+        if let Some(row) = self.rows.get_mut(key) { row.flags &= !READY_MEMBER; }
     }
-    // Content changes preserve membership. Only the first ready observation of a
-    // new pathname can expand the set of usable layouts.
+
+    // A new pathname or a changed generation becomes a dependency only
+    // when the existing Watch admission has accepted it as ready.
     pub fn admit_member(&mut self, key: &str, newly_available: bool) -> bool {
         let Some(row) = self.rows.get_mut(key) else { return false; };
         if !row.persistent() || row.flags & (DIRECTORY | READY_MEMBER) != 0 { return false; }
         row.flags |= READY_MEMBER;
         if !newly_available { return false; }
         let stem = catalog_stem(row.name());
-        self.buckets.get_mut(stem.as_str()).expect("indexed file").last_addition = next_revision();
+        self.buckets.get_mut(stem.as_str()).expect("indexed file").advance();
         true
     }
 
@@ -397,9 +396,6 @@ impl ScopeCatalog {
                 old.flags = (old.flags & READY_MEMBER) | u8::from(record.is_dir) * DIRECTORY
                     | u8::from(record.size.is_some()) * HAS_SIZE
                     | u8::from(record.mtime_ns.is_some()) * HAS_MTIME;
-                if !record.is_dir {
-                    self.touch(&record.path);
-                }
                 return;
             }
         }
@@ -442,11 +438,7 @@ impl ScopeCatalog {
                 let stem = catalog_stem(&record.path).into_boxed_str();
                 match self.buckets.entry(stem) {
                     Entry::Occupied(mut bucket) => {
-                        if reuse_indexes {
-                            bucket.get_mut().touch();
-                        } else {
-                            bucket.get_mut().push(Arc::clone(&key));
-                        }
+                        if !reuse_indexes { bucket.get_mut().push(Arc::clone(&key)); }
                     }
                     Entry::Vacant(bucket) => {
                         debug_assert!(!reuse_indexes);
@@ -462,6 +454,9 @@ impl ScopeCatalog {
             self.persistent_len -= 1;
             if !row.is_dir() {
                 let stem = catalog_stem(&row.name);
+                if row.flags & READY_MEMBER != 0 {
+                    if let Some(bucket) = self.buckets.get_mut(stem.as_str()) { bucket.advance(); }
+                }
                 if let Some(dirty) = dirty.filter(|_| {
                     matches!(
                         self.buckets.get(stem.as_str()).map(|bucket| &bucket.rows),
