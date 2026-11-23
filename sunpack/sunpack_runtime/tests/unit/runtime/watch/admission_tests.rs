@@ -267,6 +267,51 @@ fn admission_rejects_capture_during_readiness_without_losing_deadline() {
 }
 
 #[test]
+fn sharing_backoff_survives_writes_and_admits_after_release() {
+    const CHILD: &str = "SUNPACK_WATCH_SHARING_RETRY_TEST";
+    let Some(base) = std::env::var_os(CHILD) else {
+        run_isolated("sharing_backoff_survives_writes_and_admits_after_release", CHILD);
+        return;
+    };
+    use std::io::Write;
+    let base = PathBuf::from(base);
+    let mut scheduler = audit_scheduler(&base, base.join("unused-worker.exe"));
+    let root = key(&base.join("input"));
+    let source = base.join("input/download.001");
+    let name = source.to_string_lossy().into_owned();
+    let id = key(&source);
+    let mut writer = fs::OpenOptions::new().create_new(true).write(true)
+        .share_mode(7).open(&source).unwrap();
+    writer.write_all(b"first chunk").unwrap();
+    scheduler.enqueue(&root, name.clone(), CandidateAdmission::Retry).unwrap();
+
+    let first = scheduler.pending[&id].due;
+    assert!(scheduler.prepare_ready_blocking(first, 1).unwrap().is_empty());
+    let retry = scheduler.pending[&id].busy_retry.until.unwrap();
+    assert_eq!(scheduler.pending[&id].busy_retry.streak, 1);
+
+    // A normal same-object write can requeue the input but cannot force
+    // a strict open before the busy floor.
+    writer.write_all(b" more data").unwrap();
+    scheduler.enqueue(&root, name, CandidateAdmission::Retry).unwrap();
+    assert_eq!(scheduler.pending[&id].busy_retry.until, Some(retry));
+    assert!(scheduler.prepare_ready_blocking(retry - Duration::from_millis(1), 1).unwrap().is_empty());
+    assert_eq!(scheduler.pending[&id].busy_retry.streak, 1);
+
+    let due = scheduler.pending[&id].due;
+    drop(writer);
+    let mut ready = scheduler.prepare_ready_blocking(due, 1).unwrap();
+    if ready.is_empty() {
+        let due = scheduler.pending[&id].due;
+        ready = scheduler.prepare_ready_blocking(due, 1).unwrap();
+    }
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].1.candidate.size, b"first chunk more data".len() as u64);
+    assert!(ready[0].1.busy_retry.until.is_none());
+    assert!(scheduler.pending.is_empty());
+}
+
+#[test]
 fn retiring_last_pending_candidate_arms_idle_cleanup() {
     const CHILD: &str = "SUNPACK_RETIRED_ADMISSION_IDLE_TEST";
     let Some(base) = std::env::var_os(CHILD) else {

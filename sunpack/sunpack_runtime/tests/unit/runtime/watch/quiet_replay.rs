@@ -2,7 +2,6 @@
 use super::*;
 use std::cell::RefCell;
 use std::io::{BufRead, Write};
-use std::time::Duration;
 
 #[derive(Deserialize)]
 struct Mutation {
@@ -33,7 +32,6 @@ struct Replay {
 struct Metrics {
     metadata_probes: usize,
     readiness_probes: usize,
-    coalesced_busy_timer_runs: usize,
     scheduled_deadlines: usize,
     peak_live_estimators: usize,
 }
@@ -42,10 +40,8 @@ struct VirtualFiles {
     epoch: Instant,
     at: Instant,
     files: Vec<File>,
-    deliveries: Vec<Vec<f64>>,
     indices: HashMap<String, usize>,
     identities: Vec<Vec<usize>>,
-    busy: HashMap<String, f64>,
     metrics: Metrics,
 }
 
@@ -110,56 +106,11 @@ pub(super) fn readable(path: &str) -> Option<bool> {
         state.metrics.readiness_probes += 1;
         let id = watch_path_key(path);
         let file = &state.files[state.indices[&id]];
-        let blocked = file.blocked.iter().find(|&&(start, end)| {
+        Some(!file.blocked.iter().any(|&(start, end)| {
             quiet::after(state.epoch, start) <= state.at
                 && state.at < quiet::after(state.epoch, end)
-        });
-        if let Some(&(_, release)) = blocked {
-            let next = file
-                .mutations
-                .partition_point(|item| quiet::after(state.epoch, item.at) <= state.at);
-            let deliveries = &state.deliveries[state.indices[&id]];
-            let delivery =
-                deliveries.partition_point(|at| quiet::after(state.epoch, *at) <= state.at);
-            let wake = file
-                .mutations
-                .get(next)
-                .map_or(release, |item| release.min(item.at))
-                .min(deliveries.get(delivery).copied().unwrap_or(release));
-            state.busy.insert(id, wake);
-        }
-        Some(blocked.is_none())
+        }))
     })
-}
-
-fn skip_busy(scheduler: &mut Scheduler, at: Instant, epoch: Instant) {
-    VIRTUAL.with_borrow_mut(|state| {
-        let state = state.as_mut().unwrap();
-        for (id, wake) in state.busy.drain() {
-            let Some(pending) = scheduler.pending.get_mut(&id) else {
-                continue;
-            };
-            // The probe requeued with the production delay. Preserve its phase
-            // until the next change in this file's snapshot or readability.
-            let wake = quiet::after(epoch, wake);
-            if pending.due >= wake {
-                continue;
-            }
-            let interval = pending.due.duration_since(at);
-            let due = if interval.is_zero() {
-                wake
-            } else {
-                let step = interval.as_nanos();
-                let skip = wake.duration_since(pending.due).as_nanos().div_ceil(step);
-                let advance = u64::try_from(skip * step).unwrap();
-                pending.due + Duration::from_nanos(advance)
-            };
-            scheduler.due.remove(&(pending.due, id.clone()));
-            pending.due = due;
-            scheduler.due.insert((due, id), ());
-            state.metrics.coalesced_busy_timer_runs += 1;
-        }
-    });
 }
 
 fn thread_cpu_ns() -> u64 {
@@ -218,19 +169,13 @@ fn replay(base: &Path, input: Replay) -> Value {
         })
         .collect();
     let epoch = Instant::now();
-    let mut deliveries = vec![Vec::new(); paths.len()];
-    for &(at, index, _) in &input.observations {
-        deliveries[index].push(at);
-    }
     VIRTUAL.with_borrow_mut(|state| {
         *state = Some(VirtualFiles {
             epoch,
             at: epoch,
             files: input.files,
-            deliveries,
             indices,
             identities,
-            busy: HashMap::new(),
             metrics: Metrics::default(),
         })
     });
@@ -253,7 +198,6 @@ fn replay(base: &Path, input: Replay) -> Value {
         VIRTUAL.with_borrow_mut(|state| {
             let state = state.as_mut().unwrap();
             state.at = at;
-            state.busy.clear();
         });
         if delivery == Some(at) && (deadline != Some(at) || input.observation_first) {
             let (_, index, directory) = events.next().unwrap();
@@ -294,7 +238,6 @@ fn replay(base: &Path, input: Replay) -> Value {
                 scheduler.retire_admitted_observation(&id, &pending);
                 scheduler.unpublished.remove(&id);
             }
-            skip_busy(&mut scheduler, at, epoch);
         }
         VIRTUAL.with_borrow_mut(|state| {
             let metrics = &mut state.as_mut().unwrap().metrics;

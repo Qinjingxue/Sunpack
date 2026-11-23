@@ -871,6 +871,7 @@ fn retained_regroup_handoff_persists_the_new_current_root() {
     payload.insert("discovery_scope".into(), Value::Object(recovery.record()));
     payload.insert("password_scope_dir".into(), json!(recovery.password_scope));
     let mut pending = Pending {
+        busy_retry: BusyRetry::default(),
         root: watch_path_key(r"C:\watch\old"), candidate,
         quiet: quiet::Activity::default(), due: Instant::now(), force: true, recovery: None,
     };
@@ -1488,7 +1489,7 @@ fn physical_completion_consumes_claimed_siblings_before_release_reobservation() 
     for (index, path) in group.members.iter().enumerate().skip(1) {
         let id = watch_path_key(path);
         let deadline = now + std::time::Duration::from_secs(index as u64);
-        pending.insert(id.clone(), Pending { root: "root".into(),
+        pending.insert(id.clone(), Pending { busy_retry: BusyRetry::default(), root: "root".into(),
             candidate: WatchCandidateRow { path: path.clone(), size: 42, mtime: 1.0,
                 observation: crate::filesystem::WatchFileObservation {
                     file_id: String::new(), change_usn: index as i64, change_reasons: None,

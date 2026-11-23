@@ -121,6 +121,21 @@ impl<T> WatchFileSnapshot<T> {
     }
 }
 
+pub(crate) enum WatchSnapshotResult<T> {
+    Ready(WatchFileSnapshot<T>),
+    Busy,
+    Unavailable,
+}
+
+impl<T> WatchSnapshotResult<T> {
+    fn into_option(self) -> Option<WatchFileSnapshot<T>> {
+        match self {
+            Self::Ready(snapshot) => Some(snapshot),
+            Self::Busy | Self::Unavailable => None,
+        }
+    }
+}
+
 enum WatchSnapshotMode {
     Observe { report_absent: bool },
     Ready,
@@ -138,7 +153,7 @@ pub(crate) fn watch_observed_file_snapshot(
         since_usn,
         WatchSnapshotMode::Observe { report_absent },
         |_, _| before_identity(),
-    )
+    ).map(WatchSnapshotResult::into_option)
 }
 
 /// Sample one file object while its sharing mode excludes writers and renames.
@@ -147,6 +162,16 @@ pub(crate) fn watch_ready_file_snapshot<T>(
     since_usn: Option<i64>,
     capture: impl FnOnce(&File, &std::fs::Metadata) -> io::Result<T>,
 ) -> io::Result<Option<WatchFileSnapshot<T>>> {
+    watch_ready_file_snapshot_status(path, since_usn, capture)
+        .map(WatchSnapshotResult::into_option)
+}
+
+/// Distinguish sharing conflicts at the strict open from empty or invalid inputs.
+pub(crate) fn watch_ready_file_snapshot_status<T>(
+    path: &Path,
+    since_usn: Option<i64>,
+    capture: impl FnOnce(&File, &std::fs::Metadata) -> io::Result<T>,
+) -> io::Result<WatchSnapshotResult<T>> {
     watch_file_snapshot(path, since_usn, WatchSnapshotMode::Ready, capture)
 }
 
@@ -155,7 +180,7 @@ fn watch_file_snapshot<T>(
     since_usn: Option<i64>,
     mode: WatchSnapshotMode,
     capture: impl FnOnce(&File, &std::fs::Metadata) -> io::Result<T>,
-) -> io::Result<Option<WatchFileSnapshot<T>>> {
+) -> io::Result<WatchSnapshotResult<T>> {
     let (metadata, captured, file, volume) = {
         let _resource = crate::io::resource_lifecycle::NativeResourceGuard::register(
             [path.to_path_buf()],
@@ -178,25 +203,25 @@ fn watch_file_snapshot<T>(
                     {
                         Err(error)
                     } else {
-                        Ok(None)
+                        Ok(WatchSnapshotResult::Unavailable)
                     }
                 }
                 WatchSnapshotMode::Ready if matches!(
                     error.raw_os_error(),
                     Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
-                ) => Ok(None),
+                ) => Ok(WatchSnapshotResult::Busy),
                 _ => Err(error),
             },
         };
         let metadata = handle.metadata()?;
         if !metadata.is_file() || metadata.len() == 0 {
-            return Ok(None);
+            return Ok(WatchSnapshotResult::Unavailable);
         }
         let captured = capture(&handle, &metadata)?;
         let (file, volume) = read_watch_observation(&handle, path, since_usn)?;
         (metadata, captured, file, volume)
     };
-    Ok(Some(WatchFileSnapshot {
+    Ok(WatchSnapshotResult::Ready(WatchFileSnapshot {
         metadata,
         change_reasons: file.change_reasons(volume.as_deref(), since_usn),
         file,

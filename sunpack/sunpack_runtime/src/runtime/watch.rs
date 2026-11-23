@@ -71,16 +71,26 @@ fn admission_readable(path: &str) -> io::Result<bool> {
 // Seal the admitted observation while the existing readability handle excludes
 // writers and renames. A probe made before the last writer closes can carry an
 // older USN even when its size/mtime already describe the final contents.
-fn admission_candidate(mut candidate: WatchCandidateRow, since_usn: i64) -> io::Result<(WatchCandidateRow, bool)> {
+fn admission_candidate(mut candidate: WatchCandidateRow, since_usn: i64) -> io::Result<(WatchCandidateRow, Readiness)> {
+    use filesystem::WatchSnapshotResult;
     #[cfg(test)]
-    if let Some(readable) = quiet_replay::readable(&candidate.path) { return Ok((candidate, readable)); }
-    let Some(snapshot) = filesystem::watch_ready_file_snapshot(
-        Path::new(&candidate.path), Some(since_usn), |_, _| Ok(()))? else { return Ok((candidate, false)); };
+    if let Some(readable) = quiet_replay::readable(&candidate.path) {
+        return Ok((candidate, if readable { Readiness::Ready } else { Readiness::Busy }));
+    }
+    let snapshot = match filesystem::watch_ready_file_snapshot_status(
+        Path::new(&candidate.path), Some(since_usn), |_, _| Ok(()))? {
+        WatchSnapshotResult::Ready(snapshot) => snapshot,
+        WatchSnapshotResult::Busy => return Ok((candidate, Readiness::Busy)),
+        WatchSnapshotResult::Unavailable => return Ok((candidate, Readiness::Unavailable)),
+    };
     candidate.size = snapshot.metadata.len();
     candidate.mtime = crate::postprocess::mtime_seconds(&snapshot.metadata);
     candidate.observation = snapshot.observation();
-    Ok((candidate, true))
+    Ok((candidate, Readiness::Ready))
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Readiness { Ready, Busy, Unavailable }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Root {
@@ -1868,7 +1878,26 @@ fn due_admissions(
         .collect()
 }
 
+#[derive(Default)]
+struct BusyRetry {
+    until: Option<Instant>,
+    streak: u8,
+}
+
+impl BusyRetry {
+    fn update(&mut self, readiness: Readiness, now: impl FnOnce() -> Instant) {
+        if readiness == Readiness::Busy {
+            let delay = (25u64 << self.streak.min(4)).min(250);
+            self.streak = self.streak.saturating_add(1);
+            self.until = Some(now() + Duration::from_millis(delay));
+        } else {
+            *self = Self::default();
+        }
+    }
+}
+
 struct Pending {
+    busy_retry: BusyRetry,
     root: String,
     candidate: WatchCandidateRow,
     quiet: quiet::Activity,
@@ -4504,6 +4533,7 @@ impl Scheduler {
                         self.due.remove(&(pending.due, id.clone()));
                         pending.quiet.accelerate(observed_now, now);
                         pending.due = now;
+                        pending.busy_retry = BusyRetry::default();
                         if !self.active_paths.contains_key(&id)
                             && !self.hub.claims.lock().unwrap().contains_key(&id)
                         {
@@ -4544,7 +4574,10 @@ impl Scheduler {
                     || old.candidate.size > candidate.size
             },
         );
-        if let Some(old) = prior { self.due.remove(&(old.due, id.clone())); }
+        let busy_retry = prior.map_or_else(BusyRetry::default, |old| {
+            self.due.remove(&(old.due, id.clone()));
+            if new_identity { BusyRetry::default() } else { old.busy_retry }
+        });
         let quiet = activity;
         let retry_unchanged = became_active && match admission {
             CandidateAdmission::PasswordRetry => blocked_unchanged,
@@ -4590,6 +4623,7 @@ impl Scheduler {
         self.pending.insert(
             id,
             Pending {
+                busy_retry,
                 root: root_id.to_owned(),
                 candidate,
                 quiet,
@@ -5254,7 +5288,8 @@ impl Scheduler {
                 continue;
             };
             self.due.remove(&(due, id.clone()));
-            if let Some(deadline) = pending.quiet.deadline().filter(|deadline| *deadline > now && *deadline > pending.due) {
+            let recheck = pending.quiet.deadline().max(pending.busy_retry.until);
+            if let Some(deadline) = recheck.filter(|deadline| *deadline > now && *deadline > pending.due) {
                 pending.due = deadline;
                 self.due.insert((deadline, id.clone()), ());
                 self.pending.insert(id, pending);
@@ -5281,7 +5316,7 @@ impl Scheduler {
             };
             #[cfg(test)]
             admission_tests::before_readiness(&pending.candidate.path);
-            let (current, readable) = match admission_candidate(current, previous_usn) {
+            let (current, readiness) = match admission_candidate(current, previous_usn) {
                 Ok(value) => value,
                 Err(error) if missing_path(&error) => {
                     self.retire_admission(&id, &pending)?;
@@ -5293,6 +5328,8 @@ impl Scheduler {
                     continue;
                 }
             };
+            // Keep sharing backoff independent of quiet history and ordinary writes.
+            pending.busy_retry.update(readiness, admission_now);
             // A callback can arrive while the filesystem readiness probe runs.
             // Read its generation and deadline atomically, not as independent
             // matches/deadline checks that could accept a just-written file.
@@ -5350,7 +5387,7 @@ impl Scheduler {
                 self.unpublished.insert(id.clone());
             }
             pending.candidate = current;
-            if !readable {
+            if readiness != Readiness::Ready {
                 self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, None);
                 self.delay(id, pending, admission_now());
                 continue;
@@ -5508,11 +5545,10 @@ impl Scheduler {
     }
 
     fn delay(&mut self, id: String, mut pending: Pending, now: Instant) {
-        // Main keeps a fresh/reset quiet window immediately eligible even
-        // after a busy or failed probe; do not impose a separate wait floor.
-        pending.due = pending.quiet.boundary_deadline(
+        let quiet_due = pending.quiet.boundary_deadline(
             now, self.settings.watch.boundary_confirmation_seconds,
         );
+        pending.due = pending.busy_retry.until.map_or(quiet_due, |retry| quiet_due.max(retry));
         self.due.insert((pending.due, id.clone()), ());
         self.pending.insert(id, pending);
     }
