@@ -285,8 +285,12 @@ fn sharing_backoff_survives_writes_and_admits_after_release() {
     writer.write_all(b"first chunk").unwrap();
     scheduler.enqueue(&root, name.clone(), CandidateAdmission::Retry).unwrap();
 
+    // No notification or enqueue for this write. The strict open must fail
+    // while the handle is held, but the fallback must still observe the bytes.
+    writer.write_all(b" without notification").unwrap();
     let first = scheduler.pending[&id].due;
     assert!(scheduler.prepare_ready_blocking(first, 1).unwrap().is_empty());
+    assert_eq!(scheduler.pending[&id].candidate.size, b"first chunk without notification".len() as u64);
     let retry = scheduler.pending[&id].busy_retry.until.unwrap();
     assert_eq!(scheduler.pending[&id].busy_retry.streak, 1);
 
@@ -306,7 +310,7 @@ fn sharing_backoff_survives_writes_and_admits_after_release() {
         ready = scheduler.prepare_ready_blocking(due, 1).unwrap();
     }
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].1.candidate.size, b"first chunk more data".len() as u64);
+    assert_eq!(ready[0].1.candidate.size, b"first chunk without notification more data".len() as u64);
     assert!(ready[0].1.busy_retry.until.is_none());
     assert!(scheduler.pending.is_empty());
 }

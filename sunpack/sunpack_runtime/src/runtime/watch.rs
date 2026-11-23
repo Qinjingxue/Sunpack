@@ -7,6 +7,7 @@ use crate::core::config::{self, Config, Snapshot};
 use crate::core::passwords::BuiltinStore;
 use crate::core::resources::{self, FileMutex};
 use crate::filesystem;
+use crate::filesystem::WatchSnapshotResult;
 use crate::io::config_changes::{DirectoryChange, NativeConfigChanges};
 use crate::io::reader::PhysicalFileGeneration;
 use crate::pipeline::cleanup::{DeleteReceipt, DeleteSource};
@@ -68,29 +69,36 @@ fn admission_readable(path: &str) -> io::Result<bool> {
     filesystem::watch_file_is_ready(path)
 }
 
-// Seal the admitted observation while the existing readability handle excludes
-// writers and renames. A probe made before the last writer closes can carry an
-// older USN even when its size/mtime already describe the final contents.
-fn admission_candidate(mut candidate: WatchCandidateRow, since_usn: i64) -> io::Result<(WatchCandidateRow, Readiness)> {
-    use filesystem::WatchSnapshotResult;
+// Sample metadata and USN from the same handle that excludes writers and renames.
+fn admission_snapshot(path: &str, since_usn: i64) -> io::Result<AdmissionSnapshot> {
     #[cfg(test)]
-    if let Some(readable) = quiet_replay::readable(&candidate.path) {
-        return Ok((candidate, if readable { Readiness::Ready } else { Readiness::Busy }));
+    if let Some(readable) = quiet_replay::readable(path) {
+        return Ok(if readable {
+            quiet_replay::sealed(Path::new(path), Some(since_usn))
+                .map_or(AdmissionSnapshot::NotReady(Readiness::Unavailable), AdmissionSnapshot::Ready)
+        } else {
+            AdmissionSnapshot::NotReady(Readiness::Busy)
+        });
     }
-    let snapshot = match filesystem::watch_ready_file_snapshot_status(
-        Path::new(&candidate.path), Some(since_usn), |_, _| Ok(()))? {
-        WatchSnapshotResult::Ready(snapshot) => snapshot,
-        WatchSnapshotResult::Busy => return Ok((candidate, Readiness::Busy)),
-        WatchSnapshotResult::Unavailable => return Ok((candidate, Readiness::Unavailable)),
-    };
-    candidate.size = snapshot.metadata.len();
-    candidate.mtime = crate::postprocess::mtime_seconds(&snapshot.metadata);
-    candidate.observation = snapshot.observation();
-    Ok((candidate, Readiness::Ready))
+    Ok(match filesystem::watch_ready_file_snapshot_status(Path::new(path), Some(since_usn), |_, _| Ok(()))? {
+        WatchSnapshotResult::Ready(snapshot) => AdmissionSnapshot::Ready(WatchCandidateRow {
+            path: path.to_owned(),
+            size: snapshot.metadata.len(),
+            mtime: crate::postprocess::mtime_seconds(&snapshot.metadata),
+            observation: snapshot.observation(),
+        }),
+        WatchSnapshotResult::Busy => AdmissionSnapshot::NotReady(Readiness::Busy),
+        WatchSnapshotResult::Unavailable => AdmissionSnapshot::NotReady(Readiness::Unavailable),
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Readiness { Ready, Busy, Unavailable }
+
+enum AdmissionSnapshot {
+    Ready(WatchCandidateRow),
+    NotReady(Readiness),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Root {
@@ -5296,36 +5304,47 @@ impl Scheduler {
                 continue;
             }
             if self.retire_owned_admission(&id, &pending)? { continue; }
-            let path = Path::new(&pending.candidate.path);
+            let path = &pending.candidate.path;
             let previous_usn = pending.candidate.observation.change_usn;
-            let (current, observed_now, observed_at) = match pending.quiet.probe(path, Some(previous_usn)) {
-                Ok((Some(current), observed_now, observed_at)) => (current, observed_now, observed_at),
-                Ok((None, _, _)) => {
-                    self.retire_admission(&id, &pending)?;
-                    continue;
-                }
-                Err(error) if missing_path(&error) => {
-                    self.retire_admission(&id, &pending)?;
-                    continue;
-                }
-                Err(error) => {
-                    self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, admission_now());
-                    continue;
-                }
-            };
+            // A capture racing the strict open must still be able to veto admission.
+            let observed_now = admission_now();
+            let observed_at = windows::monotonic_seconds();
             #[cfg(test)]
-            admission_tests::before_readiness(&pending.candidate.path);
-            let (current, readiness) = match admission_candidate(current, previous_usn) {
-                Ok(value) => value,
-                Err(error) if missing_path(&error) => {
-                    self.retire_admission(&id, &pending)?;
-                    continue;
-                }
-                Err(error) => {
-                    self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, admission_now());
-                    continue;
+            let observed_at = quiet_replay::relative_time().unwrap_or(observed_at);
+            #[cfg(test)]
+            admission_tests::before_readiness(path);
+            let (current, readiness, observed_now, observed_at) = match admission_snapshot(path, previous_usn) {
+                Ok(AdmissionSnapshot::Ready(current)) => (current, Readiness::Ready, observed_now, observed_at),
+                fallback => {
+                    let (current, stamp, at) = match pending.quiet.probe(Path::new(path), Some(previous_usn)) {
+                        Ok((Some(current), stamp, at)) => (current, stamp, at),
+                        Ok((None, _, _)) => {
+                            self.retire_admission(&id, &pending)?;
+                            continue;
+                        }
+                        Err(error) if missing_path(&error) => {
+                            self.retire_admission(&id, &pending)?;
+                            continue;
+                        }
+                        Err(error) => {
+                            self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, path, Some(&error));
+                            self.delay(id, pending, admission_now());
+                            continue;
+                        }
+                    };
+                    // The loose observation can update pending content but never admit it.
+                    // If the path reappeared after the strict open, keep it pending.
+                    let readiness = match fallback {
+                        Ok(AdmissionSnapshot::NotReady(readiness)) => readiness,
+                        Err(error) if missing_path(&error) => Readiness::Unavailable,
+                        Err(error) => {
+                            self.candidate_diagnostics.log_wait(&self.journal, admission_now(), &id, path, Some(&error));
+                            self.delay(id, pending, admission_now());
+                            continue;
+                        }
+                        Ok(AdmissionSnapshot::Ready(_)) => unreachable!(),
+                    };
+                    (current, readiness, stamp, at)
                 }
             };
             // Keep sharing backoff independent of quiet history and ordinary writes.

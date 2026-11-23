@@ -57,11 +57,23 @@ pub(super) fn probe(
     path: &Path,
     since: Option<i64>,
 ) -> Option<(Option<WatchCandidateRow>, Instant, f64)> {
+    snapshot(path, since, true)
+}
+
+pub(super) fn relative_time() -> Option<f64> {
+    VIRTUAL.with_borrow(|state| state.as_ref().map(|state| state.at.duration_since(state.epoch).as_secs_f64()))
+}
+
+pub(super) fn sealed(path: &Path, since: Option<i64>) -> Option<WatchCandidateRow> {
+    snapshot(path, since, false)?.0
+}
+
+fn snapshot(path: &Path, since: Option<i64>, loose: bool) -> Option<(Option<WatchCandidateRow>, Instant, f64)> {
     VIRTUAL.with_borrow_mut(|state| {
         let state = state.as_mut()?;
         let path = path.to_str().unwrap();
         let index = state.indices[&watch_path_key(path)];
-        state.metrics.metadata_probes += 1;
+        state.metrics.metadata_probes += usize::from(loose);
         let at = state.at.duration_since(state.epoch).as_secs_f64();
         let file = &state.files[index];
         let end = file
