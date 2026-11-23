@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=Latest%20release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20only-2f6070" alt="Windows only">
-  <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT License"></a>
+  <a href="docs/licensing.md"><img src="https://img.shields.io/badge/license-MIT%20%2B%20third--party-blue" alt="라이선스"></a>
 </p>
 
 <p align="center"><img src="sunpack_en.gif" width="80%" alt="SunPack 데모(영어 UI)"></p>
@@ -199,7 +199,7 @@ CLI / Watch / Explorer (runtime)
 
 ## 라이선스
 
-SunPack 자체 코드에는 [MIT 라이선스](LICENSE)가 적용됩니다. 7-Zip, zlib-ng, LZ4, RustCrypto에서 가져온 구현 등 타사 코드와 바이너리에는 각각의 원래 라이선스가 적용됩니다. 구성 요소, 저작권 및 배포에 필요한 자료는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), [라이선스와 배포](docs/ko/licensing.md)를 참고하세요. 7-Zip 소스 라이선스는 [7zip-source-license.txt](licenses/7zip-source-license.txt), LGPL 2.1 전문은 [LGPL-2.1.txt](licenses/LGPL-2.1.txt)에 있습니다.
+Worker의 애플리케이션 코드를 포함해 SunPack이 독자적으로 작성한 코드는 [MIT 라이선스](LICENSE)를 따릅니다. Worker는 수정된 7-Zip을, Runtime은 7-Zip의 Deflate64 디코더를 내장합니다. 해당 7-Zip 코드와 그 사용에는 GNU LGPL 2.1 이상이 적용됩니다. 7-Zip, zlib-ng, LZ4, RustCrypto에서 가져온 구현 등 타사 코드와 바이너리에는 각각의 원래 라이선스가 적용됩니다. 구성 요소, 저작권 및 배포에 필요한 자료는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), [라이선스와 배포](docs/ko/licensing.md)를 참고하세요. 7-Zip 소스 라이선스는 [7zip-source-license.txt](licenses/7zip-source-license.txt), LGPL 2.1 전문은 [LGPL-2.1.txt](licenses/LGPL-2.1.txt)에 있습니다.
 
 입력 프리페치 최적화는 단일 및 동시 작업 모두에서 효과가 유지되지 않아 채택하지 않았습니다.
 

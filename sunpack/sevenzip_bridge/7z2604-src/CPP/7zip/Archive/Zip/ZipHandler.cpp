@@ -1,4 +1,5 @@
 // ZipHandler.cpp
+// SunPack modifications recorded on 2026-11-18, 2026-11-19.
 //
 // Modified by SunPack, 2026-09-20:
 // route selected ZIP Deflate entries through the external zlib-ng decoder while

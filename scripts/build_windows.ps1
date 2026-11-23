@@ -8,6 +8,7 @@ param(
     [ValidateRange(1, 64)]
     [int]$BuildJobs = 4,
     [string]$Version,
+    [string]$CorrespondingSourceUrl,
     [string]$InnoCompilerPath,
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64"
@@ -564,7 +565,8 @@ New-Item -ItemType Directory -Path $distToolsRoot | Out-Null
 Copy-Item -LiteralPath $sevenZipWorkerPath, $toastHostPath -Destination $distToolsRoot -Force
 
 & (Join-Path $repoRoot "scripts\generate_license_bundle.ps1") -RepoRoot $repoRoot `
-    -GuiLicenseRoot (Join-Path $guiBuildDir "licenses") -OutputPath $distLicenseBundlePath -Target $rustTarget
+    -GuiLicenseRoot (Join-Path $guiBuildDir "licenses") -OutputPath $distLicenseBundlePath -Target $rustTarget `
+    -CorrespondingSourceUrl $CorrespondingSourceUrl
 
 $distScriptsRoot = Join-Path $distAppRoot "scripts"
 New-Item -ItemType Directory -Path $distScriptsRoot -Force | Out-Null

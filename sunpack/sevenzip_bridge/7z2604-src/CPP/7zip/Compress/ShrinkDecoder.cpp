@@ -1,4 +1,5 @@
 // ShrinkDecoder.cpp
+// SunPack modifications recorded on 2026-11-02.
 
 #include "StdAfx.h"
 

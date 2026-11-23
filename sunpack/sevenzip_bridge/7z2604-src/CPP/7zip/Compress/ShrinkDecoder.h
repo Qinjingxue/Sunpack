@@ -1,4 +1,5 @@
 // ShrinkDecoder.h
+// SunPack modifications recorded on 2026-11-02.
 
 #ifndef ZIP7_INC_COMPRESS_SHRINK_DECODER_H
 #define ZIP7_INC_COMPRESS_SHRINK_DECODER_H

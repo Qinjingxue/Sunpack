@@ -1,4 +1,5 @@
 // Common/MyVector.h
+// SunPack modifications recorded on 2026-10-10.
 
 #ifndef ZIP7_INC_COMMON_MY_VECTOR_H
 #define ZIP7_INC_COMMON_MY_VECTOR_H

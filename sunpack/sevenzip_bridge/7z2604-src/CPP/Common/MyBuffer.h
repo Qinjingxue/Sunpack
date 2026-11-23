@@ -1,4 +1,5 @@
 // Common/MyBuffer.h
+// SunPack modifications recorded on 2026-10-27.
 
 #ifndef ZIP7_INC_COMMON_MY_BUFFER_H
 #define ZIP7_INC_COMMON_MY_BUFFER_H

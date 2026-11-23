@@ -1,4 +1,5 @@
 // BZip2Crc.h
+// SunPack modifications recorded on 2026-11-09.
 
 #ifndef ZIP7_INC_BZIP2_CRC_H
 #define ZIP7_INC_BZIP2_CRC_H

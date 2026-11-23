@@ -1,4 +1,5 @@
 // BZip2Crc.cpp
+// SunPack modifications recorded on 2026-11-09.
 
 #include "StdAfx.h"
 

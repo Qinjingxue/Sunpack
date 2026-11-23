@@ -1,4 +1,5 @@
 // LzfseDecoder.cpp
+// SunPack modifications recorded on 2026-10-27.
 
 /*
 This code implements LZFSE data decompressing.

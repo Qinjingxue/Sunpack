@@ -1,4 +1,5 @@
 // HandlerOut.h
+// SunPack modifications recorded on 2026-09-22.
 
 #ifndef ZIP7_INC_HANDLER_OUT_H
 #define ZIP7_INC_HANDLER_OUT_H

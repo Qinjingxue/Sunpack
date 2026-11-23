@@ -1,4 +1,5 @@
 // Crypto/Rar5Aes.cpp
+// SunPack modifications recorded on 2026-11-17.
 
 #include "StdAfx.h"
 

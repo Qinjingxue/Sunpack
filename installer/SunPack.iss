@@ -26,7 +26,7 @@ OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseFilename}
 SetupIconFile={#SourceDir}\sunpack.ico
 UninstallDisplayIcon={app}\sunpack.ico
-LicenseFile=..\LICENSE
+InfoBeforeFile={#SourceDir}\THIRD_PARTY_LICENSES.txt
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -824,7 +824,6 @@ end;
 
 procedure InitializeWizard();
 begin
-  WizardForm.LicenseAcceptedRadio.Checked := True;
   StartupTaskDefaultApplied := False;
 end;
 

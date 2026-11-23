@@ -1,4 +1,5 @@
 // XzDecoder.cpp
+// SunPack modifications recorded on 2026-09-19, 2026-09-22, 2026-11-09.
 
 #include "StdAfx.h"
 

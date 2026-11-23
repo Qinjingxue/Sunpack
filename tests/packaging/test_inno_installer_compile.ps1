@@ -62,6 +62,7 @@ try {
         [System.Text.UTF8Encoding]::new($false)
     )
 
+    Copy-Item -LiteralPath (Join-Path $repoRoot "THIRD_PARTY_NOTICES.md") -Destination (Join-Path $sourceDir "THIRD_PARTY_LICENSES.txt")
     Copy-Item -LiteralPath (Join-Path $repoRoot "builtin_passwords.json") -Destination $sourceDir
     $scriptsDir = Join-Path $sourceDir "scripts"
     New-Item -ItemType Directory -Path $scriptsDir | Out-Null

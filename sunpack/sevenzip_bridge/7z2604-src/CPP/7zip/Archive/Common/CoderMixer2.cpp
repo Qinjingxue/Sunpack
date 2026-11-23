@@ -1,4 +1,5 @@
 // CoderMixer2.cpp
+// SunPack modifications recorded on 2026-09-23.
 
 #include "StdAfx.h"
 

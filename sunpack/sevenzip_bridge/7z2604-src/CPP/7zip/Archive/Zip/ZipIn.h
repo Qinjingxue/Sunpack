@@ -1,4 +1,5 @@
 // Archive/ZipIn.h
+// SunPack modifications recorded on 2026-10-10, 2026-11-19.
 
 #ifndef ZIP7_INC_ZIP_IN_H
 #define ZIP7_INC_ZIP_IN_H

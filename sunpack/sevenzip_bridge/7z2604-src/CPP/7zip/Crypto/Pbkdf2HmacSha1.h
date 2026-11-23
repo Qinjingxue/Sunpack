@@ -1,4 +1,5 @@
 // Pbkdf2HmacSha1.h
+// SunPack modifications recorded on 2026-11-18.
 // Password-Based Key Derivation Function (RFC 2898, PKCS #5) based on HMAC-SHA-1
 
 #ifndef ZIP7_INC_CRYPTO_PBKDF2_HMAC_SHA1_H

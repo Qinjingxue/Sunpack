@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=Latest%20release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20only-2f6070" alt="Windows only">
-  <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT License"></a>
+  <a href="docs/licensing.md"><img src="https://img.shields.io/badge/license-MIT%20%2B%20third--party-blue" alt="Licensing"></a>
 </p>
 
 <p align="center">
@@ -297,9 +297,9 @@ Thank you to everyone who contributes code, reports issues, or shares suggestion
 
 ## License
 
-The root [LICENSE](LICENSE) (MIT) applies to SunPack-original code. It does not mean that third-party code or binaries are also licensed under MIT.
+SunPack's independently written code, including original Worker application code, is licensed under [MIT](LICENSE). The Worker embeds modified 7-Zip code and the Runtime embeds 7-Zip's Deflate64 decoder. The LGPL-covered code and its use are subject to GNU LGPL 2.1 or later. Upstream terms continue to apply to third-party code and modifications to it.
 
-The repository includes several third-party components, including 7-Zip 26.04 at `sunpack/sevenzip_bridge/7z2604-src/`, zlib-ng 2.3.3 at `sunpack/sevenzip_bridge/zlib-ng-2.3.3/`, LZ4 1.10.0 at `sunpack/third_party/lz4/`, and cryptographic algorithm implementations adapted from RustCrypto. These components remain subject to their respective original licenses. For component scope, copyright and license information, and the license materials required for releases, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md).
+The repository includes several third-party components, including a trimmed 7-Zip 26.05 source tree at `sunpack/sevenzip_bridge/7z2604-src/`, zlib-ng 2.3.3 at `sunpack/sevenzip_bridge/zlib-ng-2.3.3/`, LZ4 1.10.0 at `sunpack/third_party/lz4/`, and cryptographic algorithm implementations adapted from RustCrypto. These components remain subject to their respective original licenses. For component scope, copyright and license information, and the license materials required for releases, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md).
 
 The 7-Zip source license is copied at [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt), and the full GNU LGPL 2.1 text is available at [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt). License copies for other components are in [licenses/](licenses/).
 

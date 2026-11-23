@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC" alt="最新版本"></a>
   <img src="https://img.shields.io/badge/平台-Windows%20%E5%B0%88%E7%94%A8-2f6070" alt="Windows 專用">
-  <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT 授權條款"></a>
+  <a href="docs/licensing.md"><img src="https://img.shields.io/badge/license-MIT%20%2B%20third--party-blue" alt="授權條款"></a>
 </p>
 
 <p align="center">
@@ -287,7 +287,7 @@ uv run --locked pytest
 
 ## 授權條款
 
-倉程式庫根目錄的 [LICENSE](LICENSE)（MIT）適用於 SunPack 原創程式碼，不代表第三方程式碼或二進位也採用 MIT 授權條款。
+SunPack 獨立編寫的程式碼採用 [MIT 授權條款](LICENSE)，包括 Worker 的原創應用程式碼。Worker 內建修改過的 7-Zip，Runtime 內建 7-Zip 的 Deflate64 解碼器。適用的 7-Zip 程式碼及其使用受 GNU LGPL 2.1 或更新版本規範。第三方程式碼及對其所做的修改依適用的上游條款發行。
 
 倉程式庫包含多個第三方元件，包括位於 `sunpack/sevenzip_bridge/7z2604-src/` 的 7-Zip 26.05 裁剪定制實現（沿用原目錄名）、位於 `sunpack/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3、位於 `sunpack/third_party/lz4/` 的 LZ4 1.10.0，以及改編自 RustCrypto 的加密演算法實現。這些元件仍受各自原始授權條款約束。各元件的範圍、版權與授權條款資訊，以及發行時需要附帶的許可材料，詳見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/zh-TW/licensing.md)。
 

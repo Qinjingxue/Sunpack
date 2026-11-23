@@ -1,4 +1,6 @@
 // BZip2Decoder.cpp
+// SunPack modifications recorded on 2026-09-19, 2026-09-20, 2026-09-22,
+// 2026-09-23, 2026-09-25, 2026-11-09, 2026-11-10.
 
 #include "StdAfx.h"
 

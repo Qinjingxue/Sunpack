@@ -5,6 +5,14 @@ Windows C++ component containing SunPack's embedded 7-Zip extraction worker.
 The product runtime uses `sunpack_sevenzip_worker.exe`. The former in-process
 `sunpack_sevenzip.dll` resource-analysis ABI has been removed.
 
+## License
+
+SunPack's independently written application code in the Worker is licensed
+under [MIT](../../LICENSE). The embedded 7-Zip source and patches follow the
+[upstream terms](7z2604-src/DOC/License.txt), including GNU LGPL 2.1 or later
+for the covered code. See [Licensing and distribution](../../docs/licensing.md)
+for the corresponding source and rebuild instructions.
+
 ## Responsibilities
 
 - worker-internal bounded password candidate confirmation

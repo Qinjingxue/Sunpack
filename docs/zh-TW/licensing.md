@@ -1,12 +1,12 @@
 # 授權條款與發行
 
-[English](../licensing.md) | **繁體中文** | [日本語](../ja/licensing.md) | [한국어](../ko/licensing.md)
+[English](../licensing.md) | [简体中文](../zh-CN/licensing.md) | **繁體中文** | [日本語](../ja/licensing.md) | [한국어](../ko/licensing.md)
 
 本文說明 SunPack 儲存庫中各授權條款的適用範圍，以及發行時要保留的文件。摘要如與授權原文不同，以原文為準。
 
 ## SunPack 原創程式碼
 
-為 SunPack 編寫的原始碼採用專案根目錄中的 [MIT 授權條款](../../LICENSE)。隨附的第三方原始碼仍適用上游專案及 [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) 記載的授權條款。
+SunPack 獨立編寫的原始碼採用專案根目錄中的 [MIT 授權條款](../../LICENSE)。隨附的第三方原始碼及其修改適用上游專案及 [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) 記載的授權條款。
 
 ## 隨附的 7-Zip 26.05 原始碼
 
@@ -33,9 +33,9 @@ ZIP Deflate 快速路徑使用的建置原始碼位於 `sunpack/sevenzip_bridge/
 
 ## 發行套件
 
-Windows 發行套件會安裝 `scripts/generate_license_bundle.ps1` 產生的 `THIRD_PARTY_LICENSES.txt`。內容包括 SunPack 的 MIT 授權、第三方元件概覽、儲存庫的 `licenses/` 原文、GUI 相依項目的聲明（如 FreeType 和 stb），以及所選 Windows 目標鎖定的 Cargo 相依項目授權與聲明。也可能包含建置及測試相依項目的聲明。各元件的適用範圍依原始聲明而定。
+Windows 安裝程式會顯示並安裝 `scripts/generate_license_bundle.ps1` 產生的 `THIRD_PARTY_LICENSES.txt`。內容包括 SunPack 的 MIT 授權、第三方元件概覽、儲存庫的 `licenses/` 原文、GUI 相依項目的聲明（如 FreeType 和 stb），以及所選 Windows 目標鎖定的 Cargo 相依項目授權與聲明。也可能包含建置及測試相依項目的聲明。各元件的適用範圍依原始聲明而定。
 
-授權原文仍保留在儲存庫和 GUI 相依項目原始碼中。安裝程式顯示根目錄的 MIT 授權條款，並且不另行安裝授權原始目錄。缺少必要資料時，整合檔案會產生失敗。新增相依項目時仍須審查其授權條款。
+授權原文仍保留在儲存庫和 GUI 相依項目原始碼中。授權檔案會說明 Worker 和 Runtime 內建的 LGPL 7-Zip 程式碼，並提供官方發行版的確切原始碼連結。請參閱[重建說明](../licensing.md#rebuild-the-worker-and-runtime)。缺少必要資料時，整合檔案會產生失敗。新增相依項目時仍須審查其授權條款。
 
 如果發行版編譯或連結受 LGPL 規範的 7-Zip 程式碼，發行流程須符合適用的 LGPL 要求，包括提供建置所用的確切原始碼，並讓接收者能修改相關程式碼及重新建置、連結合併後的成果。從發行流程移除相關原始碼或建置資料前，請先審查授權要求。
 

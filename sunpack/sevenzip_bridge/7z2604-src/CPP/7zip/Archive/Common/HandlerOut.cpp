@@ -1,4 +1,5 @@
 // HandlerOut.cpp
+// SunPack modifications recorded on 2026-09-22.
 
 #include "StdAfx.h"
 

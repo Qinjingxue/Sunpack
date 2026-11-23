@@ -1,4 +1,5 @@
 // Crypto/Rar5Aes.h
+// SunPack modifications recorded on 2026-11-17.
 
 #ifndef ZIP7_INC_CRYPTO_RAR5_AES_H
 #define ZIP7_INC_CRYPTO_RAR5_AES_H

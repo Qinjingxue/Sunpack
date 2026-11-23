@@ -1,4 +1,5 @@
 // RarHandler.cpp
+// SunPack modifications recorded on 2026-09-19, 2026-11-18.
 
 #include "StdAfx.h"
 #include "internal/password_proof_property.hpp"

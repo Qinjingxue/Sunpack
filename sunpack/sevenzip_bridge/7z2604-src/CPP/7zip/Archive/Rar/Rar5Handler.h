@@ -1,4 +1,5 @@
 // Rar5Handler.h
+// SunPack modifications recorded on 2026-11-19.
 // Modified for SunPack on 2026-09-20: forward the existing RAR5 "mt"
 // property to the RAR5/RAR7 decoder's optional parallel decode path.
 

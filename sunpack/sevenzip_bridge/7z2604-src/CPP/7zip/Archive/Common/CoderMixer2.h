@@ -1,4 +1,5 @@
 // CoderMixer2.h
+// SunPack modifications recorded on 2026-09-23.
 
 #ifndef ZIP7_INC_CODER_MIXER2_H
 #define ZIP7_INC_CODER_MIXER2_H

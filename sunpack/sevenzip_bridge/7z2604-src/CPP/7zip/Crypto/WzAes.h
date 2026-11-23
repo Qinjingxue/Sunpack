@@ -1,4 +1,5 @@
 // Crypto/WzAes.h
+// SunPack modifications recorded on 2026-11-18.
 /*
 This code implements Brian Gladman's scheme
 specified in "A Password Based File Encryption Utility":

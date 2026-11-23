@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC" alt="最新版本"></a>
   <img src="https://img.shields.io/badge/平台-Windows%20%E4%B8%93%E7%94%A8-2f6070" alt="Windows 专用">
-  <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT License"></a>
+  <a href="docs/zh-CN/licensing.md"><img src="https://img.shields.io/badge/license-MIT%20%2B%20third--party-blue" alt="许可证"></a>
 </p>
 
 <p align="center">
@@ -285,9 +285,9 @@ uv run --locked pytest
 
 ## 许可证
 
-仓库根目录的 [LICENSE](LICENSE)（MIT）适用于 SunPack 原创代码，不代表第三方代码或二进制也采用 MIT 许可证。
+SunPack 独立编写的代码采用 [MIT 许可证](LICENSE)，包括 Worker 的原创应用代码。Worker 内置修改过的 7-Zip，Runtime 内置 7-Zip 的 Deflate64 解码器。适用的 7-Zip 代码及其使用受 GNU LGPL 2.1 或更高版本约束。第三方代码及对它的修改按适用的上游条款分发。
 
-仓库包含多个第三方组件，包括位于 `sunpack/sevenzip_bridge/7z2604-src/` 的 7-Zip 26.05 裁剪定制实现（沿用原目录名）、位于 `sunpack/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3、位于 `sunpack/third_party/lz4/` 的 LZ4 1.10.0，以及改编自 RustCrypto 的加密算法实现。这些组件仍受各自原始许可证约束。各组件的范围、版权与许可证信息，以及发布时需要附带的许可材料，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/licensing.md)。
+仓库包含多个第三方组件，包括位于 `sunpack/sevenzip_bridge/7z2604-src/` 的 7-Zip 26.05 裁剪定制实现（沿用原目录名）、位于 `sunpack/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3、位于 `sunpack/third_party/lz4/` 的 LZ4 1.10.0，以及改编自 RustCrypto 的加密算法实现。这些组件仍受各自原始许可证约束。各组件的范围、版权与许可证信息，以及发布时需要附带的许可材料，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [许可与分发说明](docs/zh-CN/licensing.md)。
 
 其中，7-Zip 源码许可证副本位于 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt)，GNU LGPL 2.1 完整文本位于 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt)；其他组件的许可证副本见 [licenses/](licenses/)。
 

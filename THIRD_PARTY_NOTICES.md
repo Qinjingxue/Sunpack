@@ -1,8 +1,19 @@
 # Third-Party Notices
 
-Release packages contain one `THIRD_PARTY_LICENSES.txt` with this overview,
-SunPack's MIT terms, and full collected dependency notices. Paths below identify
-the original files in the source repository, not separate installed files.
+SunPack's independent original code, including original Worker application
+code, is licensed under MIT. Third-party code and modifications to it are
+distributed under the applicable upstream terms.
+
+`tools/sunpack_sevenzip_worker.exe` includes and uses the modified 7-Zip
+backend. `sunpack-runtime.exe` independently includes and uses the 7-Zip
+Deflate64 decoder. The LGPL-covered 7-Zip code and its use in these executables
+are licensed under GNU LGPL 2.1 or later. File-specific third-party terms
+remain applicable, including the unRAR restrictions for the Worker.
+
+The installer displays and installs `THIRD_PARTY_LICENSES.txt` with this
+overview, the license texts, and the corresponding source location for the
+official build. Paths below refer to files in the source repository. See
+[Licensing and distribution](docs/licensing.md) for the rebuild instructions.
 
 ## SunPack GUI
 
@@ -14,13 +25,6 @@ QuickJS-NG, LunaSVG and PlutoVG dependencies. Their full license texts are
 staged by the GUI build and consolidated into `THIRD_PARTY_LICENSES.txt`
 in release packages, together with the bundled FreeType and stb notices. The GUI also
 reuses the repository's bundled xxHash implementation and its BSD notice.
-
-SunPack-original source code is licensed under the MIT License. Third-party
-source code and binaries included in this repository or staged by SunPack's
-development and release workflows remain subject to their original licenses.
-
-See [docs/licensing.md](docs/licensing.md) for the repository's license scope
-and release-compliance guidance.
 
 ## Inno Setup installer messages
 
@@ -42,9 +46,9 @@ historical directory name:
 The 26.05 update imports the Shrink decoder rewrite, container-handler
 initialization fixes and string-copy cleanup while preserving SunPack's codec,
 memory and CPU-budget patches. Changes outside supported runtime paths are
-omitted. See the [26.05 synchronization record](docs/zh-CN/sevenzip_26_05_sync_review.md)
-and the [26.04 synchronization record](docs/zh-CN/sevenzip_26_04_sync_review.md)
-for the upstream provenance and exact scope.
+omitted. The vendored tree also retains unchanged files from earlier releases.
+Upstream sources are available from the
+[7-Zip 26.05 release](https://github.com/ip7z/7zip/releases/tag/26.05).
 
 That subtree is not covered by SunPack's MIT License. It remains under the
 upstream 7-Zip source license. The authoritative license file imported with the
@@ -98,19 +102,6 @@ reproduced in [licenses/7zip-license.txt](licenses/7zip-license.txt).
 
 7-Zip source code and official releases are available from
 [7-zip.org](https://www.7-zip.org/).
-
-## License boundary
-
-The repository-root MIT License applies to SunPack-original code. It does not
-relicense the vendored 7-Zip source tree or other third-party components.
-
-If SunPack modifies LGPL-covered 7-Zip files, the applicable upstream copyright
-and license notices must be preserved and the change notices required by the
-LGPL must be added.
-
-If a release compiles or links LGPL-covered 7-Zip source into a SunPack binary,
-that release must also satisfy the applicable LGPL source, modification, and
-rebuild/relink requirements for the exact code used to produce the binary.
 
 ## LZ4 1.10.0 and xxHash
 

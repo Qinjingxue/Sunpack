@@ -1,4 +1,5 @@
 // Pbkdf2HmacSha1.cpp
+// SunPack modifications recorded on 2026-11-18.
 
 #include "StdAfx.h"
 

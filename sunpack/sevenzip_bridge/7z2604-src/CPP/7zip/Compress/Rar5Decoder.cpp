@@ -1,4 +1,6 @@
 // Rar5Decoder.cpp
+// SunPack modifications recorded on 2026-09-19, 2026-09-22, 2026-09-23,
+// 2026-11-09.
 // According to unRAR license, this code may not be used to develop
 // a program that creates RAR archives
 // Modified for SunPack on 2026-09-20: add an optional RAR5/RAR7 parallel

@@ -159,8 +159,8 @@ PublisherUrl: https://github.com/Qinjingxue/Sunpack
 PublisherSupportUrl: https://github.com/Qinjingxue/Sunpack/issues
 PackageName: SunPack
 PackageUrl: https://github.com/Qinjingxue/Sunpack
-License: MIT
-LicenseUrl: https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE
+License: MIT and third-party licenses
+LicenseUrl: https://github.com/$Repository/blob/main/docs/licensing.md
 ShortDescription: Windows archive detection, extraction, and recovery tool
 Description: SunPack identifies and processes archives by binary features, including disguised extensions, nested archives, encrypted archives, split volumes, and embedded archives.
 Tags:

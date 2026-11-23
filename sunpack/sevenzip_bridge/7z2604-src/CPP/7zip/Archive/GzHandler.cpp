@@ -1,4 +1,5 @@
 // GzHandler.cpp
+// SunPack modifications recorded on 2026-11-15.
 //
 // Modified by SunPack, 2026-09-20:
 // add a metadata-routed zlib-ng fast path for seekable gzip extraction.

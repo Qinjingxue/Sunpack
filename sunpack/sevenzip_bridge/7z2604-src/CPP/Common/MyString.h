@@ -1,4 +1,5 @@
 // Common/MyString.h
+// SunPack modifications recorded on 2026-11-02.
 
 #ifndef ZIP7_INC_COMMON_MY_STRING_H
 #define ZIP7_INC_COMMON_MY_STRING_H

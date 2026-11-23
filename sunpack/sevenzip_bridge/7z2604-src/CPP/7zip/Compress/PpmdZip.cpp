@@ -1,4 +1,5 @@
 // PpmdZip.cpp
+// SunPack modifications recorded on 2026-09-19, 2026-11-19.
 
 #include "StdAfx.h"
 

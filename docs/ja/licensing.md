@@ -1,12 +1,12 @@
 # ライセンスと配布
 
-[English](../licensing.md) | [繁體中文](../zh-TW/licensing.md) | **日本語** | [한국어](../ko/licensing.md)
+[English](../licensing.md) | [简体中文](../zh-CN/licensing.md) | [繁體中文](../zh-TW/licensing.md) | **日本語** | [한국어](../ko/licensing.md)
 
 このページでは、SunPack リポジトリのライセンスの適用範囲と、配布時に保持する資料を説明します。要約と原文に違いがある場合は原文が優先されます。
 
 ## SunPack 独自コード
 
-SunPack 用に作成したソースコードは、ルートの [MIT ライセンス](../../LICENSE) に従います。同梱するサードパーティーコードには、各上流プロジェクトと [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) に記載された元のライセンスが適用されます。
+Worker のアプリケーションコードを含め、SunPack が独自に作成したソースコードは、ルートの [MIT ライセンス](../../LICENSE) に従います。同梱するサードパーティーコードとその改変には、各上流プロジェクトと [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) に記載された元のライセンスが適用されます。
 
 ## 同梱の 7-Zip 26.05
 
@@ -33,9 +33,9 @@ ZIP Deflate の高速処理で使用するソースは `sunpack/sevenzip_bridge/
 
 ## リリースパッケージ
 
-`scripts/generate_license_bundle.ps1` が生成する `THIRD_PARTY_LICENSES.txt` をインストールします。SunPack の MIT ライセンス、サードパーティーの概要、リポジトリの `licenses/`、GUI 依存ライブラリー（FreeType と stb を含む）の告知、および対象 Windows 向けロック済み Cargo 依存関係のライセンス・告知を収録します。ビルド・テスト用の告知が入る場合もあります。各ファイルの適用範囲は元の告知に従います。
+`scripts/generate_license_bundle.ps1` が生成する `THIRD_PARTY_LICENSES.txt` をインストーラーで表示し、インストールします。SunPack の MIT ライセンス、サードパーティーの概要、リポジトリの `licenses/`、GUI 依存ライブラリー（FreeType と stb を含む）の告知、および対象 Windows 向けロック済み Cargo 依存関係のライセンス・告知を収録します。ビルド・テスト用の告知が入る場合もあります。各ファイルの適用範囲は元の告知に従います。
 
-原本はリポジトリと GUI 依存ソースに残ります。インストーラーはルートの MIT ライセンスを表示し、ライセンスのソースツリーは別途インストールしません。必須資料が欠けている場合は生成に失敗します。新しい依存関係を追加するときもライセンス条件を確認してください。
+原本はリポジトリと GUI 依存ソースに残ります。告知ファイルには Worker と Runtime に組み込まれた LGPL 対象の 7-Zip コードと、公式リリースに対応するソースへのリンクを記載します。[再ビルド手順](../licensing.md#rebuild-the-worker-and-runtime)を参照してください。必須資料が欠けている場合は生成に失敗します。新しい依存関係を追加するときもライセンス条件を確認してください。
 
 LGPL 対象の 7-Zip コードをコンパイルまたはリンクするリリースでは、ビルドに使った正確なソース、受領者による対象コードの変更、組み合わせた成果物の再ビルド・再リンクについて、適用される LGPL 条件を満たす必要があります。関連するソースやビルド資料を配布手順から取り除く前にライセンス上の確認を行ってください。
 

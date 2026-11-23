@@ -29,7 +29,13 @@ try {
     $arguments = @{ RepoRoot=$repo; GuiLicenseRoot=$gui; OutputPath=$output; Target='x86_64-pc-windows-msvc'; MetadataPath=$metaPath }
     $script = Join-Path $repo 'scripts/generate_license_bundle.ps1'
     & $script @arguments
+    Check (([IO.File]::ReadAllText($output)).Contains('the source tree used to build this installer')) 'Local builds must identify their corresponding source'
+    $arguments.CorrespondingSourceUrl = 'https://github.com/Qinjingxue/Sunpack/archive/0123456789012345678901234567890123456789.tar.gz'
+    & $script @arguments
     $first = [IO.File]::ReadAllText($output)
+    $summary = ($first -split '\nCONTENTS\n', 2)[0]
+    Check ($summary.Contains('sunpack_sevenzip_worker.exe') -and $summary.Contains('sunpack-runtime.exe') -and
+        $summary.Contains('GNU LGPL 2.1 or later') -and $summary.Contains($arguments.CorrespondingSourceUrl)) 'Both executables and the corresponding source must be prominent'
     & $script @arguments
     Check ($first -ceq [IO.File]::ReadAllText($output)) 'Generation must be deterministic'
     Check (([regex]::Matches($first, 'SHARED FULL TERMS')).Count -eq 1) 'Duplicate terms must occur once'

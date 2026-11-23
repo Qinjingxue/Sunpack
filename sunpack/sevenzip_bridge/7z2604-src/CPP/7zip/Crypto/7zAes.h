@@ -1,4 +1,5 @@
 // 7zAes.h
+// SunPack modifications recorded on 2026-11-17, 2026-11-18.
 
 #ifndef ZIP7_INC_CRYPTO_7Z_AES_H
 #define ZIP7_INC_CRYPTO_7Z_AES_H

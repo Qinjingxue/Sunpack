@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory = $true)][string]$GuiLicenseRoot,
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [Parameter(Mandatory = $true)][string]$Target,
+    [string]$CorrespondingSourceUrl,
     # Allows offline verification against the same cargo metadata schema.
     [string]$MetadataPath
 )
@@ -32,7 +33,7 @@ function Add-License([string]$Label, [string]$Path) {
     $sections.Add($entry)
     $byText.Add($text, $entry)
 }
-Add-License 'SunPack - repository LICENSE (MIT)' (Join-Path $RepoRoot 'LICENSE')
+Add-License 'SunPack independent original code (MIT)' (Join-Path $RepoRoot 'LICENSE')
 Add-License 'SunPack third-party component overview (source paths below refer to the source repository)' (Join-Path $RepoRoot 'THIRD_PARTY_NOTICES.md')
 foreach ($name in @('7zip-license.txt', '7zip-source-license.txt', 'LGPL-2.1.txt', 'zlib-ng-license.txt', 'lz4-license.txt', 'twofish-license.txt', 'serpent-license.txt', 'threefish-license.txt', 'magma-license.txt', 'blowfish-license.txt', 'rc6-license.txt')) {
     if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "licenses/$name") -PathType Leaf)) { throw "Missing required repository license: $name" }
@@ -79,11 +80,27 @@ foreach ($package in ($metadata.packages | Where-Object { $included.Contains($_.
 $builder = [Text.StringBuilder]::new()
 [void]$builder.AppendLine('SUNPACK - LICENSES AND THIRD-PARTY NOTICES')
 [void]$builder.AppendLine("Target: $Target")
-[void]$builder.AppendLine('Source: https://github.com/Qinjingxue/Sunpack')
-[void]$builder.AppendLine('This document consolidates original terms; it does not relicense third-party code.')
+[void]$builder.AppendLine()
+[void]$builder.AppendLine('SunPack independent original code is licensed under MIT.')
+[void]$builder.AppendLine('tools/sunpack_sevenzip_worker.exe includes and uses a modified 7-Zip backend.')
+[void]$builder.AppendLine('sunpack-runtime.exe includes and uses the 7-Zip Deflate64 decoder.')
+[void]$builder.AppendLine('7-Zip copyright (C) 1999-2026 Igor Pavlov and other respective holders.')
+[void]$builder.AppendLine('The applicable 7-Zip code and its use are covered by GNU LGPL 2.1 or later.')
+[void]$builder.AppendLine('See the full LGPL, the 7-Zip license with unRAR and BSD terms, and the')
+[void]$builder.AppendLine('other applicable third-party terms below. Upstream: https://www.7-zip.org/')
+[void]$builder.AppendLine()
+if ($CorrespondingSourceUrl) {
+    [void]$builder.AppendLine("Corresponding source and build scripts: $CorrespondingSourceUrl")
+} else {
+    [void]$builder.AppendLine('Corresponding source is the source tree used to build this installer.')
+    [void]$builder.AppendLine('Distributors of local builds must provide access to that exact source and build scripts.')
+}
+[void]$builder.AppendLine('See docs/licensing.md in the corresponding source for rebuilding both executables.')
+[void]$builder.AppendLine('Recipients may modify the combined executables for their own use and reverse engineer')
+[void]$builder.AppendLine('them to debug those modifications, as provided by the LGPL.')
+[void]$builder.AppendLine()
 [void]$builder.AppendLine('Cargo entries include the resolved workspace dependency closure, including build/test tools; inclusion does not assert that every component is linked into the installed binaries. Package-internal terms apply only to the files specified by their original notices.')
 [void]$builder.AppendLine('Source-file paths in the overview identify repository originals, reproduced below. Source license files are retained in the repository.')
-[void]$builder.AppendLine('LGPL corresponding-source and modification/relinking obligations remain separate release requirements. This notice bundle alone does not satisfy them; see docs/licensing.md in the source repository.')
 [void]$builder.AppendLine("`nCONTENTS")
 for ($i = 0; $i -lt $sections.Count; $i++) {
     foreach ($label in $sections[$i].Labels) { [void]$builder.AppendLine("[$($i + 1)] $label") }

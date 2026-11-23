@@ -1,4 +1,5 @@
 // 7zIn.h
+// SunPack modifications recorded on 2026-11-18.
 
 #ifndef ZIP7_INC_7Z_IN_H
 #define ZIP7_INC_7Z_IN_H

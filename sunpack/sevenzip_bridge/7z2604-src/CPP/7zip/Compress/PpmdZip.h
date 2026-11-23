@@ -1,4 +1,5 @@
 // PpmdZip.h
+// SunPack modifications recorded on 2026-11-19.
 
 #ifndef ZIP7_INC_COMPRESS_PPMD_ZIP_H
 #define ZIP7_INC_COMPRESS_PPMD_ZIP_H

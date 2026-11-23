@@ -1,4 +1,6 @@
 // Rar5Handler.cpp
+// SunPack modifications recorded on 2026-09-19, 2026-09-20, 2026-09-22,
+// 2026-11-18, 2026-11-19.
 // Modified for SunPack: preserve upstream archive/volume/extraction machinery
 // while delegating worker decoder concurrency exclusively to the CPU-credit broker.
 

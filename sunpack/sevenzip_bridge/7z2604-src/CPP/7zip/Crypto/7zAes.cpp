@@ -1,4 +1,5 @@
 // 7zAes.cpp
+// SunPack modifications recorded on 2026-11-17, 2026-11-18.
 
 #include "StdAfx.h"
 
