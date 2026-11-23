@@ -124,6 +124,7 @@ enum CandidateKind {
     Archive,
     Anchor,
     SplitZipLocal,
+    ZipAwaitingTail,
     EncryptedRar,
 }
 
@@ -139,7 +140,14 @@ pub(crate) struct EmbeddedCandidate {
 
 impl EmbeddedCandidate {
     pub(crate) fn is_logical_archive(&self) -> bool {
-        matches!(self.kind, CandidateKind::Archive | CandidateKind::EncryptedRar)
+        matches!(
+            self.kind,
+            CandidateKind::Archive | CandidateKind::EncryptedRar | CandidateKind::ZipAwaitingTail
+        )
+    }
+
+    pub(crate) fn awaits_zip_tail(&self) -> bool {
+        self.kind == CandidateKind::ZipAwaitingTail
     }
 
     pub(crate) fn password_required(&self) -> bool {
@@ -469,6 +477,7 @@ fn scan_embedded_archives_native_with_iocp(
             candidate.offset,
             candidate.format,
             std::cmp::Reverse(candidate_rank(candidate)),
+            std::cmp::Reverse(candidate.zip_eocd_offset),
         )
     });
     candidates.dedup_by_key(|candidate| (candidate.offset, candidate.format));
@@ -599,6 +608,26 @@ fn validate_raw_hits(
         .filter_map(|candidate| candidate.end_offset.map(|end| (candidate.offset, end)))
         .collect::<Vec<_>>();
     seeded_ranges.sort_unstable();
+    // An exact older end is valid byte geometry, but not permission to publish
+    // a prefix of an already-visible append. An independently verified ZIP
+    // rooted at that end is a peer, not a continuation of this segment.
+    for item in &mut candidates {
+        let Some(end) = item.end_offset else { continue };
+        if file_size.saturating_sub(end) < 10
+            || seeded_ranges.binary_search_by_key(&end, |range| range.0).is_ok()
+        {
+            continue;
+        }
+        let mut locals = raw_hits.iter_mask(1);
+        locals.seek_ge(end);
+        if locals.next().is_none_or(|hit| hit.offset() != end) {
+            continue;
+        }
+        let header = read_at(reader, end, 30)?;
+        if crate::formats::zip::zip_continuation_prefix(&header) {
+            item.kind = CandidateKind::ZipAwaitingTail;
+        }
+    }
 
     let mut range_index = 0usize;
     let mut covered_until = 0u64;
@@ -683,6 +712,9 @@ fn xz_stream_padding(reader: &ManagedReader, mut start: u64, end: u64) -> io::Re
 }
 
 fn candidate_rank(candidate: &EmbeddedCandidate) -> u8 {
+    if candidate.awaits_zip_tail() {
+        return 2;
+    }
     match (candidate.is_logical_archive(), candidate.end_offset.is_some()) {
         (true, true) => 3,
         (true, false) => 2,

@@ -16,6 +16,7 @@
 #ifdef _WIN32
 #include "sevenzip_async_output.hpp"
 #include "sevenzip_space_directory.hpp"
+#include "Windows/PropVariant.h"
 #endif
 
 #ifdef _WIN32
@@ -481,6 +482,22 @@ namespace sunpack::sevenzip
                 set_failure(result, "archive_open", "encrypted_or_wrong_password");
                 result.message = "RAR4 encrypted headers could not be decoded";
                 return result;
+            }
+            if (format.Data4[5] == 0x01 || format.Data4[5] == 0xCC || format.Data4[5] == 0xEE)
+            {
+                // An archive can open and yield valid members despite a short
+                // structural record. Do not let their success publish the prefix.
+                NWindows::NCOM::CPropVariant flags;
+                if (archive->GetArchiveProperty(kpidErrorFlags, &flags) == S_OK &&
+                    flags.vt == VT_UI4 && (flags.ulVal & kpv_ErrorFlags_UnexpectedEnd))
+                {
+                    result.status = PasswordTestStatus::Damaged;
+                    result.damaged = true;
+                    result.operation_result = kOpUnexpectedEnd;
+                    set_failure(result, "archive_open", "unexpected_end");
+                    result.message = "archive structure is incomplete";
+                    return result;
+                }
             }
             auto *job_replay = current_extraction_replay;
             std::array<std::uint8_t, 16> handler{};

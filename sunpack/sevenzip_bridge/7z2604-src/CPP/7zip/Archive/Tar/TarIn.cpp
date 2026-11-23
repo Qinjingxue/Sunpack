@@ -195,8 +195,10 @@ HRESULT CArchive::GetNextItemReal(CItemEx &item)
     RINOK(ReadStream(SeqStream, buf, &processedSize))
     if (processedSize == 0)
     {
-      if (!thereAreEmptyRecords)
-        error = k_ErrorType_UnexpectedEnd; // "There are no trailing zero-filled records";
+      // EOF immediately after a complete member is not evidence of a
+      // truncated record. Preserve support for archives without zero blocks.
+      if (!thereAreEmptyRecords && NumFiles == 0)
+        error = k_ErrorType_UnexpectedEnd;
       return S_OK;
     }
     if (processedSize != NFileHeader::kRecordSize)
@@ -857,7 +859,7 @@ HRESULT CArchive::ReadItem2(CItemEx &item)
           || item.LongName_WasUsed
           || item.LongLink_WasUsed
           || item.Num_Pax_Records != 0)
-        error = k_ErrorType_Corrupted;
+        error = k_ErrorType_UnexpectedEnd;
       return S_OK;
     }
     if (error != k_ErrorType_OK)
@@ -896,7 +898,10 @@ HRESULT CArchive::ReadItem2(CItemEx &item)
       const unsigned kLongNameSizeMax = (unsigned)1 << 14;
       RINOK(ReadDataToBuffer(item, *tb, kLongNameSizeMax))
       if (error != k_ErrorType_OK)
+      {
+        filled = false; // A metadata pseudo-entry is never a payload.
         return S_OK;
+      }
 
       if (lf == NFileHeader::NLinkFlag::kGnu_LongName)
       {
@@ -943,7 +948,10 @@ HRESULT CArchive::ReadItem2(CItemEx &item)
 
       RINOK(ReadDataToBuffer(item, *tb, kParsingPaxSizeMax))
       if (error != k_ErrorType_OK)
+      {
+        filled = false; // A metadata pseudo-entry is never a payload.
         return S_OK;
+      }
 
       item.HeaderSize += item.Get_PackSize_Aligned();
 

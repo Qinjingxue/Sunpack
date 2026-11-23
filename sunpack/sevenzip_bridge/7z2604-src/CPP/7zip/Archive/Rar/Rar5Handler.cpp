@@ -2417,7 +2417,10 @@ HRESULT CHandler::Open2(IInStream *stream,
             return res;
           if (arch.UnexpectedEnd)
           {
-            _errorFlags |= kpv_ErrorFlags_UnexpectedEnd;
+            // A short block is explicit truncation. A standalone stream
+            // ending exactly between blocks may simply omit the end marker.
+            if (arcInfo.EndPos < endPos || arcInfo.IsVolume())
+              _errorFlags |= kpv_ErrorFlags_UnexpectedEnd;
             if (arcInfo.EndPos < arch.Position)
                 arcInfo.EndPos = arch.Position;
             if (arcInfo.EndPos < endPos)

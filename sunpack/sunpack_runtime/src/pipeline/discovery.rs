@@ -1223,7 +1223,11 @@ fn project_segments(
         let resolution = resolutions.remove(&item.offset);
         let resolved_end = resolution.as_ref().and_then(|result| result.end_offset);
         let end = resolved_end.or(item.end_offset);
-        let failure = resolution.as_ref().and_then(|result| result.failure_reason);
+        let awaiting_zip_tail = item.awaits_zip_tail();
+        let failure = resolution
+            .as_ref()
+            .and_then(|result| result.failure_reason)
+            .or_else(|| awaiting_zip_tail.then_some("embedded_truncated"));
         // The validated ENC header admits decryption through EOF without
         // supplying an exact archive boundary.
         let confirmed = item.is_logical_archive()
@@ -1244,7 +1248,7 @@ fn project_segments(
         input.analysis.origin = AnalysisOrigin::Embedded;
         input.analysis.password_required = item.password_required();
         input.analysis.structure_complete = item.format == "lz4" && end.is_some();
-        input.analysis.volume_completeness = Some(if end.is_some() {
+        input.analysis.volume_completeness = Some(if end.is_some() && !awaiting_zip_tail {
             VolumeCompleteness::Complete
         } else {
             VolumeCompleteness::Unknown

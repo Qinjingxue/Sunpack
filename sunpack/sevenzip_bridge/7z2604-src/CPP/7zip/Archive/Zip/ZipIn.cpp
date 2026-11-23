@@ -3430,6 +3430,35 @@ HRESULT CInArchive::Open(IInStream *stream, const UInt64 *searchLimit,
     {
       ArcInfo.FinishPos = GetVirtStreamPos();
       ArcInfo.ThereIsTail = (ArcInfo.FileEndPos > ArcInfo.FinishPos);
+      // Do not publish an old central directory when the same logical
+      // stream already contains the start of another member immediately
+      // after it. Independently bounded carrier ranges have no such tail.
+      if (res == S_OK && !UnexpectedEnd &&
+          ArcInfo.ThereIsTail && ArcInfo.FileEndPos - ArcInfo.FinishPos >= 10)
+      {
+        Byte next[kLocalHeaderSize];
+        const UInt64 remaining = ArcInfo.FileEndPos - ArcInfo.FinishPos;
+        const unsigned requested = remaining < sizeof(next) ? (unsigned)remaining : sizeof(next);
+        unsigned size = 0;
+        HRESULT tailRes = S_OK;
+        if (GetAvail() < requested)
+        {
+          // Do not refill the full header cache for one fixed local header.
+          DisableBufMode();
+          tailRes = Seek_SavePos(ArcInfo.FinishPos);
+        }
+        if (tailRes == S_OK)
+          tailRes = ReadFromCache(next, requested, size);
+        if (tailRes != S_OK)
+          res = tailRes;
+        else if (size >= 10 && Get32(next) == NSignature::kLocalFileHeader)
+        {
+          const unsigned version = Get16(next + 4);
+          if (version >= 10 && version <= 100 && (Get16(next + 6) & 0xc000) == 0 &&
+              (size < kLocalHeaderSize || Get16(next + 26) != 0))
+            UnexpectedEnd = true;
+        }
+      }
     }
 
     DisableBufMode();

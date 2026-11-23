@@ -11,6 +11,16 @@ pub(crate) fn relation_local_header_len(data: &[u8], offset: usize) -> Option<us
     Some(30 + usize::from(u16_le(fixed, 26)) + usize::from(u16_le(fixed, 28)))
 }
 
+/// A local-header prefix at a validated older EOCD end is a reason to
+/// defer a whole-archive delivery, not proof that an independent ZIP exists.
+pub(crate) fn zip_continuation_prefix(bytes: &[u8]) -> bool {
+    bytes.len() >= 10
+        && bytes.starts_with(LFH_SIG)
+        && (10..=100).contains(&u16_le(bytes, 4))
+        && u16_le(bytes, 6) & 0xc000 == 0
+        && (bytes.len() < LOCAL_HEADER_LEN || u16_le(bytes, 26) != 0)
+}
+
 /// Relation probes read a tail window rather than a whole-file slice. Keep
 /// the same validated extent and check its physical locator before using IDs.
 pub(crate) fn zip64_relation_disk_numbers(

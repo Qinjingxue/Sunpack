@@ -47,6 +47,7 @@ pub(crate) const SEVEN_ZIP_STUB: u32 = 1 << 20;
 pub(crate) const WINRAR_STUB: u32 = 1 << 21;
 pub(crate) const EMBEDDED_VOLUME: u32 = 1 << 22;
 pub(crate) const UNRESOLVED_VOLUME: u32 = 1 << 23;
+pub(crate) const ZIP_AWAITING_TAIL: u32 = 1 << 24;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct VolumeAnchor {
@@ -665,6 +666,13 @@ fn probe_zip_reader(
         out.bytes_read = bytes_read;
         return false;
     }
+    if trailing && out.has_any(ZIP_SINGLE_DISK) {
+        if let Some(record) = eocd {
+            if crate::formats::zip::zip_continuation_prefix(&tail[record.end..]) {
+                out.flags |= ZIP_AWAITING_TAIL;
+            }
+        }
+    }
     recognized
 }
 
@@ -903,6 +911,17 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> Volume
                 Ok(true)
             ) {
                 continue;
+            }
+            // The relation fallback found an older directory outside the
+            // ordinary tail window. Carry the same append evidence as Deep;
+            // do not make that directory a successful bounded delivery.
+            let after = offset + len as u64;
+            if candidate.has_any(ZIP_SINGLE_DISK) && reader.len().saturating_sub(after) >= 10 {
+                let Ok(next) = reader.read_cached_at(after, 30) else { return out };
+                candidate.bytes_read += next.len() as u64;
+                if crate::formats::zip::zip_continuation_prefix(&next) {
+                    candidate.flags |= ZIP_AWAITING_TAIL;
+                }
             }
             out.format = candidate.format;
             out.strong = candidate.strong;

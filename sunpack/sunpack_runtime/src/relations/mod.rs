@@ -3,7 +3,7 @@ use crate::analysis_native::volume_anchor::{
     MEMBER, RAR_END_CHECKED, RAR_OLD_NUMBERING, RAR_PART_NUMBERING, SEVEN_ZIP_NEXT_HEADER_CRC,
     SEVEN_ZIP_STUB, SFX_CHECKED, TERMINAL, UNRESOLVED_VOLUME, WINRAR_STUB, ZIP_CARRIER_CHECKED,
     ZIP_DIRECTORY_MEMBER, ZIP_EOCD_HEAD, ZIP_LOCAL_HEADER, ZIP_SINGLE_DISK, ZIP_SPLIT_END,
-    ZIP_SPLIT_START, ZIP_TAIL_CHECKED, ZIP_TAIL_WITHOUT_HEAD,
+    ZIP_AWAITING_TAIL, ZIP_SPLIT_START, ZIP_TAIL_CHECKED, ZIP_TAIL_WITHOUT_HEAD,
 };
 use crate::io::archive_state::{
     AnalysisOrigin, ArchiveInput, InputExtent, InputPart, InputRole, OpenMode, VolumeCompleteness,
@@ -281,7 +281,13 @@ impl NativeRelationGroup {
         );
         input.analysis.password_required = data.needs_password;
         input.analysis.origin = AnalysisOrigin::Relations;
+        let zip_awaits_tail = anchor.is_some_and(|a| a.has_any(ZIP_AWAITING_TAIL))
+            && match self {
+                Self::Ordinary(..) => true,
+                Self::Proposal(validation) => validation.proposal.volumes.len() == 1,
+            };
         let failure_reason = match self {
+            _ if zip_awaits_tail => Some("corrupt_archive"),
             Self::Proposal(validation) => project_proposal(validation, &mut input),
             Self::Ordinary(..) => {
                 if !data.relation_confirmed { input.analysis.origin = AnalysisOrigin::RelationsFallback; }
