@@ -146,14 +146,14 @@ bool CCoder::ReadTables(void)
 }
 
 
-HRESULT CCoder::InitInStream(bool needInit)
+HRESULT CCoder::InitInStream(bool needInit, size_t bufferSize)
 {
   if (needInit)
   {
     // for HDD-Windows:
     // (1 << 15) - best for reading only prefetch
     // (1 << 22) - best for real reading / writing
-    if (!m_InBitStream.Create(1 << 20))
+    if (!m_InBitStream.Create(bufferSize))
       return E_OUTOFMEMORY;
     m_InBitStream.Init();
     _needInitInStream = false;

@@ -146,18 +146,7 @@ namespace sunpack::sevenzip
               pipeline_timing_(trace ? trace->pipeline_timing : nullptr),
 #endif
               enabled_(config.enabled && config.window_bytes && size)
-        {
-            if (!enabled_) return;
-            for (auto &slot : slots_)
-            {
-                slot.overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-                if (!slot.overlapped.hEvent)
-                {
-                    close();
-                    return;
-                }
-            }
-        }
+        {}
 
         OverlappedPrefetcher(const OverlappedPrefetcher &) = delete;
         OverlappedPrefetcher &operator=(const OverlappedPrefetcher &) = delete;
@@ -215,15 +204,30 @@ namespace sunpack::sevenzip
             return true;
         }
 
-        void after_read(UInt64 end) { advance_safely(end); }
+        void after_read(UInt64 end)
+        {
+            if (!enabled_) return;
+            if (demand_ == Demand::None)
+            {
+                demand_ = Demand::SingleRead;
+                return;
+            }
+            // Header reads before the next seek commonly discard both windows.
+            // A second contiguous read and one window of demand justify lookahead.
+            if (demand_ == Demand::SingleRead && end - next_offset_ < window_bytes_) return;
+            demand_ = Demand::Sequential;
+            advance_safely(end);
+        }
 
         void invalidate(UInt64 next)
         {
             cancel();
             next_offset_ = next;
+            demand_ = Demand::None;
         }
 
     private:
+        enum class Demand { None, SingleRead, Sequential };
         enum class State { Empty, Pending, Ready, Failed };
         struct Slot
         {
@@ -313,6 +317,15 @@ namespace sunpack::sevenzip
                 if (slot.state != State::Empty || next_offset_ >= virtual_size_) continue;
                 PrefetchSource source;
                 if (!resolver_(next_offset_, source) || !source.path || !source.length) break;
+                if (!slot.overlapped.hEvent)
+                {
+                    slot.overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                    if (!slot.overlapped.hEvent)
+                    {
+                        close();
+                        return;
+                    }
+                }
                 if (slot.handle == INVALID_HANDLE_VALUE || slot.path != source.path)
                 {
                     if (slot.handle != INVALID_HANDLE_VALUE) CloseHandle(slot.handle);
@@ -360,6 +373,7 @@ namespace sunpack::sevenzip
         PipelineTiming *pipeline_timing_;
 #endif
         bool enabled_;
+        Demand demand_ = Demand::None;
         // At most two file handles, even for thousands of volumes/ranges.
         std::array<Slot, 2> slots_;
     };

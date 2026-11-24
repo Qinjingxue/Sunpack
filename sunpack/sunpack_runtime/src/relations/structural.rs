@@ -297,7 +297,7 @@ fn remember_tail_facts(row: &RelationInput, anchor: &Arc<VolumeAnchor>) {
     };
     let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
     let Some(old) = cached.as_ref() else {
-        if anchor.zip_eocd_absent_generation.is_some() {
+        if anchor.zip_eocd_absent_generation().is_some() {
             *cached = Some(CheapAnchor::Full(Arc::clone(anchor)));
         }
         return;

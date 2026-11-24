@@ -54,8 +54,8 @@ fn long_streams_end_on_structure_instead_of_record_quotas() {
     let source = ManagedReader::from_bytes(bytes, ReaderConfig::default());
     let head = source.read_direct_at(0, 512).unwrap();
     assert_eq!(
-        identity(&head, source.len(), |at, len| source.read_direct_at(at, len)),
-        Ok(true)
+        first_frame(&head, source.len(), |at, len| source.read_direct_at(at, len)),
+        Ok(Some(65_537 * 8))
     );
     let parsed = walk(&source, 0, source.len());
     assert!(parsed.complete);
@@ -95,8 +95,8 @@ fn all_header_layouts_preserve_known_zero_and_descriptor_length() {
             let bytes = frame(b"", flags, block << 4, size, dict);
             let header = parse_header(&bytes).unwrap();
             assert_eq!(
-                identity(&bytes, bytes.len() as u64, |_, _| unreachable!()),
-                Ok(true)
+                first_frame(&bytes, bytes.len() as u64, |_, _| unreachable!()),
+                Ok(Some(0))
             );
             assert_eq!(header.content_size, size);
             assert_eq!(
@@ -129,11 +129,50 @@ fn concatenated_skip_bounds_and_trailing_carrier() {
     assert_eq!(parsed.content_checksums, 2);
     assert_eq!(parsed.block_checksums, 2);
 }
+
+#[test]
+fn standalone_probe_only_walks_when_the_tail_may_be_open() {
+    let payload = [0x51u8; 4096];
+    let complete = frame(&payload, 0x64, 0x40, None, None);
+    assert_eq!(
+        standalone_truncated(&complete[..512], complete.len() as u64, |offset, len| {
+            assert_eq!((offset, len), (complete.len() as u64 - 8, 8));
+            Ok(complete[complete.len() - 8..].to_vec())
+        }),
+        Some(false)
+    );
+
+    let mut skipped = complete.clone();
+    skipped.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3]);
+    for (bytes, expected) in [
+        (&complete[..complete.len() - 1], true),
+        (skipped.as_slice(), false),
+        (&skipped[..skipped.len() - 1], true),
+    ] {
+        let read = |offset: u64, len| Ok(bytes[offset as usize..offset as usize + len].to_vec());
+        assert_eq!(
+            standalone_truncated(&bytes[..512], bytes.len() as u64, read),
+            Some(expected)
+        );
+    }
+
+    // A short OS read cannot establish that a field exceeds the file size.
+    assert_eq!(
+        standalone_truncated(&skipped[..512], skipped.len() as u64, |offset, len| {
+            if offset == skipped.len() as u64 - 8 {
+                Ok(skipped[skipped.len() - len..].to_vec())
+            } else {
+                Ok(Vec::new())
+            }
+        }),
+        Some(false)
+    );
+}
 #[test]
 fn header_corruption_truncation_and_size_limits_fail_closed() {
     let original = frame(b"hello", 0x7c, 0x40, Some(5), None);
     let header_len = parse_header(&original).unwrap().len;
-    assert!(identity(&original, header_len as u64, |_, _| unreachable!()).is_err());
+    assert!(first_frame(&original, header_len as u64, |_, _| unreachable!()).is_err());
     for length in 4..original.len() {
         assert!(!index(original[..length].to_vec(), 0).complete);
     }
@@ -152,8 +191,8 @@ fn legacy_inputs_and_dictionary_descriptors_preserve_structure_identity() {
     let legacy = b"\x02\x21\x4c\x18\x06\0\0\0\x50hello";
     assert!(!leading(legacy));
     assert_eq!(
-        identity(legacy, legacy.len() as u64, |_, _| unreachable!()),
-        Ok(false)
+        first_frame(legacy, legacy.len() as u64, |_, _| unreachable!()),
+        Ok(None)
     );
     assert_eq!(index(legacy.to_vec(), 0).error, "lz4_magic_not_found");
     for id in [0, 123, u32::MAX] {

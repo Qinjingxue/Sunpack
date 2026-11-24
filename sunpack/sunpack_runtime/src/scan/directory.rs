@@ -670,9 +670,9 @@ impl NativeDirectoryScanOptions {
                             .and_then(Option::as_ref)
                             .and_then(|cell| {
                                 let saved = cell.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-                                let generation = saved.anchor()?.zip_eocd_absent_generation.as_ref()?;
+                                let generation = saved.anchor()?.zip_eocd_absent_generation()?;
                                 capture_file_generation(Path::new(&record.path))
-                                    .is_ok_and(|current| &current == generation.as_ref())
+                                    .is_ok_and(|current| &current == generation)
                                     .then_some(saved)
                             })
                             .or_else(|| previous.table.relation_anchors[row]

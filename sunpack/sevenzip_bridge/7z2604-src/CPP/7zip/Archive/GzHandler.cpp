@@ -469,6 +469,8 @@ Z7_CLASS_IMP_CHandler_IInArchive_3(
   CSingleMethodProps _props;
   CHandlerTimeOptions _timeOptions;
 
+  HRESULT OpenHeader(ISequentialInStream *stream, bool seekable);
+
 public:
   CHandler():
       _isArc(false)
@@ -611,7 +613,7 @@ Z7_COM7F_IMF(CCompressProgressInfoImp::SetRatioInfo(const UInt64 *inSize, const 
 Z7_COM7F_IMF(CHandler::Open(IInStream *stream, const UInt64 *, IArchiveOpenCallback *))
 {
   COM_TRY_BEGIN
-  RINOK(OpenSeq(stream))
+  RINOK(OpenHeader(stream, true))
   _isArc = false;
   UInt64 endPos;
   RINOK(stream->Seek(-8, STREAM_SEEK_END, &endPos))
@@ -627,12 +629,27 @@ Z7_COM7F_IMF(CHandler::Open(IInStream *stream, const UInt64 *, IArchiveOpenCallb
 Z7_COM7F_IMF(CHandler::OpenSeq(ISequentialInStream *stream))
 {
   COM_TRY_BEGIN
+  return OpenHeader(stream, false);
+  COM_TRY_END
+}
+
+HRESULT CHandler::OpenHeader(ISequentialInStream *stream, bool seekable)
+{
   try
   {
     Close();
     CreateDecoder();
     _decoder->SetInStream(stream);
-    _decoder->InitInStream(true);
+    if (seekable)
+    {
+      // Open() will seek to the footer and Extract() will rewind. A small
+      // refill keeps the same header parser without reading a payload window.
+      RINOK(_decoder->InitInStream(true, 1 << 12))
+    }
+    else
+    {
+      RINOK(_decoder->InitInStream(true))
+    }
     RINOK(_item.ReadHeader(_decoder.ClsPtr()))
     if (_decoder->InputEofError())
       return S_FALSE;
@@ -641,7 +658,6 @@ Z7_COM7F_IMF(CHandler::OpenSeq(ISequentialInStream *stream))
     return S_OK;
   }
   catch(const CInBufferException &e) { return e.ErrorCode; }
-  COM_TRY_END
 }
 
 Z7_COM7F_IMF(CHandler::Close())

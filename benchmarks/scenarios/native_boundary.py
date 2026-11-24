@@ -243,7 +243,7 @@ def main(argv=None):
     parser.add_argument("--password-entries", type=int, default=10000)
     parser.add_argument("--password", action="append", default=[])
     parser.add_argument("--compare-7z", action="store_true")
-    parser.add_argument("--cold", action="store_true", help="Shut down the resident runtime between rounds.")
+    parser.add_argument("--cold", action="store_true", help="Shut down the resident runtime before each measured request.")
     parser.add_argument("--live-arrival", action="store_true", help="Feed new files to one continuous Watch session.")
     parser.add_argument("--arrival-interval-ms", type=float, default=0, help="Idle time between live Watch waves.")
     parser.add_argument("--recursive", default="*")
@@ -312,7 +312,7 @@ def main(argv=None):
                 if args.mode == "watch":
                     _configure_watch(app, args, inputs, workspace.outputs)
                 for run in range(args.runs):
-                    if args.cold or args.mode == "watch":
+                    if (args.cold and args.mode != "extract") or args.mode == "watch":
                         app.shutdown()
                     if args.mode == "watch":
                         measurement = _watch_persistence(app)
@@ -332,9 +332,13 @@ def main(argv=None):
                         if output.exists():
                             shutil.rmtree(output)
                     else:
+                        scan_flags = ("-d",) if args.shape == "carrier" else ()
                         for key, item, copy, name, entry in staged:
+                            if args.cold:
+                                app.shutdown()
                             output = workspace.outputs / f"round-{run}-{name}"
-                            measurement = app.run("extract", "--direct-file", "-d", "-r", args.recursive, "-c", "k", "-nf", "-npa", "-o", output, entry, *password_args)
+                            measurement = app.run("extract", *scan_flags, "-r", args.recursive,
+                                                  "-c", "k", "-nf", "-npa", "-o", output, entry, *password_args)
                             row = {"case": key, "format": item["format"], "run": run, "copy": copy, "output": output_summary(output), **measurement}
                             if args.compare_7z:
                                 # Compare identical unwrapped archive input; carrier

@@ -128,7 +128,7 @@ public:
 
 public:
   HRESULT CodeResume(ISequentialOutStream *outStream, const UInt64 *outSize, ICompressProgressInfo *progress);
-  HRESULT InitInStream(bool needInit);
+  HRESULT InitInStream(bool needInit, size_t bufferSize = 1 << 20);
 
   void AlignToByte() { m_InBitStream.AlignToByte(); }
   Byte ReadAlignedByte();

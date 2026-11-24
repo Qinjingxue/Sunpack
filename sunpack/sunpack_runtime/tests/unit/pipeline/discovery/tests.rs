@@ -3,6 +3,27 @@ use super::*;
 const STORED_ZIP: &[u8] = b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00";
 
 #[test]
+fn zip_carrier_search_keeps_eocd_crossing_the_checked_suffix() {
+    use crate::analysis_native::volume_anchor::{
+        probe_volume_anchor_path_cheap, upgrade_relation_zip_carrier_tail,
+        upgrade_relation_zip_tail, TERMINAL,
+    };
+
+    let eocd = STORED_ZIP.len() - 22;
+    let mut carrier = STORED_ZIP.to_vec();
+    // The bounded suffix begins halfway through the actual EOCD signature.
+    carrier.resize(eocd + 2 + crate::formats::zip::EOCD_SEARCH_BYTES as usize, b'A');
+    let path = crate::test_support::temp_file("zip_eocd_crossing_suffix", &carrier);
+    let anchor = probe_volume_anchor_path_cheap(path.to_str().unwrap());
+    let tail = upgrade_relation_zip_tail(&anchor);
+    assert!(!tail.has_any(TERMINAL));
+    let resolved = upgrade_relation_zip_carrier_tail(&tail);
+    assert!(resolved.has_any(TERMINAL));
+    assert_eq!(resolved.zip_eocd_offset, Some(eocd as u64));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn zip_retry_reuses_negative_tail_only_for_the_same_physical_generation() {
     use crate::analysis_native::volume_anchor::CheapAnchor;
 
@@ -25,7 +46,7 @@ fn zip_retry_reuses_negative_tail_only_for_the_same_physical_generation() {
     let has_negative = |snapshot: &NativeDirectorySnapshot| {
         snapshot.rows().any(|row| {
             snapshot.table.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor)
-                .is_some_and(|anchor| anchor.zip_eocd_absent_generation.is_some())
+                .is_some_and(|anchor| anchor.zip_eocd_absent_generation().is_some())
         })
     };
     assert!(has_negative(&refresh().1));

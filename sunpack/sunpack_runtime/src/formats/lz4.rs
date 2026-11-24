@@ -31,11 +31,11 @@ pub(crate) fn leading(bytes: &[u8]) -> bool {
             .is_some_and(|p| skippable(u32::from_le_bytes(p.try_into().unwrap())))
 }
 
-pub(crate) fn identity(
+fn first_frame(
     prefix: &[u8],
     limit: u64,
     mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
-) -> Result<bool, &'static str> {
+) -> Result<Option<u64>, &'static str> {
     // A maximal frame header and its first block word fit in 23 bytes.
     // Reuse the filesystem's prefix unless a skippable frame jumps past it.
     let mut window;
@@ -65,12 +65,50 @@ pub(crate) fn identity(
             continue;
         }
         if magic != 0x184d2204 {
-            return Ok(false);
+            return Ok(None);
         }
         let header = parse_header(head)?;
         let block = word(header.len)?;
-        return Ok(header.block_span(block).is_ok());
+        return Ok(header.block_span(block).is_ok().then_some(offset));
     }
+}
+
+pub(crate) fn standalone_truncated(
+    prefix: &[u8],
+    size: u64,
+    mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
+) -> Option<bool> {
+    let offset = first_frame(prefix, size, &mut read).ok()??;
+    let end_mark = |tail: &[u8]| tail.chunks_exact(4).any(|word| word == [0; 4]);
+    // The last frame may include a content checksum. A possible end mark
+    // leaves validation to the decoder, so normal complete inputs avoid
+    // another traversal. The mark alone does not establish completeness.
+    let tail_start = size.saturating_sub(8);
+    let possible_end = if let Ok(end) = usize::try_from(size) {
+        prefix.get(end.saturating_sub(8)..end).map(end_mark)
+    } else {
+        None
+    };
+    let possible_end = match possible_end {
+        Some(found) => found,
+        None => {
+            let Ok(tail) = read(tail_start, 8) else { return Some(false); };
+            if tail.len() != 8 {
+                return Some(false);
+            }
+            end_mark(&tail)
+        }
+    };
+    if possible_end {
+        return Some(false);
+    }
+    let mut refill = |offset, len, window: &mut Vec<u8>| {
+        *window = read(offset, len)?;
+        Ok(())
+    };
+    let mut input = StructureReader::new(size, prefix, &mut refill);
+    let index = inspect(&mut input, offset, &mut |_| Ok(()));
+    Some(matches!(index.error, "lz4_stream_truncated" | "lz4_header_truncated"))
 }
 
 #[derive(Clone, Debug)]
@@ -154,19 +192,23 @@ pub(crate) struct Index {
 // One bounded window per parse, never a process-wide cache. Length jumps still
 // skip payload, including large skippable frames and virtual multi-volume input.
 struct StructureReader<'a> {
-    reader: &'a ManagedReader,
+    read: &'a mut dyn FnMut(u64, usize, &mut Vec<u8>) -> std::io::Result<()>,
+    prefix: &'a [u8],
     limit: u64,
-    window_bytes: usize,
     start: u64,
     window: Vec<u8>,
 }
 
 impl<'a> StructureReader<'a> {
-    fn new(reader: &'a ManagedReader, limit: u64, window_bytes: usize) -> Self {
+    fn new(
+        limit: u64,
+        prefix: &'a [u8],
+        read: &'a mut dyn FnMut(u64, usize, &mut Vec<u8>) -> std::io::Result<()>,
+    ) -> Self {
         Self {
-            reader,
+            read,
+            prefix,
             limit,
-            window_bytes,
             start: 0,
             window: Vec::new(),
         }
@@ -177,6 +219,9 @@ impl<'a> StructureReader<'a> {
         if end > self.limit {
             return Err("lz4_stream_truncated");
         }
+        if end <= self.prefix.len() as u64 {
+            return Ok(&self.prefix[cursor as usize..end as usize]);
+        }
         if cursor < self.start || end > self.start + self.window.len() as u64 {
             // Nearby headers can land just past the window after a short
             // compressed block. Grow for those too, while long payload
@@ -186,32 +231,18 @@ impl<'a> StructureReader<'a> {
                 && cursor >= self.start
                 && cursor - self.start <= (previous + previous.min(256)) as u64
             {
-                (previous * 4).min(self.window_bytes)
+                (previous * 4).min(16 * 1024)
             } else {
-                self.window_bytes.min(256)
+                256
             };
             self.start = cursor;
             let wanted = (self.limit - cursor).min(window_bytes as u64) as usize;
-            self.window
-                .try_reserve_exact(wanted.saturating_sub(previous))
-                .map_err(|_| "os_error")?;
-            self.window.resize(wanted, 0);
-            let mut read = 0;
-            while read < wanted {
-                let count = self.reader
-                    .read_into_at(cursor + read as u64, &mut self.window[read..])
-                    .map_err(|_| "os_error")?;
-                if count == 0 {
-                    break;
-                }
-                read += count;
-            }
-            self.window.truncate(read);
+            (self.read)(cursor, wanted, &mut self.window).map_err(|_| "os_error")?;
         }
         let from = (cursor - self.start) as usize;
         self.window
             .get(from..from + n)
-            .ok_or("lz4_stream_truncated")
+            .ok_or("os_error")
     }
 
     fn word(&mut self, cursor: u64) -> Result<u32, &'static str> {
@@ -238,14 +269,38 @@ pub(crate) fn walk_observed(
     limit: u64,
     visit: &mut dyn FnMut(u64) -> Result<(), &'static str>,
 ) -> Index {
+    let mut read = |offset, wanted: usize, window: &mut Vec<u8>| {
+        window
+            .try_reserve_exact(wanted.saturating_sub(window.len()))
+            .map_err(std::io::Error::other)?;
+        window.resize(wanted, 0);
+        let mut read = 0;
+        while read < wanted {
+            let count = reader.read_into_at(offset + read as u64, &mut window[read..])?;
+            if count == 0 {
+                break;
+            }
+            read += count;
+        }
+        window.truncate(read);
+        Ok(())
+    };
+    let mut input = StructureReader::new(limit.min(reader.len()), &[], &mut read);
+    inspect(&mut input, offset, visit)
+}
+
+fn inspect(
+    input: &mut StructureReader<'_>,
+    offset: u64,
+    visit: &mut dyn FnMut(u64) -> Result<(), &'static str>,
+) -> Index {
     let mut index = Index {
         start: offset,
         end: offset,
         decoded_size: Some(0),
         ..Index::default()
     };
-    let mut input = StructureReader::new(reader, limit.min(reader.len()), 16 * 1024);
-    let result = walk_inner(&mut input, &mut index, visit);
+    let result = walk_inner(input, &mut index, visit);
     index.error = result.err().unwrap_or("");
     index.complete = index.error.is_empty() && index.frames > 0;
     index

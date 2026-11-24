@@ -483,25 +483,32 @@ void check_prefetch_lifetime_and_seek()
     DWORD handles_before = 0, handles_after = 0;
     GetProcessHandleCount(GetCurrentProcess(), &handles_before);
     {
+        unsigned requested_windows = 0;
         OverlappedPrefetcher prefetch({true, 64}, 1024,
             [&](UInt64 offset, PrefetchSource &source) {
+                ++requested_windows;
                 source = PrefetchSource{&pipe_name, offset, 1024 - offset};
                 return true;
             });
-        prefetch.after_read(1);
+        prefetch.after_read(32);
+        check(requested_windows == 0, "one read does not issue speculative reads");
+        prefetch.after_read(64);
+        check(requested_windows == 2, "contiguous demand fills both prefetch slots");
         prefetch.invalidate(400);
-        prefetch.after_read(400);
+        prefetch.after_read(432);
+        check(requested_windows == 2, "seek resets contiguous demand");
+        prefetch.after_read(464);
         unsigned char expected[64];
-        std::memset(expected, 400 % 251, sizeof(expected));
+        std::memset(expected, 464 % 251, sizeof(expected));
         bool written = true;
         for (auto pipe : pipes)
         {
             DWORD count = 0;
             written &= WriteFile(pipe, expected, sizeof(expected), &count, nullptr) && count == sizeof(expected);
         }
-        check(written && prefetch.consume(400, bytes, 64) && !std::memcmp(bytes, expected, sizeof(bytes)),
+        check(written && prefetch.consume(464, bytes, 64) && !std::memcmp(bytes, expected, sizeof(bytes)),
               "seek cancels pending reads before reusing their buffers and OVERLAPPED structures");
-        prefetch.after_read(464); // Leave a real pending read for destruction.
+        prefetch.after_read(528); // Leave a real pending read for destruction.
     }
     GetProcessHandleCount(GetCurrentProcess(), &handles_after);
     check(handles_before == handles_after, "prefetch destruction drains requests and releases file/event handles");
@@ -513,11 +520,12 @@ void check_prefetch_lifetime_and_seek()
     CMyComPtr<IInStream> stream(raw);
     UInt32 read = 0;
     check(stream->Read(bytes, 64, &read) == S_OK && read == 64, "file stream starts with direct read");
+    check(stream->Read(bytes, 64, &read) == S_OK && read == 64, "second read establishes contiguous demand");
     check(stream->Read(bytes, 64, &read) == S_OK && read == 64, "file stream reads the prefetched next window");
     UInt64 position = 0;
-    check(stream->Seek(0, FILE_CURRENT, &position) == S_OK && position == 128,
+    check(stream->Seek(0, FILE_CURRENT, &position) == S_OK && position == 192,
           "relative Seek uses logical cursor after cached reads");
-    check(stream->Seek(-65, FILE_CURRENT, &position) == S_OK && position == 63,
+    check(stream->Seek(-129, FILE_CURRENT, &position) == S_OK && position == 63,
           "backward relative Seek recalibrates the decoder handle");
     unsigned char expected[65]{};
     InputPrefetchConfig disabled{false, 64};
@@ -567,12 +575,13 @@ void check_prefetch_virtual_inputs()
         correct &= stream->Read(bytes, 1, &read) == S_OK && read == 1;
         check(correct, "single-file double buffers preserve bytes across windows, fallback, EOF and seek");
         // The decoder handle must be lazily repositioned on a cache miss:
-        // one direct byte, one prefetched window, then a request exceeding
+        // two direct reads, a prefetch hit, then a request exceeding
         // both available windows without an intervening Seek.
         stream->Seek(0, FILE_BEGIN, nullptr);
         bool lazy_sync = stream->Read(bytes, 1, &read) == S_OK && read == 1;
         lazy_sync &= stream->Read(bytes + 1, 64, &read) == S_OK && read == 64;
-        lazy_sync &= stream->Read(bytes + 65, 192, &read) == S_OK && read == 192;
+        lazy_sync &= stream->Read(bytes + 65, 17, &read) == S_OK && read == 17;
+        lazy_sync &= stream->Read(bytes + 82, 175, &read) == S_OK && read == 175;
         check(lazy_sync && !std::memcmp(bytes, payload, 257),
               "prefetch hit followed by direct fallback keeps the logical file offset");
         // Both the seek above and destruction below can retire live requests.
@@ -582,6 +591,7 @@ void check_prefetch_virtual_inputs()
                 source = PrefetchSource{&path, offset, 321 - offset};
                 return true;
             });
+        short_read.after_read(64);
         short_read.after_read(240);
         check(!short_read.consume(240, bytes, 64),
               "short OVERLAPPED completion falls back without publishing a partial window");
