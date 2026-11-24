@@ -71,6 +71,7 @@ fn cancellation_drains_live_scan_and_preserves_other_requests() {
             2,
             1,
             0,
+            None,
             |data, _, _| {
                 if first.swap(false, Ordering::Relaxed) {
                     entered_tx.send(()).unwrap();
@@ -100,6 +101,7 @@ fn cancellation_drains_live_scan_and_preserves_other_requests() {
         2,
         1,
         0,
+        None,
         |data, _, _| ScanBatch {
             results: data.len(),
             discarded_results: 0,

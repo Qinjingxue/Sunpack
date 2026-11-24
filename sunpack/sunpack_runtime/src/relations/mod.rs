@@ -455,6 +455,7 @@ pub(crate) fn build_native_candidate_groups_from_snapshot(
     raw_snapshot: &NativeDirectorySnapshot,
     filtered_snapshot: &NativeDirectorySnapshot,
     cached: Option<&RelationCache>,
+    prepared_zip_scan: Option<&mut Option<crate::scan::embedded::PreparedZipScan>>,
 ) -> Vec<NativeRelationGroup> {
     let filtered_keys: HashSet<String> = filtered_snapshot
         .rows()
@@ -464,7 +465,7 @@ pub(crate) fn build_native_candidate_groups_from_snapshot(
     if filtered_keys.is_empty() {
         return Vec::new();
     }
-    build_candidate_groups(raw_snapshot, &filtered_keys, cached, None)
+    build_candidate_groups(raw_snapshot, &filtered_keys, cached, None, prepared_zip_scan)
 }
 
 pub(crate) fn collect_relation_cache<'a>(
@@ -544,6 +545,7 @@ pub(crate) fn resolve_embedded_volumes(
             &keys,
             Some(&cache),
             Some(excluded),
+            None,
         ));
     }
     output
@@ -607,7 +609,7 @@ fn resolve_shared_carrier_volumes(
             let name_index = BucketIndex::build(&rows, Some(&selected));
             // Proven logical slices may share a physical lease. Ordinary path
             // arbitration would erase a blocked sibling when another succeeds.
-            for validation in resolve_candidate_validations(&mut rows, &name_index, Some(&cache)) {
+            for validation in resolve_candidate_validations(&mut rows, &name_index, Some(&cache), None) {
                 let has_head = validation.proposal.volumes.iter().any(|(_, slot)| *slot == 1);
                 let selected = validation.proposal.volumes.iter()
                     .filter(|(_, slot)| *slot == 1 || !has_head && *slot == 0)
@@ -712,8 +714,9 @@ fn resolve_candidate_validations(
     rows: &mut [RelationInput],
     index: &BucketIndex,
     cached: Option<&RelationCache>,
+    prepared_zip_scan: Option<&mut Option<crate::scan::embedded::PreparedZipScan>>,
 ) -> Vec<ProposalValidation> {
-    structural::collect(rows, index);
+    structural::collect(rows, index, prepared_zip_scan);
     let mut validations = assignment::resolve_buckets(rows, index, cached);
     for validation in &mut validations {
         attempts::resolve_carrier_geometry(validation);
@@ -727,6 +730,7 @@ fn build_candidate_groups(
     filtered_keys: &HashSet<String>,
     cached: Option<&RelationCache>,
     excluded: Option<&HashSet<String>>,
+    prepared_zip_scan: Option<&mut Option<crate::scan::embedded::PreparedZipScan>>,
 ) -> Vec<NativeRelationGroup> {
     let source = RelationSource::Snapshot(snapshot, cached);
     let scope = RelationScopeIndex::build(&source, filtered_keys, excluded);
@@ -737,7 +741,7 @@ fn build_candidate_groups(
         .map(|row| source.materialize(row))
         .collect();
     let name_index = BucketIndex::build(&directory_rows, Some(filtered_keys));
-    let validations = resolve_candidate_validations(&mut directory_rows, &name_index, cached);
+    let validations = resolve_candidate_validations(&mut directory_rows, &name_index, cached, prepared_zip_scan);
     // Arbitration considers every candidate in the active stem bucket,
     // including competitors whose head was not selected by the caller.
     let validation_owned_paths: Vec<HashSet<String>> =

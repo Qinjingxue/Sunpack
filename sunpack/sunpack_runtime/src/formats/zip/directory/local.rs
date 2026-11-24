@@ -21,6 +21,72 @@ pub(crate) fn zip_continuation_prefix(bytes: &[u8]) -> bool {
         && (bytes.len() < LOCAL_HEADER_LEN || u16_le(bytes, 26) != 0)
 }
 
+/// Local geometry only. The declared payload can extend past the visible file.
+pub(crate) struct ZipLocalMember {
+    pub(crate) data_start: u64,
+    pub(crate) data_end: u64,
+    pub(crate) flags: u16,
+    pub(crate) method: u16,
+}
+
+pub(crate) fn zip_local_fixed_plausible(fixed: &[u8]) -> bool {
+    fixed.len() >= LOCAL_HEADER_LEN
+        && fixed.starts_with(LFH_SIG)
+        && u16_le(fixed, 4) <= 100
+        && u16_le(fixed, 6) & 0xc000 == 0
+        && u16_le(fixed, 26) != 0
+}
+
+pub(crate) fn read_zip_local_member<E, B: AsRef<[u8]>>(
+    fixed: &[u8],
+    offset: u64,
+    size: u64,
+    mut read: impl FnMut(u64, usize) -> Result<B, E>,
+) -> Result<Option<ZipLocalMember>, E> {
+    if !zip_local_fixed_plausible(fixed) {
+        return Ok(None);
+    }
+    let name_len = u64::from(u16_le(fixed, 26));
+    let extra_len = usize::from(u16_le(fixed, 28));
+    let Some(extra_start) = offset.checked_add(LOCAL_HEADER_LEN as u64 + name_len) else {
+        return Ok(None);
+    };
+    let Some(data_start) = extra_start.checked_add(extra_len as u64).filter(|end| *end <= size) else {
+        return Ok(None);
+    };
+    let compressed_32 = u32_le(fixed, 18);
+    let uncompressed_32 = u32_le(fixed, 22);
+    let mut compressed_size = u64::from(compressed_32);
+    if compressed_32 == u32::MAX || uncompressed_32 == u32::MAX {
+        let extra = read(extra_start, extra_len)?;
+        let Some(zip64) = zip64::extra_field(extra.as_ref()) else {
+            return Ok(None);
+        };
+        let mut cursor = 0;
+        if uncompressed_32 == u32::MAX {
+            if zip64.len() < 8 {
+                return Ok(None);
+            }
+            cursor = 8;
+        }
+        if compressed_32 == u32::MAX {
+            let Some(value) = zip64.get(cursor..cursor + 8) else {
+                return Ok(None);
+            };
+            compressed_size = u64::from_le_bytes(value.try_into().unwrap());
+        }
+    }
+    let Some(data_end) = data_start.checked_add(compressed_size) else {
+        return Ok(None);
+    };
+    Ok(Some(ZipLocalMember {
+        data_start,
+        data_end,
+        flags: u16_le(fixed, 6),
+        method: u16_le(fixed, 8),
+    }))
+}
+
 /// Relation probes read a tail window rather than a whole-file slice. Keep
 /// the same validated extent and check its physical locator before using IDs.
 pub(crate) fn zip64_relation_disk_numbers(

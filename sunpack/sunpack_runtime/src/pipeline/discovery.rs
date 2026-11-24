@@ -414,7 +414,9 @@ pub(super) fn discover(
         if !shared_roots.contains_key(scope.key()) {
             result.scan_errors.extend(filtered.scan_errors());
         }
-        let mut table = NativeCandidateTable::from_directory(&raw, &filtered, Some(&targets), request.deep);
+        let mut table = NativeCandidateTable::from_directory_with_shared_zip_scan(
+            &raw, &filtered, Some(&targets), request.deep, request.config.embedded_scan.enabled,
+        );
         match probe_relations(&mut table, &filtered, &raw, Some(&targets), candidates, &mut verified, request) {
             Ok(()) => tables.push(table),
             Err(error) if request.watch_catalog.is_some() && !crate::io::cancellation::is_cancellation(&error) => {

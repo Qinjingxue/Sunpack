@@ -3,9 +3,10 @@ use crate::analysis_native::volume_anchor::{
     SEVEN_ZIP_CARRIER_INTERRUPTED, ZIP_CARRIER_CHECKED, ZIP_LOCAL_HEADER, ZIP_SPLIT_START,
     ZIP_TAIL_CHECKED,
 };
+use crate::formats::zip::{read_zip_local_member, zip_local_fixed_plausible};
 #[cfg(windows)]
 use crate::io::iocp;
-use crate::io::reader::{CachedBytes, ManagedReader};
+use crate::io::reader::{capture_file_generation, CachedBytes, ManagedReader, PhysicalFileGeneration};
 use crate::io::ScanBatch;
 use crate::scan::compression_stream::{
     bzip2_header_block_limit, bzip2_prefix_valid, gzip_fixed_header_flags, parse_xz_footer,
@@ -17,7 +18,9 @@ use crc32fast::hash as crc32;
 use memchr::memmem;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::sync::OnceLock;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
 
@@ -224,6 +227,7 @@ pub(crate) struct NativeScanResult {
     #[cfg(test)]
     raw_hit_count: usize,
     zip_eocd_absent: bool,
+    unique_zip_eocd: Option<u64>,
 }
 
 pub(crate) struct RarInputResolution {
@@ -318,7 +322,51 @@ pub(crate) fn scan_embedded_path(
     path: &str,
     parallel_files: usize,
 ) -> io::Result<NativeScanResult> {
+    scan_embedded_path_with_generation(path, parallel_files, None)
+}
+
+/// Scope-local carrier evidence, usable only while this path names the scanned file.
+pub(crate) struct PreparedZipScan {
+    path: String,
+    generation: PhysicalFileGeneration,
+    scan: Arc<NativeScanResult>,
+}
+
+impl PreparedZipScan {
+    pub(crate) fn scan(path: &str, generation: PhysicalFileGeneration) -> io::Result<Self> {
+        let scan = scan_embedded_path_with_generation(path, 1, Some(&generation))?;
+        if capture_file_generation(Path::new(path))? != generation {
+            return Err(io::Error::other("file changed after embedded scan"));
+        }
+        Ok(Self { path: path.to_owned(), generation, scan: Arc::new(scan) })
+    }
+
+    pub(crate) fn zip_eocd_absent(&self) -> bool {
+        self.scan.zip_eocd_absent
+    }
+
+    pub(crate) fn unique_zip_eocd(&self, path: &str) -> Option<(u64, &PhysicalFileGeneration)> {
+        self.scan.unique_zip_eocd
+            .filter(|_| self.path == path)
+            .map(|offset| (offset, &self.generation))
+    }
+
+    pub(crate) fn reuse(&self, path: &str) -> Option<Arc<NativeScanResult>> {
+        (path == self.path
+            && capture_file_generation(Path::new(path)).is_ok_and(|current| current == self.generation))
+            .then(|| Arc::clone(&self.scan))
+    }
+}
+
+fn scan_embedded_path_with_generation(
+    path: &str,
+    parallel_files: usize,
+    generation: Option<&PhysicalFileGeneration>,
+) -> io::Result<NativeScanResult> {
     let reader = ManagedReader::open(path)?;
+    if generation.is_some() && reader.physical_generation() != generation {
+        return Err(io::Error::other("file changed before embedded scan"));
+    }
     let parallel_files = parallel_files.clamp(1, 8);
     let workers = (DEFAULT_IOCP_WORKERS / parallel_files).max(1);
     // scan_file owns buffer_count read slots and buffer_count + workers jobs.
@@ -329,7 +377,7 @@ pub(crate) fn scan_embedded_path(
         // Reserve room for the additional producers' readers and validators.
         DISCOVERY_IOCP_BYTE_BUDGET / (parallel_files * slots)
     };
-    scan_embedded_archives_native_with_iocp(reader, chunk_bytes, DEFAULT_IOCP_BUFFERS, workers)
+    scan_embedded_archives_native_with_iocp(reader, chunk_bytes, DEFAULT_IOCP_BUFFERS, workers, generation)
 }
 
 fn embedded_matcher() -> &'static AhoCorasick {
@@ -350,6 +398,7 @@ fn scan_embedded_archives_native_with_iocp(
     iocp_chunk_bytes: usize,
     iocp_buffers: usize,
     iocp_workers: usize,
+    generation: Option<&PhysicalFileGeneration>,
 ) -> io::Result<NativeScanResult> {
     let cancellation = crate::io::cancellation::Cancellation::current();
     cancellation.check_io()?;
@@ -377,15 +426,31 @@ fn scan_embedded_archives_native_with_iocp(
         }
         builder.push(batch)
     };
-    let saw_zip_eocd = std::sync::atomic::AtomicBool::new(false);
+    // Zero is absent. A definite single signature stores its offset plus one.
+    // Multiple or untracked signatures keep the legacy relation tail search.
+    let physical_zip_eocd = AtomicU64::new(0);
     let scan = |sample: &[u8], carry: usize, base: u64| {
         let batch = scan_sample_batch(sample, carry, base);
         #[cfg(all(test, windows))]
         if let Some(capture) = &capture {
             capture.record(&batch.results, base + carry as u64);
         }
-        if file_size.saturating_sub(batch.results.first_zip_eocd) >= 22 {
-            saw_zip_eocd.store(true, std::sync::atomic::Ordering::Relaxed);
+        let first = batch.results.first_zip_eocd;
+        if file_size.saturating_sub(first) >= 22 {
+            if generation.is_some() {
+                let after_first = (first - base) as usize + ZIP_EOCD.len();
+                // A signature can start only where the full fixed EOCD fits.
+                // At a chunk edge the next chunk owns a crossing signature.
+                let end = (file_size - base - (22 - ZIP_EOCD.len()) as u64)
+                    .min(sample.len() as u64) as usize;
+                let multiple = sample.get(after_first..end)
+                    .is_some_and(|tail| memmem::find(tail, ZIP_EOCD).is_some());
+                let _ = physical_zip_eocd.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(if old == 0 && !multiple { first + 1 } else { u64::MAX })
+                });
+            } else {
+                physical_zip_eocd.store(u64::MAX, Ordering::Relaxed);
+            }
         }
         ScanBatch {
             results: (!batch.results.is_empty()).then(|| {
@@ -408,6 +473,9 @@ fn scan_embedded_archives_native_with_iocp(
             // and skip the second file handle, completion port and job queue.
             let output = if file_size <= chunk_bytes as u64 {
                 let data = reader.read_direct_at(0, file_size as usize)?;
+                if generation.is_some() && data.len() as u64 != file_size {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short embedded scan read"));
+                }
                 let hits = scan(&data, 0, 0);
                 collect(hits.results)?;
                 iocp::IocpScanOutput {
@@ -424,6 +492,7 @@ fn scan_embedded_archives_native_with_iocp(
                     iocp_buffers,
                     iocp_workers,
                     embedded_overlap(),
+                    generation,
                     |sample, carry, base| {
                         let batch = scan(sample, carry, base);
                         ScanBatch {
@@ -448,6 +517,7 @@ fn scan_embedded_archives_native_with_iocp(
                 iocp_chunk_bytes,
                 iocp_buffers,
                 iocp_workers,
+                generation,
             );
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -511,12 +581,16 @@ fn scan_embedded_archives_native_with_iocp(
     }
     resolve_logical_candidates(&mut candidates);
     cancellation.check_io()?;
+    let physical_zip_eocd = physical_zip_eocd.load(Ordering::Relaxed);
     Ok(NativeScanResult {
         file_size,
         candidates,
         #[cfg(test)]
         raw_hit_count,
-        zip_eocd_absent: !saw_zip_eocd.load(std::sync::atomic::Ordering::Relaxed),
+        zip_eocd_absent: physical_zip_eocd == 0,
+        unique_zip_eocd: (physical_zip_eocd != u64::MAX)
+            .then(|| physical_zip_eocd.checked_sub(1))
+            .flatten(),
     })
 }
 
@@ -632,6 +706,7 @@ fn validate_raw_hits(
     let mut range_index = 0usize;
     let mut covered_until = 0u64;
     let mut previous_xz: Option<usize> = None;
+    let mut zip_bzip2_ends = BTreeMap::new();
     let mut cursor = raw_hits.iter_mask(!((1 << 1) | (1 << 12)));
     while let Some(hit) = cursor.next() {
         cancellation.check_io()?;
@@ -653,12 +728,38 @@ fn validate_raw_hits(
             reader
         };
         reader.hint_probe_window(hit.offset());
-        let resolved = if hit.kind() == "xz" {
+        let kind = hit.kind();
+        if matches!(kind, "zip" | "bzip2") {
+            while zip_bzip2_ends
+                .first_key_value()
+                .is_some_and(|(&start, _)| start < hit.offset())
+            {
+                zip_bzip2_ends.pop_first();
+            }
+        }
+        let resolved = if kind == "zip" {
+            validate_zip(reader, file_size, hit.offset(), &mut zip_bzip2_ends)?
+        } else if kind == "xz" {
             validate_xz(reader, file_size, hit.offset(), &mut xz_footers)?
+        } else if kind == "bzip2" {
+            let Some((end, zip_member)) = validate_bzip2(
+                reader,
+                file_size,
+                hit.offset(),
+                &mut suffixes[1],
+                zip_bzip2_ends.remove(&hit.offset()),
+            )?
+            else {
+                continue;
+            };
+            if zip_member {
+                covered_until = end;
+                continue;
+            }
+            Some(candidate("bzip2", hit.offset(), Some(end), CandidateKind::Archive))
         } else {
-            let suffix_index = match hit.kind() {
+            let suffix_index = match kind {
                 "gzip" => 0,
-                "bzip2" => 1,
                 "zstd" => 2,
                 "tar" => 3,
                 _ => 4,
@@ -666,7 +767,7 @@ fn validate_raw_hits(
             validate_candidate(
                 reader,
                 file_size,
-                hit.kind(),
+                kind,
                 hit.offset(),
                 &mut suffixes[suffix_index],
             )?
@@ -1149,11 +1250,9 @@ fn validate_candidate(
                 // candidate cannot claim other hits; decryption uses EOF.
                 .map(|_| candidate("enc", offset, None, CandidateKind::Archive)))
         }
-        "zip" => validate_zip(file, file_size, offset),
         "7z" => validate_seven_zip(file, file_size, offset),
         "rar4" | "rar5" => validate_rar(file, file_size, offset),
         "gzip" => validate_gzip(file, file_size, offset, suffixes),
-        "bzip2" => validate_bzip2(file, file_size, offset, suffixes),
         "zstd" => validate_zstd(file, file_size, offset, suffixes),
         "tar" => validate_tar(file, file_size, offset, suffixes),
         "lz4" | "lz4_skippable" => {
@@ -1531,61 +1630,23 @@ fn validate_zip(
     file: &ManagedReader,
     size: u64,
     offset: u64,
+    bzip2_ends: &mut BTreeMap<u64, u64>,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
     let header = read_at(file, offset, 30)?;
-    if header.len() < 30 || &header[..4] != ZIP_LOCAL {
-        return Ok(None);
-    }
-    let compressed_32 = u32::from_le_bytes(header[18..22].try_into().unwrap());
-    let uncompressed_32 = u32::from_le_bytes(header[22..26].try_into().unwrap());
-    let name_len = u16::from_le_bytes([header[26], header[27]]) as u64;
-    let extra_len = u16::from_le_bytes([header[28], header[29]]) as u64;
-    let header_end = offset
-        .saturating_add(30)
-        .saturating_add(name_len)
-        .saturating_add(extra_len);
-    if !zip_local_fixed_plausible(&header) || header_end > size {
-        return Ok(None);
-    }
-    let mut compressed_size = compressed_32 as u64;
-    if compressed_32 == u32::MAX || uncompressed_32 == u32::MAX {
-        let extra_start = offset + 30 + name_len;
-        let extra = read_at(file, extra_start, extra_len as usize)?;
-        let mut cursor = 0usize;
-        let mut zip64 = None;
-        while cursor + 4 <= extra.len() {
-            let id = u16::from_le_bytes(extra[cursor..cursor + 2].try_into().unwrap());
-            let field_size =
-                u16::from_le_bytes(extra[cursor + 2..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-            if cursor + field_size > extra.len() {
-                return Ok(None);
-            }
-            if id == 0x0001 {
-                zip64 = Some(&extra[cursor..cursor + field_size]);
-                break;
-            }
-            cursor += field_size;
-        }
-        let Some(zip64) = zip64 else { return Ok(None) };
-        let mut value_cursor = 0usize;
-        if uncompressed_32 == u32::MAX {
-            if zip64.len() < value_cursor + 8 {
-                return Ok(None);
-            }
-            value_cursor += 8;
-        }
-        if compressed_32 == u32::MAX {
-            if zip64.len() < value_cursor + 8 {
-                return Ok(None);
-            }
-            compressed_size =
-                u64::from_le_bytes(zip64[value_cursor..value_cursor + 8].try_into().unwrap());
-        }
-    }
-    let Some(_data_end) = header_end.checked_add(compressed_size) else {
+    let Some(member) = read_zip_local_member(&header, offset, size, |start, len| {
+        read_at(file, start, len)
+    })? else {
         return Ok(None);
     };
+    // Encryption, data descriptors and masked local fields leave an uncertain
+    // payload boundary. Only trust an explicit Bzip2 method and in-file size.
+    if member.method == 12
+        && member.flags & 0x2049 == 0
+        && member.data_end <= size
+        && member.data_end - member.data_start >= 14
+    {
+        bzip2_ends.insert(member.data_start, member.data_end);
+    }
     let split = offset >= 4 && read_at(file, offset - 4, 4)?.as_slice() == b"PK\x07\x08";
     let root = if split { offset - 4 } else { offset };
     Ok(Some(candidate(
@@ -1598,13 +1659,6 @@ fn validate_zip(
             CandidateKind::Anchor
         },
     )))
-}
-
-fn zip_local_fixed_plausible(header: &[u8]) -> bool {
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    let flags = u16::from_le_bytes([header[6], header[7]]);
-    let name_len = u16::from_le_bytes([header[26], header[27]]);
-    version <= 100 && flags & 0xc000 == 0 && name_len != 0
 }
 
 fn validate_seven_zip(
@@ -1806,19 +1860,11 @@ fn validate_bzip2(
     size: u64,
     offset: u64,
     suffixes: &mut FailedSuffixEvidence,
-) -> std::io::Result<Option<EmbeddedCandidate>> {
-    let Some(end) = suffixes.validate(offset, true, |visit| {
-        validate_bzip2_structure(file, offset, size, visit)
-    })?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(candidate(
-        "bzip2",
-        offset,
-        Some(end),
-        CandidateKind::Archive,
-    )))
+    zip_member_end: Option<u64>,
+) -> io::Result<Option<(u64, bool)>> {
+    suffixes.validate(offset, true, |visit| {
+        validate_bzip2_structure(file, offset, size, zip_member_end, visit)
+    })
 }
 
 // One physical-order analysis owns these facts. Invalid footers and indexes

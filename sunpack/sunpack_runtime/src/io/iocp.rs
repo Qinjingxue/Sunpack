@@ -458,6 +458,7 @@ pub(crate) fn scan_file<T, F, C>(
     buffer_count: usize,
     requested_worker_count: usize,
     overlap: usize,
+    generation: Option<&PhysicalFileGeneration>,
     scan: F,
     mut collect: C,
 ) -> io::Result<IocpScanOutput>
@@ -466,6 +467,8 @@ where
     F: Fn(&[u8], usize, u64) -> ScanBatch<T> + Send + Sync,
     C: FnMut(T) -> io::Result<()> + Send,
 {
+    use std::os::windows::io::FromRawHandle;
+
     let cancellation = Cancellation::current();
     cancellation.check_io()?;
     if file_size == 0 {
@@ -483,6 +486,18 @@ where
         .min(rayon::current_num_threads().clamp(1, 8));
     let expected_read_operations = file_size.div_ceil(chunk_bytes as u64);
     let handles = Arc::new(open_handles(path, SHARE_ALL)?);
+    let file = generation.map(|_| std::mem::ManuallyDrop::new(unsafe {
+        std::fs::File::from_raw_handle(handles.file)
+    }));
+    let check_generation = || -> io::Result<()> {
+        if let Some((file, expected)) = file.as_ref().zip(generation) {
+            if physical_file_generation(file)? != *expected {
+                return Err(io::Error::other("file changed during embedded scan"));
+            }
+        }
+        Ok(())
+    };
+    check_generation()?;
     let wake_handles = Arc::clone(&handles);
     let _subscription = cancellation.subscribe(move || unsafe {
         CancelIoEx(wake_handles.file, null_mut());
@@ -723,6 +738,13 @@ where
                 fatal_error = Some(io::Error::from_raw_os_error(error as i32));
                 break;
             }
+            if generation.is_some() && bytes as usize != slot.buffer.len() {
+                fatal_error = Some(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short IOCP embedded scan read",
+                ));
+                break;
+            }
             slot.bytes_read = (bytes as usize).min(slot.buffer.len());
             if slot.bytes_read > 0 {
                 completed_slots.push_back(slot);
@@ -743,7 +765,9 @@ where
         })
     });
 
-    result
+    let output = result?;
+    check_generation()?;
+    Ok(output)
 }
 
 #[cfg(test)]

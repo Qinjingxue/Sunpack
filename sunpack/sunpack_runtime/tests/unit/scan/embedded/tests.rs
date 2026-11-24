@@ -12,7 +12,14 @@ use xz2::write::XzEncoder;
 // EOCD rejected by standalone validation, especially at a read boundary.
 #[test]
 fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
-    for terminal in [None, Some(64 * 1024 - 2), Some(128 * 1024 - 21)] {
+    for (terminals, unique) in [
+        (&[][..], None),
+        (&[64 * 1024 - 2][..], Some(64 * 1024 - 2)),
+        (&[128 * 1024 - 21][..], None),
+        (&[64 * 1024 - 2, 128 * 1024 - 21][..], Some(64 * 1024 - 2)),
+        (&[64 * 1024 - 2, 128 * 1024 - 34][..], None),
+        (&[64 * 1024 - 30, 128 * 1024 - 34][..], None),
+    ] {
         let mut data = vec![b'x'; 128 * 1024];
         let mut local = [0u8; 31];
         local[..4].copy_from_slice(ZIP_LOCAL);
@@ -20,24 +27,28 @@ fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
         local[26] = 1;
         local[30] = b'a';
         data[37..68].copy_from_slice(&local);
-        if let Some(offset) = terminal {
+        for &offset in terminals {
             data[offset..offset + 4].copy_from_slice(ZIP_EOCD);
             let end = data.len().min(offset + 22);
             data[offset + 4..end].fill(0);
             data[offset + 4] = 1; // Multi-disk EOCD is not standalone.
         }
         let path = temp_file("zip_terminal_proof", &data);
+        let reader = ManagedReader::open(&path).unwrap();
+        let generation = reader.physical_generation().cloned().unwrap();
         let scan = scan_embedded_archives_native_with_iocp(
-            ManagedReader::open(&path).unwrap(),
+            reader,
             64 * 1024,
             2,
             2,
+            Some(&generation),
         )
         .unwrap();
         let anchors = scan.relation_anchors();
         assert!(!anchors.is_empty());
-        let absent = terminal.is_none_or(|offset| data.len() - offset < 22);
+        let absent = terminals.iter().all(|offset| data.len() - offset < 22);
         assert_eq!(scan.zip_eocd_absent, absent);
+        assert_eq!(scan.unique_zip_eocd, unique.map(|offset| offset as u64));
         assert!(anchors
             .iter()
             .all(|a| a.has_any(ZIP_CARRIER_CHECKED) == absent));
@@ -482,15 +493,27 @@ fn failed_suffixes_keep_inner_archives_under_read_budget_and_propagate_io() {
         let reference = ManagedReader::from_bytes(data.clone(), ReaderConfig::default());
         let mut expected = Vec::new();
         for hit in &hits {
-            if let Some(candidate) = validate_candidate(
-                &reference,
-                reference.len(),
-                kind,
-                hit.offset(),
-                &mut Default::default(),
-            )
-            .unwrap()
-            {
+            let resolved = if kind == "bzip2" {
+                validate_bzip2(
+                    &reference,
+                    reference.len(),
+                    hit.offset(),
+                    &mut Default::default(),
+                    None,
+                )
+                .unwrap()
+                .map(|(end, _)| candidate("bzip2", hit.offset(), Some(end), CandidateKind::Archive))
+            } else {
+                validate_candidate(
+                    &reference,
+                    reference.len(),
+                    kind,
+                    hit.offset(),
+                    &mut Default::default(),
+                )
+                .unwrap()
+            };
+            if let Some(candidate) = resolved {
                 expected.push(candidate);
             }
         }
@@ -768,6 +791,64 @@ fn keeps_bzip2_streams_separate_across_invalid_gap() {
 }
 
 #[test]
+fn zip_bzip2_ownership_preserves_independent_streams() {
+    let mut encoder = BzEncoder::new(Vec::new(), BzCompression::fast());
+    encoder.write_all(b"zip member").unwrap();
+    let payload = encoder.finish().unwrap();
+    let mut encoder = BzEncoder::new(Vec::new(), BzCompression::fast());
+    encoder.write_all(b"appended archive").unwrap();
+    let peer = encoder.finish().unwrap();
+
+    let append_local = |data: &mut Vec<u8>, method: u16, flags: u16, declared: usize| {
+        let mut header = [0; 31];
+        header[..4].copy_from_slice(ZIP_LOCAL);
+        header[4] = 46;
+        header[6..8].copy_from_slice(&flags.to_le_bytes());
+        header[8..10].copy_from_slice(&method.to_le_bytes());
+        header[14..18].copy_from_slice(&crc32(b"zip member").to_le_bytes());
+        header[18..22].copy_from_slice(&(declared as u32).to_le_bytes());
+        header[22..26].copy_from_slice(&10u32.to_le_bytes());
+        header[26] = 1;
+        header[30] = b'a';
+        data.extend_from_slice(&header);
+        let start = data.len() as u64;
+        data.extend_from_slice(&payload);
+        start
+    };
+    let mut data = b"carrier prefix PK\x07\x08".to_vec();
+    append_local(&mut data, 12, 0, payload.len());
+    append_local(&mut data, 12, 0, payload.len());
+    let peer_start = data.len() as u64;
+    data.extend_from_slice(&peer);
+    let scan = |data: &[u8]| {
+        let path = temp_file("embedded_zip_method_bzip2", data);
+        let result = scan_embedded_path(path.to_str().unwrap(), 1).unwrap();
+        let _ = fs::remove_file(path);
+        assert!(result.candidates.iter().any(|item| item.format == "zip"));
+        result
+            .candidates
+            .into_iter()
+            .filter(|item| item.format == "bzip2")
+            .map(|item| (item.offset, item.end_offset))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(scan(&data), [(peer_start, Some(data.len() as u64))]);
+
+    for (method, flags, declared) in [
+        (0, 0, payload.len()),
+        (12, 8, payload.len()),
+        (12, 1, payload.len()),
+        (12, 0, payload.len() - 1),
+        (12, 0, payload.len() + peer.len()),
+    ] {
+        let mut data = Vec::new();
+        let start = append_local(&mut data, method, flags, declared);
+        data.extend_from_slice(&peer);
+        assert_eq!(scan(&data), [(start, Some(data.len() as u64))]);
+    }
+}
+
+#[test]
 fn packed_search_matches_overlapping_aho_on_randomized_layouts() {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut data = vec![0u8; 2 * 1024 * 1024];
@@ -884,6 +965,7 @@ fn validates_supported_stream_headers_in_one_pass() {
         TEST_IOCP_CHUNK_SIZE,
         4,
         4,
+        None,
     )
     .unwrap();
     assert!(scan.raw_hit_count > 2000);
@@ -972,6 +1054,7 @@ fn iocp_matches_reference_scan_across_chunk_boundaries() {
         4,
         4,
         embedded_overlap(),
+        None,
         scan_sample_batch,
         |batch| {
             results.extend(batch.iter());

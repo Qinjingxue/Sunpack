@@ -115,6 +115,51 @@ impl VolumeAnchor {
             .map(|absence| &absence.generation)
     }
 
+    /// A missing natural end makes the existing Embedded pass useful for
+    /// Relations too. Keep the backwards tail fast path for a padded ZIP.
+    pub(crate) fn zip_carrier_scan_generation(&self) -> Option<&PhysicalFileGeneration> {
+        use crate::formats::zip::{read_zip_local_member, EOCD_SEARCH_BYTES};
+
+        let suffix = self.zip_eocd_absence.as_deref().filter(|suffix| suffix.start != 0)?;
+        if self.structure_offset != Some(0) || !self.has_any(ZIP_LOCAL_HEADER)
+            || self.has_any(ZIP_CARRIER_CHECKED | ZIP_SPLIT_START)
+        {
+            return None;
+        }
+        let reader = ManagedReader::open(&self.path).ok()?.probe_reader();
+        if reader.physical_generation() != Some(&suffix.generation) {
+            return None;
+        }
+        let mut offset = 0;
+        loop {
+            let fixed = reader.read_cached_at(offset, 30).ok()?;
+            if offset >= suffix.start && fixed.starts_with(b"PK\x01\x02") {
+                return Some(&suffix.generation);
+            }
+            let member = read_zip_local_member(&fixed, offset, reader.len(), |start, len| {
+                reader.read_cached_at(start, len)
+            }).ok()??;
+            // Descriptor-based and masked sizes cannot locate the next field.
+            if member.flags & 0x2008 != 0 {
+                return None;
+            }
+            if member.data_end >= reader.len() {
+                return Some(&suffix.generation);
+            }
+            // Avoid a seek per member on densely packed ZIPs. Their existing
+            // reverse search remains cheaper than walking the local chain.
+            if member.data_end - offset < EOCD_SEARCH_BYTES {
+                return None;
+            }
+            offset = member.data_end;
+        }
+    }
+
+    pub(crate) fn mark_zip_eocd_absent(&mut self, generation: PhysicalFileGeneration) {
+        self.flags |= ZIP_CARRIER_CHECKED;
+        self.zip_eocd_absence = Some(Arc::new(ZipEocdAbsence { generation, start: 0 }));
+    }
+
     /// A volume set is discovered from one archive entry, never from an orphan
     /// continuation. Other volumes contribute facts only to that entry's plan.
     pub(crate) fn is_volume_entry(&self) -> bool {
@@ -902,7 +947,10 @@ pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
 /// Only a known ZIP bucket without a terminal enters this fallback. Scan its
 /// bytes in fixed windows; verify each candidate using the
 /// shared EOCD/directory parsers before accepting a carrier's logical end.
-pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
+pub(crate) fn upgrade_relation_zip_carrier_tail(
+    anchor: &VolumeAnchor,
+    known_eocd: Option<(u64, &PhysicalFileGeneration)>,
+) -> VolumeAnchor {
     let mut out = anchor.clone();
     if out.has_any(ZIP_CARRIER_CHECKED) {
         return out;
@@ -914,13 +962,19 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> Volume
     let checked_suffix = out.zip_eocd_absence.take().filter(|absence| {
         reader.physical_generation() == Some(&absence.generation)
     });
+    let unique_eocd = known_eocd.filter(|(_, generation)| {
+        reader.physical_generation() == Some(*generation)
+    }).map(|(offset, _)| offset);
     // Keep enough overlap to find a signature straddling the checked suffix.
     let mut end = checked_suffix.as_ref().map_or(reader.len(), |suffix| {
         if suffix.start == 0 { 0 } else { suffix.start + ZIP_EOCD.len() as u64 - 1 }
     });
+    if let Some(offset) = unique_eocd {
+        end = offset + 22;
+    }
     let mut possible_eocd = false;
     while end != 0 {
-        let start = end.saturating_sub(64 * 1024);
+        let start = unique_eocd.unwrap_or_else(|| end.saturating_sub(64 * 1024));
         let length = (end - start) as usize;
         let Ok(window) = reader.read_cached_at(start, length) else {
             return out;
@@ -1010,10 +1064,13 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> Volume
             out.flags |= TERMINAL | candidate.flags | ZIP_CARRIER_CHECKED;
             return out;
         }
-        if start == 0 {
+        if start == 0 || unique_eocd.is_some() {
             break;
         }
         end = start + 3;
+    }
+    if unique_eocd.is_some() && !possible_eocd {
+        return upgrade_relation_zip_carrier_tail(anchor, None);
     }
     out.flags |= ZIP_CARRIER_CHECKED;
     if !possible_eocd && anchor.has_any(ZIP_LOCAL_HEADER) {
@@ -1022,10 +1079,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> Volume
                 && capture_file_generation(std::path::Path::new(&out.path))
                     .is_ok_and(|current| &current == *generation)
         }) {
-            out.zip_eocd_absence = Some(Arc::new(ZipEocdAbsence {
-                generation: generation.clone(),
-                start: 0,
-            }));
+            out.mark_zip_eocd_absent(generation.clone());
         }
     }
     out

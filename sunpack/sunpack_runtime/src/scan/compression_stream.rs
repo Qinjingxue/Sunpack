@@ -8,6 +8,7 @@ const BUFFER_SIZE: usize = 64 * 1024;
 const INITIAL_PROBE_BYTES: usize = 256;
 const GZIP_MAGIC: &[u8] = b"\x1f\x8b\x08";
 const BZIP2_MAGIC: &[u8] = b"BZh";
+const BZIP2_END_MARKER: u64 = 0x1772_4538_5090;
 const XZ_MAGIC: &[u8] = b"\xfd7zXZ\x00";
 const XZ_STREAM_HEADER_SIZE: usize = 12;
 pub(crate) const MAX_XZ_PREFIX_SIZE: usize = XZ_STREAM_HEADER_SIZE + 1024;
@@ -115,6 +116,10 @@ impl<'a, B: AsRef<[u8]>> ByteCursor<'a, B> {
                 .saturating_mul(4)
                 .min(BUFFER_SIZE)
         };
+        self.refill_window(window_size)
+    }
+
+    fn refill_window(&mut self, window_size: usize) -> ValidationResult<()> {
         self.buffer_start = self.pos;
         let count = (window_size as u64).min(self.limit - self.pos) as usize;
         self.buffer = (self.read)(self.pos, count)?;
@@ -678,6 +683,15 @@ fn add_decoded_size(size: u64, count: u64) -> ValidationResult<u64> {
         .ok_or(ValidationError::Invalid("decoded_size_overflow"))
 }
 
+fn stored_deflate_length(header: &[u8; 4]) -> ValidationResult<u16> {
+    let length = u16::from_le_bytes([header[0], header[1]]);
+    let complement = u16::from_le_bytes([header[2], header[3]]);
+    if length != !complement {
+        return invalid("deflate_stored_length_mismatch");
+    }
+    Ok(length)
+}
+
 fn parse_deflate(bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>) -> ValidationResult<u64> {
     let mut decoded_size = 0u64;
     loop {
@@ -685,13 +699,9 @@ fn parse_deflate(bits: &mut LsbBits<'_, '_, impl AsRef<[u8]>>) -> ValidationResu
         let block_type = bits.read(2)?;
         if block_type == 0 {
             bits.align_byte();
-            let length = bits.read(16)? as u16;
-            let complement = bits.read(16)? as u16;
-            if length != !complement {
-                return invalid("deflate_stored_length_mismatch");
-            }
-            bits.cursor.skip(u64::from(length))?;
-            decoded_size = add_decoded_size(decoded_size, u64::from(length))?;
+            let length = u64::from(stored_deflate_length(&bits.cursor.read_array()?)?);
+            bits.cursor.skip(length)?;
+            decoded_size = add_decoded_size(decoded_size, length)?;
         } else if block_type == 1 || block_type == 2 {
             let dynamic_trees;
             let (literal_tree, distance_tree) = if block_type == 1 {
@@ -795,16 +805,30 @@ fn read_gzip_header(input: &mut ByteCursor<'_, impl AsRef<[u8]>>) -> ValidationR
     Ok(())
 }
 
-pub(crate) fn validate_gzip_identity(
+pub(crate) fn gzip_head_extent(
     prefix: &[u8],
     limit: u64,
     mut read: impl FnMut(u64, usize) -> io::Result<Vec<u8>>,
-) -> ValidationResult<()> {
-    use flate2::{Decompress, FlushDecompress, Status};
-
+) -> ValidationResult<StreamReadiness> {
     let mut read = |offset, count| read(offset, count).map(Cow::Owned);
     let mut cursor = ByteCursor::new(&mut read, 0, limit, Cow::Borrowed(prefix));
     read_gzip_header(&mut cursor)?;
+    let first_block = cursor.position();
+    let stored = cursor.available()?[0] & 6 == 0;
+    validate_gzip_deflate_identity(&mut cursor)?;
+    if stored {
+        cursor.pos = first_block;
+        if matches!(stored_gzip_truncated(&mut cursor), Ok(true)) {
+            return Ok(StreamReadiness::Truncated);
+        }
+    }
+    Ok(StreamReadiness::Candidate)
+}
+
+fn validate_gzip_deflate_identity(
+    cursor: &mut ByteCursor<'_, impl AsRef<[u8]>>,
+) -> ValidationResult<()> {
+    use flate2::{Decompress, FlushDecompress, Status};
 
     let mut decoder = Decompress::new(false);
     let mut output = [0; 1024];
@@ -832,6 +856,94 @@ pub(crate) fn validate_gzip_identity(
         if consumed == 0 {
             return invalid("gzip_deflate_made_no_progress");
         }
+    }
+}
+
+fn gzip_may_end_in_stored_block(tail: &[u8]) -> bool {
+    // A stored final block is byte-aligned, with LEN/NLEN before its payload
+    // and the eight-byte Gzip trailer immediately after it.
+    let Some(last_header) = tail.len().checked_sub(13) else {
+        return false;
+    };
+    tail[..tail.len() - 8].windows(5).enumerate().any(|(offset, header)| {
+        header[0] & 7 == 1
+            && stored_deflate_length(header[1..].try_into().unwrap())
+                .is_ok_and(|length| usize::from(length) == last_header - offset)
+    })
+}
+
+fn stored_gzip_truncated(cursor: &mut ByteCursor<'_, impl AsRef<[u8]>>) -> ValidationResult<bool> {
+    let mut header = cursor.read_array::<5>()?;
+    let first_length = stored_deflate_length(header[1..].try_into().unwrap())?;
+    let minimum_remaining = u64::from(first_length) + 8;
+    let remaining = cursor.limit - cursor.pos;
+    if remaining < minimum_remaining {
+        return Ok(true);
+    }
+    if header[0] & 1 != 0 && remaining == minimum_remaining {
+        return Ok(false);
+    }
+    // Encoders generally write similarly sized stored blocks, with a shorter
+    // final block. A possible ending leaves all validation to the decoder.
+    let window = cursor.limit.min(u64::from(first_length) + 13) as usize;
+    let start = cursor.limit - window as u64;
+    let buffered_tail = start.checked_sub(cursor.buffer_start)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .and_then(|offset| cursor.buffer.as_ref().get(offset..)?.get(..window));
+    let may_end = if let Some(tail) = buffered_tail {
+        gzip_may_end_in_stored_block(tail)
+    } else {
+        let tail = (cursor.read)(start, window)?;
+        tail.as_ref().len() != window || gzip_may_end_in_stored_block(tail.as_ref())
+    };
+    if may_end {
+        return Ok(false);
+    }
+
+    let mut member_size = 0u32;
+    loop {
+        if header[0] & 6 != 0 {
+            // Huffman blocks need token traversal. The decoder does that once.
+            return Ok(false);
+        }
+        let length = stored_deflate_length(header[1..].try_into().unwrap())?;
+        if u64::from(length) > cursor.limit - cursor.pos {
+            return Ok(true);
+        }
+        cursor.skip(u64::from(length))?;
+        member_size = member_size.wrapping_add(u32::from(length));
+        let is_final = header[0] & 1 != 0;
+        if cursor.limit - cursor.pos < 8 {
+            return Ok(true);
+        }
+        // Read a short window after skipping a large payload gap. Dense
+        // small blocks keep the cursor's normal growing read windows.
+        if cursor
+            .pos
+            .saturating_sub(cursor.buffer_start + cursor.buffer.as_ref().len() as u64)
+            >= 4096
+        {
+            cursor.refill_window(64)?;
+        }
+        if is_final {
+            let trailer = cursor.read_array::<8>()?;
+            if trailer[4..] != member_size.to_le_bytes() || cursor.limit - cursor.pos < 3 {
+                return Ok(false);
+            }
+            if cursor.read_array::<3>()? != GZIP_MAGIC {
+                return Ok(false);
+            }
+            cursor.pos -= 3;
+            if cursor.limit - cursor.pos < 10 {
+                return Ok(true);
+            }
+            read_gzip_header(cursor)?;
+            member_size = 0;
+            if cursor.limit - cursor.pos < 8 {
+                return Ok(true);
+            }
+        }
+        header = cursor.read_array()?;
     }
 }
 
@@ -874,10 +986,22 @@ pub(crate) fn bzip2_header_block_limit(header: &[u8; 4]) -> ValidationResult<usi
 
 pub(crate) fn bzip2_marker_is_end(marker: u64) -> ValidationResult<bool> {
     match marker {
-        0x1772_4538_5090 => Ok(true),
+        BZIP2_END_MARKER => Ok(true),
         0x3141_5926_5359 => Ok(false),
         _ => invalid("bzip2_block_marker_invalid"),
     }
+}
+
+/// Check for the bit-aligned end marker followed by a CRC and byte padding.
+/// A candidate marker still requires the decoder to validate the stream and CRC.
+pub(crate) fn bzip2_may_end_at(tail: &[u8]) -> bool {
+    let (marker_bytes, mut shifts) = match tail.len() {
+        0..10 => return false,
+        10 => (tail, 0..=0),
+        len => (&tail[len - 11..], 1..=8),
+    };
+    let word = u64::from_be_bytes(*marker_bytes.first_chunk::<8>().unwrap());
+    shifts.any(|shift| (word << shift) >> 16 == BZIP2_END_MARKER)
 }
 
 pub(crate) fn bzip2_prefix_valid(prefix: &[u8; 10]) -> bool {
@@ -959,8 +1083,9 @@ pub(crate) fn validate_bzip2_structure(
     reader: &ManagedReader,
     offset: u64,
     limit: u64,
+    mut expected_first_end: Option<u64>,
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
-) -> ValidationResult<u64> {
+) -> ValidationResult<(u64, bool)> {
     let mut read = |offset, count| reader.read_cached_at(offset, count);
     let mut cursor = ByteCursor::new(&mut read, offset, limit, CachedBytes::default());
     let mut selectors = Vec::new();
@@ -1059,7 +1184,13 @@ pub(crate) fn validate_bzip2_structure(
                 return invalid("bzip2_orig_ptr_out_of_range");
             }
         }
-        if cursor.position() + 4 > limit {
+        // ZIP method 12 payloads own exactly one validated Bzip2 stream.
+        // A following stream outside the local size is a separate hit.
+        let end = cursor.position();
+        if expected_first_end.take() == Some(end) {
+            return Ok((end, true));
+        }
+        if end + 4 > limit {
             break;
         }
         let next = reader.read_cached_at(cursor.position(), 4)?;
@@ -1067,7 +1198,7 @@ pub(crate) fn validate_bzip2_structure(
             break;
         }
     }
-    Ok(cursor.position())
+    Ok((cursor.position(), false))
 }
 
 pub(crate) fn read_vli_slice(data: &[u8], cursor: &mut usize) -> ValidationResult<u64> {

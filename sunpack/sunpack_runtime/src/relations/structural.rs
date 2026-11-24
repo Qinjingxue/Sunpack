@@ -104,6 +104,7 @@ impl StructuralFacts {
 pub(super) fn collect(
     rows: &mut [RelationInput],
     index: &BucketIndex,
+    mut prepared_zip_scan: Option<&mut Option<crate::scan::embedded::PreparedZipScan>>,
 ) {
     let pe_rows = {
         let mut pe_rows = Vec::new();
@@ -235,13 +236,35 @@ pub(super) fn collect(
                         })
                 })
                 .collect();
+            if let (Some(prepared), [i], [_]) =
+                (prepared_zip_scan.as_deref_mut(), candidates.as_slice(), indexes.as_slice())
+            {
+                let anchor = rows[*i].anchor.as_ref().unwrap();
+                if let Some(generation) = anchor.zip_carrier_scan_generation() {
+                    if let Ok(scan) = crate::scan::embedded::PreparedZipScan::scan(
+                        &anchor.path, generation.clone(),
+                    ) {
+                        if scan.zip_eocd_absent() {
+                            let mut out = (**anchor).clone();
+                            out.mark_zip_eocd_absent(generation.clone());
+                            rows[*i].anchor = Some(Arc::new(out));
+                        }
+                        // A positive signature still goes through Relations'
+                        // exact fallback before any Embedded projection.
+                        *prepared = Some(scan);
+                    }
+                }
+            }
+            let prepared = prepared_zip_scan.as_deref().and_then(Option::as_ref);
             let updates: Vec<_> = candidates
                 .par_iter()
                 .map(|&i| {
+                    let anchor = rows[i].anchor.as_ref().unwrap();
+                    let known_eocd = prepared.and_then(|scan| scan.unique_zip_eocd(&anchor.path));
                     (
                         i,
                         crate::analysis_native::volume_anchor::upgrade_relation_zip_carrier_tail(
-                            rows[i].anchor.as_ref().unwrap(),
+                            anchor, known_eocd,
                         ),
                     )
                 })

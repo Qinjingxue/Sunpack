@@ -18,6 +18,7 @@ fn panicking_callbacks_release_scan_resources_and_leave_pool_usable() {
                 2,
                 2,
                 11,
+                None,
                 |data, carry, base| {
                     if worker_panic && base == 0 {
                         panic!("scan callback failed");
@@ -65,6 +66,7 @@ fn panicking_callbacks_release_scan_resources_and_leave_pool_usable() {
         2,
         2,
         11,
+        None,
         |data, carry, _| ScanBatch {
             results: data.len() - carry,
             discarded_results: 0,
@@ -116,6 +118,7 @@ fn keeps_io_slots_independent_of_slow_scan_workers() {
                 2,
                 1,
                 0,
+                None,
                 |_, _, base_offset| {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     ScanBatch {
@@ -164,6 +167,7 @@ fn short_job_sets_drain_with_overlap_and_no_spare_tail_buffers() {
             4,
             4,
             11,
+            None,
             |sample, carry, base| {
                 let start = base as usize;
                 assert_eq!(sample, &data[start..start + sample.len()]);

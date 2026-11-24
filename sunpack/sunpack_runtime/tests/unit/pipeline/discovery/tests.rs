@@ -17,7 +17,7 @@ fn zip_carrier_search_keeps_eocd_crossing_the_checked_suffix() {
     let anchor = probe_volume_anchor_path_cheap(path.to_str().unwrap());
     let tail = upgrade_relation_zip_tail(&anchor);
     assert!(!tail.has_any(TERMINAL));
-    let resolved = upgrade_relation_zip_carrier_tail(&tail);
+    let resolved = upgrade_relation_zip_carrier_tail(&tail, None);
     assert!(resolved.has_any(TERMINAL));
     assert_eq!(resolved.zip_eocd_offset, Some(eocd as u64));
     std::fs::remove_file(path).unwrap();

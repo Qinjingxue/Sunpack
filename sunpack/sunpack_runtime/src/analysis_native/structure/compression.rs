@@ -38,10 +38,24 @@ pub(super) fn compression_stream_evidence(
     mut read: impl FnMut(u64, usize) -> io::Result<Vec<u8>>,
 ) -> Option<StreamReadiness> {
     match kind {
-        StructuralStreamKind::Gzip => validate_gzip_identity(prefix, file_size, read)
-            .is_ok().then_some(StreamReadiness::Candidate),
-        StructuralStreamKind::Bzip2 => validate_bzip2_identity(prefix, file_size)
-            .is_ok().then_some(StreamReadiness::Candidate),
+        StructuralStreamKind::Gzip => gzip_head_extent(prefix, file_size, read).ok(),
+        StructuralStreamKind::Bzip2 => {
+            validate_bzip2_identity(prefix, file_size).ok()?;
+            // A standalone strict Bzip2 stream must end with its marker, CRC
+            // and at most seven padding bits. Carriers use their own extent.
+            let marker = if file_size <= prefix.len() as u64 {
+                Some(bzip2_may_end_at(&prefix[..file_size as usize]))
+            } else {
+                read(file_size.saturating_sub(11), 11).ok()
+                    .filter(|tail| tail.len() == 11)
+                    .map(|tail| bzip2_may_end_at(&tail))
+            };
+            Some(if marker == Some(false) {
+                StreamReadiness::Truncated
+            } else {
+                StreamReadiness::Candidate
+            })
+        }
         StructuralStreamKind::Xz => {
             validate_xz_identity(prefix, file_size, |size| read(12, size)).ok()?;
             let footer = xz_has_terminal_footer(file_size, |offset, count| {

@@ -12,7 +12,7 @@ use crate::scan::directory::{
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
 };
 use crate::scan::embedded::{
-    scan_embedded_path, NativeScanResult, RarInputResolution,
+    scan_embedded_path, NativeScanResult, PreparedZipScan, RarInputResolution,
     ResolvedEmbeddedScan,
 };
 use crate::scan::pe_overlay::{inspect_pe_image_native, PeProbe, PeState};
@@ -82,6 +82,7 @@ impl Candidate {
 #[derive(Default)]
 pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
+    prepared_zip_scan: Option<PreparedZipScan>,
     // Decrypted continuations may outlive their headless proposal. Transfer
     // their existing facts to the same embedded peer frontier, without I/O.
     volume_seeds: Vec<(Arc<DirectorySnapshotTable>, usize, Arc<VolumeAnchor>)>,
@@ -234,11 +235,12 @@ impl NativeCandidateTable {
     }
 
     fn relation_groups(
-        &self,
+        &mut self,
         raw: &NativeDirectorySnapshot,
         filtered: &NativeDirectorySnapshot,
         targeted: Option<&NativeDirectorySnapshot>,
         cached: Option<&RelationCache>,
+        reuse_embedded: bool,
     ) -> Vec<NativeRelationGroup> {
         let routed_view;
         let selection = if let Some(targeted) = targeted {
@@ -247,8 +249,10 @@ impl NativeCandidateTable {
             routed_view = filtered.file_route_view(FILE_ROUTE_RELATIONS);
             &routed_view
         };
+        let prepared = (reuse_embedded && targeted.is_some_and(|view| view.rows().len() == 1))
+            .then_some(&mut self.prepared_zip_scan);
         let mut groups =
-            build_native_candidate_groups_from_snapshot(raw, selection, cached);
+            build_native_candidate_groups_from_snapshot(raw, selection, cached, prepared);
         // Only an explicit selection can nominate files on other routes.
         // Relations can claim them as parts, but ordinary results stay on
         // their original route.
@@ -429,8 +433,9 @@ fn scan_embedded_jobs(
                         };
                         let (table, batch) = groups[group];
                         let (path, pe) = table.rows[index].embedded_source();
-                        let outcome =
-                            scan_embedded_candidate(path, batch.force_scan, pe, parallel_files);
+                        let outcome = scan_embedded_candidate(
+                            path, batch.force_scan, pe, parallel_files, table.prepared_zip_scan.as_ref(),
+                        );
                         if !matches!(outcome, EmbeddedOutcome::Residual) {
                             completed.push((position, group, index, outcome));
                         }
@@ -515,6 +520,7 @@ impl NativeEmbeddedBatch {
                 batch.cursor = 0;
                 batch.peer_rows = None;
                 batch.seen_paths = HashSet::new();
+                table.prepared_zip_scan = None;
             }
         }
         debug_assert!(outcomes.next().is_none());
@@ -979,11 +985,21 @@ impl NativeCandidateTable {
         targets: Option<&FileTargets>,
         deep: bool,
     ) -> Self {
+        Self::from_directory_with_shared_zip_scan(raw, filtered, targets, deep, false)
+    }
+
+    pub(crate) fn from_directory_with_shared_zip_scan(
+        raw: &NativeDirectorySnapshot,
+        filtered: &NativeDirectorySnapshot,
+        targets: Option<&FileTargets>,
+        deep: bool,
+        reuse_embedded: bool,
+    ) -> Self {
         debug_assert!(raw.rows().zip(raw.rows().skip(1)).all(|(a, b)| a < b));
         let mut table = Self::default();
         let selected = targets.and_then(|targets| targets.select(filtered));
         let groups = if deep { Vec::new() } else {
-            table.relation_groups(raw, filtered, selected.as_ref(), None)
+            table.relation_groups(raw, filtered, selected.as_ref(), None, reuse_embedded)
         };
         // Embedded is the only producer in deep mode. Keep raw peers for
         // directed volume recovery on both discovery paths.
@@ -1103,6 +1119,7 @@ impl NativeCandidateTable {
             filtered,
             selected.as_ref(),
             Some(&cached),
+            false,
         );
         for group in &groups {
             for path in group.part_paths().chain([group.entry_path()]) {
@@ -1504,6 +1521,7 @@ fn scan_embedded_candidate(
     force_scan: bool,
     pe_state: Option<PeState>,
     parallel_files: usize,
+    prepared_zip_scan: Option<&PreparedZipScan>,
 ) -> EmbeddedOutcome {
     if path.is_empty() {
         return EmbeddedOutcome::Residual;
@@ -1523,6 +1541,9 @@ fn scan_embedded_candidate(
         if is_pe {
             return EmbeddedOutcome::Residual;
         }
+    }
+    if let Some(scan) = prepared_zip_scan.and_then(|prepared| prepared.reuse(path)) {
+        return if scan.has_candidates() { EmbeddedOutcome::Scan(scan) } else { EmbeddedOutcome::Residual };
     }
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,

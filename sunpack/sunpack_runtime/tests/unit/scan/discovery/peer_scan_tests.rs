@@ -2,6 +2,65 @@ use super::*;
 use crate::analysis_native::volume_anchor::VolumeAnchor;
 use crate::scan::directory::DirectoryEntryRecord;
 
+#[test]
+fn targeted_zip_carrier_reuses_the_scan_and_preserves_the_peer_archive() {
+    use crate::analysis_native::volume_anchor::probe_volume_anchor_path_cheap;
+    use std::io::Write;
+
+    // A truncated stored ZIP starts at byte zero, followed by an independent
+    // gzip archive. A negative ZIP tail proves no terminal, not an empty carrier.
+    let mut bytes = vec![0; 31];
+    bytes[..4].copy_from_slice(b"PK\x03\x04");
+    bytes[4] = 20;
+    bytes[18..22].copy_from_slice(&(2u32 * 1024 * 1024).to_le_bytes());
+    bytes[22..26].copy_from_slice(&(2u32 * 1024 * 1024).to_le_bytes());
+    bytes[26] = 1;
+    bytes[30] = b'x';
+    bytes.resize(768 * 1024, 0);
+    let gzip_start = bytes.len() as u64;
+    let mut gzip = flate2::write::GzEncoder::new(bytes, flate2::Compression::fast());
+    gzip.write_all(b"independent archive").unwrap();
+    let path = crate::test_support::temp_file("truncated_zip_carrier", &gzip.finish().unwrap());
+    let path_str = path.to_str().unwrap();
+    let anchor = probe_volume_anchor_path_cheap(path_str);
+    let entry = DirectoryEntryRecord {
+        path: path_str.to_owned(),
+        size: Some(anchor.size),
+        relation_member_eligible: true,
+        relation_anchor: Some(CheapAnchor::Full(Arc::new(anchor))),
+        ..Default::default()
+    };
+    let (filtered, raw) = NativeDirectorySnapshot::from_views(
+        vec![0], [entry], Default::default(), Vec::new(),
+    );
+    let targets = FileTargets::new(vec![(path_str.to_owned(), "archive".into())]);
+    let table = NativeCandidateTable::from_directory_with_shared_zip_scan(
+        &raw, &filtered, Some(&targets), false, true,
+    );
+    let prepared = table.prepared_zip_scan.as_ref().unwrap();
+    assert!(prepared.zip_eocd_absent());
+    let EmbeddedOutcome::Scan(scan) =
+        scan_embedded_candidate(path_str, false, Some(PeState::None), 1, Some(prepared))
+    else {
+        panic!("the carrier should retain the independent archive");
+    };
+    assert!(Arc::ptr_eq(&scan, &prepared.reuse(path_str).unwrap()));
+    assert!(scan.candidates().iter().any(|candidate| {
+        candidate.format == "gzip" && candidate.offset == gzip_start
+    }));
+    // Reusing a negative observation or its candidates after replacement
+    // would hide a real archive. Keep length and last-write time unchanged.
+    let replacement = path.with_extension("replacement");
+    let original = std::fs::metadata(&path).unwrap();
+    std::fs::copy(&path, &replacement).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&replacement).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(original.modified().unwrap())).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(replacement, &path).unwrap();
+    assert!(prepared.reuse(path_str).is_none());
+    std::fs::remove_file(path).unwrap();
+}
+
 static SCANS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 

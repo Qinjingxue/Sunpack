@@ -372,8 +372,8 @@ fn bzip2_huffman_walk_reaches_stream_end() {
             .unwrap();
     let source = reader(data.clone());
     assert_eq!(
-        validate_bzip2_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
-        data.len() as u64
+        validate_bzip2_structure(&source, 0, source.len(), None, |_| Ok(())).unwrap(),
+        (data.len() as u64, false)
     );
 }
 
@@ -417,8 +417,8 @@ fn bzip2_walk_skips_unused_selector_records() {
     assert_eq!(decoded, b"B");
     let source = reader(data);
     assert_eq!(
-        validate_bzip2_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
-        source.len(),
+        validate_bzip2_structure(&source, 0, source.len(), None, |_| Ok(())).unwrap(),
+        (source.len(), false),
     );
 }
 
@@ -471,8 +471,8 @@ fn long_streams_validate_without_archive_wide_quotas() {
     bzip.extend([0x17, 0x72, 0x45, 0x38, 0x50, 0x90, 0, 0, 0, 0]);
     let source = reader(bzip);
     assert_eq!(
-        validate_bzip2_structure(&source, 0, source.len(), |_| Ok(())).unwrap(),
-        source.len()
+        validate_bzip2_structure(&source, 0, source.len(), None, |_| Ok(())).unwrap(),
+        (source.len(), false)
     );
 
     let mut xz = vec![0xfd, b'7', b'z', b'X', b'Z', 0, 0, 0];

@@ -175,6 +175,19 @@ pub(crate) struct CentralValues {
     pub disk: u64,
 }
 
+pub(super) fn extra_field(mut extra: &[u8]) -> Option<&[u8]> {
+    while let Some(header) = extra.first_chunk::<4>() {
+        let id = u16::from_le_bytes([header[0], header[1]]);
+        let size = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        let (field, remaining) = extra[4..].split_at_checked(size)?;
+        if id == 1 {
+            return Some(field);
+        }
+        extra = remaining;
+    }
+    None
+}
+
 pub(crate) fn central_entry_values(header: &[u8], extra: &[u8]) -> Option<CentralValues> {
     if header.len() < 46 {
         return None;
@@ -194,33 +207,23 @@ pub(crate) fn central_entry_values(header: &[u8], extra: &[u8]) -> Option<Centra
     if !sentinels.iter().any(|value| *value) {
         return Some(values);
     }
-    let mut cursor = 0usize;
-    while cursor.checked_add(4)? <= extra.len() {
-        let id = u16::from_le_bytes(extra[cursor..cursor + 2].try_into().ok()?);
-        let size = u16::from_le_bytes(extra[cursor + 2..cursor + 4].try_into().ok()?) as usize;
-        cursor += 4;
-        let payload = extra.get(cursor..cursor.checked_add(size)?)?;
-        if id == 1 {
-            let mut at = 0usize;
-            for (needed, width, target) in [
-                (sentinels[0], 8, &mut values.uncompressed),
-                (sentinels[1], 8, &mut values.compressed),
-                (sentinels[2], 8, &mut values.local_offset),
-                (sentinels[3], 4, &mut values.disk),
-            ] {
-                if needed {
-                    let bytes = payload.get(at..at + width)?;
-                    *target = if width == 4 {
-                        u32::from_le_bytes(bytes.try_into().ok()?) as u64
-                    } else {
-                        u64::from_le_bytes(bytes.try_into().ok()?)
-                    };
-                    at += width;
-                }
-            }
-            return Some(values);
+    let payload = extra_field(extra)?;
+    let mut at = 0usize;
+    for (needed, width, target) in [
+        (sentinels[0], 8, &mut values.uncompressed),
+        (sentinels[1], 8, &mut values.compressed),
+        (sentinels[2], 8, &mut values.local_offset),
+        (sentinels[3], 4, &mut values.disk),
+    ] {
+        if needed {
+            let bytes = payload.get(at..at + width)?;
+            *target = if width == 4 {
+                u32::from_le_bytes(bytes.try_into().ok()?) as u64
+            } else {
+                u64::from_le_bytes(bytes.try_into().ok()?)
+            };
+            at += width;
         }
-        cursor += size;
     }
-    None
+    Some(values)
 }

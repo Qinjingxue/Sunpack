@@ -84,6 +84,65 @@ fn standalone_xz_and_zstd_detect_open_ends() {
 }
 
 #[test]
+fn standalone_gzip_and_bzip2_prove_incomplete_extents() {
+    use std::io::Write;
+
+    let classify = |data: &[u8], format, truncated| {
+        let mut extra_bytes = 0;
+        let mut anchor = VolumeAnchor {
+            size: data.len() as u64,
+            ..VolumeAnchor::default()
+        };
+        probe_standalone_stream(&data[..data.len().min(512)], &mut anchor, |offset, count| {
+            let offset = offset as usize;
+            extra_bytes += count;
+            Ok(data[offset..offset + count].to_vec())
+        });
+        assert!(anchor.standalone);
+        assert_eq!(anchor.format, format);
+        assert_eq!(anchor.has_any(STANDALONE_TRUNCATED), truncated);
+        extra_bytes
+    };
+
+    fn stored_member() -> Vec<u8> {
+        let payload = [b'a'; 16 * 1024];
+        let mut data = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+        let mut crc = crc32fast::Hasher::new();
+        for block_index in 0..4 {
+            data.push(u8::from(block_index == 3));
+            data.extend((payload.len() as u16).to_le_bytes());
+            data.extend((!(payload.len() as u16)).to_le_bytes());
+            data.extend(payload);
+            crc.update(&payload);
+        }
+        data.extend(crc.finalize().to_le_bytes());
+        data.extend(((payload.len() * 4) as u32).to_le_bytes());
+        data
+    }
+
+    let member = stored_member();
+    assert!(classify(&member, "gzip", false) < 17 * 1024);
+    let mut joined = [member.as_slice(), &member].concat();
+    assert!(classify(&joined, "gzip", false) < 17 * 1024);
+    assert!(classify(&joined[..joined.len() - 1], "gzip", true) < 17 * 1024);
+    assert!(classify(&joined[..joined.len() - 1_000], "gzip", true) < 17 * 1024);
+    let mut huffman = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    huffman.write_all(&[b'b'; 32 * 1024]).unwrap();
+    joined.extend(huffman.finish().unwrap());
+    classify(&joined, "gzip", false);
+
+    let mut bzip = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+    for n in 0..10_000u32 {
+        bzip.write_all(&n.to_le_bytes()).unwrap();
+    }
+    let member = bzip.finish().unwrap();
+    let joined = [member.as_slice(), &member].concat();
+    assert_eq!(classify(&member, "bzip2", false), 11);
+    assert_eq!(classify(&joined, "bzip2", false), 11);
+    assert_eq!(classify(&joined[..joined.len() - 1], "bzip2", true), 11);
+}
+
+#[test]
 fn bare_mz_does_not_expand_or_authorize_nonleading_archive_probes() {
     let mut seven_zip = SEVEN_ZIP.to_vec();
     seven_zip.extend([0, 4]);
