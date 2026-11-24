@@ -98,7 +98,7 @@ fn admission_boundary_preserves_zero_quiet_and_caps_learned_windows() {
 }
 
 #[test]
-fn content_close_preserves_learned_quiet_and_unchanged_retry_is_immediate() {
+fn content_close_caps_deadline_not_learned_cadence_and_unchanged_retry_is_immediate() {
     let mut quiet = Quiet::default();
     let now = Instant::now();
     for at in [0.0, 1.0, 2.0] {
@@ -107,10 +107,64 @@ fn content_close_preserves_learned_quiet_and_unchanged_retry_is_immediate() {
     let learned = quiet.seconds;
     assert!(learned > 1.0);
     let due = quiet.content_deadline(now, 3.0, true, false, false);
-    assert_eq!(due, after(now, learned));
-    assert!(due > after(now, 0.8)); // the next write precedes admission
+    assert_eq!(due, after(now, CONTENT_CLOSE_QUIET_CAP_SECONDS));
+    assert_eq!(quiet.seconds, learned);
     assert!(quiet.last.is_none()); // CLOSE still ends cadence learning
     assert_eq!(quiet.content_deadline(now, 4.0, true, false, true), now);
     assert_eq!(quiet.content_deadline(now, 5.0, true, true, false), now);
     assert_eq!(quiet.seconds, 0.0); // a replaced/truncated file starts anew
+}
+
+#[test]
+fn folded_close_caps_only_new_content_and_never_overrides_newer_writes() {
+    let now = Instant::now();
+    let mut state = ActivityState::default();
+    let mut row = WatchCandidateRow {
+        path: "path".into(), size: 0, mtime: 0.0,
+        observation: crate::filesystem::WatchFileObservation {
+            file_id: "one".into(), change_usn: 0,
+            change_reasons: Some(sunpack_usn_core::ChangeReasons { all: 1, without_close: 1 }),
+        },
+    };
+    let advance = |row: &mut WatchCandidateRow, at: f64, flags: u32| {
+        row.size += 1;
+        row.mtime = at;
+        row.observation.change_usn += 1;
+        row.observation.change_reasons.as_mut().unwrap().all = flags;
+    };
+    for at in [0.0, 2.0, 4.0] {
+        advance(&mut row, at, 1);
+        state.record(&row, after(now, at), at, false, None);
+    }
+    let window = state.quiet.seconds;
+    assert!(window > CONTENT_CLOSE_QUIET_CAP_SECONDS);
+    assert_eq!(state.due, Some(after(now, 4.0 + window)));
+
+    advance(&mut row, 6.0, 1 | CLOSE);
+    let before = after(now, 6.0);
+    state.record(&row, before, 6.0, false, None);
+    let close_due = Some(after(before, CONTENT_CLOSE_QUIET_CAP_SECONDS));
+    assert_eq!(state.due, close_due);
+    assert_eq!(state.quiet.seconds, window);
+    let close_row = row.clone();
+    // The scheduler receives the callback's snapshot after capture; it must
+    // neither apply the cap a second time nor move the existing deadline.
+    state.record(&row, after(now, 6.1), 6.1, false, None);
+    assert_eq!(state.due, close_due);
+
+    // Rename without CLOSE is not a completion signal.
+    advance(&mut row, 6.2, 1 | 0x2000);
+    let resumed = after(now, 6.2);
+    state.record(&row, resumed, 6.2, false, None);
+    let resumed_due = Some(after(resumed, window));
+    assert_eq!(state.due, resumed_due);
+    // Out-of-order delivery of the old CLOSE must not shorten this wait.
+    state.record(&close_row, before, 6.0, false, None);
+    assert_eq!(state.due, resumed_due);
+
+    state.quiet.seconds = 0.1;
+    advance(&mut row, 6.3, 1 | CLOSE);
+    let short = after(now, 6.3);
+    state.record(&row, short, 6.3, false, None);
+    assert_eq!(state.due, Some(after(short, 0.1)));
 }

@@ -213,7 +213,7 @@ impl ActivityState {
             self.quiet.end_phase();
         }
         if changed || forced_content_change.is_some() {
-            self.due = Some(after(now, self.quiet.seconds));
+            self.due = Some(after(now, self.quiet.content_wait(changed && boundary)));
         }
         self.baseline = Some((candidate.size, candidate.mtime,
             candidate.observation.file_id.clone(), candidate.observation.change_usn));
@@ -231,6 +231,7 @@ fn probe_candidate(path: &std::path::Path, since_usn: Option<i64>)
 
 const WINDOW: usize = 12;
 const CLOSE: u32 = 0x8000_0000;
+const CONTENT_CLOSE_QUIET_CAP_SECONDS: f64 = 1.0;
 
 pub(super) fn is_boundary(candidate: &WatchCandidateRow) -> bool {
     candidate.observation.change_reasons.is_some_and(|reasons| reasons.all & CLOSE != 0)
@@ -263,10 +264,15 @@ impl Quiet {
     ) -> Instant {
         if retry_unchanged { return now; }
         self.observe(observed_at, boundary, reset, true);
-        // CLOSE ends the handle epoch, not the download. Content observations
-        // keep the learned quiet window; metadata-only CLOSE acceleration and
-        // admission boundary confirmation are handled separately by Watch.
-        after(now, self.seconds)
+        after(now, self.content_wait(boundary))
+    }
+
+    #[inline]
+    fn content_wait(&self, content_close: bool) -> f64 {
+        // A CLOSE folded into a new content observation ends the handle
+        // epoch, not the download. Cap this deadline without altering the
+        // learned cadence or bypassing the strict readiness check.
+        if content_close { self.seconds.min(CONTENT_CLOSE_QUIET_CAP_SECONDS) } else { self.seconds }
     }
 
     pub(super) fn boundary_deadline(&self, now: Instant, confirmation: f64) -> Instant {
