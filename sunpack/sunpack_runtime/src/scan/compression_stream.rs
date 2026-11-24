@@ -927,8 +927,14 @@ fn stored_gzip_truncated(cursor: &mut ByteCursor<'_, impl AsRef<[u8]>>) -> Valid
         }
         if is_final {
             let trailer = cursor.read_array::<8>()?;
-            if trailer[4..] != member_size.to_le_bytes() || cursor.limit - cursor.pos < 3 {
+            if trailer[4..] != member_size.to_le_bytes() {
                 return Ok(false);
+            }
+            match cursor.limit - cursor.pos {
+                0 => return Ok(false),
+                1 => return Ok(cursor.read_array::<1>()? == GZIP_MAGIC[..1]),
+                2 => return Ok(cursor.read_array::<2>()? == GZIP_MAGIC[..2]),
+                _ => {}
             }
             if cursor.read_array::<3>()? != GZIP_MAGIC {
                 return Ok(false);

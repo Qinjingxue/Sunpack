@@ -48,7 +48,8 @@ fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
         assert!(!anchors.is_empty());
         let absent = terminals.iter().all(|offset| data.len() - offset < 22);
         assert_eq!(scan.zip_eocd_absent, absent);
-        assert_eq!(scan.unique_zip_eocd, unique.map(|offset| offset as u64));
+        assert_eq!(scan.unique_zip_eocd.as_ref().and_then(|search| search.unique_offset),
+            unique.map(|offset| offset as u64));
         assert!(anchors
             .iter()
             .all(|a| a.has_any(ZIP_CARRIER_CHECKED) == absent));

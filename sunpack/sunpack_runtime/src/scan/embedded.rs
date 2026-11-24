@@ -1,12 +1,15 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_reader_at_offset, upgrade_relation_rar_end_reader, VolumeAnchor, FIRST,
+    probe_volume_anchor_reader_at_offset, upgrade_relation_rar_end_reader, VolumeAnchor,
+    ZipEocdSearch, FIRST,
     SEVEN_ZIP_CARRIER_INTERRUPTED, ZIP_CARRIER_CHECKED, ZIP_LOCAL_HEADER, ZIP_SPLIT_START,
     ZIP_TAIL_CHECKED,
 };
 use crate::formats::zip::{read_zip_local_member, zip_local_fixed_plausible};
 #[cfg(windows)]
 use crate::io::iocp;
-use crate::io::reader::{capture_file_generation, CachedBytes, ManagedReader, PhysicalFileGeneration};
+use crate::io::reader::{
+    capture_file_generation, CachedBytes, ManagedReader, PhysicalFileGeneration, ReaderConfig,
+};
 use crate::io::ScanBatch;
 use crate::scan::compression_stream::{
     bzip2_header_block_limit, bzip2_prefix_valid, gzip_fixed_header_flags, parse_xz_footer,
@@ -227,7 +230,7 @@ pub(crate) struct NativeScanResult {
     #[cfg(test)]
     raw_hit_count: usize,
     zip_eocd_absent: bool,
-    unique_zip_eocd: Option<u64>,
+    unique_zip_eocd: Option<Arc<ZipEocdSearch>>,
 }
 
 pub(crate) struct RarInputResolution {
@@ -288,10 +291,14 @@ impl NativeScanResult {
                     boundaries.next();
                 }
                 anchor.carrier_limit = boundaries.peek().map(|c| c.offset);
-                // The full physical signature pass includes split EOCDs too.
-                // Keep only this negative byte fact, not a second hit index.
-                if anchor.format == "zip" && self.zip_eocd_absent {
-                    anchor.flags |= ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED;
+                // Physical signature evidence includes split EOCDs too and
+                // survives without retaining the hit index.
+                if anchor.format == "zip" {
+                    if self.zip_eocd_absent {
+                        anchor.flags |= ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED;
+                    } else {
+                        anchor.zip_eocd_search.clone_from(&self.unique_zip_eocd);
+                    }
                 }
                 Some(anchor)
             })
@@ -347,7 +354,9 @@ impl PreparedZipScan {
 
     pub(crate) fn unique_zip_eocd(&self, path: &str) -> Option<(u64, &PhysicalFileGeneration)> {
         self.scan.unique_zip_eocd
+            .as_ref()
             .filter(|_| self.path == path)
+            .and_then(|search| search.unique_offset)
             .map(|offset| (offset, &self.generation))
     }
 
@@ -437,7 +446,7 @@ fn scan_embedded_archives_native_with_iocp(
         }
         let first = batch.results.first_zip_eocd;
         if file_size.saturating_sub(first) >= 22 {
-            if generation.is_some() {
+            if generation.is_some() || file_size <= chunk_bytes as u64 {
                 let after_first = (first - base) as usize + ZIP_EOCD.len();
                 // A signature can start only where the full fixed EOCD fits.
                 // At a chunk edge the next chunk owns a crossing signature.
@@ -460,7 +469,7 @@ fn scan_embedded_archives_native_with_iocp(
             discarded_results: batch.discarded_results,
         }
     };
-    let _output = {
+    let (_output, full_buffer) = {
         #[cfg(windows)]
         {
             let path = reader.iocp_path().ok_or_else(|| {
@@ -471,21 +480,26 @@ fn scan_embedded_archives_native_with_iocp(
             })?;
             // A single read cannot overlap other reads. Use the open reader
             // and skip the second file handle, completion port and job queue.
-            let output = if file_size <= chunk_bytes as u64 {
+            if file_size <= chunk_bytes as u64 {
                 let data = reader.read_direct_at(0, file_size as usize)?;
                 if generation.is_some() && data.len() as u64 != file_size {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short embedded scan read"));
                 }
                 let hits = scan(&data, 0, 0);
+                let reuse = data.len() as u64 == file_size
+                    && (generation.is_some() || hits.results.is_none()
+                        || reader.physical_generation().is_some_and(|expected| {
+                            capture_file_generation(path).is_ok_and(|current| &current == expected)
+                        }));
                 collect(hits.results)?;
-                iocp::IocpScanOutput {
+                (iocp::IocpScanOutput {
                     #[cfg(test)]
                     discarded_results: hits.discarded_results,
                     #[cfg(test)]
                     read_operations: u64::from(file_size != 0),
-                }
+                }, reuse.then_some(data))
             } else {
-                iocp::scan_file(
+                (iocp::scan_file(
                     path,
                     file_size,
                     chunk_bytes,
@@ -505,9 +519,8 @@ fn scan_embedded_archives_native_with_iocp(
                         }
                     },
                     |batch| collect(batch.map(|batch| *batch)),
-                )?
-            };
-            output
+                )?, None)
+            }
         }
         #[cfg(not(windows))]
         {
@@ -538,10 +551,18 @@ fn scan_embedded_archives_native_with_iocp(
         raw_hit_count += _output.discarded_results;
     }
 
-    // Structural facts survive in the result; transient validation windows
-    // share this reader's generation/request state, not the global block cache.
-    let probe_reader = reader.probe_reader();
-    let mut candidates = validate_raw_hits(&probe_reader, file_size, raw_hits, xz_footer_hits)?;
+    // Validate against bytes from the same complete read when available.
+    // Otherwise transient validation windows share the open file reader.
+    let scan_generation = generation.or_else(|| {
+        full_buffer.as_ref().and(reader.physical_generation())
+    });
+    let mut candidates = {
+        let probe_reader = match full_buffer {
+            Some(data) => ManagedReader::from_bytes(data, ReaderConfig::default()),
+            None => reader.probe_reader(),
+        };
+        validate_raw_hits(&probe_reader, file_size, raw_hits, xz_footer_hits)?
+    };
     candidates.sort_by_key(|candidate| {
         (
             candidate.offset,
@@ -588,9 +609,9 @@ fn scan_embedded_archives_native_with_iocp(
         #[cfg(test)]
         raw_hit_count,
         zip_eocd_absent: physical_zip_eocd == 0,
-        unique_zip_eocd: (physical_zip_eocd != u64::MAX)
-            .then(|| physical_zip_eocd.checked_sub(1))
-            .flatten(),
+        unique_zip_eocd: scan_generation.zip(physical_zip_eocd.checked_sub(1))
+            .filter(|_| physical_zip_eocd != u64::MAX)
+            .map(|(generation, offset)| Arc::new(ZipEocdSearch::unique(generation.clone(), offset))),
     })
 }
 

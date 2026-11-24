@@ -372,10 +372,8 @@ impl ManagedReader {
         Ok(Self::new(source, config))
     }
 
-    #[cfg(test)]
     pub(crate) fn from_bytes(data: Vec<u8>, config: ReaderConfig) -> Self {
-        let data: Arc<[u8]> = Arc::from(data);
-        Self::new(Arc::new(BytesSource { data }), config)
+        Self::new(Arc::new(BytesSource(CachedSlice::from_vec(data))), config)
     }
 
     /// One analysis borrows the same generation, budget and request
@@ -775,15 +773,11 @@ impl Seek for SourceCursor {
     }
 }
 
-#[cfg(test)]
-struct BytesSource {
-    data: Arc<[u8]>,
-}
+struct BytesSource(CachedSlice);
 
-#[cfg(test)]
 impl ByteSource for BytesSource {
     fn len(&self) -> u64 {
-        self.data.len() as u64
+        self.0.len() as u64
     }
 
     fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -791,8 +785,18 @@ impl ByteSource for BytesSource {
             return Ok(Vec::new());
         }
         let start = offset as usize;
-        let end = start.saturating_add(len).min(self.data.len());
-        Ok(self.data[start..end].to_vec())
+        let end = start.saturating_add(len).min(self.0.len());
+        Ok(self.0[start..end].to_vec())
+    }
+
+    fn read_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        if offset >= self.len() {
+            return Ok(0);
+        }
+        let source = &self.0[offset as usize..];
+        let count = source.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&source[..count]);
+        Ok(count)
     }
 
     fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
@@ -800,12 +804,7 @@ impl ByteSource for BytesSource {
             return Ok(Vec::new());
         }
         let start = offset as usize;
-        let end = start.saturating_add(len).min(self.data.len());
-        Ok(vec![CachedSlice::from_shared(
-            Arc::clone(&self.data),
-            start,
-            end,
-        )])
+        Ok(vec![self.0.slice(start, len.min(self.0.len() - start))])
     }
 }
 

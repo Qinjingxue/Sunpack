@@ -5,6 +5,8 @@ use std::ffi::c_void;
 use std::io::Read;
 
 pub(crate) const MAGIC: &[u8] = b"\x04\x22\x4d\x18";
+const MAX_FRAME_HEADER: usize = 19;
+const SPARSE_READ_BYTES: usize = 256;
 
 unsafe extern "C" {
     fn SUNPACK_LZ4_XXH32(input: *const c_void, size: usize, seed: u32) -> u32;
@@ -31,18 +33,23 @@ pub(crate) fn leading(bytes: &[u8]) -> bool {
             .is_some_and(|p| skippable(u32::from_le_bytes(p.try_into().unwrap())))
 }
 
+struct FirstFrame {
+    offset: u64,
+    probe_ambiguous_end: bool,
+}
+
 fn first_frame(
     prefix: &[u8],
     limit: u64,
     mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
-) -> Result<Option<u64>, &'static str> {
+) -> Result<Option<FirstFrame>, &'static str> {
     // A maximal frame header and its first block word fit in 23 bytes.
     // Reuse the filesystem's prefix unless a skippable frame jumps past it.
     let mut window;
     let mut head = &prefix[..limit.min(prefix.len() as u64) as usize];
     let mut offset = 0;
     loop {
-        let needed = (limit - offset).min(23) as usize;
+        let needed = (limit - offset).min(MAX_FRAME_HEADER as u64 + 4) as usize;
         if head.len() < needed {
             // Batch runs of short skippable headers as well as isolated ones.
             let size = (limit - offset).min(4096) as usize;
@@ -69,8 +76,28 @@ fn first_frame(
         }
         let header = parse_header(head)?;
         let block = word(header.len)?;
-        return Ok(header.block_span(block).is_ok().then_some(offset));
+        return Ok(header.block_span(block).ok().map(|span| FirstFrame {
+            offset,
+            probe_ambiguous_end: header.content_checksum && span >= SPARSE_READ_BYTES as u64,
+        }));
     }
+}
+
+fn possible_frame_end(tail: &[u8]) -> bool {
+    let (before_trailer, trailer) = tail.split_at(tail.len() - 8);
+    // A zero word overlapping a longer zero run on either side can belong to
+    // the last block. Let the structural walk resolve it on the wider probe.
+    let overlapping_zero = !before_trailer.is_empty()
+        && (before_trailer.last() == Some(&0) || trailer[4] == 0);
+    if trailer[..4] == [0; 4] && !overlapping_zero {
+        return true;
+    }
+    // A bare zero word can also be part of a short concatenated frame header.
+    trailer[4..] == [0; 4]
+        && (before_trailer.is_empty()
+            || !tail.windows(MAGIC.len()).enumerate().any(|(start, word)| {
+                word == MAGIC && matches!(parse_header(&tail[start..]), Err("lz4_header_truncated"))
+            }))
 }
 
 pub(crate) fn standalone_truncated(
@@ -78,28 +105,35 @@ pub(crate) fn standalone_truncated(
     size: u64,
     mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
 ) -> Option<bool> {
-    let offset = first_frame(prefix, size, &mut read).ok()??;
-    let end_mark = |tail: &[u8]| tail.chunks_exact(4).any(|word| word == [0; 4]);
+    let first = first_frame(prefix, size, &mut read).ok()??;
     // The last frame may include a content checksum. A possible end mark
     // leaves validation to the decoder, so normal complete inputs avoid
     // another traversal. The mark alone does not establish completeness.
-    let tail_start = size.saturating_sub(8);
-    let possible_end = if let Ok(end) = usize::try_from(size) {
-        prefix.get(end.saturating_sub(8)..end).map(end_mark)
+    // The largest partial next header needs 18 bytes. Keep the short read for
+    // dense first blocks, where an ambiguous ending can require many reads.
+    let tail_window = if first.probe_ambiguous_end {
+        MAX_FRAME_HEADER - 1
     } else {
-        None
+        8
     };
-    let possible_end = match possible_end {
-        Some(found) => found,
+    let tail_len = size.min(tail_window as u64) as usize;
+    let tail_start = size - tail_len as u64;
+    let tail_data;
+    let tail = match usize::try_from(size)
+        .ok()
+        .and_then(|end| prefix.get(end - tail_len..end))
+    {
+        Some(bytes) => bytes,
         None => {
-            let Ok(tail) = read(tail_start, 8) else { return Some(false); };
-            if tail.len() != 8 {
+            let Ok(bytes) = read(tail_start, tail_len) else { return Some(false); };
+            if bytes.len() != tail_len {
                 return Some(false);
             }
-            end_mark(&tail)
+            tail_data = bytes;
+            &tail_data
         }
     };
-    if possible_end {
+    if possible_frame_end(tail) {
         return Some(false);
     }
     let mut refill = |offset, len, window: &mut Vec<u8>| {
@@ -107,7 +141,7 @@ pub(crate) fn standalone_truncated(
         Ok(())
     };
     let mut input = StructureReader::new(size, prefix, &mut refill);
-    let index = inspect(&mut input, offset, &mut |_| Ok(()));
+    let index = inspect(&mut input, first.offset, &mut |_| Ok(()));
     Some(matches!(index.error, "lz4_stream_truncated" | "lz4_header_truncated"))
 }
 
@@ -229,11 +263,11 @@ impl<'a> StructureReader<'a> {
             let previous = self.window.len();
             let window_bytes = if !self.window.is_empty()
                 && cursor >= self.start
-                && cursor - self.start <= (previous + previous.min(256)) as u64
+                && cursor - self.start <= (previous + previous.min(SPARSE_READ_BYTES)) as u64
             {
                 (previous * 4).min(16 * 1024)
             } else {
-                256
+                SPARSE_READ_BYTES
             };
             self.start = cursor;
             let wanted = (self.limit - cursor).min(window_bytes as u64) as usize;
@@ -344,7 +378,8 @@ fn walk_inner(
             continue;
         }
         if magic == 0x184d2204 {
-            let header = parse_header(input.field(cursor, ((limit - cursor).min(19)) as usize)?)?;
+            let head_len = (limit - cursor).min(MAX_FRAME_HEADER as u64) as usize;
+            let header = parse_header(input.field(cursor, head_len)?)?;
             advance(&mut cursor, header.len as u64, limit)?;
             loop {
                 let value = input.word(cursor)?;

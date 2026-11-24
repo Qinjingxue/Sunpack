@@ -330,6 +330,28 @@ fn gzip_member(payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn gzip_stored_readiness_distinguishes_a_short_next_member_from_a_tail() {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    encoder.write_all(b"stored payload").unwrap();
+    let member = encoder.finish().unwrap();
+    for (tail, truncated) in [
+        (&member[..1], true),
+        (&member[..2], true),
+        (&b"\x1f\x00"[..], false),
+        (&[][..], false),
+        (&member[..], false),
+    ] {
+        let data = [&member, tail].concat();
+        let readiness = gzip_head_extent(&data[..10], data.len() as u64, |offset, count| {
+            let start = offset as usize;
+            Ok(data[start..start + count].to_vec())
+        })
+        .unwrap();
+        assert_eq!(matches!(readiness, StreamReadiness::Truncated), truncated);
+    }
+}
+
+#[test]
 fn gzip_boundary_walk_rejects_wrong_later_member_size() {
     let first = gzip_member(b"first");
     let second = gzip_member(b"second");

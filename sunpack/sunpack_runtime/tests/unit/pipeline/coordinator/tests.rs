@@ -293,6 +293,34 @@ fn requests_wait_for_startup_even_when_discovery_would_be_empty() {
 }
 
 #[test]
+fn foreground_extraction_starts_worker_only_after_actionable_discovery() {
+    use std::io::Write;
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    encoder.write_all(&[b'x'; 2048]).unwrap();
+    let member = encoder.finish().unwrap();
+    let fixture = crate::test_support::temp_file("worker_after_discovery", &member[..member.len() - 1]);
+    let source = fixture.with_extension("gz");
+    fs::rename(fixture, &source).unwrap();
+    let engine = Engine::new(source.with_extension("missing-worker.exe"));
+    let extract = || {
+        engine.submit(Request::new(vec![source.clone()], Mode::Extract), Arc::new(|_: Event| {}), |result| result)
+            .join().unwrap()
+    };
+
+    let rejected = extract().unwrap();
+    assert_eq!(rejected.archives.len(), 1);
+    assert_eq!(rejected.archives[0].failure.as_ref().map(|failure| failure.kind), Some(FailureKind::Damaged));
+    assert!(engine.worker.lock().unwrap().process.is_none());
+
+    fs::write(&source, member).unwrap();
+    let error = extract().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(error.get_ref().is_some_and(|error| error.is::<super::super::StartupError>()));
+    fs::remove_file(source).unwrap();
+}
+
+#[test]
 fn cancelled_startup_is_shared_until_cleanup_then_live_borrowers_retry() {
     use std::future::Future;
     use std::thread;

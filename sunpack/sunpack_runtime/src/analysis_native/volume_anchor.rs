@@ -73,8 +73,8 @@ pub(crate) struct VolumeAnchor {
     pub(crate) carrier_limit: Option<u64>,
     pub(crate) expected_logical_size: Option<u64>,
     pub(crate) zip_eocd_offset: Option<u64>,
-    // A physical suffix already searched for a complete EOCD candidate.
-    pub(crate) zip_eocd_absence: Option<Arc<ZipEocdAbsence>>,
+    // Physical signature evidence from the bounded tail or full carrier scan.
+    pub(crate) zip_eocd_search: Option<Arc<ZipEocdSearch>>,
     pub(crate) zip_directory: Option<Arc<crate::formats::zip::RelationDirectory>>,
     // A two-disk directory can locate a carrier head without an interior disk.
     pub(crate) zip_head_size: Option<u64>,
@@ -93,9 +93,16 @@ pub(crate) struct VolumeAnchor {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct ZipEocdAbsence {
+pub(crate) struct ZipEocdSearch {
     generation: PhysicalFileGeneration,
     start: u64,
+    pub(crate) unique_offset: Option<u64>,
+}
+
+impl ZipEocdSearch {
+    pub(crate) fn unique(generation: PhysicalFileGeneration, offset: u64) -> Self {
+        Self { generation, start: 0, unique_offset: Some(offset) }
+    }
 }
 
 impl VolumeAnchor {
@@ -109,10 +116,12 @@ impl VolumeAnchor {
 
     // Only the exhaustive proof can be promoted into a later inventory.
     pub(crate) fn zip_eocd_absent_generation(&self) -> Option<&PhysicalFileGeneration> {
-        self.zip_eocd_absence
+        self.zip_eocd_search
             .as_deref()
-            .filter(|absence| absence.start == 0 && self.has_any(ZIP_CARRIER_CHECKED))
-            .map(|absence| &absence.generation)
+            .filter(|search| {
+                search.start == 0 && search.unique_offset.is_none() && self.has_any(ZIP_CARRIER_CHECKED)
+            })
+            .map(|search| &search.generation)
     }
 
     /// A missing natural end makes the existing Embedded pass useful for
@@ -120,7 +129,7 @@ impl VolumeAnchor {
     pub(crate) fn zip_carrier_scan_generation(&self) -> Option<&PhysicalFileGeneration> {
         use crate::formats::zip::{read_zip_local_member, EOCD_SEARCH_BYTES};
 
-        let suffix = self.zip_eocd_absence.as_deref().filter(|suffix| suffix.start != 0)?;
+        let suffix = self.zip_eocd_search.as_deref().filter(|suffix| suffix.start != 0)?;
         if self.structure_offset != Some(0) || !self.has_any(ZIP_LOCAL_HEADER)
             || self.has_any(ZIP_CARRIER_CHECKED | ZIP_SPLIT_START)
         {
@@ -157,7 +166,9 @@ impl VolumeAnchor {
 
     pub(crate) fn mark_zip_eocd_absent(&mut self, generation: PhysicalFileGeneration) {
         self.flags |= ZIP_CARRIER_CHECKED;
-        self.zip_eocd_absence = Some(Arc::new(ZipEocdAbsence { generation, start: 0 }));
+        self.zip_eocd_search = Some(Arc::new(ZipEocdSearch {
+            generation, start: 0, unique_offset: None,
+        }));
     }
 
     /// A volume set is discovered from one archive entry, never from an orphan
@@ -889,6 +900,16 @@ pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
     let Ok(reader) = ManagedReader::open(&anchor.path).map(|reader| reader.probe_reader()) else {
         return out;
     };
+    if anchor.zip_eocd_search.as_ref().is_some_and(|search| {
+        reader.physical_generation() == Some(&search.generation)
+            && search.unique_offset.is_some_and(|offset| {
+                offset < reader.len().saturating_sub(crate::formats::zip::EOCD_SEARCH_BYTES)
+            })
+    }) {
+        // A complete physical scan found only one signature outside this window.
+        out.flags |= ZIP_TAIL_CHECKED;
+        return out;
+    }
     let Ok((tail, start)) =
         crate::formats::zip::read_eocd_tail(&reader, 0, reader.len(), &[], &mut out.bytes_read)
     else {
@@ -910,11 +931,12 @@ pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
                 ZIP_EOCD,
             ).is_none()
         {
-            out.zip_eocd_absence = reader.physical_generation()
+            out.zip_eocd_search = reader.physical_generation()
                 .filter(|generation| generation.len == anchor.size)
-                .map(|generation| Arc::new(ZipEocdAbsence {
+                .map(|generation| Arc::new(ZipEocdSearch {
                     generation: generation.clone(),
                     start,
+                    unique_offset: None,
                 }));
         }
         return out;
@@ -959,12 +981,14 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
         return out;
     };
     // The managed reader already checks a fresh handle for this path.
-    let checked_suffix = out.zip_eocd_absence.take().filter(|absence| {
-        reader.physical_generation() == Some(&absence.generation)
+    let checked_suffix = out.zip_eocd_search.take().filter(|search| {
+        reader.physical_generation() == Some(&search.generation)
     });
     let unique_eocd = known_eocd.filter(|(_, generation)| {
         reader.physical_generation() == Some(*generation)
-    }).map(|(offset, _)| offset);
+    }).map(|(offset, _)| offset).or_else(|| {
+        checked_suffix.as_ref().and_then(|search| search.unique_offset)
+    });
     // Keep enough overlap to find a signature straddling the checked suffix.
     let mut end = checked_suffix.as_ref().map_or(reader.len(), |suffix| {
         if suffix.start == 0 { 0 } else { suffix.start + ZIP_EOCD.len() as u64 - 1 }
@@ -1070,7 +1094,8 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
         end = start + 3;
     }
     if unique_eocd.is_some() && !possible_eocd {
-        return upgrade_relation_zip_carrier_tail(anchor, None);
+        // Discard the observation before falling back to the full search.
+        return upgrade_relation_zip_carrier_tail(&out, None);
     }
     out.flags |= ZIP_CARRIER_CHECKED;
     if !possible_eocd && anchor.has_any(ZIP_LOCAL_HEADER) {

@@ -54,7 +54,8 @@ fn long_streams_end_on_structure_instead_of_record_quotas() {
     let source = ManagedReader::from_bytes(bytes, ReaderConfig::default());
     let head = source.read_direct_at(0, 512).unwrap();
     assert_eq!(
-        first_frame(&head, source.len(), |at, len| source.read_direct_at(at, len)),
+        first_frame(&head, source.len(), |at, len| source.read_direct_at(at, len))
+            .map(|first| first.map(|first| first.offset)),
         Ok(Some(65_537 * 8))
     );
     let parsed = walk(&source, 0, source.len());
@@ -95,7 +96,8 @@ fn all_header_layouts_preserve_known_zero_and_descriptor_length() {
             let bytes = frame(b"", flags, block << 4, size, dict);
             let header = parse_header(&bytes).unwrap();
             assert_eq!(
-                first_frame(&bytes, bytes.len() as u64, |_, _| unreachable!()),
+                first_frame(&bytes, bytes.len() as u64, |_, _| unreachable!())
+                    .map(|first| first.map(|first| first.offset)),
                 Ok(Some(0))
             );
             assert_eq!(header.content_size, size);
@@ -134,10 +136,11 @@ fn concatenated_skip_bounds_and_trailing_carrier() {
 fn standalone_probe_only_walks_when_the_tail_may_be_open() {
     let payload = [0x51u8; 4096];
     let complete = frame(&payload, 0x64, 0x40, None, None);
+    let tail = MAX_FRAME_HEADER - 1;
     assert_eq!(
         standalone_truncated(&complete[..512], complete.len() as u64, |offset, len| {
-            assert_eq!((offset, len), (complete.len() as u64 - 8, 8));
-            Ok(complete[complete.len() - 8..].to_vec())
+            assert_eq!((offset, len), ((complete.len() - tail) as u64, tail));
+            Ok(complete[complete.len() - tail..].to_vec())
         }),
         Some(false)
     );
@@ -159,7 +162,7 @@ fn standalone_probe_only_walks_when_the_tail_may_be_open() {
     // A short OS read cannot establish that a field exceeds the file size.
     assert_eq!(
         standalone_truncated(&skipped[..512], skipped.len() as u64, |offset, len| {
-            if offset == skipped.len() as u64 - 8 {
+            if offset == (skipped.len() - tail) as u64 {
                 Ok(skipped[skipped.len() - len..].to_vec())
             } else {
                 Ok(Vec::new())
@@ -168,6 +171,58 @@ fn standalone_probe_only_walks_when_the_tail_may_be_open() {
         Some(false)
     );
 }
+
+#[test]
+fn standalone_probe_disambiguates_payload_and_partial_header_zero_words() {
+    let mut payload = [0x51; 4096];
+    payload[4087..].copy_from_slice(&[0, 0, 0, 0, 0, 1, 2, 3, 4]);
+    let complete = frame(&payload, 0x64, 0x40, None, None);
+    let mut partial_next = complete.clone();
+    let next = frame(b"next", 0x6c, 0x40, Some(4), None);
+    partial_next.extend_from_slice(&next[..14]);
+    for bytes in [
+        &complete[..complete.len() - 8],
+        &complete[..complete.len() - 9],
+        partial_next.as_slice(),
+    ] {
+        assert_eq!(
+            standalone_truncated(&bytes[..512], bytes.len() as u64, |offset, len| {
+                let start = offset as usize;
+                Ok(bytes[start..start + len].to_vec())
+            }),
+            Some(true)
+        );
+    }
+
+    // A complete bare end is still accepted after a checksummed frame.
+    let mut mixed = complete;
+    mixed.extend_from_slice(&frame(&[0x51; 32], 0x60, 0x40, None, None));
+    assert_eq!(
+        standalone_truncated(&mixed[..512], mixed.len() as u64, |offset, len| {
+            assert_eq!(offset as usize + len, mixed.len());
+            Ok(mixed[offset as usize..].to_vec())
+        }),
+        Some(false)
+    );
+
+    // Dense tiny blocks with zero-ending payload keep the short tail path.
+    let mut dense = frame(b"", 0x64, 0x40, None, None);
+    dense.truncate(7);
+    for _ in 0..32 {
+        dense.extend_from_slice(&0x80000020u32.to_le_bytes());
+        dense.extend_from_slice(&[0; 32]);
+    }
+    dense.extend_from_slice(&[0; 4]);
+    dense.extend_from_slice(&xxh32(&[0; 1024]).to_le_bytes());
+    assert_eq!(
+        standalone_truncated(&dense[..512], dense.len() as u64, |offset, len| {
+            assert_eq!((offset, len), ((dense.len() - 8) as u64, 8));
+            Ok(dense[offset as usize..].to_vec())
+        }),
+        Some(false)
+    );
+}
+
 #[test]
 fn header_corruption_truncation_and_size_limits_fail_closed() {
     let original = frame(b"hello", 0x7c, 0x40, Some(5), None);
@@ -191,7 +246,8 @@ fn legacy_inputs_and_dictionary_descriptors_preserve_structure_identity() {
     let legacy = b"\x02\x21\x4c\x18\x06\0\0\0\x50hello";
     assert!(!leading(legacy));
     assert_eq!(
-        first_frame(legacy, legacy.len() as u64, |_, _| unreachable!()),
+        first_frame(legacy, legacy.len() as u64, |_, _| unreachable!())
+            .map(|first| first.map(|first| first.offset)),
         Ok(None)
     );
     assert_eq!(index(legacy.to_vec(), 0).error, "lz4_magic_not_found");

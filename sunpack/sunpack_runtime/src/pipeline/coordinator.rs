@@ -187,8 +187,9 @@ impl Engine {
             request_id, request.origin, &request.cancel.clone(), move |spawner| {
                 Box::pin(async move {
                     let result = async {
-                        engine.worker(&request.config.performance.worker, &request.cancel).await
-                            .map_err(super::startup_error)?;
+                        if request.origin == Origin::Watch || request.mode == Mode::Scan {
+                            engine.worker_ready(&request.config.performance.worker, &request.cancel).await?;
+                        }
                         let _claim = if reservation.is_some() {
                             reservation
                         } else if request.mode == Mode::Extract {
@@ -1303,6 +1304,13 @@ impl<'run, O: Observer> Run<'run, O> {
         } else { None };
         self.request.cancel.check_io()?;
         let discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates, true)?;
+        if self.request.origin == Origin::Foreground && self.request.mode == Mode::Extract
+            && discovered.tasks.iter().flat_map(|task| &task.inputs).any(|logical|
+                logical.failure.as_ref().is_none_or(|failure| failure.kind == FailureKind::MissingVolume))
+        {
+            // A missing volume can be discovered again during task execution.
+            self.engine.worker_ready(&self.request.config.performance.worker, &self.request.cancel).await?;
+        }
         let requested = self.watch_generations(&discovered);
         let mut watch = None;
         if let Some(members) = &requested {
