@@ -483,7 +483,8 @@ namespace sunpack::sevenzip
                 result.message = "RAR4 encrypted headers could not be decoded";
                 return result;
             }
-            if (format.Data4[5] == 0x01 || format.Data4[5] == 0xCC || format.Data4[5] == 0xEE)
+            if (format.Data4[5] == 0x01 || format.Data4[5] == 0x03 ||
+                format.Data4[5] == 0xCC || format.Data4[5] == 0xEE)
             {
                 // An archive can open and yield valid members despite a short
                 // structural record. Do not let their success publish the prefix.

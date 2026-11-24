@@ -37,6 +37,53 @@ fn standalone_gzip_reuses_sample_and_extends_long_headers() {
 }
 
 #[test]
+fn standalone_xz_and_zstd_detect_open_ends() {
+    use std::io::Write;
+
+    let classify = |data: &[u8], format, truncated| {
+        let mut anchor = VolumeAnchor {
+            size: data.len() as u64,
+            ..VolumeAnchor::default()
+        };
+        probe_standalone_stream(&data[..data.len().min(512)], &mut anchor, |offset, count| {
+            let offset = offset as usize;
+            Ok(data[offset..offset + count].to_vec())
+        });
+        assert!(anchor.standalone);
+        assert_eq!(anchor.format, format);
+        assert_eq!(anchor.has_any(STANDALONE_TRUNCATED), truncated);
+    };
+
+    let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
+    encoder.write_all(&[b'X'; 4096]).unwrap();
+    let xz = encoder.finish().unwrap();
+    classify(&xz, "xz", false);
+    let mut concatenated = xz.clone();
+    concatenated.extend([0; 4]);
+    concatenated.extend(&xz[..xz.len() - 4]);
+    classify(&concatenated, "xz", true);
+    concatenated.extend(&xz[xz.len() - 4..]);
+    concatenated.resize(concatenated.len() + 70_000, 0);
+    classify(&concatenated, "xz", false);
+
+    let mut zstd = b"\x28\xb5\x2f\xfd\x00\x00".to_vec();
+    for last in [0, 1] {
+        let header = ((600u32 << 3) | last).to_le_bytes();
+        zstd.extend(&header[..3]);
+        zstd.extend([b'Z'; 600]);
+    }
+    classify(&zstd[..zstd.len() - 1], "zstd", true);
+    classify(&zstd, "zstd", false);
+    let mut concatenated = zstd.clone();
+    concatenated.extend(b"\x5f\x2a\x4d\x18\x04\x00\x00\x00meta");
+    classify(&concatenated, "zstd", false);
+    concatenated.extend(&zstd[..3]);
+    classify(&concatenated, "zstd", true);
+    concatenated.extend(&zstd[3..]);
+    classify(&concatenated, "zstd", false);
+}
+
+#[test]
 fn bare_mz_does_not_expand_or_authorize_nonleading_archive_probes() {
     let mut seven_zip = SEVEN_ZIP.to_vec();
     seven_zip.extend([0, 4]);

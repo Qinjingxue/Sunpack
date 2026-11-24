@@ -31,55 +31,32 @@ impl StructuralStreamKind {
     }
 }
 
-pub(super) fn compression_prefix_identity(
+pub(super) fn compression_stream_evidence(
     kind: StructuralStreamKind,
     prefix: &[u8],
     file_size: u64,
     mut read: impl FnMut(u64, usize) -> io::Result<Vec<u8>>,
-) -> bool {
+) -> Option<StreamReadiness> {
     match kind {
-        StructuralStreamKind::Gzip => validate_gzip_identity(prefix, file_size, read).is_ok(),
-        StructuralStreamKind::Bzip2 => validate_bzip2_identity(prefix, file_size).is_ok(),
+        StructuralStreamKind::Gzip => validate_gzip_identity(prefix, file_size, read)
+            .is_ok().then_some(StreamReadiness::Candidate),
+        StructuralStreamKind::Bzip2 => validate_bzip2_identity(prefix, file_size)
+            .is_ok().then_some(StreamReadiness::Candidate),
         StructuralStreamKind::Xz => {
-            validate_xz_identity(prefix, file_size, |size| read(12, size)).is_ok()
+            validate_xz_identity(prefix, file_size, |size| read(12, size)).ok()?;
+            let footer = xz_has_terminal_footer(file_size, |offset, count| {
+                let offset_in_prefix = offset.min(prefix.len() as u64) as usize;
+                if let Some(bytes) = prefix.get(offset_in_prefix..offset_in_prefix + count) {
+                    return Ok(Cow::Borrowed(bytes));
+                }
+                read(offset, count).map(Cow::Owned)
+            });
+            Some(if matches!(footer, Ok(false)) {
+                StreamReadiness::Truncated
+            } else {
+                StreamReadiness::Candidate
+            })
         }
-        StructuralStreamKind::Zstd => zstd_prefix_identity(prefix, file_size),
+        StructuralStreamKind::Zstd => zstd_head_extent(prefix, file_size, read),
     }
-}
-
-fn zstd_prefix_identity(data: &[u8], file_size: u64) -> bool {
-    if data.len() < 8 {
-        return false;
-    }
-    let descriptor = data[4];
-    if descriptor & 0x18 != 0 {
-        return false;
-    }
-    let single = descriptor & 0x20 != 0;
-    let dict_size = match descriptor & 0x03 {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        _ => 4,
-    };
-    let fcs_size = match descriptor >> 6 {
-        0 => usize::from(single),
-        1 => 2,
-        2 => 4,
-        _ => 8,
-    };
-    let block_header_offset = 5 + usize::from(!single) + dict_size + fcs_size;
-    if block_header_offset + 3 > data.len() {
-        return false;
-    }
-    let block_header = u32::from(data[block_header_offset])
-        | (u32::from(data[block_header_offset + 1]) << 8)
-        | (u32::from(data[block_header_offset + 2]) << 16);
-    let block_type = (block_header >> 1) & 0x03;
-    let block_size = u64::from(block_header >> 3);
-    if block_type == 3 || block_size > 128 * 1024 {
-        return false;
-    }
-    let stored_size = if block_type == 1 { 1 } else { block_size };
-    block_header_offset as u64 + 3 + stored_size <= file_size
 }

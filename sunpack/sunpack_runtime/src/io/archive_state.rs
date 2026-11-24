@@ -97,6 +97,9 @@ pub(crate) struct AnalysisFacts {
     pub missing_volume_evidence: Option<String>,
     pub password_required: bool,
     pub structure_complete: bool,
+    // Only applies to the physical observation being executed.
+    #[serde(skip)]
+    pub standalone_truncated: bool,
     pub zip_spanned: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rar_native_volume: bool,

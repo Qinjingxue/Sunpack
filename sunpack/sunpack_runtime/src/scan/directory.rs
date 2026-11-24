@@ -10,8 +10,9 @@ use super::catalog::{catalog_stem, CatalogRow, GeneratedBaseline, NativeWatchObs
 use super::path_filter::{FilterPath, NativePathRule, PathRule, PathRuleScratch};
 use crate::analysis_native::volume_anchor::{
     cheap_fast_probe_pool, probe_volume_anchor_from_head, probe_volume_anchor_path_cheap,
-    probe_volume_anchor_record_cheap, CheapAnchor, CheapAnchorCell,
+    probe_volume_anchor_record_cheap, CheapAnchor, CheapAnchorCell, ZIP_LOCAL_HEADER,
 };
+use crate::io::reader::capture_file_generation;
 use crate::io::resource_lifecycle::{NativeReadScope, PromotionCompletion};
 
 #[derive(Debug, Default, Clone)]
@@ -106,10 +107,24 @@ impl NativeDirectorySnapshot {
         filtered_rows: Vec<usize>,
         raw: impl IntoIterator<Item = DirectoryEntryRecord>,
         errors: DirectoryReadErrors,
-        cells: Vec<Option<CheapAnchorCell>>,
+        mut cells: Vec<Option<CheapAnchorCell>>,
     ) -> (Self, Self) {
         let mut table = Self::build_table(raw);
         debug_assert!(cells.is_empty() || cells.len() == table.paths.len());
+        if cells.is_empty() {
+            for (i, anchor) in table.relation_anchors.iter().enumerate() {
+                if anchor.as_ref().and_then(CheapAnchor::anchor)
+                    .is_some_and(|anchor| !anchor.standalone && anchor.has_any(ZIP_LOCAL_HEADER))
+                {
+                    // Foreground slots start empty and only memoize exhaustive
+                    // negative ZIP tail searches used by missing-volume retry.
+                    if cells.is_empty() {
+                        cells.resize_with(table.paths.len(), || None);
+                    }
+                    cells[i] = Some(CheapAnchorCell::default());
+                }
+            }
+        }
         table.relation_anchor_cells = cells;
         table.scan_errors = errors.into_messages();
         let table = Arc::new(table);
@@ -650,10 +665,20 @@ impl NativeDirectoryScanOptions {
                         && record.size == previous.table.sizes[row]
                         && record.mtime_ns == previous.table.mtimes_ns[row]
                     {
-                        record.relation_anchor = previous.table.relation_anchors[row]
-                            .as_ref()
-                            .filter(|anchor| anchor.reusable())
-                            .cloned();
+                        record.relation_anchor = previous.table.relation_anchor_cells
+                            .get(row)
+                            .and_then(Option::as_ref)
+                            .and_then(|cell| {
+                                let saved = cell.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+                                let generation = saved.anchor()?.zip_eocd_absent_generation.as_ref()?;
+                                capture_file_generation(Path::new(&record.path))
+                                    .is_ok_and(|current| &current == generation.as_ref())
+                                    .then_some(saved)
+                            })
+                            .or_else(|| previous.table.relation_anchors[row]
+                                .as_ref()
+                                .filter(|anchor| anchor.reusable())
+                                .cloned());
                     }
                 }
             }

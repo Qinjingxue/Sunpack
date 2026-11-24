@@ -12,7 +12,7 @@ use xz2::write::XzEncoder;
 // EOCD rejected by standalone validation, especially at a read boundary.
 #[test]
 fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
-    for terminal in [false, true] {
+    for terminal in [None, Some(64 * 1024 - 2), Some(128 * 1024 - 21)] {
         let mut data = vec![b'x'; 128 * 1024];
         let mut local = [0u8; 31];
         local[..4].copy_from_slice(ZIP_LOCAL);
@@ -20,10 +20,10 @@ fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
         local[26] = 1;
         local[30] = b'a';
         data[37..68].copy_from_slice(&local);
-        if terminal {
-            let offset = 64 * 1024 - 2;
+        if let Some(offset) = terminal {
             data[offset..offset + 4].copy_from_slice(ZIP_EOCD);
-            data[offset + 4..offset + 22].fill(0);
+            let end = data.len().min(offset + 22);
+            data[offset + 4..end].fill(0);
             data[offset + 4] = 1; // Multi-disk EOCD is not standalone.
         }
         let path = temp_file("zip_terminal_proof", &data);
@@ -36,10 +36,11 @@ fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
         .unwrap();
         let anchors = scan.relation_anchors();
         assert!(!anchors.is_empty());
-        assert_eq!(scan.zip_eocd_absent, !terminal);
+        let absent = terminal.is_none_or(|offset| data.len() - offset < 22);
+        assert_eq!(scan.zip_eocd_absent, absent);
         assert!(anchors
             .iter()
-            .all(|a| a.has_any(ZIP_CARRIER_CHECKED) == !terminal));
+            .all(|a| a.has_any(ZIP_CARRIER_CHECKED) == absent));
         let _ = fs::remove_file(path);
     }
 }

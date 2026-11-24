@@ -1820,7 +1820,7 @@ impl MatchPart {
 
 // Matching jobs keep only a bounded normalization horizon and encoded leaves.
 pub(super) struct HitBuffer {
-    pub(super) saw_zip_eocd: bool,
+    pub(super) first_zip_eocd: u64,
     parts: [MatchPart; 2],
     base: u64,
     start: u64,
@@ -1833,7 +1833,7 @@ pub(super) struct HitBuffer {
 impl HitBuffer {
     pub(super) fn new(base: u64, start: u64, end: u64, overlap: usize) -> Self {
         Self {
-            saw_zip_eocd: false,
+            first_zip_eocd: u64::MAX,
             parts: std::array::from_fn(|_| MatchPart::default()),
             base,
             start,

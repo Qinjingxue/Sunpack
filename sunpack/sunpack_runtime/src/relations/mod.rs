@@ -281,6 +281,8 @@ impl NativeRelationGroup {
         );
         input.analysis.password_required = data.needs_password;
         input.analysis.origin = AnalysisOrigin::Relations;
+        input.analysis.standalone_truncated = matches!(self, Self::Ordinary(..))
+            && anchor.is_some_and(VolumeAnchor::standalone_truncated);
         let zip_awaits_tail = anchor.is_some_and(|a| a.has_any(ZIP_AWAITING_TAIL))
             && match self {
                 Self::Ordinary(..) => true,

@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex};
 use crc32fast::hash as crc32;
 use memchr::memmem;
 
-use crate::analysis_native::structure::{compression_prefix_identity, unified_prefilter_mask_from_head, StructuralStreamKind};
-use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
-use crate::io::reader::ManagedReader;
+use crate::analysis_native::structure::{compression_stream_evidence, unified_prefilter_mask_from_head, StructuralStreamKind};
+use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_header, read_vint};
+use crate::io::reader::{capture_file_generation, ManagedReader, PhysicalFileGeneration};
 use crate::io::resource_lifecycle::{IdleRayonPool, NativeReadScope, TrackedFile};
 use crate::password::rar::{
     rar5_archive_encryption_header, rar5_encryption_identity, Rar5EncryptionIdentity,
 };
+use crate::scan::compression_stream::StreamReadiness;
 use crate::scan::pe_overlay::{probe_pe_prefix, PeState};
 use std::borrow::Cow;
 
@@ -48,6 +49,8 @@ pub(crate) const WINRAR_STUB: u32 = 1 << 21;
 pub(crate) const EMBEDDED_VOLUME: u32 = 1 << 22;
 pub(crate) const UNRESOLVED_VOLUME: u32 = 1 << 23;
 pub(crate) const ZIP_AWAITING_TAIL: u32 = 1 << 24;
+// The structure of this standalone input requires bytes beyond the observed end.
+pub(crate) const STANDALONE_TRUNCATED: u32 = 1 << 25;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct VolumeAnchor {
@@ -70,6 +73,9 @@ pub(crate) struct VolumeAnchor {
     pub(crate) carrier_limit: Option<u64>,
     pub(crate) expected_logical_size: Option<u64>,
     pub(crate) zip_eocd_offset: Option<u64>,
+    // Only an exhaustive physical search without any complete EOCD candidate
+    // can promote this negative fact into a later inventory.
+    pub(crate) zip_eocd_absent_generation: Option<Arc<PhysicalFileGeneration>>,
     pub(crate) zip_directory: Option<Arc<crate::formats::zip::RelationDirectory>>,
     // A two-disk directory can locate a carrier head without an interior disk.
     pub(crate) zip_head_size: Option<u64>,
@@ -90,6 +96,10 @@ pub(crate) struct VolumeAnchor {
 impl VolumeAnchor {
     pub(crate) fn has_any(&self, flags: u32) -> bool {
         self.flags & flags != 0
+    }
+
+    pub(crate) fn standalone_truncated(&self) -> bool {
+        self.standalone && self.has_any(STANDALONE_TRUNCATED)
     }
 
     /// A volume set is discovered from one archive entry, never from an orphan
@@ -493,7 +503,7 @@ fn probe_rar(prefix: &[u8], offset: usize, out: &mut VolumeAnchor) -> bool {
         .is_some_and(|value| value.starts_with(RAR5))
     {
         let header_offset = offset + RAR5.len();
-        let Some((archive_flags, number)) = rar5_main_volume(prefix, header_offset) else {
+        let Some(main) = rar5_main_header(prefix, header_offset) else {
             let data = &prefix[offset..];
             let Some((body, end)) = rar5_archive_encryption_header(data) else { return false; };
             initialize_rar_anchor(out, offset);
@@ -505,14 +515,17 @@ fn probe_rar(prefix: &[u8], offset: usize, out: &mut VolumeAnchor) -> bool {
         };
         initialize_rar_anchor(out, offset);
         out.flags |= RAR_VERSION_5;
-        out.rar_next_header_offset = read_vint(prefix, header_offset + 4)
-            .and_then(|(size, start)| (start as u64).checked_add(size));
-        out.multivolume = archive_flags & 0x01 != 0;
+        out.rar_next_header_offset = Some(main.end as u64);
+        out.multivolume = main.archive_flags & 0x01 != 0;
         if out.multivolume {
-            out.internal_volume_number = Some(number.unwrap_or(0) + 1);
-            out.flags |= RAR_PART_NUMBERING | if number.is_none() { FIRST } else { MEMBER };
+            out.internal_volume_number = Some(main.volume_number.unwrap_or(0) + 1);
+            out.flags |= RAR_PART_NUMBERING | if main.volume_number.is_none() { FIRST } else { MEMBER };
         } else {
             out.standalone = true;
+            let available = out.size.saturating_sub(header_offset as u64);
+            if main.service_offset.is_some_and(|offset| offset >= available) {
+                out.flags |= STANDALONE_TRUNCATED;
+            }
         }
     } else if let Some(flags) = rar4_main_flags(prefix, offset + RAR4.len()) {
         initialize_rar_anchor(out, offset);
@@ -869,14 +882,23 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> Volume
         return out;
     };
     let mut end = reader.len();
+    let mut possible_eocd = false;
     while end != 0 {
         let start = end.saturating_sub(64 * 1024);
-        let Ok(window) = reader.read_cached_at(start, (end - start) as usize) else {
+        let length = (end - start) as usize;
+        let Ok(window) = reader.read_cached_at(start, length) else {
             return out;
         };
+        if window.len() != length {
+            return out;
+        }
         out.bytes_read += window.len() as u64;
         for at in memmem::rfind_iter(&window, ZIP_EOCD) {
             let offset = start + at as u64;
+            if reader.len() - offset < 22 {
+                continue;
+            }
+            possible_eocd = true;
             let Ok(fixed) = reader.read_cached_at(offset, 22) else {
                 return out;
             };
@@ -946,6 +968,15 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> Volume
         end = start + 3;
     }
     out.flags |= ZIP_CARRIER_CHECKED;
+    if !possible_eocd && anchor.has_any(ZIP_LOCAL_HEADER) {
+        if let Some(generation) = reader.physical_generation().filter(|generation| {
+            generation.len == anchor.size
+                && capture_file_generation(std::path::Path::new(&out.path))
+                    .is_ok_and(|current| &current == *generation)
+        }) {
+            out.zip_eocd_absent_generation = Some(Arc::new(generation.clone()));
+        }
+    }
     out
 }
 
@@ -1278,7 +1309,7 @@ fn probe_anchor_reader_prefix(
 fn probe_standalone_stream(
     prefix: &[u8],
     out: &mut VolumeAnchor,
-    read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
+    mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
 ) {
     // Confirm the prefix before ruling this file out as a possible volume.
     // Continuation bytes can coincide with a leading stream signature.
@@ -1287,7 +1318,16 @@ fn probe_standalone_stream(
     } else if crate::formats::lz4::leading(prefix) {
         (crate::formats::lz4::identity(prefix, out.size, read) == Ok(true)).then_some("lz4")
     } else if let Some(kind) = StructuralStreamKind::from_header(prefix) {
-        compression_prefix_identity(kind, prefix, out.size, read).then_some(kind.format())
+        compression_stream_evidence(kind, prefix, out.size, |offset, count| {
+            let bytes = read(offset, count)?;
+            out.bytes_read += bytes.len() as u64;
+            Ok(bytes)
+        }).map(|readiness| {
+            if matches!(readiness, StreamReadiness::Truncated) {
+                out.flags |= STANDALONE_TRUNCATED;
+            }
+            kind.format()
+        })
     } else if prefix.get(257..262) == Some(b"ustar") {
         crate::formats::tar::header_identity(prefix, out.size).then_some("tar")
     } else {

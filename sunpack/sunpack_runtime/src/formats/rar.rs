@@ -39,7 +39,14 @@ pub(crate) fn rar5_header_len(data: &[u8]) -> Option<usize> {
         .filter(|&n| n <= 2 * 1024 * 1024)
 }
 
-pub(crate) fn rar5_main_volume(data: &[u8], offset: usize) -> Option<(u64, Option<u32>)> {
+pub(crate) struct Rar5MainHeader {
+    pub(crate) archive_flags: u64,
+    pub(crate) volume_number: Option<u32>,
+    pub(crate) end: usize,
+    pub(crate) service_offset: Option<u64>,
+}
+
+pub(crate) fn rar5_main_header(data: &[u8], offset: usize) -> Option<Rar5MainHeader> {
     let data = data.get(offset..)?;
     let end = rar5_header_len(data)?;
     let header = data.get(..end)?;
@@ -48,7 +55,41 @@ pub(crate) fn rar5_main_volume(data: &[u8], offset: usize) -> Option<(u64, Optio
         return None;
     }
     let (_, start) = read_vint(header, 4)?;
-    rar5_common_fields(header, start)?.main_volume(header)
+    let fields = rar5_common_fields(header, start)?;
+    let (archive_flags, volume_number) = fields.main_volume(header)?;
+    let extra_size = usize::try_from(fields.extra_size).ok()?;
+    let service_offset = locator_service_offset(&header[header.len() - extra_size..]);
+    Some(Rar5MainHeader {
+        archive_flags,
+        volume_number,
+        end: offset + end,
+        service_offset,
+    })
+}
+
+/// Largest nonzero locator offset relative to the main header. An unknown or
+/// malformed optional record does not establish a required extent.
+fn locator_service_offset(mut extras: &[u8]) -> Option<u64> {
+    while !extras.is_empty() {
+        let (size, start) = read_vint(extras, 0)?;
+        let end = start.checked_add(usize::try_from(size).ok()?)?;
+        let record = extras.get(start..end)?;
+        let (kind, cursor) = read_vint(record, 0)?;
+        if kind == 1 {
+            let (flags, mut cursor) = read_vint(record, cursor)?;
+            let mut furthest = 0;
+            for flag in [1, 2] {
+                if flags & flag != 0 {
+                    let (offset, next) = read_vint(record, cursor)?;
+                    furthest = furthest.max(offset);
+                    cursor = next;
+                }
+            }
+            return (furthest != 0).then_some(furthest);
+        }
+        extras = &extras[end..];
+    }
+    None
 }
 
 pub(crate) struct Rar5CommonFields {

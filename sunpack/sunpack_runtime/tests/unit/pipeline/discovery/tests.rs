@@ -1,4 +1,49 @@
 use super::*;
+
+const STORED_ZIP: &[u8] = b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00";
+
+#[test]
+fn zip_retry_reuses_negative_tail_only_for_the_same_physical_generation() {
+    use crate::analysis_native::volume_anchor::CheapAnchor;
+
+    let root = crate::test_support::temp_file("zip_retry_generation", b"");
+    std::fs::remove_file(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let archive = root.join("item.bin");
+    let replacement = root.join("replacement.bin");
+    let mut incomplete = STORED_ZIP.to_vec();
+    let eocd = incomplete.len() - 22;
+    incomplete[eocd..].fill(0);
+    std::fs::write(&archive, incomplete).unwrap();
+    let scope = NativeDiscoveryScope::new(root.to_string_lossy().into_owned(), Some(0), Vec::new());
+    let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+    let (filtered, raw) = options.scan_scope(&scope, None).unwrap();
+    let _ = NativeCandidateTable::from_directory(&raw, &filtered, None, false);
+    let refresh = || {
+        options.refresh_relation_bucket(&scope, archive.to_str().unwrap(), &raw, None, false).unwrap()
+    };
+    let has_negative = |snapshot: &NativeDirectorySnapshot| {
+        snapshot.rows().any(|row| {
+            snapshot.table.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor)
+                .is_some_and(|anchor| anchor.zip_eocd_absent_generation.is_some())
+        })
+    };
+    assert!(has_negative(&refresh().1));
+
+    let previous_time = std::fs::metadata(&archive).unwrap().modified().unwrap();
+    std::fs::write(&replacement, STORED_ZIP).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&replacement).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(previous_time)).unwrap();
+    std::fs::remove_file(&archive).unwrap();
+    std::fs::rename(&replacement, &archive).unwrap();
+    assert_eq!(std::fs::metadata(&archive).unwrap().modified().unwrap(), previous_time);
+    let (filtered, current) = refresh();
+    assert!(!has_negative(&current));
+    let replacement = NativeCandidateTable::from_directory(&current, &filtered, None, false);
+    assert_eq!(replacement.resolve().unwrap().resolved_relations().count(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn embedded_pages_cross_scope_boundaries_without_losing_ownership() {
     let root = std::env::temp_dir().join(format!(
@@ -10,7 +55,7 @@ fn embedded_pages_cross_scope_boundaries_without_losing_ownership() {
             .as_nanos()
     ));
     let mut carrier = vec![0x41; 17];
-    carrier.extend_from_slice(b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00");
+    carrier.extend_from_slice(STORED_ZIP);
     let mut inputs = Vec::new();
     let mut expected = HashSet::new();
     // A page crosses roots and then splits inside the last root; the empty
@@ -78,7 +123,7 @@ fn covered_explicit_targets_keep_their_retry_boundary() {
     std::fs::create_dir_all(&child).unwrap();
     let archive = child.join("archive.zip");
     // A complete stored ZIP, so discovery needs no worker or passwords.
-    std::fs::write(&archive, b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00").unwrap();
+    std::fs::write(&archive, STORED_ZIP).unwrap();
     let options =
         NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
             .unwrap();

@@ -36,6 +36,11 @@ impl ValidationError {
 
 pub(crate) type ValidationResult<T> = Result<T, ValidationError>;
 
+pub(crate) enum StreamReadiness {
+    Candidate,
+    Truncated,
+}
+
 fn invalid<T>(code: &'static str) -> ValidationResult<T> {
     Err(ValidationError::Invalid(code))
 }
@@ -1139,6 +1144,47 @@ pub(crate) fn check_xz_footer(footer: &[u8], end: u64) -> ValidationResult<()> {
     Ok(())
 }
 
+pub(crate) fn xz_has_terminal_footer<B: AsRef<[u8]>>(
+    size: u64,
+    mut read: impl FnMut(u64, usize) -> io::Result<B>,
+) -> io::Result<bool> {
+    if size < 32 || size % 4 != 0 {
+        return Ok(false);
+    }
+    let mut end = size;
+    let mut window = 12;
+    while end >= 32 {
+        let count = end.min(window) as usize;
+        let start = end - count as u64;
+        let tail = read(start, count)?;
+        let tail = tail.as_ref();
+        if tail.len() != count {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let Some(last) = tail.iter().rposition(|&byte| byte != 0) else {
+            // Padding has no length field. Only this exceptional path needs
+            // larger windows, so the ordinary case reads just the footer.
+            end = start;
+            window = (window * 4).clamp(INITIAL_PROBE_BYTES as u64, BUFFER_SIZE as u64);
+            continue;
+        };
+        end = start + last as u64 + 1;
+        if end < 32 || end % 4 != 0 {
+            return Ok(false);
+        }
+        let before_padding = &tail[..=last];
+        if let Some(start) = before_padding.len().checked_sub(12) {
+            return Ok(check_xz_footer(&before_padding[start..], end).is_ok());
+        }
+        let footer = read(end - 12, 12)?;
+        if footer.as_ref().len() != 12 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        return Ok(check_xz_footer(footer.as_ref(), end).is_ok());
+    }
+    Ok(false)
+}
+
 fn xz_footer_fields(footer: &[u8], end: u64) -> ValidationResult<XzFooter> {
     if footer.len() != 12 || &footer[10..12] != b"YZ" {
         return invalid("xz_footer_magic_invalid");
@@ -1418,39 +1464,59 @@ pub(crate) fn validate_xz_identity(
     Ok(bytes_read)
 }
 
-fn read_u32(reader: &ManagedReader, offset: u64, limit: u64) -> ValidationResult<u32> {
-    if offset + 4 > limit {
-        return invalid("unexpected_end_of_stream");
-    }
-    let bytes = reader.read_cached_at(offset, 4)?;
-    if bytes.len() != 4 {
-        return invalid("unexpected_end_of_stream");
-    }
-    Ok(u32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
-}
-
 pub(crate) fn validate_zstd_structure(
     reader: &ManagedReader,
     offset: u64,
     limit: u64,
-    mut visit: impl FnMut(u64) -> ValidationResult<()>,
+    visit: impl FnMut(u64) -> ValidationResult<()>,
 ) -> ValidationResult<u64> {
-    let mut cursor = offset;
+    let mut read = |offset, count| reader.read_cached_at(offset, count);
+    let mut bytes = ByteCursor::new(&mut read, offset, limit, CachedBytes::default());
+    walk_zstd_frames(&mut bytes, visit, &mut false)
+}
+
+pub(crate) fn zstd_head_extent(
+    head: &[u8],
+    size: u64,
+    mut read: impl FnMut(u64, usize) -> io::Result<Vec<u8>>,
+) -> Option<StreamReadiness> {
+    let mut buffered_end = head.len() as u64;
+    let mut sparse = |offset, count: usize| {
+        // Dense headers can grow their read window. After a seek past a
+        // block payload, start with a small window near the next header.
+        let count = if offset == buffered_end { count } else { count.min(INITIAL_PROBE_BYTES) };
+        let bytes = read(offset, count)?;
+        if bytes.len() != count {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        buffered_end = offset + count as u64;
+        Ok(Cow::Owned(bytes))
+    };
+    let mut bytes = ByteCursor::new(&mut sparse, 0, size, Cow::Borrowed(head));
+    let mut saw_block = false;
+    let extent = walk_zstd_frames(&mut bytes, |_| Ok(()), &mut saw_block);
+    saw_block.then(|| match extent {
+        Ok(end) if end < size && size - end < 4 => StreamReadiness::Truncated,
+        Err(ValidationError::Invalid("unexpected_end_of_stream")) => StreamReadiness::Truncated,
+        _ => StreamReadiness::Candidate,
+    })
+}
+
+fn walk_zstd_frames(
+    bytes: &mut ByteCursor<'_, impl AsRef<[u8]>>,
+    mut visit: impl FnMut(u64) -> ValidationResult<()>,
+    saw_block: &mut bool,
+) -> ValidationResult<u64> {
+    let mut end = bytes.position();
     let mut has_frame = false;
-    loop {
-        visit(cursor)?;
-        let magic = read_u32(reader, cursor, limit)?;
+    while bytes.limit.saturating_sub(end) >= 4 {
+        let magic = u32::from_le_bytes(bytes.read_array()?);
         if (0x184d2a50..=0x184d2a5f).contains(&magic) {
-            let size = u64::from(read_u32(reader, cursor + 4, limit)?);
-            cursor = cursor
-                .checked_add(8 + size)
-                .ok_or(ValidationError::Invalid("zstd_skippable_size_overflow"))?;
-            if cursor > limit {
-                return invalid("zstd_skippable_frame_truncated");
-            }
+            visit(end)?;
+            let size = u32::from_le_bytes(bytes.read_array()?);
+            bytes.skip(u64::from(size))?;
         } else if magic == ZSTD_MAGIC {
-            let mut read = |offset, count| reader.read_cached_at(offset, count);
-            let mut bytes = ByteCursor::new(&mut read, cursor + 4, limit, CachedBytes::default());
+            visit(end)?;
             let descriptor = bytes.read_byte()?;
             if descriptor & 0x18 != 0 {
                 return invalid("zstd_reserved_or_unused_bit_set");
@@ -1469,6 +1535,7 @@ pub(crate) fn validate_zstd_structure(
                 let block = frame.block(bytes.read_array()?)
                     .ok_or(ValidationError::Invalid("zstd_block_header_invalid"))?;
                 bytes.skip(block.encoded_size)?;
+                *saw_block = true;
                 if block.last {
                     break;
                 }
@@ -1476,23 +1543,16 @@ pub(crate) fn validate_zstd_structure(
             if frame.has_checksum {
                 bytes.skip(4)?;
             }
-            cursor = bytes.position();
             has_frame = true;
         } else {
             break;
         }
-        if cursor + 4 > limit {
-            break;
-        }
-        let next = read_u32(reader, cursor, limit)?;
-        if next != ZSTD_MAGIC && !(0x184d2a50..=0x184d2a5f).contains(&next) {
-            break;
-        }
+        end = bytes.position();
     }
     if !has_frame {
         return invalid("zstd_frame_missing");
     }
-    Ok(cursor)
+    Ok(end)
 }
 
 #[cfg(test)]

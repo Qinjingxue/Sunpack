@@ -28,6 +28,7 @@ pub(crate) enum CandidateProjection<'a> {
         path: &'a str,
         format_hint: &'a str,
         logical_name: String,
+        standalone_truncated: bool,
     },
     Relation {
         relation: RelationProjection,
@@ -1191,13 +1192,12 @@ impl NativeCandidateTable {
         Ok(match row {
             Candidate::File(table, index) => {
                 let path = &table.paths[*index];
-                let fact = table.relation_anchors[*index].as_ref();
+                let anchor = table.relation_anchors[*index].as_ref().and_then(CheapAnchor::anchor);
                 CandidateProjection::File {
                     path,
-                    format_hint: fact
-                        .and_then(CheapAnchor::anchor)
-                        .map_or("", |anchor| anchor.format),
+                    format_hint: anchor.map_or("", |anchor| anchor.format),
                     logical_name: filesystem_logical_name(path),
+                    standalone_truncated: anchor.is_some_and(VolumeAnchor::standalone_truncated),
                 }
             }
             Candidate::Relation(group) => {

@@ -2956,6 +2956,8 @@ impl<'run, O: Observer> Run<'run, O> {
         } = logical;
         let mut result = receipt(&input, source, depth);
         result.password = password.as_deref().map(str::to_owned);
+        let truncated = input.analysis.standalone_truncated;
+        let requirement = self.request.config.extraction.content_requirement;
         if let Some(failure) = failure {
             result.failure = Some(failure);
             return Ok(Executed {
@@ -3056,7 +3058,7 @@ impl<'run, O: Observer> Run<'run, O> {
         };
         if let Some(password) = &plan.verified_password {
             result.password = Some(password.to_string());
-            if self.request.mode == Mode::Scan && complete_verified_scan_layout(&mut input, &mut result) {
+            if self.request.mode == Mode::Scan && !truncated && complete_verified_scan_layout(&mut input, &mut result) {
                 self.request.cancel.check_io()?;
                 result.encrypted = plan.encrypted;
                 self.notify(|| Event::Finalizing { id });
@@ -3238,6 +3240,13 @@ impl<'run, O: Observer> Run<'run, O> {
                         result.bytes = stats.total_size;
                         result.output = Some(output.clone());
                         inventory = stats.inventory;
+                    }
+                    // A recovery-enabled decoder may report only the members it
+                    // found. The native extent still rules out complete success.
+                    if truncated {
+                        result.failure = discovery::discovery_failure("corrupt_archive", source, &input.entry_path);
+                        result.recovered_complete_files = result.files;
+                        result.partial = accepts_partial_content(requirement, FailureKind::Damaged, result.files);
                     }
                 } else if result.failure.is_none() {
                     let split = input.mode.structured() || input.physical_paths().nth(1).is_some()

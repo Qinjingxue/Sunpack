@@ -384,7 +384,7 @@ fn scan_embedded_archives_native_with_iocp(
         if let Some(capture) = &capture {
             capture.record(&batch.results, base + carry as u64);
         }
-        if batch.results.saw_zip_eocd {
+        if file_size.saturating_sub(batch.results.first_zip_eocd) >= 22 {
             saw_zip_eocd.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         ScanBatch {
@@ -1036,13 +1036,13 @@ fn record_raw_hit(
     if end <= carry_len {
         return;
     }
-    // Standalone validation rejects multi-disk EOCDs below. Their presence
-    // must still prevent a negative Relations terminal proof.
+    let absolute = base_offset + start as u64;
+    // Standalone validation rejects multi-disk EOCDs below. Preserve any
+    // signature whose fixed record could fit, including across chunks.
     if pattern == 1 {
-        hits.results.saw_zip_eocd = true;
+        hits.results.first_zip_eocd = hits.results.first_zip_eocd.min(absolute);
     }
     let (_, _, kind) = PATTERNS[pattern];
-    let absolute = base_offset + start as u64;
     let candidate_offset = if kind == "lz4_skippable" {
         let Some(value) = absolute.checked_sub(1) else {
             return;

@@ -145,6 +145,9 @@ pub(crate) trait ByteSource: Send + Sync {
     fn file_identity(&self) -> Option<FileIdentity> {
         None
     }
+    fn physical_generation(&self) -> Option<&PhysicalFileGeneration> {
+        None
+    }
     fn attempt_cache(&self) -> Option<&AttemptCache> {
         None
     }
@@ -406,6 +409,10 @@ impl ManagedReader {
         self.source.file_identity().ok_or_else(|| {
             io::Error::other("password context requires a physical input generation")
         })
+    }
+
+    pub(crate) fn physical_generation(&self) -> Option<&PhysicalFileGeneration> {
+        self.source.physical_generation()
     }
 
     #[cfg(windows)]
@@ -1055,6 +1062,9 @@ impl ByteSource for FileSource {
     }
     fn file_identity(&self) -> Option<FileIdentity> {
         Some(self.identity.clone())
+    }
+    fn physical_generation(&self) -> Option<&PhysicalFileGeneration> {
+        Some(&self.physical)
     }
 
     fn len(&self) -> u64 {

@@ -5,7 +5,9 @@ from zipfile import ZipFile
 
 import pytest
 
-from tests.real.archive_boundary import assert_extracted, extract_report, require_generator
+from tests.helpers.real_archives import run_cmd
+from tests.helpers.tool_config import get_optional_rar
+from tests.real.archive_boundary import assert_extracted, extract_report, failure_kinds, require_generator
 from tests.real.plan7_watch_downloads.plan7_support import FACTORY, wait_for, watch_setup
 
 
@@ -102,6 +104,56 @@ def test_zip_carrier_independent_ranges_still_deliver(package, tmp_path):
         assert report["summary"]["failed_count"] == 0, report
     assert {p.name: p.read_bytes() for p in output.rglob("*") if p.is_file()} == {
         "left.txt": b"left", "right.txt": b"right", "solo.txt": b"solo",
+    }
+
+
+@pytest.mark.parametrize("version", [4, 5])
+def test_rar_rejects_prefix_with_evidence_of_missing_bytes(package, tmp_path, version):
+    require_generator("rar")
+    first = b"first stored member\n" * 64
+    second = b"second stored member\n" * 64
+    (tmp_path / "a.bin").write_bytes(first)
+    (tmp_path / "z.bin").write_bytes(second)
+    archive = tmp_path / "fixture.rar"
+    quick_open = ["-qo+"] if version == 5 else []
+    run_cmd([
+        str(get_optional_rar()), "a", "-ep", "-idq", "-m0", f"-ma{version}", *quick_open,
+        str(archive), "a.bin", "z.bin",
+    ], tmp_path)
+    full = archive.read_bytes()
+    start = full.index(first)
+    assert start < full.index(second)
+    # RAR4 has a short member header. RAR5 has the whole member, but the
+    # main header locates a later quick-open service record beyond the cut.
+    cut = start - 1 if version == 4 else start + len(first)
+    source = tmp_path / "archive.data"
+    source.write_bytes(full[:cut])
+    output = tmp_path / "out"
+    report = extract_report(package, source, output, deep=False, cleanup="d", code=1)
+    assert failure_kinds(report) == {"damaged"}, report
+    assert source.is_file()
+    assert not any(path.is_file() for path in output.rglob("*"))
+
+    if version == 5:
+        package.configure(extraction={"content_requirement": "allow_partial"})
+        salvage = tmp_path / "salvage"
+        report = extract_report(package, source, salvage, deep=False, cleanup="d", code=(0, 4))
+        assert report["summary"]["partial_success_count"] == 1, report
+        assert report["summary"]["success_count"] == 0, report
+        assert failure_kinds(report) == {"damaged"}, report
+        assert source.is_file()
+        assert {path.name: path.read_bytes() for path in salvage.rglob("*") if path.is_file()} == {
+            "a.bin": first,
+        }
+        package.configure(extraction={"content_requirement": "complete"})
+
+    with source.open("ab") as writer:
+        writer.write(full[cut:])
+    report = extract_report(package, source, output, deep=False, cleanup="d")
+    assert report["summary"]["success_count"] == 1, report
+    assert not source.exists()
+    assert {path.name: path.read_bytes() for path in output.rglob("*") if path.is_file()} == {
+        "a.bin": first, "z.bin": second,
     }
 
 

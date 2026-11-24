@@ -1,6 +1,6 @@
 use super::passwords::CandidateSet;
 use super::{DiscoverySource, Failure, FailureKind, InputError, InputErrorKind, Origin, Request};
-use crate::core::config::{Config, ScanFilterKind};
+use crate::core::config::{Config, ContentRequirement, ScanFilterKind};
 use crate::io::archive_state::{
     AnalysisOrigin, ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
 };
@@ -988,19 +988,16 @@ impl Discovered {
             return Ok(table.prepare_deep(recursive, request.config.embedded_scan.recursive_candidate_ratio));
         }
         let mut routes = table.resolve()?;
-        for &(index, _) in &routes.relations {
-            self.tasks.push(project_task(
-                table.project(index)?,
-                DiscoverySource::Relations,
-                verified,
-            ));
-        }
-        for &index in &routes.detected {
-            self.tasks.push(project_task(
-                table.project(index)?,
-                DiscoverySource::Detection,
-                verified,
-            ));
+        let relations = routes.relations.iter().map(|&(index, _)| (index, DiscoverySource::Relations));
+        let detected = routes.detected.iter().map(|&index| (index, DiscoverySource::Detection));
+        let require_complete = request.config.extraction.content_requirement == ContentRequirement::Complete;
+        for (index, source) in relations.chain(detected) {
+            let mut task = project_task(table.project(index)?, source, verified);
+            let logical = &mut task.inputs[0];
+            if require_complete && logical.input.analysis.standalone_truncated && logical.failure.is_none() {
+                logical.failure = discovery_failure("corrupt_archive", source, &logical.input.entry_path);
+            }
+            self.tasks.push(task);
         }
         let embedded = request.config.embedded_scan;
         Ok(table.prepare_embedded(
@@ -1143,13 +1140,12 @@ fn project_task(
             path,
             format_hint,
             logical_name,
-            ..
-        } => Task::single(
-            ArchiveInput::file(path.to_owned(), format_hint.to_owned(), logical_name),
-            vec![path.to_owned()],
-            source,
-            None,
-        ),
+            standalone_truncated,
+        } => {
+            let mut input = ArchiveInput::file(path.to_owned(), format_hint.to_owned(), logical_name);
+            input.analysis.standalone_truncated = standalone_truncated;
+            Task::single(input, vec![path.to_owned()], source, None)
+        }
         CandidateProjection::Relation {
             relation,
             ..
@@ -1284,7 +1280,7 @@ fn embedded_read_failure(path: &str, error: String) -> Failure {
     )
 }
 
-fn discovery_failure(reason: &'static str, source: DiscoverySource, path: &str) -> Option<Failure> {
+pub(super) fn discovery_failure(reason: &'static str, source: DiscoverySource, path: &str) -> Option<Failure> {
     let (kind, message) = match reason {
         "needs_password" | "embedded_password_required" | "wrong_password" | "embedded_wrong_password" => (FailureKind::WrongPassword, "Password not found in the password list"),
         "missing_volume" | "ambiguous_volume_mapping" | "structural_conflict" => {
