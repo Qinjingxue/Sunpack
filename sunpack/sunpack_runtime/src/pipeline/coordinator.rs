@@ -3780,6 +3780,7 @@ fn flatten_result(
     if let Some(created) = created {
         created.lock().unwrap().relocate_flatten(output, old, &new);
     }
+    crate::io::atomic_file::sync_parent(&new)?;
     observer.after_flatten(id, output, old, &new)?;
     for checkpoint in &mut children.checkpoints {
         checkpoint.relocate_flatten(output, old, &new);

@@ -114,6 +114,25 @@ mod win {
     }
 
 }
+// Namespace changes must reach the directory as well as the file itself.
+pub(crate) fn sync_directory(path: &std::path::Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
+pub(crate) fn sync_parent(path: &std::path::Path) -> io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_directory(parent),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn sharing_conflict(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(32 | 33))
 }

@@ -1093,7 +1093,7 @@ impl NativeWatchState {
             return Err(invalid("output registration requires a start"));
         }
         let key = path_key(owner);
-        let refresh = {
+        {
             let data = self.lock();
             let Some(record) = data.pending.get(&key) else {
                 return Ok(None);
@@ -1112,11 +1112,8 @@ impl NativeWatchState {
                         return Ok(record.committed_roots.covers(&output).then(NativeWatchOperations::empty));
                     }
                 }
-                keep && (!active || !record.output_identities.contains_key(&output))
-            } else {
-                true
             }
-        };
+        }
         let mut owned_paths = Vec::new();
         let path = Path::new(&output);
         let creation = if keep.is_none() {
@@ -1138,7 +1135,10 @@ impl NativeWatchState {
                     owned_paths = paths;
                 }
             }
-            if refresh && path.is_dir() {
+            // The registered path can acquire a different identity during
+            // extraction or flattening. Finish and its cleanup receipt must
+            // use the object still present at the final path.
+            if keep != Some(false) {
                 Ok(Some(crate::filesystem::directory_identity(&output)?))
             } else {
                 Ok(None)

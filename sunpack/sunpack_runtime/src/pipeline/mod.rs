@@ -791,7 +791,9 @@ pub(crate) trait Observer: Send + Sync {
     /// Restart an already claimed retained output after best-effort cleanup.
     /// New output names still use exclusive registration above.
     fn reuse_output(&self, _archive: &ArchiveResult, output: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(output).map_err(OutputCreateError::wrap)
+        crate::scan::scope::OutputRootCreation::create(output, false)
+            .map(crate::scan::scope::OutputRootCreation::commit)
+            .map_err(OutputCreateError::wrap)
     }
 
     fn after_output(&self, _archive: &ArchiveResult, _cleanup: Option<cleanup::DeleteReceipt<'_>>) -> io::Result<()> {

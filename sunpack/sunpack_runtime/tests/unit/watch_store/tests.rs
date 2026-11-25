@@ -16,6 +16,43 @@ fn replayed_entry_event_keeps_business_failure_kind_and_message() {
 }
 
 #[test]
+fn finish_binds_the_directory_that_survives_an_earlier_attempt() {
+    use std::fs;
+
+    let marker = crate::test_support::temp_file("output_identity_reuse", b"");
+    let base = marker.with_extension("outputs");
+    let output = base.join("item");
+    let old = base.join("previous");
+    let owner = base.join("item.zip").to_string_lossy().into_owned();
+    let path = output.to_string_lossy().into_owned();
+    fs::create_dir_all(&base).unwrap();
+
+    let state = NativeWatchState::new();
+    let pending = PendingRecord { path: owner.clone(), ..Default::default() };
+    state.apply(&NativeWatchOperations(vec![Operation::PutPending(path_key(&owner), Arc::new(pending))]));
+    let started = state.output_operation(&owner, owner.clone(), path.clone(), None, true).unwrap().unwrap();
+    state.apply(&started);
+    let registered = state.pending(&owner).unwrap().output_identities[&path].clone();
+
+    // Keep the first object alive so even immediate NTFS ID reuse cannot
+    // disguise a second attempt that materializes the same output name.
+    fs::rename(&output, &old).unwrap();
+    fs::create_dir(&output).unwrap();
+    let current = crate::filesystem::directory_identity(&path).unwrap();
+    assert_ne!(registered, current);
+    let completed = state.output_operation(&owner, owner.clone(), path.clone(), Some(true), false)
+        .unwrap().unwrap();
+    assert_eq!(completed.finished_output_identity(), Some(current.as_str()));
+    state.apply(&completed);
+    assert_eq!(state.pending(&owner).unwrap().output_identities[&path], current);
+
+    fs::remove_dir(&output).unwrap();
+    fs::remove_dir(&old).unwrap();
+    fs::remove_dir(&base).unwrap();
+    fs::remove_file(marker).unwrap();
+}
+
+#[test]
 fn carrier_outputs_survive_snapshot_and_incremental_replay() {
     use std::fs::{self, OpenOptions};
     use std::io::Write;

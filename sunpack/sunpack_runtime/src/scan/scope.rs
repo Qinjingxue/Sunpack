@@ -112,10 +112,19 @@ fn subtree_key(path: &str) -> String {
 }
 
 pub(crate) fn create_output_root_exclusive(path: &std::path::Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    match std::fs::create_dir(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                match create_output_root_exclusive(parent) {
+                    Ok(()) => crate::io::atomic_file::sync_parent(parent)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && parent.is_dir() => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            std::fs::create_dir(path)
+        }
+        result => result,
     }
-    std::fs::create_dir(path)
 }
 
 /// Until publication succeeds, only an exclusively created, still empty root
@@ -127,8 +136,11 @@ pub(crate) struct OutputRootCreation<'a> {
 
 impl<'a> OutputRootCreation<'a> {
     pub(crate) fn create(path: &'a std::path::Path, exclusive: bool) -> std::io::Result<Self> {
-        if exclusive { create_output_root_exclusive(path)?; }
-        else { std::fs::create_dir_all(path)?; }
+        if let Err(error) = create_output_root_exclusive(path) {
+            if exclusive || error.kind() != std::io::ErrorKind::AlreadyExists || !path.is_dir() {
+                return Err(error);
+            }
+        }
         Ok(Self { path, rollback: exclusive })
     }
 

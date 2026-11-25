@@ -771,6 +771,7 @@ namespace sunpack::sevenzip
                 , pipeline_timing
 #endif
             );
+            async_job_->sync_storage_at_publication = true;
         }
 
         ~ExtractToDiskCallback() { finalize_output(); }
@@ -813,7 +814,6 @@ namespace sunpack::sevenzip
             archive_ = nullptr; // metadata needed below was captured during GetStream
             // Decoder callbacks are over. Directory reservations survive until
             // the final snapshot, so a late interruption can replay collisions.
-            created_directories_.reset();
             decltype(last_created_directory_){}.swap(last_created_directory_);
             // Archives without hard links have no further use for member names.
             if (hard_links_.empty()) decltype(hard_link_names_){}.swap(hard_link_names_);
@@ -834,12 +834,22 @@ namespace sunpack::sevenzip
                     mark_current_item_failure(writer_error);
                 }
             }
+            if (!hard_links_.empty()) finalize_hard_links();
+            restore_directory_metadata();
+            if (!is_cancelled())
+            {
+                const auto hr = sync_output_directories();
+                if (hr != S_OK)
+                {
+                    for (auto &item : output_trace_.items) item.done = false;
+                    output_error_ = true;
+                    mark_current_item_failure(hr);
+                }
+            }
             if (output_error_ && operation_result_ == kOpOk)
             {
                 operation_result_ = kOpDataError;
             }
-            if (!hard_links_.empty()) finalize_hard_links();
-            restore_directory_metadata();
             const auto *memory = current_native_memory_job();
             // A user cancellation ends the job. Only a retryable attempt
             // needs a new inventory of the output already written.
@@ -860,6 +870,7 @@ namespace sunpack::sevenzip
                         receipt.mtime = item.mtime_ns;
                     }
             }
+            created_directories_.reset();
             async_files_.clear();
             current_async_file_.reset();
             output_paths_.reset();
@@ -1480,6 +1491,36 @@ namespace sunpack::sevenzip
             UInt32 index;
         };
 
+        HRESULT sync_output_directories() const noexcept
+        {
+            try
+            {
+                const auto parent = sync_output_directory(output_root_.parent_path().native());
+                if (parent != S_OK) return parent;
+                if (created_directories_->empty()) return sync_output_directory(output_root_.native());
+                for (const auto &path : *created_directories_)
+                {
+                    const auto result = sync_output_directory(path);
+                    if (result != S_OK) return result;
+                }
+                return S_OK;
+            }
+            catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
+            catch (...) { return E_FAIL; }
+        }
+
+        static HRESULT sync_output_directory(const std::wstring &path) noexcept
+        {
+            if (path.empty()) return S_OK;
+            const HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+            const HRESULT result = FlushFileBuffers(handle) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+            CloseHandle(handle);
+            return result;
+        }
+
         void restore_directory_metadata() noexcept
         {
             // Like 7z: children before parents, original order at equal depth.
@@ -1555,8 +1596,8 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
             ++directory_keys_built_;
 #endif
-            auto key = normalized_output_path_key(directory);
-            if (created_directories_->find(key) != created_directories_->end())
+            auto checked = directory.lexically_normal();
+            if (created_directories_->find(checked.native()) != created_directories_->end())
             {
                 // Successful checks/creation belong to this extraction callback.
                 // Repeated files in the same directory reuse that result.
@@ -1600,9 +1641,22 @@ namespace sunpack::sevenzip
                 return false;
             }
 
-            created_directories_->insert(std::move(key));
+            // Keep the verified paths, including parents created by the same
+            // mkdir call, so finalization can persist their directory entries.
+            while (created_directories_->insert(checked.native()).second && checked != output_root_)
+            {
+                auto parent = checked.parent_path();
+                if (parent.empty() || parent == checked || !relative_to_output(parent)) break;
+                checked = std::move(parent);
+            }
             last_created_directory_ = directory.native();
             return true;
+        }
+
+        bool relative_to_output(const std::filesystem::path &directory) const
+        {
+            const auto relative = directory.lexically_relative(output_root_);
+            return !relative.empty() && *relative.begin() != L"..";
         }
 
         void ensure_no_reparse_ancestors(const std::filesystem::path &directory) const

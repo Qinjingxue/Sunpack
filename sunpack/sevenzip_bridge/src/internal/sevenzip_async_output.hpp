@@ -31,6 +31,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <winternl.h>
 
 namespace sunpack::sevenzip
 {
@@ -155,6 +156,7 @@ namespace sunpack::sevenzip
             const std::size_t max_inflight_bytes;
             std::shared_ptr<std::atomic<bool>> cancel_token;
             const bool capture_inventory;
+            bool sync_storage_at_publication = false;
 #ifdef SUP7Z_DEBUG
             PipelineTiming *pipeline_timing = nullptr;
 #endif
@@ -1623,11 +1625,43 @@ namespace sunpack::sevenzip
             return {AttemptResult::Kind::PermanentFailure, static_cast<unsigned long>(error)};
         }
 
-        bool flush_file(HANDLE handle, DWORD &error) noexcept
+        bool flush_file(HANDLE handle, bool sync_storage_at_publication, DWORD &error) noexcept
         {
 #ifdef SUP7Z_DEBUG
             if (flush_fault_.consume(error)) return false;
 #endif
+            if (sync_storage_at_publication && !write_through_)
+            {
+                // Write back this file while its handle is available. The
+                // extraction callback fences the output volume after all
+                // these writes and namespace updates have completed.
+                using Flush = LONG (NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PIO_STATUS_BLOCK);
+                using ToWin32 = ULONG (NTAPI *)(LONG);
+                const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+                static const auto flush = reinterpret_cast<Flush>(GetProcAddress(ntdll, "NtFlushBuffersFileEx"));
+                static const auto to_win32 = reinterpret_cast<ToWin32>(GetProcAddress(ntdll, "RtlNtStatusToDosError"));
+                if (flush && to_win32)
+                {
+                    constexpr ULONG no_storage_sync = 2; // FLUSH_FLAGS_NO_SYNC
+                    constexpr LONG pending = 0x103;      // STATUS_PENDING
+                    IO_STATUS_BLOCK io{};
+                    auto status = flush(handle, no_storage_sync, nullptr, 0, &io);
+                    if (status == pending)
+                    {
+                        if (WaitForSingleObject(handle, INFINITE) != WAIT_OBJECT_0)
+                        {
+                            error = GetLastError();
+                            return false;
+                        }
+                        status = io.Status;
+                    }
+                    if (status >= 0) return true;
+                    error = to_win32(status);
+                    if (error != ERROR_INVALID_FUNCTION && error != ERROR_NOT_SUPPORTED &&
+                        error != ERROR_INVALID_PARAMETER && error != ERROR_CALL_NOT_IMPLEMENTED)
+                        return false;
+                }
+            }
             if (FlushFileBuffers(handle)) return true;
             error = GetLastError();
             return false;
@@ -1657,14 +1691,27 @@ namespace sunpack::sevenzip
             // and no future write can require a completion packet.
             if (should_open) result = try_open_file(file, false);
             HANDLE handle;
+            bool ready_to_flush;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 handle = file->handle;
+                ready_to_flush = file->hresult == S_OK;
             }
-            if (result.kind == AttemptResult::Kind::Succeeded && handle != INVALID_HANDLE_VALUE && write_through_)
+#ifdef SUP7Z_DEBUG
+            ArchiveMetadataErrors metadata_errors;
+#endif
+            if (ready_to_flush && result.kind == AttemptResult::Kind::Succeeded &&
+                handle != INVALID_HANDLE_VALUE && current_error(job) == S_OK)
             {
+                // Persist the final file using the writer's existing handle. A
+                // complete replay receipt can only be issued after this flush.
+                file->metadata.restore(handle
+#ifdef SUP7Z_DEBUG
+                                       , &metadata_errors
+#endif
+                );
                 DWORD error = ERROR_SUCCESS;
-                if (!flush_file(handle, error))
+                if (!flush_file(handle, job->sync_storage_at_publication, error))
                 {
                     result = {is_space_exhaustion_error(error) ? AttemptResult::Kind::SpaceFailure
                                : AttemptResult::Kind::PermanentFailure, error};
@@ -1681,28 +1728,13 @@ namespace sunpack::sevenzip
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure || result.kind == AttemptResult::Kind::PermanentFailure)
                 record_failure(file, HRESULT_FROM_WIN32(result.win32_error));
-            bool restore_times = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                restore_times = file->hresult == S_OK && result.kind == AttemptResult::Kind::Succeeded;
                 file->handle = INVALID_HANDLE_VALUE;
             }
-#ifdef SUP7Z_DEBUG
-            ArchiveMetadataErrors metadata_errors;
-#endif
             std::optional<UInt64> mtime_ns;
             if (handle != INVALID_HANDLE_VALUE)
             {
-                // All data writes have drained. Stream release can precede
-                // SetOperationResult, so timestamp restoration must not depend on it.
-                if (restore_times)
-                {
-                    file->metadata.restore(handle
-#ifdef SUP7Z_DEBUG
-                                           , &metadata_errors
-#endif
-                    );
-                }
                 FILETIME last_write{};
                 if (job->capture_inventory && GetFileTime(handle, nullptr, nullptr, &last_write))
                 {

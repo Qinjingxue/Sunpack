@@ -375,8 +375,15 @@ fn write_roots(path: &Path, roots: &[Root]) -> io::Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
     let suffix = windows::random_bytes::<8>()?;
     let temp = path.with_extension(format!("txt.{:016x}.tmp", u64::from_ne_bytes(suffix)));
-    fs::write(&temp, text)?;
-    let result = crate::io::atomic_file::replace(&temp, path);
+    let result = (|| {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        crate::io::atomic_file::replace(&temp, path)?;
+        crate::io::atomic_file::sync_parent(path)
+    })();
     if result.is_err() {
         let _ = fs::remove_file(temp);
     }
@@ -7450,16 +7457,12 @@ impl Observer for WatchObserver {
                 let id = source_cleanup_id(&self.batch, receipt.id);
                 state.runtime_record(&id).is_none().then(|| (id, receipt))
             });
-            let proof = intent.map(|(id, receipt)| (id, receipt, output.clone()));
-            let mut operations = state.output_operation(&owner, task, output, Some(keep), false)?
+            let mut operations = state.output_operation(&owner, task, output.clone(), Some(keep), false)?
                 .unwrap_or_else(NativeWatchOperations::empty);
-            if let Some((id, receipt, output)) = proof.filter(|_| !operations.is_empty()) {
-                    let identity = operations.finished_output_identity().map(str::to_owned).or_else(|| {
-                        state.pending(&owner)?.output_identities.get(&output).cloned()
-                    });
-                    if let Some(identity) = identity {
-                        store_source_cleanup(&mut operations, id, &owner, (&output, &identity), None, receipt.sources);
-                    }
+            if let Some((id, receipt)) = intent {
+                if let Some(identity) = operations.finished_output_identity().map(str::to_owned) {
+                    store_source_cleanup(&mut operations, id, &owner, (&output, &identity), None, receipt.sources);
+                }
             }
             Ok(operations)
         })
@@ -7759,7 +7762,12 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
             Path::new(destination),
             || Ok(()),
         );
+
         if identity_if_present(destination).is_ok_and(|identity| identity.as_deref() == Some(new)) {
+            if let Err(error) = crate::io::atomic_file::sync_parent(Path::new(destination)) {
+                journal.log(json!({"event":"flatten_recovery_failed","path":destination,"error":error.to_string()}));
+                continue;
+            }
             recover_finish_flatten(journal, root)?;
             if journal.state().runtime_record(&id).is_none() { settled.push(destination.to_owned()); }
         }
