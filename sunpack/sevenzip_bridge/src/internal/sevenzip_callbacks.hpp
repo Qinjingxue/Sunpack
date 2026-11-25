@@ -804,7 +804,7 @@ namespace sunpack::sevenzip
         }
 #endif
 
-        void finalize_output() noexcept
+        void finalize_output(NativeCpuJobContext *cpu = nullptr) noexcept
         {
             if (!created_directories_)
             {
@@ -817,7 +817,7 @@ namespace sunpack::sevenzip
             decltype(last_created_directory_){}.swap(last_created_directory_);
             // Archives without hard links have no further use for member names.
             if (hard_links_.empty()) decltype(hard_link_names_){}.swap(hard_link_names_);
-            const HRESULT writer_error = async_writer_->finish_job(async_job_);
+            const HRESULT writer_error = async_writer_->finish_job(async_job_, cpu);
             bool has_failed_file = false;
             for (const auto &state : async_files_)
             {

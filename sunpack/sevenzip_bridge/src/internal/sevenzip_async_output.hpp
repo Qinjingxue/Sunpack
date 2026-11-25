@@ -6,6 +6,7 @@
 #include "sevenzip_writer_meters.hpp"
 #include "extraction_replay.hpp"
 #include "decoder_memory.h"
+#include "native_cpu_budget.hpp"
 #ifdef SUP7Z_DEBUG
 #include "worker_pipeline_timing.hpp"
 #endif
@@ -703,7 +704,7 @@ namespace sunpack::sevenzip
             if (wake_producers || direct_close) producer_cv_.notify_all();
         }
 
-        HRESULT finish_job(const JobStatePtr &job) noexcept
+        HRESULT finish_job(const JobStatePtr &job, NativeCpuJobContext *cpu = nullptr) noexcept
         {
             if (!job)
             {
@@ -721,7 +722,28 @@ namespace sunpack::sevenzip
                 if (job->first_error.load(std::memory_order_acquire) != S_OK && state_->space_gate)
                     state_->space_gate->wake_waiters();
                 lock.lock();
-                producer_cv_.wait(lock, [&job] { return job->pending_files == 0; });
+                const auto drained = [&job] { return job->pending_files == 0; };
+                bool handed_off = false;
+                // An outstanding close is common even without I/O pressure. Give
+                // the existing completion wake a short head start; never delay it.
+                constexpr auto handoff_grace = std::chrono::milliseconds(8);
+                if (!drained() && cpu && cpu->may_handoff_output_drain() &&
+                    job->first_error.load(std::memory_order_acquire) == S_OK &&
+                    !producer_cv_.wait_for(lock, handoff_grace, drained) &&
+                    job->first_error.load(std::memory_order_acquire) == S_OK)
+                {
+                    // Neither the scheduler nor credit reacquisition owns the writer mutex.
+                    lock.unlock();
+                    handed_off = cpu->begin_output_drain_wait();
+                    lock.lock();
+                }
+                producer_cv_.wait(lock, drained);
+                if (handed_off)
+                {
+                    lock.unlock();
+                    cpu->end_output_drain_wait();
+                    lock.lock();
+                }
             }
 
             const HRESULT result = terminal_result_locked(job);

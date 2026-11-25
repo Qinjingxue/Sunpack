@@ -192,6 +192,7 @@ impl BucketView<'_> {
         &self,
         mut mapping: VolumeAssignment,
         domain_slack: u64,
+        raw_continuations: bool,
     ) -> Option<VolumeAssignment> {
         if !self.mapping_roles_legal(&mapping) {
             return None;
@@ -230,9 +231,9 @@ impl BucketView<'_> {
             let Some(directory) = tail.zip_directory.as_ref() else {
                 return Some(mapping);
             };
-            let prefix = compact.range(..last).try_fold(0u64, |sum, (_, &i)| {
+            let prefix = compact.range(..last).try_fold(0u64, |sum, (&number, &i)| {
                 let a = self.rows[i].anchor.as_ref()?;
-                sum.checked_add(a.payload_size())
+                sum.checked_add(if raw_continuations && number > 1 { a.size } else { a.payload_size() })
             });
             let logical_end = prefix.and_then(|prefix| {
                 prefix.checked_add(
@@ -339,7 +340,7 @@ impl BucketView<'_> {
         if inferred == 0 {
             return None;
         }
-        self.finish_mapping(out, 0)
+        self.finish_mapping(out, 0, false)
     }
 
     fn solve_loose_numeric(
@@ -384,7 +385,7 @@ impl BucketView<'_> {
         if numeric::solve(&mut out, domains)? {
             return Err(RelationFailureReason::AmbiguousVolumeMapping);
         }
-        self.finish_mapping(out, 0)
+        self.finish_mapping(out, 0, false)
             .ok_or(RelationFailureReason::StructuralConflict)
     }
 
@@ -546,8 +547,8 @@ impl BucketView<'_> {
 }
 
 /// Embedded may find ZIP member headers inside raw continuation chunks.
-/// Try the ordinary filename solver once, using EOCD geometry to choose
-/// the only possible start, rather than treating every hit as a rival head.
+/// Resolve the head from the directory, then pass ambiguous slots to the
+/// ordinary attempt planner with raw continuation extents.
 fn raw_embedded_zip(
     view: &BucketView<'_>,
     cached: Option<&RelationCache>,
@@ -562,24 +563,22 @@ fn raw_embedded_zip(
         anchor(i).is_some_and(|a| a.has_any(ZIP_LOCAL_HEADER) && !a.has_any(TERMINAL))
     });
     let first = heads.next()?;
-    let needs_layout = anchor(first).is_some_and(|a| {
+    if heads.clone().next().is_none() && !anchor(first).is_some_and(|a| {
         a.carrier_limit.is_some() && a.has_any(EMBEDDED_VOLUME)
-    }) || heads.clone().any(|i| anchor(i).is_some_and(weak));
-    if !needs_layout && !(anchor(first).is_some_and(weak) && heads.clone().next().is_some()) {
+    }) {
         return None;
     }
-    let mut heads = std::iter::once(first).chain(heads);
+    let heads = std::iter::once(first).chain(heads);
 
     let parent = Path::new(&view.rows[first].path).parent();
     let mut paths = HashSet::new();
-    let mut tail = None;
-    let mut size = 0u64;
+    let mut tails = Vec::new();
     for &i in view.indexes {
         let row = &view.rows[i];
         if Path::new(&row.path).parent() != parent || !paths.insert(&row.path_key) {
             return None;
         }
-        let bytes = if let Some(a) = anchor(i) {
+        if let Some(a) = anchor(i) {
             if a.has_any(ZIP_SPLIT_START | ZIP_SPLIT_END | ZIP_DIRECTORY_MEMBER)
                 || a.sfx || a.payload_end.is_some()
             {
@@ -587,45 +586,56 @@ fn raw_embedded_zip(
             }
             if a.has_any(TERMINAL) {
                 let directory = a.zip_directory.as_deref()?;
-                if !a.has_any(ZIP_TAIL_WITHOUT_HEAD) || directory.disk != 0 || directory.cd_disk != 0
-                    || tail.replace((i, directory)).is_some()
-                {
+                if !a.has_any(ZIP_TAIL_WITHOUT_HEAD) || directory.disk != 0 || directory.cd_disk != 0 {
                     return None;
                 }
-                directory.end
-            } else {
-                a.size
+                tails.push((i, a, *directory));
             }
-        } else {
-            row.size?
-        };
-        size = size.checked_add(bytes)?;
+        }
         features.entry(i).or_insert_with(|| cached
             .and_then(|cache| cache.names.get(&row.path_key)).cloned()
             .unwrap_or_else(|| NameFeatures::parse(row.name())));
     }
-    let start = match tail {
-        Some((_, directory)) => Some(size.checked_sub(directory.offset.checked_add(directory.size)?)?),
-        None => None,
-    };
-    let mut eligible = heads.clone().filter(|&i| match start {
-        Some(start) => anchor(i).is_some_and(|a| a.structure_offset == Some(start)),
-        None => features[&i].numbers.iter().any(|n| n.value == 1),
-    });
-    let first_match = eligible.next()?;
-    let tied_geometry = eligible.clone().next().is_some();
-    let head = if tied_geometry {
-        let mut numbered = std::iter::once(first_match).chain(eligible)
-            .filter(|i| features[i].numbers.iter().any(|n| n.value == 1));
-        let head = numbered.next()?;
-        if numbered.next().is_some() { return None; }
-        head
+    let first_label = if !tails.is_empty()
+        && heads.clone().any(|i| features[&i].numbers.iter().any(|n| n.value == 0))
+    {
+        0
     } else {
-        first_match
+        1
     };
-    if heads.any(|i| i != head && !anchor(i).is_some_and(weak)) {
-        return None;
-    }
+    let mut numbered = heads.clone().filter(|i| features[i].numbers.iter().any(|n| n.value == first_label));
+    let numbered_head = numbered.next().filter(|_| numbered.next().is_none());
+    let (head, minimum_total) = if tails.is_empty() {
+        let head = numbered_head?;
+        if heads.clone().any(|i| i != head && !anchor(i).is_some_and(weak)) {
+            return None;
+        }
+        (head, None)
+    } else {
+        let mut keys = Vec::new();
+        for i in heads {
+            let a = anchor(i)?;
+            if let Some(key) = crate::formats::zip::relation_local_key(&a.path, a.structure_offset.unwrap_or(0)).ok()? {
+                keys.push((i, key));
+            }
+        }
+        if keys.is_empty() {
+            return None;
+        }
+        let mut head = None;
+        let mut minimum = u64::MAX;
+        for &(_, tail, directory) in &tails {
+            minimum = minimum.min(attempts::zip_total(tail)?);
+            if let Some(candidate) = validate::raw_zip_directory_head(&keys, numbered_head, tail, directory) {
+                if head.replace(candidate).is_some_and(|previous| previous != candidate) {
+                    // Separate member directories each corroborate their own entry.
+                    // Leave their arbitration to the regular multi-head path.
+                    return None;
+                }
+            }
+        }
+        (head?, Some(minimum))
+    };
     if view.indexes.iter().any(|&i| i != head && anchor(i).is_some_and(|a| a.carrier_limit.is_some())) {
         return None;
     }
@@ -633,21 +643,32 @@ fn raw_embedded_zip(
     facts.get_mut(&head)?.exact_slot = Some(1);
     let view = BucketView { facts: &facts, features, loose_numeric_allowed: false, ..*view };
     let (assignment, reason) = view.solve(view.fixed());
-    if reason.is_some() || assignment.slots.len() != view.indexes.len()
-        || !assignment.slots.keys().copied().zip(1..).all(|(slot, expected)| slot == expected)
-        || tail.is_some_and(|(tail, _)| assignment.slots.last_key_value().map(|(_, i)| *i) != Some(tail))
-    {
-        return None;
-    }
-    // Only the selected layout reads the directory. Its reference to the
-    // first local header confirms the start; other local hits stay opaque.
-    if let Some((i, directory)) = tail {
-        if !validate::raw_zip_head_matches_directory(anchor(head)?, anchor(i)?, *directory) {
-            return None;
-        }
-    }
-    let extend_head = anchor(head)?.carrier_limit.is_some() && tail.is_some();
     let logical = filename::logical_name(view.rows[head].name(), &view.features[&head], "zip");
+    let fixed_tail = match tails.as_slice() {
+        [(i, _, _)] => Some(*i),
+        _ => None,
+    };
+    let unique_mapping = reason.is_none()
+        && assignment.slots.len() == view.indexes.len()
+        && assignment.slots.keys().copied().zip(1..).all(|(slot, expected)| slot == expected)
+        && (tails.is_empty() || assignment.slots.last_key_value().map(|(_, i)| *i) == fixed_tail);
+    let complete_geometry = unique_mapping && minimum_total.is_none_or(|total| {
+        assignment.slots.values().try_fold(0u64, |bytes, &i| {
+            let size = if i == head {
+                let a = anchor(i)?;
+                a.size.checked_sub(a.structure_offset.unwrap_or(0))?
+            } else if fixed_tail == Some(i) {
+                anchor(i)?.extent_end()
+            } else {
+                view.rows[i].size?
+            };
+            bytes.checked_add(size)
+        }) == Some(total)
+    });
+    if !complete_geometry {
+        return attempts::build(&view, Some(&logical), Some(minimum_total?)).pop();
+    }
+    let extend_head = anchor(head)?.carrier_limit.is_some() && fixed_tail.is_some();
     let mut validation = materialize(&view, assignment, &logical, None, None)?;
     let anchors = &mut Arc::make_mut(&mut validation.facts).anchors;
     if extend_head {
@@ -658,7 +679,7 @@ fn raw_embedded_zip(
         a.payload_end = Some(a.size);
     }
     for &i in view.indexes {
-        if i != head && anchor(i).is_some_and(weak) {
+        if i != head && anchor(i).is_some_and(|a| a.has_any(ZIP_LOCAL_HEADER)) {
             // The chosen raw layout reads the continuation from byte zero.
             // Keep the original embedded facts for other interpretations.
             let a = Arc::make_mut(anchors.get_mut(&view.rows[i].path_key)?);
@@ -848,7 +869,7 @@ pub(super) fn resolve_buckets(
                     }
                     let view = BucketView { rows, indexes: &members, facts: &facts,
                         features: &features, format, loose_numeric_allowed: true };
-                    let candidates = attempts::build(&view, None);
+                    let candidates = attempts::build(&view, None, None);
                     if !candidates.is_empty() {
                         output.extend(candidates);
                         continue;
@@ -1040,7 +1061,7 @@ pub(super) fn resolve_buckets(
                         family.clone()
                     };
                     if reason.is_some() {
-                        let candidates = attempts::build(&view, Some(&logical));
+                        let candidates = attempts::build(&view, Some(&logical), None);
                         if !candidates.is_empty() {
                             output.extend(candidates);
                             continue;

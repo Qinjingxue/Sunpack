@@ -1926,6 +1926,8 @@ public:
                 } else {
                     background_queue_.push_back(std::move(job), warm_queue_capacity());
                 }
+                refresh_output_drain_backlog_locked();
+                if (drain_loans_ != 0) spare_condition_.notify_one();
             }
         }
 
@@ -1976,7 +1978,9 @@ public:
                 withdrawn.emplace(std::move(*found));
                 jobs.erase(found);
                 queue->retire_if_drained(retired_queue);
+                refresh_output_drain_backlog_locked();
                 drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
+                if (drain_loans_ != 0) spare_condition_.notify_one();
                 break;
             }
         }
@@ -2045,6 +2049,7 @@ public:
             monitor_recheck_ = true;
         }
         condition_.notify_all();
+        spare_condition_.notify_all();
         memory_.stop();
         monitor_condition_.notify_all();
 #ifdef _WIN32
@@ -2060,6 +2065,8 @@ public:
             }
         }
         workers_.clear();
+        for (auto &worker : spare_workers_) if (worker.joinable()) worker.join();
+        spare_workers_.clear();
 #ifdef _WIN32
         // All leases are released by now (worker threads joined, a lease never outlives its job); the registry mutex is not held here.
         writer_registry_.shutdown();
@@ -2181,11 +2188,75 @@ private:
         return foreground_queue_.jobs.size() + background_queue_.jobs.size() + parked_jobs_;
     }
 
+    void refresh_output_drain_backlog_locked() noexcept {
+        const bool backlog = foreground_queue_.jobs.size() + background_queue_.jobs.size() >= 2;
+        if (output_drain_backlog_.load(std::memory_order_relaxed) != backlog)
+            output_drain_backlog_.store(backlog, std::memory_order_relaxed);
+    }
+
+    const Job& next_job_locked() const noexcept {
+        return (foreground_queue_.jobs.empty() ? background_queue_ : foreground_queue_).jobs.front();
+    }
+
+    // The adaptive lane never reorders the queue or overlaps the same writer.
+    bool can_overlap_output_locked(std::string_view draining_volume) const noexcept {
+        if (draining_volume.empty() || draining_volume.compare(0, 4, "job:") == 0 ||
+            queues_empty_locked()) return false;
+        const auto& next = next_job_locked();
+        return !next.request.scan_only && !next.request.output_volume_key.empty() &&
+            next.request.output_volume_key.compare(0, 4, "job:") != 0 && next.request.output_volume_key != draining_volume &&
+            !next.cancel_token->load(std::memory_order_relaxed);
+    }
+
+    void notify_cpu_waiter_locked() noexcept {
+        if (drain_resumers_ != 0) {
+            resume_condition_.notify_one();
+        } else if (!queues_empty_locked()) {
+            condition_.notify_one();
+            if (drain_loans_ != 0) spare_condition_.notify_one();
+        }
+    }
+
+    bool begin_output_drain_wait(std::string_view volume) noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_ || !output_drain_backlog_.load(std::memory_order_relaxed) ||
+                drain_resumers_ != 0 || active_jobs_ < worker_count_ ||
+                drain_loans_ == worker_count_ ||
+                (drain_loans_ != 0 && draining_volume_ != volume) ||
+                !can_overlap_output_locked(volume))
+                return false;
+            try {
+                if (drain_loans_ == 0) draining_volume_.assign(volume);
+                // Up to one standby per lender, created only when an actual
+                // drain would otherwise tie up a host. Creation failure falls
+                // back to the original blocking path.
+                if (spare_workers_.size() == drain_loans_)
+                    spare_workers_.emplace_back([this] { worker_loop(true); });
+            } catch (const std::exception&) {
+                return false;
+            }
+            ++drain_loans_;
+        }
+        cpu_budget_.release(1);
+        return true;
+    }
+
+    void end_output_drain_wait() noexcept {
+        std::unique_lock<std::mutex> lock(mutex_);
+        --drain_loans_;
+        ++drain_resumers_;
+        resume_condition_.wait(lock, [this] { return cpu_budget_.try_acquire_base(); });
+        --drain_resumers_;
+        if (cpu_budget_.can_acquire_base()) notify_cpu_waiter_locked();
+    }
+
     Job pop_next_job_locked(std::deque<Job>& retired) {
         auto& selected = foreground_queue_.jobs.empty() ? background_queue_ : foreground_queue_;
         Job job = std::move(selected.jobs.front());
         selected.jobs.pop_front();
         selected.retire_if_drained(retired);
+        refresh_output_drain_backlog_locked();
         return job;
     }
 
@@ -2196,7 +2267,7 @@ private:
             // and its atomic update is outside the queue mutex. Synchronize
             // with the waiter's predicate check before delivering that edge.
             std::lock_guard<std::mutex> lock(self->mutex_);
-            if (!self->queues_empty_locked()) self->condition_.notify_one();
+            self->notify_cpu_waiter_locked();
         }
     }
 
@@ -2317,7 +2388,9 @@ private:
     }
 
     bool finish_attempt_locked() noexcept {
-        if (--active_jobs_ == 0 && (NCrypto::N7z::HasGlobalKeyCache() || NCrypto::NRar5::HasGlobalKeyCache())) {
+        --active_jobs_;
+        if (drain_loans_ != 0) spare_condition_.notify_one();
+        if (active_jobs_ == 0 && (NCrypto::N7z::HasGlobalKeyCache() || NCrypto::NRar5::HasGlobalKeyCache())) {
             key_cache_deadline_ = std::chrono::steady_clock::now() + writer_config_.idle_timeout;
             return true;
         }
@@ -2344,19 +2417,23 @@ private:
         }
     }
 
-    void worker_loop() noexcept {
+    void worker_loop(bool spare = false) noexcept {
         std::deque<Job> retired_queue;
         for (;;) {
             Job job;
             bool wake_next_job = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                condition_.wait(lock, [this] {
+                auto& admission = spare ? spare_condition_ : condition_;
+                admission.wait(lock, [this, spare] {
+                    if (spare && stopping_) return true;
                     const bool empty = queues_empty_locked();
-                    return (!empty && cpu_budget_.can_acquire_base()) ||
+                    return (!empty && drain_resumers_ == 0 && cpu_budget_.can_acquire_base() &&
+                            (!spare || (drain_loans_ != 0 && active_jobs_ < worker_count_ + drain_loans_ &&
+                                can_overlap_output_locked(draining_volume_)))) ||
                         (stopping_ && empty && parked_jobs_ == 0);
                 });
-                if (stopping_ && queues_empty_locked() && parked_jobs_ == 0) {
+                if (stopping_ && (spare || (queues_empty_locked() && parked_jobs_ == 0))) {
                     break;
                 }
                 if (!cpu_budget_.try_acquire_base()) {
@@ -2372,6 +2449,7 @@ private:
                     if (stopping_ && parked_jobs_ == 0) condition_.notify_all();
                 } else {
                     wake_next_job = cpu_budget_.can_acquire_base();
+                    if (wake_next_job && drain_loans_ != 0) spare_condition_.notify_one();
                 }
             }
             // Hand admission forward one worker at a time when multiple
@@ -2397,7 +2475,23 @@ private:
                 if (job.cancel_token->load(std::memory_order_acquire)) memory_job.cancel->store(true, std::memory_order_release);
             }
             {
-                sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_);
+                struct OutputDrain {
+                    NativeJobExecutor& executor;
+                    const std::string& volume;
+                } output_drain{*this, job.request.output_volume_key};
+                sunpack::sevenzip::NativeCpuJobContext::OutputDrainHandoff handoff;
+                if (!spare && !output_drain.volume.empty()) {
+                    handoff = {
+                        &output_drain,
+                        [](void* context) noexcept {
+                            const auto& drain = *static_cast<const OutputDrain*>(context);
+                            return drain.executor.begin_output_drain_wait(drain.volume);
+                        },
+                        [](void* context) noexcept {
+                            static_cast<const OutputDrain*>(context)->executor.end_output_drain_wait();
+                        }, &output_drain_backlog_};
+                }
+                sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_, handoff);
                 sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
                 sunpack::sevenzip::NativeMemoryScope memory_scope(&memory_job);
                 auto& replay = job.execution->replay;
@@ -2488,6 +2582,8 @@ private:
                         --parked_jobs_;
                         auto &queue = !parked->request.from_watch ? foreground_queue_ : background_queue_;
                         queue.push_front(std::move(*parked), warm_queue_capacity());
+                        refresh_output_drain_backlog_locked();
+                        if (drain_loans_ != 0) spare_condition_.notify_one();
                     }
                     condition_.notify_one();
                 }, notice);
@@ -2524,6 +2620,7 @@ private:
     }
 
     std::vector<std::thread> workers_;
+    std::vector<std::thread> spare_workers_;
     std::thread monitor_thread_;
     sunpack::sevenzip::AsyncWriterConfig writer_config_;
     sunpack::sevenzip::VolumeWriterRegistry writer_registry_;
@@ -2538,6 +2635,14 @@ private:
     std::mutex mutex_;
     std::condition_variable condition_;
     std::condition_variable drain_condition_;
+    std::condition_variable spare_condition_;
+    std::condition_variable resume_condition_;
+    // All simultaneous lenders belong to one output volume. Keep an owned key
+    // since the first lender may finish before the others.
+    std::string draining_volume_;
+    std::atomic<bool> output_drain_backlog_{false}; // Hint; rechecked under mutex_ before lending.
+    std::size_t drain_loans_ = 0;
+    std::size_t drain_resumers_ = 0;
 
     // Cancellation bookkeeping is not scheduler state and must not contend
     // with admission or queue selection.

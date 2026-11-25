@@ -565,7 +565,7 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::OutputFinalize);
 #endif
-                raw_extract_callback->finalize_output();
+                raw_extract_callback->finalize_output(current_native_cpu_job_context());
             }
             last_hr = hr;
 

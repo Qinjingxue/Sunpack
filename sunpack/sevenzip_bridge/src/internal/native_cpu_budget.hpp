@@ -43,8 +43,30 @@ struct NativeCpuJobSnapshot
 class NativeCpuJobContext final
 {
 public:
-    explicit NativeCpuJobContext(
-        NativeCpuBudget &budget) noexcept;
+    struct OutputDrainHandoff
+    {
+        void *context = nullptr;
+        bool (*begin)(void *) noexcept = nullptr;
+        void (*end)(void *) noexcept = nullptr;
+        const std::atomic<bool> *backlog = nullptr;
+    };
+
+    explicit NativeCpuJobContext(NativeCpuBudget &budget) noexcept;
+    NativeCpuJobContext(NativeCpuBudget &budget, OutputDrainHandoff handoff) noexcept;
+    bool may_handoff_output_drain() const noexcept
+    {
+        return output_drain_.begin &&
+            (!output_drain_.backlog || output_drain_.backlog->load(std::memory_order_relaxed)) &&
+            !budget_.can_acquire_base() &&
+            current_extra_.load(std::memory_order_relaxed) == 0;
+    }
+    bool begin_output_drain_wait() noexcept
+    {
+        // The original pressure sample armed the wait. Recheck queue state in the scheduler,
+        // not capacity here: another lender may have just returned its CPU credit.
+        return output_drain_.begin && output_drain_.begin(output_drain_.context);
+    }
+    void end_output_drain_wait() noexcept { output_drain_.end(output_drain_.context); }
     ~NativeCpuJobContext();
 
     std::size_t acquire_extra(
@@ -57,6 +79,7 @@ public:
 
 private:
     NativeCpuBudget &budget_;
+    OutputDrainHandoff output_drain_;
     std::atomic<std::size_t> current_extra_{0};
 #ifdef SUP7Z_DEBUG
     std::atomic<std::size_t> peak_extra_{0};

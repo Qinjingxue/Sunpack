@@ -156,28 +156,36 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
     Ok(Some(consumed == next.size && crc.finalize() == next.crc))
 }
 
-pub(super) fn raw_zip_head_matches_directory(
-    head: &VolumeAnchor,
+pub(super) fn raw_zip_directory_head(
+    heads: &[(usize, crate::formats::zip::RelationLocalKey)],
+    numbered_head: Option<usize>,
     tail: &VolumeAnchor,
     mut directory: crate::formats::zip::RelationDirectory,
-) -> bool {
-    use crate::formats::zip::{relation_local_key, visit_relation_directory, RelationLocalFields};
-    let Ok(Some(local)) = relation_local_key(&head.path, head.structure_offset.unwrap_or(0)) else {
-        return false;
-    };
+) -> Option<usize> {
+    use crate::formats::zip::{visit_relation_directory, RelationLocalFields};
     // For byte-sliced ZIPs the saved offset is logical; the directory reader
     // is opening only the physical tail and needs the local coordinate.
-    let Some(physical) = directory.end.checked_sub(directory.size) else { return false; };
-    directory.offset = physical;
-    let mut matched = false;
+    directory.offset = directory.end.checked_sub(directory.size)?;
+    let mut matched = None;
+    let mut ambiguous = false;
+    let mut numbered_match = None;
     let complete = visit_relation_directory(&tail.path, directory, |record, values| {
         if values.disk == 0 && values.local_offset == 0 {
-            matched |= record.name == local.name.as_slice()
-                && RelationLocalFields::new(record.method, record.flags, record.crc32,
-                    values.compressed, values.uncompressed) == local.fields;
+            let fields = RelationLocalFields::new(record.method, record.flags, record.crc32,
+                values.compressed, values.uncompressed);
+            for (i, local) in heads {
+                if record.name == local.name.as_slice() && fields == local.fields {
+                    if numbered_head == Some(*i) {
+                        numbered_match = Some(*i);
+                    }
+                    ambiguous |= matched.replace(*i).is_some_and(|previous| previous != *i);
+                }
+            }
         }
-    });
-    complete.is_ok_and(|complete| complete && matched)
+    }).ok()?;
+    // Repeated ZIP members can have identical local keys. A unique numbered
+    // head breaks that tie only after it has matched the directory at offset zero.
+    if !complete { None } else if ambiguous { numbered_match } else { matched }
 }
 
 /// A sibling's start is only an upper bound: padding is not archive data.

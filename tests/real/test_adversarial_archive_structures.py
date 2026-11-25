@@ -19,7 +19,11 @@ def _files_under(root):
     }
 
 
-@pytest.mark.parametrize("layout", ["raw-head", "embedded-head", "shared-first-chunk", "member-aligned-chunk"])
+@pytest.mark.parametrize("layout", [
+    "raw-head", "embedded-head", "shared-first-chunk", "member-aligned-chunk",
+    "competing-chunk", "competing-tail", "competing-chunk-with-shared-head",
+    "repeated-local-header",
+])
 def test_deep_zip_member_headers_do_not_compete_with_raw_split_head(package, tmp_path, layout):
     # Each continuation starts inside the previous member, then contains
     # another genuine local header. The end record is on the third chunk.
@@ -29,13 +33,17 @@ def test_deep_zip_member_headers_do_not_compete_with_raw_split_head(package, tmp
         archive.writestr("independent.txt", b"independent")
     inner = independent.getvalue()
     prefix = b"carrier-prefix" * 211 if layout == "embedded-head" else b""
-    if layout == "shared-first-chunk":
+    shared_head = layout in {"shared-first-chunk", "competing-chunk-with-shared-head"}
+    if shared_head:
         original = entries["member-0.bin"]
         entries["member-0.bin"] = original[:500] + inner + original[500 + len(inner):]
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
         for name, data in entries.items():
             archive.writestr(name, data)
+            if layout == "repeated-local-header" and name == "member-0.bin":
+                with pytest.warns(UserWarning, match="Duplicate name"):
+                    archive.writestr(name, data)
         positions = [member.header_offset for member in archive.infolist()]
     first, second = positions[1] - (0 if layout == "member-aligned-chunk" else 37), positions[2] - 53
     raw = buffer.getvalue()
@@ -43,20 +51,34 @@ def test_deep_zip_member_headers_do_not_compete_with_raw_split_head(package, tmp
     source.mkdir()
     package.configure(live=False, filesystem={"scan_filters_enabled": False})
     slices = (prefix + raw[:first], raw[first:second], raw[second:])
-    paths = [source / f"split.part{n}.bin" for n in (1, 2, 3)]
+    labels = (0, 1, 2) if layout == "repeated-local-header" else (1, 2, 3)
+    paths = [source / f"split.part{n}.bin" for n in labels]
+    competing_slot = {"competing-chunk": 2, "competing-tail": 3, "competing-chunk-with-shared-head": 2}.get(layout)
+    if competing_slot is not None:
+        paths[competing_slot - 1] = source / f"split.part{competing_slot:02}.bin"
     for path, data in zip(paths[:2], slices[:2], strict=True):
         path.write_bytes(data)
-    pending = package.json("scan", "-d", "-npa", source, code=1)
-    item, = [row for row in pending["items"] if row.get("error_kind") == "missing_volume"]
-    assert item["main_path"] == str(paths[0]), pending
+    if layout != "repeated-local-header":
+        pending = package.json("scan", "-d", "-npa", source, code=1)
+        item, = [row for row in pending["items"] if row.get("error_kind") == "missing_volume"]
+        assert item["main_path"] == str(paths[0]), pending
     paths[2].write_bytes(slices[2])
+    if layout == "repeated-local-header":
+        report = package.json("scan", "-d", "-npa", source)
+        assert report["summary"]["archive_count"] == 1, report
+        return
+    if competing_slot is not None:
+        # The shorter alias keeps the same headers and length but corrupts
+        # the member crossing into that volume.
+        decoy = slices[competing_slot - 1]
+        (source / f"split.part{competing_slot}.bin").write_bytes(b"\x00" + decoy[1:])
     # A separately closed embedded ZIP must still be discovered.
-    if layout != "shared-first-chunk":
+    if not shared_head:
         (source / "independent.bin").write_bytes(b"prefix" + inner + b"suffix")
     output = tmp_path / "out"
     report = extract_report(package, source, output, recur="1")
     # A shared carrier is one physical task even with two logical ZIP outputs.
-    assert report["summary"]["success_count"] == (1 if layout == "shared-first-chunk" else 2), report
+    assert report["summary"]["success_count"] == (1 if shared_head else 2), report
     assert {p.name: p.read_bytes() for p in output.rglob("*") if p.is_file()} == {
         **entries, "independent.txt": b"independent",
     }

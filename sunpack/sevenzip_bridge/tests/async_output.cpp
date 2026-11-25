@@ -194,6 +194,41 @@ bool blocked_open_does_not_block_other_jobs(const std::filesystem::path& directo
     return independent && sibling_ok && writer.finish_job(blocked_job) == E_ABORT && writer.take_file_snapshot(blocked).closed;
 }
 
+bool output_drain_handoff_runs_only_for_pending_output(const std::filesystem::path& directory) {
+    using sunpack::sevenzip::NativeCpuBudget;
+    using sunpack::sevenzip::NativeCpuJobContext;
+    AsyncWriterConfig config;
+    config.threads_per_volume = 1;
+    AsyncFileWriter writer(std::make_shared<VolumeState>("test:handoff", false), config);
+    struct Latch {
+        std::promise<void> proceed;
+        unsigned began = 0;
+        unsigned ended = 0;
+    } latch;
+    auto proceed = latch.proceed.get_future();
+    const auto path = (directory / L"handoff.bin").wstring();
+    writer.set_open_probe_for_test([&](const std::wstring& opened) {
+        if (opened == path) proceed.wait_for(std::chrono::seconds(5));
+    });
+    NativeCpuBudget budget(1);
+    if (!budget.try_acquire_base()) return false;
+    NativeCpuJobContext cpu(budget, {
+        &latch,
+        [](void* context) noexcept {
+            auto& state = *static_cast<Latch*>(context);
+            if (++state.began != 1) return false;
+            state.proceed.set_value();
+            return true;
+        },
+        [](void* context) noexcept { ++static_cast<Latch*>(context)->ended; }});
+    if (writer.finish_job(writer.make_job(), &cpu) != S_OK || latch.began || latch.ended) return false;
+    const auto job = writer.make_job();
+    const auto file = writer.make_file(job, path, 0, 0);
+    writer.close_file(file, {});
+    return writer.finish_job(job, &cpu) == S_OK && latch.began == 1 && latch.ended == 1 &&
+        writer.take_file_snapshot(file).closed;
+}
+
 bool full_queue_preserves_staged_output(const std::filesystem::path& directory) {
     AsyncWriterConfig config;
     config.threads_per_volume = 1;
@@ -778,6 +813,7 @@ int main() {
     const bool passed = write_same_file_concurrently(directory) &&
         write_zero_length_file(directory) &&
         blocked_open_does_not_block_other_jobs(directory) &&
+        output_drain_handoff_runs_only_for_pending_output(directory) &&
         full_queue_preserves_staged_output(directory) &&
         timestamp_failure_does_not_fail_content(directory) &&
         closes_after_delayed_open_failure(directory) &&

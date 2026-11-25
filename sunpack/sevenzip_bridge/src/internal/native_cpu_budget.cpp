@@ -95,7 +95,12 @@ bool NativeCpuBudget::can_acquire_base() const noexcept
 
 NativeCpuJobContext::NativeCpuJobContext(
     NativeCpuBudget &budget) noexcept
-    : budget_(budget)
+    : NativeCpuJobContext(budget, {})
+{
+}
+
+NativeCpuJobContext::NativeCpuJobContext(NativeCpuBudget &budget, OutputDrainHandoff handoff) noexcept
+    : budget_(budget), output_drain_(handoff)
 {
 }
 

@@ -267,7 +267,7 @@ impl AttemptSource {
     }
 }
 
-fn zip_total(anchor: &VolumeAnchor) -> Option<u64> {
+pub(super) fn zip_total(anchor: &VolumeAnchor) -> Option<u64> {
     let directory = anchor.zip_directory.as_ref()?;
     directory
         .offset
@@ -286,7 +286,11 @@ fn head_geometry(head: &VolumeAnchor, format: &str) -> (Option<u64>, Option<u64>
     (minimum.filter(|_| trim), minimum, trim)
 }
 
-pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<ProposalValidation> {
+pub(super) fn build(
+    view: &BucketView<'_>,
+    logical: Option<&str>,
+    raw_zip_minimum: Option<u64>,
+) -> Vec<ProposalValidation> {
     let Some(first) = view.indexes.iter().position(|index| view.facts[index].exact_slot == Some(1)) else {
         return Vec::new();
     };
@@ -581,10 +585,13 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
                                 let mut representative = choices[0];
                                 for &i in choices.iter() {
                                     represented.insert(i);
-                                    let size = view.rows[i]
-                                        .anchor
-                                        .as_deref()
-                                        .map_or(0, VolumeAnchor::payload_size);
+                                    let size = view.rows[i].anchor.as_deref().map_or(0, |a| {
+                                        if raw_zip_minimum.is_some() && i != head && !a.has_any(TERMINAL) {
+                                            a.size
+                                        } else {
+                                            a.payload_size()
+                                        }
+                                    });
                                     smallest = smallest.min(size);
                                     if size >= largest {
                                         largest = size;
@@ -618,7 +625,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
                                 representative.slots.insert(last, *tail);
                             }
                             local
-                                .finish_mapping(representative, slack)
+                                .finish_mapping(representative, slack, raw_zip_minimum.is_some())
                                 .is_some_and(|normalized| {
                                     normalized
                                         .slots
@@ -746,12 +753,29 @@ pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<Proposa
         proposal.attempts = Some(VolumeAttempts {
             head_size_from_total,
             tail_totals,
-            minimum_size,
+            minimum_size: raw_zip_minimum.or(minimum_size),
             base_source_count,
             sources: sources
                 .iter()
                 .map(|i| {
-                    AttemptSource::new(&view.rows[*i].path, view.rows[*i].anchor.as_ref().unwrap())
+                    let anchor = view.rows[*i].anchor.as_ref().unwrap();
+                    let mut source = AttemptSource::new(&view.rows[*i].path, anchor);
+                    if raw_zip_minimum.is_some() {
+                        if *i == head && trim_head {
+                            // A nested ZIP may begin inside the first chunk.
+                            // The selected tail and continuations give the
+                            // outer head's end, up to the physical file limit.
+                            source.end = anchor.size;
+                        } else if *i != head && !source.terminal {
+                            // A member header inside a raw continuation does
+                            // not change the start of that volume.
+                            source.start = 0;
+                            source.end = anchor.size;
+                            source.proven_end = None;
+                            source.head_size = None;
+                        }
+                    }
+                    source
                 })
                 .collect(),
             layouts: layouts
