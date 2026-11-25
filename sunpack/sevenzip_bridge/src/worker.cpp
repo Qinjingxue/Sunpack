@@ -1196,6 +1196,10 @@ RequestOutcome scan_request(WorkerRequest& request, const std::atomic<bool>* can
     }
     if (request.encrypted >= 0 || verified || (tested && (probe.encrypted || probe.status == PasswordTestStatus::Ok)))
         fields += wire::key("encrypted") + wire::boolean(request.encrypted == 1 || verified || probe.encrypted);
+#ifdef SUP7Z_DEBUG
+    if (pipeline_timing_enabled())
+        fields += wire::key("resolution_scan_qpc") + wire::number(resolution_qpc());
+#endif
     NativeMemoryScope response_memory(nullptr);
     return {ok ? 0 : 1, wire::object() + wire::key("type") + wire::text("result") +
         wire::key("job_id") + wire::text(request.job_id) + wire::key("status") + wire::text(ok ? "ok" : "failed") +
@@ -1331,7 +1335,14 @@ RequestExecution execute_request(
     std::optional<PasswordTestResult> selected_probe;
     std::optional<VolumeProbeCache> proof_cache;
     if (volume_trials) proof_cache.emplace(request.archive_input.volume_attempts);
+#ifdef SUP7Z_DEBUG
+    const bool measure_resolution = pipeline_timing_enabled();
+    unsigned int extract_calls = 0;
+#endif
     auto extract_with_password = [&](const std::wstring& selected_password) {
+#ifdef SUP7Z_DEBUG
+        if (measure_resolution) ++extract_calls;
+#endif
         if (volume_trials) volume_replay->volume_output_started = true;
         // The callback is synchronous and its emit() serializes calls. Each
         // password/composition keeps its own progress counters on this stack.
@@ -1449,6 +1460,15 @@ RequestExecution execute_request(
             result = password_candidate_failure(*selected_probe);
             break;
         }
+#ifdef SUP7Z_DEBUG
+        unsigned long long probe_qpc = 0;
+        int probe_index = -1;
+        if (measure_resolution && selected_probe && selected_probe->status == PasswordTestStatus::Ok &&
+            selected_probe->encrypted && !selected_probe->weak_match && selected_probe->matched_index >= 0) {
+            probe_qpc = resolution_qpc();
+            probe_index = selected_probe->matched_index;
+        }
+#endif
         // Publish completed screening before the extraction-side allocations
         // so a retry keeps the same confirmed or narrowed candidate domain.
         if (volume_replay && volume_replay->confirmed_candidate_index < 0 && selected_probe &&
@@ -1529,6 +1549,12 @@ RequestExecution execute_request(
                     static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
                     result = password_candidate_failure(probe);
                 } else {
+#ifdef SUP7Z_DEBUG
+                    if (measure_resolution && probe.encrypted && !probe.weak_match && !probe_qpc) {
+                        probe_qpc = resolution_qpc();
+                        probe_index = probe.matched_index;
+                    }
+#endif
                     if (replay && probe.encrypted && !(current_native_memory_job() &&
                         current_native_memory_job()->revoked.load(std::memory_order_acquire)))
                         replay->confirmed_candidate_index = probe.matched_index;
@@ -1655,6 +1681,10 @@ RequestExecution execute_request(
             result.failure_kind = "encrypted_or_wrong_password";
             result.operation_result = kOpDataError;
         }
+#ifdef SUP7Z_DEBUG
+        if (result.status == PasswordTestStatus::Ok && result.matched_index == probe_index)
+            result.resolution_probe_qpc = probe_qpc;
+#endif
         if (!volume_trials || !volume_composition_failure(result, *volume_replay, password_verified)) break;
         if (archive_input.missing_volume_number > 0 &&
             std::none_of(request.archive_input.volume_attempts.layouts.begin(), request.archive_input.volume_attempts.layouts.end(),
@@ -1672,6 +1702,9 @@ RequestExecution execute_request(
         cursor.needs_next = true;
     }
 
+#ifdef SUP7Z_DEBUG
+    result.resolution_extract_calls = extract_calls;
+#endif
     if (!archive_input.analyzed_missing_volume_evidence.empty()) {
         if (result.missing_volume && result.missing_volume_evidence.empty()) {
             result.missing_volume_evidence = archive_input.analyzed_missing_volume_evidence;
@@ -1744,6 +1777,11 @@ RequestOutcome run_request(
         wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
     const std::string pipeline_timing_field = pipeline_timing_enabled() ?
         wire::key("pipeline_timing") + pipeline_timing_wire(result.pipeline_timing) : "";
+    const std::string resolution_field = pipeline_timing_enabled() ?
+        wire::key("resolution_probe_qpc") + wire::number(result.resolution_probe_qpc) +
+        wire::key("resolution_member_qpc") + wire::number(result.output_trace.resolution_member_qpc) +
+        wire::key("resolution_decode_qpc") + wire::number(result.resolution_decode_qpc) +
+        wire::key("resolution_extract_calls") + wire::number(result.resolution_extract_calls) : "";
 #endif
     return {ok ? 0 : 1,
         (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
@@ -1768,7 +1806,7 @@ RequestOutcome run_request(
         wire::key("message") + wire::text(result.message) +
         failure_fields
 #ifdef SUP7Z_DEBUG
-        + input_trace_field + pipeline_timing_field
+        + input_trace_field + pipeline_timing_field + resolution_field
 #endif
         + wire::end()};
 }

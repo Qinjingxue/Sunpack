@@ -541,6 +541,7 @@ namespace sunpack::sevenzip
 #endif
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
 #ifdef SUP7Z_DEBUG
+            if (pipeline_timing) result.resolution_decode_qpc = resolution_qpc();
             compute_scope.finish();
 #endif
 

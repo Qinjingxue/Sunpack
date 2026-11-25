@@ -1184,6 +1184,12 @@ namespace sunpack::sevenzip
                 item.operation_result = opRes;
                 item.done = opRes == kOpOk && !item.failed;
                 item.failed = item.failed || opRes != kOpOk;
+#ifdef SUP7Z_DEBUG
+                if (!output_trace_.resolution_member_qpc &&
+                    operation_result_ == kOpOk && item.done && item.encrypted && !item.is_dir &&
+                    item.password_proof == OutputPasswordProof::Strong && pipeline_timing_enabled())
+                    output_trace_.resolution_member_qpc = resolution_qpc();
+#endif
             }
             if (opRes != kOpOk) failed_item_had_data_ = had_data;
 

@@ -3064,9 +3064,28 @@ impl<'run, O: Observer> Run<'run, O> {
                 });
             }
         };
+        #[cfg(debug_assertions)]
+        let resolution_plan = resolution_trace_enabled().then(|| {
+            let ready_at = crate::runtime::monotonic_seconds();
+            let volume_complete = !input.mode.structured()
+                || input.analysis.volume_completeness == Some(VolumeCompleteness::Complete);
+            (ready_at, volume_complete && input.volume_attempts.is_none(),
+             plan.verified_password.is_some(), plan.encrypted)
+        });
         if let Some(password) = &plan.verified_password {
             result.password = Some(password.to_string());
             if self.request.mode == Mode::Scan && !truncated && complete_verified_scan_layout(&mut input, &mut result) {
+                #[cfg(debug_assertions)]
+                if let Some((ready_at, _, _, _)) = resolution_plan {
+                    eprintln!("sunpack-resolution {}", serde_json::json!({
+                        "task": id, "rust_plan_qpc_seconds": ready_at,
+                        "rust_scan_resolve_qpc_seconds": crate::runtime::monotonic_seconds(),
+                        "rust_scan_return": true,
+                        "volume_complete": !input.mode.structured()
+                            || input.analysis.volume_completeness == Some(VolumeCompleteness::Complete),
+                        "resolved_extents": resolution_extents(&input)
+                    }));
+                }
                 self.request.cancel.check_io()?;
                 result.encrypted = plan.encrypted;
                 self.notify(|| Event::Finalizing { id });
@@ -3229,6 +3248,23 @@ impl<'run, O: Observer> Run<'run, O> {
                                 Some(Failure::new(FailureKind::ProcessError, error.to_string()));
                         }
                     }
+                }
+                #[cfg(debug_assertions)]
+                if let Some((ready_at, fixed_complete, password_verified, encrypted)) = resolution_plan {
+                    let resolved = success && result.failure.is_none() && input.volume_attempts.is_none();
+                    eprintln!("sunpack-resolution {}", serde_json::json!({
+                        "task": id, "rust_plan_qpc_seconds": ready_at,
+                        "rust_fixed_complete": fixed_complete, "rust_password_verified": password_verified,
+                        "rust_encrypted": encrypted, "worker_ok": success,
+                        "worker_job": value.get("job_id"), "worker_volume_selection": value.get("volume_selection"),
+                        "worker_matched_index": matched_index, "worker_password_verified": flag(value, "password_verified"),
+                        "worker_scan_qpc": value.get("resolution_scan_qpc"),
+                        "worker_probe_qpc": value.get("resolution_probe_qpc"),
+                        "worker_member_qpc": value.get("resolution_member_qpc"),
+                        "worker_decode_qpc": value.get("resolution_decode_qpc"),
+                        "worker_extract_calls": value.get("resolution_extract_calls"),
+                        "resolved_extents": resolved.then(|| resolution_extents(&input))
+                    }));
                 }
                 if success && result.failure.is_none() {
                     let password_verified = self.request.mode == Mode::Extract
@@ -3784,6 +3820,23 @@ fn cleanup_failure(path: &Path, mode: &'static str, removed: io::Result<()>) -> 
         error_code: error.raw_os_error().unwrap_or(0),
         message: error.to_string(),
     })
+}
+
+#[cfg(debug_assertions)]
+fn resolution_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SUNPACK_SEVENZIP_PROFILE_PIPELINE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(debug_assertions)]
+fn resolution_extents(input: &ArchiveInput) -> Vec<Value> {
+    let mut extents: Vec<_> = input.physical_extents().map(|extent| {
+        serde_json::json!({"path": extent.path, "start": extent.start, "end": extent.end})
+    }).collect();
+    if extents.is_empty() {
+        extents.push(serde_json::json!({"path": input.entry_path, "start": 0, "end": null}));
+    }
+    extents
 }
 
 fn complete_verified_scan_layout(input: &mut ArchiveInput, result: &mut ArchiveResult) -> bool {

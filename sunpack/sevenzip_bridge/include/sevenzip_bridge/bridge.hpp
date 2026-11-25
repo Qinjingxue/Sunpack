@@ -104,6 +104,9 @@ struct ExtractOutputItemTrace {
 };
 
 struct ExtractOutputTrace {
+#ifdef SUP7Z_DEBUG
+    unsigned long long resolution_member_qpc = 0;
+#endif
     int last_hresult = 0;
     std::vector<ExtractOutputItemTrace> items;
 };
@@ -111,6 +114,9 @@ struct ExtractOutputTrace {
 struct ExtractArchiveResult {
 #ifdef SUP7Z_DEBUG
     ExtractPipelineTiming pipeline_timing;
+    unsigned long long resolution_probe_qpc = 0;
+    unsigned long long resolution_decode_qpc = 0;
+    unsigned int resolution_extract_calls = 0;
 #endif
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
     bool encrypted = false;

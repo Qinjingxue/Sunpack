@@ -191,7 +191,7 @@ pub(super) fn maintain_when_foreground_idle(
     result
 }
 
-pub(super) fn monotonic_seconds() -> f64 {
+pub(crate) fn monotonic_seconds() -> f64 {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn QueryPerformanceCounter(counter: *mut i64) -> i32;

@@ -41,6 +41,15 @@ bool pipeline_timing_enabled() noexcept
     return enabled;
 }
 
+unsigned long long resolution_qpc() noexcept
+{
+#ifdef _WIN32
+    LARGE_INTEGER counter{};
+    if (QueryPerformanceCounter(&counter)) return static_cast<unsigned long long>(counter.QuadPart);
+#endif
+    return 0;
+}
+
 void PipelineTiming::start_pipeline() noexcept
 {
     if (!enabled_)

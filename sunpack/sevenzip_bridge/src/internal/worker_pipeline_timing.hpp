@@ -38,6 +38,7 @@ enum class PipelinePreparePhase : unsigned char
 };
 
 bool pipeline_timing_enabled() noexcept;
+unsigned long long resolution_qpc() noexcept;
 
 class PipelineTiming final
 {

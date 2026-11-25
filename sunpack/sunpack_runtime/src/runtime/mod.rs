@@ -18,6 +18,8 @@ mod tray;
 mod watch;
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, debug_assertions))]
+pub(crate) use windows::monotonic_seconds;
 
 #[cfg(windows)]
 use std::io::{self, BufRead, IsTerminal, Write};
