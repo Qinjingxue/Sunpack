@@ -1704,6 +1704,10 @@ RequestExecution execute_request(
 
 #ifdef SUP7Z_DEBUG
     result.resolution_extract_calls = extract_calls;
+    if (volume_trials) {
+        result.resolution_volume_compositions = volume_replay->prepared_compositions;
+        result.resolution_volume_probes = volume_replay->scheduled_volume_probes;
+    }
 #endif
     if (!archive_input.analyzed_missing_volume_evidence.empty()) {
         if (result.missing_volume && result.missing_volume_evidence.empty()) {
@@ -1781,7 +1785,9 @@ RequestOutcome run_request(
         wire::key("resolution_probe_qpc") + wire::number(result.resolution_probe_qpc) +
         wire::key("resolution_member_qpc") + wire::number(result.output_trace.resolution_member_qpc) +
         wire::key("resolution_decode_qpc") + wire::number(result.resolution_decode_qpc) +
-        wire::key("resolution_extract_calls") + wire::number(result.resolution_extract_calls) : "";
+        wire::key("resolution_extract_calls") + wire::number(result.resolution_extract_calls) +
+        wire::key("resolution_volume_compositions") + wire::number(result.resolution_volume_compositions) +
+        wire::key("resolution_volume_probes") + wire::number(result.resolution_volume_probes) : "";
 #endif
     return {ok ? 0 : 1,
         (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +

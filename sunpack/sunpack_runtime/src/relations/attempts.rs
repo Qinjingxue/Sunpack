@@ -456,17 +456,28 @@ pub(super) fn build(
                     })
                     .collect();
                 let fixed_numbers: HashSet<_> = slots.keys().copied().collect();
-                for &i in &indexes {
-                    if view.facts[&i].exact_slot.is_some() {
-                        continue;
-                    }
-                    let unnamed_terminal = (view.facts[&i].has_next == Some(false)
-                        && numbers[&i].is_empty())
-                    .then_some(candidate_terminal)
-                    .flatten();
-                    for n in numbers[&i].iter().copied().chain(unnamed_terminal) {
-                        if view.legal(i, n, candidate_terminal) && !fixed_numbers.contains(&n) {
-                            Arc::make_mut(slots.entry(n).or_default()).push(i);
+                // A native ZIP terminal fixes the actual disk count. In the
+                // loose tier, a name only ranks unanchored disks for a slot.
+                let spanned_name_hints = spanned && channel.is_none()
+                    && candidate_terminal.is_some_and(|end| {
+                        end as usize <= indexes.len()
+                            && slots.get(&end).is_some_and(|choices| {
+                                choices.iter().any(|i| view.facts[i].terminal)
+                            })
+                    });
+                if !spanned_name_hints {
+                    for &i in &indexes {
+                        if view.facts[&i].exact_slot.is_some() {
+                            continue;
+                        }
+                        let unnamed_terminal = (view.facts[&i].has_next == Some(false)
+                            && numbers[&i].is_empty())
+                        .then_some(candidate_terminal)
+                        .flatten();
+                        for n in numbers[&i].iter().copied().chain(unnamed_terminal) {
+                            if view.legal(i, n, candidate_terminal) && !fixed_numbers.contains(&n) {
+                                Arc::make_mut(slots.entry(n).or_default()).push(i);
+                            }
                         }
                     }
                 }
@@ -474,8 +485,11 @@ pub(super) fn build(
                 // members. Never allocate up to a huge filename/terminal number.
                 let bound = candidate_terminal.or_else(|| slots.last_key_value().map(|(&n, _)| n));
                 if let Some(end) = bound.filter(|end| *end as usize <= indexes.len()) {
-                    let assigned: HashSet<_> =
-                        slots.values().flat_map(|c| c.iter()).copied().collect();
+                    let assigned: HashSet<_> = if spanned_name_hints {
+                        HashSet::new()
+                    } else {
+                        slots.values().flat_map(|c| c.iter()).copied().collect()
+                    };
                     let mut gaps = HashMap::new();
                     for n in 1..=end {
                         if !slots.contains_key(&n) {
@@ -524,7 +538,7 @@ pub(super) fn build(
                     // Consume one domain at a time: never retain G copies of
                     // U gap members while sorting/interning.
                     let mut ordered = (**choices).clone();
-                    if channel.is_none() && !fixed {
+                    if channel.is_none() && !spanned_name_hints && !fixed {
                         // Structurally owned unnamed members remain candidates.
                         let unnamed = || indexes.iter().copied().filter(|i| {
                             view.facts[i].owned

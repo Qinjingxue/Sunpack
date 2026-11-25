@@ -125,6 +125,12 @@ impl CandidateSources {
 }
 
 impl CandidateSet {
+    #[cfg(debug_assertions)]
+    pub(super) fn resolution_password_rank(&self, password: Option<&str>) -> Option<usize> {
+        let password = password?;
+        self.sources.explicit.iter().position(|candidate| candidate.as_ref() == password)
+    }
+
     pub(super) fn new(
         explicit: Arc<[Arc<str>]>,
         snapshot: Option<Arc<PasswordSnapshot>>,

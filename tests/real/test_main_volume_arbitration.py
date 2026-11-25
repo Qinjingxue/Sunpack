@@ -12,7 +12,7 @@ import pytest
 from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree
 from tests.helpers.real_archives import create_encrypted_rar_archive, create_zip_multidisk_archive
 from tests.helpers.tool_config import require_7z
-from tests.real.archive_boundary import assert_extracted, extract_report, require_generator
+from tests.real.archive_boundary import assert_extracted, extract_report, failure_kinds, require_generator
 from tests.real.plan7_watch_downloads.plan7_support import (
     FACTORY, download, source_directory_cleaned, wait_for, watch_setup,
 )
@@ -205,6 +205,43 @@ def test_pkzip_terminal_disk_with_long_trailer_and_disguised_names(package, tmp_
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
     assert not any(path.exists() for path in parts)
+
+
+@pytest.mark.parametrize("entry_mode", ["cli", WATCH])
+def test_pkzip_arbitrates_unnumbered_data_disks(package, tmp_path, entry_mode):
+    case = create_zip_multidisk_archive(
+        tmp_path / "fixtures", "opaque", payload_size=136 * 1024, split_volume_size=40 * 1024,
+    )
+    head, second, third, tail = (
+        path.rename(path.with_name(f"shared.{suffix}.图片"))
+        for path, suffix in zip(case.metadata["volume_paths"], ("head", "cedar", "birch", "tail"), strict=True)
+    )
+    assert all(b"PK\x03\x04" not in path.read_bytes() for path in (second, third))
+    # The data-only disks sort in reverse order. Equally sized unrelated disks
+    # advertise a complete numbering, but both must survive source cleanup.
+    extras = [head.with_name(f"shared.amber.part{slot}.图片") for slot in (2, 3)]
+    output = tmp_path / "out"
+    if entry_mode == "cli":
+        withheld = third.rename(tmp_path / third.name)
+        report = extract_report(package, case.archive_dir, output, code=1)
+        assert failure_kinds(report) == {"missing_volume"}, report
+        withheld.rename(third)
+        for extra in extras:
+            extra.write_bytes(b"!" * second.stat().st_size)
+        report = extract_report(package, case.archive_dir, output, cleanup="d")
+        assert report["summary"]["success_count"] == 1, report
+        delivered = case.archive_dir
+    else:
+        watch = watch_setup(package, tmp_path, passwords=[], cleanup="d")
+        for part in (head, second, tail):
+            download(watch, part)
+        watch.await_event("suspended_missing_volume", path=head.name)
+        delivered = download(watch, third).parent
+        watch.await_archive(case)
+        watch.stop()
+        watch.assert_no_terminal_failures()
+    assert_extracted(case, output, exact=True)
+    assert set(delivered.iterdir()) == (set(extras) if entry_mode == "cli" else set())
 
 
 @pytest.mark.requires_watch_broker

@@ -3081,6 +3081,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         "task": id, "rust_plan_qpc_seconds": ready_at,
                         "rust_scan_resolve_qpc_seconds": crate::runtime::monotonic_seconds(),
                         "rust_scan_return": true,
+                        "confirmed_password_rank": candidates.resolution_password_rank(result.password.as_deref()),
+                        "password_confirmed": true,
                         "volume_complete": !input.mode.structured()
                             || input.analysis.volume_completeness == Some(VolumeCompleteness::Complete),
                         "resolved_extents": resolution_extents(&input)
@@ -3249,13 +3251,25 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                     }
                 }
+                let succeeded = success && result.failure.is_none();
+                if succeeded && result.encrypted == Some(true) && (self.request.mode == Mode::Extract
+                    || plan.verified_password.is_some() || flag(value, "password_verified"))
+                {
+                    result.password = plan
+                        .remember_confirmation(matched_index, &self.engine.recent_passwords)
+                        .map(str::to_owned);
+                }
                 #[cfg(debug_assertions)]
                 if let Some((ready_at, fixed_complete, password_verified, encrypted)) = resolution_plan {
-                    let resolved = success && result.failure.is_none() && input.volume_attempts.is_none();
+                    let resolved = succeeded && !truncated && input.volume_attempts.is_none();
                     eprintln!("sunpack-resolution {}", serde_json::json!({
                         "task": id, "rust_plan_qpc_seconds": ready_at,
                         "rust_fixed_complete": fixed_complete, "rust_password_verified": password_verified,
-                        "rust_encrypted": encrypted, "worker_ok": success,
+                        "rust_encrypted": encrypted, "worker_ok": succeeded,
+                        "confirmed_password_rank": candidates.resolution_password_rank(result.password.as_deref()),
+                        "password_confirmed": result.password.is_some(),
+                        "volume_complete": fixed_complete
+                            || result.volume_completeness == Some(VolumeCompleteness::Complete),
                         "worker_job": value.get("job_id"), "worker_volume_selection": value.get("volume_selection"),
                         "worker_matched_index": matched_index, "worker_password_verified": flag(value, "password_verified"),
                         "worker_scan_qpc": value.get("resolution_scan_qpc"),
@@ -3263,18 +3277,12 @@ impl<'run, O: Observer> Run<'run, O> {
                         "worker_member_qpc": value.get("resolution_member_qpc"),
                         "worker_decode_qpc": value.get("resolution_decode_qpc"),
                         "worker_extract_calls": value.get("resolution_extract_calls"),
+                        "worker_volume_compositions_prepared": value.get("resolution_volume_compositions"),
+                        "worker_volume_probes_scheduled": value.get("resolution_volume_probes"),
                         "resolved_extents": resolved.then(|| resolution_extents(&input))
                     }));
                 }
-                if success && result.failure.is_none() {
-                    let password_verified = self.request.mode == Mode::Extract
-                        || plan.verified_password.is_some()
-                        || flag(value, "password_verified");
-                    if result.encrypted == Some(true) && password_verified {
-                        result.password = plan
-                            .remember_confirmation(matched_index, &self.engine.recent_passwords)
-                            .map(str::to_owned);
-                    }
+                if succeeded {
                     if let Some(output) = &output {
                         let collect_rows = depth <= self.request.max_depth;
                         let stats = frame.manifest.take()

@@ -1,4 +1,4 @@
-"""Start real Windows process trees under a test-owned commit limit."""
+"""Start and account for real Windows process trees."""
 
 import _winapi
 import ctypes
@@ -34,7 +34,27 @@ class _ExtendedLimits(ctypes.Structure):
     ]
 
 
+class _Accounting(ctypes.Structure):
+    _fields_ = [
+        ("user_time", ctypes.c_int64),
+        ("kernel_time", ctypes.c_int64),
+        ("period_user_time", ctypes.c_int64),
+        ("period_kernel_time", ctypes.c_int64),
+        ("page_faults", wintypes.DWORD),
+        ("total_processes", wintypes.DWORD),
+        ("active_processes", wintypes.DWORD),
+        ("terminated_processes", wintypes.DWORD),
+        ("read_operations", ctypes.c_uint64),
+        ("write_operations", ctypes.c_uint64),
+        ("other_operations", ctypes.c_uint64),
+        ("read_bytes", ctypes.c_uint64),
+        ("write_bytes", ctypes.c_uint64),
+        ("other_bytes", ctypes.c_uint64),
+    ]
+
+
 _CREATE_SUSPENDED = 0x00000004
+_JOB_OBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION = 8
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -70,15 +90,17 @@ def _check(result):
 
 
 class WindowsJob:
-    def __init__(self, memory_limit):
+    def __init__(self, memory_limit=None):
         self.memory_limit = memory_limit
 
     def __enter__(self):
         self.handle = _create_job(None, None)
         _check(self.handle)
         limits = _ExtendedLimits()
-        limits.basic.flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_JOB_MEMORY
-        limits.job_memory_limit = self.memory_limit
+        limits.basic.flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if self.memory_limit is not None:
+            limits.basic.flags |= _JOB_OBJECT_LIMIT_JOB_MEMORY
+            limits.job_memory_limit = self.memory_limit
         try:
             _check(_set_job(self.handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
                             ctypes.byref(limits), ctypes.sizeof(limits)))
@@ -86,7 +108,7 @@ class WindowsJob:
             _check(_query_job(self.handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
                               ctypes.byref(configured), ctypes.sizeof(configured), None))
             assert configured.basic.flags & limits.basic.flags == limits.basic.flags
-            assert configured.job_memory_limit == self.memory_limit
+            assert configured.job_memory_limit == limits.job_memory_limit
         except BaseException:
             _winapi.CloseHandle(self.handle)
             raise
@@ -104,7 +126,23 @@ class WindowsJob:
         finally:
             _winapi.CloseHandle(process)
 
-    def run(self, arguments, *, cwd, env, timeout):
+    def accounting(self):
+        data = _Accounting()
+        limits = _ExtendedLimits()
+        for kind, result in ((_JOB_OBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, data),
+                             (_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, limits)):
+            _check(_query_job(self.handle, kind, ctypes.byref(result), ctypes.sizeof(result), None))
+        return {
+            "cpu_user_ms": data.user_time / 10_000,
+            "cpu_kernel_ms": data.kernel_time / 10_000,
+            "peak_job_commit_bytes": limits.peak_job_memory,
+            "io_read_bytes": data.read_bytes,
+            "io_write_bytes": data.write_bytes,
+            "processes": data.total_processes,
+            "active_processes_at_snapshot": data.active_processes,
+        }
+
+    def run(self, arguments, *, cwd, env, timeout=None, encoding="utf-8", clock=None):
         args = list(map(str, arguments))
         with (
             open(os.devnull, "rb") as stdin,
@@ -120,6 +158,8 @@ class WindowsJob:
             startup.lpAttributeList = {"handle_list": handles}
             for handle in handles:
                 os.set_handle_inheritable(handle, True)
+            if clock:
+                self.start_tick = clock()
             process, thread, _, _ = _winapi.CreateProcess(
                 args[0], subprocess.list2cmdline(args), None, None, True,
                 _CREATE_SUSPENDED | subprocess.CREATE_NO_WINDOW,
@@ -130,8 +170,11 @@ class WindowsJob:
                 _check(_assign_process(self.handle, process))
                 if _resume_thread(thread) == 0xFFFFFFFF:
                     raise ctypes.WinError(ctypes.get_last_error())
-                if _winapi.WaitForSingleObject(process, int(timeout * 1000)) == _winapi.WAIT_TIMEOUT:
+                wait_ms = _winapi.INFINITE if timeout is None else int(timeout * 1000)
+                if _winapi.WaitForSingleObject(process, wait_ms) == _winapi.WAIT_TIMEOUT:
                     raise subprocess.TimeoutExpired(args, timeout)
+                if clock:
+                    self.exit_tick = clock()
                 code = _winapi.GetExitCodeProcess(process)
             except BaseException:
                 if _winapi.WaitForSingleObject(process, 0) == _winapi.WAIT_TIMEOUT:
@@ -143,5 +186,7 @@ class WindowsJob:
                 _winapi.CloseHandle(process)
             stdout.seek(0)
             stderr.seek(0)
-            return subprocess.CompletedProcess(args, code, stdout.read().decode("utf-8"),
-                                               stderr.read().decode("utf-8"))
+            out, error = stdout.read(), stderr.read()
+            if encoding:
+                out, error = out.decode(encoding), error.decode(encoding)
+            return subprocess.CompletedProcess(args, code, out, error)

@@ -118,6 +118,24 @@ impl BucketView<'_> {
             })
     }
 
+    fn needs_spanned_attempts(&self, assignment: &VolumeAssignment) -> bool {
+        if self.format != "zip" {
+            return false;
+        }
+        let Some((&end, tail)) = assignment.slots.last_key_value() else {
+            return false;
+        };
+        let end_slot = end as usize;
+        end_slot <= self.indexes.len()
+            && self.rows[*tail].anchor.as_deref().is_some_and(|anchor| {
+                anchor.has_any(ZIP_SPLIT_END) && anchor.internal_volume_number == Some(end)
+            })
+            && assignment.slots.get(&1).is_some_and(|i| self.facts[i].exact_slot == Some(1))
+            && (assignment.slots.len() < end_slot
+                || (end_slot < self.indexes.len()
+                    && assignment.slots.values().any(|i| self.facts[i].exact_slot.is_none())))
+    }
+
     fn fixed(&self) -> Result<VolumeAssignment, RelationFailureReason> {
         let mut out = VolumeAssignment::default();
         let terminal = self.terminal();
@@ -1060,7 +1078,9 @@ pub(super) fn resolve_buckets(
                     } else {
                         family.clone()
                     };
-                    if reason.is_some() {
+                    // A filename solve may leave native ZIP slots empty or assign
+                    // them ahead of opaque data disks. Preserve those alternatives.
+                    if reason.is_some() || view.needs_spanned_attempts(&assignment) {
                         let candidates = attempts::build(&view, Some(&logical), None);
                         if !candidates.is_empty() {
                             output.extend(candidates);

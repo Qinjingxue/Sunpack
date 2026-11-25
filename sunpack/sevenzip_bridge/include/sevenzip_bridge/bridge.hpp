@@ -117,6 +117,8 @@ struct ExtractArchiveResult {
     unsigned long long resolution_probe_qpc = 0;
     unsigned long long resolution_decode_qpc = 0;
     unsigned int resolution_extract_calls = 0;
+    unsigned long long resolution_volume_compositions = 0;
+    unsigned long long resolution_volume_probes = 0;
 #endif
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
     bool encrypted = false;
