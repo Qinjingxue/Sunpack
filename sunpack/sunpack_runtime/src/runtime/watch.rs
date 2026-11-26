@@ -4672,7 +4672,6 @@ impl Scheduler {
         let keys = &self.unpublished;
         let root_scope_records = &mut self.root_scope_records;
         self.journal.commit(durable, |state| {
-            use crate::watch_store::PendingObservation;
             let mut ordinary = Vec::new();
             let mut forced = Vec::new();
             let mut recoveries = Vec::new();
@@ -4683,13 +4682,7 @@ impl Scheduler {
                     continue;
                 };
                 let candidate = &pending.candidate;
-                let observation = PendingObservation(
-                    candidate.path.clone(),
-                    candidate.size.min(i64::MAX as u64) as i64,
-                    candidate.mtime,
-                    candidate.observation.file_id.clone(),
-                    candidate.observation.change_usn,
-                );
+                let observation = pending_observation(candidate);
                 if let Some(recovery) = &pending.recovery {
                     let update = (
                         observation,
@@ -6197,6 +6190,8 @@ impl Scheduler {
         {
             let input_failure = &input_failures[&crate::path_keys::path_key(&archive.path.to_string_lossy())];
             let failure = input_failure.failure().expect("retained input has a retry cause");
+            let lost = failure.worker_lost();
+            if lost && completed.cancelled { continue; }
             let id = key(&archive.path);
             if !published.insert(id.clone()) { continue; }
             let Some(candidate) = watch_candidate_for_path(&archive.path, None)? else {
@@ -6284,15 +6279,24 @@ impl Scheduler {
             let password_updated = password_updated(&entry, &self.user_password_signature);
             let pending = regroup.then(|| self.pending.get_mut(&id)).flatten();
             let handed_off = pending.is_some();
+            // The owner can be consumed before this child resumes. Persist the child's
+            // admission in the same transaction as its parent and recovery receipts.
+            if lost {
+                let update = (pending_observation(&candidate), scope.root.clone(), Some(Arc::new(recovery.record())));
+                operations.extend(self.journal.state().pending_operations(
+                    [update], true, &recovery.password_scope.to_string_lossy(), true, None));
+            }
             handoff_nested_blocker(&mut entry, route_root, root,
                 recovery, pending);
-            if handed_off {
-                self.unpublished.insert(id.clone());
+            if handed_off || lost {
+                if handed_off { self.unpublished.insert(id.clone()); }
                 operations.put_entry(entry);
             } else {
                 operations.finish_pending(&candidate.path, Some(entry));
             }
-            if (regroup && !self.pending.contains_key(&id)) || password_updated {
+            if lost {
+                retry.push((candidate.path.clone(), CandidateAdmission::ExplicitRetry));
+            } else if (regroup && !self.pending.contains_key(&id)) || password_updated {
                 retry.push((candidate.path.clone(), if password_updated {
                     CandidateAdmission::PasswordRetry
                 } else { CandidateAdmission::Retry }));
@@ -6358,7 +6362,7 @@ impl Scheduler {
                 .or_else(|| input_failure.and_then(InputFailure::failure));
             if let Some(lost) = failure.filter(|f| !completed.cancelled
                 && failed_archive.is_some_and(|archive| archive.depth == start_depth)
-                && f.evidence.as_deref().and_then(|e| e.native_kind.as_deref()) == Some("worker_lost")) {
+                && f.worker_lost()) {
                 self.retry_pipeline_error(batch, &active.root, active.recovery.as_ref(), &canonical,
                     &lost.message, io::ErrorKind::BrokenPipe, quiet, &mut operations)?;
                 continue;
@@ -6634,10 +6638,9 @@ impl Scheduler {
                 .and_then(|entry| self.blocker_route(&entry))
             {
                 let tracker = quiet.remove(&watch_path_key(&path));
+                let reason = if admission == CandidateAdmission::PasswordRetry { "password_retry" } else { "pipeline_worker_retry" };
                 self.observe_candidate_with_event(&root, path, admission, recovery, None, tracker,
-                    Some(&CandidateEvent::Business(if admission == CandidateAdmission::PasswordRetry {
-                        "password_retry"
-                    } else { "volume_changed" })), None)?;
+                    Some(&CandidateEvent::Business(reason)), None)?;
             }
         }
         let discovery_retry = outcome.errors.iter()
@@ -6788,7 +6791,7 @@ impl<'a> RecoveryReceipts<'a> {
 }
 
 fn watch_retryable(input: &InputFailure<'_>, multipart: bool) -> bool {
-    input.retryable() || (multipart && input.failure().is_some_and(|failure| failure.kind == FailureKind::Damaged))
+    input.retryable() || input.failure().is_some_and(|failure| failure.worker_lost() || (multipart && failure.kind == FailureKind::Damaged))
 }
 
 fn nested_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailure<'_>>) -> bool {
@@ -7109,6 +7112,11 @@ fn make_blocker(
     }
     entry.failure_payload = payload;
     Arc::new(entry)
+}
+
+fn pending_observation(candidate: &WatchCandidateRow) -> crate::watch_store::PendingObservation {
+    crate::watch_store::PendingObservation(candidate.path.clone(), candidate.size.min(i64::MAX as u64) as i64,
+        candidate.mtime, candidate.observation.file_id.clone(), candidate.observation.change_usn)
 }
 
 fn observed_entry(
@@ -7788,30 +7796,26 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
         if work_id.as_deref().is_some_and(|id| id != old) {
             continue;
         }
-        if work_id.is_none() && identity_if_present(root).is_ok_and(|id| id.as_deref() == Some(old)) {
-            recover_finish_flatten(journal, root)?;
-            if journal.state().runtime_record(&id).is_none() { settled.push(root.to_owned()); }
-            continue;
-        }
         let Ok(target_id) = identity_if_present(destination) else { continue; };
         let published = target_id.as_deref() == Some(new);
-        if !published && (target_id.is_some() || work_id.is_none())
-        {
-            continue;
-        }
-        if !published {
-            let Ok(relative) = Path::new(leaf).strip_prefix(root) else {
-                continue;
-            };
-            let candidate = Path::new(work).join(relative);
-            if !output_identity(&candidate.to_string_lossy()).is_ok_and(|id| id == new) {
-                continue;
-            }
-        }
+        let leaf = Path::new(leaf);
+        let operation = if published {
+            crate::postprocess::FlattenLeaf::Resume { leaf, published: true }
+        } else {
+            let Ok(relative) = leaf.strip_prefix(root) else { continue; };
+            let prepared = work_id.is_none();
+            let current = if prepared { root } else { work };
+            if prepared && !identity_if_present(root).is_ok_and(|id| id.as_deref() == Some(old)) { continue; }
+            if target_id.is_some() && !(prepared && watch_path_key(root) == watch_path_key(destination)) { continue; }
+            let candidate = Path::new(current).join(relative);
+            if !output_identity(&candidate.to_string_lossy()).is_ok_and(|id| id == new) { continue; }
+            if prepared { crate::postprocess::FlattenLeaf::Prepared(leaf) }
+            else { crate::postprocess::FlattenLeaf::Resume { leaf, published: false } }
+        };
         crate::postprocess::flatten_single_branch_directories(
             Path::new(root),
             Path::new(work),
-            crate::postprocess::FlattenLeaf::Resume { leaf: Path::new(leaf), published },
+            operation,
             Path::new(destination),
             || Ok(()),
         );

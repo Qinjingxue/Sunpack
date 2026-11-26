@@ -96,7 +96,7 @@ impl Drop for LocalAllocation {
     }
 }
 
-fn current_user_sid() -> io::Result<String> {
+pub(crate) fn current_user_sid() -> io::Result<String> {
     let mut raw = null_mut();
     bool_result(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) })?;
     let token = unsafe { OwnedHandle::from_raw_handle(raw) };

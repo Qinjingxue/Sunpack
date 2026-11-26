@@ -18,6 +18,8 @@ mod tray;
 mod watch;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub(crate) use windows::current_user_sid;
 #[cfg(all(windows, debug_assertions))]
 pub(crate) use windows::monotonic_seconds;
 

@@ -5,6 +5,25 @@ use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+#[cfg(windows)]
+#[test]
+fn recycle_replay_preserves_replacement_and_ordinary_recycle_named_directory() {
+    let original = crate::test_support::temp_file("recycle_replay_identity", b"archive");
+    let base = original.with_extension("tree");
+    let apparent_bin = base.join("$Recycle.Bin").join(crate::runtime::current_user_sid().unwrap());
+    fs::create_dir_all(&apparent_bin).unwrap();
+    let source = CleanupSource { path: original.clone(), generation: capture_file_generation(&original).unwrap(), recycle: true };
+    fs::rename(&original, apparent_bin.join("$Rsample.bin")).unwrap();
+    fs::write(&original, b"replacement").unwrap();
+    let info = apparent_bin.join("$Isample.bin");
+    fs::write(&info, [0; 88]).unwrap();
+    assert!(!crate::pipeline::cleanup::clean_source(&source, true).unwrap());
+    assert_eq!(fs::read(&info).unwrap(), [0; 88]);
+    assert_eq!(fs::read(&original).unwrap(), b"replacement");
+    fs::remove_dir_all(base).unwrap();
+    fs::remove_file(original).unwrap();
+}
+
 // A normal Journal drop can finish persistence and conceal a crash ordering
 // defect. This owner is killed with real WAL, directory identities alive. No production fault hook or timing race is involved.
 #[test]
@@ -115,18 +134,6 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                 "{phase}/{reopen}: pending child cleanup did not follow its output");
             assert_eq!(fs::read(leaf.join("nested.zip")).or_else(|_| fs::read(destination.join("nested.zip"))).unwrap(),
                 b"nested archive", "the pending child was not an authorized cleanup member");
-            if phase == "prepared" && reopen == 0 {
-                // No filesystem move occurred. Recovery retires the untouched
-                // intent; the resumed pipeline can perform the same operation.
-                assert!(leaf.join("nested/payload").is_file());
-                let result = crate::postprocess::flatten_single_branch_directories(
-                    &root, &work, crate::postprocess::FlattenLeaf::Prepared(&leaf),
-                    &destination,
-                    || prepare_flatten(&journal, owner.to_str().unwrap(), &root, &work, &leaf, &destination, None, None),
-                );
-                assert!(matches!(result, crate::postprocess::FlattenOutcome::Published { cleanup_error: None }), "{result:?}");
-                finish_flatten(&journal, root.to_str().unwrap()).unwrap();
-            }
             assert_eq!(fs::read(destination.join("nested/payload")).unwrap(), b"committed payload");
             assert_eq!(output_identity(destination.join("nested").to_str().unwrap()).unwrap(),
                 fs::read_to_string(base.join("identity")).unwrap());

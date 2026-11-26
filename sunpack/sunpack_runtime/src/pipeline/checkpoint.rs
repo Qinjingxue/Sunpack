@@ -259,12 +259,14 @@ impl InputCheckpoint {
         generations: &HashMap<String, PhysicalFileGeneration>,
     ) -> bool {
         self.schema_version == SCHEMA_VERSION
-            && (self.failure.is_none() || (
-                self.input.logical_name == input.logical_name
+            // Losing the worker says nothing about this logical input. Keep
+            // its output slot and sibling receipts, but run the input again.
+            && self.failure.as_ref().is_none_or(|receipt| !receipt.failure.worker_lost()
+                    && self.input.logical_name == input.logical_name
                     && self.input.volume_style == input.volume_style
                     && self.input.analysis == input.analysis
                     && self.input.volume_attempts == input.volume_attempts
-            ))
+            )
             && (if self.failure.is_some() {
                 self.input.entry_path == input.entry_path
                     && self.input.mode == input.mode && self.input.format_hint == input.format_hint

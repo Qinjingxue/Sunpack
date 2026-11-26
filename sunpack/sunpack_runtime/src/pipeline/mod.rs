@@ -211,6 +211,10 @@ pub struct Failure {
 }
 
 impl Failure {
+    pub(crate) fn worker_lost(&self) -> bool {
+        self.evidence.as_deref().and_then(|e| e.native_kind.as_deref()) == Some("worker_lost")
+    }
+
     /// Weak ZipCrypto validation does not authorize a password retry. The
     /// classifier separately marks the password-or-volume ambiguity.
     pub(crate) fn is_password_retry(&self) -> bool {

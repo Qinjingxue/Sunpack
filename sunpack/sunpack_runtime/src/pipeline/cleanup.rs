@@ -27,6 +27,10 @@ pub(crate) fn clean_source(source: &CleanupSource, durable: bool) -> io::Result<
         FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_DELETE, FileDispositionInfoEx, SetFileInformationByHandle,
     };
+    let departed = || {
+        if durable && source.recycle { repair_recycle_info(source)?; }
+        Ok(false)
+    };
     let file = match std::fs::OpenOptions::new()
         .access_mode(if source.recycle { FILE_READ_ATTRIBUTES } else { DELETE | FILE_READ_ATTRIBUTES })
         .share_mode(if source.recycle { FILE_SHARE_READ | FILE_SHARE_DELETE } else { FILE_SHARE_READ })
@@ -34,14 +38,14 @@ pub(crate) fn clean_source(source: &CleanupSource, durable: bool) -> io::Result<
         .open(&source.path)
     {
         Ok(file) => file,
-        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => return Ok(false),
+        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => return departed(),
         Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0
         || crate::io::reader::physical_file_generation_from_metadata(&file, &metadata)? != source.generation
     {
-        return Ok(false);
+        return departed();
     }
     if source.recycle {
         recycle(&source.path)?;
@@ -49,11 +53,9 @@ pub(crate) fn clean_source(source: &CleanupSource, durable: bool) -> io::Result<
             // Shell creates the restore metadata separately from the NTFS rename.
             // Flush this small file before acknowledging a recoverable transfer.
             let payload = crate::io::resource_lifecycle::resolved_reader_path(&file)?;
-            let suffix = payload.file_name().and_then(|name| name.to_str()).and_then(|name| name.strip_prefix("$R"))
-                .filter(|_| payload.parent().and_then(Path::parent).and_then(Path::file_name)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("$Recycle.Bin")))
+            let info = recycle_info_path(&payload)
                 .ok_or_else(|| io::Error::other("Windows did not return a recycled file"))?;
-            std::fs::OpenOptions::new().write(true).open(payload.with_file_name(format!("$I{suffix}")))?.sync_all()?;
+            std::fs::OpenOptions::new().write(true).open(info)?.sync_all()?;
         }
         return Ok(true);
     }
@@ -64,6 +66,109 @@ pub(crate) fn clean_source(source: &CleanupSource, durable: bool) -> io::Result<
         return Err(io::Error::last_os_error());
     }
     Ok(true)
+}
+
+#[cfg(windows)]
+fn recycle_info_path(payload: &Path) -> Option<PathBuf> {
+    let bin = payload.parent()?.parent()?;
+    if !bin.file_name()?.eq_ignore_ascii_case("$Recycle.Bin") {
+        return None;
+    }
+    let suffix = payload.file_name()?.to_str()?.strip_prefix("$R")?;
+    Some(payload.with_file_name(format!("$I{suffix}")))
+}
+
+// The Shell rename can survive power loss while its separate restore record is
+// still zero-filled. The outstanding cleanup receipt already identifies both
+// the payload and its original name. Look up that object only on a departed path.
+#[cfg(windows)]
+fn repair_recycle_info(source: &CleanupSource) -> io::Result<()> {
+    use std::{fs::{File, OpenOptions}, io::{Read, Seek, Write},
+        os::windows::{ffi::{OsStrExt, OsStringExt}, fs::{MetadataExt, OpenOptionsExt}, io::{AsRawHandle, FromRawHandle}}};
+    use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, Storage::FileSystem::*};
+
+    let (_, id) = source.generation.object_id().unwrap();
+    let descriptor = if id[8..] == [0; 8] {
+        FILE_ID_DESCRIPTOR { dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32, Type: FileIdType,
+            Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: i64::from_le_bytes(id[..8].try_into().unwrap()) } }
+    } else {
+        FILE_ID_DESCRIPTOR { dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32, Type: ExtendedFileIdType,
+            Anonymous: FILE_ID_DESCRIPTOR_0 { ExtendedFileId: FILE_ID_128 { Identifier: id } } }
+    };
+    // The source's parent may have been removed by the same cleanup.
+    let mut parents = source.path.ancestors().skip(1);
+    let volume = loop {
+        let Some(path) = parents.next() else { return Ok(()); };
+        match OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path) {
+            Ok(dir) => break dir,
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let handle = unsafe { OpenFileById(volume.as_raw_handle(), &descriptor, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, std::ptr::null(), FILE_FLAG_OPEN_REPARSE_POINT) };
+    if handle == INVALID_HANDLE_VALUE {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) };
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    if !source.generation.matches_input(&crate::io::reader::physical_file_generation(&file)?) { return Ok(()); }
+    // A directory named $Recycle.Bin under an ordinary Watch root is user data.
+    // The GUID form anchors this check to the real root even on a mounted volume.
+    let path = crate::io::resource_lifecycle::with_handle_path(&file, VOLUME_NAME_GUID,
+        |wide| PathBuf::from(std::ffi::OsString::from_wide(wide)))?;
+    if !path.ancestors().nth(3).is_some_and(|root| root.parent().is_none()) { return Ok(()); }
+    let Some(info) = recycle_info_path(&path) else { return Ok(()); };
+    let sid = crate::runtime::current_user_sid()?;
+    if path.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new(&sid)) { return Ok(()); }
+
+    let mut payload = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut payload) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).share_mode(FILE_SHARE_READ).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut record = match options.open(&info) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound && payload.nNumberOfLinks == 1 =>
+            options.create_new(true).open(&info)?,
+        result => result?,
+    };
+    let mut attributes = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(record.as_raw_handle(), &mut attributes) } == 0 { return Err(io::Error::last_os_error()); }
+    if attributes.nNumberOfLinks != 1 || attributes.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::other("Unexpected recycle metadata identity"));
+    }
+
+    // Windows 10+ $I v2 is four little-endian fields followed by the
+    // NUL-terminated UTF-16 original path. Use the record creation time as
+    // deletion time so an interrupted repair produces identical bytes on replay.
+    let path = std::path::absolute(&source.path)?;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let metadata = record.metadata()?;
+    let mut expected = Vec::with_capacity(28 + wide.len() * 2);
+    expected.extend(2u64.to_le_bytes());
+    expected.extend(source.generation.len.to_le_bytes());
+    expected.extend(metadata.creation_time().to_le_bytes());
+    expected.extend((wide.len() as u32).to_le_bytes());
+    for c in wide { expected.extend(c.to_le_bytes()); }
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Unrecognized recycle metadata");
+    if metadata.len() > expected.len() as u64 { return Err(invalid()); }
+    let mut actual = Vec::with_capacity(metadata.len() as usize);
+    record.read_to_end(&mut actual)?;
+    if actual.len() >= 24 && actual[16..24].iter().any(|&byte| byte != 0) {
+        expected[16..24].copy_from_slice(&actual[16..24]);
+    }
+    if actual == expected {
+        return record.sync_all();
+    }
+    if actual.iter().zip(&expected).any(|(&a,&b)| a != 0 && a != b) {
+        return Err(invalid());
+    }
+    if payload.nNumberOfLinks != 1 { return Err(io::Error::other("Ambiguous recycled hard link")); }
+    record.rewind()?;
+    record.write_all(&expected)?;
+    record.sync_all()
 }
 
 #[cfg(not(windows))]

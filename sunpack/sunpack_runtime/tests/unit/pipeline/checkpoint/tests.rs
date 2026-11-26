@@ -157,6 +157,12 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
         &serde_json::to_vec(&partial).unwrap(),
     ).unwrap();
     assert!(partial.valid_for(&input, &generations));
+    let mut interrupted = serde_json::to_value(&partial).unwrap();
+    interrupted["failure"]["failure"] = serde_json::json!({
+        "kind":"process_error", "message":"worker exited", "evidence":{"native_kind":"worker_lost"}
+    });
+    let interrupted: InputCheckpoint = serde_json::from_value(interrupted).unwrap();
+    assert!(!interrupted.valid_for(&input, &generations));
     let mut metadata_only = serde_json::to_value(&partial).unwrap();
     metadata_only["sources"][0]["generation"]["created"] = serde_json::json!([false, 1, 0]);
     #[cfg(windows)]
