@@ -47,11 +47,19 @@ struct Context {
     void *cpu_context = sunpack_cpu_current_job_context();
 };
 static uint32_t acquire_cpu(void *p, uint32_t wanted) {
-    auto &c = *static_cast<Context *>(p);
-    return c.cpu_context && wanted ? sunpack_cpu_acquire_extra_for_context(c.cpu_context, wanted, 1) : 0;
+    const auto &c = *static_cast<const Context *>(p);
+    if (!c.cpu_context || !wanted) return 0;
+    const auto granted = sunpack_cpu_acquire_extra_for_context(c.cpu_context, wanted, 1);
+    // Optional helper activation: choose serial under pressure without marking
+    // the owning job denied. Skip the memory check when CPU is already full.
+    if (granted && !sunpack::sevenzip::native_current_job_allows_parallelism()) {
+        sunpack_cpu_release_extra_for_context(c.cpu_context, granted);
+        return 0;
+    }
+    return granted;
 }
 static void release_cpu(void *p, uint32_t count) {
-    auto &c = *static_cast<Context *>(p);
+    const auto &c = *static_cast<const Context *>(p);
     sunpack_cpu_release_extra_for_context(c.cpu_context, count);
 }
 static void *allocate_memory(void *, size_t size) {

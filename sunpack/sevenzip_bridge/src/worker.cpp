@@ -1828,6 +1828,32 @@ std::size_t native_logical_processor_count() noexcept {
     return hardware == 0 ? std::size_t{2} : hardware;
 }
 
+std::size_t native_physical_processor_count() {
+#ifdef _WIN32
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    if (bytes != 0) {
+        // The topology records have variable lengths (one or more processor groups).
+        std::vector<std::byte> topology(bytes);
+        if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+                reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(topology.data()), &bytes)) {
+            std::size_t cores = 0;
+            for (std::size_t offset = 0; offset < bytes;) {
+                if (bytes - offset < 2 * sizeof(DWORD)) return native_logical_processor_count();
+                const auto &entry = *reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(
+                    topology.data() + offset);
+                if (entry.Size < 2 * sizeof(DWORD) || entry.Size > bytes - offset)
+                    return native_logical_processor_count();
+                cores += entry.Relationship == RelationProcessorCore;
+                offset += entry.Size;
+            }
+            if (cores != 0) return cores;
+        }
+    }
+#endif
+    return native_logical_processor_count();
+}
+
 std::string requested_native_process_mode() {
     const char* configured = std::getenv("SUNPACK_NATIVE_PROCESS_MODE");
     const std::string mode = configured ? std::string(configured) : "normal";
@@ -2497,6 +2523,10 @@ private:
                             static_cast<const OutputDrain*>(context)->executor.end_output_drain_wait();
                         }, &output_drain_backlog_};
                 }
+#ifdef SUP7Z_DEBUG
+                static const bool cpu_diagnostics = std::getenv("SUNPACK_NATIVE_CPU_DIAGNOSTICS") != nullptr;
+                const std::string cpu_diag_id = cpu_diagnostics ? job_id : std::string{};
+#endif
                 sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_, handoff);
                 sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
                 sunpack::sevenzip::NativeMemoryScope memory_scope(&memory_job);
@@ -2551,6 +2581,15 @@ private:
 #endif
                     }
                 } catch (...) { outcome.code = -100; }
+#ifdef SUP7Z_DEBUG
+                if (cpu_diagnostics) {
+                    const auto usage = cpu_job_context.snapshot();
+                    print_frame((wire::object() + wire::key("type") + wire::text("cpu_activation") +
+                        wire::key("job_id") + wire::text(cpu_diag_id) +
+                        wire::key("peak_extra") + wire::number(usage.peak_extra_credits) +
+                        wire::key("remaining_extra") + wire::number(usage.current_extra_credits) + wire::end()));
+                }
+#endif
             }
             // Pending output and decoder threads have drained. Parked tasks
             // retain neither dictionaries, writer leases nor execution threads.
@@ -2709,7 +2748,14 @@ int main() {
     std::cerr.tie(nullptr);
     const std::string requested_process_mode = requested_native_process_mode();
     const bool process_mode_applied = apply_native_process_mode(requested_process_mode);
-    const auto worker_count = native_logical_processor_count();
+    auto worker_count = native_physical_processor_count();
+#ifdef SUP7Z_DEBUG
+    if (const char *test = std::getenv("SUNPACK_TEST_WORKER_CAPACITY")) {
+        const unsigned long count = std::strtoul(test, nullptr, 10);
+        if (count >= 1 && count <= native_logical_processor_count())
+            worker_count = static_cast<std::size_t>(count);
+    }
+#endif
     const auto memory_reserve_bytes = sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes(worker_count);
     NativeJobExecutor executor(worker_count, memory_reserve_bytes);
     print_frame(

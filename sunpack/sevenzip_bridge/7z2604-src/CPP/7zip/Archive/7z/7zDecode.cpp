@@ -8,6 +8,7 @@
 #include "../../Common/StreamUtils.h"
 
 #include "7zDecode.h"
+#include "internal/decoder_cpu_budget.h"
 
 namespace NArchive {
 namespace N7z {
@@ -267,14 +268,36 @@ HRESULT CDecoder::Decode(
   #endif
   */
   
-  if (!_bindInfoPrev_Defined || !AreBindInfoExEqual(bindInfo, _bindInfoPrev))
+  #if defined(USE_MIXER_ST) && defined(USE_MIXER_MT)
+  // The bonded graph needs every helper to make progress. Never start a
+  // partially admitted graph or wait for permits while holding the caller's.
+  bool useMixerMT = _useMixerMT && outStream;
+  struct MixerCredits
+  {
+    void *Context;
+    unsigned Count = 0;
+    ~MixerCredits() { sunpack_cpu_release_extra_for_context(Context, Count); }
+  } mixerCredits{sunpack_cpu_current_job_context()};
+  if (useMixerMT && mixerCredits.Context && folderInfo.Coders.Size() > 1)
+  {
+    const unsigned extra = folderInfo.Coders.Size() - 1;
+    mixerCredits.Count = sunpack_cpu_acquire_extra_for_context(mixerCredits.Context, extra, extra);
+    useMixerMT = mixerCredits.Count == extra;
+  }
+  #endif
+
+  if (!_bindInfoPrev_Defined || !AreBindInfoExEqual(bindInfo, _bindInfoPrev)
+      #if defined(USE_MIXER_ST) && defined(USE_MIXER_MT)
+      || useMixerMT != _previousMixerMT
+      #endif
+      )
   {
     _bindInfoPrev_Defined = false;
     _mixerRef.Release();
 
     #ifdef USE_MIXER_MT
     #ifdef USE_MIXER_ST
-    if (_useMixerMT)
+    if (useMixerMT)
     #endif
     {
       _mixerMT = new NCoderMixer2::CMixerMT(false);
@@ -338,6 +361,9 @@ HRESULT CDecoder::Decode(
       */
     }
     
+    #if defined(USE_MIXER_ST) && defined(USE_MIXER_MT)
+    _previousMixerMT = useMixerMT;
+    #endif
     _bindInfoPrev = bindInfo;
     _bindInfoPrev_Defined = true;
   }
@@ -506,7 +532,7 @@ HRESULT CDecoder::Decode(
 
   #ifdef USE_MIXER_MT
   #ifdef USE_MIXER_ST
-  bool needMtLock = _useMixerMT;
+  bool needMtLock = useMixerMT;
   #endif
   #endif
 
@@ -584,9 +610,19 @@ HRESULT CDecoder::Decode(
       progress2 = new CDecProgress(compressProgress);
 
     ISequentialOutStream *outStreamPointer = outStream;
-    return _mixer->Code(inStreamPointers, &outStreamPointer,
+    const HRESULT result = _mixer->Code(inStreamPointers, &outStreamPointer,
         progress2 ? (ICompressProgressInfo *)progress2 : compressProgress,
         dataAfterEnd_Error);
+    #if defined(USE_MIXER_ST) && defined(USE_MIXER_MT)
+    if (FAILED(result) && mixerCredits.Count)
+    {
+      // A partial startup error can leave helpers in the mixer. Destroy it
+      // (joining them) before returning their reservations.
+      _bindInfoPrev_Defined = false;
+      _mixerRef.Release();
+    }
+    #endif
+    return result;
   }
   
   #ifdef USE_MIXER_ST

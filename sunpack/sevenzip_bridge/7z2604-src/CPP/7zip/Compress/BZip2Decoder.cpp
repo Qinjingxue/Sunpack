@@ -9,7 +9,6 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -1314,7 +1313,7 @@ struct CStreamingParallelBlockJob
     return S_OK;
   }
 
-  void Process()
+  HRESULT Process()
   {
     HRESULT result = S_OK;
 
@@ -1398,11 +1397,14 @@ struct CStreamingParallelBlockJob
       result = E_FAIL;
     }
 
-    {
-      std::lock_guard<std::mutex> lock(Mutex);
-      Result = result;
-      Done = true;
-    }
+    return result;
+  }
+
+  void Complete(HRESULT result)
+  {
+    std::lock_guard<std::mutex> lock(Mutex);
+    Result = result;
+    Done = true;
     FinishedEvent.notify_one();
   }
 
@@ -1418,7 +1420,10 @@ struct CStreamingParallelBlockJob
 class CStreamingParallelBlockPool
 {
   std::vector<std::thread> _threads;
-  std::deque<CStreamingParallelBlockJob *> _queue;
+  // One activation per submitted helper. The caller drains the batch before
+  // republishing or modifying the input borrowed by these jobs.
+  std::array<CStreamingParallelBlockJob *, kStreamingBZipMaxLanes - 1> _ready{};
+  unsigned _readyCount = 0;
   std::mutex _mutex;
   std::condition_variable _workEvent;
   bool _stop;
@@ -1431,17 +1436,17 @@ class CStreamingParallelBlockPool
       CStreamingParallelBlockJob *job = NULL;
       {
         std::unique_lock<std::mutex> lock(_mutex);
-        _workEvent.wait(lock, [this] { return _stop || !_queue.empty(); });
-        if (_stop && _queue.empty())
+        _workEvent.wait(lock, [this] { return _stop || _readyCount != 0; });
+        if (_readyCount == 0)
           return;
-        job = _queue.front();
-        _queue.pop_front();
+        job = _ready[--_readyCount];
       }
 
-      job->Process();
-
-      if (_cpuContext)
-        sunpack_cpu_release_extra_for_context(_cpuContext, 1);
+      const HRESULT result = job->Process();
+      // This activation has ended. The OS thread stays parked unless it
+      // claims another explicitly credited activation.
+      sunpack_cpu_release_extra_for_context(_cpuContext, 1);
+      job->Complete(result);
     }
   }
 
@@ -1470,13 +1475,19 @@ public:
     return true;
   }
 
-  void Submit(CStreamingParallelBlockJob *job)
+  template<class Jobs>
+  void Activate(const Jobs &jobs, unsigned count)
   {
+    if (count == 0)
+      return;
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      _queue.push_back(job);
+      for (unsigned i = 0; i < count; ++i)
+        _ready[i] = jobs[count - i].get();
+      _readyCount = count;
     }
-    _workEvent.notify_one();
+    for (unsigned i = 0; i < count; ++i)
+      _workEvent.notify_one();
   }
 
   void Stop()
@@ -2316,13 +2327,12 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
           expectedCrc);
     }
 
-    for (unsigned i = 1; i < activeJobs; i++)
-      pool.Submit(jobs[i].get());
+    pool.Activate(jobs, extraWorkers);
 
-    jobs[0]->Process();
+    jobs[0]->Complete(jobs[0]->Process());
 
-    // Extra-job credits are returned by the helper threads at exact block
-    // completion. The caller's base credit covers job 0.
+    // Wait observes both completion and retirement of this batch's helpers.
+    // The caller's base credit covers job 0.
     for (unsigned i = 1; i < activeJobs; i++)
       jobs[i]->Wait();
 

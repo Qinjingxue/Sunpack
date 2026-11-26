@@ -268,12 +268,13 @@ void NativeMemoryManager::released(NativeMemoryJob &job, void *address, std::siz
     if (!waiters_.empty() || cached_headroom_ < static_cast<std::int64_t>(reserved_bytes_))
         SetEvent(change_);
 }
-bool NativeMemoryManager::may_start_thread(NativeMemoryJob &job) noexcept {
+bool NativeMemoryManager::may_start_thread(NativeMemoryJob &job, bool optional) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (job.revoked.load(std::memory_order_acquire)) return false;
     auto headroom = sample_locked();
     if (headroom + static_cast<std::int64_t>(job.admission) < 0) headroom = sample_locked(true);
     if (headroom + static_cast<std::int64_t>(job.admission) >= 0) return true;
+    if (optional) return false;
     // No per-thread memory accounting. Avoid entering the Windows loader while
     // already under pressure; its initial stack growth cannot run our callbacks.
     job.denied.store(true, std::memory_order_release);

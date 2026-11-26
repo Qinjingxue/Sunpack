@@ -16,6 +16,72 @@ type FreeFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type CancelFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 #[derive(Clone, Copy)]
+pub(crate) struct NativeCpu {
+    pub(crate) ctx: *mut c_void,
+    pub(crate) acquire: AcquireFn,
+    pub(crate) release: ReleaseFn,
+}
+
+pub(crate) struct HelperCredits {
+    cpu: NativeCpu,
+    remaining: usize,
+}
+
+pub(crate) struct HelperCredit(NativeCpu);
+
+// SAFETY: only release crosses threads. The native callback reads the immutable
+// CPU context pointer and releases from its atomic budget. The enclosing scope
+// joins every helper before the synchronous FFI call can release its context.
+unsafe impl Send for HelperCredit {}
+
+impl Drop for HelperCredit {
+    fn drop(&mut self) {
+        unsafe { (self.0.release)(self.0.ctx, 1) }
+    }
+}
+
+impl NativeCpu {
+    pub(crate) fn reserve(self, wanted: usize) -> HelperCredits {
+        let granted = if wanted == 0 {
+            0
+        } else {
+            unsafe { (self.acquire)(self.ctx, wanted as u32) as usize }
+        };
+        let remaining = if granted == 0 {
+            0
+        } else {
+            granted.min(wanted).min(rayon::current_num_threads())
+        };
+        if granted > remaining {
+            unsafe { (self.release)(self.ctx, (granted - remaining) as u32) };
+        }
+        HelperCredits {
+            cpu: self,
+            remaining,
+        }
+    }
+}
+
+impl HelperCredits {
+    pub(crate) fn len(&self) -> usize {
+        self.remaining
+    }
+    pub(crate) fn take(&mut self) -> HelperCredit {
+        assert!(self.remaining != 0);
+        self.remaining -= 1;
+        HelperCredit(self.cpu)
+    }
+}
+
+impl Drop for HelperCredits {
+    fn drop(&mut self) {
+        if self.remaining != 0 {
+            unsafe { (self.cpu.release)(self.cpu.ctx, self.remaining as u32) }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct MemoryCallbacks {
     ctx: *mut c_void,
     allocate: AllocateFn,
@@ -156,6 +222,11 @@ pub unsafe extern "C" fn sup_enc_open(
         // Only the selected password reaches extraction. KDF memory is released
         // at the end of Open; the decoder retains just its small derived keys.
         let mut workspace = crate::Workspace::default();
+        workspace.native_cpu = Some(NativeCpu {
+            ctx,
+            acquire,
+            release,
+        });
         workspace.external = Some(ExternalArena {
             callbacks: MemoryCallbacks {
                 ctx,
@@ -166,14 +237,7 @@ pub unsafe extern "C" fn sup_enc_open(
             data: std::ptr::null_mut(),
             len: 0,
         });
-        let opened = Decoder::open_with_budget(
-            &mut input,
-            length,
-            pw,
-            workspace,
-            |wanted| acquire(ctx, wanted as u32) as usize,
-            |count| release(ctx, count as u32),
-        );
+        let opened = Decoder::open_with_budget(&mut input, length, pw, workspace);
         match opened {
             Ok(value) => {
                 *output_size = value.output_size();
@@ -200,11 +264,18 @@ pub unsafe extern "C" fn sup_enc_decrypt(
         return 4;
     }
     catch_unwind(AssertUnwindSafe(|| {
-        status((*decoder).decrypt_with_budget(
+        let cpu = NativeCpu {
+            ctx,
+            acquire,
+            release,
+        };
+        status((*decoder).decrypt(
             &mut Input { ctx, read, seek },
             &mut Output { ctx, write },
-            |wanted| acquire(ctx, wanted as u32) as usize,
-            |count| release(ctx, count as u32),
+            |cipher, offset, bytes, wanted| {
+                let mut credits = cpu.reserve(wanted);
+                cipher.apply_with_threads(offset, bytes, 1 + credits.len(), Some(&mut credits));
+            },
             |n| {
                 if progress(ctx, n) == 0 {
                     Ok(())

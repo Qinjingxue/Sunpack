@@ -929,6 +929,19 @@ namespace sunpack::sevenzip
             active_files_.pop_back();
         }
 
+        // A synchronous close can block until writeback; it cannot also be the
+        // last consumer of write completions. Preserve the configured close
+        // parallelism with one extra shared consumer on multi-thread writers.
+        std::size_t io_thread_count() const noexcept
+        {
+            return writer_count_ + (writer_count_ > 1);
+        }
+
+        std::size_t queued_work_count_locked() const noexcept
+        {
+            return work_queue_.size() + pending_closes_.size();
+        }
+
         void initialize(std::size_t buffer_count)
         {
             buffers_.reserve(buffer_count);
@@ -940,7 +953,7 @@ namespace sunpack::sevenzip
                 buffers_.push_back(std::move(buffer));
             }
             completion_port_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0,
-                                                       static_cast<DWORD>(writer_count_));
+                                                       static_cast<DWORD>(io_thread_count()));
             if (!completion_port_) throw std::bad_alloc();
             try
             {
@@ -949,8 +962,8 @@ namespace sunpack::sevenzip
                     space_wake_ = std::make_shared<CompletionWake>(completion_port_);
                     state_->space_gate->subscribe(space_wake_);
                 }
-                workers_.reserve(writer_count_);
-                for (std::size_t index = 0; index < writer_count_; ++index)
+                workers_.reserve(io_thread_count());
+                for (std::size_t index = 0; index < io_thread_count(); ++index)
                 {
                     workers_.emplace_back([this]
                                           { writer_loop(); });
@@ -1025,7 +1038,7 @@ namespace sunpack::sevenzip
             if (!job || !file || file->close_requested) return false;
             if (file->staging_buffer && file->staging_buffer->size == kBufferSize)
             {
-                return work_queue_.size() < queue_limit_;
+                return queued_work_count_locked() < queue_limit_;
             }
             return job->inflight_bytes < job->max_inflight_bytes &&
                    file->inflight_bytes < kDefaultFileInFlightBytes &&
@@ -1137,7 +1150,7 @@ namespace sunpack::sevenzip
             {
                 return false;
             }
-            if (!force_queue && work_queue_.size() >= queue_limit_)
+            if (!force_queue && queued_work_count_locked() >= queue_limit_)
             {
                 return false;
             }
@@ -1266,7 +1279,7 @@ namespace sunpack::sevenzip
                     if (work_queue_.empty()) continue;
                     item = std::move(work_queue_.front());
                     work_queue_.pop_front();
-                    wake_producers = work_queue_.size() == queue_limit_ - 1 ||
+                    wake_producers = queued_work_count_locked() == queue_limit_ - 1 ||
                         (work_queue_.empty() && active_files_.empty());
                 }
                 // Dequeue changes only queue capacity. Data completion wakes
@@ -1274,10 +1287,63 @@ namespace sunpack::sevenzip
                 if (wake_producers) producer_cv_.notify_all();
                 if (item.kind == WorkItem::Kind::Close)
                 {
-                    process_close(item.file);
+                    dispatch_close(item.file);
                     continue;
                 }
                 dispatch_data(item.buffer);
+            }
+        }
+
+        void dispatch_close(FileStatePtr file, ProbeLease lease = {}) noexcept
+        {
+            if (writer_count_ == 1)
+            {
+                process_close(file, std::move(lease));
+                return;
+            }
+            bool owns_slot = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (active_closes_ < writer_count_)
+                {
+                    ++active_closes_;
+                    owns_slot = true;
+                }
+                else
+                {
+                    try
+                    {
+                        pending_closes_.emplace_back();
+                        pending_closes_.back().file = std::move(file);
+                        pending_closes_.back().lease = std::move(lease);
+                        return;
+                    }
+                    catch (...)
+                    {
+                        // No writer may wait for a queue node to become available.
+                        // Mark the job terminal, then release the handle without flush.
+                        fail_file_locked(file, E_OUTOFMEMORY);
+                    }
+                }
+            }
+            for (;;)
+            {
+                process_close(file, std::move(lease));
+                if (!owns_slot) return;
+                bool wake;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (pending_closes_.empty())
+                    {
+                        --active_closes_;
+                        return;
+                    }
+                    file = std::move(pending_closes_.front().file);
+                    lease = std::move(pending_closes_.front().lease);
+                    pending_closes_.pop_front();
+                    wake = queued_work_count_locked() == queue_limit_ - 1;
+                }
+                if (wake) producer_cv_.notify_all();
             }
         }
 
@@ -1388,7 +1454,7 @@ namespace sunpack::sevenzip
                     item.buffer->probe_lease = std::move(lease);
                     dispatch_data(item.buffer);
                 }
-                else process_close(item.file, std::move(lease));
+                else dispatch_close(item.file, std::move(lease));
             }
         }
 
@@ -1467,7 +1533,7 @@ namespace sunpack::sevenzip
                         static_cast<unsigned long>(error)};
             }
             DWORD registration_error = ERROR_SUCCESS;
-            if (has_data && !CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(writer_count_)))
+            if (has_data && !CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(io_thread_count())))
             {
                 registration_error = GetLastError();
             }
@@ -1836,6 +1902,13 @@ namespace sunpack::sevenzip
         bool large_payload_used_ = false;
         std::vector<std::thread> workers_;
         std::deque<WorkItem> work_queue_;
+        struct PendingClose
+        {
+            FileStatePtr file;
+            ProbeLease lease;
+        };
+        std::deque<PendingClose> pending_closes_;
+        std::size_t active_closes_ = 0; // under mutex_
         std::vector<std::weak_ptr<JobState>> active_jobs_;
         std::vector<FileStatePtr> active_files_;
         mutable std::mutex mutex_;

@@ -108,6 +108,7 @@ pub struct Workspace {
     memory: Vec<Block>,
     external: Option<ffi::ExternalArena>,
     kdf_threads: Option<usize>,
+    native_cpu: Option<ffi::NativeCpu>,
     cancellation: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     kdf_runs: usize,
@@ -172,6 +173,7 @@ impl Workspace {
             self.memory.resize(count, Block::default());
         }
         let callbacks = self.external.as_ref().map(|arena| arena.callbacks);
+        let cpu = self.native_cpu;
         let cancelled = || {
             cancellation
                 .as_ref()
@@ -201,6 +203,7 @@ impl Workspace {
             &mut *derived,
             memory,
             self.kdf_threads.unwrap_or(4),
+            cpu,
             cancelled,
         )
         .map_err(|_| {
@@ -320,7 +323,9 @@ impl PasswordProbe {
     fn quick_matches(&self, keys: &Keys) -> bool {
         let mut quick = self.quick;
         cipher::Stream::new(self.header.bytes[6], &keys.key, &keys.nonce).apply(&mut quick);
-        quick.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        quick
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
     }
 
     fn checked_keys(
@@ -334,8 +339,12 @@ impl PasswordProbe {
         let study_start = std::time::Instant::now();
         let matches = self.quick_matches(&keys);
         #[cfg(test)]
-        { workspace.study_seconds[4] += study_start.elapsed().as_secs_f64(); }
-        if !matches { return Err(Error::Password); }
+        {
+            workspace.study_seconds[4] += study_start.elapsed().as_secs_f64();
+        }
+        if !matches {
+            return Err(Error::Password);
+        }
         Ok(keys)
     }
 }
@@ -359,38 +368,15 @@ impl<F: FnMut(usize)> Drop for CpuLease<'_, F> {
     }
 }
 impl Decoder {
-    /// Worker final KDF: borrow at most three extra credits, then return them
-    /// before reading recovery framing. No derived keys cross process boundaries.
+    /// Final KDF joins all licensed helpers before reading recovery framing.
     fn open_with_budget<R: Read + Seek>(
         input: &mut R,
         length: u64,
         password: &[u16],
         mut workspace: Workspace,
-        mut acquire: impl FnMut(usize) -> usize,
-        mut release: impl FnMut(usize),
     ) -> Result<Self> {
         let probe = PasswordProbe::read(input, length)?;
-        let extra = acquire(3);
-        let keys = {
-            let mut lease = CpuLease {
-                extra,
-                release: &mut release,
-            };
-            if lease.extra != 0 {
-                // Only initialize the shared executor if CPU was granted.
-                // Return surplus immediately when its capacity is smaller.
-                let usable = lease
-                    .extra
-                    .min(3)
-                    .min(rayon::current_num_threads().saturating_sub(1));
-                if usable != lease.extra {
-                    (lease.release)(lease.extra - usable);
-                    lease.extra = usable;
-                }
-            }
-            workspace.kdf_threads = Some(1 + lease.extra);
-            probe.checked_keys(password, &mut workspace, KeyPurpose::Extraction)?
-        };
+        let keys = probe.checked_keys(password, &mut workspace, KeyPurpose::Extraction)?;
         drop(workspace); // return large KDF memory before recovery/payload I/O
 
         // A password-only Test must succeed after a valid quick proof even if
@@ -424,6 +410,32 @@ impl Decoder {
         output: &mut W,
         mut acquire: impl FnMut(usize) -> usize,
         mut release: impl FnMut(usize),
+        progress: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        self.decrypt(
+            input,
+            output,
+            |cipher, offset, bytes, wanted| {
+                let wanted = if wanted == 0 {
+                    0
+                } else {
+                    wanted.min(rayon::current_num_threads().saturating_sub(1))
+                };
+                let extra = if wanted == 0 { 0 } else { acquire(wanted) };
+                let _lease = CpuLease {
+                    extra,
+                    release: &mut release,
+                };
+                cipher.apply_with_threads(offset, bytes, 1 + extra.min(wanted), None);
+            },
+            progress,
+        )
+    }
+    fn decrypt<R: Read + Seek, W: Write>(
+        &self,
+        input: &mut R,
+        output: &mut W,
+        mut compute: impl FnMut(&cipher::Stream, u64, &mut [u8], usize),
         mut progress: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         if let Some(error) = self.framing_error {
@@ -447,31 +459,13 @@ impl Decoder {
             progress(position)?;
             let decrypt_n = self.encrypted_end.saturating_sub(position).min(n as u64) as usize;
             if decrypt_n != 0 {
-                {
-                    let extra = {
-                        let wanted = (decrypt_n / grain).saturating_sub(1);
-                        let wanted = if wanted != 0 {
-                            // Bound demand by the executor before borrowing CPU.
-                            wanted.min(rayon::current_num_threads().saturating_sub(1))
-                        } else {
-                            0
-                        };
-                        if wanted == 0 {
-                            0
-                        } else {
-                            acquire(wanted)
-                        }
-                    };
-                    let _lease = CpuLease {
-                        extra,
-                        release: &mut release,
-                    };
-                    cipher.apply_with_threads(
-                        position - PREFIX,
-                        &mut buffer[..decrypt_n],
-                        1 + extra,
-                    );
-                } // Return extra credits before writing; none are held during I/O.
+                compute(
+                    &cipher,
+                    position - PREFIX,
+                    &mut buffer[..decrypt_n],
+                    (decrypt_n / grain).saturating_sub(1),
+                );
+                // The scoped helpers have joined before output I/O.
                 let skip = (PREFIX + CHECK)
                     .saturating_sub(position)
                     .min(decrypt_n as u64) as usize;

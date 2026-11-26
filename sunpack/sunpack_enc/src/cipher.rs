@@ -228,23 +228,41 @@ impl Stream {
             stage.apply_at(offset, bytes);
         }
     }
-    pub fn apply_with_threads(&self, offset: u64, bytes: &mut [u8], threads: usize) {
+    pub fn apply_with_threads(
+        &self,
+        offset: u64,
+        bytes: &mut [u8],
+        threads: usize,
+        credits: Option<&mut crate::ffi::HelperCredits>,
+    ) {
         if threads <= 1 || bytes.is_empty() {
             self.apply_at(offset, bytes);
             return;
         }
         // Align lane boundaries within an aligned payload window. Only
         // helpers leave the caller.
-        let chunk_size = bytes.len().div_ceil(threads).next_multiple_of(128);
-        let mut chunks = bytes.chunks_mut(chunk_size);
-        let first = chunks.next().unwrap();
+        let mut credits = credits;
+        let mut rest = bytes;
+        let units = rest.len().div_ceil(128);
+        let threads = threads.min(units);
+        let width = units / threads;
+        let larger = units % threads;
+        // Consume the credits on the caller, transferring exactly one to each
+        // helper. The caller owns the final chunk and its existing base credit.
         rayon::in_place_scope(|scope| {
-            for (index, part) in chunks.enumerate() {
+            let mut position = offset;
+            for index in 0..threads - 1 {
+                let size = (width + usize::from(index < larger)) * 128;
+                let (part, remainder) = rest.split_at_mut(size);
+                rest = remainder;
+                let credit = credits.as_deref_mut().map(|batch| batch.take());
                 scope.spawn(move |_| {
-                    self.apply_at(offset + ((index + 1) * chunk_size) as u64, part);
+                    self.apply_at(position, part);
+                    drop(credit);
                 });
+                position += size as u64;
             }
-            self.apply_at(offset, first);
+            self.apply_at(position, rest);
         });
     }
 }

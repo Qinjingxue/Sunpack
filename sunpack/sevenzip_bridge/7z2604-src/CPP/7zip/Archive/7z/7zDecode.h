@@ -27,6 +27,7 @@ class CDecoder
   #ifdef USE_MIXER_ST
   #ifdef USE_MIXER_MT
     bool _useMixerMT;
+    bool _previousMixerMT = false;
   #endif
   #endif
   CBindInfoEx _bindInfoPrev;

@@ -194,6 +194,57 @@ bool blocked_open_does_not_block_other_jobs(const std::filesystem::path& directo
     return independent && sibling_ok && writer.finish_job(blocked_job) == E_ABORT && writer.take_file_snapshot(blocked).closed;
 }
 
+bool keeps_a_data_consumer_when_close_slots_are_full(const std::filesystem::path& directory) {
+    std::mutex gate_mutex;
+    std::condition_variable gate;
+    unsigned entered = 0;
+    bool release = false;
+    AsyncWriterConfig config;
+    config.threads_per_volume = 2;
+    config.buffer_count = 4;
+    AsyncFileWriter writer(std::make_shared<VolumeState>("test:close-slots", false), config);
+    writer.set_open_probe_for_test([&](const std::wstring& path) {
+        if (path.find(L"close-latch-") == std::wstring::npos) return;
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        ++entered;
+        gate.notify_all();
+        gate.wait(lock, [&] { return release; });
+    });
+    const auto closes = writer.make_job();
+    for (unsigned i = 0; i < 3; ++i) {
+        auto file = writer.make_file(closes, (directory / (L"close-latch-" + std::to_wstring(i))).wstring(), i, i);
+        writer.close_file(file, {});
+    }
+    bool full = false;
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        full = gate.wait_for(lock, std::chrono::seconds(5), [&] { return entered >= 2; });
+    }
+    const auto job = writer.make_job();
+    const auto file = writer.make_file(job, (directory / L"write-during-close.bin").wstring(), 0, 0);
+    // A full block enters IOCP without requesting close.
+    const std::vector<unsigned char> payload(1U << 20, 0x73);
+    UInt32 processed = 0;
+    const auto hr = writer.write(file, payload.data(), static_cast<UInt32>(payload.size()), &processed);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool drained = false;
+    do {
+        drained = writer.take_file_snapshot(file).written_bytes == payload.size();
+        if (!drained) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (!drained && std::chrono::steady_clock::now() < deadline);
+    bool capped;
+    {
+        const std::lock_guard<std::mutex> lock(gate_mutex);
+        capped = entered == 2;
+        release = true;
+    }
+    gate.notify_all();
+    writer.close_file(file, {});
+    const bool data_ok = writer.finish_job(job) == S_OK;
+    const bool closes_ok = writer.finish_job(closes) == S_OK;
+    return full && capped && drained && hr == S_OK && processed == payload.size() && data_ok && closes_ok;
+}
+
 bool output_drain_handoff_runs_only_for_pending_output(const std::filesystem::path& directory) {
     using sunpack::sevenzip::NativeCpuBudget;
     using sunpack::sevenzip::NativeCpuJobContext;
@@ -813,6 +864,7 @@ int main() {
     const bool passed = write_same_file_concurrently(directory) &&
         write_zero_length_file(directory) &&
         blocked_open_does_not_block_other_jobs(directory) &&
+        keeps_a_data_consumer_when_close_slots_are_full(directory) &&
         output_drain_handoff_runs_only_for_pending_output(directory) &&
         full_queue_preserves_staged_output(directory) &&
         timestamp_failure_does_not_fail_content(directory) &&

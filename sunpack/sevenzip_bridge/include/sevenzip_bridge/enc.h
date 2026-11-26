@@ -10,6 +10,7 @@ typedef int (*sup_enc_seek)(void *, uint64_t);
 typedef int (*sup_enc_write)(void *, const uint8_t *, size_t);
 typedef int (*sup_enc_progress)(void *, uint64_t);
 typedef uint32_t (*sup_enc_acquire)(void *, uint32_t);
+// Release may run concurrently on helper threads, all joined before the call returns.
 typedef void (*sup_enc_release)(void *, uint32_t);
 typedef void *(*sup_enc_allocate)(void *, size_t);
 typedef void (*sup_enc_free)(void *, void *);

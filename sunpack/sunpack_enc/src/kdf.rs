@@ -8,7 +8,6 @@ use argon2_rust::{
         Position,
     },
 };
-use rayon::prelude::*;
 use zeroize::Zeroizing;
 
 struct LaneExecutor<'a> {
@@ -36,6 +35,7 @@ pub(super) fn derive(
     output: &mut [u8; 256],
     memory: &mut [Block],
     threads: usize,
+    cpu: Option<crate::ffi::NativeCpu>,
     cancelled: impl Fn() -> bool,
 ) -> Result<(), Error> {
     if memory.len() != params.memory_blocks() as usize || params.tag_len_bytes() != output.len() {
@@ -65,10 +65,9 @@ pub(super) fn derive(
         )
     };
     let fill = fill_segment_fn(backend());
-    let threads = if threads > 1 {
-        threads
-            .min(instance.lanes as usize)
-            .min(rayon::current_num_threads())
+    let max_threads = threads.max(1).min(instance.lanes as usize);
+    let local_threads = if cpu.is_none() && max_threads > 1 {
+        max_threads.min(rayon::current_num_threads())
     } else {
         1
     };
@@ -81,21 +80,31 @@ pub(super) fn derive(
             if cancelled() {
                 return Err(Error::IncorrectParameter);
             }
+            let mut credits = cpu.map(|cpu| cpu.reserve(max_threads - 1));
+            let threads = credits
+                .as_ref()
+                .map_or(local_threads, |batch| 1 + batch.len());
             if threads == 1 {
                 for lane in 0..instance.lanes {
                     executor.fill_lane(pass, slice, lane);
                 }
             } else {
-                // Exactly one task per granted credit. A task may fill
-                // several lanes; all join before the next Argon2 slice.
-                (0..threads)
-                    .into_par_iter()
-                    .with_max_len(1)
-                    .for_each(|task| {
-                        for lane in (task as u32..instance.lanes).step_by(threads) {
-                            executor.fill_lane(pass, slice, lane);
-                        }
-                    });
+                let fill = |task: usize| {
+                    for lane in (task as u32..instance.lanes).step_by(threads) {
+                        executor.fill_lane(pass, slice, lane);
+                    }
+                };
+                let fill = &fill;
+                rayon::in_place_scope(|scope| {
+                    for task in 1..threads {
+                        let credit = credits.as_mut().map(|batch| batch.take());
+                        scope.spawn(move |_| {
+                            fill(task);
+                            drop(credit);
+                        });
+                    }
+                    fill(0);
+                });
             }
         }
     }

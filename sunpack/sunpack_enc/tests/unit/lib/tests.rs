@@ -44,78 +44,80 @@ fn kdf_credit_counts_preserve_official_keys() {
 
 #[test]
 fn open_returns_kdf_credits_before_io_and_on_password_failure() {
-    use std::cell::Cell;
+    use std::ffi::c_void;
+    use std::sync::atomic::AtomicUsize;
+    struct Budget {
+        cap: usize,
+        held: AtomicUsize,
+        calls: AtomicUsize,
+    }
+    unsafe extern "C" fn acquire(ctx: *mut c_void, wanted: u32) -> u32 {
+        let budget = &*ctx.cast::<Budget>();
+        budget.calls.fetch_add(1, Ordering::Relaxed);
+        let grant = (wanted as usize).min(budget.cap);
+        budget.held.fetch_add(grant, Ordering::Relaxed);
+        grant as u32
+    }
+    unsafe extern "C" fn release(ctx: *mut c_void, count: u32) {
+        (&*ctx.cast::<Budget>())
+            .held
+            .fetch_sub(count as usize, Ordering::Relaxed);
+    }
     struct CheckedReader<'a> {
         input: Cursor<&'a [u8]>,
-        held: &'a Cell<usize>,
+        held: &'a AtomicUsize,
     }
     impl Read for CheckedReader<'_> {
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            assert_eq!(self.held.get(), 0, "KDF credits held during input I/O");
+            assert_eq!(self.held.load(Ordering::Relaxed), 0);
             self.input.read(bytes)
         }
     }
     impl Seek for CheckedReader<'_> {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-            assert_eq!(self.held.get(), 0, "KDF credits held during seek");
+            assert_eq!(self.held.load(Ordering::Relaxed), 0);
             self.input.seek(pos)
         }
     }
-    let run = || {
-        for grant in 0..=3 {
-            for password in ["sunpack-test", "wrong"] {
-                let held = Cell::new(0);
-                let acquired = Cell::new(0);
-                let mut input = CheckedReader {
-                    input: Cursor::new(FIXTURES[9]),
-                    held: &held,
-                };
-                let result = Decoder::open_with_budget(
-                    &mut input,
-                    FIXTURES[9].len() as u64,
-                    &pw(password),
-                    Workspace::default(),
-                    |wanted| {
-                        assert_eq!(wanted, 3);
-                        let extra = wanted.min(grant);
-                        assert_eq!(held.get(), 0);
-                        held.set(extra);
-                        acquired.set(extra);
-                        extra
-                    },
-                    |extra| {
-                        assert!(held.get() >= extra);
-                        held.set(held.get() - extra);
-                    },
-                );
-                assert_eq!(held.get(), 0);
+    for grant in 0..=3 {
+        for (bytes, password, valid) in [
+            (FIXTURES[9], "sunpack-test", true),
+            (FIXTURES[9], "wrong", true),
+            (&FIXTURES[0][..39], "sunpack-test", false),
+        ] {
+            let budget = Budget {
+                cap: grant,
+                held: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+            };
+            let mut workspace = Workspace::default();
+            workspace.native_cpu = Some(ffi::NativeCpu {
+                ctx: std::ptr::from_ref(&budget).cast_mut().cast(),
+                acquire,
+                release,
+            });
+            let result = Decoder::open_with_budget(
+                &mut CheckedReader {
+                    input: Cursor::new(bytes),
+                    held: &budget.held,
+                },
+                bytes.len() as u64,
+                &pw(password),
+                workspace,
+            );
+            assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+            if !valid {
+                assert!(result.is_err());
+                assert_eq!(budget.calls.load(Ordering::Relaxed), 0);
+            } else {
+                assert!(budget.calls.load(Ordering::Relaxed) > 0);
                 if password == "wrong" {
                     assert!(matches!(result, Err(Error::Password)));
                 } else {
                     assert_eq!(result.unwrap().output_size(), 192);
                 }
-                assert_eq!(acquired.get(), grant);
             }
         }
-        // Invalid/short input is rejected before requesting CPU or KDF memory.
-        for bytes in [&FIXTURES[0][..39], b"bad header".as_slice()] {
-            assert!(Decoder::open_with_budget(
-                &mut Cursor::new(bytes),
-                bytes.len() as u64,
-                &pw("sunpack-test"),
-                Workspace::default(),
-                |_| panic!("invalid header requested credits"),
-                |_| panic!("unexpected release"),
-            )
-            .is_err());
-        }
-    };
-    for threads in 1..=4 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap()
-            .install(run);
     }
 }
 fn pw(s: &str) -> Vec<u16> {
@@ -126,14 +128,7 @@ fn open_without_extra_credits(
     length: u64,
     password: &str,
 ) -> Result<Decoder> {
-    Decoder::open_with_budget(
-        input,
-        length,
-        &pw(password),
-        Workspace::default(),
-        |_| 0,
-        |_| unreachable!("no extra CPU credits were granted"),
-    )
+    Decoder::open_with_budget(input, length, &pw(password), Workspace::with_threads(1))
 }
 fn decode(bytes: &[u8], password: &str, expected: &[u8]) {
     let mut input = Cursor::new(bytes);

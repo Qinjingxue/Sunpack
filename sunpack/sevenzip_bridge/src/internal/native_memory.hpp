@@ -68,7 +68,7 @@ public:
     void stop() noexcept;
     void *allocate(NativeMemoryJob &job, std::size_t size, bool optional = false,
                    void *commit_address = nullptr) noexcept;
-    bool may_start_thread(NativeMemoryJob &job) noexcept;
+    bool may_start_thread(NativeMemoryJob &job, bool optional = false) noexcept;
     void released(NativeMemoryJob &job, void *address, std::size_t size) noexcept;
     static std::int64_t query_windows(std::uint64_t reserve_bytes) noexcept;
 
@@ -113,6 +113,10 @@ private:
 };
 inline NativeMemoryJob *current_native_memory_job() noexcept {
     return static_cast<NativeMemoryJob *>(sunpack_memory_current_context());
+}
+inline bool native_current_job_allows_parallelism() noexcept {
+    auto *job = current_native_memory_job();
+    return !job || job->owner.may_start_thread(*job, true);
 }
 inline std::shared_ptr<std::atomic<bool>> native_job_cancel_token() noexcept {
     const auto *job = current_native_memory_job();
