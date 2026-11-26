@@ -10,7 +10,7 @@ use crate::filesystem;
 use crate::filesystem::WatchSnapshotResult;
 use crate::io::config_changes::{DirectoryChange, NativeConfigChanges};
 use crate::io::reader::PhysicalFileGeneration;
-use crate::pipeline::cleanup::{DeleteReceipt, DeleteSource};
+use crate::pipeline::cleanup::{CleanupReceipt, CleanupSource};
 use crate::pipeline::{
     ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
     GeneratedSource, Request, InputFailure,
@@ -5102,6 +5102,13 @@ impl Scheduler {
                     continue;
                 }
             }
+            // Preserve the observation that authorized this delivery. A metadata-only
+            // journal event after restart can then be compared with the original input.
+            if !verified.is_empty() && !missing_output && !pending.internal_recovery
+                && !revisit.contains_key(&id) && source.is_file() {
+                self.catalog.remember_observation(&pending.path, pending.size.max(0) as u64,
+                    pending.mtime, &pending.file_id, pending.change_usn, false);
+            }
             let owner = id;
             let mut rebase = !revisit.contains_key(&owner);
             let has_output_work = pending.has_output_work();
@@ -5213,10 +5220,10 @@ fn recover_source_cleanup<'a>(
             }
         }
         if !verified && inaccessible { continue; }
-        if !verified || engine.recover_delete_sources(
+        if !verified || engine.recover_cleanup_sources(
             &record.sources,
             |parent| !boundaries.is_empty() && boundaries.contains(&crate::pipeline::cleanup_boundary_key(parent)),
-            |path, error| journal.log(json!({"event":"crash_source_cleanup","path":path,"error":error.to_string()})),
+            |source, error| journal.log(json!({"event":"crash_source_cleanup","path":source.path,"error":error.to_string()})),
         ) {
             journal.retire_source_cleanup(id);
         }
@@ -5638,7 +5645,7 @@ impl Scheduler {
         let mut outputs = BTreeMap::new();
         for candidate in &candidates {
             request.checkpoints.extend(restore_checkpoints(
-                self.journal.state(), &candidate.path, &mut outputs,
+                self.journal.state(), &candidate.path, &mut outputs, &mut request.generated_sources,
             )?);
         }
         let layout_checked_at = self.journal.state().take_prepared_volumes(candidates.iter().map(|input| input.path.as_str()),
@@ -6197,9 +6204,9 @@ impl Scheduler {
             };
             // The completion must not grant recovery to a replacement made
             // after this nested input was examined by the pipeline.
-            let source = generated.get_or_init(|| outcome.generated_sources.iter()
-                .map(|source| (key(source.path()), source)).collect::<HashMap<_, _>>()).get(&id);
-            if !source.is_some_and(|source| crate::io::reader::capture_file_generation(&archive.path)
+            let sources = generated.get_or_init(|| outcome.generated_sources.iter()
+                .map(|source| (key(source.path()), source)).collect::<HashMap<_, _>>());
+            if !sources.get(&id).is_some_and(|source| crate::io::reader::capture_file_generation(&archive.path)
                 .is_ok_and(|current| source.matches(&current))) { continue; }
             if self.active_paths.contains_key(&id) {
                 continue;
@@ -6258,6 +6265,8 @@ impl Scheduler {
             );
             Arc::make_mut(&mut entry).layout_checked_at = layout_checked_at;
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
+            payload.insert("generated_sources".into(), serde_json::to_value(archive.source_paths.iter()
+                .filter_map(|path| sources.get(&key(path))).collect::<Vec<_>>())?);
             payload.insert("input_checkpoints".into(), serde_json::to_value(
                 recovery_receipts().select(archive.source_paths.iter().map(PathBuf::as_path)))?);
             let route_root = &active.root;
@@ -6347,6 +6356,13 @@ impl Scheduler {
                 .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))));
             let failure = segment_blocker.and_then(InputFailure::failure).or(discovery_failure)
                 .or_else(|| input_failure.and_then(InputFailure::failure));
+            if let Some(lost) = failure.filter(|f| !completed.cancelled
+                && failed_archive.is_some_and(|archive| archive.depth == start_depth)
+                && f.evidence.as_deref().and_then(|e| e.native_kind.as_deref()) == Some("worker_lost")) {
+                self.retry_pipeline_error(batch, &active.root, active.recovery.as_ref(), &canonical,
+                    &lost.message, io::ErrorKind::BrokenPipe, quiet, &mut operations)?;
+                continue;
+            }
             let failure_message = failure.map(|failure| super::failure::message(failure, self.settings.cli.language));
             let error = failure_message.as_deref()
                 .or_else(|| input_error.map(|error| error.message.as_str()));
@@ -6461,6 +6477,11 @@ impl Scheduler {
                         serde_json::to_value(recovery_receipts().select([Path::new(&canonical)]))
                             .expect("serializable input checkpoints"));
                     if recovery.is_some() {
+                        if let Some(previous) = self.journal.state().entry(&canonical) {
+                            if let Some(sources) = previous.failure_payload.get("generated_sources") {
+                                Arc::make_mut(&mut entry).failure_payload.insert("generated_sources".into(), sources.clone());
+                            }
+                        }
                         if let Some((root, _)) = self.roots.get(&active.root) {
                             Arc::make_mut(&mut entry)
                                 .failure_payload
@@ -6667,6 +6688,8 @@ impl Scheduler {
         // missing-path failure to that newly observed generation.
         let event = if matches!(kind, io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) {
             "pipeline_discovery_retry"
+        } else if kind == io::ErrorKind::BrokenPipe {
+            "pipeline_worker_retry"
         } else {
             "failed_terminal"
         };
@@ -7416,7 +7439,7 @@ impl Observer for WatchObserver {
     }
 
     fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path, destination: &Path,
-        cleanup: Option<DeleteReceipt<'_>>) -> io::Result<()> {
+        cleanup: Option<CleanupReceipt<'_>>) -> io::Result<()> {
         let owner = self.owner_for_path(root).unwrap_or_default();
         prepare_flatten(&self.journal, &owner, root, work, leaf, destination, None,
             Some((self.batch.as_ref(), cleanup)))?;
@@ -7440,7 +7463,16 @@ impl Observer for WatchObserver {
         Ok(())
     }
 
-    fn after_output(&self, archive: &ArchiveResult, cleanup: Option<DeleteReceipt<'_>>) -> io::Result<()> {
+    fn exclude_recovery_files(&self, archive: &ArchiveResult, paths: Vec<String>) -> io::Result<()> {
+        if let Some(owner) = self.owner(archive) {
+            // A child publication can make the parent tree recoverable before
+            // the parent finishes. Save exclusions before dispatching children.
+            self.journal.commit(true, |_| Ok(crate::watch_store::NativeWatchOperations::exclude_recovery_files(&owner, paths)))?;
+        }
+        Ok(())
+    }
+
+    fn after_output(&self, archive: &ArchiveResult, cleanup: Option<CleanupReceipt<'_>>) -> io::Result<()> {
         let Some(output) = &archive.output else {
             return Ok(());
         };
@@ -7453,7 +7485,7 @@ impl Observer for WatchObserver {
         self.journal.commit(true, |state| {
             use crate::watch_store::NativeWatchOperations;
             let keep = archive.failure.is_none() || archive.partial;
-            let intent = cleanup.filter(|_| keep).and_then(|receipt| {
+            let intent = cleanup.filter(|receipt| keep && !receipt.sources.is_empty()).and_then(|receipt| {
                 let id = source_cleanup_id(&self.batch, receipt.id);
                 state.runtime_record(&id).is_none().then(|| (id, receipt))
             });
@@ -7462,6 +7494,23 @@ impl Observer for WatchObserver {
             if let Some((id, receipt)) = intent {
                 if let Some(identity) = operations.finished_output_identity().map(str::to_owned) {
                     store_source_cleanup(&mut operations, id, &owner, (&output, &identity), None, receipt.sources);
+                }
+            }
+            if cleanup.is_some() && archive.source_paths.len() > 1 && keep {
+                // The owner can replay the whole family if its output is lost.
+                // Retire only peer admissions sealed by this complete publication.
+                let claimed = self.claimed.lock().unwrap();
+                let groups = self.groups.lock().unwrap();
+                let owner_key = watch_path_key(&owner);
+                for path in &archive.source_paths {
+                    let peer = key(path);
+                    if peer == owner_key || groups.shared_owners.contains(&peer)
+                        || groups.members.get(&peer) != Some(&1) { continue; }
+                    if let Some(Some(row)) = claimed.candidates.get(&peer) {
+                        if state.pending(&row.path).is_some_and(|p| !p.has_output_work() && p.matches_observation(row)) {
+                            operations.retire_pending(peer);
+                        }
+                    }
                 }
             }
             Ok(operations)
@@ -7490,7 +7539,7 @@ struct SourceCleanupPublication {
     owner: String,
     output: (String, String),
     alternate: Option<(String, String)>,
-    sources: Vec<DeleteSource>,
+    sources: Vec<CleanupSource>,
 }
 
 fn source_cleanup_id(batch: &str, id: crate::pipeline::TaskId) -> String {
@@ -7498,7 +7547,7 @@ fn source_cleanup_id(batch: &str, id: crate::pipeline::TaskId) -> String {
 }
 
 fn store_source_cleanup(operations: &mut crate::watch_store::NativeWatchOperations, id: String, owner: &str,
-    output: (&str, &str), alternate: Option<(&str, &str)>, sources: &[DeleteSource]) {
+    output: (&str, &str), alternate: Option<(&str, &str)>, sources: &[CleanupSource]) {
     operations.set_runtime(id, Some(json!({
         "owner":owner, "output":output, "alternate":alternate, "sources":sources,
     })));
@@ -7512,7 +7561,7 @@ fn prepare_flatten(
     leaf: &Path,
     destination: &Path,
     continuation: Option<&str>,
-    publication: Option<(&str, Option<DeleteReceipt<'_>>)>,
+    publication: Option<(&str, Option<CleanupReceipt<'_>>)>,
 ) -> io::Result<()> {
     journal.commit(true, |state| {
         use crate::watch_store::NativeWatchOperations;
@@ -7539,7 +7588,7 @@ fn prepare_flatten(
                 owner, vec![root.to_string_lossy().into_owned()],
             ) {
                 operations.extend(checkpoint);
-                if let Some((batch, Some(receipt))) = publication {
+                if let Some((batch, Some(receipt))) = publication.filter(|(_, receipt)| receipt.is_some_and(|r| !r.sources.is_empty())) {
                     store_source_cleanup(&mut operations, source_cleanup_id(batch, receipt.id), owner,
                         (&root.to_string_lossy(), &old), Some((&destination.to_string_lossy(), &new)), receipt.sources);
                 }
@@ -7676,8 +7725,12 @@ fn restore_checkpoints(
     state: &crate::watch_store::NativeWatchState,
     owner: &str,
     outputs: &mut BTreeMap<String, String>,
+    generated: &mut Vec<GeneratedSource>,
 ) -> io::Result<Vec<crate::pipeline::InputCheckpoint>> {
     let entry = state.entry(owner);
+    if let Some(rows) = entry.as_ref().and_then(|e| e.failure_payload.get("generated_sources")).and_then(Value::as_array) {
+        for row in rows { generated.push(GeneratedSource::deserialize(row).map_err(io::Error::other)?); }
+    }
     let checkpoints = input_checkpoints(entry.as_deref()).collect::<io::Result<Vec<_>>>()?;
     // Reusing a receipt deliberately skips register_output's exclusive create.
     // Restore its routing separately, before the engine discovers children.

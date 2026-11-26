@@ -158,6 +158,7 @@ enum OutputChange {
     Protect {
         sources: Vec<String>,
     },
+    ExcludeRecovery { paths: Vec<String> },
 }
 
 impl PendingRecord {
@@ -222,6 +223,9 @@ impl PendingRecord {
                 destination,
                 identity,
             } => self.apply_output_relocation(source, leaf, destination, identity),
+            OutputChange::ExcludeRecovery { paths } => {
+                for path in paths { self.completed_sources.insert(path.clone()); }
+            }
             OutputChange::Protect {
                 sources,
             } => {
@@ -643,6 +647,10 @@ impl NativeWatchOperations {
 
     pub(crate) fn set_runtime(&mut self, key: String, value: Option<Value>) {
         self.0.push(Operation::Runtime(key, value.map(Arc::new)));
+    }
+
+    pub(crate) fn exclude_recovery_files(owner: &str, paths: Vec<String>) -> Self {
+        Self(vec![Operation::Output(path_key(owner), OutputChange::ExcludeRecovery { paths })])
     }
 
     pub(crate) fn finished_output_identity(&self) -> Option<&str> {

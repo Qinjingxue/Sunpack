@@ -252,13 +252,17 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
     carrier = tmp_path / "damaged.zip"
     intact_files = 55
     with zipfile.ZipFile(carrier, "w", compression=zipfile.ZIP_STORED) as archive:
+        invalid = _zip_bytes({"must-not-extract.txt": b"failed parent CRC"})
+        archive.writestr("damaged.zip", invalid)
+        bad = archive.getinfo("damaged.zip")
         archive.writestr("nested.zip", _zip_bytes({"recovered.txt": b"verified payload"}))
-        archive.writestr("damaged.txt", b"will fail verification")
-        bad = archive.getinfo("damaged.txt")
         for index in range(intact_files - 1):
             archive.writestr(f"verified-{index}.txt", b"verified payload")
     content = bytearray(carrier.read_bytes())
-    content[bad.header_offset + 30 + len(bad.filename)] ^= 1
+    content[bad.header_offset + 14] ^= 1
+    central = archive.start_dir
+    assert content[central + 46:central + 46 + len(bad.filename)] == bad.filename.encode()
+    content[central + 16] ^= 1
     carrier.write_bytes(content)
 
     output = tmp_path / "out"
@@ -269,8 +273,7 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
     _only_output(output, "recovered.txt", b"verified payload")
     assert carrier.is_file()
     assert not list(output.rglob("nested.zip"))
-
-
+    assert not list(output.rglob("must-not-extract.txt"))
 
 
 @pytest.mark.parametrize("requirement,nested", [("allow_partial", False), ("allow_partial", True), ("complete", False)])

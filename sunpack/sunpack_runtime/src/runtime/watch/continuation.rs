@@ -273,7 +273,7 @@ impl Observer for FlattenPublication<'_> {
         work: &Path,
         leaf: &Path,
         destination: &Path,
-        _: Option<DeleteReceipt<'_>>,
+        _: Option<CleanupReceipt<'_>>,
     ) -> io::Result<()> {
         prepare_flatten(
             self.journal,

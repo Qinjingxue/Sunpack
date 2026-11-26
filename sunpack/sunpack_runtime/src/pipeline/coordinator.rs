@@ -1,6 +1,6 @@
 use super::results::RunOutcome as Outcome;
 use super::checkpoint::{CheckpointKey, InputCheckpoint, InputRecovery, GeneratedSource, ReportState};
-use super::cleanup::{DeleteReceipt, DeleteSource};
+use super::cleanup::{CleanupReceipt, CleanupSource};
 use super::discovery::{self, Discovered, LogicalInput, Task};
 use super::passwords::{CandidateSet, RecentPasswords};
 use super::scheduling::{boxed_phase, stage, Scheduler, Spawner};
@@ -556,13 +556,13 @@ impl CleanupOwner {
 
 #[derive(Default)]
 struct SourceCleanup {
-    deletes: Vec<DeleteSource>,
-    recycles: Vec<PathBuf>,
+    sources: Vec<CleanupSource>,
+    multipart: bool,
 }
 
 impl SourceCleanup {
-    fn receipt(&self, id: TaskId) -> Option<DeleteReceipt<'_>> {
-        (!self.deletes.is_empty()).then_some(DeleteReceipt { id, sources: &self.deletes })
+    fn receipt(&self, id: TaskId) -> Option<CleanupReceipt<'_>> {
+        (self.multipart || !self.sources.is_empty()).then_some(CleanupReceipt { id, sources: &self.sources })
     }
 }
 
@@ -2546,16 +2546,16 @@ impl<'run, O: Observer> Run<'run, O> {
                             this.observer.sources_processed(family,
                                 carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
                         }
-                        let SourceCleanup { deletes, recycles } = cleanup_plan.unwrap_or_else(|| {
+                        let SourceCleanup { sources: actions, .. } = cleanup_plan.unwrap_or_else(|| {
                             let plan = this.plan_cleanup(sources, &physical_sources, &generations,
                                 cleanup_mode, watch_root, depth);
                             sources.release(true);
                             plan
                         });
-                        if deletes.is_empty() && recycles.is_empty() {
+                        if actions.is_empty() {
                             drop(lease);
                         } else {
-                            let paths = (!watch_root).then(|| deletes.iter().map(|source| &source.path).chain(&recycles)
+                            let paths = (!watch_root).then(|| actions.iter().map(|source| &source.path)
                                 .map(|path| Arc::from(namespace_key(path))).collect());
                             let cleanup = Arc::clone(this);
                             let work = async move {
@@ -2566,12 +2566,11 @@ impl<'run, O: Observer> Run<'run, O> {
                                 let mut failures = Vec::new();
                                 if stage("background_source_cleanup", &cleanup.request.cancel).await.is_ok() {
                                     let mut shell = cleanup.engine.shell.branch();
-                                    cleanup.recycle_sources(&recycles, &mut failures, &mut shell);
-                                    if cleanup.engine.delete_sources(&deletes,
+                                    if cleanup.engine.cleanup_sources(&actions, cleanup.request.origin == Origin::Watch,
                                         |parent| !cleanup.cleanup_boundaries.is_empty()
                                             && cleanup.cleanup_boundaries.contains(&resolved_key(parent)), &mut shell,
-                                        |path, error| failures.extend(cleanup_failure(path, "delete", Err(error))),
-                                    ) && !deletes.is_empty() {
+                                        |source, error| failures.extend(cleanup_failure(&source.path, if source.recycle { "recycle" } else { "delete" }, Err(error))),
+                                    ) {
                                         cleanup.observer.source_cleanup_done(task_id);
                                     }
                                 }
@@ -3323,7 +3322,12 @@ impl<'run, O: Observer> Run<'run, O> {
                             self.request.config.extraction.content_requirement,
                             failure.kind, complete_files,
                         );
-                        let stats = scan_output_stats(&output_string, partial && depth <= self.request.max_depth);
+                        let stats = scan_output_stats(&output_string, false);
+                        if let Some(manifest) = frame.manifest.take() {
+                            let (verified, excluded) = manifest.partial_inventory(&output_string, self.request.origin == Origin::Watch);
+                            if !excluded.is_empty() { self.observer.exclude_recovery_files(&result, excluded)?; }
+                            if partial && depth <= self.request.max_depth { inventory = verified; }
+                        }
                         // Retaining damaged payload is not partial success:
                         // main keeps nonempty failed output for manual recovery,
                         // but only verified files authorize recursive processing.
@@ -3333,7 +3337,6 @@ impl<'run, O: Observer> Run<'run, O> {
                             result.files = stats.file_count;
                             result.bytes = stats.total_size;
                             result.output = Some(output.clone());
-                            inventory = stats.inventory;
                         }
                     }
                     failure.evidence = worker_evidence(value, plan.evidence);
@@ -3564,65 +3567,28 @@ impl<'run, O: Observer> Run<'run, O> {
         depth: usize,
     ) -> SourceCleanup {
         let mut allowed = owner.allowed();
-        let mut plan = SourceCleanup::default();
+        let mut plan = SourceCleanup { multipart: watch_root && paths.len() > 1, ..Default::default() };
         for path in paths {
             let source = Path::new(path);
             if !allowed.remove(&namespace_key(source)) { continue; }
-            if mode == CleanupMode::Delete || self.generated_source(path, generations, watch_root, depth).is_some() {
+            let delete = mode == CleanupMode::Delete || self.generated_source(path, generations, watch_root, depth).is_some();
+            if delete || mode == CleanupMode::Recycle {
                 if let Some(generation) = generations.get(&path_key(path)) {
-                    plan.deletes.push(DeleteSource { path: source.to_owned(), generation: generation.clone() });
+                    plan.sources.push(CleanupSource { path: source.to_owned(), generation: generation.clone(), recycle: !delete });
                 }
-            } else if mode == CleanupMode::Recycle {
-                plan.recycles.push(source.to_owned());
             }
         }
         plan
     }
 
-    fn recycle_sources(
-        &self,
-        paths: &[PathBuf],
-        failures: &mut Vec<CleanupResult>,
-        shell: &mut ShellUpdates<'_>,
-    ) {
-        let mode = "recycle";
-        let mut existing = Vec::new();
-        for path in paths {
-            match path.try_exists() {
-                Ok(true) => existing.push(path),
-                Ok(false) => {}
-                Err(error) => failures.extend(cleanup_failure(path, mode, Err(error))),
-            }
-        }
-        if existing.is_empty() {
-            return;
-        }
-        let _promotion = match Promotion::begin(existing.iter().map(|path| (*path).clone())) {
-            Ok(promotion) => promotion,
-            Err(error) => {
-                for path in existing {
-                    failures.extend(cleanup_failure(path, mode, Err(copy_io_error(&error))));
-                }
-                return;
-            }
-        };
-        for path in existing {
-            let removed = super::cleanup::recycle(path);
-            if removed.is_ok() {
-                source_removed(path, |parent| !self.cleanup_boundaries.is_empty()
-                    && self.cleanup_boundaries.contains(&resolved_key(parent)), shell);
-            }
-            failures.extend(cleanup_failure(path, mode, removed));
-        }
-    }
 }
 
 impl Engine {
-    pub(crate) fn recover_delete_sources(
+    pub(crate) fn recover_cleanup_sources(
         &self,
-        sources: &[DeleteSource],
+        sources: &[CleanupSource],
         protected: impl Fn(&Path) -> bool,
-        failure: impl FnMut(&Path, io::Error),
+        failure: impl FnMut(&CleanupSource, io::Error),
     ) -> bool {
         // Recovery runs outside a pipeline request. Take the same namespace
         // and request claims, but never wait behind a live consumer.
@@ -3649,32 +3615,33 @@ impl Engine {
                 Lease { owner: Arc::clone(&self.leases), keys },
             )
         };
-        self.delete_sources(sources, protected, &mut self.shell.branch(), failure)
+        self.cleanup_sources(sources, true, protected, &mut self.shell.branch(), failure)
     }
 
-    fn delete_sources(
+    fn cleanup_sources(
         &self,
-        sources: &[DeleteSource],
+        sources: &[CleanupSource],
+        durable: bool,
         protected: impl Fn(&Path) -> bool,
         shell: &mut ShellUpdates<'_>,
-        mut failure: impl FnMut(&Path, io::Error),
+        mut failure: impl FnMut(&CleanupSource, io::Error),
     ) -> bool {
         if sources.is_empty() { return true; }
         let _promotion = match Promotion::begin(sources.iter().map(|source| source.path.clone())) {
             Ok(promotion) => promotion,
             Err(error) => {
-                for source in sources { failure(&source.path, copy_io_error(&error)); }
+                for source in sources { failure(source, copy_io_error(&error)); }
                 return false;
             }
         };
         let mut settled = true;
         for source in sources {
-            match super::cleanup::delete_source(source) {
+            match super::cleanup::clean_source(source, durable) {
                 Ok(true) => source_removed(&source.path, &protected, shell),
                 Ok(false) => {}
                 Err(error) => {
                     settled = false;
-                    failure(&source.path, error);
+                    failure(source, error);
                 }
             }
         }
@@ -3698,7 +3665,7 @@ fn flatten_result(
     created: Option<&Mutex<CreatedOutputs>>,
     names: &OutputReservationGuard,
     naming: crate::core::config::FlattenDirectoryName,
-    cleanup: Option<DeleteReceipt<'_>>,
+    cleanup: Option<CleanupReceipt<'_>>,
 ) -> io::Result<()> {
     let Some(output) = result.output.as_ref() else {
         return Ok(());

@@ -1026,7 +1026,7 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
         fn reuse_output(&self, _: &ArchiveResult, _: &Path) -> io::Result<()> {
             panic!("completed output must not acquire a second durable owner")
         }
-        fn after_output(&self, _: &ArchiveResult, _: Option<DeleteReceipt<'_>>) -> io::Result<()> {
+        fn after_output(&self, _: &ArchiveResult, _: Option<CleanupReceipt<'_>>) -> io::Result<()> {
             panic!("completed output must not be republished")
         }
     }
@@ -3457,7 +3457,7 @@ fn flatten_work_avoids_unmaterialized_output_claim_and_releases_its_slot() {
     struct Work(Mutex<Option<PathBuf>>);
     impl Observer for Work {
         fn notify(&self, _: Event) {}
-        fn before_flatten(&self, _: &Path, work: &Path, _: &Path, _: &Path, _: Option<DeleteReceipt<'_>>) -> io::Result<()> {
+        fn before_flatten(&self, _: &Path, work: &Path, _: &Path, _: &Path, _: Option<CleanupReceipt<'_>>) -> io::Result<()> {
             *self.0.lock().unwrap() = Some(work.to_owned());
             Ok(())
         }

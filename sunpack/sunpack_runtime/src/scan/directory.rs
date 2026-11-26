@@ -299,6 +299,26 @@ impl NativeWorkerManifest {
         self.complete
     }
 
+    /// Failed jobs may have written intact archives whose enclosing member failed CRC.
+    /// Keep only decoder-confirmed rows for discovery, even when the bytes look valid.
+    pub(crate) fn partial_inventory(self, root: &str, watch: bool) -> (Option<NativeOutputInventory>, Vec<String>) {
+        let ManifestFiles::Rows(mut files) = self.files else { return (None, Vec::new()); };
+        let mut excluded = Vec::new();
+        Arc::make_mut(&mut files).retain(|row| {
+            if row.status == 1 { return true; }
+            if watch {
+                if let Some(path) = inventory_file_path(Path::new(root), row) {
+                    excluded.push(path_to_string(&path));
+                }
+            }
+            false
+        });
+        let inventory = (!files.is_empty()).then(|| NativeOutputInventory {
+            root: root.to_owned(), files: OutputInventoryFiles::Manifest(files),
+        });
+        (inventory, excluded)
+    }
+
     pub(crate) fn into_output_stats(self, root: &str, collect_rows: bool) -> Option<OutputStats> {
         if !self.complete {
             return None;

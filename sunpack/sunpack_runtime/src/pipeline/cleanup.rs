@@ -3,31 +3,33 @@ use std::{io, path::{Path, PathBuf}};
 use crate::io::reader::PhysicalFileGeneration;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct DeleteSource {
+pub(crate) struct CleanupSource {
     pub(crate) path: PathBuf,
     pub(crate) generation: PhysicalFileGeneration,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) recycle: bool,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct DeleteReceipt<'a> {
+pub(crate) struct CleanupReceipt<'a> {
     pub(crate) id: super::TaskId,
-    pub(crate) sources: &'a [DeleteSource],
+    pub(crate) sources: &'a [CleanupSource],
 }
 
 // Ok(false) settles an absent or replaced source without touching its namespace.
 // Open without write sharing, then validate and unlink the very same handle.
 #[cfg(windows)]
-pub(crate) fn delete_source(source: &DeleteSource) -> io::Result<bool> {
+pub(crate) fn clean_source(source: &CleanupSource, durable: bool) -> io::Result<bool> {
     use std::os::windows::{fs::{MetadataExt, OpenOptionsExt}, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
         FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FileDispositionInfoEx, SetFileInformationByHandle,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_DELETE, FileDispositionInfoEx, SetFileInformationByHandle,
     };
     let file = match std::fs::OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ)
+        .access_mode(if source.recycle { FILE_READ_ATTRIBUTES } else { DELETE | FILE_READ_ATTRIBUTES })
+        .share_mode(if source.recycle { FILE_SHARE_READ | FILE_SHARE_DELETE } else { FILE_SHARE_READ })
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(&source.path)
     {
@@ -41,6 +43,20 @@ pub(crate) fn delete_source(source: &DeleteSource) -> io::Result<bool> {
     {
         return Ok(false);
     }
+    if source.recycle {
+        recycle(&source.path)?;
+        if durable {
+            // Shell creates the restore metadata separately from the NTFS rename.
+            // Flush this small file before acknowledging a recoverable transfer.
+            let payload = crate::io::resource_lifecycle::resolved_reader_path(&file)?;
+            let suffix = payload.file_name().and_then(|name| name.to_str()).and_then(|name| name.strip_prefix("$R"))
+                .filter(|_| payload.parent().and_then(Path::parent).and_then(Path::file_name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("$Recycle.Bin")))
+                .ok_or_else(|| io::Error::other("Windows did not return a recycled file"))?;
+            std::fs::OpenOptions::new().write(true).open(payload.with_file_name(format!("$I{suffix}")))?.sync_all()?;
+        }
+        return Ok(true);
+    }
     let info = FILE_DISPOSITION_INFO_EX { Flags: FILE_DISPOSITION_FLAG_DELETE
         | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE };
     if unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfoEx,
@@ -51,7 +67,7 @@ pub(crate) fn delete_source(source: &DeleteSource) -> io::Result<bool> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn delete_source(_: &DeleteSource) -> io::Result<bool> {
+pub(crate) fn clean_source(_: &CleanupSource, _: bool) -> io::Result<bool> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "generation-checked deletion requires Windows"))
 }
 

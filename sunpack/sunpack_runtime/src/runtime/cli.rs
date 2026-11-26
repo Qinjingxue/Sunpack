@@ -1480,7 +1480,7 @@ impl Observer for Progress {
     }
 
     fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path, destination: &Path,
-        _: Option<crate::pipeline::cleanup::DeleteReceipt<'_>>) -> io::Result<()> {
+        _: Option<crate::pipeline::cleanup::CleanupReceipt<'_>>) -> io::Result<()> {
         self.watch.prepare_external_flatten(root, work, leaf, destination)
     }
 
@@ -1500,7 +1500,7 @@ impl Observer for Progress {
         self.watch.finish_external_outputs(&paths())
     }
 
-    fn after_output(&self, archive: &ArchiveResult, _: Option<crate::pipeline::cleanup::DeleteReceipt<'_>>) -> io::Result<()> {
+    fn after_output(&self, archive: &ArchiveResult, _: Option<crate::pipeline::cleanup::CleanupReceipt<'_>>) -> io::Result<()> {
         if let Some(output) = &archive.output {
             self.watch.finish_external_flatten(output)?;
         }

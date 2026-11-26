@@ -530,7 +530,11 @@ std::string pipeline_timing_wire(const sunpack::sevenzip::ExtractPipelineTiming&
 }
 #endif
 
-std::string verified_manifest_wire(const std::string& job_id, sunpack::sevenzip::ExtractArchiveResult& result, bool include_rows) {
+bool verified_file(const sunpack::sevenzip::ExtractOutputItemTrace& item) {
+    return !item.is_dir && item.done && !item.failed && item.operation_result == 0;
+}
+
+std::string verified_manifest_wire(const std::string& job_id, sunpack::sevenzip::ExtractArchiveResult& result, bool include_rows, bool partial) {
     std::optional<WorkerChunks> chunks;
     if (include_rows) {
         chunks.emplace(job_id, "manifest_chunk", "rows");
@@ -551,7 +555,7 @@ std::string verified_manifest_wire(const std::string& job_id, sunpack::sevenzip:
         row += wire::array();
         wire::append_text(row, wide_to_utf8(item.output_path));
         wire::append_number(row, item.has_expected_size ? item.expected_size : item.bytes_written);
-        wire::append_number(row, item.done ? 1 : item.failed ? 2 : 0);
+        wire::append_number(row, partial ? (verified_file(item) ? 1 : 2) : (item.done ? 1 : item.failed ? 2 : 0));
         if (item.has_mtime_ns) wire::append_number(row, item.mtime_ns);
         else row.push_back(wire::kNull);
         wire::append_text(row, std::string_view(reinterpret_cast<const char*>(item.magic.data()), item.magic.size()), wire::kBytes);
@@ -565,7 +569,7 @@ std::string verified_manifest_wire(const std::string& job_id, sunpack::sevenzip:
     const std::string chunk_count = chunks
         ? wire::key("chunk_count") + wire::number(chunks->finish()) : "";
     return wire::object() +
-        wire::key("complete") + wire::boolean(complete && file_count == result.files_written) +
+        wire::key("complete") + wire::boolean(!partial && complete && file_count == result.files_written) +
         wire::key("file_count") + wire::number(file_count) +
         wire::key("total_size") + wire::number(total_size) +
         chunk_count + wire::end();
@@ -1764,13 +1768,12 @@ RequestOutcome run_request(
     if (retire_extraction) retire_extraction();
     NativeMemoryScope response_memory(nullptr);
     // A preexisting output root needs a directory scan to include its old files.
-    const std::string manifest_field = ok && result.output_inventory_complete
-        ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result, include_inventory) : "";
     const auto complete_files = !ok ? std::count_if(
-        result.output_trace.items.begin(), result.output_trace.items.end(),
-        [](const ExtractOutputItemTrace& item) {
-            return !item.is_dir && item.done && !item.failed && item.operation_result == 0;
-        }) : 0;
+        result.output_trace.items.begin(), result.output_trace.items.end(), verified_file) : 0;
+    const bool partial_inventory = !ok && !result.output_trace.items.empty() &&
+        (include_inventory || request.from_watch);
+    const std::string manifest_field = (ok && result.output_inventory_complete) || partial_inventory
+        ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result, include_inventory || partial_inventory, !ok) : "";
     const std::string failure_fields = ok ? "" :
         wire::key("failure_stage") + wire::text(result.failure_stage) +
         wire::key("failure_kind") + wire::text(result.failure_kind) +

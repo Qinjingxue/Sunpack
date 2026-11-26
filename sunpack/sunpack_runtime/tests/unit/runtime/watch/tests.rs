@@ -1959,7 +1959,7 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
     {
         let journal = Arc::new(journal::Journal::open(&directory, 7).unwrap());
         let mut outputs = BTreeMap::new();
-        let checkpoints = restore_checkpoints(journal.state(), owner, &mut outputs).unwrap();
+        let checkpoints = restore_checkpoints(journal.state(), owner, &mut outputs, &mut Vec::new()).unwrap();
         assert_eq!(checkpoints.len(), 1);
         let observer = WatchObserver {
             dedup_enabled: false,

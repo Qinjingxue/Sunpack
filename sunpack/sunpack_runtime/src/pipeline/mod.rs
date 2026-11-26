@@ -796,7 +796,9 @@ pub(crate) trait Observer: Send + Sync {
             .map_err(OutputCreateError::wrap)
     }
 
-    fn after_output(&self, _archive: &ArchiveResult, _cleanup: Option<cleanup::DeleteReceipt<'_>>) -> io::Result<()> {
+    fn exclude_recovery_files(&self, _archive: &ArchiveResult, _paths: Vec<String>) -> io::Result<()> { Ok(()) }
+
+    fn after_output(&self, _archive: &ArchiveResult, _cleanup: Option<cleanup::CleanupReceipt<'_>>) -> io::Result<()> {
         Ok(())
     }
 
@@ -809,7 +811,7 @@ pub(crate) trait Observer: Send + Sync {
     }
 
     fn before_flatten(&self, _root: &Path, _work: &Path, _leaf: &Path, _destination: &Path,
-        _cleanup: Option<cleanup::DeleteReceipt<'_>>) -> io::Result<()> {
+        _cleanup: Option<cleanup::CleanupReceipt<'_>>) -> io::Result<()> {
         Ok(())
     }
 

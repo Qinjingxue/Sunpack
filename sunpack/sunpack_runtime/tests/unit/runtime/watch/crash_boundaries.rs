@@ -48,12 +48,12 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
             }
             store_source_cleanup(&mut operations, source_cleanup_id("crashed", 2), owner_text,
                 (nested_output.to_str().unwrap(), &fs::read_to_string(base.join("identity"))?),
-                None, &[DeleteSource { path: settled_child.clone(), generation: capture_file_generation(&settled_child)? }]);
+                None, &[CleanupSource { recycle: false, path: settled_child.clone(), generation: capture_file_generation(&settled_child)? }]);
             Ok(operations)
         }).unwrap();
-        let deletes = [DeleteSource { path: owner.clone(), generation: capture_file_generation(&owner).unwrap() }];
+        let deletes = [CleanupSource { recycle: false, path: owner.clone(), generation: capture_file_generation(&owner).unwrap() }];
         prepare_flatten(&journal, owner_text, &root, &work, &leaf, &destination, None,
-            Some(("crashed", Some(DeleteReceipt { id: 1, sources: &deletes })))).unwrap();
+            Some(("crashed", Some(CleanupReceipt { id: 1, sources: &deletes })))).unwrap();
         let phase = std::env::var(PHASE).unwrap();
         if phase != "prepared" {
             crate::io::atomic_file::rename_no_replace(&root, &work).unwrap();
@@ -159,7 +159,7 @@ fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replaceme
         let path = source.to_str().unwrap();
         let target = output.to_str().unwrap();
         fs::write(&source, b"archive").unwrap();
-        let deletes = [DeleteSource { path: source.clone(), generation: capture_file_generation(&source).unwrap() }];
+        let deletes = [CleanupSource { recycle: false, path: source.clone(), generation: capture_file_generation(&source).unwrap() }];
         let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
         journal.commit(true, |state| Ok(state.pending_operations(
             [(PendingObservation(path.into(), 7, 1.0, String::new(), 0), String::new(), None)],
@@ -182,11 +182,11 @@ fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replaceme
         fs::write(base.join("output_identity"), output_identity(target).unwrap()).unwrap();
         archive.output = Some(output);
         let before = journal.frontier_seq_for_test();
-        observer.after_output(&archive, Some(DeleteReceipt { id: 1, sources: &deletes })).unwrap();
+        observer.after_output(&archive, Some(CleanupReceipt { id: 1, sources: &deletes })).unwrap();
         assert_eq!(journal.frontier_seq_for_test(), before + 1);
         assert!(journal.state().runtime_record(&id).is_some());
         if std::env::var(CASE).unwrap() == "after_delete" {
-            assert!(crate::pipeline::cleanup::delete_source(&deletes[0]).unwrap());
+            assert!(crate::pipeline::cleanup::clean_source(&deletes[0], true).unwrap());
             observer.source_cleanup_done(1);
         }
         println!("{READY}");
