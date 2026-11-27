@@ -12,7 +12,7 @@ use crate::io::config_changes::{DirectoryChange, NativeConfigChanges};
 use crate::io::reader::PhysicalFileGeneration;
 use crate::pipeline::cleanup::{CleanupReceipt, CleanupSource};
 use crate::pipeline::{
-    ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
+    ArchiveResult, Cancellation, Engine, Event, Failure, FailureKind, Mode, Observer, Origin, Outcome,
     GeneratedSource, Request, InputFailure,
 };
 use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
@@ -6191,7 +6191,8 @@ impl Scheduler {
             let input_failure = &input_failures[&crate::path_keys::path_key(&archive.path.to_string_lossy())];
             let failure = input_failure.failure().expect("retained input has a retry cause");
             let lost = failure.worker_lost();
-            if lost && completed.cancelled { continue; }
+            let retry_execution = lost || failure.output_filesystem_error();
+            if retry_execution && completed.cancelled { continue; }
             let id = key(&archive.path);
             if !published.insert(id.clone()) { continue; }
             let Some(candidate) = watch_candidate_for_path(&archive.path, None)? else {
@@ -6281,14 +6282,14 @@ impl Scheduler {
             let handed_off = pending.is_some();
             // The owner can be consumed before this child resumes. Persist the child's
             // admission in the same transaction as its parent and recovery receipts.
-            if lost {
+            if retry_execution {
                 let update = (pending_observation(&candidate), scope.root.clone(), Some(Arc::new(recovery.record())));
                 operations.extend(self.journal.state().pending_operations(
                     [update], true, &recovery.password_scope.to_string_lossy(), true, None));
             }
             handoff_nested_blocker(&mut entry, route_root, root,
                 recovery, pending);
-            if handed_off || lost {
+            if handed_off || retry_execution {
                 if handed_off { self.unpublished.insert(id.clone()); }
                 operations.put_entry(entry);
             } else {
@@ -6355,11 +6356,13 @@ impl Scheduler {
                 .map_or((None, InputFailure::default()), |(rows, blockers)| (Some(rows), blockers));
             // Keep the physical claim retryable if any segment is blocked,
             // even if another segment finished with a terminal failure.
-            let segment_blocker = segment_blockers.retryable().then_some(&segment_blockers);
+            let segment_blocker = watch_retryable(&segment_blockers, false).then_some(&segment_blockers);
             let input_failure = segment_blocker.or_else(|| failed_archive.and_then(|archive| input_failures
                 .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))));
             let failure = segment_blocker.and_then(InputFailure::failure).or(discovery_failure)
                 .or_else(|| input_failure.and_then(InputFailure::failure));
+            let defer_output = !completed.cancelled && failure.is_some_and(Failure::output_filesystem_error)
+                && failed_archive.is_some_and(|archive| archive.depth == start_depth);
             if let Some(lost) = failure.filter(|f| !completed.cancelled
                 && failed_archive.is_some_and(|archive| archive.depth == start_depth)
                 && f.worker_lost()) {
@@ -6507,7 +6510,7 @@ impl Scheduler {
                     retry.push((record.path.clone(), CandidateAdmission::Retry));
                 }
             }
-            if resumed.is_none() && deferred.is_none()
+            if !defer_output && resumed.is_none() && deferred.is_none()
                 && record.as_ref().is_some_and(|entry| entry.failure_payload.contains_key("segments"))
             {
                 // The entry update publishes the segment cards. No completion
@@ -6583,7 +6586,15 @@ impl Scheduler {
                         "owner":batch,"retire_group":true}));
                 }
             }
-            if resumed.is_some() {
+            if defer_output {
+                // Keep the failed generation for the next normal Watch startup. Repeated
+                // writes against the same failing device must not drive a live retry loop.
+                let update = (pending_observation(&candidate), self.roots[&active.root].1.root.clone(),
+                    recovery.map(|r| Arc::new(r.record())));
+                operations.extend(self.journal.state().pending_operations([update], true,
+                    &active.password_scope.to_string_lossy(), recovery.is_some(), None));
+                if let Some(entry) = record { operations.put_entry(entry); }
+            } else if resumed.is_some() {
                 operations.settle_pending(&candidate.path, record);
             } else {
                 operations.finish_pending(&candidate.path, record);
@@ -6791,7 +6802,7 @@ impl<'a> RecoveryReceipts<'a> {
 }
 
 fn watch_retryable(input: &InputFailure<'_>, multipart: bool) -> bool {
-    input.retryable() || input.failure().is_some_and(|failure| failure.worker_lost() || (multipart && failure.kind == FailureKind::Damaged))
+    input.retryable() || input.failure().is_some_and(|failure| failure.worker_lost() || failure.output_filesystem_error() || (multipart && failure.kind == FailureKind::Damaged))
 }
 
 fn nested_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailure<'_>>) -> bool {
@@ -7034,6 +7045,10 @@ fn completion_segments<'a>(
                 blockers.password.get_or_insert(failure);
                 "failed_password"
             }
+            Some(failure) if failure.output_filesystem_error() => {
+                blockers.terminal.get_or_insert(failure);
+                "failed_terminal"
+            }
             Some(_) => "failed_terminal",
             None if nested.is_some() => "failed_terminal",
             None => "done",
@@ -7052,7 +7067,7 @@ fn completion_segments<'a>(
         }
         row
     }).collect();
-    blockers.failed = blockers.missing.is_some() || blockers.password.is_some();
+    blockers.failed = blockers.missing.is_some() || blockers.password.is_some() || blockers.terminal.is_some();
     Some((Value::Array(rows), blockers))
 }
 
@@ -7092,7 +7107,8 @@ fn make_blocker(
     let mut blockers = Vec::new();
     if missing { blockers.push("missing_volume"); }
     if password { blockers.push("password"); }
-    if !missing && group.is_some_and(|group| group.members.len() > 1) { blockers.push("volume_candidate"); }
+    if !missing && group.is_some_and(|group| group.members.len() > 1)
+        && !failure.failure().is_some_and(Failure::output_filesystem_error) { blockers.push("volume_candidate"); }
     let mut payload = serde_json::Map::new();
     payload.insert("blockers".into(), json!(blockers));
     if let Some(group) = group {

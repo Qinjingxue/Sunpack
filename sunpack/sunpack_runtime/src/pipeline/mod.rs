@@ -215,6 +215,10 @@ impl Failure {
         self.evidence.as_deref().and_then(|e| e.native_kind.as_deref()) == Some("worker_lost")
     }
 
+    pub(crate) fn output_filesystem_error(&self) -> bool {
+        self.evidence.as_deref().and_then(|e| e.native_kind.as_deref()) == Some("output_filesystem")
+    }
+
     /// Weak ZipCrypto validation does not authorize a password retry. The
     /// classifier separately marks the password-or-volume ambiguity.
     pub(crate) fn is_password_retry(&self) -> bool {
@@ -537,6 +541,7 @@ impl Outcome {
             match failure.kind {
                 _ if failure.kind == FailureKind::MissingVolume => { input.missing.get_or_insert(failure); }
                 _ if failure.is_password_retry() => { input.password.get_or_insert(failure); }
+                _ if failure.output_filesystem_error() && !archive.partial => { input.terminal = Some(failure); }
                 _ if !archive.partial => { input.terminal.get_or_insert(failure); }
                 _ => {}
             }
