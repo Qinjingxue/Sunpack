@@ -117,6 +117,7 @@ fn xz_footer_evidence_preserves_false_headers_peers_and_lazy_io() {
         source.len(),
         stored_hits(&hits).view(0),
         stored_hits(&ends).view(0),
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -193,6 +194,7 @@ fn lz4_suffixes_keep_payload_roots_and_own_long_concatenations() {
             source.len(),
             stored_hits(&hits).view(0),
             stored_hits(&[]).view(0),
+            false,
         )
         .unwrap();
         assert_eq!(candidates.len(), 1);
@@ -254,6 +256,7 @@ fn xz_index_evidence_keeps_future_roots_under_read_budget_and_propagates_io() {
         source.len(),
         stored_hits(&hits).view(0),
         stored_hits(&ends).view(0),
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -530,7 +533,8 @@ fn failed_suffixes_keep_inner_archives_under_read_budget_and_propagate_io() {
                 &source,
                 source.len(),
                 stored_hits(&hits).view(0),
-                stored_hits(&[]).view(0)
+                stored_hits(&[]).view(0),
+                false,
             )
             .unwrap_or_else(|error| panic!("{kind}: {error}")),
             expected,
@@ -555,6 +559,7 @@ fn long_zstd_concatenations_keep_their_original_root() {
         source.len(),
         stored_hits(&hits).view(0),
         stored_hits(&[]).view(0),
+        false,
     )
     .unwrap();
     assert_eq!(candidates.len(), 1);
@@ -739,6 +744,45 @@ fn aggregates_many_tar_member_anchors_into_one_logical_archive() {
     assert_eq!(tar[0].offset, start);
     assert_eq!(tar[0].end_offset, Some(end));
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn leading_v7_tar_owns_member_archives_and_keeps_an_appended_peer() {
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+    gzip.write_all(b"independent peer").unwrap();
+    let gzip = gzip.finish().unwrap();
+    let mut zip = Vec::new();
+    append_zip64_archive(&mut zip);
+    let mut data = Vec::new();
+    append_tar_member(&mut data, "inner.zip", &zip);
+    data[257..265].fill(0);
+    let checksum = crate::formats::tar::checksum(&data[..512]);
+    data[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    data.extend_from_slice(&[0; 1024]);
+    let end = data.len() as u64;
+    data.extend_from_slice(&gzip);
+    let path = temp_file("leading_v7_tar_and_peer", &data);
+    let scan = scan_embedded_path(path.to_str().unwrap(), 1).unwrap();
+    assert_eq!(
+        scan.candidates
+            .iter()
+            .map(|item| (item.format, item.offset, item.end_offset))
+            .collect::<Vec<_>>(),
+        [("tar", 0, Some(end)), ("gzip", end, Some(data.len() as u64))],
+    );
+
+    // A valid first header alone cannot hide a peer when the walk fails.
+    data[end as usize - 1] = 1;
+    fs::write(&path, &data).unwrap();
+    let scan = scan_embedded_path(path.to_str().unwrap(), 1).unwrap();
+    let _ = fs::remove_file(path);
+    assert_eq!(
+        scan.candidates
+            .iter()
+            .map(|item| (item.format, item.offset))
+            .collect::<Vec<_>>(),
+        [("zip", 512), ("gzip", end)],
+    );
 }
 
 #[test]

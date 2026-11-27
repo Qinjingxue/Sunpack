@@ -22,7 +22,7 @@ use memchr::memmem;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
@@ -438,7 +438,11 @@ fn scan_embedded_archives_native_with_iocp(
     // Zero is absent. A definite single signature stores its offset plus one.
     // Multiple or untracked signatures keep the legacy relation tail search.
     let physical_zip_eocd = AtomicU64::new(0);
+    let leading_legacy_tar = AtomicBool::new(false);
     let scan = |sample: &[u8], carry: usize, base: u64| {
+        if base == 0 && crate::formats::tar::possible_legacy_header(sample, file_size) {
+            leading_legacy_tar.store(true, Ordering::Relaxed);
+        }
         let batch = scan_sample_batch(sample, carry, base);
         #[cfg(all(test, windows))]
         if let Some(capture) = &capture {
@@ -487,7 +491,8 @@ fn scan_embedded_archives_native_with_iocp(
                 }
                 let hits = scan(&data, 0, 0);
                 let reuse = data.len() as u64 == file_size
-                    && (generation.is_some() || hits.results.is_none()
+                    && (generation.is_some()
+                        || (hits.results.is_none() && !leading_legacy_tar.load(Ordering::Relaxed))
                         || reader.physical_generation().is_some_and(|expected| {
                             capture_file_generation(path).is_ok_and(|current| &current == expected)
                         }));
@@ -561,7 +566,10 @@ fn scan_embedded_archives_native_with_iocp(
             Some(data) => ManagedReader::from_bytes(data, ReaderConfig::default()),
             None => reader.probe_reader(),
         };
-        validate_raw_hits(&probe_reader, file_size, raw_hits, xz_footer_hits)?
+        validate_raw_hits(
+            &probe_reader, file_size, raw_hits, xz_footer_hits,
+            leading_legacy_tar.into_inner(),
+        )?
     };
     candidates.sort_by_key(|candidate| {
         (
@@ -634,9 +642,18 @@ fn validate_raw_hits(
     file_size: u64,
     raw_hits: HitView<'_>,
     xz_footer_hits: HitView<'_>,
+    leading_legacy_tar: bool,
 ) -> io::Result<Vec<EmbeddedCandidate>> {
     let cancellation = crate::io::cancellation::Cancellation::current();
     let mut suffixes: [FailedSuffixEvidence; 5] = std::array::from_fn(|_| Default::default());
+    // A V7 TAR can have no byte signature. A complete leading walk owns its
+    // members, while hits after its validated end remain independent peers.
+    let leading_tar = if leading_legacy_tar {
+        validate_tar(reader, file_size, 0, &mut suffixes[3])?
+    } else {
+        None
+    };
+    let leading_end = leading_tar.as_ref().and_then(|tar| tar.end_offset).unwrap_or(0);
     let mut xz_footers = XzFooterEvidence {
         ends: xz_footer_hits,
         next_unchecked: 0,
@@ -647,7 +664,11 @@ fn validate_raw_hits(
     let mut zip64_records = BTreeMap::new();
     let use_windows = raw_hits.len() + xz_footer_hits.len() >= 128;
     let mut windowed = None;
-    for hit in raw_hits.iter_mask(1 << 12) {
+    let mut zip64_hits = raw_hits.iter_mask(1 << 12);
+    if leading_end != 0 {
+        zip64_hits.seek_ge(leading_end);
+    }
+    for hit in zip64_hits {
         let reader: &ManagedReader = if use_windows {
             windowed.get_or_insert_with(|| reader.windowed_probe_reader())
         } else {
@@ -669,6 +690,9 @@ fn validate_raw_hits(
         }
     }
     let mut eocds = raw_hits.iter_mask(1 << 1);
+    if leading_end != 0 {
+        eocds.seek_ge(leading_end);
+    }
     let mut candidates = match (eocds.next(), eocds.next()) {
         (None, _) => Vec::new(),
         (Some(hit), None) => validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, None)?
@@ -676,6 +700,7 @@ fn validate_raw_hits(
             .collect(),
         _ => raw_hits
             .par_iter_mask(1 << 1)
+            .filter(|hit| hit.offset() >= leading_end)
             .map_init(Vec::new, |suffixes, hit| {
                 cancellation.run(|| {
                     validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, Some(suffixes))
@@ -692,6 +717,9 @@ fn validate_raw_hits(
                 Ok(left)
             })?,
     };
+    if leading_end != 0 {
+        candidates.retain(|item| item.offset >= leading_end);
+    }
 
     // ZIP EOCD geometry can prove a logical root before its local-header hit is
     // visited. Seed exact ownership with those ranges, then process every other
@@ -725,10 +753,14 @@ fn validate_raw_hits(
     }
 
     let mut range_index = 0usize;
-    let mut covered_until = 0u64;
+    let mut covered_until = leading_end;
+    candidates.extend(leading_tar);
     let mut previous_xz: Option<usize> = None;
     let mut zip_bzip2_ends = BTreeMap::new();
     let mut cursor = raw_hits.iter_mask(!((1 << 1) | (1 << 12)));
+    if covered_until != 0 {
+        cursor.seek_ge(covered_until);
+    }
     while let Some(hit) = cursor.next() {
         cancellation.check_io()?;
         while range_index < seeded_ranges.len() && seeded_ranges[range_index].0 <= hit.offset() {
@@ -2002,24 +2034,29 @@ fn walk_tar_candidate(
         return Err(ValidationError::Invalid("tar_header_missing"));
     }
     let header = read_at(file, offset, 512)?;
-    if header.len() < 512 || &header[257..262] != TAR_USTAR {
+    if header.len() < 512
+        || (&header[257..262] != TAR_USTAR
+            && (offset != 0
+                || !crate::formats::tar::possible_legacy_header(&header, size)
+                || !crate::formats::tar::header_identity_fields(&header)))
+    {
         return Err(ValidationError::Invalid("tar_header_invalid"));
     }
     let mut first_header = Some(header);
     let mut cursor = offset;
     let mut state = crate::formats::tar::TarState::default();
     loop {
-        // A PAX size inherited from an earlier header cannot disprove a TAR
-        // rooted at this cursor with its own fresh metadata context.
-        if state.boundary_context_free() {
-            visit(cursor)?;
-        }
         let current = match first_header.take() {
             Some(header) => header,
             None => read_at(file, cursor, 512)?,
         };
         if current.len() != 512 {
             return Err(ValidationError::Invalid("tar_header_missing"));
+        }
+        // Cache only roots the scanner can revisit. An inherited PAX size
+        // cannot disprove a TAR with its own metadata context.
+        if &current[257..262] == TAR_USTAR && state.boundary_context_free() {
+            visit(cursor)?;
         }
         if current.iter().all(|byte| *byte == 0) {
             let second = read_at(file, cursor + 512, 512)?;

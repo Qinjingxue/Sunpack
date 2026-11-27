@@ -69,7 +69,9 @@ NativeMemoryManager::NativeMemoryManager(std::uint64_t reserve, std::function<vo
                                          , Query query
 #endif
     )
-    : reserve_bytes_(reserve), reclaim_(std::move(reclaim))
+    : reserve_bytes_(reserve),
+      recovery_margin_(static_cast<std::int64_t>((std::min)(reserve, small_workspace_bytes_per_credit))),
+      reclaim_(std::move(reclaim))
 #ifdef SUP7Z_DEBUG
     , query_(std::move(query))
 #endif
@@ -133,7 +135,10 @@ void NativeMemoryManager::begin(NativeMemoryJob &job, std::function<void()> wake
     job.wake_pending = false;
     job.failed_headroom = -1;
     job.retry_headroom = INT64_MAX;
-    if (!job.revoked.load(std::memory_order_acquire)) job.required = 0;
+    if (!job.revoked.load(std::memory_order_acquire)) {
+        job.required = 0;
+        job.retry_floor = 0;
+    }
     job.peak = job.committed;
     job.revoked.store(false, std::memory_order_release);
     job.denied.store(false, std::memory_order_release);
@@ -172,12 +177,14 @@ void NativeMemoryManager::revoke_locked(NativeMemoryJob &job) {
     // take a writer/registry lock under the arbitrator or on that same stack.
     job.wake_pending = true;
 }
-void NativeMemoryManager::failed_locked(NativeMemoryJob &job, std::uint64_t required, std::int64_t headroom) {
+void NativeMemoryManager::failed_locked(NativeMemoryJob &job, std::uint64_t required, std::int64_t headroom,
+                                        std::uint64_t denied_bytes) {
     // A replay can be withdrawn before it reaches the allocation that failed
     // last time. Keep that observed workspace instead of relearning a smaller
-    // prefix forever under contention. Real capacity growth still permits the
-    // existing bounded probe below this requirement.
+    // prefix forever under contention. Only a concrete mandatory denial sets
+    // the minimum size for a lower-workspace retry.
     job.required = (std::max)(job.required, required);
+    job.retry_floor = (std::max)(job.retry_floor, denied_bytes);
     // Compare external capacity after refunding this attempt, not the extra
     // room produced merely by freeing its own dictionaries/admission.
     job.retry_headroom = headroom + static_cast<std::int64_t>(job.committed + job.admission);
@@ -198,19 +205,26 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool
         const auto total = wanted > UINT64_MAX - job.committed ? UINT64_MAX : job.committed + wanted;
         if (!optional) job.peak = (std::max)(job.peak, total);
         const auto credit = (std::min)(wanted, job.admission);
+        const auto unreserved = wanted - credit;
+        const auto fits = [&](std::int64_t room) {
+            // A funded mandatory allocation can finish rebuilding within the
+            // shared recovery margin. New and optional commitments still need
+            // room above the normal reserve.
+            return !optional && unreserved == 0 ? room >= -recovery_margin_ : can_fit(room, unreserved);
+        };
         auto headroom = sample_locked();
         // Do not deny a legal allocation on an old external snapshot. A low
         // Windows notification also bypasses the ledger's normal fast path.
-        if (!can_fit(headroom, wanted - credit) ||
+        if (!fits(headroom) ||
             (low_ && WaitForSingleObject(low_, 0) == WAIT_OBJECT_0)) headroom = sample_locked(true);
-        if (!can_fit(headroom, wanted - credit)) {
+        if (!fits(headroom)) {
             // Let existing codec fallbacks (e.g. MT -> serial) work first.
             // Only an unsuccessful attempt is replayed for this denial.
             // Reclaim on the monitor: global-new callers may already hold a
             // writer/registry mutex, so inline cache reclaim can deadlock.
             reclaim_requested_ = true;
             if (!optional) {
-                failed_locked(job, total, headroom);
+                failed_locked(job, total, headroom, wanted);
                 job.denied.store(true, std::memory_order_release);
             }
             SetEvent(change_);
@@ -229,7 +243,7 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool
             headroom = sample_locked(true);
             if (!optional) {
                 job.failed_headroom = headroom + static_cast<std::int64_t>(job.committed + job.admission);
-                failed_locked(job, total, headroom);
+                failed_locked(job, total, headroom, wanted);
                 job.denied.store(true, std::memory_order_release);
             }
             changed();
@@ -245,6 +259,8 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool
         set_admission_locked(job, job.admission - credit);
         job.committed += wanted;
         if (optional) job.peak = (std::max)(job.peak, total);
+        else if (job.retry_floor && wanted >= job.retry_floor && !job.denied.load(std::memory_order_relaxed))
+            job.retry_floor = 0;
         cached_headroom_ -= static_cast<std::int64_t>(wanted);
         if (job.admission && job.committed >= job.required) {
             // The observed dictionary workspace is now funded. Reconcile the
@@ -318,11 +334,7 @@ void NativeMemoryManager::monitor() {
         bool pressure;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            const auto available = sample_locked(event == WAIT_OBJECT_0 + 1 || event == WAIT_TIMEOUT);
-            // Refund forecasts before reclaiming real memory. An unconsumed
-            // restart reservation is not a working dictionary to protect.
-            if (available < 0 && reserved_bytes_ != 0)
-                for (auto *job : jobs_) set_admission_locked(*job, 0);
+            sample_locked(event == WAIT_OBJECT_0 + 1 || event == WAIT_TIMEOUT);
             pressure = !stopping_ && (reclaim_requested_ || cached_headroom_ < 0);
             reclaim_requested_ = false;
         }
@@ -332,15 +344,22 @@ void NativeMemoryManager::monitor() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopped = stopping_;
-            const auto headroom = sample_locked(pressure);
-            if (!stopped && headroom < 0) {
+            auto headroom = sample_locked(pressure);
+            // Temporary codec and writer workspace can cross the admission
+            // threshold. Use one existing per-credit cushion across the
+            // worker before withdrawing funded replays or live dictionaries.
+            if (headroom < -recovery_margin_ && reserved_bytes_ != 0) {
+                for (auto *job : jobs_) set_admission_locked(*job, 0);
+                headroom = cached_headroom_;
+            }
+            if (!stopped && headroom < -recovery_margin_) {
                 std::uint64_t retiring = 0;
                 NativeMemoryJob *victim = nullptr;
                 for (auto *job : jobs_) {
                     if (job->revoked.load(std::memory_order_acquire)) retiring += job->committed;
                     else if (job->running && job->committed && (!victim || victim->committed < job->committed)) victim = job;
                 }
-                if (victim && retiring < static_cast<std::uint64_t>(-headroom)) {
+                if (victim && retiring < static_cast<std::uint64_t>(-(headroom + recovery_margin_))) {
                     failed_locked(*victim, victim->committed, headroom);
                     revoke_locked(*victim);
                 }
@@ -363,22 +382,23 @@ void NativeMemoryManager::monitor() {
                 const auto available = cached_headroom_ - static_cast<std::int64_t>(reserved_bytes_);
                 // Retained replay metadata is already in process commitment;
                 // reserve only the additional workspace, never charge it twice.
-                const auto needed = job.required > job.committed ? job.required - job.committed : 0;
+                const auto needed = (std::max)(job.retry_floor,
+                    job.required > job.committed ? job.required - job.committed : 0);
                 // Replays also recreate their small codec/IO workspace. Do not
                 // wake a whole wave using dictionary bytes alone. This is the
                 // same coarse, measured per-credit cushion as the reserve;
                 // ordinary task admission and CPU credits are unchanged.
                 const auto reservation = needed > UINT64_MAX - small_workspace_bytes_per_credit
                     ? UINT64_MAX : needed + small_workspace_bytes_per_credit;
-                // A failed mandatory allocation includes the dictionaries still
-                // live at that point. An unclassified withdrawal may include
-                // optional parallel storage: allow a budgeted probe after real
-                // capacity grows by one managed-allocation quantum.
+                // The observed workspace may include optional buffers. Allow
+                // a lower-memory probe after real growth, provided it can fund
+                // a known mandatory allocation in full.
                 const bool growth = available >= static_cast<std::int64_t>(quantum) &&
                     job.retry_headroom <= available - static_cast<std::int64_t>(quantum);
                 // Always permit one otherwise-fitting task even if the extra
                 // cushion cannot fit; the fixed reserve protects that probe.
-                const bool fits = (can_fit(available, reservation) ||
+                const bool fits = can_fit(available, job.retry_floor) &&
+                    (can_fit(available, reservation) ||
                     (!progressing && can_fit(available, needed)) || growth) &&
                     (job.failed_headroom < 0 || available > job.failed_headroom);
                 if (canceled || fits) {

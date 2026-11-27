@@ -23,6 +23,7 @@ struct NativeMemoryJob final {
     // The manager mutex protects all non-atomic fields.
     std::uint64_t committed = 0, peak = 0, admission = 0;
     std::uint64_t required = 0; // observed failed workspace, retained across early replay withdrawals
+    std::uint64_t retry_floor = 0; // denied mandatory allocation, excluding other live workspace
     std::int64_t failed_headroom = -1;
     std::int64_t retry_headroom = INT64_MAX;
     std::size_t manager_index = SIZE_MAX; // index of a running job or its pending admission
@@ -76,10 +77,12 @@ private:
     std::int64_t sample_locked(bool fresh = false);
     void add_job_locked(NativeMemoryJob &job);
     void set_admission_locked(NativeMemoryJob &job, std::uint64_t bytes) noexcept;
-    void failed_locked(NativeMemoryJob &job, std::uint64_t required, std::int64_t headroom);
+    void failed_locked(NativeMemoryJob &job, std::uint64_t required, std::int64_t headroom,
+                       std::uint64_t denied_bytes = 0);
     void revoke_locked(NativeMemoryJob &job);
     void monitor();
     const std::uint64_t reserve_bytes_;
+    const std::int64_t recovery_margin_;
     std::function<void()> reclaim_;
 #ifdef SUP7Z_DEBUG
     Query query_;

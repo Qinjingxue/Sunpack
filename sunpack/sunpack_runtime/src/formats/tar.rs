@@ -313,8 +313,21 @@ mod tests;
 pub(crate) fn header_identity(header: &[u8], file_size: u64) -> bool {
     let Ok(size) = header_size(header) else { return false; };
     BLOCK.saturating_add(size).saturating_add(padding(size)) <= file_size
-        && header[..100].iter().any(|byte| *byte != 0)
+        && header_identity_fields(header)
+}
+
+pub(crate) fn header_identity_fields(header: &[u8]) -> bool {
+    header[..100].iter().any(|byte| *byte != 0)
         && (header[156] == 0 || (0x20..0x7f).contains(&header[156]))
         && [100..108, 108..116, 116..124, 136..148].into_iter()
             .all(|field| number(&header[field]).is_some())
+}
+
+pub(crate) fn possible_legacy_header(prefix: &[u8], file_size: u64) -> bool {
+    let Some(header) = prefix.get(..BLOCK as usize) else { return false; };
+    file_size >= 3 * BLOCK
+        && header[0] != 0
+        && header[257..265] == [0; 8]
+        && matches!(header[148], b' ' | b'0'..=b'7')
+        && matches!(header[156], 0 | b'0'..=b'7')
 }

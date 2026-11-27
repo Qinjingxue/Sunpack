@@ -177,6 +177,41 @@ void batched_waiter_admission() {
     manager.end(first);
 }
 
+void recovery_margin() {
+    std::atomic<std::int64_t> capacity{32 * MiB};
+    NativeMemoryJob *active = nullptr;
+    NativeMemoryManager manager(16 * MiB, {}, [&] {
+        return capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0);
+    });
+    NativeMemoryJob replay(manager), peer(manager);
+    active = &replay;
+    replay.required = 32 * MiB;
+    std::atomic<bool> cancel{false};
+    std::promise<bool> admitted, withdrawn;
+    auto admission = admitted.get_future(), withdrawal = withdrawn.get_future();
+    manager.park(replay, cancel, [&](bool value) { admitted.set_value(value); });
+    require(ready(admission), "tight budget should fund one replay");
+
+    capacity = 28 * MiB;
+    manager.changed();
+    manager.begin(peer);
+    require(!manager.allocate(peer, 4 * MiB, true), "new work spent the replay margin");
+    manager.end(peer);
+    manager.begin(replay, [&] { withdrawn.set_value(true); });
+    require(!manager.allocate(replay, 4 * MiB, true), "optional workspace spent the replay margin");
+    auto *dictionary = manager.allocate(replay, 32 * MiB);
+    require(dictionary, "small workspace growth invalidated a funded replay");
+    require(withdrawal.wait_for(300ms) == std::future_status::timeout,
+        "a temporary deficit inside the recovery margin withdrew a live dictionary");
+
+    capacity = 12 * MiB;
+    manager.changed();
+    require(ready(withdrawal) && replay.revoked, "pressure beyond the margin must still revoke");
+    sunpack_memory_free(dictionary);
+    manager.end(replay);
+    manager.stop();
+}
+
 // Codec tests cannot distinguish a required dictionary from an earlier,
 // optional parallel buffer. This single scenario covers both restart gates
 // and the no-growth/no-spin invariant, without loading a large real archive.
@@ -196,21 +231,25 @@ void restart_working_set() {
     manager.end(job);
     manager.begin(job);
     auto *dictionary = manager.allocate(job, 24 * MiB);
-    auto *parallel = manager.allocate(job, 64 * MiB);
+    auto *parallel = manager.allocate(job, 64 * MiB, true);
     require(dictionary && parallel, "initial parallel workspace unavailable");
     sunpack_memory_free(parallel);
-    capacity = 48 * MiB;
+    capacity = 25 * MiB;
     manager.changed();
     require(!manager.allocate(job, 32 * MiB), "required allocation should be denied");
     manager.retry(job);
     sunpack_memory_free(dictionary);
     manager.end(job);
     std::atomic<bool> cancel{false};
-    std::promise<bool> resume;
+    std::promise<bool> paused, resume;
+    auto waiting = paused.get_future();
     auto resumed = resume.get_future();
-    manager.park(job, cancel, [&](bool value) { resume.set_value(value); });
+    manager.park(job, cancel, [&](bool value) { resume.set_value(value); },
+        [&](bool pause, const auto &, auto) { if (pause) paused.set_value(true); });
+    require(ready(waiting), "denied dictionary did not enter memory wait");
+    capacity = 30 * MiB; manager.changed();
     require(resumed.wait_for(300ms) == std::future_status::timeout,
-        "refunding the failed attempt must not trigger a replay loop");
+        "real growth below the denied 32 MiB allocation must not cause a retry");
     capacity = 64 * MiB; manager.changed();
     require(resumed.wait_for(5s) == std::future_status::ready,
         "optional historical peak blocked the required 56 MiB workspace");
@@ -421,6 +460,7 @@ int main() {
     rar_ppmd_growth_under_pressure();
     simultaneous_scaled_machine_budgets();
     batched_waiter_admission();
+    recovery_margin();
     restart_working_set();
     bzip2_optional_workspace();
     sparse_replay(directory);
